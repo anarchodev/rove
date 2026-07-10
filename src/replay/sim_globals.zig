@@ -218,7 +218,12 @@ const SYSTEM_SHIM =
     \\    blob: {
     \\      presign: function(hash, ttl, ct){ return "https://sim.invalid/blob/" + hash + (ttl != null ? "?ttl=" + ttl : ""); },
     \\      write: function(){}, seal: function(){ return {}; },
-    \\      receive: function(on){ push({ kind: "blob", op: "receive", on: on || null }); },
+    \\      // `blob.receive(on)` (own-tenant) and `platform.scope(id).blob.receive`
+    \\      // (which lowers to `receive(on, id, JSON.stringify(ctx))`) both bottom
+    \\      // out here. Record `scope` + the issue-time `app` ctx so a
+    \\      // `.receive().stored({...})` continuation can echo `app` back exactly
+    \\      // as `emitTerminal` does (`request.ctx = {hash, len, app}`).
+    \\      receive: function(on, scope, appJson){ var app = null; if (appJson !== undefined && appJson !== null) { try { app = JSON.parse(appJson); } catch (_) { app = null; } } push({ kind: "blob", op: "receive", on: on || null, scope: (scope !== undefined ? scope : null), app: app }); },
     \\    },
     \\    stream: {
     \\      start: function(){},

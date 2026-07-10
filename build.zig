@@ -1357,6 +1357,9 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/platformkv", // platform.scope(id)/root per-store kv isolation
         "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
         "src/replay/testdata/platformadmin", // platform.* admin-only gating (fail-closed)
+        "src/replay/testdata/upload", // headers-first onHeaders + blob.receive → onStored continuation
+        "src/replay/testdata/concurrent", // whenConcurrent: cross-order fetch interleavings + invariant
+        "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

@@ -267,6 +267,31 @@ class Scenario {
     }));
   }
 
+  /** A headers-first inbound activation → the root node at `onHeaders`. The
+   *  streaming-body trust boundary: the export runs BEFORE the body is accepted,
+   *  so the only body-accepting move from here is `blob.receive({on})` then
+   *  `return next()` (which opens the valve — resume the receive with
+   *  `node.receive().stored({...})`). Same request surface as `inbound`
+   *  (`_middlewares/before` runs first if the app has one); the export resolves
+   *  to `onHeaders` via the `inbound_headers` kind. */
+  inboundHeaders(req = {}) {
+    const w = this._base({
+      activation: "inbound_headers",
+      request: {
+        method: req.method || "GET",
+        path: req.path || "/",
+        host: req.host || "",
+        headers: req.headers || {},
+        ip: req.ip,
+        session: req.session,
+      },
+    });
+    // onHeaders normally carries no ctx; thread one only if the caller supplies
+    // it (parity with the documented `{ ctx? }` surface).
+    if (req.ctx !== undefined) w.ctx = req.ctx;
+    return new Node(this, w);
+  }
+
   /** A DETACHED durable delivery callback (`webhook.send` / `email.send` `on`),
    *  authored directly — NOT folded from an emitter. The send fires after the
    *  handler commits and its `on` module runs later as its own activation, so
@@ -300,6 +325,35 @@ class Scenario {
           id: r.id != null ? r.id : null,
           headers: r.headers || {},
         },
+      },
+    }));
+  }
+
+  /** A bare fetch-continuation MODULE authored in isolation — the `on` module of
+   *  an `after.fetch`/`http.fetch`, driven standalone given an upstream result
+   *  (parallel to `sendCallback`, but the fetch-result surface rather than the
+   *  send-callback one). The response lands flattened on `request.{status, ok,
+   *  done, body}` and the echoed `ctx` bare on `request.ctx` — the same shape a
+   *  folded `FetchHandle.resolve` produces, so a `_rp/complete.mjs`-style module
+   *  is testable without standing up the emitter that would reach it.
+   *
+   *  spec: { on: "<continuation module path>", ctx?: <echoed context>,
+   *          status?, ok?, done?, body? }
+   */
+  fetchResult(spec = {}) {
+    if (typeof spec.on !== "string")
+      throw new Error("fetchResult({ on }): `on` must be the continuation module path");
+    const status = spec.status != null ? spec.status : (spec.ok === false ? 502 : 200);
+    return new Node(this, this._base({
+      entry: spec.on, // the continuation module IS this activation's entry
+      activation: "fetch_chunk",
+      export: "default",
+      ctx: spec.ctx === undefined ? null : spec.ctx,
+      request: {
+        status,
+        ok: spec.ok != null ? spec.ok : (status >= 200 && status < 300),
+        done: spec.done != null ? spec.done : true,
+        body: spec.body != null ? spec.body : null,
       },
     }));
   }
@@ -444,6 +498,35 @@ class Node {
     return new FetchHandle(this, hit);
   }
 
+  /** Drive ≥2 concurrently-outstanding `after.fetch`es (emitted by THIS held
+   *  activation) whose results race — where an invariant must hold no matter
+   *  which upstream responds first. `specs` is `[{ match, resolve?, label? }]`,
+   *  one per outstanding fetch (`match` = url matcher, `resolve` = its response).
+   *  `.forEachOrder(fn)` / `.invariant(project)` fold each arrival order,
+   *  threading every resolution's writes into the next resume's overlay — so a
+   *  leg that observes an earlier leg's write is expressible (which the
+   *  single-parent `.fetch().resolve()` fold cannot do). See the class doc. */
+  whenConcurrent(specs) {
+    requireHeld(this, "whenConcurrent");
+    if (!Array.isArray(specs) || specs.length < 2)
+      throw new Error("whenConcurrent([...]): pass ≥2 {match, resolve} specs (one per racing effect)");
+    return new Interleaving(this, specs);
+  }
+
+  /** Locate an emitted `blob.receive` (headers-first streamed upload) → a
+   *  handle that resumes the held chain at its `on` export once the object is
+   *  durable. `opts.on` selects a specific receive when several were armed;
+   *  otherwise the first. Only meaningful on a held node (the handler armed the
+   *  receive then `next()`d to open the body valve). */
+  receive(opts = {}) {
+    requireHeld(this, "receive");
+    const rx = this.effects.filter((e) => e.kind === "blob" && e.op === "receive");
+    if (!rx.length) throw new Error("receive(): the activation armed no blob.receive");
+    const hit = opts.on ? rx.find((e) => e.on === opts.on) : rx[0];
+    if (!hit) throw new Error(`receive({on:${opts.on}}): no armed blob.receive matched`);
+    return new ReceiveHandle(this, hit);
+  }
+
   /** Advance the clock; `.fire()` delivers the due `after.ms` timer wake. */
   get clock() {
     const node = this;
@@ -560,24 +643,12 @@ class FetchHandle {
   resolve(response = {}) {
     const parent = this.node;
     const pb = parent.force();
-    const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
-    const world = carrySources(parent.world, {
-      entry: parent.world.entry,
-      activation: "fetch_chunk",
-      export: this.fx.on || "onFetchResult",
-      ctx: this.fx.ctx === undefined ? null : this.fx.ctx,
-      kv: foldKv(parent.world.kv, pb.effects),
-      seed: (parent.world.seed || 0) + 1,
-      now_ms: (parent.world.now_ms || 0) + (response.latencyMs || 1),
-      request: {
-        status,
-        // The real engine sets fetch/callback `ok` = status in [200,300) (a 3xx
-        // is NOT ok) — match it so a handler's `if (request.ok)` branch agrees.
-        ok: response.ok != null ? response.ok : (!response.timeout && status >= 200 && status < 300),
-        done: response.done != null ? response.done : true,
-        body: response.body != null ? response.body : null,
-      },
-    });
+    const world = fetchResumeWorld(
+      parent.world, this.fx, response,
+      foldKv(parent.world.kv, pb.effects),
+      (parent.world.seed || 0) + 1,
+      (parent.world.now_ms || 0) + (response.latencyMs || 1),
+    );
     return new Node(parent.scenario, world);
   }
 
@@ -600,10 +671,11 @@ class FetchHandle {
     let now = pw.now_ms || 0;
     let node = null;
     const step = (body, done, seq) => {
+      const t = onTarget(pw.entry, on, done ? "onFetchDone" : "onFetchChunk");
       node = new Node(scn, carrySources(pw, {
-        entry: pw.entry,
+        entry: t.entry,
         activation: "fetch_chunk",
-        export: on || (done ? "onFetchDone" : "onFetchChunk"),
+        export: t.export,
         ctx,
         kv,
         seed: ++seed,
@@ -633,10 +705,180 @@ class FetchHandle {
   }
 }
 
+/** A located `blob.receive` → resolve its completion into the dependent
+ *  resume at the receive's `on` export. Parallel to `FetchHandle.resolve`: the
+ *  parent's writes/ctx/clock fold forward; the completion arrives on
+ *  `request.ctx` (NOT `request.body`) and durability on `request.activation.ok`
+ *  — the exact `emitTerminal` contract (`blob_receive.zig`):
+ *    success → `request.ctx = { hash, len, app }`, `request.activation.ok === true`
+ *    failure → `request.ctx = { error, app }`,        `request.activation.ok === false`
+ *  where `app` echoes the issue-time ctx the caller threaded (recorded on the
+ *  receive effect); the test may override it with `spec.app`. */
+class ReceiveHandle {
+  constructor(node, fx) { this.node = node; this.fx = fx; }
+
+  /** Resume the held chain with the durable object. `spec`: `{ hash, len, ok?,
+   *  app?, error? }`. `ok` defaults true; on `ok:false` nothing was stored, so
+   *  `hash`/`len` are dropped and `error` (default "receive failed") rides ctx. */
+  stored(spec = {}) {
+    const parent = this.node;
+    const pb = parent.force();
+    const ok = spec.ok != null ? spec.ok : true;
+    // `app` echoes the recorded issue-time ctx unless the caller overrides.
+    const app = spec.app !== undefined ? spec.app
+      : (this.fx.app !== undefined ? this.fx.app : null);
+    const ctx = ok
+      ? { hash: spec.hash, len: spec.len != null ? spec.len : 0, app }
+      : { error: spec.error != null ? spec.error : "receive failed", app };
+    const world = carrySources(parent.world, {
+      entry: parent.world.entry,
+      // Receive completions resume through the FetchEngine router (a bound
+      // terminal event) — the same continuation shape as a fetch result.
+      activation: "fetch_chunk",
+      export: this.fx.on || "onStored",
+      ctx,
+      kv: foldKv(parent.world.kv, pb.effects),
+      seed: (parent.world.seed || 0) + 1,
+      now_ms: (parent.world.now_ms || 0) + 1,
+      request: { activation: { kind: "blob_stored", ok } },
+    });
+    return new Node(parent.scenario, world);
+  }
+}
+
+/** Concurrent-effect interleaving over a held node's multiple outstanding
+ *  fetches. Each arrival ORDER is folded as an ordered chain: resolve the first
+ *  effect against the parent's post-writes overlay, take THAT resume's folded kv
+ *  as the base for the next effect, and so on — so a later leg reads the earlier
+ *  leg's writes (read-your-writes ACROSS the race), the thing the single-parent
+ *  `.fetch().resolve()` fold can't express. All effects are located on the
+ *  parent (they were emitted together in the one held activation); only the kv
+ *  overlay threads. Full factorial is exponential, so `forEachOrder` caps auto-
+ *  enumeration at 5 legs — pass explicit orders via `.orders([...])` beyond that. */
+class Interleaving {
+  constructor(node, specs) { this.node = node; this.specs = specs; }
+
+  _locate(match) {
+    const fx = this.node.effects.filter((e) => e.kind === "fetch");
+    const hit = fx.find((e) => matchUrl(e.url, match));
+    if (!hit) {
+      const seen = fx.map((f) => f.url).join(", ") || "none";
+      throw new Error(`whenConcurrent: no emitted after.fetch matched ${match} (saw: ${seen})`);
+    }
+    return hit;
+  }
+
+  /** Fold the specs in one arrival order (array of spec indices) → terminal node. */
+  _foldOrder(order) {
+    const parent = this.node;
+    const pb = parent.force();
+    let kv = foldKv(parent.world.kv, pb.effects);
+    let seed = parent.world.seed || 0;
+    let now = parent.world.now_ms || 0;
+    let node = parent;
+    for (const i of order) {
+      const spec = this.specs[i];
+      const fx = this._locate(spec.match);
+      node = new Node(parent.scenario, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now));
+      kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
+    }
+    return node;
+  }
+
+  _label(order) { return order.map((i) => (this.specs[i].label != null ? this.specs[i].label : i)); }
+
+  /** All permutations of [0..n-1]. */
+  _permutations() {
+    const n = this.specs.length;
+    if (n > 5) throw new Error(`whenConcurrent.forEachOrder: ${n} legs = ${n}! orders — pass explicit orders via .orders([[...], ...]) instead of blind enumeration`);
+    const idx = Array.from({ length: n }, (_, i) => i);
+    const out = [];
+    const permute = (prefix, rest) => {
+      if (!rest.length) { out.push(prefix); return; }
+      for (let i = 0; i < rest.length; i++)
+        permute(prefix.concat(rest[i]), rest.slice(0, i).concat(rest.slice(i + 1)));
+    };
+    permute([], idx);
+    return out;
+  }
+
+  /** Resolve `orders` (arrays of spec indices OR label strings) to index arrays. */
+  _resolveOrders(orders) {
+    return orders.map((ord) => ord.map((step) => {
+      if (typeof step === "number") return step;
+      const i = this.specs.findIndex((sp) => sp.label === step);
+      if (i < 0) throw new Error(`whenConcurrent: no spec labelled ${JSON.stringify(step)}`);
+      return i;
+    }));
+  }
+
+  /** Run `fn(terminalNode, orderLabels)` for every arrival order (all
+   *  permutations). Returns the array of `fn` results (one per order). */
+  forEachOrder(fn) {
+    return this._permutations().map((order) => fn(this._foldOrder(order), this._label(order)));
+  }
+
+  /** Run only the caller-supplied `orders` (each an array of spec indices or
+   *  labels) — for when the factorial is too large to enumerate blindly. */
+  orders(orders) {
+    return this._resolveOrders(orders).map((order) => this._foldOrder(order));
+  }
+
+  /** Invariant helper: `project(terminalNode)` must yield the SAME value under
+   *  every arrival order. Records one streamed assertion (pass iff all orders
+   *  agree), so a divergence fails the test with each order's value shown. */
+  invariant(project, label) {
+    const results = this._permutations().map((order) => ({ order, value: project(this._foldOrder(order)) }));
+    const agree = results.every((r) => deepEq(r.value, results[0].value));
+    return record("invariant" + (label ? " " + label : ""), agree, {
+      values: results.map((r) => ({ order: this._label(r.order), value: r.value })),
+    });
+  }
+}
+
 function carrySources(parentWorld, world) {
   if (parentWorld.source_dir) world.source_dir = parentWorld.source_dir;
   if (parentWorld.sources) world.sources = parentWorld.sources;
   return world;
+}
+
+/** Resolve a continuation `on` to its `{entry, export}`. A bare name (no `/`,
+ *  not `.mjs`) is an export in the SAME module — the common case (admin's
+ *  `onFetchResult` / agent's `onLLM`), so `entry` stays the parent's and the
+ *  name is the export. A module PATH (`hooks/onX.mjs`) names a DIFFERENT file
+ *  reached only as a continuation (admin's `_rp/jwks.mjs`), so that file becomes
+ *  the entry, invoked at its `default` export — mirroring how `sendCallback` /
+ *  `wake` set `entry: spec.on`. */
+function onTarget(parentEntry, on, fallbackExport) {
+  if (typeof on === "string" && (on.includes("/") || on.endsWith(".mjs")))
+    return { entry: on, export: "default" };
+  return { entry: parentEntry, export: on || fallbackExport };
+}
+
+/** Build the `fetch_chunk` resume world for a located fetch effect against an
+ *  EXPLICIT kv/seed/now base — the shared core of `FetchHandle.resolve` and the
+ *  `whenConcurrent` interleaving fold (which threads a running overlay through a
+ *  chosen arrival order rather than always folding from the one parent). */
+function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now) {
+  const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
+  const t = onTarget(parentWorld.entry, fx.on, "onFetchResult");
+  return carrySources(parentWorld, {
+    entry: t.entry,
+    activation: "fetch_chunk",
+    export: t.export,
+    ctx: fx.ctx === undefined ? null : fx.ctx,
+    kv: kvBase,
+    seed,
+    now_ms: now,
+    request: {
+      status,
+      // The real engine sets fetch/callback `ok` = status in [200,300) (a 3xx is
+      // NOT ok) — match it so a handler's `if (request.ok)` branch agrees.
+      ok: response.ok != null ? response.ok : (!response.timeout && status >= 200 && status < 300),
+      done: response.done != null ? response.done : true,
+      body: response.body != null ? response.body : null,
+    },
+  });
 }
 
 // ── WebSocket held-socket fold ────────────────────────────────────────────
