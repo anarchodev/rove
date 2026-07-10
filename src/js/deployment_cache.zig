@@ -1356,7 +1356,10 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
                 // load sees the existing `*BlobBytes` and just bumps
                 // refcount.
                 const bb: *BlobBytes = if (cache.acquire(&entry.bytecode_hex)) |hit| hit else blk: {
-                    const bytes = try bs.get(&entry.bytecode_hex, allocator);
+                    // `bc-{hash}` — the engine-only bytecode namespace
+                    // (JS_ReadObject trust boundary; files_mod.BC_KEY_PREFIX).
+                    var bc_key_buf: [files_mod.BC_KEY_LEN]u8 = undefined;
+                    const bytes = try bs.get(files_mod.bcKey(&bc_key_buf, &entry.bytecode_hex), allocator);
                     errdefer allocator.free(bytes);
                     break :blk try cache.insert(&entry.bytecode_hex, bytes);
                 };
@@ -1446,7 +1449,8 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
             }
             errdefer allocator.free(key);
             const bb: *BlobBytes = if (cache.acquire(&f.bytecode_hex)) |hit| hit else blk: {
-                const bytes = try bs.get(&f.bytecode_hex, allocator);
+                var bc_key_buf: [files_mod.BC_KEY_LEN]u8 = undefined;
+                const bytes = try bs.get(files_mod.bcKey(&bc_key_buf, &f.bytecode_hex), allocator);
                 errdefer allocator.free(bytes);
                 break :blk try cache.insert(&f.bytecode_hex, bytes);
             };

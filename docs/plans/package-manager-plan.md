@@ -361,6 +361,32 @@ defense-in-depth.** Every privileged native self-gates (`is_system_module`
   §6.4 arrives with the mechanism.
 - **Frozen primitives are un-overridable** — `overrides` cannot retarget
   `@rewind/webhook`/`@rewind/wake`; the resolver rejects it.
+- **LOCKED (2026-07-09): the platform never accepts bytecode — only
+  source.** quickjs's bytecode reader (`JS_ReadObject`) is not hardened
+  against adversarial input; crafted bytecode is a sandbox-escape
+  primitive, so bytecode is trusted-input-only by construction:
+  - Every ingestion wire takes SOURCE and compiles engine-side
+    (`platform.compile` / `/v1/deploy/pkgfile`) — true today; keep it
+    that way. P-Reg accepts source only; publish-time compilation runs
+    on the platform, never the author's machine. A lockfile/manifest
+    `bytecode_hash` is a *reference to platform-compiled output*, never
+    an upload.
+  - **Hash-laundering closed by the `bc-` prefix split (SHIPPED
+    2026-07-09).** Uploads (statics via `blob.receive`) and compiled
+    bytecode used to share the per-tenant `file-blobs` namespace at
+    bare-hash keys, so a manifest referencing an uploaded blob's hash as
+    `bytecode_hash` would feed attacker bytes to `JS_ReadObject` (gated
+    only by the admin-only manifest-stamp door — vigilance). Now
+    `compileAndStage` is the ONLY writer of `bc-{hash}` keys
+    (`files_mod.BC_KEY_PREFIX`), and every bytecode fetch (loader,
+    package staging) reads ONLY `bc-{hash}`; upload paths compute native
+    64-hex keys and structurally cannot produce a `bc-` key, so a
+    laundered hash finds nothing and fails loud. "Referenced bytecode is
+    compiler output" now holds by construction. (`bc-`, not `bc/` —
+    rove-blob's `validateKey` forbids `/`. `bytecode_hash` in manifests
+    stays the bare content hash; the prefix is a storage namespace.)
+    Storage-layout change: pre-launch, no back-compat — wipe +
+    re-genesis dev; coordinate the prod re-genesis.
 
 ---
 

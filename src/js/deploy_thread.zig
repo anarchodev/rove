@@ -349,7 +349,12 @@ pub const DeployThread = struct {
                         a.free(key);
                         continue;
                     }
-                    const bytes = bs.get(&f.bytecode_hex, a) catch {
+                    // `bc-{hash}` — engine-only bytecode namespace (the
+                    // JS_ReadObject trust boundary): an uploaded blob's
+                    // hash laundered into `bytecode_hash` finds nothing
+                    // here and fails loud.
+                    var bc_key_buf: [files_mod.BC_KEY_LEN]u8 = undefined;
+                    const bytes = bs.get(files_mod.bcKey(&bc_key_buf, &f.bytecode_hex), a) catch {
                         std.log.warn("deploy thread: package bytecode {s} for {s} not staged", .{ &f.bytecode_hex, key });
                         a.free(key);
                         return fail(self, router, job, 400, "package bytecode not staged");
