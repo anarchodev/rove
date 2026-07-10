@@ -371,16 +371,16 @@ defense-in-depth.** Every privileged native self-gates (`is_system_module`
     on the platform, never the author's machine. A lockfile/manifest
     `bytecode_hash` is a *reference to platform-compiled output*, never
     an upload.
-  - **Known gap (hash-laundering), to close with the `bc/` prefix
+  - **Known gap (hash-laundering), to close with the `bc-` prefix
     split:** uploads (statics via `blob.receive`) and compiled bytecode
     both land content-addressed in the same per-tenant `file-blobs`
     namespace, so a manifest that references an uploaded blob's hash as
     `bytecode_hash` would get attacker bytes into `JS_ReadObject`.
     Today this is gated by trust (manifest stamping is admin-door-only
     and the deploy apps only stamp engine-returned hashes) — vigilance,
-    not teeth. The fix: engine-produced bytecode PUTs under a `bc/`
+    not teeth. The fix: engine-produced bytecode PUTs under a `bc-`
     key prefix that no upload path can write, and every bytecode fetch
-    (loader, deploy thread, snapshot populator) reads ONLY `bc/{hash}`
+    (loader, deploy thread, snapshot populator) reads ONLY `bc-{hash}`
     — then "referenced bytecode is compiler output" holds by
     construction. Storage-layout change: pre-launch, no back-compat —
     wipe + re-genesis dev clusters, coordinate the prod re-genesis.
