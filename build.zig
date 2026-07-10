@@ -1363,6 +1363,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
         "src/replay/testdata/wsmessage", // a WS frame reads back as request.text/.bytes (browser.message)
+        "src/replay/testdata/wsfetchloop", // continue a WS conversation past a fetch resume (agent-loop shape)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

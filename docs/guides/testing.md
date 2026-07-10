@@ -227,6 +227,18 @@ frame text (what `browser.message()` parses as JSON), a binary frame's
 `request.bytes` is the decoded bytes, and the frame is on
 `request.activation.data` too — read whichever the handler uses.
 
+A WS handler can issue an `after.fetch` (or arm a timer / `after.kv`) mid-chain
+and keep going: resolve the fetch, then call `.receive(nextFrame)` on the
+resolved node to run the next `onMessage` on the same connection, seeing the
+resume's threaded ctx and writes — the agent-loop shape (frame → fetch → resume →
+next frame):
+
+```js
+const f1 = ws.receive(JSON.stringify({ t: "start" }));   // issues after.fetch, holds
+const r  = f1.fetch(/llm/).resolve({ status: 200, body: "…" });  // onResult runs, re-holds
+const f2 = r.receive(JSON.stringify({ t: "next" }));     // continues the conversation
+```
+
 ### A streamed upload (headers-first)
 
 A handler that exports `onHeaders` runs *before* the body is accepted, and the

@@ -586,7 +586,7 @@ class Node {
       if (v === null) { delete kv[key]; entries.push({ kind: "kv", key, op: "d", firedAt: now }); }
       else { kv[key] = typeof v === "string" ? v : JSON.stringify(v); entries.push({ kind: "kv", key, op: "p", firedAt: now }); }
     }
-    return new Node(parent.scenario, carrySources(parent.world, {
+    return resumeNode(parent, carrySources(parent.world, {
       entry: parent.world.entry,
       activation: "wake_batch",
       export: kw.on || "onWake",
@@ -604,7 +604,7 @@ class Node {
     requireHeld(this, "disconnect");
     const parent = this;
     const pb = parent.force();
-    return new Node(parent.scenario, carrySources(parent.world, {
+    return resumeNode(parent, carrySources(parent.world, {
       entry: parent.world.entry,
       activation: "disconnect",
       export: "onDisconnect",
@@ -650,7 +650,7 @@ class Clock {
     if (!timers.length) throw new Error("clock.advance().fire(): the activation armed no after.ms timer wake");
     const t = timers[0];
     const now = (parent.world.now_ms || 0) + this.ms;
-    return new Node(parent.scenario, carrySources(parent.world, {
+    return resumeNode(parent, carrySources(parent.world, {
       entry: parent.world.entry,
       activation: "wake_batch",
       export: t.on || "onWake",
@@ -677,7 +677,7 @@ class FetchHandle {
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + (response.latencyMs || 1),
     );
-    return new Node(parent.scenario, world);
+    return resumeNode(parent, world);
   }
 
   /** Deliver a STREAMED fetch (`after.fetch({ stream: true })`): one
@@ -690,7 +690,7 @@ class FetchHandle {
    *  responds). `chunks` are strings (or `{ binary }` bytes via `opts`).
    *  Assumes the handler re-holds (`next()`) between chunks until `done`. */
   stream(chunks, opts = {}) {
-    const scn = this.node.scenario;
+    const parentNode = this.node;
     const pw = this.node.world;
     const on = this.fx.on;
     const ctx = this.fx.ctx === undefined ? null : this.fx.ctx;
@@ -700,7 +700,7 @@ class FetchHandle {
     let node = null;
     const step = (body, done, seq) => {
       const t = onTarget(pw.entry, on, done ? "onFetchDone" : "onFetchChunk");
-      node = new Node(scn, carrySources(pw, {
+      node = resumeNode(parentNode, carrySources(pw, {
         entry: t.entry,
         activation: "fetch_chunk",
         export: t.export,
@@ -770,7 +770,7 @@ class ReceiveHandle {
       now_ms: (parent.world.now_ms || 0) + 1,
       request: { activation: { kind: "blob_stored", ok } },
     });
-    return new Node(parent.scenario, world);
+    return resumeNode(parent, world);
   }
 }
 
@@ -807,7 +807,7 @@ class Interleaving {
     for (const i of order) {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
-      node = new Node(parent.scenario, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now));
+      node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now));
       kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
     }
     return node;
@@ -877,6 +877,19 @@ function carrySources(parentWorld, world) {
     if (pr.correlationId !== undefined && r.correlationId === undefined) r.correlationId = pr.correlationId;
   }
   return world;
+}
+
+/** Build a resume node that PRESERVES a WS connection. When the parent
+ *  activation is part of a WS chain (a `WsNode`), the fetch/timer/kv/receive
+ *  resume is itself a `WsNode` bound to the same connection — so `.receive(next
+ *  frame)` continues the conversation past the resume (the agent-loop shape:
+ *  onMessage → fetch → onLLM → next frame). Its `.receive` folds THIS resume's
+ *  ctx + writes forward, exactly like frame-to-frame. A non-WS resume stays a
+ *  plain `Node`. */
+function resumeNode(parent, world) {
+  return parent instanceof WsNode
+    ? new WsNode(parent.scenario, world, parent._conn)
+    : new Node(parent.scenario, world);
 }
 
 /** Resolve a continuation `on` to its `{entry, export}`. A bare name (no `/`,
