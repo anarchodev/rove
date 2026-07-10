@@ -439,10 +439,19 @@ lift. rove and rewind-apps phases interleave.
   app-import shim, populates the tenant `bytecodes` map with
   hash-qualified paths (`deployment_cache.zig`). Smoke: deploy a "app +
   one hand-placed package" bundle, hit it.
-- **P2 — Manifest `dependencies` + static capability gate (rove).** Make
-  the deploy path *consume* `app_manifest.dependencies`; reject
-  `_system`/`__rove_*` in package source; record per-package
-  `capabilities`. Author feedback on undeclared/forbidden deps.
+- **P2 — Static capability gate (rove). SHIPPED 2026-07-09 (engine
+  half).** The deploy-time static gate rejects any package whose source
+  names `_system` / `__rove` (`referencesPrivilegedSurface`,
+  `deploy_thread.zig` — identifier-boundary lexical scan, deliberately
+  blunt: comments/strings too); per-package `capabilities` ride the
+  manifest v2 sections (parsed since P0, enforcement deferred to real
+  demand — the natives' self-gate is the boundary); author feedback on
+  undeclared deps = the compile validation gate now surfaces the quickjs
+  exception, naming the unresolvable module. Verified by
+  `pm_deploy_smoke.py`. MOVED OUT: "consume `app_manifest.dependencies`"
+  belongs to **P-CLI** — loose ranges are the *resolver's* input; the
+  engine consumes the resolved lockfile (`resolution` wire, shipped in
+  P1-deploy). Registry-side publish gating lands with P-Reg.
 - **P-Reg — Registry app (rewind-apps).** Publish API, naming →
   versions → hashes index, discovery. A rewind-app; reserved `@rewind`
   scope. Where the "best of class" UX lives — but out of *engine* scope.

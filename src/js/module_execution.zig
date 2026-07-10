@@ -467,13 +467,27 @@ pub const module_loader = struct {
         opaque_ptr: ?*anyopaque,
     ) callconv(.c) ?*c.JSModuleDef {
         const self: *const Ctx = @ptrCast(@alignCast(opaque_ptr.?));
-        const map = self.bytecodes orelse return null;
         const name_s = std.mem.span(name);
-        const bb = map.get(name_s) orelse return null;
+        // quickjs contract: when a loader func is installed and returns
+        // NULL, quickjs does NOT throw for us (it only synthesizes
+        // "could not load module" when NO loader is installed) — a
+        // silent null here surfaces as an exception-less failure
+        // ("[uninitialized]"). Throw the canonical message ourselves so
+        // compile-time validation and runtime load failures both name
+        // the module.
+        const map = self.bytecodes orelse {
+            _ = c.JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
+            return null;
+        };
+        const bb = map.get(name_s) orelse {
+            _ = c.JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
+            return null;
+        };
         const obj = c.JS_ReadObject(ctx, bb.bytes.ptr, bb.bytes.len, c.JS_READ_OBJ_BYTECODE);
         if (c.JS_IsException(obj)) return null;
         if (obj.tag != c.JS_TAG_MODULE) {
             c.JS_FreeValue(ctx, obj);
+            _ = c.JS_ThrowReferenceError(ctx, "module blob for '%s' is not a module", name);
             return null;
         }
         const mod_def: ?*c.JSModuleDef = @ptrCast(@alignCast(obj.u.ptr));

@@ -279,10 +279,26 @@ pub const DeployThread = struct {
 
         const fail = struct {
             fn emit(dt: *DeployThread, r: *msg_router_mod.MsgRouter, j: *Job, status: u16, msg: []const u8) void {
-                const cj = std.fmt.allocPrint(dt.allocator, "{{\"ok\":false,\"status\":{d},\"error\":\"{s}\"}}", .{ status, msg }) catch return;
+                const cj = errorCtxJson(dt.allocator, status, msg) catch return;
                 routeCompileEvent(r, dt.allocator, j.fetch_id, j.chain_tenant, j.name, status, false, cj);
             }
         }.emit;
+
+        // PM P2 static gate: package source must not name the privileged
+        // surface. Best-effort lexical backstop — the real boundary is the
+        // natives' own `is_system_module` self-gate; this exists to reject
+        // a package that even *mentions* `_system` / `__rove` with a clear
+        // deploy-time error instead of a confusing runtime one (and it
+        // deliberately hits comments/strings too — a distributed package
+        // has no business naming the privileged surface at all).
+        if (job.pkg_hash.len != 0) {
+            for (job.inputs) |in| {
+                if (referencesPrivilegedSurface(in.bytes)) {
+                    std.log.warn("deploy thread: package {s} file {s} references the privileged surface; rejecting", .{ job.pkg_hash, in.path });
+                    return fail(self, router, job, 400, "package source must not reference the privileged surface (_system / __rove)");
+                }
+            }
+        }
 
         const rt = rt_ptr orelse return fail(self, router, job, 500, "compiler unavailable");
         // Fresh context per job — hermetic module table (see threadMain).
@@ -376,6 +392,22 @@ pub const DeployThread = struct {
 
         const compiled = files_mod.compileAndStage(a, file_be.blobStore(), compileThunk, &jctx, job.inputs, virtual_dir) catch |err| {
             std.log.warn("deploy thread: compile-batch scope={s} (compile {d}) failed: {s}", .{ job.tenant_id, job.compile_id, @errorName(err) });
+            // Author feedback (PM P2): a CompileFailed leaves the quickjs
+            // exception pending on the job context — its message names the
+            // actual problem (syntax error, or "could not load module
+            // '@scope/pkg'" for an undeclared/unstaged import). Surface it
+            // instead of a bare "compile failed"; `fail` JSON-escapes.
+            if (err == error.CompileFailed) {
+                if (jctx.takeExceptionMessage(a)) |m| {
+                    defer a.free(m);
+                    if (m.len != 0) {
+                        const detail = std.fmt.allocPrint(a, "compile failed: {s}", .{m}) catch
+                            return fail(self, router, job, 400, "compile failed");
+                        defer a.free(detail);
+                        return fail(self, router, job, 400, detail);
+                    }
+                } else |_| {}
+            }
             const status: u16, const msg: []const u8 = switch (err) {
                 error.CompileFailed => .{ 400, "compile failed" },
                 error.InvalidManifest => .{ 400, "invalid input (duplicate paths or too many entries)" },
@@ -477,6 +509,52 @@ fn compileThunk(
     return ctx.compileToBytecode(source, filename, allocator, kind);
 }
 
+/// `{"ok":false,"status":N,"error":<msg>}` with `msg` JSON-escaped
+/// (compile-failure detail carries quickjs exception text, which can
+/// contain quotes/backslashes). Caller owns the result — in practice
+/// `routeCompileEvent` takes ownership.
+fn errorCtxJson(allocator: std.mem.Allocator, status: u16, msg: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+        defer buf = aw.toArrayList();
+        try aw.writer.print("{{\"ok\":false,\"status\":{d},\"error\":", .{status});
+        try std.json.Stringify.value(msg, .{}, &aw.writer);
+        try aw.writer.writeByte('}');
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// PM P2 static gate: does `src` name the privileged surface? Lexical,
+/// identifier-boundary-aware, and deliberately blunt (matches inside
+/// comments/strings too — best-effort hygiene, not the security
+/// boundary; that's the natives' `is_system_module` self-gate).
+/// Rules: `_system` as an exact identifier (both boundaries — so
+/// `my_system` / `_systematic` pass); any identifier STARTING with
+/// `__rove` (catches the `__rove.*` holder and every `__rove_*`
+/// native).
+pub fn referencesPrivilegedSurface(src: []const u8) bool {
+    return findsIdent(src, "_system", true) or findsIdent(src, "__rove", false);
+}
+
+fn isIdentChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+        (ch >= '0' and ch <= '9') or ch == '_' or ch == '$';
+}
+
+fn findsIdent(src: []const u8, needle: []const u8, bound_after: bool) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
+        const pre_ok = at == 0 or !isIdentChar(src[at - 1]);
+        const end = at + needle.len;
+        const post_ok = !bound_after or end >= src.len or !isIdentChar(src[end]);
+        if (pre_ok and post_ok) return true;
+        i = at + 1;
+    }
+    return false;
+}
+
 /// Free a job's owned memory (its tenant id, every input's owned
 /// slices, and the inputs slice itself).
 fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
@@ -559,6 +637,35 @@ test "deinit frees jobs the thread never reached" {
     // deinit (leak-checked by the test allocator).
     try dt.enqueue(try makeJob(3, "gamma"));
     dt.deinit();
+}
+
+test "referencesPrivilegedSurface: catches _system + __rove*, not lookalikes" {
+    // hits
+    try testing.expect(referencesPrivilegedSurface("const h = _system.http;"));
+    try testing.expect(referencesPrivilegedSurface("globalThis.__rove.fetch(u)"));
+    try testing.expect(referencesPrivilegedSurface("__rove_check_email_rate()"));
+    try testing.expect(referencesPrivilegedSurface("x=_system"));
+    try testing.expect(referencesPrivilegedSurface("// mentions _system in a comment"));
+    // misses (identifier boundaries)
+    try testing.expect(!referencesPrivilegedSurface("const my_system = 1;"));
+    try testing.expect(!referencesPrivilegedSurface("let _systematic = 2;"));
+    try testing.expect(!referencesPrivilegedSurface("import {v} from '@rewind/jwt';"));
+    try testing.expect(!referencesPrivilegedSurface("const x__rove = 3;"));
+    try testing.expect(!referencesPrivilegedSurface("rove and system, separately"));
+    try testing.expect(!referencesPrivilegedSurface(""));
+}
+
+test "errorCtxJson escapes quotes in the message" {
+    const a = testing.allocator;
+    const cj = try errorCtxJson(a, 400, "compile failed: could not load module '@x/y' \"quoted\"");
+    defer a.free(cj);
+    try testing.expectEqualStrings(
+        "{\"ok\":false,\"status\":400,\"error\":\"compile failed: could not load module '@x/y' \\\"quoted\\\"\"}",
+        cj,
+    );
+    // Parses back as JSON.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, cj, .{});
+    defer parsed.deinit();
 }
 
 test "freeJob frees compile_batch routing fields" {

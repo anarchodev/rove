@@ -10,7 +10,10 @@ pm-p0-resolution-spec.md + pm-compile-cache-fix.md):
     reloadDeployment stages /pkg/<hash>/ bytecode + builds the snapshot
     resolver → the dispatcher's module loader resolves per-importer);
   - a handler importing an UNDECLARED package fails AT DEPLOY (compile is
-    the import-validation gate), not at first request;
+    the import-validation gate), with the module NAMED in the error (P2
+    author feedback), not at first request;
+  - a package whose source names the privileged surface (_system/__rove)
+    is rejected by the P2 deploy-time static gate;
   - a second deploy that REPINS the app's @rewind/jwt to 1.4 serves the
     new pin immediately — the whole chain (dep_id → snapshot → compile)
     has no stale-resolution path.
@@ -46,6 +49,11 @@ BAD_HANDLER_SRC = (
     'import { x } from "@rewind/undeclared";\n'
     'export function handler() { return String(x); }\n'
 )
+
+# PM P2: a package whose source names the privileged surface must be
+# rejected by the deploy-time static gate (even in a comment — blunt on
+# purpose; distributed code has no business naming it).
+EVIL_PKG_SRC = 'export const h = _system.http;\n'
 
 
 def packages(app_jwt_hash: str) -> list[dict]:
@@ -93,7 +101,7 @@ def main() -> int:
                   r.status == 200 and "app=jwt19 oidc=jwt14" in r.body,
                   f"got {r.status} {r.body!r}")
 
-        print("step 4: undeclared package import fails AT DEPLOY (validation gate)")
+        print("step 4: undeclared package import fails AT DEPLOY, naming the module")
         try:
             c.deploy_with_packages(
                 "pkgacme", {"index.mjs": rpc_wrap(BAD_HANDLER_SRC)},
@@ -101,10 +109,29 @@ def main() -> int:
                 {"@rewind/oidc": OIDC_HASH, "@rewind/jwt": JWT19_HASH})
             check("undeclared import rejected", False, "deploy unexpectedly succeeded")
         except RuntimeError as e:
-            check("undeclared import rejected", "file index.mjs" in str(e), str(e)[:120])
+            # P2 author feedback: the error must NAME the unresolvable
+            # module, not just say "compile failed".
+            check("undeclared import rejected, module named",
+                  "file index.mjs" in str(e) and "@rewind/undeclared" in str(e),
+                  str(e)[:160])
+
+        print("step 5: package naming the privileged surface is rejected (P2 static gate)")
+        try:
+            c.deploy_with_packages(
+                "pkgacme", {"index.mjs": rpc_wrap(HANDLER_SRC)},
+                packages(JWT19_HASH) + [
+                    {"spec": "@evil/sys", "version": "1.0.0", "pkg_hash": "e" * 64,
+                     "files": {"index.mjs": EVIL_PKG_SRC}, "imports": {}}],
+                {"@rewind/oidc": OIDC_HASH, "@rewind/jwt": JWT19_HASH,
+                 "@evil/sys": "e" * 64})
+            check("privileged-surface package rejected", False,
+                  "deploy unexpectedly succeeded")
+        except RuntimeError as e:
+            check("privileged-surface package rejected",
+                  "privileged surface" in str(e), str(e)[:160])
 
         if dep1:
-            print("step 5: REPIN app's @rewind/jwt → 1.4 (same handler source) and redeploy")
+            print("step 6: REPIN app's @rewind/jwt → 1.4 (same handler source) and redeploy")
             try:
                 dep2 = c.deploy_with_packages(
                     "pkgacme", {"index.mjs": rpc_wrap(HANDLER_SRC)},
