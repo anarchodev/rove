@@ -114,13 +114,13 @@ pub fn jsHttpFetch(
     return res;
 }
 
-/// `__rove_fetch(opts)` — capability-scoped twin of `_system.http.fetch`
-/// for baked `__system/` modules (durable-wake-plan P5(a)). Baked
-/// modules eval AFTER the `_harden.js` `delete globalThis._system`
-/// step, so they can't reach `_system.http`; this persistent global
-/// (gated on `is_system_module`, same posture as `__rove_set_wake`)
-/// is how `__system/webhook_fire` issues the retry/scheduled-fire
-/// fetch the deleted Zig owed sweep used to build natively.
+/// `__rove.fetch(opts)` — gated twin of `_system.http.fetch` for baked
+/// `__system/` modules (durable-wake-plan P5(a)). Baked modules eval
+/// AFTER the `_harden.js` `delete globalThis._system` step, so they
+/// can't reach `_system.http`; this persistent, `is_system_module`-gated
+/// op (in the `__rove.*` holder, same posture as `__rove.wake.set`) is
+/// how `__system/webhook_fire` issues the retry/scheduled-fire fetch the
+/// deleted Zig owed sweep used to build natively.
 pub fn jsSystemFetch(
     ctx: ?*c.JSContext,
     this: c.JSValue,

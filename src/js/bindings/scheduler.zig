@@ -1,9 +1,10 @@
-//! `__rove_set_wake` / `__rove_fire_wake` — the §2.6 durable-wake
-//! engine primitive, capability-scoped to baked `__system/` modules
-//! (durable-wake P0; `docs/architecture/effects-and-handlers.md`). These are the ONLY two builtins
-//! the durable-wake primitive adds; everything else (the queue,
-//! ordering, fan-out, backoff) lives in JS (`scheduler.js` +
-//! `scheduler_tick.mjs`), per the durability-as-JS-shim direction.
+//! `__rove.wake.set` / `__rove.wake.fire` — the §2.6 durable-wake
+//! engine primitive, gated to baked `__system/` modules (durable-wake
+//! P0; `docs/architecture/effects-and-handlers.md`). Registered under the
+//! `__rove.*` privileged-ops holder (STATIC_NAMESPACES, globals.zig).
+//! These are the ONLY two ops the durable-wake primitive adds;
+//! everything else (the queue, ordering, fan-out, backoff) lives in JS
+//! (`schedule.js` + `scheduler_tick.mjs`), per durability-as-JS-shim.
 //!
 //! Both are gated on `state.is_system_module`: they throw for ordinary
 //! customer handlers, so only the baked `__system/scheduler_tick`

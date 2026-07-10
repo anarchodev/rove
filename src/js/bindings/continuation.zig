@@ -256,7 +256,7 @@ test "BENCH tryExtract per-request hot-path tax (ROVE_BENCH=1)" {
 // terminal — if any parked continuation on this worker has
 // `bound_schedule_id == send_id`, the call dispatches a
 // `resumeContinuation` with `outcome_json = event_json`. Returns
-// `true` when it matched (caller skips its own __rove_next chain);
+// `true` when it matched (caller skips its own `next()` chain);
 // `false` for the ordinary webhook path (no held-sync open hop).
 //
 // Tenant scoping: every parked-continuation entity carries its
