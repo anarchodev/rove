@@ -1347,6 +1347,7 @@ pub fn build(b: *std.Build) void {
         "examples/loop46-demo-tenants/wswake", // ↔ ws_wake_smoke_v2 (WS+wake)
         "src/replay/testdata/authsurface", // compute globals (crypto/base64url/jwt/oidc/sessions) in the sim base
         "src/replay/testdata/middleware", // real _middlewares/before + request.session injection
+        "src/replay/testdata/middlewarejs", // .js-spelled _middlewares runs too, .mjs preferred (issue #51)
         "src/replay/testdata/platformsurface", // http/platform/browser globals (effect recorders)
         "src/replay/testdata/oidcverify", // RS256 crypto.verifyRsa + jwt.verify offline
         "src/replay/testdata/ecdsaverify", // ES256 crypto.verifyEcdsa (P-256) + jwt.verify offline

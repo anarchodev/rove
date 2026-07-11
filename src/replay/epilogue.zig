@@ -56,11 +56,13 @@ pub const Opts = struct {
     /// / `request.correlation_id`. Plain strings (null → not set).
     tenant: ?[]const u8 = null,
     correlation_id: ?[]const u8 = null,
-    /// Run the tenant's real `_middlewares/index.mjs` `before` ahead of the
-    /// handler (inbound trust boundary only) — it may mutate `request` (e.g.
-    /// `request.auth`) or short-circuit. Set by the caller iff the middleware
-    /// module is resolvable AND this is an inbound-family activation.
-    run_middleware: bool = false,
+    /// The RESOLVED specifier of the tenant's real `_middlewares` module
+    /// (`_middlewares/index.mjs` or the `.js` spelling — prod probes both,
+    /// `.mjs` first) whose `before` runs ahead of the handler (inbound trust
+    /// boundary only) — it may mutate `request` (e.g. `request.auth`) or
+    /// short-circuit. null = no resolvable middleware / not a trust-boundary
+    /// activation → the import is never emitted.
+    middleware_path: ?[]const u8 = null,
     /// The flattened fetch/callback result → top-level `request.*`.
     result: ?Result = null,
 };
@@ -224,9 +226,12 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     // The real middleware, imported as a namespace so the async IIFE can run its
     // `before`. A static import (hoisted, loaded before the module body) — only
     // when it's resolvable AND this is an inbound-family activation, so a handler
-    // without `_middlewares` never triggers a load divergence.
-    if (opts.run_middleware) {
-        try w.writeAll("import * as __rove_mw from \"_middlewares/index.mjs\";\n");
+    // without `_middlewares` never triggers a load divergence. The specifier is
+    // the caller-RESOLVED spelling (`.mjs` or `.js`).
+    if (opts.middleware_path) |mp| {
+        try w.writeAll("import * as __rove_mw from ");
+        try jsonStr(w, mp);
+        try w.writeAll(";\n");
     }
 
     buf = aw.toArrayList();
@@ -406,7 +411,8 @@ const EPILOGUE_BODY =
     \\    // Real middleware (inbound trust boundary): run `_middlewares`' `before`
     \\    // first — it sees globalThis.request/response and may MUTATE the request
     \\    // (e.g. request.auth = {...}) or SHORT-CIRCUIT by returning a response.
-    \\    // `__rove_mw` is imported only when run_middleware (build() appends it);
+    \\    // `__rove_mw` is imported only when middleware_path resolved (build()
+    \\    // appends the import at the caller's spelling — .mjs or .js);
     \\    // `typeof` is safe when it isn't declared.
     \\    if (typeof __rove_mw !== "undefined" && __rove_mw) {
     \\      if (typeof __rove_mw.before !== "function") {
