@@ -1358,6 +1358,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
         "src/replay/testdata/platformadmin", // platform.* admin-only gating (fail-closed)
         "src/replay/testdata/upload", // headers-first onHeaders + blob.receive → onStored continuation
+        "src/replay/testdata/deploydoor", // result-in-ctx bound doors: platform.compile → onFileStaged / stampManifest → onCut (issue #6)
         "src/replay/testdata/concurrent", // whenConcurrent: cross-order fetch interleavings + invariant
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches

@@ -263,6 +263,34 @@ recovers the target path). A torn upload is `stored({ ok: false })` — the resu
 runs with `request.activation.ok === false` and `request.ctx = { error, app }`,
 nothing stored.
 
+### The deploy doors (result-in-ctx)
+
+`platform.compile(files, { on })` and `platform.scope(t).deploy.stampManifest(
+entries, { on })` are the two admin deploy doors: like `blob.receive`, they bind
+to the held chain (`return next()` after) and deliver their result on the
+resume's `request.ctx`, not `request.body`. Drive them with `.compile().staged(
+...)` and `.stampManifest().cut(...)`:
+
+```js
+const file = s.inbound({ method: "POST", path: "/v1/deploy/file",
+  headers: { authorization: "Bearer …" },
+  body: JSON.stringify({ tenant: "acme", path: "index.mjs", source: "…" }) });
+expect(file.disposition).toBe("held");           // the compile door armed + held
+
+const staged = file.compile().staged({
+  results: [{ path: "index.mjs", source_hex: "aa11", bytecode_hex: "bb22" }] });
+expect(staged.status).toBe(200);                 // onFileStaged ran with request.ctx
+```
+
+`staged({ results })` resumes at the compile's `on` with `request.ctx = { ok:
+true, results, app }`, where `app` echoes the issue-time `platform.compile(...,
+{ ctx })` (override it with `staged({ app })`). A failed compile is `staged({ ok:
+false, status, error })` — the resume sees `request.ctx = { ok: false, status,
+error }`. `stampManifest().cut({ dep_id })` resumes at the stamp's `on` with
+`request.ctx = { ok: true, dep_id }` (a failed PUT is `cut({ ok: false, dep_id })`,
+still echoing the dep_id). When a handler arms more than one compile door (a
+handler batch and a package batch), select with `.compile({ on: "onPkgStaged" })`.
+
 ## Detached delivery callbacks
 
 `webhook.send` and `email.send` fire *after* the handler commits — their `on`

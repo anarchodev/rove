@@ -555,6 +555,37 @@ class Node {
     return new ReceiveHandle(this, hit);
   }
 
+  /** Locate the `platform.compile` door this held activation armed (a bound
+   *  after.fetch to `rove-compile.internal`) → a handle whose `.staged()`
+   *  delivers the compile result on the resume's `request.ctx` (NOT
+   *  `request.body`) — the `routeCompileEvent` contract (`deploy_thread.zig`
+   *  §buildResultsJson). Parallel to `receive()`; a plain `fetch().resolve()`
+   *  would hand the resume the fetch's ISSUE-TIME ctx instead of the door
+   *  result. `opts.on` selects a specific compile when several were armed (e.g.
+   *  a handler vs a package batch), otherwise the first. */
+  compile(opts = {}) {
+    requireHeld(this, "compile");
+    const cx = this._byKind("fetch").filter((e) => matchUrl(e.url, /rove-compile\.internal/));
+    if (!cx.length) throw new Error("compile(): the activation armed no platform.compile door");
+    const hit = opts.on ? cx.find((e) => e.on === opts.on) : cx[0];
+    if (!hit) throw new Error(`compile({on:${opts.on}}): no armed platform.compile matched`);
+    return new CompileHandle(this, hit);
+  }
+
+  /** Locate the `platform.scope(t).deploy.stampManifest` staging barrier this
+   *  held activation armed (a bound after.fetch to `rove-stage.internal`) → a
+   *  handle whose `.cut()` delivers `{ok, dep_id}` on the resume's
+   *  `request.ctx` — the `processManifestPut` contract (`deploy_thread.zig`).
+   *  `opts.on` selects a specific stamp when several were armed. */
+  stampManifest(opts = {}) {
+    requireHeld(this, "stampManifest");
+    const sx = this._byKind("fetch").filter((e) => matchUrl(e.url, /rove-stage\.internal/));
+    if (!sx.length) throw new Error("stampManifest(): the activation armed no deploy.stampManifest door");
+    const hit = opts.on ? sx.find((e) => e.on === opts.on) : sx[0];
+    if (!hit) throw new Error(`stampManifest({on:${opts.on}}): no armed deploy.stampManifest matched`);
+    return new StampHandle(this, hit);
+  }
+
   /** Advance the clock; `.fire()` delivers the due `after.ms` timer wake. */
   get clock() {
     const node = this;
@@ -782,6 +813,72 @@ class ReceiveHandle {
       now_ms: (parent.world.now_ms || 0) + 1,
       request: { activation: { kind: "blob_stored", ok } },
     });
+    return resumeNode(parent, world);
+  }
+}
+
+/** A located `platform.compile` door → resolve its completion into the
+ *  dependent resume at the door's `on` export. Like `ReceiveHandle`, the door
+ *  is a BOUND fetch whose result rides `request.ctx` (NOT `request.body`): a
+ *  compile is a fetch completion whose `ctx_json` is set, so it reuses the
+ *  fetch-completion fold with the door JSON as ctx and a null body — the exact
+ *  `routeCompileEvent` shape (`deploy_thread.zig`, terminal `UpstreamFetchEvent`):
+ *    success → `request.ctx = { ok:true, results:[{path, source_hex,
+ *              bytecode_hex}, …], app }`, `request.ok === true`
+ *    failure → `request.ctx = { ok:false, status, error }`, `request.ok === false`
+ *  where `app` echoes the issue-time `platform.compile(..., {ctx})` (recorded on
+ *  the door fetch); the test may override it with `spec.app`. */
+class CompileHandle {
+  constructor(node, fx) { this.node = node; this.fx = fx; }
+
+  /** Resume with the staged bytecode. `spec`: `{ results, ok?, app?, status?,
+   *  error? }`. `ok` defaults true; on `ok:false` nothing was staged, so
+   *  `results`/`app` are dropped and `{status, error}` ride ctx. */
+  staged(spec = {}) {
+    const parent = this.node;
+    const pb = parent.force();
+    const ok = spec.ok != null ? spec.ok : true;
+    const status = spec.status != null ? spec.status : (ok ? 200 : 500);
+    // `app` echoes the recorded issue-time on.fetch ctx unless overridden.
+    const app = spec.app !== undefined ? spec.app
+      : (this.fx.ctx != null ? this.fx.ctx : null);
+    const ctx = ok
+      ? { ok: true, results: spec.results != null ? spec.results : [], app }
+      : { ok: false, status, error: spec.error != null ? spec.error : "compile failed" };
+    const world = fetchResumeWorld(
+      parent.world, this.fx, { status, ok, body: null },
+      foldKv(parent.world.kv, pb.effects),
+      (parent.world.seed || 0) + 1,
+      (parent.world.now_ms || 0) + 1,
+      ctx,
+    );
+    return resumeNode(parent, world);
+  }
+}
+
+/** A located `deploy.stampManifest` staging barrier → resolve it into the
+ *  dependent resume at the door's `on` export. The staging-barrier completion
+ *  delivers `request.ctx = { ok, dep_id }` (`processManifestPut`), with no
+ *  body — the same bound-fetch-with-ctx fold as `CompileHandle`. */
+class StampHandle {
+  constructor(node, fx) { this.node = node; this.fx = fx; }
+
+  /** Resume with the cut release. `spec`: `{ dep_id, ok?, status? }`. `ok`
+   *  defaults true; `dep_id` (16-hex) is echoed on ctx either way — a failed
+   *  PUT still carries the dep_id the manifest would have taken. */
+  cut(spec = {}) {
+    const parent = this.node;
+    const pb = parent.force();
+    const ok = spec.ok != null ? spec.ok : true;
+    const status = spec.status != null ? spec.status : (ok ? 200 : 502);
+    const ctx = { ok, dep_id: spec.dep_id != null ? spec.dep_id : "0000000000000000" };
+    const world = fetchResumeWorld(
+      parent.world, this.fx, { status, ok, body: null },
+      foldKv(parent.world.kv, pb.effects),
+      (parent.world.seed || 0) + 1,
+      (parent.world.now_ms || 0) + 1,
+      ctx,
+    );
     return resumeNode(parent, world);
   }
 }
