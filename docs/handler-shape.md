@@ -192,7 +192,10 @@ calls that re-invoke a handler still holding the socket. Ephemeral
   pattern is lossless — `effect-algebra.md` §6.4).
 - `after.fetch(url, opts?, { on? })` — perform an outbound request and wake
   on its result (whole or chunked). Connection-scoped outbound; its
-  durable twin is `webhook.send` (§2.4).
+  durable twin is `webhook.send` (§2.4). On the resume, `request.ctx` is the
+  fetch's own `{ctx}` option if you passed one, else the connection's
+  `next({ctx})` memory (decisions.md §4.14) — one rule on WS and HTTP. So a
+  no-ctx fetch on a held chain still reads the state you threaded via `next()`.
 
 `{ on: "module.method" }` routes the wake to a different export (still
 holding *this* connection) — the UNIVERSAL callback-target key, the

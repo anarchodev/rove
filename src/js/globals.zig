@@ -2766,6 +2766,10 @@ pub fn installRequest(
                     if (c.JS_IsException(parsed)) {
                         _ = c.JS_GetException(ctx); // clear; no ctx
                     } else {
+                        // `request.ctx` = the resume envelope's ctx — the fetch's
+                        // own ctx, or the chain's `next()` ctx when the fetch
+                        // carried none (the override resolved worker-side, see
+                        // worker_streaming.fetchResumeCtx; decisions.md §4.14).
                         const ctx_val = c.JS_GetPropertyStr(ctx, parsed, "ctx");
                         // Setter consumes the ctx_val reference.
                         _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", ctx_val);

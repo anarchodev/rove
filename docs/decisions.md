@@ -795,6 +795,43 @@ handler-owned watermark) back.
 best-effort-with-metric (a reaction primitive that silently misses
 under load is a footgun — the audit found exactly that).
 
+### 4.14 A fetch resume's `request.ctx` — the fetch's own ctx, else the chain's `next({ctx})` (2026-07-10)
+- **Decision**: on a held connection, a bound `after.fetch` (and everything that
+  lowers to one — `blob.get`, `segments.get`, `platform.compile`/`deploy`/
+  `stampManifest`/`release`) resumes with `request.ctx` = **the fetch's own ctx
+  if it carried one, else the held chain's parked `next({ctx})`**. One
+  deterministic rule, identical on WS and HTTP.
+- **Why (issue #3)**: the two ctxs — a fetch's `{ctx}` option and the
+  connection's `next({ctx})` memory — collided on the single `request.ctx` slot,
+  and prod resolved the collision *by transport*: `worker_drain` (HTTP) read the
+  fetch's `ev.ctx_json`; `worker_ws` (WS) read the chain's `chain_st.ctx_json`.
+  So the same handler behaved differently by transport, and the `rewind test`
+  sim (which matched HTTP) disagreed with prod-WS. The fix makes the fetch's own
+  ctx win when present (matching the established §4.9 behavior — `blob.get`/
+  compile all pass a ctx and read it back), and fall back to the chain's `next()`
+  ctx when the fetch carried none (so a handler that threads connection state via
+  `next()` and fetches with no ctx — the browser-agent `getReplay` shape — reads
+  that state, on *both* transports).
+- **Mechanism**: `worker_streaming.fetchResumeCtx(fetch_json, chain_json)`
+  resolves the override worker-side (`ev.ctx_json` if non-`"null"`, else
+  `c.ctx_json` / `chain_st.ctx_json`); the resume envelope stays `{"ctx":…}` and
+  `installRequest` lifts it to `request.ctx` exactly as before — no new field.
+  The sim mirrors it in `rewind_test.mjs` (`fetchResumeCtx(parent, fx)` =
+  `fx.ctx ?? heldCtx(parent)`), so sim and prod agree by construction.
+- **Rejected**: (a) *`request.ctx` = the chain's `next()` always, `request.extra`
+  = the fetch's ctx* — clean in the abstract, but it moves EVERY bound-fetch
+  effect callback (blob/compile/deploy/segments) off `request.ctx`, a large
+  cross-cutting rename of shipped storage/deploy internals; and no real handler
+  needs BOTH ctxs on one resume (each reads exactly one), so the second field is
+  speculative. (b) *A separate `request.conn` for the chain memory alongside the
+  fetch ctx* — same "nobody needs both" objection; deferred until a genuine
+  both-case appears (a fetch that carries per-call correlation AND wants the
+  connection state can put it in the fetch's own ctx). (c) *Drop `next(ctx)`,
+  make every wake/frame carry its own ctx* — `next(ctx)` is the ONLY ctx channel
+  for the un-armed continuations (WS frame, disconnect, inbound body chunk: there
+  is no `after.message`/`after.disconnect`/`after.chunk` to hang a ctx on), so it
+  is load-bearing and can't be removed.
+
 ### 5.1 Replicate readsets (not intents); gate the callback, not the propose
 - **Decision** (Phases 1–6 shipped 2026-05-25/27; see
   `architecture/effects-and-handlers.md` §Readset replication): the three-substrate model is **Raft = inputs +

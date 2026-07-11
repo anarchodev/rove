@@ -1966,10 +1966,11 @@ pub fn resumeBoundFetchChain(
     // Build the resume request. Target the customer's chosen
     // named export — `ev.name` if the bind specified `to:`, else the
     // conventional fetch export (onFetchResult / onFetchChunk /
-    // onFetchDone, handler-shape.md §3). Body is `{ctx: <ctx_json>}` —
-    // handler reads `request.body` for the chunk bytes from the
-    // activation_fetch_bytes slot, not from request.body.
-    const ctx_src: []const u8 = if (ev.ctx_json.len > 0) ev.ctx_json else "{}";
+    // onFetchDone, handler-shape.md §3). `request.ctx` (decisions.md §4.14) =
+    // the fetch's own ctx (`ev.ctx_json`) if it carried one, else the held
+    // chain's `next({ctx})` memory (`c.ctx_json`) — the issue-#3 fix, one rule
+    // on both transports. Chunk bytes come from the activation slot.
+    const ctx_src = worker_streaming.fetchResumeCtx(ev.ctx_json, c.ctx_json);
     const body = worker_streaming.synthCtxBody(allocator, ctx_src) catch return;
     defer allocator.free(body);
     // First-class resume target (decisions.md §4.5) — no synthetic

@@ -1203,6 +1203,19 @@ pub fn synthCtxBody(allocator: std.mem.Allocator, ctx_json: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_json});
 }
 
+/// The `request.ctx` a bound-FETCH resume observes (decisions.md §4.14): the
+/// fetch's OWN ctx (`fetch_json` — its `{ctx}` option, or a platform door's
+/// result) when it carried one, else the held chain's `next({ctx})` memory
+/// (`chain_json`). One deterministic rule on both transports — a WS fetch
+/// resume no longer swaps the chain ctx onto `request.ctx` when the fetch DID
+/// carry a ctx (the issue-#3 bug), and a no-ctx fetch still threads the
+/// connection's `next()` state. Args are JSON text ("null" when absent).
+pub fn fetchResumeCtx(fetch_json: []const u8, chain_json: []const u8) []const u8 {
+    if (fetch_json.len > 0 and !std.mem.eql(u8, fetch_json, "null")) return fetch_json;
+    if (chain_json.len > 0) return chain_json;
+    return "null";
+}
+
 /// Synthesize an effect-RESULT delivery body: `{"ctx":{result, context}}` —
 /// the shape the `send_callback` hoist flattens onto `request.body`/`.status`
 /// (metadata → `request.activation`, `context` → `request.ctx`). Used by a
