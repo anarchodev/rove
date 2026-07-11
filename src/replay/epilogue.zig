@@ -35,6 +35,10 @@ pub const Opts = struct {
     body_bytes: ?[]const u8 = null,
     /// The export the activation invokes ("default", "onChunk", ...).
     export_name: []const u8 = "default",
+    /// The activation KIND ("inbound", "disconnect", ...) — drives the
+    /// missing-export disposition (prod: disconnect = no-op, inbound_headers /
+    /// inbound_chunk fall back to the buffered default, else 404).
+    activation: []const u8 = "inbound",
     /// Chunk activations (`inbound_chunk` / `fetch_chunk`): the live
     /// `request.body` is a byte-exact Uint8Array, so the replay body is base64
     /// (binary), not a decoded string.
@@ -209,6 +213,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     } else try w.writeAll("null");
     try w.writeAll(",\"fn\":");
     try jsonStr(w, opts.export_name);
+    try w.writeAll(",\"kind\":");
+    try jsonStr(w, opts.activation);
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
@@ -369,6 +375,32 @@ const EPILOGUE_BODY =
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  let __result = null, __err = null, __short = false;
+    \\  // Await like the worker's pumpJobs: drain microtasks, and if the promise
+    \\  // is STILL pending treat it as a plain value (prod ships its JSON — "{}")
+    \\  // rather than awaiting forever (response_building.unwrapPromise). Returns
+    \\  // a {v, pending?} wrapper — returning the pending promise bare from an
+    \\  // async fn would chain-adopt it and never resolve.
+    \\  const __settle = async (p) => {
+    \\    if (!p || typeof p.then !== "function") return { v: p };
+    \\    let done = false, ok = false, val;
+    \\    p.then((x) => { done = true; ok = true; val = x; }, (x) => { done = true; val = x; });
+    \\    // Each turn yields one microtask tick. Prod pumps until the queue is
+    \\    // quiet; the queue isn't visible from JS, so approximate with a budget
+    \\    // generous beyond any real await chain. A handler needing more turns
+    \\    // than this is reported as pending (the warn log below flags it).
+    \\    for (let i = 0; i < 4096 && !done; i++) await null;
+    \\    if (!done) return { v: p, pending: true };
+    \\    if (!ok) throw val;
+    \\    return { v: val };
+    \\  };
+    \\  // NOTE: returns the {v, pending?} WRAPPER — callers read `.v`. Returning
+    \\  // a still-pending `v` bare from an async fn would make the caller's
+    \\  // `await` re-adopt it and hang the epilogue forever.
+    \\  const __settled = async (p) => {
+    \\    const r = await __settle(p);
+    \\    if (r.pending) __effects.push({ kind: "log", level: "warn", message: "handler returned a still-pending promise — prod treats it as a plain value (body \"{}\")" });
+    \\    return r;
+    \\  };
     \\  try {
     \\    const ns = __arena_entry_ns();
     \\    // Real middleware (inbound trust boundary): run `_middlewares`' `before`
@@ -376,17 +408,49 @@ const EPILOGUE_BODY =
     \\    // (e.g. request.auth = {...}) or SHORT-CIRCUIT by returning a response.
     \\    // `__rove_mw` is imported only when run_middleware (build() appends it);
     \\    // `typeof` is safe when it isn't declared.
-    \\    if (typeof __rove_mw !== "undefined" && __rove_mw && typeof __rove_mw.before === "function") {
-    \\      const __mwr = await __rove_mw.before();
-    \\      if (__mwr !== undefined && __mwr !== null) { __result = __mwr; __short = true; }
+    \\    if (typeof __rove_mw !== "undefined" && __rove_mw) {
+    \\      if (typeof __rove_mw.before !== "function") {
+    \\        // A malformed middleware is loud (module_execution.runMiddleware):
+    \\        // 500 short-circuit, the handler never runs.
+    \\        globalThis.response = { status: 500, headers: {}, cookies: [] };
+    \\        __result = "_middlewares/index.mjs must export a `before` function\n";
+    \\        __short = true;
+    \\      } else {
+    \\        const __mwr = (await __settled(__rove_mw.before())).v;
+    \\        if (__mwr !== undefined && __mwr !== null) { __result = __mwr; __short = true; }
+    \\      }
     \\    }
     \\    if (!__short) {
-    \\      if (typeof ns[D.fn] !== "function") throw new Error("replay: entry module has no '" + D.fn + "' export");
-    \\      __result = await ns[D.fn]();
+    \\      const __fn = ns[D.fn];
+    \\      if (typeof __fn === "function") {
+    \\        __result = (await __settled(__fn())).v;
+    \\      } else if (D.kind === "disconnect") {
+    \\        // Prod: a missing onDisconnect is a no-op, not a 404 — the held
+    \\        // stream closes regardless (module_execution).
+    \\      } else if ((D.kind === "inbound_headers" || D.kind === "inbound_chunk") && typeof ns["default"] === "function") {
+    \\        // Prod: no onHeaders/onChunk probe hit → fall back to the classic
+    \\        // buffered dispatch at the default export (worker_dispatch §3.5).
+    \\        __result = (await __settled(ns["default"]())).v;
+    \\      } else {
+    \\        // Prod 404s any other missing export (module_execution).
+    \\        globalThis.response = { status: 404, headers: {}, cookies: [] };
+    \\        __result = 'module export "' + D.fn + '" not found or not a function\n';
+    \\      }
     \\    }
     \\    globalThis.__replay_result = __result;
     \\  } catch (e) {
     \\    __err = { message: String((e && e.message) || e), stack: String((e && e.stack) || "") };
+    \\    // Prod parity (worker_dispatch): a JS exception → 500 with
+    \\    // "handler threw: {ToString}\n" as the body, the handler-set response
+    \\    // head DISCARDED, and the txn rolled back. Mark this activation's
+    \\    // outputs rolled back so kv folds and matchers exclude them — reads and
+    \\    // console lines are not outputs, and stream frames may already be on
+    \\    // the wire (prod flushes them eagerly), so those stay.
+    \\    globalThis.response = { status: 500, headers: {}, cookies: [] };
+    \\    __result = "handler threw: " + String(e) + "\n";
+    \\    for (const __e of __effects) {
+    \\      if (__e.kind !== "read" && __e.kind !== "log" && __e.kind !== "stream") __e.rolledBack = true;
+    \\    }
     \\  }
     \\  globalThis.kv = __kvNative;   // restore before the native OUTPUT_KEY write
     \\  let __out;

@@ -234,6 +234,7 @@ pub const Engine = struct {
             .request_reads = reads.items,
             .body_bytes = wv.body,
             .export_name = export_name,
+            .activation = wv.activation,
             .binary_body = binary_body,
             .ctx_json = wv.ctx_json,
             .activation_json = wv.activation_json,
@@ -629,13 +630,20 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     } else try w.writeAll("[]");
 
     try w.writeAll(",\"error\":");
+    var has_err = args.run_json == null;
     if (run) |r| {
         if (r.get("error")) |ev| {
-            if (ev == .null) try w.writeAll("null") else try std.json.Stringify.value(ev, .{}, w);
+            if (ev == .null) try w.writeAll("null") else {
+                has_err = true;
+                try std.json.Stringify.value(ev, .{}, w);
+            }
         } else try w.writeAll("null");
     } else try w.writeAll("{\"message\":\"the run produced no output — it failed before the handler completed (see divergence)\"}");
 
-    const ok_run = args.run_json != null and args.divergence == null;
+    // ok = the activation completed CLEANLY: output parked, no divergence, no
+    // thrown handler. A thrown handler is a 500 in prod — `ok:true` on it
+    // misled error-path tests (issue #10).
+    const ok_run = args.run_json != null and args.divergence == null and !has_err;
     try w.print(",\"ok\":{s}", .{if (ok_run) "true" else "false"});
 
     // divergence — only when present (replay/fail signal; absent in a clean sim).

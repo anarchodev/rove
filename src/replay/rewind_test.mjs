@@ -101,10 +101,18 @@ function subsetMatch(obj, subset) {
   return true;
 }
 
+/** Effects that SURVIVED the activation. A thrown handler rolls its txn back
+ *  in prod (500 "handler threw"), so the sim marks that activation's
+ *  writes/cmds `rolledBack` — they must not fold forward or satisfy matchers
+ *  (issue #10). They stay on `node.effects` for debugging. */
+function live(effects) {
+  return (effects || []).filter((e) => !e.rolledBack);
+}
+
 /** base kv object, overlaid with a bundle's writes/deletes (read-your-writes). */
 function foldKv(base, effects) {
   const kvOut = Object.assign({}, base || {});
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind !== "write" && e.kind !== "delete") continue;
     // A store-tagged write/delete (platform.scope(id) / platform.root) folds into
     // that store's namespaced slot, so it never collides with the tenant's own
@@ -132,7 +140,7 @@ function foldKv(base, effects) {
  *  recorder entries. */
 function scheduledEffects(effects) {
   const out = [];
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind === "timer") out.push({ target: e.on, kind: "timer" });
     else if (e.kind === "kv-wake") out.push({ target: e.on, kind: "kv-wake" });
     else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_sched/by_id/")) {
@@ -155,7 +163,7 @@ function scheduledEffects(effects) {
  *  on_result, context, …}), the durable artifact that actually replicates. */
 function sentEffects(effects) {
   const out = [];
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
       try { const m = JSON.parse(e.value); out.push({ url: m.url, method: m.method, body: m.body, on: m.on_result, context: m.context }); }
       catch (_) { /* skip a non-JSON marker */ }
@@ -171,7 +179,7 @@ function sentEffects(effects) {
  *  webhooks (read those with `toHaveSent("webhook", …)`). */
 function emailSent(effects) {
   const out = [];
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
       try {
         const m = JSON.parse(e.value);
@@ -1189,7 +1197,9 @@ class Matcher {
     if (!node) return false;
     // Tenant store only — a `platform.scope(id)` / `platform.root` write carries
     // a `store` tag and is asserted with `instanceKv(id, …)` / `rootKv(…)`.
-    const writes = node.effects.filter((e) => e.kind === "write" && e.key === key && !e.store);
+    // Rolled-back writes (thrown handler) never commit in prod, so they never
+    // satisfy the matcher.
+    const writes = live(node.effects).filter((e) => e.kind === "write" && e.key === key && !e.store);
     const pass = writes.some((w) => subsetMatch(tryParse(w.value), subset));
     return this._record(`toHaveWritten ${fmt(key)}`, pass, {
       subset: subset === undefined ? null : subset,
@@ -1200,7 +1210,7 @@ class Matcher {
   toHaveFetched(matcher) {
     const node = this._node("toHaveFetched");
     if (!node) return false;
-    const fx = node.effects.filter((e) => e.kind === "fetch");
+    const fx = live(node.effects).filter((e) => e.kind === "fetch");
     return this._record(`toHaveFetched ${matcher == null ? "" : matcher}`, fx.some((e) => matchUrl(e.url, matcher)), {
       fetched: fx.map((e) => e.url),
     });
@@ -1225,7 +1235,7 @@ class Matcher {
       ? sentEffects(node.effects)
       : kind === "email"
       ? emailSent(node.effects)
-      : node.effects.filter((e) => e.kind === kind);
+      : live(node.effects).filter((e) => e.kind === kind);
     const pass = sent.some((e) => subsetMatch(e, subset));
     return this._record(`toHaveSent ${fmt(kind)}`, pass, { subset: subset === undefined ? null : subset, sent });
   }
@@ -1259,9 +1269,10 @@ class Matcher {
 }
 
 /** The stable facets a snapshot captures: response head, disposition, body/ctx,
- *  and the writes/cmds from the effect log (logs + reads excluded — noisy). */
+ *  and the writes/cmds from the effect log (logs + reads excluded — noisy;
+ *  rolled-back entries excluded — they never commit in prod). */
 function snapshotFacets(b) {
-  const cmds = (b.effects || []).filter((e) =>
+  const cmds = live(b.effects).filter((e) =>
     e.kind !== "read" && e.kind !== "log");
   return {
     response: b.response || null,
