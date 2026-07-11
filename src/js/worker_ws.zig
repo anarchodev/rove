@@ -752,9 +752,14 @@ pub fn resumeBoundFetchChainWs(
     defer p.deinit(allocator);
     const tc = p.dep.tc;
 
-    // The resumed export reads its chunk via the activation; `request.ctx`
-    // carries the held chain's threaded ctx (same `{ctx}` body as fireWsMessage).
-    const body = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch return;
+    // `request.ctx` (decisions.md §4.14) = the fetch's own ctx (`ev.ctx_json`,
+    // its `{ctx}` option / a platform door's result) if it carried one, else the
+    // held chain's `next({ctx})` memory (`chain_st.ctx_json`). A WS fetch resume
+    // now reads its fetch data on `request.ctx` — matching HTTP — instead of
+    // silently swapping the chain ctx in (the issue-#3 bug); a no-ctx fetch
+    // still threads the connection's `next()` state.
+    const ws_ctx_src = worker_streaming.fetchResumeCtx(ev.ctx_json, chain_st.ctx_json);
+    const body = worker_streaming.synthCtxBody(allocator, ws_ctx_src) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);

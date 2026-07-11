@@ -165,6 +165,29 @@ def main():
         except Exception as e:
             check("on.fetch resumed onUpstream", False, repr(e))
             c.dump_node_log(grep=["fetch", "onUpstream", "ws-fetch", "error", "warn"])
+
+        # issue #3 / §4.14: a WS fetch with NO ctx → request.ctx is the
+        # connection's next({tag}) — the same value HTTP delivers (the fix).
+        print("step: WS fetch resume — no fetch ctx → request.ctx = the connection's next({tag})")
+        send_text(sock, f"fetchctx:http://127.0.0.1:{stub_port}/x")
+        try:
+            op, pl = recv_text(sock)
+            check("no-ctx WS fetch → request.ctx = next({tag})",
+                  op == OP_TEXT and pl == b"ctx:chain-42", f"op={op} pl={pl!r}")
+        except Exception as e:
+            check("no-ctx WS fetch → request.ctx = next({tag})", False, repr(e))
+            c.dump_node_log(grep=["fetch", "onUpstreamCtx", "error", "warn"])
+
+        # The fetch carries its OWN ctx → request.ctx is the fetch's, not the chain's.
+        print("step: WS fetch resume — fetch ctx present → request.ctx = the fetch's ctx")
+        send_text(sock, f"fetchboth:http://127.0.0.1:{stub_port}/x")
+        try:
+            op, pl = recv_text(sock)
+            check("WS fetch with ctx → request.ctx = the fetch's ctx",
+                  op == OP_TEXT and pl == b"ctx:FF", f"op={op} pl={pl!r}")
+        except Exception as e:
+            check("WS fetch with ctx → request.ctx = the fetch's ctx", False, repr(e))
+            c.dump_node_log(grep=["fetch", "onUpstreamBoth", "error", "warn"])
         sock.close()
 
     if failures:

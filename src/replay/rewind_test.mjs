@@ -632,6 +632,17 @@ function heldCtx(node) {
   return c === undefined ? null : c;
 }
 
+/** The `request.ctx` a located `after.fetch`'s resume observes (decisions.md
+ *  §4.14): the fetch's OWN ctx (`fx.ctx`) when it carried one, else the held
+ *  chain's parked `next({ctx})` (`heldCtx(parent)`). One deterministic rule,
+ *  matching the worker (`worker_streaming.fetchResumeCtx`) on both transports —
+ *  so a no-ctx fetch on a held chain threads the connection's `next()` state. */
+function fetchResumeCtx(parent, fx) {
+  // `!= null` catches both undefined and the null the recorder stores for a
+  // no-ctx fetch — matching the worker, which treats JSON "null" as absent.
+  return fx.ctx != null ? fx.ctx : heldCtx(parent);
+}
+
 function parseDuration(s) {
   const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/.exec(String(s).trim());
   if (!m) throw new Error(`clock.advance: unrecognized duration ${JSON.stringify(s)} (use e.g. 500, "1500ms", "1.5s", "2m", "1h", "3d")`);
@@ -676,6 +687,7 @@ class FetchHandle {
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + (response.latencyMs || 1),
+      fetchResumeCtx(parent, this.fx),
     );
     return resumeNode(parent, world);
   }
@@ -693,7 +705,7 @@ class FetchHandle {
     const parentNode = this.node;
     const pw = this.node.world;
     const on = this.fx.on;
-    const ctx = this.fx.ctx === undefined ? null : this.fx.ctx;
+    const ctx = fetchResumeCtx(parentNode, this.fx);
     let kv = foldKv(pw.kv, this.node.force().effects);
     let seed = pw.seed || 0;
     let now = pw.now_ms || 0;
@@ -807,7 +819,7 @@ class Interleaving {
     for (const i of order) {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
-      node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now));
+      node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx)));
       kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
     }
     return node;
@@ -909,14 +921,16 @@ function onTarget(parentEntry, on, fallbackExport) {
  *  EXPLICIT kv/seed/now base — the shared core of `FetchHandle.resolve` and the
  *  `whenConcurrent` interleaving fold (which threads a running overlay through a
  *  chosen arrival order rather than always folding from the one parent). */
-function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now) {
+function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx) {
   const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
   const t = onTarget(parentWorld.entry, fx.on, "onFetchResult");
   return carrySources(parentWorld, {
     entry: t.entry,
     activation: "fetch_chunk",
     export: t.export,
-    ctx: fx.ctx === undefined ? null : fx.ctx,
+    // §4.14 override, resolved by the caller (fetchResumeCtx): the fetch's own
+    // ctx if it carried one, else the held chain's next() ctx.
+    ctx: ctx === undefined ? null : ctx,
     kv: kvBase,
     seed,
     now_ms: now,
