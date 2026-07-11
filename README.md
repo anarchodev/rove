@@ -82,6 +82,7 @@ src/
   tape/         deterministic replay tape encoder
   tenant/       account / domain metadata (Tenant + Instance)
   qjs/          arenajs wrapper (one frozen base arena + per-request reset)
+  replay/       the one replay/sim engine — runWorld(world, code) behind rewind replay/sim
   acme/         ACME HTTP-01 client
   jwt/  ssrf/  plan/   leaf modules (HS256 / SSRF blocklist / tier table)
   js/           worker dispatcher (request → handler → response loop)
@@ -108,8 +109,9 @@ published as ordinary tenant bundles.
   settled call.
 - [`docs/architecture/`](docs/architecture/) — as-built references, one
   doc per subsystem (`overview`, `consensus-and-storage`,
-  `effects-and-handlers`, `routing-and-ingress`, `control-plane`,
-  `deployment-and-logs`, `auth-and-domains`, `observability`).
+  `effects-and-handlers`, `routing-and-ingress`, `websockets`,
+  `control-plane`, `deployment-and-logs`, `replay-and-sim`,
+  `auth-and-domains`, `observability`).
 - [`docs/effect-algebra.md`](docs/effect-algebra.md) and
   [`docs/handler-shape.md`](docs/handler-shape.md) — the customer-facing
   effect model + handler API surface.
