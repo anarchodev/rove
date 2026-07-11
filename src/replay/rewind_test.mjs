@@ -197,6 +197,21 @@ function stable(v) {
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stable(v[k])).join(",") + "}";
 }
 
+// Split a durable-wake target `"module.method"` into module + optional export
+// (handler-shape.md §2.4, issue #9). The method suffix is recognized ONLY when
+// the module part ends in `.mjs`/`.js` — so a bare `"reports.mjs"`, a slash
+// path, or a `__system/` module stays whole (default export). MUST match the
+// worker's `splitDurableTarget` in `src/js/worker_streaming.zig`.
+function splitDurableTarget(target) {
+  const dot = target.lastIndexOf(".");
+  if (dot < 0) return { module: target, method: null };
+  const head = target.slice(0, dot);
+  const tail = target.slice(dot + 1);
+  if (tail.length > 0 && (head.endsWith(".mjs") || head.endsWith(".js")))
+    return { module: head, method: tail };
+  return { module: target, method: null };
+}
+
 // ── the scenario + activation tree ───────────────────────────────────────────
 
 export function scenario(cfg = {}) {
@@ -401,7 +416,13 @@ class Scenario {
    *  target fires the same way (via the baked `cron_tick`, which the customer
    *  never sees); each occurrence is one `wake(...)`.
    *
-   *  spec: { on: "<target module path>", ctx?: <payload>, method?: "<export>",
+   *  `on` is the target as passed to `schedule`/`cron`: a bare module
+   *  (`"jobs/reminder"` → `default` export) or the `module.method` form
+   *  (`"reports.mjs.weekly"` → the `weekly` export — the method suffix is
+   *  only recognized after a `.mjs`/`.js` module, issue #9). You may also
+   *  split it explicitly with `method`.
+   *
+   *  spec: { on: "<target>", ctx?: <payload>, method?: "<export>",
    *          id?: "<schedule id>", key?: "<idempotency key>",
    *          scheduledAtNs?: <ns since epoch>, now?: <fire time> }
    */
@@ -421,12 +442,16 @@ class Scenario {
     };
     // Present only when the schedule was armed with an idempotency key.
     if (spec.key != null) activation.key = spec.key;
+    // A `module.method` target (`on: "reports.mjs.weekly"`) resolves the same
+    // way the worker fires it (splitDurableTarget); an explicit `spec.method`
+    // wins for the split-out form (`on: "reports.mjs", method: "weekly"`).
+    const _t = splitDurableTarget(spec.on);
     return new Node(this, this._base({
-      entry: spec.on, // the scheduled target module IS this activation's entry
+      entry: _t.module, // the scheduled target module IS this activation's entry
       activation: "durable_wake",
       // durable_wake dispatches at the target's default export (rpc_dispatch);
-      // a `module.method` target overrides via `method`.
-      export: spec.method || "default",
+      // a `module.method` target overrides the export (issue #9).
+      export: spec.method || _t.method || "default",
       ctx: spec.ctx === undefined ? null : spec.ctx,
       now_ms: fireMs,
       request: { activation },

@@ -25,3 +25,13 @@ export default function () {
   }
   return { ok: true, count: n };
 }
+
+// A NAMED export — the target of a `schedule(..., "jobs/reminder.mjs.weekly")`
+// (issue #9). Writes a distinct marker so a test can prove the method ran
+// rather than `default`.
+export function weekly() {
+  const a = request.activation;
+  const { user } = request.ctx || {};
+  kv.set("weekly/" + user, JSON.stringify({ export: "weekly", firedFrom: a.id }));
+  return { ok: true, export: "weekly" };
+}

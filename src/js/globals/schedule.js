@@ -204,8 +204,12 @@
    *
    * @param {object} when - `{ in: number|string }` or
    *   `{ at: bigint|number|Date|string }`.
-   * @param {string} target - Handler module specifier to invoke
-   *   (`"module"` or `"module.method"`).
+   * @param {string} target - Handler module specifier to invoke: a bare
+   *   module (`"jobs/reminder"` → its `default` export) or the
+   *   `module.method` form (`"reports.mjs.weekly"` → the `weekly` export).
+   *   The method suffix is only recognized after a `.mjs`/`.js` module —
+   *   so `"reports.mjs"` is a whole module, and to name a method include
+   *   the extension.
    * @param {*} [ctx] - JSON-serializable payload, surfaced as
    *   `request.ctx`. Capped at 16 KiB serialized.
    * @param {object} [opts]
