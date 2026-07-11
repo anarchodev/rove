@@ -61,7 +61,7 @@ export default function () {
 
     // Result shape — handed to __rove_next as {ctx:{result, context}};
     // the runtime then flattens it onto the customer's `{on}` request
-    // surface (request.bytes/.status/.ok + request.ctx; globals.zig).
+    // surface (request.bytes/.status + request.ctx; globals.zig).
     // The response bytes ride base64url-encoded (`body_b64`) — the
     // JSON envelope can't carry raw bytes (decisions.md
     // §4.11); the consumer's text view derives from the bytes.
@@ -69,7 +69,13 @@ export default function () {
         ? base64url.encode(a.bytes)
         : base64url.encode(ctx.result_body || "");
     const result_status = (a.kind === "fetch_chunk") ? a.status : ctx.result_status;
-    const result_ok = (a.kind === "fetch_chunk") ? a.ok : ctx.result_ok;
+    // Raw transport bit — did the delivery attempt reach an HTTP
+    // response at all? The retry classifier below must keep an upstream
+    // 5xx distinct from a hard transport failure, so it can't lean on a
+    // single 2xx/not-2xx flag. Convention (issue #7): `status === 0` ⟺
+    // no HTTP response reached us; 4xx/5xx are transport-ok with a real
+    // status.
+    const transport_ok = (a.kind === "fetch_chunk") ? (result_status !== 0) : !!ctx.result_ok;
     const result_headers = (a.kind === "fetch_chunk")
         ? (a.headers || {})
         : (ctx.result_headers || {});
@@ -77,7 +83,7 @@ export default function () {
 
     const result = {
         id: id,
-        ok: result_ok && result_status < 400,
+        ok: transport_ok && result_status < 400,
         status: result_status,
         body_b64: body_b64,
         headers: result_headers,
@@ -87,7 +93,7 @@ export default function () {
     };
 
     // Classify.
-    const transport_failed = !result_ok;
+    const transport_failed = !transport_ok;
     const upstream_5xx = result_status >= 500;
     const upstream_4xx = result_status >= 400 && result_status < 500;
     const max_attempts = (typeof owed.max_attempts === "number" && owed.max_attempts >= 1)

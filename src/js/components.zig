@@ -289,10 +289,15 @@ pub const UpstreamFetchEvent = struct {
     /// Surfaces as `request.activation.status`.
     terminal_status: u16 = 0,
     /// `final` only: transport-only success flag (libcurl returned
-    /// cleanly AND any cap-based abort was deliberate, not an
-    /// error). `ok: true, status: 503` is "transport worked, server
-    /// said no" — the JS shim decides retry policy. Surfaces as
-    /// `request.activation.ok`.
+    /// cleanly AND any cap-based abort was deliberate, not an error).
+    /// `terminal_ok: true, status: 503` is "transport worked, server
+    /// said no." This is INTERNAL bookkeeping — it is NOT surfaced to
+    /// JS. The customer-facing result contract is `terminal_status`
+    /// alone (`request.status`): `200 ≤ status < 300` is success,
+    /// `status === 0` is a hard transport failure. There is no derived
+    /// `request.ok` (issue #7 — it was redundant with `status`). The
+    /// transport bit is folded into `terminal_status == 0` on a hard
+    /// failure, which is what JS reads.
     terminal_ok: bool = false,
     /// `final` only: true iff the response body exceeded the cap
     /// (`max_response_chunk_bytes` when `stream: false`, or

@@ -514,8 +514,11 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 - **Decision** (2026-06-15): every effect-result resume — a bound `on.fetch` /
   `blob.get` (held chain) **and** a connectionless `webhook.send` / `blob.put` /
   `retry` `on_result` callback — presents the result the **same** way: the
-  response bytes on `request.body`, `request.status` / `request.ok` /
-  `request.done` at the **top level**, and the echoed customer `context` +
+  response bytes on `request.body`, `request.status` / `request.done` at
+  the **top level** (`status` is the single success signal — `200 ≤ status
+  < 300` is ok, `status === 0` is a hard transport failure; there is no
+  derived `request.ok`, removed in issue #7 as redundant + drift-prone),
+  and the echoed customer `context` +
   per-path delivery metadata (`attempts`, `error`, `id`, `headers`, blob `hash`)
   on `request.ctx`. **`request.result` does not exist** in any path — it was a
   doc fiction referenced in ~6 sites and implemented nowhere.

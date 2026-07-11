@@ -337,7 +337,7 @@ globalThis.oauth = {
 
   /**
    * Cache the JWKS delivered to the {@link oauth.fetchJwks} `{on}`
-   * module. Reads the ambient result (`request.ok` / `request.text`) —
+   * module. Reads the ambient result (`request.status` / `request.text`) —
    * call it, then re-run {@link oauth.verifyIdToken}.
    *
    * @param {string} [cache_path] - Same `cache_path` passed to
@@ -346,7 +346,10 @@ globalThis.oauth = {
    */
   cacheJwks(cache_path) {
     const req = globalThis.request;
-    if (!req || !req.ok) return false;
+    // Only cache a 2xx JWKS fetch. Written as `!(2xx)` so a missing
+    // status (no fetch result) is treated as not-ok too. `status` is the
+    // single result signal — no request.ok, issue #7.
+    if (!req || !(req.status >= 200 && req.status < 300)) return false;
     let jwks = null;
     try { jwks = JSON.parse(req.text || "{}"); } catch (_) {}
     if (!jwks || !Array.isArray(jwks.keys)) return false;

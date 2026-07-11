@@ -26,11 +26,12 @@ function pad(seq) {
 
 export default function () {
     // Unified effect-result surface (handler-shape §7, Endpoint A): a
-    // blob.put on_result arrives flattened — `request.ok`/`.status` top-
-    // level, the echoed `context` (the threaded value) IS `request.ctx`,
-    // and the stored blob `hash` is on `request.activation.hash`.
+    // blob.put on_result arrives flattened — `request.status` top-level
+    // (the single success signal; 2xx = ok, no `request.ok`, issue #7),
+    // the echoed `context` (the threaded value) IS `request.ctx`, and
+    // the stored blob `hash` is on `request.activation.hash`.
     const c = request.ctx || {};
-    if (!request.ok) {
+    if (request.status < 200 || request.status >= 300) {
         // Marker evidence persists per blob.put semantics; next seal
         // retries. Nothing to clean.
         return { status: 200 };

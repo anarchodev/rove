@@ -51,7 +51,7 @@ export function onHeaders() {
 }
 
 export function onStored() {
-    if (!request.activation.ok) {
+    if (request.activation.status < 200 || request.activation.status >= 300) {
         response.status = 502;
         return "store failed";
     }
@@ -77,7 +77,7 @@ export default function () {
     return next();
 }
 export function onBlob() {
-    if (!request.activation.ok || request.activation.status !== 200) {
+    if (request.activation.status !== 200) {
         response.status = 404;
         return "missing";
     }

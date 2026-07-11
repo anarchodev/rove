@@ -325,10 +325,12 @@ class Scenario {
    *  handler commits and its `on` module runs later as its own activation, so
    *  you test that module in isolation given a delivery result. Mirrors the
    *  flattened send_callback surface (dispatcher.zig): the response on
-   *  `request.status`/`.ok`/`.bytes`, the echoed `ctx` bare on `request.ctx`,
-   *  and delivery metadata on `request.activation.*`.
+   *  `request.status`/`.bytes`, the echoed `ctx` bare on `request.ctx`,
+   *  and delivery metadata on `request.activation.*`. `status` is the
+   *  single success signal (2xx = delivered, 0 = never reached) — there
+   *  is no `request.ok` (issue #7).
    *
-   *  spec: { on: "<result-module path>", result?: {status, ok?, body?, attempts?,
+   *  spec: { on: "<result-module path>", result?: {status, body?, attempts?,
    *          error?, id?, headers?}, ctx?: <echoed context> }
    */
   sendCallback(spec = {}) {
@@ -343,7 +345,6 @@ class Scenario {
       ctx: spec.ctx === undefined ? null : spec.ctx,
       request: {
         status,
-        ok: r.ok != null ? r.ok : (status >= 200 && status < 300),
         done: true,
         body: r.body != null ? r.body : null,
         activation: {
@@ -360,18 +361,20 @@ class Scenario {
   /** A bare fetch-continuation MODULE authored in isolation — the `on` module of
    *  an `after.fetch`/`http.fetch`, driven standalone given an upstream result
    *  (parallel to `sendCallback`, but the fetch-result surface rather than the
-   *  send-callback one). The response lands flattened on `request.{status, ok,
+   *  send-callback one). The response lands flattened on `request.{status,
    *  done, body}` and the echoed `ctx` bare on `request.ctx` — the same shape a
    *  folded `FetchHandle.resolve` produces, so a `_rp/complete.mjs`-style module
-   *  is testable without standing up the emitter that would reach it.
+   *  is testable without standing up the emitter that would reach it. `status`
+   *  is the single success signal (2xx = ok, 0 = transport failure) — there is
+   *  no `request.ok` (issue #7).
    *
    *  spec: { on: "<continuation module path>", ctx?: <echoed context>,
-   *          status?, ok?, done?, body? }
+   *          status?, done?, body? }
    */
   fetchResult(spec = {}) {
     if (typeof spec.on !== "string")
       throw new Error("fetchResult({ on }): `on` must be the continuation module path");
-    const status = spec.status != null ? spec.status : (spec.ok === false ? 502 : 200);
+    const status = spec.status != null ? spec.status : 200;
     return new Node(this, this._base({
       entry: spec.on, // the continuation module IS this activation's entry
       activation: "fetch_chunk",
@@ -379,7 +382,6 @@ class Scenario {
       ctx: spec.ctx === undefined ? null : spec.ctx,
       request: {
         status,
-        ok: spec.ok != null ? spec.ok : (status >= 200 && status < 300),
         done: spec.done != null ? spec.done : true,
         body: spec.body != null ? spec.body : null,
       },
@@ -753,7 +755,6 @@ class FetchHandle {
         now_ms: ++now,
         request: {
           status: opts.status != null ? opts.status : 200,
-          ok: opts.ok != null ? opts.ok : true,
           done,
           chunkSeq: seq,
           body,
@@ -779,10 +780,11 @@ class FetchHandle {
 /** A located `blob.receive` → resolve its completion into the dependent
  *  resume at the receive's `on` export. Parallel to `FetchHandle.resolve`: the
  *  parent's writes/ctx/clock fold forward; the completion arrives on
- *  `request.ctx` (NOT `request.body`) and durability on `request.activation.ok`
- *  — the exact `emitTerminal` contract (`blob_receive.zig`):
- *    success → `request.ctx = { hash, len, app }`, `request.activation.ok === true`
- *    failure → `request.ctx = { error, app }`,        `request.activation.ok === false`
+ *  `request.ctx` (NOT `request.body`) and durability on `request.status`
+ *  (2xx = stored, 0 = failed; no `request.ok`, issue #7) — the exact
+ *  `emitTerminal` contract (`blob_receive.zig`, which emits status 200/0):
+ *    success → `request.ctx = { hash, len, app }`, `request.status === 200`
+ *    failure → `request.ctx = { error, app }`,        `request.status === 0`
  *  where `app` echoes the issue-time ctx the caller threaded (recorded on the
  *  receive effect); the test may override it with `spec.app`. */
 class ReceiveHandle {
@@ -811,7 +813,7 @@ class ReceiveHandle {
       kv: foldKv(parent.world.kv, pb.effects),
       seed: (parent.world.seed || 0) + 1,
       now_ms: (parent.world.now_ms || 0) + 1,
-      request: { activation: { kind: "blob_stored", ok } },
+      request: { status: ok ? 200 : 0, activation: { kind: "blob_stored" } },
     });
     return resumeNode(parent, world);
   }
@@ -823,9 +825,12 @@ class ReceiveHandle {
  *  compile is a fetch completion whose `ctx_json` is set, so it reuses the
  *  fetch-completion fold with the door JSON as ctx and a null body — the exact
  *  `routeCompileEvent` shape (`deploy_thread.zig`, terminal `UpstreamFetchEvent`):
+ *  The compile OUTCOME rides `request.ctx.ok` (a door can HTTP-200 yet
+ *  fail to compile); the door's HTTP status is `request.status` (no
+ *  `request.ok`, issue #7):
  *    success → `request.ctx = { ok:true, results:[{path, source_hex,
- *              bytecode_hex}, …], app }`, `request.ok === true`
- *    failure → `request.ctx = { ok:false, status, error }`, `request.ok === false`
+ *              bytecode_hex}, …], app }`, `request.status === 200`
+ *    failure → `request.ctx = { ok:false, status, error }`, `request.status === 500`
  *  where `app` echoes the issue-time `platform.compile(..., {ctx})` (recorded on
  *  the door fetch); the test may override it with `spec.app`. */
 class CompileHandle {
@@ -846,7 +851,7 @@ class CompileHandle {
       ? { ok: true, results: spec.results != null ? spec.results : [], app }
       : { ok: false, status, error: spec.error != null ? spec.error : "compile failed" };
     const world = fetchResumeWorld(
-      parent.world, this.fx, { status, ok, body: null },
+      parent.world, this.fx, { status, body: null },
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
@@ -873,7 +878,7 @@ class StampHandle {
     const status = spec.status != null ? spec.status : (ok ? 200 : 502);
     const ctx = { ok, dep_id: spec.dep_id != null ? spec.dep_id : "0000000000000000" };
     const world = fetchResumeWorld(
-      parent.world, this.fx, { status, ok, body: null },
+      parent.world, this.fx, { status, body: null },
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
@@ -1033,9 +1038,10 @@ function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx) {
     now_ms: now,
     request: {
       status,
-      // The real engine sets fetch/callback `ok` = status in [200,300) (a 3xx is
-      // NOT ok) — match it so a handler's `if (request.ok)` branch agrees.
-      ok: response.ok != null ? response.ok : (!response.timeout && status >= 200 && status < 300),
+      // `status` is the single fetch-result signal — the real engine
+      // surfaces NO `request.ok` (issue #7). A handler derives success
+      // itself: `status >= 200 && status < 300`; `status === 0` is a
+      // transport failure (here: `response.timeout`).
       done: response.done != null ? response.done : true,
       body: response.body != null ? response.body : null,
     },
