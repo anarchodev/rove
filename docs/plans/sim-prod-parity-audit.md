@@ -15,11 +15,15 @@
 >
 > **Filed as issues (2026-07-11).** Worker-vs-docs conflicts, treated as PROD
 > bugs (P1, per an@'s call): D1 → #7, D2 → #8, D3 → #9. Sim side: §1 error
-> semantics → #10 (P1); §5.1 TextEncoder → #11; §5.2-5.3 kv guardrails →
-> #12; §2.1/2.3/2.4/2.7 effect drop + validation → #13; §2.2/2.5/2.8/2.9/
-> 2.10 fetch-recorder opts/ids → #14; §4 resume folds → #15; §2.6/4.11
-> coverage verbs → #16; §3 request/response surface → #17; §5.4-5.6 crypto →
-> #18; §6 substrate → #19.
+> semantics → #10 (P1, **fixed** `2bd491a`); §5.1 TextEncoder → #11;
+> §5.2-5.3 kv guardrails → #12. The remaining bundles were split into
+> per-fix-locus leaf issues (2026-07-11, second pass), with the originals
+> kept as tracking checklists: #13 → #20–#23 (recorder drop-parity +
+> validation), #14 → #24–#26 (fetch/platform recorder + views), #15 →
+> #27–#35 (resume folds; the inboundHeaders fallback shipped with #10),
+> #16 → #36–#39 (coverage verbs; #39 blocked on #8), #17 → #40–#44
+> (request/response surface), #18 → #45–#47 (crypto), #19 → #48–#55
+> (substrate).
 
 ## 0. The three doc-vs-worker conflicts (decide before fixing the sim)
 
