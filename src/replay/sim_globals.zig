@@ -189,6 +189,31 @@ const SYSTEM_SHIM =
     \\  var GATE_MSG = "platform is only available on the admin handler";
     \\  var gate = function(fn){ return function(){ if (globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
     \\  var rootStore_r = storeKv(NS_STORE + "r/", "r");
+    \\  // Fetch/subscribe recorder. Ids are unique per run (`ftch_<seq>` — the
+    \\  // epilogue resets the counter each activation), NOT prod's ftch_<64hex>:
+    \\  // determinism over realism, but distinct so a handler can correlate the
+    \\  // returned id with the `request.fetchId` its resume observes (issue #24).
+    \\  // The effect entry carries the FULL option bag prod reads
+    \\  // (http.zig buildFetchRow), defaults applied, in the PUBLIC spellings
+    \\  // (timeoutMs/maxChunkBytes/maxTotalBytes — this recorder sits under the
+    \\  // after.js/http.js shims, which already lowered them to the native
+    \\  // snake_case, so translate back) — so `toHaveSent("fetch", { headers,
+    \\  // stream, timeoutMs, … })` matches what the handler wrote and `.not.`
+    \\  // variants aren't vacuous.
+    \\  var nextSeq = function(){ return (globalThis.__rove_fetch_seq = (globalThis.__rove_fetch_seq || 0) + 1); };
+    \\  var recFetch = function(url, o, on){
+    \\    var id = "ftch_" + nextSeq();
+    \\    push({ kind: "fetch", id: id, url: url, method: (o && o.method) || "GET",
+    \\      body: (o && o.body !== undefined) ? o.body : null,
+    \\      headers: (o && o.headers) || {},
+    \\      ctx: (o && o.ctx !== undefined) ? o.ctx : null,
+    \\      on: on || null,
+    \\      stream: !!(o && o.stream),
+    \\      timeoutMs: (o && o.timeout_ms != null) ? o.timeout_ms : 30000,
+    \\      maxChunkBytes: (o && o.max_response_chunk_bytes != null) ? o.max_response_chunk_bytes : 262144,
+    \\      maxTotalBytes: (o && o.max_total_response_bytes != null) ? o.max_total_response_bytes : 52428800 });
+    \\    return id;
+    \\  };
     \\  globalThis._system = {
     \\    // The park/continue native (`next.js` captures this at base-eval).
     \\    // Mirrors the worker's disposition: target "" = same-module;
@@ -212,13 +237,13 @@ const SYSTEM_SHIM =
     \\      oidcGenerateKey: no("oidcGenerateKey"), oidcSign: no("oidcSign"),
     \\    },
     \\    http: {
-    \\      fetch: function(o){ o = o || {}; push({ kind: "fetch", url: o.url, method: o.method || "GET", body: (o.body !== undefined ? o.body : null), ctx: (o.ctx !== undefined ? o.ctx : null), on: o.on_chunk || o.on || null }); return "ftch_sim"; },
+    \\      fetch: function(o){ o = o || {}; return recFetch(o.url, o, o.on_chunk || o.on || null); },
     \\      cancelFetch: function(){},
-    \\      subscribe: function(o){ o = o || {}; push({ kind: "subscribe", url: o.url, on: o.on_chunk || o.on || null }); return "sub_sim"; },
+    \\      subscribe: function(o){ o = o || {}; var id = "sub_" + nextSeq(); push({ kind: "subscribe", id: id, url: o.url, headers: o.headers || {}, on: o.on_chunk || o.on || null }); return id; },
     \\      cancelSubscription: function(){},
     \\    },
     \\    after: {
-    \\      fetch: function(url, o, tgt){ push({ kind: "fetch", url: url, method: (o && o.method) || "GET", body: (o && o.body !== undefined) ? o.body : null, ctx: (o && o.ctx !== undefined) ? o.ctx : null, on: (tgt && tgt.to) || (o && o.on) || null }); return "ftch_sim"; },
+    \\      fetch: function(url, o, tgt){ return recFetch(url, o, (tgt && tgt.to) || (o && o.on) || null); },
     \\      kv: function(prefix, tgt){ push({ kind: "kv-wake", prefix: prefix, on: (tgt && tgt.to) || null }); },
     \\      timer: function(ms, tgt){ push({ kind: "timer", ms: ms, on: (tgt && tgt.to) || null }); },
     \\    },

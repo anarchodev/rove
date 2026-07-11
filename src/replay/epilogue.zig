@@ -76,6 +76,8 @@ pub const Result = struct {
     done: ?bool = null,
     fetch_id: ?[]const u8 = null,
     chunk_seq: ?i64 = null,
+    fetches_pending: ?i64 = null,
+    body_truncated: ?bool = null,
 };
 
 /// Mirror `rpc_dispatch.defaultExportForKind` / the mjs `exportForActivation`.
@@ -211,6 +213,10 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
         if (r.fetch_id) |s| try jsonStr(w, s) else try w.writeAll("null");
         try w.writeAll(",\"chunkSeq\":");
         try optInt(w, r.chunk_seq);
+        try w.writeAll(",\"fetchesPending\":");
+        try optInt(w, r.fetches_pending);
+        try w.writeAll(",\"bodyTruncated\":");
+        try optBool(w, r.body_truncated);
         try w.writeByte('}');
     } else try w.writeAll("null");
     try w.writeAll(",\"fn\":");
@@ -250,6 +256,10 @@ const EPILOGUE_BODY =
     \\  // (the sim_globals `_system.*` recorders) push to the SAME ordered log
     \\  // as these per-request shims. `__effects` is a local alias to it.
     \\  const __effects = (globalThis.__rove_effects = []);
+    \\  // Per-run fetch/subscribe id counter (the sim_globals recorders mint
+    \\  // `ftch_<seq>`/`sub_<seq>` from it) — reset here so ids are deterministic
+    \\  // per activation, like prod's per-request derived ids.
+    \\  globalThis.__rove_fetch_seq = 0;
     \\  const __mklog = (level) => (...a) => { __effects.push({ kind: "log", level, message: a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ") }); };
     \\  globalThis.console = { log: __mklog("info"), warn: __mklog("warn"), error: __mklog("error"), info: __mklog("info"), debug: __mklog("debug") };
     \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
@@ -338,6 +348,8 @@ const EPILOGUE_BODY =
     \\    if (D.result.done !== null) request.done = D.result.done;
     \\    if (D.result.fetchId !== null) request.fetchId = D.result.fetchId;
     \\    if (D.result.chunkSeq !== null) request.chunkSeq = D.result.chunkSeq;
+    \\    if (D.result.fetchesPending !== null) request.fetchesPending = D.result.fetchesPending;
+    \\    if (D.result.bodyTruncated !== null) request.bodyTruncated = D.result.bodyTruncated;
     \\  }
     \\  // ── effect shims ──
     \\  // The connection/continuation + durable-effect globals ALL come from the sim

@@ -229,8 +229,17 @@ pub const Engine = struct {
         // resolved name a callback needs) wins; else the conventional export.
         const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
         const result: ?epilogue.Result = if (wv.status != null or wv.ok != null or
-            wv.done != null or wv.fetch_id != null or wv.chunk_seq != null)
-            .{ .status = wv.status, .ok = wv.ok, .done = wv.done, .fetch_id = wv.fetch_id, .chunk_seq = wv.chunk_seq }
+            wv.done != null or wv.fetch_id != null or wv.chunk_seq != null or
+            wv.fetches_pending != null or wv.body_truncated != null)
+            .{
+                .status = wv.status,
+                .ok = wv.ok,
+                .done = wv.done,
+                .fetch_id = wv.fetch_id,
+                .chunk_seq = wv.chunk_seq,
+                .fetches_pending = wv.fetches_pending,
+                .body_truncated = wv.body_truncated,
+            }
         else
             null;
         const epi = try epilogue.build(a, .{
