@@ -193,10 +193,12 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   (post-handler injection hits a conflict). Defer in-loop kv-react fires to a
   post-loop drain (avoid iterate-while-modify). Use `JS_NewBigUint64` for `u64 >
   2^63` (deployment ids).
-- **Backpressure (gap 2.2, shipped)**: surfaces are bounded — a K=32 wake-
-  accumulator ring with a `lost_oldest` counter, and a 256 KB StreamChunks soft
-  cap with drop-newest + `dropped_chunks`. Caps are deliberately hard-coded;
-  per-tenant configurability is deferred to an operator hook on demand.
+- **Backpressure (gap 2.2, shipped; wake half superseded)**: surfaces are
+  bounded — originally a K=32 wake-accumulator ring with a `lost_oldest`
+  counter, replaced 2026-07-11 by per-arm fired state (§3.10 — nothing to
+  accumulate, nothing to overflow), and a 256 KB StreamChunks soft cap with
+  drop-newest + `dropped_chunks`. Caps are deliberately hard-coded; per-tenant
+  configurability is deferred to an operator hook on demand.
 - **Streaming `http.fetch` (gap 2.3, shipped)**: Pattern A (`on_chunk`) fires a
   handler activation per chunk; the last carries `final: true`. **`pipe_to`
   (Pattern B) was retired in Phase 5 PR-1** — the three-variant
@@ -369,6 +371,34 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   billed opt-in is deferred to a real LLM-stream customer.
 - Wire: `READSET_VERSION` is `7` (`src/tape/root.zig`); channels are `kv` +
   `module` + `fetch_responses` + `trigger_payload` + `request_reads`.
+
+### 3.10 Wake resumes surface the fired prefix, never matched keys
+
+**Decision (2026-07-11, issue #8).** An `after.kv`/`after.ms` resume tells the
+handler **which watch fired** — `request.activation.wakes[]` carries one
+`{kind:"kv", prefix, firedAt:<ms>}` entry per fired arm (the armed prefix,
+verbatim) plus `{kind:"timer", firedAt:<ms>}` — and never the matched keys,
+ops, or values. `onWake` stays a pure edge ("go look") wake: the handler
+re-reads authoritative `kv` under the fired prefix. Identical on all three
+resume paths (streaming chain, buffered held `next()`, held WebSocket) and in
+the sim. Internals follow the contract: fired state is a per-arm timestamp on
+`StreamWakes.kv_prefixes` (`KvArm.fired_at_ns`) + a scalar `timer_fired_ns` —
+the K=32 `PendingWakes` key ring, its drop-oldest overflow, and the
+`overflow.lost_oldest` JS surface are deleted.
+
+**Rejected: delivering matched keys** (the pre-2026-07-11 streaming-path
+behavior, and what handler-shape.md promised). Three reasons:
+1. **It was best-effort by construction** — the ring overflowed under a match
+   burst and the handler had to check `lost_oldest` and re-snapshot anyway, so
+   keys were a hint that silently went incomplete exactly when they were
+   interesting. Every correct handler needed the prefix-rescan fallback; the
+   fast path was an attractive nuisance. A fired-prefix bit is always
+   complete — one safe semantic instead of a fast path + mandatory fallback.
+2. **Cost** — a key dup per matched write per parked chain on the kv fan-out
+   path; prefix-fired is a timestamp stamp, no allocation.
+3. **Bounded activation input** — `wakes[]` is part of the activation's Msg;
+   prefixes bound it by the number of arms, keys made it proportional to
+   matched writes.
 
 ---
 

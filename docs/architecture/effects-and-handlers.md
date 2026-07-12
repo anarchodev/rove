@@ -177,7 +177,9 @@ S3 PUT lands. A body-durability `.failed` returns 503 and does **not** re-submit
 - **One held chain** carries one h2 entity through multiple activations via
   `ctx`. Three components ride the entity: `StreamChain` (path + ctx),
   `StreamChunks` (256 KB soft cap, drop-newest + `dropped_chunks`), `StreamWakes`
-  (a K=32 wake-accumulator ring, drop-oldest + `lost_oldest`).
+  (fired state per armed prefix + a timer-fired stamp — issue #8: a wake
+  surfaces the fired *prefix*, never matched keys, so there is no
+  accumulator ring and nothing to overflow).
 - **The one rule**: a chunk reaches the wire only *after* the activation that
   produced it commits (`Cmd.stream_chunk`). See
   [`routing-and-ingress.md`](routing-and-ingress.md) for the streaming substrate

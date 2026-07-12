@@ -2573,11 +2573,12 @@ pub fn installRequest(
     // — streaming-handlers-plan §2: every handler run is a recorded
     // "request," and the activation source is one field on the
     // request shape the handler can branch on. The `wake_batch`
-    // variant (§9.4, Gap 2.2 Phase E) carries a temporal-order
-    // `wakes: [{kind:"kv",key,op,firedAt} | {kind:"timer",firedAt}]`
-    // array + an `overflow: { lost_oldest }` counter. The singular
+    // variant (issue #8: fired-prefix contract) carries
+    // `wakes: [{kind:"kv",prefix,firedAt} | {kind:"timer",firedAt}]`
+    // — the ARMED prefix that fired, never matched keys (the handler
+    // re-reads authoritative kv; handler-shape.md §7). The singular
     // `.kv_wake` source still maps to `kind:"kv"` but carries no
-    // key/op payload (the pre-Gap-2.2 single-slot fields had no
+    // payload (the pre-Gap-2.2 single-slot fields had no
     // producer and were dropped); live kv fan-out rides `.wake_batch`.
     const activation_obj = c.JS_NewObject(ctx);
     const kind: []const u8 = switch (request.activation.source()) {
@@ -2604,34 +2605,29 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation == .wake_batch) {
         const wb = request.activation.wake_batch;
-        // wakes: [{kind:"kv",key,op,firedAt}|{kind:"timer",firedAt}, ...]
+        // wakes: [{kind:"kv",prefix,firedAt}|{kind:"timer",firedAt}, ...]
+        // — one entry per fired ARM (issue #8), identical on every
+        // resume path (stream / held / WS). No overflow signal: a
+        // bit-per-arm can't lose fires.
         const wakes_arr = c.JS_NewArray(ctx);
         for (wb.wakes, 0..) |w, i| {
             const entry = c.JS_NewObject(ctx);
             switch (w.tag) {
                 .kv => {
                     _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "kv", 2));
-                    _ = c.JS_SetPropertyStr(ctx, entry, "key", c.JS_NewStringLen(ctx, w.kv_key.ptr, w.kv_key.len));
-                    const op_str: []const u8 = switch (w.kv_op) {
-                        'p' => "put",
-                        'd' => "delete",
-                        else => "",
-                    };
-                    if (op_str.len > 0) {
-                        _ = c.JS_SetPropertyStr(ctx, entry, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
-                    }
+                    _ = c.JS_SetPropertyStr(ctx, entry, "prefix", c.JS_NewStringLen(ctx, w.prefix.ptr, w.prefix.len));
                 },
                 .timer => {
                     _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "timer", 5));
                 },
             }
-            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, w.fired_at_ns));
+            // `firedAt` in MILLISECONDS since epoch — matches every other
+            // JS-facing timestamp; `fired_at_ns` stays the internal wall
+            // clock. Mirrored in the sim (rewind_test.mjs).
+            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, @divFloor(w.fired_at_ns, std.time.ns_per_ms)));
             _ = c.JS_SetPropertyUint32(ctx, wakes_arr, @intCast(i), entry);
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "wakes", wakes_arr);
-        const overflow = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, overflow, "lost_oldest", c.JS_NewInt64(ctx, @intCast(wb.lost_oldest)));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "overflow", overflow);
     }
 
     // (Removed: the §9.4 `write_pressure.dropped_chunks` surface. stream.write

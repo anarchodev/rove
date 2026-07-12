@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""V2 port of `streaming_overflow_smoke.py` — Gap 2.2 §9.4 `PendingWakes`
-ring overflow, on the `V2Cluster` harness.
+"""Wake-batch COALESCING — issue #8 fired-prefix contract
+(decisions.md §3.10), on the `V2Cluster` harness. Supersedes the
+retired `streaming_overflow_smoke_v2.py` (the K=32 ring + `lost_oldest`
+it asserted are deleted).
 
-`/overflow_watch` arms `after.kv("overflow/")`; on every wake_batch activation
-it emits ONE status frame echoing `request.activation.wakes.length` +
-`request.activation.overflow.lost_oldest`, then re-arms.
-`/overflow_burst` POSTs `{count}` and does `kv.set("overflow/k{i}", ...)`
+`/coalesce_watch` arms `after.kv("burst/")`; on every wake_batch
+activation it emits ONE status frame echoing
+`request.activation.wakes.length`, the fired prefixes, and whether the
+retired `overflow` object is present, then re-arms.
+`/coalesce_burst` POSTs `{count}` and does `kv.set("burst/k{i}", ...)`
 for i in 0..count in ONE handler invocation — one writeset → one apply
-broadcast → one drain pushing N events into the ring. With N > CAP (32)
-the ring drops the oldest (N - CAP) entries and bumps `lost_oldest`.
+broadcast → ONE fired-arm stamp on the watcher.
 
-Essential assertion kept from V1 (the load-bearing §9.4 contract): a
-50-key burst yields a `batch` frame reporting `wakes=32 lost=18`
-(PENDING_WAKES_CAP=32, 50 - 32 = 18).
-
-Dropped from V1 (V2-irrelevant): TLS/https, 3-node leader/discover_leader.
+The load-bearing contract: a 50-key burst yields a `batch` frame
+reporting `wakes=1 prefix=burst/ overflow=absent` — N matches on one
+armed prefix coalesce into ONE `{kind:"kv", prefix}` entry, and there
+is no overflow signal because a bit-per-arm cannot lose fires.
 
 Streaming addressing (same as streaming_kv_wake_smoke_v2): the held SSE
 GET and the burst POST both go DIRECT to the node — the front buffers
@@ -34,9 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
-# Handler JS verbatim from the V1 demo tenant
-# (examples/loop46-demo-tenants/acme/{overflow_watch,overflow_burst}/index.mjs).
-OVERFLOW_WATCH_SRC = """\
+# Handler JS verbatim from the demo tenant
+# (examples/loop46-demo-tenants/acme/{coalesce_watch,coalesce_burst}/index.mjs).
+COALESCE_WATCH_SRC = """\
 export default function () {
     response.status = 200;
     response.headers = {
@@ -45,25 +46,27 @@ export default function () {
     };
     stream.start();
     stream.write("event: open\\ndata: ok\\n\\n");
-    after.kv("overflow/");
+    after.kv("burst/");
     return next();
 }
 
 export function onWake() {
     const a = request.activation;
     stream.start();
-    stream.write(`event: batch\\ndata: wakes=${a.wakes.length} lost=${a.overflow.lost_oldest}\\n\\n`);
-    after.kv("overflow/");
+    const prefixes = a.wakes.filter((w) => w.kind === "kv").map((w) => w.prefix).join(",");
+    const overflow = a.overflow === undefined ? "absent" : "present";
+    stream.write(`event: batch\\ndata: wakes=${a.wakes.length} prefix=${prefixes} overflow=${overflow}\\n\\n`);
+    after.kv("burst/");
     return next();
 }
 """
 
-OVERFLOW_BURST_SRC = """\
+COALESCE_BURST_SRC = """\
 export default function () {
     const body = JSON.parse(request.text || "{}");
     const count = body.count ?? 50;
     for (let i = 0; i < count; i++) {
-        kv.set("overflow/k" + i, "v" + i);
+        kv.set("burst/k" + i, "v" + i);
     }
     response.status = 204;
     return "";
@@ -94,17 +97,17 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    with V2Cluster.spawn("stream-overflow", nodes=1) as c:
+    with V2Cluster.spawn("stream-coalesce", nodes=1) as c:
         print("step 1: provision tenant 'acme' via the CP")
         r = c.provision("acme")
         check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
 
-        print("step 2: deploy overflow_watch + overflow_burst (+ readiness probe)")
+        print("step 2: deploy coalesce_watch + coalesce_burst (+ readiness probe)")
         try:
             dep_id = c.deploy_handlers("acme", {
                 "index.mjs": rpc_wrap(READY_SRC),
-                "overflow_watch/index.mjs": OVERFLOW_WATCH_SRC,
-                "overflow_burst/index.mjs": OVERFLOW_BURST_SRC,
+                "coalesce_watch/index.mjs": COALESCE_WATCH_SRC,
+                "coalesce_burst/index.mjs": COALESCE_BURST_SRC,
             })
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
@@ -125,20 +128,20 @@ def main() -> int:
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1
 
-        print("step 4: hold SSE GET /overflow_watch, POST a 50-key burst")
-        watcher = _stream_watch(c, "/overflow_watch", max_time=4.0)
-        time.sleep(0.5)  # let the inbound hop arm after.kv("overflow/")
+        print("step 4: hold SSE GET /coalesce_watch, POST a 50-key burst")
+        watcher = _stream_watch(c, "/coalesce_watch", max_time=4.0)
+        time.sleep(0.5)  # let the inbound hop arm after.kv("burst/")
 
         # The burst: 50 kv writes in ONE handler invocation → ONE writeset
-        # → ONE apply broadcast → ONE drain of 50 events into the ring.
-        # CAP=32; expect 18 dropped. DIRECT to the node (separate conn).
-        burst = c.node_request("/overflow_burst", method="POST",
+        # → ONE apply broadcast → ONE fired-arm stamp on the watcher.
+        # DIRECT to the node (separate conn).
+        burst = c.node_request("/coalesce_burst", method="POST",
                                host=c.host_for("acme"),
                                headers={"Content-Type": "application/json"},
                                data='{"count":50}')
         if burst.status != 204:
             watcher.kill()
-            check("overflow_burst → 204", False, f"got {burst.status} {burst.body!r}")
+            check("coalesce_burst → 204", False, f"got {burst.status} {burst.body!r}")
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1
         check("burst posted (50 kv writes in one writeset)", True)
@@ -163,20 +166,21 @@ def main() -> int:
         check("initial open frame received",
               "event: open\ndata: ok\n\n" in body, f"body={body!r}")
 
-        # The §9.4 contract: ring CAP=32, burst=50 → wakes=32, lost=18.
-        expected = "event: batch\ndata: wakes=32 lost=18\n\n"
+        # The issue-#8 contract: a 50-write burst on one armed prefix →
+        # ONE fired-prefix entry, and no overflow surface at all.
+        expected = "event: batch\ndata: wakes=1 prefix=burst/ overflow=absent\n\n"
         ok = expected in body
         batch_lines = [ln for ln in body.splitlines() if ln.startswith("data: wakes=")]
-        check("§9.4 ring overflow surfaced (wakes=32 lost=18)", ok,
+        check("burst coalesced (wakes=1 prefix=burst/ overflow=absent)", ok,
               f"batch lines: {batch_lines!r}; full body: {body!r}")
         if not ok:
-            c.dump_node_log(grep=["overflow", "stream", "wake", "kv",
+            c.dump_node_log(grep=["coalesce", "stream", "wake", "kv",
                                   "resolve", "404", "error", "warn"])
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print("\nPASS streaming overflow smoke (v2)")
+    print("\nPASS streaming wake-coalesce smoke (v2)")
     return 0
 
 

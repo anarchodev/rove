@@ -599,8 +599,11 @@ class Node {
 
   /** An `after.kv` wake: a change under a watched prefix resumes the held
    *  connection. `changes` is a `{ key: value | null }` map folded into the KV
-   *  overlay (null = delete); each surfaces on `request.activation.wakes`.
-   *  `opts.prefix` selects which armed `after.kv` fires when several are armed. */
+   *  overlay (null = delete). The resume surfaces the FIRED PREFIXES — one
+   *  `{kind:"kv", prefix, firedAt}` per armed `after.kv` a change key falls
+   *  under, never the keys themselves (issue #8; the handler re-reads kv).
+   *  `opts.prefix` selects which armed `after.kv`'s `{on}` export resumes
+   *  when several are armed. */
   wakeKv(changes = {}, opts = {}) {
     requireHeld(this, "wakeKv");
     const parent = this;
@@ -611,12 +614,20 @@ class Node {
     if (!kw) throw new Error(`wakeKv(): no armed after.kv matched prefix ${opts.prefix}`);
     const kv = foldKv(parent.world.kv, pb.effects);
     const now = (parent.world.now_ms || 0) + 1;
-    const entries = [];
-    for (const key of Object.keys(changes)) {
+    const keys = Object.keys(changes);
+    for (const key of keys) {
       const v = changes[key];
-      if (v === null) { delete kv[key]; entries.push({ kind: "kv", key, op: "d", firedAt: now }); }
-      else { kv[key] = typeof v === "string" ? v : JSON.stringify(v); entries.push({ kind: "kv", key, op: "p", firedAt: now }); }
+      if (v === null) delete kv[key];
+      else kv[key] = typeof v === "string" ? v : JSON.stringify(v);
     }
+    // One entry per fired ARM, matching the worker (drainFired): an arm
+    // fires when any change key starts with its prefix; N matches on one
+    // arm surface once.
+    const entries = armed
+      .filter((e) => keys.some((k) => k.startsWith(e.prefix)))
+      .map((e) => ({ kind: "kv", prefix: e.prefix, firedAt: now }));
+    if (!entries.length)
+      throw new Error(`wakeKv(): no change key falls under an armed after.kv prefix (armed: ${armed.map((e) => JSON.stringify(e.prefix)).join(", ")})`);
     return resumeNode(parent, carrySources(parent.world, {
       entry: parent.world.entry,
       activation: "wake_batch",
@@ -625,7 +636,7 @@ class Node {
       kv,
       seed: (parent.world.seed || 0) + 1,
       now_ms: now,
-      request: { activation: { kind: "wake_batch", wakes: entries, overflow: { lost_oldest: 0 } } },
+      request: { activation: { kind: "wake_batch", wakes: entries } },
     }));
   }
 
@@ -700,7 +711,7 @@ class Clock {
       kv: foldKv(parent.world.kv, pb.effects),
       seed: (parent.world.seed || 0) + 1,
       now_ms: now,
-      request: { activation: { kind: "wake_batch", wakes: [{ kind: "timer", firedAt: now }], overflow: { lost_oldest: 0 } } },
+      request: { activation: { kind: "wake_batch", wakes: [{ kind: "timer", firedAt: now }] } },
     }));
   }
 }
