@@ -1768,20 +1768,28 @@ fn resumeContinuation(
     // export (default `onWake`) and drains the entity's wake ring so
     // the fired entries are consumed (the timer-due / kv-match
     // trigger).
+    // The drained §9.4 kv-match ring, surfaced on `request.activation.wakes[]`
+    // (issue #8). Owned for the dispatch's lifetime; freed after the JS has
+    // copied the entries. `onWake` is a "go look" edge wake — the handler
+    // re-reads authoritative kv for correctness — but the matched keys ride
+    // along as a hint (handler-shape.md §7), the same as the stream resume
+    // path (worker_streaming.resumeStream).
+    var batch_owned: []components_mod.WakeEntry = &.{};
+    var batch_lost_oldest: u32 = 0;
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
     const resume_fn: ?[]const u8 = if (wake) blk: {
         const sw = server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
-        // Drain the §9.4 kv-match ring (if any) — this resume consumes
-        // every accumulated `on.kv` match, so they must not re-fire on
-        // the next sweep. The entries are freed; `onWake` is a "go look"
-        // edge wake, so the matched keys aren't surfaced to the handler
-        // (it re-reads authoritative kv state). A timer-only wake leaves
-        // the ring empty, so this is a no-op there.
-        if (sw.pending_wakes.len > 0) {
-            if (sw.pending_wakes.drainInto(allocator)) |drained| {
-                for (drained.wakes) |*we| we.deinit(allocator);
-                if (drained.wakes.len > 0) allocator.free(drained.wakes);
-            } else |_| {}
-        }
+        // Drain the ring — this resume consumes every accumulated `on.kv`
+        // match, so they must not re-fire on the next sweep. Draining
+        // unconditionally also captures `lost_oldest` when a ring
+        // overflowed then emptied (a timer-only wake drains empty).
+        if (sw.pending_wakes.drainInto(allocator)) |drained| {
+            batch_owned = drained.wakes;
+            batch_lost_oldest = drained.lost_oldest;
+        } else |_| {}
         break :blk if (sw.wake_to) |t| t else "onWake";
     } else cont_fn_name;
     const named: bool = wake or cont_fn_name != null;
@@ -1845,8 +1853,11 @@ fn resumeContinuation(
         // Inherit the chain id from the parking request so every tape row
         // of this chain shares one correlation_id; mark this activation as
         // a send-callback resume (streaming-handlers-plan §6) — or
-        // .wake_batch for an on.* connection wake.
-        .activation = if (wake) .{ .wake_batch = .{} } else .send_callback,
+        // .wake_batch (with the surfaced match ring) for an on.* wake.
+        .activation = if (wake)
+            .{ .wake_batch = .{ .wakes = batch_owned, .lost_oldest = batch_lost_oldest } }
+        else
+            .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },

@@ -614,8 +614,10 @@ class Node {
     const entries = [];
     for (const key of Object.keys(changes)) {
       const v = changes[key];
-      if (v === null) { delete kv[key]; entries.push({ kind: "kv", key, op: "d", firedAt: now }); }
-      else { kv[key] = typeof v === "string" ? v : JSON.stringify(v); entries.push({ kind: "kv", key, op: "p", firedAt: now }); }
+      // `op` is the full word + `firedAt` in ms — the one JS-facing wake
+      // encoding, matching the worker's globals.zig (issue #8).
+      if (v === null) { delete kv[key]; entries.push({ kind: "kv", key, op: "delete", firedAt: now }); }
+      else { kv[key] = typeof v === "string" ? v : JSON.stringify(v); entries.push({ kind: "kv", key, op: "put", firedAt: now }); }
     }
     return resumeNode(parent, carrySources(parent.world, {
       entry: parent.world.entry,

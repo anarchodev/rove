@@ -731,10 +731,16 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `request.ctx` is `undefined` on the **first** activation of a chain
   (nothing threaded yet). A `cron`/`schedule` target reads the payload
   it was scheduled with as `request.ctx` too — the one-ctx rule has no
-  exceptions. `after.kv`/`after.ms` are edge
-  ("go look") wakes — they carry **no** matched key/value; `onWake`
-  re-reads authoritative `kv`, and which keys fired is on
-  `request.activation.wakes[]` if you need it.
+  exceptions. `after.kv`/`after.ms` are edge ("go look") wakes — the
+  matched value isn't handed to you; `onWake` re-reads authoritative
+  `kv`. But **which** keys fired rides along on
+  **`request.activation.wakes[]`** as a hint (temporal order): each entry
+  is `{ kind: "kv", key, op, firedAt }` or `{ kind: "timer", firedAt }`,
+  where `op` is `"put"` or `"delete"` and `firedAt` is milliseconds since
+  epoch. `request.activation.overflow.lost_oldest > 0` means the match
+  ring overflowed and you missed some — re-snapshot. This is surfaced the
+  same on every resume path (a streaming chain, a buffered held `next()`,
+  and a held WebSocket).
 - **Fetch / effect results — one flattened surface:** a bound `after.fetch` /
   `blob.get` resume **and** a `webhook.send` / `blob.put` / `retry`
   `{on}` callback (and a §6.4 held-sync resume) present the result

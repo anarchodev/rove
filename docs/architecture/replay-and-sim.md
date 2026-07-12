@@ -135,7 +135,7 @@ declares/captures:
 | `inbound` (default) | `default` | `request.method/.path/.headers/.body/.cookies/.ip` (read-recorded) |
 | `inbound_chunk` | `onChunk` | this chunk's bytes (binary), `request.done`, `request.chunkSeq`, `request.ctx` |
 | `after.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{on}` | flattened: `request.bytes`/`.text`/`.json`, `request.status/.ok/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
-| `after.kv`/`after.ms` wake | `onWake` or `{on}` | `request.ctx`; matched keys on `request.activation.wakes[]` (edge — "go look") |
+| `after.kv`/`after.ms` wake | `onWake` or `{on}` | `request.ctx`; matched keys on `request.activation.wakes[]` (edge — "go look"): `{kind:"kv",key,op:"put"\|"delete",firedAt:<ms>}` or `{kind:"timer",firedAt}`, `overflow.lost_oldest` on ring overflow. Surfaced on every resume path (stream/held/WS) |
 | `ws_message` | `onMessage` | `request.activation = {opcode, data}`, `request.ctx` |
 | `disconnect` | `onDisconnect` | `request.ctx` |
 | `durable_wake` / `cron` / `schedule` | the named target | `request.activation.msg`; no inbound headers/body; connection verbs inert |

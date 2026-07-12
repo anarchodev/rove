@@ -2625,7 +2625,12 @@ pub fn installRequest(
                     _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "timer", 5));
                 },
             }
-            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, w.fired_at_ns));
+            // `firedAt` in MILLISECONDS since epoch — matches every other
+            // JS-facing timestamp (Date.now(), scheduledAtNs is the lone
+            // ns exception). `fired_at_ns` is a nanosecond wall clock
+            // internally (issue #8). ms is the one JS-facing wake encoding,
+            // mirrored in the sim (rewind_test.mjs).
+            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, @divFloor(w.fired_at_ns, std.time.ns_per_ms)));
             _ = c.JS_SetPropertyUint32(ctx, wakes_arr, @intCast(i), entry);
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "wakes", wakes_arr);

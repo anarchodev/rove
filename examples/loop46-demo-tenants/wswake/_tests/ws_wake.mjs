@@ -13,8 +13,10 @@ expect(w).toHaveSentFrame("watching:feed/");
 
 // A kv write under the prefix fires onWake, which re-scans kv.prefix("feed/")
 // and replies with the last value.
+// The resume surfaces the matched key/op on request.activation.wakes[] (#8) —
+// the frame carries the "put:feed/1" hint, matching the worker.
 const woke = w.wakeKv({ "feed/1": "hello" });
-expect(woke).toHaveSentFrame("woke:hello");
+expect(woke).toHaveSentFrame("woke:hello|put:feed/1");
 
 // timer → arm after.ms, reply "armed"; the timer elapsing resumes onTimer.
 const t = ws.receive("timer");

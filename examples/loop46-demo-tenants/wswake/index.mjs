@@ -30,7 +30,13 @@ export function onWake() {                      // kv under the prefix changed
   // request.ctx — it re-reads the watched prefix it knows it armed).
   const rows = kv.prefix("feed/");
   const last = rows.length ? rows[rows.length - 1].value : "<none>";
-  stream.write("woke:" + last);
+  // issue #8: the matched keys ride along on request.activation.wakes[]
+  // even on the WS resume path (a hint on top of the "go look" re-read).
+  const hint = (request.activation.wakes || [])
+    .filter((w) => w.kind === "kv")
+    .map((w) => w.op + ":" + w.key)
+    .join(",");
+  stream.write("woke:" + last + "|" + hint);
   return next();
 }
 

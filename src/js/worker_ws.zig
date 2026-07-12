@@ -860,14 +860,22 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
     const wakes_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes) catch return;
 
-    // Consume the kv-match ring — this resume is the "go look" edge; the
-    // entries must not re-fire next sweep (onWake re-reads authoritative kv).
-    if (wakes_st.pending_wakes.len > 0) {
-        if (wakes_st.pending_wakes.drainInto(allocator)) |drained| {
-            for (drained.wakes) |*we| we.deinit(allocator);
-            if (drained.wakes.len > 0) allocator.free(drained.wakes);
-        } else |_| {}
-    }
+    // Drain the kv-match ring — this resume consumes the "go look" edge,
+    // so the entries must not re-fire next sweep (onWake re-reads
+    // authoritative kv). Surface them on `request.activation.wakes[]`
+    // (issue #8): the matched keys ride along as a hint, the same as the
+    // held (worker_drain) and stream (worker_streaming) resume paths.
+    // Owned for the dispatch's lifetime; freed after the JS copies them.
+    var batch_owned: []components_mod.WakeEntry = &.{};
+    var batch_lost_oldest: u32 = 0;
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
+    if (wakes_st.pending_wakes.drainInto(allocator)) |drained| {
+        batch_owned = drained.wakes;
+        batch_lost_oldest = drained.lost_oldest;
+    } else |_| {}
 
     const path = chain_st.module_path;
     var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-wake") orelse {
@@ -913,7 +921,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         .body = body,
         .fn_override = resume_fn,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
-        .activation = .{ .wake_batch = .{} },
+        .activation = .{ .wake_batch = .{ .wakes = batch_owned, .lost_oldest = batch_lost_oldest } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
