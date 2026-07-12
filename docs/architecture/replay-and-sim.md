@@ -273,8 +273,28 @@ callback kind lands**. Because smokes run Debug workers, *every* smoke is now an
 L3 checker — it caught a deliberately-regressed capture site (fired during the
 deploy flow, before the test even ran). (2) A **per-kind replay matrix**
 (`scripts/smoke/replay_matrix_smoke_v2.py`) captures + replays a real `inbound` /
-`fetch_chunk` / `ws_message` recording and asserts each reproduces. The pure
-predicate `l3MissingChannel` has an inline unit test.
+`fetch_chunk` / `ws_message` / `wake_batch` recording and asserts each
+reproduces. The pure predicate `l3MissingChannel` has an inline unit test.
+
+**Update 2026-07-12 — `wake_batch` fully recorded (issue #62).** A wake
+resume's Msg is the drained fired-watch batch (`request.activation.wakes[]`,
+the #8 fired-prefix contract) — now taped on all three resume paths (stream /
+held `next()` / WS) as `activation_bytes` (the wakes JSON, verbatim in the
+JS-facing encoding — `captureWakeBatchTapes`; always at least `[]`, so the L3
+guard asserts it), alongside the threaded ctx envelope on `trigger_payload`
+(kept past the read-taping elision via `Readset.ctx_payload` — ctx is consumed
+unconditionally at install, never a lazily-read body) and the resolved wake
+export (`{on}` override) on `export` (G3). `export-fixture` transcodes the
+batch onto the world's `request.activation.{kind,wakes}` — the same bag shape
+an authored `rewind:test` world carries — so `wake_batch` joins the
+faithful-transcode set (`isFaithfulTranscode`). Validated end-to-end in the
+replay matrix: a live `after.kv` resume replays offline reproducing
+`wakes[]` (prefix + ms `firedAt`), `request.ctx`, and the hop's kv write.
+Known limitation: the ctx/wakes capture runs at log time (post-propose), so
+the RAFT copy of a writing wake's readset lacks the ctx entry — follower-side
+record rebuild (Phase 5c) would miss `request.ctx`; the leader's log record
+(what `pull`/replay consume) carries everything. `send_callback` resumes
+remain untaped (their Msg is the callee outcome) — the remaining kind.
 
 ## 6. Implications for the sim / export-fixture plan
 

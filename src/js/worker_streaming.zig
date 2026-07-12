@@ -467,11 +467,18 @@ fn matchEventsToWakes(
 /// Which Msg-tape the stream-family log records carry (per-capture
 /// materialization; see `finishContResume`'s twin in worker_drain.zig
 /// for why the order is part of the wire format).
-const StreamTape = enum { none, fetch };
+const StreamTape = enum { wake, fetch };
 
 inline fn streamTapes(worker: anytype, comptime tape: StreamTape, ctx: *const StreamFinishCtx) log_mod.TapePayloads {
     return switch (tape) {
-        .none => .{},
+        // issue #62: a wake resume's Msg is the drained fired-watch
+        // batch — tape it (+ readset/ctx) so the hop is replayable.
+        // Guarded on the runtime kind: resumeStream only fires
+        // `.wake_batch` today, but the activation param is runtime.
+        .wake => if (ctx.act == .wake_batch)
+            worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, "")
+        else
+            .{},
         .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
     };
 }
@@ -511,9 +518,12 @@ const StreamFinishCtx = struct {
     /// the bound-fetch site is always `.fetch_chunk`).
     act: log_mod.ActivationSource,
     pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
-    /// Tape sources for `StreamTape.fetch`.
+    /// Tape sources: `.fetch` reads `tape_body` + `tape_ev`; `.wake`
+    /// reads `tape_body` (the `{"ctx":…}` envelope) + `wakes` (the
+    /// drained fired-watch batch, issue #62).
     tape_body: []const u8 = "",
     tape_ev: ?worker_mod.FetchEvent = null,
+    wakes: []const components_mod.WakeEntry = &.{},
 };
 
 /// §2.2 (refactor-audit): the ONE outcome-finishing switch for the two
@@ -923,12 +933,14 @@ fn resumeStream(
         .site = "stream-resume",
         .panic_site = "resumeStream",
         .cancel_binds = false,
-        .tape = .none,
+        .tape = .wake,
     }, &oc, .{
         .ent = ent,
         .ws = &ws,
         .txn = txn,
         .readset = &readset,
+        .tape_body = body,
+        .wakes = batch_owned,
         .chain_ctx = chain_ctx,
         .chain_st = chain_st,
         .chunks_st = chunks_st,

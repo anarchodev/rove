@@ -36,7 +36,7 @@ const export_fixture = @import("export_fixture.zig");
 /// `export-fixture` verb (offline).
 pub const exportFixture = export_fixture.transcode;
 pub const exportFixtureActivation = export_fixture.activationOf;
-pub const exportFixtureIsInbound = export_fixture.isInboundFamily;
+pub const exportFixtureIsFaithful = export_fixture.isFaithfulTranscode;
 
 // ── the JS-authored test runner (harness reactor + saga library) ──
 const harness = @import("harness.zig");
