@@ -332,7 +332,7 @@ pub const FetchEvent = struct {
     terminal_ok: bool,
     body_truncated: bool = false,
     /// The resolved export this fetch resume dispatched to (`ev.resolvedExport()`
-    /// — a `{to}` override, or onFetchResult/Chunk/Done). Recorded so replay
+    /// — a `{on}` override, or onFetchResult/Chunk/Done). Recorded so replay
     /// invokes the same export (`replay-and-sim.md` §5 G3).
     export_name: []const u8 = "",
 };

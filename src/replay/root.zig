@@ -202,29 +202,43 @@ pub const Engine = struct {
             std.mem.eql(u8, wv.activation, "inbound_chunk") or
             std.mem.eql(u8, wv.activation, "fetch_chunk");
 
-        // Run the real `_middlewares/index.mjs` `before` iff it's resolvable AND
-        // this is an inbound-family (trust-boundary) activation — the worker
-        // skips middleware for continuations (a resume already ran behind the
-        // gate). Resolvable = inline in `sources`, or on disk under `src_dir`.
-        const MW_PATH = "_middlewares/index.mjs";
+        // Run the real `_middlewares` `before` iff it's resolvable AND this is
+        // an inbound-family (trust-boundary) activation — the worker skips
+        // middleware for continuations (a resume already ran behind the gate).
+        // Resolvable = inline in `sources`, or on disk under `src_dir` —
+        // probing BOTH spellings in prod's order, `.mjs` then `.js`
+        // (dispatcher.zig's bytecode lookup), so a `.js`-spelled middleware
+        // gates offline exactly as it does live (issue #51).
+        const MW_PATHS = [_][]const u8{ "_middlewares/index.mjs", "_middlewares/index.js" };
         const is_trust_boundary = std.mem.eql(u8, wv.activation, "inbound") or
             std.mem.eql(u8, wv.activation, "inbound_headers") or
             std.mem.eql(u8, wv.activation, "inbound_chunk") or
             std.mem.eql(u8, wv.activation, "ws_message");
-        const has_middleware = if (sources.get(MW_PATH) != null)
-            true
-        else if (src_dir) |dir| blk: {
-            const mp = std.fs.path.join(a, &.{ dir, MW_PATH }) catch break :blk false;
-            std.fs.cwd().access(mp, .{}) catch break :blk false;
-            break :blk true;
-        } else false;
-        const run_middleware = is_trust_boundary and has_middleware;
-        // The resolved export: the world's explicit `export` (the `{to}` /
+        const mw_path: ?[]const u8 = blk: {
+            for (MW_PATHS) |p| {
+                if (sources.get(p) != null) break :blk p;
+                if (src_dir) |dir| {
+                    const mp = std.fs.path.join(a, &.{ dir, p }) catch continue;
+                    std.fs.cwd().access(mp, .{}) catch continue;
+                    break :blk p;
+                }
+            }
+            break :blk null;
+        };
+        // The resolved export: the world's explicit `export` (the `{on}` /
         // resolved name a callback needs) wins; else the conventional export.
         const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
         const result: ?epilogue.Result = if (wv.status != null or
-            wv.done != null or wv.fetch_id != null or wv.chunk_seq != null)
-            .{ .status = wv.status, .done = wv.done, .fetch_id = wv.fetch_id, .chunk_seq = wv.chunk_seq }
+            wv.done != null or wv.fetch_id != null or wv.chunk_seq != null or
+            wv.fetches_pending != null or wv.body_truncated != null)
+            .{
+                .status = wv.status,
+                .done = wv.done,
+                .fetch_id = wv.fetch_id,
+                .chunk_seq = wv.chunk_seq,
+                .fetches_pending = wv.fetches_pending,
+                .body_truncated = wv.body_truncated,
+            }
         else
             null;
         const epi = try epilogue.build(a, .{
@@ -234,13 +248,14 @@ pub const Engine = struct {
             .request_reads = reads.items,
             .body_bytes = wv.body,
             .export_name = export_name,
+            .activation = wv.activation,
             .binary_body = binary_body,
             .ctx_json = wv.ctx_json,
             .activation_json = wv.activation_json,
             .session_json = wv.session_json,
             .tenant = wv.tenant,
             .correlation_id = wv.correlation_id,
-            .run_middleware = run_middleware,
+            .middleware_path = if (is_trust_boundary) mw_path else null,
             .result = result,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
@@ -426,7 +441,7 @@ fn matchWrite(a: std.mem.Allocator, effects: []const std.json.Value, want: std.j
     return false;
 }
 
-/// A `cmd` expectation `{kind, url?, to?}` must match some effect of that kind.
+/// A `cmd` expectation `{kind, url?, on?}` must match some effect of that kind.
 fn matchCmd(a: std.mem.Allocator, effects: []const std.json.Value, want: std.json.Value) bool {
     if (want != .object) return false;
     for (effects) |e| {
@@ -439,8 +454,12 @@ fn matchCmd(a: std.mem.Allocator, effects: []const std.json.Value, want: std.jso
             const eu = e.object.get("url") orelse continue;
             if (!valEq(a, eu, wu)) continue;
         }
-        if (want.object.get("to")) |wt| {
-            const et = e.object.get("to") orelse continue;
+        // The effect log's target key is `on` (the recorders' one spelling);
+        // an expectation's `on` must find it. (The pre-rename `to` key here
+        // could never match a recorded effect — the fixture surface and the
+        // recorders had drifted.)
+        if (want.object.get("on")) |wt| {
+            const et = e.object.get("on") orelse continue;
             if (!valEq(a, et, wt)) continue;
         }
         return true;
@@ -530,8 +549,8 @@ fn buildExpected(a: std.mem.Allocator, w: *std.Io.Writer, bundle_json: []const u
             try w.writeAll(",\"url\":");
             try std.json.Stringify.value(u, .{}, w);
         }
-        if (e.object.get("to")) |t| if (t != .null) {
-            try w.writeAll(",\"to\":");
+        if (e.object.get("on")) |t| if (t != .null) {
+            try w.writeAll(",\"on\":");
             try std.json.Stringify.value(t, .{}, w);
         };
         try w.writeByte('}');
@@ -629,13 +648,20 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     } else try w.writeAll("[]");
 
     try w.writeAll(",\"error\":");
+    var has_err = args.run_json == null;
     if (run) |r| {
         if (r.get("error")) |ev| {
-            if (ev == .null) try w.writeAll("null") else try std.json.Stringify.value(ev, .{}, w);
+            if (ev == .null) try w.writeAll("null") else {
+                has_err = true;
+                try std.json.Stringify.value(ev, .{}, w);
+            }
         } else try w.writeAll("null");
     } else try w.writeAll("{\"message\":\"the run produced no output — it failed before the handler completed (see divergence)\"}");
 
-    const ok_run = args.run_json != null and args.divergence == null;
+    // ok = the activation completed CLEANLY: output parked, no divergence, no
+    // thrown handler. A thrown handler is a 500 in prod — `ok:true` on it
+    // misled error-path tests (issue #10).
+    const ok_run = args.run_json != null and args.divergence == null and !has_err;
     try w.print(",\"ok\":{s}", .{if (ok_run) "true" else "false"});
 
     // divergence — only when present (replay/fail signal; absent in a clean sim).

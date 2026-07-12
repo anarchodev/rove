@@ -703,7 +703,7 @@ fn installWsWakes(
                 arms.append(allocator, .{ .prefix = dup }) catch allocator.free(dup);
             },
         }
-        if (reg.to) |t| {
+        if (reg.on) |t| {
             if (wake_to) |old_to| allocator.free(old_to);
             wake_to = allocator.dupe(u8, t) catch null;
         }
@@ -729,7 +729,7 @@ fn installWsWakes(
 }
 
 /// WS sibling of `worker_drain.resumeBoundFetchChain`: an `on.fetch` issued from
-/// a held WebSocket chain's `onMessage` completed — re-invoke the `{to}` export
+/// a held WebSocket chain's `onMessage` completed — re-invoke the `{on}` export
 /// (e.g. `onLLM`) with the result as a `.fetch_chunk` activation, and ship its
 /// `stream.write` frames back over the SAME socket via `shipWsFrames`. (The HTTP
 /// path's `resolveParked` would stamp a meaningless h2 response onto a WS conn.)
@@ -804,7 +804,7 @@ pub fn resumeBoundFetchChainWs(
         .terminal_status = if (ev.final) ev.terminal_status else 0,
         .terminal_ok = if (ev.final) ev.terminal_ok else false,
         .body_truncated = if (ev.final) ev.body_truncated else false,
-        .export_name = ev.resolvedExport(), // record the resolved export ({to}) — G3
+        .export_name = ev.resolvedExport(), // record the resolved export ({on}) — G3
     };
     const request: Request = .{
         .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),

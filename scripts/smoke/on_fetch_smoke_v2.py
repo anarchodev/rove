@@ -2,16 +2,16 @@
 """V2 port of `on_fetch_smoke.py` — the `on.fetch` surface (handler-surface
 Phase 3 slice 3a) on the `V2Cluster` harness (`smoke_lib_v2`).
 
-`after.fetch(url, opts, {to})` is the connection-scoped outbound: it binds the
-fetch to the held chain — each upstream chunk wakes the `{to}` export while
-the chain holds the socket. Proves bind + `{to}` export override + chunk
+`after.fetch(url, { …, on })` is the connection-scoped outbound: it binds the
+fetch to the held chain — each upstream chunk wakes the `{on}` export while
+the chain holds the socket. Proves bind + `{on}` export override + chunk
 resume WITHOUT stream.* output (the handler accumulates each chunk in kv and
 returns the reconstructed body on the terminal chunk).
 
 Two tenants on a single node:
-  - `acme` `/onfetch?url=` binds a streaming on.fetch with `{to:onUpstream}`;
+  - `acme` `/onfetch?url=` binds a streaming on.fetch with `{on:onUpstream}`;
     each chunk appends to kv; the terminal chunk returns the reconstructed
-    body. `/onfetchbuf?url=` does a non-streaming on.fetch (no `{to}`) whose
+    body. `/onfetchbuf?url=` does a non-streaming on.fetch (no `{on}`) whose
     whole body arrives in one `onFetchResult` activation.
   - `wb` `/bulk` serves a deterministic 170-byte ASCII body.
 
@@ -20,7 +20,7 @@ Handler JS reused VERBATIM from the V1 demo tenants
 
 Essential assertions (unchanged from V1):
   - `/onfetch` → 200 with the upstream body reconstructed byte-exact
-    (streaming bind + {to} export + per-chunk resume).
+    (streaming bind + {on} export + per-chunk resume).
   - `/onfetchbuf` → 200 with the whole body byte-exact (non-streaming →
     conventional `onFetchResult` export).
 
@@ -105,7 +105,7 @@ def main() -> int:
 
         bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/bulk"
 
-        # ── 3. THE on.fetch (streaming + {to:onUpstream}). ────────────
+        # ── 3. THE on.fetch (streaming + {on:onUpstream}). ────────────
         r = c.get("acme", f"/onfetch?url={up.quote(bulk_url)}", timeout=30.0)
         if r.status != 200:
             check("/onfetch → 200", False, f"status={r.status} body={r.body!r}")
@@ -134,7 +134,7 @@ def main() -> int:
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print("\nPASS on.fetch smoke (v2): streaming bind + {to} export resume; "
+    print("\nPASS on.fetch smoke (v2): streaming bind + {on} export resume; "
           "non-streaming → onFetchResult")
     return 0
 

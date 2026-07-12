@@ -263,7 +263,7 @@ pub const TapePayloads = struct {
     /// True iff `activation_bytes` is a truncated prefix.
     activation_bytes_truncated: bool = false,
     /// The **resolved export** the activation dispatched to (a callback's
-    /// `{to}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
+    /// `{on}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
     /// derivable from the activation kind alone. Lets replay invoke the SAME
     /// export instead of the conventional one (`replay-and-sim.md` §5 G3).
     /// Empty when the conventional export applies. Allocator-owned.

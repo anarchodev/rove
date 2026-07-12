@@ -57,7 +57,7 @@ def synth_world(ev, kv, base):
         r = ev["response"]
         st = r.get("status", 200)
         w["activation"] = "fetch_chunk"
-        w["export"] = ev["to"] or "onFetchResult"
+        w["export"] = ev["on"] or "onFetchResult"
         w["request"] = {"status": st, "ok": st < 400, "done": True,
                         "fetchId": ev["id"], "body": r.get("body")}
         if ev.get("ctx") is not None:
@@ -161,7 +161,7 @@ def drive(scenario, rewind_bin, source_dir):
             i = attempts.get(f["id"], 0); attempts[f["id"]] = i + 1
             resp = f["responses"][min(i, len(f["responses"]) - 1)]
             sched.enqueue({"kind": "fetch_chunk", "id": f'{f["id"]}#{i+1}',
-                           "to": e.get("to"), "ctx": e.get("ctx"), "response": resp},
+                           "on": e.get("on"), "ctx": e.get("ctx"), "response": resp},
                           f.get("latency_ms", 0))
 
         # 3. record durable sends (recorded, not re-run) for the top-level rollup

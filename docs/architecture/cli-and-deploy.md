@@ -184,7 +184,7 @@ Design notes:
   divergence, default; `resolve` = best-effort). Faithfulness is an output-level
   check (`status_match`), not a per-read order check. Covers **all activation
   kinds** — `inbound`, `fetch_chunk` (ctx + flattened fetch result + resolved
-  `{to}` export), `ws_message` (frame, text + binary), `wake`/`disconnect` —
+  `{on}` export), `ws_message` (frame, text + binary), `wake`/`disconnect` —
   because the worker records every callback's Msg (`replay-and-sim.md` §5).
 - **`sim` is the resolve corner** — `run(authored/partial world, any code,
   on-miss=resolve)`: reads a plain-JSON world (request surface, a key→value KV
@@ -196,7 +196,7 @@ Design notes:
   the same transcode `pull` runs online, exposed for offline/manual use (and the
   smokes). KV reads → an initial-snapshot map + `kvAbsent`; **`kv.prefix` scans →
   `kvPrefix`** (the exact recorded rows, served verbatim so a scan is faithful,
-  not an over-inclusive map re-scan); the fetch result / ws frame / ctx / `{to}`
+  not an over-inclusive map re-scan); the fetch result / ws frame / ctx / `{on}`
   export / `recorded` block all transcode too.
 - **Guardrails**: the worker asserts L3 at capture time (a callback that records
   no Msg panics in debug / loud-logs in prod), and `scripts/smoke/replay_matrix_smoke_v2.py`

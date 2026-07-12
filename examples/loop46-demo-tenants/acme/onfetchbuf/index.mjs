@@ -4,7 +4,7 @@
 //   GET /onfetchbuf?url=<upstream>
 //
 // A connection-scoped on.fetch WITHOUT `stream: true` and WITHOUT a
-// `{to}` override: the whole upstream body is buffered and delivered in
+// `{on}` override: the whole upstream body is buffered and delivered in
 // ONE terminal event that dispatches to the conventional `onFetchResult`
 // export (not onFetchChunk / onFetchDone — those are the streaming
 // split). No stream.* output; the held client gets the buffered body.
@@ -22,7 +22,7 @@ export default function () {
         response.status = 400;
         return "missing ?url=";
     }
-    // Buffered (no stream:true) + conventional export (no {to}).
+    // Buffered (no stream:true) + conventional export (no {on}).
     after.fetch(url);
     return next();
 }

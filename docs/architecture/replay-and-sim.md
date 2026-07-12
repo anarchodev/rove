@@ -248,7 +248,7 @@ resolved export (`ev.resolvedExport()`) now rides `TapePayloads.export_name`
 (recorded per fetch resume, emitted as the record's `export` field), `pull`
 carries it, and `root.run` prefers it over the event-shape derivation. So an
 overridden callback replays under its actual export. Validated in the matrix
-(`replay_matrix_smoke_v2.py` uses `{to:'onUpstream'}` with **no** `onFetchResult`
+(`replay_matrix_smoke_v2.py` uses `{on:'onUpstream'}` with **no** `onFetchResult`
 — reproduction proves the recorded export is used). ~~(b) `TextDecoder`/`stream.*`/`next` absent in the bare
 replay arena~~ **FIXED** — the epilogue now shims `TextDecoder`/`TextEncoder`,
 `stream.*`/`on.*`/`next`/`webhook`/`schedule`/`cron`/`blob`/`request.tag`; outputs

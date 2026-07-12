@@ -413,7 +413,7 @@ behavior, and what handler-shape.md promised). Three reasons:
   not a return argument. Dispatch is by named export keyed on activation kind
   (`onWake` / `onDisconnect` / `onFetchResult` / `onFetchChunk` / `onFetchDone` /
   `onSubscription` / default; `onCron` retired with durable-wake, `onBoot` retired 2026-07-05 (unused)
-  P5(b); `{to}` overrides). The
+  P5(b); `{on}` overrides). The
   `stream` pipeline is unchanged — only the entry trigger, head, and disposition
   changed. The old `bind:true` / `stream`-return-verb / `detach` framings are
   retired.
@@ -699,6 +699,11 @@ behavior, and what handler-shape.md promised). Three reasons:
   **universal callback-target key `{on: "module.method"}`** across
   every effect (`{to}`/`{on_result}` retired; `email.send`'s recipient
   `to` was the collision that ruled out `to` as the universal key).
+  2026-07-11 follow-through: the native `_system.*` layer uses `on` too —
+  the bindings read `opts.on` directly and the `{to}` third-arg wrapper
+  object is gone, so surface and wire share one spelling (the shim-side
+  lowering had already caused one bug: code written against internal
+  comments used the retired form and its target was silently dropped).
   Threaded context is **`ctx` in / `request.ctx` out, no exceptions**
   (completes §4.9; `request.activation.msg` folded in).
   `webhook.send(url, opts)` takes a positional url; `scheduler.after`

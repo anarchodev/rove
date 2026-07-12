@@ -931,7 +931,7 @@ test "dispatch: after.fetch returns a ftch_-prefixed id (§2.3/§2.4)" {
     var resp = try runOne(
         &d,
         kv,
-        \\const id = after.fetch("http://up.test/", {}, { on: "onR" });
+        \\const id = after.fetch("http://up.test/", { on: "onR" });
         \\if (typeof id !== "string" || !id.startsWith("ftch_")) return "new-bad:" + id;
         \\if (typeof after.ms !== "function" || typeof after.kv !== "function") return "no-after";
         \\if (typeof globalThis.on !== "undefined") return "on-alias-still-installed";

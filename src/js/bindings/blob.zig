@@ -179,13 +179,13 @@ pub fn jsBlobWrite(
     return c.JS_NewInt64(ctx, @intCast(total));
 }
 
-/// `_system.blob.seal(to, content_type?)` → hash hex. Finalizes the chain's
+/// `_system.blob.seal(on, content_type?)` → hash hex. Finalizes the chain's
 /// session: takes the buffer + sha256 from the trampoline and
 /// appends a natively-built `connection_scoped` PendingFetch — a PUT
 /// through the `rove-blob.internal` door — to the activation's
 /// pending-fetches accumulator. The EXISTING handler-success seam
 /// then bind-or-drops it exactly like an `on.fetch`: held ⇒ the PUT
-/// result resumes this chain at the `to` export (with
+/// result resumes this chain at the `on` export (with
 /// `request.ctx.hash`); not held ⇒ inert (bytes freed, nothing
 /// promised) — the same scope semantics as every `on.*` verb.
 pub fn jsBlobSeal(
@@ -209,13 +209,13 @@ pub fn jsBlobSeal(
         return js_exception;
     }
 
-    var to_len: usize = 0;
-    const to_c = c.JS_ToCStringLen(ctx, &to_len, argv[0]);
-    if (to_c == null) return js_exception;
-    defer c.JS_FreeCString(ctx, to_c);
-    const to = @as([*]const u8, @ptrCast(to_c))[0..to_len];
-    if (!http_b.isValidExportName(to)) {
-        _ = c.JS_ThrowTypeError(ctx, "blob.seal: `to` must be a JS identifier");
+    var on_len: usize = 0;
+    const on_c = c.JS_ToCStringLen(ctx, &on_len, argv[0]);
+    if (on_c == null) return js_exception;
+    defer c.JS_FreeCString(ctx, on_c);
+    const on_name = @as([*]const u8, @ptrCast(on_c))[0..on_len];
+    if (!http_b.isValidExportName(on_name)) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: `on` must be a JS identifier");
         return js_exception;
     }
 
@@ -299,7 +299,7 @@ pub fn jsBlobSeal(
         _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
         return js_exception;
     };
-    const name_dup = dupePrint(a, &built, "{s}", .{to}) orelse {
+    const name_dup = dupePrint(a, &built, "{s}", .{on_name}) orelse {
         _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
         return js_exception;
     };
@@ -333,12 +333,12 @@ pub fn jsBlobSeal(
     id_owned = null;
 
     // The hash is known synchronously (incremental hasher) — return
-    // it so the handler can use it immediately; the `to` resume also
+    // it so the handler can use it immediately; the `on` resume also
     // receives it as `request.ctx.hash` (the seal PUT's ctx_json).
     return c.JS_NewStringLen(ctx, &sealed.hash_hex, 64);
 }
 
-/// `_system.blob.receive(to)` — blob-storage-plan §3.5
+/// `_system.blob.receive(on)` — blob-storage-plan §3.5
 /// (P3; `docs/architecture/routing-and-ingress.md`): pipe the inbound body socket → tenant-prefix S3 multipart
 /// with ZERO chunk Msgs. Only callable from an `onHeaders`
 /// activation (the body is still at the door); at most once per
@@ -347,7 +347,7 @@ pub fn jsBlobSeal(
 /// `rove-receive.internal` door — the EXISTING handler-success seam
 /// bind-or-drops it exactly like `blob.seal`'s PUT: held (`next()`)
 /// ⇒ the worker arms the upload driver at the commit point and the
-/// completion event resumes this chain at `to` with
+/// completion event resumes this chain at `on` with
 /// `request.ctx = {hash, len}`; not held ⇒ inert (nothing promised,
 /// the stream stays held and the response flips it to discard).
 pub fn jsBlobReceive(
@@ -378,13 +378,13 @@ pub fn jsBlobReceive(
         return js_exception;
     }
 
-    var to_len: usize = 0;
-    const to_c = c.JS_ToCStringLen(ctx, &to_len, argv[0]);
-    if (to_c == null) return js_exception;
-    defer c.JS_FreeCString(ctx, to_c);
-    const to = @as([*]const u8, @ptrCast(to_c))[0..to_len];
-    if (!http_b.isValidExportName(to)) {
-        _ = c.JS_ThrowTypeError(ctx, "blob.receive: `to` must be a JS identifier");
+    var on_len: usize = 0;
+    const on_c = c.JS_ToCStringLen(ctx, &on_len, argv[0]);
+    if (on_c == null) return js_exception;
+    defer c.JS_FreeCString(ctx, on_c);
+    const on_name = @as([*]const u8, @ptrCast(on_c))[0..on_len];
+    if (!http_b.isValidExportName(on_name)) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: `on` must be a JS identifier");
         return js_exception;
     }
 
@@ -468,7 +468,7 @@ pub fn jsBlobReceive(
         _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
         return js_exception;
     };
-    const name_dup = dupePrint(a, &built, "{s}", .{to}) orelse {
+    const name_dup = dupePrint(a, &built, "{s}", .{on_name}) orelse {
         _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
         return js_exception;
     };

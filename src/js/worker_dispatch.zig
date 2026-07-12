@@ -357,7 +357,7 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
 /// Handler-surface Phase 1: arm the held continuation's `StreamWakes`
 /// from its drained `on.timer`/`on.kv` registrations + the §8.4 read-view
 /// baseline, set on the entity in `request_out` so the component rides
-/// the park into `parked_continuations`. The kv prefixes + `{to}` are
+/// the park into `parked_continuations`. The kv prefixes + `{on}` are
 /// duped into the component; `s.cont_wakes` is consumed (freed + nulled).
 /// No-op when the handler registered no wakes (a plain park). Errors
 /// propagate to the caller's errdefer (the entity is still in
@@ -378,9 +378,9 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
             .timer => interval_ms = reg.interval_ms,
             .kv => try arms.append(allocator, .{ .prefix = try allocator.dupe(u8, reg.prefix) }),
         }
-        // Last `{to}` wins — `on.*` wakes resume one "edge wake" export
+        // Last `{on}` wins — `on.*` wakes resume one "edge wake" export
         // per held connection; a default `onWake` applies when null.
-        if (reg.to) |t| {
+        if (reg.on) |t| {
             if (wake_to) |old| allocator.free(old);
             wake_to = try allocator.dupe(u8, t);
         }

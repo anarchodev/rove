@@ -57,7 +57,7 @@ pub fn parseDispatch(
 /// wake — and the legacy singular `kv_wake`/`timer`) lands in `onWake`.
 /// Inbound and the kinds whose resume path always names its own target —
 /// send_callback (the `next({fn})` / `on_result`), fetch_chunk
-/// (`{to}`/`onFetchChunk`), cron + subscription_fire (the registration's
+/// (`{on}`/`onFetchChunk`), cron + subscription_fire (the registration's
 /// export), durable_wake (the baked `scheduler_tick` default) — fall
 /// through to `default`.
 fn defaultExportForKind(src: ActivationSource) []const u8 {

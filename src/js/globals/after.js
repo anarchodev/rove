@@ -33,13 +33,8 @@ function _rejectRenamed(verb, opts, renames) {
 }
 
 
-  // Lower the public `{on}` key onto the native binding's field.
-  function tgt(opts) {
-    if (opts && typeof opts === "object" && typeof opts.on === "string") {
-      return { to: opts.on };
-    }
-    return undefined;
-  }
+  // The callback-target key is `on` at the native layer too — the bindings
+  // read `opts.on` directly, so opts pass through with no respelling.
 
   /**
    * Connection wake triggers — re-invoke a held handler when something
@@ -77,7 +72,7 @@ function _rejectRenamed(verb, opts, renames) {
      * after.ms(30_000, { on: "onTimeout" }); // deadline for a join
      */
     ms(ms, opts) {
-      return sys.timer(ms, tgt(opts));
+      return sys.timer(ms, opts);
     },
 
     /**
@@ -96,7 +91,7 @@ function _rejectRenamed(verb, opts, renames) {
      * after.kv(`jobs/${id}/`, { on: "onJob" }); // explicit target
      */
     kv(prefix, opts) {
-      return sys.kv(prefix, tgt(opts));
+      return sys.kv(prefix, opts);
     },
 
     /**
@@ -146,10 +141,11 @@ function _rejectRenamed(verb, opts, renames) {
         stream: opts.stream,
         ctx: opts.ctx,
       };
+      if (typeof opts.on === "string") native.on = opts.on;
       if (opts.timeoutMs != null) native.timeout_ms = opts.timeoutMs;
       if (opts.maxChunkBytes != null) native.max_response_chunk_bytes = opts.maxChunkBytes;
       if (opts.maxTotalBytes != null) native.max_total_response_bytes = opts.maxTotalBytes;
-      return sys.fetch(url, native, tgt(opts));
+      return sys.fetch(url, native);
     },
 
     /**

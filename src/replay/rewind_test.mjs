@@ -101,10 +101,18 @@ function subsetMatch(obj, subset) {
   return true;
 }
 
+/** Effects that SURVIVED the activation. A thrown handler rolls its txn back
+ *  in prod (500 "handler threw"), so the sim marks that activation's
+ *  writes/cmds `rolledBack` — they must not fold forward or satisfy matchers
+ *  (issue #10). They stay on `node.effects` for debugging. */
+function live(effects) {
+  return (effects || []).filter((e) => !e.rolledBack);
+}
+
 /** base kv object, overlaid with a bundle's writes/deletes (read-your-writes). */
 function foldKv(base, effects) {
   const kvOut = Object.assign({}, base || {});
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind !== "write" && e.kind !== "delete") continue;
     // A store-tagged write/delete (platform.scope(id) / platform.root) folds into
     // that store's namespaced slot, so it never collides with the tenant's own
@@ -132,7 +140,7 @@ function foldKv(base, effects) {
  *  recorder entries. */
 function scheduledEffects(effects) {
   const out = [];
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind === "timer") out.push({ target: e.on, kind: "timer" });
     else if (e.kind === "kv-wake") out.push({ target: e.on, kind: "kv-wake" });
     else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_sched/by_id/")) {
@@ -155,7 +163,7 @@ function scheduledEffects(effects) {
  *  on_result, context, …}), the durable artifact that actually replicates. */
 function sentEffects(effects) {
   const out = [];
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
       try { const m = JSON.parse(e.value); out.push({ url: m.url, method: m.method, body: m.body, on: m.on_result, context: m.context }); }
       catch (_) { /* skip a non-JSON marker */ }
@@ -171,7 +179,7 @@ function sentEffects(effects) {
  *  webhooks (read those with `toHaveSent("webhook", …)`). */
 function emailSent(effects) {
   const out = [];
-  for (const e of effects || []) {
+  for (const e of live(effects)) {
     if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
       try {
         const m = JSON.parse(e.value);
@@ -390,16 +398,26 @@ class Scenario {
     if (typeof spec.on !== "string")
       throw new Error("fetchResult({ on }): `on` must be the continuation module path");
     const status = spec.status != null ? spec.status : 200;
+    const done = spec.done != null ? spec.done : true;
+    // Mirror the bound-resume surface prod builds (globals.zig): chunkSeq /
+    // fetchesPending / fetchId on every event; status/bodyTruncated
+    // TERMINAL-only (defaulted only when done — an explicit spec still wins;
+    // no `ok` — status is the single success signal, issue #7).
+    const request = {
+      done,
+      body: spec.body != null ? spec.body : null,
+      chunkSeq: spec.chunkSeq != null ? spec.chunkSeq : 0,
+      fetchesPending: spec.fetchesPending != null ? spec.fetchesPending : 1,
+    };
+    if (spec.fetchId != null) request.fetchId = spec.fetchId;
+    if (done || spec.status != null) request.status = status;
+    if (done) request.bodyTruncated = spec.bodyTruncated != null ? spec.bodyTruncated : false;
     return new Node(this, this._base({
       entry: spec.on, // the continuation module IS this activation's entry
       activation: "fetch_chunk",
       export: "default",
       ctx: spec.ctx === undefined ? null : spec.ctx,
-      request: {
-        status,
-        done: spec.done != null ? spec.done : true,
-        body: spec.body != null ? spec.body : null,
-      },
+      request,
     }));
   }
 
@@ -751,12 +769,19 @@ class FetchHandle {
   resolve(response = {}) {
     const parent = this.node;
     const pb = parent.force();
+    // A stream:true fetch never delivers one whole-body event in prod — it
+    // arrives as per-chunk onFetchChunk events + a terminal done. Warn (a
+    // passing record, visible in the run output) rather than fail: the fold
+    // still works, but the offline shape diverges from what prod would send.
+    if (this.fx.stream)
+      record("warn: .resolve() on a streaming fetch (stream:true) — prod delivers per-chunk events; use .stream([...])", true, { url: this.fx.url });
     const world = fetchResumeWorld(
       parent.world, this.fx, response,
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + (response.latencyMs || 1),
       fetchResumeCtx(parent, this.fx),
+      armedFetches(parent),
     );
     return resumeNode(parent, world);
   }
@@ -771,16 +796,35 @@ class FetchHandle {
    *  responds). `chunks` are strings (or `{ binary }` bytes via `opts`).
    *  Assumes the handler re-holds (`next()`) between chunks until `done`. */
   stream(chunks, opts = {}) {
+    // Prod only chunk-delivers a fetch issued with `stream: true` — one issued
+    // without it arrives as a single whole-body onFetchResult, so streaming it
+    // offline would pass a shape prod never sends. Fail loud (issue #24).
+    if (!this.fx.stream)
+      throw new Error(`stream(): this fetch was issued WITHOUT stream:true (${this.fx.url}) — prod delivers one whole-body result; use .resolve({...}) or issue the fetch with { stream: true }`);
     const parentNode = this.node;
     const pw = this.node.world;
-    const on = this.fx.on;
-    const ctx = fetchResumeCtx(parentNode, this.fx);
+    const fx = this.fx;
+    const on = fx.on;
+    const ctx = fetchResumeCtx(parentNode, fx);
+    // The fetch stays pending through every chunk INCLUDING its terminal done
+    // event (prod counts "including this one").
+    const pending = opts.fetchesPending != null ? opts.fetchesPending : armedFetches(parentNode);
     let kv = foldKv(pw.kv, this.node.force().effects);
     let seed = pw.seed || 0;
     let now = pw.now_ms || 0;
     let node = null;
     const step = (body, done, seq) => {
       const t = onTarget(pw.entry, on, done ? "onFetchDone" : "onFetchChunk");
+      // Prod stamps status/bodyTruncated ONLY on the terminal event
+      // (globals.zig `if (fc.final)`); non-final chunks carry done/chunkSeq/
+      // fetchId/fetchesPending + the payload, nothing else. No `ok` —
+      // status is the single success signal (issue #7).
+      const request = { done, chunkSeq: seq, body, fetchesPending: pending };
+      if (fx.id != null) request.fetchId = fx.id;
+      if (done) {
+        request.status = opts.status != null ? opts.status : 200;
+        request.bodyTruncated = opts.bodyTruncated != null ? opts.bodyTruncated : false;
+      }
       node = resumeNode(parentNode, carrySources(pw, {
         entry: t.entry,
         activation: "fetch_chunk",
@@ -789,12 +833,7 @@ class FetchHandle {
         kv,
         seed: ++seed,
         now_ms: ++now,
-        request: {
-          status: opts.status != null ? opts.status : 200,
-          done,
-          chunkSeq: seq,
-          body,
-        },
+        request,
       }));
       kv = foldKv(kv, node.force().effects); // thread writes to the next chunk
     };
@@ -892,6 +931,7 @@ class CompileHandle {
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
       ctx,
+      armedFetches(parent),
     );
     return resumeNode(parent, world);
   }
@@ -919,6 +959,7 @@ class StampHandle {
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
       ctx,
+      armedFetches(parent),
     );
     return resumeNode(parent, world);
   }
@@ -954,10 +995,14 @@ class Interleaving {
     let seed = parent.world.seed || 0;
     let now = parent.world.now_ms || 0;
     let node = parent;
+    // Each arrival retires one outstanding fetch: the first leg sees every
+    // armed fetch pending (including itself), the last sees only itself.
+    let pending = armedFetches(parent);
     for (const i of order) {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
-      node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx)));
+      node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
+      pending--;
       kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
     }
     return node;
@@ -1059,9 +1104,29 @@ function onTarget(parentEntry, on, fallbackExport) {
  *  EXPLICIT kv/seed/now base — the shared core of `FetchHandle.resolve` and the
  *  `whenConcurrent` interleaving fold (which threads a running overlay through a
  *  chosen arrival order rather than always folding from the one parent). */
-function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx) {
+function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx, pending) {
   const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
+  const done = response.done != null ? response.done : true;
   const t = onTarget(parentWorld.entry, fx.on, "onFetchResult");
+  const request = {
+    done,
+    body: response.body != null ? response.body : null,
+    // Prod stamps chunkSeq + fetchesPending on EVERY bound fetch event, and the
+    // ftch_ id the arm returned (globals.zig) — thread the recorded id so the
+    // documented correlate-by-id and `done && fetchesPending === 1` patterns
+    // work offline (issue #24).
+    chunkSeq: response.chunkSeq != null ? response.chunkSeq : 0,
+    fetchesPending: response.fetchesPending != null ? response.fetchesPending
+      : (pending != null ? pending : 1),
+  };
+  if (fx.id != null) request.fetchId = fx.id;
+  // status/bodyTruncated are TERMINAL-only in prod (set iff `final`,
+  // globals.zig) — default them only on the final event; honor an explicit
+  // override so a deliberate off-spec world stays authorable. `status` is
+  // the single success signal (2xx = ok, 0 = transport failure — here
+  // `response.timeout`); the real engine surfaces NO `request.ok` (issue #7).
+  if (done || response.status != null) request.status = status;
+  if (done) request.bodyTruncated = response.bodyTruncated != null ? response.bodyTruncated : false;
   return carrySources(parentWorld, {
     entry: t.entry,
     activation: "fetch_chunk",
@@ -1072,16 +1137,15 @@ function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx) {
     kv: kvBase,
     seed,
     now_ms: now,
-    request: {
-      status,
-      // `status` is the single fetch-result signal — the real engine
-      // surfaces NO `request.ok` (issue #7). A handler derives success
-      // itself: `status >= 200 && status < 300`; `status === 0` is a
-      // transport failure (here: `response.timeout`).
-      done: response.done != null ? response.done : true,
-      body: response.body != null ? response.body : null,
-    },
+    request,
   });
+}
+
+/** Bound fetches a node armed that are still outstanding — prod's
+ *  `request.fetchesPending` base ("including this one"). Rolled-back arms never
+ *  issued, so they don't count. */
+function armedFetches(node) {
+  return live(node.force().effects).filter((e) => e.kind === "fetch").length;
 }
 
 // ── WebSocket held-socket fold ────────────────────────────────────────────
@@ -1231,7 +1295,9 @@ class Matcher {
     if (!node) return false;
     // Tenant store only — a `platform.scope(id)` / `platform.root` write carries
     // a `store` tag and is asserted with `instanceKv(id, …)` / `rootKv(…)`.
-    const writes = node.effects.filter((e) => e.kind === "write" && e.key === key && !e.store);
+    // Rolled-back writes (thrown handler) never commit in prod, so they never
+    // satisfy the matcher.
+    const writes = live(node.effects).filter((e) => e.kind === "write" && e.key === key && !e.store);
     const pass = writes.some((w) => subsetMatch(tryParse(w.value), subset));
     return this._record(`toHaveWritten ${fmt(key)}`, pass, {
       subset: subset === undefined ? null : subset,
@@ -1242,7 +1308,7 @@ class Matcher {
   toHaveFetched(matcher) {
     const node = this._node("toHaveFetched");
     if (!node) return false;
-    const fx = node.effects.filter((e) => e.kind === "fetch");
+    const fx = live(node.effects).filter((e) => e.kind === "fetch");
     return this._record(`toHaveFetched ${matcher == null ? "" : matcher}`, fx.some((e) => matchUrl(e.url, matcher)), {
       fetched: fx.map((e) => e.url),
     });
@@ -1267,7 +1333,7 @@ class Matcher {
       ? sentEffects(node.effects)
       : kind === "email"
       ? emailSent(node.effects)
-      : node.effects.filter((e) => e.kind === kind);
+      : live(node.effects).filter((e) => e.kind === kind);
     const pass = sent.some((e) => subsetMatch(e, subset));
     return this._record(`toHaveSent ${fmt(kind)}`, pass, { subset: subset === undefined ? null : subset, sent });
   }
@@ -1301,9 +1367,10 @@ class Matcher {
 }
 
 /** The stable facets a snapshot captures: response head, disposition, body/ctx,
- *  and the writes/cmds from the effect log (logs + reads excluded — noisy). */
+ *  and the writes/cmds from the effect log (logs + reads excluded — noisy;
+ *  rolled-back entries excluded — they never commit in prod). */
 function snapshotFacets(b) {
-  const cmds = (b.effects || []).filter((e) =>
+  const cmds = live(b.effects).filter((e) =>
     e.kind !== "read" && e.kind !== "log");
   return {
     response: b.response || null,

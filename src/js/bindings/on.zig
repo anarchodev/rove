@@ -1,6 +1,6 @@
 //! `_system.on` — connection wake triggers (`docs/handler-shape.md`
 //! §2.3). `on.timer(ms)` /
-//! `on.kv(prefix, {to?})` register a wake **for the current
+//! `on.kv(prefix, {on?})` register a wake **for the current
 //! connection**: a body-builder effect (not a return verb) that
 //! accumulates onto `DispatchState.pending_wakes` during the
 //! activation. At end-of-activation the worker arms the accumulated
@@ -15,10 +15,12 @@
 //! and these calls are inert no-ops, per the model (all `on.*` wakes
 //! are for the current connection).
 //!
-//! `{ to: "module.method" | "method" }` routes the wake to a specific
+//! `{ on: "module.method" | "method" }` routes the wake to a specific
 //! export; the default is `onWake` (the generic "edge wake — go look"
 //! export, wired in Phase 4's kind→export map). The target reuses the
-//! continuation `path`/`fn_name` resolution.
+//! continuation `path`/`fn_name` resolution. The key is `on` end to end
+//! — the same spelling the customer writes (the `after.js` shim passes
+//! opts through; the pre-rename `{to}` wire spelling is gone).
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
@@ -31,13 +33,13 @@ const js_exception = globals.js_exception;
 
 const PendingWakeReg = globals.PendingWakeReg;
 
-/// Read the optional `{ to }` selector from an opts object arg. Returns
+/// Read the optional `{ on }` selector from an opts object arg. Returns
 /// an owned dup or null. On allocation failure returns null (the wake
 /// still arms, defaulting to `onWake` — losing a non-default target is
 /// preferable to dropping the wake).
-fn readTo(state: *globals.DispatchState, ctx: ?*c.JSContext, opts: c.JSValue) ?[]u8 {
+fn readOn(state: *globals.DispatchState, ctx: ?*c.JSContext, opts: c.JSValue) ?[]u8 {
     if (!c.JS_IsObject(opts)) return null;
-    const tv = c.JS_GetPropertyStr(ctx, opts, "to");
+    const tv = c.JS_GetPropertyStr(ctx, opts, "on");
     defer c.JS_FreeValue(ctx, tv);
     if (!c.JS_IsString(tv)) return null;
     var len: usize = 0;
@@ -68,9 +70,9 @@ pub fn jsOnTimer(
         return js_exception;
     }
     const list = state.pending_wakes orelse return js_undefined; // connectionless ⇒ inert
-    const to: ?[]u8 = if (argc >= 2) readTo(state, ctx, argv[1]) else null;
-    list.append(state.allocator, .{ .kind = .timer, .interval_ms = ms, .to = to }) catch {
-        if (to) |t| state.allocator.free(t);
+    const on: ?[]u8 = if (argc >= 2) readOn(state, ctx, argv[1]) else null;
+    list.append(state.allocator, .{ .kind = .timer, .interval_ms = ms, .on = on }) catch {
+        if (on) |t| state.allocator.free(t);
         _ = c.JS_ThrowInternalError(ctx, "after.ms: out of memory");
         return js_exception;
     };
@@ -101,10 +103,10 @@ pub fn jsOnKv(
         _ = c.JS_ThrowInternalError(ctx, "after.kv: out of memory");
         return js_exception;
     };
-    const to: ?[]u8 = if (argc >= 2) readTo(state, ctx, argv[1]) else null;
-    list.append(state.allocator, .{ .kind = .kv, .prefix = prefix, .to = to }) catch {
+    const on: ?[]u8 = if (argc >= 2) readOn(state, ctx, argv[1]) else null;
+    list.append(state.allocator, .{ .kind = .kv, .prefix = prefix, .on = on }) catch {
         state.allocator.free(prefix);
-        if (to) |t| state.allocator.free(t);
+        if (on) |t| state.allocator.free(t);
         _ = c.JS_ThrowInternalError(ctx, "after.kv: out of memory");
         return js_exception;
     };
