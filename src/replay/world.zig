@@ -104,8 +104,9 @@ pub const World = struct {
     tenant: ?[]const u8 = null,
     correlation_id: ?[]const u8 = null,
     /// The flattened fetch/callback result surface — top-level on `request`.
+    /// `status` is the single success signal (2xx = ok, 0 = transport
+    /// failure); there is no `ok` (issue #7).
     status: ?i64 = null,
-    ok: ?bool = null,
     done: ?bool = null,
     fetch_id: ?[]const u8 = null,
     chunk_seq: ?i64 = null,
@@ -152,11 +153,9 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             w.body = buf;
             w.body_is_binary = true;
         }
-        // Flattened fetch/callback result surface (`request.status` etc.).
+        // Flattened fetch/callback result surface (`request.status` etc.;
+        // no `ok` — status is the single success signal, issue #7).
         w.status = jInt(r, "status");
-        if (r.get("ok")) |v| {
-            if (v == .bool) w.ok = v.bool;
-        }
         if (r.get("done")) |v| {
             if (v == .bool) w.done = v.bool;
         }
@@ -310,7 +309,7 @@ test "fromValue: non-inbound (fetch result) surface" {
     const json =
         \\{
         \\  "entry": "h.mjs", "activation": "fetch_chunk", "export": "onUpstream",
-        \\  "request": { "status": 502, "ok": false, "done": true, "fetchId": "ftch_1",
+        \\  "request": { "status": 502, "done": true, "fetchId": "ftch_1",
         \\               "chunkSeq": 3, "body": "boom",
         \\               "activation": { "attempts": 2, "error": "timeout" } },
         \\  "ctx": { "attempt": 2 }
@@ -322,7 +321,6 @@ test "fromValue: non-inbound (fetch result) surface" {
     try testing.expectEqualStrings("fetch_chunk", w.activation);
     try testing.expectEqualStrings("onUpstream", w.export_name.?); // {to} override
     try testing.expectEqual(@as(i64, 502), w.status.?);
-    try testing.expectEqual(false, w.ok.?);
     try testing.expectEqual(true, w.done.?);
     try testing.expectEqualStrings("ftch_1", w.fetch_id.?);
     try testing.expectEqual(@as(i64, 3), w.chunk_seq.?);

@@ -67,7 +67,7 @@ CBRESULT_SRC = r'''export default function () {
     // Unified flattened on_result surface (handler-shape §7, Endpoint A).
     const a = request.activation || {};
     const record = {
-        ok: request.ok,
+        ok: request.status >= 200 && request.status < 300,
         status: request.status,
         body: request.text,
         context: request.ctx ?? null,

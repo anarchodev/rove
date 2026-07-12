@@ -66,7 +66,6 @@ pub const Opts = struct {
 /// these are the scalar siblings.
 pub const Result = struct {
     status: ?i64 = null,
-    ok: ?bool = null,
     done: ?bool = null,
     fetch_id: ?[]const u8 = null,
     chunk_seq: ?i64 = null,
@@ -197,8 +196,6 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     if (opts.result) |r| {
         try w.writeAll("{\"status\":");
         try optInt(w, r.status);
-        try w.writeAll(",\"ok\":");
-        try optBool(w, r.ok);
         try w.writeAll(",\"done\":");
         try optBool(w, r.done);
         try w.writeAll(",\"fetchId\":");
@@ -302,7 +299,8 @@ const EPILOGUE_BODY =
     \\  request.unmaskedIp = function () { if (!D.ipRaw) miss("request.unmaskedIp()"); return D.ipRaw.value || null; };
     \\  // Non-inbound activation surface (null for inbound → no-ops):
     \\  // the threaded ctx, the request.activation metadata bag, and the
-    \\  // flattened fetch/callback result (request.status/.ok/.done/...).
+    \\  // flattened fetch/callback result (request.status/.done/...; the
+    \\  // single success signal is `status`, 2xx = ok — no request.ok, #7).
     \\  if (D.ctx !== null) request.ctx = D.ctx;
     \\  // Injected request.session (worker-resolved in prod — no code to run).
     \\  if (D.session !== null) request.session = D.session;
@@ -323,7 +321,6 @@ const EPILOGUE_BODY =
     \\  }
     \\  if (D.result !== null) {
     \\    if (D.result.status !== null) request.status = D.result.status;
-    \\    if (D.result.ok !== null) request.ok = D.result.ok;
     \\    if (D.result.done !== null) request.done = D.result.done;
     \\    if (D.result.fetchId !== null) request.fetchId = D.result.fetchId;
     \\    if (D.result.chunkSeq !== null) request.chunkSeq = D.result.chunkSeq;

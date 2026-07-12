@@ -1948,10 +1948,72 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
 /// always proposes through raft even for a target that itself writes
 /// nothing. Errors log + skip — the entry survives for the next
 /// tick (its `_sched` keys weren't committed).
+const DurableTarget = struct { module: []const u8, method: ?[]const u8 };
+
+/// Split a durable-wake target `"module.method"` into its module path and
+/// optional export (handler-shape.md §2.4, issue #9). The method suffix is
+/// recognized ONLY when the module part ends in `.mjs`/`.js` — so a bare
+/// `"reports.mjs"` module, a slash path `"jobs/reminder"`, or a `__system/`
+/// baked module stays whole (fires `default`), and only the documented
+/// `"reports.mjs.weekly"` form carries an export. This rule is unambiguous
+/// (a `.mjs` extension never gets mistaken for a method) and MUST match the
+/// sim's `wake()` split in `src/replay/rewind_test.mjs`.
+fn splitDurableTarget(target: []const u8) DurableTarget {
+    const last_dot = std.mem.lastIndexOfScalar(u8, target, '.') orelse
+        return .{ .module = target, .method = null };
+    const head = target[0..last_dot];
+    const tail = target[last_dot + 1 ..];
+    if (tail.len > 0 and (std.mem.endsWith(u8, head, ".mjs") or std.mem.endsWith(u8, head, ".js")))
+        return .{ .module = head, .method = tail };
+    return .{ .module = target, .method = null };
+}
+
+test "splitDurableTarget: module.method only when module ends .mjs/.js" {
+    const expectEqualStrings = std.testing.expectEqualStrings;
+    const expect = std.testing.expect;
+
+    // Documented form → split.
+    const a = splitDurableTarget("reports.mjs.weekly");
+    try expectEqualStrings("reports.mjs", a.module);
+    try expectEqualStrings("weekly", a.method.?);
+    const a2 = splitDurableTarget("jobs.mjs.send");
+    try expectEqualStrings("jobs.mjs", a2.module);
+    try expectEqualStrings("send", a2.method.?);
+    const a3 = splitDurableTarget("lib/util.js.run");
+    try expectEqualStrings("lib/util.js", a3.module);
+    try expectEqualStrings("run", a3.method.?);
+
+    // Bare `.mjs` module (no method) — the extension is NOT a method.
+    const b = splitDurableTarget("reports.mjs");
+    try expectEqualStrings("reports.mjs", b.module);
+    try expect(b.method == null);
+    const b2 = splitDurableTarget("jobs/reminder.mjs");
+    try expectEqualStrings("jobs/reminder.mjs", b2.module);
+    try expect(b2.method == null);
+
+    // No dot / slash path / baked system module → whole module, default.
+    const c = splitDurableTarget("jobs/reminder");
+    try expectEqualStrings("jobs/reminder", c.module);
+    try expect(c.method == null);
+    const c2 = splitDurableTarget("__system/cron_tick");
+    try expectEqualStrings("__system/cron_tick", c2.module);
+    try expect(c2.method == null);
+
+    // A dotted module name that isn't `.mjs`/`.js` stays whole.
+    const d = splitDurableTarget("my.config");
+    try expectEqualStrings("my.config", d.module);
+    try expect(d.method == null);
+}
+
 fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) void {
     const allocator = worker.allocator;
     const tenant_id = dw.tenant_id;
-    const module_path = dw.module_path;
+    // A `schedule`/`cron` target may name `"module.method"` — fire the
+    // named export instead of `default` (handler-shape.md §2.4, issue #9).
+    // Both verbs land here (`cron` re-dispatches through `schedule({in:0},
+    // target)`), so this is the one split site. Mirrors the sim's `wake()`.
+    const dt = splitDurableTarget(dw.module_path);
+    const module_path = dt.module;
     var p = firePrep(worker, tenant_id, module_path, "durable-wake") orelse return;
     defer p.deinit(allocator);
 
@@ -1988,6 +2050,9 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
         .path = spath,
         .body = body,
         .query = null,
+        // `"module.method"` → fire the named export; a bare module → null
+        // → the conventional `default` (rpc_dispatch.defaultExportForKind).
+        .fn_override = dt.method,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .{ .durable_wake = .{
             .id = dw.id,

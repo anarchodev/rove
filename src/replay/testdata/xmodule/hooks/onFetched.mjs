@@ -5,7 +5,7 @@
 export default function () {
   const ctx = request.ctx || {};
   kv.set("result/" + ctx.key, JSON.stringify({
-    ok: request.ok,
+    ok: request.status >= 200 && request.status < 300,
     status: request.status,
     body: request.text,
   }));

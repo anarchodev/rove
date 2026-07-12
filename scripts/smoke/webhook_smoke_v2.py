@@ -59,11 +59,12 @@ CBFIRE_SRC = '''export function fire(url, tag) {
 
 CBRESULT_SRC = '''export default function () {
     // Unified flattened on_result surface (handler-shape §7, Endpoint A):
-    // response on request.body/.status/.ok, echoed context IS request.ctx,
-    // delivery metadata on request.activation.*.
+    // response on request.body/.status (2xx = delivered; no request.ok,
+    // issue #7), echoed context IS request.ctx, delivery metadata on
+    // request.activation.*.
     const a = request.activation || {};
     const record = {
-        ok: request.ok,
+        ok: request.status >= 200 && request.status < 300,
         status: request.status,
         body: request.text,
         context: request.ctx ?? null,

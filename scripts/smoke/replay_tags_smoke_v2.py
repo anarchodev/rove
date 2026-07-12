@@ -50,7 +50,7 @@ REPLAY_SELF_SRC = r"""export default function () {
     return next();
 }
 export function onFetchResult() {
-    if (request.ok) {
+    if (request.status >= 200 && request.status < 300) {
         response.status = 200;
         return "ok:" + request.status + ":" +
             (request.text || "");
@@ -66,7 +66,7 @@ REPLAY_OTHER_SRC = r"""export default function () {
     return next();
 }
 export function onFetchResult() {
-    if (request.ok) { response.status = 200; return "ok:" + request.status; }
+    if (request.status >= 200 && request.status < 300) { response.status = 200; return "ok:" + request.status; }
     response.status = 502;
     return "fail:" + (request.status || "?");
 }

@@ -129,10 +129,11 @@ globalThis.webhook = {
    * @param {string} [opts.on] - Module path of a customer result
    *   handler. Receives the terminal event on the unified flattened
    *   surface (handler-shape §7): the response on `request.bytes` /
-   *   `.text` / `.json`, `request.status` / `.ok` / `.bodyTruncated`;
-   *   the threaded `ctx` value bare on `request.ctx`; delivery
-   *   metadata (`attempts`, `error?`, `id`, `headers`) on
-   *   `request.activation.*`. There is no `request.result`.
+   *   `.text` / `.json`, and `request.status` / `.bodyTruncated`
+   *   (2xx = delivered; `status === 0` = never reached the endpoint;
+   *   no derived `request.ok`, issue #7); the threaded `ctx` value bare
+   *   on `request.ctx`; delivery metadata (`attempts`, `error?`, `id`,
+   *   `headers`) on `request.activation.*`. There is no `request.result`.
    * @param {*} [opts.ctx] - Opaque customer payload echoed back as
    *   `request.ctx` on the result event.
    * @returns {string} The marker id — random unless `handle` was

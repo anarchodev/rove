@@ -56,7 +56,9 @@ export function onHeaders() {
 export function onStored() {
   const ctx = request.ctx || {};
   const app = ctx.app || {};
-  const ok = request.activation && request.activation.ok;
+  // blob.receive completion: 2xx = stored, status 0 = failed (status is
+  // the single success signal — no request.ok).
+  const ok = request.status >= 200 && request.status < 300;
   if (!ok || !ctx.hash) {
     response.status = 502;
     return JSON.stringify({ ok: false, error: "receive failed" });

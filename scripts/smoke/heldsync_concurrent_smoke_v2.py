@@ -62,7 +62,7 @@ HELDSYNC_SRC = r"""export default function () {
 ONRESULT_SRC = r"""export function onResult() {
     // Endpoint A: ctx IS request.ctx; result flattened on request.*.
     const ctx = request.ctx || {};
-    if (!request.ok) {
+    if (request.status < 200 || request.status >= 300) {
         response.status = 502;
         return "heldsync upstream failed: " + (request.activation.error || request.status);
     }

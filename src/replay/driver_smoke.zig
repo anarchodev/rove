@@ -28,7 +28,6 @@ const FETCH_HANDLER =
     \\  response.status = request.status;
     \\  return {
     \\    upstreamStatus: request.status,
-    \\    ok: request.ok,
     \\    done: request.done,
     \\    fetchId: request.fetchId,
     \\    ctxAttempt: request.ctx.attempt,
@@ -98,7 +97,7 @@ fn runFetchChunk(a: std.mem.Allocator) !void {
     const w = &aw.writer;
     try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"fetch_chunk\",\"export\":\"onFetchResult\",");
     try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"\",");
-    try w.writeAll("\"status\":502,\"ok\":false,\"done\":true,\"fetchId\":\"ftch_1\",\"body\":\"boom\"},");
+    try w.writeAll("\"status\":502,\"done\":true,\"fetchId\":\"ftch_1\",\"body\":\"boom\"},");
     try w.writeAll("\"ctx\":{\"attempt\":2},\"seed\":1,");
     try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
     try std.json.Stringify.value(FETCH_HANDLER, .{}, w);

@@ -134,7 +134,7 @@ declares/captures:
 |---|---|---|
 | `inbound` (default) | `default` | `request.method/.path/.headers/.body/.cookies/.ip` (read-recorded) |
 | `inbound_chunk` | `onChunk` | this chunk's bytes (binary), `request.done`, `request.chunkSeq`, `request.ctx` |
-| `after.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{on}` | flattened: `request.bytes`/`.text`/`.json`, `request.status/.ok/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
+| `after.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{on}` | flattened: `request.bytes`/`.text`/`.json`, `request.status/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
 | `after.kv`/`after.ms` wake | `onWake` or `{on}` | `request.ctx`; fired watches on `request.activation.wakes[]` (edge — "go look"): `{kind:"kv",prefix,firedAt:<ms>}` per fired arm or `{kind:"timer",firedAt:<ms>}` — the armed prefix, never matched keys. Identical on every resume path (stream/held/WS) |
 | `ws_message` | `onMessage` | `request.activation = {opcode, data}`, `request.ctx` |
 | `disconnect` | `onDisconnect` | `request.ctx` |
@@ -187,7 +187,7 @@ every activation runnable. Three gaps, in priority order:
 **Update 2026-06-30 — mechanism landed, then a REAL recording refuted the fetch
 data-path.** The driver gained decoders + install for `trigger_payload` (the
 `{"ctx": …}` envelope → `request.ctx`) and `fetch_responses` (→ the flattened
-`request.status/.ok/.done/.fetchId` + body), export-resolution by event shape,
+`request.status/.done/.fetchId` + body), export-resolution by event shape,
 and `pull` carries the channels. That passed a *programmatic* fixture — but
 validating against a **real** `fetch_chunk` recording (a live `after.fetch` →
 `onFetchResult`, `scripts/smoke/replay_noninbound_smoke_v2.py`) refuted the
@@ -302,7 +302,7 @@ Landed 2026-06-30: the declarative-world sim path (`world.zig`, the host's
 `.map` mode + miss policy, `runWorld`, `rewind sim`), now covering **all
 activation kinds** — a world declares the `activation` kind, the resolved
 `export` (the `{on}` / callback name), the threaded `ctx` (→ `request.ctx`), the
-flattened fetch/callback result (`request.status/.ok/.done/.fetchId/.chunkSeq`),
+flattened fetch/callback result (`request.status/.done/.fetchId/.chunkSeq`),
 and the `request.activation` metadata bag, per the §3 table. So G1/G2/G3 above
 constrain **replay** (captured worlds) only; **sim** of any activation needs no
 recording change, because the authored world supplies the export and the

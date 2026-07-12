@@ -19,7 +19,7 @@ export function onMessage() {
 
 export function onResult() {
   const turn = request.ctx.turn;
-  kv.set("ws/llm", JSON.stringify({ turn: turn, ok: request.ok }));
+  kv.set("ws/llm", JSON.stringify({ turn: turn, ok: request.status >= 200 && request.status < 300 }));
   stream.write("llm-done");
   return next({ turn: turn + 1 }); // bump the connection ctx for the next frame
 }
