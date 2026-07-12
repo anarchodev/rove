@@ -23,7 +23,7 @@ expect(done.body).toEqual({ done: true, key: "alpha" });
 const solo = s.fetchResult({
   on: "hooks/onFetched.mjs",
   ctx: { key: "beta" },
-  status: 502, ok: false, body: "nope",
+  status: 502, body: "nope",
 });
 expect(solo).toHaveWritten("result/beta", { ok: false, status: 502, body: "nope" });
 expect(solo.body).toEqual({ done: true, key: "beta" });

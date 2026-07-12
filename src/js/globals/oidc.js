@@ -974,7 +974,7 @@ class OIDCRelyingParty {
 
   // The callback event the on_result modules receive. The webhook.send
   // result arrives on the unified flattened surface (handler-shape §7):
-  // `request.text`/`.status`/`.ok` top-level, with the delivery
+  // `request.text`/`.status` top-level, with the delivery
   // metadata + echoed `context` on `request.ctx`. We assemble the
   // `{ok, status, body, context, ...}` event the OIDC RP's
   // `completeToken` / `completeJwks` expect.
@@ -982,8 +982,10 @@ class OIDCRelyingParty {
     // Endpoint A: result flattened on `request.*`; delivery metadata on
     // `request.activation.*`; `request.ctx` IS the echoed customer context.
     const a = request.activation || {};
+    // No `ok` — `status` is the single result signal (issue #7); the
+    // readers below treat 2xx as success (`status === 0` = transport
+    // failure).
     return {
-      ok: request.ok,
       status: request.status,
       body: request.text,
       body_truncated: request.bodyTruncated,
@@ -1011,7 +1013,10 @@ class OIDCRelyingParty {
   completeToken() {
     const ev = this._event();
     const ctx = ev.context || {};
-    if (!ev.ok) {
+    // Not a 2xx exchange → failure. Written as `!(2xx)` so a missing
+    // status (an inbound activation with no fetch result) is treated as
+    // failure too — `undefined < 200` would be false. (No request.ok, #7.)
+    if (!(ev.status >= 200 && ev.status < 300)) {
       // Token exchange failed; nothing to do — the poll page keeps
       // polling and the user can retry login. Log via response body
       // (callback responses are dropped, but tape/logs capture it).
@@ -1058,7 +1063,7 @@ class OIDCRelyingParty {
   completeJwks() {
     const ev = this._event();
     const ctx = ev.context || {};
-    if (!ev.ok) { response.status = 200; return "jwks fetch failed"; }
+    if (!(ev.status >= 200 && ev.status < 300)) { response.status = 200; return "jwks fetch failed"; }
     let jwks = null;
     try { jwks = JSON.parse(ev.body || "{}"); } catch (_) {}
     if (!jwks || !Array.isArray(jwks.keys)) {

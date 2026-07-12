@@ -507,7 +507,7 @@ export default function () {
 }
 
 export function onCharge() {                      // connectionless {on} callback — no socket; does work, returns nothing
-  if (!request.ok) return;                        // delivery failed (request.activation.error says why)
+  if (request.status < 200 || request.status >= 300) return;  // delivery failed (request.activation.error says why; status 0 = never reached)
   const charge = request.json;                    // the response payload, parsed (§7)
   kv.set(`charges/${charge.id}`, JSON.stringify(charge));
 }
@@ -740,9 +740,23 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `{on}` callback (and a §6.4 held-sync resume) present the result
   identically — the response payload on **`request.bytes`/`.text`/
   `.json`** (the whole body for a non-streamed fetch, this chunk for a
-  streamed one), with `request.status` / `request.ok` / `request.done`
+  streamed one), with `request.status` / `request.done`
   (+ `request.fetchId` / `request.chunkSeq` for fetch chunks) at the
-  **top level**; the threaded `ctx` on **`request.ctx`** (bare); and
+  **top level**. **`request.status` is the single success signal — there
+  is no `request.ok`.** Branch on the status: `200 ≤ status < 300` is
+  success; a non-zero non-2xx is an upstream error you can inspect
+  (`request.status === 502`); and **`request.status === 0`** is a hard
+  transport failure (timeout, DNS, connect refused, policy block —
+  we never reached a server). One field, three cases, nothing derived
+  to disagree with it. (A derived `ok` boolean used to ride here; it was
+  removed because it was fully recomputable from `status` yet drifted
+  into three disagreeing definitions — issue #7. If you want the web
+  `Response.ok` shorthand, write it yourself:
+  `const ok = request.status >= 200 && request.status < 300`. The
+  `webhook.send` / `retry` durability shims classify *delivery* with a
+  wider `status < 400` rule — a 302 is a delivered webhook — but that is
+  the shim's own retry bookkeeping; your `{on}` handler still just reads
+  `request.status`.) The threaded `ctx` on **`request.ctx`** (bare); and
   per-delivery metadata (`attempts`, `error`, `id`, `headers`, blob
   `hash`) on **`request.activation.*`**. `request.fetchId` is the SAME
   opaque `ftch_…` string `after.fetch()` returned, so the two compare

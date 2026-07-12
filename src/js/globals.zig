@@ -2724,8 +2724,13 @@ pub fn installRequest(
         // JSValue constants instead.
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "final", if (fc.final) js_true else js_false);
         if (fc.final) {
+            // `status` is the SINGLE source of truth for a fetch/callback
+            // result (handler-shape.md §3): `200 ≤ status < 300` is
+            // success, `status === 0` is a hard transport failure (no HTTP
+            // response reached us). There is deliberately no derived `ok`
+            // boolean — it was redundant with `status` and drifted into
+            // three disagreeing definitions (issue #7).
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (fc.terminal_ok) js_true else js_false);
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
         }
         // UNBOUND (Pattern-A `on_chunk:"module"`) fires carry the
@@ -2803,15 +2808,14 @@ pub fn installRequest(
             // `request.done && request.fetchesPending === 1` to
             // detect "last chunk of last fetch."
             _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchesPending", c.JS_NewInt64(ctx, @intCast(request.activation_fetches_pending)));
-            // Terminal-only fields. Customer's onFetchChunk
-            // branches on `request.done` and inspects these to
-            // decide between "all good" and "transport / upstream
-            // failure." Mirrors handler-shape.md §3 — these are
-            // the same fields that ride on the unbound
-            // `request.activation.{ok,status,body_truncated}` but
-            // hoisted to the top level for the bound surface.
+            // Terminal-only fields. Customer's onFetchChunk branches on
+            // `request.done` and inspects `request.status` to decide
+            // between "all good" (2xx), "upstream error" (non-zero
+            // non-2xx), and "transport failure" (status 0) — the same
+            // `status` fields that ride on the unbound
+            // `request.activation.{status,body_truncated}`, hoisted to
+            // the top level for the bound surface. No derived `ok` (#7).
             if (fc.final) {
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", if (fc.terminal_ok) js_true else js_false);
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
             }
@@ -3011,8 +3015,11 @@ pub fn installRequest(
             }
             c.JS_FreeValue(ctx, legacy_body);
         }
+        // `status` is the single success signal (#7 — no derived `ok`).
+        // A shim result's own `ok`/`error` (webhook delivery `< 400`,
+        // etc.) rides `request.activation.error` for diagnosis; the
+        // handler branches on `request.status` (0 = transport failure).
         _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
 

@@ -122,7 +122,8 @@ globalThis.blob = {
    *   returned on direct GETs of the object.
    * @param {string} [opts.on] - Module path receiving the
    *   terminal result on the unified flattened surface (handler-shape
-   *   §7): `request.ok` / `request.status` top-level, the echoed
+   *   §7): `request.status` top-level (2xx = stored; no `request.ok`,
+   *   issue #7), the echoed
    *   `context` (the threaded value) IS `request.ctx`, and the stored
    *   `hash` is on `request.activation.hash`.
    * @param {*} [opts.ctx] - Opaque payload echoed to the `on` module
@@ -410,11 +411,11 @@ globalThis.blob = {
    * needs.
    *
    * The chain resumes at `to` when the object is durable:
-   * `request.ctx = { hash, len }` with
-   * `request.activation.ok === true`. On failure (client
-   * disconnect, storage error) `to` runs with
-   * `request.activation.ok === false` and nothing was stored —
-   * S3 multipart is commit-gated, so a torn upload is invisible.
+   * `request.ctx = { hash, len }` with `request.status === 200`. On
+   * failure (client disconnect, storage error) `to` runs with
+   * `request.status === 0` and nothing was stored — S3 multipart is
+   * commit-gated, so a torn upload is invisible. (`status` is the
+   * single result signal; no `request.ok`, issue #7.)
    *
    * The litmus (vs `onChunk` + blob.write): does your logic depend
    * on the CONTENT of the bytes? No → this, one PUT. Yes → the
@@ -431,7 +432,7 @@ globalThis.blob = {
    *   return next();
    * }
    * export function onStored() {
-   *   if (!request.activation.ok) { response.status = 502; return "store failed"; }
+   *   if (request.status !== 200) { response.status = 502; return "store failed"; }
    *   kv.set(`media/${request.ctx.hash}`, JSON.stringify({ len: request.ctx.len }));
    *   return JSON.stringify({ hash: request.ctx.hash });
    * }
