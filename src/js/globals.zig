@@ -2105,7 +2105,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },
         .{ .name = "kv",    .cfunc = on_b.jsOnKv,      .argc = 2 },
         // Handler-surface Phase 3: connection-scoped outbound. Binds the
-        // fetch to the held chain (chunks → `{to}`/`onFetchChunk`) when
+        // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
         // held; inert when not. Lives in the http binding (composes the
         // same fetch primitive as `http.fetch`).
         .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 3 },

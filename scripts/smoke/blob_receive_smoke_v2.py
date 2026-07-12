@@ -3,9 +3,9 @@
 
 The Case-B inbound pipe: a module exporting `onHeaders` dispatches
 from headers alone (body still at the door, h2 window held);
-`blob.receive({to}) + next()` opens the valve and streams the body
+`blob.receive({on}) + next()` opens the valve and streams the body
 socket → tenant-prefix S3 multipart with ZERO chunk activations; the
-completion event resumes the held chain at `{to}` with
+completion event resumes the held chain at `{on}` with
 `request.ctx = {hash, len}`, and the handler answers the
 still-open socket.
 

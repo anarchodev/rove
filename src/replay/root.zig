@@ -225,7 +225,7 @@ pub const Engine = struct {
             }
             break :blk null;
         };
-        // The resolved export: the world's explicit `export` (the `{to}` /
+        // The resolved export: the world's explicit `export` (the `{on}` /
         // resolved name a callback needs) wins; else the conventional export.
         const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
         const result: ?epilogue.Result = if (wv.status != null or wv.ok != null or

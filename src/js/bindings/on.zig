@@ -18,7 +18,10 @@
 //! `{ to: "module.method" | "method" }` routes the wake to a specific
 //! export; the default is `onWake` (the generic "edge wake — go look"
 //! export, wired in Phase 4's kind→export map). The target reuses the
-//! continuation `path`/`fn_name` resolution.
+//! continuation `path`/`fn_name` resolution. `to` is the NATIVE field
+//! name only — the public surface is `{on}`, which the `after.js` shim
+//! lowers to `{to}` before calling `_system.*`; customer code never
+//! passes `to` (the shim rejects it as a retired spelling).
 
 const std = @import("std");
 const qjs = @import("rove-qjs");

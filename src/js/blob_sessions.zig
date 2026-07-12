@@ -22,7 +22,7 @@
 //! ## Durability contract
 //!
 //! `seal` carries NO owed-marker (unlike `blob.put`): the PUT result
-//! resumes the held chain at the customer's `{to}` export, and the
+//! resumes the held chain at the customer's `{on}` export, and the
 //! customer's own kv index write — made after observing `ok` — is
 //! the durability commit point. A crash in between means the client
 //! saw a failure and re-uploads; content-addressing makes the retry

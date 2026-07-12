@@ -204,7 +204,7 @@ pub const StreamWakes = struct {
     /// Handler-surface Phase 1 (`on.*`): the export a wake routes to —
     /// `"module.method"` or a bare `"method"`, or null → the default
     /// `onWake` (the generic "edge wake — go look" export). Allocator-
-    /// owned; set from the last `on.*` registration's `{to}` selector.
+    /// owned; set from the last `on.*` registration's `{on}` selector.
     wake_to: ?[]u8 = null,
 
     pub fn deinit(allocator: std.mem.Allocator, items: []StreamWakes) void {
@@ -308,7 +308,7 @@ pub const UpstreamFetchEvent = struct {
     /// with the whole body) lands in `onFetchResult`; a streaming
     /// fetch's intermediate chunks (`final == false`) land in
     /// `onFetchChunk` and its terminal event (`final == true`) lands
-    /// in `onFetchDone`. The customer's `{to}` override (`name`)
+    /// in `onFetchDone`. The customer's `{on}` override (`name`)
     /// supersedes this for every event of the fetch. Plain bool — no
     /// allocation, so `deinitItem` needs no change.
     stream: bool = false,
@@ -369,7 +369,7 @@ pub const UpstreamFetchEvent = struct {
 
     /// `docs/handler-shape.md` §3: resolve the named export this event
     /// dispatches to on the bound (connection-scoped) `on.fetch`
-    /// resume. An explicit `{to}` (`name`) overrides for every event of
+    /// resume. An explicit `{on}` (`name`) overrides for every event of
     /// the fetch; otherwise the export is chosen by the event shape:
     ///   - non-streaming (`stream == false`) — one `final` event with
     ///     the whole body → `onFetchResult`.

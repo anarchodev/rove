@@ -9,12 +9,10 @@
 
 export default function () {
   const cart = JSON.parse(request.text || "{}");
-  on.fetch("https://api.stripe.com/v1/charges",
-    { method: "POST", body: { amount: cart.total }, ctx: { cartId: cart.id } },
-    { to: "onCharge" });
-  on.fetch("https://ledger.internal/append",
-    { method: "POST", body: { cartId: cart.id }, ctx: { cartId: cart.id } },
-    { to: "onLedger" });
+  after.fetch("https://api.stripe.com/v1/charges",
+    { method: "POST", body: JSON.stringify({ amount: cart.total }), ctx: { cartId: cart.id }, on: "onCharge" });
+  after.fetch("https://ledger.internal/append",
+    { method: "POST", body: JSON.stringify({ cartId: cart.id }), ctx: { cartId: cart.id }, on: "onLedger" });
   response.status = 202;             // head: accepted
   return "accepted";                 // terminal body → commit + close
 }

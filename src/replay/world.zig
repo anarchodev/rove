@@ -43,7 +43,7 @@ pub const Source = struct { path: []const u8, kind: []const u8, source: []const 
 pub const World = struct {
     entry: []const u8 = "index.mjs",
     activation: []const u8 = "inbound",
-    /// The export to invoke. For a callback (a fetch result, a `{to}`, an
+    /// The export to invoke. For a callback (a fetch result, a `{on}`, an
     /// `onResult`) this is the *resolved* export name — the runtime doesn't
     /// derive it from the kind (see `architecture/replay-and-sim.md` §2). When
     /// null, `runWorld` falls back to the conventional export for the kind.
@@ -332,7 +332,7 @@ test "fromValue: non-inbound (fetch result) surface" {
     const w = try fromValue(a, parsed.value);
 
     try testing.expectEqualStrings("fetch_chunk", w.activation);
-    try testing.expectEqualStrings("onUpstream", w.export_name.?); // {to} override
+    try testing.expectEqualStrings("onUpstream", w.export_name.?); // {on} override
     try testing.expectEqual(@as(i64, 502), w.status.?);
     try testing.expectEqual(false, w.ok.?);
     try testing.expectEqual(true, w.done.?);

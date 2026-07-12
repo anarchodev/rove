@@ -12,7 +12,7 @@ against real S3 (the V2 blob backend is S3-only):
      with `ok: true`.
   2. `blob.get`: a second request reads the object back through the
      signed `rove-blob.internal` door (connection-scoped `on.fetch`
-     composition, `{to}` export routing) — bytes round-trip.
+     composition, `{on}` export routing) — bytes round-trip.
   3. `blob.url`: a presigned GET URL minted by the handler is fetched
      DIRECTLY from this test process (zero worker involvement) and
      returns the bytes with the signed content-type — proves the

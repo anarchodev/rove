@@ -383,7 +383,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   not a return argument. Dispatch is by named export keyed on activation kind
   (`onWake` / `onDisconnect` / `onFetchResult` / `onFetchChunk` / `onFetchDone` /
   `onSubscription` / default; `onCron` retired with durable-wake, `onBoot` retired 2026-07-05 (unused)
-  P5(b); `{to}` overrides). The
+  P5(b); `{on}` overrides). The
   `stream` pipeline is unchanged — only the entry trigger, head, and disposition
   changed. The old `bind:true` / `stream`-return-verb / `detach` framings are
   retired.

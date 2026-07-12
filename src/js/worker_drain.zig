@@ -2049,7 +2049,7 @@ pub fn resumeBoundFetchChain(
         .terminal_status = ev.terminal_status,
         .terminal_ok = ev.terminal_ok,
         .body_truncated = ev.body_truncated,
-        .export_name = fn_name, // record the resolved export ({to} / onFetch*) — G3
+        .export_name = fn_name, // record the resolved export ({on} / onFetch*) — G3
     };
     const req: Request = .{
         .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, cont_path),

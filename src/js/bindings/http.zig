@@ -189,9 +189,12 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
 }
 
 /// `_system.on.fetch(url, opts?, { to? })` — connection-scoped outbound
-/// (handler-surface Phase 3, `docs/handler-shape.md` §2.3). Issues an
+/// (handler-surface Phase 3, `docs/handler-shape.md` §2.3). The third
+/// arg's `to` is the NATIVE spelling of the public `{on}` (the
+/// `after.js` shim lowers `opts.on` → `{to}` before calling this;
+/// customer code never passes `to`). Issues an
 /// HTTP request whose result wakes THIS connection: chunks resume the
-/// held chain's `{to}` export (default `onFetchChunk`). Connection-only
+/// held chain's `{on}` export (default `onFetchChunk`). Connection-only
 /// — if the activation doesn't end up holding the socket the fetch is
 /// INERT (dropped at the success seam, no unbound fire); connectionless
 /// outbound is `webhook.send`. The transient twin of `webhook.send`;
@@ -246,7 +249,8 @@ pub fn jsOnFetch(
 
 /// Build a `BuiltFetch` for `on.fetch`: `url` is a positional string
 /// (arg0, not `opts.url`); the shared transport fields come from `opts`;
-/// `{to}` (an optional `{ to: "export" }` object) selects the bound
+/// the third arg (an optional `{ to: "export" }` object — the lowered
+/// form of the public `{on}`) selects the bound
 /// export via `name`. `connection_scoped = true`,
 /// `on_chunk` empty (a connection-scoped fetch never fires unbound).
 fn buildOnFetchRow(
@@ -487,7 +491,7 @@ const BuiltFetch = struct {
     name: []u8 = &.{},
     /// Handler-surface Phase 3: true ⇒ this fetch was issued via
     /// `on.fetch` — a CONNECTION trigger. Connection-scoped by
-    /// construction: it binds to the held chain (chunks → `{to}` /
+    /// construction: it binds to the held chain (chunks → `{on}` /
     /// `onFetchChunk`) when the activation holds the socket, and is
     /// INERT (dropped, no unbound fire) when it doesn't — the model's
     /// "all `on.*` are for the current connection; connectionless

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """WS `on.fetch` smoke — proves a held WebSocket chain can call out via
-`on.fetch` from `onMessage` and resume its `{to}` export over the SAME socket
+`on.fetch` from `onMessage` and resume its `{on}` export over the SAME socket
 (the engine fix's on.fetch half; `ws_wake_smoke_v2.py` covers on.kv/on.timer).
 
 A deployed handler, on a `fetch:<url>` frame, issues `after.fetch(url)` from a

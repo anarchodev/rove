@@ -57,7 +57,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     const path = if (req) |r| (jStr(r, "path") orelse "/") else "/";
     const host = if (req) |r| (jStr(r, "host") orelse "") else "";
 
-    const export_name = jStr(obj, "export"); // recorded resolved export ({to}) — G3
+    const export_name = jStr(obj, "export"); // recorded resolved export ({on}) — G3
     const recorded = if (obj.get("recorded")) |v| (if (v == .object) v.object else null) else null;
 
     const tapes = if (obj.get("tapes")) |v| (if (v == .object) v.object else null) else null;

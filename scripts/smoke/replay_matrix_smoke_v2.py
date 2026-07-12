@@ -100,7 +100,7 @@ def replay(rec, tenant, activation, source):
         "tapes": {fx: tapes[rf] for rf, fx in _REMAP if tapes.get(rf)},
         "sources": [{"path": "index.mjs", "kind": "handler", "source": source}],
     }
-    if tapes.get("export"):  # the recorded resolved export ({to}) — G3
+    if tapes.get("export"):  # the recorded resolved export ({on}) — G3
         fixture["export"] = tapes["export"]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(fixture, f)
@@ -147,7 +147,7 @@ def main() -> int:
         bulk_url = f"http://up.{PUBLIC_SUFFIX}:{c.front_port}/"
         r = c.get("fch", f"/?url={up.quote(bulk_url)}", timeout=30.0)
         live_len = (json.loads(r.body).get("len") if r.status == 200 else None)
-        check("[fetch_chunk] live on.fetch → onUpstream ({to})", live_len == len(EXPECTED_BODY), f"{r.status} {r.body!r}")
+        check("[fetch_chunk] live on.fetch → onUpstream ({on})", live_len == len(EXPECTED_BODY), f"{r.status} {r.body!r}")
         rec = find_record(c, "fch", "fetch_chunk")
         art = replay(rec, "fch", "fetch_chunk", FETCH_SRC) if rec else None
         summ = {}
@@ -155,7 +155,7 @@ def main() -> int:
             summ = json.loads(art.get("body") or "{}") if art else {}
         except (json.JSONDecodeError, TypeError):
             pass
-        check("[fetch_chunk+G3] replay uses recorded {to} export, reproduces body+status",
+        check("[fetch_chunk+G3] replay uses recorded {on} export, reproduces body+status",
               art and art.get("divergence") is None and summ.get("len") == len(EXPECTED_BODY) and summ.get("status") == 200,
               f"summ={summ!r} div={art.get('divergence') if art else None}")
 

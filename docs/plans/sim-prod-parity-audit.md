@@ -103,7 +103,7 @@ match the worker bakes in behavior that may itself be the bug:
   divergence. Each of these greens in sim, throws in prod: `after.ms(0)`
   (`on.zig:60-69`); `after.kv(nonString)` (`on.zig:90-93`); `after.fetch()`
   sans URL (`http.zig:207-210`); non-string/U8 fetch body (`http.zig:694`);
-  `{on}`/`{to}` containing `/` or `.` (`http.zig:285-291` — see also 4.6);
+  `{on}` (native `to`/`name`) containing `/` or `.` (`http.zig:285-291` — see also 4.6);
   `http.subscribe` without `on` (`http.zig:549-551`); `stream.write({})` and
   the 4 MiB stream buffer cap (`stream.zig:146-212`); `blob.url` ttl range
   (`bindings/blob.zig:62-70`); `blob.receive` outside onHeaders / twice
@@ -216,7 +216,7 @@ match the worker bakes in behavior that may itself be the bug:
   `parent.world.entry` (`rewind_test.mjs:620-629,695-704`). Prod resumes at
   the continuation's own path (`worker_drain.zig:1740-1752`).
 - **4.2 Per-wake `{on}` routing.** divergence. Sim honors each armed wake's
-  own export; prod keeps ONE `wake_to` per held connection — last `{to}`
+  own export; prod keeps ONE `wake_to` per held connection — last `{on}`
   wins (`worker_dispatch.zig:376-386`, `worker_ws.zig:694-705`) — and the
   HTTP-stream resume path ignores it entirely (no fn_override in
   `resumeStream`, `worker_streaming.zig:899-924` → always `onWake`).

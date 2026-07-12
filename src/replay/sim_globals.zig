@@ -243,6 +243,9 @@ const SYSTEM_SHIM =
     \\      cancelSubscription: function(){},
     \\    },
     \\    after: {
+    \\      // NB: `tgt.to` is the NATIVE lowered form — the public after.js shim
+    \\      // translates the customer's `{on}` to `{to}` before calling _system.*.
+    \\      // Customer code passes `{on}` IN OPTS ({to}/third-arg-{on} are retired).
     \\      fetch: function(url, o, tgt){ return recFetch(url, o, (tgt && tgt.to) || (o && o.on) || null); },
     \\      kv: function(prefix, tgt){ push({ kind: "kv-wake", prefix: prefix, on: (tgt && tgt.to) || null }); },
     \\      timer: function(ms, tgt){ push({ kind: "timer", ms: ms, on: (tgt && tgt.to) || null }); },
