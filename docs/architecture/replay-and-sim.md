@@ -253,7 +253,9 @@ overridden callback replays under its actual export. Validated in the matrix
 replay arena~~ **FIXED** — the epilogue now shims `TextDecoder`/`TextEncoder`,
 `stream.*`/`on.*`/`next`/`webhook`/`schedule`/`cron`/`blob`/`request.tag`; outputs
 are captured into the bundle (`stream`/`wakes`/`sends`) rather than fired.
-`stream`/`on`/`next`/`TextDecoder` are fully faithful; `webhook`/`schedule`/
+`stream`/`on`/`next`/`TextEncoder`/`TextDecoder` are fully faithful (the codec
+is real UTF-8 matching prod byte-for-byte — WTF-8 lone-surrogate encode + per-
+bad-byte U+FFFD decode — issue #11, was latin1-truncating); `webhook`/`schedule`/
 `cron`/`blob` record but don't re-run their durability shims (their kv markers
 aren't reproduced — the handler's own kv writes are). ~~(c) binary WS frames need
 a `Uint8Array` surface~~ **FIXED** — a binary frame (opcode 2) carries its bytes
