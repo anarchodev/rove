@@ -131,8 +131,9 @@ pub const WsMessage = struct {};
 pub const KvWake = struct {};
 
 /// Batched kv-wake (`streaming-handlers-plan` §9.4 + primitive-gaps
-/// §2.2). Today: `PendingWakes` ring → temporal-order batch on stream
-/// resume. Migrates alongside the streaming origins.
+/// §2.2). Today: `StreamWakes` per-arm fired state → fired-prefix
+/// batch on resume (decisions.md §3.10). Migrates alongside the
+/// streaming origins.
 pub const WakeBatch = struct {};
 
 /// Subscription chain origin — kv-react (primitive-gaps §2.1; the

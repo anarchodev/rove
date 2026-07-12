@@ -13,10 +13,11 @@ expect(held.ctx).toEqual({ room: "r1", seen: 0 });
 const timedOut = held.clock.advance("30s").fire();
 expect(timedOut).toHaveWritten("room/r1/closed", "timeout");
 
-// after.kv wake → onMsg; the change shows on request.activation.wakes; re-holds.
+// after.kv wake → onMsg; the FIRED PREFIX shows on request.activation.wakes
+// (issue #8 — never the matched key); re-holds.
 const woke = held.wakeKv({ "msg/r1/1": { text: "hi" } });
 expect(woke.disposition).toBe("held");
-expect(woke).toHaveWritten("room/r1/lastwake", { count: 1, key: "msg/r1/1" });
+expect(woke).toHaveWritten("room/r1/lastwake", { count: 1, prefix: "msg/r1/" });
 expect(woke.ctx).toEqual({ room: "r1", seen: 1 });
 
 // client disconnect → onDisconnect, held ctx threaded.

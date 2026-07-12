@@ -18,7 +18,7 @@ export function onTimeout() {
 export function onMsg() {
   const room = request.ctx.room;
   const wakes = request.activation.wakes;
-  kv.set("room/" + room + "/lastwake", JSON.stringify({ count: wakes.length, key: wakes[0].key }));
+  kv.set("room/" + room + "/lastwake", JSON.stringify({ count: wakes.length, prefix: wakes[0].prefix }));
   return next({ room, seen: request.ctx.seen + 1 }); // re-hold (SSE loop)
 }
 

@@ -65,18 +65,20 @@ STREAMKV_SRC = r"""export default function () {
     stream.start();
     stream.write("event: ready\ndata: 1\n\n");
     after.kv("streamkv/in/");
-    return next();
+    return next({ cursor: null });
 }
 
 export function onWake() {
     stream.start();
-    for (const w of request.activation.wakes) {
-        if (w.kind !== "kv") continue;
-        const v = kv.get(w.key) ?? "(absent)";
-        stream.write("event: update\ndata: " + w.key + "=" + v + "\n\n");
+    // Go-look drain (issue #8): the wake names the fired prefix, never
+    // the matched keys; emit everything past the ctx cursor.
+    const cursor = request.ctx ? request.ctx.cursor : null;
+    const rows = kv.prefix("streamkv/in/", cursor);
+    for (const r of rows) {
+        stream.write("event: update\ndata: " + r.key + "=" + r.value + "\n\n");
     }
     after.kv("streamkv/in/");
-    return next();
+    return next({ cursor: rows.length ? rows.at(-1).key : cursor });
 }
 """
 

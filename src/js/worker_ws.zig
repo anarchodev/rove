@@ -681,22 +681,21 @@ fn installWsWakes(
     const server = worker.h2;
 
     if (server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
-        for (old.kv_prefixes) |pfx| allocator.free(pfx);
+        for (old.kv_prefixes) |arm| allocator.free(arm.prefix);
         if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
         if (old.wake_to) |t| allocator.free(t);
-        old.pending_wakes.deinit(allocator);
         old.* = .{};
     } else |_| {}
 
     var interval_ms: i64 = 0;
     var wake_to: ?[]u8 = null;
-    var prefixes: std.ArrayListUnmanaged([]u8) = .empty;
+    var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     for (pending.items) |reg| {
         switch (reg.kind) {
             .timer => interval_ms = reg.interval_ms,
             .kv => if (reg.prefix.len > 0) {
                 const dup = allocator.dupe(u8, reg.prefix) catch continue;
-                prefixes.append(allocator, dup) catch allocator.free(dup);
+                arms.append(allocator, .{ .prefix = dup }) catch allocator.free(dup);
             },
         }
         if (reg.to) |t| {
@@ -709,9 +708,9 @@ fn installWsWakes(
         now_ns + interval_ms * std.time.ns_per_ms
     else
         std.math.maxInt(i64);
-    const kv_prefixes = prefixes.toOwnedSlice(allocator) catch {
-        for (prefixes.items) |pfx| allocator.free(pfx);
-        prefixes.deinit(allocator);
+    const kv_prefixes = arms.toOwnedSlice(allocator) catch {
+        for (arms.items) |arm| allocator.free(arm.prefix);
+        arms.deinit(allocator);
         if (wake_to) |t| allocator.free(t);
         return; // OOM — leave the chain unarmed rather than leak
     };
@@ -860,14 +859,18 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
     const wakes_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes) catch return;
 
-    // Consume the kv-match ring — this resume is the "go look" edge; the
-    // entries must not re-fire next sweep (onWake re-reads authoritative kv).
-    if (wakes_st.pending_wakes.len > 0) {
-        if (wakes_st.pending_wakes.drainInto(allocator)) |drained| {
-            for (drained.wakes) |*we| we.deinit(allocator);
-            if (drained.wakes.len > 0) allocator.free(drained.wakes);
-        } else |_| {}
-    }
+    // Drain the fired arms — this resume consumes the "go look" edge, so
+    // nothing re-fires next sweep (onWake re-reads authoritative kv).
+    // The entries surface on `request.activation.wakes[]` as fired
+    // PREFIXES (issue #8) — same contract as the held (worker_drain) and
+    // stream (worker_streaming) resume paths. Owned for the dispatch's
+    // lifetime; freed after the JS copies them. OOM → empty batch, arms
+    // stay fired and re-fire next tick (safe under edge semantics).
+    const batch_owned: []components_mod.WakeEntry = wakes_st.drainFired(allocator) catch &.{};
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
 
     const path = chain_st.module_path;
     var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-wake") orelse {
@@ -913,7 +916,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         .body = body,
         .fn_override = resume_fn,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
-        .activation = .{ .wake_batch = .{} },
+        .activation = .{ .wake_batch = .{ .wakes = batch_owned } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },

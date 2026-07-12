@@ -54,12 +54,17 @@ export default function () {
 
 export function onWake() {
     stream.start(); // keep the stream alive even on a zero-frame wake
+    // Go-look relay (issue #8): the wake names the FIRED PREFIX; scan
+    // under it and relay everything not yet processed (the out-key
+    // marker doubles as the dedupe cursor).
     for (const w of request.activation.wakes) {
         if (w.kind !== "kv") continue;
-        const value = kv.get(w.key) ?? "(absent)";
-        const out_key = "watchwrite/out/" + w.key.slice("watchwrite/in/".length);
-        kv.set(out_key, "processed:" + value);
-        stream.write(`event: relayed\\ndata: ${w.key}->${out_key}\\n\\n`);
+        for (const r of kv.prefix(w.prefix)) {
+            const out_key = "watchwrite/out/" + r.key.slice(w.prefix.length);
+            if (kv.get(out_key) != null) continue; // already relayed
+            kv.set(out_key, "processed:" + r.value);
+            stream.write(`event: relayed\\ndata: ${r.key}->${out_key}\\n\\n`);
+        }
     }
     after.kv("watchwrite/in/");
     return next();

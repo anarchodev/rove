@@ -338,7 +338,7 @@ export** a trigger's activation lands in; it does not invent a kind.
 > (`runModule`). `request.activation.kind` is no longer a dispatch
 > discriminator (the named export is); it remains on
 > `request.activation` alongside the wake / source payload (`wakes` /
-> `overflow` / `write_pressure` / `source`). The inbound-chunk
+> `source`). The inbound-chunk
 > (`onChunk`) split in the table above is SHIPPED (gap 2.4,
 > 2026-06-10): a chunk activation's payload is arbitrary bytes — read
 > it as `request.bytes` (or `.text`/`.json`, same as every payload
@@ -739,10 +739,17 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `request.ctx` is `undefined` on the **first** activation of a chain
   (nothing threaded yet). A `cron`/`schedule` target reads the payload
   it was scheduled with as `request.ctx` too — the one-ctx rule has no
-  exceptions. `after.kv`/`after.ms` are edge
-  ("go look") wakes — they carry **no** matched key/value; `onWake`
-  re-reads authoritative `kv`, and which keys fired is on
-  `request.activation.wakes[]` if you need it.
+  exceptions. `after.kv`/`after.ms` are edge ("go look") wakes — they
+  carry **no** matched key or value; `onWake` re-reads authoritative
+  `kv`. What the resume tells you is **which watch fired**, on
+  **`request.activation.wakes[]`**: one entry per fired arm, `{ kind:
+  "kv", prefix, firedAt }` (the armed prefix, exactly as you passed it
+  to `after.kv`) or `{ kind: "timer", firedAt }`, with `firedAt` in
+  milliseconds since epoch. A burst of writes under one prefix is one
+  entry (latest `firedAt` wins) — the signal is complete by
+  construction, so there is nothing to overflow and no missed-wakes
+  counter to check. Identical on every resume path (a streaming chain,
+  a buffered held `next()`, and a held WebSocket).
 - **Fetch / effect results — one flattened surface:** a bound `after.fetch` /
   `blob.get` resume **and** a `webhook.send` / `blob.put` / `retry`
   `{on}` callback (and a §6.4 held-sync resume) present the result

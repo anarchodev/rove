@@ -26,11 +26,16 @@ export function onMessage() {
 }
 
 export function onWake() {                      // kv under the prefix changed
-  // Edge "go look" wake: re-read authoritative kv (onWake doesn't get
-  // request.ctx — it re-reads the watched prefix it knows it armed).
-  const rows = kv.prefix("feed/");
+  // Edge "go look" wake: request.activation.wakes[] names WHICH armed
+  // prefix fired (issue #8 — never the matched keys); re-read
+  // authoritative kv under it for the data.
+  const fired = (request.activation.wakes || [])
+    .filter((w) => w.kind === "kv")
+    .map((w) => w.prefix)
+    .join(",");
+  const rows = kv.prefix(fired || "feed/");
   const last = rows.length ? rows[rows.length - 1].value : "<none>";
-  stream.write("woke:" + last);
+  stream.write("woke:" + last + "|fired:" + fired);
   return next();
 }
 

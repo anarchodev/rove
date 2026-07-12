@@ -175,15 +175,15 @@ pub fn setStreamComponents(
     }
 
     {
-        const spine: [][]u8 = if (kv_prefixes.len > 0)
-            try allocator.alloc([]u8, kv_prefixes.len)
+        const spine: []components_mod.KvArm = if (kv_prefixes.len > 0)
+            try allocator.alloc(components_mod.KvArm, kv_prefixes.len)
         else
             &.{};
         errdefer if (kv_prefixes.len > 0) allocator.free(spine);
         var built: usize = 0;
-        errdefer for (spine[0..built]) |p| allocator.free(p);
+        errdefer for (spine[0..built]) |arm| allocator.free(arm.prefix);
         for (kv_prefixes, 0..) |p, i| {
-            spine[i] = try allocator.dupe(u8, p);
+            spine[i] = .{ .prefix = try allocator.dupe(u8, p) };
             built = i + 1;
         }
         const next_wake_ns: i64 = if (interval_ms > 0)
@@ -287,24 +287,21 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             continue;
         }
 
-        // Gap 2.2 Phase D: timer-due → push timer entry to the
-        // §9.4 ring + advance next_wake_ns; the wake-batch
-        // activation below fires from the ring (kv + timer
-        // unified). next_wake_ns is reset relative to now
-        // (drift-on-each-fire, matching the existing pattern in
-        // resumeStream's outcome handler at ~4472).
+        // Gap 2.2 Phase D: timer-due → stamp `timer_fired_ns` +
+        // advance next_wake_ns; the wake-batch activation below
+        // fires from the fired state (kv + timer unified).
+        // next_wake_ns is reset relative to now (drift-on-each-fire,
+        // matching the existing pattern in resumeStream's outcome
+        // handler at ~4472).
         if (wakes_comp.interval_ms > 0 and now_ns >= wakes_comp.next_wake_ns) {
-            wakes_comp.pending_wakes.push(worker.allocator, .{
-                .tag = .timer,
-                .fired_at_ns = now_ns,
-            });
+            wakes_comp.timer_fired_ns = now_ns;
             wakes_comp.next_wake_ns = now_ns + wakes_comp.interval_ms * std.time.ns_per_ms;
         }
 
-        // Any wakes in the ring? Fire one wake_batch activation
-        // (drains kv + timer entries in temporal order; surfaces
-        // `lost_oldest` as the §9.4 rate-limit signal).
-        if (wakes_comp.pending_wakes.len > 0) {
+        // Any arm fired? Fire one wake_batch activation (drains the
+        // fired kv arms + timer into `request.activation.wakes[]` —
+        // fired PREFIXES, issue #8).
+        if (wakes_comp.anyFired()) {
             if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
                 std.log.warn(
                     "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
@@ -353,10 +350,10 @@ pub fn serviceParkedStreams(worker: anytype) !void {
 
 /// Drain the worker's `wake_inbox` of kv-write events. For every
 /// stream entity (in one of the h2 stream-pipeline collections,
-/// not draining) whose `kv_prefixes` includes a prefix of the
-/// event's key, push a `WakeEntry` into the §9.4 `pending_wakes`
-/// ring (oldest-first, ring drops oldest + bumps `lost_oldest`
-/// on overflow — surfaces to the handler as the rate-limit signal).
+/// not draining), stamp `fired_at_ns` on every armed `kv_prefixes`
+/// arm that prefixes the event's key (issue #8: a match marks the
+/// ARM fired; keys are never accumulated, so a burst of matches is
+/// one re-stamp — nothing to overflow, nothing lost).
 /// Events whose tenant_id matches no held stream are simply
 /// dropped — the per-tenant scoping § 4.6 invariant lives at
 /// REGISTRATION time (a cell only registers prefixes for its own
@@ -399,25 +396,22 @@ fn drainKvWakeInbox(worker: anytype) !void {
         for (wakes_col, chains_col, drain_col) |*wakes, chain_ctx, drain| {
             if (drain.is_draining) continue;
             if (wakes.kv_prefixes.len == 0) continue;
-            try matchEventsToWakes(allocator, &events, wakes, chain_ctx);
+            matchEventsToWakes(&events, wakes, chain_ctx);
         }
     }
 }
 
-/// Walk events oldest-first; push every matching event into the §9.4
-/// `PendingWakes` ring on this stream. The ring drops oldest +
-/// bumps `lost_oldest` on overflow, so a burst of >K matches is
-/// rate-limited by construction — the handler sees `lost_oldest > 0`
-/// on its next activation and re-reads kv state.
+/// Walk events oldest-first; stamp every armed prefix that matches an
+/// event's key as fired (issue #8 fired-prefix contract). EVERY
+/// matching arm fires — a key under two armed prefixes marks both.
+/// No allocation, no accumulation: N matches on one arm are one
+/// re-stamp (latest fire time wins), so nothing can overflow.
 fn matchEventsToWakes(
-    allocator: std.mem.Allocator,
     events: *std.ArrayListUnmanaged(KvWakeEvent),
     wakes: *components_mod.StreamWakes,
     chain_ctx: components_mod.ChainContext,
-) !void {
+) void {
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    // Oldest-first so the ring preserves temporal order (§9.4 wakes
-    // surface in the order they happened; the handler iterates).
     for (events.items) |ev| {
         if (!std.mem.eql(u8, ev.tenant_id, chain_ctx.tenant_id)) continue;
         // §8.4 watch baseline (`on.kv`): a watch armed at `read_version`
@@ -426,25 +420,11 @@ fn matchEventsToWakes(
         // pre-`on.kv` stream path — fire on any prefix match. `maxInt`
         // event versions (producer couldn't read the clock) always pass.
         if (wakes.read_version != 0 and ev.write_version <= wakes.read_version) continue;
-        var matched: bool = false;
-        for (wakes.kv_prefixes) |pfx| {
-            if (std.mem.startsWith(u8, ev.key, pfx)) {
-                matched = true;
-                break;
+        for (wakes.kv_prefixes) |*arm| {
+            if (std.mem.startsWith(u8, ev.key, arm.prefix)) {
+                arm.fired_at_ns = now_ns;
             }
         }
-        if (!matched) continue;
-
-        // `push` takes ownership of the duplicated key on success;
-        // on full-ring it drops the oldest (freeing its key) and
-        // bumps `lost_oldest`.
-        const ring_key = try allocator.dupe(u8, ev.key);
-        wakes.pending_wakes.push(allocator, .{
-            .tag = .kv,
-            .kv_key = ring_key,
-            .kv_op = ev.op,
-            .fired_at_ns = now_ns,
-        });
     }
 }
 
@@ -456,11 +436,11 @@ fn matchEventsToWakes(
 /// Handler-cmds Phase 8 TEA-framing (Gap 2.2 reshape):
 ///   - **Msg**:   `(wake_batch, entity in stream_data_out with
 ///                non-empty StreamChain.module_path AND
-///                StreamWakes.pending_wakes.len > 0)`.
+///                StreamWakes.anyFired())`.
 ///   - **prep**:  read four stream components on the entity; resolve
-///                deployment; drain `pending_wakes` ring into the
-///                Request's `activation_wakes` slice + `lost_oldest`
-///                snapshot; build request body = `{ctx}` with
+///                deployment; drain the fired arms (`drainFired`) into
+///                the Request's wake_batch slice (fired prefixes,
+///                issue #8); build request body = `{ctx}` with
 ///                `.wake_batch` activation.
 ///   - **run**:   `dispatcher.runOutcome` (chain-tail txn).
 ///   - **apply (Cmd-list)**: switch on outcome:
@@ -771,13 +751,22 @@ fn finishStreamResume(
                 ctx.wakes_st.next_wake_ns = std.math.maxInt(i64);
             }
             // Replace the StreamWakes kv-wake registration with whatever
-            // the handler returned: free old prefixes, take ownership of
-            // the new ones (the (tenant, prefix) registry is a derived
-            // view recomputed on every match scan — no unregister step).
-            for (ctx.wakes_st.kv_prefixes) |p| allocator.free(p);
-            if (ctx.wakes_st.kv_prefixes.len > 0) allocator.free(ctx.wakes_st.kv_prefixes);
-            ctx.wakes_st.kv_prefixes = s2.kv_prefixes;
-            s2.kv_prefixes = &.{};
+            // the handler returned: free old arms, take ownership of the
+            // new prefixes as unfired arms (the (tenant, prefix) registry
+            // is a derived view recomputed on every match scan — no
+            // unregister step). On OOM keep the old arms — the chain
+            // stays armed with its previous watches rather than none.
+            if (components_mod.armsFromPrefixes(allocator, s2.kv_prefixes)) |arms| {
+                for (ctx.wakes_st.kv_prefixes) |arm| allocator.free(arm.prefix);
+                if (ctx.wakes_st.kv_prefixes.len > 0) allocator.free(ctx.wakes_st.kv_prefixes);
+                ctx.wakes_st.kv_prefixes = arms;
+                s2.kv_prefixes = &.{};
+            } else |_| {
+                std.log.warn("rove-js " ++ spec.site ++ ": wake rearm alloc failed; keeping prior arms", .{});
+                for (s2.kv_prefixes) |p| allocator.free(p);
+                if (s2.kv_prefixes.len > 0) allocator.free(s2.kv_prefixes);
+                s2.kv_prefixes = &.{};
+            }
             ctx.chain_st.activation_count += 1;
             captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, fw_seq);
         },
@@ -855,21 +844,18 @@ fn resumeStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    // wake_batch activation: drain the StreamWakes ring into a
-    // temporal-order slice + `lost_oldest` snapshot; resumeStream
-    // owns the slice + each entry's `kv_key` for the dispatch's
-    // lifetime.
+    // wake_batch activation: drain the fired arms (issue #8 — fired
+    // PREFIXES, fire-time order) so nothing re-fires next sweep;
+    // resumeStream owns the slice + each entry's `prefix` for the
+    // dispatch's lifetime.
     var batch_owned: []components_mod.WakeEntry = &.{};
-    var batch_lost_oldest: u32 = 0;
     defer if (batch_owned.len > 0) {
         for (batch_owned) |*w| w.deinit(allocator);
         allocator.free(batch_owned);
     };
     if (activation == .wake_batch) {
-        const drained = wakes_st.pending_wakes.drainInto(allocator) catch
+        batch_owned = wakes_st.drainFired(allocator) catch
             return error.ResumeWakeDrain;
-        batch_owned = drained.wakes;
-        batch_lost_oldest = drained.lost_oldest;
     }
     // Handler-surface Phase 2: a resumed stream handler re-arms its
     // wakes via `on.*` and emits more output via `stream.write()`, just
@@ -906,7 +892,7 @@ fn resumeStream(
         // other stream-wake kinds) — build the payload arm for wake_batch,
         // fall back to the payload-less arm for the rest.
         .activation = if (activation == .wake_batch)
-            .{ .wake_batch = .{ .wakes = batch_owned, .lost_oldest = batch_lost_oldest } }
+            .{ .wake_batch = .{ .wakes = batch_owned } }
         else
             dispatcher_mod.Activation.fromSource(activation),
         .trace = .{
