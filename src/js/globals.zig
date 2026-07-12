@@ -314,12 +314,13 @@ pub const PendingWakeReg = struct {
     /// and the list's deinit frees the rest.
     prefix: []u8 = &.{},
     /// Resume export selector ("module.method" or a bare "method"), or
-    /// null → the default `onWake` export. Allocator-owned.
-    to: ?[]u8 = null,
+    /// null → the default `onWake` export. Allocator-owned. Mirrors the
+    /// `{on}` opts key — one spelling from customer surface to here.
+    on: ?[]u8 = null,
 
     pub fn deinit(self: *PendingWakeReg, allocator: std.mem.Allocator) void {
         if (self.prefix.len > 0) allocator.free(self.prefix);
-        if (self.to) |t| allocator.free(t);
+        if (self.on) |t| allocator.free(t);
         self.* = undefined;
     }
 };
@@ -2108,7 +2109,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
         // held; inert when not. Lives in the http binding (composes the
         // same fetch primitive as `http.fetch`).
-        .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 3 },
+        .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 2 },
     } },
     // Handler-surface Phase 2: connection output effects. `stream.start`
     // / `stream.write` accumulate onto `DispatchState`; the worker

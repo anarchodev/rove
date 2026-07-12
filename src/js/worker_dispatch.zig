@@ -380,7 +380,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         }
         // Last `{on}` wins — `on.*` wakes resume one "edge wake" export
         // per held connection; a default `onWake` applies when null.
-        if (reg.to) |t| {
+        if (reg.on) |t| {
             if (wake_to) |old| allocator.free(old);
             wake_to = try allocator.dupe(u8, t);
         }

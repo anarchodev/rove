@@ -442,7 +442,7 @@ fn matchWrite(a: std.mem.Allocator, effects: []const std.json.Value, want: std.j
     return false;
 }
 
-/// A `cmd` expectation `{kind, url?, to?}` must match some effect of that kind.
+/// A `cmd` expectation `{kind, url?, on?}` must match some effect of that kind.
 fn matchCmd(a: std.mem.Allocator, effects: []const std.json.Value, want: std.json.Value) bool {
     if (want != .object) return false;
     for (effects) |e| {
@@ -455,8 +455,12 @@ fn matchCmd(a: std.mem.Allocator, effects: []const std.json.Value, want: std.jso
             const eu = e.object.get("url") orelse continue;
             if (!valEq(a, eu, wu)) continue;
         }
-        if (want.object.get("to")) |wt| {
-            const et = e.object.get("to") orelse continue;
+        // The effect log's target key is `on` (the recorders' one spelling);
+        // an expectation's `on` must find it. (The pre-rename `to` key here
+        // could never match a recorded effect — the fixture surface and the
+        // recorders had drifted.)
+        if (want.object.get("on")) |wt| {
+            const et = e.object.get("on") orelse continue;
             if (!valEq(a, et, wt)) continue;
         }
         return true;
@@ -546,8 +550,8 @@ fn buildExpected(a: std.mem.Allocator, w: *std.Io.Writer, bundle_json: []const u
             try w.writeAll(",\"url\":");
             try std.json.Stringify.value(u, .{}, w);
         }
-        if (e.object.get("to")) |t| if (t != .null) {
-            try w.writeAll(",\"to\":");
+        if (e.object.get("on")) |t| if (t != .null) {
+            try w.writeAll(",\"on\":");
             try std.json.Stringify.value(t, .{}, w);
         };
         try w.writeByte('}');

@@ -197,7 +197,7 @@
      * replay log — the "why" channel. Issues a read-only fetch through
      * the internal `rewind-logs.internal` door, which the engine pins to
      * THIS handler's own tenant (it can't reach another tenant's logs).
-     * The result wakes `opts.to`; the handler must `return next(...)`
+     * The result wakes `opts.on`; the handler must `return next(...)`
      * after this to hold the connection across the round-trip — same
      * shape as `after.fetch`.
      *
@@ -231,10 +231,10 @@
       }
       if (opts.since) url += "&after_received_ns=" + opts.since;
       // The result-target `on` rides IN opts — `after.fetch(url, opts)` takes two
-      // args and lowers `opts.on` to the native `{to}`. Passing `{on}` as a third
-      // arg (as this once did) is silently dropped, so the reply resumes at the
-      // default `onFetchResult` instead of the caller's `on` — the success bounce
-      // never reaches it.
+      // args (the key is `on` at the native layer too). Passing a target as a
+      // third arg (as this once did) is silently dropped, so the reply resumes at
+      // the default `onFetchResult` instead of the caller's `on` — the success
+      // bounce never reaches it.
       after.fetch(url, { method: "GET", on: on_key });
       return true;
     },

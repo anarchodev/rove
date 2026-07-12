@@ -82,10 +82,10 @@
           max_response_chunk_bytes: opts.max_bytes || 8 * 1024 * 1024,
         };
         if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
+        fetch_opts.on = opts.on || "onFetchResult";
         return sysOn.fetch(
           "http://rove-blob-read.internal/" + id + "/blob/" + hash,
           fetch_opts,
-          { to: opts.on || "onFetchResult" },
         );
       };
       // deploy.stampManifest is the deploy's STAGING BARRIER — it lowers to
@@ -104,8 +104,7 @@
             req.resolution = JSON.stringify(opts.resolution);
           return sysOn.fetch(
             "http://rove-stage.internal/",
-            { method: "POST", body: JSON.stringify(req) },
-            { to: opts.on || "onStamped" },
+            { method: "POST", body: JSON.stringify(req), on: opts.on || "onStamped" },
           );
         },
         // readManifest is the READ twin of stampManifest: it reads `id`'s
@@ -116,12 +115,11 @@
         // `scope(id).kv.get("_deploy/current")`.
         readManifest(dep_id, opts) {
           opts = opts || {};
-          const fetch_opts = { method: "GET" };
+          const fetch_opts = { method: "GET", on: opts.on || "onFetchResult" };
           if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
           return sysOn.fetch(
             "http://rove-blob-read.internal/" + id + "/manifest/" + dep_id,
             fetch_opts,
-            { to: opts.on || "onFetchResult" },
           );
         },
       };
@@ -177,8 +175,7 @@
       // target + composed static entries into the onCompiled handler.
       return sysOn.fetch(
         "http://rove-compile.internal/",
-        { method: "POST", body, ctx: opts.ctx },
-        { to: opts.on || "onFetchResult" },
+        { method: "POST", body, ctx: opts.ctx, on: opts.on || "onFetchResult" },
       );
     },
 

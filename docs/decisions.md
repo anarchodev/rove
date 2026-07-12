@@ -666,6 +666,11 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   **universal callback-target key `{on: "module.method"}`** across
   every effect (`{to}`/`{on_result}` retired; `email.send`'s recipient
   `to` was the collision that ruled out `to` as the universal key).
+  2026-07-11 follow-through: the native `_system.*` layer uses `on` too —
+  the bindings read `opts.on` directly and the `{to}` third-arg wrapper
+  object is gone, so surface and wire share one spelling (the shim-side
+  lowering had already caused one bug: code written against internal
+  comments used the retired form and its target was silently dropped).
   Threaded context is **`ctx` in / `request.ctx` out, no exceptions**
   (completes §4.9; `request.activation.msg` folded in).
   `webhook.send(url, opts)` takes a positional url; `scheduler.after`

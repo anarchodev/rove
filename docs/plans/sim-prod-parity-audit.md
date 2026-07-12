@@ -103,7 +103,7 @@ match the worker bakes in behavior that may itself be the bug:
   divergence. Each of these greens in sim, throws in prod: `after.ms(0)`
   (`on.zig:60-69`); `after.kv(nonString)` (`on.zig:90-93`); `after.fetch()`
   sans URL (`http.zig:207-210`); non-string/U8 fetch body (`http.zig:694`);
-  `{on}` (native `to`/`name`) containing `/` or `.` (`http.zig:285-291` — see also 4.6);
+  `{on}`/`name` containing `/` or `.` (`http.zig:285-291` — see also 4.6);
   `http.subscribe` without `on` (`http.zig:549-551`); `stream.write({})` and
   the 4 MiB stream buffer cap (`stream.zig:146-212`); `blob.url` ttl range
   (`bindings/blob.zig:62-70`); `blob.receive` outside onHeaders / twice

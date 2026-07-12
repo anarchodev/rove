@@ -699,7 +699,7 @@ fn installWsWakes(
                 prefixes.append(allocator, dup) catch allocator.free(dup);
             },
         }
-        if (reg.to) |t| {
+        if (reg.on) |t| {
             if (wake_to) |old_to| allocator.free(old_to);
             wake_to = allocator.dupe(u8, t) catch null;
         }

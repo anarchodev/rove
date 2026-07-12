@@ -243,12 +243,11 @@ const SYSTEM_SHIM =
     \\      cancelSubscription: function(){},
     \\    },
     \\    after: {
-    \\      // NB: `tgt.to` is the NATIVE lowered form — the public after.js shim
-    \\      // translates the customer's `{on}` to `{to}` before calling _system.*.
-    \\      // Customer code passes `{on}` IN OPTS ({to}/third-arg-{on} are retired).
-    \\      fetch: function(url, o, tgt){ return recFetch(url, o, (tgt && tgt.to) || (o && o.on) || null); },
-    \\      kv: function(prefix, tgt){ push({ kind: "kv-wake", prefix: prefix, on: (tgt && tgt.to) || null }); },
-    \\      timer: function(ms, tgt){ push({ kind: "timer", ms: ms, on: (tgt && tgt.to) || null }); },
+    \\      // `on` is the ONE spelling end to end — the after.js shim passes the
+    \\      // opts bag through and the worker bindings read `opts.on` the same way.
+    \\      fetch: function(url, o){ return recFetch(url, o, (o && o.on) || null); },
+    \\      kv: function(prefix, o){ push({ kind: "kv-wake", prefix: prefix, on: (o && o.on) || null }); },
+    \\      timer: function(ms, o){ push({ kind: "timer", ms: ms, on: (o && o.on) || null }); },
     \\    },
     \\    blob: {
     \\      presign: function(hash, ttl, ct){ return "https://sim.invalid/blob/" + hash + (ttl != null ? "?ttl=" + ttl : ""); },
