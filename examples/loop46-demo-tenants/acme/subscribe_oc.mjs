@@ -12,7 +12,7 @@ export default function () {
     }
     if (a.final) {
         kv.set("sub/done/" + a.fetchId, JSON.stringify({
-            ok: a.ok,
+            ok: a.status >= 200 && a.status < 300,
             status: a.status,
             bodyTruncated: a.bodyTruncated,
         }));

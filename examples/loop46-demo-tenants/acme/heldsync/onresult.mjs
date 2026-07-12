@@ -3,7 +3,8 @@
 // Invoked by the resume engine when the bound webhook.send completes
 // (or the §6.4 deadline fires), on the Endpoint-A flattened surface
 // (handler-shape §7): the threaded ctx on `request.ctx`, the outcome
-// on `request.ok`/`.status`/`.text` (+ `request.activation.error` —
+// on `request.status`/`.text` (2xx = delivered, `status === 0` = never
+// reached; no `request.ok`, issue #7) (+ `request.activation.error` —
 // ONE failure-cause field: the webhook classifier's
 // transport_failed/upstream_5xx, or the platform's "deadline").
 //
@@ -13,7 +14,7 @@
 // via `ctx.retry_to`).
 export function onResult() {
     const ctx = request.ctx || {};
-    if (!request.ok) {
+    if (request.status < 200 || request.status >= 300) {
         // Recipe-1: compose a retry yourself. One re-issue to a
         // known-good target, then re-park (allow_repark=true).
         if (ctx.retry_to && ctx.tries < 1) {

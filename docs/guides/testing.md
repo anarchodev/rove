@@ -266,11 +266,12 @@ const stored = h.receive().stored({ hash: "abc123", len: 4096 });
 expect(stored.status).toBe(200);               // onStored ran with request.ctx = {hash, len, app}
 ```
 
-`stored({ hash, len })` resumes at the receive's `on` with `request.activation.ok
-=== true` and `request.ctx = { hash, len, app }`, where `app` echoes the issue-time
+`stored({ hash, len })` resumes at the receive's `on` with `request.status
+=== 200` and `request.ctx = { hash, len, app }`, where `app` echoes the issue-time
 ctx (for a scoped `platform.scope(t).blob.receive({ ctx })`, that's how `onStored`
 recovers the target path). A torn upload is `stored({ ok: false })` — the resume
-runs with `request.activation.ok === false` and `request.ctx = { error, app }`,
+runs with `request.status === 0` (a hard failure — `status` is the single
+success signal, no `request.ok`; issue #7) and `request.ctx = { error, app }`,
 nothing stored.
 
 ### The deploy doors (result-in-ctx)
@@ -341,7 +342,7 @@ upstream result on the flattened `request.{status, ok, done, body}` surface:
 ```js
 const done = s.fetchResult({
   on: "hooks/onFetched.mjs",
-  status: 502, ok: false,
+  status: 502,                  // 5xx → the handler derives ok:false (no request.ok, #7)
   ctx: { key: "beta" },        // arrives as request.ctx
 });
 expect(done).toHaveWritten("result/beta", { ok: false, status: 502 });

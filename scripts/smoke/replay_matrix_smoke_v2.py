@@ -7,8 +7,10 @@ records it → unreplayable). The complementary broad guard is the capture-time 
 assert (`worker_log.l3AssertMsgRecorded`), which fires in ANY debug smoke.
 
 Kinds covered: `inbound` (request surface), `fetch_chunk` (on.fetch →
-onFetchResult), `ws_message` (WS frame → onMessage). wake/disconnect capture
-readset+ctx (covered by the L3 assert; their end-to-end replay is a follow-up).
+onFetchResult), `ws_message` (WS frame → onMessage), `wake_batch` (after.kv →
+{on} export; the fired-watch batch + ctx + resolved export all recorded —
+issue #62). disconnect captures readset+ctx (covered by the L3 assert; its
+end-to-end replay is a follow-up).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -61,6 +63,26 @@ export function onMessage() {
   const m = request.activation;
   kv.set("last_frame", m.opcode === 1 ? m.data : "(binary)");
   return "";
+}
+"""
+# NB: {on:'onFired'} with NO onWake export — the G3 check for wakes: if the
+# resolved export weren't recorded, replay would call the (missing)
+# conventional onWake and fail. The body + write fold in the batch's fired
+# prefix AND the threaded ctx, so reproduction proves both recorded inputs.
+WAKE_SRC = """
+export default function () {
+  const q = request.query || "";
+  if (q.includes("op=write")) { kv.set("wk/flag", "1"); response.status = 204; return ""; }
+  kv.get("wk/flag");
+  after.kv("wk/", { on: "onFired" });
+  return next({ armed: true });
+}
+export function onFired() {
+  const fired = request.activation.wakes.filter((w) => w.kind === "kv").map((w) => w.prefix).join(",");
+  const ms_ok = request.activation.wakes.every((w) => w.firedAt > 1e12 && w.firedAt < 1e13);
+  kv.set("observed", fired);
+  response.status = 200;
+  return "woke:" + fired + ":" + String(ms_ok) + ":" + String(request.ctx && request.ctx.armed === true);
 }
 """
 BULK_SRC = (REPO_ROOT / "examples" / "loop46-demo-tenants" / "wb" / "bulk" / "index.mjs").read_text()
@@ -129,7 +151,7 @@ def main() -> int:
 
     with V2Cluster.spawn("replaymatrix", nodes=1) as c:
         c.spawn_log_server()
-        for t, src in (("inb", INBOUND_SRC), ("fch", FETCH_SRC), ("wsm", WS_SRC), ("up", BULK_SRC)):
+        for t, src in (("inb", INBOUND_SRC), ("fch", FETCH_SRC), ("wsm", WS_SRC), ("wak", WAKE_SRC), ("up", BULK_SRC)):
             c.provision(t)
             c.deploy_handlers(t, {"index.mjs": src})
         c.wait_for_handler("up", "/", want_status=200, want_body=EXPECTED_BODY, timeout_s=25.0)
@@ -179,10 +201,32 @@ def main() -> int:
               art and art.get("divergence") is None and last and last.get("value") == "hello-ws",
               f"writes={writes!r} div={art.get('divergence') if art else None}")
 
+        # ── wake_batch (issue #62) ──
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(lambda: c.request("wak", "/?op=hold", method="POST", data="{}", timeout=30.0))
+            time.sleep(0.5)  # let the inbound hop park + arm after.kv("wk/")
+            c.node_request("/?op=write", method="POST", host=c.host_for("wak"), data="{}")
+            live = fut.result(timeout=35.0)
+        live_body = "woke:wk/:true:true"
+        check("[wake_batch] live after.kv resume", live.status == 200 and live.body == live_body,
+              f"{live.status} {live.body!r}")
+        rec = find_record(c, "wak", "wake_batch")
+        check("[wake_batch] recorded (activation_bytes + export on the tape)",
+              bool(rec and rec.get("tapes", {}).get("activation_bytes_b64") and rec.get("tapes", {}).get("export") == "onFired"),
+              f"tapes keys={sorted((rec or {}).get('tapes', {}).keys())}")
+        art = replay(rec, "wak", "wake_batch", WAKE_SRC) if rec else None
+        writes = [e for e in ((art.get("effects") if art else None) or []) if e.get("kind") == "write"]
+        obs = next((w for w in writes if w.get("key") == "observed"), None)
+        check("[wake_batch+G3] replay uses recorded export, reproduces wakes[]+ctx (body + write)",
+              art and art.get("divergence") is None and art.get("body") == live_body
+              and obs and obs.get("value") == "wk/",
+              f"body={art.get('body') if art else None} writes={writes!r} div={art.get('divergence') if art else None}")
+
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print("\n✅ replay matrix: inbound + fetch_chunk + ws_message all reproduce from real recordings")
+    print("\n✅ replay matrix: inbound + fetch_chunk + ws_message + wake_batch all reproduce from real recordings")
     return 0
 
 

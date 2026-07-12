@@ -20,18 +20,19 @@ export default function () {
     stream.start();                              // commit the head
     stream.write("event: ready\ndata: 1\n\n");   // first frame
     after.kv("streamkv/in/");                        // wait for writes
-    return next();     // hold the socket
+    return next({ cursor: null });     // hold the socket
 }
 
-// A kv write under the watched prefix landed (§8.4-gated) — emit one
-// frame per kv entry in the §9.4 batch (temporal order), then re-arm.
+// A kv write under the watched prefix landed (§8.4-gated) — the wake
+// names the FIRED PREFIX (issue #8); drain past the ctx cursor and emit
+// one frame per new entry, then re-arm.
 export function onWake() {
     stream.start(); // keep the stream alive even on a zero-frame wake
-    for (const w of request.activation.wakes) {
-        if (w.kind !== "kv") continue;
-        const v = kv.get(w.key) ?? "(absent)";
-        stream.write("event: update\ndata: " + w.key + "=" + v + "\n\n");
+    const cursor = request.ctx ? request.ctx.cursor : null;
+    const rows = kv.prefix("streamkv/in/", cursor);
+    for (const r of rows) {
+        stream.write("event: update\ndata: " + r.key + "=" + r.value + "\n\n");
     }
     after.kv("streamkv/in/");                        // re-arm
-    return next();
+    return next({ cursor: rows.length ? rows.at(-1).key : cursor });
 }

@@ -14,7 +14,7 @@ export function onMessage() {
 }
 
 export function onReplay() {
-  kv.set("replay/log", JSON.stringify({ ok: request.ok, body: request.text }));
+  kv.set("replay/log", JSON.stringify({ ok: request.status >= 200 && request.status < 300, body: request.text }));
   stream.write("replay ready");
   return;
 }

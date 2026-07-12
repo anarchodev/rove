@@ -71,7 +71,7 @@ export default function () {
   });
 
   check("OIDCRelyingParty#completeToken", () => {
-    // Inbound activation carries no fetch result (request.ok unset) —
+    // Inbound activation carries no fetch result (request.status unset) —
     // the failed-exchange arm, status placeholder "?".
     eq(rp.completeToken(), "token exchange failed: ?");
     eq(response.status, 200);

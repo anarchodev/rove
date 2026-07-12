@@ -2,7 +2,8 @@
 // bag prod reads (headers/stream/timeoutMs/maxChunkBytes/maxTotalBytes, in
 // the public spellings), arms return unique ftch_
 // ids that resumes echo as request.fetchId, fetchesPending threads through the
-// folds, status/ok/bodyTruncated are terminal-only, and .stream() of a fetch
+// folds, status/bodyTruncated are terminal-only (request.ok does not exist,
+// issue #7), and .stream() of a fetch
 // issued WITHOUT stream:true fails loud.
 import { scenario, expect } from "rewind:test";
 const s = scenario({});
@@ -32,9 +33,9 @@ expect(h).toHaveSent("fetch", { id: ids.b, url: "https://b.example/y" });
 // Independent single-resolve branches: both fetches still outstanding when
 // either result arrives → fetchesPending = 2 ("including this one").
 const ra = h.fetch(/a\.example/).resolve({ status: 200, body: "A" });
-expect(ra.kv("seen/a")).toEqual({ idMatches: true, pending: 2, status: 200, ok: true, done: true });
+expect(ra.kv("seen/a")).toEqual({ idMatches: true, pending: 2, status: 200, hasOk: false, done: true });
 const rb = h.fetch(/b\.example/).resolve({ status: 201, body: "B" });
-expect(rb.kv("seen/b")).toEqual({ idMatches: true, pending: 2, status: 201, ok: true, done: true });
+expect(rb.kv("seen/b")).toEqual({ idMatches: true, pending: 2, status: 201, hasOk: false, done: true });
 
 // Ordered arrival (whenConcurrent): pending counts down 2 → 1, and the
 // documented `done && fetchesPending === 1` last-result pattern fires on the
@@ -44,15 +45,15 @@ const w = h.whenConcurrent([
   { match: /b\.example/, resolve: { body: "B" }, label: "b" },
 ]);
 const [last] = w.orders([["a", "b"]]);
-expect(last.kv("seen/a")).toEqual({ idMatches: true, pending: 2, status: 200, ok: true, done: true });
-expect(last.kv("seen/b")).toEqual({ idMatches: true, pending: 1, status: 200, ok: true, done: true });
+expect(last.kv("seen/a")).toEqual({ idMatches: true, pending: 2, status: 200, hasOk: false, done: true });
+expect(last.kv("seen/b")).toEqual({ idMatches: true, pending: 1, status: 200, hasOk: false, done: true });
 
-// ── streaming: chunk events are bare (no status/ok/bodyTruncated until final) ──
+// ── streaming: chunk events are bare (no status/bodyTruncated until final) ──
 const st = s.inbound({ path: "/stream" });
 const done = st.fetch(/s\.example/).stream(["he", "llo"]);
 expect(done.kv("chunk/0")).toEqual({ hasStatus: false, hasOk: false, hasTruncated: false, pending: 1 });
 expect(done.kv("chunk/1")).toEqual({ hasStatus: false, hasOk: false, hasTruncated: false, pending: 1 });
-expect(done.kv("final")).toEqual({ status: 200, ok: true, truncated: false, seq: 2, pending: 1, acc: "hello" });
+expect(done.kv("final")).toEqual({ status: 200, hasOk: false, truncated: false, seq: 2, pending: 1, acc: "hello" });
 
 // ── .stream() on a NON-streaming fetch fails loud ──
 let threw = null;

@@ -36,7 +36,7 @@ const export_fixture = @import("export_fixture.zig");
 /// `export-fixture` verb (offline).
 pub const exportFixture = export_fixture.transcode;
 pub const exportFixtureActivation = export_fixture.activationOf;
-pub const exportFixtureIsInbound = export_fixture.isInboundFamily;
+pub const exportFixtureIsFaithful = export_fixture.isFaithfulTranscode;
 
 // ── the JS-authored test runner (harness reactor + saga library) ──
 const harness = @import("harness.zig");
@@ -228,12 +228,11 @@ pub const Engine = struct {
         // The resolved export: the world's explicit `export` (the `{on}` /
         // resolved name a callback needs) wins; else the conventional export.
         const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
-        const result: ?epilogue.Result = if (wv.status != null or wv.ok != null or
+        const result: ?epilogue.Result = if (wv.status != null or
             wv.done != null or wv.fetch_id != null or wv.chunk_seq != null or
             wv.fetches_pending != null or wv.body_truncated != null)
             .{
                 .status = wv.status,
-                .ok = wv.ok,
                 .done = wv.done,
                 .fetch_id = wv.fetch_id,
                 .chunk_seq = wv.chunk_seq,

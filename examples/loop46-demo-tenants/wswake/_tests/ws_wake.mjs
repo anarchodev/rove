@@ -11,10 +11,11 @@ const w = ws.receive("watch:feed/");
 expect(w.disposition).toBe("held");
 expect(w).toHaveSentFrame("watching:feed/");
 
-// A kv write under the prefix fires onWake, which re-scans kv.prefix("feed/")
-// and replies with the last value.
+// A kv write under the prefix fires onWake. The resume surfaces the FIRED
+// PREFIX on request.activation.wakes[] (issue #8 — never the matched key);
+// the handler re-scans kv under it and replies with the last value.
 const woke = w.wakeKv({ "feed/1": "hello" });
-expect(woke).toHaveSentFrame("woke:hello");
+expect(woke).toHaveSentFrame("woke:hello|fired:feed/");
 
 // timer → arm after.ms, reply "armed"; the timer elapsing resumes onTimer.
 const t = ws.receive("timer");

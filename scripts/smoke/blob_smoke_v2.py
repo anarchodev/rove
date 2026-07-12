@@ -76,10 +76,10 @@ export function onBlob() {
 PUTRESULT_SRC = """
 export default function () {
   // Unified flattened on_result surface (handler-shape §7, Endpoint A):
-  // request.ok/.status top-level, blob hash on request.activation.hash,
-  // echoed context IS request.ctx.
+  // request.status top-level (2xx = stored; no request.ok, issue #7),
+  // blob hash on request.activation.hash, echoed context IS request.ctx.
   kv.set("put_result", JSON.stringify({
-    result: { ok: request.ok, status: request.status, hash: request.activation.hash },
+    result: { ok: request.status >= 200 && request.status < 300, status: request.status, hash: request.activation.hash },
     context: request.ctx,
   }));
 }
@@ -118,7 +118,7 @@ SEALEDNOTE_SRC = """
 export default function () {
   kv.set("sealed/" + (request.ctx && request.ctx.tag || "unknown"), JSON.stringify({
     hash: request.activation.hash,
-    ok: request.ok,
+    ok: request.status >= 200 && request.status < 300,
     body: request.json,
   }));
   return "";

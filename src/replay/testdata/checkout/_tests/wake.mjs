@@ -36,3 +36,15 @@ expect(keyed).not.toHaveScheduled("jobs/reminder");
 const occurrence = s.wake({ on: "jobs/reminder.mjs", ctx: { user: "cron", count: 0 }, key: "cron/reminder" });
 expect(occurrence.body).toEqual({ ok: true, count: 1 });
 expect(occurrence).toHaveWritten("reminder/cron", { key: "cron/reminder" });
+
+// issue #9: a `module.method` target fires the NAMED export, not `default`.
+// The combined string ("module.method") resolves the same way the worker's
+// `splitDurableTarget` does — the `.mjs`/`.js` module part, then the export.
+const named = s.wake({ on: "jobs/reminder.mjs.weekly", ctx: { user: "zoe" } });
+expect(named.body).toEqual({ ok: true, export: "weekly" }); // default returns {ok,count} — this proves `weekly` ran
+expect(named).toHaveWritten("weekly/zoe", { export: "weekly", firedFrom: "sched_test" });
+
+// The split-out `method` form is equivalent to the combined string.
+const namedSplit = s.wake({ on: "jobs/reminder.mjs", method: "weekly", ctx: { user: "yan" } });
+expect(namedSplit.body).toEqual({ ok: true, export: "weekly" });
+expect(namedSplit).toHaveWritten("weekly/yan", { export: "weekly" });

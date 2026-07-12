@@ -12,8 +12,7 @@
 //!
 //! 1. Backpressure is a property of the primitive (the queue cap;
 //!    `error.Full` + `overflow_count` on overflow, surfaced on
-//!    `/_system/metrics` the same way `dropped_chunks` /
-//!    `lost_oldest` already are).
+//!    `/_system/metrics` the same way `dropped_chunks` already is).
 //! 2. The dispatch loop is one `for (queue.drain()) |msg| ...`
 //!    instead of N per-origin sweeps.
 //!
@@ -98,8 +97,8 @@ pub const MsgQueue = struct {
     cap: usize,
     /// Cumulative count of `enqueueMsg` calls that hit the cap and
     /// returned `error.Full`. Per-origin migration surfaces this in
-    /// the metrics endpoint the same way `dropped_chunks` /
-    /// `lost_oldest` already do for the streaming primitives.
+    /// the metrics endpoint the same way `dropped_chunks` already
+    /// does for the streaming primitives.
     overflow_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cap: usize) MsgQueue {

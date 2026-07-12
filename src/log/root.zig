@@ -114,12 +114,13 @@ pub const ActivationSource = enum(u8) {
     /// still decode pre-§9.4 tapes.
     kv_wake = 4,
     /// Wake-batch activation (streaming-handlers-plan §9.4 +
-    /// `docs/primitive-gaps.md` §2.2). The held stream's
-    /// `PendingWakes` ring drained into a temporal-order batch of
-    /// kv-write + timer entries; the handler sees
-    /// `request.activation = { kind: "wake_batch", wakes: [...],
-    /// overflow: { lost_oldest } }`. Supersedes the per-wake
-    /// `kv_wake` / `timer` activation sources for held streams.
+    /// `docs/primitive-gaps.md` §2.2; fired-prefix contract per
+    /// decisions.md §3.10). The held chain's fired arms drained
+    /// into a batch of fired-prefix + timer entries; the handler
+    /// sees `request.activation = { kind: "wake_batch",
+    /// wakes: [{kind:"kv",prefix,firedAt}|{kind:"timer",firedAt}] }`.
+    /// Supersedes the per-wake `kv_wake` / `timer` activation
+    /// sources for held streams.
     wake_batch = 5,
     /// Subscription chain origin (`docs/primitive-gaps.md` §2.1 +
     /// `docs/subscriptions-plan.md`). A `_subscriptions/<name>/`

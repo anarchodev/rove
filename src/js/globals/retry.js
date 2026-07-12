@@ -26,7 +26,8 @@
 //   //   export default function () {
 //   //     if (retry.shouldRetry()) { retry.again(); return; }
 //   //     const ctx = retry.ctx();
-//   //     if (request.ok) kv.set(`charge/${ctx.charge_id}`, request.text);
+//   //     const ok = request.status >= 200 && request.status < 300;
+//   //     if (ok) kv.set(`charge/${ctx.charge_id}`, request.text);
 //   //     else kv.set(`failed/${ctx.charge_id}`, request.activation.error);
 //   //   }
 //
@@ -79,7 +80,7 @@ function backoffMsFor(retry_state, next_attempt) {
  * export default function () {
  *   if (retry.shouldRetry()) { retry.again(); return; }
  *   const ctx = retry.ctx();
- *   // ... your terminal handling on request.ok/.status/.text ...
+ *   // ... your terminal handling on request.status/.text ...
  * }
  */
 globalThis.retry = {
@@ -163,7 +164,7 @@ globalThis.retry = {
 
   /**
    * Whether this result should be retried: a failure with attempts
-   * remaining. Reads the ambient flattened result (`request.ok`,
+   * remaining. Reads the ambient flattened result (`request.status`,
    * `request.ctx._retry`) — no arguments. Always `false` on success or
    * outside a retry.send result activation.
    *
@@ -171,7 +172,10 @@ globalThis.retry = {
    */
   shouldRetry() {
     const req = globalThis.request;
-    if (!req || req.ok) return false;
+    // Retry a non-2xx result (includes `status === 0` transport
+    // failure). Success (2xx) never retries. `status` is the single
+    // result signal — there is no `request.ok` (issue #7).
+    if (!req || (req.status >= 200 && req.status < 300)) return false;
     const r = req.ctx && req.ctx[RETRY_KEY];
     if (!r) return false;
     return (r.attempt || 1) < (r.max_attempts || 1);

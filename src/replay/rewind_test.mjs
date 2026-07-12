@@ -205,6 +205,21 @@ function stable(v) {
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stable(v[k])).join(",") + "}";
 }
 
+// Split a durable-wake target `"module.method"` into module + optional export
+// (handler-shape.md §2.4, issue #9). The method suffix is recognized ONLY when
+// the module part ends in `.mjs`/`.js` — so a bare `"reports.mjs"`, a slash
+// path, or a `__system/` module stays whole (default export). MUST match the
+// worker's `splitDurableTarget` in `src/js/worker_streaming.zig`.
+function splitDurableTarget(target) {
+  const dot = target.lastIndexOf(".");
+  if (dot < 0) return { module: target, method: null };
+  const head = target.slice(0, dot);
+  const tail = target.slice(dot + 1);
+  if (tail.length > 0 && (head.endsWith(".mjs") || head.endsWith(".js")))
+    return { module: head, method: tail };
+  return { module: target, method: null };
+}
+
 // ── the scenario + activation tree ───────────────────────────────────────────
 
 export function scenario(cfg = {}) {
@@ -333,10 +348,12 @@ class Scenario {
    *  handler commits and its `on` module runs later as its own activation, so
    *  you test that module in isolation given a delivery result. Mirrors the
    *  flattened send_callback surface (dispatcher.zig): the response on
-   *  `request.status`/`.ok`/`.bytes`, the echoed `ctx` bare on `request.ctx`,
-   *  and delivery metadata on `request.activation.*`.
+   *  `request.status`/`.bytes`, the echoed `ctx` bare on `request.ctx`,
+   *  and delivery metadata on `request.activation.*`. `status` is the
+   *  single success signal (2xx = delivered, 0 = never reached) — there
+   *  is no `request.ok` (issue #7).
    *
-   *  spec: { on: "<result-module path>", result?: {status, ok?, body?, attempts?,
+   *  spec: { on: "<result-module path>", result?: {status, body?, attempts?,
    *          error?, id?, headers?}, ctx?: <echoed context> }
    */
   sendCallback(spec = {}) {
@@ -351,7 +368,6 @@ class Scenario {
       ctx: spec.ctx === undefined ? null : spec.ctx,
       request: {
         status,
-        ok: r.ok != null ? r.ok : (status >= 200 && status < 300),
         done: true,
         body: r.body != null ? r.body : null,
         activation: {
@@ -368,22 +384,25 @@ class Scenario {
   /** A bare fetch-continuation MODULE authored in isolation — the `on` module of
    *  an `after.fetch`/`http.fetch`, driven standalone given an upstream result
    *  (parallel to `sendCallback`, but the fetch-result surface rather than the
-   *  send-callback one). The response lands flattened on `request.{status, ok,
+   *  send-callback one). The response lands flattened on `request.{status,
    *  done, body}` and the echoed `ctx` bare on `request.ctx` — the same shape a
    *  folded `FetchHandle.resolve` produces, so a `_rp/complete.mjs`-style module
-   *  is testable without standing up the emitter that would reach it.
+   *  is testable without standing up the emitter that would reach it. `status`
+   *  is the single success signal (2xx = ok, 0 = transport failure) — there is
+   *  no `request.ok` (issue #7).
    *
    *  spec: { on: "<continuation module path>", ctx?: <echoed context>,
-   *          status?, ok?, done?, body? }
+   *          status?, done?, body? }
    */
   fetchResult(spec = {}) {
     if (typeof spec.on !== "string")
       throw new Error("fetchResult({ on }): `on` must be the continuation module path");
-    const status = spec.status != null ? spec.status : (spec.ok === false ? 502 : 200);
+    const status = spec.status != null ? spec.status : 200;
     const done = spec.done != null ? spec.done : true;
     // Mirror the bound-resume surface prod builds (globals.zig): chunkSeq /
-    // fetchesPending / fetchId on every event; status/ok/bodyTruncated
-    // TERMINAL-only (defaulted only when done — an explicit spec still wins).
+    // fetchesPending / fetchId on every event; status/bodyTruncated
+    // TERMINAL-only (defaulted only when done — an explicit spec still wins;
+    // no `ok` — status is the single success signal, issue #7).
     const request = {
       done,
       body: spec.body != null ? spec.body : null,
@@ -392,7 +411,6 @@ class Scenario {
     };
     if (spec.fetchId != null) request.fetchId = spec.fetchId;
     if (done || spec.status != null) request.status = status;
-    if (done || spec.ok != null) request.ok = spec.ok != null ? spec.ok : (status >= 200 && status < 300);
     if (done) request.bodyTruncated = spec.bodyTruncated != null ? spec.bodyTruncated : false;
     return new Node(this, this._base({
       entry: spec.on, // the continuation module IS this activation's entry
@@ -418,7 +436,13 @@ class Scenario {
    *  target fires the same way (via the baked `cron_tick`, which the customer
    *  never sees); each occurrence is one `wake(...)`.
    *
-   *  spec: { on: "<target module path>", ctx?: <payload>, method?: "<export>",
+   *  `on` is the target as passed to `schedule`/`cron`: a bare module
+   *  (`"jobs/reminder"` → `default` export) or the `module.method` form
+   *  (`"reports.mjs.weekly"` → the `weekly` export — the method suffix is
+   *  only recognized after a `.mjs`/`.js` module, issue #9). You may also
+   *  split it explicitly with `method`.
+   *
+   *  spec: { on: "<target>", ctx?: <payload>, method?: "<export>",
    *          id?: "<schedule id>", key?: "<idempotency key>",
    *          scheduledAtNs?: <ns since epoch>, now?: <fire time> }
    */
@@ -438,12 +462,16 @@ class Scenario {
     };
     // Present only when the schedule was armed with an idempotency key.
     if (spec.key != null) activation.key = spec.key;
+    // A `module.method` target (`on: "reports.mjs.weekly"`) resolves the same
+    // way the worker fires it (splitDurableTarget); an explicit `spec.method`
+    // wins for the split-out form (`on: "reports.mjs", method: "weekly"`).
+    const _t = splitDurableTarget(spec.on);
     return new Node(this, this._base({
-      entry: spec.on, // the scheduled target module IS this activation's entry
+      entry: _t.module, // the scheduled target module IS this activation's entry
       activation: "durable_wake",
       // durable_wake dispatches at the target's default export (rpc_dispatch);
-      // a `module.method` target overrides via `method`.
-      export: spec.method || "default",
+      // a `module.method` target overrides the export (issue #9).
+      export: spec.method || _t.method || "default",
       ctx: spec.ctx === undefined ? null : spec.ctx,
       now_ms: fireMs,
       request: { activation },
@@ -616,8 +644,11 @@ class Node {
 
   /** An `after.kv` wake: a change under a watched prefix resumes the held
    *  connection. `changes` is a `{ key: value | null }` map folded into the KV
-   *  overlay (null = delete); each surfaces on `request.activation.wakes`.
-   *  `opts.prefix` selects which armed `after.kv` fires when several are armed. */
+   *  overlay (null = delete). The resume surfaces the FIRED PREFIXES — one
+   *  `{kind:"kv", prefix, firedAt}` per armed `after.kv` a change key falls
+   *  under, never the keys themselves (issue #8; the handler re-reads kv).
+   *  `opts.prefix` selects which armed `after.kv`'s `{on}` export resumes
+   *  when several are armed. */
   wakeKv(changes = {}, opts = {}) {
     requireHeld(this, "wakeKv");
     const parent = this;
@@ -628,12 +659,20 @@ class Node {
     if (!kw) throw new Error(`wakeKv(): no armed after.kv matched prefix ${opts.prefix}`);
     const kv = foldKv(parent.world.kv, pb.effects);
     const now = (parent.world.now_ms || 0) + 1;
-    const entries = [];
-    for (const key of Object.keys(changes)) {
+    const keys = Object.keys(changes);
+    for (const key of keys) {
       const v = changes[key];
-      if (v === null) { delete kv[key]; entries.push({ kind: "kv", key, op: "d", firedAt: now }); }
-      else { kv[key] = typeof v === "string" ? v : JSON.stringify(v); entries.push({ kind: "kv", key, op: "p", firedAt: now }); }
+      if (v === null) delete kv[key];
+      else kv[key] = typeof v === "string" ? v : JSON.stringify(v);
     }
+    // One entry per fired ARM, matching the worker (drainFired): an arm
+    // fires when any change key starts with its prefix; N matches on one
+    // arm surface once.
+    const entries = armed
+      .filter((e) => keys.some((k) => k.startsWith(e.prefix)))
+      .map((e) => ({ kind: "kv", prefix: e.prefix, firedAt: now }));
+    if (!entries.length)
+      throw new Error(`wakeKv(): no change key falls under an armed after.kv prefix (armed: ${armed.map((e) => JSON.stringify(e.prefix)).join(", ")})`);
     return resumeNode(parent, carrySources(parent.world, {
       entry: parent.world.entry,
       activation: "wake_batch",
@@ -642,7 +681,7 @@ class Node {
       kv,
       seed: (parent.world.seed || 0) + 1,
       now_ms: now,
-      request: { activation: { kind: "wake_batch", wakes: entries, overflow: { lost_oldest: 0 } } },
+      request: { activation: { kind: "wake_batch", wakes: entries } },
     }));
   }
 
@@ -717,7 +756,7 @@ class Clock {
       kv: foldKv(parent.world.kv, pb.effects),
       seed: (parent.world.seed || 0) + 1,
       now_ms: now,
-      request: { activation: { kind: "wake_batch", wakes: [{ kind: "timer", firedAt: now }], overflow: { lost_oldest: 0 } } },
+      request: { activation: { kind: "wake_batch", wakes: [{ kind: "timer", firedAt: now }] } },
     }));
   }
 }
@@ -776,14 +815,14 @@ class FetchHandle {
     let node = null;
     const step = (body, done, seq) => {
       const t = onTarget(pw.entry, on, done ? "onFetchDone" : "onFetchChunk");
-      // Prod stamps status/ok/bodyTruncated ONLY on the terminal event
+      // Prod stamps status/bodyTruncated ONLY on the terminal event
       // (globals.zig `if (fc.final)`); non-final chunks carry done/chunkSeq/
-      // fetchId/fetchesPending + the payload, nothing else.
+      // fetchId/fetchesPending + the payload, nothing else. No `ok` —
+      // status is the single success signal (issue #7).
       const request = { done, chunkSeq: seq, body, fetchesPending: pending };
       if (fx.id != null) request.fetchId = fx.id;
       if (done) {
         request.status = opts.status != null ? opts.status : 200;
-        request.ok = opts.ok != null ? opts.ok : true;
         request.bodyTruncated = opts.bodyTruncated != null ? opts.bodyTruncated : false;
       }
       node = resumeNode(parentNode, carrySources(pw, {
@@ -816,10 +855,11 @@ class FetchHandle {
 /** A located `blob.receive` → resolve its completion into the dependent
  *  resume at the receive's `on` export. Parallel to `FetchHandle.resolve`: the
  *  parent's writes/ctx/clock fold forward; the completion arrives on
- *  `request.ctx` (NOT `request.body`) and durability on `request.activation.ok`
- *  — the exact `emitTerminal` contract (`blob_receive.zig`):
- *    success → `request.ctx = { hash, len, app }`, `request.activation.ok === true`
- *    failure → `request.ctx = { error, app }`,        `request.activation.ok === false`
+ *  `request.ctx` (NOT `request.body`) and durability on `request.status`
+ *  (2xx = stored, 0 = failed; no `request.ok`, issue #7) — the exact
+ *  `emitTerminal` contract (`blob_receive.zig`, which emits status 200/0):
+ *    success → `request.ctx = { hash, len, app }`, `request.status === 200`
+ *    failure → `request.ctx = { error, app }`,        `request.status === 0`
  *  where `app` echoes the issue-time ctx the caller threaded (recorded on the
  *  receive effect); the test may override it with `spec.app`. */
 class ReceiveHandle {
@@ -848,7 +888,7 @@ class ReceiveHandle {
       kv: foldKv(parent.world.kv, pb.effects),
       seed: (parent.world.seed || 0) + 1,
       now_ms: (parent.world.now_ms || 0) + 1,
-      request: { activation: { kind: "blob_stored", ok } },
+      request: { status: ok ? 200 : 0, activation: { kind: "blob_stored" } },
     });
     return resumeNode(parent, world);
   }
@@ -860,9 +900,12 @@ class ReceiveHandle {
  *  compile is a fetch completion whose `ctx_json` is set, so it reuses the
  *  fetch-completion fold with the door JSON as ctx and a null body — the exact
  *  `routeCompileEvent` shape (`deploy_thread.zig`, terminal `UpstreamFetchEvent`):
+ *  The compile OUTCOME rides `request.ctx.ok` (a door can HTTP-200 yet
+ *  fail to compile); the door's HTTP status is `request.status` (no
+ *  `request.ok`, issue #7):
  *    success → `request.ctx = { ok:true, results:[{path, source_hex,
- *              bytecode_hex}, …], app }`, `request.ok === true`
- *    failure → `request.ctx = { ok:false, status, error }`, `request.ok === false`
+ *              bytecode_hex}, …], app }`, `request.status === 200`
+ *    failure → `request.ctx = { ok:false, status, error }`, `request.status === 500`
  *  where `app` echoes the issue-time `platform.compile(..., {ctx})` (recorded on
  *  the door fetch); the test may override it with `spec.app`. */
 class CompileHandle {
@@ -883,7 +926,7 @@ class CompileHandle {
       ? { ok: true, results: spec.results != null ? spec.results : [], app }
       : { ok: false, status, error: spec.error != null ? spec.error : "compile failed" };
     const world = fetchResumeWorld(
-      parent.world, this.fx, { status, ok, body: null },
+      parent.world, this.fx, { status, body: null },
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
@@ -911,7 +954,7 @@ class StampHandle {
     const status = spec.status != null ? spec.status : (ok ? 200 : 502);
     const ctx = { ok, dep_id: spec.dep_id != null ? spec.dep_id : "0000000000000000" };
     const world = fetchResumeWorld(
-      parent.world, this.fx, { status, ok, body: null },
+      parent.world, this.fx, { status, body: null },
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
@@ -1077,14 +1120,12 @@ function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx, pen
       : (pending != null ? pending : 1),
   };
   if (fx.id != null) request.fetchId = fx.id;
-  // status/ok/bodyTruncated are TERMINAL-only in prod (set iff `final`,
+  // status/bodyTruncated are TERMINAL-only in prod (set iff `final`,
   // globals.zig) — default them only on the final event; honor an explicit
-  // override so a deliberate off-spec world stays authorable.
+  // override so a deliberate off-spec world stays authorable. `status` is
+  // the single success signal (2xx = ok, 0 = transport failure — here
+  // `response.timeout`); the real engine surfaces NO `request.ok` (issue #7).
   if (done || response.status != null) request.status = status;
-  if (done || response.ok != null)
-    // The real engine sets fetch/callback `ok` = status in [200,300) (a 3xx is
-    // NOT ok) — match it so a handler's `if (request.ok)` branch agrees.
-    request.ok = response.ok != null ? response.ok : (!response.timeout && status >= 200 && status < 300);
   if (done) request.bodyTruncated = response.bodyTruncated != null ? response.bodyTruncated : false;
   return carrySources(parentWorld, {
     entry: t.entry,
