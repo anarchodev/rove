@@ -432,6 +432,10 @@ const WsMsgTape = union(enum) {
     none,
     fetch: worker_mod.FetchEvent,
     frame: struct { opcode: u8, data: []const u8 },
+    /// A wake resume's Msg (issue #62): the drained fired-watch batch +
+    /// the resolved wake export (G3 — an `{on}` override must replay to
+    /// the same export).
+    wakes: struct { batch: []const components_mod.WakeEntry, export_name: []const u8 },
 };
 
 /// Capture the readset + ctx + the kind-specific Msg for a WS resume. Called at
@@ -441,6 +445,7 @@ fn wsResumeTapes(worker: anytype, readset: *tape_mod.Readset, ctx_body: []const 
         .none => worker_mod.captureTapes(worker, readset, ctx_body),
         .fetch => |fe| worker_mod.captureFetchChunkTapes(worker, readset, ctx_body, fe),
         .frame => |f| worker_mod.captureWsFrameTapes(worker, readset, ctx_body, f.opcode, f.data),
+        .wakes => |wt| worker_mod.captureWakeBatchTapes(worker, readset, ctx_body, wt.batch, wt.export_name),
     };
 }
 
@@ -886,6 +891,11 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     // `request.ctx`, so `onWake` reads `request.ctx` like every other
     // continuation. No positional args.
     const resume_fn: []const u8 = if (wakes_st.wake_to) |t| t else "onWake";
+    // Owned snapshot for the tape (issue #62 — G3): `resume_fn` borrows
+    // StreamWakes.wake_to, which finishWsResume's re-arm (installWsWakes)
+    // frees before the post-outcome tape capture runs.
+    const wake_export_owned: []const u8 = allocator.dupe(u8, resume_fn) catch "";
+    defer if (wake_export_owned.len > 0) allocator.free(wake_export_owned);
     const body = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
@@ -939,7 +949,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     };
 
     var oc = run_oc;
-    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", .none);
+    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", .{ .wakes = .{ .batch = batch_owned, .export_name = wake_export_owned } });
 }
 
 /// Ship the frames an `onMessage` produced to `ws_send_in`. Read-only frames
