@@ -226,6 +226,14 @@ run whether or not anyone is connected. Each names the export it invokes:
   once, at a time.
 - `cron(spec, "module.method")` — run the target on a recurring schedule.
 
+For `schedule`/`cron`, the target is a single string. A bare module
+(`"jobs/reminder"`) fires its `default` export; the `module.method` form
+fires a named export — but the method suffix is only recognized **after a
+`.mjs`/`.js` module** (`"reports.mjs.weekly"` → the `weekly` export of
+`reports.mjs`). So `"reports.mjs"` is the whole module (not module
+`reports` + method `mjs`), and to name a method you include the
+extension: `"jobs/reminder.mjs.retry"`.
+
 A connectionless request can read/write `kv`, register more
 connectionless triggers, and do work — but it has **no connection**, so
 the disposition verbs and `stream.*` / `after.*` are **inert** there. To
