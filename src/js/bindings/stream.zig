@@ -177,7 +177,7 @@ pub fn jsStreamWrite(
 /// distinguished here (the same split `crypto.zig`'s `extractKeyOrDataBytes`
 /// makes). Anything else throws TypeError — a `String()` fallback
 /// would ship `"[object Object]"` as a wire chunk
-/// (docs/decisions.md Â§4.11).
+/// (docs/decisions.md §4.11).
 fn jsValueAsOwnedBytes(
     allocator: std.mem.Allocator,
     ctx: ?*c.JSContext,

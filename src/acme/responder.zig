@@ -8,7 +8,7 @@
 //!
 //! The ACME client publishes a token before asking the CA to
 //! validate and clears it after; only the leader's client populates
-//! the map (see src/loop46 orchestration). Graceful shutdown polls a
+//! the map (see src/cp orchestration). Graceful shutdown polls a
 //! shared stop flag so `accept` never wedges teardown.
 
 const std = @import("std");

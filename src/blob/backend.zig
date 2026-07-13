@@ -41,7 +41,7 @@ pub const BackendConfig = struct {
 ///   followers via S3-shaped object storage. Used for file-blobs
 ///   (bytecode + static assets) and log-blobs.
 /// - `http` — read-only fetch against a colocated files-server
-///   over HTTP/2. Used by loop46 worker for manifest reads
+///   over HTTP/2. Used by the worker for manifest reads
 ///   (production.md #1.4 step 4 — manifests live in raft-replicated
 ///   KV inside the files-server cluster, not S3).
 ///

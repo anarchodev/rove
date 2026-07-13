@@ -67,7 +67,7 @@ pub fn checkpointTmpPath(
 /// just re-upload more entries, which idempotency at the indexer
 /// absorbs).
 ///
-/// Caller-supplied `data_dir` is the loop46 instance's
+/// Caller-supplied `data_dir` is the rewind-worker instance's
 /// `--data-dir`. The `_meta` subdir is created lazily on the
 /// first `writeCheckpoint` call.
 pub fn readCheckpoint(

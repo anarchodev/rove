@@ -6,7 +6,7 @@
 //!   - `Client` — the RFC 8555 order→challenge→finalize state machine.
 //!
 //! Cert distribution + leader-gated issuance orchestration lives in
-//! `src/loop46/` (it needs raft + the tenant domain registry); this
+//! `src/cp/` (it needs raft + the tenant domain registry); this
 //! module is the reusable, network/crypto core.
 
 pub const crypto = @import("crypto.zig");

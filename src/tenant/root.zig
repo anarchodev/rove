@@ -3,8 +3,8 @@
 //! ## Store-per-instance model
 //!
 //! Each instance owns a directory at `{dir}/{id}/` and its app-state
-//! store lives at `{dir}/{id}/app.db`. Consumers (worker, files-server,
-//! log-server) open additional stores under the same directory —
+//! store lives at `{dir}/{id}/app.db`. Consumers (worker, log-server)
+//! open additional stores under the same directory —
 //! `{dir}/{id}/files.db`, `{dir}/{id}/log.db`, plus blob dirs — so a
 //! tenant's entire state is one directory that can be copied, moved,
 //! or removed as a unit. rove-tenant itself only knows about the

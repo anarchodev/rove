@@ -202,7 +202,7 @@ pub const Envelope = struct {
     payload: []const u8,
 };
 
-/// Decode an envelope into the enum-typed loop46 view. Slices into the
+/// Decode an envelope into the enum-typed worker view. Slices into the
 /// input buffer; valid until the caller drops `payload`.
 ///
 /// Thin wrapper over the shared `kv.decodeEnvelope` header codec: the

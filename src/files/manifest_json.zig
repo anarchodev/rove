@@ -6,7 +6,7 @@
 //!
 //! ```json
 //! {
-//!   "v": 1,
+//!   "v": 2,
 //!   "deployment_id": 42,
 //!   "entries": [
 //!     {"path": "index.mjs",         "kind": "handler",
@@ -32,8 +32,8 @@
 //!   via the JS dispatcher; the wire content-type comes from the
 //!   handler's response object), and the manifest-stamped MIME for
 //!   statics.
-//! - `v: 1` is reserved for forward-compat. Decoder rejects anything
-//!   that doesn't match.
+//! - `v` is the schema version (currently `2`). The decoder rejects
+//!   anything that doesn't match.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -79,7 +79,7 @@ pub const Package = struct {
     private: bool,
 };
 
-/// In-memory manifest as the worker / files-server consume it after
+/// In-memory manifest as the worker consumes it after
 /// parsing. Owns its `entries` slice + each entry's `path` and
 /// `content_type` allocations, plus the `packages` / `app_imports`
 /// sections and every string they own. `packages`/`app_imports` are

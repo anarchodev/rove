@@ -683,7 +683,7 @@ fn valueToOwnedString(
 /// (`"[object Object]"`, a Uint8Array's `"1,2,3"`) and null/undefined
 /// at a write site is a handler bug — all throw TypeError instead of
 /// corrupting the durable store
-/// (docs/decisions.md Â§4.11). JSON encoding stays
+/// (docs/decisions.md §4.11). JSON encoding stays
 /// the handler's explicit choice (`kv.set(k, JSON.stringify(v))`).
 fn kvWriteArgToOwnedString(
     state: *DispatchState,

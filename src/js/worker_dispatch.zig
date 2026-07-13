@@ -4012,11 +4012,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 break :transfer;
             };
             // `docs/auto-bind-plan.md`: decide bind at handler SUCCESS,
-            // when the outcome is known. A fetch **auto-binds** (chunks
-            // resume this chain's `onFetchChunk`) iff the handler held
-            // the chain (`next()`/`stream()`) AND the customer didn't
-            // opt out with `detach: true`. A terminal handler has no
-            // chain, so its fetches are always detached (Pattern A).
+            // when the outcome is known. A fetch binds (its chunks resume
+            // this chain's `onFetchChunk`) only when it is an `on.fetch`
+            // from a held activation (`next()`/`stream()`); the exact rule
+            // is applied per-fetch below. A terminal handler has no chain,
+            // so its fetches are always transient (Pattern A).
             // The outcome ISN'T known at the `http.fetch` call, so the
             // decision (and registration) can only live here — a
             // handler that throws never reaches this block, so it never

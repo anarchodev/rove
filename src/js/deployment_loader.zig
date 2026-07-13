@@ -16,7 +16,7 @@
 //!    in-memory ReleaseTable.
 //! 3. This thread picks up the queued load, calls `load_fn` (a
 //!    worker-supplied callback), which is responsible for:
-//!      - Fetching the manifest from files-server (HTTP).
+//!      - Fetching the manifest from the deployment manifest backend.
 //!      - Fetching all referenced bytecodes (eventually a
 //!        curl_multi pool).
 //!      - Mirroring `_config/*.json` rows into kv via raft

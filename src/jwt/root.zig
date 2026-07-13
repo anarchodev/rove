@@ -1,5 +1,5 @@
 //! HS256 JWT helpers for the standalone services' `Authorization:
-//! Bearer` gates (log-server, files-server) plus the worker's
+//! Bearer` gates (log-server) plus the worker's
 //! `/_system/release` and `/_system/admin-kv` endpoints. Not a
 //! general-purpose JWT library — fixed alg, narrow payload shape.
 //!

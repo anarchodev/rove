@@ -608,7 +608,7 @@ test "dispatch: request.session is null when no sid resolved" {
     try testing.expectEqualStrings("null", resp.body);
 }
 
-// ── docs/decisions.md Â§4.11 (fail-loud sweep) ─────────
+// ── docs/decisions.md §4.11 (fail-loud sweep) ─────────
 
 test "dispatch: Uint8Array return ships raw bytes, not JSON (C1)" {
     var buf: [64]u8 = undefined;
@@ -740,7 +740,7 @@ test "dispatch: next({ctx}) with unserializable ctx throws, absent ctx stays leg
     try testing.expectEqualStrings("threw", resp.body);
 }
 
-// ── decisions.md Â§4.11 — the uniform payload surface ──
+// ── decisions.md §4.11 — the uniform payload surface ──
 
 test "dispatch: request.bytes/.text/.json on plain inbound (§2.2)" {
     var buf: [64]u8 = undefined;
@@ -914,7 +914,7 @@ test "dispatch: ws_message frame payload on request.bytes/.text (§2.2)" {
     }
 }
 
-// ── decisions.md Â§4.11 — the grammar sweep ──────────
+// ── decisions.md §4.11 — the grammar sweep ──────────
 
 test "dispatch: after.fetch returns a ftch_-prefixed id (§2.3/§2.4)" {
     var buf: [64]u8 = undefined;
