@@ -1355,6 +1355,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/email", // email.send → webhook _send/owed marker (Resend)
         "src/replay/testdata/blobrecipe", // blob put/write/seal/url — streaming sha256 offline
         "src/replay/testdata/utf8body", // multibyte UTF-8 request body round-trips (json/text/bytes)
+        "src/replay/testdata/utf8encode", // TextEncoder/base64url/hash over non-ASCII ↔ utf8_encode_smoke_v2 (issue #11)
         "src/replay/testdata/platformkv", // platform.scope(id)/root per-store kv isolation
         "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
         "src/replay/testdata/platformadmin", // platform.* admin-only gating (fail-closed)
