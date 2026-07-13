@@ -134,8 +134,8 @@ declares/captures:
 |---|---|---|
 | `inbound` (default) | `default` | `request.method/.path/.headers/.body/.cookies/.ip` (read-recorded) |
 | `inbound_chunk` | `onChunk` | this chunk's bytes (binary), `request.done`, `request.chunkSeq`, `request.ctx` |
-| `after.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{on}` | flattened: `request.bytes`/`.text`/`.json`, `request.status/.ok/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
-| `after.kv`/`after.ms` wake | `onWake` or `{on}` | `request.ctx`; matched keys on `request.activation.wakes[]` (edge — "go look") |
+| `after.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{on}` | flattened: `request.bytes`/`.text`/`.json`, `request.status/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
+| `after.kv`/`after.ms` wake | `onWake` or `{on}` | `request.ctx`; fired watches on `request.activation.wakes[]` (edge — "go look"): `{kind:"kv",prefix,firedAt:<ms>}` per fired arm or `{kind:"timer",firedAt:<ms>}` — the armed prefix, never matched keys. Identical on every resume path (stream/held/WS) |
 | `ws_message` | `onMessage` | `request.activation = {opcode, data}`, `request.ctx` |
 | `disconnect` | `onDisconnect` | `request.ctx` |
 | `durable_wake` / `cron` / `schedule` | the named target | `request.activation.msg`; no inbound headers/body; connection verbs inert |
@@ -187,7 +187,7 @@ every activation runnable. Three gaps, in priority order:
 **Update 2026-06-30 — mechanism landed, then a REAL recording refuted the fetch
 data-path.** The driver gained decoders + install for `trigger_payload` (the
 `{"ctx": …}` envelope → `request.ctx`) and `fetch_responses` (→ the flattened
-`request.status/.ok/.done/.fetchId` + body), export-resolution by event shape,
+`request.status/.done/.fetchId` + body), export-resolution by event shape,
 and `pull` carries the channels. That passed a *programmatic* fixture — but
 validating against a **real** `fetch_chunk` recording (a live `after.fetch` →
 `onFetchResult`, `scripts/smoke/replay_noninbound_smoke_v2.py`) refuted the
@@ -248,7 +248,7 @@ resolved export (`ev.resolvedExport()`) now rides `TapePayloads.export_name`
 (recorded per fetch resume, emitted as the record's `export` field), `pull`
 carries it, and `root.run` prefers it over the event-shape derivation. So an
 overridden callback replays under its actual export. Validated in the matrix
-(`replay_matrix_smoke_v2.py` uses `{to:'onUpstream'}` with **no** `onFetchResult`
+(`replay_matrix_smoke_v2.py` uses `{on:'onUpstream'}` with **no** `onFetchResult`
 — reproduction proves the recorded export is used). ~~(b) `TextDecoder`/`stream.*`/`next` absent in the bare
 replay arena~~ **FIXED** — the epilogue now shims `TextDecoder`/`TextEncoder`,
 `stream.*`/`on.*`/`next`/`webhook`/`schedule`/`cron`/`blob`/`request.tag`; outputs
@@ -273,8 +273,28 @@ callback kind lands**. Because smokes run Debug workers, *every* smoke is now an
 L3 checker — it caught a deliberately-regressed capture site (fired during the
 deploy flow, before the test even ran). (2) A **per-kind replay matrix**
 (`scripts/smoke/replay_matrix_smoke_v2.py`) captures + replays a real `inbound` /
-`fetch_chunk` / `ws_message` recording and asserts each reproduces. The pure
-predicate `l3MissingChannel` has an inline unit test.
+`fetch_chunk` / `ws_message` / `wake_batch` recording and asserts each
+reproduces. The pure predicate `l3MissingChannel` has an inline unit test.
+
+**Update 2026-07-12 — `wake_batch` fully recorded (issue #62).** A wake
+resume's Msg is the drained fired-watch batch (`request.activation.wakes[]`,
+the #8 fired-prefix contract) — now taped on all three resume paths (stream /
+held `next()` / WS) as `activation_bytes` (the wakes JSON, verbatim in the
+JS-facing encoding — `captureWakeBatchTapes`; always at least `[]`, so the L3
+guard asserts it), alongside the threaded ctx envelope on `trigger_payload`
+(kept past the read-taping elision via `Readset.ctx_payload` — ctx is consumed
+unconditionally at install, never a lazily-read body) and the resolved wake
+export (`{on}` override) on `export` (G3). `export-fixture` transcodes the
+batch onto the world's `request.activation.{kind,wakes}` — the same bag shape
+an authored `rewind:test` world carries — so `wake_batch` joins the
+faithful-transcode set (`isFaithfulTranscode`). Validated end-to-end in the
+replay matrix: a live `after.kv` resume replays offline reproducing
+`wakes[]` (prefix + ms `firedAt`), `request.ctx`, and the hop's kv write.
+Known limitation: the ctx/wakes capture runs at log time (post-propose), so
+the RAFT copy of a writing wake's readset lacks the ctx entry — follower-side
+record rebuild (Phase 5c) would miss `request.ctx`; the leader's log record
+(what `pull`/replay consume) carries everything. `send_callback` resumes
+remain untaped (their Msg is the callee outcome) — the remaining kind.
 
 ## 6. Implications for the sim / export-fixture plan
 
@@ -302,7 +322,7 @@ Landed 2026-06-30: the declarative-world sim path (`world.zig`, the host's
 `.map` mode + miss policy, `runWorld`, `rewind sim`), now covering **all
 activation kinds** — a world declares the `activation` kind, the resolved
 `export` (the `{on}` / callback name), the threaded `ctx` (→ `request.ctx`), the
-flattened fetch/callback result (`request.status/.ok/.done/.fetchId/.chunkSeq`),
+flattened fetch/callback result (`request.status/.done/.fetchId/.chunkSeq`),
 and the `request.activation` metadata bag, per the §3 table. So G1/G2/G3 above
 constrain **replay** (captured worlds) only; **sim** of any activation needs no
 recording change, because the authored world supplies the export and the

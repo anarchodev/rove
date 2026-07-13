@@ -12,7 +12,7 @@ against real S3 (the V2 blob backend is S3-only):
      with `ok: true`.
   2. `blob.get`: a second request reads the object back through the
      signed `rove-blob.internal` door (connection-scoped `on.fetch`
-     composition, `{to}` export routing) — bytes round-trip.
+     composition, `{on}` export routing) — bytes round-trip.
   3. `blob.url`: a presigned GET URL minted by the handler is fetched
      DIRECTLY from this test process (zero worker involvement) and
      returns the bytes with the signed content-type — proves the
@@ -76,10 +76,10 @@ export function onBlob() {
 PUTRESULT_SRC = """
 export default function () {
   // Unified flattened on_result surface (handler-shape §7, Endpoint A):
-  // request.ok/.status top-level, blob hash on request.activation.hash,
-  // echoed context IS request.ctx.
+  // request.status top-level (2xx = stored; no request.ok, issue #7),
+  // blob hash on request.activation.hash, echoed context IS request.ctx.
   kv.set("put_result", JSON.stringify({
-    result: { ok: request.ok, status: request.status, hash: request.activation.hash },
+    result: { ok: request.status >= 200 && request.status < 300, status: request.status, hash: request.activation.hash },
     context: request.ctx,
   }));
 }
@@ -118,7 +118,7 @@ SEALEDNOTE_SRC = """
 export default function () {
   kv.set("sealed/" + (request.ctx && request.ctx.tag || "unknown"), JSON.stringify({
     hash: request.activation.hash,
-    ok: request.ok,
+    ok: request.status >= 200 && request.status < 300,
     body: request.json,
   }));
   return "";

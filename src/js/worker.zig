@@ -3336,6 +3336,7 @@ pub const captureTapes = worker_log.captureTapes;
 pub const captureTapesWithActivation = worker_log.captureTapesWithActivation;
 pub const captureFetchChunkTapes = worker_log.captureFetchChunkTapes;
 pub const captureWsFrameTapes = worker_log.captureWsFrameTapes;
+pub const captureWakeBatchTapes = worker_log.captureWakeBatchTapes;
 pub const FetchEvent = worker_log.FetchEvent;
 pub const captureLog = worker_log.captureLog;
 pub const captureLogWithId = worker_log.captureLogWithId;

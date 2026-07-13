@@ -1347,6 +1347,7 @@ pub fn build(b: *std.Build) void {
         "examples/loop46-demo-tenants/wswake", // ↔ ws_wake_smoke_v2 (WS+wake)
         "src/replay/testdata/authsurface", // compute globals (crypto/base64url/jwt/oidc/sessions) in the sim base
         "src/replay/testdata/middleware", // real _middlewares/before + request.session injection
+        "src/replay/testdata/middlewarejs", // .js-spelled _middlewares runs too, .mjs preferred (issue #51)
         "src/replay/testdata/platformsurface", // http/platform/browser globals (effect recorders)
         "src/replay/testdata/oidcverify", // RS256 crypto.verifyRsa + jwt.verify offline
         "src/replay/testdata/ecdsaverify", // ES256 crypto.verifyEcdsa (P-256) + jwt.verify offline
@@ -1366,6 +1367,8 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/wsmessage", // a WS frame reads back as request.text/.bytes (browser.message)
         "src/replay/testdata/wsfetchloop", // continue a WS conversation past a fetch resume (agent-loop shape)
         "src/replay/testdata/fetchctx", // fetch-resume ctx override: fetch's own ctx if any, else the chain's next() (issue #3, §4.14)
+        "src/replay/testdata/errorsemantics", // throw→500+rollback, pending-promise→200 "{}", missing-export 404/no-op/fallback, bad middleware (issue #10)
+        "src/replay/testdata/fetchrecorder", // fetch option bag + unique ftch_ ids + fetchId/fetchesPending threading + terminal-only status/ok + stream gating (issue #24)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

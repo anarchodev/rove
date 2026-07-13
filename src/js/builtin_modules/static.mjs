@@ -64,11 +64,12 @@ export default function () {
 export function onChunk() {
   const a = request.activation;
   // Honor the upstream read's outcome on the terminal event. A failed
-  // (missing blob / S3 error / timeout) or truncated file-blobs read
-  // must NOT be served — and strong-ETag cached — as a well-formed 200.
-  // Every sibling {on} builtin gates on request.ok; static must too.
-  // (`ok`/`status`/`bodyTruncated` are only set on the final event.)
-  if (a.final && (!a.ok || a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
+  // (missing blob / S3 error / timeout → status 0 or non-2xx) or
+  // truncated file-blobs read must NOT be served — and strong-ETag
+  // cached — as a well-formed 200. Gate on `status` (the single result
+  // truth; no `request.ok`, issue #7). (`status`/`bodyTruncated` are
+  // only set on the final event.)
+  if (a.final && (a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
     if (a.seq === 0) {
       // First-and-final chunk (e.g. a missing blob): nothing streamed,
       // the response head isn't committed yet — send a clean 502.

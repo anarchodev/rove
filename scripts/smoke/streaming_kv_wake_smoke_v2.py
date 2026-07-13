@@ -11,7 +11,7 @@ client POSTs three writes under `watch/` (DIRECT to the node — see below).
 Essential assertions kept from V1:
   1. Content-Type is text/event-stream.
   2. Initial `snapshot` frame fires on the inbound hop.
-  3. The three writes arrive as `update` frames carrying key=value (op)
+  3. The three writes arrive as `update` frames carrying key=value
      — proving the wake_batch activation reads `request.activation.wakes`
      and the cell re-registers its prefix on every `next()`.
 
@@ -57,18 +57,20 @@ export default function () {
     stream.start();
     stream.write("event: snapshot\\ndata: initial\\n\\n");
     after.kv("watch/");
-    return next();
+    return next({ cursor: null });
 }
 
 export function onWake() {
     stream.start(); // keep the stream alive even on a zero-frame wake
-    for (const w of request.activation.wakes) {
-        if (w.kind !== "kv") continue;
-        const value = kv.get(w.key) ?? "(deleted)";
-        stream.write(`event: update\\ndata: ${w.key}=${value} (${w.op})\\n\\n`);
+    // Go-look drain (issue #8): the wake names the fired prefix, never
+    // the matched keys; emit everything past the ctx cursor.
+    const cursor = request.ctx ? request.ctx.cursor : null;
+    const rows = kv.prefix("watch/", cursor);
+    for (const r of rows) {
+        stream.write(`event: update\\ndata: ${r.key}=${r.value}\\n\\n`);
     }
     after.kv("watch/");
-    return next();
+    return next({ cursor: rows.length ? rows.at(-1).key : cursor });
 }
 """
 
@@ -196,9 +198,9 @@ def main() -> int:
               f"body={body!r}")
 
         expected_updates = [
-            "event: update\ndata: watch/1=alpha (put)\n\n",
-            "event: update\ndata: watch/2=bravo (put)\n\n",
-            "event: update\ndata: watch/3=charlie (put)\n\n",
+            "event: update\ndata: watch/1=alpha\n\n",
+            "event: update\ndata: watch/2=bravo\n\n",
+            "event: update\ndata: watch/3=charlie\n\n",
         ]
         seen = sum(1 for f in expected_updates if f in body)
         check("≥2 of 3 kv-wake update frames", seen >= 2,

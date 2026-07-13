@@ -181,10 +181,12 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     row.name = &.{};
 }
 
-/// `_system.on.fetch(url, opts?, { to? })` — connection-scoped outbound
-/// (`docs/handler-shape.md` §2.3). Issues an
+/// `_system.on.fetch(url, opts?)` — connection-scoped outbound
+/// (`docs/handler-shape.md` §2.3). `opts.on` selects the bound export —
+/// the SAME key the customer writes on `after.fetch` (the shim passes it
+/// through; no wire respelling). Issues an
 /// HTTP request whose result wakes THIS connection: chunks resume the
-/// held chain's `{to}` export (default `onFetchChunk`). Connection-only
+/// held chain's `{on}` export (default `onFetchChunk`). Connection-only
 /// — if the activation doesn't end up holding the socket the fetch is
 /// INERT (dropped at the success seam, no unbound fire); connectionless
 /// outbound is `webhook.send`. The transient twin of `webhook.send`;
@@ -198,7 +200,7 @@ pub fn jsOnFetch(
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
     if (argc < 1 or !c.JS_IsString(argv[0])) {
-        _ = c.JS_ThrowTypeError(ctx, "after.fetch(url, opts?, {on?}) requires a url string");
+        _ = c.JS_ThrowTypeError(ctx, "after.fetch(url, opts?) requires a url string");
         return js_exception;
     }
     // `opts` (arg1) is optional; the field readers need a real object
@@ -207,9 +209,8 @@ pub fn jsOnFetch(
     const made_opts = !(argc >= 2 and c.JS_IsObject(argv[1]));
     const opts: c.JSValue = if (made_opts) c.JS_NewObject(ctx) else argv[1];
     defer if (made_opts) c.JS_FreeValue(ctx, opts);
-    const to_obj: c.JSValue = if (argc >= 3) argv[2] else js_undefined;
 
-    var row = buildOnFetchRow(ctx, state, argv[0], opts, to_obj) catch |err| switch (err) {
+    var row = buildOnFetchRow(ctx, state, argv[0], opts) catch |err| switch (err) {
         error.JsException => return js_exception,
         else => {
             state.pending_kv_error = err;
@@ -239,7 +240,7 @@ pub fn jsOnFetch(
 
 /// Build a `BuiltFetch` for `on.fetch`: `url` is a positional string
 /// (arg0, not `opts.url`); the shared transport fields come from `opts`;
-/// `{to}` (an optional `{ to: "export" }` object) selects the bound
+/// `opts.on` (the customer's `{on}` key, unchanged) selects the bound
 /// export via `name`. `connection_scoped = true`,
 /// `on_chunk` empty (a connection-scoped fetch never fires unbound).
 fn buildOnFetchRow(
@@ -247,7 +248,6 @@ fn buildOnFetchRow(
     state: *globals.DispatchState,
     url_val: c.JSValue,
     opts: c.JSValue,
-    to_obj: c.JSValue,
 ) !BuiltFetch {
     const a = state.allocator;
     var fetched: FetchExtracted = .{};
@@ -269,16 +269,13 @@ fn buildOnFetchRow(
     // `on_chunk` module path is never consulted — leave it empty.
     fetched.on_chunk_module = try a.dupe(u8, "");
     fetched.bound_send_id = try a.dupe(u8, "");
-    // `{to}` → the bound-export override (`name`). Empty = default
-    // `onFetchChunk`. Read from `to_obj.to` (the third arg).
-    fetched.name = if (c.JS_IsObject(to_obj))
-        try dupeJsString(ctx, a, to_obj, "to", "")
-    else
-        try a.dupe(u8, "");
+    // `{on}` → the bound-export override (`name`). Empty = default
+    // `onFetchChunk`.
+    fetched.name = try dupeJsString(ctx, a, opts, "on", "");
     if (fetched.name.?.len > 0 and !isValidExportName(fetched.name.?)) {
         _ = c.JS_ThrowTypeError(
             ctx,
-            "on.fetch: `to` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)",
+            "after.fetch: `on` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)",
         );
         return error.JsException;
     }
@@ -477,7 +474,7 @@ const BuiltFetch = struct {
     name: []u8 = &.{},
     /// True ⇒ this fetch was issued via
     /// `on.fetch` — a CONNECTION trigger. Connection-scoped by
-    /// construction: it binds to the held chain (chunks → `{to}` /
+    /// construction: it binds to the held chain (chunks → `{on}` /
     /// `onFetchChunk`) when the activation holds the socket, and is
     /// INERT (dropped, no unbound fire) when it doesn't — the model's
     /// "all `on.*` are for the current connection; connectionless

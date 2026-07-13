@@ -432,11 +432,11 @@ test "dispatch: ambient retry.shouldRetry / retry.ctx logic" {
     defer d.deinit();
 
     var resp = try runOne(&d, kv,
-        \\const mk = (okv, r) => { request.ok = okv; request.ctx = { _retry: r }; return retry.shouldRetry(); };
+        \\const mk = (okv, r) => { request.status = okv ? 200 : 500; request.ctx = { _retry: r }; return retry.shouldRetry(); };
         \\const ok = mk(true, { attempt: 1, max_attempts: 3 });
         \\const failed_with_attempts = mk(false, { attempt: 1, max_attempts: 3 });
         \\const failed_exhausted = mk(false, { attempt: 3, max_attempts: 3 });
-        \\request.ok = false; request.ctx = { charge_id: 42 };
+        \\request.status = 500; request.ctx = { charge_id: 42 };
         \\const no_retry_meta = retry.shouldRetry();
         \\request.ctx = { charge_id: 42, _retry: { attempt: 2 } };
         \\const stripped = JSON.stringify(retry.ctx());
@@ -453,7 +453,8 @@ test "dispatch: ambient retry.shouldRetry / retry.ctx logic" {
 // blob.put / retry) AND a §6.4 held-sync resume both arrive as a
 // `.send_callback` whose body is `{"ctx":{result,context}}`. The runtime
 // hoists it onto the SAME flattened surface a bound fetch resume uses:
-// `request.body` = response bytes, top-level `request.status`/`.ok`/`.done`,
+// `request.body` = response bytes, top-level `request.status`/`.done`
+// (`status` is the single success signal; no `request.ok`, issue #7),
 // the THREADED ctx (the echoed `context`) on `request.ctx` (bare), and the
 // per-delivery metadata on `request.activation.*`. There is NO
 // `request.result` and no positional `outcome`.
@@ -471,7 +472,6 @@ test "dispatch: connectionless on_result presents the flattened result surface (
     var resp = try runOne(&d, kv,
         \\return [
         \\  "status=" + request.status,
-        \\  "ok=" + request.ok,
         \\  "done=" + request.done,
         \\  "body=" + request.text,
         \\  "ctx.order=" + request.ctx.order,
@@ -492,7 +492,7 @@ test "dispatch: connectionless on_result presents the flattened result surface (
 
     try testing.expectEqualStrings("", resp.exception);
     try testing.expectEqualStrings(
-        "status=200 ok=true done=true body=PONG ctx.order=42 act.attempts=1 act.error=null result=undefined",
+        "status=200 done=true body=PONG ctx.order=42 act.attempts=1 act.error=null result=undefined",
         resp.body,
     );
 }
@@ -928,7 +928,7 @@ test "dispatch: after.fetch returns a ftch_-prefixed id (§2.3/§2.4)" {
     var resp = try runOne(
         &d,
         kv,
-        \\const id = after.fetch("http://up.test/", {}, { on: "onR" });
+        \\const id = after.fetch("http://up.test/", { on: "onR" });
         \\if (typeof id !== "string" || !id.startsWith("ftch_")) return "new-bad:" + id;
         \\if (typeof after.ms !== "function" || typeof after.kv !== "function") return "no-after";
         \\if (typeof globalThis.on !== "undefined") return "on-alias-still-installed";
@@ -1205,7 +1205,7 @@ test "static onChunk: a failed upstream read fails loud (502), never a silent 20
     const bc = try ctx.compileToBytecode(
         \\export function onChunk() {
         \\  const a = request.activation;
-        \\  if (a.final && (!a.ok || a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
+        \\  if (a.final && (a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
         \\    if (a.seq === 0) { response.status = 502; return "static asset read failed (status " + a.status + ")"; }
         \\    throw new Error("static read failed mid-stream");
         \\  }

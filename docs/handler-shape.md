@@ -226,6 +226,14 @@ run whether or not anyone is connected. Each names the export it invokes:
   once, at a time.
 - `cron(spec, "module.method")` — run the target on a recurring schedule.
 
+For `schedule`/`cron`, the target is a single string. A bare module
+(`"jobs/reminder"`) fires its `default` export; the `module.method` form
+fires a named export — but the method suffix is only recognized **after a
+`.mjs`/`.js` module** (`"reports.mjs.weekly"` → the `weekly` export of
+`reports.mjs`). So `"reports.mjs"` is the whole module (not module
+`reports` + method `mjs`), and to name a method you include the
+extension: `"jobs/reminder.mjs.retry"`.
+
 A connectionless request can read/write `kv`, register more
 connectionless triggers, and do work — but it has **no connection**, so
 the disposition verbs and `stream.*` / `after.*` are **inert** there. To
@@ -330,7 +338,7 @@ export** a trigger's activation lands in; it does not invent a kind.
 > (`runModule`). `request.activation.kind` is no longer a dispatch
 > discriminator (the named export is); it remains on
 > `request.activation` alongside the wake / source payload (`wakes` /
-> `overflow` / `write_pressure` / `source`). The inbound-chunk
+> `source`). The inbound-chunk
 > (`onChunk`) split in the table above is SHIPPED (gap 2.4,
 > 2026-06-10): a chunk activation's payload is arbitrary bytes — read
 > it as `request.bytes` (or `.text`/`.json`, same as every payload
@@ -507,7 +515,7 @@ export default function () {
 }
 
 export function onCharge() {                      // connectionless {on} callback — no socket; does work, returns nothing
-  if (!request.ok) return;                        // delivery failed (request.activation.error says why)
+  if (request.status < 200 || request.status >= 300) return;  // delivery failed (request.activation.error says why; status 0 = never reached)
   const charge = request.json;                    // the response payload, parsed (§7)
   kv.set(`charges/${charge.id}`, JSON.stringify(charge));
 }
@@ -731,18 +739,39 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `request.ctx` is `undefined` on the **first** activation of a chain
   (nothing threaded yet). A `cron`/`schedule` target reads the payload
   it was scheduled with as `request.ctx` too — the one-ctx rule has no
-  exceptions. `after.kv`/`after.ms` are edge
-  ("go look") wakes — they carry **no** matched key/value; `onWake`
-  re-reads authoritative `kv`, and which keys fired is on
-  `request.activation.wakes[]` if you need it.
+  exceptions. `after.kv`/`after.ms` are edge ("go look") wakes — they
+  carry **no** matched key or value; `onWake` re-reads authoritative
+  `kv`. What the resume tells you is **which watch fired**, on
+  **`request.activation.wakes[]`**: one entry per fired arm, `{ kind:
+  "kv", prefix, firedAt }` (the armed prefix, exactly as you passed it
+  to `after.kv`) or `{ kind: "timer", firedAt }`, with `firedAt` in
+  milliseconds since epoch. A burst of writes under one prefix is one
+  entry (latest `firedAt` wins) — the signal is complete by
+  construction, so there is nothing to overflow and no missed-wakes
+  counter to check. Identical on every resume path (a streaming chain,
+  a buffered held `next()`, and a held WebSocket).
 - **Fetch / effect results — one flattened surface:** a bound `after.fetch` /
   `blob.get` resume **and** a `webhook.send` / `blob.put` / `retry`
   `{on}` callback (and a §6.4 held-sync resume) present the result
   identically — the response payload on **`request.bytes`/`.text`/
   `.json`** (the whole body for a non-streamed fetch, this chunk for a
-  streamed one), with `request.status` / `request.ok` / `request.done`
+  streamed one), with `request.status` / `request.done`
   (+ `request.fetchId` / `request.chunkSeq` for fetch chunks) at the
-  **top level**; the threaded `ctx` on **`request.ctx`** (bare); and
+  **top level**. **`request.status` is the single success signal — there
+  is no `request.ok`.** Branch on the status: `200 ≤ status < 300` is
+  success; a non-zero non-2xx is an upstream error you can inspect
+  (`request.status === 502`); and **`request.status === 0`** is a hard
+  transport failure (timeout, DNS, connect refused, policy block —
+  we never reached a server). One field, three cases, nothing derived
+  to disagree with it. (A derived `ok` boolean used to ride here; it was
+  removed because it was fully recomputable from `status` yet drifted
+  into three disagreeing definitions — issue #7. If you want the web
+  `Response.ok` shorthand, write it yourself:
+  `const ok = request.status >= 200 && request.status < 300`. The
+  `webhook.send` / `retry` durability shims classify *delivery* with a
+  wider `status < 400` rule — a 302 is a delivered webhook — but that is
+  the shim's own retry bookkeeping; your `{on}` handler still just reads
+  `request.status`.) The threaded `ctx` on **`request.ctx`** (bare); and
   per-delivery metadata (`attempts`, `error`, `id`, `headers`, blob
   `hash`) on **`request.activation.*`**. `request.fetchId` is the SAME
   opaque `ftch_…` string `after.fetch()` returned, so the two compare

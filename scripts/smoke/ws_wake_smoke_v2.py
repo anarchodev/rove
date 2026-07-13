@@ -148,7 +148,10 @@ def main():
               f"got {w.status} {w.body!r}")
         try:
             op, pl = recv_text(sock)
-            check("on.kv woke the held chain", op == OP_TEXT and pl == b"woke:hello",
+            # issue #8: the WS resume surfaces the FIRED PREFIX on
+            # request.activation.wakes[] — the frame carries "|fired:feed/".
+            check("on.kv woke the held chain (+ fired prefix surfaced)",
+                  op == OP_TEXT and pl == b"woke:hello|fired:feed/",
                   f"op={op} pl={pl!r}")
         except Exception as e:
             check("on.kv woke the held chain", False, repr(e))

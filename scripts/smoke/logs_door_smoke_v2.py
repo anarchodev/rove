@@ -31,7 +31,8 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # holds the client response until the upstream result arrives in `onFetchResult`
 # (handler-shape.md §3 — the on.fetch buffered convention, mirrors the
 # acme/onfetchbuf example). The door's setup errors (e.g. LogsDoorForbidden for
-# a non-admin tenant) surface as a terminal `request.ok == false` event.
+# a non-admin tenant) surface as a terminal event with `request.status === 0`
+# (a hard transport failure — the outbound was refused at the door).
 PROBE_SRC = r"""export default function () {
     const t = new URLSearchParams(request.query || "").get("t") || "acme";
     after.fetch("http://rewind-logs.internal/v1/" + t + "/list?limit=5");
@@ -39,7 +40,7 @@ PROBE_SRC = r"""export default function () {
 }
 
 export function onFetchResult() {
-    if (request.ok) {
+    if (request.status >= 200 && request.status < 300) {
         response.status = 200;
         return "ok:" + request.status + ":" +
             (request.text || "");

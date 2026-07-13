@@ -90,7 +90,9 @@ pub fn jsSetWake(
 
 /// Enqueue one `durable_wake` activation for THIS tenant. Called once
 /// per due `_sched/by_time` entry by `scheduler_tick`. Args:
-///   0 target        — handler module path (string)
+///   0 target        — handler target (string): a module path, or the
+///                     `"module.method"` form (split in
+///                     `fireDurableWakeActivation`, issue #9)
 ///   1 id            — scheduler entry id (string)
 ///   2 key           — idempotency key (string | null)
 ///   3 scheduledAtNs — absolute fire time, decimal string

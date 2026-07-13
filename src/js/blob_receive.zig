@@ -11,7 +11,7 @@
 //! copies to the content-addressed `app-blobs/{sha256}` home, deletes
 //! the temp, and emits ONE terminal `UpstreamFetchEvent` — `{hash,
 //! len}` in `ctx_json` — through the same router the FetchEngine
-//! uses, so the held chain resumes at the customer's `{to}` export
+//! uses, so the held chain resumes at the customer's `{on}` export
 //! with zero receive-specific resume machinery.
 //!
 //! Flow control is end-to-end: h2 only repays the client's
@@ -97,7 +97,7 @@ pub const Job = struct {
 
     // Immutable after create():
     /// The tenant holding the chain (where the terminal event routes + the
-    /// `{to}` export resumes). For own-tenant receives this is also the S3
+    /// `{on}` export resumes). For own-tenant receives this is also the S3
     /// staging tenant; for cross-tenant (admin) receives the staging tenant is
     /// `target_id`.
     tenant_id: []u8,
@@ -109,7 +109,7 @@ pub const Job = struct {
     /// receive re-entry. Empty when absent.
     app_ctx: []u8,
     fetch_id: []u8,
-    /// Customer `{to}` export the terminal event resumes.
+    /// Customer `{on}` export the terminal event resumes.
     name: []u8,
     content_type: ?[]u8,
     router: *msg_router_mod.MsgRouter,
@@ -420,7 +420,7 @@ pub const Job = struct {
 
     /// One terminal `UpstreamFetchEvent` through the FetchEngine's
     /// router path: `bind` routes it to the worker holding the
-    /// chain; `name` resumes the customer's `{to}` export;
+    /// chain; `name` resumes the customer's `{on}` export;
     /// `ctx_json` carries `{hash, len}` (the §3.5 completion Msg —
     /// all replay strictly needs).
     fn emitTerminal(self: *Job, ok: bool, status: u16, len: u64, hash_hex: ?*const [64]u8) void {
@@ -442,7 +442,7 @@ pub const Job = struct {
             return;
         };
         // `app` echoes the issue-time ctx (raw JSON) so a cross-tenant deploy
-        // receive can thread {tenant, path, content_type} to its `{to}` export.
+        // receive can thread {tenant, path, content_type} to its `{on}` export.
         const app: []const u8 = if (self.app_ctx.len == 0) "null" else self.app_ctx;
         ev.ctx_json = blk: {
             if (hash_hex) |h| {

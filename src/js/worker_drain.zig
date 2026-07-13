@@ -1008,17 +1008,22 @@ fn proposeAndParkContResume(
             // StreamChunks via tryAppend; free the outer spine.
             if (s.chunks.len > 0) allocator.free(s.chunks);
 
-            // Install StreamWakes (kv-prefixes spine + entries
-            // transfer ownership). interval_ms = 0 = no timer wake;
-            // bound-fetch chunks are the wake source.
+            // Install StreamWakes (prefix strings wrap into unfired
+            // arms; ownership transfers). interval_ms = 0 = no timer
+            // wake; bound-fetch chunks are the wake source.
             const next_wake_ns: i64 = if (s.interval_ms > 0)
                 @as(i64, @intCast(std.time.nanoTimestamp())) + s.interval_ms * std.time.ns_per_ms
             else
                 std.math.maxInt(i64);
+            const arms = try components_mod.armsFromPrefixes(allocator, s.kv_prefixes);
+            errdefer {
+                for (arms) |arm| allocator.free(arm.prefix);
+                if (arms.len > 0) allocator.free(arms);
+            }
             try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
                 .interval_ms = s.interval_ms,
                 .next_wake_ns = next_wake_ns,
-                .kv_prefixes = s.kv_prefixes,
+                .kv_prefixes = arms,
             });
 
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
@@ -1108,10 +1113,18 @@ fn installStreamComponentsInline(
         @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
     else
         std.math.maxInt(i64);
+    const arms = components_mod.armsFromPrefixes(allocator, kv_prefixes) catch blk: {
+        // OOM — chain proceeds unarmed for kv (matches this function's
+        // best-effort `catch {}` posture); free the untransferred strings.
+        for (kv_prefixes) |p| allocator.free(p);
+        if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
+        const empty: []components_mod.KvArm = &.{};
+        break :blk empty;
+    };
     server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
-        .kv_prefixes = kv_prefixes,
+        .kv_prefixes = arms,
     }) catch {};
 
     server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
@@ -1353,7 +1366,7 @@ fn resumeErrStatus(worker: anytype) u16 {
 /// readset, and the write arms serialize the readset into the propose,
 /// so materialization order is part of the wire format; keep it exactly
 /// where each capture runs).
-const ContTape = enum { none, chunk, fetch };
+const ContTape = enum { wake, chunk, fetch };
 
 /// Comptime per-site axes of `finishContResume` — everything else the
 /// three cont-family sites do is identical (that identity is the point —
@@ -1405,15 +1418,27 @@ const ContFinishCtx = struct {
     allow_repark: bool = true,
     pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
     /// Tape sources, read per `ContFinishSpec.tape`: `.chunk` reads
-    /// `tape_bytes`; `.fetch` reads `tape_body` + `tape_ev`.
+    /// `tape_bytes`; `.fetch` reads `tape_body` + `tape_ev`; `.wake`
+    /// reads `tape_body` (the `{"ctx":…}` envelope) + `wakes` (the
+    /// drained fired-watch batch) + `wake_export` (issue #62).
     tape_bytes: []const u8 = "",
     tape_body: []const u8 = "",
     tape_ev: ?worker_mod.FetchEvent = null,
+    wakes: []const components_mod.WakeEntry = &.{},
+    wake_export: []const u8 = "",
 };
 
 inline fn contTapes(worker: anytype, comptime tape: ContTape, ctx: *const ContFinishCtx) log_mod.TapePayloads {
     return switch (tape) {
-        .none => .{},
+        // issue #62: a wake resume's Msg is the drained fired-watch
+        // batch — tape it (+ readset/ctx + the resolved export) so the
+        // hop is replayable. The same site also handles send_callback
+        // resumes, which stay untaped for now (their Msg is the callee
+        // outcome; taping it is a follow-up) — hence the runtime guard.
+        .wake => if (ctx.act == .wake_batch)
+            worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, ctx.wake_export)
+        else
+            .{},
         .chunk => worker_mod.captureTapes(worker, ctx.readset, ctx.tape_bytes),
         .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
     };
@@ -1658,7 +1683,7 @@ fn finishContResume(
                 // The activation's Msg tape, built BEFORE the write path
                 // serializes the readset into the propose (see
                 // StreamResumeCtx.tapes for why that ordering matters).
-                .tapes = if (comptime spec.tape == .none) null else contTapes(worker, spec.tape, &ctx),
+                .tapes = contTapes(worker, spec.tape, &ctx),
             });
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations produce
@@ -1737,29 +1762,39 @@ fn resumeContinuation(
     // (callback); default export → a plain body object
     // `{ctx,outcome}` the handler reads via `request.body`.
     // ctx_json/outcome_json are JSON text embedded verbatim. The
-    // `{fn,args}` body envelope is never synthesized
+    // A `{fn,args}` body envelope is never synthesized
     // (decisions.md §4.5 — dispatch targeting is first-class;
     // formatting fn names into a JSON envelope is an escaping
     // hazard). A wake resume routes to the StreamWakes `wake_to`
-    // export (default `onWake`) and drains the entity's wake ring so
-    // the fired entries are consumed (the timer-due / kv-match
-    // trigger).
+    // export (default `onWake`) and drains the entity's fired arms so
+    // they don't re-fire on the next sweep.
+    // The drained fired arms are surfaced on `request.activation.wakes[]`
+    // as fired PREFIXES — same contract as the stream (resumeStream) and
+    // WS (resumeWakeChainWs) resume paths. `onWake` stays a "go look"
+    // edge wake: the entries name which watch fired; the handler re-reads
+    // authoritative kv. Owned for the dispatch's lifetime; freed after
+    // the JS has copied them.
+    var batch_owned: []components_mod.WakeEntry = &.{};
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
     const resume_fn: ?[]const u8 = if (wake) blk: {
         const sw = server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
-        // Drain the §9.4 kv-match ring (if any) — this resume consumes
-        // every accumulated `on.kv` match, so they must not re-fire on
-        // the next sweep. The entries are freed; `onWake` is a "go look"
-        // edge wake, so the matched keys aren't surfaced to the handler
-        // (it re-reads authoritative kv state). A timer-only wake leaves
-        // the ring empty, so this is a no-op there.
-        if (sw.pending_wakes.len > 0) {
-            if (sw.pending_wakes.drainInto(allocator)) |drained| {
-                for (drained.wakes) |*we| we.deinit(allocator);
-                if (drained.wakes.len > 0) allocator.free(drained.wakes);
-            } else |_| {}
-        }
+        // OOM → empty batch, arms stay fired and re-fire next tick
+        // (safe under edge semantics).
+        batch_owned = sw.drainFired(allocator) catch &.{};
         break :blk if (sw.wake_to) |t| t else "onWake";
     } else cont_fn_name;
+    // Owned snapshot of the wake export for the tape (issue #62 — G3):
+    // `resume_fn` borrows StreamWakes.wake_to, which a repark arm can
+    // rewrite before the post-repark log capture runs (the same UAF
+    // class `cont_path_log` guards).
+    const wake_export_owned: []const u8 = if (wake)
+        allocator.dupe(u8, resume_fn.?) catch ""
+    else
+        "";
+    defer if (wake_export_owned.len > 0) allocator.free(wake_export_owned);
     const named: bool = wake or cont_fn_name != null;
     // Endpoint A (decisions.md): the resume's threaded ctx + (for a
     // callback) the effect outcome ride the synthesized body envelope —
@@ -1821,8 +1856,8 @@ fn resumeContinuation(
         // Inherit the chain id from the parking request so every tape row
         // of this chain shares one correlation_id; mark this activation as
         // a send-callback resume (streaming-handlers-plan §6) — or
-        // .wake_batch for an on.* connection wake.
-        .activation = if (wake) .{ .wake_batch = .{} } else .send_callback,
+        // .wake_batch (with the drained fired prefixes) for an on.* wake.
+        .activation = if (wake) .{ .wake_batch = .{ .wakes = batch_owned } } else .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
@@ -1845,7 +1880,7 @@ fn resumeContinuation(
         .site = "cont-resume",
         .noun = "continuation",
         .cancel_binds = false,
-        .tape = .none,
+        .tape = .wake,
     }, &oc, .{
         .ent = ent,
         .sid = sid,
@@ -1866,6 +1901,9 @@ fn resumeContinuation(
         .act = act_src,
         .allow_repark = allow_repark,
         .pending_fetches = &pending_fetches,
+        .tape_body = body,
+        .wakes = batch_owned,
+        .wake_export = wake_export_owned,
     });
 }
 
@@ -2023,7 +2061,7 @@ pub fn resumeBoundFetchChain(
         .terminal_status = ev.terminal_status,
         .terminal_ok = ev.terminal_ok,
         .body_truncated = ev.body_truncated,
-        .export_name = fn_name, // record the resolved export ({to} / onFetch*)
+        .export_name = fn_name, // record the resolved export ({on} / onFetch*)
     };
     const req: Request = .{
         .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, cont_path),
@@ -2323,17 +2361,21 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
             // Two `on.*` wake sources fan into one `onWake` fire:
             //   - `on.timer`: `next_wake_ns` elapsed. Advance it
             //     (drift-on-fire, matching `serviceParkedStreams`) so it
-            //     re-fires next interval; the StreamWakes component rides
-            //     the `next()` re-park, so recurrence needs no re-arming.
-            //   - `on.kv`: `drainKvWakeInbox` pushed a §8.4-gated prefix
-            //     match onto the ring; `pending_wakes.len > 0` is the
-            //     "go look" signal (`resumeContinuation` drains it).
+            //     re-fires next interval, and stamp `timer_fired_ns` so
+            //     the resume's drain surfaces the `{kind:"timer"}` entry;
+            //     the StreamWakes component rides the `next()` re-park,
+            //     so recurrence needs no re-arming.
+            //   - `on.kv`: `drainKvWakeInbox` stamped a §8.4-gated arm
+            //     fired; `anyFired()` is the "go look" signal
+            //     (`resumeContinuation` drains it).
             // One resume per tick even if both are due — the handler's
             // `onWake` re-reads kv state regardless of the trigger.
             const timer_due = sw.interval_ms > 0 and now_ns >= sw.next_wake_ns;
-            const kv_due = sw.pending_wakes.len > 0;
-            if (timer_due) sw.next_wake_ns = now_ns + sw.interval_ms * std.time.ns_per_ms;
-            if (timer_due or kv_due) {
+            if (timer_due) {
+                sw.timer_fired_ns = now_ns;
+                sw.next_wake_ns = now_ns + sw.interval_ms * std.time.ns_per_ms;
+            }
+            if (timer_due or sw.anyFired()) {
                 try wake_due.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
             }
         }

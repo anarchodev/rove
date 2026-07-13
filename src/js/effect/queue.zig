@@ -7,8 +7,7 @@
 //!
 //! 1. Backpressure is a property of the primitive (the queue cap;
 //!    `error.Full` + `overflow_count` on overflow, surfaced on
-//!    `/_system/metrics` the same way `dropped_chunks` /
-//!    `lost_oldest` are).
+//!    `/_system/metrics` the same way `dropped_chunks` is).
 //! 2. The dispatch loop is one `for (queue.drain()) |msg| ...`
 //!    instead of N per-origin sweeps.
 //!
@@ -89,9 +88,8 @@ pub const MsgQueue = struct {
     items: std.ArrayListUnmanaged(Msg) = .empty,
     cap: usize,
     /// Cumulative count of `enqueueMsg` calls that hit the cap and
-    /// returned `error.Full`. Surfaced in the metrics endpoint the
-    /// same way `dropped_chunks` / `lost_oldest` are for the streaming
-    /// primitives.
+    /// returned `error.Full`. Surfaced in the metrics endpoint the same
+    /// way `dropped_chunks` does for the streaming primitives.
     overflow_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cap: usize) MsgQueue {

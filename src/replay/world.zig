@@ -43,7 +43,7 @@ pub const Source = struct { path: []const u8, kind: []const u8, source: []const 
 pub const World = struct {
     entry: []const u8 = "index.mjs",
     activation: []const u8 = "inbound",
-    /// The export to invoke. For a callback (a fetch result, a `{to}`, an
+    /// The export to invoke. For a callback (a fetch result, a `{on}`, an
     /// `onResult`) this is the *resolved* export name — the runtime doesn't
     /// derive it from the kind (see `architecture/replay-and-sim.md` §2). When
     /// null, `runWorld` falls back to the conventional export for the kind.
@@ -104,11 +104,19 @@ pub const World = struct {
     tenant: ?[]const u8 = null,
     correlation_id: ?[]const u8 = null,
     /// The flattened fetch/callback result surface — top-level on `request`.
+    /// `status` is the single success signal (2xx = ok, 0 = transport
+    /// failure); there is no `ok` (issue #7).
     status: ?i64 = null,
-    ok: ?bool = null,
     done: ?bool = null,
     fetch_id: ?[]const u8 = null,
     chunk_seq: ?i64 = null,
+    /// Pending bound-fetch count including this one (prod sets it on every
+    /// bound resume — `request.done && request.fetchesPending === 1` is the
+    /// documented last-chunk-of-last-fetch pattern).
+    fetches_pending: ?i64 = null,
+    /// Terminal-only: the response body hit `max_total_response_bytes` (prod
+    /// stamps it only when `final`, alongside status).
+    body_truncated: ?bool = null,
 };
 
 pub const Error = error{BadWorld} || std.mem.Allocator.Error;
@@ -152,16 +160,18 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             w.body = buf;
             w.body_is_binary = true;
         }
-        // Flattened fetch/callback result surface (`request.status` etc.).
+        // Flattened fetch/callback result surface (`request.status` etc.;
+        // no `ok` — status is the single success signal, issue #7).
         w.status = jInt(r, "status");
-        if (r.get("ok")) |v| {
-            if (v == .bool) w.ok = v.bool;
-        }
         if (r.get("done")) |v| {
             if (v == .bool) w.done = v.bool;
         }
         if (jStr(r, "fetchId")) |s| w.fetch_id = s;
         w.chunk_seq = jInt(r, "chunkSeq");
+        w.fetches_pending = jInt(r, "fetchesPending");
+        if (r.get("bodyTruncated")) |v| {
+            if (v == .bool) w.body_truncated = v.bool;
+        }
         // `request.activation.*` metadata bag.
         if (r.get("activation")) |av| {
             if (av != .null) w.activation_json = try jsonText(a, av);
@@ -310,8 +320,9 @@ test "fromValue: non-inbound (fetch result) surface" {
     const json =
         \\{
         \\  "entry": "h.mjs", "activation": "fetch_chunk", "export": "onUpstream",
-        \\  "request": { "status": 502, "ok": false, "done": true, "fetchId": "ftch_1",
-        \\               "chunkSeq": 3, "body": "boom",
+        \\  "request": { "status": 502, "done": true, "fetchId": "ftch_1",
+        \\               "chunkSeq": 3, "fetchesPending": 2, "bodyTruncated": false,
+        \\               "body": "boom",
         \\               "activation": { "attempts": 2, "error": "timeout" } },
         \\  "ctx": { "attempt": 2 }
         \\}
@@ -320,12 +331,13 @@ test "fromValue: non-inbound (fetch result) surface" {
     const w = try fromValue(a, parsed.value);
 
     try testing.expectEqualStrings("fetch_chunk", w.activation);
-    try testing.expectEqualStrings("onUpstream", w.export_name.?); // {to} override
+    try testing.expectEqualStrings("onUpstream", w.export_name.?); // {on} override
     try testing.expectEqual(@as(i64, 502), w.status.?);
-    try testing.expectEqual(false, w.ok.?);
     try testing.expectEqual(true, w.done.?);
     try testing.expectEqualStrings("ftch_1", w.fetch_id.?);
     try testing.expectEqual(@as(i64, 3), w.chunk_seq.?);
+    try testing.expectEqual(@as(i64, 2), w.fetches_pending.?);
+    try testing.expectEqual(false, w.body_truncated.?);
     try testing.expectEqualStrings("boom", w.body.?);
     // ctx + request.activation are JSON *text* (string values would be quoted).
     try testing.expectEqualStrings("{\"attempt\":2}", w.ctx_json.?);

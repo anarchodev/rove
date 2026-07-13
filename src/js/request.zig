@@ -84,16 +84,13 @@ pub const FetchChunk = struct {
     body_truncated: bool = false,
 };
 
-/// Wake-batch payload (Gap 2.2 Phase D / streaming-handlers-plan §9.4).
+/// Wake-batch payload (issue #8: fired-prefix contract). One entry per
+/// fired arm — `{kind:"kv", prefix, firedAt}` / `{kind:"timer", firedAt}`
+/// — drained via `StreamWakes.drainFired`. Surfaces as
+/// `request.activation.wakes`. Borrowed slice — the resuming caller owns
+/// the entries + their `prefix` bytes for the duration of the dispatch.
 pub const WakeBatch = struct {
-    /// A temporal-order slice drained from the held stream's `PendingWakes`
-    /// ring. Surfaces as `request.activation.wakes`. Borrowed slice — the
-    /// caller (`resumeStream`) owns the entries + their `kv_key` bytes for
-    /// the duration of the dispatch.
     wakes: []const components_mod.WakeEntry = &.{},
-    /// Ring-overflow count snapshotted at drain time. Surfaces as
-    /// `request.activation.overflow.lost_oldest`; 0 in the common case.
-    lost_oldest: u32 = 0,
 };
 
 /// Gap 2.1 subscription_fire payload. `name` is the subscription's

@@ -357,7 +357,7 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
 /// Arm the held continuation's `StreamWakes`
 /// from its drained `on.timer`/`on.kv` registrations + the §8.4 read-view
 /// baseline, set on the entity in `request_out` so the component rides
-/// the park into `parked_continuations`. The kv prefixes + `{to}` are
+/// the park into `parked_continuations`. The kv prefixes + `{on}` are
 /// duped into the component; `s.cont_wakes` is consumed (freed + nulled).
 /// No-op when the handler registered no wakes (a plain park). Errors
 /// propagate to the caller's errdefer (the entity is still in
@@ -367,20 +367,20 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
     if (s.cont_wakes.len == 0) return;
     var interval_ms: i64 = 0;
     var wake_to: ?[]u8 = null;
-    var prefixes: std.ArrayListUnmanaged([]u8) = .empty;
+    var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     errdefer {
-        for (prefixes.items) |p| allocator.free(p);
-        prefixes.deinit(allocator);
+        for (arms.items) |arm| allocator.free(arm.prefix);
+        arms.deinit(allocator);
         if (wake_to) |t| allocator.free(t);
     }
     for (s.cont_wakes) |reg| {
         switch (reg.kind) {
             .timer => interval_ms = reg.interval_ms,
-            .kv => try prefixes.append(allocator, try allocator.dupe(u8, reg.prefix)),
+            .kv => try arms.append(allocator, .{ .prefix = try allocator.dupe(u8, reg.prefix) }),
         }
-        // Last `{to}` wins — `on.*` wakes resume one "edge wake" export
+        // Last `{on}` wins — `on.*` wakes resume one "edge wake" export
         // per held connection; a default `onWake` applies when null.
-        if (reg.to) |t| {
+        if (reg.on) |t| {
             if (wake_to) |old| allocator.free(old);
             wake_to = try allocator.dupe(u8, t);
         }
@@ -390,9 +390,9 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         now_ns + interval_ms * std.time.ns_per_ms
     else
         std.math.maxInt(i64);
-    const kv_prefixes = try prefixes.toOwnedSlice(allocator);
+    const kv_prefixes = try arms.toOwnedSlice(allocator);
     errdefer {
-        for (kv_prefixes) |p| allocator.free(p);
+        for (kv_prefixes) |arm| allocator.free(arm.prefix);
         if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
     }
     try server.reg.set(s.ent, &server.request_out, components_mod.StreamWakes, .{

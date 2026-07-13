@@ -32,6 +32,7 @@ const tenant_mod = @import("rove-tenant");
 
 const worker_mod = @import("worker.zig");
 const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
+const components_mod = @import("components.zig");
 const TenantLog = worker_mod.TenantLog;
 
 // ── Tenant-log open/free ──────────────────────────────────────────────
@@ -213,6 +214,98 @@ pub fn captureTapesWithActivation(
     return payloads;
 }
 
+/// Serialize a drained wake batch to the EXACT JSON the handler saw on
+/// `request.activation.wakes` (globals.zig's wake_batch block, issue #62):
+/// one `{"kind":"kv","prefix":…,"firedAt":<ms>}` / `{"kind":"timer",
+/// "firedAt":<ms>}` per entry, fire-time order preserved, `firedAt` in
+/// milliseconds (the JS-facing encoding — `fired_at_ns` is internal).
+/// An empty batch emits `[]` (never ""), so a taped wake_batch record
+/// explicitly says "empty batch" and the L3 guard can read an empty
+/// `activation_bytes` as "not recorded".
+pub fn wakesToJson(
+    allocator: std.mem.Allocator,
+    wakes: []const components_mod.WakeEntry,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    for (wakes, 0..) |w, i| {
+        if (i != 0) try buf.append(allocator, ',');
+        switch (w.tag) {
+            .kv => {
+                try buf.appendSlice(allocator, "{\"kind\":\"kv\",\"prefix\":\"");
+                // Byte-level JSON string escape (same table as the replay
+                // side's jsonStr): quote/backslash/C0 — sufficient for
+                // UTF-8, no multi-byte escapes needed.
+                for (w.prefix) |b| switch (b) {
+                    '"' => try buf.appendSlice(allocator, "\\\""),
+                    '\\' => try buf.appendSlice(allocator, "\\\\"),
+                    '\n' => try buf.appendSlice(allocator, "\\n"),
+                    '\r' => try buf.appendSlice(allocator, "\\r"),
+                    '\t' => try buf.appendSlice(allocator, "\\t"),
+                    0...0x07, 0x0b, 0x0e...0x1f => {
+                        const esc = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{b});
+                        defer allocator.free(esc);
+                        try buf.appendSlice(allocator, esc);
+                    },
+                    else => try buf.append(allocator, b),
+                };
+                try buf.appendSlice(allocator, "\",\"firedAt\":");
+            },
+            .timer => try buf.appendSlice(allocator, "{\"kind\":\"timer\",\"firedAt\":"),
+        }
+        const ms = @divFloor(w.fired_at_ns, std.time.ns_per_ms);
+        const ms_str = try std.fmt.allocPrint(allocator, "{d}}}", .{ms});
+        defer allocator.free(ms_str);
+        try buf.appendSlice(allocator, ms_str);
+    }
+    try buf.append(allocator, ']');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Record a `wake_batch` activation's Msg — the drained fired-watch batch
+/// (issue #62, follow-on to the #8 fired-prefix contract) — so a wake
+/// resume is replayable. The batch tapes as `activation_bytes` (the wakes
+/// JSON, always at least `[]`); `ctx_body` is the `{"ctx":…}` envelope →
+/// trigger_payload (→ `request.ctx`); `export_name` is the resolved wake
+/// export when the arm carried an `{on}` override (G3 — replay must
+/// invoke the same export), "" when the default `onWake` applies.
+/// Bounded input: post-#8 the batch is one entry per armed watch, so the
+/// JSON is always far under `REQUEST_BODY_CAP`.
+pub fn captureWakeBatchTapes(
+    worker: anytype,
+    readset: *tape_mod.Readset,
+    ctx_body: []const u8,
+    wakes: []const components_mod.WakeEntry,
+    export_name: []const u8,
+) log_mod.TapePayloads {
+    const allocator = worker.allocator;
+    // The threaded ctx is part of the wake's Msg — record the `{"ctx":…}`
+    // envelope on trigger_payload so replay reconstructs `request.ctx`
+    // (export_fixture's extractCtx reads it back). `ctx_payload` keeps it
+    // past the read-taping elision: ctx is consumed unconditionally at
+    // install, so `body_read` never flips for it.
+    if (ctx_body.len > 0 and ctx_body.len <= REQUEST_BODY_CAP) {
+        readset.trigger_payload.appendTriggerPayload(
+            .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(ctx_body.len) },
+            ctx_body,
+        ) catch |err| {
+            std.log.warn("rove-js wake-ctx capture failed: {s}", .{@errorName(err)});
+        };
+        readset.ctx_payload = true;
+    }
+    const json = wakesToJson(allocator, wakes) catch |err| {
+        std.log.warn("rove-js wake-batch tape serialize failed: {s}", .{@errorName(err)});
+        return captureTapes(worker, readset, ctx_body);
+    };
+    defer allocator.free(json);
+    var payloads = captureTapesWithActivation(worker, readset, ctx_body, json);
+    if (export_name.len > 0) {
+        payloads.export_name = allocator.dupe(u8, export_name) catch &.{};
+    }
+    return payloads;
+}
+
 /// The fetch-event fields a `fetch_chunk` activation must record so replay can
 /// rebuild `request.body` (the chunk bytes) + the flattened result surface
 /// (`request.status/.ok/.done/.fetchId`). Decoupled from `UpstreamFetchEvent`
@@ -228,7 +321,7 @@ pub const FetchEvent = struct {
     terminal_ok: bool,
     body_truncated: bool = false,
     /// The resolved export this fetch resume dispatched to (`ev.resolvedExport()`
-    /// — a `{to}` override, or onFetchResult/Chunk/Done). Recorded so replay
+    /// — a `{on}` override, or onFetchResult/Chunk/Done). Recorded so replay
     /// invokes the same export (`replay-and-sim.md` §5 G3).
     export_name: []const u8 = "",
 };
@@ -322,6 +415,14 @@ pub fn l3MissingChannel(
             null,
         .ws_message => if (tapes.activation_bytes.len == 0)
             "activation_bytes (the WS frame)"
+        else
+            null,
+        // issue #62: the drained fired-watch batch is the wake's Msg.
+        // `captureWakeBatchTapes` always emits at least `[]`, so an
+        // empty `activation_bytes` here means the capture was skipped,
+        // never "the batch was empty".
+        .wake_batch => if (tapes.activation_bytes.len == 0)
+            "activation_bytes (the wake batch)"
         else
             null,
         else => null,
@@ -830,5 +931,34 @@ test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + 
     // Kinds whose Msg may be empty are not asserted (no false positives).
     try testing.expect(l3MissingChannel(.inbound, .ok, empty) == null);
     try testing.expect(l3MissingChannel(.disconnect, .ok, empty) == null);
-    try testing.expect(l3MissingChannel(.wake_batch, .ok, empty) == null);
+
+    // issue #62: a wake_batch's Msg is the fired-watch batch —
+    // `captureWakeBatchTapes` always tapes at least `[]`, so empty
+    // activation_bytes on a successful wake IS a missed capture.
+    try testing.expect(l3MissingChannel(.wake_batch, .ok, empty) != null);
+    try testing.expect(l3MissingChannel(.wake_batch, .ok, ab) == null);
+    try testing.expect(l3MissingChannel(.wake_batch, .handler_error, empty) == null);
+}
+
+test "wakesToJson matches the JS-facing encoding (prefix escape, ms, empty batch)" {
+    const testing = std.testing;
+    const a = testing.allocator;
+
+    const empty_json = try wakesToJson(a, &.{});
+    defer a.free(empty_json);
+    try testing.expectEqualStrings("[]", empty_json);
+
+    var entries = [_]components_mod.WakeEntry{
+        .{ .tag = .kv, .prefix = @constCast("feed/"), .fired_at_ns = 1_500_000_000 },
+        .{ .tag = .timer, .fired_at_ns = 2_999_999_999 },
+        .{ .tag = .kv, .prefix = @constCast("q\"x\\/"), .fired_at_ns = 3_000_000_000 },
+    };
+    const json = try wakesToJson(a, &entries);
+    defer a.free(json);
+    try testing.expectEqualStrings(
+        "[{\"kind\":\"kv\",\"prefix\":\"feed/\",\"firedAt\":1500}," ++
+            "{\"kind\":\"timer\",\"firedAt\":2999}," ++
+            "{\"kind\":\"kv\",\"prefix\":\"q\\\"x\\\\/\",\"firedAt\":3000}]",
+        json,
+    );
 }

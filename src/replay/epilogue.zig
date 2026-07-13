@@ -35,6 +35,10 @@ pub const Opts = struct {
     body_bytes: ?[]const u8 = null,
     /// The export the activation invokes ("default", "onChunk", ...).
     export_name: []const u8 = "default",
+    /// The activation KIND ("inbound", "disconnect", ...) — drives the
+    /// missing-export disposition (prod: disconnect = no-op, inbound_headers /
+    /// inbound_chunk fall back to the buffered default, else 404).
+    activation: []const u8 = "inbound",
     /// Chunk activations (`inbound_chunk` / `fetch_chunk`): the live
     /// `request.body` is a byte-exact Uint8Array, so the replay body is base64
     /// (binary), not a decoded string.
@@ -52,11 +56,13 @@ pub const Opts = struct {
     /// / `request.correlation_id`. Plain strings (null → not set).
     tenant: ?[]const u8 = null,
     correlation_id: ?[]const u8 = null,
-    /// Run the tenant's real `_middlewares/index.mjs` `before` ahead of the
-    /// handler (inbound trust boundary only) — it may mutate `request` (e.g.
-    /// `request.auth`) or short-circuit. Set by the caller iff the middleware
-    /// module is resolvable AND this is an inbound-family activation.
-    run_middleware: bool = false,
+    /// The RESOLVED specifier of the tenant's real `_middlewares` module
+    /// (`_middlewares/index.mjs` or the `.js` spelling — prod probes both,
+    /// `.mjs` first) whose `before` runs ahead of the handler (inbound trust
+    /// boundary only) — it may mutate `request` (e.g. `request.auth`) or
+    /// short-circuit. null = no resolvable middleware / not a trust-boundary
+    /// activation → the import is never emitted.
+    middleware_path: ?[]const u8 = null,
     /// The flattened fetch/callback result → top-level `request.*`.
     result: ?Result = null,
 };
@@ -66,10 +72,11 @@ pub const Opts = struct {
 /// these are the scalar siblings.
 pub const Result = struct {
     status: ?i64 = null,
-    ok: ?bool = null,
     done: ?bool = null,
     fetch_id: ?[]const u8 = null,
     chunk_seq: ?i64 = null,
+    fetches_pending: ?i64 = null,
+    body_truncated: ?bool = null,
 };
 
 /// Mirror `rpc_dispatch.defaultExportForKind` / the mjs `exportForActivation`.
@@ -197,18 +204,22 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     if (opts.result) |r| {
         try w.writeAll("{\"status\":");
         try optInt(w, r.status);
-        try w.writeAll(",\"ok\":");
-        try optBool(w, r.ok);
         try w.writeAll(",\"done\":");
         try optBool(w, r.done);
         try w.writeAll(",\"fetchId\":");
         if (r.fetch_id) |s| try jsonStr(w, s) else try w.writeAll("null");
         try w.writeAll(",\"chunkSeq\":");
         try optInt(w, r.chunk_seq);
+        try w.writeAll(",\"fetchesPending\":");
+        try optInt(w, r.fetches_pending);
+        try w.writeAll(",\"bodyTruncated\":");
+        try optBool(w, r.body_truncated);
         try w.writeByte('}');
     } else try w.writeAll("null");
     try w.writeAll(",\"fn\":");
     try jsonStr(w, opts.export_name);
+    try w.writeAll(",\"kind\":");
+    try jsonStr(w, opts.activation);
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
@@ -218,9 +229,12 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     // The real middleware, imported as a namespace so the async IIFE can run its
     // `before`. A static import (hoisted, loaded before the module body) — only
     // when it's resolvable AND this is an inbound-family activation, so a handler
-    // without `_middlewares` never triggers a load divergence.
-    if (opts.run_middleware) {
-        try w.writeAll("import * as __rove_mw from \"_middlewares/index.mjs\";\n");
+    // without `_middlewares` never triggers a load divergence. The specifier is
+    // the caller-RESOLVED spelling (`.mjs` or `.js`).
+    if (opts.middleware_path) |mp| {
+        try w.writeAll("import * as __rove_mw from ");
+        try jsonStr(w, mp);
+        try w.writeAll(";\n");
     }
 
     buf = aw.toArrayList();
@@ -239,6 +253,10 @@ const EPILOGUE_BODY =
     \\  // (the sim_globals `_system.*` recorders) push to the SAME ordered log
     \\  // as these per-request shims. `__effects` is a local alias to it.
     \\  const __effects = (globalThis.__rove_effects = []);
+    \\  // Per-run fetch/subscribe id counter (the sim_globals recorders mint
+    \\  // `ftch_<seq>`/`sub_<seq>` from it) — reset here so ids are deterministic
+    \\  // per activation, like prod's per-request derived ids.
+    \\  globalThis.__rove_fetch_seq = 0;
     \\  const __mklog = (level) => (...a) => { __effects.push({ kind: "log", level, message: a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ") }); };
     \\  globalThis.console = { log: __mklog("info"), warn: __mklog("warn"), error: __mklog("error"), info: __mklog("info"), debug: __mklog("debug") };
     \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
@@ -302,7 +320,8 @@ const EPILOGUE_BODY =
     \\  request.unmaskedIp = function () { if (!D.ipRaw) miss("request.unmaskedIp()"); return D.ipRaw.value || null; };
     \\  // Non-inbound activation surface (null for inbound → no-ops):
     \\  // the threaded ctx, the request.activation metadata bag, and the
-    \\  // flattened fetch/callback result (request.status/.ok/.done/...).
+    \\  // flattened fetch/callback result (request.status/.done/...; the
+    \\  // single success signal is `status`, 2xx = ok — no request.ok, #7).
     \\  if (D.ctx !== null) request.ctx = D.ctx;
     \\  // Injected request.session (worker-resolved in prod — no code to run).
     \\  if (D.session !== null) request.session = D.session;
@@ -323,10 +342,11 @@ const EPILOGUE_BODY =
     \\  }
     \\  if (D.result !== null) {
     \\    if (D.result.status !== null) request.status = D.result.status;
-    \\    if (D.result.ok !== null) request.ok = D.result.ok;
     \\    if (D.result.done !== null) request.done = D.result.done;
     \\    if (D.result.fetchId !== null) request.fetchId = D.result.fetchId;
     \\    if (D.result.chunkSeq !== null) request.chunkSeq = D.result.chunkSeq;
+    \\    if (D.result.fetchesPending !== null) request.fetchesPending = D.result.fetchesPending;
+    \\    if (D.result.bodyTruncated !== null) request.bodyTruncated = D.result.bodyTruncated;
     \\  }
     \\  // ── effect shims ──
     \\  // The connection/continuation + durable-effect globals ALL come from the sim
@@ -369,24 +389,83 @@ const EPILOGUE_BODY =
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  let __result = null, __err = null, __short = false;
+    \\  // Await like the worker's pumpJobs: drain microtasks, and if the promise
+    \\  // is STILL pending treat it as a plain value (prod ships its JSON — "{}")
+    \\  // rather than awaiting forever (response_building.unwrapPromise). Returns
+    \\  // a {v, pending?} wrapper — returning the pending promise bare from an
+    \\  // async fn would chain-adopt it and never resolve.
+    \\  const __settle = async (p) => {
+    \\    if (!p || typeof p.then !== "function") return { v: p };
+    \\    let done = false, ok = false, val;
+    \\    p.then((x) => { done = true; ok = true; val = x; }, (x) => { done = true; val = x; });
+    \\    // Each turn yields one microtask tick. Prod pumps until the queue is
+    \\    // quiet; the queue isn't visible from JS, so approximate with a budget
+    \\    // generous beyond any real await chain. A handler needing more turns
+    \\    // than this is reported as pending (the warn log below flags it).
+    \\    for (let i = 0; i < 4096 && !done; i++) await null;
+    \\    if (!done) return { v: p, pending: true };
+    \\    if (!ok) throw val;
+    \\    return { v: val };
+    \\  };
+    \\  // NOTE: returns the {v, pending?} WRAPPER — callers read `.v`. Returning
+    \\  // a still-pending `v` bare from an async fn would make the caller's
+    \\  // `await` re-adopt it and hang the epilogue forever.
+    \\  const __settled = async (p) => {
+    \\    const r = await __settle(p);
+    \\    if (r.pending) __effects.push({ kind: "log", level: "warn", message: "handler returned a still-pending promise — prod treats it as a plain value (body \"{}\")" });
+    \\    return r;
+    \\  };
     \\  try {
     \\    const ns = __arena_entry_ns();
     \\    // Real middleware (inbound trust boundary): run `_middlewares`' `before`
     \\    // first — it sees globalThis.request/response and may MUTATE the request
     \\    // (e.g. request.auth = {...}) or SHORT-CIRCUIT by returning a response.
-    \\    // `__rove_mw` is imported only when run_middleware (build() appends it);
+    \\    // `__rove_mw` is imported only when middleware_path resolved (build()
+    \\    // appends the import at the caller's spelling — .mjs or .js);
     \\    // `typeof` is safe when it isn't declared.
-    \\    if (typeof __rove_mw !== "undefined" && __rove_mw && typeof __rove_mw.before === "function") {
-    \\      const __mwr = await __rove_mw.before();
-    \\      if (__mwr !== undefined && __mwr !== null) { __result = __mwr; __short = true; }
+    \\    if (typeof __rove_mw !== "undefined" && __rove_mw) {
+    \\      if (typeof __rove_mw.before !== "function") {
+    \\        // A malformed middleware is loud (module_execution.runMiddleware):
+    \\        // 500 short-circuit, the handler never runs.
+    \\        globalThis.response = { status: 500, headers: {}, cookies: [] };
+    \\        __result = "_middlewares/index.mjs must export a `before` function\n";
+    \\        __short = true;
+    \\      } else {
+    \\        const __mwr = (await __settled(__rove_mw.before())).v;
+    \\        if (__mwr !== undefined && __mwr !== null) { __result = __mwr; __short = true; }
+    \\      }
     \\    }
     \\    if (!__short) {
-    \\      if (typeof ns[D.fn] !== "function") throw new Error("replay: entry module has no '" + D.fn + "' export");
-    \\      __result = await ns[D.fn]();
+    \\      const __fn = ns[D.fn];
+    \\      if (typeof __fn === "function") {
+    \\        __result = (await __settled(__fn())).v;
+    \\      } else if (D.kind === "disconnect") {
+    \\        // Prod: a missing onDisconnect is a no-op, not a 404 — the held
+    \\        // stream closes regardless (module_execution).
+    \\      } else if ((D.kind === "inbound_headers" || D.kind === "inbound_chunk") && typeof ns["default"] === "function") {
+    \\        // Prod: no onHeaders/onChunk probe hit → fall back to the classic
+    \\        // buffered dispatch at the default export (worker_dispatch §3.5).
+    \\        __result = (await __settled(ns["default"]())).v;
+    \\      } else {
+    \\        // Prod 404s any other missing export (module_execution).
+    \\        globalThis.response = { status: 404, headers: {}, cookies: [] };
+    \\        __result = 'module export "' + D.fn + '" not found or not a function\n';
+    \\      }
     \\    }
     \\    globalThis.__replay_result = __result;
     \\  } catch (e) {
     \\    __err = { message: String((e && e.message) || e), stack: String((e && e.stack) || "") };
+    \\    // Prod parity (worker_dispatch): a JS exception → 500 with
+    \\    // "handler threw: {ToString}\n" as the body, the handler-set response
+    \\    // head DISCARDED, and the txn rolled back. Mark this activation's
+    \\    // outputs rolled back so kv folds and matchers exclude them — reads and
+    \\    // console lines are not outputs, and stream frames may already be on
+    \\    // the wire (prod flushes them eagerly), so those stay.
+    \\    globalThis.response = { status: 500, headers: {}, cookies: [] };
+    \\    __result = "handler threw: " + String(e) + "\n";
+    \\    for (const __e of __effects) {
+    \\      if (__e.kind !== "read" && __e.kind !== "log" && __e.kind !== "stream") __e.rolledBack = true;
+    \\    }
     \\  }
     \\  globalThis.kv = __kvNative;   // restore before the native OUTPUT_KEY write
     \\  let __out;

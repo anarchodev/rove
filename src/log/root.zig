@@ -103,12 +103,13 @@ pub const ActivationSource = enum(u8) {
     /// still decode older tapes.
     kv_wake = 4,
     /// Wake-batch activation (streaming-handlers-plan §9.4 +
-    /// `docs/primitive-gaps.md` §2.2). The held stream's
-    /// `PendingWakes` ring drained into a temporal-order batch of
-    /// kv-write + timer entries; the handler sees
-    /// `request.activation = { kind: "wake_batch", wakes: [...],
-    /// overflow: { lost_oldest } }`. Used for held streams instead of
-    /// the per-wake `kv_wake` / `timer` activation sources.
+    /// `docs/primitive-gaps.md` §2.2; fired-prefix contract per
+    /// decisions.md §3.10). The held chain's fired arms drained
+    /// into a batch of fired-prefix + timer entries; the handler
+    /// sees `request.activation = { kind: "wake_batch",
+    /// wakes: [{kind:"kv",prefix,firedAt}|{kind:"timer",firedAt}] }`.
+    /// Used for held streams instead of the per-wake `kv_wake` /
+    /// `timer` activation sources.
     wake_batch = 5,
     /// Subscription chain origin (`docs/primitive-gaps.md` §2.1 +
     /// `docs/subscriptions-plan.md`). A `_subscriptions/<name>/`
@@ -248,7 +249,7 @@ pub const TapePayloads = struct {
     /// True iff `activation_bytes` is a truncated prefix.
     activation_bytes_truncated: bool = false,
     /// The **resolved export** the activation dispatched to (a callback's
-    /// `{to}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
+    /// `{on}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
     /// derivable from the activation kind alone. Lets replay invoke the SAME
     /// export instead of the conventional one (`replay-and-sim.md` §5 G3).
     /// Empty when the conventional export applies. Allocator-owned.

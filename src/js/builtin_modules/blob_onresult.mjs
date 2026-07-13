@@ -37,7 +37,10 @@ export default function () {
     const owed = JSON.parse(owed_raw);
 
     const status = (a.kind === "fetch_chunk") ? a.status : 0;
-    const ok = (a.kind === "fetch_chunk") ? (a.ok && status >= 200 && status < 300) : false;
+    // Success is a 2xx PUT. `status === 0` is a hard transport failure
+    // (no HTTP response) — also not-ok. `status` is the single truth;
+    // there is no `request.ok` (issue #7).
+    const ok = status >= 200 && status < 300;
 
     if (ok) {
         kv.delete(key);

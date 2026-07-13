@@ -175,20 +175,26 @@ pub const StreamChunks = struct {
     }
 };
 
-/// Wake registrations + outstanding matches for a held stream. The
-/// `kv_prefixes` slice is rewritten on every `__rove_stream(...)`
-/// return; `pending_wakes` is the §9.4 accumulator (ring of
-/// `PENDING_WAKES_CAP`, fan-in of kv + timer events; `lost_oldest`
-/// exposed to the handler as rate-limit backpressure) populated by
-/// `drainKvWakeInbox` (kv matches) and the per-tick timer-due
-/// detection in `serviceParkedStreams` (timer fires).
+/// Wake registrations + fired state for a held stream. The
+/// `kv_prefixes` arm slice is rewritten on every `__rove_stream(...)`
+/// return (a rearm starts unfired by construction). Fired state rides
+/// ON the arm (`KvArm.fired_at_ns`) plus the scalar `timer_fired_ns`
+/// — issue #8: the wake contract is "which armed prefix fired", never
+/// the matched keys, so there is no per-match accumulator, no ring
+/// cap, and no overflow signal. `drainKvWakeInbox` marks kv arms
+/// fired; the per-tick timer-due detection (`serviceParkedStreams` /
+/// `sweepParkedContinuations`) stamps `timer_fired_ns`; every resume
+/// path drains via `drainFired`.
 /// `next_wake_ns == maxInt(i64)` is the "no timer pending"
 /// sentinel; we never compare against it as an active deadline.
 pub const StreamWakes = struct {
     interval_ms: i64 = 0,
     next_wake_ns: i64 = std.math.maxInt(i64),
-    kv_prefixes: [][]u8 = &.{},
-    pending_wakes: PendingWakes = .{},
+    kv_prefixes: []KvArm = &.{},
+    /// Non-zero when the interval timer fired since the last drain
+    /// (the fire's wall-clock ns). Surfaces as a `{kind:"timer"}`
+    /// entry on `request.activation.wakes[]`.
+    timer_fired_ns: i64 = 0,
     /// The `on.kv` §8.4 watch baseline — the kvexp write-clock version
     /// the arming handler read at. A kv-write event fires this watch only
     /// when its `writeVersion` is strictly greater (i.e. the write landed
@@ -198,19 +204,101 @@ pub const StreamWakes = struct {
     /// The `on.*` export a wake routes to — `"module.method"` or a bare
     /// `"method"`, or null → the default `onWake` (the generic "edge
     /// wake — go look" export). Allocator-owned; set from the last
-    /// `on.*` registration's `{to}` selector.
+    /// `on.*` registration's `{on}` selector.
     wake_to: ?[]u8 = null,
+
+    /// True when at least one arm (kv or timer) fired since the last
+    /// drain — the "a resume is due" Msg predicate.
+    pub fn anyFired(self: *const StreamWakes) bool {
+        if (self.timer_fired_ns != 0) return true;
+        for (self.kv_prefixes) |arm| {
+            if (arm.fired_at_ns != 0) return true;
+        }
+        return false;
+    }
+
+    /// Drain the fired arms into an owned `WakeEntry` slice (prefix
+    /// bytes duped; entries sorted by fire time) and reset the fired
+    /// state so nothing re-fires next sweep. Empty slice when nothing
+    /// fired (a `drainFired` on an idle chain is a no-op). On OOM the
+    /// fired state is left intact — the wake re-fires next tick, which
+    /// is safe under edge ("go look") semantics.
+    pub fn drainFired(
+        self: *StreamWakes,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}![]WakeEntry {
+        var count: usize = 0;
+        for (self.kv_prefixes) |arm| {
+            if (arm.fired_at_ns != 0) count += 1;
+        }
+        if (self.timer_fired_ns != 0) count += 1;
+        if (count == 0) return &.{};
+
+        const out = try allocator.alloc(WakeEntry, count);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |*w| w.deinit(allocator);
+            allocator.free(out);
+        }
+        for (self.kv_prefixes) |arm| {
+            if (arm.fired_at_ns == 0) continue;
+            out[built] = .{
+                .tag = .kv,
+                .prefix = try allocator.dupe(u8, arm.prefix),
+                .fired_at_ns = arm.fired_at_ns,
+            };
+            built += 1;
+        }
+        if (self.timer_fired_ns != 0) {
+            out[built] = .{ .tag = .timer, .fired_at_ns = self.timer_fired_ns };
+            built += 1;
+        }
+        // Every dupe landed — reset fired state now (not before: an
+        // OOM above must leave the arms fired so the wake retries).
+        for (self.kv_prefixes) |*arm| arm.fired_at_ns = 0;
+        self.timer_fired_ns = 0;
+        std.mem.sort(WakeEntry, out, {}, struct {
+            fn lessThan(_: void, a: WakeEntry, b: WakeEntry) bool {
+                return a.fired_at_ns < b.fired_at_ns;
+            }
+        }.lessThan);
+        return out;
+    }
 
     pub fn deinit(allocator: std.mem.Allocator, items: []StreamWakes) void {
         for (items) |*item| {
-            for (item.kv_prefixes) |p| allocator.free(p);
+            for (item.kv_prefixes) |arm| allocator.free(arm.prefix);
             if (item.kv_prefixes.len > 0) allocator.free(item.kv_prefixes);
             if (item.wake_to) |t| allocator.free(t);
-            item.pending_wakes.deinit(allocator);
             item.* = .{};
         }
     }
 };
+
+/// One armed `after.kv` prefix + its fired state. `prefix` is
+/// allocator-owned; `fired_at_ns != 0` means a kv write landed under
+/// the prefix since the last drain (value = the latest match's
+/// wall-clock ns). A bit-per-arm can't overflow, so "which prefix
+/// fired" is always complete — the honest form of an edge wake.
+pub const KvArm = struct {
+    prefix: []u8 = &.{},
+    fired_at_ns: i64 = 0,
+};
+
+/// Wrap freshly-registered prefix strings into unfired arms. Takes
+/// ownership of every string AND the old spine (freed here); the
+/// returned arm slice owns the strings. On OOM nothing is consumed —
+/// the caller still owns `prefixes` and frees it on its error path.
+pub fn armsFromPrefixes(
+    allocator: std.mem.Allocator,
+    prefixes: [][]u8,
+) error{OutOfMemory}![]KvArm {
+    if (prefixes.len == 0) return &.{};
+    const arms = try allocator.alloc(KvArm, prefixes.len);
+    for (prefixes, arms) |p, *arm| arm.* = .{ .prefix = p };
+    allocator.free(prefixes);
+    return arms;
+}
 
 /// One `http.fetch` upstream event awaiting handler dispatch on a
 /// local worker. Every event is a chunk; the LAST event in a fetch
@@ -281,10 +369,15 @@ pub const UpstreamFetchEvent = struct {
     /// Surfaces as `request.activation.status`.
     terminal_status: u16 = 0,
     /// `final` only: transport-only success flag (libcurl returned
-    /// cleanly AND any cap-based abort was deliberate, not an
-    /// error). `ok: true, status: 503` is "transport worked, server
-    /// said no" — the JS shim decides retry policy. Surfaces as
-    /// `request.activation.ok`.
+    /// cleanly AND any cap-based abort was deliberate, not an error).
+    /// `terminal_ok: true, status: 503` is "transport worked, server
+    /// said no." This is INTERNAL bookkeeping — it is NOT surfaced to
+    /// JS. The customer-facing result contract is `terminal_status`
+    /// alone (`request.status`): `200 ≤ status < 300` is success,
+    /// `status === 0` is a hard transport failure. There is no derived
+    /// `request.ok` (issue #7 — it was redundant with `status`). The
+    /// transport bit is folded into `terminal_status == 0` on a hard
+    /// failure, which is what JS reads.
     terminal_ok: bool = false,
     /// `final` only: true iff the response body exceeded the cap
     /// (`max_response_chunk_bytes` when `stream: false`, or
@@ -300,7 +393,7 @@ pub const UpstreamFetchEvent = struct {
     /// with the whole body) lands in `onFetchResult`; a streaming
     /// fetch's intermediate chunks (`final == false`) land in
     /// `onFetchChunk` and its terminal event (`final == true`) lands
-    /// in `onFetchDone`. The customer's `{to}` override (`name`)
+    /// in `onFetchDone`. The customer's `{on}` override (`name`)
     /// supersedes this for every event of the fetch. Plain bool — no
     /// allocation, so `deinitItem` skips it.
     stream: bool = false,
@@ -361,7 +454,7 @@ pub const UpstreamFetchEvent = struct {
 
     /// `docs/handler-shape.md` §3: resolve the named export this event
     /// dispatches to on the bound (connection-scoped) `on.fetch`
-    /// resume. An explicit `{to}` (`name`) overrides for every event of
+    /// resume. An explicit `{on}` (`name`) overrides for every event of
     /// the fetch; otherwise the export is chosen by the event shape:
     ///   - non-streaming (`stream == false`) — one `final` event with
     ///     the whole body → `onFetchResult`.
@@ -427,131 +520,33 @@ pub const StreamDraining = struct {
     pub fn deinit(_: std.mem.Allocator, _: []StreamDraining) void {}
 };
 
-/// Ring-buffer capacity for `PendingWakes` (streaming-handlers §9.4 +
-/// §11.4 — K=32 starting target). Per-stream constant; per-tenant /
-/// per-stream configurability hooks are cheap to add if benches show
-/// one stream-class wants a different K.
-pub const PENDING_WAKES_CAP: usize = 32;
-
-/// One entry in the per-stream wake accumulator. The tag picks
-/// which payload field is meaningful; `kv_key` is allocator-owned
-/// when `tag == .kv`. Both kv and timer wakes go through the same
-/// ring so the handler sees them in temporal order on each
-/// activation (`streaming-handlers-plan.md` §9.4).
+/// One drained fired-wake entry, surfaced to the handler as
+/// `request.activation.wakes[i]`. The tag picks which fields are
+/// meaningful; `prefix` is the ARMED `after.kv` prefix that fired
+/// (allocator-owned dup made at drain time), never a matched key —
+/// the wake tells you which watch fired; the handler re-reads
+/// authoritative kv under it ("go look").
 pub const WakeEntry = struct {
     tag: Tag = .timer,
     /// Set when `tag == .kv`; allocator-owned. Empty slice when
-    /// `tag == .timer` (the default leaves `kv_key.len == 0` so a
+    /// `tag == .timer` (the default leaves `prefix.len == 0` so a
     /// drain consumer can branch on `entry.tag` without checking
-    /// for sentinel keys).
-    kv_key: []u8 = &.{},
-    /// Set when `tag == .kv`. `'p'` (put) or `'d'` (delete). Zero
-    /// when `tag == .timer`.
-    kv_op: u8 = 0,
-    /// Set on every entry — monotonic ns the wake matched. For
-    /// timers this is the scheduled fire time; for kv-writes it's
-    /// the apply-thread observe time. Surfaces to the handler as
-    /// `wakes[i].firedAt` so it can order / dedupe across kinds.
+    /// for sentinel strings).
+    prefix: []u8 = &.{},
+    /// Set on every entry — wall-clock ns the wake fired (latest
+    /// match for a kv arm; scheduled fire time for a timer).
+    /// Surfaces to the handler as `wakes[i].firedAt` in MILLISECONDS.
     fired_at_ns: i64 = 0,
 
     pub const Tag = enum(u8) { kv, timer };
 
     /// Free owned slices. Safe to call on a default-init entry
-    /// (`kv_key.len == 0` short-circuits).
+    /// (`prefix.len == 0` short-circuits).
     pub fn deinit(self: *WakeEntry, allocator: std.mem.Allocator) void {
-        if (self.tag == .kv and self.kv_key.len > 0) {
-            allocator.free(self.kv_key);
+        if (self.tag == .kv and self.prefix.len > 0) {
+            allocator.free(self.prefix);
         }
         self.* = .{};
-    }
-};
-
-/// The §9.4 per-stream wake accumulator. Bounded ring of
-/// `PENDING_WAKES_CAP` entries; pushed-to on every kv-prefix match
-/// (apply-thread fan-out) and every timer fire while the handler
-/// is running or queued; drained as one batch by `resumeStream`
-/// when the cell is free.
-///
-/// On ring-full, the oldest entry is dropped (its `kv_key` freed)
-/// and `lost_oldest` is incremented — the rate-limit IS the ring,
-/// and `lost_oldest > 0` is the signal the handler reads on the
-/// next activation ("re-snapshot kv state; you missed some
-/// writes"). Wraps on u32 overflow which is fine for a counter
-/// that resets to 0 on every drain.
-///
-/// Default-init is the "empty ring" state — `len == 0`,
-/// `lost_oldest == 0`, all entries inert. Safe to leave on every
-/// `StreamWakes` even when the stream never uses the accumulator
-/// (e.g., timer-only streams pay one extra ~1KB SoA slot).
-pub const PendingWakes = struct {
-    /// Ring storage. Entries between `head` and `head+len` (mod
-    /// CAP) are valid; everything else is the default `.{}`.
-    entries: [PENDING_WAKES_CAP]WakeEntry = [_]WakeEntry{.{}} ** PENDING_WAKES_CAP,
-    /// Index of the oldest valid entry.
-    head: u8 = 0,
-    /// Number of valid entries currently in the ring (0..=CAP).
-    len: u8 = 0,
-    /// Cumulative count of entries dropped to make room since the
-    /// last drain. Reset to 0 by `drainInto`. Wraps on u32
-    /// overflow (saturating not needed — drain frequency caps the
-    /// running total).
-    lost_oldest: u32 = 0,
-
-    /// Push an entry. On full ring, drop the oldest (freeing its
-    /// `kv_key`) + bump `lost_oldest`. Takes ownership of any
-    /// allocator-owned fields on `entry`.
-    pub fn push(self: *PendingWakes, allocator: std.mem.Allocator, entry: WakeEntry) void {
-        if (self.len == PENDING_WAKES_CAP) {
-            self.entries[self.head].deinit(allocator);
-            self.head = @intCast((@as(usize, self.head) + 1) % PENDING_WAKES_CAP);
-            self.lost_oldest +%= 1;
-        } else {
-            self.len += 1;
-        }
-        const tail = @as(usize, self.head) + self.len - 1;
-        self.entries[tail % PENDING_WAKES_CAP] = entry;
-    }
-
-    /// Drain all valid entries into an allocator-owned slice + the
-    /// `lost_oldest` snapshot. Resets the ring to empty + clears
-    /// `lost_oldest`. Caller owns the returned slice and every
-    /// entry's `kv_key`; on success the ring no longer references
-    /// them. Returns an empty slice when `len == 0` (still useful
-    /// for the `lost_oldest` snapshot — a ring that overflowed
-    /// completely and then was drained-but-empty still wants to
-    /// report the loss).
-    pub fn drainInto(
-        self: *PendingWakes,
-        allocator: std.mem.Allocator,
-    ) error{OutOfMemory}!struct { wakes: []WakeEntry, lost_oldest: u32 } {
-        const lost = self.lost_oldest;
-        self.lost_oldest = 0;
-        if (self.len == 0) {
-            return .{ .wakes = &.{}, .lost_oldest = lost };
-        }
-        const out = try allocator.alloc(WakeEntry, self.len);
-        var idx: usize = self.head;
-        for (out) |*slot| {
-            slot.* = self.entries[idx];
-            self.entries[idx] = .{}; // ownership moved; clear retained ref
-            idx = (idx + 1) % PENDING_WAKES_CAP;
-        }
-        self.head = 0;
-        self.len = 0;
-        return .{ .wakes = out, .lost_oldest = lost };
-    }
-
-    /// Free every retained entry. Called by `StreamWakes.deinit`.
-    pub fn deinit(self: *PendingWakes, allocator: std.mem.Allocator) void {
-        var idx: usize = self.head;
-        var rem: u8 = self.len;
-        while (rem > 0) : (rem -= 1) {
-            self.entries[idx].deinit(allocator);
-            idx = (idx + 1) % PENDING_WAKES_CAP;
-        }
-        self.head = 0;
-        self.len = 0;
-        self.lost_oldest = 0;
     }
 };
 
@@ -679,7 +674,7 @@ test "StreamChunks.atSoftCap reflects the backpressure high-water" {
     try testing.expect(sc.atSoftCap()); // at the high-water → producer pauses
 }
 
-test "StreamWakes deinit frees kv_prefixes spine + entries" {
+test "StreamWakes deinit frees kv arm spine + prefixes" {
     const a = testing.allocator;
     const prefixes = try a.alloc([]u8, 2);
     prefixes[0] = try a.dupe(u8, "orders/");
@@ -687,107 +682,93 @@ test "StreamWakes deinit frees kv_prefixes spine + entries" {
     var items = [_]StreamWakes{.{
         .interval_ms = 200,
         .next_wake_ns = 1_500_000_000,
-        .kv_prefixes = prefixes,
+        .kv_prefixes = try armsFromPrefixes(a, prefixes),
     }};
+    items[0].kv_prefixes[1].fired_at_ns = 100; // fired state is inert to deinit
     StreamWakes.deinit(a, &items);
     try testing.expectEqual(@as(usize, 0), items[0].kv_prefixes.len);
 }
 
-test "StreamWakes deinit drains the §9.4 PendingWakes ring (Gap 2.2 Phase A)" {
+test "StreamWakes.drainFired surfaces fired PREFIXES (not keys), sorted, and resets" {
     const a = testing.allocator;
-    var items = [_]StreamWakes{.{}};
-    items[0].pending_wakes.push(a, .{
-        .tag = .kv,
-        .kv_key = try a.dupe(u8, "orders/u/12"),
-        .kv_op = 'p',
-        .fired_at_ns = 100,
-    });
-    items[0].pending_wakes.push(a, .{
-        .tag = .timer,
-        .fired_at_ns = 200,
-    });
-    StreamWakes.deinit(a, &items);
-    try testing.expectEqual(@as(u8, 0), items[0].pending_wakes.len);
-}
+    const prefixes = try a.alloc([]u8, 3);
+    prefixes[0] = try a.dupe(u8, "orders/");
+    prefixes[1] = try a.dupe(u8, "alerts/");
+    prefixes[2] = try a.dupe(u8, "quiet/");
+    var items = [_]StreamWakes{.{ .kv_prefixes = try armsFromPrefixes(a, prefixes) }};
+    defer StreamWakes.deinit(a, &items);
+    const sw = &items[0];
 
-test "PendingWakes push/drain preserves temporal order" {
-    const a = testing.allocator;
-    var ring: PendingWakes = .{};
-    defer ring.deinit(a);
+    try testing.expect(!sw.anyFired());
+    sw.kv_prefixes[1].fired_at_ns = 50; // alerts/ fired first
+    sw.kv_prefixes[0].fired_at_ns = 200; // orders/ fired later
+    sw.timer_fired_ns = 100;
+    try testing.expect(sw.anyFired());
 
-    ring.push(a, .{ .tag = .kv, .kv_key = try a.dupe(u8, "k1"), .kv_op = 'p', .fired_at_ns = 1 });
-    ring.push(a, .{ .tag = .timer, .fired_at_ns = 2 });
-    ring.push(a, .{ .tag = .kv, .kv_key = try a.dupe(u8, "k2"), .kv_op = 'd', .fired_at_ns = 3 });
-
-    const drained = try ring.drainInto(a);
+    const drained = try sw.drainFired(a);
     defer {
-        for (drained.wakes) |*w| w.deinit(a);
-        a.free(drained.wakes);
+        for (drained) |*w| w.deinit(a);
+        a.free(drained);
     }
-    try testing.expectEqual(@as(usize, 3), drained.wakes.len);
-    try testing.expectEqual(@as(u32, 0), drained.lost_oldest);
-    try testing.expectEqual(WakeEntry.Tag.kv, drained.wakes[0].tag);
-    try testing.expectEqualStrings("k1", drained.wakes[0].kv_key);
-    try testing.expectEqual(WakeEntry.Tag.timer, drained.wakes[1].tag);
-    try testing.expectEqual(@as(i64, 2), drained.wakes[1].fired_at_ns);
-    try testing.expectEqual(WakeEntry.Tag.kv, drained.wakes[2].tag);
-    try testing.expectEqualStrings("k2", drained.wakes[2].kv_key);
-    try testing.expectEqual(@as(u8, 'd'), drained.wakes[2].kv_op);
+    // quiet/ never fired → 2 kv entries + 1 timer, sorted by fire time.
+    try testing.expectEqual(@as(usize, 3), drained.len);
+    try testing.expectEqual(WakeEntry.Tag.kv, drained[0].tag);
+    try testing.expectEqualStrings("alerts/", drained[0].prefix);
+    try testing.expectEqual(WakeEntry.Tag.timer, drained[1].tag);
+    try testing.expectEqual(@as(i64, 100), drained[1].fired_at_ns);
+    try testing.expectEqual(WakeEntry.Tag.kv, drained[2].tag);
+    try testing.expectEqualStrings("orders/", drained[2].prefix);
 
-    // Ring is empty after drain.
-    try testing.expectEqual(@as(u8, 0), ring.len);
-    try testing.expectEqual(@as(u32, 0), ring.lost_oldest);
+    // Fired state fully reset — a second drain is empty.
+    try testing.expect(!sw.anyFired());
+    const again = try sw.drainFired(a);
+    try testing.expectEqual(@as(usize, 0), again.len);
 }
 
-test "PendingWakes drops oldest on overflow + counts lost_oldest" {
+test "StreamWakes.drainFired dedupes per arm — N matches surface once" {
     const a = testing.allocator;
-    var ring: PendingWakes = .{};
-    defer ring.deinit(a);
+    const prefixes = try a.alloc([]u8, 1);
+    prefixes[0] = try a.dupe(u8, "feed/");
+    var items = [_]StreamWakes{.{ .kv_prefixes = try armsFromPrefixes(a, prefixes) }};
+    defer StreamWakes.deinit(a, &items);
+    const sw = &items[0];
 
-    // Fill ring + push 5 extra; CAP+5 total → oldest 5 dropped.
-    var i: usize = 0;
-    while (i < PENDING_WAKES_CAP + 5) : (i += 1) {
-        const key = try std.fmt.allocPrint(a, "k{d}", .{i});
-        ring.push(a, .{ .tag = .kv, .kv_key = key, .kv_op = 'p', .fired_at_ns = @intCast(i) });
-    }
-    try testing.expectEqual(@as(u8, @intCast(PENDING_WAKES_CAP)), ring.len);
-    try testing.expectEqual(@as(u32, 5), ring.lost_oldest);
+    // A burst of matches just re-stamps the arm — latest wins; a
+    // bit-per-arm can't overflow, so there is no lost_oldest.
+    sw.kv_prefixes[0].fired_at_ns = 10;
+    sw.kv_prefixes[0].fired_at_ns = 20;
+    sw.kv_prefixes[0].fired_at_ns = 30;
 
-    const drained = try ring.drainInto(a);
+    const drained = try sw.drainFired(a);
     defer {
-        for (drained.wakes) |*w| w.deinit(a);
-        a.free(drained.wakes);
+        for (drained) |*w| w.deinit(a);
+        a.free(drained);
     }
-    // Oldest surviving entry is k5 (k0..k4 were dropped).
-    try testing.expectEqualStrings("k5", drained.wakes[0].kv_key);
-    try testing.expectEqual(@as(i64, 5), drained.wakes[0].fired_at_ns);
-    // Newest entry is k{CAP+4}.
-    var buf: [16]u8 = undefined;
-    const expected_last = try std.fmt.bufPrint(&buf, "k{d}", .{PENDING_WAKES_CAP + 4});
-    try testing.expectEqualStrings(expected_last, drained.wakes[drained.wakes.len - 1].kv_key);
-    try testing.expectEqual(@as(u32, 5), drained.lost_oldest);
+    try testing.expectEqual(@as(usize, 1), drained.len);
+    try testing.expectEqualStrings("feed/", drained[0].prefix);
+    try testing.expectEqual(@as(i64, 30), drained[0].fired_at_ns);
 }
 
-test "PendingWakes drainInto on empty ring returns empty slice + lost_oldest snapshot" {
+test "armsFromPrefixes takes ownership; empty input is a no-op" {
     const a = testing.allocator;
-    var ring: PendingWakes = .{};
-    defer ring.deinit(a);
+    try testing.expectEqual(@as(usize, 0), (try armsFromPrefixes(a, &.{})).len);
 
-    // Push a single entry, drain it, then drain again on empty.
-    ring.push(a, .{ .tag = .timer, .fired_at_ns = 42 });
-    const first = try ring.drainInto(a);
-    a.free(first.wakes);
-
-    const second = try ring.drainInto(a);
-    try testing.expectEqual(@as(usize, 0), second.wakes.len);
-    try testing.expectEqual(@as(u32, 0), second.lost_oldest);
+    const prefixes = try a.alloc([]u8, 1);
+    prefixes[0] = try a.dupe(u8, "x/");
+    const arms = try armsFromPrefixes(a, prefixes);
+    defer {
+        for (arms) |arm| a.free(arm.prefix);
+        a.free(arms);
+    }
+    try testing.expectEqualStrings("x/", arms[0].prefix);
+    try testing.expectEqual(@as(i64, 0), arms[0].fired_at_ns);
 }
 
-test "WakeEntry default-init has empty kv_key + deinit is safe" {
+test "WakeEntry default-init has empty prefix + deinit is safe" {
     const a = testing.allocator;
     var entry: WakeEntry = .{};
     entry.deinit(a);
-    try testing.expectEqual(@as(usize, 0), entry.kv_key.len);
+    try testing.expectEqual(@as(usize, 0), entry.prefix.len);
 }
 
 test "UpstreamFetchEvent default-init + deinit is benign" {

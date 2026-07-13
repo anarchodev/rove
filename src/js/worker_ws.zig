@@ -432,6 +432,10 @@ const WsMsgTape = union(enum) {
     none,
     fetch: worker_mod.FetchEvent,
     frame: struct { opcode: u8, data: []const u8 },
+    /// A wake resume's Msg (issue #62): the drained fired-watch batch +
+    /// the resolved wake export (G3 — an `{on}` override must replay to
+    /// the same export).
+    wakes: struct { batch: []const components_mod.WakeEntry, export_name: []const u8 },
 };
 
 /// Capture the readset + ctx + the kind-specific Msg for a WS resume. Called at
@@ -441,6 +445,7 @@ fn wsResumeTapes(worker: anytype, readset: *tape_mod.Readset, ctx_body: []const 
         .none => worker_mod.captureTapes(worker, readset, ctx_body),
         .fetch => |fe| worker_mod.captureFetchChunkTapes(worker, readset, ctx_body, fe),
         .frame => |f| worker_mod.captureWsFrameTapes(worker, readset, ctx_body, f.opcode, f.data),
+        .wakes => |wt| worker_mod.captureWakeBatchTapes(worker, readset, ctx_body, wt.batch, wt.export_name),
     };
 }
 
@@ -681,25 +686,24 @@ fn installWsWakes(
     const server = worker.h2;
 
     if (server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
-        for (old.kv_prefixes) |pfx| allocator.free(pfx);
+        for (old.kv_prefixes) |arm| allocator.free(arm.prefix);
         if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
         if (old.wake_to) |t| allocator.free(t);
-        old.pending_wakes.deinit(allocator);
         old.* = .{};
     } else |_| {}
 
     var interval_ms: i64 = 0;
     var wake_to: ?[]u8 = null;
-    var prefixes: std.ArrayListUnmanaged([]u8) = .empty;
+    var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     for (pending.items) |reg| {
         switch (reg.kind) {
             .timer => interval_ms = reg.interval_ms,
             .kv => if (reg.prefix.len > 0) {
                 const dup = allocator.dupe(u8, reg.prefix) catch continue;
-                prefixes.append(allocator, dup) catch allocator.free(dup);
+                arms.append(allocator, .{ .prefix = dup }) catch allocator.free(dup);
             },
         }
-        if (reg.to) |t| {
+        if (reg.on) |t| {
             if (wake_to) |old_to| allocator.free(old_to);
             wake_to = allocator.dupe(u8, t) catch null;
         }
@@ -709,9 +713,9 @@ fn installWsWakes(
         now_ns + interval_ms * std.time.ns_per_ms
     else
         std.math.maxInt(i64);
-    const kv_prefixes = prefixes.toOwnedSlice(allocator) catch {
-        for (prefixes.items) |pfx| allocator.free(pfx);
-        prefixes.deinit(allocator);
+    const kv_prefixes = arms.toOwnedSlice(allocator) catch {
+        for (arms.items) |arm| allocator.free(arm.prefix);
+        arms.deinit(allocator);
         if (wake_to) |t| allocator.free(t);
         return; // OOM — leave the chain unarmed rather than leak
     };
@@ -725,7 +729,7 @@ fn installWsWakes(
 }
 
 /// WS sibling of `worker_drain.resumeBoundFetchChain`: an `on.fetch` issued from
-/// a held WebSocket chain's `onMessage` completed — re-invoke the `{to}` export
+/// a held WebSocket chain's `onMessage` completed — re-invoke the `{on}` export
 /// (e.g. `onLLM`) with the result as a `.fetch_chunk` activation, and ship its
 /// `stream.write` frames back over the SAME socket via `shipWsFrames`. (The HTTP
 /// path's `resolveParked` would stamp a meaningless h2 response onto a WS conn.)
@@ -800,7 +804,7 @@ pub fn resumeBoundFetchChainWs(
         .terminal_status = if (ev.final) ev.terminal_status else 0,
         .terminal_ok = if (ev.final) ev.terminal_ok else false,
         .body_truncated = if (ev.final) ev.body_truncated else false,
-        .export_name = ev.resolvedExport(), // record the resolved export ({to}) — G3
+        .export_name = ev.resolvedExport(), // record the resolved export ({on}) — G3
     };
     const request: Request = .{
         .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
@@ -860,14 +864,18 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
     const wakes_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes) catch return;
 
-    // Consume the kv-match ring — this resume is the "go look" edge; the
-    // entries must not re-fire next sweep (onWake re-reads authoritative kv).
-    if (wakes_st.pending_wakes.len > 0) {
-        if (wakes_st.pending_wakes.drainInto(allocator)) |drained| {
-            for (drained.wakes) |*we| we.deinit(allocator);
-            if (drained.wakes.len > 0) allocator.free(drained.wakes);
-        } else |_| {}
-    }
+    // Drain the fired arms — this resume consumes the "go look" edge, so
+    // nothing re-fires next sweep (onWake re-reads authoritative kv).
+    // The entries surface on `request.activation.wakes[]` as fired
+    // PREFIXES (issue #8) — same contract as the held (worker_drain) and
+    // stream (worker_streaming) resume paths. Owned for the dispatch's
+    // lifetime; freed after the JS copies them. OOM → empty batch, arms
+    // stay fired and re-fire next tick (safe under edge semantics).
+    const batch_owned: []components_mod.WakeEntry = wakes_st.drainFired(allocator) catch &.{};
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
 
     const path = chain_st.module_path;
     var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-wake") orelse {
@@ -883,6 +891,11 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     // `request.ctx`, so `onWake` reads `request.ctx` like every other
     // continuation. No positional args.
     const resume_fn: []const u8 = if (wakes_st.wake_to) |t| t else "onWake";
+    // Owned snapshot for the tape (issue #62 — G3): `resume_fn` borrows
+    // StreamWakes.wake_to, which finishWsResume's re-arm (installWsWakes)
+    // frees before the post-outcome tape capture runs.
+    const wake_export_owned: []const u8 = allocator.dupe(u8, resume_fn) catch "";
+    defer if (wake_export_owned.len > 0) allocator.free(wake_export_owned);
     const body = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
@@ -913,7 +926,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         .body = body,
         .fn_override = resume_fn,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
-        .activation = .{ .wake_batch = .{} },
+        .activation = .{ .wake_batch = .{ .wakes = batch_owned } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
@@ -936,7 +949,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     };
 
     var oc = run_oc;
-    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", .none);
+    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", .{ .wakes = .{ .batch = batch_owned, .export_name = wake_export_owned } });
 }
 
 /// Ship the frames an `onMessage` produced to `ws_send_in`. Read-only frames

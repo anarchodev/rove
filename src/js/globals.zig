@@ -311,12 +311,13 @@ pub const PendingWakeReg = struct {
     /// and the list's deinit frees the rest.
     prefix: []u8 = &.{},
     /// Resume export selector ("module.method" or a bare "method"), or
-    /// null → the default `onWake` export. Allocator-owned.
-    to: ?[]u8 = null,
+    /// null → the default `onWake` export. Allocator-owned. Mirrors the
+    /// `{on}` opts key — one spelling from customer surface to here.
+    on: ?[]u8 = null,
 
     pub fn deinit(self: *PendingWakeReg, allocator: std.mem.Allocator) void {
         if (self.prefix.len > 0) allocator.free(self.prefix);
-        if (self.to) |t| allocator.free(t);
+        if (self.on) |t| allocator.free(t);
         self.* = undefined;
     }
 };
@@ -2099,10 +2100,10 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },
         .{ .name = "kv",    .cfunc = on_b.jsOnKv,      .argc = 2 },
         // Connection-scoped outbound. Binds the
-        // fetch to the held chain (chunks → `{to}`/`onFetchChunk`) when
+        // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
         // held; inert when not. Lives in the http binding (composes the
         // same fetch primitive as `http.fetch`).
-        .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 3 },
+        .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 2 },
     } },
     // Connection output effects. `stream.start`
     // / `stream.write` accumulate onto `DispatchState`; the worker
@@ -2562,11 +2563,12 @@ pub fn installRequest(
     // — streaming-handlers-plan §2: every handler run is a recorded
     // "request," and the activation source is one field on the
     // request shape the handler can branch on. The `wake_batch`
-    // variant (§9.4, Gap 2.2) carries a temporal-order
-    // `wakes: [{kind:"kv",key,op,firedAt} | {kind:"timer",firedAt}]`
-    // array + an `overflow: { lost_oldest }` counter. The singular
-    // `.kv_wake` source maps to `kind:"kv"` but carries no
-    // key/op payload; live kv fan-out rides `.wake_batch`.
+    // variant (fired-prefix contract) carries
+    // `wakes: [{kind:"kv",prefix,firedAt} | {kind:"timer",firedAt}]`
+    // — the ARMED prefix that fired, never matched keys (the handler
+    // re-reads authoritative kv; handler-shape.md §7). The singular
+    // `.kv_wake` source maps to `kind:"kv"` but carries no payload;
+    // live kv fan-out rides `.wake_batch`.
     const activation_obj = c.JS_NewObject(ctx);
     const kind: []const u8 = switch (request.activation.source()) {
         .inbound => "inbound",
@@ -2592,34 +2594,29 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation == .wake_batch) {
         const wb = request.activation.wake_batch;
-        // wakes: [{kind:"kv",key,op,firedAt}|{kind:"timer",firedAt}, ...]
+        // wakes: [{kind:"kv",prefix,firedAt}|{kind:"timer",firedAt}, ...]
+        // — one entry per fired ARM (issue #8), identical on every
+        // resume path (stream / held / WS). No overflow signal: a
+        // bit-per-arm can't lose fires.
         const wakes_arr = c.JS_NewArray(ctx);
         for (wb.wakes, 0..) |w, i| {
             const entry = c.JS_NewObject(ctx);
             switch (w.tag) {
                 .kv => {
                     _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "kv", 2));
-                    _ = c.JS_SetPropertyStr(ctx, entry, "key", c.JS_NewStringLen(ctx, w.kv_key.ptr, w.kv_key.len));
-                    const op_str: []const u8 = switch (w.kv_op) {
-                        'p' => "put",
-                        'd' => "delete",
-                        else => "",
-                    };
-                    if (op_str.len > 0) {
-                        _ = c.JS_SetPropertyStr(ctx, entry, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
-                    }
+                    _ = c.JS_SetPropertyStr(ctx, entry, "prefix", c.JS_NewStringLen(ctx, w.prefix.ptr, w.prefix.len));
                 },
                 .timer => {
                     _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "timer", 5));
                 },
             }
-            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, w.fired_at_ns));
+            // `firedAt` in MILLISECONDS since epoch — matches every other
+            // JS-facing timestamp; `fired_at_ns` stays the internal wall
+            // clock. Mirrored in the sim (rewind_test.mjs).
+            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, @divFloor(w.fired_at_ns, std.time.ns_per_ms)));
             _ = c.JS_SetPropertyUint32(ctx, wakes_arr, @intCast(i), entry);
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "wakes", wakes_arr);
-        const overflow = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, overflow, "lost_oldest", c.JS_NewInt64(ctx, @intCast(wb.lost_oldest)));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "overflow", overflow);
     }
 
     // stream.write is lossless — the runtime never drops; it backpressures the
@@ -2711,8 +2708,13 @@ pub fn installRequest(
         // JSValue constants instead.
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "final", if (fc.final) js_true else js_false);
         if (fc.final) {
+            // `status` is the SINGLE source of truth for a fetch/callback
+            // result (handler-shape.md §3): `200 ≤ status < 300` is
+            // success, `status === 0` is a hard transport failure (no HTTP
+            // response reached us). There is deliberately no derived `ok`
+            // boolean — it was redundant with `status` and drifted into
+            // three disagreeing definitions (issue #7).
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (fc.terminal_ok) js_true else js_false);
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
         }
         // UNBOUND (Pattern-A `on_chunk:"module"`) fires carry the
@@ -2788,15 +2790,14 @@ pub fn installRequest(
             // `request.done && request.fetchesPending === 1` to
             // detect "last chunk of last fetch."
             _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchesPending", c.JS_NewInt64(ctx, @intCast(request.activation_fetches_pending)));
-            // Terminal-only fields. Customer's onFetchChunk
-            // branches on `request.done` and inspects these to
-            // decide between "all good" and "transport / upstream
-            // failure." Mirrors handler-shape.md §3 — these are
-            // the same fields that ride on the unbound
-            // `request.activation.{ok,status,body_truncated}` but
-            // hoisted to the top level for the bound surface.
+            // Terminal-only fields. Customer's onFetchChunk branches on
+            // `request.done` and inspects `request.status` to decide
+            // between "all good" (2xx), "upstream error" (non-zero
+            // non-2xx), and "transport failure" (status 0) — the same
+            // `status` fields that ride on the unbound
+            // `request.activation.{status,body_truncated}`, hoisted to
+            // the top level for the bound surface. No derived `ok` (#7).
             if (fc.final) {
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", if (fc.terminal_ok) js_true else js_false);
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
             }
@@ -2996,8 +2997,11 @@ pub fn installRequest(
             }
             c.JS_FreeValue(ctx, legacy_body);
         }
+        // `status` is the single success signal (#7 — no derived `ok`).
+        // A shim result's own `ok`/`error` (webhook delivery `< 400`,
+        // etc.) rides `request.activation.error` for diagnosis; the
+        // handler branches on `request.status` (0 = transport failure).
         _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
 

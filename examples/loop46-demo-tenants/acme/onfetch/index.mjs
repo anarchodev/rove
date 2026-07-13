@@ -1,8 +1,8 @@
-// on.fetch exerciser (handler-surface Phase 3 slice 3a). The NEW
-// connection-scoped outbound surface: `after.fetch(url, opts, {to})` binds
-// the fetch to the held chain — each upstream chunk wakes the `{to}`
+// on.fetch exerciser (handler-surface Phase 3 slice 3a). The
+// connection-scoped outbound surface: `after.fetch(url, { …, on })` binds
+// the fetch to the held chain — each upstream chunk wakes the `{on}`
 // export ("onUpstream" here) while the chain holds the socket. Proves
-// the bind + the `{to}` export override + chunk resume end to end,
+// the bind + the `{on}` export override + chunk resume end to end,
 // WITHOUT stream.* output (the bound-fetch stream.* path is slice 3d):
 // each chunk appends to kv, and the terminal chunk returns the
 // reconstructed body to the held client.
@@ -28,7 +28,7 @@ export default function () {
     return next();
 }
 
-// Per upstream chunk (bound via on.fetch's {to}). Accumulate in kv; on
+// Per upstream chunk (bound via after.fetch's {on}). Accumulate in kv; on
 // the terminal chunk, return the reconstructed body to the held client.
 export function onUpstream() {
     if (request.done) {

@@ -704,6 +704,13 @@ pub const Readset = struct {
     /// gate on it. False ⇒ the body never influenced execution and
     /// the log carries no reference to it.
     body_read: bool = false,
+    /// True when the `trigger_payload` entry is a resume's threaded-ctx
+    /// envelope (`{"ctx":…}`) rather than an inbound request body
+    /// (issue #62 — wake resumes). The read-taping elision does not
+    /// apply: ctx is an activation input consumed unconditionally at
+    /// request install (`request.ctx`), never a lazily-read body, so
+    /// `body_read` stays false while the entry must survive.
+    ctx_payload: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -752,7 +759,7 @@ pub const Readset = struct {
     /// Idempotent; called at the top of `captureTapes` and before
     /// every raft-entry readset serialization.
     pub fn elideUnreadBody(self: *Readset) void {
-        if (self.body_read) return;
+        if (self.body_read or self.ctx_payload) return;
         if (self.trigger_payload.entries.items.len == 0) return;
         for (self.trigger_payload.entries.items) |*e| {
             freeEntry(self.trigger_payload.allocator, e);

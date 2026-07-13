@@ -15,10 +15,13 @@
 //! key isn't in the map, so replay resolves it to not_found (a *new* read the
 //! original never made surfaces the same way, visible in the effect log).
 //!
-//! Scope: faithful for `inbound` activations. The pulled fixture carries only
-//! the kv / request_reads / request_body channels, so a non-inbound activation
-//! (`fetch_chunk`/`onWake`/…) loses its ctx + fetch-result surface + resolved
-//! export (`replay-and-sim.md` §5 G1/G3) — the caller is warned.
+//! Scope: faithful for `inbound` activations and `wake_batch` (issue #62 —
+//! the fired-watch batch rides `activation_bytes`, ctx rides
+//! `trigger_payload`, the resolved export rides `export`). `fetch_chunk`
+//! transcodes its whole-body case (the matrix smoke proves it) but streamed
+//! multi-chunk stays best-effort; other non-inbound activations lose their
+//! result surface (`replay-and-sim.md` §5 G1/G3) — the caller is warned via
+//! `isFaithfulTranscode`.
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
@@ -29,10 +32,13 @@ pub const Error = error{
 } || decode.Error || std.mem.Allocator.Error;
 
 /// True when the pulled fixture's activation can be transcoded faithfully
-/// (the inbound family — its whole input rides the decoded channels).
-pub fn isInboundFamily(activation: []const u8) bool {
+/// — its whole input rides the decoded channels. The inbound family, plus
+/// `wake_batch` since issue #62 (ctx via trigger_payload, the fired-watch
+/// batch via activation_bytes, the resolved export via `export`).
+pub fn isFaithfulTranscode(activation: []const u8) bool {
     return std.mem.eql(u8, activation, "inbound") or
-        std.mem.eql(u8, activation, "inbound_headers");
+        std.mem.eql(u8, activation, "inbound_headers") or
+        std.mem.eql(u8, activation, "wake_batch");
 }
 
 /// Parse the activation field of a pulled fixture (for the caller's warning).
@@ -57,7 +63,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     const path = if (req) |r| (jStr(r, "path") orelse "/") else "/";
     const host = if (req) |r| (jStr(r, "host") orelse "") else "";
 
-    const export_name = jStr(obj, "export"); // recorded resolved export ({to}) — G3
+    const export_name = jStr(obj, "export"); // recorded resolved export ({on}) — G3
     const recorded = if (obj.get("recorded")) |v| (if (v == .object) v.object else null) else null;
 
     const tapes = if (obj.get("tapes")) |v| (if (v == .object) v.object else null) else null;
@@ -179,6 +185,18 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         };
     }
 
+    // ── wake_batch: activation_bytes = the wakes JSON (issue #62) —
+    // the drained fired-watch batch, recorded verbatim in the JS-facing
+    // encoding by `captureWakeBatchTapes`. Passed through into the
+    // world's `request.activation` bag so replay observes the same
+    // `request.activation.wakes` the live hop did.
+    var wake_batch_json: ?[]const u8 = null;
+    if (std.mem.eql(u8, activation, "wake_batch")) {
+        if (activation_bytes) |ab| if (ab.len >= 1 and ab[0] == '[') {
+            wake_batch_json = ab;
+        };
+    }
+
     // ── emit the world ──
     var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
     defer out.* = aw.toArrayList();
@@ -224,6 +242,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     if (fetch_id) |id| {
         try w.writeAll(",\n    \"fetchId\": ");
         try jsonStr(w, id);
+    }
+    // wake batch → request.activation {kind:"wake_batch", wakes:[…]}
+    // (the same bag shape an authored `rewind:test` world carries).
+    if (wake_batch_json) |wj| {
+        try w.writeAll(",\n    \"activation\": { \"kind\": \"wake_batch\", \"wakes\": ");
+        try w.writeAll(wj);
+        try w.writeAll(" }");
     }
     // ws frame → request.activation {opcode, data | dataB64}
     if (ws_opcode) |op| {
@@ -397,9 +422,51 @@ test "transcode: kv reads → closed-world map; not-found is omitted" {
     try testing.expectEqual(@as(i64, 1700000000000), wo.get("now_ms").?.integer);
 }
 
-test "isInboundFamily" {
-    try testing.expect(isInboundFamily("inbound"));
-    try testing.expect(isInboundFamily("inbound_headers"));
-    try testing.expect(!isInboundFamily("fetch_chunk"));
-    try testing.expect(!isInboundFamily("wake_batch"));
+test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue #62)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const wakes_json = "[{\"kind\":\"kv\",\"prefix\":\"feed/\",\"firedAt\":1700000000123},{\"kind\":\"timer\",\"firedAt\":1700000000456}]";
+    var ab_b64_buf: [256]u8 = undefined;
+    const ab_b64 = std.base64.standard.Encoder.encode(&ab_b64_buf, wakes_json);
+
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"wake_batch", "export":"feed.onFeed",
+        \\   "request": {{ "method":"POST", "path":"/feed", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "activation_bytes_b64":"{s}" }}, "sources":[] }}
+    , .{ab_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const wo = wp.value.object;
+    try testing.expectEqualStrings("wake_batch", wo.get("activation").?.string);
+    // The resolved wake export (G3) survives the transcode.
+    try testing.expectEqualStrings("feed.onFeed", wo.get("export").?.string);
+    // The recorded batch lands on request.activation.{kind,wakes}
+    // -- the same bag shape an authored rewind:test world carries.
+    const req = wo.get("request").?.object;
+    const bag = req.get("activation").?.object;
+    try testing.expectEqualStrings("wake_batch", bag.get("kind").?.string);
+    const wakes = bag.get("wakes").?.array;
+    try testing.expectEqual(@as(usize, 2), wakes.items.len);
+    const w0 = wakes.items[0].object;
+    try testing.expectEqualStrings("kv", w0.get("kind").?.string);
+    try testing.expectEqualStrings("feed/", w0.get("prefix").?.string);
+    try testing.expectEqual(@as(i64, 1700000000123), w0.get("firedAt").?.integer);
+    const w1 = wakes.items[1].object;
+    try testing.expectEqualStrings("timer", w1.get("kind").?.string);
+}
+
+test "isFaithfulTranscode" {
+    try testing.expect(isFaithfulTranscode("inbound"));
+    try testing.expect(isFaithfulTranscode("inbound_headers"));
+    try testing.expect(!isFaithfulTranscode("fetch_chunk"));
+    // issue #62: a wake_batch's whole input is recorded (ctx + wakes),
+    // so it transcodes faithfully.
+    try testing.expect(isFaithfulTranscode("wake_batch"));
 }

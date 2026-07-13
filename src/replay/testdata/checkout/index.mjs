@@ -18,7 +18,7 @@ export default function () {
 
 export function onCharge() {
   const user = request.ctx.user;
-  if (request.ok) {
+  if (request.status >= 200 && request.status < 300) {
     kv.set("order/" + user, JSON.stringify({ status: "paid" }));
     email.send({ apiKey: "re_test_key", from: "orders@shop.test", to: user + "@example.com", subject: "Your order is paid" });
     return { ok: true };
