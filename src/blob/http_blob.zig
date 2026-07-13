@@ -1,8 +1,8 @@
 //! `HttpBlobStore` — read-only `BlobStore` that fetches manifests
-//! from a files-server cluster over HTTP/2. Production.md #1.4 step
-//! 4: loop46 worker swaps S3-direct manifest reads for queries
-//! against the colocated files-server, where manifests live in
-//! raft-replicated KV.
+//! from a files-server cluster over HTTP/2 (Production.md #1.4
+//! step 4). The worker reads manifests via queries against
+//! the colocated files-server, where manifests live in
+//! raft-replicated KV, rather than reading S3 directly.
 //!
 //! ## URL shape
 //!
@@ -13,16 +13,15 @@
 //!   `{base_url}/{instance_id}/deployments/{N:hex}/manifest.bin`
 //!
 //! Returns the raw bytes the server stored at
-//! `deployment/{N:020x}/manifest` in the cluster store. Same bytes
-//! `manifest_json.decode` would have parsed off S3 in the legacy
-//! path.
+//! `deployment/{N:020x}/manifest` in the cluster store — the same
+//! bytes `manifest_json.decode` parses from an S3-direct read.
 //!
 //! ## What's NOT supported
 //!
 //! Writes (`put` / `delete`) and existence checks (`exists`) all
 //! return `error.NotImplemented`. The cluster owns manifest writes
 //! end-to-end via raft — clients propose at the leader, never PUT
-//! directly. Loop46 worker only ever calls `get`; the unimplemented
+//! directly. The worker only ever calls `get`; the unimplemented
 //! methods exist only to satisfy the `BlobStore` vtable.
 //!
 //! ## Auth
@@ -46,7 +45,7 @@
 //! `curl.Easy` is single-handle, mutex-protected internally. One
 //! `HttpBlobStore` per tenant is wasteful but bounded; sharing a
 //! single Easy across all tenants is the right optimization once
-//! we measure contention. Today loop46 reads manifests rarely
+//! we measure contention. Today the worker reads manifests rarely
 //! (cold-start + each release POST), so a per-tenant handle is
 //! fine.
 

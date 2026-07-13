@@ -1,7 +1,6 @@
 //! arenajs wrapper for rove-qjs.
 //!
-//! Replaces shift-js's memcpy + bitmap-relocation snapshot machinery
-//! with the arenajs dual-arena model: the runtime+context are created
+//! Wraps the arenajs dual-arena model: the runtime+context are created
 //! and frozen once into a base arena that lives forever; each request
 //! resets the request arena via a single cursor write (~9 ns) and
 //! reseeds time/random.
@@ -42,20 +41,19 @@ pub const c = root.c;
 
 /// Default base-arena size: holds the runtime, intrinsics, globals,
 /// and any setup eval the init_fn does. Must fit everything the
-/// init_fn allocates plus arenajs's internal overhead. Matches the
-/// 10 MiB ceiling shift-js's old memcpy snapshot used to hit.
+/// init_fn allocates plus arenajs's internal overhead.
 pub const DEFAULT_BASE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Default request-arena size: holds per-request allocations (loaded
 /// handler bytecode, intermediate JS values, response building).
 /// Handler authors who exceed this see JS OOM on the offending alloc.
 ///
-/// Sizing notes (raised 4 MiB → 100 MiB, 2026-06-09):
+/// Sizing notes:
 /// - This bounds ALLOCATION VOLUME per activation, not live-set —
 ///   a bump arena never reclaims within a request, so transient
-///   garbage counts in full. 4 MiB proved tight for handlers
+///   garbage counts in full. A few MiB is too tight for handlers
 ///   touching ~100 KB+ payloads once any allocation-amplifying
-///   code ran over them.
+///   code runs over them.
 /// - The arena is lazily-committed anonymous mmap (qjs-arena.c), so
 ///   the per-worker cost is virtual until touched; RSS grows to
 ///   each worker's high-water mark, not worker_count × 100 MiB.

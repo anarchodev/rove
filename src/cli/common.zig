@@ -1,8 +1,8 @@
-//! Shared infrastructure for the rewind operator CLIs (`rewind-ops` now; the
-//! OIDC-scoped customer `rewind` later). The split is by credential/audience
+//! Shared infrastructure for the rewind operator CLIs (`rewind-ops` and the
+//! OIDC-scoped customer `rewind`). The split is by credential/audience
 //! (docs/architecture/cli-and-deploy.md §6): platform verbs that carry root +
 //! move-secret + ops-secret live in `rewind-ops`; tenant verbs that carry an
-//! OIDC session will live in `rewind`. This module is the credential-agnostic
+//! OIDC session live in `rewind`. This module is the credential-agnostic
 //! core both reuse: operator env loader, curl/ssh transport, JSON helpers, and
 //! the bundle classifier. std-only — no rove modules, no system libs.
 
@@ -297,7 +297,7 @@ pub fn extractDepId(a: std.mem.Allocator, body: []const u8) ?[]const u8 {
 
 pub const Handler = struct { path: []const u8, source: []const u8 };
 /// Statics stream straight to S3 (raw bytes → PUT /v1/upload), so carry the raw
-/// file bytes (no base64 — the JSON deploy path is handlers-only now).
+/// file bytes (no base64 — the JSON deploy path is handlers-only).
 pub const Static = struct { path: []const u8, content_type: []const u8, bytes: []const u8 };
 pub const Bundle = struct { handlers: []Handler, statics: []Static, skipped: [][]const u8 };
 

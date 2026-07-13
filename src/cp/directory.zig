@@ -5,12 +5,12 @@
 //! This is the routing source of truth: given a tenant's store id, which
 //! cluster currently serves it. The **front-door** (`src/front/`)
 //! reads it on every inbound request to pick a backend; the **move
-//! orchestration** (Phase 4 / Phase 7) writes it — flipping a tenant's
-//! placement is the atomic commit point of a tenant move.
+//! orchestration** writes it — flipping a tenant's placement is the atomic
+//! commit point of a tenant move.
 //!
 //! ## Two representations: the durable log + the in-memory projection
 //!
-//! Placement must survive a control-plane restart and (Slice 2) agree
+//! Placement must survive a control-plane restart and agree
 //! across HA nodes, so the authoritative state lives in a **replicated
 //! kvexp store** behind our own `bridge`/`Node` raft substrate — a single
 //! "directory" raft group (gid = hash of `__directory__`). Each mutating
@@ -47,16 +47,16 @@
 //! skip replication and just update the projection. The pure unit tests use
 //! this; the durability test wires a real single-node bridge.
 //!
-//! ## Slice 1 scope / deferrals
+//! ## Single-writer + HA
 //!
-//!   - **Single-node CP only.** Writes assume this node leads the directory
-//!     group (single-node always does). Slice 2 adds multi-node HA: a write
-//!     on a follower faults → leader-aware retry; followers update their
-//!     projection from the apply path, not just from local proposes.
-//!   - **Host→tenant** is now a replicated axis here too (gap #2): the
-//!     `hosts` projection + `host/{host}` keys, authored by the
-//!     `/_control/host` write and seeded from `REWIND_HOSTS`. (It was a
-//!     static front-door map in Slice 1.)
+//!   - Directory WRITES commit only on the node that leads the directory
+//!     group; a write proposed on a follower faults, so a multi-node CP
+//!     follower forwards a control write to the leader (single-node always
+//!     leads). Followers update their projection from the apply path, not
+//!     from local proposes.
+//!   - **Host→tenant** is a replicated axis here too: the `hosts` projection
+//!     + `host/{host}` keys, authored by the `/_control/host` write and
+//!     seeded from `REWIND_HOSTS`.
 
 const std = @import("std");
 const bridge_mod = @import("bridge");
@@ -93,7 +93,7 @@ pub const Error = error{
 
 /// Where a cluster lives, from the front door's point of view. `nodes` is
 /// the cluster's member node origins (e.g. `http://127.0.0.1:18092`) — one
-/// for a single-node cluster, N for a multi-node (Phase 5) cluster. The
+/// for a single-node cluster, N for a multi-node cluster. The
 /// front door forwards a tenant's request to whichever node currently
 /// leads its group (it discovers the leader by trying nodes; a follower
 /// 503s a write so the front door retries the next), and fans a move's
@@ -108,8 +108,8 @@ pub const ClusterRef = struct {
 
 /// A tenant's placement. Kept as a struct (not a bare cluster id) so added
 /// state can ride alongside the cluster without touching `clusterFor`'s callers.
-/// The move converged to one zero-downtime path that keeps the source serving
-/// until the atomic `move` flip, so there is no mid-move hold state.
+/// The move is one zero-downtime path that keeps the source serving until the
+/// atomic `move` flip, so there is no mid-move hold state.
 pub const Placement = struct {
     /// Index into `clusters` (the cluster currently serving this tenant).
     cluster_idx: usize,
@@ -146,20 +146,20 @@ pub const Directory = struct {
     /// + serves the bytes verbatim; the DP parses them into effective limits
     /// (decisions.md §10.9 + docs/architecture/control-plane.md). Owned key + value.
     plans: std.StringHashMapUnmanaged([]u8) = .empty,
-    /// host (`acme.com`) → tenant store id — the replicated domain index
-    /// (gap #2). The front door resolves `host → tenant → cluster` via
+    /// host (`acme.com`) → tenant store id — the replicated domain index.
+    /// The front door resolves `host → tenant → cluster` via
     /// `/_cp/route`; this is the first hop, authored by a control write so
     /// custom domains can be provisioned at runtime (replacing the static
     /// `REWIND_HOSTS` env map). Placement-independent — a host points at a
     /// tenant, not a cluster, so it never changes on a move. Owned key + value.
     hosts: std.StringHashMapUnmanaged([]u8) = .empty,
     /// host (`acme.com`) → packed TLS cert+key (`[4B BE cert_len][cert_pem]
-    /// [key_pem]`, `packCert`) — the replicated cert-state axis (gap #3). The
+    /// [key_pem]`, `packCert`) — the replicated cert-state axis. The
     /// single leader-elected ACME issuer (or a `/_control/cert` operator
     /// upload) writes here; every stateless front-door pulls a host's cert via
     /// `/_cp/cert` for SNI termination. Admin-authored + placement-independent
     /// (survives moves), so it's a sibling axis here, not per-cluster
-    /// `__root__.db` like V1 (v2-front-door-architecture.md). Owned key + value.
+    /// `__root__.db` (v2-front-door-architecture.md). Owned key + value.
     certs: std.StringHashMapUnmanaged([]u8) = .empty,
     /// `{cluster}/{id}` → packed node transport address (`packNodeAddr`:
     /// `raft_addr \t cp_raft_addr \t http_url`) — the node-address registry, the
@@ -762,7 +762,7 @@ pub const Directory = struct {
         gop.value_ptr.* = val_dup;
     }
 
-    // ── Domain index (host → tenant; gap #2) ─────────────────────────
+    // ── Domain index (host → tenant) ─────────────────────────────────
 
     /// Map a host to a tenant store id (`host/{host} = tenant`). The first hop
     /// of routing — the front door resolves `host → tenant` here, then
@@ -810,7 +810,7 @@ pub const Directory = struct {
         gop.value_ptr.* = val_dup;
     }
 
-    // ── Cert state (ACME issuer / operator writes, front-door reads; gap #3) ─
+    // ── Cert state (ACME issuer / operator writes, front-door reads) ─────
 
     /// A host's packed TLS cert+key
     /// (`[1B version][4B BE cert_len][cert_pem][key_pem]`), split into PEM
@@ -1114,7 +1114,7 @@ pub const Directory = struct {
     /// Seed initial placements from a config string of the form
     /// `tenant=cluster_id;tenant=cluster_id;…`. Each entry is `assign`'d,
     /// so every named cluster must already be seeded (`seedClusters`
-    /// first). The Phase-3 "static placement for the first move" path.
+    /// first). The static-placement path (into a fresh directory).
     pub fn seedPlacements(self: *Directory, config: []const u8) Error!void {
         var it = std.mem.tokenizeScalar(u8, config, ';');
         while (it.next()) |raw| {
@@ -1129,8 +1129,8 @@ pub const Directory = struct {
     }
 
     /// Seed the domain index from a config string of the form
-    /// `host=tenant;host=tenant;…` (the old static `REWIND_HOSTS` map, now
-    /// written INTO the replicated directory so it survives a restart + spans
+    /// `host=tenant;host=tenant;…` (the static `REWIND_HOSTS` map, written
+    /// INTO the replicated directory so it survives a restart + spans
     /// the HA nodes). Each entry is `setHost`'d (replicated). Runtime custom
     /// domains are added later via the `/_control/host` control write.
     pub fn seedHosts(self: *Directory, config: []const u8) Error!void {
@@ -1463,7 +1463,7 @@ test "directory: seedClusters + seedPlacements parse static config" {
     try testing.expectError(error.UnknownCluster, dir.seedPlacements("x=ghost-cluster"));
 }
 
-// ── Replicated (durable) directory — Slice 1 ────────────────────────────
+// ── Replicated (durable) directory ──────────────────────────────────────
 
 test "directory: replicated placement survives a CP restart (Slice 1 exit)" {
     const a = testing.allocator;
@@ -1512,7 +1512,7 @@ test "directory: replicated placement survives a CP restart (Slice 1 exit)" {
     }
 }
 
-// ── Multi-node CP — Slice 2: apply-driven projection / HA ───────────────
+// ── Multi-node CP: apply-driven projection / HA ─────────────────────────
 
 test "directory: a leader's write replicates to FOLLOWER projections (Slice 2A)" {
     // The heart of multi-node CP: a directory write on the leader replicates

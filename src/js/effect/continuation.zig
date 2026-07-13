@@ -2,11 +2,11 @@
 //! (`docs/effect-algebra.md` §2.2; `docs/effect-reification-plan.md`
 //! Phase 3).
 //!
-//! Today every "parked on raft seq" site hand-rolls its own struct:
+//! The "parked on raft seq" sites this primitive unifies:
 //!
 //!   - `worker.ParkedUnit` (`src/js/worker.zig:132`) — used by
 //!     `parkSendOps` / `parkKvWakes` / `proposeForgetfulWrites`;
-//!     already commit-gated end-to-end.
+//!     commit-gated end-to-end.
 //!   - h2 `RaftWait` (`worker.zig:114`) tagging entities in the
 //!     three `raft_pending_*` sibling collections (response / cont /
 //!     stream); the H2 reference path.
@@ -15,20 +15,18 @@
 //!   - `stream_data_out` + `stream_response_in` (`src/h2/root.zig`) —
 //!     the held-stream lifecycle.
 //!
-//! Phase 3 collapses these into ONE `Continuation` + ONE `reconcile`
-//! system. This file (Phase 3.0) declares the primitive; the
-//! migrations (Phases 3.1–3.5) move each site onto it incrementally.
-//! The H2 reference path (3.2) is the dragon — generalize with
-//! byte-identical H2 behavior, prove via smokes + perf gate, then
-//! add non-H2 registrants. See `docs/effect-reification-plan.md`
-//! Phase 3 sub-plan.
+//! One `Continuation` + one `reconcile` system covers these. The H2
+//! reference path is the dragon — it must generalize with byte-identical
+//! H2 behavior, proven via smokes + a perf gate, before non-H2
+//! registrants attach. See `docs/effect-reification-plan.md` Phase 3
+//! sub-plan.
 //!
 //! ## Comptime-generic
 //!
 //! `Continuation(Buffered, Txn)` is parameterized over the buffered-
-//! effects type (Phase 4's interpretCmd shape) and the txn pointer
-//! type (today `*kv_mod.KvStore.TrackedTxn`). The effect module is
-//! a leaf — it does NOT import `kv_mod` or `send_dispatch_mod`.
+//! effects type (the interpretCmd shape) and the txn pointer type
+//! (`*kv_mod.KvStore.TrackedTxn` at the instantiation site). The effect
+//! module is a leaf — it does NOT import `kv_mod` or `send_dispatch_mod`.
 //! Concrete types are bound by the caller (worker.zig) at the
 //! instantiation site.
 //!
@@ -125,8 +123,7 @@ pub const RollbackOutcome = union(enum) {
 };
 
 /// Shared seq-keyed txn pool — the encapsulation of the per-worker
-/// `pending_txns` hashmap. Replaces the pre-3.2.c bare
-/// `std.AutoHashMapUnmanaged(u64, Txn)` field on `Worker`.
+/// `pending_txns` hashmap.
 ///
 /// **Architectural fact:** multiple entities can share one txn at a
 /// given seq. Per-tenant batching in `worker_dispatch.finalizeBatch`
@@ -152,13 +149,12 @@ pub fn SharedTxnPool(comptime Txn: type) type {
     return struct {
         const Self = @This();
 
-        /// Keyed by (group_id, seq) — V2 seqs are PER-TENANT (every
-        /// tenant's first write is seq 1), so a bare-seq key collides
-        /// the moment two tenants have writes in flight at the same
-        /// seq: `put` silently overwrote (leaking the first txn
-        /// uncommitted) and `commitAndTake` committed the WRONG
-        /// tenant's txn. V1's node-global seq made bare keys unique;
-        /// the V2 cutover required the composite.
+        /// Keyed by (group_id, seq) — seqs are PER-TENANT (every
+        /// tenant's first write is seq 1), so a bare-seq key would
+        /// collide the moment two tenants have writes in flight at the
+        /// same seq: `put` would silently overwrite (leaking the first
+        /// txn uncommitted) and `commitAndTake` would commit the WRONG
+        /// tenant's txn. The composite key keeps them distinct.
         txns: std.AutoHashMapUnmanaged(u128, Txn) = .empty,
 
         inline fn key(gid: u64, seq: u64) u128 {
@@ -243,14 +239,12 @@ pub fn SharedTxnPool(comptime Txn: type) type {
         /// remove it) has NOT yet happened, OR `commitAndTake`
         /// returned `.conflict` (which keeps it for retry).
         ///
-        /// Effect-reification Phase 4.1.3: lets the `parked_units`
-        /// commit arm see whether the SIBLING entity-backed arm
-        /// (`drainEntityArm` for the same `seq`) actually committed.
-        /// If the txn is still parked, that arm conflicted
-        /// (NotChainHead — a predecessor hasn't committed yet) and
-        /// the unit's `Cmd.respond` must NOT move the entity. The
-        /// unit defers to the next tick so commit + move stay
-        /// atomic (matching the pre-4.1.3 inline-move behavior).
+        /// Lets the `parked_units` commit arm see whether the SIBLING
+        /// entity-backed arm (`drainEntityArm` for the same `seq`)
+        /// actually committed. If the txn is still parked, that arm
+        /// conflicted (NotChainHead — a predecessor hasn't committed
+        /// yet) and the unit's `Cmd.respond` must NOT move the entity.
+        /// The unit defers to the next tick so commit + move stay atomic.
         pub fn contains(self: *const Self, gid: u64, seq: u64) bool {
             return self.txns.contains(key(gid, seq));
         }
@@ -272,11 +266,9 @@ pub fn SharedTxnPool(comptime Txn: type) type {
 /// Cmds + move to next state; `.fault` → discard buffered +
 /// downgrade; `.pending` → skip this iteration).
 ///
-/// Effect-reification Phase 3.2.a: extracts the previously-duplicated
-/// predicate from the three `raft_pending_*` `drainEntityArm` arms +
-/// the `parked_units` sweep. The four sites computed identical
-/// logic in four places; a single classifier guarantees future
-/// divergence is a compile error rather than a drift bug.
+/// The four parked-seq sites (the three `raft_pending_*`
+/// `drainEntityArm` arms + the `parked_units` sweep) share this one
+/// classifier, so divergence is a compile error rather than a drift bug.
 pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
     if (w.committed >= seq) return .commit;
     if (w.faulted > 0 and w.faulted >= seq) return .fault;
@@ -284,12 +276,9 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
     return .pending;
 }
 
-/// The shared per-tick iteration kernel for a parked-seq collection.
-/// Replaces the hand-rolled `while` loops that each re-implemented
-/// "classify every unit; commit / fault / skip". Phase 3.0
-/// deliberately left this undeclared until the iteration shape
-/// stabilized (see the design note below `ReconcileCtx`); Phase 3.2.a
-/// fills it for the H2 reference path (`worker_drain.drainEntityArm`).
+/// The shared per-tick iteration kernel for a parked-seq collection:
+/// classify every unit, then commit / fault / skip. The H2 reference
+/// path (`worker_drain.drainEntityArm`) uses it.
 ///
 /// `ctx` is `anytype` so the effect module stays a leaf — it imports
 /// no host type. The caller supplies a context exposing four methods:
@@ -298,8 +287,8 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
 ///   - `deadlineAt(i) i64` — its absolute timeout deadline (ns)
 ///   - `watermarkAt(i) Watermarks` — the i-th unit's PER-TENANT
 ///     watermark (`bridge.committedSeq(group_id)` / `faultedSeq` +
-///     a once-captured `now_ns`). V2 Phase 2c: each parked unit belongs
-///     to a different tenant raft group, so the commit/fault watermark
+///     a once-captured `now_ns`). Each parked unit belongs to a
+///     different tenant raft group, so the commit/fault watermark
 ///     is looked up per-unit by its `group_id` rather than passed as one
 ///     node-wide snapshot. This is what keeps tenant B's commit from
 ///     waiting on tenant A's (no global serialization point).
@@ -314,8 +303,7 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
 /// `count` is snapshotted by the caller BEFORE the loop. Entity
 /// `reg.move`/`reg.destroy` are deferred to `reg.flush` (rove's
 /// poll/flush model), so moving units out inside `commitAt`/`faultAt`
-/// does not shift the slices a ctx caches — the same property the
-/// pre-3.2.a fault arm already relied on. Callers whose action can
+/// does not shift the slices a ctx caches. Callers whose action can
 /// CREATE new units in the same collection (the kv-react re-entrancy
 /// in the `parked_units` arm) still pass a snapshot-backed ctx; that
 /// guard is the caller's, not reconcile's.
@@ -336,40 +324,32 @@ pub fn reconcile(ctx: anytype, count: usize) !void {
     }
 }
 
-/// The Msg / route key a Continuation parks on (Phase 3.5 — the
-/// O(1) wake-correlation index). Today's resume is a cross-worker
-/// scan (the effect-audit's cross-worker-resume finding). The indexed
-/// form replaces it.
-///
-/// Declared but unindexed in Phase 3.0; the migration sub-phases
-/// 3.1-3.4 populate `wake_key` on existing units, and 3.5 wires
-/// the per-worker hash index that lets resume be O(1) instead of
-/// O(workers × parked).
+/// The Msg / route key a Continuation parks on — the wake-correlation
+/// index that lets resume be O(1) instead of a cross-worker scan
+/// (O(workers × parked)).
 pub const WakeKey = union(enum) {
-    /// Wait on a raft seq to commit (the H2-reference shape:
-    /// `RaftWait.seq` today). Most parked units use this.
+    /// Wait on a raft seq to commit (the H2-reference shape,
+    /// `RaftWait.seq`). Most parked units use this.
     seq: u64,
     /// Wait on a chain's correlation_id wake (held-sync resume,
-    /// `parked_continuations` today).
+    /// `parked_continuations`).
     correlation_id: []const u8,
-    /// Wait on an `effect.Msg` arrival of a specific kind (Phase
-    /// 3.5 — fully-typed wake routing).
+    /// Wait on an `effect.Msg` arrival of a specific kind
+    /// (fully-typed wake routing).
     msg: msg_mod.ActivationSource,
 };
 
 /// The generalized commit-gated parked unit.
 ///
-/// Comptime-generic over `Buffered` (the Cmd buffer shape — Phase 4
-/// settles on `effect.Cmd`'s collection type; pre-Phase-4 sites
-/// embed their bespoke shapes) and `Txn` (the txn pointer type;
-/// today `*kv_mod.KvStore.TrackedTxn` at the instantiation site).
+/// Comptime-generic over `Buffered` (the Cmd buffer shape — per-site
+/// until a uniform `effect.Cmd` collection settles) and `Txn` (the
+/// txn pointer type, `*kv_mod.KvStore.TrackedTxn` at the instantiation
+/// site).
 ///
-/// The struct mirrors today's `worker.ParkedUnit` field-by-field
-/// PLUS a `wake_key` slot — so a Phase 3.1 migration is structural,
-/// not behavioral. The H2-reference path (Phase 3.2) eventually
-/// instantiates this with the same `txn` type and a `Buffered`
-/// shape covering the H2 response staging (h2.RespBody +
-/// RespHeaders + Status etc.).
+/// The struct carries `worker.ParkedUnit`'s fields plus a `wake_key`
+/// slot. The H2-reference path instantiates it with that `txn` type
+/// and a `Buffered` shape covering the H2 response staging (h2.RespBody
+/// + RespHeaders + Status etc.).
 pub fn Continuation(comptime Buffered: type, comptime Txn: type) type {
     return struct {
         const Self = @This();
@@ -382,8 +362,8 @@ pub fn Continuation(comptime Buffered: type, comptime Txn: type) type {
         /// Owned copy when non-empty. Free in `deinit`.
         tenant_id: []u8 = &.{},
         /// Buffered effects released by the reconciler on commit,
-        /// discarded on fault. Shape is per-site until Phase 4
-        /// settles a uniform `effect.Cmd` list.
+        /// discarded on fault. Shape is per-site until a uniform
+        /// `effect.Cmd` list settles.
         buffered: Buffered = .{},
         /// Optional txn pointer (`*kv_mod.KvStore.TrackedTxn` at the
         /// instantiation site). Null on entity-backed parked units
@@ -391,8 +371,7 @@ pub fn Continuation(comptime Buffered: type, comptime Txn: type) type {
         /// non-null on the `proposeForgetfulWrites` flavor that has
         /// no entity in `raft_pending`.
         txn: ?Txn = null,
-        /// Phase 3.5 wake index key. Declared in 3.0; populated by
-        /// 3.1+; indexed in 3.5.
+        /// Wake index key for O(1) resume correlation.
         wake_key: ?WakeKey = null,
 
         /// Rove-compatible component deinit. Called by
@@ -413,7 +392,7 @@ pub fn Continuation(comptime Buffered: type, comptime Txn: type) type {
         ///   any rollback error (kvexp's overlay is volatile — no
         ///   on-disk divergence to undo).
         ///
-        /// Phase 3.1 worker.ParkedUnit instantiates with
+        /// `worker.ParkedUnit` instantiates with
         /// `Buffered = worker.BufferedSendKvOps` (the send_ops +
         /// kv_wakes pair) and `Txn = *kv_mod.KvStore.TrackedTxn`.
         pub fn deinit(allocator: std.mem.Allocator, items: []Self) void {
@@ -444,11 +423,10 @@ pub fn Continuation(comptime Buffered: type, comptime Txn: type) type {
 /// origin that wants commit-gated effects parks a Continuation +
 /// trusts the reconciler — no need to reinvent the gate.
 ///
-/// Phase 3.0 declares the function shape; Phase 3.1+ migrates each
-/// existing drain (drainRaftPending's parked_units arm, the H2
-/// raft_pending_* sweeps, parked_continuations, the streaming
-/// sweeps) onto it. Comptime-generic over the host types so the
-/// effect module stays a leaf.
+/// The drains it covers — drainRaftPending's parked_units arm, the
+/// H2 raft_pending_* sweeps, parked_continuations, the streaming
+/// sweeps — plug into it. Comptime-generic over the host types so
+/// the effect module stays a leaf.
 ///
 /// `now_ns` — caller passes `std.time.nanoTimestamp()` (or test-
 /// injected) so the reconciler is pure-function-testable.
@@ -471,15 +449,10 @@ pub fn ReconcileCtx(comptime Cont: type, comptime UserCtx: type) type {
     };
 }
 
-// Note: the actual `reconcile(...)` loop is intentionally NOT
-// declared as a single concrete function in Phase 3.0 — each
-// existing drain site has its own iteration + entity-destroy
-// idiom (rove ECS deferred destroy + reg.move for state-as-
-// membership). The migration approach is to extract the
-// commit-vs-fault decision logic per site into a call to a
-// shared helper, then unify those calls when the shape stabilizes.
-// Phase 3.1's PR is where the first concrete iteration template
-// emerges; the design here is the contract that template fills.
+// Each drain site keeps its own iteration + entity-destroy idiom
+// (rove ECS deferred destroy + reg.move for state-as-membership);
+// the shared decision logic is factored into `classify` / `reconcile`
+// above, and `ReconcileCtx` is the contract each site's ctx fills.
 
 // ── tests ───────────────────────────────────────────────────────
 
@@ -604,7 +577,7 @@ test "classify: commit / fault / timeout / pending outcomes" {
     }));
     try testing.expectEqual(SweepClass.commit, classify(7, 1, .{
         // Edge: now > deadline AND committed >= seq → commit still
-        // wins. The order matches today's drainRaftPending body.
+        // wins. The order matches drainRaftPending's body.
         .committed = 7, .faulted = 0, .now_ns = 9999,
     }));
 
@@ -677,8 +650,8 @@ test "reconcile: dispatches commit / fault / pending per classify" {
             return self.deadlines[i];
         }
         fn watermarkAt(_: *@This(), _: usize) Watermarks {
-            // Per-tenant watermark (V2 Phase 2c): this test treats all
-            // three units as one tenant — committed through 6, faulted at 8.
+            // Per-tenant watermark: this test treats all three units
+            // as one tenant — committed through 6, faulted at 8.
             return .{ .committed = 6, .faulted = 8, .now_ns = 0 };
         }
         fn commitAt(self: *@This(), i: usize) !void {

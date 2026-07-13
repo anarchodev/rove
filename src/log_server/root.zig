@@ -1,4 +1,4 @@
-//! rove-log-server — Phase 5.5 (a) standalone log-server module.
+//! rove-log-server — standalone log-server module.
 //!
 //! Worker → BatchStore (S3 or fs, via `flush_writer`) → indexer
 //! (`indexer.zig`) → sqlite local index (`index_db.zig`) → query

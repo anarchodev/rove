@@ -1,8 +1,9 @@
-//! libcurl multi-interface engine — Phase 1 of `docs/curl-multi-plan.md`.
+//! libcurl multi-interface engine (`docs/curl-multi-plan.md`).
 //!
 //! One `Multi` handle drives many concurrent `Transfer`s on a single
-//! thread. This file declares the surface; no production consumer
-//! exists yet (Phase 2 migrates `http.fetch` off `Easy + FetchPool`).
+//! thread. This file declares the surface; `FetchEngine`
+//! (`src/js/fetch_engine.zig`) is the production consumer, driving
+//! `http.fetch` on it.
 //!
 //! ## Why two driver shapes
 //!
@@ -15,8 +16,7 @@
 //!   `curl_multi_socket_action`. Event-driven: the application's
 //!   event loop watches the fds libcurl asks for (via the
 //!   `CURLMOPT_SOCKETFUNCTION` callback) and calls this on
-//!   readiness. The production path Phase 2's `FetchEngine` wires
-//!   to epoll.
+//!   readiness. The production path `FetchEngine` wires to epoll.
 //!
 //! Both paths share the `drainCompleted` step that fires per-transfer
 //! `on_done` callbacks.
@@ -144,8 +144,8 @@ pub const Transfer = struct {
     err_buf: [c.CURL_ERROR_SIZE]u8,
     /// Upload cursor for PUT/POST; `src.len == 0` for other methods.
     body_cursor: BodyCursor,
-    /// Response body accumulator (Phase 1: whole-body capture; Phase
-    /// 2 can grow a streaming variant).
+    /// Response body accumulator (whole-body capture; the streaming
+    /// variant routes bytes through `on_chunk` and leaves this empty).
     resp_body: std.ArrayListUnmanaged(u8),
     /// Captured response headers (name + value both allocator-owned).
     resp_headers: std.ArrayListUnmanaged(Header),
@@ -166,8 +166,8 @@ pub const Transfer = struct {
     /// `writeBodyCb` forwards each writeback to this fn instead of
     /// appending to `resp_body` (which stays empty). Returns true to
     /// continue, false to abort the transfer (libcurl surfaces this
-    /// as `CURLE_WRITE_ERROR` in the Result). Phase 2's `FetchEngine`
-    /// uses this to drive per-chunk event emission.
+    /// as `CURLE_WRITE_ERROR` in the Result). `FetchEngine` uses this
+    /// to drive per-chunk event emission.
     on_chunk: ?*const fn (bytes: []const u8, ctx: ?*anyopaque) bool,
     /// Optional per-header-line streaming hook. When non-null,
     /// `writeHeaderCb` forwards each raw libcurl-delivered line
@@ -286,7 +286,7 @@ pub const Transfer = struct {
 
     /// Streaming variant — same wiring as `init` but installs the
     /// per-writeback `on_chunk` + per-header-line `on_header_line`
-    /// hooks. Used by Phase 2's `FetchEngine` to drive per-chunk
+    /// hooks. Used by `FetchEngine` to drive per-chunk
     /// event emission for `http.fetch` `stream: true` and to
     /// route the raw header block to the consumer's own parser.
     /// The `Result.body` / `.headers` passed to `on_done` will be
@@ -399,8 +399,8 @@ pub const Multi = struct {
     /// thread that has no other event loop (test path,
     /// `runDriver`).
     ///
-    /// Phase 2's `FetchEngine` uses `socketAction` instead so its
-    /// epoll loop integrates with the wakeup eventfd.
+    /// `FetchEngine` uses `socketAction` instead so its epoll loop
+    /// integrates with the wakeup eventfd.
     pub fn poll(self: *Multi, timeout_ms: c_int) Error!c_int {
         var numfds: c_int = 0;
         const wait_rc = c.curl_multi_poll(self.handle, null, 0, timeout_ms, &numfds);
@@ -421,8 +421,8 @@ pub const Multi = struct {
         if (rc != c.CURLM_OK) return Error.CurlMultiFailed;
     }
 
-    /// Event-driven entry — Phase 2's `FetchEngine` wires this with
-    /// epoll. `fd == CURL_SOCKET_TIMEOUT` (`-1`) means "the timer
+    /// Event-driven entry — `FetchEngine` wires this with epoll.
+    /// `fd == CURL_SOCKET_TIMEOUT` (`-1`) means "the timer
     /// fired"; otherwise `fd` must be an fd libcurl asked us to
     /// watch (via the SOCKETFUNCTION callback) and `ev_bits` is
     /// `CURL_CSELECT_IN | CURL_CSELECT_OUT | CURL_CSELECT_ERR`.
@@ -476,9 +476,9 @@ pub const Multi = struct {
 };
 
 /// Convenience driver: poll + drain in a loop until `stop_flag` is
-/// set. Used by Phase 1 tests and any single-purpose driver thread
-/// that doesn't need to integrate with an external event loop.
-/// Phase 2's `FetchEngine` runs its own loop instead.
+/// set. Used by tests and any single-purpose driver thread that
+/// doesn't need to integrate with an external event loop.
+/// `FetchEngine` runs its own loop instead.
 pub fn runDriver(
     multi: *Multi,
     stop_flag: *std.atomic.Value(bool),
@@ -508,7 +508,7 @@ fn writeBodyCb(
         const cont = cb(bytes, transfer.user_ctx);
         return if (cont) total else 0;
     }
-    // Whole-body variant (Phase 1 default): append to resp_body for
+    // Whole-body variant (default): append to resp_body for
     // surfacing in `Result.body` on completion.
     transfer.resp_body.appendSlice(transfer.allocator, bytes) catch {
         transfer.alloc_failed = true;

@@ -1,5 +1,5 @@
 //! HS256 JWT helpers for the standalone services' `Authorization:
-//! Bearer` gates (log-server, files-server) plus the worker's
+//! Bearer` gates (log-server) plus the worker's
 //! `/_system/release` and `/_system/admin-kv` endpoints. Not a
 //! general-purpose JWT library — fixed alg, narrow payload shape.
 //!
@@ -100,7 +100,7 @@ pub const MintOptions = struct {
     /// `verifyWithCapAndTenant` rejects it for any other tenant.
     /// Mint enforces `[a-zA-Z0-9_-]` (so the substring-based verify
     /// needs no JSON unescaping, same as caps). Null = unscoped (the
-    /// legacy "any tenant" shape; a tenant-scoped verify rejects it).
+    /// "any tenant" shape; a tenant-scoped verify rejects it).
     tenant: ?[]const u8 = null,
 };
 
@@ -616,8 +616,8 @@ test "tenant-scoped token: rejects a different tenant" {
 }
 
 test "tenant-scoped verify rejects a token with NO tenant claim (the gap)" {
-    // The core fix: an unscoped (legacy "any tenant") token must never
-    // satisfy a tenant-scoped verify, or the cross-tenant read gap stays.
+    // An unscoped ("any tenant") token must never satisfy a
+    // tenant-scoped verify, or a cross-tenant read gap opens.
     const a = testing.allocator;
     const tok = try mint(a, "k", .{ .exp_ms = 1_000_000, .caps = &.{"logs-read"} });
     defer a.free(tok);

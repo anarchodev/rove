@@ -1,5 +1,5 @@
 //! Native replay/sim host — the input side of the arenajs replay ABI
-//! (`qjs-arena-replay-bindings.h`), Phase 2 §2c.
+//! (`qjs-arena-replay-bindings.h`).
 //!
 //! `arena_init` installs the replay bindings; the embedder registers a `Host`
 //! whose responders serve a **closed-world** `world.json` (`world.zig`). KV
@@ -73,7 +73,7 @@ pub const Host = struct {
     /// When set, `module_load` reads `{source_dir}/{spec}` from the working
     /// tree instead of `sources` — the what-if lever for local changes.
     source_dir: ?[]const u8 = null,
-    /// First divergence message, if any — only `module_load` can diverge now (a
+    /// First divergence message, if any — only `module_load` can diverge (a
     /// module the source tree / fixture lacks). Distinct from a handler-thrown
     /// error.
     diverged: ?[]const u8 = null,

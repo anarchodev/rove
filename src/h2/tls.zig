@@ -29,8 +29,8 @@ const HostEntry = struct {
 pub const TlsConfig = struct {
     /// The default / fallback context, built from `--tls-cert`/`--tls-key`
     /// (the wildcard). Serves every connection whose SNI is absent or
-    /// not in `host_store` — i.e. unchanged behavior for the common
-    /// case. The servername callback only ever *overrides* this.
+    /// not in `host_store` — the common case. The servername callback
+    /// only ever *overrides* this.
     ssl_ctx: *c.SSL_CTX,
     allocator: std.mem.Allocator,
 
@@ -38,8 +38,8 @@ pub const TlsConfig = struct {
     /// handshake (servername cb, worker threads — hot path), written
     /// only by the main-thread reload poll → `RwLock`, not `mu`.
     /// Keys + entry ctxs are owned. Empty (and `custom_cert_dir`
-    /// null) ⇒ this whole subsystem is inert and TLS behaves exactly
-    /// as before Phase 2c.
+    /// null) ⇒ this whole subsystem is inert and TLS uses the default
+    /// ctx for every conn.
     host_store: std.StringHashMapUnmanaged(HostEntry) = .{},
     store_rw: std.Thread.RwLock = .{},
     /// `{dir}/{host}/{cert,key}.pem`. Owned. Null ⇒ no custom certs.
@@ -47,8 +47,7 @@ pub const TlsConfig = struct {
     /// Operator mTLS (§3.5): PEM CA path. When non-null, EVERY ctx —
     /// the default and every per-host store entry — requires a client
     /// cert chaining to this CA (`SSL_VERIFY_PEER |
-    /// FAIL_IF_NO_PEER_CERT`). Owned. Null ⇒ no client-cert demand,
-    /// behavior identical to pre-2d.
+    /// FAIL_IF_NO_PEER_CERT`). Owned. Null ⇒ no client-cert demand.
     client_ca_path: ?[]u8 = null,
 
     /// Paths to the PEM files on disk. Owned. Null when the config
@@ -176,9 +175,8 @@ pub const TlsConfig = struct {
     /// Poll granularity is 50 ms, reload cadence is 1 s — cheap enough
     /// to keep running unconditionally, fast enough to surface a fresh
     /// cert within one renewal-tick. Doubles as the "block until
-    /// SIGTERM" primitive each binary's main needs anyway, so the four
-    /// loop46/files-server/log-server/sse-server entry points all hand
-    /// off to this after their listeners are up.
+    /// SIGTERM" primitive each binary's main needs anyway, so entry
+    /// points hand off to this after their listeners are up.
     pub fn runReloadPoll(
         tls_config: ?*TlsConfig,
         stop_flag: *std.atomic.Value(bool),
@@ -241,8 +239,8 @@ pub const TlsConfig = struct {
 
     /// Point the per-host store at `{dir}/{host}/{cert,key}.pem` and
     /// do an initial load. Idempotent; safe before listeners are up.
-    /// When never called, `host_store` stays empty and TLS behaves
-    /// exactly as it did pre-Phase-2c (default ctx for every conn).
+    /// When never called, `host_store` stays empty and TLS uses the
+    /// default ctx for every conn.
     pub fn setCustomCertDir(self: *TlsConfig, dir: []const u8) !void {
         if (self.custom_cert_dir) |old| self.allocator.free(old);
         self.custom_cert_dir = try self.allocator.dupe(u8, dir);

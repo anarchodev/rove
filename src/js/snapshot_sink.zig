@@ -1,4 +1,4 @@
-//! Dest side of the raft Phase 2.5 streaming snapshot transfer
+//! Dest side of the streaming snapshot transfer
 //! (`docs/architecture/raft-native-alignment.md`; codec in `raft-kv`'s `snapshot_stream`).
 //!
 //! `POST /_system/v2-snapshot-stream` arrives as a streamed inbound body. Rather
@@ -48,8 +48,8 @@ pub const Box = struct {
     /// delete; also handy for logging). Freed in `unref`.
     tenant: []u8,
     /// Raft group + data-free baseline to install on a `.replace` finish
-    /// (carried in request headers — collapses the old two-call v2-load-replace
-    /// + v2-apply-snapshot into one streamed call). Unused for `.merge`.
+    /// (carried in request headers, so one streamed call carries both the data
+    /// and the baseline). Unused for `.merge`.
     gid: u64,
     index: u64,
     term: u64,

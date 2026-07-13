@@ -1,14 +1,13 @@
 //! `owed_retry.zig` — the `_send/owed/` marker's Zig-visible surface.
 //!
-//! Post durable-wake-plan P5(a) this is ONLY the held-sync §6.4
-//! binding scan: the leader-side retry sweep (`sweepOwedRetries*` +
-//! `buildRetryFetch` + the platform-header stamping) is deleted —
-//! deferred webhook fires (scheduled sends, retry re-arms, crash
-//! recovery) ride the durable `scheduler` as a wake aimed at the
-//! baked `__system/webhook_fire`, which issues the fetch in JS via
-//! the capability-scoped `__rove_fetch`. `_send/owed/` is ordinary
-//! library kv with no privileged consumer; the prefix constant stays
-//! only because the §6.4 open-hop/repark scan keys on it.
+//! This is ONLY the held-sync §6.4 binding scan — there is no
+//! leader-side retry sweep here. Deferred webhook fires (scheduled
+//! sends, retry re-arms, crash recovery) ride the durable `scheduler`
+//! as a wake aimed at the baked `__system/webhook_fire`, which issues
+//! the fetch in JS via the capability-scoped `__rove_fetch`.
+//! `_send/owed/` is ordinary library kv with no privileged consumer;
+//! the prefix constant exists only because the §6.4 open-hop/repark
+//! scan keys on it.
 
 const std = @import("std");
 const kv_mod = @import("raft-kv");
@@ -16,7 +15,7 @@ const kv_mod = @import("raft-kv");
 const testing = std.testing;
 
 /// `_send/owed/` kv prefix — the durable marker key the JS-shim
-/// `webhook.send` writes (Phase 5 PR-3). Owned end-to-end by the JS
+/// `webhook.send` writes. Owned end-to-end by the JS
 /// composition (`globals/webhook.js` + `__system/webhook_fire` +
 /// `__system/webhook_onresult`); Zig touches it only to *recognize*
 /// a lone owed-put in a writeset for §6.4 held-sync binding.

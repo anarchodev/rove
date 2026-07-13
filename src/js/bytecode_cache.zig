@@ -1,8 +1,8 @@
 //! Process-wide content-addressed cache for compiled module bytecode.
 //!
-//! Phase 3 of `docs/deployment-snapshots-plan.md`. Lifted into its
-//! own module so `globals`, `dispatcher`, and `worker` can all
-//! reference `BlobBytes` without cycling through each other:
+//! `docs/deployment-snapshots-plan.md` Phase 3. A standalone module so
+//! `globals`, `dispatcher`, and `worker` can all reference `BlobBytes`
+//! without cycling through each other:
 //!
 //!     worker ──┐
 //!     globals ─┼──> bytecode_cache

@@ -139,7 +139,7 @@ const SuccessRec = struct {
     /// `ChainContext` component by the cont helpers so the resume
     /// inherits the same chain id.
     correlation_id: ?[]const u8 = null,
-    /// Handler-surface Phase 1: `on.timer`/`on.kv` registrations drained
+    /// `on.timer`/`on.kv` registrations drained
     /// from this activation's `pending_wakes` accumulator when it
     /// returned `next(...)`. Owned slice; `parkSuccessesOnSiblings` arms
     /// the entity's `StreamWakes` from it and frees it. Empty when the
@@ -277,7 +277,7 @@ pub fn parseStreamHeaders(
 /// `response_in`), no response stamped. Returns true iff it parked
 /// (caller skips its own move + captures as parked).
 ///
-/// Handler-cmds Phase 7: cont state lives on the entity's components.
+/// Cont state lives on the entity's components.
 /// Ownership of `s.cont` transfers directly into `ContDescriptor` —
 /// no dual-write, no clone.
 fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator, tenant_id: []const u8, s: *SuccessRec) !bool {
@@ -318,7 +318,7 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
 /// Continuation success parked on raft (write/barrier path): set the
 /// cont components on the entity in `request_out` so they ride the
 /// raft park into `raft_pending_cont` and onward to
-/// `parked_continuations`. Phase 7: same ownership transfer as
+/// `parked_continuations`. Same ownership transfer as
 /// `contParkIfAny`; no side table.
 fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator, tenant_id: []const u8, s: *SuccessRec) !void {
     _ = worker;
@@ -354,7 +354,7 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
     try armContWakesIfAny(server, allocator, s);
 }
 
-/// Handler-surface Phase 1: arm the held continuation's `StreamWakes`
+/// Arm the held continuation's `StreamWakes`
 /// from its drained `on.timer`/`on.kv` registrations + the §8.4 read-view
 /// baseline, set on the entity in `request_out` so the component rides
 /// the park into `parked_continuations`. The kv prefixes + `{on}` are
@@ -422,14 +422,13 @@ fn contDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
     }
 }
 
-// ── Streaming-handlers Phase 2b-ii finalize helpers ────────────────
+// ── Stream finalize helpers ────────────────────────────────────────
 // Symmetric to the cont helpers: redirect the FINAL entity
 // destination (`stream_response_in` instead of `response_in`) and
 // set the chain-level stream components on the entity (via
-// `worker.setStreamComponents`) — Phase 7 folded the old
-// `parked_streams_meta` side-store onto the entity, and its
-// membership in the stream pipeline is the lifecycle discriminant
-// (`feedback_state_is_collection`).
+// `worker.setStreamComponents`). The stream components live on the
+// entity, and its membership in the stream pipeline is the lifecycle
+// discriminant (`feedback_state_is_collection`).
 
 /// Committed read-only first-hop success that is a stream → register
 /// the chain cell + move the entity into h2's stream pipeline.
@@ -443,7 +442,7 @@ fn streamParkIfAny(
 ) !bool {
     var meta = s.stream orelse return false;
     s.stream = null;
-    // Phase 7: the entity's components are the sole home for stream
+    // The entity's components are the sole home for stream
     // state. setStreamComponents clones every slice into its
     // component-side owners; we then free the originals via the
     // SuccessRec's StreamFirstHopMeta.deinit. (A future "transfer-
@@ -484,10 +483,10 @@ fn streamDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
     }
 }
 
-/// Phase 4d / 7: stream-first-hop success on a write batch. Populates
+/// Stream-first-hop success on a write batch. Populates
 /// the entity's stream components in `request_out` so they ride the
 /// raft park into `raft_pending_stream` and onward to
-/// `stream_response_in` on commit. Phase 7: no side table; the
+/// `stream_response_in` on commit. No side table; the
 /// SuccessRec's StreamFirstHopMeta is freed inline after the clones
 /// land on the components. Symmetric to `contRecordIfAny`.
 fn streamRecordIfAnyAt(
@@ -544,15 +543,14 @@ fn streamRecordIfAnyAt(
 /// console/exception ownership out of `s` (so the SuccessRec
 /// teardown can't double-free) and emit the commit-time log
 /// record. The only per-path variance is `(status, outcome)`; the
-/// caller keeps its own `processed += 1`. Behavior-identical to
-/// the five hand-inlined copies it replaced.
+/// caller keeps its own `processed += 1`.
 fn captureSuccess(
     worker: anytype,
     anchor_id: []const u8,
     s: *SuccessRec,
     status: u16,
     outcome: log_mod.Outcome,
-    /// Phase 5b: the raft seq this success was proposed at. Pass 0
+    /// The raft seq this success was proposed at. Pass 0
     /// for the read-only commit path (no propose, no seq) and for
     /// the propose-fail downgrade (entry never made it to raft).
     /// The leader's flushLogs uses `max(record.raft_seq across the
@@ -585,7 +583,7 @@ fn captureSuccess(
 /// continuation → the cont sibling, else a plain response. Stream
 /// takes priority over cont (a stream hop may also have opened a
 /// continuation, but it parks as a stream). One owner for the 3-way
-/// routing the finalize arms below otherwise hand-rolled four times.
+/// routing the finalize arms below share.
 const ParkRoute = enum {
     response,
     cont,
@@ -637,7 +635,7 @@ fn parkSuccessesOnSiblings(
     seq: u64,
 ) !usize {
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-    // V2 Phase 2c: the tenant is already registered (it just proposed),
+    // The tenant is already registered (it just proposed),
     // so `gidForTenant` resolves its raft group id for the per-tenant
     // RaftWait the drain looks up. 0 (absent) only on the empty-propose
     // path, where seq==0 leaves the unit pending — harmless.
@@ -682,15 +680,14 @@ fn finalizeBatch(
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *const kv_mod.WriteSet,
     successes: *std.ArrayList(SuccessRec),
-    /// Effect-reification Phase 4.1.2: accumulated `http.fetch`
-    /// calls from successful handlers in this batch. On the
-    /// read-only / barrier paths we flush via
+    /// Accumulated `http.fetch` calls from successful handlers in
+    /// this batch. On the read-only / barrier paths we flush via
     /// `enqueuePendingFetches`; on the write path we stage as
     /// `Cmd.http_fetch` entries on the parked unit via
     /// `parkKvWakes`'s `initial_cmds` parameter — the engine
     /// submits AFTER raft commit, closing the marker-commit race
-    /// `webhook.send`'s sweep-only path papered over. On
-    /// propose-fail / handler-error → caller's defer frees the
+    /// between the `_send/owed` marker and the shim's inline fetch.
+    /// On propose-fail / handler-error → caller's defer frees the
     /// list.
     batch_pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
     /// `docs/readset-replication-plan.md` Phase 3d (multi-readset
@@ -708,7 +705,7 @@ fn finalizeBatch(
     const allocator = worker.allocator;
     const anchor_id = anchor.id;
     const batch_seq = txn.txn_seq;
-    // Option-A: the batch's accumulated admin side effects
+    // The batch's accumulated admin side effects
     // (`platform.root.*` + cross-tenant trampolines) are folded into
     // this batch's single raft entry by `proposeBatch`. Reset on
     // every exit: on the write/side paths proposeBatch has already
@@ -788,12 +785,12 @@ fn finalizeBatch(
             // nulls `s.cont`/`s.stream`, so a stream/cont in the
             // barrier path gets `source`/`dest` matching where it
             // parks — not the stale `raft_pending_response` →
-            // `response_in` the pre-null read used to emit.
+            // `response_in` a post-null read would emit.
             txn.park(seq) catch |perr|
                 std.log.warn("rove-js finalizeBatch (barrier): park seq={d} tenant={s}: {s} (pointer fallback)", .{ seq, anchor_id, @errorName(perr) });
             try worker.pending_txns.park(allocator, barrier_proposed.group_id, seq, txn);
 
-            // Effect-reification Phase 4.1.2: the barrier path's
+            // The barrier path's
             // batch had no writes BUT did read speculative state;
             // the http.fetch'es it issued may have computed on
             // that state. Stage them on a parked unit so they
@@ -802,7 +799,7 @@ fn finalizeBatch(
             // below. `parkKvWakes` with an empty writeset still
             // creates the unit when `extra_cmds` is non-empty.
             //
-            // Phase 4.1.3: also build Cmd.respond per success so
+            // Also build Cmd.respond per success so
             // the deferred payload (Status/RespHeaders/RespBody/
             // H2IoResult) stamps + moves at commit time via
             // `interpretCmd`. Mirrors the write-path branch's
@@ -831,7 +828,7 @@ fn finalizeBatch(
             // (success or its errdefer). Caller-side copy is now
             // stale; do not free.
 
-            // Phase 5: now park each success on the raft-pending
+            // Now park each success on the raft-pending
             // sibling matching its outcome (drainRaftPending dispatches
             // by collection membership). Last, because it nulls the
             // cont/stream flags the respond loop above just read.
@@ -847,8 +844,8 @@ fn finalizeBatch(
         // chain-head requirement, so it CANNOT return Conflict. The
         // speculation case is handled by the idiom-0 barrier branch
         // above. Any error here (incl. Conflict) is therefore a
-        // broken invariant — panic, do NOT soft-rollback: the prior
-        // `Conflict => txn.rollback()` arm fell through to a `.ok`
+        // broken invariant — panic, do NOT soft-rollback: a
+        // `Conflict => txn.rollback()` arm would fall through to a `.ok`
         // response, i.e. a false 2xx after a rollback (the exact
         // escaped-effect class this path exists to prevent). Fail
         // loud (feedback_infallibility_violations).
@@ -860,7 +857,7 @@ fn finalizeBatch(
             .{ anchor_id, @errorName(err) },
         );
         allocator.destroy(txn);
-        // Effect-reification Phase 4.1.2: read-only batches don't
+        // Read-only batches don't
         // park, so the batch's `http.fetch`es can fire immediately
         // — there's no marker-commit race because there's no
         // marker (no writes). Flush via `enqueuePendingFetches`
@@ -898,7 +895,7 @@ fn finalizeBatch(
                 processed += 1;
                 continue;
             }
-            // Streaming-handlers Phase 2b-ii: committed read-only
+            // Committed read-only
             // first-hop that returned `__rove_stream(...)` → register
             // the chain cell + redirect into h2's stream pipeline.
             // captured as parked (status 0, same shape as the cont
@@ -990,12 +987,11 @@ fn finalizeBatch(
     // many customer requests ride one raft log entry.
     worker.node.dispatch_writeset_size.observe(@intCast(successes.items.len));
 
-    // Phase 5 PR-3: the `_send/*` commit-gate (parkSendOps) retired
-    // with the SendDispatch kernel. `_send/owed/` is an ordinary
-    // envelope-0 kv put now; the per-worker partitioned retry
-    // sweep (`sweepOwedRetries`) is the fire mechanism.
+    // `_send/owed/` is an ordinary envelope-0 kv put; the per-worker
+    // partitioned retry sweep (`sweepOwedRetries`) is the fire
+    // mechanism (there is no dedicated send commit-gate).
 
-    // streaming-handlers-plan §4.6 + effect-reification Phase 4.1.2:
+    // streaming-handlers-plan §4.6:
     // park the kv-wake fan-out intents (one per writeset op) AND
     // the batch's accumulated `http.fetch` Cmds on the same seq.
     // `drainRaftPending`'s parked_units commit arm runs
@@ -1003,11 +999,9 @@ fn finalizeBatch(
     // submitting each fetch to the FetchEngine, both strictly
     // AFTER raft commits the writeset.
     //
-    // The `http_fetch` staging closes the marker-commit race that
-    // forced `webhook.send`'s sweep-only path: the shim's inline
-    // `http.fetch` now rides the same commit gate as the
-    // `_send/owed/{id}` marker, so when `webhook_onresult` fires
-    // it always sees the marker.
+    // The `http_fetch` staging rides the same commit gate as the
+    // `_send/owed/{id}` marker, so when `webhook_onresult` fires it
+    // always sees the marker — closing the marker-commit race.
     var write_path_cmds: effect_mod.cmd.BufferedCmds = .{};
     for (batch_pending_fetches.items) |pf| {
         write_path_cmds.items.append(allocator, .{ .http_fetch = pf }) catch {
@@ -1017,13 +1011,13 @@ fn finalizeBatch(
         };
     }
     batch_pending_fetches.clearRetainingCapacity();
-    // Phase 4.1.3: emit a move-only `Cmd.respond` per success.
+    // Emit a move-only `Cmd.respond` per success.
     // The h2 payload components were stamped inline at
     // handler-success time (above); this Cmd just routes the
     // commit-arm move (raft_pending_X → response_in /
     // parked_continuations / stream_response_in) through
     // `interpretCmd` instead of `drainEntityArm`'s inline move.
-    // Post-Option-2 every path that parks an entity in
+    // Every path that parks an entity in
     // raft_pending_X also emits Cmd.respond, so `drainEntityArm`
     // unconditionally skips the move on commit.
     appendRespondCmds(allocator, &write_path_cmds, successes);
@@ -1031,7 +1025,7 @@ fn finalizeBatch(
         std.log.warn("rove-js parkKvWakes (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
     // parkKvWakes consumed write_path_cmds unconditionally.
 
-    // Phase 5: each success parks on the raft-pending sibling matching
+    // Each success parks on the raft-pending sibling matching
     // its outcome so drainRaftPending's dispatch is collection-
     // membership, not a discriminator field-check.
     processed += try parkSuccessesOnSiblings(worker, server, allocator, anchor_id, successes, seq);
@@ -1092,7 +1086,7 @@ fn tryHandleSystem(
     const path_no_q = if (qmark) |q| path[0..q] else path;
     const sys_rest = path_no_q["/_system/".len..];
 
-    // V2 Phase 4 — the cluster-internal tenant-move surface (`v2-*`). It
+    // The cluster-internal tenant-move surface (`v2-*`). It
     // carries its own `move_secret` auth (the front door holds it, not the
     // operator root bearer) and no CORS, so it short-circuits before the
     // admin-auth gate below. Disabled (404) when no move secret is set.
@@ -1131,7 +1125,7 @@ fn tryHandleSystem(
         return true;
     }
 
-    // Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — JWT minter for
+    // JWT minter for
     // the standalone services (log-server + files-server). Caller is
     // already admin-authenticated; we hand back a 5-minute HS256
     // token + the public origins of both services so the dashboard
@@ -1213,18 +1207,15 @@ fn tryHandleSystem(
     // Cluster-wide admin config push. files-server-standalone POSTs
     // `{"pairs":[{"key":"...","value":"..."},...]}` here at platform
     // bootstrap time so operator-supplied --bootstrap-kv values land
-    // in `__admin__/app.db` via raft (envelope 0). Replaces the
-    // worker's old --bootstrap-kv flag, which wrote per-node
-    // bypassing raft.
+    // in `__admin__/app.db` via raft (envelope 0).
     if (std.mem.eql(u8, sys_rest, "admin-kv")) {
         try handleAdminKv(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
         return true;
     }
 
-    // No remaining proxy subsystems on the worker — `/_system/log/*`
-    // retired in Phase 5.5(a) Step B, `/_system/files/*` retired in
-    // Phase 5.5(e) Step F1. `/_system/kv/*` and `/_system/tenant/*`
-    // moved to the `__admin__` JS handler long before.
+    // No proxy subsystems live on the worker — the log, files, kv, and
+    // tenant `/_system/*` routes are served by the standalone services
+    // or the `__admin__` JS handler, not here.
     try respb.setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
     return true;
 }
@@ -1487,16 +1478,15 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
     // requests per raft entry". If the third is bumping the
     // `--propose-linger-us` value, the linger budget could be raised.
     try writeCountHistogram(w, "dispatch_writeset_size_requests", worker.node.dispatch_writeset_size.snapshot());
-    // V2 Phase 2c: the V1 leader-side propose-batch/linger histograms
-    // lived on the cluster-wide RaftNode; the per-tenant bridge has no
-    // global proposer to measure. The DP-layer pump metrics return in a
-    // later phase (per-pump-cycle histograms on the bridge).
+    // The per-tenant bridge has no global proposer, so there are no
+    // leader-side propose-batch/linger histograms to emit here
+    // (per-pump-cycle histograms on the bridge are future work).
 
-    // `docs/cross-worker-held-state-plan.md` Phase 2A: routing
-    // observability. cross_worker counts wake events routed to a
-    // worker different from hash(tenant_id) — the path that would
-    // have silently failed pre-Phase-2A. A non-zero count means the
-    // SO_REUSEPORT vs hash(tenant_id) gap is being closed in practice.
+    // `docs/cross-worker-held-state-plan.md`: routing observability.
+    // cross_worker counts wake events routed to a worker different
+    // from hash(tenant_id) — the cross-worker held-state path. A
+    // non-zero count means the SO_REUSEPORT vs hash(tenant_id) gap is
+    // being closed in practice.
     try w.print(
         \\# HELP bound_fetch_cross_worker_routes_total bound fetch chunks routed to owner worker ≠ hash(tenant_id) % N (the Phase 2A path).
         \\# TYPE bound_fetch_cross_worker_routes_total counter
@@ -1544,7 +1534,7 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
 
     // `docs/chunk-spool-plan.md` P6: live retained (sealed-but-not-
     // fully-consumed) coordinator batches. Refcount-release keeps this
-    // at the live backlog; pre-P6 it grew without bound.
+    // at the live backlog.
     if (worker.node.blob_coord.coordinator) |coord| {
         try w.print(
             \\# HELP coord_retained_batches live retained (sealed, not fully consumed) blob-coordinator batches.
@@ -1743,8 +1733,7 @@ const SNAP_BUNDLE_MAGIC = "ROVSNAP1";
 /// wholesale. NOT shipped: `raft.log.db`, term/vote — those are
 /// raft-layer concerns the follower manages on its own.
 ///
-/// Bundle wire format (unchanged from the pre-consolidation
-/// multi-file shape, just always one entry now):
+/// Bundle wire format (a single-entry framing):
 ///   `ROVSNAP1 [u32 file_count=1] [u16 name_len][name="cluster.kv"]
 ///    [u64 file_size][bytes]`
 ///
@@ -1966,7 +1955,7 @@ fn handleRelease(
     // bytecodes / statics. See `worker.zig::DeploymentLoader`.
     //
     // Trade-off: `_deploy/current` and the `_config/*` mirror
-    // are no longer atomic in raft. There is a small window
+    // are not atomic in raft. There is a small window
     // after release commit where `kv.fromConfig(...)` returns
     // the previous deployment's value. The window closes when
     // the loader finishes — typically ~tens-of-ms for an empty
@@ -2025,12 +2014,12 @@ fn handleRelease(
     // Park the request on the response-sibling of raft-pending —
     // release POST is always terminal (no cont / stream).
     // drainRaftPending will:
-    //   - on commit: commitTxn (drop kv_undo) + deliver 204
-    //   - on fault / timeout: undoTxn + deliver 503
+    //   - on commit: commit the parked txn + deliver 204
+    //   - on fault / timeout: roll back + deliver 503
     // The worker thread is free to dispatch the next stream
     // immediately; this is what lets proposeBatcher actually
     // batch multiple in-flight release POSTs.
-    // Phase 4.1.3 Option-2 (full Pattern B): a move-only Cmd.respond on
+    // A move-only Cmd.respond on
     // a parked_unit routes the commit-arm move through `interpretCmd
     // .respond` (matching every other entity park path). BUILD IT FIRST:
     // if its (1-slot) alloc fails after the entity is committed to
@@ -2200,9 +2189,7 @@ fn handleAdminKv(
     // back). Mirrors the Class-B-correct release handler above:
     // drainRaftPending delivers the staged 204 at committedSeq>=seq
     // / 503 on fault/timeout. docs/proposer-audit.md idiom-2,
-    // docs/unified-effect-gating.md. (Replaces the prior
-    // fire-and-forget propose + immediate commitTxn(drop-undo) +
-    // accept-time 204.)
+    // docs/unified-effect-gating.md.
     // System endpoint with no dispatched-handler readset; empty
     // rs_bytes is the right value here.
     const seq = (raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID, "") catch |err| {
@@ -2231,9 +2218,9 @@ fn handleAdminKv(
         .seq = seq,
         .deadline_ns = deadline_ns,
     });
-    // Phase 5: admin kv-write is always terminal — response sibling.
+    // Admin kv-write is always terminal — response sibling.
     try server.reg.move(ent, &server.request_out, &worker.raft_pending_response);
-    // Phase 4.1.3 Option-2 (full Pattern B): emit Cmd.respond on a
+    // Emit Cmd.respond on a
     // parked_unit so the commit-arm move routes through `interpretCmd
     // .respond` (matching every other entity park path). Pass empty
     // writeset — admin-kv's actual writes ride on the entity's own
@@ -2295,7 +2282,7 @@ const ResolveResult = union(enum) {
 /// engine crash) to a 504 so the h2 stream never hangs forever.
 const FORWARD_PARK_DEADLINE_NS: i64 = 35 * std.time.ns_per_s;
 
-/// Async serve-or-forward (Phase 7 follow-up): this cluster has no tenant
+/// Async serve-or-forward: this cluster has no tenant
 /// for `host`. If a control plane is configured, COPY the request,
 /// allocate a forward id, park the entity in `forward_pending`, and
 /// submit a `ProxyJobSpec` to the node's proxy engine — which runs the
@@ -2305,11 +2292,10 @@ const FORWARD_PARK_DEADLINE_NS: i64 = 35 * std.time.ns_per_s;
 /// is done with it); false only when forwarding is unconfigured (caller
 /// falls through to the inline 404).
 ///
-/// Replaces the prior blocking `tryForwardToOwner`, which ran two
-/// synchronous libcurl round-trips (CP query + forward) on the worker's
-/// poll loop — stalling every other request on the thread for the full
-/// cross-cluster latency on each mis-routed request (acute during a
-/// post-move routing burst).
+/// Runs the CP query + forward OFF the worker poll loop: a synchronous
+/// CP-query-then-forward would stall every other request on the thread
+/// for the full cross-cluster latency on each mis-routed request (acute
+/// during a post-move routing burst).
 fn parkForward(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -2476,7 +2462,7 @@ fn resolveRequest(
             return .handled;
         };
         if (r == null) {
-            // Serve-or-forward (Phase 7 slice a): this cluster can't resolve
+            // Serve-or-forward: this cluster can't resolve
             // the tenant locally. If a control plane is configured, ask who
             // owns the host and forward there (a stale public route or a
             // post-move source lands here) — a hop, not a 404. Only a genuine
@@ -2578,7 +2564,7 @@ fn resolveRequest(
     // (default export AND named-export RPCs), checks cookie/bearer,
     // and either sets request.auth or short-circuits 401. Pre-auth
     // paths (signup / auth / login / logout) skip the gate inside
-    // the middleware. Zig is no longer in the admin auth path —
+    // the middleware. Zig is not in the admin auth path —
     // `/_system/*` keeps its own auth gate via `tryHandleSystem`
     // until the files-server + log-server detach (PLAN §10.13).
 
@@ -2589,16 +2575,15 @@ fn resolveRequest(
     }
     const handler_inst = admin_opt.?;
 
-    // X-Rove-Scope no longer rebinds the dispatch tenant. The admin
+    // X-Rove-Scope does not rebind the dispatch tenant. The admin
     // handler ALWAYS dispatches on its own `__admin__`-home kv — auth,
     // sessions, and all of admin's own state must be scope-independent
-    // (the old rebind made the cookie/session path silently
-    // unvalidated under scope; only the scope-independent Bearer token
-    // ever worked there). Cross-tenant data access is now the explicit
+    // (a rebind would leave the cookie/session path silently
+    // unvalidated under scope; only a scope-independent Bearer token
+    // works under a rebind). Cross-tenant data access is the explicit
     // `platform.scope(id).kv` accessor, which resolves the target
     // itself and throws a coded `InstanceNotFound` (→ admin handler
-    // 404) on an unknown id, preserving the old dispatch-level
-    // 404-on-unknown-scope behavior at the JS layer. See
+    // 404) on an unknown id, keeping unknown-scope a JS-layer 404. See
     // auth-domain-plan §4.7 "Primitive-fix pivot (2026-05-16)".
     return .{ .dispatch = .{
         .handler_inst = handler_inst,
@@ -2642,7 +2627,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     const sessions = server.request_out.column(h2.Session);
     const req_hdrs = server.request_out.column(h2.ReqHeaders);
     const req_bodies = server.request_out.column(h2.ReqBody);
-    // Phase 4 park-on-durability: surfaced on every iteration so
+    // Park-on-durability: surfaced on every iteration so
     // we can detect resumes (entity returning from body_pending
     // after `drainBodyPending` released it). The column slice is
     // pinned to the snapshot above — `reg.move` mutates the
@@ -2679,7 +2664,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
-    // Phase 3d (`docs/readset-replication-plan.md`): every successful
+    // `docs/readset-replication-plan.md`: every successful
     // request in the batch contributes its serialized readset to the
     // raft entry's `rs_bytes` section. Each readset blob is appended
     // to `batch_readset_blobs` as the handler finishes; at
@@ -2696,7 +2681,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var batch_readset_bytes: []u8 = &.{};
     defer if (batch_readset_bytes.len > 0) allocator.free(batch_readset_bytes);
 
-    // Effect-reification Phase 4.1.2 — batch-level `http.fetch`
+    // Batch-level `http.fetch`
     // accumulator. Each handler appends its successful fetches
     // here (transferred from the per-request `pending_fetches`
     // after handler success). `finalizeBatch` decides per branch:
@@ -2759,7 +2744,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         checkProxyWarning(rh);
 
-        // raft Phase 2.5: the streamed-snapshot dest is the ONE `/_system` route
+        // The streamed-snapshot dest is the ONE `/_system` route
         // that must NOT buffer whole — it feeds inbound chunks straight into a
         // `StreamLoader` via a dedicated `BodySink` (no S3 chunk-tape). Arm it
         // here, while the body is still arriving; the entity parks in
@@ -2843,7 +2828,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
         // Pin the current deployment snapshot for the duration of this
         // request. `release` fires at end of iteration (continue or
-        // fall-through). Phase 2: snapshot pinning guarantees a request
+        // fall-through). Snapshot pinning guarantees a request
         // sees one deployment version completely.
         const snap = slot.pinCurrent() orelse {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
@@ -2856,11 +2841,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const dep_id = snap.deployment_id;
 
         // Rate limiter: every request — admin AND customer — checks
-        // the per-instance request bucket. Admin used to bypass on
-        // the "operational traffic mustn't lock us out" theory, but a
-        // 1k+ tenant bench then proved that admin traffic without a
-        // limiter can overwhelm the worker's entity/connection
-        // queues. Operators who need higher admin throughput bump
+        // the per-instance request bucket. Admin is NOT exempt: admin
+        // traffic without a limiter can overwhelm the worker's
+        // entity/connection queues (a 1k+ tenant bench showed this;
+        // exempting admin on an "operational traffic mustn't lock us
+        // out" theory is the wrong trade). Operators who need higher admin throughput bump
         // the per-tenant cap via `--rate-limit-request-capacity` /
         // `--rate-limit-request-refill`; the right answer is to
         // size the bucket, not to bypass it. Runs BEFORE static
@@ -2912,10 +2897,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             std.fmt.parseInt(u64, std.mem.trim(u8, cl, " \t"), 10) catch 0
         else
             0;
-        // Gap 2.4: the 413 itself moved BELOW route resolution — a
+        // Gap 2.4: the 413 sits BELOW route resolution — a
         // module that exports `onChunk` streams any-size bodies, and
         // whether it does is a per-(deployment, module) question. The
-        // classic paths keep both halves of the old check: the
+        // classic paths apply both halves of the size check: the
         // pre-buffer declared-length reject (classic receiving arm)
         // and the buffered-length check (after the chunk-routing
         // decision).
@@ -3332,8 +3317,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     };
                 } else if (body.len > 0) {
                     // Large body (> INBOUND_INLINE_THRESHOLD) — coord
-                    // submit + park. docs/streaming-model.md §7
-                    // Phase 3: bytes flow to the process-global coord,
+                    // submit + park. docs/streaming-model.md §7:
+                    // bytes flow to the process-global coord,
                     // we park on the resulting seq, drain materializes
                     // the BodyRef once the seq is durable.
                     if (worker.node.blob_coord.coordinator) |coord| {
@@ -3389,8 +3374,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
 
         // Admin-handler `platform.root.set/delete` writes accumulate
-        // into the *batch* root writeset (Option-A,
-        // docs/proposer-audit.md Addendum 3) so they ride the
+        // into the *batch* root writeset
+        // (docs/proposer-audit.md Addendum 3) so they ride the
         // batch's single atomic raft entry and the caller is parked
         // on that seq — no per-request fire-and-forget. Stable
         // pointer for the whole walk (worker-owned, reset at
@@ -3429,11 +3414,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
         std.log.debug("rove-js corr: inbound corr={s} request_id={d} tenant={s}", .{ correlation_id, request_id, scope_inst.id });
 
-        // Gap 2.3 Phase C1: per-request accumulator for
+        // Gap 2.3: per-request accumulator for
         // `http.fetch` calls. The binding appends into it via
         // state.pending_fetches; on handler success we flush to
-        // NodeState.fetch_pending (Phase C2 wires the consumer
-        // pool that fires libcurl). On handler error / fault the
+        // NodeState.fetch_pending (the consumer pool that fires
+        // libcurl reads from there). On handler error / fault the
         // defer frees the entries — no orphan fetches.
         var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
         defer {
@@ -3441,18 +3426,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             pending_fetches.deinit(allocator);
         }
 
-        // Handler-surface Phase 1: per-activation `on.timer`/`on.kv`
+        // Per-activation `on.timer`/`on.kv`
         // accumulator (same shape/ownership as `pending_fetches`). This
         // is a connection activation, so the accumulator is non-null and
         // `on.*` records wakes; the worker arms them onto the held
-        // entity's `StreamWakes` at park (Phase 1 Task 2). The defer
+        // entity's `StreamWakes` at park. The defer
         // frees any leftovers on the error/no-park path.
         var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
         defer {
             for (pending_wakes.items) |*pw| pw.deinit(allocator);
             pending_wakes.deinit(allocator);
         }
-        // Handler-surface Phase 2: `stream.write(chunk)` records chunks;
+        // `stream.write(chunk)` records chunks;
         // `finishResponse` moves them into the internal Stream descriptor
         // (next ⇒ keep streaming) or onto the terminal body (close). The
         // defer frees any leftovers `finishResponse` didn't consume
@@ -3526,7 +3511,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .platform_caps = worker.adminPlatformCaps(handler_inst),
             },
             .trampolines = .{
-                // Phase 5 PR-3: §6.4 held-sync resume hook trampoline.
+                // §6.4 held-sync resume hook trampoline.
                 // Available to every dispatch (the JS-shim
                 // `__system/webhook_onresult` calls it on terminal);
                 // returns false when nothing's bound.
@@ -3568,7 +3553,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         else
             dispatcher_mod.Budget.default_duration_ns;
         var budget = dispatcher_mod.Budget.fromNow(budget_ns);
-        // §6.4 binding (5b-1): a continuation hop binds to the single
+        // §6.4 binding: a continuation hop binds to the single
         // `_send/owed/{id}` it wrote — derived from `writeset` after
         // the hop (see `cont_bound_sched_id` below). The customer
         // never sees the id (`http.send`'s value is unused by §6.4),
@@ -3612,10 +3597,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             } else if (invalidated) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 503, "speculative dependency rolled back; retry\n", allocator);
             } else {
-                // Was a bodyless, journald-silent 500 (only the tape saw it) —
-                // which made the prod __admin__ deploy-500 undiagnosable. Surface
-                // the actual DispatchError in BOTH the response body and journald,
-                // tagged with the correlation id so it ties to the tape/replay record.
+                // Surface the actual DispatchError in BOTH the response body
+                // and journald, tagged with the correlation id so it ties to
+                // the tape/replay record — a bodyless, journald-silent 500
+                // (visible only in the tape) is undiagnosable in prod.
                 std.log.warn(
                     "rove-js dispatch error: tenant={s} method={s} path={s} corr={s} err={s}",
                     .{ scope_inst.id, method, path, correlation_id, @errorName(err) },
@@ -3642,12 +3627,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // unchanged ~150-line response/SuccessRec block below run
         // verbatim (empty body/console/exception is already a
         // supported terminal shape — handlers may return nothing).
-        // Phase 4d: `stream + writes` IS supported. The entity's
+        // `stream + writes` IS supported. The entity's
         // stream components (set by `streamRecordIfAnyAt` in
         // finalizeBatch's write path) let `drainRaftPending` redirect
-        // the committed entity into `stream_response_in`. The old
-        // read-only guard that rewrote `.stream + wrote` into a 500
-        // is gone.
+        // the committed entity into `stream_response_in`.
 
         var cont_opt: ?continuation_mod.Continuation = null;
         var stream_meta_opt: ?StreamFirstHopMeta = null;
@@ -3733,7 +3716,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .terminal => |r| r,
             .continuation => |cval| ctblk: {
                 cont_opt = cval;
-                // Handler-surface Phase 6: the ambient `next(ctx)` verb
+                // The ambient `next(ctx)` verb
                 // emits an empty path; resolve it to THIS handler's
                 // module so the resume re-invokes the same module. An
                 // explicit cross-module `__rove_next("other", …)`
@@ -3754,7 +3737,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 };
             },
             .stream => |sval| stblk: {
-                // Phase 2b-ii: park the chain. The handler's
+                // Park the chain. The handler's
                 // `__rove_stream(...)` becomes (a) an empty-body
                 // first-hop Response carrying the customer status +
                 // parsed headers (the shared response-stamp block
@@ -3811,15 +3794,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // before finalizeBatch consumes the list.
         const cont_bound_sched_id: ?[]const u8 = blk: {
             _ = cont_opt orelse break :blk null;
-            // 5b-1: §6.4 binding source is the single `_send/owed/{id}`
-            // this hop wrote — env-8 `ScheduleRow`/`pending_schedules`
-            // is retired (so is apply.zig's `c/` emission via the
-            // on_result stamp; Part-B resolves §6.4 by matching
-            // `bound_schedule_id`, not via on_result). Exactly one
+            // §6.4 binding source is the single `_send/owed/{id}`
+            // this hop wrote (there is no env-8 `ScheduleRow`/
+            // `pending_schedules` and no apply.zig `c/` on_result stamp;
+            // §6.4 resolves by matching `bound_schedule_id`, not via
+            // on_result). Exactly one
             // owed put ⇒ bind the continuation to that send id; 0 or
             // >1 ⇒ null (deadline-only resume; >1 is ambiguous, no
-            // implicit pick — same semantics as the old ScheduleRow
-            // rule). The id borrows into the writeset put key — valid
+            // implicit pick). The id borrows into the writeset put key — valid
             // through finalizeBatch; the cont helper dupes it into
             // the entity's `ContDescriptor` (`bound_schedule_id`).
             // Scope the scan to THIS request's contribution only —
@@ -3843,7 +3825,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // misses.
         if (cont_bound_sched_id) |send_id| {
             _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
-            // Phase 3: also stamp the worker-local send_id → entity
+            // Also stamp the worker-local send_id → entity
             // map so `resumeBoundContinuation` can skip its scan of
             // every parked cont and lookup directly.
             worker.registerBoundSendEntity(send_id, ent);
@@ -3910,15 +3892,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .{ scope_inst.id, @errorName(err) },
         );
 
-        // (Option-A: the `platform.root.*` writes accumulated into
+        // (The `platform.root.*` writes accumulate into
         // worker.batch_side.root_ws and are proposed by
         // finalizeBatch as a type-2 inner of the batch's single
         // atomic raft entry — the calling admin request is parked on
         // that seq, so its response is gated on the root write
-        // committing. The old per-request fire-and-forget
-        // proposeRootWriteSet (caller never gated on it; "followers
-        // may diverge" was stale pre-kvexp framing anyway) is gone.
-        // docs/proposer-audit.md Addendum 3.)
+        // committing. docs/proposer-audit.md Addendum 3.)
 
         // Stamp response components on the entity. They ride through
         // `raft_pending` → `response_in` (or straight to `response_in`
@@ -3965,14 +3944,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // re-produces it deterministically from (body, tapes, source).
         const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
 
-        // Phase 3d: serialize this request's readset and append to
+        // Serialize this request's readset and append to
         // the batch's list. finalizeBatch wraps the collected blobs
         // via `tape_mod.encodeReadsetList`; each blob is one entry
         // in the raft envelope's `rs_bytes` section. Failures here
         // are non-fatal — log and skip THIS request's contribution;
         // siblings still ride.
         //
-        // Phase 5a — stamp a `LogHeader` so any follower can
+        // Stamp a `LogHeader` so any follower can
         // reconstruct the customer LogRecord from the raft entry
         // alone. The strings borrow the dispatch-local
         // `method`/`path`/`host`/`correlation_id` slices, which
@@ -4006,7 +3985,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             );
         }
 
-        // Effect-reification Phase 4.1.2: transfer this handler's
+        // Transfer this handler's
         // successful `http.fetch` accumulator to the batch-level
         // list. `finalizeBatch` decides at end-of-batch whether
         // to flush immediately (read-only paths — no race
@@ -4033,11 +4012,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 break :transfer;
             };
             // `docs/auto-bind-plan.md`: decide bind at handler SUCCESS,
-            // when the outcome is known. A fetch **auto-binds** (chunks
-            // resume this chain's `onFetchChunk`) iff the handler held
-            // the chain (`next()`/`stream()`) AND the customer didn't
-            // opt out with `detach: true`. A terminal handler has no
-            // chain, so its fetches are always detached (Pattern A).
+            // when the outcome is known. A fetch binds (its chunks resume
+            // this chain's `onFetchChunk`) only when it is an `on.fetch`
+            // from a held activation (`next()`/`stream()`); the exact rule
+            // is applied per-fetch below. A terminal handler has no chain,
+            // so its fetches are always transient (Pattern A).
             // The outcome ISN'T known at the `http.fetch` call, so the
             // decision (and registration) can only live here — a
             // handler that throws never reaches this block, so it never
@@ -4049,7 +4028,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // not the 25 s default (no intermediate activations
                 // ever bump it; zero chunk Msgs by design).
                 if (held and blob_receive_mod.isReceiveUrl(pf.url)) has_receive = true;
-                // Handler-surface Phase 3: an `on.fetch` (connection-
+                // An `on.fetch` (connection-
                 // scoped) from a NON-held activation is INERT — drop it
                 // (no unbound fire). The model's rule: all `on.*` are for
                 // the current connection; connectionless outbound is
@@ -4058,11 +4037,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     pf.deinit(allocator);
                     continue;
                 }
-                // Handler-surface Phase 3: ONLY `on.fetch` (connection-
-                // scoped) auto-binds — `detach` is retired and plain
-                // `http.fetch` is now the always-unbound Pattern-A
+                // ONLY `on.fetch` (connection-scoped) auto-binds; plain
+                // `http.fetch` is the always-unbound Pattern-A
                 // transient (fires its `on_chunk` module as a separate
-                // chain). A `webhook.send` fetch (bound_send_id set) is
+                // chain) — there is no `detach` opt-out. A
+                // `webhook.send` fetch (bound_send_id set) is
                 // never bound either — its §6.4 bound_send_owners routing
                 // would otherwise steal chunks from the webhook_onresult
                 // shim.
@@ -4087,7 +4066,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const tags_owned = resp.tags;
         resp.tags = &.{};
 
-        // Handler-surface Phase 1: a held `next(...)` carries its
+        // A held `next(...)` carries its
         // on.timer/on.kv registrations to the park site, which arms the
         // entity's StreamWakes. Transfer ownership out of the per-request
         // accumulator (its defer then no-ops). A terminal handler holds
@@ -4142,8 +4121,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // Wrap the collected per-request readset blobs into a single list
     // blob for the raft envelope's `rs_bytes` section. Empty list →
     // empty bytes (the non-handler-producer sentinel). Allocation
-    // failure is non-fatal: fall back to empty `rs_bytes`, same wire
-    // shape as pre-3d.
+    // failure is non-fatal: fall back to empty `rs_bytes`, the same
+    // wire shape as a non-handler producer.
     if (batch_readset_blobs.items.len > 0) {
         const blobs_view: []const []const u8 = @ptrCast(batch_readset_blobs.items);
         if (tape_mod.encodeReadsetList(allocator, blobs_view)) |list_bytes| {

@@ -1,19 +1,14 @@
 //! rove-js per-entity components.
 //!
-//! These types are the principle-compliant replacement for the three
-//! entity-keyed side stores (`worker.parked_meta` /
-//! `worker.parked_streams_meta` / `worker.pending_stream_meta`) that
-//! `~/.claude/memory/rove-library.md` principle #2 forbids. Per the
-//! refactor plan (`docs/streaming-handlers-plan.md`), they live as
-//! components on the entity's Row; rove's auto-deinit on
-//! entity-move / entity-destroy handles cleanup structurally instead
-//! of via manual cleanup sites.
+//! Per-entity cont/stream state lives as components on the entity's Row,
+//! not in entity-keyed side stores — `~/.claude/memory/rove-library.md`
+//! principle #2 forbids those (`docs/streaming-handlers-plan.md`). rove's
+//! auto-deinit on entity-move / entity-destroy handles cleanup
+//! structurally instead of via manual cleanup sites.
 //!
-//! The migration shipped (Phase 7 fold, 2026-05-24): the side stores
-//! are deleted, `raft_pending` is split into siblings
-//! (`raft_pending_response` / `_cont` / `_stream`), and these
-//! components are the sole structural home for per-entity
-//! cont/stream state.
+//! `raft_pending` is split into siblings (`raft_pending_response` /
+//! `_cont` / `_stream`), and these components are the sole structural
+//! home for per-entity cont/stream state.
 
 const std = @import("std");
 const continuation_mod = @import("bindings/continuation.zig");
@@ -49,9 +44,9 @@ pub const ChainContext = struct {
 /// `__rove_next(...)` and are awaiting a wake (either the bound
 /// `http.send` completion or the §6.4 deadline). Read sites gate
 /// on the entity being in `parked_continuations` /
-/// `raft_pending_cont` (Phase 5), not on `cont != null` — the
-/// optional just covers "this Row carries the component but THIS
-/// entity isn't in a cont chain."
+/// `raft_pending_cont`, not on `cont != null` — the optional just
+/// covers "this Row carries the component but THIS entity isn't in
+/// a cont chain."
 pub const ContDescriptor = struct {
     /// The handler's `__rove_next` descriptor. Null when the
     /// entity has no cont attached.
@@ -200,17 +195,16 @@ pub const StreamWakes = struct {
     /// (the fire's wall-clock ns). Surfaces as a `{kind:"timer"}`
     /// entry on `request.activation.wakes[]`.
     timer_fired_ns: i64 = 0,
-    /// Handler-surface Phase 1 (`on.kv`): the §8.4 watch baseline — the
-    /// kvexp write-clock version the arming handler read at. A kv-write
-    /// event fires this watch only when its `writeVersion` is strictly
-    /// greater (i.e. the write landed after the read view), so a watch
-    /// never fires for state the handler already saw. 0 = unanchored
-    /// (the pre-`on.kv` stream path, which matches on any post-arm event).
+    /// The `on.kv` §8.4 watch baseline — the kvexp write-clock version
+    /// the arming handler read at. A kv-write event fires this watch only
+    /// when its `writeVersion` is strictly greater (i.e. the write landed
+    /// after the read view), so a watch never fires for state the handler
+    /// already saw. 0 = unanchored (matches on any post-arm event).
     read_version: u64 = 0,
-    /// Handler-surface Phase 1 (`on.*`): the export a wake routes to —
-    /// `"module.method"` or a bare `"method"`, or null → the default
-    /// `onWake` (the generic "edge wake — go look" export). Allocator-
-    /// owned; set from the last `on.*` registration's `{on}` selector.
+    /// The `on.*` export a wake routes to — `"module.method"` or a bare
+    /// `"method"`, or null → the default `onWake` (the generic "edge
+    /// wake — go look" export). Allocator-owned; set from the last
+    /// `on.*` registration's `{on}` selector.
     wake_to: ?[]u8 = null,
 
     /// True when at least one arm (kv or timer) fired since the last
@@ -307,11 +301,10 @@ pub fn armsFromPrefixes(
 }
 
 /// One `http.fetch` upstream event awaiting handler dispatch on a
-/// local worker. Phase 5 PR-1 collapsed today's three-variant shape
-/// (`chunk` / `end` / `pipe_done`) into a single chunk-with-`final`
-/// shape: every event is a chunk; the LAST event in a fetch sets
-/// `final = true` and carries the terminal fields (status / ok /
-/// body_truncated). `on_done` and `pipe_to` retired in the same PR.
+/// local worker. Every event is a chunk; the LAST event in a fetch
+/// sets `final = true` and carries the terminal fields (status / ok /
+/// body_truncated). There is a single event shape — no separate
+/// `chunk` / `end` / `pipe_done` variants, no `on_done` / `pipe_to`.
 ///
 /// One activation kind: `fetch_chunk`. For non-streaming fetches
 /// (`stream: false`) exactly one event fires (with `final: true`,
@@ -345,9 +338,8 @@ pub const UpstreamFetchEvent = struct {
 
     /// Module path of the `on_chunk` handler — dispatched once per
     /// event. Allocator-owned. The binding rejects a fetch with no
-    /// `on_chunk` (no fire-and-forget surface in PR-1; can be
-    /// re-added cleanly as `on_chunk: null` + capture-and-tape if
-    /// concrete demand appears).
+    /// `on_chunk` (no fire-and-forget surface; could be added as
+    /// `on_chunk: null` + capture-and-tape if concrete demand appears).
     on_chunk_module: []u8 = &.{},
 
     /// 0-based chunk index. `seq == 0` is the first/only event;
@@ -403,7 +395,7 @@ pub const UpstreamFetchEvent = struct {
     /// `onFetchChunk` and its terminal event (`final == true`) lands
     /// in `onFetchDone`. The customer's `{on}` override (`name`)
     /// supersedes this for every event of the fetch. Plain bool — no
-    /// allocation, so `deinitItem` needs no change.
+    /// allocation, so `deinitItem` skips it.
     stream: bool = false,
 
     /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
@@ -435,11 +427,11 @@ pub const UpstreamFetchEvent = struct {
     /// `coord_seq == 0` with `coord_worker_id == 0` and a non-empty
     /// `bytes` means "not submitted" (unbound chunk, coord absent, or
     /// owner unresolved); the consumer falls back to inline `bytes`.
-    /// Phase 1 consumers IGNORE these fields entirely — `bytes`
-    /// remains the source of truth. Phases 2-3 introduce the spool
-    /// that reads bytes back via `coord.bodyRef(coord_worker_id,
-    /// coord_seq)` once the chunk is durable. Plain integers — no
-    /// allocation, so `deinitItem` needs no change.
+    /// Consumers that ignore these fields treat `bytes` as the source
+    /// of truth; the spool reads bytes back via
+    /// `coord.bodyRef(coord_worker_id, coord_seq)` once the chunk is
+    /// durable. Plain integers — no allocation, so `deinitItem` skips
+    /// them.
     coord_seq: u64 = 0,
     /// Companion to `coord_seq`: which coordinator per-worker queue
     /// the bytes were submitted under (the bound-fetch owner worker's
@@ -451,9 +443,9 @@ pub const UpstreamFetchEvent = struct {
     /// meaningful and the bytes can be read back via
     /// `coord.readBody`). Needed because `coord_seq == 0` /
     /// `coord_worker_id == 0` are both legitimate values — there is no
-    /// in-band sentinel. The Phase 3 spool only evicts inline bytes
-    /// for chunks where this is set; un-submitted chunks (coord
-    /// absent, owner unresolved) stay inline.
+    /// in-band sentinel. The spool only evicts inline bytes for chunks
+    /// where this is set; un-submitted chunks (coord absent, owner
+    /// unresolved) stay inline.
     coord_submitted: bool = false,
 
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
@@ -514,21 +506,14 @@ pub const BoundFetchCount = struct {
     pub fn deinit(_: std.mem.Allocator, _: []BoundFetchCount) void {}
 };
 
-/// Phase 7: replaces the Phase-6 `parked_streams_active` /
-/// `parked_streams_draining` map split — the entity stays in h2's
-/// `stream_data_out` (h2 owns the chunk-shipping pipeline, so we
-/// can't move the entity to a worker-owned sibling collection),
-/// and this component encodes "chunks-drain-then-close" instead.
+/// Encodes "chunks-drain-then-close" as a bool on the entity, which
+/// stays in h2's `stream_data_out` (h2 owns the chunk-shipping
+/// pipeline, so the entity can't move to a worker-owned sibling
+/// collection).
 ///
-/// Caveat (commit message reiterates): this is a bool flag, the
-/// strictest reading of rove-library principle #1 would prefer a
-/// sibling collection. The architectural constraint (h2 watches
-/// its own collections, not the worker's) prevents that without
-/// reshaping h2's stream pipeline — out of scope for this
-/// refactor. The shift from "side-table map membership"
-/// (Phase 6) to "component bool" (Phase 7) is principle-neutral;
-/// the real win of this phase is the side-table deletion + the
-/// structural deinit (no manual cleanup sites).
+/// A sibling collection would suit rove-library principle #1 better
+/// than a bool flag, but h2 watching its own collections (not the
+/// worker's) rules that out without reshaping h2's stream pipeline.
 pub const StreamDraining = struct {
     is_draining: bool = false,
 
@@ -539,8 +524,8 @@ pub const StreamDraining = struct {
 /// `request.activation.wakes[i]`. The tag picks which fields are
 /// meaningful; `prefix` is the ARMED `after.kv` prefix that fired
 /// (allocator-owned dup made at drain time), never a matched key —
-/// issue #8: the wake tells you which watch fired; the handler
-/// re-reads authoritative kv under it ("go look").
+/// the wake tells you which watch fired; the handler re-reads
+/// authoritative kv under it ("go look").
 pub const WakeEntry = struct {
     tag: Tag = .timer,
     /// Set when `tag == .kv`; allocator-owned. Empty slice when

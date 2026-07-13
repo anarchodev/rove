@@ -16,15 +16,13 @@
 //!           target store = `{data_dir}/__root__.db`, id_len must
 //!           be 0 — the envelope carries no per-tenant id)
 //!
-//! `log_batch` (originally type 1) and `files_writeset` (type 3) were
-//! retired in Phase 5.5 (a) and 5.5 (e) F2-storage respectively; type
-//! 1 was later reused for `multi`. Log records flow worker → S3
-//! (sidecar + ndjson) directly; per-tenant manifests live in a
+//! Type bytes other than 0/1/2 are not live: the decoder rejects every
+//! such byte as `UnknownEnvelopeType` so any stale entry in an old raft
+//! log surfaces loudly instead of silently mis-applying — the full
+//! retired-slot list lives on `EnvelopeType`. Log records flow worker →
+//! S3 (sidecar + ndjson) directly; per-tenant manifests live in a
 //! per-tenant `deployments/` BlobBackend, with the runtime release
-//! pointer riding envelope 0 in the customer's own app.db. The decoder
-//! rejects every retired type byte as `UnknownEnvelopeType` so any
-//! stale entry in an old raft log surfaces loudly instead of silently
-//! mis-applying — the full retired-slot list lives on `EnvelopeType`.
+//! pointer riding envelope 0 in the customer's own app.db.
 //!
 //! The `id` is the tenant `instance_id`. `id_len` caps at 64KB. The
 //! trailing `payload` is whatever the dispatch callback for that
@@ -60,11 +58,10 @@
 
 const std = @import("std");
 const kv = @import("raft-kv");
-// V2 Phase 2c: the V1 follower apply-fns (`applyWriteSet` /
-// `applyRootWriteSet`) + `Loop46Ctx` were deleted — apply now happens in
-// the V2 bridge/node (leader-skip on a single node), so this file is just
-// the envelope codec the worker uses to encode proposes. The codec
-// symbols resolve through the spine-free facade (`raft-kv` → kvlimbs).
+// Apply happens in the bridge/node (leader-skip on a single node), so
+// this file is just the envelope codec the worker uses to encode
+// proposes. The codec symbols resolve through the spine-free facade
+// (`raft-kv` → kvlimbs).
 
 pub const Error = error{
     Truncated,
@@ -79,38 +76,35 @@ pub const MAX_ID_LEN: usize = kv.MAX_ID_LEN;
 
 pub const EnvelopeType = enum(u8) {
     writeset = 0,
-    /// Phase 5.5 (d) — multi-envelope wrapper. Payload is
+    /// Multi-envelope wrapper. Payload is
     /// `[u8 count][u32 inner_len][inner_envelope_bytes]{count}` where
     /// each inner envelope is a complete `[type][id_len][id][payload]`
     /// blob. Inner envelopes apply in order; nesting (a `multi` inside
     /// a `multi`) panics. The standard envelope `instance_id` is empty
     /// for type=1 — per-inner-envelope ids carry the real targets.
-    /// Numbered to match `kv.cluster.ENVELOPE_TYPE_MULTI` for the
-    /// migration toward the shared Cluster library (raft-kv-design.md
-    /// step 4). The previous value (7) is retired with the rest of
-    /// the pre-migration types below.
+    /// Numbered to match `kv.cluster.ENVELOPE_TYPE_MULTI` (the shared
+    /// Cluster library; raft-kv-design.md step 4).
     multi = 1,
     root_writeset = 2,
     // RETIRED SLOTS (not enum variants ⇒ `decodeEnvelope` rejects
     // them as `UnknownEnvelopeType`, so any stale raft-log entry
     // trips the apply panic at startup instead of silently
     // mis-applying — deliberate; every migration window predates 1.0):
-    //   3        files_writeset (Phase 5.5(e) F2-storage; manifests
-    //            now in a per-tenant deployments/ BlobBackend,
-    //            `_deploy/current` rides envelope 0).
-    //   4/5/6    webhook_{enqueue_batch,complete,retry_schedule}
-    //            (rove-webhook-server retired; webhook.send is a JS
-    //            polyfill over http.send).
-    //   7        old `multi` pre-renumber (now type 1).
-    //   8/9/10/11 schedule_{upsert,complete,cancel,demote} — RETIRED
-    //            Option (b) 5b-2: the central schedule subsystem is
-    //            dissolved; webhook.send (effect-reification-plan.md
-    //            Phase 5 PR-3) composes durability in JS on top of
-    //            kv.set + http.fetch + the per-worker partitioned
-    //            retry sweep — see `globals/webhook.js`. No
-    //            schedules.db, no leader-pinned schedule-server
-    //            thread, no env-9 callback rows, and no Zig-side
-    //            SendDispatch kernel either (PR-3 deleted it).
+    //   3        files_writeset — manifests live in a per-tenant
+    //            deployments/ BlobBackend, `_deploy/current` rides
+    //            envelope 0.
+    //   4/5/6    webhook_{enqueue_batch,complete,retry_schedule} —
+    //            webhook.send is a JS polyfill over http.send (no
+    //            webhook server).
+    //   7        a stale `multi` value (multi is type 1).
+    //   8/9/10/11 schedule_{upsert,complete,cancel,demote} — there is no
+    //            central schedule subsystem; webhook.send
+    //            (effect-reification-plan.md Phase 5 PR-3) composes
+    //            durability in JS on top of kv.set + http.fetch + the
+    //            per-worker partitioned retry sweep — see
+    //            `globals/webhook.js`. No schedules.db, no leader-pinned
+    //            schedule-server thread, no env-9 callback rows, and no
+    //            Zig-side SendDispatch kernel.
 };
 
 /// Type-0 readset-framed payload — single-sourced from the shared codec
@@ -208,7 +202,7 @@ pub const Envelope = struct {
     payload: []const u8,
 };
 
-/// Decode an envelope into the enum-typed loop46 view. Slices into the
+/// Decode an envelope into the enum-typed worker view. Slices into the
 /// input buffer; valid until the caller drops `payload`.
 ///
 /// Thin wrapper over the shared `kv.decodeEnvelope` header codec: the

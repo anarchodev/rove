@@ -1,10 +1,9 @@
-//! rewind — the V2 single-node worker binary (v2-build-order
+//! rewind — the V2 worker binary (v2-build-order
 //! §Phase 2 "a v2 worker binary"). Named for the product (rewind.js) that
-//! V2 is the engine for; it is the V2 counterpart of V1's `loop46`.
+//! V2 is the engine for.
 //!
-//! It wires the reused rove-js worker stack (h2 + arenajs/qjs dispatcher +
-//! blob/tenant/deploy) onto the V2 per-tenant raft **bridge** instead of
-//! V1's cluster-wide `kv.Cluster` + willemt raft thread:
+//! It wires the rove-js worker stack (h2 + arenajs/qjs dispatcher +
+//! blob/tenant/deploy) onto the per-tenant raft **bridge**:
 //!
 //!   bridge.initSingleNode → setWorkerOverlay → startPump   (the pump thread)
 //!   NodeState.init(tenant, blob_cfg, bridge)             (shared node state)
@@ -13,7 +12,7 @@
 //! Single node: the bridge is leader of every tenant group, leader-skip
 //! apply means the worker's `TrackedTxn.commit` is the durable write, and
 //! the worker parks `RaftWait{group_id, seq}` polling the per-tenant
-//! watermark. Multi-node/HA is Phase 5; this is the mobility-path slice.
+//! watermark.
 
 const std = @import("std");
 const rove = @import("rove");
@@ -50,7 +49,7 @@ var stop_flag: std.atomic.Value(bool) = .init(false);
 
 // SIGINT/SIGTERM → stop_flag wiring lives in rove-boot (shared by all four binaries).
 
-// ── Per-worker QuickJS compiler (mirrors loop46/main.zig) ─────────────
+// ── Per-worker QuickJS compiler ───────────────────────────────────────
 const QjsCompiler = struct {
     runtime: qjs.Runtime,
     context: qjs.Context,
@@ -120,8 +119,8 @@ const WorkerCtx = struct {
     metrics: ?*rjs.MetricsServer = null,
 };
 
-/// V2 on-promotion recovery hook — closes the two failover-recovery gaps the
-/// smoke audit surfaced (`leader_failover_smoke_v2` / `durable_wake_smoke_v2`).
+/// On-promotion recovery hook for two failover-recovery cases
+/// (`leader_failover_smoke_v2` / `durable_wake_smoke_v2`).
 /// When this node wins leadership of a tenant's raft group (a follower→leader
 /// edge the bridge pump publishes via `drainPromotions`), the freshly-promoted
 /// leader must:
@@ -134,12 +133,10 @@ const WorkerCtx = struct {
 ///      are never raft-replicated) — otherwise durable scheduled wakes that
 ///      came due during the handover never fire on the new leader.
 ///
-/// V1's `loop46` drove this off a single node-wide `was_leader` edge; V2
-/// leadership is per-group, so the edge is per-tenant. The deployment reload is
-/// per promoted tenant; the watermark sweeps are partition-wide + idempotent
-/// (the per-group propose gate inside each no-ops tenants this node does not
-/// lead), so they run once per tick whenever any promotion landed — matching
-/// V1's once-per-edge semantics.
+/// Leadership is per-group, so the promotion edge is per-tenant. The deployment
+/// reload is per promoted tenant; the watermark sweeps are partition-wide +
+/// idempotent (the per-group propose gate inside each no-ops tenants this node
+/// does not lead), so they run once per tick whenever any promotion landed.
 /// DP apply observer (`bridge.setApplyObserver`): fired on the pump thread once
 /// per committed PUT on a FOLLOWER (the leader's apply is skipped). Detects the
 /// replicated `_deploy/current` marker and enqueues a load so the follower
@@ -149,8 +146,8 @@ const WorkerCtx = struct {
 /// `id_str` is the tenant the writeset TARGETED — for a release published
 /// through the admin batch (a `multi` cross-tenant inner) that is the
 /// release's target tenant, NOT the admin anchor whose group carried the
-/// entry, so it must come from the observer (the old `idStrForGid(gid)`
-/// lookup resolved the anchor and enqueued the wrong tenant's deployment).
+/// entry, so it must come from the observer, not a `idStrForGid(gid)` lookup
+/// (which resolves the anchor, not the target tenant).
 /// Borrowed for the call; the loader dups it. Empty for root writesets
 /// (no `_deploy/current` key there — the key check filters them).
 fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8, value: []const u8) void {
@@ -163,7 +160,7 @@ fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8,
 }
 
 /// Poll-loop hook: move the pump's queued snapshot catch-up jobs onto the
-/// background `SnapshotCatchupThread` (raft-native-alignment Phase 1). Cheap —
+/// background `SnapshotCatchupThread`. Cheap —
 /// drains the bridge queue (resolving each gid's tenant id) and hands off the
 /// heavy store-dump + HTTP push to the thread. The borrowed `id_str` is duped
 /// into the owned job before enqueue. On an enqueue failure (OOM) the in-flight
@@ -191,9 +188,7 @@ fn runPromotionHook(worker: anytype) void {
         worker.node.deploy.enqueueCurrentDeployment(tenant_id);
     }
     // The wake sweep is partitioned by `hash(tenant) % N_inboxes`, so every
-    // worker covers its own slice exactly once. (The owed retry sweep retired
-    // with durable-wake-plan P5(a) — webhook recovery is a durable wake now;
-    // the boot-subscription sweep retired with kind=boot, 2026-07-05.)
+    // worker covers its own slice exactly once.
     rjs.sweepDurableWakesOnPromotion(worker);
     rjs.sweepDirtySubscriptionsOnPromotion(worker);
 }
@@ -266,12 +261,12 @@ fn workerMain(args: *WorkerCtx) !void {
     defer worker.destroy();
 
     // Background compile+stage thread for `/_system/deploy`
-    // (docs/architecture/cli-and-deploy.md §4 — files-server dissolution). Owns its
+    // (docs/architecture/cli-and-deploy.md §4). Owns its
     // own QuickJS runtime so it never races the poll-loop compiler.
     try worker.startDeployThread();
 
-    // Out-of-band snapshot catch-up driver (raft-native-alignment Phase 1):
-    // the pump's `snapshotTriggerTick` queues a `(gid, peer)` for any peer in
+    // Out-of-band snapshot catch-up driver: the pump's
+    // `snapshotTriggerTick` queues a `(gid, peer)` for any peer in
     // `StateSnapshot`; this thread dumps the leader's store + pushes
     // `v2-load-replace` + `v2-apply-snapshot` to the peer, off the poll loop.
     const catchup = try rjs.SnapshotCatchupThread.init(
@@ -284,7 +279,7 @@ fn workerMain(args: *WorkerCtx) !void {
     defer catchup.deinit();
     try catchup.start();
     defer catchup.shutdown();
-    // raft Phase 2.5: the same off-loop driver also runs CP-triggered move
+    // The same off-loop driver also runs CP-triggered move
     // pushes (`/_system/v2-snapshot-push` → `armSnapshotPush` enqueues here).
     worker.snapshot_push_driver = catchup;
 
@@ -317,14 +312,14 @@ fn workerMain(args: *WorkerCtx) !void {
         runPromotionHook(worker);
         drainSnapshotCatchupJobs(worker, catchup);
         try rjs.drainForwardPending(worker);
-        // raft Phase 2.5: finalize completed streamed-snapshot transfers
+        // Finalize completed streamed-snapshot transfers
         // (install the baseline + respond) parked in `snapshot_streams`, and
         // respond to parked CP-triggered move pushes as the driver finishes them.
         try rjs.drainSnapshotStreams(worker);
         try rjs.drainSnapshotPushes(worker, catchup);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
-        // Gap 2.4 (docs/architecture/effects-and-handlers.md): fire the next staged
+        // docs/architecture/effects-and-handlers.md: fire the next staged
         // inbound body chunk into each held `onChunk` chain. Runs after
         // drainRaftPending so a writing chunk's committed entity is back
         // in parked_continuations (the pump's readiness signal) within
@@ -368,13 +363,12 @@ fn workerMain(args: *WorkerCtx) !void {
 /// and worker threads let a follower-apply land its writes INSIDE the
 /// worker's concurrently-open speculative txn (silent corruption: the
 /// replicated entry's data then rode the worker txn's commit/rollback)
-/// or trip on its lease/txn state mid-mutation — the intermittent
-/// `Sqlite` pump panic the failover smoke caught once apply failures
-/// became fatal. Each resolved id instead gets a PUMP-OWNED sibling
+/// or trip on its lease/txn state mid-mutation. Each resolved id instead
+/// gets a PUMP-OWNED sibling
 /// handle attached into the SAME manifest at the SAME store id: the
 /// underlying store state (kvexp `TenantState` — overlay, LMDB, lease)
 /// is per store-id and internally locked, so the data stays unified
-/// (the worker serves exactly what the pump applies — the Phase-5
+/// (the worker serves exactly what the pump applies — the
 /// store-unification requirement) while the per-handle txn state stays
 /// private to the pump. Cross-handle writes serialize on kvexp's
 /// blocking per-store lease.
@@ -450,9 +444,9 @@ const PumpStores = struct {
     }
 };
 
-// ── Multi-node (Phase 5) config ───────────────────────────────────────
+// ── Multi-node config ─────────────────────────────────────────────────
 
-/// Parsed multi-node bridge config (Phase 5 HA) — the shared
+/// Parsed multi-node bridge config (HA) — the shared
 /// `consensus/cluster_config.zig` parser under the worker's `REWIND_`
 /// env prefix (`REWIND_NODE_ID` / `REWIND_VOTERS` / `REWIND_PEERS`; the
 /// raft ports are DISTINCT from the HTTP listen port, argv[2]). `null`
@@ -473,7 +467,7 @@ fn parseMultiNode(a: std.mem.Allocator) !?MultiNode {
 ///                         DISTINCT from the HTTP listen port, argv[2]).
 /// Returns null (→ fall through to the static multi-node / single-node paths)
 /// when either is unset, OR when a static `REWIND_VOTERS`/`REWIND_PEERS` is also
-/// present (that's the legacy multi-node path, kept until Phase 3 deletes it).
+/// present (that's the static multi-node path).
 const Genesis = struct {
     node_id: u64,
     listen_addr: std.net.Address,
@@ -579,11 +573,11 @@ pub fn main() !void {
             );
         }
     }
-    // V2 Phase 4 — shared secret for the cluster-internal tenant-move
+    // Shared secret for the cluster-internal tenant-move
     // surface (`/_system/v2-*`). The front door presents it as
     // `X-Rewind-Move-Secret`. Unset → the move surface is disabled.
     const move_secret = std.posix.getenv("REWIND_MOVE_SECRET");
-    // V2 Phase 7 — serve-or-forward: this cluster's id + the control-plane
+    // Serve-or-forward: this cluster's id + the control-plane
     // base URL. Set together; either unset → a local tenant miss 404s (no
     // forwarding). A DP that can't serve a tenant locally asks the CP who
     // owns it and forwards there.
@@ -596,13 +590,13 @@ pub fn main() !void {
 
     // Peer HTTP base URLs indexed by raft id − 1 (the worker analog of CP's
     // `REWIND_CP_PEER_URLS`): the leader-push target for the out-of-band
-    // snapshot catch-up driver (raft-native-alignment Phase 1). DISTINCT from
+    // snapshot catch-up driver. DISTINCT from
     // `REWIND_PEERS` (the raft transport `host:port`s); these are the workers'
     // HTTP `/_system/` listen origins. Unset (single-node) → catch-up disabled.
     const peer_urls = try parseUrlList(allocator, std.posix.getenv("REWIND_PEER_URLS") orelse "");
     defer freeUrlList(allocator, peer_urls);
 
-    // Step 3 (docs/architecture/auth-consolidation.md A2/A3): wire the `rewind-logs.internal`
+    // docs/architecture/auth-consolidation.md A2/A3: wire the `rewind-logs.internal`
     // fetch-engine door so the `__admin__` chokepoint reads tenant logs with a
     // worker-minted, tenant-scoped `logs-read` token. The secret is the SAME
     // hex `LOOP46_SERVICES_JWT_SECRET` the log-server verifies with (hex-decoded
@@ -632,8 +626,8 @@ pub fn main() !void {
     // per-target failure is soft. `REWIND_LOG_PUSH_BASES` is a `,`/`;`-list of
     // internal origins (e.g. `http://10.0.0.1:8444,http://10.0.0.2:8444,…`),
     // reachable on the private plane (the log-servers must bind it, not
-    // loopback). Unset → fall back to the single `log_public_base` (back-compat:
-    // dev + single-node push-to-local); both empty → push disabled, poll-only.
+    // loopback). Unset → fall back to the single `log_public_base`
+    // (dev + single-node push-to-local); both empty → push disabled, poll-only.
     const log_push_bases: []const []const u8 = blk: {
         const env = std.posix.getenv("REWIND_LOG_PUSH_BASES") orelse "";
         if (env.len > 0) break :blk try parseUrlList(allocator, env);
@@ -650,21 +644,21 @@ pub fn main() !void {
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
     defer blob_owned.deinit(allocator);
 
-    // Node-wide root store + seq counters + tenant registry. In V2 the
-    // worker opens the root store directly (no cluster.openRoot).
+    // Node-wide root store + seq counters + tenant registry. The
+    // worker opens the root store directly.
     const root_kv = try kv.KvStore.openClusterOwned(allocator, data_dir, "cluster.kv", "__root__");
     var seq_counters = kv.SeqCounterRegistry.init(allocator);
     defer seq_counters.deinit();
     const node_tenant = try tenant_mod.Tenant.createWithCounters(allocator, root_kv, data_dir, &seq_counters);
     defer node_tenant.destroy();
     try node_tenant.createInstance(tenant_mod.ADMIN_INSTANCE_ID);
-    // 2e exit-smoke wiring: a root bearer so `/_system/admin-kv` (the
+    // A root bearer so `/_system/admin-kv` (the
     // built-in envelope-0 write path) is reachable, exercising propose →
     // bridge commit → worker txn.commit end to end on a single node.
     node_tenant.root_token_secret = admin_root_token;
     // Wildcard tenant routing: `REWIND_PUBLIC_SUFFIX=<suffix>` lets the worker
     // resolve `{instance_id}.{suffix}` → that instance without an explicit
-    // `domain/` alias (the V1 `rewindjsapp.localhost` pattern). The front routes
+    // `domain/` alias. The front routes
     // the host to this cluster via the CP directory; the worker then resolves
     // the proxied host locally. Unset = wildcard disabled (explicit aliases only).
     if (std.posix.getenv("REWIND_PUBLIC_SUFFIX")) |suffix| {
@@ -680,7 +674,7 @@ pub fn main() !void {
 
     // The V2 per-tenant raft bridge + its pump thread. Leader-skip: the
     // worker owns the speculative overlay. Single node by default; a
-    // multi-node (Phase 5 HA) node is configured by env — this node's
+    // multi-node (HA) node is configured by env — this node's
     // 1-based raft id, the voter set, and the per-node raft transport
     // addresses (distinct from the HTTP port). See `parseMultiNode`.
     const bridge = if (try parseGenesis(allocator)) |g| blk: {
@@ -694,16 +688,15 @@ pub fn main() !void {
         std.log.info("rewind: multi-node id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
         const b = try Bridge.initMultiNode(allocator, data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
         // Route peer addressing through the runtime registry (genesis §3.3),
-        // seeded with the statically-configured peers — so today's behavior is
-        // unchanged, but attach / conf-change can teach it nodes beyond the
-        // static set, and Phase 3 can drop the static seed entirely.
+        // seeded with the statically-configured peers — so attach / conf-change
+        // can teach it nodes beyond the static set.
         b.enablePeerRegistry() catch return error.OutOfMemory;
         for (mn.peers, 0..) |p, i| try b.learnPeer(@intCast(i + 1), p.host, p.port);
         break :blk b;
     } else try Bridge.initSingleNode(allocator, data_dir);
     defer bridge.deinit();
     bridge.setWorkerOverlay();
-    // Full-HA store unification (Phase 5): a FOLLOWER has no worker serving
+    // Full-HA store unification: a FOLLOWER has no worker serving
     // this tenant, so its replicated writes must land in the SAME store a
     // worker WOULD serve from — the same manifest + store id the tenant's
     // `inst.kv` serves, via the pump's OWN sibling handle (two-handle
@@ -712,7 +705,7 @@ pub fn main() !void {
     // touching the worker handle's txn state. Set BEFORE startPump so the
     // first replicated entry already routes here.
     bridge.setStoreResolver(.{ .ctx = &pump_stores, .func = PumpStores.resolve });
-    // Auto-demote policy (conf_change Phase 2): a far-behind, presumed-dead
+    // Auto-demote policy: a far-behind, presumed-dead
     // voter is demoted to a learner so it stops pinning the WAL-compaction
     // floor. Defaults are baked into Node; env overrides tune the lag threshold
     // (entries; 0 disables) and the evaluation cadence (ms). Set before
@@ -758,8 +751,8 @@ pub fn main() !void {
     // Per-tenant request-log / tape batches → S3. The only tape-query surface,
     // `rewind-logs`, reads S3-only (its indexer LISTs + serves
     // `/v1/{tenant}/list` + `/show`), so a local `FsBatchStore` would be
-    // unreadable by it — writer (fs) and reader (S3) never met, which is why
-    // captured tapes could never be queried back out for replay. Build the
+    // unreadable by it — an fs writer and an S3 reader would never meet,
+    // leaving captured tapes unqueryable for replay. Build the
     // batch store from the SAME S3 connection params as the blob backend (rove
     // blob is S3-only), plus an optional `LOG_S3_KEY_PREFIX` so log batches can
     // sit under a named prefix; both sides default to "" and so agree. The
@@ -774,11 +767,11 @@ pub fn main() !void {
     // coordinator, msg router, builtin modules).
     var node_state = try rjs.NodeState.init(allocator, node_tenant, blob_owned.cfg, bridge);
     defer node_state.deinit();
-    // Step 3: hand the node the credential + base for the `rewind-logs.internal`
+    // Hand the node the credential + base for the `rewind-logs.internal`
     // door (borrowed; both outlive node_state per defer ordering above).
     node_state.services_jwt_secret = services_jwt_secret;
     node_state.log_internal_base = log_internal_base;
-    // Step 3 B4: the `rewind-cp.internal` door — the move-secret (already read
+    // The `rewind-cp.internal` door — the move-secret (already read
     // for the move surface) + a CP base (the first configured CP node; the CP
     // forwards control writes to its leader). Both borrowed (env / cp_urls live
     // for the process). Either unset → the CP door is disabled.

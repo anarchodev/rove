@@ -1,7 +1,7 @@
 //! Built-in handler modules — the `__system/` namespace.
 //!
-//! Phase 5 PR-2 introduces module paths that the runtime resolves
-//! without those modules being in any tenant's deployment files.
+//! Module paths in this namespace resolve without those modules being
+//! in any tenant's deployment files.
 //! `webhook.send.js` (the shim) fires `http.fetch` with
 //! `on_chunk: "__system/webhook_onresult"`; the runtime's module
 //! resolver (`worker.resolveDeployment`) recognizes the `__system/`
@@ -13,12 +13,10 @@
 //! The shim's bookkeeping handler needs to run as a normal
 //! dispatcher activation (so it has access to kv, http, __rove_next,
 //! etc. — every tenant-context global). Putting it in every tenant's
-//! deployment files is the wrong shape (auto-injection at deploy
-//! time was Q2 option #1, rejected — auto-inject every tenant
-//! pollutes their filesystem AND requires re-deploying every tenant
-//! to update the shim). The chosen path (Q2 option #3, native Zig
-//! resolution): compile once at NodeState init, share the bytecode
-//! across every tenant.
+//! deployment files is the wrong shape — auto-injecting into every
+//! tenant pollutes their filesystem AND requires re-deploying every
+//! tenant to update the shim. Instead, native Zig resolution compiles
+//! once at NodeState init and shares the bytecode across every tenant.
 //!
 //! ## Lifecycle
 //!
@@ -70,7 +68,7 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_scheduler_tick_mjs"),
     },
     .{
-        // Handler-surface Phase 5: the `cron(...)` recurrence engine.
+        // The `cron(...)` recurrence engine.
         .path = "__system/cron_tick.mjs",
         .src = @embedFile("builtin_cron_tick_mjs"),
     },

@@ -1,10 +1,9 @@
 //! `http.fetch` engine — Phase 2 of `docs/curl-multi-plan.md`.
 //!
-//! Replaces `fetch_pool.zig` (8 worker threads each blocking on one
-//! `curl_easy_perform`) with a single thread driving a `curl_multi`
-//! handle that holds many concurrent transfers. Lifts the
-//! `FETCH_POOL_SIZE = 8` ceiling structurally — the engine runs as
-//! many simultaneous fetches as libcurl + the OS allow.
+//! A single thread drives a `curl_multi` handle that holds many
+//! concurrent transfers, so there is no fixed worker-thread ceiling —
+//! the engine runs as many simultaneous fetches as libcurl + the OS
+//! allow.
 //!
 //! ## Architecture
 //!
@@ -18,7 +17,7 @@
 //! `NodeState.enqueueFetchEventForTenant` (hash-routed by tenant_id
 //! to the worker that issued the fetch).
 //!
-//! ## Streaming modes (preserves Phase 5 PR-1 contract)
+//! ## Streaming modes
 //!
 //! - `stream: false` (default) — body buffered up to
 //!   `max_response_chunk_bytes`. On completion, ONE event with
@@ -575,7 +574,7 @@ pub const FetchEngine = struct {
         if (self.inflight_by_id.count() >= ENGINE_MAX_INFLIGHT) {
             return error.TooManyInflight;
         }
-        // Phase 3 (gap 2.5): per-tenant held-subscription cap. Check
+        // Per-tenant held-subscription cap (gap 2.5). Check
         // BEFORE allocating any state so the rejection path is
         // cheap. The defined rejection (a single `final: true,
         // ok: false` event with `body_truncated = false`) fires
@@ -1163,9 +1162,7 @@ pub const FetchEngine = struct {
         // become durable via the process-global blob coordinator at
         // upstream rate, decoupled from the held chain's raft commit
         // cadence. This stamps `coord_seq`/`coord_worker_id` on the
-        // event; the consumer still reads inline `bytes` (no behavior
-        // change). Phases 2-3 switch the consumer onto a spool that
-        // reads bytes back from the coordinator.
+        // event; the consumer reads inline `bytes`.
         self.submitBoundChunkToCoord(&event);
         self.node.router.enqueueFetchEventForTenant(tenant_id, event) catch |err| {
             if (err == error.NoWorkers and
@@ -1184,8 +1181,7 @@ pub const FetchEngine = struct {
     /// bytes to the process-global blob coordinator and stamp the
     /// resulting `(worker_id, seq)` on the event. The coordinator dups
     /// the bytes internally, so the event retains ownership of `bytes`
-    /// and the inline copy stays the consumer's source of truth for
-    /// Phase 1.
+    /// and the inline copy is the consumer's source of truth.
     ///
     /// Best-effort and side-effect-free on the read path: if this is
     /// not a bound chunk, the coordinator isn't up, the owner isn't
@@ -1216,9 +1212,8 @@ pub const FetchEngine = struct {
 
 // ── Per-transfer streaming state ──────────────────────────────────────
 
-/// Per-transfer state — mirrors `fetch_pool.StreamState` field-for-field,
-/// just heap-allocated (Phase 1's `Transfer` does not own this).
-/// Lifetime: created in `startTransfer`, freed in `onDoneCb`.
+/// Per-transfer state — heap-allocated (the `Transfer` does not own
+/// this). Lifetime: created in `startTransfer`, freed in `onDoneCb`.
 const FetchCtx = struct {
     engine: *FetchEngine,
     allocator: std.mem.Allocator,
@@ -1311,7 +1306,7 @@ const FetchCtx = struct {
 // ── curl_multi callback bridges ───────────────────────────────────────
 
 /// Per-writeback chunk callback — engine-thread, fires inside
-/// `multi.poll`. Mirrors `fetch_pool.onBody` exactly.
+/// `multi.poll`.
 fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) bool {
     const s: *FetchCtx = @ptrCast(@alignCast(ctx.?));
     if (s.failed or s.capped) return false;
@@ -1391,8 +1386,7 @@ fn onDoneCb(transfer: *blob_curl_multi.Transfer, result: blob_curl_multi.Result,
     }
 
     if (!s.stream_mode) {
-        // Phase 5 PR-1: ONE event with `final: true` + the body +
-        // terminal fields.
+        // ONE event with `final: true` + the body + terminal fields.
         emitFinalWithBody(s, result.status, transport_ok) catch |err|
             std.log.warn(
                 "rove-js fetch_engine: emit final tenant={s} id={s}: {s}",
@@ -1553,9 +1547,8 @@ test "tenant door: pin redirects host to internal fronts, only port 443" {
 }
 
 /// Setup-failure path: fire a single empty `final: true` event with
-/// ok=false. Mirrors `fetch_pool.pushFinalEmpty` on the catch path.
-/// The pf isn't owned by an engine ctx in this path — borrows from
-/// the caller (drainInbound, which frees pf separately).
+/// ok=false. The pf isn't owned by an engine ctx in this path —
+/// borrows from the caller (drainInbound, which frees pf separately).
 fn emitFailedSetupEvent(engine: *FetchEngine, pf: *PendingFetch) !void {
     const a = engine.allocator;
     var ev = try buildChunkEvent(a, pf, 0, 0, &.{}, null);
@@ -1603,7 +1596,7 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     s.emitted_seq += 1;
 }
 
-// ── Shared helpers (ported verbatim from fetch_pool.zig) ──────────────
+// ── Shared helpers ────────────────────────────────────────────────────
 
 fn parseMethod(s: []const u8) ?blob_curl_multi.Method {
     if (std.ascii.eqlIgnoreCase(s, "GET")) return .GET;

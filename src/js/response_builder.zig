@@ -200,7 +200,7 @@ pub fn finalizeResponse(
     // Observability: every 5xx that flows through the canned-response
     // chokepoint gets a journald line (these otherwise only land on the
     // tenant tape via captureLog, invisible to an operator tailing the
-    // worker journal — the empty-body deploy-500 hunt that motivated this).
+    // worker journal).
     // body_len==0 is flagged because a bodyless 5xx tells the operator
     // nothing on its own.
     if (status_code >= 500) {
@@ -249,10 +249,9 @@ pub fn overwriteWith421(
 /// leader, so this 503 must never be auto-retried by the platform —
 /// see `overwriteWith421` for the retry-safe sibling. Caller is
 /// responsible for freeing the old body (done in `drainRaftPending`
-/// where the column access lives). Handler-cmds Phase 5: takes the
-/// owning collection explicitly — the worker has three sibling
-/// raft-pending collections now (response / cont / stream), each
-/// reachable via its own pointer.
+/// where the column access lives). Takes the owning collection
+/// explicitly — the worker has three sibling raft-pending collections
+/// (response / cont / stream), each reachable via its own pointer.
 pub fn overwrite503InPending(
     worker: anytype,
     coll: anytype,
@@ -558,7 +557,7 @@ fn serveStaticByKey(
 }
 
 /// Cache-Control for statics served at their stable, MUTABLE friendly path
-/// (every kind now — HTML/JS/CSS/…): the path→bytes mapping changes per
+/// (every kind — HTML/JS/CSS/…): the path→bytes mapping changes per
 /// deploy, so revalidate every load. The strong ETag (= content hash) makes
 /// the revalidation a cheap 304 when unchanged, and lets a CF edge cache it.
 const STATIC_REVALIDATE_CACHE_CONTROL = "public, max-age=0, must-revalidate";

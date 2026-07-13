@@ -81,8 +81,8 @@ fn defaultSessionPath(a: std.mem.Allocator) []const u8 {
 
 /// The customer CLI's default config path: $XDG_CONFIG_HOME/rewind/config (or
 /// ~/.config/rewind/config), KEY=VALUE lines (same format as --env). Falls back
-/// to the shared operator default (rove/prod.env, ./.env.prod) when absent, for
-/// back-compat. An explicit --env <file> overrides this.
+/// to the shared operator default (rove/prod.env, ./.env.prod) when absent.
+/// An explicit --env <file> overrides this.
 fn defaultConfigPath(a: std.mem.Allocator) ?[]const u8 {
     const base = (std.process.getEnvVarOwned(a, "XDG_CONFIG_HOME") catch null) orelse blk: {
         const home = std.process.getEnvVarOwned(a, "HOME") catch return c.defaultEnvPath(a);
@@ -312,9 +312,9 @@ fn cmdRelease(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, dep_id:
     // JSON.parse / JS_ToFloat64 and release the wrong (rounded) manifest.
     _ = std.fmt.parseInt(u64, dep_id, 16) catch c.fatal("bad dep_id {s} (want hex)", .{dep_id});
     // REST route: POST /v1/instances/{id}/release {"dep_id":"<hex>"} (admin app's
-    // ROUTES table). The old `{fn,args}` RPC to `/` was retired — posting it left
-    // dep_id in publishRelease's lossy number branch → 400 "must be a positive
-    // integer". Keep dep_id a hex string so it never round-trips through an f64.
+    // ROUTES table). Keep dep_id a hex string so it never round-trips through an
+    // f64 — a JSON number lands in publishRelease's lossy number branch → 400
+    // "must be a positive integer".
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"dep_id\":") catch c.oom();
     c.writeJsonString(&body, a, dep_id);
@@ -338,7 +338,7 @@ fn cmdRelease(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, dep_id:
 /// 421/503 (or a 502 door-transient while the CP leader settles). Returns the
 /// final Resp; the caller interprets the status (e.g. provision treats 409 as
 /// idempotent-OK). Fatals on auth failures. Relies on the admin app's
-/// `onFetchResult` relaying the real upstream status (it does, post-fix).
+/// `onFetchResult` relaying the real upstream status.
 fn cpOp(a: std.mem.Allocator, cfg: *const Cfg, sub: []const u8, body: []const u8, timeout_s: u32) c.Resp {
     const url = std.fmt.allocPrint(a, "{s}/v1/cp/{s}", .{ cfg.admin_url, sub }) catch c.oom();
     var attempt: usize = 0;
@@ -464,7 +464,7 @@ fn cmdDeployments(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8) voi
     }
 }
 
-// ── replay: pull a recorded request + re-execute it natively (Phase 2) ─────
+// ── replay: pull a recorded request + re-execute it natively ─────
 
 /// `rewind logs <tenant> [--limit N] [--after CURSOR]` — list recorded request
 /// summaries (GET /v1/logs/{tenant}/list). Prints the log-server's JSON
@@ -810,7 +810,7 @@ fn jInt(v: std.json.Value, key: []const u8) ?i64 {
     return if (f == .integer) f.integer else null;
 }
 
-// ── manifest-driven publish (replaces scripts/ops/publish_firstparty.py) ───────
+// ── manifest-driven publish ───────
 
 fn jStr(v: std.json.Value, key: []const u8) ?[]const u8 {
     if (v != .object) return null;

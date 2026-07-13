@@ -7,10 +7,9 @@
 //!   nodes (leader-aware retry on 421 not-leader; ambiguous 503s relay).
 //!
 //! It holds NO directory / raft state — placement lives in the CP
-//! (`rewind-cp`), which this binary reads as a cached read-replica. That is
-//! the split that fixes the prototype's inverted scaling (front door used to
-//! BE a CP raft voter): front doors now scale horizontally behind an L4
-//! ingress, independent of the CP voter set. A stale cache costs at most a
+//! (`rewind-cp`), which this binary reads as a cached read-replica. Holding
+//! no raft state, front doors scale horizontally behind an L4 ingress,
+//! independent of the CP voter set. A stale cache costs at most a
 //! serve-or-forward hop at the DP, never a wrong answer (the CP is the one
 //! authority, serve-or-forward the one backstop, this cache an
 //! intentionally-stale hint).
@@ -25,7 +24,7 @@
 //! relayed through the server's stream_response/stream_data pipeline,
 //! h2 AND h1 downstream). Backpressure is end-to-end window-repayment-
 //! on-drain in both directions. Nothing on the data path blocks;
-//! libcurl survives only for CP control-plane lookups (route / cert /
+//! libcurl is used only for CP control-plane lookups (route / cert /
 //! ACME) — cached, small, off the data path. Retry semantics (421
 //! re-aim with a replay buffer, ambiguous-503 relay, 502 cache
 //! invalidation) live in proxy.zig.
@@ -59,7 +58,7 @@ var stop_flag: std.atomic.Value(bool) = .init(false);
 
 // SIGINT/SIGTERM → stop_flag wiring lives in rove-boot (shared by all four binaries).
 
-// ── Cert sync (gap #3 slice 2): pull per-host certs from the CP ────────
+// ── Cert sync: pull per-host certs from the CP ─────────────────────────
 //
 // The front door terminates public TLS and SNI-selects a per-host cert. The
 // SNI servername callback runs *inside* the handshake and cannot block on a CP
@@ -207,12 +206,12 @@ fn envMs(name: []const u8, default: i128) i128 {
     return std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch default;
 }
 
-// ── Phase 5: the :80 plaintext listener (ACME HTTP-01 + HTTP→HTTPS redirect) ──
+// ── The :80 plaintext listener (ACME HTTP-01 + HTTP→HTTPS redirect) ───────────
 //
-// rove-h2 speaks HTTP/1.1 (gap #6 phases 1–4), so the front door answers
-// the ACME HTTP-01 `:80` challenge natively. Two behaviors: serve
+// rove-h2 speaks HTTP/1.1, so the front door answers the ACME HTTP-01 `:80`
+// challenge natively. Two behaviors: serve
 // `/.well-known/acme-challenge/<token>` (the key-authorization fetched from
-// the CP issuer, slice 3) and 308-redirect every other request to its HTTPS
+// the CP issuer) and 308-redirect every other request to its HTTPS
 // origin.
 
 const ACME_PREFIX = "/.well-known/acme-challenge/";
@@ -274,7 +273,7 @@ fn acmeChallengeLookup(a: std.mem.Allocator, cp_urls: []const []const u8, token:
             .body = "",
             .http_version = .h2c_prior_knowledge,
             .verify_tls = false,
-            // Runs on the :80 thread now (off the :443 loop), but still
+            // Runs on the :80 thread (off the :443 loop), but still
             // bound tight so a slow CP can't pile up other :80 requests.
             .connect_timeout_ms = 1000,
             .timeout_ms = 2000,
@@ -341,7 +340,7 @@ const freeUrlList = boot.freeUrlList;
 /// connection/io-ring formatter — IDENTICAL to the worker's, so the front's
 /// connection-setup-collapse signals (recv_enobufs, admission_denied,
 /// tls_handshake / conn depth — the things the per-second front-diag log warns
-/// on) are now scrapable instead of grep-only — plus the proxy's live-flow /
+/// on) are scrapable instead of grep-only — plus the proxy's live-flow /
 /// tunnel leak canaries. Rendered + published on the :443 poll loop (the only
 /// thread that touches `server`/`proxy`); the MetricsServer thread serves bytes.
 fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: *const Proxy) ![]u8 {
@@ -480,7 +479,7 @@ pub fn main() !void {
     const cache_ms = envMs("REWIND_ROUTE_CACHE_MS", 1_000);
     // Browser-facing h2 idle-connection reap timeout. 30 s (vs the 10 s
     // rove-h2 default) — a longer keepalive cuts reconnect churn and,
-    // since the reap is now graceful (GOAWAY queued AFTER reads are fed
+    // since the reap is graceful (GOAWAY queued AFTER reads are fed
     // to nghttp2, so a just-arrived reuse request is never reaped out
     // from under itself), fewer reaps means fewer race opportunities.
     // The cure is the graceful close + reap-after-reads ordering in
@@ -526,11 +525,10 @@ pub fn main() !void {
     });
     defer reg.deinit();
 
-    // Public TLS termination (gap #3 slice 2). The default ctx is the platform
+    // Public TLS termination. The default ctx is the platform
     // wildcard from `REWIND_TLS_CERT`/`REWIND_TLS_KEY`; per-host custom-domain
     // certs are synced from the CP (`CertSync`). Both env unset ⇒ the front
-    // door stays h2c (TLS terminated upstream) — the prior behavior, so
-    // existing h2c smokes are unaffected.
+    // door stays h2c (TLS terminated upstream).
     const tls_config: ?*h2.TlsConfig = blk: {
         const cert = std.posix.getenv("REWIND_TLS_CERT");
         const key = std.posix.getenv("REWIND_TLS_KEY");
@@ -597,7 +595,7 @@ pub fn main() !void {
         proxy.deinit();
     }
 
-    // Phase 5: optional plaintext `:80` listener (ACME HTTP-01 + HTTP→HTTPS
+    // Optional plaintext `:80` listener (ACME HTTP-01 + HTTP→HTTPS
     // redirect). Defaults to :80 when we terminate TLS (we own the public edge);
     // disabled in h2c mode (TLS terminated upstream → the LB owns :80). Override
     // with `REWIND_HTTP_PORT` (0 disables; a high port for tests).

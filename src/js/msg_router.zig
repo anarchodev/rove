@@ -1,11 +1,10 @@
 //! `MsgRouter` — async-activation routing for the rove-js worker node.
 //!
-//! Extracted from `NodeState` (worker.zig) as the first step of the
-//! NodeState decomposition. Owns the per-worker inbox registries (the
-//! unified `effect.MsgInbox` + the kv-wake `KvWakeInbox`) and the
-//! cross-worker held-state owner registries (`bound_fetch_owners` /
-//! `bound_send_owners`), plus every enqueue/broadcast path that routes
-//! a cross-thread `effect.Msg` to the worker that should service it.
+//! Owns the per-worker inbox registries (the unified `effect.MsgInbox`
+//! + the kv-wake `KvWakeInbox`) and the cross-worker held-state owner
+//! registries (`bound_fetch_owners` / `bound_send_owners`), plus every
+//! enqueue/broadcast path that routes a cross-thread `effect.Msg` to
+//! the worker that should service it.
 //!
 //! Routing rules:
 //!   - default: `hash(tenant_id) % N_inboxes` — *consistent*, NOT
@@ -23,8 +22,8 @@
 //!
 //! Dependency surface is intentionally tiny: `allocator` only. The
 //! typed input/payload types come from `effect`, `components`, and the
-//! `KvWakeInbox` definitions that still
-//! live next to their producers in `worker.zig` / `worker_streaming.zig`.
+//! `KvWakeInbox` definitions that live next to their producers in
+//! `worker.zig` / `worker_streaming.zig`.
 
 const std = @import("std");
 const effect_mod = @import("effect/root.zig");
@@ -49,10 +48,9 @@ pub const MsgRouter = struct {
     wake_inboxes_mutex: std.Thread.Mutex = .{},
     wake_inboxes: std.ArrayListUnmanaged(*KvWakeInbox) = .empty,
 
-    /// Effect-reification Phase 2E: unified per-worker Msg inbox
-    /// registry. Replaces the pre-2E pair (`sub_fire_inboxes` +
-    /// `fetch_chunk_inboxes`) — one registry, one push path,
-    /// `hash(tenant_id) % N_inboxes` for hash-by-tenant stickiness.
+    /// Unified per-worker Msg inbox registry — one registry, one push
+    /// path, `hash(tenant_id) % N_inboxes` for hash-by-tenant
+    /// stickiness.
     /// Producers from non-worker threads (`deployment_loader` for
     /// boot, the `FetchEngine` libcurl thread) call
     /// `enqueueMsgForTenant`; the typed wrappers
@@ -84,12 +82,12 @@ pub const MsgRouter = struct {
     bound_fetch_owners: std.StringHashMapUnmanaged(usize) = .empty,
     bound_send_owners: std.StringHashMapUnmanaged(usize) = .empty,
 
-    /// Phase 2A instrumentation — observability for the owner-routing
-    /// path. `cross_worker_routes` counts decisions where the owner
-    /// worker differs from `hash(tenant_id) % N` (i.e., the path that
-    /// would have failed pre-Phase-2A); `same_worker_routes` counts
-    /// decisions where they happen to coincide (correct but doesn't
-    /// exercise the bug fix). A smoke that sees zero cross-worker
+    /// Instrumentation — observability for the owner-routing path.
+    /// `cross_worker_routes` counts decisions where the owner worker
+    /// differs from `hash(tenant_id) % N` (the path owner-routing
+    /// corrects); `same_worker_routes` counts decisions where they
+    /// happen to coincide (correct but doesn't exercise the
+    /// owner-routing path). A smoke that sees zero cross-worker
     /// routes hasn't actually tested the routing — its kernel
     /// SO_REUSEPORT spread happened to coincide with the tenant hash.
     /// Counters never reset; surfaced on `/_system/metrics` as
@@ -148,8 +146,8 @@ pub const MsgRouter = struct {
         }
     }
 
-    /// Effect-reification Phase 2E: register a worker's unified Msg
-    /// inbox. The producer-side enqueueXxxForTenant functions
+    /// Register a worker's unified Msg inbox. The producer-side
+    /// enqueueXxxForTenant functions
     /// hash-route to one of these by `hash(tenant_id) % N`. Returns
     /// the inbox's slot index in `msg_inboxes` — workers store it so
     /// the per-worker partitioned sweeps (`sweepDurableWakes`) can
@@ -293,18 +291,17 @@ pub const MsgRouter = struct {
         self.allocator.free(entry.key);
     }
 
-    /// Gap 2.3 Phase C2 + effect-reification Phase 2E: route a fetch
-    /// event (chunk / end / pipe_done) to the destination worker's
-    /// unified `MsgInbox` as the matching `effect.Msg` variant.
-    /// Caller-side ownership of every owned slice in `ev` transfers in
-    /// on success; on `error.NoWorkers` the caller retains and is
-    /// responsible for `UpstreamFetchEvent.deinitItem`.
+    /// Route a fetch event (chunk / end / pipe_done) to the
+    /// destination worker's unified `MsgInbox` as the matching
+    /// `effect.Msg` variant. Caller-side ownership of every owned slice
+    /// in `ev` transfers in on success; on `error.NoWorkers` the caller
+    /// retains and is responsible for `UpstreamFetchEvent.deinitItem`.
     ///
     /// `docs/cross-worker-held-state-plan.md` Phase 2A: when `ev.bind`
     /// is true AND `bound_fetch_owners[ev.fetch_id]` resolves, route
     /// directly to the owning worker's inbox. Otherwise fall back to
-    /// `hash(tenant_id)` — the existing behavior for unbound (Pattern
-    /// A) fetches, subscription fires, kv-react, etc.
+    /// `hash(tenant_id)` — the behavior for unbound (Pattern A)
+    /// fetches, subscription fires, kv-react, etc.
     ///
     /// The owner-routing path closes the cross-worker bind gap: the
     /// inbound that registered the bound fetch may live on a
@@ -317,17 +314,16 @@ pub const MsgRouter = struct {
         tenant_id: []const u8,
         ev: components_mod.UpstreamFetchEvent,
     ) !void {
-        // Phase 5 PR-1: single `fetch_chunk` Msg variant; the event's
-        // `final` flag distinguishes streaming intermediates from the
-        // terminal.
+        // Single `fetch_chunk` Msg variant; the event's `final` flag
+        // distinguishes streaming intermediates from the terminal.
         const msg: effect_mod.Msg = .{ .fetch_chunk = ev };
-        // Phase 2A: bound fetch chunks route to the held-state owner
-        // via `bound_fetch_owners`. Phase 2B: webhook.send callback
-        // chunks (the fetch has no bind:true, but its bound_send_id
-        // names the cont's send_id) route via `bound_send_owners`.
-        // Either path skips `hash(tenant_id)` to land on the worker
-        // that holds the resume target. Unbound / non-webhook fetches
-        // fall through to today's hash routing.
+        // Bound fetch chunks route to the held-state owner via
+        // `bound_fetch_owners`. webhook.send callback chunks (the
+        // fetch has no bind:true, but its bound_send_id names the
+        // cont's send_id) route via `bound_send_owners`. Either path
+        // skips `hash(tenant_id)` to land on the worker that holds the
+        // resume target. Unbound / non-webhook fetches fall through to
+        // hash routing.
         const owner_opt: ?usize = blk: {
             if (ev.bind) {
                 if (self.lookupBoundFetchOwner(ev.fetch_id)) |idx| break :blk idx;
@@ -378,8 +374,8 @@ pub const MsgRouter = struct {
         try inbox.push(msg);
     }
 
-    /// Phase 5 PR-2: hash-route a chained dispatch — a `__rove_next`
-    /// returned from a `fetch_chunk` handler — to the destination
+    /// Hash-route a chained dispatch — a `__rove_next` returned from a
+    /// `fetch_chunk` handler — to the destination
     /// worker's MsgInbox as a `SendCallback` variant. The customer's
     /// next-hop handler runs there with `request.activation.kind ==
     /// "send_callback"` and the cont's ctx wrapped as

@@ -88,12 +88,11 @@ pub const DeployHooks = struct {
 /// `streaming-handlers-plan.md` §5.
 ///
 /// One kind (see `Spec` below): kv (apply-time fan-out from a
-/// watched tenant prefix). The cron kind retired with
-/// durable-wake-plan P5(b) — recurrence is the `cron(spec, target)`
-/// verb over the durable scheduler; the boot kind retired 2026-07-05
-/// (unused — seed recurring registrations from any handler
-/// activation instead; `_sched/*` entries are durable kv and survive
-/// deploys). The handler is a normal TEA `update`; the
+/// watched tenant prefix). Recurrence is instead the
+/// `cron(spec, target)` verb over the durable scheduler; recurring
+/// registrations are seeded from any handler activation (`_sched/*`
+/// entries are durable kv and survive deploys). The handler is a
+/// normal TEA `update`; the
 /// difference is the activation source (`subscription_fire`) and
 /// the absence of a held socket — `Response`/`__rove_next`/
 /// `__rove_stream` returns are recorded on the tape but bytes
@@ -132,7 +131,7 @@ pub const SubscriptionEntry = struct {
 /// trampoline. Reads (get/prefix) go direct and need no trampoline.
 pub const ScopeKvOp = enum { put, delete };
 
-/// Gap 2.3 Phase C: in-memory carrier for an `http.fetch` request
+/// Gap 2.3: in-memory carrier for an `http.fetch` request
 /// awaiting transport. Lives on `DispatchState.pending_fetches`
 /// during the handler's run; flushed to `NodeState.fetch_pending`
 /// at end-of-handler; consumed by the `NodeState.fetch_pool`
@@ -157,14 +156,13 @@ pub const PendingFetch = struct {
     headers_json: []u8,
     body: []u8,
     timeout_ms: u32,
-    /// Module path for `fetch_chunk` activations. Phase 5 PR-1
-    /// made this required — the prior `on_done` separate-terminal
-    /// hook + `pipe_to` direct-route paths retired.
+    /// Module path for `fetch_chunk` activations. Always set — every
+    /// fetch routes its chunk events through a module path.
     on_chunk_module: []u8,
     /// Threaded forward to each activation as `request.ctx`. JSON
     /// string; "null" when omitted.
     ctx_json: []u8,
-    /// Phase 5 PR-1: `stream: false` (default) emits exactly one
+    /// `stream: false` (default) emits exactly one
     /// `fetch_chunk` event (with `final: true`, up to
     /// `max_response_chunk_bytes` of body; cap-overflow sets
     /// `body_truncated`). `stream: true` emits one event per
@@ -207,7 +205,7 @@ pub const PendingFetch = struct {
     /// uses the supplied identifier as the named-export target.
     /// Allocator-owned.
     name: []u8 = &.{},
-    /// Handler-surface Phase 3: true ⇒ issued via `on.fetch` (a
+    /// True ⇒ issued via `on.fetch` (a
     /// CONNECTION trigger). The success seam binds it when the
     /// activation held the socket and DROPS it (inert, no unbound fire)
     /// when it didn't — connectionless outbound is `webhook.send`
@@ -270,8 +268,7 @@ pub const PlatformCaps = struct {
         value: []const u8,
     ) anyerror!void = null,
     // (Cross-tenant blob writes use `platform.scope(t).blob.receive` — the
-    // streamed S3 sink — not a cap; the old `scope_blob_put` deferred-PUT cap
-    // was retired when statics moved to streaming.)
+    // streamed S3 sink — not a cap.)
 };
 
 /// §2.6 durable-wake fan-out input: one due `_sched/by_time` entry the
@@ -297,7 +294,7 @@ pub const FireWakeInput = struct {
     cleanup_keys: []const []const u8,
 };
 
-/// Handler-surface Phase 1: one `on.timer(ms)` / `on.kv(prefix,{to?})`
+/// One `on.timer(ms)` / `on.kv(prefix,{to?})`
 /// registration accumulated during the body. Mirrors the
 /// `pending_fetches` accumulator shape — the binding appends, the
 /// worker drains at end-of-activation and arms the held entity's
@@ -381,11 +378,10 @@ pub const DispatchState = struct {
     /// what keeps the body's tape/log reference alive
     /// (`Readset.elideUnreadBody`).
     req_body: []const u8 = "",
-    // `docs/primitive-gaps.md` §9 — the per-request Zig PRNG was
-    // retired. arenajs's per-request `xorshift64star` state (in
-    // `js_random_state_active(ctx)`) is now the single PRNG. The
-    // dispatcher seeds it once via `JS_SetRandomSeed` in
-    // `installRequest`; Math.random + crypto.* draw from it.
+    // `docs/primitive-gaps.md` §9 — arenajs's per-request
+    // `xorshift64star` state (in `js_random_state_active(ctx)`) is the
+    // single PRNG. The dispatcher seeds it once via `JS_SetRandomSeed`
+    // in `installRequest`; Math.random + crypto.* draw from it.
     /// Per-request identifier, pre-minted by the worker. Combined with
     /// `http_fetch_index` to derive a deterministic fetch id for
     /// each `http.fetch` call.
@@ -395,7 +391,7 @@ pub const DispatchState = struct {
     /// + a `"FTCH"` tag to derive the platform-default `fetch_id`
     /// deterministically for replay.
     http_fetch_index: u32 = 0,
-    /// Gap 2.3 Phase C1: per-handler accumulator for `http.fetch`
+    /// Gap 2.3: per-handler accumulator for `http.fetch`
     /// calls. Caller-owned (pointer to a list the worker_dispatch
     /// allocates per handler invocation); each binding call
     /// appends a `PendingFetch`; at end-of-handler the worker
@@ -404,14 +400,14 @@ pub const DispatchState = struct {
     /// frees any leftovers on error paths (no orphan fetches).
     /// Null on test paths that don't care.
     pending_fetches: ?*std.ArrayListUnmanaged(PendingFetch) = null,
-    /// Handler-surface Phase 1: caller-owned accumulator for `on.timer`
+    /// Caller-owned accumulator for `on.timer`
     /// / `on.kv` registrations during this activation (same ownership
     /// model as `pending_fetches`). The `_system.on.*` bindings append;
     /// the worker arms them onto the held entity's `StreamWakes` at
     /// park time and frees the list. Null on connectionless / test
     /// paths — `on.*` is then inert (the model: connection-only wakes).
     pending_wakes: ?*std.ArrayListUnmanaged(PendingWakeReg) = null,
-    /// Handler-surface Phase 2 (`stream.*` effects, `docs/handler-shape.md`
+    /// `stream.*` effects (`docs/handler-shape.md`
     /// §2.2): true once the handler called `stream.start()` or the first
     /// `stream.write()` — the activation opens/continues a streamed
     /// response. Read by the worker post-dispatch to drive the stream-
@@ -421,13 +417,13 @@ pub const DispatchState = struct {
     /// architecture/websockets.md (piece D): true when this activation's
     /// `stream.write` output is WS frames, not a streamed HTTP response.
     /// Set by the dispatcher for `.ws_message` activations. Bypasses the
-    /// Phase-2 stream bridge (`stream_started` → `Stream` descriptor /
+    /// stream bridge (`stream_started` → `Stream` descriptor /
     /// terminal chunk-prepend) so the chunks stay in
     /// `pending_stream_chunks` for `shipWsFrames` to lower to
     /// `ws_send_in`, and `next()` stays a plain continuation (the WS
     /// chain parks on frame arrival, not the stream pipeline).
     ws_frame_output: bool = false,
-    /// Handler-surface Phase 2: caller-owned accumulator for chunks
+    /// Caller-owned accumulator for chunks
     /// emitted via `stream.write(chunk)` this activation (same ownership
     /// model as `pending_fetches`/`pending_wakes`). Each is an owned byte
     /// slice; the worker stages them as commit-gated `Cmd.stream_chunk`
@@ -455,11 +451,11 @@ pub const DispatchState = struct {
     /// and telling the customer loudly to paginate with `next()`. Reset per
     /// dispatch (the field is fresh on each DispatchState).
     stream_pending_bytes: usize = 0,
-    /// Phase 5 PR-2b: true ⇒ the dispatched module is a `__system/`
+    /// True ⇒ the dispatched module is a `__system/`
     /// built-in (e.g. the webhook shim's `webhook_onresult.mjs`).
     /// `isCustomerWriteReserved` is skipped so the shim can write
     /// `_send/owed/{id}` markers; customer modules see false and
-    /// the reserved-prefix check applies as before. Set by
+    /// the reserved-prefix check applies. Set by
     /// `Dispatcher.runOutcome` from `Request.is_system_module`.
     is_system_module: bool = false,
     /// Resolved session id (see `Request.session_id`). 64 lowercase hex
@@ -550,7 +546,7 @@ pub const DispatchState = struct {
     /// with no resolved plan (tests, async activations).
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
-    /// Gap 2.3 Phase E: correlation_id of the chain this handler
+    /// Gap 2.3: correlation_id of the chain this handler
     /// run belongs to. `http.fetch({pipe_to})` stamps it onto the
     /// `PendingFetch` so the upstream bytes can later be routed to
     /// the held stream entity carrying the matching
@@ -564,7 +560,7 @@ pub const DispatchState = struct {
     /// callables reject at the gate. See `PlatformCaps`.
     platform_caps: ?PlatformCaps = null,
 
-    /// Phase 5 PR-3: trampoline backing
+    /// Trampoline backing
     /// `_system.continuation.resumeIfBound(send_id, event_json)`.
     /// Worker provides a concrete fn that casts `ctx` back to its
     /// `*Worker(opts)` type and calls `worker.resumeBoundContinuation`
@@ -585,8 +581,7 @@ pub const DispatchState = struct {
     /// The binding (`bindings/http.zig:jsHttpCancelFetch`) calls
     /// this to ask `FetchEngine.cancel` to drop an in-flight
     /// transfer by id. Null on test paths / non-worker dispatches;
-    /// the JS callable becomes a no-op in that case (the prior
-    /// behavior before the engine landed).
+    /// the JS callable becomes a no-op in that case.
     cancel_fetch: ?*const fn (
         ctx: *anyopaque,
         id: []const u8,
@@ -649,7 +644,7 @@ pub const DispatchState = struct {
             c.JS_FreeValue(ctx, e.value_ptr.*);
         }
         self.trigger_module_ns.deinit(self.allocator);
-        // Gap 2.3 Phase C1: `pending_fetches` is caller-owned (a
+        // Gap 2.3: `pending_fetches` is caller-owned (a
         // pointer); cleanup of accumulated entries lives at the
         // caller's defer. DispatchState only borrows.
         self.* = undefined;
@@ -689,7 +684,7 @@ fn valueToOwnedString(
 /// (`"[object Object]"`, a Uint8Array's `"1,2,3"`) and null/undefined
 /// at a write site is a handler bug — all throw TypeError instead of
 /// corrupting the durable store
-/// (docs/decisions.md Â§4.11). JSON encoding stays
+/// (docs/decisions.md §4.11). JSON encoding stays
 /// the handler's explicit choice (`kv.set(k, JSON.stringify(v))`).
 fn kvWriteArgToOwnedString(
     state: *DispatchState,
@@ -886,10 +881,10 @@ fn jsKvSet(
     // Reject writes into platform-reserved namespaces. Platform writers
     // (http.send → `_send/owed/` marker, etc.) bypass jsKvSet and write
     // through state.txn / state.writeset directly, so this guard only
-    // fires when customer JS tries to spoof a platform key. Phase 5
-    // PR-2b: `__system/` built-in modules (the webhook shim's
-    // onresult handler) are platform-trusted and bypass the check —
-    // they need to write `_send/owed/{id}` markers.
+    // fires when customer JS tries to spoof a platform key.
+    // `__system/` built-in modules (the webhook shim's onresult
+    // handler) are platform-trusted and bypass the check — they need
+    // to write `_send/owed/{id}` markers.
     if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
     }
@@ -909,8 +904,8 @@ fn jsKvSet(
     // Nothing about a write is a replay input, so it isn't taped.
 
     // Fast path: no triggers match → write directly, no savepoint, no
-    // previousValue lookup, no chain machinery. Same cost as before
-    // triggers existed.
+    // previousValue lookup, no chain machinery — no added cost over a
+    // plain write.
     if (!td.anyTriggerMatches(state, key_str)) {
         state.txn.put(key_str, val_str) catch |err| {
             state.pending_kv_error = err;
@@ -993,7 +988,7 @@ fn jsKvDelete(
     defer state.allocator.free(key_str);
 
     // Same reserved-namespace guard as jsKvSet — see the comment there.
-    // Phase 5 PR-2b: `__system/` built-ins bypass.
+    // `__system/` built-ins bypass.
     if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
     }
@@ -1163,7 +1158,7 @@ fn jsKvPrefix(
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
 // `docs/primitive-gaps.md` §9 + fold-in: per-request non-determinism
-// is now collapsed to two scalars in the readset header — `seed`
+// is collapsed to two scalars in the readset header — `seed`
 // (xorshift64star PRNG) and `timestamp_ns` (Date.now / new Date()).
 // Neither has a per-call tape channel. arenajs's native
 // implementations service them via per-context state set by the
@@ -1181,8 +1176,8 @@ fn jsKvPrefix(
 // reactor exports for the WASM build, direct API calls for the
 // server build).
 
-// `docs/primitive-gaps.md` §9 — `jsMathRandom` retired. arenajs's
-// native `js_math_random` runs against the per-request
+// `docs/primitive-gaps.md` §9 — arenajs's native `js_math_random`
+// runs against the per-request
 // xorshift64star state (seeded once per request via
 // `JS_SetRandomSeed` in `installRequest`). crypto.* draws from the
 // same state via `JS_FillRandomBytes`. Replay reproduces by
@@ -1534,7 +1529,7 @@ fn jsPlatformInstancesCreate(
 /// JSON to `deployments/`, then proposes `_deploy/current = 1`
 /// through raft so followers see the active deployment.
 ///
-/// Sealed primitive in v1: starter content is platform-baked
+/// Sealed primitive: starter content is platform-baked
 /// (`STARTER_INDEX_MJS` / `STARTER_STATIC_INDEX_HTML` in worker.zig),
 /// not customer-supplied. A general `platform.deploy(name, files)`
 /// is deferred until concrete demand (e.g. a libraries marketplace)
@@ -1636,8 +1631,8 @@ fn jsPlatformReleasesPublish(
 
     // dep_id is a sha256-derived u64 (computeDeploymentId), routinely > 2^53, so
     // a JS number loses precision (JS_ToFloat64). Prefer a HEX STRING — parsed to
-    // an exact u64 here — and keep the number path only as back-compat for the
-    // (small-id) legacy callers.
+    // an exact u64 here; the number path handles small-id callers, where
+    // precision isn't at risk.
     var dep_id: u64 = undefined;
     if (c.JS_IsString(argv[1])) {
         const s = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
@@ -1680,17 +1675,16 @@ fn jsPlatformReleasesPublish(
 
 // ── platform.scope(id).kv.* (admin singleton only) ────────────────
 //
-// Explicit, additive cross-tenant accessor. Replaces the old
-// `X-Rove-Scope`→global-`kv`-rebind (which conflated "who is the
-// principal" with "which store" and made auth impossible to express
-// in a scoped dispatch — auth-domain-plan §4.7 "Primitive-fix
-// pivot"). `platform.scope("acme").kv.get/prefix` read the target
-// store directly; `.set/.delete` go through the worker trampoline
-// (per-call txn + envelope-0 propose, the proven `handleAdminKv`
-// shape). Gated on `state.platform != null` like the rest of
-// `platform.*`. Unknown instance → a coded `InstanceNotFound` JS
-// error so the admin handler can map it to 404 (preserves the old
-// dispatch-level 404-on-unknown-scope behavior).
+// Explicit, additive cross-tenant accessor.
+// `platform.scope("acme").kv.get/prefix` read the target store
+// directly; `.set/.delete` go through the worker trampoline
+// (per-call txn + envelope-0 propose, the `handleAdminKv` shape). A
+// dedicated accessor rather than rebinding the global `kv` keeps "who
+// is the principal" separate from "which store" so auth stays
+// expressible in a scoped dispatch (auth-domain-plan §4.7
+// "Primitive-fix pivot"). Gated on `state.platform != null` like the
+// rest of `platform.*`. Unknown instance → a coded `InstanceNotFound`
+// JS error so the admin handler can map it to 404.
 
 fn jsThrowInstanceNotFound(ctx: ?*c.JSContext) c.JSValue {
     const err_obj = c.JS_NewError(ctx);
@@ -1737,7 +1731,7 @@ fn jsPlatformScope(
         return js_exception;
     }
     // Resolve eagerly so `platform.scope("ghost")` throws at the
-    // call site (→ admin handler 404), matching the old behavior.
+    // call site (→ admin handler 404).
     if (scopeResolve(state, id) == null) return jsThrowInstanceNotFound(ctx);
 
     const kv_obj = c.JS_NewObject(ctx);
@@ -1880,13 +1874,13 @@ fn scopeKvWrite(
         // the writeset — exactly as `jsKvSet`/`jsKvDelete` do. `state.txn` is
         // the local durability + read-your-write overlay AND what marks the
         // batch dirty so `finalizeBatch` proposes it; the writeset is the raft
-        // payload for followers. The original d8362eb fix wrote ONLY the
-        // writeset, so a standalone self-scope write never entered the overlay:
-        // the dispatch looked clean, the 2xx was released, and the write was
-        // silently dropped (never locally durable, never proposed). `state.txn`
-        // is THIS dispatch's already-open txn, so there is no second
-        // `beginTrackedImmediate` acquire — that trampoline double-acquire was
-        // the wedge d8362eb set out to avoid.
+        // payload for followers. BOTH are required: writing only the writeset
+        // would leave a standalone self-scope write out of the overlay, so the
+        // dispatch would look clean, the 2xx would be released, and the write
+        // would be silently dropped (never locally durable, never proposed).
+        // `state.txn` is THIS dispatch's already-open txn, so there is no
+        // second `beginTrackedImmediate` acquire — avoiding the trampoline
+        // double-acquire wedge.
         switch (op) {
             .put => {
                 state.txn.put(key, val) catch |err| {
@@ -1985,7 +1979,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     //   - base64.js: atob/btoa, globalThis.base64url, globalThis.hex.
     //   - urlsearchparams.js: URLSearchParams class.
     //   - retry.js: customer-side retry helper on http.send.
-    //   - webhook.js: legacy webhook.send shim on http.send.
+    //   - webhook.js: webhook.send shim on http.send.
     //   - email.js: Resend wrapper that calls webhook.send (the shim).
     //   - kv/console/crypto/http/events/platform .js: public shims
     //     over `_system.*` (docs/plans/builtin-libs-docs-plan.md Phase A).
@@ -2018,15 +2012,15 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "cron.js", CRON_JS);
     evalSnippet(ctx, "retry.js", RETRY_JS);
     // §2.6 durable scheduled wake. After base64/crypto/kv (its deps).
-    // Handler-surface Phase 5: connectionless `schedule` verb (after
-    // scheduler.js + cron.js — reuses cron.parseDuration). `cron` the
-    // recurring verb lives in cron.js (already eval'd above).
+    // The connectionless `schedule` verb (after scheduler.js + cron.js
+    // — reuses cron.parseDuration). `cron` the recurring verb lives in
+    // cron.js (already eval'd above).
     evalSnippet(ctx, "schedule.js", SCHEDULE_JS);
-    // The after.* connection wake triggers (canonical) + the on.* dual-name-window alias.
+    // The after.* connection wake triggers (canonical) + the on.* alias.
     evalSnippet(ctx, "after.js", AFTER_JS);
-    // Handler-surface Phase 2: connection output effects (`stream.*`).
+    // Connection output effects (`stream.*`).
     evalSnippet(ctx, "stream.js", STREAM_JS);
-    // Handler-surface Phase 6: the public `next` disposition verb.
+    // The public `next` disposition verb.
     evalSnippet(ctx, "next.js", NEXT_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
@@ -2046,7 +2040,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // kv + URLSearchParams + TextEncoder (all evaluated above).
     evalSnippet(ctx, "activitypub.js", ACTIVITYPUB_JS);
 
-    // Phase A reachability hardening (docs/plans/builtin-libs-docs-plan.md).
+    // Reachability hardening (docs/plans/builtin-libs-docs-plan.md).
     // Every native shim above captured its slice as
     // `const sys = _system.X` at eval time, so the `_system.*` objects
     // stay alive through those closures — the global holder is dead
@@ -2105,13 +2099,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "after" }, .fns = &.{
         .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },
         .{ .name = "kv",    .cfunc = on_b.jsOnKv,      .argc = 2 },
-        // Handler-surface Phase 3: connection-scoped outbound. Binds the
+        // Connection-scoped outbound. Binds the
         // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
         // held; inert when not. Lives in the http binding (composes the
         // same fetch primitive as `http.fetch`).
         .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 2 },
     } },
-    // Handler-surface Phase 2: connection output effects. `stream.start`
+    // Connection output effects. `stream.start`
     // / `stream.write` accumulate onto `DispatchState`; the worker
     // drives the stream-pipeline entry + stages chunks as commit-gated
     // `Cmd.stream_chunk` at park. Inert when there's no held connection.
@@ -2169,8 +2163,6 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // http.fetch / http.cancelFetch — the platform's outbound HTTP
     // primitive. Transient + best-effort; durability is composed in
     // JS by `webhook.send` (effect-reification-plan.md Phase 5 PR-3).
-    // The legacy `http.send` / `http.cancel` bindings retired with
-    // PR-3 alongside the Zig SendDispatch kernel.
     .{ .path = &.{ "_system", "http" }, .fns = &.{
         .{ .name = "fetch",              .cfunc = http_b.jsHttpFetch,              .argc = 1 },
         .{ .name = "cancelFetch",        .cfunc = http_b.jsHttpCancelFetch,        .argc = 1 },
@@ -2195,9 +2187,9 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // `onHeaders` activation.
         .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
     } },
-    // Phase 5 PR-3: `resumeIfBound` can't live under `_system.*` — the
+    // `resumeIfBound` can't live under `_system.*` — the
     // `_harden.js` `delete globalThis._system` runs BEFORE baked modules
-    // eval, so `__system/webhook_onresult.mjs` couldn't reach a
+    // eval, so `__system/webhook_onresult.mjs` can't reach a
     // `_system.*` reference. It lives (persistent, gated) as
     // `__rove.resumeIfBound` in the `__rove.*` holder further below.
     // platform = { root, instances }. Installed on every context;
@@ -2205,8 +2197,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // handlers.
     .{ .path = &.{ "_system", "platform" }, .fns = &.{
         // platform.scope(id) → { kv: { get, prefix, set, delete } }
-        // bound to instance `id`. The explicit cross-tenant accessor
-        // that replaced the X-Rove-Scope global-kv rebind.
+        // bound to instance `id`. The explicit cross-tenant accessor.
         .{ .name = "scope", .cfunc = jsPlatformScope, .argc = 1 },
     } },
     .{ .path = &.{ "_system", "platform", "root" }, .fns = &.{
@@ -2241,8 +2232,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // delete, reach these as live globals — they can't see a shim's
     // captured closure. Every entry is `is_system_module`-gated: a
     // customer naming `__rove.X` gets a throw at call time. No
-    // customer-facing shim touches this surface (the one that used to —
-    // `next` — was widened into `_system.continuation.next`). See
+    // customer-facing shim touches this surface. See
     // `docs/plans/privileged-surface-and-ratelimit-spec.md`.
     .{ .path = &.{"__rove"}, .fns = &.{
         // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
@@ -2281,12 +2271,11 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // called by the base-eval `email.js` shim (so by the surface rule
     // it should be `_system.email`, not `__rove.*`), and the
     // rate-limit rework that removes it is deferred
-    // (`docs/plans/privileged-surface-and-ratelimit-spec.md` §3). The
-    // continuation / wake / systemFetch natives that used to live here
-    // moved into `_system.continuation.*` (widened `next`) and the
-    // gated `__rove.*` holder (STATIC_NAMESPACES) — every remaining
-    // privileged op reached by baked `__system/` modules is now under
-    // `__rove.*`, not a scattered bare global.
+    // (`docs/plans/privileged-surface-and-ratelimit-spec.md` §3). Every
+    // other privileged op reached by baked `__system/` modules lives
+    // under `_system.continuation.*` (the widened `next`) or the gated
+    // `__rove.*` holder (STATIC_NAMESPACES), not a scattered bare
+    // global.
     .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
 };
 
@@ -2574,13 +2563,12 @@ pub fn installRequest(
     // — streaming-handlers-plan §2: every handler run is a recorded
     // "request," and the activation source is one field on the
     // request shape the handler can branch on. The `wake_batch`
-    // variant (issue #8: fired-prefix contract) carries
+    // variant (fired-prefix contract) carries
     // `wakes: [{kind:"kv",prefix,firedAt} | {kind:"timer",firedAt}]`
     // — the ARMED prefix that fired, never matched keys (the handler
     // re-reads authoritative kv; handler-shape.md §7). The singular
-    // `.kv_wake` source still maps to `kind:"kv"` but carries no
-    // payload (the pre-Gap-2.2 single-slot fields had no
-    // producer and were dropped); live kv fan-out rides `.wake_batch`.
+    // `.kv_wake` source maps to `kind:"kv"` but carries no payload;
+    // live kv fan-out rides `.wake_batch`.
     const activation_obj = c.JS_NewObject(ctx);
     const kind: []const u8 = switch (request.activation.source()) {
         .inbound => "inbound",
@@ -2590,7 +2578,7 @@ pub fn installRequest(
         .kv_wake => "kv",
         .wake_batch => "wake_batch",
         .subscription_fire => "subscription_fire",
-        // Phase 5 PR-1: single fetch activation kind; `final` flag
+        // Single fetch activation kind; `final` flag
         // distinguishes streaming intermediates from the terminal.
         .fetch_chunk => "fetch_chunk",
         // §2.6 durable scheduled wake.
@@ -2631,10 +2619,9 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "wakes", wakes_arr);
     }
 
-    // (Removed: the §9.4 `write_pressure.dropped_chunks` surface. stream.write
-    // is lossless now — the runtime never drops; it backpressures the producer
-    // or throws loudly on a single-activation overrun. There is nothing to
-    // surface.)
+    // stream.write is lossless — the runtime never drops; it backpressures the
+    // producer or throws loudly on a single-activation overrun. So there is no
+    // `write_pressure.dropped_chunks` surface (§9.4) to populate here.
 
     // Gap 2.1 subscription_fire payload. The activation's `name`
     // is the subscription's directory name; `source` carries the
@@ -2659,7 +2646,7 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
     }
 
-    // Phase 5 PR-1: single `fetch_chunk` activation kind. Every
+    // Single `fetch_chunk` activation kind. Every
     // event carries `fetch_id` / `seq` / `byteOffset` / `bytes`
     // (+ `headers` on seq 0). The LAST event for a fetch has
     // `final: true` and carries the terminal fields (`status`,
@@ -2731,8 +2718,8 @@ pub fn installRequest(
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
         }
         // UNBOUND (Pattern-A `on_chunk:"module"`) fires carry the
-        // synthesized `{"ctx":…}` envelope in `Request.body`; with
-        // `request.body` retired, lift it so the internal shim modules
+        // synthesized `{"ctx":…}` envelope in `Request.body`; there is
+        // no `request.body`, so lift it so the internal shim modules
         // (webhook/blob onresult) read `request.ctx` like every other
         // callback.
         if (request.activation_entity == null) {
@@ -2756,10 +2743,8 @@ pub fn installRequest(
             // synthesized `Request.body` as `{"ctx":...}` but the
             // bound surface replaces `request.body` with the chunk
             // bytes below — lift the ctx to its documented home
-            // first. (Pre-P2 this was silently dropped: any bound
-            // fetch's `ctx:` was unreachable from the handler.)
-            // Same NUL-terminated-buffer rule as the fetch-headers
-            // parse above.
+            // first. Same NUL-terminated-buffer rule as the
+            // fetch-headers parse above.
             if (request.body.len > 0) {
                 if (state.allocator.allocSentinel(u8, request.body.len, 0)) |buf| {
                     defer state.allocator.free(buf);
@@ -2782,7 +2767,7 @@ pub fn installRequest(
             // The uniform payload view (§2.2): `bytes` = the chunk
             // payload (the activation's Msg, recorded on the
             // fetch_responses tape — never read-elided); `text`/`json`
-            // derive on the prototype. (`request.body` retired.)
+            // derive on the prototype. (There is no `request.body`.)
             _ = c.JS_DefinePropertyValueStr(
                 ctx,
                 req_obj,
@@ -2846,8 +2831,8 @@ pub fn installRequest(
         );
     }
 
-    // Endpoint A — uniform ctx threading (decisions.md, supersedes §4.7's
-    // ctx-envelope): every activation that is a continuation of a prior
+    // Endpoint A — uniform ctx threading (decisions.md): every activation
+    // that is a continuation of a prior
     // `next({ctx})` reads that payload as `request.ctx`. These kinds carry
     // it as the synthesized `{"ctx":<ctx_json>}` body (the WS / SSE / wake
     // / continuation resume paths all build that envelope), so lift it once
@@ -2878,7 +2863,7 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(ic.byte_offset)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "done", if (ic.done) js_true else js_false);
         // The uniform payload view (§2.2): `bytes` = this chunk.
-        // (`request.body` retired — the accessors are the payload
+        // (There is no `request.body` — the accessors are the payload
         // surface; decisions.md §4.11.)
         _ = c.JS_DefinePropertyValueStr(
             ctx,
@@ -2940,7 +2925,7 @@ pub fn installRequest(
     // A customer `on_result` hop (`webhook.send` / `blob.put` / `retry.send`)
     // AND a §6.4 held-sync resume both arrive as `.send_callback` with
     // `request.body = {"ctx":{result, context}}` — the held-sync producer
-    // (worker_drain.resumeContinuation) now wraps the outcome into the SAME
+    // (worker_drain.resumeContinuation) wraps the outcome into the SAME
     // shape, so there is ONE surface. Present it exactly like a bound-fetch
     // FINAL: `request.body` = the response bytes, top-level
     // `request.status`/`.ok`/`.done`; the THREADED ctx (the echoed `context`
@@ -2971,7 +2956,7 @@ pub fn installRequest(
             // Not a result delivery (a webhook_onresult self-hop /
             // internal chained dispatch): the envelope's ctx IS the
             // hop's payload — lift it whole so the target reads
-            // `request.ctx` (request.body is retired).
+            // `request.ctx` (there is no request.body).
             _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_DupValue(ctx, cb_ctx));
             break :hoist;
         }
@@ -2980,7 +2965,7 @@ pub fn installRequest(
         // carries the response bytes as base64url-no-pad `body_b64` (a
         // JSON envelope can't hold raw bytes); decode once onto
         // `request.bytes` — `text`/`json` derive on the prototype.
-        // (`request.body` retired.) A producer that only carries a
+        // (There is no `request.body`.) A producer that only carries a
         // `body` string (held-sync deadline events) still yields bytes
         // from its UTF-8.
         var payload_done = false;
@@ -3123,7 +3108,7 @@ fn definePropertyGetter(
 /// every value onto the tape. Values are recorded only when a getter
 /// actually fires. Last-write-wins on duplicate header names —
 /// re-defining the accessor keeps the first occurrence's enumeration
-/// position, matching the old eager `JS_SetPropertyStr` semantics.
+/// position.
 fn installHeaders(
     ctx: *c.JSContext,
     state: *DispatchState,
@@ -3436,7 +3421,7 @@ fn parseCookies(
     }
 }
 
-/// Back-compat wrapper: install everything at once. Used by tests and
+/// Convenience wrapper: install everything at once. Used by tests and
 /// by any caller that doesn't have a pre-built snapshot to restore
 /// from (e.g. the rove-files compile-on-upload path that just needs a
 /// throwaway context to compile JS to bytecode).
@@ -3479,7 +3464,7 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is the one
     // remaining internal GLOBAL_BUILTIN (called only by globals/email.js;
-    // the privileged-surface cleanup moved the rest under `__rove.*` /
+    // the other privileged ops live under `__rove.*` /
     // `_system.continuation.*`).
     const builtin_exceptions = [_][]const u8{"__rove_check_email_rate"};
 

@@ -1,15 +1,15 @@
-//! V2 Phase 5 — cross-node raft transport (coalesced, per-recipient).
+//! Cross-node raft transport (coalesced, per-recipient).
 //!
-//! v2-build-order §Phase 5: "reuse rove's `raft_net.zig` io_uring
-//! transport as the wire layer, adapted to per-recipient **coalesced**
-//! envelopes carrying many groups' messages plus epoch stamps"
-//! (multiraft-scaling-learnings §3.3). This is the wire half of multi-node
-//! V2: each node's raft groups produce outbound messages addressed to peer
-//! nodes (`Manager.takeMessages` → `(to, bytes)`); the transport buffers
-//! them per destination for the cycle and flushes **one envelope per
-//! destination node** carrying every group's messages to that node, each
-//! stamped with its group's migration epoch. The receiver decodes the
-//! envelope and `stepBatch`es the lot into its `Manager` in one FFI call.
+//! The wire layer is rove's `raft_net.zig` io_uring transport, adapted to
+//! per-recipient **coalesced** envelopes carrying many groups' messages
+//! plus epoch stamps (multiraft-scaling-learnings §3.3). This is the wire
+//! half of multi-node operation: each node's raft groups produce outbound
+//! messages addressed to peer nodes (`Manager.takeMessages` → `(to,
+//! bytes)`); the transport buffers them per destination for the cycle and
+//! flushes **one envelope per destination node** carrying every group's
+//! messages to that node, each stamped with its group's migration epoch.
+//! The receiver decodes the envelope and `stepBatch`es the lot into its
+//! `Manager` in one FFI call.
 //!
 //! ## Why coalesce
 //!
@@ -33,15 +33,15 @@
 //! (`docs/architecture/format-versioning.md` §3.2 — "version without widening
 //! the per-record header"): one byte amortized over a whole coalesced
 //! frame, zero per-record growth, so the deliberately-shrunk 20-byte
-//! record header (Phase 2f) is untouched. The decoder rejects an unknown
+//! record header is untouched. The decoder rejects an unknown
 //! version loudly (rate-limited) rather than mis-stepping garbage into
 //! the Manager.
 //!
 //! `msg bytes` is the opaque rust-protobuf `eraftpb::Message` from
 //! `takeMessages`, fed verbatim to the peer's `stepBatch`/`stepFenced`.
-//! (A per-record `floor` field — the leader's lockstep WAL-compaction floor —
-//! was removed in Phase 2f: mechanism-A compaction is per-node, so no cross-node
-//! floor is propagated and the WAL bounds via the catch-up buffer + snapshots.)
+//! (There is no per-record `floor` field: mechanism-A compaction is
+//! per-node, so no cross-node WAL-compaction floor is propagated — the WAL
+//! bounds via the catch-up buffer + snapshots.)
 //!
 //! ## Node-id mapping
 //!
@@ -91,8 +91,8 @@ const OutBuf = struct {
 };
 
 /// Per-record header in the coalesced body: [group_id:u64][epoch:u64][len:u32].
-/// (The WAL-compaction `floor` field was removed in Phase 2f — mechanism-A
-/// compaction is per-node, so no cross-node floor is propagated.)
+/// (There is no WAL-compaction `floor` field — mechanism-A compaction is
+/// per-node, so no cross-node floor is propagated.)
 const RECORD_HDR_SIZE: usize = 20;
 /// Coalesced-frame version byte (`docs/architecture/format-versioning.md` §3.2).
 /// Bump when the frame/record layout changes; the decoder rejects any
@@ -128,10 +128,10 @@ pub const Transport = struct {
     manager: *raft.Manager,
     /// Resolves a raft node id → transport address the first time we address a
     /// peer we haven't dialed yet (the growth seam). Defaults to a static
-    /// resolver over the init-time peer list (`static_peers`), so a cluster
-    /// configured the old way behaves identically — every initial peer is
-    /// already configured in `raft_net`, so the resolver is never consulted.
-    /// `1c` injects a CP-registry-backed resolver here instead.
+    /// resolver over the init-time peer list (`static_peers`), so a
+    /// statically-configured cluster never consults the resolver — every
+    /// initial peer is already configured in `raft_net`. A CP-registry-backed
+    /// resolver can be injected here instead.
     resolver: PeerResolver,
     /// Owned copy of the init-time peer addresses (host strings duped), backing
     /// the default static resolver. Indexed by `node_id - 1`. Present even when
@@ -146,7 +146,7 @@ pub const Transport = struct {
     /// Group ids that received a NON-heartbeat message since the last
     /// `drainWoke`. The pump drains this each cycle and `bumpActive`s each,
     /// so a hibernated group wakes on real raft traffic but NOT on its own
-    /// keep-alive heartbeats (Phase 6 / §3.1). Appended in `onRecv` (pump
+    /// keep-alive heartbeats (multiraft-scaling-learnings §3.1). Appended in `onRecv` (pump
     /// thread); cleared by `drainWoke`. Dups are fine — `bumpActive` is
     /// idempotent — so no per-message dedup.
     woke: std.ArrayListUnmanaged(u64) = .empty,
@@ -193,7 +193,7 @@ pub const Transport = struct {
         manager: *raft.Manager,
         /// Optional address resolver for nodes added after init (the growth
         /// seam). When null, a static resolver over `peers` is synthesized, so
-        /// statically-configured clusters behave exactly as before.
+        /// statically-configured clusters need no resolver.
         resolver: ?PeerResolver = null,
         /// Largest cluster this node will ever address; sizes the destination
         /// buffers + the `raft_net` peer table. Must be ≥ `peers.len`.
@@ -340,8 +340,8 @@ pub const Transport = struct {
         // dialed yet, resolve its address and register it so `raft_net`'s
         // reconnect loop starts dialing. A node still unknown to the resolver is
         // dropped (raft re-emits next tick). In the static path every initial
-        // peer is already configured, so this is never taken — identical
-        // behavior. `peer_id = node_id - 1`.
+        // peer is already configured, so this is never taken.
+        // `peer_id = node_id - 1`.
         const peer_id: u32 = @intCast(to - 1);
         if (!self.net.isPeerConfigured(peer_id)) {
             const pa = self.resolver.resolve(to) orelse return;
@@ -649,7 +649,7 @@ test "transport: queueOut resolves + registers a peer beyond the init set (growt
 
 test "transport: the default static resolver does not grow past the init set" {
     // With no custom resolver, a node addressed beyond its static peer list is
-    // dropped — the old positional behavior, preserved. Proves the static path
+    // dropped — the static positional behavior. Proves the static path
     // never silently fabricates a peer.
     const a = testing.allocator;
 

@@ -10,9 +10,9 @@
 //! under a newer engine. So every request is stamped with the engine
 //! version that executed it (into the `LogRecord` + the replicated
 //! readset header), and a future replay driver fetches the matching
-//! engine WASM by that version (Phase 3, post-GA — deferred until the
-//! first semantics-affecting bump, at which point selection stops being
-//! a no-op).
+//! engine WASM by that version (post-GA — deferred until the first
+//! semantics-affecting bump, at which point selection stops being a
+//! no-op).
 //!
 //! ## The integer
 //!

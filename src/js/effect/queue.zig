@@ -2,38 +2,31 @@
 //! (`docs/effect-algebra.md` §2.3; `docs/effect-reification-plan.md`
 //! Phase 2 §3.4).
 //!
-//! The pre-Phase-2 world had each origin staging into its own area:
-//! two rove collections (`subscription_fire_pending`,
-//! `fetch_event_pending`) plus two cross-thread inboxes
-//! (`SubscriptionFireInbox`, `FetchChunkInbox`) plus the implicit h2
-//! `request_out`. Phase 2 collapses them into **one** in-thread
-//! ingress (`MsgQueue`) fed from one cross-thread inbox (`MsgInbox`)
-//! per worker so:
+//! One in-thread ingress (`MsgQueue`) fed from one cross-thread inbox
+//! (`MsgInbox`) per worker, rather than per-origin staging areas, so:
 //!
 //! 1. Backpressure is a property of the primitive (the queue cap;
 //!    `error.Full` + `overflow_count` on overflow, surfaced on
-//!    `/_system/metrics` the same way `dropped_chunks` already is).
+//!    `/_system/metrics` the same way `dropped_chunks` is).
 //! 2. The dispatch loop is one `for (queue.drain()) |msg| ...`
 //!    instead of N per-origin sweeps.
 //!
-//! Migrated origins today: `subscription_fire` (kv-react / cron /
-//! boot — `worker_streaming.zig`), `fetch_chunk`, `send_callback`.
-//! `inbound` stays entity-driven through H2 (Phase 3's reconciler
-//! scope) — it has a Msg variant for type-system parity but no
-//! `enqueueMsg` path. `timer` / `disconnect` / `kv_wake` /
-//! `wake_batch` are dispatcher-internal control variants with no
-//! owned bytes (see `freeOwnedMsg` below).
+//! Origins routed through `MsgQueue`: `subscription_fire` (kv-react /
+//! cron / boot — `worker_streaming.zig`), `fetch_chunk`,
+//! `send_callback`. `inbound` stays entity-driven through H2 — it has
+//! a Msg variant for type-system parity but no `enqueueMsg` path.
+//! `timer` / `disconnect` / `kv_wake` / `wake_batch` are
+//! dispatcher-internal control variants with no owned bytes (see
+//! `freeOwnedMsg` below).
 //!
 //! ## Taping
 //!
 //! Algebra L3 ("every Msg is a recorded input") is satisfied by
-//! per-dispatch-site taping via `captureTapes*` — the
-//! existing inbound-HTTP tape mechanism (kv/date/random/module
-//! channels plus activation_bytes for chunk variants). The
-//! pre-handler hook contemplated in early drafts wasn't needed:
-//! post-handler taping records the same bytes the handler observed
-//! and meets the effect-audit's "taped per fire" check (the L3 law,
-//! `docs/effect-algebra.md` §2.3).
+//! per-dispatch-site taping via `captureTapes*` — the inbound-HTTP
+//! tape mechanism (kv/date/random/module channels plus
+//! activation_bytes for chunk variants). Post-handler taping records
+//! the same bytes the handler observed and meets the L3 "taped per
+//! fire" law (`docs/effect-algebra.md` §2.3).
 //!
 //! ## Ownership model
 //!
@@ -62,17 +55,16 @@ pub fn freeOwnedMsg(allocator: std.mem.Allocator, msg: *Msg) void {
         .fetch_chunk => |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator),
         .send_callback => |*sc| sc.deinit(allocator),
         .durable_wake => |*dw| dw.deinit(allocator),
-        // No-owned-bytes variants. Phase 2E declares an Inbound
-        // payload as a placeholder; dispatch for inbound stays
-        // entity-driven through H2 (Phase 3's reconciler scope),
-        // so no enqueueMsg path exists for it yet.
+        // No-owned-bytes variants. Inbound has a placeholder payload;
+        // dispatch for inbound stays entity-driven through H2, so no
+        // enqueueMsg path exists for it.
         .inbound,
         .timer,
         .disconnect,
         .kv_wake,
         .wake_batch,
-        // subscription_fire: empty placeholder since decisions §4.13
-        // (kv-react rides the durable dirty-marker path).
+        // subscription_fire: empty placeholder (decisions §4.13 —
+        // kv-react rides the durable dirty-marker path).
         .subscription_fire,
         // ws_message is never enqueued (serviceWsMessages drains the h2
         // collection in-line); the empty payload owns nothing.
@@ -96,9 +88,8 @@ pub const MsgQueue = struct {
     items: std.ArrayListUnmanaged(Msg) = .empty,
     cap: usize,
     /// Cumulative count of `enqueueMsg` calls that hit the cap and
-    /// returned `error.Full`. Per-origin migration surfaces this in
-    /// the metrics endpoint the same way `dropped_chunks` already
-    /// does for the streaming primitives.
+    /// returned `error.Full`. Surfaced in the metrics endpoint the same
+    /// way `dropped_chunks` does for the streaming primitives.
     overflow_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cap: usize) MsgQueue {
@@ -144,9 +135,7 @@ pub fn enqueueMsg(queue: *MsgQueue, msg: Msg) !void {
 /// threads) push from off-worker threads; the owning worker calls
 /// `drainInto` on its tick (mutex held only across the move).
 ///
-/// Effect-reification Phase 2E: collapses the two pre-2E inboxes
-/// (`SubscriptionFireInbox` + `FetchChunkInbox`) into one. Hash-
-/// routing by `tenant_id` happens on the NodeState registry side
+/// Hash-routing by `tenant_id` happens on the NodeState registry side
 /// (see `NodeState.enqueueMsgForTenant`); this struct is the
 /// per-worker mailbox the registry routes into.
 ///

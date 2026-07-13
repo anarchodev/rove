@@ -1,4 +1,4 @@
-//! End-to-end native driver smoke (Phase 2 §2c). Drives `runWorld` — the ONE
+//! End-to-end native driver smoke. Drives `runWorld` — the ONE
 //! replay/sim engine — over declarative worlds on the real arenajs link, no
 //! cluster. Scenarios: an inbound request (kv.get + kv.set + console + response)
 //! and a non-inbound `fetch_chunk` callback (ctx + flattened fetch result).

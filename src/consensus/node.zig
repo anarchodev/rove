@@ -1,7 +1,6 @@
-//! V2 data-plane core — the per-tenant pump (single node).
+//! Data-plane core — the per-tenant pump.
 //!
-//! v2-build-order §Phase 1: "the heart of the rewrite." A
-//! `Node` owns one `SharedWal` + one raft-rs `Manager`, and a pump that
+//! A `Node` owns one `SharedWal` + one raft-rs `Manager`, and a pump that
 //! drives the active set of per-tenant raft groups:
 //!
 //!     tickGroups(active) → pollReady → processReady (decode a committed
@@ -12,38 +11,30 @@
 //! own `GroupedFileStorage` over the shared per-node WAL — the
 //! single-fsync-per-cycle constraint that makes multi-tenant raft viable
 //! (multiraft-scaling-learnings §3.2). The committed-entry apply path
-//! reuses the limbs unchanged: the `envelope` codec, `writeset.applyEncoded`,
+//! reuses the limbs: the `envelope` codec, `writeset.applyEncoded`,
 //! and `kvexp` via `KvStore` as the per-tenant state engine.
 //!
-//! Scope boundaries for Phase 1, deliberately deferred to later phases:
-//!   - **single node, single voter** — no cross-node transport, so
-//!     `takeMessages` drains to nowhere. Multi-node is Phase 5.
-//!   - **no HTTP / JS** — propose + read are called directly. The
-//!     worker-dispatch seam swap is Phase 2.
-//!   - hibernation (Phase 6, `multiraft-scaling-learnings §3.1`): the
-//!     `active` set is a true HIBERNATING set — a group idle (no propose,
-//!     no non-heartbeat inbound step) for `hibernate_ns` drops out and is
-//!     no longer ticked, so an idle tenant stops heartbeating (leader) /
-//!     running its election timer (follower) and costs the pump nothing.
-//!     The activity bump deliberately SKIPS heartbeats (a heartbeat means
-//!     "don't elect me," not "I have work"), so a quiet group's own
-//!     keep-alive traffic can't keep it awake. Correctness across nodes:
-//!     every node counts a group's idle deadline from the last REAL
-//!     message (all see it ~simultaneously), so they hibernate within
-//!     network-jitter of each other — well under the election timeout —
-//!     and a hibernated group's frozen election timer never fires a
-//!     spurious campaign. A propose or a non-heartbeat step wakes it
-//!     cluster-wide.
-//!   - **no migration / epoch fence** — `createGroup` (birth epoch 0);
-//!     detach/attach is Phase 4.
-//!   - **no speculative overlay** — entries apply on commit (both the
-//!     proposer and any follower run the same apply). The `TrackedTxn`
-//!     pre-write-then-propose latency optimization belongs to the
-//!     Phase-2 request path.
+//! Hibernation (`multiraft-scaling-learnings §3.1`): the `active` set is a
+//! true HIBERNATING set — a group idle (no propose, no non-heartbeat
+//! inbound step) for `hibernate_ns` drops out and is no longer ticked, so
+//! an idle tenant stops heartbeating (leader) / running its election timer
+//! (follower) and costs the pump nothing. The activity bump deliberately
+//! SKIPS heartbeats (a heartbeat means "don't elect me," not "I have
+//! work"), so a quiet group's own keep-alive traffic can't keep it awake.
+//! Correctness across nodes: every node counts a group's idle deadline
+//! from the last REAL message (all see it ~simultaneously), so they
+//! hibernate within network-jitter of each other — well under the election
+//! timeout — and a hibernated group's frozen election timer never fires a
+//! spurious campaign. A propose or a non-heartbeat step wakes it
+//! cluster-wide.
 //!
-//! Structural reference: rewind2's `multi_dispatcher.zig` (the
-//! multi-node, multi-pump-worker, migration-capable superset this is the
-//! single-node kernel of).
+//! Entries apply on commit (both the proposer and any follower run the
+//! same apply); the `TrackedTxn` pre-write-then-propose latency
+//! optimization lives in the request path. Migration attaches a group at
+//! an explicit epoch fence (`createGroupAtEpoch`); birth is epoch 0
+//! (`createGroup`). A single-node node has no cross-node transport, so
+//! `takeMessages` drains to nowhere and groups campaign to leader at
+//! creation.
 
 const std = @import("std");
 const raft = @import("raft_rs_zig");
@@ -99,8 +90,8 @@ const group_raft_config: raft.manager.GroupConfig = blk: {
     break :blk cfg;
 };
 
-/// Default hibernation idle window (Phase 6, `multiraft-scaling-learnings
-/// §3.1`): a group with no propose / non-heartbeat step for this long drops
+/// Default hibernation idle window (`multiraft-scaling-learnings §3.1`): a
+/// group with no propose / non-heartbeat step for this long drops
 /// out of the active set and is no longer ticked. Comfortably longer than
 /// the raft election timeout in wall-clock terms — what must stay below the
 /// election timeout is the *skew* between nodes hibernating the same group
@@ -117,8 +108,7 @@ pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 /// hard-failover recovers in a fraction of a second rather than waiting on luck.
 pub const DEFAULT_LEADERLESS_ESCALATE_NS: i64 = 150 * std.time.ns_per_ms;
 
-/// Default durabilize cadence (V2 port of V1's `Cluster.tickSnapshot`
-/// interval): how often the pump folds each dirty tenant store's in-memory
+/// Default durabilize cadence: how often the pump folds each dirty tenant store's in-memory
 /// overlay into LMDB + stamps its raft watermark + (single-node) compacts the
 /// WAL. A committed write is already durable in the fsync'd raft WAL the
 /// instant it commits; this checkpoint just bounds how much WAL a restart must
@@ -137,7 +127,7 @@ pub const DEFAULT_DURABILIZE_NS: i64 = 500 * std.time.ns_per_ms;
 /// caught up — valid, just snapshot-heavy).
 pub const DEFAULT_SNAPSHOT_GRACE: u64 = 5_000;
 
-/// Auto-demote policy (conf_change Phase 2): on the leader, a peer voter that
+/// Auto-demote policy: on the leader, a peer voter that
 /// is BOTH this many entries behind the leader's last index AND `!recent_active`
 /// (no contact within ~an election timeout, under check_quorum) is demoted to a
 /// learner. A permanently-dead voter pins the voters-only WAL-compaction floor
@@ -165,8 +155,8 @@ pub const DEFAULT_AUTO_DEMOTE_NS: i64 = 5 * std.time.ns_per_s;
 /// timeout?" unanswerable. Gating the tick on a fixed monotonic interval
 /// decouples it: `tickGroups` fires at most once per `tick_interval_ns`
 /// regardless of loop speed, so `election_tick × tick_interval_ns` is a stable,
-/// justifiable number. The default preserves the historical ~1ms idle cadence
-/// (so behavior is unchanged) while also CAPPING the rate under load; raise it
+/// justifiable number. The default is a ~1ms idle cadence while also CAPPING
+/// the rate under load; raise it
 /// (env `REWIND_RAFT_TICK_MS`) once a soak has measured the broadcast-time +
 /// pause-jitter tail this must clear (see docs/architecture/raft-best-practices.md).
 pub const DEFAULT_TICK_NS: i64 = 1 * std.time.ns_per_ms;
@@ -174,7 +164,7 @@ pub const DEFAULT_TICK_NS: i64 = 1 * std.time.ns_per_ms;
 /// Resolves the store a replicated entry applies to, keyed by the
 /// envelope's tenant id string. Two callers need it:
 ///
-///   - a FOLLOWER's apply in `worker_overlay` mode (Phase 5 "Full HA"):
+///   - a FOLLOWER's apply in `worker_overlay` mode:
 ///     without it, a follower writes the node's own `slot.store` — a file
 ///     the worker never reads, so a follower promoted to leader would
 ///     serve from an empty serving store. The bridge sets this (via
@@ -210,7 +200,7 @@ pub const StoreResolver = struct {
 /// waiter. Because the watermark is the worker's durable-ack signal,
 /// the hook is staged during `processReady` and fired only after
 /// `wal.flush()` succeeds — never ahead of the fsync. `null` in the
-/// Phase-1 unit tests, which drive the pump directly and read inline.
+/// unit tests, which drive the pump directly and read inline.
 pub const CommitHook = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, group_id: u64, origin: u64, seq: u64, raft_index: u64) void,
@@ -279,17 +269,17 @@ pub const ApplyObserver = struct {
 /// §Phase 2 leader-skip + the speculative overlay).
 pub const ApplyMode = enum {
     /// Decode a committed writeset and write it to the tenant's kvexp
-    /// store. The Phase-1 default and the bare-node multi-node test: there
+    /// store. The default and the bare-node multi-node test: there
     /// is no speculative overlay, so apply IS the write.
     apply_on_commit,
-    /// Single-node LEADER (legacy): the worker already wrote the entry into
-    /// its own `TrackedTxn` speculative overlay before proposing and
-    /// commits that overlay when the watermark advances — so the pump must
-    /// NOT re-write the store (it would double-apply on a second handle).
-    /// Superseded by `worker_overlay` for the bridge (which is role-aware);
-    /// kept for any caller that wants an unconditional skip.
+    /// Single-node LEADER unconditional skip: the worker already wrote the
+    /// entry into its own `TrackedTxn` speculative overlay before proposing
+    /// and commits that overlay when the watermark advances — so the pump
+    /// must NOT re-write the store (it would double-apply on a second
+    /// handle). The bridge uses the role-aware `worker_overlay` instead;
+    /// this stays for any caller that wants an unconditional skip.
     leader_skip,
-    /// Worker-fronted multi-node (Phase 5): the apply behavior depends on
+    /// Worker-fronted multi-node: the apply behavior depends on
     /// this node's role in the group. On the **leader**, the worker owns
     /// the speculative overlay and commits it on watermark advance, so the
     /// pump skips the store write (as `leader_skip`). On a **follower**,
@@ -340,7 +330,7 @@ pub const TenantSlot = struct {
     /// Highest raft index whose committed entry has been applied to
     /// `store`. 0 until the first apply.
     applied_idx: u64 = 0,
-    /// Hibernation (Phase 6): wall-clock deadline past which this group is
+    /// Hibernation: wall-clock deadline past which this group is
     /// considered idle and swept out of the active tick set. Refreshed by
     /// `bumpActive` on every propose + non-heartbeat inbound step (NOT on
     /// heartbeats). 0 = never bumped (a fresh slot not yet active).
@@ -383,7 +373,7 @@ pub const TenantSlot = struct {
     gfs: *raft.GroupedFileStorage,
 };
 
-/// One V2 node: a `Manager` of per-tenant raft groups over one shared
+/// One node: a `Manager` of per-tenant raft groups over one shared
 /// WAL, plus the per-tenant kvexp stores the committed entries apply to.
 pub const Node = struct {
     allocator: std.mem.Allocator,
@@ -410,7 +400,7 @@ pub const Node = struct {
     /// in `destroyGroupAndReclaim`. Lives at `{data_dir}/__groups__/app.db`.
     groups_manifest: *KvStore,
 
-    /// Cross-node transport (Phase 5). `null` for a single-node node
+    /// Cross-node transport. `null` for a single-node node
     /// (`initSingleNode`): no peers, so groups campaign to leader at
     /// creation and `takeMessages` drains to nowhere. Non-null for a
     /// multi-node node: the pump drives it each cycle (flush coalesced
@@ -420,8 +410,8 @@ pub const Node = struct {
     /// tenant_id → slot. Iterated on deinit; looked up in the apply
     /// callback by `group_id`.
     groups: std.AutoHashMapUnmanaged(u64, *TenantSlot) = .empty,
-    /// Group ids ticked every pump cycle — the HIBERNATING active set
-    /// (Phase 6). A group enters via `bumpActive` (propose / formation /
+    /// Group ids ticked every pump cycle — the HIBERNATING active set.
+    /// A group enters via `bumpActive` (propose / formation /
     /// non-heartbeat step) and leaves when its `active_until_ns` passes
     /// (`sweepHibernated`). NOT pre-seeded with every created group: an idle
     /// group is not ticked, so the pump cost is O(active), not O(all groups)
@@ -449,8 +439,8 @@ pub const Node = struct {
     /// can be compacted to a floor (their commits interleave in the one WAL).
     dirty: std.ArrayListUnmanaged(u64) = .empty,
     /// Wall-clock of the last `durabilizeTick`; the tick is interval-gated
-    /// (`durabilize_interval_ns`) like V1's `Cluster.tickSnapshot` — folding
-    /// the overlay into LMDB is an fsync, amortized over many commits.
+    /// (`durabilize_interval_ns`) — folding the overlay into LMDB is an
+    /// fsync, amortized over many commits.
     last_durabilize_ns: i64 = 0,
     durabilize_interval_ns: i64 = DEFAULT_DURABILIZE_NS,
     /// Auto-demote policy (see `DEFAULT_AUTO_DEMOTE_LAG`): lag threshold in
@@ -469,32 +459,22 @@ pub const Node = struct {
     /// the pump loop speed. Tests that want fast elections set this small.
     tick_interval_ns: i64 = DEFAULT_TICK_NS,
     last_tick_ns: i64 = 0,
-    /// Whether `durabilizeTick` also COMPACTS the WAL (single-node only) after
-    /// durabilizing — truncating the log up to the durabilized index so it stays
-    /// bounded. ON. Safe because durabilize folds the overlay into LMDB (and
-    /// stamps `lastAppliedRaftIdx`) BEFORE truncating, so data up to the
-    /// compaction point is durable independent of the WAL; recovery reloads it
-    /// from LMDB and replays only the post-compaction tail.
+    /// Whether `durabilizeTick` also COMPACTS the WAL after durabilizing —
+    /// truncating the log up to the durabilized index so it stays bounded. ON.
+    /// Safe because durabilize folds the overlay into LMDB (and stamps
+    /// `lastAppliedRaftIdx`) BEFORE truncating, so data up to the compaction
+    /// point is durable independent of the WAL; recovery reloads it from LMDB
+    /// and replays only the post-compaction tail.
     ///
-    /// Prereqs that are now met: the raft-rs-zig compact→recover hardstate bug
-    /// (a recovered group loaded a stale `commit=0` → `hs.commit out of range`)
-    /// is fixed upstream by persisting the `LightReady` commit index (pinned at
-    /// raft-rs-zig 5092bc6).
+    /// Requires two raft-rs-zig properties (pinned at 5092bc6): the
+    /// compact→recover hardstate fix that persists the `LightReady` commit index
+    /// (else a recovered group loads a stale `commit=0` → `hs.commit out of
+    /// range`), and raft-sys built at `opt-level = 1` (a rustc -O0
+    /// `movaps`/`.rodata.cst16` alignment GPF otherwise).
     ///
-    /// A prior note here claimed enabling this "crashes the real THREADED
-    /// binaries" — that was a red herring. The crash was a rustc -O0
-    /// `movaps`/`.rodata.cst16` alignment GPF triggered by the dependency bump
-    /// (it reproduced with `compact_wal = false` too), fixed by building
-    /// raft-sys at `opt-level = 1` (raft-rs-zig 5092bc6). With that fixed,
-    /// compaction is verified: single-node compaction runs and survives
-    /// compact→recover across restart (no `hs.commit` panic, no cross-thread
-    /// abort), and the full V2 smoke suite (rewind / tenant_move / three_node /
-    /// cp_move_recovery / zero_downtime_move) passes.
-    ///
-    /// Multi-node compaction is now on too (`durabilizeTick`): leader and
-    /// follower both truncate to the cluster-wide min match index (the leader
-    /// propagates it on its messages), so a lagging voter always catches up from
-    /// the log — snapshot-free.
+    /// On single- and multi-node alike (`durabilizeTick`): each node truncates
+    /// per its own durable apply watermark less the fixed catch-up buffer, so a
+    /// lagging voter within the buffer catches up from the log — snapshot-free.
     compact_wal: bool = true,
     /// Set true while a group's recovery drain (`createGroupCore`) re-applies
     /// the replayed WAL tail: forces the store WRITE even in `worker_overlay`
@@ -515,7 +495,7 @@ pub const Node = struct {
     commit_notify: std.ArrayListUnmanaged(CommitNotify) = .empty,
 
     /// Optional per-committed-entry notification (see `CommitHook`).
-    /// Set by the bridge; left null by the Phase-1 inline tests.
+    /// Set by the bridge; left null by the inline tests.
     commit_hook: ?CommitHook = null,
 
     /// Optional worker-overlay skip oracle (see `SkipQuery`). Set by the
@@ -544,12 +524,11 @@ pub const Node = struct {
     /// How committed entries apply (see `ApplyMode`): write the store
     /// (`apply_on_commit`, default) vs. role-aware skip-on-leader
     /// (`worker_overlay`, which the bridge sets when it fronts a worker
-    /// owning the speculative overlay). The Phase-1 tests + the bridge
-    /// unit tests keep the default so a read after commit sees the pump's
-    /// write.
+    /// owning the speculative overlay). The node + bridge unit tests keep
+    /// the default so a read after commit sees the pump's write.
     apply_mode: ApplyMode = .apply_on_commit,
 
-    /// Hibernation idle window (Phase 6). Overridable per node (tests use a
+    /// Hibernation idle window. Overridable per node (tests use a
     /// short value); production keeps `DEFAULT_HIBERNATE_NS`.
     hibernate_ns: i64 = DEFAULT_HIBERNATE_NS,
     /// Leaderless-escalation window: how long an active group may stay
@@ -568,7 +547,7 @@ pub const Node = struct {
 
     /// Optional follower-apply store resolver (see `StoreResolver`). Set by
     /// the bridge in `worker_overlay` mode so a follower's replicated writes
-    /// land in the worker's own serving store (Phase 5 "Full HA"). Null in
+    /// land in the worker's own serving store. Null in
     /// the bare-node tests, which read the node's own `slot.store`.
     store_resolver: ?StoreResolver = null,
 
@@ -577,7 +556,7 @@ pub const Node = struct {
         return Node.init(allocator, data_dir, 1, &.{1});
     }
 
-    /// Stand up a multi-node node (Phase 5): `node_id` ∈ `voters`, the full
+    /// Stand up a multi-node node: `node_id` ∈ `voters`, the full
     /// voter set across the cluster, plus the cross-node transport bound to
     /// `listen_addr` with `peers` (indexed by raft_net peer id = raft node
     /// id − 1, `len == cluster size`). Groups created here do NOT campaign
@@ -675,9 +654,9 @@ pub const Node = struct {
         // CRC-scans the existing segments, truncates only a torn tail, and
         // buckets the recovered records per group for `initRecover` to replay.
         // On a fresh data dir there is nothing to recover, so it behaves like
-        // `init`. Using `init` here (truncate-fresh) was discarding every
-        // committed entry on restart — the fsync'd log was thrown away, so a
-        // hard crash lost all writes since the last graceful close.
+        // `init`. Using `init` here (truncate-fresh) would discard every
+        // committed entry on restart — the fsync'd log thrown away, so a
+        // hard crash would lose all writes since the last graceful close.
         const wal = raft.SharedWal.open(allocator, wal_path) catch return Error.Io;
         errdefer wal.deinit();
 
@@ -753,13 +732,13 @@ pub const Node = struct {
     }
 
     /// Attach a tenant group at an explicit migration fence `epoch` (the
-    /// Phase-4 move-destination path; v2-build-order §Phase 4
+    /// move-destination path; v2-build-order §Phase 4
     /// "createGroupEpoch(tenant, epoch+1) on destination"). The tenant's
     /// kvexp state must already have been loaded (the bundle landed in the
     /// worker's `cluster.kv` store); this just stands up the consensus
     /// half — a fresh group whose epoch fences out any straggler traffic
     /// from the source incarnation (moot single-node, load-bearing under
-    /// Phase-7 live overlap). `clearTombstone` first so a tenant id reused
+    /// live overlap). `clearTombstone` first so a tenant id reused
     /// after a prior `destroyGroupAndReclaim` on THIS node can re-attach.
     /// Errors if the group already exists (attach is not idempotent — a
     /// double attach is an orchestration bug worth surfacing).
@@ -878,13 +857,12 @@ pub const Node = struct {
     /// the raft group at `epoch`, register the slot, and drive it to
     /// leader (single-node campaign). Caller has already verified the
     /// group does not exist.
-    /// `voters_override` (Phase 2e — cluster node-set SSOT): the initial voter set
-    /// a FRESH group is born with, supplied by the control plane (the cluster's
-    /// node set, the single source of truth) instead of this node's static
-    /// `REWIND_VOTERS` env. Null → fall back to `self.voters` (unchanged). Ignored
-    /// on the `recover` path (a rejoining group restores its membership from the
-    /// WAL) and immaterial under a baseline (the baseline's ConfState overwrites
-    /// the born membership — Phase 2d).
+    /// `voters_override`: the initial voter set a FRESH group is born with,
+    /// supplied by the control plane (the cluster's node set, the single source
+    /// of truth) instead of this node's static `REWIND_VOTERS` env. Null → fall
+    /// back to `self.voters`. Ignored on the `recover` path (a rejoining group
+    /// restores its membership from the WAL) and immaterial under a baseline
+    /// (the baseline's ConfState overwrites the born membership).
     fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool, as_learner: bool, voters_override: ?[]const u64) Error!*TenantSlot {
         // {data_dir}/{tenant_id}/app.db
         const dir = std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ self.data_dir, tenant_id }) catch
@@ -917,7 +895,7 @@ pub const Node = struct {
         // Fresh-group only: `recover` restores the persisted membership from the
         // WAL, so a rejoining node keeps whatever role it last held.
         // The born ConfState's voter set: the CP-supplied cluster node set when
-        // given (Phase 2e SSOT), else this node's static `REWIND_VOTERS`.
+        // given (the single source of truth), else this node's static `REWIND_VOTERS`.
         const base_voters = voters_override orelse self.voters;
         if (!recover) std.log.info(
             "v2 node: gid={d} born voters={any} source={s}",
@@ -1168,9 +1146,8 @@ pub const Node = struct {
     /// mechanism-A compaction truncates to `durabilized_idx − snapshot_grace`
     /// (`durabilizeTick`), so `durabilized_idx` sits `snapshot_grace` entries ABOVE
     /// the leader's first (compacted) index — the member born here starts at an entry
-    /// the leader still holds. (The prior comment's claim that the durable watermark
-    /// "sits below the compaction floor" was inverted; the floor is
-    /// `durabilized − grace`.) 0 on unknown group, and 0 for a fresh group with
+    /// the leader still holds. (The floor is `durabilized − grace`, so the durable
+    /// watermark sits ABOVE it, not below.) 0 on unknown group, and 0 for a fresh group with
     /// nothing folded yet — the trigger skips index 0, correctly deferring catch-up
     /// until a consistent snapshot exists. Pump-thread only (reads pump-owned slot).
     pub fn baselineIndex(self: *Node, tenant_id: u64) u64 {
@@ -1279,7 +1256,7 @@ pub const Node = struct {
     }
 
     /// Tear down a tenant's raft group and reclaim its WAL segments (the
-    /// Phase-4 move-source cleanup; v2-build-order §Phase 4
+    /// move-source cleanup; v2-build-order §Phase 4
     /// "destroyGroup + noteGroupDestroyed on source"). `destroyGroup`
     /// frees the group's `GroupedFileStorage` (and tombstones the id so a
     /// stray later create is rejected); `noteGroupDestroyed` lets the
@@ -1327,7 +1304,7 @@ pub const Node = struct {
         };
     }
 
-    // ── Hibernation active set (Phase 6) ─────────────────────────────
+    // ── Hibernation active set ─────────────────────────────
 
     fn nowNs() i64 {
         return @intCast(std.time.nanoTimestamp());
@@ -1605,7 +1582,7 @@ pub const Node = struct {
             // Multi-node: buffered per destination node, stamped with the
             // group's migration epoch, for the coalesced flush below. (No
             // cross-node compaction floor is sent — mechanism-A compaction is
-            // per-node; the floor wire field was removed in Phase 2f.)
+            // per-node; there is no floor wire field.)
             for (ready) |g| {
                 var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
@@ -1673,8 +1650,8 @@ pub const Node = struct {
         return ready.len > 0 or ready2.len > 0;
     }
 
-    /// Checkpoint dirty stores (V2 port of V1's `Cluster.tickSnapshot`).
-    /// Interval-gated. For each group with committed-but-not-durable writes,
+    /// Checkpoint dirty stores. Interval-gated. For each group with
+    /// committed-but-not-durable writes,
     /// fold its overlay into LMDB + stamp `lastAppliedRaftIdx` (one atomic
     /// durabilize), then compact the shared WAL so the log stays bounded.
     /// Compaction is mechanism A (raft-native-alignment §I4): truncate to a FIXED
@@ -1746,10 +1723,10 @@ pub const Node = struct {
                 keep += 1;
                 continue;
             };
-            // Compact when enabled (single-, leader-, AND follower-side now —
-            // everyone truncates to the same propagated floor). Skip when
-            // `compact_target` is 0 (a follower that hasn't heard a floor yet)
-            // so a floorless group doesn't trigger the pre-compact flush.
+            // Compact when enabled (single-, leader-, and follower-side alike;
+            // each node truncates to its own `target − snapshot_grace`). Skip
+            // when `compact_target` is 0 (a group still below the catch-up
+            // buffer) so it doesn't trigger the pre-compact flush.
             if (self.compact_wal and compact_target > 0) {
                 if (!compaction_flushed) {
                     self.wal.flush() catch |e| {
@@ -1786,7 +1763,7 @@ pub const Node = struct {
         self.dirty.shrinkRetainingCapacity(keep);
     }
 
-    /// Leader-side auto-demote policy (conf_change Phase 2). For each group this
+    /// Leader-side auto-demote policy. For each group this
     /// node leads with un-durabilized writes (so the log is actively advancing
     /// and a dead voter is pinning the WAL floor), demote the first voter that
     /// is BOTH far behind (`lag > auto_demote_lag`) AND `!recent_active` to a
@@ -1951,7 +1928,7 @@ pub const Node = struct {
             .worker_overlay => blk: {
                 if (self.skip_query) |q|
                     break :blk q.func(q.ctx, group_id, frame.origin, frame.seq);
-                // No bridge (bare-node tests): the old role-keyed skip.
+                // No bridge (bare-node tests): the role-keyed skip.
                 break :blk self.mgr.isLeader(group_id);
             },
         };
@@ -2030,9 +2007,9 @@ pub const Node = struct {
     /// worker), the resolver routes by id — the worker's own per-tenant
     /// serving store for a tenant id, the node-wide root store for `""` —
     /// so a follower's replicated writes (including an admin batch's
-    /// cross-tenant inners) land in the SAME stores the worker serves from
-    /// (Phase 5 "Full HA"). Without a resolver (the bare-node multi-node +
-    /// Phase-1 tests, the CP) only the group's OWN id routes — to the slot
+    /// cross-tenant inners) land in the SAME stores the worker serves from.
+    /// Without a resolver (the bare-node multi-node tests, the CP) only the
+    /// group's OWN id routes — to the slot
     /// store; a cross-tenant or root target has nowhere to land and
     /// surfaces as null (→ `UnroutedApply`, an invariant violation: those
     /// producers only exist on worker-fronted nodes, which set a resolver).
@@ -2782,10 +2759,9 @@ test "two tenants get independent stores on the same node" {
 test "multi: inner writesets route by INNER id (cross-tenant + root) through the resolver" {
     // The admin-batch shape (`raft_propose.zig proposeBatch`): one multi
     // through the ANCHOR tenant's group carrying [anchor ws, cross-tenant
-    // target ws, root ws]. Apply must route each inner by ITS id — the
-    // old slot-routed apply wrote the target's keys into the anchor's
-    // store on a follower (cross-tenant corruption) and errored on the
-    // root inner.
+    // target ws, root ws]. Apply must route each inner by ITS id: slot-routed
+    // apply would write the target's keys into the anchor's store on a
+    // follower (cross-tenant corruption) and error on the root inner.
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2876,16 +2852,16 @@ test "multi: inner writesets route by INNER id (cross-tenant + root) through the
     defer a.free(rv);
     try testing.expectEqualStrings("1", rv);
 
-    // …and did NOT leak into the anchor's store (the old corruption).
+    // …and did NOT leak into the anchor's store (the cross-tenant corruption).
     try testing.expectError(Error.NotFound, anchor_store.get("target-key"));
     try testing.expectError(Error.NotFound, anchor_store.get("instance/acme"));
 }
 
 test "multi: a cross-tenant inner with no resolver fails loud (UnroutedApply)" {
     // A bare node (no worker, no resolver) has nowhere to land a
-    // cross-tenant inner — applying it to the anchor's store would be the
-    // exact corruption the routing fix removes, so it must surface as an
-    // invariant violation instead of applying silently.
+    // cross-tenant inner — applying it to the anchor's store would be exactly
+    // the cross-tenant corruption routing-by-inner-id prevents, so it must
+    // surface as an invariant violation instead of applying silently.
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2921,7 +2897,7 @@ test "multi: a cross-tenant inner with no resolver fails loud (UnroutedApply)" {
     try testing.expectError(Error.NotFound, node.get(gid, "k"));
 }
 
-// ── Phase 6: hibernation / active-set ─────────────────────────────────
+// ── hibernation / active-set ─────────────────────────────────
 
 test "Phase 6: an idle group hibernates out of the active set, a propose re-wakes it" {
     const a = testing.allocator;

@@ -5,10 +5,7 @@
 //!
 //! ## Primary consumer: the auth stack
 //!
-//! Originally added as the SSE event-routing identity; that subsystem
-//! was retired (streaming-handlers Phase 5, 2026-05-19 — cross-node
-//! SSE now rides raft-replicated kv-write wakes, no sticky-session
-//! routing). The cookie's load-bearing role today is the auth anchor
+//! The cookie's load-bearing role is the auth anchor
 //! for `globals/oidc.js` (both the IdP and the relying party, incl.
 //! the platform's own `__auth__` IdP + admin dashboard). The OIDC RP
 //! depends on a *platform-minted* cookie specifically: its token

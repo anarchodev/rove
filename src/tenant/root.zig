@@ -3,8 +3,8 @@
 //! ## Store-per-instance model
 //!
 //! Each instance owns a directory at `{dir}/{id}/` and its app-state
-//! store lives at `{dir}/{id}/app.db`. Consumers (worker, files-server,
-//! log-server) open additional stores under the same directory —
+//! store lives at `{dir}/{id}/app.db`. Consumers (worker, log-server)
+//! open additional stores under the same directory —
 //! `{dir}/{id}/files.db`, `{dir}/{id}/log.db`, plus blob dirs — so a
 //! tenant's entire state is one directory that can be copied, moved,
 //! or removed as a unit. rove-tenant itself only knows about the
@@ -42,11 +42,10 @@
 //! cache entries get invalidated on writes — the underlying instance
 //! struct + its `*KvStore` pointer are stable.
 //!
-//! ## M1 scope
+//! ## Scope
 //!
-//! Just instances and domain aliases. Accounts, users, auth, and the
-//! root-instance privilege check arrive in Phase 5 alongside
-//! `rove-js-ctl`.
+//! Instances, domain aliases, root-token auth, and admin sessions.
+//! A full multi-account user model is not modeled here.
 
 const std = @import("std");
 const kv_mod = @import("raft-kv");
@@ -317,7 +316,7 @@ pub const Tenant = struct {
     /// Delete an instance. Closes its open `KvStore`, drops it from
     /// the in-memory map, erases the existence marker, and sweeps any
     /// domain aliases that pointed at it. The on-disk `{dir}/{id}/`
-    /// directory is NOT removed — demo-era simplification — so
+    /// directory is NOT removed (a deliberate simplification), so
     /// re-creating an instance with the same id reuses its old files.
     /// Idempotent: deleting a non-existent instance is a no-op.
     pub fn deleteInstance(self: *Tenant, id: []const u8) Error!void {
@@ -608,8 +607,8 @@ pub const Tenant = struct {
             else => return Error.OpenFailed,
         };
 
-        // Under the kvexp cutover, per-instance state lives as a
-        // store inside the same manifest as `self.root` — the
+        // Per-instance state lives as a store inside the same manifest
+        // as `self.root` — the
         // cluster's `cluster.kv` in production, the test's
         // standalone manifest in unit-test fixtures. `inst_dir`
         // remains on disk for sibling artifacts (file-blobs etc.)
@@ -689,7 +688,7 @@ pub const Tenant = struct {
     // ── adminKv: storage handle for admin-surface state ──────────────
     //
     // Sessions and magic-link rows live in the singleton admin tenant's
-    // own app.db now, not the root store. Callers reach them via this
+    // own app.db, not the root store. Callers reach them via this
     // helper rather than hard-coding `instances.get(ADMIN_INSTANCE_ID)`.
     // Requires `__admin__` to be registered first — callers are
     // expected to `createInstance(ADMIN_INSTANCE_ID)` during bootstrap
@@ -712,10 +711,10 @@ pub const Tenant = struct {
     // `{"expires_at_ns":<i64>,"is_root":<bool>}` (JSON, so admin's
     // JS handler can parse via `kv.get` + `JSON.parse`).
     //
-    // Mint + revoke live in admin's deployed JS bundle now (post-
-    // 2d cutover); only `authenticateSession` remains in Zig
+    // Mint + revoke live in admin's deployed JS bundle; only
+    // `authenticateSession` is in Zig
     // because `extractAdminAuth` (used by /_system/* + the admin
-    // host's RPC auth gate) still validates cookies before
+    // host's RPC auth gate) validates cookies before
     // dispatching to JS.
 
     pub const SESSION_HEX_LEN: usize = 64;
@@ -771,11 +770,10 @@ pub const Tenant = struct {
     }
 
     /// Check whether the given auth context is allowed to operate on
-    /// `instance_id`. In the single-account M1 shape the root token
+    /// `instance_id`. In the single-account shape the root token
     /// grants access to every instance, so this reduces to
-    /// `ctx.is_root`. Multi-account will consult
-    /// `account_member/{account_id}/{user_id}` markers here once the
-    /// user+account model lands.
+    /// `ctx.is_root`. A multi-account model would consult
+    /// `account_member/{account_id}/{user_id}` markers here.
     pub fn canAccessInstance(
         self: *Tenant,
         ctx: AuthContext,
@@ -1498,15 +1496,12 @@ test "authenticateSession returns is_root=false for non-root sessions" {
     try testing.expect(!resolved.?.is_root);
 }
 
-// Note: resend_key + platform_email_from were typed Zig shims
-// (installResendKey / getResendKey / installPlatformEmailFrom) until
-// the bootstrap-kv generalization. They're now plain kv pairs admin's
-// JS reads via `kv.get`; bootstrap writes them via the generic
-// `--bootstrap-kv key=value` flag in `loop46/main.zig`. No Zig-side
-// shim, no Zig-side knowledge of which keys exist.
+// Note: resend_key + platform_email_from are plain kv pairs that
+// admin's JS reads via `kv.get`; bootstrap writes them via the generic
+// `--bootstrap-kv key=value` flag. There is no Zig-side shim and no
+// Zig-side knowledge of which keys exist.
 
-// Note: mintMagic + redeemMagic + their tests moved to admin's
-// deployed JS bundle (loop46/main.zig ADMIN_HANDLER_SRC) when the
-// /v1/* handler port landed. Coverage now lives in
-// scripts/signup_smoke.sh which exercises the full mint → email
+// Note: mintMagic + redeemMagic + their tests live in admin's
+// deployed JS bundle, not here. Coverage lives in
+// scripts/signup_smoke.sh, which exercises the full mint → email
 // outbox → click → redeem path against a live worker.

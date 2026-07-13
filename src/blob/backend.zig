@@ -41,7 +41,7 @@ pub const BackendConfig = struct {
 ///   followers via S3-shaped object storage. Used for file-blobs
 ///   (bytecode + static assets) and log-blobs.
 /// - `http` — read-only fetch against a colocated files-server
-///   over HTTP/2. Used by loop46 worker for manifest reads
+///   over HTTP/2. Used by the worker for manifest reads
 ///   (production.md #1.4 step 4 — manifests live in raft-replicated
 ///   KV inside the files-server cluster, not S3).
 ///
@@ -118,8 +118,8 @@ pub const BlobBackend = struct {
     /// through colocated files-server) variant; an S3 backend always
     /// produces a URL. Caller frees on success.
     ///
-    /// Used by Phase 4 of deployment-snapshots-plan to 302-redirect
-    /// static asset requests directly to S3. `expires_secs` caps the
+    /// Used by the deployment-snapshots plan to 302-redirect static
+    /// asset requests directly to S3. `expires_secs` caps the
     /// URL's lifetime (max 604800 = 7 days per the SigV4 spec).
     /// `response_content_type` overrides whatever Content-Type S3
     /// has stored for the object — set it from the static

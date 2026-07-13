@@ -1,4 +1,4 @@
-//! De-risking spike for the native arenajs replay path (Phase 2, plan §2a).
+//! De-risking spike for the native arenajs replay path.
 //!
 //! Proves, end to end and self-contained (no Node, no WASM), that we can:
 //!   1. link arenajs's native reactor + replay-bindings + trace (TRACE on),

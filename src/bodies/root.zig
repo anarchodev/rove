@@ -1,19 +1,15 @@
 //! rove-bodies — wire-format types for readset BodyRefs.
 //!
-//! Historically this module also held the per-tenant `BodyBuffer`
-//! that accumulated bytes in RAM and periodically PUT to S3. As of
-//! `docs/streaming-model.md §7` Phase 3 (2026-05-27), body flush
-//! moved to the process-global `blob.BlobCoordinator`; the only
-//! survivors here are the on-wire shape (`BodyRef`, `NO_BATCH`) and
-//! the leaf-key formatter (`batchKey`) that replay still needs to
-//! reconstruct S3 keys from raft entry readsets.
+//! This module holds the on-wire shape (`BodyRef`, `NO_BATCH`) and the
+//! leaf-key formatters that replay needs to reconstruct S3 keys from
+//! raft entry readsets. Body flush itself lives in the process-global
+//! `blob.BlobCoordinator` (`docs/streaming-model.md §7`).
 //!
-//! Phase 5 (2026-05-27): the coordinator collapsed per-(tenant,
-//! worker) lanes into a single cross-tenant `_pool/` prefix, and
-//! `batch_id` became globally unique via raft reservation. The wire
-//! `BodyRef` shape is `{batch_id, offset, len}`; it resolves to one
-//! key template — `{key_prefix_base}_pool/{batch_id:0>20}`, a
-//! cross-tenant pool under one backend prefix.
+//! `batch_id` is globally unique (via raft reservation) and keys live
+//! under a single cross-tenant `_pool/` prefix. The wire `BodyRef`
+//! shape is `{batch_id, offset, len}`; it resolves to one key template
+//! — `{key_prefix_base}_pool/{batch_id:0>20}`, a cross-tenant pool
+//! under one backend prefix.
 //!
 //! Use `poolKey` to format a pool leaf; `batchKey` is the generic
 //! zero-padded formatter it builds on.

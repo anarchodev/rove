@@ -8,8 +8,8 @@
 //!
 //! Periodic `flushLogs` drains the node-wide log buffer into a single
 //! embedded-sidecar `.ndjson` object PUT to the configured
-//! `BatchStore` (Phase 5.5 a — leader only; followers' buffer stays
-//! empty because `dispatchPending` early-returns 503 on followers).
+//! `BatchStore` (leader only; followers' buffer stays empty because
+//! `dispatchPending` early-returns 503 on followers).
 //! `pushLoop` runs on its own thread and POSTs the resulting batch
 //! keys to log-server so its indexer GETs them directly rather than
 //! waiting for the LIST polling cycle.
@@ -88,10 +88,10 @@ pub fn getOrOpenTenantLog(
 // request_reads); the worker allocates one per dispatch, hands its
 // pointer to the dispatcher via `Request.readset`, then serializes +
 // flushes the non-empty channels via `captureTapes*` below.
-// `Math.random` / `crypto.*` / `Date.now` no longer have dedicated
-// channels (§9 + fold-in); the readset's `seed` + `timestamp_ns`
-// scalars are stamped onto arenajs's per-context state by the
-// dispatcher (`JS_SetRandomSeed` + `JS_SetDateNow`).
+// `Math.random` / `crypto.*` / `Date.now` have no dedicated channels;
+// the readset's `seed` + `timestamp_ns` scalars are stamped onto
+// arenajs's per-context state by the dispatcher (`JS_SetRandomSeed` +
+// `JS_SetDateNow`).
 
 /// Body-size threshold for inlining `request_body` / `activation_bytes`
 /// directly into the LogRecord (vs leaving the caller to retrieve via
@@ -104,8 +104,7 @@ pub fn getOrOpenTenantLog(
 /// survives raft compaction via the log batch's separate retention).
 /// Bodies > this cap are NOT inlined into the LogRecord — they live
 /// in BlobBackend via the readset's BodyRef, and the dashboard /
-/// replay fetches on demand. Eliminates the pre-2026-05-27
-/// "inline up to 256 KB into the log record" duplicate path.
+/// replay fetches on demand.
 pub const REQUEST_BODY_CAP: usize = 16 * 1024;
 
 /// Serialize each non-empty tape into the request's `TapePayloads`,
@@ -116,14 +115,6 @@ pub const REQUEST_BODY_CAP: usize = 16 * 1024;
 /// Best-effort: on any serialize failure the channel is left empty
 /// and a warning is logged. Tape capture failures must never kill
 /// the request.
-///
-/// Pre-Phase-5.5(a-2) this function ('uploadTapes') issued one
-/// content-addressed S3 PUT per channel per request through a
-/// shared std.http.Client. The fanout — plus a stdlib keep-alive
-/// bug that drops the OVH connection under concurrency — capped
-/// tape capture at single-digit-thousand req/s. Inlining moves
-/// the bytes onto the per-flush PUT path, which carries the whole
-/// batch in a single request.
 pub fn captureTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
@@ -190,16 +181,14 @@ pub fn captureTapes(
     return payloads;
 }
 
-/// `captureTapes` + activation-input bytes capture (effect-reification
-/// Phase 2D). Used by activations whose Msg payload carries bytes the
-/// handler reads as `request.activation.bytes` — today only
-/// `fetch_chunk`. Same inline rule as `request_body`: bytes ≤
-/// `REQUEST_BODY_CAP` (16 KB) ride inline in
-/// `TapePayloads.activation_bytes`; larger chunks live in BlobBackend
-/// via the readset's `fetch_responses` BodyRef and are fetched on
-/// demand. L3 (algebra): closes the effect-audit's untaped-chunk
-/// finding — every Msg is recorded (the BodyRef IS the record for the
-/// >16 KB case).
+/// `captureTapes` + activation-input bytes capture. Used by
+/// activations whose Msg payload carries bytes the handler reads as
+/// `request.activation.bytes` — today only `fetch_chunk`. Same inline
+/// rule as `request_body`: bytes ≤ `REQUEST_BODY_CAP` (16 KB) ride
+/// inline in `TapePayloads.activation_bytes`; larger chunks live in
+/// BlobBackend via the readset's `fetch_responses` BodyRef and are
+/// fetched on demand. L3 (algebra): every Msg is recorded (the BodyRef
+/// IS the record for the >16 KB case).
 ///
 /// TODO(read-taping): `activation_bytes` is still captured
 /// unconditionally. Read-flagging it (like `request.body`) needs a
@@ -494,10 +483,10 @@ pub fn captureLog(
     /// handler tags (early errors, faults).
     tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
-    /// Phase 5b: the raft seq the envelope carrying this request's
-    /// writeset was proposed at. Pass 0 for paths with no associated
-    /// raft entry (early-error / read-only). The per-worker
-    /// `flushLogs` advances `last_uploaded_seq` by `max(raft_seq)`.
+    /// The raft seq the envelope carrying this request's writeset was
+    /// proposed at. Pass 0 for paths with no associated raft entry
+    /// (early-error / read-only). The per-worker `flushLogs` advances
+    /// `last_uploaded_seq` by `max(raft_seq)`.
     raft_seq: u64,
 ) void {
     captureLogWithId(
@@ -679,15 +668,15 @@ fn freeTags(allocator: std.mem.Allocator, tags: []log_mod.Tag) void {
 
 /// Periodically drain the worker's node-wide log buffer into a
 /// single embedded-sidecar `.ndjson` object and PUT it to the
-/// configured `BatchStore` (Phase 5.5 a). Runs on the leader only
-/// — followers' buffer is always empty because `dispatchPending`
-/// early-returns 503 on followers. Lossy on PUT failure: records
-/// already left the buffer; per `docs/logs-plan.md` §1 a node-
-/// failure window may drop one batch.
+/// configured `BatchStore`. Runs on the leader only — followers'
+/// buffer is always empty because `dispatchPending` early-returns 503
+/// on followers. Lossy on PUT failure: records already left the
+/// buffer; per `docs/logs-plan.md` §1 a node-failure window may drop
+/// one batch.
 ///
-/// Phase 5.5(a-2) interleaved-per-node flush: every record carries
-/// its `tenant_id`; the indexer demuxes on read. One S3 object per
-/// flush window per node regardless of tenant fan-in.
+/// Interleaved-per-node flush: every record carries its `tenant_id`;
+/// the indexer demuxes on read. One S3 object per flush window per
+/// node regardless of tenant fan-in.
 pub fn flushLogs(worker: anytype) !void {
     const allocator = worker.allocator;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -707,11 +696,10 @@ pub fn flushLogs(worker: anytype) !void {
         allocator.free(records);
     }
 
-    // No node-wide leadership gate: V2 log batches are per-NODE (one S3
+    // No node-wide leadership gate: log batches are per-NODE (one S3
     // object per flush window per node, demuxed by `tenant_id` on read),
     // not per-group, so flushing is independent of which tenants' groups
-    // this node leads. (The old `worker.raft.isLeader()` gate was a V1
-    // node-wide shim that always returned true anyway.)
+    // this node leads.
 
     var node_buf: [8]u8 = undefined;
     const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
@@ -751,12 +739,12 @@ pub fn flushLogs(worker: anytype) !void {
         );
     };
 
-    // Phase 5b: advance the per-worker `last_uploaded_seq` checkpoint
-    // by `max(record.raft_seq)` across the drained batch. Records
+    // Advance the per-worker `last_uploaded_seq` checkpoint by
+    // `max(record.raft_seq)` across the drained batch. Records
     // with raft_seq == 0 (early-error / read-only / not-yet-plumbed
     // paths) are skipped so they don't reset the watermark. Failure
     // here is non-fatal — the checkpoint stays at its previous value;
-    // Phase 5c's walker will re-derive + re-push the entries we
+    // the checkpoint walker re-derives + re-pushes the entries we
     // would've advanced past, and the indexer's
     // `INSERT OR IGNORE (tenant_id, request_id)` absorbs the
     // duplicate.
@@ -791,9 +779,8 @@ fn advanceUploadCheckpoint(
 
 /// Enqueue a freshly-PUT batch key for the push thread to ship to
 /// log-server. Fast path: dupe + mutex-protected append + event set.
-/// The synchronous curl POST that used to live here now happens on
-/// the `pushLoop` thread, batching every key that queued up between
-/// pushes into one request body.
+/// The curl POST happens on the `pushLoop` thread, batching every key
+/// that queued up between pushes into one request body.
 fn pushBatchKey(
     worker: anytype,
     allocator: std.mem.Allocator,

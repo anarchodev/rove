@@ -1,9 +1,9 @@
-//! snapshot_stream.zig — streaming snapshot-transfer codec (raft Phase 2.5).
+//! snapshot_stream.zig — streaming snapshot-transfer codec.
 //!
-//! Phase 2.5 retires the single-shot `dumpTenantBundle` → buffered-POST →
-//! `loadTenantBundle` path (the whole store materialized into one `ArrayList`,
-//! one HTTP body, one txn — the multi-GB wall) in favour of a streamed transfer
-//! whose resident memory is bounded to ONE pair + one apply batch on each end:
+//! A streamed alternative to the single-shot `dumpTenantBundle` →
+//! buffered-POST → `loadTenantBundle` path (which materializes the whole
+//! store into one `ArrayList`, one HTTP body, one txn — the multi-GB wall).
+//! Resident memory here is bounded to ONE pair + one apply batch on each end:
 //!
 //!   SOURCE — `StreamDumper`: a PULL-model serializer over a held kvexp
 //!     `Snapshot` cursor. `pull(dst)` fills the caller's buffer (curl's

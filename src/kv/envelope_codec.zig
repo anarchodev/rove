@@ -10,7 +10,7 @@
 //! `kvlimbs.zig` re-exports it so the rove-js worker (`apply.zig`) gets
 //! the codec without dragging in the consensus spine, and
 //! `src/consensus/envelope.zig` delegates its header / multi / writeset-
-//! payload primitives here, layering only the V2-spine additions
+//! payload primitives here, layering only the consensus-spine additions
 //! (`EntryFrame`, the typed `Type` enum) on top. There is no second
 //! implementation to keep in sync: a producer encoding through either
 //! surface and a follower decoding through the other read the same bytes
@@ -23,15 +23,15 @@ const std = @import("std");
 /// the tighter sanity bound. Enforced on ENCODE only (`IdTooLong`) —
 /// `decodeEnvelope` accepts whatever the length field says, so the cap
 /// can tighten without stranding old log entries. One value for every
-/// encoder (worker and consensus spine alike; they briefly diverged
-/// 256 vs 512, making ids in the gap encodable on one path only).
+/// encoder (worker and consensus spine alike) — a divergence would make
+/// ids in the gap encodable on one path only.
 pub const MAX_ID_LEN: usize = 256;
 
 pub const ENVELOPE_TYPE_WRITESET: u8 = 0;
 pub const ENVELOPE_TYPE_MULTI: u8 = 1;
 
-/// Codec error set. A subset of `cluster.Error`, so `cluster.zig`'s
-/// re-exported functions coerce cleanly into its wider set.
+/// Codec error set. A subset of the callers' wider error sets (consensus
+/// / worker), so the re-exported functions coerce cleanly into them.
 pub const Error = error{
     Truncated,
     IdTooLong,

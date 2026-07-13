@@ -17,10 +17,10 @@
 //!
 //! `{ on: "module.method" | "method" }` routes the wake to a specific
 //! export; the default is `onWake` (the generic "edge wake — go look"
-//! export, wired in Phase 4's kind→export map). The target reuses the
+//! export, wired in the kind→export map). The target reuses the
 //! continuation `path`/`fn_name` resolution. The key is `on` end to end
 //! — the same spelling the customer writes (the `after.js` shim passes
-//! opts through; the pre-rename `{to}` wire spelling is gone).
+//! opts through; there is no separate wire spelling).
 
 const std = @import("std");
 const qjs = @import("rove-qjs");

@@ -1,5 +1,5 @@
-//! Background snapshot catch-up driver — the worker-thread half of the
-//! raft-native alignment arc's Phase 1 (native trigger + out-of-band data,
+//! Background snapshot catch-up driver — the worker-thread half of raft-native
+//! snapshot alignment (native trigger + out-of-band data,
 //! `docs/architecture/raft-native-alignment.md`).
 //!
 //! The pump's `snapshotTriggerTick` detects a peer raft holds in
@@ -15,11 +15,11 @@
 //!      pair stream (libcurl pulls from the dumper at the wire's drain rate, so
 //!      a multi-GB store is never buffered whole), with the data-free baseline
 //!      `{tenant, index, term}` carried in headers. The dest applies in bounded
-//!      txns and, on clean END_STREAM, installs the raft baseline — ONE call vs
-//!      the retired v2-load-replace + v2-apply-snapshot pair (raft Phase 2.5).
+//!      txns and, on clean END_STREAM, installs the raft baseline — ONE call,
+//!      not a separate load-replace + apply-snapshot pair.
 //! The peer's `match` then advances past the leader's first_index, raft clears
 //! `StateSnapshot`, and the tail replicates normally — the `promote_back`
-//! sequence, now streamed + auto-orchestrated by the native trigger.
+//! sequence, streamed + auto-orchestrated by the native trigger.
 //!
 //! Leader-push first (the leader dumps + pushes); a follower-sourced offload is
 //! a later optimization. On completion (success OR failure) the job clears its
@@ -43,7 +43,7 @@ const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
 const SNAP_TERM_HEADER = "x-rewind-snapshot-term";
 
-/// Upload producer over a held-snapshot `StreamDumper` (raft Phase 2.5): libcurl
+/// Upload producer over a held-snapshot `StreamDumper`: libcurl
 /// pulls the next wire slice via `fill` only as fast as the peer's receive
 /// window drains, so the body is never materialized whole.
 const DumpProducerCtx = struct {
@@ -295,7 +295,7 @@ pub const SnapshotCatchupThread = struct {
     /// Open a held-snapshot dumper over a tenant's live manifest. `openSnapshot`
     /// captures a consistent MVCC view (read txn + a copy of the committed
     /// overlay) WITHOUT forcing a `durabilize` — no leader-poll-loop fsync
-    /// contention, unlike the retired single-shot `dumpTenantBundle`. The read
+    /// contention. The read
     /// txn pins LMDB pages for the transfer (the deadline bounds the pinning).
     fn openDumper(self: *Self, tenant: []const u8) ?kv_mod.StreamDumper {
         const inst = (self.tenant.getInstance(tenant) catch null) orelse {

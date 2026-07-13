@@ -1,12 +1,12 @@
-//! V2 raft-log envelope codec — the typed byte blob that travels through
+//! Raft-log envelope codec — the typed byte blob that travels through
 //! a tenant's raft group and is decoded at apply time (`node.zig`).
 //!
 //! The byte layout (`[1B type][2B id_len BE][id][payload]`, the multi
 //! wrapper, and the readset-framed type-0 `WriteSetPayload`) lives ONCE
 //! in `src/kv/envelope_codec.zig` (std-only, re-exported by `kvlimbs`);
-//! this file delegates those primitives and layers the V2-spine
+//! this file delegates those primitives and layers the consensus-spine
 //! additions on top: the origin-identity `EntryFrame` and the typed
-//! `Type` enum whose decode rejects retired V1 slots loudly. A worker
+//! `Type` enum whose decode rejects unknown slots loudly. A worker
 //! propose (encoded via `apply.zig` → the same codec) applies unchanged
 //! on any follower by construction — there is no second implementation
 //! to hold in sync.
@@ -24,9 +24,9 @@ pub const Error = error{
     UnknownEnvelopeType,
     NestedMulti,
     /// A raft entry did not start with the `ENTRY_FRAME_MAGIC` byte —
-    /// every V2 entry is origin-framed at propose; a bare envelope in
-    /// the log is a producer bug (or a stale pre-frame entry, which a
-    /// pre-launch data-dir wipe removes).
+    /// every entry is origin-framed at propose, so a bare envelope in
+    /// the log is a producer bug (or an unframed entry from an incompatible
+    /// format, which a data-dir wipe removes).
     BadEntryFrame,
     OutOfMemory,
 };
@@ -100,23 +100,22 @@ pub fn decodeEntryFrame(bytes: []const u8) Error!EntryFrame {
     };
 }
 
-/// Envelope type byte. Numbering matches V1's `apply.EnvelopeType` so
-/// the wire format is stable across the cutover. Retired V1 slots
-/// (3..=11) are intentionally absent — `decode` rejects any byte that
-/// isn't a live variant as `UnknownEnvelopeType`, so a stale entry
-/// surfaces loudly instead of mis-applying.
+/// Envelope type byte (wire-frozen numbering). Only the live variants
+/// below decode; `decode` rejects any other byte — including the
+/// reserved/retired slots 3..=11 — as `UnknownEnvelopeType`, so a stale or
+/// unexpected entry surfaces loudly instead of mis-applying.
 pub const Type = enum(u8) {
-    /// Per-tenant writeset. `id` = tenant store id; payload = the raw
-    /// `writeset.WriteSet.encode` bytes (Phase 1: no readset section).
+    /// Per-tenant writeset. `id` = tenant store id; payload = the readset-
+    /// framed `WriteSetPayload` (the `writeset.WriteSet.encode` bytes plus
+    /// an optional readset section).
     writeset = 0,
     /// Multi-envelope wrapper. `id` empty; payload =
     /// `[u8 count]([u32 len LE][inner_envelope]){count}`. Inner
     /// envelopes apply in order; nesting panics (`NestedMulti`).
     multi = 1,
     /// Root writeset — applied to the node-wide `__root__` store.
-    /// Producer is the control plane (provisionInstance / admin), which
-    /// arrives in Phase 2+; decode is supported here so the type round-
-    /// trips, but `node.zig`'s apply path does not route it in Phase 1.
+    /// Producer is the control plane (provisionInstance / admin);
+    /// `node.zig`'s apply path routes it to the `__root__` store.
     root_writeset = 2,
 };
 
@@ -284,7 +283,7 @@ test "multi wrapper round-trips and unwraps inner envelopes in order" {
 }
 
 test "decode rejects a retired/unknown type byte" {
-    // Type 8 was a retired V1 schedule envelope; must surface loudly.
+    // Type 8 is a reserved/retired slot (a former schedule envelope); must surface loudly.
     var buf = [_]u8{ 8, 0, 0 };
     try testing.expectError(Error.UnknownEnvelopeType, decode(&buf));
 }

@@ -19,10 +19,10 @@
 //! the JS-authored test runner (`harness.zig`, `runTests`) holds ONE persistent
 //! `Engine` and folds a whole saga over repeated `simulate` calls, running the
 //! test body itself on a SEPARATE harness reactor — two reactors, one thread,
-//! the de-singletoned instance API's headline use case.
+//! the instance API's headline use case.
 //! The base64-tape → world transcode lives in `export_fixture.zig` (used by
-//! `pull` online + `export-fixture` offline). The old ordered-cursor `run` +
-//! its `.tape` host mode are retired — resolution is by-key.
+//! `pull` online + `export-fixture` offline). Resolution is by-key (there is
+//! no ordered-cursor `run` or `.tape` host mode).
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
@@ -46,13 +46,12 @@ pub const TestReport = harness.Report;
 pub const TestFileResult = harness.FileResult;
 
 // ── arenajs native ABI — instance API (qjs-arena-reactor.h) ──
-// The reactor was de-singletoned in arenajs 0.3.3 (`arena_reactor_new` + the
-// `_r` variants): each `ArenaReactor*` owns its own runtime, so two can coexist
-// on one thread and runs may NEST across them. That is exactly the shape the
-// rewind test runner needs — a long-lived harness runtime whose test body
-// synchronously drives a reset-reused sim runtime via `simulate()` — so we drop
-// the old process-global singleton (`arena_init`/`arena_run_module`) entirely
-// and consume the instance surface (converge to one path, no coexistence).
+// Each `ArenaReactor*` (arenajs 0.3.3's `arena_reactor_new` + the `_r`
+// variants) owns its own runtime, so two can coexist on one thread and runs
+// may NEST across them. That is exactly the shape the rewind test runner needs
+// — a long-lived harness runtime whose test body synchronously drives a
+// reset-reused sim runtime via `simulate()` — so the engine consumes the
+// instance surface, not a process-global singleton.
 pub const ArenaReactor = opaque {};
 extern fn arena_reactor_new(base_kb: c_int, request_kb: c_int) ?*ArenaReactor;
 // arenajs 0.3.4 deferred-freeze construction — lets us install the compute
@@ -107,8 +106,7 @@ pub const Engine = struct {
     /// those objects outlive the request arena but are referenced from base —
     /// `JS_FreeRuntime`'s leak check would abort if we freed the runtime with
     /// them still rooted. The replay/sim/test CLIs are one-shot processes, so
-    /// the reactor is reclaimed at exit (the same lifetime the pre-0.3.3
-    /// singleton had — it never freed either). `deinit` stays for API symmetry
+    /// the reactor is reclaimed at exit. `deinit` stays for API symmetry
     /// and to mark the owning scope.
     pub fn deinit(self: *Engine) void {
         _ = self;
@@ -277,8 +275,7 @@ pub const Engine = struct {
         // reactor, so a GC world must not leak GC mode into the next bump world.
         arena_set_request_mode_r(self.sim, if (wv.arena_gc) 0 else 1);
         arena_set_random_seed_r(self.sim, wv.seed);
-        // Reinterpret the u64 ms bit-pattern as the i64 the API takes (matches
-        // the pre-instance lo/hi split, which passed the same 64 bits); a plain
+        // Reinterpret the u64 ms bit-pattern as the i64 the API takes; a plain
         // @intCast would panic on a pathological now_ms ≥ 2^63.
         arena_set_date_now_r(self.sim, @bitCast(wv.now_ms));
         arena_set_trace_mode_r(self.sim, 0);
@@ -305,7 +302,7 @@ pub const Engine = struct {
 /// Process-global sim engine backing `runWorld`. Lazily created once and
 /// **reused** (each `simulate` resets the sim reactor's request arena), so
 /// repeated `runWorld` calls in one process share one reactor rather than
-/// leaking a fresh ~16 MiB runtime per call — the pre-0.3.3 init-once behavior.
+/// leaking a fresh ~16 MiB runtime per call.
 /// Not thread-safe (one thread, per the reactor contract). The harness runner
 /// holds its OWN separate `Engine`; this is only `rewind sim`/`replay`.
 var g_run_engine: ?Engine = null;

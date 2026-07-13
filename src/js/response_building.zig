@@ -42,7 +42,7 @@ pub fn unwrapPromise(ctx: *c.JSContext, v: c.JSValue) Unwrapped {
 ///   - Uint8Array / typed-array view → raw backing bytes verbatim;
 ///     `is_json_out` = false (returned bytes mean bytes — the former
 ///     JSON.stringify fallthrough corrupted them to `{"0":..}`;
-///     docs/decisions.md Â§4.11)
+///     docs/decisions.md §4.11)
 ///   - undefined/null → empty body; `is_json_out` = false
 ///   - anything else → `JSON.stringify(ret)`; `is_json_out` = true
 pub fn bodyFromReturn(

@@ -16,12 +16,11 @@ const c = @import("nghttp2_c.zig").c;
 // Component types
 // =============================================================================
 
-// ── Connection/stream leaf state (refactor-audit §4.6 step 1) ────────
+// ── Connection/stream leaf state (refactor-audit §4.6) ──────────────
 // The non-generic per-connection / per-stream types (Conn, Http1Conn +
 // its lifecycle arms, Stream, WsReassembler, HeaderBuf, BodySink, …)
-// live in conn_state.zig; re-exported here under their old names so no
-// call site — internal or external — changed spelling. Visibility
-// mirrors the pre-split declarations.
+// live in conn_state.zig; re-exported here so call sites — internal or
+// external — reference them through this module.
 const conn_state = @import("conn_state.zig");
 pub const HeaderField = conn_state.HeaderField;
 pub const BodySink = conn_state.BodySink;
@@ -174,7 +173,7 @@ pub const H2Options = struct {
     /// already 1000× the expected end-to-end time. A connection
     /// silent for 10 s is either an abandoned client or a stuck
     /// peer; either way, freeing the slot is the right move. Set
-    /// to 0 to disable (legacy behavior).
+    /// to 0 to disable idle reaping entirely.
     idle_timeout_ns: u64 = 10 * std.time.ns_per_s,
     /// Idle reap timeout for CLIENT-direction connections (this
     /// instance acting as an h2 client — e.g. the front door's pooled
@@ -429,9 +428,8 @@ pub fn H2(comptime opts: Options) type {
 
         // ENOBUFS-on-recv tracking. The kernel returns ENOBUFS when
         // the io_uring registered buffer pool (`buf_count`) is empty
-        // at recv time. Used to be silently dropped (destroyed the
-        // conn, lost the request); now it's treated as back-pressure
-        // and the connection is re-armed, with a warning on first
+        // at recv time. Treated as back-pressure: the connection is
+        // re-armed rather than dropped, with a warning on first
         // occurrence and every 10k events thereafter so the
         // misconfiguration is visible.
         recv_enobufs_total: u64 = 0,
@@ -445,7 +443,7 @@ pub fn H2(comptime opts: Options) type {
         /// Server-side response counts by HTTP status CLASS, indexed
         /// [0]=other(<100) [1]=1xx [2]=2xx [3]=3xx [4]=4xx [5]=5xx — the RED
         /// error-rate signal (the serving-path metric the consensus/io gauges
-        /// lacked). NO per-route/tenant labels (the active-series rule), just
+        /// don't cover). NO per-route/tenant labels (the active-series rule), just
         /// the 6 bounded classes. Bumped in `consumeResponses` for every
         /// response emitted to a client (h1 + h2); read by `writeConnMetrics`
         /// on the SAME poll-loop thread, so plain counters (no atomics). On the
@@ -1160,8 +1158,8 @@ pub fn H2(comptime opts: Options) type {
                     },
                     // Data frames: the shared `WsFragments` core owns the §5.4
                     // rules + the running size cap. Any feed error — a protocol
-                    // violation, or OOM mid-reassembly (previously a silent
-                    // frame drop that desynced the fragment state) — closes
+                    // violation, or OOM mid-reassembly (dropping the frame
+                    // silently would desync the fragment state) — closes
                     // with 1002, matching this parser's oversize posture above.
                     .text, .binary, .continuation => blk: {
                         const fed = wr.frag.feed(h2.allocator, frame.opcode, frame.fin, frame.payload, Http1Conn.MAX_WS_MESSAGE) catch {
@@ -2155,9 +2153,9 @@ pub fn H2(comptime opts: Options) type {
             });
 
             // RED error-rate signal: responses served to clients by status
-            // class. The serving-path counter the consensus/io gauges lacked —
-            // an on-call's first question ("are we serving 5xx, and how many?")
-            // is now answerable + alertable. Bounded labels (5 classes + other);
+            // class. The serving-path counter the consensus/io gauges don't
+            // provide — an on-call's first question ("are we serving 5xx, and
+            // how many?") is answerable + alertable. Bounded labels (5 classes + other);
             // tenant/route stay OUT (active-series rule) — they're trace
             // exemplars, not labels.
             const hc = self.http_status_class;
@@ -2813,8 +2811,7 @@ pub fn H2(comptime opts: Options) type {
                 // empty." That's a buffer leak fingerprint —
                 // buffers handed to userspace and lost via some
                 // destruction path that bypasses the regular
-                // return cycle (the bug fixed in commit 6ee648a
-                // was the canonical case). Abort with the diag
+                // return cycle. Abort with the diag
                 // numbers so the next investigator sees the
                 // imbalance directly instead of having to chase
                 // it down by hand.
@@ -3653,8 +3650,8 @@ pub fn H2(comptime opts: Options) type {
         /// holds the field array + name/value bytes, freed by `ReqHeaders.deinit`.
         /// Build the h1 request's ReqHeaders through the SAME `HeaderBuf`
         /// the h2 path uses — one hardened growth/pack implementation, one
-        /// combined-allocation layout (§4.2: the h1 copy used to hand-roll
-        /// the layout and could drift from the h2spec-hardened builder).
+        /// combined-allocation layout (§4.2: a separate h1 layout would
+        /// risk drifting from the h2spec-hardened builder).
         /// Pseudo-headers first (h2 ordering rules), then the head's real
         /// headers lowercased, minus hop-by-hop + Connection-nominated.
         fn http1BuildReqHeaders(self: *Self, head: http1.Head, scheme: []const u8) !ReqHeaders {
@@ -3784,7 +3781,7 @@ pub fn H2(comptime opts: Options) type {
                 }
             } else {
                 // Connection: close — let the idle-timeout GC reap once the write
-                // drains (same proven path as the old 426 reply).
+                // drains.
                 h1c.closing = true;
             }
         }
@@ -4008,8 +4005,8 @@ pub fn H2(comptime opts: Options) type {
             resp.appendSlice(h2.allocator, "\r\n\r\n") catch return .gone;
 
             // Materialize the 101 BEFORE any state flips so every failure arm
-            // leaves the conn in its parked-pending shape (the old code rolled
-            // back by hand and briefly held a half-flipped conn).
+            // leaves the conn in its parked-pending shape (rolling back by
+            // hand would briefly hold a half-flipped conn).
             const out = resp.toOwnedSlice(h2.allocator) catch return .gone;
 
             h2.body_sinks.append(h2.allocator, .{
@@ -4626,7 +4623,7 @@ pub fn H2(comptime opts: Options) type {
                 if (conn_ptr.ng_session == null) continue;
 
                 // Graceful idle reap (h2): the idle DETECTION that queues
-                // the GOAWAY now lives in `reapIdleConnections`, which runs
+                // the GOAWAY lives in `reapIdleConnections`, which runs
                 // in `pollPostlude` AFTER inbound reads are fed to nghttp2 —
                 // so a request that just arrived on an idle connection
                 // refreshes `last_active_ns` and is never reaped out from
@@ -4818,9 +4815,9 @@ pub fn H2(comptime opts: Options) type {
         /// request that just arrived on an idle connection has already
         /// refreshed `last_active_ns` and is NOT reaped out from under
         /// itself. This ordering is the cure for the idle-keepalive
-        /// reuse-vs-reap race (the front-door TTFB stall): when the
+        /// reuse-vs-reap race (the front-door TTFB stall): if the
         /// detection ran in `driveAllSends` (BEFORE reads), a reuse
-        /// request landing exactly as the idle timer expired was
+        /// request landing exactly as the idle timer expired would be
         /// terminated before it was ever read, stranding the client.
         ///
         /// For h2 we queue a graceful GOAWAY (`terminate_session`) and

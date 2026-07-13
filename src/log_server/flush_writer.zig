@@ -3,19 +3,20 @@
 //! embedded as a fixed-size header prefix) and PUTs it into a
 //! `BatchStore` as a single object.
 //!
-//! Wire format (Phase 5.5(a-3)):
+//! Wire format:
 //!
 //!   [4 bytes]  sidecar_size_le  — u32, little-endian
-//!   [N bytes]  sidecar JSON     — same shape as the old `.idx.json`
-//!                                 minus `ndjson_key` (now self-
-//!                                 referential)
+//!   [N bytes]  sidecar JSON     — the index shape, minus `ndjson_key`
+//!                                 (self-referential; it lives in this
+//!                                 object)
 //!   [M bytes]  concatenated raw-deflate frames
 //!                                — one self-terminating frame per
 //!                                  record, BFINAL=1; record offsets
 //!                                  in the sidecar are file-relative
 //!                                  (i.e. include `4 + sidecar_size`)
 //!
-//! One PUT per flush replaces the previous ndjson + .idx.json pair.
+//! One PUT per flush writes the whole batch as a single object (no
+//! separate `.idx.json`).
 //! The orphan-on-crash story is bounded by the BatchStore's atomic
 //! semantics — partial PUTs surface as 4xx/5xx and the in-memory
 //! records are dropped per the lossy-on-failure semantics in
@@ -385,16 +386,15 @@ fn writeTags(w: *std.Io.Writer, tags: []const log_mod.Tag) !void {
 /// Emit `tapes` as `{name_b64: "<base64>", ...}`. Empty channels
 /// emit `null` (not the empty string) so consumers can distinguish
 /// "no capture" from "captured zero bytes." `*_body_truncated`
-/// flags are only emitted alongside the body fields, matching the
-/// pre-refactor schema.
+/// flags are only emitted alongside the body fields.
 fn writeTapePayloads(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     t: *const log_mod.TapePayloads,
 ) !void {
     try w.writeByte('{');
-    // `docs/primitive-gaps.md` §9 + fold-in: per-request scalars
-    // used at capture time. Replay reseeds the per-context PRNG
+    // `docs/primitive-gaps.md` §9: per-request scalars used at
+    // capture time. Replay reseeds the per-context PRNG
     // with `seed` and pins `Date.now()` to
     // `@divTrunc(timestamp_ns, ns_per_ms)` so `Math.random` /
     // `crypto.*` / `Date.now()` / `new Date()` reproduce the

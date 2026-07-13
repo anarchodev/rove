@@ -1,5 +1,5 @@
-//! `log_index.db` — local SQLite store the log-server (Phase 5.5 a)
-//! polls into. Schema mirrors `docs/logs-plan.md` §4.2: one row per
+//! `log_index.db` — local SQLite store the log-server polls into.
+//! Schema mirrors `docs/logs-plan.md` §4.2: one row per
 //! batch (for the indexer's idempotency + sidecar bookkeeping) and
 //! one row per record (for the dashboard's list / show queries).
 //!
@@ -86,10 +86,9 @@ const SCHEMA: [:0]const u8 =
 ///     gives the reader a consistent snapshot without blocking the
 ///     writer.
 ///
-/// Before the split both roles shared ONE FULLMUTEX connection, so
-/// every read serialized against every indexer write — the index's
-/// near-term scaling ceiling. WAL was already on; the split just hands
-/// reads their own handle.
+/// The two connections keep reads off the writer's mutex: a single
+/// shared FULLMUTEX connection would serialize every read against
+/// every indexer write.
 pub const IndexDb = struct {
     allocator: std.mem.Allocator,
     db: *c.sqlite3,
@@ -460,8 +459,8 @@ fn execLogIndexInserts(
         _ = c.sqlite3_reset(st);
         _ = c.sqlite3_clear_bindings(st);
         // Each record carries its own tenant_id under the
-        // interleaved-per-node layout (Phase 5.5 a-2). The indexer
-        // demuxes here so log_index stays per-tenant.
+        // interleaved-per-node layout. The indexer demuxes here so
+        // log_index stays per-tenant.
         // The sidecar's per-record offset is frame-relative; add
         // `header_size` (= 4 + sidecar_size) so the stored offset is
         // file-relative — /show's range-GET reads at this offset

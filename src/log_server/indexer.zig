@@ -38,8 +38,8 @@
 //! past that whole node, repeat. O(nodes) tiny LISTs — no delimiter
 //! support needed from the backend, so it works identically on S3 /
 //! memory / fs. Per pass the cost is O(nodes), not O(objects-ever-
-//! written) as the full scan was; idle passes that find nothing cost a
-//! handful of empty LISTs regardless of how much history has accrued.
+//! written); idle passes that find nothing cost a handful of empty
+//! LISTs regardless of how much history has accrued.
 //!
 //! The cursor always advances to the last LISTed key, even past a batch
 //! that failed to read (logged + counted in `skipped_invalid`) — so a
@@ -626,7 +626,7 @@ test "pollOnce cursor skips already-indexed batches on the next pass" {
 
     // Per-node cursor: the second pass resumes start-after the indexed
     // key, so it re-reads NOTHING — the proof the cursor advanced and
-    // persisted. (The old full-scan re-walked the sidecar every pass.)
+    // persisted.
     const stats2 = try pollOnce(a, store, db, 32);
     try testing.expectEqual(@as(u32, 0), stats2.sidecars_seen);
     try testing.expectEqual(@as(u32, 0), stats2.batches_indexed);
@@ -730,7 +730,7 @@ test "pollOnce clock-skew buffer rescues a late lower-ns batch" {
 
     // …then a batch whose node flushed LATE but with a clock 20 s behind (well
     // within CURSOR_LAG_NS = 30 s), so its key sorts BELOW the cursor's true
-    // max. The old non-lagged cursor would skip it forever; the buffer re-lists
+    // max. A non-lagged cursor would skip it forever; the buffer re-lists
     // the window and indexes it.
     const late_ns: u64 = 80 * std.time.ns_per_s;
     const late_bid = try std.fmt.allocPrint(a, "{d:0>20}-{d:0>20}", .{ late_ns, @as(u64, 3) });

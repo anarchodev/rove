@@ -1,9 +1,8 @@
-//! Standalone log-server (Phase 5.5 a, step 2) — combines the
-//! background indexer thread + an h2 query API in one process.
+//! Standalone log-server — combines the background indexer thread +
+//! an h2 query API in one process.
 //!
-//! Loopback-only at this stage (no public TLS); step 6 of the
-//! migration moves it to `logs.{public_suffix}` with TLS + JWT
-//! handoff. The wire shape follows `docs/logs-plan.md` §5:
+//! Reachable at `logs.{public_suffix}` with TLS + JWT handoff. The
+//! wire shape follows `docs/logs-plan.md` §5:
 //!
 //!   GET /v1/{tenant_id}/list
 //!         ?limit=N&after_received_ns=X&after_request_id=Y
@@ -16,17 +15,16 @@
 //!         in the .ndjson payload)
 //!       → 404 if the request id isn't indexed
 //!
-//!   GET /v1/{tenant_id}/count                       (Phase 5.5 a, A2)
+//!   GET /v1/{tenant_id}/count
 //!       → 200 text/plain (decimal record count for the tenant)
 //!
-//! For step 2 the binary spawns one indexer + one h2 server, both
-//! against a `BatchStore` / `IndexDb` the caller wires up. Step 3
-//! added the worker-side flush path (`log.backend = s3`) so real
-//! traffic populates the bucket. Phase 5.5 a-2 retired
-//! `/v1/{tenant_id}/blob/{hash}` and the per-tenant `log-blobs/`
-//! store — tape + body bytes now ride inline in the ndjson record
-//! (`record.tapes.{kv,date,...}_b64`). The replay UI's existing
-//! /show round-trip already returns the bytes it needs, no second
+//! The binary spawns one indexer + one h2 server, both against a
+//! `BatchStore` / `IndexDb` the caller wires up. The worker-side
+//! flush path (`log.backend = s3`) is what populates the bucket.
+//! There is no `/v1/{tenant_id}/blob/{hash}` endpoint and no
+//! per-tenant `log-blobs/` store — tape + body bytes ride inline in
+//! the ndjson record (`record.tapes.{kv,date,...}_b64`). The replay
+//! UI's /show round-trip returns the bytes it needs, no second
 //! fetch.
 
 const std = @import("std");
@@ -418,9 +416,7 @@ fn handleOne(
     //     chokepoint guarantee (docs/architecture/cli-and-deploy.md §7; docs/architecture/auth-consolidation.md
     //     A4): the worker's fetch engine mints the scoped token when it
     //     rewrites the `rewind-logs.internal` host the `__admin__`
-    //     chokepoint issues. Closes the audit's open latent-critical —
-    //     the old "trusts `exp`, treats every token as any-tenant" gap is
-    //     deleted, not patched.
+    //     chokepoint issues.
     //   • The worker→log-server batch PUSH (`/v1/_internal/batch-pushed`)
     //     is inherently multi-tenant ingestion (one S3 flush interleaves
     //     tenants), so it can't be tenant-scoped; it takes a plain
@@ -766,7 +762,7 @@ fn decompressRawDeflate(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Total record count for a tenant (Phase 5.5 a, A2). Plain decimal
+/// Total record count for a tenant. Plain decimal
 /// body (`{count}\n`) so a shell pipeline can `wc`/`grep` it without
 /// pulling in jq. Backed by `IndexDb.queryCount` — covering scan on
 /// the (tenant_id, received_ns) primary index, cheap.

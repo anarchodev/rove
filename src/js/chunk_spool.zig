@@ -12,11 +12,11 @@
 //! of the comptime Worker type and avoids an import cycle). The
 //! push/pop/dispatch/read-back policy lives in `worker_streaming.zig`.
 //!
-//! Phase 3: a FIFO with a K-deep RAM window. Entries within K of the
+//! A FIFO with a K-deep RAM window. Entries within K of the
 //! head keep their inline `bytes`; entries pushed beyond K have their
 //! inline bytes evicted (freed) — the coordinator copy
-//! (`coord_worker_id`/`coord_seq`, submitted by the producer in Phase
-//! 1) is the durable ground truth, and the consumer reads evicted
+//! (`coord_worker_id`/`coord_seq`, submitted by the producer) is the
+//! durable ground truth, and the consumer reads evicted
 //! bytes back via `coord.readBody` when the entry finally reaches the
 //! head. This bounds the spool's inline RAM at ~K chunks regardless
 //! of how far the consumer falls behind the producer.
@@ -28,7 +28,7 @@ const UpstreamFetchEvent = components_mod.UpstreamFetchEvent;
 
 /// One spooled chunk. Wraps the carry-through `UpstreamFetchEvent`
 /// (which already owns its `bytes`, `fetch_headers`, `name`,
-/// `fetch_id`, … and carries the Phase 1 coord pointer) plus the
+/// `fetch_id`, … and carries the coord pointer) plus the
 /// eviction marker.
 pub const SpoolEntry = struct {
     event: UpstreamFetchEvent,

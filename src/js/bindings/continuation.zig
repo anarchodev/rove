@@ -64,9 +64,8 @@ pub const Continuation = struct {
     /// through the SAME dispatch path a request is — it is not a new
     /// calling convention.
     fn_name: ?[]u8,
-    /// The author's `ctx`, JSON-serialized. The runtime later forms
-    /// the next hop's request body as ctx + the injected effect
-    /// outcome (Phase 3b-iii); 3b-i only captures it.
+    /// The author's `ctx`, JSON-serialized. The runtime forms the
+    /// next hop's request body as ctx + the injected effect outcome.
     ctx_json: []u8,
     /// User-defined index tags set via `request.tag(k,v)` during the
     /// activation that returned this continuation. Owned slice + owned
@@ -132,7 +131,7 @@ pub fn jsNext(
                 // A PROVIDED ctx that JSON can't carry (BigInt, function,
                 // circular) must fail loudly — storing "null" silently
                 // loses continuation state
-                // (docs/decisions.md Â§4.11).
+                // (docs/decisions.md §4.11).
                 c.JS_FreeValue(ctx, ctx_json);
                 c.JS_FreeValue(ctx, obj);
                 _ = c.JS_ThrowTypeError(ctx, "next({ctx}): ctx must be JSON-serializable (no BigInt/function/circular values)");
@@ -202,8 +201,8 @@ fn ownedJsStr(
 }
 
 test "BENCH tryExtract per-request hot-path tax (ROVE_BENCH=1)" {
-    // Suspect #1: `tryExtract` runs on EVERY handler return. Baseline
-    // cost is zero (it didn't exist), so its ns/op on a representative
+    // Suspect #1: `tryExtract` runs on EVERY handler return. Its
+    // baseline cost is zero, so its ns/op on a representative
     // JSON-return object IS the per-request tax. Contextualized vs the
     // `JS_JSONStringify` every object-returning handler already pays.
     if (std.posix.getenv("ROVE_BENCH") == null) return error.SkipZigTest;
@@ -251,7 +250,7 @@ test "BENCH tryExtract per-request hot-path tax (ROVE_BENCH=1)" {
 
 // ── `_system.continuation.resumeIfBound(send_id, event_json)` ──────
 //
-// Phase 5 PR-3: the §6.4 held-sync resume hook from the JS shim.
+// The §6.4 held-sync resume hook from the JS shim.
 // The `__system/webhook_onresult` baked module calls this on
 // terminal — if any parked continuation on this worker has
 // `bound_schedule_id == send_id`, the call dispatches a

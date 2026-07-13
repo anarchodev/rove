@@ -1,11 +1,9 @@
-//! V2 data-plane bridge — the worker-facing seam over the per-tenant pump.
+//! Data-plane bridge — the worker-facing seam over the per-tenant pump.
 //!
-//! v2-build-order §Phase 2: swap the V1 *cluster-wide* raft
-//! propose/apply at the worker-dispatch seam for "propose to *this
-//! tenant's* group → await commit → apply." The bridge is what the
-//! reused rove-js worker talks to in place of V1's single global
-//! `kv.RaftNode`. It owns the Phase-1 `Node` (one raft-rs `Manager` +
-//! one `SharedWal`, per-tenant groups) and drives its pump.
+//! The bridge is the seam the rove-js worker proposes through at the
+//! worker-dispatch point: "propose to *this tenant's* group → await commit
+//! → apply." It owns the `Node` (one raft-rs `Manager` + one `SharedWal`,
+//! per-tenant groups) and drives its pump.
 //!
 //! ## Threading split (the load-bearing invariant)
 //!
@@ -49,17 +47,16 @@
 //! this bridge's own id and its seq is still pending** — an identity
 //! binding, never a positional one.
 //!
-//! Two earlier bindings were wrong in turn. Phase-2 *counting* (Nth
-//! commit = seq N) broke under multi-node: a follower applies entries
-//! with no local proposer, and a rejected propose never commits. The
-//! Phase-5 *leader-gated FIFO pop* fixed those but still bound by
-//! POSITION: an old-term entry resurrected by a re-election (committing
-//! while a NEW propose sat at the FIFO front) popped the wrong seq — a
-//! false durable ack for a write that had not committed. Identity makes
-//! that impossible: a committed entry can only ever credit the exact
-//! propose that produced it, and the per-boot random origin also fences
-//! a restarted node's replayed entries from colliding with the new
-//! incarnation's seqs.
+//! Two simpler bindings don't work here, so identity is load-bearing.
+//! *Counting* (Nth commit = seq N) breaks under multi-node: a follower
+//! applies entries with no local proposer, and a rejected propose never
+//! commits. A *leader-gated FIFO pop* still binds by POSITION: an old-term
+//! entry resurrected by a re-election (committing while a NEW propose sits
+//! at the FIFO front) pops the wrong seq — a false durable ack for a write
+//! that has not committed. Identity makes that impossible: a committed
+//! entry can only ever credit the exact propose that produced it, and the
+//! per-boot random origin also fences a restarted node's replayed entries
+//! from colliding with the new incarnation's seqs.
 //!
 //! The same identity keys the worker-overlay store skip (`skipQuery`):
 //! the pump skips the store write iff the entry is this bridge's own
@@ -165,10 +162,10 @@ pub const GroupSig = struct {
     /// used by `refreshLeadership` to detect the follower→leader (false→true)
     /// promotion edge. A freshly-promoted leader must run the on-promotion
     /// recovery hook (reload the tenant's deployment + reconstruct the
-    /// volatile scheduler/owed-retry watermarks the old leader held in RAM) —
-    /// V1's `loop46` drove this off a single node-wide `was_leader`, but V2
-    /// leadership is per-group, so the edge lives here. Touched only in
-    /// `refreshLeadership` under `Bridge.mutex`.
+    /// volatile scheduler/owed-retry watermarks the old leader held in RAM).
+    /// Leadership is per-group, so the promotion edge lives here (not a
+    /// single node-wide flag). Touched only in `refreshLeadership` under
+    /// `Bridge.mutex`.
     was_leader: bool = false,
     /// FIFO of proposed-but-not-yet-committed seqs (front = oldest).
     /// Pushed by `propose`; the commit hook removes EXACTLY the
@@ -228,16 +225,16 @@ const ControlCmd = struct {
     /// bytes written (out). `lt_ok` flags a resolved entry.
     entry_buf: ?[]u8 = null,
     entry_len: usize = 0,
-    /// `apply_local_snapshot` (Phase 2 — membership SSOT): the source leader's
+    /// `apply_local_snapshot` (membership SSOT): the source leader's
     /// ConfState the baseline carries, so a joiner learns its membership from the
     /// snapshot. Null → keep the group's current membership (membership-neutral
-    /// promote-back, unchanged). Borrowed from the caller stack for the call.
+    /// promote-back). Borrowed from the caller stack for the call.
     snap_voters: ?[]const u64 = null,
     snap_learners: ?[]const u64 = null,
-    /// `create_group_epoch` (Phase 2e — cluster node-set SSOT): the initial voter
+    /// `create_group_epoch` (cluster node-set SSOT): the initial voter
     /// set a FRESH group is born with, supplied by the control plane (the cluster
-    /// node set) instead of the node's static `REWIND_VOTERS`. Null → `self.voters`
-    /// (unchanged). Borrowed from the caller stack for the blocking call.
+    /// node set) instead of the node's static `REWIND_VOTERS`. Null → `self.voters`.
+    /// Borrowed from the caller stack for the blocking call.
     birth_voters: ?[]const u64 = null,
     /// `conf_state`: caller buffers to fill + the counts written back.
     cs_voters: []u64 = &.{},
@@ -327,13 +324,13 @@ const ProposeItem = struct {
 };
 
 pub const Bridge = struct {
-    /// Mirrors the field shape of V1's `RaftNode.config` that the reused
-    /// worker reads (`worker.raft.config.node_id`) — single-node default 1.
+    /// Config surface the worker reads as `worker.raft.config.node_id` —
+    /// single-node default 1.
     pub const Config = struct { node_id: u32 = 1 };
 
     allocator: std.mem.Allocator,
     node: *Node,
-    /// Compatibility surface for the reused worker's `.raft.config.*` reads.
+    /// Config surface the worker reads via `.raft.config.*`.
     config: Config = .{},
 
     /// Runtime peer-address registry (consensus-and-storage.md "Cluster genesis
@@ -365,7 +362,7 @@ pub const Bridge = struct {
     groups: std.AutoHashMapUnmanaged(u64, *GroupSig) = .empty,
     /// id_str → gid (a deterministic hash; see `registerTenant`). The
     /// cross-cluster tenant→cluster directory is the separate control-plane
-    /// `Directory` (Phase 3); this is just the local id→raft-group map.
+    /// `Directory`; this is just the local id→raft-group map.
     by_id: std.StringHashMapUnmanaged(u64) = .empty,
     inbox: std.ArrayListUnmanaged(ProposeItem) = .empty,
     /// Gids with a non-empty `GroupSig.pending` (in-flight proposes). The
@@ -442,7 +439,7 @@ pub const Bridge = struct {
         return Bridge.init(allocator, node);
     }
 
-    /// Stand up a multi-node bridge (Phase 5) over a fresh multi-node
+    /// Stand up a multi-node bridge over a fresh multi-node
     /// `Node`: this node's `node_id` ∈ `voters`, the cross-node transport
     /// bound to `listen_addr` with `peers` (indexed by raft node id − 1).
     /// Like the single-node bridge it does NOT start the pump thread —
@@ -499,8 +496,8 @@ pub const Bridge = struct {
     /// advance, so the pump skips the store write **on the leader** (the
     /// worker wrote it) but still writes it **on a follower** (no worker
     /// for that tenant here). Single-node is always the leader, so this is
-    /// the old leader-skip behavior there. Call before serving (`rewind`).
-    /// The 2a unit tests, which read the pump's own store, keep the
+    /// an unconditional leader-skip there. Call before serving (`rewind`).
+    /// The unit tests, which read the pump's own store, keep the
     /// default `apply_on_commit`.
     pub fn setWorkerOverlay(self: *Bridge) void {
         self.node.apply_mode = .worker_overlay;
@@ -578,8 +575,8 @@ pub const Bridge = struct {
     }
 
 
-    /// Point follower-apply at the worker's own per-tenant serving store
-    /// (Phase 5 "Full HA"). In `worker_overlay` mode a follower has no local
+    /// Point follower-apply at the worker's own per-tenant serving store.
+    /// In `worker_overlay` mode a follower has no local
     /// worker for the tenant, so its replicated writes must land in the
     /// store a worker WOULD serve from — the worker's `inst.kv`, provisioned
     /// on demand — so that a follower promoted to leader after a failover
@@ -639,8 +636,8 @@ pub const Bridge = struct {
     /// The gid is a **deterministic hash of `id_str`**, not a local
     /// counter: a raft group spans all nodes, so every node must derive the
     /// SAME group id for a tenant or replication can't bind the incarnations
-    /// together. (Phase-2/3 used a local monotonic counter — fine for one
-    /// node, wrong the moment a second node joins.)
+    /// together. (A local monotonic counter would be fine for one node but
+    /// wrong the moment a second node joins.)
     pub fn registerTenant(self: *Bridge, id_str: []const u8) Error!u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -689,9 +686,8 @@ pub const Bridge = struct {
 
     /// Assign a per-tenant seq, enqueue a COPY of `payload` for the pump,
     /// and return the seq for the worker to park on. Copies (rather than
-    /// takes ownership) to match V1 `RaftNode.propose` semantics, so the
-    /// reused worker's existing "free the envelope after propose" logic is
-    /// unchanged — the bridge owns the copy and frees it after
+    /// takes ownership) so the worker's "free the envelope after propose"
+    /// logic holds — the bridge owns the copy and frees it after
     /// `node.propose`. Never blocks on commit; the worker polls
     /// `committedSeq(gid)`.
     ///
@@ -852,18 +848,18 @@ pub const Bridge = struct {
     }
 
     /// Highest seq for this tenant known to have faulted (leadership
-    /// loss / shutdown). Phase 2: only moves on teardown.
+    /// loss / shutdown).
     pub fn faultedSeq(self: *Bridge, gid: u64) u64 {
         const sig = self.sigFor(gid) orelse return 0;
         return sig.faulted_seq.load(.acquire);
     }
 
     /// Node-wide leadership for OBSERVABILITY ONLY: true iff this node is the
-    /// raft leader of at least one group it carries. V2 leadership is
+    /// raft leader of at least one group it carries. Leadership is
     /// per-GROUP — there is no single node-wide leader — so this must NEVER
-    /// gate a per-tenant decision (use `isLeaderOf(gid)` for that; the old
-    /// always-true `isLeader()` shim was deleted because it silently no-op'd
-    /// such gates). Used by `/_system/leader` and the `raft_is_leader` metric
+    /// gate a per-tenant decision (use `isLeaderOf(gid)` for that; an
+    /// always-true node-wide `isLeader()` would silently no-op such gates).
+    /// Used by `/_system/leader` and the `raft_is_leader` metric
     /// as a "does this node serve any group as leader" signal. Single-node
     /// short-circuits true (the sole voter leads every group, and groups form
     /// lazily so the map may be empty), preserving the smoke readiness probe.
@@ -934,7 +930,7 @@ pub const Bridge = struct {
         return self.node.meshSnapshot();
     }
 
-    /// Per-group leadership (Phase 5 multi-node). True when this node is the
+    /// Per-group leadership. True when this node is the
     /// raft leader of `gid`'s group — used to leader-gate the move surface
     /// (`v2-bundle` / `v2-kv` PUT reject fast on a follower so the front
     /// door retries the leader, avoiding a non-leader speculative write that
@@ -983,10 +979,10 @@ pub const Bridge = struct {
     /// thread (move destination). The tenant must already be
     /// `registerTenant`'d (so `gid` resolves and `id_str` is stable) and
     /// its kvexp state already loaded into the worker store. Blocks until
-    /// the pump has created + led the group. (Phase 4 destination attach.)
-    /// `birth_voters` (Phase 2e — cluster node-set SSOT): the initial voter set the
+    /// the pump has created + led the group (the move destination attach).
+    /// `birth_voters` (cluster node-set SSOT): the initial voter set the
     /// fresh group is born with (the CP-supplied cluster node set). Null →
-    /// `REWIND_VOTERS` (unchanged). The plain (no-baseline) formation path, e.g.
+    /// `REWIND_VOTERS`. The plain (no-baseline) formation path, e.g.
     /// provision's empty-attach.
     pub fn createGroupEpoch(self: *Bridge, gid: u64, epoch: u64, birth_voters: ?[]const u64) Error!void {
         const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
@@ -1002,7 +998,7 @@ pub const Bridge = struct {
     /// behaves exactly like `createGroupEpoch` (no baseline). `as_learner` births
     /// the group with this node as a non-voting learner (joining an existing
     /// group via the reconciler's learner-first path) — see node.createGroupCore.
-    /// `voters`/`learners` (Phase 2d — membership SSOT): the source leader's
+    /// `voters`/`learners` (membership SSOT): the source leader's
     /// ConfState the installed baseline carries, so the joining node learns its
     /// real membership from the snapshot rather than the static voter set. Null →
     /// membership-neutral (the born/current prs). The supplied membership MUST
@@ -1024,7 +1020,7 @@ pub const Bridge = struct {
     }
 
     /// Destroy a tenant's raft group + reclaim its WAL on the pump thread
-    /// (move source cleanup). Blocks until done. (Phase 4 source evict.)
+    /// (move source cleanup). Blocks until done.
     pub fn destroyGroup(self: *Bridge, gid: u64) Error!void {
         var cmd: ControlCmd = .{ .kind = .destroy_group, .gid = gid };
         return self.runControl(&cmd);
@@ -1056,7 +1052,7 @@ pub const Bridge = struct {
         return cmd.count;
     }
 
-    /// Operator-triggered membership change on `gid`'s group (conf_change Phase 1):
+    /// Operator-triggered membership change on `gid`'s group:
     /// `cc_type` 0 = add voter / promote, 1 = remove, 2 = add learner / demote.
     /// Runs on the pump (the only Manager toucher); leader-gated + quorum-guarded
     /// in the FFI (`Error.NotLeader` / `Error.ConfChangeQuorumGuard`). The
@@ -1384,8 +1380,8 @@ pub const Bridge = struct {
             // redelivered, so this replica is silently diverged from the
             // log), or the WAL fsync failed (nothing acked from here on
             // would be durable), or allocation failed on the commit path.
-            // Warn-and-continue (the old behavior) served a diverged
-            // replica that could later win an election; die loudly instead
+            // Warn-and-continue would serve a diverged replica that could
+            // later win an election; die loudly instead
             // — a restart replays the WAL from the last checkpoint and
             // converges. (Tests drive `pumpOnce` directly and still see
             // error returns; boot-time recovery has its own retry-from-
@@ -1395,8 +1391,7 @@ pub const Bridge = struct {
             };
             // Idle backoff: nothing to drain and nothing committed this
             // cycle. Single-node has no election/heartbeat traffic to
-            // service, so a short sleep is fine; Phase 6 wires the
-            // hibernation deadline / mailbox-driven wake here.
+            // service, so a short sleep is fine.
             if (!did) std.Thread.sleep(1 * std.time.ns_per_ms);
         }
     }
@@ -1552,10 +1547,10 @@ pub const Bridge = struct {
     /// a group processes ticks or messages, which (almost always — see
     /// `LEADER_SCAN_INTERVAL_NS`) implies it was woken into the active set
     /// earlier in the same pump cycle. A full all-groups scan runs
-    /// interval-gated as the staleness backstop. The old shape scanned
-    /// every registered group every cycle under the bridge mutex — an
-    /// O(N_tenants) per-cycle hot-path cost that nullified hibernation's
-    /// O(active) win at K=thousands. Pump-thread only (reads the Manager
+    /// interval-gated as the staleness backstop. Scanning every registered
+    /// group every cycle under the bridge mutex would be an O(N_tenants)
+    /// per-cycle hot-path cost that nullifies hibernation's O(active) win at
+    /// K=thousands. Pump-thread only (reads the Manager
     /// + `node.active`). The worker reads the atomics lock-free via
     /// `isLeaderOf`.
     fn refreshLeadership(self: *Bridge) void {

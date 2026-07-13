@@ -17,13 +17,12 @@
 //!    "version 1" is that discriminant's current shape; the NEXT change
 //!    bumps the embedded version field (RTAP/RREA/MGS2) or reserves the
 //!    next magic/type value (entry frame `0xF8`, a new envelope type) —
-//!    decoders already reject unknown discriminants loudly, so no new
-//!    per-record byte was added to the Tier-A raft-log formats
-//!    (`wire width vs interpretation`, §5 entry-frame open question
-//!    resolved: magic-IS-the-version).
-//!  - Where there was NO discriminant, a single version byte was added:
-//!    the coalesced transport frame (one byte per frame, not per record)
-//!    and the packed cert frame.
+//!    decoders already reject unknown discriminants loudly, so the Tier-A
+//!    raft-log formats carry no per-record version byte
+//!    (`wire width vs interpretation`, §5: magic-IS-the-version).
+//!  - Where there is NO discriminant, a single version byte carries the
+//!    format version: the coalesced transport frame (one byte per frame,
+//!    not per record) and the packed cert frame.
 //!
 //! Pre-launch freeze: every format here is "v1". The point of the field
 //! being in place now is that the NEXT change is a soft, fail-loud
