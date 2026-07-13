@@ -1,10 +1,10 @@
 //! Connection/stream leaf state for the h2 runtime (refactor-audit
-//! §4.6 step 1): the non-generic per-connection and per-stream types —
+//! §4.6): the non-generic per-connection and per-stream types —
 //! `Conn`, `Http1Conn` (with its lifecycle arms, §4.1), the `Stream`
 //! accumulator, the shared `HeaderBuf` (§4.2) and `WsFragments` (§4.3)
 //! cores, `WsReassembler`, `BodySink`/`BodyData`. root.zig re-exports
-//! everything under the pre-split names; the generic `H2(opts)` runtime
-//! (poll loop, nghttp2 callbacks, public API) stays in root.zig.
+//! these types; the generic `H2(opts)` runtime (poll loop, nghttp2
+//! callbacks, public API) lives in root.zig.
 //!
 //! The nghttp2 C import is shared via nghttp2_c.zig — a second
 //! `@cImport` would mint DISTINCT pointer types and `Conn.ng_session`
@@ -86,8 +86,8 @@ pub const Conn = struct {
     /// later frames may have arbitrary leading bytes.
     first_read_seen: bool = false,
     /// HTTP/1.1 connection state, mutually exclusive with `ng_session`.
-    /// Set when the first-read sniff (or, in a later phase, ALPN) routes
-    /// a server connection to the h1 codec instead of nghttp2. While this
+    /// Set when the first-read sniff (or ALPN) routes a server
+    /// connection to the h1 codec instead of nghttp2. While this
     /// is non-null the connection is driven entirely by `http1Feed` /
     /// `http1WriteResponse` (docs/v2-edge-http1-ingress.md).
     h1: ?*Http1Conn = null,
@@ -157,8 +157,8 @@ pub const Conn = struct {
 /// `websocket_surface` instances). Framed vs tunnel are per-instance disjoint
 /// (comptime opts), and an upgrade head only ever parses from the
 /// idle-between-requests state, so cross-phase combinations (`body_active`
-/// while framed, a tunnel sink mid-body, …) were never legal — now they are
-/// unrepresentable. Deliberately TOP-LEVEL because more than one phase
+/// while framed, a tunnel sink mid-body, …) are unrepresentable.
+/// Deliberately TOP-LEVEL because more than one phase
 /// consults them:
 ///   - `buf` — the inbound accumulator across the whole life: request bytes,
 ///     then the coalesced early frame bytes that ride across an upgrade,
@@ -177,8 +177,7 @@ pub const Http1Conn = struct {
     buf: std.ArrayList(u8),
     /// Set once a response with `Connection: close` (or a fatal error response)
     /// has been queued, or a phase's fatal path fired; the connection is reaped
-    /// by the idle-timeout GC after the write drains (same path the old 426
-    /// used).
+    /// by the idle-timeout GC after the write drains.
     closing: bool = false,
     /// The read entity parked in `_read_h1_paused` while inbound bytes have
     /// outrun the consumer (streaming h1 body OR tunnel relay). nil = reads
@@ -206,7 +205,7 @@ pub const Http1Conn = struct {
         /// Keep-alive decision captured from the in-flight request's head, applied
         /// when its response is serialized.
         keep_alive: bool = true,
-        /// Chunked-request decode state (Phase 4). `chunk_body` accumulates the
+        /// Chunked-request decode state. `chunk_body` accumulates the
         /// assembled body across reads; `chunk_pos` is the resume offset into the
         /// post-head region so consumed chunks are never re-scanned. Reset per
         /// request at emit. `continue_sent` guards against re-emitting `100
@@ -378,7 +377,7 @@ pub const Http1Conn = struct {
     pub const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
 
     /// Hard ceiling on a buffered request body at the edge. Per-tenant plan
-    /// limits (gap #1, 413) are enforced in the DP worker; this is the coarse
+    /// limits (413) are enforced in the DP worker; this is the coarse
     /// front-door backstop against an unbounded `Content-Length` OOM-ing the
     /// proxy before the request ever reaches a tenant.
     pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;

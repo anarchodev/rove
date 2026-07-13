@@ -16,15 +16,6 @@
 //!     layout interleaves tenants — the worker writes one object per
 //!     flush window regardless of tenant fan-in.
 //!
-//! Pre-Phase-5.5(a-2): a single `LogStore` per tenant held both
-//! responsibilities, plus a per-tenant in-memory buffer. The buffer
-//! was leftover from the raft-era per-tenant `log.db` model — every
-//! flush combined all tenants' buffers into one batch anyway, so the
-//! per-tenant slicing was complexity with no purpose. Splitting the
-//! struct removes a `HashMap(instance_id, *Buffer)` from the hot
-//! append path and folds the two-pass `flushLogs` into a single
-//! threshold check + drain.
-//!
 //! ## Best-effort, not durable
 //!
 //! Records sit in volatile memory between flushes. A worker crash
@@ -81,14 +72,12 @@ pub const Outcome = enum(u8) {
 
 /// What caused this handler activation (streaming-handlers-plan §2,
 /// the wire enum behind `request.Activation` (via its `source()`) and
-/// `LogRecord.activation`). v1 has the two implemented variants; the
-/// enum grows (`kv_wake`, `timer`, `disconnect`) when `__rove_stream`
-/// lands.
+/// `LogRecord.activation`).
 pub const ActivationSource = enum(u8) {
     inbound = 0,
     send_callback = 1,
     /// Timer wake on a held stream (streaming-handlers-plan §4.5).
-    /// Phase 2b-ii: the streaming-handler primitive's `waitFor.timer`
+    /// The streaming-handler primitive's `waitFor.timer`
     /// fires this when its `intervalMs` (or absMs) reaches the
     /// sweep's check.
     timer = 2,
@@ -109,17 +98,17 @@ pub const ActivationSource = enum(u8) {
     /// key, op }`. Prefix-only — predicate filters out of scope
     /// (§4.6 + §11.1).
     ///
-    /// Legacy single-slot activation source. Superseded by
-    /// `wake_batch` (Gap 2.2). Retained in the enum so replay can
-    /// still decode pre-§9.4 tapes.
+    /// A single-slot activation source; live held streams use
+    /// `wake_batch` instead. Retained in the enum so replay can
+    /// still decode older tapes.
     kv_wake = 4,
     /// Wake-batch activation (streaming-handlers-plan §9.4 +
     /// `docs/primitive-gaps.md` §2.2). The held stream's
     /// `PendingWakes` ring drained into a temporal-order batch of
     /// kv-write + timer entries; the handler sees
     /// `request.activation = { kind: "wake_batch", wakes: [...],
-    /// overflow: { lost_oldest } }`. Supersedes the per-wake
-    /// `kv_wake` / `timer` activation sources for held streams.
+    /// overflow: { lost_oldest } }`. Used for held streams instead of
+    /// the per-wake `kv_wake` / `timer` activation sources.
     wake_batch = 5,
     /// Subscription chain origin (`docs/primitive-gaps.md` §2.1 +
     /// `docs/subscriptions-plan.md`). A `_subscriptions/<name>/`
@@ -137,9 +126,7 @@ pub const ActivationSource = enum(u8) {
     /// last one `final: true`). Activation shape: `{ kind:
     /// "fetch_chunk", fetch_id, seq, byteOffset, bytes, headers? (seq=0),
     /// final, status? (final), ok? (final), body_truncated? (final),
-    /// ctx }`. Phase 5 PR-1 collapsed the prior `fetch_done` (8) and
-    /// `fetch_pipe_done` (9) variants into this single tag along with
-    /// dropping `pipe_to` / `on_done`.
+    /// ctx }`.
     fetch_chunk = 7,
     /// Durable scheduled wake (`docs/primitive-gaps.md` §2.6 +
     /// `docs/architecture/effects-and-handlers.md`). A `scheduler.at(whenNs, target,
@@ -170,8 +157,8 @@ pub const ActivationSource = enum(u8) {
     /// single body byte. The body bytes are untaped by derivation —
     /// no Msg carries them (§3.5's pipe_to symmetry).
     inbound_headers = 10,
-    /// Streaming inbound body chunk (gap 2.4,
-    /// `docs/architecture/effects-and-handlers.md` + `docs/handler-shape.md` §4). The
+    /// Streaming inbound body chunk
+    /// (`docs/architecture/effects-and-handlers.md` + `docs/handler-shape.md` §4). The
     /// handler module exports `onChunk`; the inbound body dispatches
     /// per-chunk — `request.body` = THIS chunk, `request.done` flags
     /// the last, `request.chunkSeq` counts from 0. A body that
@@ -187,14 +174,13 @@ pub const ActivationSource = enum(u8) {
 /// — the `tapes: TapePayloads` field — and the flush writer emits
 /// them base64-encoded in the ndjson line.
 ///
-/// Pre-Phase-5.5(a-2) these were content-addressed blobs in a
-/// per-tenant `log-blobs/` S3 prefix, with the LogRecord carrying
-/// only `*_hex` hash refs. The fanout (one PUT per channel per
-/// request) capped tape capture at single-digit-thousand req/s
-/// because std.http.Client serializes a single OVH connection that
-/// drops mid-write under concurrent load. Inlining collapses the
-/// per-request PUT count to zero — bytes ride the existing per-flush
-/// ndjson PUT — and removes the read-side hash→blob fetch hop.
+/// These bytes are inlined into the per-flush ndjson PUT rather than
+/// stored as a content-addressed blob per channel per request:
+/// inlining keeps the per-request PUT count at zero and drops the
+/// read-side hash→blob fetch hop. A per-channel-per-request fanout
+/// instead caps tape capture at single-digit-thousand req/s (one PUT
+/// per channel, serialized on a single connection that drops mid-write
+/// under concurrent load).
 pub const TapePayloads = struct {
     /// `docs/primitive-gaps.md` §9 seed-not-draws. The PRNG seed
     /// used to initialize arenajs's per-context xorshift64star for
@@ -381,15 +367,14 @@ pub const LogRecord = struct {
     /// omit them — tags are leader-captured observability.
     tags: []Tag = &.{},
     /// Per-chain identifier (streaming-handlers-plan §6). Empty
-    /// string when the record has no chain context (pre-Phase-1
-    /// records, or paths where the runtime couldn't synthesize one
+    /// string when the record has no chain context (paths where the
+    /// runtime couldn't synthesize one
     /// — early-error captures before request handling started).
     /// Allocator-owned alongside the other `[]const u8` fields.
     correlation_id: []const u8 = "",
     /// What caused this activation (streaming-handlers-plan §2).
-    /// Defaults to `.inbound` for back-compat with code paths that
-    /// haven't been updated to set it explicitly; the inbound case
-    /// is by far the dominant one historically.
+    /// Defaults to `.inbound` for code paths that don't set it
+    /// explicitly; inbound is by far the dominant case.
     activation: ActivationSource = .inbound,
     /// `docs/readset-replication-plan.md` Phase 5b: the raft seq
     /// the envelope carrying this request's writeset was proposed at.
@@ -545,8 +530,8 @@ pub fn parseLogHeader(bytes: []const u8) LogHeaderParseError!LogHeader {
 
 /// Request-id reservation window size. `nextRequestId` hands out this
 /// many ids in memory before persisting a new high-water mark to the
-/// kv store. Larger = fewer SQLite autocommits per request (which
-/// dominated ~29% of dispatch CPU profiling before this was batched);
+/// kv store. Larger = fewer SQLite autocommits per request (the
+/// per-request autocommit dominates ~29% of dispatch CPU in profiling);
 /// smaller = fewer ids wasted to sparse gaps after a crash.
 ///
 /// Invariant: after a crash, the next process resumes from the last

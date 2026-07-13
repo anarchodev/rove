@@ -1,7 +1,6 @@
 //! JSON encoder / decoder for the per-deployment manifest stored in
-//! S3 at `tenants/{id}/deployments/{dep_id:020d}.json`. Phase 5.5(e)
-//! F2-storage replaced the per-tenant `files.db` `deployment/{id}` rows
-//! with these objects in a per-tenant `deployments/` BlobBackend.
+//! S3 at `tenants/{id}/deployments/{dep_id:020d}.json` — one object per
+//! deployment in a per-tenant `deployments/` BlobBackend.
 //!
 //! Wire shape (also the storage shape):
 //!
@@ -24,8 +23,8 @@
 //! Notes on the schema:
 //!
 //! - `hash` is the source-blob hash (handlers) or content-blob hash
-//!   (statics). Kept as the historical name `hash` so the dashboard's
-//!   existing reader (`web/admin/api.js`) still matches.
+//!   (statics). Named `hash` (not `source_hash`) so the dashboard's
+//!   reader (`web/admin/api.js`) matches.
 //! - `bytecode_hash` is required for `handler` entries (worker fetches
 //!   bytecode via this hash from the file-blobs BlobBackend) and
 //!   omitted for `static` entries.
@@ -40,9 +39,9 @@ const std = @import("std");
 const root = @import("root.zig");
 
 /// `v:2` — handlers/statics + the optional `packages` / `app_imports`
-/// sections (package manager P0). No v1 back-compat: the package-manager
-/// rollout is a complete redeploy (pre-launch, no customers), so the
-/// decoder rejects anything that isn't v2 and `encode` always emits v2.
+/// sections. The decoder rejects anything that isn't v2 and `encode`
+/// always emits v2; pre-launch (no customers), a version bump is a
+/// complete redeploy rather than a compatibility shim.
 /// (A package-less deploy is simply a v2 manifest with no `packages`.)
 pub const VERSION: u32 = 2;
 
@@ -52,7 +51,7 @@ pub const Error = error{
 };
 
 /// One file a package ships (path within the package + its hashes). The
-/// P1 populator stages the bytecode at `/pkg/<pkg_hash>/<path>`.
+/// populator stages the bytecode at `/pkg/<pkg_hash>/<path>`.
 pub const PkgFile = struct {
     path: []const u8,
     bytecode_hex: [root.HASH_HEX_LEN]u8,
@@ -82,9 +81,9 @@ pub const Package = struct {
 
 /// In-memory manifest as the worker / files-server consume it after
 /// parsing. Owns its `entries` slice + each entry's `path` and
-/// `content_type` allocations, plus (v2) the `packages` / `app_imports`
+/// `content_type` allocations, plus the `packages` / `app_imports`
 /// sections and every string they own. `packages`/`app_imports` are
-/// empty for a v1 (package-less) manifest.
+/// empty for a package-less manifest.
 pub const Manifest = struct {
     id: u64,
     entries: []root.Entry,
@@ -313,9 +312,9 @@ pub fn decode(
         filled += 1;
     }
 
-    // v2 (package manager P0): optional `packages` / `app_imports`. A v1
-    // manifest omits both → empty slices → today's behavior. Allocate
-    // 0-length (not `&.{}`) so the errdefers / deinit free unconditionally.
+    // Optional `packages` / `app_imports`. A manifest that omits both →
+    // empty slices. Allocate 0-length (not `&.{}`) so the errdefers /
+    // deinit free unconditionally.
     const packages = if (obj.get("packages")) |pv|
         try parsePackages(allocator, pv)
     else
@@ -339,7 +338,7 @@ pub fn decode(
     };
 }
 
-/// A deploy-time resolution context (PM P1-deploy): just the `packages` +
+/// A deploy-time resolution context: just the `packages` +
 /// `app_imports` sections of a manifest, wire-identical to their v2
 /// manifest shapes. The deploy path carries this alongside a compile
 /// batch so package imports resolve (= are validated + loadable) at
@@ -573,15 +572,7 @@ pub fn manifestKey(buf: *[25]u8, dep_id: u64) []const u8 {
 
 /// Compute a deploy id from the manifest's entry list.
 ///
-/// Pre-launch shift: dep_ids were sequential local counters bumped by
-/// `writeManifestFromWorkingTree(current_id + 1)`. That allowed the
-/// seed's offline bootstrap (counter=0 → mints id=1 with empty
-/// manifest) and a runtime files-server (counter=0 → mints id=1 with
-/// real files) to collide on the same numeric id, masking content
-/// changes from the worker's deployment loader. Three workarounds had
-/// to be added around the loader before that surfaced.
-///
-/// The fix: dep_id is sha-256 of a canonical encoding of the entries
+/// dep_id is sha-256 of a canonical encoding of the entries
 /// list, truncated to 64 bits. Same content → same id automatically;
 /// re-deploys of identical bytes are no-ops at the storage level (PUT
 /// to the same S3 key with identical bytes). Different content → new
@@ -823,7 +814,7 @@ test "computeDeploymentId: empty entries is stable" {
     try testing.expectEqual(id_a, id_b);
 }
 
-// ── package manager P0: manifest v2 ────────────────────────────────
+// ── package manager: manifest v2 ───────────────────────────────────
 
 fn findPkg(m: Manifest, spec: []const u8) ?Package {
     for (m.packages) |p| if (std.mem.eql(u8, p.spec, spec)) return p;

@@ -3,13 +3,13 @@
 //! The front door is a single-threaded poll loop. Resolving a
 //! tenant's Host→cluster placement means a `/_cp/route` round-trip to
 //! the control plane — synchronous libcurl. Doing that on the poll
-//! loop froze the WHOLE front door (every tenant, every in-flight
-//! request) for the duration of the CP call: ~hundreds of ms when the
-//! CP answered promptly, multiple seconds when a CP node was slow or
-//! down (5 s connect timeout + failover). The workers were built to
-//! never block; a blocking proxy in front of them makes that moot.
+//! loop would freeze the WHOLE front door (every tenant, every
+//! in-flight request) for the duration of the CP call: ~hundreds of ms
+//! when the CP answers promptly, multiple seconds when a CP node is
+//! slow or down (5 s connect timeout + failover). The workers never
+//! block; a blocking proxy in front of them would make that moot.
 //!
-//! This moves the CP query off the loop. The poll loop hands a host
+//! So the CP query runs off the loop. The poll loop hands a host
 //! to `enqueue`; this thread runs the curl query and pushes a
 //! `Completion` back. The loop drains completions each cycle,
 //! populates its route cache, and resumes the requests it parked
@@ -25,7 +25,7 @@ const std = @import("std");
 const blob = @import("rove-blob");
 const curl = blob.curl;
 
-/// CP queries run off the loop, so a slow CP no longer freezes
+/// CP queries run off the loop, so a slow CP doesn't freeze
 /// serving — but it shouldn't pin the resolver thread for the libcurl
 /// defaults (5 s connect / 15 s total) either, since that delays other
 /// hosts' resolves queued behind it. Tight bounds matched to the
@@ -70,11 +70,11 @@ pub const RouteResolver = struct {
     done_mu: std.Thread.Mutex,
 
     stop: std.atomic.Value(bool),
-    /// Resolver worker pool (plan A6b). One thread serialized every
-    /// cold resolve behind the slowest CP query (up to 2 s each) —
-    /// under a burst of distinct cold hosts the tail starved into its
-    /// park deadline. Each thread owns its own curl handle; the two
-    /// queues stay the only shared state.
+    /// Resolver worker pool (plan A6b). A single thread would serialize
+    /// every cold resolve behind the slowest CP query (up to 2 s each),
+    /// starving the tail into its park deadline under a burst of
+    /// distinct cold hosts. Each thread owns its own curl handle; the
+    /// two queues stay the only shared state.
     threads: [MAX_THREADS]?std.Thread,
 
     pub const MAX_THREADS = 8;
@@ -185,7 +185,7 @@ pub const RouteResolver = struct {
     }
 
     /// Non-blocking pop; caller holds `req_mu` (tests call via
-    /// `popRequest`). FIFO — the old LIFO `pop()` starved the OLDEST
+    /// `popRequest`). FIFO — a LIFO pop would starve the OLDEST
     /// parked flows under backlog, the ones closest to their 503
     /// deadline (plan A6).
     fn popLocked(self: *RouteResolver) ?[]u8 {
@@ -217,9 +217,8 @@ pub const RouteResolver = struct {
         if (failed) self.freeCompletion(c);
     }
 
-    /// The CP `/_cp/route` query — formerly `Proxy.cpRouteQuery`, now
-    /// off the loop. Tries each CP node in order; tight timeouts so a
-    /// dead node fails over fast.
+    /// The CP `/_cp/route` query, run off the loop. Tries each CP node
+    /// in order; tight timeouts so a dead node fails over fast.
     fn query(self: *RouteResolver, host: []const u8) Outcome {
         const a = self.allocator;
         const suffix = std.fmt.allocPrint(a, "/_cp/route?host={s}", .{host}) catch return .err;

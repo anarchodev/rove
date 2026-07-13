@@ -2,11 +2,11 @@
 //!
 //! Port of shift-js's raft_write_set_t model. The leader writes each op to
 //! its LOCAL KvStore (outside this module — the worker does it in its txn),
-//! then submits the write-set via `RaftNode.proposeWriteSet`. Followers
-//! receive the replicated entry and replay the ops against their own
-//! KvStore in `RaftNode.cbApplyLog` — see `applyEncoded` below.
+//! then submits the write-set as a raft entry. Followers receive the
+//! replicated entry and replay the ops against their own KvStore — see
+//! `applyEncoded` / `applyEncodedDirect` below.
 //!
-//! Wire format (after the 8-byte seq prefix that `RaftNode` adds):
+//! Wire format:
 //!
 //!   [4B op_count]
 //!   per op:
@@ -176,15 +176,9 @@ pub const WriteSet = struct {
 /// for every PUT. Wraps the ops in a single begin/commit transaction. On
 /// error, rolls back (on a best-effort basis) and returns the error.
 ///
-/// No per-store apply-idx stamp — raft idx is globally ordered, so the
-/// apply filter lives in the caller's in-memory cluster-wide counter
-/// (with one row in `__root__.db` for restart recovery). Per-tenant
-/// `_apply_state` is no longer written; see `docs/production.md` #1.5.
-///
 /// No allocation: keys/values are borrowed by pointer straight out
 /// of `payload` into the kvexp txn (which copies them into its
 /// overlay on `put`), safe because `payload` outlives the txn here.
-/// (Pre-kvexp this fed sqlite3_bind_* with SQLITE_STATIC.)
 pub fn applyEncoded(
     kv: *kvstore.KvStore,
     seq: u64,
@@ -279,9 +273,8 @@ pub fn scanPutValue(payload: []const u8, key: []const u8) ?[]const u8 {
 /// it is) — zero-copy, like `scanPutValue`. The apply path already
 /// rejected malformed payloads loudly before any consumer of this
 /// runs; truncation/bad-type returns the error after a partial fill
-/// (callers may treat best-effort). Used by the Option (b) follower
-/// feed (`send_dispatch.classifyPayload`) to mirror the leader-side
-/// `classify(*WriteSet)` over the replicated bytes.
+/// (callers may treat best-effort). Used to decode replicated writeset
+/// bytes back into ops (e.g. the apply observer's per-put notification).
 pub fn decodeOps(
     payload: []const u8,
     allocator: std.mem.Allocator,
@@ -375,10 +368,9 @@ test "encode/decode round trip via KvStore" {
 
     try testing.expectError(kvstore.Error.NotFound, kv.get("charlie"));
     // Under kvexp there is no per-row seq column; the engine doesn't
-    // persist `applyEncoded`'s seq argument. The pre-cutover test
-    // asserted `kv.maxSeq() == 7` here — that invariant was a SQLite-
-    // era impl detail (the kv_seq table). Behavioral assertions on
-    // the key state above are what matter.
+    // persist `applyEncoded`'s seq argument, so there's nothing to assert
+    // about it here. The behavioral assertions on the key state above are
+    // what matter.
 }
 
 test "containsKey: matches put + delete ops, misses absent keys" {

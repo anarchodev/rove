@@ -782,7 +782,7 @@ pub fn Io(comptime opts: Options) type {
             // file slot immediately. Each conn ultimately holds at
             // most one registered buffer for its armed recv; accepting
             // past the pool's headroom guarantees recv ENOBUFS, which
-            // the upper layer now treats as transient (so requests
+            // the upper layer treats as transient (so requests
             // succeed eventually) but the back-pressure is real. We
             // surface it loudly to the operator (warning on first
             // denial + every 10k thereafter) — the right answer is

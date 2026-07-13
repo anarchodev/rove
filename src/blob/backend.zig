@@ -118,8 +118,8 @@ pub const BlobBackend = struct {
     /// through colocated files-server) variant; an S3 backend always
     /// produces a URL. Caller frees on success.
     ///
-    /// Used by Phase 4 of deployment-snapshots-plan to 302-redirect
-    /// static asset requests directly to S3. `expires_secs` caps the
+    /// Used by the deployment-snapshots plan to 302-redirect static
+    /// asset requests directly to S3. `expires_secs` caps the
     /// URL's lifetime (max 604800 = 7 days per the SigV4 spec).
     /// `response_content_type` overrides whatever Content-Type S3
     /// has stored for the object — set it from the static

@@ -1,6 +1,6 @@
 //! Replay-side `request` reconstruction — the Zig port of
-//! `rewind-apps/replay/_static/request-replay.mjs` `buildRequestEpilogue`
-//! (Phase 2 §2c). Returns a JS source string the driver APPENDS to the entry
+//! `rewind-apps/replay/_static/request-replay.mjs` `buildRequestEpilogue`.
+//! Returns a JS source string the driver APPENDS to the entry
 //! module's source before `arena_run_module`. Appended lines never shift the
 //! original source's line numbers, so the trace timeline stays aligned.
 //!
@@ -182,7 +182,7 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try w.writeAll(",\"ipRaw\":");
     try optValue(w, f.ip_raw);
     // ctx / activation are pre-serialized JSON values (null for inbound, so the
-    // inbound surface is byte-identical to before).
+    // inbound surface carries neither).
     try w.writeAll(",\"ctx\":");
     try w.writeAll(opts.ctx_json orelse "null");
     try w.writeAll(",\"activation\":");

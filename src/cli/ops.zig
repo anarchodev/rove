@@ -1,11 +1,11 @@
 //! `rewind-ops` — the platform/operator CLI (docs/architecture/cli-and-deploy.md §2–§3,
 //! §6). The privileged half of the split: every verb here carries an operator
 //! secret (root token → workers + deploy app; REWIND_MOVE_SECRET → CP control,
-//! which now also propagates the worker domain alias). Never shipped to
+//! which also propagates the worker domain alias). Never shipped to
 //! customers — the OIDC-scoped tenant verbs live in the separate `rewind`
 //! binary (built when the __auth__ IdP lands; both reuse `common.zig`).
 //!
-//! Verbs (audited against the live server primitives, not just the old script):
+//! Verbs:
 //!   bootstrap                       provision __admin__ via the CP + reset —
 //!                                   first-time bring-up of a virgin cluster.
 //!   reset                           POST {worker}/_system/reset — (re)deploy the
@@ -72,8 +72,8 @@ fn cmdDeploy(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, bundle
 
     const headers = authHeaders(a, env);
     // Per-file WORKSPACE deploy: reset the workspace → upload each file →
-    // cut a release. Each request is small; the old single mega-POST
-    // base64-buffered the whole bundle in the deploy app's JS heap and OOM'd
+    // cut a release. Each request is small; a single mega-POST would
+    // base64-buffer the whole bundle in the deploy app's JS heap and OOM
     // on any real static-bearing bundle.
     _ = deployPost(a, env, "/v1/deploy/reset", headers, c.tenantBody(a, tenant), "reset");
     for (b.handlers) |h| {
@@ -420,8 +420,8 @@ fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster:
 /// directory index (front routing) AND propagates the worker `__root__/domain`
 /// alias to the tenant's serving cluster (`/_system/v2-domain`), so a worker
 /// recognizes the custom host on direct/relayed requests. The CP owns
-/// host→tenant end-to-end now — no second operator secret (`ADMIN_OPS_SECRET`
-/// retired, docs/architecture/auth-consolidation.md B3). A 503 means the alias didn't land (tenant
+/// host→tenant end-to-end — no second operator secret
+/// (docs/architecture/auth-consolidation.md B3). A 503 means the alias didn't land (tenant
 /// unplaced / no reachable leader) — provision the tenant first, then retry.
 fn cmdHostAdd(a: std.mem.Allocator, env: *const c.Env, host: []const u8, tenant: []const u8) void {
     var body = std.ArrayList(u8){};
@@ -540,9 +540,8 @@ pub fn main() void {
         } else if (std.mem.eql(u8, arg, "--release")) {
             flags.release = true;
         } else if (std.mem.eql(u8, arg, "--live")) {
-            // Tolerated no-op: the move is always zero-downtime now (the
-            // brief-pause variant was retired). Accepted so old invocations
-            // don't error.
+            // Tolerated no-op: the move is always zero-downtime. Accepted
+            // so old invocations don't error.
         } else if (std.mem.eql(u8, arg, "--yes")) {
             flags.yes = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {

@@ -1,4 +1,4 @@
-//! Focused decoder for the RTAP per-`Tape` wire format (Phase 2 §2c).
+//! Focused decoder for the RTAP per-`Tape` wire format.
 //!
 //! `rewind pull` writes the recorded request's tape channels as base64 blobs
 //! (`record.tapes.{kv,module,request_reads}_tape_b64`); `rewind replay` decodes

@@ -1,11 +1,9 @@
 //! Streaming reverse-proxy core for rewind-front.
 //!
-//! Replaces the first-cut blocking-curl forward (one synchronous
-//! `easy.request` per proxied request inside the poll loop) with
-//! same-poll-loop rove-h2 CLIENT legs: one pooled h2c connection per
-//! backend node, every proxied request a multiplexed stream on it.
-//! Nothing blocks; bodies stream both ways with end-to-end
-//! backpressure:
+//! Forwards each proxied request over same-poll-loop rove-h2 CLIENT
+//! legs: one pooled h2c connection per backend node, every proxied
+//! request a multiplexed stream on it. Nothing blocks; bodies stream
+//! both ways with end-to-end backpressure:
 //!
 //!   downstream request body  → BodySink on the front's h2 SERVER side
 //!                              (headers_first) → per-flow buffer →
@@ -19,14 +17,14 @@
 //!                              upstream window only as chunks drain
 //!                              to the downstream socket.
 //!
-//! curl survives ONLY for control-plane lookups (`/_cp/route`; cert +
+//! curl is used ONLY for control-plane lookups (`/_cp/route`; cert +
 //! ACME fetches stay in main.zig) — cached, small, off the data path.
 //!
-//! ## Retry semantics (unchanged contracts, new mechanics)
+//! ## Retry semantics
 //!
 //! 421 not-leader is retry-safe by contract (nothing entered the raft
-//! log). The old front retried because it held the whole body; a
-//! streaming front can only retry what it can REPLAY. Every flow keeps
+//! log). A streaming front can only retry what it can REPLAY — it does
+//! not hold the whole body. Every flow keeps
 //! the request body in a replay buffer until it outgrows `REPLAY_CAP`
 //! (complete classic bodies are kept whole regardless of size — they
 //! are already in RAM). On 421 / transport-error-before-response with
@@ -135,8 +133,8 @@ const CONNECT_TIMEOUT_NS_DEFAULT: i128 = 1000 * std.time.ns_per_ms;
 
 /// How long a request parks waiting for a cold route resolution before
 /// it gives up with a retryable 503. Bounds the worst case for a
-/// never-seen host when the CP is slow/down (vs. the old behavior of
-/// freezing the whole loop for the libcurl timeout).
+/// never-seen host when the CP is slow/down (a slow resolve must never
+/// freeze the whole loop for the libcurl timeout).
 const ROUTE_WAIT_NS: i128 = 2500 * std.time.ns_per_ms;
 
 /// A flow whose request is fully sent upstream but that produces no
@@ -155,7 +153,7 @@ const RESPONSE_WAIT_NS: i128 = 30_000 * std.time.ns_per_ms;
 /// advertises, so in practice it never fires).
 const SETTLE_WAIT_NS: i128 = 2000 * std.time.ns_per_ms;
 
-// ── Small shared helpers (formerly in main.zig) ───────────────────────
+// ── Small shared helpers ──────────────────────────────────────────────
 
 pub fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
     const fields = rh.fields orelse return null;
@@ -606,7 +604,8 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// gate instead of replayed (plan A2).
         count_ambiguous_502: u64 = 0,
         /// Requests shed 503 because every upstream leg was saturated
-        /// (plan A3) — the visible form of what used to queue invisibly.
+        /// (plan A3) — saturation surfaced as a shed rather than an
+        /// invisible queue.
         count_upstream_sheds: u64 = 0,
         /// Requests 429'd at the per-client-IP flow cap (plan C13).
         count_client_limited: u64 = 0,
@@ -1589,8 +1588,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             }
             if (self.anyLegUp(up)) {
                 // Every leg live but saturated: SHED with a retryable
-                // 503 (nothing submitted) — the bounded, visible form
-                // of what used to queue invisibly in nghttp2 (plan A3).
+                // 503 (nothing submitted) — a bounded, visible shed
+                // rather than an invisible queue in nghttp2 (plan A3).
                 self.count_upstream_sheds += 1;
                 std.log.warn("front: all {d} leg(s) to {s} saturated — shedding", .{ up.n_legs, up.origin });
                 self.finishWithStatus(flow, 503);
@@ -2460,9 +2459,9 @@ pub fn Proxy(comptime FrontH2: type) type {
         }
 
         /// One histogram sample + one access-log line per completed
-        /// flow (plan C11) — the RED signals the front was missing:
-        /// who was served what, how fast, by which node, in how many
-        /// attempts. `status=0` means the flow died before any
+        /// flow (plan C11) — the front's RED signals: who was served
+        /// what, how fast, by which node, in how many attempts.
+        /// `status=0` means the flow died before any
         /// response (client gone / teardown).
         fn recordFlowDone(self: *Self, flow: *Flow) void {
             const dur_ns = std.time.nanoTimestamp() - flow.t_start_ns;

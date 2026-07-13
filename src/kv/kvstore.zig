@@ -1,10 +1,8 @@
 //! KvStore — handle into a `kvexp.Store` within a node-wide manifest.
 //!
-//! Phase 1 of the kvexp cutover. SQLite is gone; the data engine is
-//! anarchodev/kvexp (vendored at `vendor/kvexp/`). One kvexp manifest
-//! per binary holds all of that binary's stores; each tenant /
-//! `__root__` / `schedules` lives as a `store_id` within. Mapping
-//! `string store_id → u64` is `std.hash.Wyhash`.
+//! The data engine is anarchodev/kvexp. One kvexp manifest per binary
+//! holds all of that binary's stores; each tenant / `__root__` lives as a
+//! `store_id` within. Mapping `string store_id → u64` is `std.hash.Wyhash`.
 //!
 //! ## Two open modes
 //!
@@ -15,26 +13,24 @@
 //! - **Standalone** (tests, CLI tools): `KvStore.open(path)` builds
 //!   its own kvexp stack (PagedFile + BufferPool + PageCache +
 //!   Manifest) backing a fresh file with a single store inside.
-//!   `close` tears the whole thing down. Standalone mode preserves
-//!   the pre-cutover one-file-per-thing semantics for callers that
-//!   haven't been consolidated yet.
+//!   `close` tears the whole thing down. Standalone mode gives
+//!   one-file-per-thing semantics for callers that manage their own
+//!   file (tests, CLI tools).
 //!
 //! ## Durability
 //!
 //! Writes mutate the in-memory page cache. `kvexp.Manifest.durabilize`
-//! flushes them; that runs from `Cluster.tickSnapshot` on the raft
+//! flushes them; that runs from the durabilize checkpoint on the raft
 //! thread. Crash before durabilize loses in-memory state but the
 //! raft log is the WAL — replay reconstitutes everything past
 //! `manifest.lastAppliedRaftIdx()`.
 //!
-//! ## Legacy seq surface
+//! ## Seq surface
 //!
-//! `nextSeq` / `maxSeq` / `putSeq` / `delta` existed because the
-//! SQLite path needed an explicit row-level seq column for raft
-//! snapshot deltas. With raft-as-WAL the engine doesn't need it.
-//! The API is preserved as in-memory counters (no on-disk state)
-//! so callers compile; the delta-based snapshot path will be
-//! replaced by `kvexp.dumpSnapshot` / `loadSnapshot` in a follow-up.
+//! `nextSeq` / `maxSeq` / `putSeq` / `delta` are in-memory counters with
+//! no on-disk state — kvexp carries no per-row seq column (raft is the
+//! WAL). They exist for API compatibility; the production snapshot path is
+//! `kvexp.dumpSnapshot` / `loadSnapshot`.
 
 const std = @import("std");
 const kvexp = @import("kvexp");
@@ -43,9 +39,8 @@ pub const Error = error{
     NotFound,
     OutOfMemory,
     Conflict,
-    /// Underlying engine error. Name preserved so callers that
-    /// switch on `Error.Sqlite` keep compiling; rename is a future
-    /// cleanup pass.
+    /// Generic underlying storage-engine (kvexp) error. The `Sqlite`
+    /// spelling is a historical name for the generic engine error.
     Sqlite,
     Io,
     /// This txn's chain predecessor faulted while it was open, so a
@@ -96,10 +91,9 @@ pub const DeltaResult = struct {
     }
 };
 
-/// Lock-free monotonic counter. In the SQLite era this was sourced
-/// from `kv_seq` AUTOINCREMENT. Under kvexp it's a pure in-memory
-/// counter; the value is used as `TrackedTxn.txn_seq` and as a
-/// debugging breadcrumb. No on-disk state.
+/// Lock-free monotonic counter. A pure in-memory counter (no on-disk
+/// state); the value is used as `TrackedTxn.txn_seq` and as a debugging
+/// breadcrumb.
 pub const SeqCounter = struct {
     value: std.atomic.Value(u64) align(std.atomic.cache_line),
 
@@ -194,7 +188,7 @@ pub fn hashStoreId(id_str: []const u8) u64 {
     return std.hash.Wyhash.hash(0, id_str);
 }
 
-// Per-tenant dispatch serialization lives in kvexp now
+// Per-tenant dispatch serialization lives in kvexp
 // (`Manifest.acquire` / `tryAcquire` → `StoreLease`). Rove obtains a
 // lease per batch and releases it as soon as the handler walk
 // finishes — well before the raft propose. The Txn outlives the
@@ -205,12 +199,12 @@ pub fn hashStoreId(id_str: []const u8) u64 {
 pub const KvStore = struct {
     allocator: std.mem.Allocator,
     /// Pointer to the manifest backing this handle. In attached mode
-    /// the manifest is borrowed (owned by Cluster or equivalent);
+    /// the manifest is borrowed (owned by the node / process-wide owner);
     /// in standalone mode it lives inside `owned.manifest`.
     manifest: *kvexp.Manifest,
     store_id: u64,
-    /// Shared or owned legacy seq counter. With raft-as-WAL nothing
-    /// load-bearing depends on this; preserved for API compatibility.
+    /// Shared or owned seq counter. Nothing load-bearing depends on it
+    /// (raft is the WAL); kept for API compatibility.
     counter: *SeqCounter,
     owned_counter: ?SeqCounter,
     owned: ?*StandaloneStack,
@@ -240,12 +234,9 @@ pub const KvStore = struct {
     /// close before this one.
     ///
     /// `filename` is the manifest filename inside `data_dir`.
-    /// Multiple binaries sharing one `data_dir` (loop46 worker +
-    /// files-server-standalone — see kv_bench_cluster.sh) MUST
-    /// use distinct filenames to avoid racing on the same file
-    /// (kvexp is single-process). loop46 uses "cluster.kv",
-    /// files-server uses "files-server.kv", schedule-server uses
-    /// "schedule-server.kv".
+    /// Multiple binaries sharing one `data_dir` MUST use distinct
+    /// filenames to avoid racing on the same file (kvexp is
+    /// single-process).
     pub fn openClusterOwned(
         allocator: std.mem.Allocator,
         data_dir: []const u8,
@@ -447,9 +438,9 @@ pub const KvStore = struct {
     // KvStore from one thread serialize naturally. There's no
     // "begin/commit" boundary at the engine level — all mutations
     // are immediately visible in-memory and become durable at the
-    // next `durabilize`. `begin`/`commit`/`rollback` are kept as
-    // no-ops so legacy callers compile; a proper multi-op-atomic
-    // story belongs in `TrackedTxn` (savepoint-style root revert).
+    // next `durabilize`. `begin`/`commit`/`rollback` are no-ops (there
+    // is no engine-level begin/commit boundary); multi-op-atomic
+    // behavior lives in `TrackedTxn` (savepoint-style root revert).
 
     pub fn begin(self: *KvStore) Error!void {
         _ = self;
@@ -539,8 +530,8 @@ pub const KvStore = struct {
         // Blocking acquire — direct KvStore.put is used by test/admin
         // paths where contention is rare; we don't surface Conflict.
         // Each collapse-to-Sqlite site logs the underlying kvexp error
-        // first — the V2 follower-apply panic surfaced as a bare
-        // `Sqlite` with the real cause swallowed here.
+        // first, so the real cause isn't swallowed behind a bare `Sqlite`
+        // (e.g. a follower-apply failure).
         var lease = self.manifest.acquire(self.store_id) catch |err| {
             std.log.warn("kvstore.put acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
             return Error.Sqlite;
@@ -561,9 +552,8 @@ pub const KvStore = struct {
         };
     }
 
-    /// Legacy: SQLite-era version that stamped a seq column with
-    /// each row. Under kvexp seq is not persisted; this is a plain
-    /// `put`.
+    /// Seq is not persisted under kvexp, so this is a plain `put`
+    /// (the `seq` arg is ignored).
     pub fn putSeq(self: *KvStore, key: []const u8, value: []const u8, seq: u64) Error!void {
         _ = seq;
         return self.put(key, value);
@@ -612,9 +602,7 @@ pub const KvStore = struct {
 
     /// Stamp the manifest's last applied raft idx by durabilizing
     /// at `idx`. Folds main_overlay into LMDB and writes the
-    /// watermark atomically. Use this instead of the pre-cutover
-    /// pattern of `setLastAppliedRaftIdx` + later `durabilize` —
-    /// the new API requires those to be the same call.
+    /// watermark atomically — the stamp and the durabilize are one call.
     pub fn setLastAppliedRaftIdx(self: *KvStore, idx: u64) Error!void {
         self.manifest.durabilize(idx) catch return Error.Sqlite;
     }
@@ -622,8 +610,8 @@ pub const KvStore = struct {
     /// Chain-BYPASSING authoritative put — the replicated-apply seam
     /// (kvexp `StoreLease.applyPut`). A follower applying a committed
     /// raft entry must never sequence behind the tenant's open
-    /// speculative txn chain: the one-shot `put` path returned
-    /// `NotChainHead` whenever a local read batch had a txn open/parked
+    /// speculative txn chain: the one-shot `put` path returns
+    /// `NotChainHead` whenever a local read batch has a txn open/parked
     /// for the tenant (and retrying deadlocks — a parked predecessor
     /// resolves only through the apply loop stuck behind it). Writes
     /// straight into the committed overlay under the dispatch lease.
@@ -700,13 +688,11 @@ pub const KvStore = struct {
         };
     }
 
-    // ── Legacy sequence / replication ───────────────────────────
+    // ── Sequence / replication ──────────────────────────────────
     //
-    // Under raft-as-WAL the engine doesn't carry per-write seqs.
-    // Counters below are in-memory only; `delta` returns an empty
-    // result. Snapshot transfer in raft_snapshot.zig still calls
-    // these but the production catch-up path is `kvexp.dumpSnapshot`
-    // / `loadSnapshot` — see follow-up.
+    // kvexp carries no per-write seqs; the counters below are in-memory
+    // only and `delta` returns an empty result. The production catch-up
+    // path is `kvexp.dumpSnapshot` / `loadSnapshot`.
 
     pub fn nextSeq(self: *KvStore) u64 {
         return self.counter.next();
@@ -726,10 +712,6 @@ pub const KvStore = struct {
         const empty = self.allocator.alloc(DeltaEntry, 0) catch return Error.OutOfMemory;
         return .{ .entries = empty, .allocator = self.allocator };
     }
-
-    // (disableAutoCheckpoint / setBusyTimeout removed 2026-05-17 —
-    // no-op SQLite-knob stubs with zero callers, same dead-stub
-    // class as the deleted undo machinery.)
 
     /// Snapshot of the underlying kvexp manifest's counters/gauges.
     /// In attached mode, every KvStore on a node shares the same
@@ -857,8 +839,8 @@ pub const KvStore = struct {
     /// from an authoritative snapshot: a key the source deleted after this node
     /// last saw it is removed, not left behind as a phantom (which would make a
     /// promoted-back voter diverge from the cluster). Unlike `loadTenantBundle`
-    /// (overwrite + add only). The zero-downtime move's insert-if-absent load is
-    /// now the streamed path (`snapshot_stream.StreamLoader`, `mode=merge`).
+    /// (overwrite + add only). The zero-downtime move's insert-if-absent load
+    /// uses the streamed path (`snapshot_stream.StreamLoader`, `mode=merge`).
     pub fn loadTenantBundleReplace(self: *KvStore, bundle: []const u8) Error!void {
         return self.loadBundleImpl(bundle, .{ .clear_existing = true });
     }
@@ -1198,14 +1180,10 @@ pub const KvStore = struct {
         };
     }
 
-    // (Pre-kvexp `undoTxn` / `commitTxn` / `gcUndoThrough` /
-    // `recoverOrphans` removed 2026-05-17 — they were SQLite
-    // kv_undo-log machinery and had degenerated to no-op stubs.
-    // Under kvexp the speculative overlay is volatile (→ LMDB only
-    // at raft-apply), so a pre-quorum crash loses it with no
-    // on-disk divergence and nothing to recover; the live rollback
-    // primitive is `TrackedTxn.rollback()`. See
-    // docs/proposer-audit.md.)
+    // The speculative overlay is volatile (→ LMDB only at raft-apply),
+    // so a pre-quorum crash loses it with no on-disk divergence and
+    // nothing to recover; the live rollback primitive is
+    // `TrackedTxn.rollback()`. See docs/proposer-audit.md.
 };
 
 /// Collect entries from a kvexp prefix cursor into `list`, honoring
@@ -1299,14 +1277,13 @@ fn dumpOneStoreRemapped(
     try w.writeInt(u32, kvexp.SNAPSHOT_MAGIC, .little);
     try w.writeByte(kvexp.SNAPSHOT_VERSION);
     // Header layout mirrors kvexp.dumpSnapshot exactly:
-    //   u64 reserved (was snap_seq; now ignored on load)
+    //   u64 reserved (ignored on load)
     //   u64 durable raft idx (loader rehydrates it as last_applied)
     try w.writeInt(u64, 0, .little);
     try w.writeInt(u64, try snap.manifest.durableRaftIdx(), .little);
 
     // Iterate this store's records (returns no entries if the store
-    // doesn't exist in the snapshot — same shape as the storeRoot
-    // existence check that used to gate this block).
+    // doesn't exist in the snapshot).
     var cursor = try snap.scanPrefix(src_store_id, "");
     defer cursor.deinit();
     while (try cursor.next()) {

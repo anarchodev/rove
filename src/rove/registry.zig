@@ -257,7 +257,7 @@ pub const Registry = struct {
     }
 
     // =============================================================
-    // Create — immediate for now (entity is live right away)
+    // Create — immediate (entity is live right away)
     // =============================================================
 
     pub inline fn create(self: *Self, dst: anytype) !Entity {

@@ -1,5 +1,5 @@
 //! BatchStore — read+write surface for log batches under hierarchical
-//! `{tenant}/{node}/{batch}.{ext}` keys (Phase 5.5 a).
+//! `{tenant}/{node}/{batch}.{ext}` keys.
 //!
 //! Why not reuse `rove-blob`: that abstraction is per-tenant-prefixed
 //! and validates keys to forbid `/`. Logs need (a) hierarchical keys
@@ -13,11 +13,10 @@
 //!     fixture. Used by unit tests to stay hermetic; production
 //!     never touches it.
 //!
-//! There is no longer a filesystem backend — the design ships
-//! S3-only after Phase 5.5 (a) step 3. Local-disk batch storage
-//! created subtle drift between dev and prod (different list
-//! semantics, different consistency, different operational story);
-//! collapsing to one backend removes that fork.
+//! There is no filesystem backend — the design ships S3-only.
+//! Local-disk batch storage would create subtle drift between dev
+//! and prod (different list semantics, different consistency,
+//! different operational story); one backend removes that fork.
 
 const std = @import("std");
 

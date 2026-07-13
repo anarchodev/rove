@@ -1,10 +1,10 @@
 //! rove-boot — the shared process-boot scaffolding for the four serving
 //! binaries (rewind-worker / rewind-cp / rewind-front / rewind-logs).
-//! Each of these blocks used to be copy-pasted per main.zig: SIGINT/TERM
-//! → stop-flag wiring, URL-list env parsing, and the operator-metrics
-//! listener bring-up (whose per-binary default ports must stay disjoint
-//! so all four coexist on a co-located host — that invariant now lives
-//! in ONE table below instead of four cross-referencing comments).
+//! It holds the blocks the four binaries share: SIGINT/TERM → stop-flag
+//! wiring, URL-list env parsing, and the operator-metrics listener
+//! bring-up (whose per-binary default ports must stay disjoint so all
+//! four coexist on a co-located host — that invariant lives in ONE
+//! table below).
 
 const std = @import("std");
 const MetricsServer = @import("metrics-server").MetricsServer;

@@ -14,22 +14,22 @@
 //!
 //! ## Channels
 //!
-//! shift-js split non-determinism into several independent tapes so
-//! replay could diff each channel separately and surface which source
-//! of non-determinism drifted. We keep that split:
+//! Non-determinism is split into several independent tapes so replay
+//! can diff each channel separately and surface which source of
+//! non-determinism drifted:
 //!
 //! - `.kv`            — every foreign `kv.get` / `kv.prefix` resolution
 //!                      (§8 minimal kv read set; writes are outputs)
 //! - `.module`        — module resolution tree (what deployment id / path
 //!                      resolved to which bytecode hash)
 //!
-//! `Math.random` + `crypto.*` + `Date.now` no longer have dedicated
-//! channels (`docs/primitive-gaps.md` §9 + fold-in): arenajs's per-
-//! context state (`xorshift64star` PRNG + `date_now_pinned`) is
-//! set once per request from `Readset.seed` + `Readset.timestamp_ns`
-//! and produces the same sequence + clock values on capture and
-//! replay. Two scalars in the readset header are the entire input —
-//! O(1) instead of O(draws + clock-reads).
+//! `Math.random` + `crypto.*` + `Date.now` have no dedicated
+//! channels (`docs/primitive-gaps.md` §9): arenajs's per-context
+//! state (`xorshift64star` PRNG + `date_now_pinned`) is set once per
+//! request from `Readset.seed` + `Readset.timestamp_ns` and produces
+//! the same sequence + clock values on capture and replay. Two
+//! scalars in the readset header are the entire input — O(1) instead
+//! of O(draws + clock-reads).
 //!
 //! Each channel is its own `Tape` value — a linear sequence of
 //! `Entry`s — and each tape serializes to its own blob. On flush, the
@@ -92,14 +92,15 @@ comptime {
 }
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-/// Bumped 1 → 2 by `docs/primitive-gaps.md` §8 (minimal kv read set);
-/// 2 → 3 by §9 (seed-not-draws — dropped math_random + crypto_random);
-/// 3 → 4 by the §9 fold-in (dropped `.date` channel — Date.now is
-/// pinned per-request via `JS_SetDateNow`, the timestamp scalar in
-/// the readset header is the entire input); 4 → 5 by the read-taped
-/// request surface (new `.request_reads` channel; the dead
-/// `TriggerPayloadEntry.headers` reserved field removed). Pre-launch
-/// — no v4 tapes need to be readable post-bump.
+/// Per-tape wire version. The channel set: `.kv`, `.module`,
+/// `.fetch_responses`, `.trigger_payload`, `.request_reads`. There
+/// are no `.math_random` / `.crypto_random` / `.date` channels —
+/// `Math.random`, `crypto.*`, and `Date.now` are seeded from the two
+/// readset-header scalars (`seed`, `timestamp_ns`), not taped
+/// (`docs/primitive-gaps.md` §8 minimal kv read set + §9
+/// seed-not-draws). The parser accepts exactly this version and
+/// rejects anything else loudly — the version byte is a format guard,
+/// not a compatibility band; no older tapes need to remain readable.
 pub const VERSION: u16 = 5;
 
 /// Magic + version for the whole-Readset wire format used by
@@ -107,44 +108,32 @@ pub const VERSION: u16 = 5;
 /// Distinct from per-tape `MAGIC` so a misrouted bytes/payload trips
 /// the wrong-magic check at the decoder.
 pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
-/// Bumped 1 → 2 by `docs/readset-replication-plan.md` Phase 5a: the
-/// trailing `[u32 log_header_len][log_header_bytes]` section was
-/// added after the 7 channels so any node can rebuild the customer
-/// LogRecord from the raft entry alone. `log_header_len == 0` is
-/// the "no header" sentinel (non-handler producers, paths that
-/// don't yet stamp a header). 2 → 3 by `docs/primitive-gaps.md` §9
-/// (seed-not-draws): the `.math_random` and `.crypto_random`
-/// channels were removed, dropping the channel count 7 → 5.
-/// 3 → 4 by the §9 fold-in: the `.date` channel was removed
-/// (Date.now is pinned per-request via JS_SetDateNow); count
-/// drops 5 → 4. The header's `seed` + `timestamp_ns` scalars are
-/// now the entire input for the random + clock sources.
-/// 5 → 6 by the read-taped request surface: the `.request_reads`
-/// channel was added (count 4 → 5) — the lazily-recorded inbound
-/// request inputs (header names/values, body-read flag, ip reads).
-/// 6 → 7 by the format-versioning freeze (`docs/architecture/format-versioning.md`
-/// §4): a `js_engine_version: u16` scalar was added to the header
-/// (after `seed`), so every replicated request records which JS engine
-/// executed it. Header grows 22 → 24 bytes. This bump rides in the
-/// durable raft log (type-0 envelopes carry the readset), so it forces
-/// a pre-launch data-dir wipe — old v6 readsets are rejected loudly.
-/// Pre-launch — hard cutover, no old raft logs to migrate. The parser
-/// accepts exactly this version and rejects anything else loudly; the
-/// version byte is a format guard, not a compatibility band. BodyRefs
-/// resolve through the one cross-tenant pool key template
-/// (`_pool/{batch_id:0>20}`). When the format changes, bump this and
-/// delete the old shape in the same change — do not add a
-/// min-supported fallback.
+/// Whole-Readset wire version. The header carries the `timestamp_ns`
+/// + `seed` + `js_engine_version` scalars, then the 5 channel blobs in
+/// fixed order, then a trailing `[u32 log_header_len][log_header_bytes]`
+/// section so any node can rebuild the customer LogRecord from the raft
+/// entry alone (`log_header_len == 0` is the "no header" sentinel for
+/// non-handler producers and paths that don't stamp a header). The
+/// `js_engine_version: u16` scalar (`docs/architecture/format-versioning.md`
+/// §4) records which JS engine executed each replicated request, so a
+/// follower rebuilds the record against the same engine the leader ran.
+/// BodyRefs resolve through the one cross-tenant pool key template
+/// (`_pool/{batch_id:0>20}`). The parser accepts exactly this version
+/// and rejects anything else loudly — the version byte is a format
+/// guard, not a compatibility band. This version rides in the durable
+/// raft log (type-0 envelopes carry the readset): when the format
+/// changes, bump this and delete the old shape in the same change (and
+/// wipe the data dir) — do not add a min-supported fallback.
 pub const READSET_VERSION: u16 = 7;
 pub const READSET_CHANNEL_COUNT: usize = 5;
 
-/// Renumbered contiguously by `docs/primitive-gaps.md` §9 +
-/// fold-in: `math_random` + `crypto_random` + `date` channels are
-/// removed. `Math.random` / `crypto.*` / `Date.now()` are now seeded
-/// from per-request scalars (`Readset.seed` + `Readset.timestamp_ns`)
-/// in the readset header. Renumbering rides the VERSION bump
-/// (per-tape decoder rejects mismatched ids against the inner-blob
-/// channel header).
+/// Wire ids are contiguous and stable — the per-tape decoder rejects
+/// mismatched ids against the inner-blob channel header, so a wire id
+/// can never be reused for a different channel without a VERSION bump.
+/// There are no `math_random` / `crypto_random` / `date` channels:
+/// `Math.random` / `crypto.*` / `Date.now()` are seeded from the
+/// per-request scalars (`Readset.seed` + `Readset.timestamp_ns`) in
+/// the readset header (`docs/primitive-gaps.md` §9).
 pub const Channel = enum(u16) {
     kv = 0,
     module = 1,
@@ -286,11 +275,10 @@ pub const Entry = union(Channel) {
     ///   live in the per-tenant readset-blob; `inline_bytes` is
     ///   empty. Used for chunks over the inline threshold.
     /// - `body_ref.batch_id == bodies_mod.NO_BATCH` AND
-    ///   `inline_bytes.len > 0`: bytes ride inline in the entry
-    ///   (Phase 4-fetch-inline). Used for chunks under the
-    ///   inline threshold — handler runs immediately, raft
-    ///   entry fsync IS the durability substrate, same shape as
-    ///   the inbound `trigger_payload` inline path.
+    ///   `inline_bytes.len > 0`: bytes ride inline in the entry.
+    ///   Used for chunks under the inline threshold — handler runs
+    ///   immediately, raft entry fsync IS the durability substrate,
+    ///   same shape as the inbound `trigger_payload` inline path.
     /// - `body_ref.batch_id == bodies_mod.NO_BATCH` AND
     ///   `inline_bytes.len == 0`: a terminal-only event with no
     ///   body bytes (transport errors, stream-mode FINs, etc.).
@@ -381,9 +369,9 @@ pub const Entry = union(Channel) {
 
 /// Append-only in-memory tape for a single channel. The worker
 /// allocates one per channel per in-flight request; on dispatch exit
-/// the tapes are serialized and either discarded (Phase 3 baseline,
-/// tape_refs all null) or uploaded to the tenant's log-blob store and
-/// referenced by hash on the LogRecord.
+/// the tapes are serialized and either discarded (when tape_refs are
+/// all null) or uploaded to the tenant's log-blob store and referenced
+/// by hash on the LogRecord.
 pub const Tape = struct {
     allocator: std.mem.Allocator,
     channel: Channel,
@@ -662,19 +650,17 @@ pub const Tape = struct {
 /// 1:1 (rewind-apps repo `replay/replay-wasm-plan.md` §4) — same five
 /// channels, same names. No translation layer between capture and replay.
 ///
-/// `docs/readset-replication-plan.md` Phase 1 lifted this from
-/// `src/js/worker_log.zig:RequestTapes`; this revision adds the
-/// `timestamp_ns` / `seed` scalars from §4.1 so the readset is the
-/// single home for every per-request non-deterministic input the
-/// raft entry will eventually carry. Later phases will extend with
-/// `fetch_responses` + `trigger_payload`.
+/// The readset is the single home for every per-request
+/// non-deterministic input the raft entry carries: the per-channel
+/// tapes plus the `timestamp_ns` / `seed` scalars captured once at
+/// dispatch entry (`docs/readset-replication-plan.md` §4.1).
 pub const Readset = struct {
     /// Wall-clock nanosecond timestamp captured once at dispatch
     /// entry — the canonical "when this request was received."
     /// The `installRequest` path derives `Date.now()`'s pinned ms
     /// value from this (`@divTrunc(timestamp_ns, ns_per_ms)`).
     /// `Date.now()` and `new Date()` (no args) both return that
-    /// scalar for every call inside one request (§9 fold-in).
+    /// scalar for every call inside one request (`docs/primitive-gaps.md` §9).
     timestamp_ns: i64,
     /// PRNG seed for arenajs's per-context xorshift64star, set once
     /// per request via `JS_SetRandomSeed` in `installRequest`.
@@ -694,7 +680,7 @@ pub const Readset = struct {
     /// callers set it from `qjs.JS_ENGINE_VERSION` at the dispatch
     /// site; 0 is the "unknown engine" default for tests / non-handler
     /// paths. One engine per binary today, so selection is a no-op
-    /// until the first semantics-affecting bump (Phase 3, post-GA).
+    /// until the first semantics-affecting engine bump.
     js_engine_version: u16 = 0,
     kv: Tape,
     module: Tape,
@@ -785,10 +771,10 @@ pub const Readset = struct {
     /// [u16  version = READSET_VERSION]
     /// [i64  timestamp_ns       big-endian]
     /// [u64  seed               big-endian]
-    /// [u16  js_engine_version  big-endian]   // §4 format-versioning freeze
+    /// [u16  js_engine_version  big-endian]   // format-versioning.md §4
     /// for each of the 5 channels in fixed order:
     ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
-    /// [u32 log_header_len BE][log_header_bytes]   // Phase 5a
+    /// [u32 log_header_len BE][log_header_bytes]
     /// ```
     ///
     /// Channels are emitted in fixed order: kv, module,
@@ -800,8 +786,8 @@ pub const Readset = struct {
     /// `log_header == null` writes a 4-byte zero length and no
     /// payload (the "no header stamped" sentinel). Pass a real
     /// `LogHeader` from the dispatch site so follower-side tape
-    /// upload (Phase 5c) can reconstruct the customer LogRecord
-    /// without re-executing the handler.
+    /// upload can reconstruct the customer LogRecord without
+    /// re-executing the handler.
     pub fn serialize(
         self: *const Readset,
         allocator: std.mem.Allocator,
@@ -834,7 +820,7 @@ pub const Readset = struct {
             try buf.appendSlice(allocator, blob);
         }
 
-        // Phase 5a — trailing LogHeader section.
+        // Trailing LogHeader section.
         if (log_header) |lh| {
             const lh_bytes = try lh.serialize(allocator);
             defer allocator.free(lh_bytes);
@@ -857,15 +843,14 @@ pub const Readset = struct {
 /// be fed to `parse(allocator, blob)` to materialize ParsedTape
 /// values (which copy the bytes into their own backing buffer).
 ///
-/// `readset-replication-plan.md` Phase 3: Phase 3 only needs to
-/// VALIDATE the readset shape (Phase 5 is where followers actually
-/// use the channels), so the apply path consumes this for shape
-/// validation today and a future slice will materialize tapes for
-/// follower-side tape upload.
+/// The apply path consumes this to validate the readset shape; the
+/// channel blob slices can be materialized into tapes for
+/// follower-side tape upload (`docs/readset-replication-plan.md`).
 pub const ParsedReadset = struct {
     timestamp_ns: i64,
     seed: u64,
-    /// The JS engine version that ran the request (§4 freeze). Mirrors
+    /// The JS engine version that ran the request
+    /// (`docs/architecture/format-versioning.md` §4). Mirrors
     /// `Readset.js_engine_version`; 0 means unknown / pre-stamp.
     js_engine_version: u16,
     /// Borrowed slices into the input bytes, one per channel in
@@ -901,7 +886,7 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
         blobs[i] = bytes[cur .. cur + blob_len];
         cur += blob_len;
     }
-    // Phase 5a trailing log-header section.
+    // Trailing log-header section.
     if (cur + 4 > bytes.len) return ParseError.Truncated;
     const lh_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
     cur += 4;
@@ -984,9 +969,9 @@ pub fn encodeReadsetList(
 /// `encodeReadsetList(&.{blob})`, with the intermediate blob freed
 /// internally. The single owner of the "wrap a lone readset as the
 /// 1-item list the wire expects" step that every single-readset
-/// producer (cont-resume, proposeForgetfulWrites) needs after
-/// 3d-multi promoted `rs_bytes` to a list. Returns freshly-allocated
-/// bytes the caller owns. On any failure the caller's convention is
+/// producer (cont-resume, proposeForgetfulWrites) needs, since
+/// `rs_bytes` is always a list. Returns freshly-allocated bytes the
+/// caller owns. On any failure the caller's convention is
 /// to log + fall back to empty `rs_bytes` (best-effort replication).
 pub fn encodeSingleReadset(
     allocator: std.mem.Allocator,
@@ -1478,8 +1463,8 @@ test "kv tape: prefix capture round-trips inputs and results" {
     try testing.expectEqualStrings("1", parsed.entries[3].kv.value);
 }
 
-// `docs/primitive-gaps.md` §9 + fold-in: math_random + crypto_random
-// + date tape channels removed. `Math.random` + `crypto.*` draw
+// There are no math_random / crypto_random / date tape channels
+// (`docs/primitive-gaps.md` §9). `Math.random` + `crypto.*` draw
 // from arenajs's per-context xorshift64star (seeded once per
 // request from `Readset.seed`); `Date.now()` returns a pinned
 // scalar (set via `JS_SetDateNow` from

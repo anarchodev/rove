@@ -1,8 +1,8 @@
 //! `HttpBlobStore` — read-only `BlobStore` that fetches manifests
-//! from a files-server cluster over HTTP/2. Production.md #1.4 step
-//! 4: loop46 worker swaps S3-direct manifest reads for queries
-//! against the colocated files-server, where manifests live in
-//! raft-replicated KV.
+//! from a files-server cluster over HTTP/2 (Production.md #1.4
+//! step 4). The loop46 worker reads manifests via queries against
+//! the colocated files-server, where manifests live in
+//! raft-replicated KV, rather than reading S3 directly.
 //!
 //! ## URL shape
 //!
@@ -13,9 +13,8 @@
 //!   `{base_url}/{instance_id}/deployments/{N:hex}/manifest.bin`
 //!
 //! Returns the raw bytes the server stored at
-//! `deployment/{N:020x}/manifest` in the cluster store. Same bytes
-//! `manifest_json.decode` would have parsed off S3 in the legacy
-//! path.
+//! `deployment/{N:020x}/manifest` in the cluster store — the same
+//! bytes `manifest_json.decode` parses from an S3-direct read.
 //!
 //! ## What's NOT supported
 //!

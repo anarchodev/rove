@@ -6,10 +6,9 @@
 //! request hot path** — the stateless `rewind-front` proxy learns placement
 //! from this binary's `/_cp/route` endpoint and caches it.
 //!
-//! This split fixes the prototype's inverted scaling: previously the front
-//! door hosted the directory raft, so every front-door replica was a CP
-//! voter (front-door count == voter count). Now the directory raft lives
-//! only here; front doors scale horizontally as stateless read-replicas.
+//! The directory raft lives only here, never on the front door — so
+//! front-door replica count is decoupled from CP voter count and front
+//! doors scale horizontally as stateless read-replicas.
 //!
 //! Surface served (control only — NO customer traffic):
 //!   - `POST /_control/move` / `/_control/move-live` — move orchestration
@@ -69,12 +68,11 @@ fn parseCpMultiNode(a: std.mem.Allocator) !?CpMultiNode {
     return bridge_mod.cluster_config.fromEnv(a, "REWIND_CP_");
 }
 
-// The domain index (host → tenant) is no longer a static in-memory map: it
-// moved into the replicated `__directory__` group (`directory.zig` `hosts`
-// projection + `host/{host}` keys, gap #2), so it survives a CP restart, spans
-// the HA nodes, and accepts runtime custom-domain provisioning via the
-// `/_control/host` control write. The static `REWIND_HOSTS` env is now seeded
-// INTO the directory (see `main`).
+// The domain index (host → tenant) lives in the replicated `__directory__`
+// group (`directory.zig` `hosts` projection + `host/{host}` keys), so it
+// survives a CP restart, spans the HA nodes, and accepts runtime custom-domain
+// provisioning via the `/_control/host` control write. The static `REWIND_HOSTS`
+// env is seeded INTO the directory (see `main`).
 
 // ── Header lookup over h2 ReqHeaders ──────────────────────────────────
 fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
@@ -134,7 +132,7 @@ const Router = struct {
     /// can't be served and hangs until the request timeout. Null for a
     /// single-node CP (no forwarding).
     self_cp_idx: ?usize = null,
-    /// The leader-elected ACME issuer (gap #3 slice 3), or null when
+    /// The leader-elected ACME issuer, or null when
     /// `REWIND_ACME_DIRECTORY` is unset. Serves `/_cp/acme-challenge?token=`
     /// from its in-memory challenge store.
     acme: ?*acme_issuer.Handle = null,
@@ -271,7 +269,7 @@ const Router = struct {
             return;
         };
         const a = self.allocator;
-        // Domain index (gap #2): host → tenant from the replicated directory.
+        // Domain index: host → tenant from the replicated directory.
         // Owned copy (a host's tenant can be replaced by a concurrent apply,
         // and `resolve` re-takes the directory mutex), freed after we resolve.
         const tenant = (self.directory.hostTenantForOwned(a, host) catch {
@@ -327,7 +325,7 @@ const Router = struct {
     /// served verbatim — the front door unpacks), or 404 if no
     /// cert is stored (the front door then SNI-falls-back to the platform
     /// wildcard / refuses). The stateless front-door pool pulls this for SNI
-    /// termination (gap #3). No auth: it serves only over the private CP
+    /// termination. No auth: it serves only over the private CP
     /// network, same trust as `/_cp/route`. (The PRIVATE key crosses this hop —
     /// it must stay on the private network; production fronts the CP with the
     /// same network boundary as `/_cp/route`.)
@@ -351,7 +349,7 @@ const Router = struct {
 
     /// `GET /_cp/acme-challenge?token=T` — the HTTP-01 key-authorization for an
     /// in-flight challenge token, served from the issuer's in-memory store. The
-    /// front door's `:80` listener (gap #6 phase 5) forwards
+    /// front door's `:80` listener forwards
     /// `/.well-known/acme-challenge/<token>` here so the ACME CA's validation
     /// reaches the leader that published the token. 404 when no issuer is
     /// running or the token isn't published (the correct "no challenge" answer).
@@ -463,9 +461,8 @@ const Router = struct {
         else if (is_provision)
             try self.handleProvision(server, ent, sid, sess, body)
         else
-            // Convergence (raft-native-alignment): the brief-pause move was
-            // dropped — `move` and `move-live` are the SAME (zero-downtime) move.
-            // Both route names accepted so existing callers don't break.
+            // `move` and `move-live` name the SAME (zero-downtime) move; both
+            // route names are accepted so callers can use either.
             try self.handleMoveLive(server, ent, sid, sess, body);
     }
 
@@ -533,7 +530,7 @@ const Router = struct {
     }
 
     /// `POST /_control/provision {tenant, cluster, host?}` — stand up a
-    /// brand-new tenant (gaps #4 + #5): form its raft group on EVERY node of
+    /// brand-new tenant: form its raft group on EVERY node of
     /// `cluster` via an empty-attach (no bundle — the multi-node formation path
     /// that needs no move), await the group's election, then write the
     /// placement (the commit point that makes it routable), and optionally map
@@ -587,8 +584,8 @@ const Router = struct {
         //      `project_prod_genesis_gap`), and the RC-6 reconciler grows it to
         //      the full node set learner-first over the next passes. This is the
         //      path the genesis smoke validates.
-        //    - Legacy (no reconciler): birth the full node set on EVERY node
-        //      (`1,2,…,nodes.len`) — the cold-multi formation kept for
+        //    - No reconciler: birth the full node set on EVERY node
+        //      (`1,2,…,nodes.len`) — the cold-multi formation for
         //      static-config clusters that have no reconciler to finish a grow.
         //
         //    Either way a new tenant has no plan yet → free tier until
@@ -697,7 +694,7 @@ const Router = struct {
         try replyText(server, ent, sid, sess, 200, msg);
     }
 
-    /// Map a host to a tenant: `POST /_control/host {host, tenant}` (gap #2,
+    /// Map a host to a tenant: `POST /_control/host {host, tenant}` (writes
     /// the replicated domain index). A directory WRITE: leader-gated, so a
     /// follower has already forwarded to the leader by the time we get here.
     /// Routing is a pure CP read (`/_cp/route`), so unlike a plan change there
@@ -725,7 +722,7 @@ const Router = struct {
         // tenant's serving cluster (docs/architecture/auth-consolidation.md B3). The CP owns
         // host→tenant, so it pushes the alias the workers need for local
         // custom-host resolution (`resolveDomain`) — no operator-held worker
-        // secret (`ADMIN_OPS_SECRET` retired). If it didn't land (tenant
+        // secret is needed. If it didn't land (tenant
         // unplaced, or no reachable leader), the directory mapping still
         // stands; report 503 so the operator re-runs once the tenant is placed.
         if (!self.pushDomainToServingCluster(parsed.value.tenant, parsed.value.host)) {
@@ -902,7 +899,7 @@ const Router = struct {
     /// failure returns false; the caller evicts the partially-attached set.
     /// The cluster's voter set as a comma-separated raft-id list `1,2,…,n` (raft
     /// ids are positional — node index i → id i+1, the `REWIND_PEERS` convention).
-    /// Caller frees. The Phase 2e cluster node-set SSOT for a fresh tenant group.
+    /// Caller frees. The cluster node-set SSOT for a fresh tenant group.
     fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(a);
@@ -923,7 +920,7 @@ const Router = struct {
             hdrs[nh] = .{ .name = PLAN_HEADER, .value = p };
             nh += 1;
         }
-        // Phase 2e (cluster node-set SSOT): the cluster's node set as the born
+        // Cluster node-set SSOT: the cluster's node set as the born
         // group's voter set, the CP-owned single source of truth — the SAME set
         // for every node, so the group forms consistently without depending on
         // each node's static `REWIND_VOTERS`. Null → the node falls back to its env.
@@ -980,7 +977,7 @@ const Router = struct {
         }
     }
 
-    /// Additive membership reconciler (Phase 4, opt-in `reconcile_membership`).
+    /// Additive membership reconciler (opt-in `reconcile_membership`).
     /// On the directory leader, converge each placed tenant's DP group
     /// membership to its cluster's node set: for the first not-caught-up node
     /// per group per pass, take a LEARNER-FIRST `ensureMember` step. ADDITIVE
@@ -1023,7 +1020,7 @@ const Router = struct {
         }
     }
 
-    // ── Zero-downtime move (Phase 7 slice c) ─────────────────────────
+    // ── Zero-downtime move ───────────────────────────────────────────
 
     /// Orchestrate a ZERO-DOWNTIME tenant move — the source keeps serving the
     /// whole time; no quiesce, no `moving` hold. Built on slice (b)'s
@@ -1046,8 +1043,7 @@ const Router = struct {
     ///
     /// A pre-flip failure forward-ends the source (stops dual-writing) +
     /// evicts the half-attached dest, leaving the tenant serving on the
-    /// source untouched. Brief-pause `handleMove` stays for callers that want
-    /// it. The forward target is the full dest node list (leader first) —
+    /// source untouched. The forward target is the full dest node list (leader first) —
     /// the source re-aims past 421s, so a dest-leader change mid-overlap
     /// degrades to a retry hop, not a failed acked write.
     fn handleMoveLive(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
@@ -1120,7 +1116,7 @@ const Router = struct {
 
         // 4+5. Stream the source leader's non-quiescing snapshot directly to
         //      every dest node in merge mode (insert-if-absent). The source
-        //      pushes peer→peer; the CP no longer buffers the bundle, so a
+        //      pushes peer→peer; the CP never buffers the bundle, so a
         //      multi-GB tenant moves with bounded memory on all three parties.
         if (!self.streamMergeToAll(src_nodes, dest_nodes, tenant)) {
             self.forwardEndOnLeader(src_nodes, tenant);
@@ -1213,10 +1209,9 @@ const Router = struct {
         }
     }
 
-    /// raft Phase 2.5: STREAM the source leader's non-quiescing snapshot directly
-    /// to every destination node in merge mode (insert-if-absent) — the source
-    /// pushes peer→peer, so the CP never buffers a (multi-GB) bundle. Replaces the
-    /// retired buffered dump→CP→dest fan (the old `v2-load-merge` load endpoint).
+    /// STREAM the source leader's non-quiescing snapshot directly to every
+    /// destination node in merge mode (insert-if-absent) — the source pushes
+    /// peer→peer, so the CP never buffers a (multi-GB) bundle.
     fn streamMergeToAll(self: *Router, src_nodes: []const []const u8, dest_nodes: []const []const u8, tenant: []const u8) bool {
         for (dest_nodes) |dest| {
             if (!self.snapshotPushToLeader(src_nodes, tenant, dest)) return false;
@@ -1259,7 +1254,7 @@ const Router = struct {
     /// Blocking libcurl call to a backend's move surface, presenting the
     /// move secret plus any `extra_headers` (e.g. `X-Rewind-Tenant`,
     /// `X-Rewind-Plan`). Returns status + an owned copy of the response body.
-    // ── membership reconciler: ensureMember (Phase 3) ───────────────────────
+    // ── membership reconciler: ensureMember ─────────────────────────────────
     //
     // Composes the proven out-of-band endpoints into a LEARNER-FIRST step
     // machine that converges a node toward a caught-up voter. Additive/safe:
@@ -1454,8 +1449,7 @@ const Router = struct {
     /// log position, not apply). An out-of-band baseline (`apply_local_snapshot`)
     /// advances `last_index` directly, unlike the commit-seq atomic or the
     /// bundle-seeded store watermark, so a quiescent caught-up learner still trips
-    /// the gate. (Earlier this was misnamed/-documented as an "applied/committed
-    /// index" read from a `v2-committed` endpoint — neither exists; B2.)
+    /// the gate.
     fn nodeLastIndex(self: *Router, node_url: []const u8, tenant: []const u8) ?u64 {
         const a = self.allocator;
         const path = std.fmt.allocPrint(a, "/_system/v2-last-index?tenant={s}", .{tenant}) catch return null;
@@ -1510,7 +1504,7 @@ const Router = struct {
     /// load) on the node, then install the data-free raft baseline so the leader
     /// replicates the tail.
     /// Format a raft-id list as `a,b,c`, optionally appending one more id. Caller
-    /// frees. The Phase 2d augmented-ConfState membership headers.
+    /// frees. Builds the augmented-ConfState membership headers.
     fn joinIdsAug(a: std.mem.Allocator, ids: []const u64, extra: ?u64) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(a);
@@ -1597,7 +1591,7 @@ const Router = struct {
         // (the genesis `__admin__` group is epoch 0; a moved tenant is >1).
         const bepoch = std.fmt.allocPrint(a, "{d}", .{bp.value.epoch}) catch return false;
         defer a.free(bepoch);
-        // Membership SSOT (Phase 2d), the AUGMENTED-ConfState approach: the
+        // Membership SSOT, the AUGMENTED-ConfState approach: the
         // baseline carries the leader's CURRENT ConfState PLUS this node as a
         // learner, so the joiner learns its membership from the snapshot
         // (raft.rs:2629) AND satisfies the recipient-must-be-in-the-ConfState rule
@@ -1933,7 +1927,7 @@ pub fn main() !void {
     const cp_peer_urls = try parseUrlList(allocator, getEnvCfg("REWIND_CP_PEER_URLS"));
     defer freeUrlList(allocator, cp_peer_urls);
 
-    // V2 Phase 4 — shared secret for the cluster-internal move surface. The CP
+    // Shared secret for the cluster-internal move surface. The CP
     // presents it to backends' `/_system/v2-*` endpoints and requires it on
     // `/_control/move`. Unset → move control disabled.
     const move_secret: ?[]const u8 = std.posix.getenv("REWIND_MOVE_SECRET");
@@ -1954,7 +1948,7 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    // Leader-elected ACME HTTP-01 issuer (gap #3 slice 3). Inert unless
+    // Leader-elected ACME HTTP-01 issuer. Inert unless
     // `REWIND_ACME_DIRECTORY` is set — then it issues certs for mapped custom
     // domains lacking a `cert/{host}` and serves the challenge via
     // `/_cp/acme-challenge` (the front door's :80 listener forwards to it).

@@ -4,12 +4,9 @@
 //! process worker → rewind-logs path when the operator
 //! hasn't wired S3 (typical local dev / smoke).
 //!
-//! Phase 5.5(a) step 3 originally retired the on-disk batch store
-//! to keep dev and prod on a single backend. Phase 5.5(a) Task #61
-//! (the standalone-process split) brings it back as the cross-
-//! process equivalent of MemoryBatchStore: same behavior, but the
-//! state lives on disk so the worker's PUT and the standalone's
-//! LIST/GET see each other across process boundaries.
+//! The cross-process equivalent of MemoryBatchStore: same behavior,
+//! but the state lives on disk so the worker's PUT and the
+//! standalone's LIST/GET see each other across process boundaries.
 //!
 //! Concurrency: two-process safe for the normal worker / standalone
 //! shape (worker writes, standalone reads). Atomic writes via temp

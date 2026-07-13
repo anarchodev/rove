@@ -1,11 +1,11 @@
 //! Process-global write coordinator for object-storage PUTs.
 //!
-//! See `docs/streaming-model.md §7` for the full design. As of
-//! Phase 5 (2026-05-27), submissions land in a single cross-tenant
-//! pool under `{key_prefix_base}_pool/{batch_id:0>20}`; the per-
-//! (tenant, worker) lane shape Phase 3 shipped is gone. `batch_id`
-//! is globally unique by construction — minted from a raft-reserved
-//! block (`_system/coord_next_pool_batch`, plan §3.5b).
+//! See `docs/streaming-model.md §7` for the full design. Submissions
+//! land in a single cross-tenant pool under
+//! `{key_prefix_base}_pool/{batch_id:0>20}` — there are no per-
+//! (tenant, worker) lanes; workers freely mix in one pool object.
+//! `batch_id` is globally unique by construction — minted from a
+//! raft-reserved block (`_system/coord_next_pool_batch`, plan §3.5b).
 //!
 //! Architecture (plan §3.2):
 //!
@@ -218,8 +218,7 @@ const SealedBatch = struct {
     /// cleanup): count of entries not yet `release`d by their
     /// consumer. Initialized to `entries.len` at retain; each
     /// `release` decrements it and frees that entry's bytes; when it
-    /// hits 0 the whole batch is freed (it's the unbounded leak today
-    /// — `retained` kept every batch forever). Guarded by `retained_mu`.
+    /// hits 0 the whole batch is freed. Guarded by `retained_mu`.
     live: usize = 0,
 
     fn deinit(self: *SealedBatch, allocator: std.mem.Allocator) void {
@@ -238,11 +237,11 @@ const SealedSubEntry = struct {
     worker_id: u8,
     seq: u64,
     offset: u64,
-    /// Owned by the entry until coord deinit. We keep it around so
-    /// a recompute / re-PUT path (future) could rebuild the payload
-    /// without re-asking workers. Phase 5 keeps the parallel copy;
-    /// production tuning can revisit (payload + entries are both
-    /// retained, doubling RAM for in-flight batches).
+    /// Owned by the entry until coord deinit. Kept around so a
+    /// recompute / re-PUT path (future) could rebuild the payload
+    /// without re-asking workers. The parallel copy is retained
+    /// (payload + entries both, doubling RAM for in-flight batches);
+    /// production tuning can revisit.
     bytes: []u8,
 };
 
@@ -286,7 +285,7 @@ pub const BlobCoordinator = struct {
     /// Sealed batches awaiting consumption, retained for `bodyRef` /
     /// `readBody` dereference. `docs/chunk-spool-plan.md` P6: each
     /// batch is refcounted by its un-`release`d entries (`SealedBatch
-    /// .live`) and freed when fully consumed — no longer kept forever.
+    /// .live`) and freed when fully consumed.
     /// `retained_by_batch` is the O(1) `batch_id → *SealedBatch` index
     /// `release` uses (the `retained` list is the iteration/shutdown
     /// set). Both guarded by `retained_mu`.
@@ -509,8 +508,8 @@ pub const BlobCoordinator = struct {
     /// Count of retained (sealed-but-not-fully-consumed) batches —
     /// `docs/chunk-spool-plan.md` P6 RAM diagnostic. With refcount
     /// release this stays at the live submitted-but-unconsumed
-    /// backlog; pre-P6 it grew without bound (every batch ever).
-    /// Exposed on `/_system/metrics` as `coord_retained_batches`.
+    /// backlog. Exposed on `/_system/metrics` as
+    /// `coord_retained_batches`.
     pub fn retainedBatchCount(self: *Self) usize {
         self.retained_mu.lock();
         defer self.retained_mu.unlock();
@@ -1089,7 +1088,7 @@ fn jitter(base_ns: u64, pct: u8) u64 {
 fn removeFromSorted(list: *std.ArrayListUnmanaged(u64), seq: u64) void {
     // Binary search would be O(log N) but the list is small in
     // practice (bounded by in-flight submissions per worker).
-    // Linear scan is fine for Phase 1.
+    // Linear scan is fine.
     for (list.items, 0..) |s, i| {
         if (s == seq) {
             _ = list.orderedRemove(i);

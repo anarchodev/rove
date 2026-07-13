@@ -1,4 +1,4 @@
-//! Declarative world parser (Phase 12 — `docs/architecture/replay-and-sim.md`,
+//! Declarative world parser (`docs/architecture/replay-and-sim.md`,
 //! "The model — one run, parameterized").
 //!
 //! A *world* is everything one activation reads: the trigger/request surface,

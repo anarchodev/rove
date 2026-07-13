@@ -2,8 +2,8 @@
 //! `simulate(world) → bundle` atom into a JS-authored test surface
 //! (`docs/architecture/replay-and-sim.md` "The saga test model").
 //!
-//! Two reactors, one thread (unblocked by arenajs 0.3.3's de-singletoned
-//! instance API, `qjs-arena-reactor.h`):
+//! Two reactors, one thread (arenajs 0.3.3's instance API,
+//! `qjs-arena-reactor.h`):
 //!
 //!   - the **harness** reactor `H` runs each `_tests/*.mjs` file — the test
 //!     body's `expect`/loops/`scenario` control flow — and imports the embedded
@@ -497,7 +497,7 @@ test "parseAssertPass reads the top-level pass, not a nested one" {
     try testing.expect(parseAssertPass(a, "{\"name\":\"x\",\"pass\":true}"));
     try testing.expect(!parseAssertPass(a, "{\"name\":\"x\",\"pass\":false}"));
     // A FAILING assertion whose detail contains a nested "pass":true must stay
-    // a fail — the old substring scan reported this green.
+    // a fail — a substring scan would report this green.
     try testing.expect(!parseAssertPass(a,
         "{\"name\":\"x\",\"pass\":false,\"detail\":{\"expected\":{\"pass\":true}}}"));
     try testing.expect(!parseAssertPass(a, "not json"));

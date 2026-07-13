@@ -252,7 +252,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     }
     try w.writeAll(if (kv.items.len != 0) "\n  }" else "}");
     // The recorded status becomes an `expected` assertion — replay verifies the
-    // re-run reproduces it (this replaces the old `recorded`/`status_match`).
+    // re-run reproduces it.
     if (recorded) |r| {
         if (r.get("status")) |sv| if (sv == .integer) {
             try w.print(",\n  \"expected\": {{ \"response\": {{ \"status\": {d} }} }}", .{sv.integer});

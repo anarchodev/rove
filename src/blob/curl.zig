@@ -91,7 +91,7 @@ pub const Response = struct {
     /// leaving `self.body` untouched. For callers that take ownership
     /// of `body` and translate the rest into their own struct (the
     /// S3 blob + log batch stores do this); without it those callers
-    /// silently leaked every response header.
+    /// would silently leak every response header.
     pub fn deinitHeaders(self: *Response, allocator: std.mem.Allocator) void {
         for (self.headers) |h| {
             allocator.free(h.name);
@@ -118,7 +118,7 @@ pub const Request = struct {
     /// handshake overhead, tight enough that a stuck connection
     /// fails fast and logs the warning instead of papering over a
     /// degraded link. The kernel's 15-minute TCP retransmit timer
-    /// is now never reachable. Bench / smoke callers can override.
+    /// is never reachable. Bench / smoke callers can override.
     timeout_ms: u32 = 15_000,
     /// Connect-only deadline. Caps how long we spend on DNS + TCP +
     /// TLS handshake before giving up. 5 s tolerates real-world
@@ -560,15 +560,14 @@ pub const Easy = struct {
 };
 
 /// Process-wide pool of libcurl `Easy` handles, reused across every
-/// `S3BlobStore` / `HttpBlobStore` in the process. Replaces the
-/// previous one-Easy-per-store pattern: at scale that put a separate
-/// keep-alive TCP+TLS connection in flight for every per-tenant
-/// store × every worker thread × every backend (file-blobs + manifest
-/// + log-blobs), which blew the FD count and the per-connection
-/// libcurl/BoringSSL state into the 8-GB-per-worker range at 1k
-/// active tenants.
+/// `S3BlobStore` / `HttpBlobStore` in the process. A per-store Easy
+/// would not scale: it puts a separate keep-alive TCP+TLS connection
+/// in flight for every per-tenant store × every worker thread × every
+/// backend (file-blobs + manifest + log-blobs), blowing the FD count
+/// and the per-connection libcurl/BoringSSL state into the
+/// 8-GB-per-worker range at 1k active tenants.
 ///
-/// Now: one fixed-size pool of N handles. Any caller `acquire()`s a
+/// One fixed-size pool of N handles. Any caller `acquire()`s a
 /// handle (blocking on a condvar when the pool is exhausted), runs
 /// one request, `release()`s it back. N is the maximum number of
 /// concurrent in-flight S3 requests this process will pipeline.

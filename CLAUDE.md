@@ -159,7 +159,7 @@ Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`
 - Tests are inline Zig tests (`test "description" { ... }`) co-located with the code they cover.
 - Module public API is exported through each module's `root.zig`.
 - No async/await — concurrency uses collection-based polling + phase-based dispatch.
-- Comments reference a "Phase" numbering system tracking the incremental delivery plan; phases run 0 through 14 (with 5.5 as the storage-scalability bucket). See `docs/PLAN.md` §3 for current phase content and §10.16 for the beta / 1.0 / post-1.0 launch sequencing.
+- Write comments in the timeless present: explain the current code — keep rationale, invariants, and cross-references (including `docs/` pointers). Don't narrate the change that produced it (no "was X / now Y", issue-# tags, or bare Phase-N history — that belongs in git + the PR, where it stays accurate as the code moves on). When a past pitfall matters, encode it as a present-tense constraint, not a changelog line. The phased delivery plan itself lives in `docs/PLAN.md` (§3 for phase content, §10.16 for launch sequencing) — reference it by doc-pointer rather than tagging a comment with a phase number.
 
 ## Working with multiple agents (git worktrees)
 

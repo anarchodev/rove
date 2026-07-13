@@ -1,4 +1,4 @@
-//! S3 backend for `BatchStore` (Phase 5.5 a, step 3a).
+//! S3 backend for `BatchStore`.
 //!
 //! Parallels `src/blob/s3.zig` — same SigV4 plumbing — but exposes
 //! the `BatchStore` vtable instead of `BlobStore`. Two ops the

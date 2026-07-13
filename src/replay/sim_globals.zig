@@ -18,7 +18,7 @@
 //! base globals and per-request shims share one ordered log:
 //!   - `http`/`platform`/`browser` and the connection/continuation trio
 //!     `after`/`stream`/`next` are faithful recorders (they don't decompose),
-//!     installed unconditionally — the epilogue no longer stubs them;
+//!     installed unconditionally — the epilogue does not stub them;
 //!   - the durable-effect verbs `cron`/`schedule`/`webhook`/`email` are the REAL
 //!     shims, so `webhook.send`/`email.send` decompose into `http.fetch`+`kv`
 //!     (`_send/owed`) + a watchdog `schedule` (`_sched/*`), and `schedule`/`cron`
@@ -279,14 +279,14 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_activitypub") ++
     // The connection/continuation shims — `after` (wake triggers), `stream`
     // (output frames), `next` (park disposition). Faithful recorders (they don't
-    // decompose), installed unconditionally; the epilogue no longer stubs them.
+    // decompose), installed unconditionally; the epilogue does not stub them.
     // All three are IIFE-wrapped upstream, so freeze-safe as embedded.
     "\n;" ++ @embedFile("g_after") ++
     "\n;" ++ @embedFile("g_stream") ++
     "\n;" ++ @embedFile("g_next") ++
     // The durable-effect shims — the real webhook/schedule/cron/email verbs, so
     // they decompose to primitives (`_send/owed` + `_sched/*` kv writes +
-    // `http.fetch`) in the effect log; the epilogue no longer stubs them.
+    // `http.fetch`) in the effect log; the epilogue does not stub them.
     // Order mirrors the worker's GLOBALS_FILES: `cron` (fire-time helpers + the
     // recurring verb) → `schedule` (reuses `cron.parseDuration`) → `webhook`
     // (composes over `kv`+`schedule`+the `_system.http` fetch primitive it

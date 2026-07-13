@@ -14,15 +14,12 @@
 //!
 //! Concurrency: NOT thread-safe. Each `*S3BlobStore` owns one
 //! `std.http.Client` reused across calls (so TLS handshake +
-//! TCP connect happen once, not per-op — the smoke went from
-//! ~500ms × 6 ops to one handshake + amortized request cost).
+//! TCP connect happen once, not per-op, amortizing the ~500ms
+//! handshake cost across requests).
 //! Multi-threaded callers should hold per-thread instances, the
 //! same model the per-tenant SQLite handles use elsewhere in rove.
 //!
 //! What's deliberately NOT here:
-//! - (Multipart upload WAS here-listed as omitted; it shipped with
-//!   blob-storage-plan §3.5 slice A — create/uploadPart/complete/
-//!   abort/copyObject below — as the storage half of `blob.receive`.)
 //! - Server-side encryption headers (S3 SSE / SSE-KMS). Loop46's
 //!   own page-encryption (PLAN Phase 9) handles this client-side;
 //!   no need for S3-side enc on top.
@@ -78,14 +75,13 @@ pub const S3BlobStore = struct {
     /// from short-lived allocations (e.g. a per-request key prefix).
     config: Config,
     /// Process-wide libcurl handle pool. Each request acquires an
-    /// Easy from the pool, runs the call, returns it. Previous
-    /// design was one Easy per S3BlobStore — at 1k tenants × 4
-    /// worker threads × 2 backends (file-blobs + manifest) per
-    /// tenant that put 8000 persistent S3 connections per process,
-    /// burning FDs + memory. The pool caps total concurrent S3
-    /// requests at its size (default 64, env
-    /// `ROVE_S3_POOL_SIZE`), and the per-request acquire-release
-    /// is uncontended under steady load.
+    /// Easy from the pool, runs the call, returns it. A per-store
+    /// Easy would not scale — at 1k tenants × 4 worker threads × 2
+    /// backends (file-blobs + manifest) per tenant that would be
+    /// 8000 persistent S3 connections per process, burning FDs +
+    /// memory. The pool caps total concurrent S3 requests at its
+    /// size (default 64, env `ROVE_S3_POOL_SIZE`), and the
+    /// per-request acquire-release is uncontended under steady load.
     pool: *curl_mod.EasyPool,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !S3BlobStore {

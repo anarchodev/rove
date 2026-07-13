@@ -1,25 +1,25 @@
 //! HTTP/1.1 codec for the rove-h2 edge listener (docs/v2-edge-http1-ingress.md).
 //!
-//! Phase 1: the pure, I/O-free parser + serializer. `parseHead` turns an
+//! The pure, I/O-free parser + serializer. `parseHead` turns an
 //! accumulated request buffer into a `Head` (request line + headers + the body
 //! framing it implies); `writeResponse` serializes a status + headers + body
 //! into HTTP/1.1 bytes. No sockets, no entities, no allocation in the parser —
-//! Phase 2 wires this into `root.zig`'s connection / request-entity plumbing.
+//! `root.zig` wires this into its connection / request-entity plumbing.
 //!
 //! Scope (per the design doc): request/response with `Content-Length` bodies +
-//! keep-alive. Chunked transfer-encoding is detected (so Phase 2 can 411/handle
-//! it) but not decoded here yet (Phase 4). No pipelining.
+//! keep-alive. Chunked transfer-encoding is detected and decoded
+//! (`decodeChunked`). No pipelining.
 
 const std = @import("std");
 
-/// Bounds — coherent with the gap #1 body cap philosophy: refuse to buffer an
-/// unbounded request head. (The body cap is enforced separately, by plan.)
+/// Bounds — refuse to buffer an unbounded request head, coherent with the
+/// body-cap philosophy. (The body cap is enforced separately, by plan.)
 pub const MAX_HEAD_BYTES: usize = 64 * 1024;
 pub const MAX_HEADERS: usize = 100;
 
 pub const Header = struct {
     /// Borrowed from the input buffer. Name is NOT lowercased here (HTTP/1
-    /// names are case-insensitive); Phase 2 lowercases when it builds the
+    /// names are case-insensitive); it's lowercased when `root.zig` builds the
     /// h2-style `ReqHeaders` so downstream matching stays uniform.
     name: []const u8,
     value: []const u8,

@@ -1,7 +1,7 @@
-//! Sidecar wire format for the S3-direct logs path. Phase 5.5(a-3)
-//! embeds the sidecar at the head of the `.ndjson` object as a
-//! length-prefixed JSON blob; this module owns the sidecar's JSON
-//! shape (parse + encode), independent of where it lives on disk.
+//! Sidecar wire format for the S3-direct logs path. The sidecar is
+//! embedded at the head of the `.ndjson` object as a length-prefixed
+//! JSON blob; this module owns the sidecar's JSON shape (parse +
+//! encode), independent of where it lives on disk.
 //!
 //! See `docs/logs-plan.md` §2 for the on-disk layout. Record offsets
 //! in the sidecar are **frame-relative** (into the raw-deflate
@@ -26,10 +26,10 @@ pub const VERSION: u32 = 1;
 /// `log_index` table stores per record. Owned strings are duplicated
 /// on parse so the caller can free the source bytes immediately.
 ///
-/// Phase 5.5(a-2) interleaved layout: each row carries its own
-/// `tenant_id` so a single per-node sidecar can index records
-/// belonging to many tenants. The indexer demuxes on this when
-/// populating `log_index.db`.
+/// Interleaved layout: each row carries its own `tenant_id` so a
+/// single per-node sidecar can index records belonging to many
+/// tenants. The indexer demuxes on this when populating
+/// `log_index.db`.
 pub const Record = struct {
     tenant_id: []const u8,
     request_id: u64,
@@ -240,8 +240,8 @@ fn dupeStr(
 }
 
 /// Like `dupeStr` but returns `""` (static, not owned) when the field
-/// is absent. For optional fields added after the format shipped, so
-/// older sidecars still parse.
+/// is absent. For optional fields that older sidecars may omit, so
+/// they still parse.
 fn dupeStrOpt(
     allocator: std.mem.Allocator,
     obj: std.json.ObjectMap,

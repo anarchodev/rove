@@ -10,9 +10,9 @@
 //!    `PUT` / `GET` / `HEAD` / `DELETE` against any S3-compatible
 //!    endpoint. Signs exactly three headers.
 //! 2. **Query-mode** (`presignGet`) — the signature rides in the
-//!    query string. Used by Phase 4 of the deployment-snapshots
-//!    plan to 302-redirect static asset requests directly to S3,
-//!    so the worker never proxies the bytes. Body payload-hash is
+//!    query string. Used by the deployment-snapshots plan to
+//!    302-redirect static asset requests directly to S3, so the
+//!    worker never proxies the bytes. Body payload-hash is
 //!    `UNSIGNED-PAYLOAD`; the only signed header is `host`. Caller
 //!    can sign `response-content-type` into the URL to override
 //!    whatever Content-Type S3 has stored for the object.
