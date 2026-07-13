@@ -3,11 +3,6 @@
 //! schedule row. Throws an `rate_limited` JS error when the
 //! per-instance email bucket is exhausted; customer can catch in
 //! their handler.
-//!
-//! Originally lived in `bindings/webhook.zig` alongside the
-//! `webhook.send` C binding; that binding retired (replaced by the
-//! `globals/webhook.js` polyfill on http.send), and this hidden
-//! builtin came along to its current name.
 
 const std = @import("std");
 const qjs = @import("rove-qjs");

@@ -1,6 +1,6 @@
 //! Dispatch resolution — which export an activation invokes.
 //!
-//! Extracted from `dispatcher.zig`. The platform invokes exactly ONE
+//! The platform invokes exactly ONE
 //! export per activation: the resume path's first-class target
 //! (`Request.fn_override`, set by the worker's resume engines) or, when
 //! none is named, the activation kind's conventional export
@@ -8,13 +8,13 @@
 //! positional arguments — resume payloads ride `request.body` and the
 //! `request.activation` union.
 //!
-//! The former customer-facing `{fn,args}` JSON-body envelope and
-//! `?fn=name&args=` query dispatch are RETIRED (decisions.md §4.5):
-//! the request body and query string are opaque payload the platform
-//! never interprets. Handlers that want named-function routing do it
-//! in JS — the documented `rpc({...})` recipe in `handler-shape.md`
-//! parses the same wire shapes inside the handler, where every read
-//! is taped. Pure data-shaping — no JS engine, no `Dispatcher` state.
+//! The request body and query string are opaque payload the platform
+//! never interprets — there is no `{fn,args}` JSON-body envelope or
+//! `?fn=name&args=` query dispatch (decisions.md §4.5). Handlers that
+//! want named-function routing do it in JS — the documented
+//! `rpc({...})` recipe in `handler-shape.md` parses the same wire
+//! shapes inside the handler, where every read is taped. Pure
+//! data-shaping — no JS engine, no `Dispatcher` state.
 
 const std = @import("std");
 const request_mod = @import("request.zig");
@@ -33,7 +33,7 @@ pub fn parseDispatch(
     request: Request,
 ) error{OutOfMemory}![]u8 {
     // Headers-first dispatch targets `onHeaders` unconditionally, and
-    // chunk dispatch targets `onChunk` (gap 2.4) — these are the
+    // chunk dispatch targets `onChunk` — these are the
     // activation's structural contract; no override applies (no
     // resume engine sets one on them).
     if (request.activation == .inbound_headers) return allocator.dupe(u8, "onHeaders");
@@ -46,15 +46,15 @@ pub fn parseDispatch(
         if (fn_name.len > 0) return allocator.dupe(u8, fn_name);
     }
 
-    // The activation kind's conventional export (handler-surface
-    // Phase 4, docs/handler-shape.md §3).
+    // The activation kind's conventional export
+    // (docs/handler-shape.md §3).
     return allocator.dupe(u8, defaultExportForKind(request.activation.source()));
 }
 
-/// Handler-surface Phase 4: map an activation source to its conventional
+/// Map an activation source to its conventional
 /// named export, used when the resume path didn't name one explicitly
 /// (`Request.fn_override`). `wake_batch` (the `on.kv`/`on.timer` edge
-/// wake — and the legacy singular `kv_wake`/`timer`) lands in `onWake`.
+/// wake — and the singular `kv_wake`/`timer`) lands in `onWake`.
 /// Inbound and the kinds whose resume path always names its own target —
 /// send_callback (the `next({fn})` / `on_result`), fetch_chunk
 /// (`{to}`/`onFetchChunk`), cron + subscription_fire (the registration's
@@ -83,8 +83,8 @@ test "parseDispatch: inbound with no override → default export" {
         .query = "x=also-ignored",
     });
     defer testing.allocator.free(fn_name);
-    // Body and query are opaque payload — the retired envelope shapes
-    // must NOT influence dispatch.
+    // Body and query are opaque payload — these `{fn,args}`/`?fn=`
+    // shapes must NOT influence dispatch.
     try testing.expectEqualStrings("default", fn_name);
 }
 

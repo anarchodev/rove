@@ -1,14 +1,14 @@
 //! Native UTF-8 transcode for `TextEncoder` / `TextDecoder`
 //! (`_system.textcodec.*`).
 //!
-//! The original pure-JS shim decoded byte-by-byte with
-//! `s += String.fromCharCode(b)` — ~N string reallocations of
-//! intermediate garbage, which a no-reclaim bump arena counts in
-//! full: a ~139 KB decode exhausted the (then 4 MiB) request arena.
-//! Natively both directions are a single conversion: QuickJS strings
-//! construct FROM UTF-8 (`JS_NewStringLen`) and convert TO UTF-8
-//! (`JS_ToCStringLen`), so decode/encode are one allocation each,
-//! O(1) garbage, and multi-MB payloads cost what they weigh.
+//! A byte-by-byte JS approach (`s += String.fromCharCode(b)`) costs
+//! ~N string reallocations of intermediate garbage, which a
+//! no-reclaim bump arena counts in full (a ~139 KB decode can
+//! exhaust a small request arena). Natively both directions are a
+//! single conversion: QuickJS strings construct FROM UTF-8
+//! (`JS_NewStringLen`) and convert TO UTF-8 (`JS_ToCStringLen`), so
+//! decode/encode are one allocation each, O(1) garbage, and multi-MB
+//! payloads cost what they weigh.
 //!
 //! The WHATWG-shaped class shells (label validation, `fatal`,
 //! BufferSource normalization) stay in `globals/textcodec.js`; only
@@ -47,9 +47,9 @@ pub fn jsTextEncode(
 ///
 /// Valid UTF-8 (the overwhelmingly common case) is one
 /// `JS_NewStringLen` — no copy beyond the string itself. Invalid
-/// input: `fatal` throws `TypeError` (same message the JS shim
-/// used); lenient substitutes U+FFFD per invalid sequence via a
-/// one-pass Zig sanitize, then converts the (now valid) buffer.
+/// input: `fatal` throws `TypeError`; lenient substitutes U+FFFD per
+/// invalid sequence via a one-pass Zig sanitize, then converts the
+/// (now valid) buffer.
 /// Validating ourselves matters: `JS_NewStringLen` on malformed
 /// UTF-8 falls back to latin-1 byte semantics, which is neither
 /// WHATWG behavior.
@@ -115,9 +115,8 @@ pub fn lenientUtf8JsString(
 const REPLACEMENT = "\xef\xbf\xbd"; // U+FFFD as UTF-8
 
 /// Replace every invalid sequence with U+FFFD (one replacement per
-/// rejected lead byte — same looseness as the retired JS shim; the
-/// WHATWG maximal-subpart refinement is not load-bearing for any
-/// in-tree consumer). Caller frees.
+/// rejected lead byte; the WHATWG maximal-subpart refinement is not
+/// load-bearing for any in-tree consumer). Caller frees.
 fn sanitizeUtf8(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);

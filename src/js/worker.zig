@@ -28,8 +28,7 @@
 //! off a raft propose + moves to `raft_pending`. `drainRaftPending`
 //! polls each parked entity's seq against `raft.committedSeq()` and
 //! `raft.faultedSeq()`, moving committed entities onward; this is the
-//! shift-js "pending" collection pattern, replacing the synchronous
-//! spin-wait that session 4 shipped as a placeholder.
+//! shift-js "pending" collection pattern.
 //!
 //! Parking means multiple requests can be in-flight through raft
 //! simultaneously — the h2 poll loop no longer blocks waiting for a
@@ -38,7 +37,7 @@
 //!
 //! Handler bytecode is loaded per deployment, not hard-coded: each
 //! tenant's `TenantFilesSnapshot` holds a path→bytecode map backed by
-//! the node-wide `BytecodeCache`, populated from the files-server's
+//! the node-wide `BytecodeCache`, populated from the tenant's
 //! deployment manifest. Routes and triggers come from that manifest;
 //! `reloadDeployment` refreshes the snapshot when a new release rolls
 //! out.
@@ -55,8 +54,7 @@ const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
-// V2 Phase 2c: the per-tenant raft bridge replaces V1's node-wide
-// `kv_mod.RaftNode` at the worker seam (v2-build-order §Phase 2).
+// The per-tenant raft bridge is the worker's consensus seam.
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
 const blob_mod = @import("rove-blob");
@@ -107,9 +105,9 @@ pub const MsgRouter = msg_router_mod.MsgRouter;
 const blob_coordination_mod = @import("blob_coordination.zig");
 pub const BlobCoordination = blob_coordination_mod.BlobCoordination;
 const deployment_cache = @import("deployment_cache.zig");
-// Phase C: the per-tenant deployment cache + TenantSlot type family live
-// in deployment_cache.zig now. Re-exported here so existing callers
-// (worker_mod.X internally, root.zig, main.zig via rjs.X) keep working.
+// The per-tenant deployment cache + TenantSlot type family live in
+// deployment_cache.zig. Re-exported here so callers (root.zig,
+// main.zig via rjs.X) keep working.
 pub const DeploymentCache = deployment_cache.DeploymentCache;
 pub const TenantSlot = deployment_cache.TenantSlot;
 pub const TenantFilesSnapshot = deployment_cache.TenantFilesSnapshot;
@@ -120,10 +118,9 @@ pub const PrefetchedManifest = deployment_cache.PrefetchedManifest;
 pub const ManifestHttpConfig = deployment_cache.ManifestHttpConfig;
 pub const ManifestPrefetchMap = deployment_cache.ManifestPrefetchMap;
 const owed_retry = @import("owed_retry.zig");
-// The `_send/owed/` marker's §6.4 held-sync binding scan (the retry
-// SWEEP retired with durable-wake-plan P5(a) — deferred fires ride the
-// durable scheduler as `__system/webhook_fire` wakes). Re-exported so
-// worker_drain/worker_dispatch (worker_mod.X) keep working unchanged.
+// The `_send/owed/` marker scan helpers. Deferred fires ride the
+// durable scheduler as `__system/webhook_fire` wakes. Re-exported so
+// worker_drain/worker_dispatch keep working.
 pub const OWED_PREFIX = owed_retry.OWED_PREFIX;
 pub const scanLoneOwedSendId = owed_retry.scanLoneOwedSendId;
 const starter = @import("starter.zig");
@@ -133,7 +130,7 @@ const durable_wake = @import("durable_wake.zig");
 pub const sweepDurableWakes = durable_wake.sweepDurableWakes;
 pub const sweepDurableWakesOnPromotion = durable_wake.sweepDurableWakesOnPromotion;
 
-/// Phase 5 PR-3: deferred §6.4 held-sync resume entry. The baked
+/// Deferred §6.4 held-sync resume entry. The baked
 /// `__system/webhook_onresult` shim calls
 /// `_system.continuation.resumeIfBound`; the trampoline appends
 /// this row + the worker drains it post-dispatch (see
@@ -170,10 +167,8 @@ const Request = dispatcher_mod.Request;
 /// raft `seq`: on commit it runs `TrackedTxn.commit()` (chain-head
 /// detach, retried on `Conflict`); on fault/timeout it runs
 /// `TrackedTxn.rollback()` on the pointer held in
-/// `worker.pending_txns[seq]`. (The legacy `KvStore.undoTxn` /
-/// `commitTxn` / `kv_undo`-log path was pre-kvexp SQLite machinery,
-/// since deleted; rollback is `TrackedTxn.rollback()` + kvexp
-/// volatility, not an undo-log walk.)
+/// `worker.pending_txns[seq]`. Rollback is `TrackedTxn.rollback()` +
+/// kvexp volatility, not an undo-log walk.
 ///
 /// Fields:
 /// - `seq`: raft-side sequence from `raft.highWatermark()+1`, tracked
@@ -181,10 +176,10 @@ const Request = dispatcher_mod.Request;
 ///   `worker.pending_txns` that owns the parked `TrackedTxn`.
 /// - `deadline_ns`: absolute `std.time.nanoTimestamp()` deadline.
 pub const RaftWait = struct {
-    /// V2 Phase 2c: the tenant's raft group id. The drain looks up this
-    /// tenant's per-tenant committed/faulted watermark
-    /// (`bridge.committedSeq(group_id)`) instead of V1's single global
-    /// watermark — so tenant B's commit never waits on tenant A's.
+    /// The tenant's raft group id. The drain looks up this tenant's
+    /// per-tenant committed/faulted watermark
+    /// (`bridge.committedSeq(group_id)`), so tenant B's commit never
+    /// waits on tenant A's.
     group_id: u64 = 0,
     /// Per-tenant propose seq (the bridge assigns it; monotonic per
     /// tenant). Durable when `bridge.committedSeq(group_id) >= seq`.
@@ -206,8 +201,8 @@ pub const ForwardWait = struct {
     deadline_ns: i64 = 0,
 };
 
-/// Per-entity park record for `docs/readset-replication-plan.md`
-/// Phase 4 (park-on-durability). When `dispatchPending` parks an
+/// Per-entity park record for park-on-durability
+/// (`docs/readset-replication-plan.md`). When `dispatchPending` parks an
 /// entity waiting for its inbound request body's batch to flush,
 /// it sets this component with the coordinator's `(worker_id,
 /// worker_seq)` durability key and the owning tenant id, then
@@ -275,7 +270,7 @@ pub fn onHeadersRemember(worker: anytype, dep_id: u64, module_base: []const u8, 
     gop.value_ptr.* = has_onheaders;
 }
 
-/// Gap 2.4: the `onChunk` twin of `onHeadersLookup` — same key shape,
+/// The `onChunk` twin of `onHeadersLookup` — same key shape,
 /// same probe-and-fill discipline.
 pub fn onChunkLookup(worker: anytype, dep_id: u64, module_base: []const u8) ?bool {
     var key_buf: [512]u8 = undefined;
@@ -283,7 +278,7 @@ pub fn onChunkLookup(worker: anytype, dep_id: u64, module_base: []const u8) ?boo
     return worker.onchunk_cache.get(key);
 }
 
-/// Gap 2.4: the `onChunk` twin of `onHeadersRemember`.
+/// The `onChunk` twin of `onHeadersRemember`.
 pub fn onChunkRemember(worker: anytype, dep_id: u64, module_base: []const u8, has_onchunk: bool) void {
     const allocator = worker.allocator;
     if (worker.onchunk_cache.count() >= 8192) {
@@ -329,7 +324,7 @@ pub const BodyDurabilityWait = struct {
     tenant_id: []const u8 = "",
 };
 
-/// Slice 4-fetch-park: parked outbound-fetch chunk activation.
+/// Parked outbound-fetch chunk activation.
 /// `UpstreamFetchEvent`s arrive via the msg_inbox and don't have
 /// an h2 entity to attach a `BodyDurabilityWait` component to, so
 /// the park list lives as a plain `ArrayListUnmanaged` on
@@ -357,16 +352,13 @@ pub const ParkedFetchEvent = struct {
     tenant_id_view: []const u8,
 };
 
-/// Effect-reification Phase 4.1: the typed Cmd buffer a `ParkedUnit`
-/// carries — commit-gated `kv_wake_broadcast` Cmds (was
-/// `BufferedSendKvOps.kv_wakes`), `stream_chunk` Cmds (was
-/// `staged_chunks` + `stream_entity`), `stream_close` Cmd (was
-/// `mark_draining`), and `http_fetch` Cmds (the new commit-gated
-/// staging for webhook.send's inline fetch — closes the
-/// marker-commit race the Phase-5-PR-3 close-out documented).
-/// Defined in `effect/cmd.zig`; aliased here for the
+/// The typed Cmd buffer a `ParkedUnit` carries — commit-gated
+/// `kv_wake_broadcast` Cmds, `stream_chunk` Cmds, `stream_close` Cmd,
+/// and `http_fetch` Cmds (commit-gated staging for webhook.send's
+/// inline fetch, which closes the marker-commit race). Defined in
+/// `effect/cmd.zig`; aliased here for the
 /// `ParkedUnit = Continuation(BufferedSendKvOps, ...)` declaration
-/// below to keep the historical name in worker-internal contexts.
+/// below (worker-internal code refers to it as `BufferedSendKvOps`).
 ///
 /// Released by `drainRaftPending` on `committedSeq >= seq` (via
 /// `BufferedCmds.releaseAll` → `interpretCmd` per Cmd); discarded
@@ -390,17 +382,14 @@ pub const BufferedSendKvOps = effect_mod.cmd.BufferedCmds;
 /// discards them on fault/timeout/leadership-loss (the effect
 /// never escaped).
 ///
-/// Effect-reification Phase 3.1: `ParkedUnit` is now the first
-/// concrete instantiation of `effect.Continuation`. Same fields
-/// (seq, deadline_ns, tenant_id, txn) and same rove-compatible
-/// `deinit(allocator, items)` signature — the migration is
-/// structural. The pre-3.1 `send_ops` + `kv_wakes` fields live
-/// under `unit.buffered.send_ops` / `unit.buffered.kv_wakes` now;
-/// the inner shape `BufferedSendKvOps` is defined above. The new
-/// `wake_key` slot is present but unused at this site
-/// (entity-less parked units don't need wake routing — the
-/// drainRaftPending sweep walks the collection directly). Phase
-/// 3.2+ uses `wake_key` when the H2 entity path migrates.
+/// `ParkedUnit` is a concrete instantiation of `effect.Continuation`
+/// (fields: seq, deadline_ns, tenant_id, txn; rove-compatible
+/// `deinit(allocator, items)` signature). The buffered ops live under
+/// `unit.buffered.send_ops` / `unit.buffered.kv_wakes`; the inner shape
+/// `BufferedSendKvOps` is defined above. The `wake_key` slot is present
+/// but unused at this site — entity-less parked units don't need wake
+/// routing, since the `drainRaftPending` sweep walks the collection
+/// directly.
 pub const ParkedUnit = effect_mod.Continuation(BufferedSendKvOps, *kv_mod.KvStore.TrackedTxn);
 
 /// One inbound WS frame held behind its connection's input gate
@@ -460,7 +449,7 @@ pub const KvWakeOp = effect_mod.cmd.KvWakeOp;
 /// h2 components at resolve time.
 /// §6.4 mandatory-timeout for a continuation-parked stream — a real
 /// 504 must go out before any browser/LB/CDN intermediary gives up.
-/// Fixed for 3b-ii (config knob is a later refinement); mirrors the
+/// Fixed value (a config knob is a later refinement); mirrors the
 /// connection-holder's `default_hold_deadline_ms` (25 s).
 pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
 
@@ -471,15 +460,15 @@ pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
 /// timeout reaps genuinely dead clients long before this.
 pub const RECEIVE_HOLD_DEADLINE_NS: i64 = 15 * 60 * std.time.ns_per_s;
 
-// Phase 7: `ParkedCont` struct removed — cont state lives on the
-// entity's `ContDescriptor` + `ChainContext` components, which
-// deinit structurally on entity destroy.
+// Continuation state lives on the entity's `ContDescriptor` +
+// `ChainContext` components, which deinit structurally on entity
+// destroy (no separate `ParkedCont` struct).
 
-// Phase 7: `StreamCell` removed — stream state lives on the entity's
-// `ChainContext` + `StreamChain` + `StreamChunks` + `StreamWakes`
-// components (defined in components.zig); each has its own
-// component-style deinit that rove `Collection.deinit` invokes
-// structurally on every entity in the collection on shutdown.
+// Stream state lives on the entity's `ChainContext` + `StreamChain` +
+// `StreamChunks` + `StreamWakes` components (defined in components.zig);
+// each has its own component-style deinit that rove `Collection.deinit`
+// invokes structurally on every entity in the collection on shutdown
+// (no separate `StreamCell` struct).
 
 /// One kv-write event that crossed the apply boundary (either via
 /// `applyWriteSet` on a follower or via the leader-side eager fire
@@ -491,7 +480,7 @@ pub const KvWakeEvent = struct {
     tenant_id: []u8,
     key: []u8,
     op: u8,
-    /// Handler-surface Phase 1 (`on.kv`): the producer store's
+    /// For `on.kv`: the producer store's
     /// `KvStore.writeVersion` at the moment this write was incorporated
     /// (§8.4). `matchEventsToWakes` fires a watch only when this is
     /// strictly greater than the watch's `read_version` baseline, so a
@@ -558,10 +547,10 @@ pub const KvWakeInbox = struct {
     }
 };
 
-/// Phase 2b-ii: per-stream caps (hard, no operator config yet). A
+/// Per-stream caps (hard, no operator config yet). A
 /// misbehaving handler can't run a stream forever; once these hit,
 /// `serviceParkedStreams` forces `close_pending` and the entity
-/// shuts down cleanly. Configurable per-tenant lands in Phase 2c.
+/// shuts down cleanly.
 pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 
 /// `docs/chunk-spool-plan.md` Phase 3: default per-fetch chunk-spool
@@ -588,11 +577,10 @@ fn readBoundFetchSpoolDepth() usize {
     return @max(parsed, 1);
 }
 
-// Effect-reification Phase 2E: SubscriptionFireInbox + FetchChunkInbox
-// + PendingFireMessage retired. The unified `effect.MsgInbox` carries
-// Msgs (variant-typed) across the thread boundary; producers build the
-// Msg variant before push (no inbox-side adapter type needed). See
-// `effect/queue.zig` for the inbox + drain shape.
+// The unified `effect.MsgInbox` carries Msgs (variant-typed) across
+// the thread boundary; producers build the Msg variant before push
+// (no inbox-side adapter type needed). See `effect/queue.zig` for the
+// inbox + drain shape.
 
 /// One cross-tenant target's accumulated writeset within a batch.
 /// `id` is an owned dup of the target instance id.
@@ -664,20 +652,16 @@ pub const BatchSideEffects = struct {
     }
 };
 
-/// Default handler entry path. Each tenant's deployment must have a
-/// file at this path — it's the script the worker runs per request.
-/// Name of the single handler file the old single-bytecode path
-/// expected, kept as a constant for the smoke-test bootstrap that
-/// publishes one `index.js` per tenant. The request router now picks
-/// any file in the deployment (see `router.zig`), so this constant is
-/// only a convenience for tools that want to know where the root entry
-/// point lives by default.
+/// Default handler entry path. Kept as a constant for the smoke-test
+/// bootstrap that publishes one `index.js` per tenant; the request
+/// router picks any file in the deployment (see `router.zig`), so this
+/// is only a convenience for tools that want the default root entry
+/// point.
 pub const DEFAULT_HANDLER_PATH = "index.js";
 
 /// Tick-local scratch list of tenants whose kvexp dispatch lease
 /// `tryAcquire` returned contended (surfaced as `error.Conflict`)
-/// during the current tick — the kvexp successor of the pre-cutover
-/// `SQLITE_BUSY`-on-`BEGIN IMMEDIATE` skip. Owned by the caller
+/// during the current tick. Owned by the caller
 /// (the worker main loop), cleared at the top of each tick, passed
 /// by-pointer into `dispatchOnce` so a blocked tenant doesn't get
 /// picked as anchor again until the tick ends and the list is
@@ -710,10 +694,10 @@ pub const BlockedTenants = struct {
 /// per-tenant `RequestIdMinter`. Opened eagerly in `Worker.create`,
 /// closed in `Worker.destroy`.
 ///
-/// The in-memory record buffer that used to live here has moved to
-/// the worker-wide `log_buffer: NodeLogBuffer` (one buffer per node,
-/// not per tenant), since every flush combines all tenants' records
-/// into one batch anyway. See `docs/logs-plan.md` §3.1 / §6.9.
+/// Record buffering lives on the worker-wide `log_buffer:
+/// NodeLogBuffer` (one buffer per node, not per tenant), since every
+/// flush combines all tenants' records into one batch anyway. See
+/// `docs/logs-plan.md` §3.1 / §6.9.
 pub const TenantLog = struct {
     allocator: std.mem.Allocator,
     instance_id: []u8,
@@ -733,13 +717,12 @@ pub const TenantLog = struct {
 /// `Entry.free(allocator, *Entry)`, with `getOrOpen` as the lazy
 /// constructor and `clearAllEntries`/`deinit` as bulk teardown.
 ///
-/// Now used only by `tenant_logs` (`TenantMap(TenantLog)`). The
-/// per-tenant *slot* cache used to share this generic but no longer
-/// does: opening a slot performs blob/libcurl I/O that must run without
-/// holding the cache lock, which `getOrOpen` can't express — so
-/// `DeploymentCache` open-codes that path and uses a plain
-/// `StringHashMapUnmanaged(*TenantSlot)` instead. This generic stays
-/// for the log cache, whose open is cheap and fits the convention.
+/// Used only by `tenant_logs` (`TenantMap(TenantLog)`). The per-tenant
+/// *slot* cache doesn't use this generic: opening a slot performs
+/// blob/libcurl I/O that must run without holding the cache lock, which
+/// `getOrOpen` can't express — so `DeploymentCache` open-codes that path
+/// with a plain `StringHashMapUnmanaged(*TenantSlot)`. This generic fits
+/// the log cache, whose open is cheap.
 fn TenantMap(comptime Entry: type) type {
     return struct {
         const Self = @This();
@@ -813,8 +796,8 @@ pub const Options = struct {
 /// Process-wide state shared across every worker on a node.
 /// Owned by `main.zig`; workers borrow `*NodeState`.
 ///
-/// Hoisting per-worker fields here fixes three latent bugs the kvexp
-/// cutover surfaced (see `docs/deployment-snapshots-plan.md`):
+/// Process-wide placement of these fields avoids three problems (see
+/// `docs/deployment-snapshots-plan.md`):
 ///
 ///   1. Per-worker bytecode duplication. The deployment cache is
 ///      pure read-only bytes between releases; one copy per process
@@ -823,16 +806,13 @@ pub const Options = struct {
 ///      via SO_REUSEPORT; with per-worker `tenant_files_map` only
 ///      that worker reloads. Sharing the map means one reload reaches
 ///      every dispatcher on the node.
-///   3. Cold-start duplication. Each worker walked `tenant.instances`
-///      and opened its own TenantFiles + libcurl Easies. One process-
-///      wide eager-open replaces N.
+///   3. Cold-start duplication. A per-worker map would have every
+///      worker walk `tenant.instances` and open its own TenantFiles +
+///      libcurl Easies; one process-wide eager-open does it once.
 ///
-/// Phase 1 of the rollout — sharing the map + single loader fix
-/// (1) and (2). Phase 2 layers in refcounted snapshots so the in-place
-/// reload race goes away too. `tenant_logs` stays per-worker because
-/// `RequestIdMinter` bakes the worker_id into the request id's upper
-/// 16 bits — sharing the minter would alias request ids across
-/// workers.
+/// `tenant_logs` stays per-worker because `RequestIdMinter` bakes the
+/// worker_id into the request id's upper 16 bits — sharing the minter
+/// would alias request ids across workers.
 pub const NodeState = struct {
     allocator: std.mem.Allocator,
 
@@ -897,7 +877,7 @@ pub const NodeState = struct {
     /// default vs held-state owner override).
     router: MsgRouter,
 
-    /// Phase 5 PR-2b: built-in `__system/*` module bytecodes,
+    /// Built-in `__system/*` module bytecodes,
     /// compiled once at `init` from sources baked into the binary
     /// (see `src/js/builtin_modules.zig`). Shared across every
     /// tenant context — the shim's onresult handler runs against
@@ -913,15 +893,14 @@ pub const NodeState = struct {
     /// many customer requests ride one raft log entry".
     dispatch_writeset_size: kv_mod.CountHistogram = .{},
 
-    // Effect-reification Phase 2E: `fetch_chunk_inboxes` collapsed
-    // into the unified `msg_inboxes` registry above. `FetchEngine`
-    // calls `enqueueFetchEventForTenant` which builds the appropriate
-    // `effect.Msg` and routes through the same hash-by-tenant
-    // registry as subscriptions and (future) inbound HTTP.
+    // Fetch events route through the unified `msg_inboxes` registry
+    // above: `FetchEngine` calls `enqueueFetchEventForTenant`, which
+    // builds the appropriate `effect.Msg` and routes through the same
+    // hash-by-tenant registry as subscriptions and (future) inbound HTTP.
 
     /// `docs/curl-multi-plan.md` Phase 2: the outbound-fetch engine.
     /// One thread + one `curl_multi` handle drives many concurrent
-    /// transfers (replaces the prior 8-thread FetchPool ceiling).
+    /// transfers.
     /// Lazy init via `startFetchEngine` after NodeState is wired +
     /// workers spawned. Producers (worker batch-finalize) call
     /// `enqueuePendingFetches` which routes to `engine.submit`; the
@@ -929,11 +908,10 @@ pub const NodeState = struct {
     /// the response + calls `enqueueFetchEventForTenant`.
     fetch_engine: ?*fetch_engine_mod.FetchEngine = null,
 
-    /// Async serve-or-forward engine (Phase 7 follow-up). One thread +
-    /// one `curl_multi` handle proxies mis-routed requests to the owning
-    /// cluster OFF the worker poll loop (the prior blocking
-    /// `tryForwardToOwner` stalled the loop for a full cross-cluster
-    /// round-trip). Lazy init via `startProxyEngine` after workers spawn.
+    /// Async serve-or-forward engine. One thread + one `curl_multi`
+    /// handle proxies mis-routed requests to the owning cluster OFF the
+    /// worker poll loop, so a full cross-cluster round-trip never stalls
+    /// the loop. Lazy init via `startProxyEngine` after workers spawn.
     /// See `proxy_engine.zig`.
     proxy_engine: ?*proxy_engine_mod.ProxyEngine = null,
     /// Per-worker result inboxes the proxy engine pushes into, indexed
@@ -961,7 +939,7 @@ pub const NodeState = struct {
         blob_backend_cfg: blob_mod.BackendConfig,
         raft: *Bridge,
     ) !NodeState {
-        // Phase 5 PR-2b: compile every `__system/*` built-in module
+        // Compile every `__system/*` built-in module
         // at startup. Bake them once; share across tenants via
         // `resolveDeployment`'s fallback. Failure here is fatal —
         // a baked module that won't compile is a build-time bug.
@@ -1000,11 +978,9 @@ pub const NodeState = struct {
     /// this returns so its defer doesn't double-free.
     ///
     /// If `fetch_engine` is null (not yet started, or already shut
-    /// down) the entries are silently dropped — same posture as
-    /// the previous "queued in fetch_pending; freed at deinit"
-    /// (the customer's chain never fires; nothing to recover at
-    /// shutdown). A warning logs once via the engine's own
-    /// no-inbox latch.
+    /// down) the entries are silently dropped (the customer's chain
+    /// never fires; nothing to recover at shutdown). A warning logs
+    /// once via the engine's own no-inbox latch.
     pub fn enqueuePendingFetches(
         self: *NodeState,
         items: []const globals.PendingFetch,
@@ -1025,7 +1001,7 @@ pub const NodeState = struct {
     }
 
     pub fn deinit(self: *NodeState) void {
-        // Gap 2.3 Phase C2: stop + join the fetch pool BEFORE any
+        // Stop + join the fetch pool BEFORE any
         // other tear-down so its threads don't observe half-freed
         // state. Workers already deinit'd their fetch-chunk
         // inboxes in their own destroy path; we drained those
@@ -1062,9 +1038,9 @@ pub const NodeState = struct {
         // no producer thread touches the registries mid-teardown.
         self.router.deinit();
         builtin_modules_mod.deinit(&self.builtin_modules, self.allocator);
-        // Phase 2 of curl-multi work: pending-fetches queue
-        // moved into the FetchEngine; its shutdown above already
-        // drained + freed any queued + in-flight entries.
+        // The pending-fetches queue lives in the FetchEngine; its
+        // shutdown above already drained + freed any queued +
+        // in-flight entries.
         //
         // Deployment cache last: stops the loader thread, frees every
         // tenant slot, then the bytecode cache (after the slots, which
@@ -1126,32 +1102,32 @@ pub const WorkerConfig = struct {
     /// Upper bound on how long a parked raft proposal can wait before
     /// we compensate-rollback and return 503. See `RaftWait` docs.
     commit_wait_timeout_ns: u64 = 2 * std.time.ns_per_s,
-    /// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — HMAC-SHA256
-    /// secret used to sign JWTs minted at `/_system/services-token`.
+    /// HMAC-SHA256 secret used to sign JWTs minted at
+    /// `/_system/services-token`.
     /// The standalone log-server + files-server (separate threads /
     /// processes, addressable at `log_public_base` + `files_public_base`)
     /// verify the same JWT on every request. Borrowed; the caller
     /// keeps the bytes alive for the worker's lifetime. When null,
     /// `/_system/services-token` returns 503.
     services_jwt_secret: ?[]const u8 = null,
-    /// V2 Phase 4 — shared secret for the cluster-internal tenant-move
+    /// Shared secret for the cluster-internal tenant-move
     /// surface (`/_system/v2-*`: kv seed/read, bundle dump, attach,
     /// evict). The front door (`rewind-front`) holds the same secret and
     /// presents it as `X-Rewind-Move-Secret` when orchestrating a move
     /// across clusters. Distinct from the operator root bearer (which the
     /// front door does not hold) and from the services JWT. When null the
     /// move endpoints are disabled (404/501). Borrowed; alive for the
-    /// worker's lifetime. (v2-build-order §Phase 4.)
+    /// worker's lifetime.
     move_secret: ?[]const u8 = null,
-    /// This cluster's logical id in the control-plane directory (Phase 7
-    /// serve-or-forward). When set together with `cp_urls`, a request for a
+    /// This cluster's logical id in the control-plane directory
+    /// (serve-or-forward). When set together with `cp_urls`, a request for a
     /// tenant this cluster can't resolve locally is forwarded to the cluster
     /// the CP says owns it, instead of 404 — so a stale public route (or a
     /// request to a post-move source) costs an extra hop, never a failure.
     /// Unset → no forwarding (a local miss 404s as before). Borrowed.
     cluster_id: ?[]const u8 = null,
     /// Base URLs of the CP nodes for the route lookup
-    /// (`{cp}/_cp/route?host=`). A LIST (Slice 2 HA): the CP is a 3-node
+    /// (`{cp}/_cp/route?host=`). A LIST: the CP is a 3-node
     /// cluster, and routing reads work on ANY CP node (apply-driven
     /// projection), so the worker tries each until one answers — surviving a
     /// CP node failure. Paired with `cluster_id`; empty disables serve-or-
@@ -1194,9 +1170,8 @@ pub const WorkerConfig = struct {
     /// correct for the single-worker-per-process case but wrong for
     /// multi-worker.
     log_worker_id: ?u16 = null,
-    /// Per-(instance, action) rate limit caps. v1 uses a single
-    /// tier — operator can tune via CLI flags before launch.
-    /// Phase 10 will branch on instance plan tier.
+    /// Per-(instance, action) rate limit caps. A single tier for now —
+    /// operator tunes via CLI flags.
     rate_limit_caps: limiter_mod.RateLimitCaps = .{},
     /// JS → bytecode compiler used by the signup path to deploy
     /// starter content for a freshly-created instance. When null,
@@ -1213,8 +1188,8 @@ pub const WorkerConfig = struct {
     // manifest_easy, manifest_prefetch) lives on `NodeState`. Reach
     // it via `worker.node`.
 
-    /// Phase 5.5 (a) — `BatchStore` the worker flushes log batches
-    /// into. loop46 always supplies one — S3 if env wired, in-memory
+    /// The `BatchStore` the worker flushes log batches into. The
+    /// embedding binary always supplies one — S3 if env wired, in-memory
     /// otherwise. Required because `flushLogs` shouldn't have to
     /// reason about a missing observability backend.
     log_batch_store: log_server_mod.batch_store.BatchStore,
@@ -1234,20 +1209,18 @@ pub const drainRequestReceiving = dispatch.drainRequestReceiving;
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
     // park entities in `raft_pending` without allocating side state.
-    // No proxy components anymore — Phase 5.5 retired all `/_system/*`
-    // proxies (logs Step B, files Step F1) in favor of standalone
-    // services on their own subdomains.
+    // There are no proxy components: the standalone log-server and
+    // files-server live on their own subdomains, not behind
+    // `/_system/*` proxies.
     //
-    // Phase 1 of the handler-cmds refactor
-    // (`docs/handler-cmds-refactor-plan.md`): cont + stream state
-    // components ride on every h2 stream collection + worker
-    // `parked_continuations` + worker `raft_pending`. Non-cont /
-    // non-stream entities carry default-empty instances; the SoA
-    // cost is the per-entity overhead the open question in the plan
-    // doc bounded at ~324 bytes (≈3 MB at 10k concurrent). Phase 2-4
-    // flips readers from the side stores to these components; Phase
-    // 5 splits raft_pending into siblings + Phase 7 deletes the side
-    // stores.
+    // Cont + stream state components
+    // (`docs/handler-cmds-refactor-plan.md`) ride on every h2 stream
+    // collection + worker `parked_continuations` + worker
+    // `raft_pending`. Non-cont / non-stream entities carry
+    // default-empty instances; the SoA cost is the per-entity
+    // overhead the plan doc bounds at ~324 bytes (≈3 MB at 10k
+    // concurrent). Readers consult these components directly (no side
+    // stores).
     const merged_request_row = rove.Row(&.{
         RaftWait,
         ForwardWait,
@@ -1260,7 +1233,7 @@ pub fn Worker(comptime opts: Options) type {
         components_mod.StreamWakes,
         components_mod.StreamDraining,
         components_mod.BoundFetchCount,
-        // raft Phase 2.5 streamed-snapshot dest state (inert {box=null} on every
+        // Streamed-snapshot dest state (inert {box=null} on every
         // non-snapshot stream entity). In the shared StreamRow so `arm` can set
         // the box in-place in `request_out` and the deferred move to
         // `snapshot_streams` CARRIES the value (rove-library #10).
@@ -1276,22 +1249,21 @@ pub fn Worker(comptime opts: Options) type {
     const StreamRow = H2Type.StreamRow;
     const StreamColl = rove.Collection(StreamRow, .{});
 
-    // Effect-reification Phase 2C: the `subscription_fire_pending`
-    // collection that lived here is gone. Every producer (cron + boot
-    // kv-react via the durable dirty-marker path, decisions §4.13)
-    // now routes through `effect.enqueueMsg` onto `Worker.msg_queue`;
-    // `dispatchSubscriptionFires` drains the queue. The cross-thread
-    // `SubscriptionFireInbox` stays as the boundary for non-worker
-    // producers.
+    // There is no `subscription_fire_pending` collection: every
+    // producer (cron + boot kv-react via the durable dirty-marker
+    // path, decisions §4.13) routes through `effect.enqueueMsg` onto
+    // `Worker.msg_queue`; `dispatchSubscriptionFires` drains the
+    // queue. The cross-thread `SubscriptionFireInbox` is the boundary
+    // for non-worker producers.
 
     // Worker-only collection for entity-less post-propose parked
     // units (`parkSendOps` / `parkKvWakes` / `proposeForgetfulWrites`).
-    // The flat `ArrayList<ParkedUnit>` predecessor required manual
-    // iterate-then-swapRemove inside drainRaftPending, which bit us
-    // with the iterate-while-modify GPE during Gap 2.1 Phase E.
-    // Collection-as-state gives deferred-destroy re-entrancy safety
-    // by construction (rove principle #1) + structural deinit
-    // (principle #2: data lifetime through components).
+    // A flat `ArrayList<ParkedUnit>` would need manual
+    // iterate-then-swapRemove inside drainRaftPending, risking an
+    // iterate-while-modify GPE. Collection-as-state gives
+    // deferred-destroy re-entrancy safety by construction (rove
+    // principle #1) + structural deinit (principle #2: data lifetime
+    // through components).
     const ParkedUnitRow = rove.Row(&.{ParkedUnit});
     const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
 
@@ -1303,11 +1275,9 @@ pub fn Worker(comptime opts: Options) type {
     const BlobSessionRow = rove.Row(&.{blob_sessions_mod.Session});
     const BlobSessionColl = rove.Collection(BlobSessionRow, .{});
 
-    // Effect-reification Phase 2D: the `fetch_event_pending`
-    // collection that lived here is gone. Inbox messages drain
-    // directly onto `Worker.msg_queue` (the unified ingress);
-    // `dispatchPendingMsgs` fires them per tick. Twin of the
-    // 2C `subscription_fire_pending` retirement.
+    // There is no `fetch_event_pending` collection: inbox messages
+    // drain directly onto `Worker.msg_queue` (the unified ingress);
+    // `dispatchPendingMsgs` fires them per tick.
 
     return struct {
         const Self = @This();
@@ -1342,11 +1312,10 @@ pub fn Worker(comptime opts: Options) type {
         /// h2 state. Uses the same row as every other h2 stream
         /// collection so moves in and out preserve every component.
         ///
-        /// Handler-cmds Phase 5: `raft_pending` was split into three
-        /// siblings (`raft_pending_response` / `raft_pending_cont` /
-        /// `raft_pending_stream`) — the entity's collection IS the
-        /// dispatch state, no membership field-check needed
-        /// (principle #1, state-via-collection-membership).
+        /// `raft_pending` is three siblings (`raft_pending_response` /
+        /// `raft_pending_cont` / `raft_pending_stream`) — the entity's
+        /// collection IS the dispatch state, no membership field-check
+        /// needed (principle #1, state-via-collection-membership).
         raft_pending_response: StreamColl,
         /// Continuation-bound raft park. Commits route to
         /// `parked_continuations`. Same Row as `raft_pending_response`.
@@ -1391,7 +1360,7 @@ pub fn Worker(comptime opts: Options) type {
         /// (`compile_batch` / `blob_put` / `manifest_put`). Poll-loop only
         /// (no lock). Starts at 0; pre-incremented so the first job is 1.
         next_compile_id: u64 = 0,
-        /// Slice 4-fetch-park: parked outbound-fetch chunk events
+        /// Parked outbound-fetch chunk events
         /// (large chunks waiting on durability). Plain
         /// `ArrayListUnmanaged` rather than a rove `Collection`
         /// because `UpstreamFetchEvent`s don't have an h2 entity
@@ -1415,14 +1384,14 @@ pub fn Worker(comptime opts: Options) type {
         /// collection so moves preserve all components — mirrors
         /// `raft_pending` exactly.
         parked_continuations: StreamColl,
-        /// raft Phase 2.5 streamed-snapshot dest: request entities receiving a
+        /// Streamed-snapshot dest: request entities receiving a
         /// `/_system/v2-snapshot-stream` body. Membership IS the "parked,
         /// mid-snapshot-stream" state (out of the dispatch walk); the per-entity
         /// `SnapshotStream` component owns the streaming `Box`. `arm` moves the
         /// entity here; `drainSnapshotStreams` finalizes (install baseline →
         /// `response_in`) or destroys it. Same StreamRow as every h2 collection.
         snapshot_streams: StreamColl,
-        /// raft Phase 2.5 SOURCE side of a streamed move: CP-trigger entities
+        /// SOURCE side of a streamed move: CP-trigger entities
         /// (`POST /_system/v2-snapshot-push`) parked while the off-loop driver
         /// streams the held snapshot to a dest. Membership IS "push in flight";
         /// `drainSnapshotPushes` responds + moves to `response_in` on completion.
@@ -1433,7 +1402,7 @@ pub fn Worker(comptime opts: Options) type {
         /// the run loop (main.zig) after both exist; `armSnapshotPush` enqueues
         /// move-push jobs here. Null until wired (push surface inert).
         snapshot_push_driver: ?*snapshot_catchup_mod.SnapshotCatchupThread = null,
-        /// Streaming-handlers Phase 2b-ii: per-entity DATA side-store
+        /// Per-entity DATA side-store
         /// for active `__rove_stream(...)` chains. The entity lives
         /// in the h2 module's `stream_data_out` collection (h2 owns
         /// its in-flight state); this map holds the chain-level
@@ -1443,17 +1412,16 @@ pub fn Worker(comptime opts: Options) type {
         /// alive; on close (handler returns `Response` or cap hits),
         /// the entity moves to `stream_close_in` (h2 sends END_STREAM)
         /// and the map entry is removed.
-        // Phase 7: `parked_streams_active` + `parked_streams_draining`
-        // side tables removed. Stream state lives on the entity's
-        // `ChainContext` / `StreamChain` / `StreamChunks` /
-        // `StreamWakes` components; the "drain-and-close" flag lives
-        // on `StreamDraining.is_draining`.
-        // Phase 7: `pending_stream_meta` removed — stream components
-        // are populated in `streamRecordIfAnyAt` (Phase 4a) before
-        // the entity moves into `raft_pending_stream`; the meta's
-        // owned slices are freed there too. The raft_pending_stream
-        // drainEntityArm just moves the entity to stream_response_in
-        // on commit; no side-table consume.
+        // Stream state lives on the entity's `ChainContext` /
+        // `StreamChain` / `StreamChunks` / `StreamWakes` components
+        // (no `parked_streams_active` / `parked_streams_draining` side
+        // tables); the "drain-and-close" flag lives on
+        // `StreamDraining.is_draining`. Stream components are populated
+        // in `streamRecordIfAnyAt` before the entity moves into
+        // `raft_pending_stream` (its owned slices are freed there
+        // too); the raft_pending_stream drainEntityArm just moves the
+        // entity to stream_response_in on commit — no side-table
+        // consume, no `pending_stream_meta`.
         /// Per-worker kv-wake inbox (streaming-handlers-plan §4.6).
         /// Producers (apply.zig + leader-side worker_dispatch) push
         /// events here via `worker.node.broadcastKvWake`;
@@ -1469,13 +1437,11 @@ pub fn Worker(comptime opts: Options) type {
         /// failure or raft fault, the txn is `rollback`'d instead.
         /// Single-threaded per worker (the dispatch loop owns it).
         ///
-        /// Effect-reification Phase 3.2.c: encapsulated as
-        /// `effect.SharedTxnPool` (was: bare `AutoHashMapUnmanaged`).
-        /// The pool exposes `park` / `commitAndTake` / `rollbackAndTake`
-        /// + `CommitOutcome` / `RollbackOutcome` so producer + consumer
-        /// sites consult ONE typed surface instead of poking at the
-        /// hashmap directly. The architectural fact (multiple
-        /// entities per seq) is documented on the pool — see
+        /// Encapsulated as `effect.SharedTxnPool`. The pool exposes
+        /// `park` / `commitAndTake` / `rollbackAndTake` +
+        /// `CommitOutcome` / `RollbackOutcome` so producer + consumer
+        /// sites consult ONE typed surface. The architectural fact
+        /// (multiple entities per seq) is documented on the pool — see
         /// `effect/continuation.zig`'s `SharedTxnPool` doc.
         pending_txns: effect_mod.SharedTxnPool(*kv_mod.KvStore.TrackedTxn) = .{},
         /// Non-entity post-propose parked units (divergence
@@ -1497,20 +1463,17 @@ pub fn Worker(comptime opts: Options) type {
         /// consulted by the headers-first disposition so steady-state
         /// classic POSTs pay no probe. Worker-local — no locking.
         onheaders_cache: std.StringHashMapUnmanaged(bool) = .empty,
-        /// Gap 2.4: per-(deployment, module) "exports onChunk" cache —
+        /// Per-(deployment, module) "exports onChunk" cache —
         /// same shape, fill discipline, and bound as `onheaders_cache`.
         /// Consulted after a known-no onHeaders outcome to pick the
         /// chunk-dispatch path without re-probing.
         onchunk_cache: std.StringHashMapUnmanaged(bool) = .empty,
-        /// Effect-reification Phase 2 ingress
-        /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
-        /// Phase 2). One bounded queue per worker; every migrated
-        /// origin routes into it via `effect.enqueueMsg`. Phase 2B
-        /// routes cron + boot; 2C routes kv-react; 2D routes outbound
-        /// HTTP (fetch chunk / done / pipe_done); 2E (this phase)
-        /// collapses the cross-thread inbox layer (see `msg_inbox`
-        /// below). Inbound-HTTP dispatch stays entity-driven through
-        /// h2 — Phase 3's reconciler scope.
+        /// Unified per-worker ingress queue (`docs/effect-algebra.md`
+        /// §2.3). One bounded queue per worker; every origin routes
+        /// into it via `effect.enqueueMsg` — cron + boot, kv-react,
+        /// and outbound HTTP (fetch chunk / done / pipe_done). The
+        /// cross-thread inbox layer feeds it (see `msg_inbox` below).
+        /// Inbound-HTTP dispatch stays entity-driven through h2.
         msg_queue: effect_mod.MsgQueue = undefined,
         /// durable-kv-subscriptions: the immediate-fire pending set —
         /// "tenant\x1fname" keys (owned), one entry max per dirty
@@ -1520,11 +1483,9 @@ pub fn Worker(comptime opts: Options) type {
         /// Throttle for `sweepDirtySubscriptions` (0 forces a sweep —
         /// the promotion hook uses that).
         last_sub_sweep_ns: i64 = 0,
-        /// Effect-reification Phase 2E: unified cross-thread Msg
-        /// inbox. Replaces the pre-2E pair (`sub_fire_inbox` +
-        /// `fetch_chunk_inbox`). Producers from non-worker threads
-        /// (deployment-loader boot, cron sweep, FetchPool libcurl
-        /// threads) `node.enqueueMsgForTenant`-hash-route here;
+        /// Unified cross-thread Msg inbox. Producers from non-worker
+        /// threads (deployment-loader boot, cron sweep, FetchPool
+        /// libcurl threads) `node.enqueueMsgForTenant`-hash-route here;
         /// `drainMsgInbox` (once per tick from `serviceSubscriptionFires`
         /// / `serviceFetchEvents`) moves Msgs onto `msg_queue`.
         msg_inbox: effect_mod.MsgInbox = undefined,
@@ -1535,7 +1496,7 @@ pub fn Worker(comptime opts: Options) type {
         /// because the sweep is partitioned the same way the owed
         /// sweep is — `hash(tenant_id) % N_msg_inboxes == self.msg_inbox_idx`.
         last_wake_sweep_ns: i64 = 0,
-        /// Phase 5 PR-3: deferred held-sync resumes. The baked
+        /// Deferred held-sync resumes. The baked
         /// `__system/webhook_onresult` shim calls
         /// `_system.continuation.resumeIfBound` on terminal; that
         /// trampoline appends `(tenant_id, send_id, event_json)`
@@ -1578,7 +1539,7 @@ pub fn Worker(comptime opts: Options) type {
         /// IS the held lifecycle); this is only the conn→state index,
         /// the WS analog of `bound_fetch_entities`.
         ws_conns: std.AutoHashMapUnmanaged(rove.Entity, WsConnState) = .empty,
-        /// Gap 2.4 (`docs/architecture/effects-and-handlers.md`, Streaming inbound body): live inbound-chunk
+        /// (`docs/architecture/effects-and-handlers.md`, Streaming inbound body): live inbound-chunk
         /// jobs, keyed by the request entity. One per body-carrying
         /// request whose module routes to `onChunk`. `dispatchOnce`
         /// stages the FIRST fire (the probe); `pumpInboundChunks` fires
@@ -1626,7 +1587,7 @@ pub fn Worker(comptime opts: Options) type {
         bound_fetch_spool_depth_peak: usize = 0,
         /// Count of spool-head chunks whose evicted inline bytes were
         /// read back from the coordinator (`coord.readBody`) at
-        /// dispatch. Non-zero proves the Phase 3 eviction → coord
+        /// dispatch. Non-zero proves the eviction → coord
         /// read-back path actually ran (vs. the consumer keeping up so
         /// the window never overflowed). Exposed on `/_system/metrics`
         /// as `bound_fetch_spool_readback_total`. Never reset.
@@ -1657,7 +1618,7 @@ pub fn Worker(comptime opts: Options) type {
         /// + `resumeBoundContinuation` for O(1) lookup instead of
         /// scanning every entity in `parked_continuations`.
         ///
-        /// Phase 2B routing guarantees: a chunk arriving here has
+        /// The routing guarantees: a chunk arriving here has
         /// `bound_send_owners[send_id] == this worker's idx`, so
         /// the entity IS in this worker's `parked_continuations`
         /// (modulo the brief window between unregister and entity
@@ -1667,7 +1628,7 @@ pub fn Worker(comptime opts: Options) type {
         ///
         /// Keys allocator-owned; freed on remove + on shutdown.
         bound_send_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
-        /// Phase 5 PR-3: this worker's slot index in
+        /// This worker's slot index in
         /// `node.msg_inboxes`. Set from `registerMsgInbox`'s
         /// return value at `create`. The per-worker partitioned
         /// retry sweep uses this to match the
@@ -1704,8 +1665,8 @@ pub fn Worker(comptime opts: Options) type {
         tenant_logs: TenantMap(TenantLog),
         /// Per-node in-memory `LogRecord` buffer. Every tenant's
         /// dispatch tick appends here; `flushLogs` drains the whole
-        /// buffer into one combined batch per flush window. Replaces
-        /// the per-tenant `LogStore.buffer` from before Phase 5.5(a-2).
+        /// buffer into one combined batch per flush window. One node
+        /// buffer, not per-tenant.
         log_buffer: log_mod.NodeLogBuffer,
         /// Circuit breaker for handlers that blow past their CPU
         /// budget. A tenant with `kill_threshold` interrupts inside a
@@ -1756,18 +1717,17 @@ pub fn Worker(comptime opts: Options) type {
         // manifest_http, manifest_easy, manifest_prefetch) lives on
         // `node`. Reach via `worker.node.blob_backend_cfg`, etc.
 
-        /// Phase 5.5 (a) — store the worker flushes log batches into.
-        /// Lives for the worker's full lifetime; loop46 picks S3 vs
+        /// Store the worker flushes log batches into. Lives for the
+        /// worker's full lifetime; the embedding binary picks S3 vs
         /// in-memory at startup.
         log_batch_store: log_server_mod.batch_store.BatchStore,
-        /// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — JWT secret +
-        /// public origins for the standalone services. Returned to the
-        /// dashboard via `/_system/services-token`.
+        /// JWT secret + public origins for the standalone services.
+        /// Returned to the dashboard via `/_system/services-token`.
         services_jwt_secret: ?[]const u8,
-        /// V2 Phase 4 — shared secret gating the `/_system/v2-*` tenant-
-        /// move surface. See `WorkerConfig.move_secret`.
+        /// Shared secret gating the `/_system/v2-*` tenant-move
+        /// surface. See `WorkerConfig.move_secret`.
         move_secret: ?[]const u8,
-        /// V2 Phase 7 — serve-or-forward. See `WorkerConfig.cluster_id` /
+        /// Serve-or-forward. See `WorkerConfig.cluster_id` /
         /// `cp_urls`. cluster_id null or cp_urls empty → forwarding disabled.
         cluster_id: ?[]const u8,
         cp_urls: []const []const u8,
@@ -1776,7 +1736,7 @@ pub fn Worker(comptime opts: Options) type {
         /// no push thread; `pushBatchKey` short-circuits. Borrowed.
         log_push_bases: []const []const u8,
         files_public_base: ?[]const u8,
-        /// Internal-service POST insecure-TLS toggle (now log-push
+        /// Internal-service POST insecure-TLS toggle (log-push
         /// only — see the worker struct field doc).
         internal_insecure_tls: bool,
         /// libcurl handle for log-server push (`POST /v1/_internal/
@@ -1857,9 +1817,9 @@ pub fn Worker(comptime opts: Options) type {
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .blob_sessions = try BlobSessionColl.init(allocator),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
-                // Effect-reification Phase 2 ingress. Cap chosen
-                // well above the typical per-tick fire rate (cron
-                // ≤ 1 Hz × N tenants; boot drains once per deploy);
+                // Cap chosen well above the typical per-tick fire
+                // rate (cron ≤ 1 Hz × N tenants; boot drains once per
+                // deploy);
                 // overflow surfaces `error.Full` + bumps
                 // `overflow_count` for the per-origin caller to
                 // log + drop (re-fire on next sweep).
@@ -1932,13 +1892,12 @@ pub fn Worker(comptime opts: Options) type {
             try config.node.router.registerWakeInbox(&self.wake_inbox);
             errdefer config.node.router.unregisterWakeInbox(&self.wake_inbox);
 
-            // Effect-reification Phase 2E: register the unified Msg
-            // inbox with the node so every cross-thread producer
-            // (deployment-loader boot, cron sweeper, FetchPool
-            // libcurl threads) hash-routes here via
+            // Register the unified Msg inbox with the node so every
+            // cross-thread producer (deployment-loader boot, cron
+            // sweeper, FetchPool libcurl threads) hash-routes here via
             // `node.enqueueMsgForTenant`. The returned slot index is
             // this worker's partition key for the per-worker
-            // partitioned sweeps (`sweepOwedRetries` — Phase 5 PR-3).
+            // partitioned sweeps (`sweepOwedRetries`).
             self.msg_inbox_idx = try config.node.router.registerMsgInbox(&self.msg_inbox);
             errdefer config.node.router.unregisterMsgInbox(&self.msg_inbox);
 
@@ -2052,7 +2011,7 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
             self.log_buffer.deinit();
-            // Phase 3.2.c: SharedTxnPool.deinit walks any leftover
+            // SharedTxnPool.deinit walks any leftover
             // txns (best-effort rollback) before freeing the
             // hashmap. Non-empty means we're exiting with
             // proposals still in flight (process kill / fatal
@@ -2063,19 +2022,18 @@ pub fn Worker(comptime opts: Options) type {
             // then drops the collection.
             self.batch_side.reset(allocator);
             self.batch_side.targets.deinit(allocator);
-            // Phase 7: side tables (parked_meta, parked_streams_active,
-            // parked_streams_draining, pending_stream_meta) are gone.
-            // All stream/cont state lives on the entities themselves;
-            // rove `Collection.deinit` invokes each component's deinit
-            // on shutdown (parked_continuations + the three
-            // raft_pending_* siblings walked below).
+            // All stream/cont state lives on the entities themselves
+            // (no parked_meta / parked_streams_active /
+            // parked_streams_draining / pending_stream_meta side
+            // tables); rove `Collection.deinit` invokes each
+            // component's deinit on shutdown (parked_continuations +
+            // the three raft_pending_* siblings walked below).
             // Unregister + tear down the kv-wake inbox. Order
             // matters: unregister FIRST so no producer can still
             // be pushing into it while we walk + free the queue.
             self.node.router.unregisterWakeInbox(&self.wake_inbox);
             self.wake_inbox.deinit();
-            // Effect-reification Phase 2E: one unified Msg inbox
-            // replaces the pre-2E pair. Unregister BEFORE deinit so
+            // Unregister the unified Msg inbox BEFORE deinit so
             // no cross-thread producer (deployment-loader,
             // cron sweeper, FetchPool) can push after we start
             // freeing entries. `MsgInbox.deinit` walks the items
@@ -2088,9 +2046,8 @@ pub fn Worker(comptime opts: Options) type {
             self.msg_queue.deinit();
             for (self.pending_sub_fires.keys()) |k| self.allocator.free(k);
             self.pending_sub_fires.deinit(self.allocator);
-            // Phase 5 PR-3: any pending bound-resumes left at shutdown
-            // — the leader change drain would have surfaced these, but
-            // be defensive.
+            // Any pending bound-resumes left at shutdown — the leader
+            // change drain would have surfaced these, but be defensive.
             for (self.pending_bound_resumes.items) |*p| p.deinit(allocator);
             self.pending_bound_resumes.deinit(allocator);
             // Free every fetch_id key in the bound-fetch registry.
@@ -2117,7 +2074,7 @@ pub fn Worker(comptime opts: Options) type {
                 }
                 self.ws_conns.deinit(allocator);
             }
-            // Gap 2.4: drop the worker's reference on every live
+            // Drop the worker's reference on every live
             // inbound-chunk job (h2's sink reference, if still held,
             // releases through h2's own teardown; the refcount frees
             // the job on the last drop).
@@ -2142,10 +2099,10 @@ pub fn Worker(comptime opts: Options) type {
                 }
                 self.bound_fetch_spools.deinit(allocator);
             }
-            // P6: deferred coord releases — drop at shutdown (the coord
+            // Deferred coord releases — drop at shutdown (the coord
             // is torn down separately; lossy-on-shutdown is fine).
             self.coord_pending_releases.deinit(allocator);
-            // Phase 3: same pattern for the bound_send_entities map.
+            // Same pattern for the bound_send_entities map.
             {
                 var it = self.bound_send_entities.iterator();
                 while (it.next()) |entry| allocator.free(entry.key_ptr.*);
@@ -2169,10 +2126,10 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending_stream.deinit();
             self.body_pending.deinit();
             self.forward_pending.deinit();
-            // Slice 4-fetch-park: drop any still-parked fetch
-            // chunks at shutdown (best-effort, same lossy posture
-            // as the log flusher's final drain). Each entry owns
-            // its UpstreamFetchEvent's bytes.
+            // Drop any still-parked fetch chunks at shutdown
+            // (best-effort, same lossy posture as the log flusher's
+            // final drain). Each entry owns its UpstreamFetchEvent's
+            // bytes.
             for (self.fetch_pending_durability.items) |*pe|
                 components_mod.UpstreamFetchEvent.deinitItem(&pe.event, allocator);
             self.fetch_pending_durability.deinit(allocator);
@@ -2231,8 +2188,7 @@ pub fn Worker(comptime opts: Options) type {
         /// per-target side writeset so `proposeBatch` replicates
         /// them in the batch's single atomic raft entry and
         /// `finalizeBatch` parks the calling admin request on that
-        /// seq. Behavior-identical to the three inlined copies it
-        /// replaced (docs/proposer-audit.md Addendum 3).
+        /// seq (docs/proposer-audit.md Addendum 3).
         fn applyTargetWrite(
             self: *Self,
             allocator: std.mem.Allocator,
@@ -2389,9 +2345,9 @@ pub fn Worker(comptime opts: Options) type {
         /// `finalizeBatch` parks the calling admin request on the
         /// batch seq, so the 2xx releases only once the
         /// `_deploy/current` write reaches quorum (a pre-quorum
-        /// fault → 503, no escaped effect). No fire-and-forget; the
-        /// old "logged but not compensated" divergence note is
-        /// obsolete (kvexp volatility + the Option-A gate).
+        /// fault → 503, no escaped effect). No fire-and-forget: kvexp
+        /// volatility + the Option-A gate keep the effect from
+        /// escaping before quorum.
         pub fn releasePublishTrampoline(
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -2662,8 +2618,8 @@ pub fn Worker(comptime opts: Options) type {
             };
         }
 
-        /// Phase 5 PR-3: `_system.continuation.resumeIfBound`
-        /// trampoline. Returns true when a parked continuation on
+        /// `_system.continuation.resumeIfBound` trampoline. Returns
+        /// true when a parked continuation on
         /// this worker is bound to `send_id` and the tenant
         /// matches — but does NOT dispatch the resume inline. The
         /// caller (`__system/webhook_onresult`) runs inside a
@@ -2687,20 +2643,18 @@ pub fn Worker(comptime opts: Options) type {
             // Probe: does the worker hold a parked cont bound to
             // this send-id?
             //
-            // Phase 3: fast-path via the worker-local
-            // `bound_send_entities` map. Phase 2B's owner routing
-            // guarantees that if a parked cont exists anywhere, it
-            // exists on the worker the chunk landed on — so the
-            // map hit is the common case. Verify the entity is
-            // still in `parked_continuations` (tenant + bsid both
-            // checked indirectly: tenant matches because the
+            // Fast-path via the worker-local `bound_send_entities`
+            // map. The owner routing guarantees that if a parked cont
+            // exists anywhere, it exists on the worker the chunk
+            // landed on — so the map hit is the common case. Verify
+            // the entity is still in `parked_continuations` (tenant +
+            // bsid both checked indirectly: tenant matches because the
             // chunk hash-routes by tenant; bsid matches because
             // the map is keyed by send_id).
             //
             // Lookup-miss falls back to the linear scan as a
             // safety net for the registry-empty edge case (entry
             // was unregistered between the lookup and now, etc.).
-            // Same `entitySlice` + column scan as pre-Phase-3.
             const server = self.h2;
             const map_hit = self.lookupBoundSendEntity(send_id);
             var matched = false;
@@ -3098,7 +3052,7 @@ pub fn Worker(comptime opts: Options) type {
             };
         }
 
-        /// Gap 2.4 (`docs/architecture/effects-and-handlers.md`, Streaming inbound body): create the
+        /// (`docs/architecture/effects-and-handlers.md`, Streaming inbound body): create the
         /// inbound-chunk job for a receiving request and attach it to
         /// the stream as the h2 body sink. Returns null (and leaves no
         /// references behind) if the stream is already gone. On
@@ -3139,7 +3093,7 @@ pub fn Worker(comptime opts: Options) type {
             return job;
         }
 
-        /// raft Phase 2.5: attach a streamed-snapshot `BodySink` (ctx = the heap
+        /// Attach a streamed-snapshot `BodySink` (ctx = the heap
         /// `box`, refcounted: this sink ref + the `SnapshotStream` component
         /// ref) and park the request entity in `snapshot_streams`. The box is
         /// set on the component IN PLACE in `request_out` (its StreamRow carries
@@ -3235,9 +3189,8 @@ pub fn Worker(comptime opts: Options) type {
             // `docs/cross-worker-held-state-plan.md` Phase 1: mirror
             // the registration onto the NodeState owner map so a
             // future chunk arriving on a different worker can find
-            // the owner. Failures here are non-fatal — Phase 2's
-            // routing falls back to hash(tenant_id) when the
-            // registry misses, which is the same behavior as today.
+            // the owner. Failures here are non-fatal — the routing
+            // falls back to hash(tenant_id) when the registry misses.
             _ = self.node.router.registerBoundFetchOwner(fetch_id, self.msg_inbox_idx);
             // Increment the per-chain bound-fetch counter. The
             // entity is in request_out at this point; the merged
@@ -3273,8 +3226,8 @@ pub fn Worker(comptime opts: Options) type {
             const entry = self.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
             const entity = entry.value;
             self.allocator.free(entry.key);
-            // Mirror the NodeState owner-map drop. Same Phase 1
-            // pairing as the registration site above.
+            // Mirror the NodeState owner-map drop, paired with the
+            // registration site above.
             self.node.router.unregisterBoundFetchOwner(fetch_id);
             // Decrement the per-chain pending count. Naturally
             // saturates at 0 (defensive — register/unregister
@@ -3307,7 +3260,7 @@ pub fn Worker(comptime opts: Options) type {
             } else |_| {}
         }
 
-        /// Phase 3: register a `send_id → entity` mapping on this
+        /// Register a `send_id → entity` mapping on this
         /// worker. Paired with `NodeState.registerBoundSendOwner`
         /// — every site that stamps the owner map also stamps
         /// this. Collision (same send_id, already present) logs +
@@ -3331,15 +3284,15 @@ pub fn Worker(comptime opts: Options) type {
             gop.value_ptr.* = entity;
         }
 
-        /// Phase 3: O(1) lookup. Replaces the linear scan in
-        /// `resumeIfBoundTrampoline` / `resumeBoundContinuation`.
-        /// Returns null on miss → caller falls back to the scan
-        /// (stale-registry safety net).
+        /// O(1) `send_id → entity` lookup used by
+        /// `resumeIfBoundTrampoline` / `resumeBoundContinuation` in
+        /// place of a linear scan. Returns null on miss → caller falls
+        /// back to the scan (stale-registry safety net).
         pub fn lookupBoundSendEntity(self: *Self, send_id: []const u8) ?rove.Entity {
             return self.bound_send_entities.get(send_id);
         }
 
-        /// Phase 3: remove + free the registry key. Idempotent.
+        /// Remove + free the registry key. Idempotent.
         /// Paired with `NodeState.unregisterBoundSendOwner` —
         /// fires alongside the bsid free sites in
         /// `worker_drain.zig`'s repark + stream-transition arms.
@@ -3372,8 +3325,8 @@ pub fn getOrOpenTenantSlot(
 
 // ── Per-tenant log loading ────────────────────────────────────────────
 //
-// Moved to `worker_log.zig`. Re-exported here so external callers
-// (root.zig's `pub const flushLogs = worker.flushLogs;`,
+// These helpers live in `worker_log.zig`. Re-exported here so external
+// callers (root.zig's `pub const flushLogs = worker.flushLogs;`,
 // worker_dispatch.zig's `worker_mod.captureLog*` / `captureTapes*`)
 // keep working without touching their import lines. Internal callers
 // in this file use `worker_log.X` directly.
@@ -3390,7 +3343,7 @@ pub const flushLogs = worker_log.flushLogs;
 
 // ── Dispatch system ───────────────────────────────────────────────────
 //
-// Moved to `worker_drain.zig`: drainRaftPending + the three
+// These live in `worker_drain.zig`: drainRaftPending + the three
 // raft_pending_* siblings via drainEntityArm + parked_units arm,
 // resolveDeployment, resolveParked, the held-cont resume engine
 // (resumeContinuation + resumeBoundContinuation + drainPendingBoundResumes
@@ -3399,12 +3352,6 @@ pub const flushLogs = worker_log.flushLogs;
 // `drainPendingBoundResumes` / `sweepParkedContinuations`, plus
 // `worker_streaming.zig`'s `resolveDeployment` import — keep working
 // without touching their import lines.
-//
-// Phase 7 fold (2026-05-24): the `parked_meta` / `parked_streams_*` /
-// `pending_stream_meta` side tables don't exist as fields anywhere;
-// the migration shipped earlier. What remained — stale comments
-// narrating the side-table world — was rewritten in place during
-// the move. No behavior change.
 pub const drainRaftPending = worker_drain.drainRaftPending;
 pub const drainForwardPending = worker_drain.drainForwardPending;
 pub const drainBodyPending = worker_drain.drainBodyPending;
@@ -3420,18 +3367,17 @@ pub const drainOnLeadershipLoss = worker_drain.drainOnLeadershipLoss;
 pub const cleanupResponses = worker_drain.cleanupResponses;
 pub const scanAndCancelBoundFetches = worker_drain.scanAndCancelBoundFetches;
 
-// ── Streaming-handlers Phase 2b-ii ────────────────────────────────────
+// ── Streaming handlers ────────────────────────────────────────────────
 //
-// Moved to `worker_streaming.zig`. Re-exported here so external
+// These live in `worker_streaming.zig`. Re-exported here so external
 // callers — `root.zig`'s `serviceParkedStreams` / `serviceSubscriptionFires`
 // and `worker_dispatch.zig`'s `setStreamComponents` — keep working
 // without touching their import lines. Internal callers in this file
 // use `worker_streaming.X` directly.
 //
-// The moved file covers more than streaming proper: the original
-// section had absorbed every fire*Activation entry point + the
-// Msg-queue dispatch. See `worker_streaming.zig`'s module doc for the
-// full scope.
+// `worker_streaming.zig` covers more than streaming proper: it holds
+// every fire*Activation entry point + the Msg-queue dispatch. See its
+// module doc for the full scope.
 pub const SubscriptionFireSource = worker_streaming.SubscriptionFireSource;
 pub const StreamResumeStage = worker_streaming.StreamResumeStage;
 pub const setStreamComponents = worker_streaming.setStreamComponents;
@@ -3660,21 +3606,13 @@ pub const ADMIN_SESSION_COOKIE = auth.ADMIN_SESSION_COOKIE;
 
 const testing = std.testing;
 
-// Pre-cutover this file held two tests:
-//   - "openTenantFiles runs the orphan sweep on startup"
-//   - "commitTxn drops the undo row so the next sweep is a no-op"
-// Both exercised the SQLite-era `kv_undo` table + the recoverOrphans
-// sweep. Under kvexp with deferred-durabilize the orphan scenario is
-// structurally impossible: writes mutate the in-memory page cache
-// only, durabilize is gated on the raft thread's tick, and a crash
-// before durabilize loses the in-memory state entirely. The in-flight
-// rollback case (raft rejects a still-pending proposal) is covered by
-// `TrackedTxn.rollback`'s root-pointer revert — see kvstore.zig's
-// "tracked txn rollback reverts pre_root" test.
-//
-// Tests intentionally removed rather than kept as skipped — they were
-// asserting an invariant that no longer exists, and a "this test is
-// disabled" comment with dead code is misleading.
+// No orphan-sweep test here: under kvexp with deferred-durabilize the
+// orphan scenario is structurally impossible — writes mutate the
+// in-memory page cache only, durabilize is gated on the raft thread's
+// tick, and a crash before durabilize loses the in-memory state
+// entirely. The in-flight rollback case (raft rejects a still-pending
+// proposal) is covered by `TrackedTxn.rollback`'s root-pointer revert
+// — see kvstore.zig's "tracked txn rollback reverts pre_root" test.
 
 test "captureLog appends a record to the worker's node-wide buffer" {
     // Verifies the captureLog helper end to end: build a fake worker
@@ -3746,15 +3684,15 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     try testing.expectEqualStrings("/test", buffered.path);
     try testing.expectEqual(@as(u64, 42), buffered.deployment_id);
     try testing.expectEqual(log_mod.Outcome.ok, buffered.outcome);
-    // Phase 1b: the new tape fields make the round-trip.
+    // The tape fields make the round-trip.
     try testing.expectEqualStrings("test-correlation-id", buffered.correlation_id);
     try testing.expectEqual(log_mod.ActivationSource.inbound, buffered.activation);
-    // Phase 5b: raft_seq round-trips through the buffer.
+    // raft_seq round-trips through the buffer.
     try testing.expectEqual(@as(u64, 12345), buffered.raft_seq);
 }
 
 test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
-    // Same fixture as the test above, asserting the new tape fields
+    // Same fixture as the test above, asserting the tape fields
     // round-trip when the activation source is a §6.4 resume.
     const allocator = testing.allocator;
     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
@@ -3818,14 +3756,13 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
     try testing.expectEqual(log_mod.ActivationSource.send_callback, buffered.activation);
 }
 
-// Phase 7: ParkedCont deinit tests removed — ContDescriptor +
-// ChainContext components have their own deinit tests in
-// components.zig.
+// ContDescriptor + ChainContext components have their own deinit tests
+// in components.zig.
 
-// ── Phase 5 PR-3: retry sweep — buildRetryFetch focused tests ─────────
+// ── Retry sweep — buildRetryFetch focused tests ───────────────────────
 //
-// The sweep proper exercises through `webhook_recovery_smoke.py` (PR-3
-// step 6). The unit tests here cover the JSON-marker parsing arms +
+// The sweep proper exercises through `webhook_recovery_smoke.py`. The
+// unit tests here cover the JSON-marker parsing arms +
 // stamped-header / ctx shapes that the smoke can't easily inspect
 // without a tape harness — the bits most likely to drift on the next
 // shim-side change.

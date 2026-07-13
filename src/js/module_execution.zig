@@ -1,5 +1,5 @@
 //! Module execution — loading + running a tenant's JS module against one
-//! request. Extracted from `dispatcher.zig`. These are the engine ops the
+//! request. These are the engine ops the
 //! `Dispatcher` drives each activation: load bytecode, evaluate the module
 //! top level, run `_middlewares/index.mjs`'s `before`, then dispatch the
 //! named export. They take a `*Dispatcher` + a `*PendingResponse` that the
@@ -26,7 +26,7 @@ const rpc_dispatch = @import("rpc_dispatch.zig");
 const response_building = @import("response_building.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
-const files_mod = @import("rove-files"); // manifest_json (PM P0 resolver build)
+const files_mod = @import("rove-files"); // manifest_json (resolver build)
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 
 const RunError = error{ Interrupted, OutOfMemory, JsException };
@@ -60,7 +60,7 @@ pub const PendingResponse = struct {
     /// classic body buffering instead of a 404.
     no_onheaders: bool = false,
     /// Set by `runModule` when an `.inbound_chunk` probe found no
-    /// `onChunk` export (gap 2.4). `finishResponse` maps it to
+    /// `onChunk` export. `finishResponse` maps it to
     /// `RunOutcome.no_onchunk` — the dispatch site falls back to the
     /// classic `.inbound` dispatch instead of a 404.
     no_onchunk: bool = false,
@@ -303,7 +303,7 @@ pub fn runModule(
     const handler = c.JS_GetPropertyStr(ctx.raw, ns, fn_name_z.ptr);
     defer c.JS_FreeValue(ctx.raw, handler);
     if (c.JS_IsException(handler) or !c.JS_IsFunction(ctx.raw, handler)) {
-        // Handler-surface Phase 4: a missing `onDisconnect` is a no-op,
+        // A missing `onDisconnect` is a no-op,
         // not a 404 — disconnect cleanup is optional (the held stream
         // closes regardless). Other kinds (onWake, etc.) DO require the
         // export; the §6 deploy-time coverage lint flags those.
@@ -321,7 +321,7 @@ pub fn runModule(
             pending.no_onheaders = true;
             return;
         }
-        // Chunk-dispatch probe (gap 2.4): a module without `onChunk`
+        // Chunk-dispatch probe: a module without `onChunk`
         // wants the classic buffered path — same fall-back posture as
         // the `onHeaders` probe above, not a 404.
         if (request.activation == .inbound_chunk) {
@@ -364,7 +364,7 @@ pub fn runModule(
     // persisted discriminant).
     if (try continuation_mod.tryExtract(d.allocator, ctx.raw, result.val)) |cont| {
         pending.continuation = cont;
-        // Handler-surface Phase 2: a `stream.*` + `next()` activation
+        // A `stream.*` + `next()` activation
         // commits the ambient `response.*` head NOW (stream.start). A
         // plain `next()` defers the head — nothing to capture. Pull
         // status/headers/cookies so `finishResponse`'s stream bridge has
@@ -376,11 +376,11 @@ pub fn runModule(
         }
         return;
     }
-    // Handler-surface Phase 2: the `__rove_stream(...)` return verb is
-    // gone — a streaming handler returns `next()` (handled above, with
-    // the ambient head captured when `stream_started`) and produces
-    // output via the `stream.*` effects, which `finishResponse` bridges
-    // to the internal Stream descriptor.
+    // A streaming handler returns `next()` (handled above, with the
+    // ambient head captured when `stream_started`) and produces output
+    // via the `stream.*` effects, which `finishResponse` bridges to the
+    // internal Stream descriptor. There is no `__rove_stream(...)` return
+    // verb.
 
     // Body from return value. Status / cookies from the ambient
     // `response` global.
@@ -416,7 +416,7 @@ pub const module_loader = struct {
         module_tape: ?*tape_mod.Tape = null,
         /// Package-manager resolution (PM P0). Maps `@scope/pkg` bare
         /// specifiers to package-virtual keys (`/pkg/<pkg_hash>/index.mjs`)
-        /// per-importer. Null ⇒ no packages ⇒ pre-PM behavior (every
+        /// per-importer. Null ⇒ no packages ⇒ plain path resolution (every
         /// current deployment). See `docs/plans/pm-p0-resolution-spec.md`.
         resolver: ?*const PackageResolver = null,
     };
@@ -433,7 +433,7 @@ pub const module_loader = struct {
         const base_s = if (base != null) std.mem.span(base) else "";
         const name_s = if (name != null) std.mem.span(name) else "";
 
-        // PM P0: a bare `@scope/pkg` specifier resolves via the
+        // A bare `@scope/pkg` specifier resolves via the
         // per-importer package resolver (app_imports for an app handler,
         // the importing package's own imports for a `/pkg/…` importer).
         // A miss falls through to the string resolver below, so relative
@@ -565,7 +565,7 @@ fn resolveSpecifier(base: []const u8, specifier: []const u8, scratch: []u8) []co
     return scratch[0..w];
 }
 
-/// Per-importer `@scope/pkg` resolution (PM P0). Package modules live in
+/// Per-importer `@scope/pkg` resolution. Package modules live in
 /// the deployment bytecode map under `/pkg/<pkg_hash>/…`; this maps a
 /// bare specifier to the resolved package's entry key. Resolution is
 /// keyed on the *importer* (`base`) — which is the whole flat-surface /
@@ -627,7 +627,7 @@ fn pkgDirKey(allocator: std.mem.Allocator, pkg_hash_hex: []const u8) ![]const u8
 }
 
 /// Build a `PackageResolver` from a manifest's (or a deploy-time
-/// `Resolution`'s) package sections (PM P1). `app_imports` becomes the
+/// `Resolution`'s) package sections. `app_imports` becomes the
 /// flat app surface; each package's `imports` becomes its encapsulated
 /// per-importer map (keyed by its `/pkg/<hash>/` dir). Values are entry
 /// keys (`/pkg/<dep_hash>/index.mjs`). Caller owns the result —
@@ -685,7 +685,7 @@ fn packageDirOf(base: []const u8) ?[]const u8 {
     return base[0 .. prefix.len + slash + 1]; // include the trailing '/'
 }
 
-// ── PM P0: resolution tests ────────────────────────────────────────
+// ── resolution tests ────────────────────────────────────────
 
 const testing = std.testing;
 

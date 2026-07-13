@@ -1,10 +1,9 @@
 //! `BlobCoordination` — the process-global readset-blob write subsystem
 //! for the rove-js worker node.
 //!
-//! Extracted from `NodeState` (worker.zig) as the second step of the
-//! NodeState decomposition. Owns the singleton `BlobCoordinator` (one
-//! drainer + K=32 executor pool), the shared `_pool/` S3 backend it
-//! writes against, and the heap-owned raft-backed reservation context.
+//! Owns the singleton `BlobCoordinator` (one drainer + K=32 executor
+//! pool), the shared `_pool/` S3 backend it writes against, and the
+//! heap-owned raft-backed reservation context.
 //! See `docs/streaming-model.md §7` Phases 3 + 5.
 //!
 //! All worker bodies > 16 KB (inbound + outbound fetch chunks) submit
@@ -19,12 +18,10 @@
 const std = @import("std");
 const blob_mod = @import("rove-blob");
 
-// V2 Phase 2c: the raft-backed cross-tenant `batch_id` reservation
-// (`CoordReservationCtx`, which proposed an envelope-2 root_writeset
-// through `kv.Cluster.proposeAndWait`) is removed. Single-node V2 uses
-// the coordinator's local atomic counter, which is correct for one node.
-// Multi-node (Phase 5) reintroduces cluster-wide reservation through the
-// bridge's `__root__` group — see docs/streaming-model.md §7 Phase 5.
+// Single-node uses the coordinator's local atomic counter for
+// cross-tenant `batch_id` reservation, which is correct for one node.
+// Cluster-wide reservation (multi-node) goes through the bridge's
+// `__root__` group — see docs/streaming-model.md §7 Phase 5.
 
 pub const BlobCoordination = struct {
     allocator: std.mem.Allocator,
@@ -36,11 +33,10 @@ pub const BlobCoordination = struct {
     blob_backend_cfg: blob_mod.BackendConfig,
 
     /// `docs/streaming-model.md §7` Phase 3: process-global write
-    /// coordinator for readset blob PUTs. Replaces the per-worker
-    /// `BodyFlushPool`. All worker bodies (inbound + outbound fetch
-    /// chunks > 16 KB) submit here; the coord runs one drainer + K=32
-    /// executor pool. Lazy init via `start` after the node is wired +
-    /// `num_workers` is known.
+    /// coordinator for readset blob PUTs. All worker bodies (inbound +
+    /// outbound fetch chunks > 16 KB) submit here; the coord runs one
+    /// drainer + K=32 executor pool. Lazy init via `start` after the
+    /// node is wired + `num_workers` is known.
     coordinator: ?*blob_mod.BlobCoordinator = null,
 
     /// `docs/streaming-model.md §7` Phase 5: backend that owns the
@@ -61,7 +57,7 @@ pub const BlobCoordination = struct {
     /// `main.zig` after the node is wired + `num_workers` is known
     /// (the coord allocates per-worker queues up front).
     ///
-    /// Phase 5: opens a single shared S3 backend at the
+    /// Opens a single shared S3 backend at the
     /// `{key_prefix_base}_pool/` prefix; submissions land in that one
     /// pool, demuxed by `BodyRef.(offset, len)`. When `cluster` is
     /// non-null the coord uses raft-backed `batch_id` reservation
@@ -95,10 +91,10 @@ pub const BlobCoordination = struct {
         errdefer pool_backend.deinit();
         self.pool_backend = pool_backend;
 
-        // V2 Phase 2c single-node: local atomic-counter reservation
-        // (`reservation = null`). The cross-tenant raft-backed reservation
-        // returns in Phase 5 (multi-node) via the bridge's `__root__`
-        // group — see the file header.
+        // Single-node: local atomic-counter reservation
+        // (`reservation = null`). Cluster-wide raft-backed reservation
+        // is the multi-node path via the bridge's `__root__` group —
+        // see the file header.
         const coord = try blob_mod.BlobCoordinator.init(
             self.allocator,
             self.pool_backend.?.blobStore(),

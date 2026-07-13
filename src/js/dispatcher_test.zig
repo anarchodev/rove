@@ -27,7 +27,7 @@ const RunOutcome = dispatcher_mod.RunOutcome;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const testing = std.testing;
 
-/// Phase 3 test fixture helper: the production snapshot stores
+/// Test fixture helper: the production snapshot stores
 /// bytecodes as `*BlobBytes` leases into the node-wide cache, but
 /// tests run without a NodeState. Each `put` heap-allocates a
 /// `BlobBytes` wrapper that aliases the caller's already-allocated
@@ -113,8 +113,8 @@ test "dispatch: kv.get on missing key returns null" {
 
 /// Test harness: wrap a statement-level snippet in a named export
 /// named `go`, compile as .mjs, dispatch via the internal
-/// `fn_override` target (the resume-engine mechanism — the customer
-/// `?fn=` query dispatch is retired, decisions.md §4.5).
+/// `fn_override` target (the resume-engine mechanism — customer
+/// `?fn=` query dispatch is not a selector, decisions.md §4.5).
 fn runOneOutcome(
     d: *Dispatcher,
     kv: *kv_mod.KvStore,
@@ -147,9 +147,8 @@ fn runOneOutcome(
     return outcome;
 }
 
-/// Back-compat harness: collapses to `Response`. All existing
-/// `runOne`-based tests use this unchanged; continuation tests call
-/// `runOneOutcome`.
+/// Harness that collapses to `Response`. `runOne`-based tests use
+/// this; continuation tests call `runOneOutcome`.
 fn runOne(
     d: *Dispatcher,
     kv: *kv_mod.KvStore,
@@ -172,7 +171,7 @@ fn runOne(
     }
 }
 
-/// Phase 5 PR-3 test helper. The JS-shim `webhook.send` writes
+/// Test helper. The JS-shim `webhook.send` writes
 /// `_send/owed/{id}` as a JSON object marker (see
 /// `globals/webhook.js`). The caller owns the returned slice +
 /// frees with `testing.allocator.free`.
@@ -235,8 +234,8 @@ test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
     try testing.expectEqual(@as(i32, 200), r.status);
     try testing.expectEqualStrings("hi", r.body);
 
-    // And a continuation through the back-compat `run` collapses to
-    // 501 (Phase 3b-i: resume path not wired yet), never hangs/panics.
+    // And a continuation through the collapsing `run` path yields
+    // 501 (that path has no resume wiring), never hangs/panics.
     var outcome = try runOneOutcome(
         &d,
         kv,
@@ -347,10 +346,8 @@ fn readSchedByKey(kv: *kv_mod.KvStore, send_id: []const u8) ![]u8 {
     return kv.get(kv_key);
 }
 
-// Phase 5 PR-3: the original Zig http.send-binding tests deleted
-// here (they exercised the now-retired surface). The JS-shim path
-// is exercised by the marker tests above + the webhook smoke
-// (`scripts/webhook_smoke.py`).
+// The JS-shim `webhook.send` path is exercised by the marker tests
+// above + the webhook smoke (`scripts/webhook_smoke.py`).
 
 test "dispatch: webhook.send with handle derives a stable id; same handle overwrites the marker" {
     var buf: [64]u8 = undefined;
@@ -804,7 +801,7 @@ test "dispatch: send_callback body_b64 → byte-true request.bytes (§2.2)" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
     // body_b64 "aAD_" = bytes [0x68, 0x00, 0xff] (base64url, no pad) —
-    // a payload the old lossy string channel could not carry.
+    // a payload a lossy string channel could not carry.
     var resp = try runOne(&d, kv,
         \\const b = request.bytes;
         \\if (!(b instanceof Uint8Array)) return "not-bytes";
@@ -1172,7 +1169,7 @@ test "arena-oom: loud 500 when even GC can't fit the request (no silent empty bo
     // the 8 MiB arena — the churny reassign trick wouldn't help (GC's
     // ceiling is peak live). Bump OOMs → GC retry OOMs too → must fail
     // LOUD (a 500 with an exception), never the silent empty 200 a
-    // mangled OOM outcome used to yield.
+    // mangled OOM outcome would otherwise yield.
     var resp = try runOne(&d, kv,
         \\const a = [];
         \\for (let i = 0; i < 32; i++) a.push("x".repeat(1 << 19));
@@ -2029,8 +2026,8 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         body_1 = try testing.allocator.dupe(u8, resp.body);
     }
 
-    // Two scalars: ZERO tape entries on any random / date channel
-    // because they no longer exist.
+    // Two scalars: ZERO tape entries on any random / date channel —
+    // those channels don't exist.
 
     // Date.now is pinned. Both `Date.now()` calls AND
     // `(new Date()).getTime()` should return the same ms scalar
@@ -2156,7 +2153,7 @@ test "dispatch: .mjs module + internal fn_override dispatch" {
     }
 
     // Compile a tiny module with two exports plus a default that
-    // proves customer envelope shapes no longer route (the platform
+    // proves customer envelope shapes don't route (the platform
     // invokes only the conventional export when nothing overrides).
     var rt = try qjs.Runtime.init();
     defer rt.deinit();
@@ -2233,7 +2230,7 @@ test "dispatch: .mjs module + internal fn_override dispatch" {
         try testing.expect(std.mem.indexOf(u8, resp.body, "nope") != null);
     }
 
-    // The retired customer envelope shapes are inert: a `?fn=` query
+    // The customer envelope shapes are inert: a `?fn=` query
     // and a `{fn,args}` body both land in the DEFAULT export.
     {
         var txn = try kv.beginTrackedImmediate();
@@ -3554,10 +3551,10 @@ test "dispatch: webhook.send (JS shim) writes _send/owed/{id} markers" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Phase 5 PR-3: webhook.send is the JS-shim composition
-    // (`globals/webhook.js`). Each writes a JSON `_send/owed/{id}`
-    // marker the baked `__system/webhook_fire` / `webhook_onresult`
-    // modules read (deferred fires ride the durable scheduler).
+    // webhook.send is the JS-shim composition (`globals/webhook.js`).
+    // Each writes a JSON `_send/owed/{id}` marker the baked
+    // `__system/webhook_fire` / `webhook_onresult` modules read
+    // (deferred fires ride the durable scheduler).
     var resp = try runOne(
         &d,
         kv,
@@ -4707,10 +4704,10 @@ test "dispatch: TextDecoder handles MB-scale payloads (native transcode, no per-
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // 2 MiB of multi-byte content. The retired pure-JS decoder's
-    // per-char `s += fromCharCode(b)` loop generated string-realloc
-    // garbage far beyond any plausible arena at this size; the
-    // native path is one conversion each way.
+    // 2 MiB of multi-byte content. A per-char `s += fromCharCode(b)`
+    // JS decoder loop would generate string-realloc garbage far beyond
+    // any plausible arena at this size; the native path is one
+    // conversion each way.
     var resp = try runOne(
         &d,
         kv,

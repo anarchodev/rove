@@ -1,16 +1,15 @@
-//! Async serve-or-forward engine — Phase 7 (zero-downtime move) follow-up.
+//! Async serve-or-forward engine.
 //!
 //! When a DP (`rewind`) cluster receives a request for a tenant it does
 //! NOT own (a stale public route, or a post-move source), it must
-//! reverse-proxy the request to the cluster that DOES own it. The
-//! original implementation (`worker_dispatch.tryForwardToOwner`) did
-//! this with **blocking libcurl on the worker's poll loop**: one
-//! synchronous `GET /_cp/route` to the control plane, then a
-//! synchronous forward to the owner. Under a post-move routing burst
-//! that stalls the whole worker — every mis-routed request blocks the
-//! loop for a full cross-cluster round-trip.
+//! reverse-proxy the request to the cluster that DOES own it. Doing
+//! this synchronously — blocking libcurl on the worker's poll loop for
+//! a `GET /_cp/route` to the control plane then a forward to the owner
+//! — would stall the whole worker: under a post-move routing burst
+//! every mis-routed request blocks the loop for a full cross-cluster
+//! round-trip.
 //!
-//! This engine moves both stages OFF the worker loop, mirroring the
+//! This engine runs both stages OFF the worker loop, mirroring the
 //! `FetchEngine` (`fetch_engine.zig`) model: one thread driving a
 //! `curl_multi` handle that holds many concurrent transfers. The
 //! worker **parks** the h2 stream (see `worker.forward_pending` +

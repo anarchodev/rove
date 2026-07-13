@@ -1,6 +1,6 @@
 //! `_system.stream.start()` / `_system.stream.write(chunk)` — the
-//! connection-output EFFECT surface (handler-surface Phase 2,
-//! `docs/handler-shape.md` §2.2). `stream` is an ambient namespace (like
+//! connection-output EFFECT surface (`docs/handler-shape.md` §2.2).
+//! `stream` is an ambient namespace (like
 //! `kv`), NOT a return verb: a held handler produces its streamed
 //! response over time via these effects + `on.*` waits + `return next()`
 //! (keep streaming) / a terminal (close). The effects accumulate onto
@@ -10,13 +10,10 @@
 //! `.stream` arm + the bound-fetch resume paths drive through the h2
 //! stream pipeline.
 //!
-//! Phase 2 retired the `__rove_stream({status, headers, write, waitFor,
-//! ctx})` RETURN verb + its JS constructor (`jsStream`), brand nonce,
-//! and `tryExtract` JS→Stream parse: the head comes from the ambient
-//! `response.*`, the chunks from the `stream.write` buffer, and the
-//! waits from `on.*` — so none of the descriptor parsing survives. The
-//! `Stream` struct + `jsValueAsOwnedBytes` remain (built by the bridge /
-//! used by `jsStreamWrite`).
+//! There is no `__rove_stream({...})` return verb: the head comes from
+//! the ambient `response.*`, the chunks from the `stream.write` buffer,
+//! and the waits from `on.*`. The `Stream` struct + `jsValueAsOwnedBytes`
+//! are built by the bridge / used by `jsStreamWrite`.
 //!
 //! There is deliberately NO connection handle in this surface
 //! (project-connection-actor-unified-trigger): the held socket is the
@@ -34,11 +31,9 @@ const js_exception = globals.js_exception;
 
 // ── The internal stream descriptor (Zig side) ──────────────────────
 
-/// Internal representation of a streamed response. Handler-surface
-/// Phase 2 retired the `__rove_stream({...})` return verb + its JS
-/// constructor / brand / `tryExtract` parse; this struct is now built
-/// ONLY by the dispatcher's `finishResponse` bridge from the `stream.*`
-/// effect surface (`buildStreamFromEffects`) and consumed by the worker
+/// Internal representation of a streamed response. Built ONLY by the
+/// dispatcher's `finishResponse` bridge from the `stream.*` effect
+/// surface (`buildStreamFromEffects`) and consumed by the worker
 /// `.stream` arm + the bound-fetch resume paths. `deinit` frees it.
 pub const Stream = struct {
     /// First-hop status code. Default 200. Ignored on subsequent
@@ -81,7 +76,7 @@ pub const Stream = struct {
 
 // ── `_system.stream.start()` / `_system.stream.write(chunk)` ───────
 //
-// Handler-surface Phase 2 (`docs/handler-shape.md` §2.2): `stream` is
+// `docs/handler-shape.md` §2.2: `stream` is
 // an **effect namespace** (ambient, like `kv`), NOT a return verb. The
 // streamed response is produced over time by `stream.start()` (commit
 // the ambient `response.*` head + open the stream) and
@@ -180,8 +175,8 @@ pub fn jsStreamWrite(
 /// `JS_GetUint8Array` — running binary through `JS_ToCStringLen` would
 /// truncate at embedded NULs and mangle non-UTF-8, so the type must be
 /// distinguished here (the same split `crypto.zig`'s `extractKeyOrDataBytes`
-/// makes). Anything else throws TypeError — the former `String()`
-/// fallback shipped `"[object Object]"` as a wire chunk
+/// makes). Anything else throws TypeError — a `String()` fallback
+/// would ship `"[object Object]"` as a wire chunk
 /// (docs/decisions.md Â§4.11).
 fn jsValueAsOwnedBytes(
     allocator: std.mem.Allocator,

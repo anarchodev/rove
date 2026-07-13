@@ -16,9 +16,9 @@
 //!   the ENTIRE leading-`_` keyspace is platform-reserved against customer
 //!   writes, EXCEPT the `SHIM_WRITABLE_PREFIXES` the JS shims must write
 //!   from ordinary handler context. Reserving the whole namespace (rather
-//!   than an enumerated list) is the pre-customer lock-in fix: any NEW
-//!   platform `_…/` key family is safe to introduce later without
-//!   colliding with customer data (docs/architecture/format-versioning.md §7.1).
+//!   than an enumerated list) means any NEW platform `_…/` key family is
+//!   safe to introduce later without colliding with customer data
+//!   (docs/architecture/format-versioning.md §7.1).
 //!   Customers get the entire non-`_` keyspace. Reads are NOT guarded
 //!   (`_config/` is a documented customer-readable namespace). Platform Zig
 //!   writers bypass `jsKvSet` and write via `state.txn.put` directly, and
@@ -52,23 +52,22 @@ const std = @import("std");
 ///                         `_config/{lib}/{name}.json` in the
 ///                         customer's tree; mirror runs on release.
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
-///   `_callback/`        → retired receipt prefix (Option (b)
-///                         resolves sends via in-memory Completions
-///                         + `_send/proof/`, not `_callback/` rows).
-///                         Stays reserved so customer JS can't spoof
-///                         a legacy receipt key.
+///   `_callback/`        → reserved receipt prefix (sends resolve via
+///                         in-memory Completions + `_send/proof/`, not
+///                         `_callback/` rows). Stays reserved so customer
+///                         JS can't spoof a receipt key.
 ///   `_log/`             → per-tenant log metadata in app.db. Today
 ///                         only `_log/next_request_seq` lives here
-///                         (Phase 5.5 a, A4 — moved off log.db so
-///                         the worker can drop log.db opens entirely).
+///                         (in app.db, not log.db, so the worker opens
+///                         no log.db).
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
 ///   `_sessions/`        → reserved for future platform session storage
 ///
 /// Used only by `isReservedTriggerPrefix` (the deploy-load trigger guard).
-/// The customer-WRITE guard no longer pivots on this enumerated list — it
+/// The customer-WRITE guard does not pivot on this enumerated list — it
 /// reserves the whole leading-`_` keyspace minus `SHIM_WRITABLE_PREFIXES`
-/// (see below). This list stays as the catalog of *known* platform-owned
+/// (see below). This list is the catalog of *known* platform-owned
 /// namespaces for the bidirectional trigger-prefix collision check.
 pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_app/",
@@ -160,8 +159,8 @@ test "isReservedTriggerPrefix: exact platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_log/"));
     try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
     try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
-    // `_send/` is NOT reserved post-Phase-5-PR-3 — webhook.send (JS
-    // shim) writes the marker as ordinary customer-tenant kv.
+    // `_send/` is NOT reserved — webhook.send (JS shim) writes the
+    // marker as ordinary customer-tenant kv.
     try std.testing.expect(!isReservedTriggerPrefix("_send/"));
 }
 
@@ -202,10 +201,10 @@ test "isCustomerWriteReserved: known platform prefixes blocked" {
 }
 
 test "isCustomerWriteReserved: whole leading-_ keyspace reserved" {
-    // The pre-customer lock-in fix: ANY leading-`_` key not in the
-    // shim-writable allowlist is reserved, including ones with no platform
-    // owner today (so we can claim them later). Retired prefixes
-    // (`_events/`, `_outbox/`, `_dlq/`) and bare `_foo` are now reserved.
+    // ANY leading-`_` key not in the shim-writable allowlist is reserved,
+    // including ones with no platform owner today (so we can claim them
+    // later). Prefixes like `_events/`, `_outbox/`, `_dlq/` and bare `_foo`
+    // are reserved too.
     try std.testing.expect(isCustomerWriteReserved("_events/sid/0001"));
     try std.testing.expect(isCustomerWriteReserved("_outbox/abc"));
     try std.testing.expect(isCustomerWriteReserved("_dlq/abc"));

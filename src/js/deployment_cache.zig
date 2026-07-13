@@ -1,18 +1,16 @@
 //! `deployment_cache.zig` — per-tenant deployment cache subsystem.
 //!
-//! Extracted from `worker.zig` (Phase C of the NodeState decomposition).
 //! Owns the `TenantSlot` type family (`TenantFilesSnapshot` / `TenantSlot`
 //! / `TenantFiles`), the manifest-fetch config types, the deployment
 //! discovery/snapshot-build helpers, and the `DeploymentCache` struct +
 //! its loader thunk. Depends only on leaf modules — no import of
-//! `worker.zig` (the slot no longer carries a `*NodeState` back-pointer,
-//! and the slot cache is a plain map, not the shared `TenantMap`
-//! generic). `worker.zig` re-exports the public types for existing
-//! callers.
+//! `worker.zig` (the slot carries no `*NodeState` back-pointer, and the
+//! slot cache is a plain map, not the shared `TenantMap` generic).
+//! `worker.zig` re-exports the public types for callers.
 
 const std = @import("std");
 const kv_mod = @import("raft-kv");
-// V2 Phase 2c: per-tenant raft bridge replaces V1's node-wide RaftNode.
+// Per-tenant raft bridge (one group per tenant).
 const Bridge = @import("bridge").Bridge;
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
@@ -87,7 +85,7 @@ pub fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
 const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 
 /// Parse a `_subscriptions/<name>/<file>` deployment path into its
-/// name + file-kind. Mirror of `triggerPathToPrefix` for Gap 2.1:
+/// name + file-kind. Mirror of `triggerPathToPrefix`:
 ///
 ///   `_subscriptions/cleanup/index.mjs`  → `{name: "cleanup", kind: .handler}`
 ///   `_subscriptions/cleanup/index.js`   → `{name: "cleanup", kind: .handler}`
@@ -136,7 +134,7 @@ const SubscriptionFileKind = enum { handler, spec };
 /// fields fail the deploy.
 const SubscriptionSpecJson = struct {
     kind: []const u8,
-    /// Legacy kind=cron field — tolerated by the parser so the
+    /// The kind=cron field — tolerated by the parser so the
     /// kind=cron rejection below produces its pointed migration
     /// error instead of a generic unknown-field parse failure.
     interval_ms: ?i64 = null,
@@ -262,10 +260,10 @@ fn translateSpec(
     raw: SubscriptionSpecJson,
 ) !globals.SubscriptionEntry.Spec {
     if (std.mem.eql(u8, raw.kind, "cron")) {
-        // durable-wake-plan P5(b): the manifest cron subscription (a
-        // non-durable in-memory interval clock) retired in favor of
-        // the durable scheduler. Fail the deploy loudly with the
-        // migration recipe instead of silently ignoring the spec.
+        // The manifest cron subscription (a non-durable in-memory
+        // interval clock) is not supported — the durable scheduler
+        // replaces it. Fail the deploy loudly with the migration
+        // recipe instead of silently ignoring the spec.
         std.log.err(
             "rove-js: subscription `{s}` kind=cron is retired — register recurrence from any " ++
                 "handler activation instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) " ++
@@ -287,12 +285,12 @@ fn translateSpec(
         return .{ .kv = .{ .prefix = try allocator.dupe(u8, prefix) } };
     }
     if (std.mem.eql(u8, raw.kind, "boot")) {
-        // Retired 2026-07-05 (handler-api-ergonomics arc; unused). The
-        // "run once on deploy" hook is gone — seed recurring
-        // registrations (`cron`, `schedule`) from any handler
-        // activation; they are idempotent by key and `_sched/*`
-        // entries are durable kv that survive deploys. Fail the
-        // deploy loudly with the recipe, same posture as kind=cron.
+        // kind=boot is not supported — there is no "run once on
+        // deploy" hook. Seed recurring registrations (`cron`,
+        // `schedule`) from any handler activation; they are
+        // idempotent by key and `_sched/*` entries are durable kv
+        // that survive deploys. Fail the deploy loudly with the
+        // recipe, same posture as kind=cron.
         std.log.err(
             "rove-js: subscription `{s}` kind=boot is retired — seed registrations from any " ++
                 "handler activation instead (idempotent by key; durable across deploys)",
@@ -359,18 +357,18 @@ pub const TenantFilesSnapshot = struct {
     deployment_id: u64,
     /// All handler bytecodes from this deployment, keyed by full
     /// deployment path. Keys are allocator-owned; values are leases
-    /// into the node-wide `BytecodeCache` (Phase 3) — snapshot
+    /// into the node-wide `BytecodeCache` — snapshot
     /// `deinit` releases each via `cache.release`.
     bytecodes: std.StringHashMapUnmanaged(*BlobBytes),
     /// Source-blob hash hex (64 chars) per handler path. Parallel to
     /// `bytecodes`. Read by the QuickJS module loader for per-request
     /// module-resolution tapes.
     source_hashes: std.StringHashMapUnmanaged([64]u8),
-    /// Per-importer `@scope/pkg` resolution (PM P1). Built from the
+    /// Per-importer `@scope/pkg` resolution. Built from the
     /// manifest's `packages` / `app_imports` by `buildResolver`; the
     /// package modules it points at live in `bytecodes` under their
     /// `/pkg/<pkg_hash>/…` keys. Null for package-less deployments —
-    /// the module loader then behaves exactly pre-PM.
+    /// the module loader then resolves as if no packages were declared.
     resolver: ?module_execution.PackageResolver = null,
     /// Static files keyed by stored path; bytes fetched on demand
     /// from the slot's `blob_backend`.
@@ -384,11 +382,10 @@ pub const TenantFilesSnapshot = struct {
     /// Trigger registry. Sorted descending by prefix length so a
     /// forward scan visits innermost (most-specific) triggers first.
     triggers: []TriggerEntry,
-    /// Subscription registry (Gap 2.1) — chain origins that fire
-    /// without an inbound request. Built from
+    /// Subscription registry — chain origins that fire without an
+    /// inbound request. Built from
     /// `_subscriptions/<name>/{spec.json,index.mjs}` manifest pairs.
-    /// Default empty for snapshots that pre-date subscription
-    /// discovery; only the deploy-loader populates it.
+    /// Defaults empty; only the deploy-loader populates it.
     subscriptions: []globals.SubscriptionEntry = &.{},
     /// Raw manifest bytes for this deployment. Re-released callers
     /// re-decode locally on dep_id match, skipping a fetch.
@@ -440,9 +437,9 @@ pub const TenantFilesSnapshot = struct {
         for (self.subscriptions) |*s| {
             // Cast away const for the deinit call; the slice is
             // allocator-owned at this point (no aliases reach this
-            // path — Phase B's snapshot-build hands ownership to
-            // the snapshot, the swap drops the old, and `deinit`
-            // is the sole site that frees).
+            // path — snapshot-build hands ownership to the snapshot,
+            // the swap drops the old, and `deinit` is the sole site
+            // that frees).
             const mut: *globals.SubscriptionEntry = @constCast(s);
             mut.deinit(allocator);
         }
@@ -470,17 +467,16 @@ pub const TenantSlot = struct {
     /// Borrowed process raft node. The loader's `reloadDeployment`
     /// uses it to leader-gate + propose the `_config/**.json` mirror
     /// (auth-domain-plan §9: the release/loader path must mirror
-    /// per-deploy config to kv — fixes the `7eb70ed` regression).
-    /// Optional/`null` only in unit-test slot literals — a slot with
-    /// no raft handle just skips the config mirror.
+    /// per-deploy config to kv). Optional/`null` only in unit-test
+    /// slot literals — a slot with no raft handle just skips the
+    /// config mirror.
     raft: ?*Bridge = null,
     /// Borrowed pointer to the node-wide content-addressed bytecode
     /// cache. Set by `openTenantSlotNode`; `reloadAllBytecodes` builds
     /// each snapshot's lease set through it. Optional only in unit-test
-    /// slot literals. (Phase A of the TenantSlot/DeploymentCache split:
-    /// replaces the former `node: *NodeState` god-pointer — a slot now
-    /// borrows only the two subsystems it actually uses, `bytecode_cache`
-    /// + `router`, decoupling it from NodeState entirely.)
+    /// slot literals. A slot borrows only the two subsystems it
+    /// actually uses (`bytecode_cache` + `router`), not a
+    /// `*NodeState` back-pointer.
     bytecode_cache: ?*BytecodeCache = null,
     /// Borrowed pointer to the node's async-activation router. Set by
     /// `openTenantSlotNode`; used for cross-thread subscription
@@ -573,8 +569,8 @@ pub const TenantSlot = struct {
     // Note: no `open`/`free` lifecycle wrappers here. Slots are opened
     // via `DeploymentCache.getOrOpenTenantSlot` (which open-codes the
     // unlocked-open + re-check race) and freed via `freeTenantSlot`.
-    // The old `TenantMap` `Entry.open`/`Entry.free` convention no
-    // longer applies — the slot cache is a plain map.
+    // The slot cache is a plain map, so there is no `TenantMap`
+    // `Entry.open`/`Entry.free` convention.
 
     /// Try to pin the current snapshot for a request. Returns null
     /// if no deployment has loaded yet. Caller MUST `snap.release()`
@@ -632,9 +628,9 @@ pub const TenantFiles = struct {
         self.snap.release();
     }
 
-    /// Open is no longer a thing — slots are opened, snapshots are
-    /// loaded by the deployment loader. Kept as a compile error to
-    /// surface old call sites that need updating.
+    /// `TenantFiles` is a view, not something you `open` — slots are
+    /// opened and snapshots are loaded by the deployment loader. This
+    /// stays a compile error to steer call sites to `slot.pinCurrent()`.
     pub fn open(_: anytype, _: anytype) noreturn {
         @compileError("TenantFiles is a view; use `slot.pinCurrent()` to construct one");
     }
@@ -673,22 +669,20 @@ pub const ManifestHttpConfig = struct {
 
 /// Manifest-prefetch slot map. Keys + value bytes are allocator-owned;
 /// consumed at TenantFiles.open time (`fetchRemove` transfers ownership
-/// out). Kept on NodeState so cold-start prefetch persists across the
-/// transition from "main spawns workers" to "each worker boots".
+/// out). Lives on NodeState so cold-start prefetch persists across
+/// worker boot.
 pub const ManifestPrefetchMap = std.StringHashMapUnmanaged(PrefetchedManifest);
 
 /// Per-tenant deployment cache subsystem — the tenant-slot map, the
 /// node-wide content-addressed bytecode cache, the single
-/// deployment-loader thread, and the manifest-fetch config. Extracted
-/// from NodeState (Phase B of the TenantSlot/DeploymentCache split).
+/// deployment-loader thread, and the manifest-fetch config.
 ///
 /// Borrows the handles it needs rather than the whole node: `tenant`,
 /// `raft`, and `blob_backend_cfg` are captured at `init`; `router` is
 /// wired post-init via `NodeState.wireInternal` (it's a self-pointer
 /// into NodeState, which can't be taken during the by-value `init`).
-/// Keeping the dependency surface narrow is what lets Phase C relocate
-/// this + the TenantSlot family into their own module without a cycle
-/// back to NodeState.
+/// The narrow dependency surface keeps this module and the TenantSlot
+/// family free of a cycle back to NodeState.
 pub const DeploymentCache = struct {
     allocator: std.mem.Allocator,
 
@@ -715,7 +709,7 @@ pub const DeploymentCache = struct {
     /// `instance_id`). `tenant_files_lock` guards inserts; the
     /// TenantSlot entries' deployment-version content is served via an
     /// atomic-pointer-swapped `TenantFilesSnapshot` (phase 2 of
-    /// `docs/deployment-snapshots-plan.md`), so reload no longer races
+    /// `docs/deployment-snapshots-plan.md`), so reload doesn't race
     /// with the dispatcher.
     ///
     /// A plain map (not the `TenantMap` lifecycle generic): slot
@@ -934,8 +928,8 @@ pub const DeploymentCache = struct {
 /// `*DeploymentCache`. Looks up the tenant's TenantSlot (skip if
 /// absent), short-circuits when the current snapshot already has this
 /// dep_id (content-addressed: same id ⇒ same content), and calls
-/// `reloadDeployment` otherwise. Phase 2: readers either see the old
-/// snapshot or the new one, never a half-written mix.
+/// `reloadDeployment` otherwise. Readers either see the old snapshot
+/// or the new one, never a half-written mix.
 fn deploymentLoadFnNode(
     ctx_opaque: ?*anyopaque,
     tenant_id: []const u8,
@@ -975,15 +969,13 @@ fn deploymentLoadFnNode(
 ///
 /// (No startup orphan sweep: kvexp has no `kv_undo` table — a
 /// pre-quorum crash loses the volatile speculative overlay, so
-/// there are no orphan rows to recover. The pre-kvexp SQLite sweep
-/// was removed.)
+/// there are no orphan rows to recover.)
 fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*TenantSlot {
     const allocator = dc.allocator;
 
     // (No startup orphan sweep: kvexp has no kv_undo table — a
     // pre-quorum crash loses the volatile speculative overlay, so
-    // there are no orphan rows to recover. The pre-kvexp SQLite
-    // sweep was removed.)
+    // there are no orphan rows to recover.)
 
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
@@ -1062,11 +1054,10 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     // 503 until either the dashboard pushes a release or the
     // periodic reload retry succeeds.
     //
-    // Cold-start "implicit deploy" semantics: the synchronous
-    // reload that used to run here is gone. Each tenant's
-    // initial deployment load now goes through the same
-    // background `DeploymentLoader` path runtime releases use
-    // (`Worker.create` enqueues every tenant after the open
+    // Cold-start "implicit deploy" semantics: no synchronous reload
+    // runs here. Each tenant's initial deployment load goes through
+    // the same background `DeploymentLoader` path runtime releases
+    // use (`Worker.create` enqueues every tenant after the open
     // loop). The hot request path stays free of network I/O at
     // cold-start, just like everywhere else.
     //
@@ -1260,9 +1251,8 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     const bs = slot.blob_backend.blobStore();
 
     // Mirror `_config/**.json` → tenant kv (auth-domain-plan §9: the
-    // release/loader path MUST mirror per-deploy user config; fixes
-    // the `7eb70ed` regression where this promise was made but never
-    // wired). Leader-gated + proposed exactly like `_deploy/current`:
+    // release/loader path MUST mirror per-deploy user config).
+    // Leader-gated + proposed exactly like `_deploy/current`:
     // the leader writes locally + proposes an envelope-0 writeset
     // (leader-skip on apply), so followers receive `_config/*` purely
     // via that raft apply and their own (non-leader) reloadDeployment
@@ -1288,11 +1278,10 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     // Build the new maps in locals before installing, so if any fetch
     // fails mid-way the slot keeps serving the old deployment.
     //
-    // Phase 3: bytecode values are leases (`*BlobBytes`) into the
-    // node-wide `BytecodeCache`. The errdefer releases each partial
-    // lease so a mid-build fetch failure doesn't leak refcount on
-    // any cache entry we already touched (either reused or fresh-
-    // inserted).
+    // Bytecode values are leases (`*BlobBytes`) into the node-wide
+    // `BytecodeCache`. The errdefer releases each partial lease so a
+    // mid-build fetch failure doesn't leak refcount on any cache
+    // entry we already touched (either reused or fresh-inserted).
     const cache: *BytecodeCache = slot.bytecode_cache orelse return error.SlotNotOpenedThroughNode;
     var next_bc: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
     errdefer {
@@ -1350,7 +1339,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         errdefer allocator.free(path_copy);
         switch (entry.kind) {
             .handler => {
-                // Phase 3 diff-fetch: try the cache first; only the
+                // Diff-fetch: try the cache first; only the
                 // misses hit S3. Two tenants with the same bytecode
                 // hash share one cache entry — the second tenant's
                 // load sees the existing `*BlobBytes` and just bumps
@@ -1433,7 +1422,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         }
     }
 
-    // PM P1: stage package modules into the bytecode map at their
+    // Stage package modules into the bytecode map at their
     // package-virtual keys (`/pkg/<pkg_hash>/<path>`) so the module
     // loader can serve `@scope/pkg` imports. Same lease-or-fetch path
     // as handler bytecode — packages are content-addressed, so two
@@ -1463,9 +1452,9 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         }
     }
 
-    // PM P1: per-importer package resolution for the module loader.
-    // Null when the deployment declares no packages — the loader then
-    // resolves exactly as pre-PM.
+    // Per-importer package resolution for the module loader. Null
+    // when the deployment declares no packages — the loader then
+    // resolves as if no packages were declared.
     var next_resolver: ?module_execution.PackageResolver =
         if (manifest.packages.len > 0 or manifest.app_imports.len > 0)
             try module_execution.buildResolver(allocator, manifest.packages, manifest.app_imports)
@@ -1490,7 +1479,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         }
     }.lessThan);
 
-    // Gap 2.1 Phase B: discover subscription chain origins from
+    // Discover subscription chain origins from
     // `_subscriptions/<name>/{index.mjs,spec.json}` manifest pairs.
     // Failures abort the deploy (consistent with the trigger
     // discovery posture above — a misconfigured subscription is a

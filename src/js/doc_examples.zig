@@ -8,10 +8,9 @@
 //!           the build.
 //!   Gate B (all examples): contains no RETIRED spelling (the
 //!           handler-shape §10 what's-gone list, kept in sync below).
-//!           This is the gate that would have caught every drift
-//!           instance the 2026-07 ergonomics audit found — `kv.range`
-//!           fiction, `request.result`, the pre-rename `on.*` verbs —
-//!           years before a reader did.
+//!           This gate catches drift like `kv.range` fiction,
+//!           `request.result`, or retired `on.*` verbs before a
+//!           reader copies an example that no longer works.
 //!   Gate C (drivable examples): EXECUTES against the real baked
 //!           globals through the dispatcher, with a chameleon stub
 //!           standing in for the example's deliberate free variables
@@ -67,7 +66,7 @@ const RETIRED_SPELLINGS = [_]RetiredSpelling{
     .{ .pattern = "scheduled_at_ns", .hint = "handler-visible fields are camelCase: scheduledAtNs" },
     .{ .pattern = "onBoot", .hint = "kind=boot subscriptions are retired; seed registrations from any handler activation" },
     .{ .pattern = "http.send(", .hint = "durable outbound is webhook.send(url, opts)" },
-    // Audit batch 3 (2026-07-06): option-key unification.
+    // Option-key unification (camelCase options + `{at}`/`{in}` coercions).
     .{ .pattern = "fire_at_ns", .hint = "deferred fires are `{at}`/`{in}` (schedule's coercions)" },
     .{ .pattern = "timeout_ms", .hint = "camelCase options: `timeoutMs`" },
     .{ .pattern = "max_attempts", .hint = "camelCase options: `maxAttempts`" },
@@ -79,7 +78,7 @@ const RETIRED_SPELLINGS = [_]RetiredSpelling{
     .{ .pattern = "handle:", .hint = "webhook.send's idempotency option is `key` (like schedule)" },
     .{ .pattern = "cancelFetch", .hint = "cancel an after.fetch with after.cancel(id)" },
     // durable-kv-subscriptions (decisions §4.13): fires carry only the
-    // dirty prefix — per-write key/op payloads retired.
+    // dirty prefix, not per-write key/op payloads.
     .{ .pattern = "source.key", .hint = "subscription fires are coalesced level triggers: request.activation.source.prefix (read the prefix, reconcile)" },
     .{ .pattern = "source.op", .hint = "subscription fires carry no op — read current state under source.prefix" },
 };

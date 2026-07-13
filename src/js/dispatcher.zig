@@ -65,14 +65,14 @@ pub const DispatchError = error{
 /// uncatchable InternalError into the handler.
 ///
 /// `deadline_ns` is wall-clock (monotonic), not CPU time — simpler, and
-/// a runaway JS loop burns wall and CPU in lockstep anyway. Phase 4's
-/// tape replay will want deterministic cutoff by `bytecode_op_count`
-/// instead; leaving the field here now so the shape is forward-compat.
+/// a runaway JS loop burns wall and CPU in lockstep anyway. Deterministic
+/// tape replay may instead want a cutoff by `bytecode_op_count`; the
+/// `tick_count` field below leaves room for that.
 pub const Budget = struct {
     deadline_ns: i64,
-    /// Incremented on every interrupt-handler tick. Not yet used; Phase
-    /// 4 tape replay can clamp on this instead of the deadline so replay
-    /// cuts off at the same logical point as the original run.
+    /// Incremented on every interrupt-handler tick. Reserved for
+    /// deterministic tape replay to clamp on instead of the deadline,
+    /// so replay cuts off at the same logical point as the original run.
     tick_count: u64 = 0,
 
     /// Per-request wall-clock budget for customer handlers. Fires
@@ -193,9 +193,9 @@ pub const Dispatcher = struct {
     ///     hard error (500).
     ///   - The invoked export is the resume path's first-class target
     ///     (`Request.fn_override`) or the activation kind's
-    ///     conventional export (`rpc_dispatch.parseDispatch`); the
-    ///     retired customer `?fn=`/`{fn,args}` shapes are opaque
-    ///     payload (decisions.md §4.5).
+    ///     conventional export (`rpc_dispatch.parseDispatch`); customer
+    ///     `?fn=`/`{fn,args}` shapes are opaque payload, not interpreted
+    ///     as export selectors (decisions.md §4.5).
     ///   - The invoked export gets no positional arguments — resume
     ///     payloads (ctx / outcome) ride `Request.body` and the
     ///     `Request.activation` union, read through the request surface.
@@ -209,12 +209,11 @@ pub const Dispatcher = struct {
     /// (`*BlobBytes` from `worker.BytecodeCache`) used by the module
     /// loader to resolve `import` statements the entry module pulls
     /// in. `null` is valid if the entry has no imports.
-    /// The dispatch core. `run` (back-compat: returns `Response`,
-    /// collapses `.continuation`→501) wraps this; the
-    /// continuation-aware worker path (Phase 3b-ii/iii) calls
-    /// `runOutcome` directly. Splitting here keeps every existing
-    /// `run` call site (≈30 tests + 3 production callers) unchanged
-    /// while exposing the trampoline outcome where it's needed.
+    /// The dispatch core. `run` (returns `Response`, collapsing
+    /// `.continuation`→501) wraps this; the continuation-aware worker
+    /// path calls `runOutcome` directly. The split keeps every `run`
+    /// call site unchanged while exposing the trampoline outcome where
+    /// it's needed.
     /// One dispatch attempt under an explicit arena regime. The
     /// public `runOutcome` wraps this with the bump→GC OOM retry.
     fn runOutcomeAttempt(
@@ -253,9 +252,9 @@ pub const Dispatcher = struct {
             .console = &console_buf,
             .tags = &tags_buf,
             .readset = request.trace.readset,
-            // `docs/primitive-gaps.md` §9 — Zig-side PRNG retired.
-            // arenajs's per-request xorshift64star state is the
-            // single PRNG; seeded by `installRequest` from
+            // `docs/primitive-gaps.md` §9 — arenajs's per-request
+            // xorshift64star state is the single PRNG (no Zig-side
+            // PRNG); seeded by `installRequest` from
             // `state.readset.?.seed`.
             .request_id = request.trace.request_id,
             .session_id = request.session_id,
@@ -347,7 +346,7 @@ pub const Dispatcher = struct {
         // body and skips the handler. Return undefined / fall off the
         // end → continue.
         //
-        // Phase 5 PR-3: `__system/` built-in modules SKIP middleware.
+        // `__system/` built-in modules SKIP middleware.
         // They're the platform's own bookkeeping (e.g. the baked
         // `__system/webhook_onresult` shim that runs as a fetch_chunk
         // activation in the issuing tenant). A tenant's middleware
@@ -408,7 +407,7 @@ pub const Dispatcher = struct {
     /// same pinned clock, same inputs); the ONE exception is an
     /// attempt that fired an immediate worker-side effect
     /// (blob streaming, cancel_fetch, fire_wake, resume_if_bound) —
-    /// those don't retry and fail as before.
+    /// those don't retry.
     ///
     /// After return, `last_arena_mode` / `last_arena_gc_retry` say
     /// what happened (the worker's churny-map + LogRecord inputs).
@@ -535,8 +534,8 @@ pub const Dispatcher = struct {
     /// Discard a doomed OOM attempt's outputs before returning a loud
     /// failure: free the mangled outcome, roll back the attempt-scoped
     /// readset/effects, and truncate the batch-shared writeset to this
-    /// attempt's boundary (mirrors the pre-retry cleanup — a wholesale
-    /// clear would eat sibling handlers' ops).
+    /// attempt's boundary (a wholesale clear would eat sibling
+    /// handlers' ops).
     fn dropDoomedOutcome(
         allocator: std.mem.Allocator,
         outcome: DispatchError!RunOutcome,
@@ -595,11 +594,9 @@ pub const Dispatcher = struct {
         }
     }
 
-    /// Back-compat dispatch: run, and collapse a `.continuation` to a
-    /// terminal 501. Every existing caller uses this unchanged until
-    /// Phase 3b-iii wires the worker-local park + resume. A
-    /// continuation arriving here is an EXPECTED condition (a customer
-    /// used `next(...)` before the resume path exists), not an
+    /// Dispatch that runs and collapses a `.continuation` to a terminal
+    /// 501. A continuation arriving here is an EXPECTED condition (a
+    /// customer used `next(...)` before the resume path exists), not an
     /// infallibility violation — graceful 501, never panic
     /// (`feedback_infallibility_violations`).
     pub fn run(
@@ -631,11 +628,10 @@ pub const Dispatcher = struct {
                 };
             },
             .stream => |*s| {
-                // Phase 2a: streaming-handlers type plumbing only;
-                // the worker's chunked-write wiring lands in Phase 2b.
-                // Paths that don't yet support streams degrade to a
-                // defined 501 — mirrors the `.continuation` posture on
-                // call sites that can't handle the trampoline.
+                // Paths that don't support streams on this back-compat
+                // path degrade to a defined 501 — mirrors the
+                // `.continuation` posture on call sites that can't
+                // handle the trampoline.
                 s.deinit(self.allocator);
                 return .{
                     .status = 501,
@@ -704,21 +700,21 @@ fn finishResponse(
         // (runOutcome) handles the cleanup. Don't deinit here, or
         // we'd double-free: ArrayList.deinit sets self.* =
         // undefined, and the errdefer's second deinit call frees
-        // a garbage slice. Pre-fix that landed crashes in
-        // multi-worker concurrent heldsync where kv races into
-        // pending_kv_error and the panic surfaces as a GPF inside
-        // @memset under std.mem.Allocator.free.
+        // a garbage slice. That double-free crashes multi-worker
+        // concurrent heldsync where kv races into pending_kv_error —
+        // the panic surfaces as a GPF inside @memset under
+        // std.mem.Allocator.free.
         return DispatchError.KvFailed;
     }
 
-    // Handler-surface Phase 2 (`stream.*` effects, §2.2): a handler that
-    // called `stream.start()`/`stream.write()` produces the streamed
+    // Handler `stream.*` effects (§2.2): a handler that called
+    // `stream.start()`/`stream.write()` produces the streamed
     // response from the ambient `response.*` head + the chunk effect
     // buffer, with disposition `return next()` (keep streaming) or a
     // terminal (close). Bridge to the internal `Stream` descriptor so
-    // the existing stream pipeline (worker `.stream` arm →
-    // serviceParkedStreams → resumeStream) drives BOTH the old
-    // `__rove_stream` surface and this one, unchanged. The disposition
+    // the stream pipeline (worker `.stream` arm →
+    // serviceParkedStreams → resumeStream) drives both the
+    // `__rove_stream` surface and this one. The disposition
     // is preserved: `next()` ⇒ `.stream` (re-arm); a terminal ⇒ keep the
     // terminal but prepend the buffered chunks so the final frames ship
     // before END_STREAM.
@@ -737,8 +733,8 @@ fn finishResponse(
             };
             c2.deinit(d.allocator); // path/fn_name/ctx_json — ctx was dup'd into `s`
             console_buf.deinit(d.allocator);
-            // Streams don't carry a tag set today (no log record per
-            // chunk write); drop what the handler set.
+            // Streams don't carry a tag set (no log record per chunk
+            // write); drop what the handler set.
             freeTagsBuf(d.allocator, tags_buf);
             return .{ .stream = s };
         }
@@ -800,7 +796,7 @@ fn finishResponse(
     } };
 }
 
-// ── Handler-surface Phase 2: stream.* effect → Stream descriptor ───
+// ── stream.* effect → Stream descriptor ────────────────────────────
 
 /// Build the internal `Stream` descriptor for a `next()`-disposition
 /// activation that emitted `stream.*` output. Head comes from the
@@ -809,7 +805,7 @@ fn finishResponse(
 /// buffer; kv/timer wakes come from the `on.*` accumulator (dup'd — the
 /// worker's list deinit frees the originals); `ctx_json` is dup'd from
 /// the `next({ctx})` descriptor. Cookies on the stream head are not
-/// carried (parity with the retired `__rove_stream` surface).
+/// carried (parity with the `__rove_stream` surface).
 fn buildStreamFromEffects(
     allocator: std.mem.Allocator,
     state: *globals.DispatchState,
@@ -912,5 +908,5 @@ fn prependStreamChunks(
 // ── Tests ──────────────────────────────────────────────────────────────
 //
 // In `dispatcher_test.zig` (same module; root.zig's test block wires it
-// into the build) — 152 tests + fixtures, split out so this file is the
+// into the build) — tests + fixtures live there so this file is the
 // production dispatcher only.

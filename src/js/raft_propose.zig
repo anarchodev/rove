@@ -21,11 +21,10 @@ const std = @import("std");
 const kv_mod = @import("raft-kv");
 const apply_mod = @import("apply.zig");
 
-/// V2 Phase 2c: the result of a propose. `group_id` is the tenant's raft
-/// group (the worker parks `RaftWait{group_id, seq}` and the drain polls
-/// `bridge.committedSeq(group_id)`); `seq` is the per-tenant propose seq,
-/// or 0 when nothing was proposed (empty writeset, skip path). Replaces
-/// the bare `u64` seq the V1 global watermark used.
+/// The result of a propose. `group_id` is the tenant's raft group (the
+/// worker parks `RaftWait{group_id, seq}` and the drain polls
+/// `bridge.committedSeq(group_id)`); `seq` is the per-tenant propose
+/// seq, or 0 when nothing was proposed (empty writeset, skip path).
 pub const Proposed = struct {
     group_id: u64 = 0,
     seq: u64 = 0,
@@ -43,8 +42,8 @@ fn proposeEncoded(
     const allocator = worker.allocator;
 
     // Resolve (or assign) this tenant's raft group id. Idempotent; the
-    // bridge maps the envelope `id` string → numeric gid (Phase-3
-    // directory stub). The root writeset (`instance_id == ""`) maps to a
+    // bridge maps the envelope `id` string → numeric gid (directory
+    // stub). The root writeset (`instance_id == ""`) maps to a
     // reserved root group.
     const gid = try worker.raft.registerTenant(instance_id);
 
@@ -71,9 +70,7 @@ fn proposeEncoded(
 /// (`docs/readset-replication-plan.md` Phase 3). Pass `""` from
 /// non-handler producers (ACME, config mirror, internal admin
 /// endpoints); pass `tape_mod.Readset.serialize(...)` bytes from
-/// dispatched-handler paths. Slice 3b ships the signature change
-/// with every call site passing `""`; slice 3d wires the actual
-/// readset serialization from `dispatchPending`.
+/// dispatched-handler paths.
 pub fn proposeWriteSet(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
@@ -83,15 +80,16 @@ pub fn proposeWriteSet(
     return proposeEncoded(worker, writeset, .writeset, instance_id, rs_bytes, false);
 }
 
-// (proposeRootWriteSet removed 2026-05-17: Option-A folds
-// platform.root.* writes into the batch multi-envelope via
-// proposeBatch, so there is no standalone root-writeset proposer.
-// The type-2 encoder `apply.encodeRootWriteSetEnvelope` stays —
-// proposeBatch and acme.zig use it directly.)
+// platform.root.* writes fold into the batch multi-envelope via
+// `proposeBatch`, so there is no general standalone root-writeset
+// proposer (the narrow `proposeRoot` below serves only the
+// control-plane domain-alias write). The type-2 encoder
+// `apply.encodeRootWriteSetEnvelope` is used by `proposeBatch` and
+// `acme.zig` directly.
 
 /// Propose a single `__root__` writeset (type=2 → `{data_dir}/__root__.db`)
-/// through `anchor_id`'s raft group. Narrow standalone proposer re-added for
-/// the control-plane domain-alias write (`/_system/v2-domain`, docs/architecture/auth-consolidation.md
+/// through `anchor_id`'s raft group. Narrow standalone proposer for the
+/// control-plane domain-alias write (`/_system/v2-domain`, docs/architecture/auth-consolidation.md
 /// B3): the caller must have already committed the write to its root overlay
 /// speculatively (so the leader sees it; the durabilize floor folds it on the
 /// `noteWorkerCommitted` ack); followers apply this envelope. Returns the
@@ -114,10 +112,9 @@ pub fn proposeRoot(
 }
 
 /// Propose a dynamic list of already-encoded, **non-multi** inner
-/// envelopes. Replaces the per-producer fixed `[N][]u8` arrays — the
-/// multi wire format already supports up to 255 inners (u8 count) and
-/// apply already loops them; the old `[3]`/`[4]` caps were just stack
-/// arrays sized for the then-current producers.
+/// envelopes. The multi wire format supports up to 255 inners (u8
+/// count) and apply loops them, so the inner list is dynamic rather
+/// than a fixed-size array.
 ///
 ///  - 0 inners      → no-op, returns seq 0
 ///  - 1 inner        → bare propose (no multi-wrapper overhead — the
@@ -132,13 +129,12 @@ pub fn proposeRoot(
 ///    replay, not rollback. This only bites in the extreme >255-ops-
 ///    for-one-tenant-in-one-pass case: a mid-chunk leader change can
 ///    re-apply the not-yet-resolved `_send/owed/` markers, which
-///    Option-(b) resolve-once (proof-presence + send-id dedup) makes
-///    idempotent — the same at-least-once posture as the existing
-///    http.send contract.
+///    resolve-once (proof-presence + send-id dedup) makes idempotent
+///    — the same at-least-once posture as the http.send contract.
 ///
 /// Returns the LAST propose's seq (the batch watermark). The H2
 /// dispatch path parks its txn on this seq and never exceeds the
-/// cap, so it always sees a single-propose seq exactly as before.
+/// cap, so it always sees a single-propose seq.
 pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8) !Proposed {
     if (inner.len == 0) return .{};
     const allocator = worker.allocator;
@@ -148,11 +144,11 @@ pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8) !Propo
     while (i < inner.len) {
         const end = @min(i + CHUNK, inner.len);
         const slice = inner[i..end];
-        // V2 Phase 2c: the whole multi (anchor writeset + any same-batch
-        // side writes) replicates through the ANCHOR tenant's group. The
-        // V1 cross-tenant trampoline (target tenants + root in one multi)
+        // The whole multi (anchor writeset + any same-batch side
+        // writes) replicates through the ANCHOR tenant's group. The
+        // cross-tenant trampoline (target tenants + root in one multi)
         // is an admin/control-plane path off the single-tenant slice;
-        // Phase 3 (directory) routes those per-target.
+        // the directory routes those per-target.
         if (slice.len == 1) {
             seq = try worker.raft.propose(gid, slice[0]);
         } else {
@@ -184,8 +180,8 @@ pub fn proposeBatch(
     // hand off to proposeMulti. encodeTyped @memcpy's the payload so
     // each env owns its bytes — transient payload buffers are freed
     // immediately after encoding. Inner order keeps the writes
-    // contiguous and early (anchor at inner[0], then the Option-A
-    // side writes) so the atomic-critical set lands in the first
+    // contiguous and early (anchor at inner[0], then the side
+    // writes) so the atomic-critical set lands in the first
     // chunk in the realistic case (proposeMulti splits at its
     // `CHUNK` = 255; cross-chunk non-atomicity only bites in the
     // extreme >255-inners-for-one-batch path).
@@ -200,16 +196,15 @@ pub fn proposeBatch(
         defer allocator.free(ws_bytes);
         try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_bytes, rs_bytes));
     }
-    // Option-A (docs/proposer-audit.md Addendum 3): the admin
-    // handler's cross-tenant trampoline writes (per target, type-0
-    // with the target id) and `platform.root.*` writes (type-2)
+    // The admin handler's cross-tenant trampoline writes (per target,
+    // type-0 with the target id) and `platform.root.*` writes (type-2)
     // ride the SAME multi-envelope → one raft seq the calling admin
-    // request is parked on by finalizeBatch. Replaces the per-site
-    // fire-and-forget proposes the caller never gated on. `apply`
-    // routes each inner to its per-target store; the inners share one
-    // raft entry (atomic replication), but each commits its own kvexp
-    // txn — apply is not cross-inner transactional, so recovery is via
-    // idempotent replay, not rollback.
+    // request is parked on by finalizeBatch (docs/proposer-audit.md
+    // Addendum 3). `apply` routes each inner to its per-target store;
+    // the inners share one raft entry (atomic replication), but each
+    // commits its own kvexp txn — apply is not cross-inner
+    // transactional, so recovery is via idempotent replay, not
+    // rollback.
     //
     // Target + root envelopes carry empty rs_bytes — the readset
     // lives on the anchor envelope (inner[0]) above; one readset

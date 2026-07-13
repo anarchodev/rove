@@ -53,7 +53,7 @@ pub const SubscriptionFireSource = union(enum) {
 // Activation — the per-source payload, discriminated by source kind.
 // ---------------------------------------------------------------------
 
-/// Gap 2.3 / Phase 5 PR-1 `http.fetch` activation payload. `id`
+/// Gap 2.3 `http.fetch` activation payload. `id`
 /// correlates every activation of one fetch; surfaces as
 /// `request.activation.fetch_id`. Borrowed slices — the caller
 /// (`fireFetchEventActivation`) owns the bytes for the dispatch.
@@ -167,8 +167,8 @@ pub const Activation = union(enum) {
     timer,
     /// Client disconnect on a held stream (streaming-handlers-plan §4.4).
     disconnect,
-    /// Legacy single-slot kv-write wake. Superseded by `wake_batch`;
-    /// retained so replay can still decode pre-§9.4 tapes.
+    /// Single-slot kv-write wake. `wake_batch` is the live shape; this
+    /// variant is kept so replay can decode old tapes.
     kv_wake,
     wake_batch: WakeBatch,
     subscription_fire: SubscriptionFire,
@@ -202,10 +202,10 @@ pub const Activation = union(enum) {
     /// external request. `_middlewares` is an authn/authz gate for the trust
     /// boundary — the inbound request — and a continuation already ran behind
     /// that gate, so the dispatcher SKIPS middleware for these. Otherwise a
-    /// tenant's own auth middleware 401s its own callbacks: the reason
-    /// `__system/*` modules were special-cased, and the bound-fetch-through-
-    /// middleware footgun A5 surfaced (an `onFetchResult` resume — a
-    /// `fetch_chunk` — short-circuited by `__admin__`'s RP guard). Auth that a
+    /// tenant's own auth middleware 401s its own callbacks — the same
+    /// reason `__system/*` modules are special-cased, and what would
+    /// otherwise 401 a bound-fetch resume (an `onFetchResult`
+    /// `fetch_chunk` short-circuited by `__admin__`'s RP guard). Auth that a
     /// continuation needs is threaded via its ctx, not re-derived here. New
     /// activation kinds default to NON-continuation (gated) — the safe side.
     pub fn isContinuation(self: Activation) bool {
@@ -239,7 +239,7 @@ pub const Activation = union(enum) {
 // ---------------------------------------------------------------------
 // Concern clusters — cross-cutting references bundled by subsystem. Each
 // is embedded (non-optional) with fully-defaulted fields, so omitting a
-// sub-field is identical to the pre-decomposition flat default.
+// sub-field yields the same default as a flat field would.
 // ---------------------------------------------------------------------
 
 /// Rate-limit / plan inputs, threaded to `DispatchState` so both the
@@ -302,8 +302,8 @@ pub const Admin = struct {
 /// test paths / non-worker dispatches; the matching JS callable degrades
 /// gracefully (returns false / no-ops) when null.
 pub const Trampolines = struct {
-    /// Phase 5 PR-3: `_system.continuation.resumeIfBound(send_id,
-    /// event_json)` — the §6.4 held-sync resume hook. Wired to
+    /// `_system.continuation.resumeIfBound(send_id, event_json)` — the
+    /// §6.4 held-sync resume hook. Wired to
     /// `worker.resumeBoundContinuation`.
     resume_if_bound: ?*const fn (
         ctx: *anyopaque,
@@ -348,12 +348,12 @@ pub const Trampolines = struct {
 /// the dispatcher threads the pointers into `DispatchState` and the worker
 /// flushes / frees them after the run.
 pub const PendingEffects = struct {
-    /// `http.fetch` accumulator (Gap 2.3 Phase C1).
+    /// `http.fetch` accumulator (Gap 2.3).
     pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
-    /// `on.timer` / `on.kv` accumulator (Handler-surface Phase 1). Set only
+    /// `on.timer` / `on.kv` accumulator. Set only
     /// on connection activations; null elsewhere (`on.*` inert).
     pending_wakes: ?*std.ArrayListUnmanaged(globals.PendingWakeReg) = null,
-    /// `stream.write(chunk)` accumulator (Handler-surface Phase 2).
+    /// `stream.write(chunk)` accumulator.
     /// `finishResponse` drains it into the `Stream` descriptor (next() ⇒
     /// keep streaming) or prepends it to the terminal body (close).
     pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
@@ -383,14 +383,15 @@ pub const Request = struct {
     body: []const u8 = "",
     /// Query string (everything after `?`, not including it). Null when the
     /// URL had none. Surfaced as `request.query` — opaque to the platform
-    /// (the former `?fn=`/`&args=` platform dispatch is retired; handlers
+    /// (the platform does not interpret `?fn=`/`&args=`; handlers
     /// that want query-based routing parse it in JS, decisions.md §4.5).
     query: ?[]const u8 = null,
     /// Internal resume-path dispatch target. The platform's own resume
     /// engines (send-callback / wake / bound-fetch / subscription /
     /// chained dispatch) name the export to invoke here — first-class,
     /// never via the customer-visible body or query string (the
-    /// `{fn,args}` envelope is retired, decisions.md §4.5). Null →
+    /// `{fn,args}` envelope is not a dispatch selector, decisions.md
+    /// §4.5). Null →
     /// the activation kind's conventional export
     /// (`rpc_dispatch.defaultExportForKind`). The export is invoked
     /// with no positional arguments — resume payloads (ctx / outcome)
@@ -405,7 +406,7 @@ pub const Request = struct {
     /// minted). 64 lowercase hex chars when set; null on paths with no
     /// browser context. Surfaces as `request.session.id` / `null`.
     session_id: ?[64]u8 = null,
-    /// Phase 5 PR-2b: true when the dispatched module belongs to the
+    /// True when the dispatched module belongs to the
     /// `__system/` namespace. Built-in modules are platform-trusted — they
     /// bypass the `isCustomerWriteReserved` check and skip middleware.
     is_system_module: bool = false,
@@ -498,14 +499,14 @@ pub const Response = struct {
 /// Outcome of a dispatch run. A *transient* function result the caller
 /// consumes immediately to choose the next collection move — NOT a
 /// discriminant persisted on a per-entity record (that would be the
-/// `feedback_state_is_collection` antipattern). `.terminal` is today's
-/// behavior verbatim; `.continuation` means the handler returned
+/// `feedback_state_is_collection` antipattern). `.terminal` is the
+/// plain response; `.continuation` means the handler returned
 /// `next(...)` and the request is mid-trampoline.
 pub const RunOutcome = union(enum) {
     terminal: Response,
     continuation: continuation_mod.Continuation,
-    /// Iterative streaming descriptor (streaming-handlers-plan §3.3, Phase
-    /// 2). The handler returned `__rove_stream(...)`. The worker's success
+    /// Iterative streaming descriptor (streaming-handlers-plan §3.3).
+    /// The handler returned `__rove_stream(...)`. The worker's success
     /// path drives the held h2 entity through the chunked-write lifecycle.
     stream: stream_mod.Stream,
     /// An `.inbound_headers` probe found no `onHeaders` export — the

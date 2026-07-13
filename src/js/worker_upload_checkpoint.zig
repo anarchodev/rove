@@ -9,8 +9,8 @@
 //! entries replicated but have no LogRecord to surface to the
 //! customer.
 //!
-//! Phase 5c will close that gap by walking raft entries on
-//! promotion and re-deriving LogRecords from each readset's
+//! A promotion walker will close that gap by walking raft entries
+//! on promotion and re-deriving LogRecords from each readset's
 //! `LogHeader`. To know WHERE to resume, the walker needs a
 //! durable "the last seq the dead leader covered" mark.
 //!
@@ -24,7 +24,7 @@
 //! Each worker's writer is the per-tick flusher, single-threaded
 //! against that worker's file.
 //!
-//! On promotion (Phase 5c), the walker reads every per-worker
+//! On promotion, the walker reads every per-worker
 //! checkpoint in `_meta/` and starts from the MINIMUM across them
 //! — that's the safe high-water mark covering all workers'
 //! workloads.
@@ -63,7 +63,7 @@ pub fn checkpointTmpPath(
 }
 
 /// Read the per-worker checkpoint. Returns 0 if the file is
-/// missing OR malformed (the safe boot default — Phase 5c will
+/// missing OR malformed (the safe boot default — the walker will
 /// just re-upload more entries, which idempotency at the indexer
 /// absorbs).
 ///

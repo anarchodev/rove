@@ -17,7 +17,7 @@
 //!
 //! `{ to: "module.method" | "method" }` routes the wake to a specific
 //! export; the default is `onWake` (the generic "edge wake — go look"
-//! export, wired in Phase 4's kind→export map). The target reuses the
+//! export, wired in the kind→export map). The target reuses the
 //! continuation `path`/`fn_name` resolution.
 
 const std = @import("std");

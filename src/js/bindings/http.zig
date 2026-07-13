@@ -1,24 +1,18 @@
 //! `http.fetch` / `http.cancelFetch` (transient streaming HTTP —
 //! `docs/upstream-streaming-plan.md`, Gap 2.3) JS bindings.
 //!
-//! Phase 5 PR-3 (effect-reification) retired the `http.send` /
-//! `http.cancel` durable primitive: durability is now composed in JS
-//! by `globals/webhook.js` (kv.set marker → http.fetch → baked
-//! `__system/webhook_onresult` shim → optional `__rove_next` to
-//! customer `on_result`). The Zig kernel — `send_dispatch.zig` /
-//! `send_inflight.zig` / `send_outbox.zig` / `callback_dispatch.zig`
-//! — deleted in the same atomic commit (see
-//! `docs/effect-reification-plan.md` Phase 5 PR-3 for the locked
-//! design).
+//! Durability is composed in JS by `globals/webhook.js` (kv.set
+//! marker → http.fetch → baked `__system/webhook_onresult` shim →
+//! optional `__rove_next` to customer `on_result`), not by a durable
+//! Zig primitive (see `docs/effect-reification-plan.md` Phase 5 PR-3
+//! for the locked design).
 //!
 //!   http.fetch — transient, best-effort, fire-immediately. No
 //!     raft involvement; the fetch-pool thread issues libcurl as
 //!     soon as the binding accumulates it; no retry on crash. One
 //!     callback (`on_chunk`); one knob (`stream: bool`) for
 //!     "give me only the first chunk" (default) vs. "deliver
-//!     every chunk as it arrives." Phase 5 PR-1 collapsed today's
-//!     three patterns (on_chunk / pipe_to / fire-and-forget +
-//!     on_done) into this single shape.
+//!     every chunk as it arrives."
 //!
 //! The customer-facing API:
 //!
@@ -30,11 +24,11 @@
 //!   });
 //!   http.cancelFetch({ id });
 //!
-//! Handler-surface Phase 3: `_system.http.fetch` (`jsHttpFetch`) is now
-//! the INTERNAL outbound primitive — the customer `http.fetch` spelling
-//! is retired. The two public outbound surfaces compose over it:
-//! `on.fetch` (`jsOnFetch`, connection-scoped, binds to the held chain)
-//! and `webhook.send` (the JS shim, durable + connectionless). Plain
+//! `_system.http.fetch` (`jsHttpFetch`) is the INTERNAL outbound
+//! primitive (no customer `http.fetch` spelling). The two public
+//! outbound surfaces compose over it: `on.fetch` (`jsOnFetch`,
+//! connection-scoped, binds to the held chain) and `webhook.send`
+//! (the JS shim, durable + connectionless). Plain
 //! `_system.http.fetch` is the always-unbound Pattern-A transport the
 //! webhook/email shims use.
 //!
@@ -80,11 +74,11 @@ pub fn jsHttpFetch(
             return js_exception;
         },
     };
-    // Handler-surface Phase 3: plain `http.fetch` is the always-unbound
-    // Pattern-A transient — its `on_chunk` module fires as a separate
-    // chain (never binds the calling chain; binding is `on.fetch`'s job).
-    // The success seam (`worker_dispatch.zig`) leaves `bind = false` for
-    // a non-`connection_scoped` fetch.
+    // Plain `http.fetch` is the always-unbound Pattern-A transient —
+    // its `on_chunk` module fires as a separate chain (never binds the
+    // calling chain; binding is `on.fetch`'s job). The success seam
+    // (`worker_dispatch.zig`) leaves `bind = false` for a
+    // non-`connection_scoped` fetch.
     state.http_fetch_index += 1;
     // Build the id JS string NOW — `appendPendingFetch` transfers
     // ownership of `row.id` into the PendingFetch and clears the
@@ -92,12 +86,12 @@ pub fn jsHttpFetch(
     // empty slice. `JS_NewStringLen` copies the bytes, so `res`
     // is independent of `row`'s subsequent fate.
     const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
-    // Gap 2.3 Phase C1: accumulate into the per-DispatchState
-    // pending-fetches list. The worker's batch-finalize phase
-    // flushes the list to NodeState.fetch_pending; the fetch-pool
-    // thread (Phase C2) drains that queue and fires libcurl. If
-    // the handler throws / faults before flush, DispatchState's
-    // deinit frees the entries — no orphan fetches.
+    // Accumulate into the per-DispatchState pending-fetches list.
+    // The worker's batch-finalize phase flushes the list to
+    // NodeState.fetch_pending; the fetch-pool thread drains that
+    // queue and fires libcurl. If the handler throws / faults before
+    // flush, DispatchState's deinit frees the entries — no orphan
+    // fetches.
     appendPendingFetch(state, &row) catch |err| {
         // Allocator failure on the dupe/append; tear down `row`
         // (still allocator-owned by this fn) + the id string, and
@@ -119,8 +113,7 @@ pub fn jsHttpFetch(
 /// AFTER the `_harden.js` `delete globalThis._system` step, so they
 /// can't reach `_system.http`; this persistent, `is_system_module`-gated
 /// op (in the `__rove.*` holder, same posture as `__rove.wake.set`) is
-/// how `__system/webhook_fire` issues the retry/scheduled-fire fetch the
-/// deleted Zig owed sweep used to build natively.
+/// how `__system/webhook_fire` issues the retry/scheduled-fire fetch.
 pub fn jsSystemFetch(
     ctx: ?*c.JSContext,
     this: c.JSValue,
@@ -169,7 +162,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .held = row.held,
         // `bind` is COMPUTED at the handler-success seam
         // (`worker_dispatch.zig`: only `connection_scoped` on.fetch
-        // binds; `detach` is retired).
+        // binds).
         .bind = false,
         .bound_send_id = row.bound_send_id,
         .name = row.name,
@@ -189,7 +182,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
 }
 
 /// `_system.on.fetch(url, opts?, { to? })` — connection-scoped outbound
-/// (handler-surface Phase 3, `docs/handler-shape.md` §2.3). Issues an
+/// (`docs/handler-shape.md` §2.3). Issues an
 /// HTTP request whose result wakes THIS connection: chunks resume the
 /// held chain's `{to}` export (default `onFetchChunk`). Connection-only
 /// — if the activation doesn't end up holding the socket the fetch is
@@ -359,12 +352,11 @@ pub fn jsHttpCancelFetch(
         fn_ptr(fn_ctx, id_slice);
     }
     // Engine null (test paths / non-worker dispatch) → silent
-    // no-op; matches the pre-engine behavior the JS side already
-    // expected.
+    // no-op; the JS side expects this.
     return js_undefined;
 }
 
-// ── http.subscribe / http.cancelSubscription — Phase 3 (gap 2.5) ───────
+// ── http.subscribe / http.cancelSubscription — gap 2.5 ────────────────
 
 /// `http.subscribe(opts) -> subscription_id` — held outbound
 /// subscription (`docs/curl-multi-plan.md` Phase 3; closes
@@ -412,9 +404,8 @@ pub fn jsHttpSubscribe(
     state.http_fetch_index += 1;
     // Customer-visible id: the same `ftch_<hex>` form as after.fetch's
     // return and activation.fetchId (§7.5 — ONE id spelling on every
-    // surface; the audit found subscribe's bare-hex return breaking
-    // correlation with the chunk activations). cancelSubscription
-    // strips the prefix on the way back in.
+    // surface, so it correlates with the chunk activations).
+    // cancelSubscription strips the prefix on the way back in.
     var sid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
     @memcpy(sid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
     @memcpy(sid_buf[log_mod.FETCH_ID_PREFIX.len..][0..row.id.len], row.id);
@@ -450,18 +441,17 @@ const BuiltFetch = struct {
     headers_json: []u8,
     body: []u8,
     timeout_ms: u32,
-    /// `on_chunk` module path. Required by `buildFetchRow` —
-    /// Phase 5 PR-1 dropped `on_done` and `pipe_to` so the
-    /// chunk callback is the only path. Allocator-owned.
+    /// `on_chunk` module path. Required by `buildFetchRow` — the
+    /// chunk callback is the only path (no `on_done` / `pipe_to`).
+    /// Allocator-owned.
     on_chunk_module: []u8,
     /// Threaded forward to each activation as `request.ctx`. JSON
     /// string; "null" when omitted.
     ctx_json: []u8,
-    /// Phase 5 PR-1: `stream: false` (default) → fire exactly one
-    /// `on_chunk` event with `final: true` (up to
-    /// `max_response_chunk_bytes` of body; cap-overflow sets
-    /// `body_truncated`). `stream: true` → fire one event per
-    /// upstream writeback, last carrying `final: true`.
+    /// `stream: false` (default) → fire exactly one `on_chunk` event
+    /// with `final: true` (up to `max_response_chunk_bytes` of body;
+    /// cap-overflow sets `body_truncated`). `stream: true` → fire one
+    /// event per upstream writeback, last carrying `final: true`.
     stream: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
@@ -485,7 +475,7 @@ const BuiltFetch = struct {
     /// switch(request.fetchId) at the top of one shared handler.
     /// Allocator-owned dupe.
     name: []u8 = &.{},
-    /// Handler-surface Phase 3: true ⇒ this fetch was issued via
+    /// True ⇒ this fetch was issued via
     /// `on.fetch` — a CONNECTION trigger. Connection-scoped by
     /// construction: it binds to the held chain (chunks → `{to}` /
     /// `onFetchChunk`) when the activation holds the socket, and is
@@ -529,7 +519,7 @@ fn buildFetchRow(
     fetched.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
     fetched.ctx_json = try dupeJsObjectAsJson(ctx, a, opts, "ctx", "null");
     fetched.on_chunk_module = try dupeJsString(ctx, a, opts, "on_chunk", "");
-    // Phase 2B: platform-internal `bound_send_id` option used by the
+    // Platform-internal `bound_send_id` option used by the
     // `webhook.send` JS shim. Empty when absent — customers' plain
     // `http.fetch` never sets this.
     fetched.bound_send_id = try dupeJsString(ctx, a, opts, "bound_send_id", "");
@@ -615,11 +605,8 @@ const FetchExtracted = struct {
 
 /// Hex(sha256(u64-le(request_id) || u32-le("FTCH") || u32-le(fetch_index))).
 /// 64 chars; stable per-replay. The "FTCH" tag is the literal
-/// string `"FTCH"` (4 ASCII bytes) — a leftover from when
-/// `http.send`'s `derivedIdHex` shared the id namespace and the
-/// tag was the disambiguator. Kept verbatim now so any in-flight
-/// fetch ids that were already deterministic across replay stay
-/// stable through the PR-3 cutover.
+/// string `"FTCH"` (4 ASCII bytes); it stays fixed so fetch ids
+/// remain deterministic across replay.
 pub fn deriveFetchIdHex(a: std.mem.Allocator, request_id: u64, fetch_index: u32) ![]u8 {
     var input: [16]u8 = undefined;
     std.mem.writeInt(u64, input[0..8], request_id, .little);
@@ -662,8 +649,7 @@ fn dupeJsString(
 /// Like `dupeJsString`, but also accepts a Uint8Array. Fetch bodies
 /// must carry binary payloads losslessly (`blob.put` media bytes);
 /// routing raw bytes through a JS string would UTF-8-mangle them.
-/// String values keep `dupeJsString`'s UTF-8-bytes semantics, so
-/// every pre-existing caller behavior is unchanged.
+/// String values keep `dupeJsString`'s UTF-8-bytes semantics.
 fn dupeJsStringOrBytes(
     ctx: ?*c.JSContext,
     a: std.mem.Allocator,

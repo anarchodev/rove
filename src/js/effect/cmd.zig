@@ -4,33 +4,29 @@
 //! commit-gated, recorded action the engine carries out after the Model
 //! write of the same activation commits (L4 — every Cmd is commit-gated).
 //!
-//! Phase 4.1, shipped 2026-05-24 (the plan doc is folded into
-//! `docs/decisions.md` §3.2 + `docs/architecture/effects-and-handlers.md`):
-//! the typed union backed by an exhaustive `interpretCmd`
-//! switch + `BufferedCmds` wrapping the per-unit list. Every buffered
-//! release point used to be a hand-rolled per-kind helper:
+//! The design is folded into `docs/decisions.md` §3.2 +
+//! `docs/architecture/effects-and-handlers.md`: a typed union backed by
+//! an exhaustive `interpretCmd` switch + `BufferedCmds` wrapping the
+//! per-unit list. Every buffered release point routes through the one
+//! switch site rather than a per-kind helper:
 //!
-//!   - `firePendingKvWakes` (broadcast to subscribed streams + kv-react)
-//!   - `transferStagedChunks` (commit-gated stream output)
-//!   - `mark_draining` flag flip (terminal close after chunks land)
+//!   - kv wake fan-out (broadcast to subscribed streams + kv-react)
+//!   - commit-gated stream output
+//!   - terminal stream close after chunks land
 //!
-//! `interpretCmd` collapses those into one switch site. Adding a new
-//! Cmd kind = adding a variant to the union; the compiler refuses to
-//! build until `interpretCmd` handles it. That's the contract the
-//! plan has been promising since Phase 1.
+//! Adding a new Cmd kind = adding a variant to the union; the compiler
+//! refuses to build until `interpretCmd` handles it.
 //!
-//! Live variants today: `kv_wake_broadcast`, `stream_chunk`,
-//! `stream_close`, `http_fetch`, `respond`. The 4.1.3 Option-2
-//! atomic flip shipped `respond`; every site that parks an entity in
-//! raft_pending_X emits one. `http_fetch` Phase 4.1.2 closes the
+//! Variants: `kv_wake_broadcast`, `stream_chunk`, `stream_close`,
+//! `http_fetch`, `respond`, `ws_send`. Every site that parks an entity
+//! in raft_pending_X emits a `respond`. `http_fetch` closes the
 //! marker-commit race — the barrier + write-path branches in
 //! `worker_dispatch.finalizeBatch` stage one Cmd.http_fetch per
 //! PendingFetch issued from a read- or write-path handler, so
 //! `interpretCmd` submits to the FetchEngine strictly after the
-//! batch commits. Future variants (e.g. `kv_write` routing,
-//! `conn_write` for inbound-WS) get added when their producer
-//! ships — adding the union arm before the producer is the
-//! `respond_deferred` failure mode the Phase 4.1 reframe ruled out.
+//! batch commits. A new variant is added when its producer ships —
+//! adding the union arm before the producer is the `respond_deferred`
+//! failure mode this design rules out.
 
 const std = @import("std");
 const kv_mod = @import("raft-kv");
@@ -54,8 +50,8 @@ pub const Cmd = union(enum) {
     kv_wake_broadcast: KvWakeOp,
 
     /// Append a chunk of bytes to a destination entity's
-    /// `StreamChunks` queue (Phase 4.0.b commit-gated stream
-    /// output). The entity is in `h2.stream_data_out`; if it's
+    /// `StreamChunks` queue (commit-gated stream output). The entity
+    /// is in `h2.stream_data_out`; if it's
     /// been moved/destroyed in the interim (client disconnect
     /// race), the bytes free via this Cmd's deinit (the chunk
     /// reached no socket — "writes committed, no chunk on the wire"
@@ -65,21 +61,19 @@ pub const Cmd = union(enum) {
     /// Flip a destination entity's `StreamDraining.is_draining`
     /// flag to true. Used by the terminal+writes arm so the
     /// chunks-empty + draining close sequence starts AFTER raft
-    /// commits (closes the pre-commit `markStreamDraining` leak
-    /// Phase 4.0.b documented).
+    /// commits — the flag flip is commit-gated so no draining marker
+    /// escapes before the writeset lands.
     stream_close: StreamCloseSignal,
 
-    /// Phase 4.1.2: submit an `http.fetch` to the FetchEngine on
-    /// commit. Closes the marker-commit race that forced
-    /// `webhook.send` to drop its inline fetch — the parked unit
-    /// owns the PendingFetch until raft commits the writeset, then
-    /// `interpretCmd` hands it to the engine; on fault, the
-    /// PendingFetch frees with the unit. Producer is
-    /// `worker_dispatch.finalizeBatch` (both barrier + write paths
-    /// stage one per `batch_pending_fetches` item).
+    /// Submit an `http.fetch` to the FetchEngine on commit. Closes
+    /// the marker-commit race — the parked unit owns the PendingFetch
+    /// until raft commits the writeset, then `interpretCmd` hands it
+    /// to the engine; on fault, the PendingFetch frees with the unit.
+    /// Producer is `worker_dispatch.finalizeBatch` (both barrier +
+    /// write paths stage one per `batch_pending_fetches` item).
     http_fetch: globals_mod.PendingFetch,
 
-    /// Phase 4.1.3: H2 response stamping deferred to commit time.
+    /// H2 response stamping deferred to commit time.
     /// Carries the h2 response payload (Status / RespHeaders /
     /// RespBody / H2IoResult) plus the entity reference + the
     /// source/dest collection enum so `interpretCmd` can stamp the
@@ -100,9 +94,8 @@ pub const Cmd = union(enum) {
     /// payload components; `interpretCmd` stamps the real values
     /// at commit time + moves to dest. Fault arm
     /// (`drainEntityArm` fault branch) stamps Status=503 +
-    /// canned-body RespBody as today; the entity's RespHeaders
-    /// stays empty on fault (was the handler's leaked headers
-    /// pre-4.1.3 — arguably more correct).
+    /// canned-body RespBody; the entity's RespHeaders stays empty
+    /// on fault (no handler-leaked headers).
     respond: RespondOut,
 
     /// architecture/websockets.md (piece D): emit one outbound WebSocket frame
@@ -116,7 +109,7 @@ pub const Cmd = union(enum) {
     /// committed, no frame on the wire," the same disconnect-race
     /// posture as `stream_chunk`. Producer: `fireWsMessage`'s write arm
     /// (read-only frames emit `ws_send_in` inline — no commit to wait
-    /// on). Supersedes the withdrawn `conn_write` Cmd reservation.
+    /// on).
     ws_send: WsSendOut,
 
     /// Discard-arm: free every owned resource. Called per-Cmd from
@@ -178,24 +171,21 @@ pub const WsSendOut = struct {
     bytes: []u8,
 };
 
-/// `respond` Cmd payload — Phase 4.1.3's commit-arm entity move
-/// for an H2 response entity. The h2 payload components (Status /
-/// RespHeaders / RespBody / H2IoResult) are already stamped on
-/// the entity at handler-success time (`worker_dispatch.zig` per
-/// success); this Cmd just routes the post-commit `reg.move` from
-/// `raft_pending_X` → the per-success destination through
-/// `interpretCmd` instead of inline in `drainEntityArm`'s commit
-/// arm. The architectural value is the exhaustive-switch
-/// contract: every buffered entity-state-transition kind now has
-/// a typed Cmd variant + interpretCmd arm.
+/// `respond` Cmd payload — the commit-arm entity move for an H2
+/// response entity. The h2 payload components (Status / RespHeaders
+/// / RespBody / H2IoResult) are already stamped on the entity at
+/// handler-success time (`worker_dispatch.zig` per success); this Cmd
+/// just routes the post-commit `reg.move` from `raft_pending_X` → the
+/// per-success destination through `interpretCmd` instead of inline in
+/// `drainEntityArm`'s commit arm. The architectural value is the
+/// exhaustive-switch contract: every buffered entity-state-transition
+/// kind has a typed Cmd variant + interpretCmd arm.
 ///
-/// (Earlier 4.1.3 draft also DEFERRED the component stamping into
-/// the Cmd payload. That broke the read-only fast path — which
-/// stamps + moves the entity inline without producing a Cmd, so
-/// h2 ended up shipping with Status=0 default values. Restricting
-/// the Cmd to the move-only shape avoids that footgun; the
-/// payload-deferral can be revisited if commit-time component
-/// stamping becomes valuable for a specific reason.)
+/// The Cmd is move-only: it must NOT also defer the component stamping
+/// into its payload. The read-only fast path stamps + moves the entity
+/// inline without producing a Cmd, so deferring the stamp would ship h2
+/// responses with Status=0 default values. Restricting the Cmd to the
+/// move-only shape avoids that footgun.
 pub const RespondOut = struct {
     entity: rove.Entity,
     /// Which raft_pending_X collection the entity is in NOW. The
@@ -230,8 +220,7 @@ pub const RespondOut = struct {
         _ = allocator;
         // Move-only Cmd; no owned payload to free. The h2
         // components on the entity are freed when the entity
-        // destroys (via the component types' own deinit) — same
-        // ownership chain pre-4.1.3.
+        // destroys (via the component types' own deinit).
     }
 };
 
@@ -299,9 +288,9 @@ pub const BufferedCmds = struct {
     }
 };
 
-/// The exhaustive switch over `Cmd` — Phase 4.1's compile-time
-/// contract. Adding a variant to `Cmd` is a compile error until
-/// this fn handles it (no `else` arm).
+/// The exhaustive switch over `Cmd` — the compile-time contract.
+/// Adding a variant to `Cmd` is a compile error until this fn
+/// handles it (no `else` arm).
 ///
 /// Consumes the Cmd's owned slices on success (transfers them to
 /// the target component / engine). On transfer error (entity moved,
