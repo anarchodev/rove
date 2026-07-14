@@ -124,6 +124,13 @@ don't exist in a test or sim run.
   module without `onHeaders`/`onChunk` falls back to its `default`), and a
   handler that returns a never-settling promise responds `200` with the body
   `{}` — all mirroring the worker, so an error-path test predicts production.
+  The `kv.*` write guards fire the same way: a non-string value (object, array,
+  `null`, `undefined`) throws a `TypeError`, a write into a platform-reserved
+  `_` prefix throws `Error{code:"reserved_key"}`, and an oversized key/value
+  throws `key_too_large` / `value_too_large` — so a `try/catch` on `err.code`
+  behaves offline exactly as in production. `kv.prefix` pages identically too:
+  an omitted or non-positive `limit` returns 100, and any request is capped at
+  1000, so a pagination loop written against a test won't silently truncate live.
 
 ## Assertions
 

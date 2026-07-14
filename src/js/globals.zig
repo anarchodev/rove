@@ -3036,27 +3036,11 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
 }
 
-/// The IP transport headers hidden from `request.headers`. The
-/// client IP is personal data under GDPR; it is reachable ONLY via
-/// `request.ip` (masked) / `request.unmaskedIp()` (raw — the
-/// deliberate, taped escalation). Hiding the raw headers is what
-/// makes that friction real: read-taping can't redact (a redacted
-/// input breaks replay determinism), so the surface is minimized
-/// instead. The worker's own native XFF uses (proxy warning, the IP
-/// derivation below) read the wire directly and are unaffected.
-const STRIPPED_IP_HEADERS = [_][]const u8{
-    "x-forwarded-for",
-    "x-real-ip",
-    "cf-connecting-ip",
-    "forwarded",
-};
-
-fn isStrippedIpHeader(name: []const u8) bool {
-    for (STRIPPED_IP_HEADERS) |s| {
-        if (std.mem.eql(u8, s, name)) return true;
-    }
-    return false;
-}
+// The IP-transport strip list lives in `reserved_headers.zig`
+// (shared with the sim's authored-header hygiene, so the two filters
+// can't drift). The worker's own native XFF uses (proxy warning, the
+// IP derivation below) read the wire directly and are unaffected.
+const isStrippedIpHeader = reserved_headers.isStrippedIpHeader;
 
 /// Record one request-surface read into the readset, if one is
 /// attached (unit-test paths run without). Failure to record is a
@@ -3132,7 +3116,7 @@ fn installHeaders(
             // Skip pseudo-headers (`:method`, `:path`, `:scheme`,
             // `:authority`) — already exposed as `request.method` /
             // `request.path` etc. — and the IP transport headers
-            // (see STRIPPED_IP_HEADERS).
+            // (reserved_headers.zig STRIPPED_IP_HEADERS).
             if (name.len > 0 and name[0] == ':') continue;
             if (isStrippedIpHeader(name)) continue;
 
