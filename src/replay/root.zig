@@ -93,14 +93,24 @@ pub const Engine = struct {
         // Build the base unfrozen, eval the compute-globals prelude into it, then
         // seal — so every handler run gets crypto/base64url/jwt/oidc/sessions/…
         // from a shared frozen base (one install, not per-request).
-        // A 16 MiB request arena (vs the worker's 8): the bump allocator never
-        // frees mid-run, so BigInt-heavy pure-JS crypto (ES256/RS256 verify)
-        // churns more than a typical handler. The worker survives such churn via
-        // its GC-on-OOM fallback, which the sim lacks — this headroom stands in
-        // for it. Reset per run, so it's a ceiling, not steady growth.
-        const s = arena_reactor_new_open(8192, 16384) orelse return Error.ArenaInit;
+        // The request arena runs in GC mode (set below), so its size is a
+        // PEAK-LIVE-SET ceiling, not a cumulative one — the allocator reclaims
+        // mid-run. This mirrors the worker's effective behavior: prod never
+        // surfaces a bump-arena OOM to a churny-but-legal handler, it
+        // re-executes under GC first (`dispatcher.zig` bump→GC retry). Sized to
+        // prod's request arena (`snap.zig` DEFAULT_REQUEST_SIZE = 100 MiB): the
+        // sim can't match prod's OOM boundary exactly (the sim's own bookkeeping
+        // shares the arena, and there's no CPU budget), but the same 100 MiB
+        // peak ceiling keeps a handler's live-set headroom in the same ballpark.
+        // 102400 KiB = 100 MiB. Reset per run, so it's a ceiling, not growth.
+        const s = arena_reactor_new_open(8192, 102400) orelse return Error.ArenaInit;
         if (arena_reactor_eval_base(s, sim_globals.PRELUDE.ptr) != 0) return Error.ArenaInit;
         arena_reactor_freeze(s);
+        // GC mode always: the sim cannot model a bump OOM faithfully (different
+        // arena size, no CPU budget) and prod's effective ceiling is the GC
+        // one, so predicting prod means running GC. Sticky on the reactor; the
+        // per-run set in `simulate` reaffirms it (see the note there).
+        arena_set_request_mode_r(s, 0);
         return .{ .sim = s };
     }
 
@@ -308,10 +318,14 @@ pub const Engine = struct {
         };
         host.install();
 
-        // Replay under the regime the live request completed under (mode binds
-        // at the entry reset). Set EVERY run — the choice is sticky on the
-        // reactor, so a GC world must not leak GC mode into the next bump world.
-        arena_set_request_mode_r(self.sim, if (wv.arena_gc) 0 else 1);
+        // GC mode, every run (issue #70). Set on each run because the mode
+        // binds at the entry reset. Forward sim and replay both run GC: the sim
+        // can't model a bump OOM faithfully, and GC is transparent to a pure
+        // handler, so replaying a bump-recorded request under GC reproduces its
+        // output while a GC-recorded (churny) one needs GC not to OOM. The
+        // recorded `wv.arena_gc` regime bit is retained through the tape as a
+        // diagnostic of prod's actual regime; it no longer selects the mode.
+        arena_set_request_mode_r(self.sim, 0);
         arena_set_random_seed_r(self.sim, wv.seed);
         // Reinterpret the u64 ms bit-pattern as the i64 the API takes; a plain
         // @intCast would panic on a pathological now_ms ≥ 2^63.

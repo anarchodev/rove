@@ -1312,6 +1312,36 @@ test "dispatch: console quartet lands level-prefixed lines in the request log" {
     try testing.expect(std.mem.indexOf(u8, resp.console, "[debug] wire") != null);
 }
 
+test "dispatch: console JSON-stringifies non-strings (never [object Object])" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    // The formatter contract (globals/console.js `fmt`, mirrored by the sim
+    // epilogue's `__fmtLog` — the consolefmt fixture pins the SAME strings):
+    // strings pass through; objects/arrays/numbers/null JSON-stringify;
+    // undefined/functions/circulars fall back to String(x).
+    var resp = try runOne(&d, kv,
+        \\console.log({ a: 1 }, [1, 2], 42, null, undefined);
+        \\const c = {}; c.self = c;
+        \\console.log(c);
+        \\console.warn({ retry: true });
+        \\console.error();
+        \\return "ok";
+    , .{ .method = "POST", .path = "/" });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "{\"a\":1} [1,2] 42 null undefined\n") != null);
+    // circular → String(x) fallback (the one place [object Object] remains)
+    try testing.expect(std.mem.indexOf(u8, resp.console, "[object Object]\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "[warn] {\"retry\":true}\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "[error]\n") != null);
+}
+
 test "dispatch: schedule verb owns the whole timer surface; scheduler global is gone" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

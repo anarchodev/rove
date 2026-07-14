@@ -1371,11 +1371,14 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
         "src/replay/testdata/headerhygiene", // authored headers lowercase + pseudo/IP/reserved dropped with a warn (issue #41)
         "src/replay/testdata/pathquery", // request.path excludes ?query; request.query carries it (issue #40)
+        "src/replay/testdata/consolefmt", // console formatting: JSON-stringified non-strings + level-prefix lines, sim text ≡ prod line (issue #44)
         "src/replay/testdata/wsmessage", // a WS frame reads back as request.text/.bytes (browser.message)
         "src/replay/testdata/wsfetchloop", // continue a WS conversation past a fetch resume (agent-loop shape)
         "src/replay/testdata/fetchctx", // fetch-resume ctx override: fetch's own ctx if any, else the chain's next() (issue #3, §4.14)
         "src/replay/testdata/errorsemantics", // throw→500+rollback, pending-promise→200 "{}", missing-export 404/no-op/fallback, bad middleware (issue #10)
         "src/replay/testdata/fetchrecorder", // fetch option bag + unique ftch_ ids + fetchId/fetchesPending threading + terminal-only status/ok + stream gating (issue #24)
+        "src/replay/testdata/arenachurn", // >arena cumulative alloc / tiny peak completes under the GC arena (issue #70)
+        "src/replay/testdata/kvguardrails", // kv.set/delete type + reserved-prefix + size guards, kv.prefix 100/1000 paging (issue #12)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);
