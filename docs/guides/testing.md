@@ -77,14 +77,29 @@ expect(req).toHaveFetched(/stripe/);
   scenario supplies them once and they thread through inbound → WS frame →
   fetch/receive resumes automatically. Set them when a handler branches on the
   per-connection identity (e.g. `browser.getReplay`, which needs both). A single
-  activation can override with `inbound({ correlationId })`.
+  activation can override with `inbound({ correlationId })`. Un-supplied, they
+  are still pinned — prod always sets them — with the placeholders `"sim"`
+  (tenant) and `""` (correlation id), and `request.session` is `null` unless
+  injected, so the documented `session === null` branch is reachable offline.
 
 The **request body** is whatever you pass as `inbound({ body })` (JSON-stringified
 if it's not a string). Omit it and the request is bodyless — reading `request.text`
 / `.bytes` / `.json` returns empty (`""`, 0-length), exactly as a real bodyless
-request (a GET, an empty POST) does. (A *replayed* recording is stricter: reading a
-body the original run never read is a divergence — but an authored world asserts a
-real empty request, not a missing one.)
+request (a GET, an empty POST) does. On a payload-less **resume** (a wake, a
+`cron`/`schedule` target, `onDisconnect`) all three read `undefined`, exactly as
+live. (A *replayed* recording is stricter: reading a body the original run never
+read is a divergence — but an authored world asserts a real empty request, not a
+missing one.)
+
+The rest of the request surface matches the worker rule for rule: `request.ip`
+is the **masked** form of the authored `inbound({ ip })` (v4 last octet zeroed,
+v6 kept to the /48) with the raw value on `request.unmaskedIp()`, and both read
+`null` when no ip is authored; `request.activation.kind` is set on every
+activation; and `request.tag(key, value)` enforces prod's validation (key 1–32
+bytes of `[a-z0-9_]`, no leading `_`; value 1–64 bytes, no control characters;
+max 4 distinct keys) — each accepted tag lands in the effect log as
+`{kind: "tag"}`. The retired surfaces (`request.body`, the pre-rename `on.*`)
+don't exist in a test or sim run.
 
 ## A node's surface
 

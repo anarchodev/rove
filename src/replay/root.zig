@@ -62,6 +62,10 @@ extern fn arena_reactor_freeze(r: *ArenaReactor) void;
 extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
 
 const sim_globals = @import("sim_globals.zig");
+// The prod ip-mask rule (src/js/ip_mask.zig, registered as an anonymous
+// import in build.zig) — the SAME rule the worker applies to `request.ip`,
+// so the sim's derived masked channel can't drift.
+const ip_mask = @import("ip_mask");
 // The prod header-filter predicates (src/js/reserved_headers.zig, registered
 // as an anonymous import in build.zig) — the SAME lists the worker's inbound
 // header installer enforces, so the sim's authored-header hygiene can't drift.
@@ -168,11 +172,16 @@ pub const Engine = struct {
         // back as request.headers["content-type"] (and an authored "Cookie"
         // parses into request.cookies), while a header that can never reach a
         // prod handler can't exist offline either — each drop leaves a warn
-        // entry in the bundle's effect log so the author learns why. Captured
-        // worlds don't pass through here (capture is already post-filter).
+        // entry in the bundle's effect log so the author learns why. A
+        // CAPTURED world's headers are the tape (already post-filter, already
+        // lowercase) — they pass through untouched.
         var headers = std.ArrayList(world.Header){};
         var header_warnings = std.ArrayList([]const u8){};
         for (wv.headers) |hh| {
+            if (wv.captured) {
+                try headers.append(a, hh);
+                continue;
+            }
             const lower = try std.ascii.allocLowerString(a, hh.name);
             const why: ?[]const u8 = if (lower.len > 0 and lower[0] == ':')
                 "an HTTP/2 pseudo-header (request.method/path/host carry these)"
@@ -213,8 +222,24 @@ pub const Engine = struct {
             try reads.append(a, .{ .kind = .header_value, .name = hh.name, .value = hh.value });
         if (wv.body != null)
             try reads.append(a, .{ .kind = .body_read, .name = "", .value = "" });
-        if (wv.ip) |ip|
-            try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+        if (wv.ip) |ip| {
+            if (wv.captured) {
+                // A transcoded capture's `ip` IS the recorded masked value —
+                // pass it through; the raw channel stays tape-only.
+                try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+            } else {
+                // Authored ip: derive BOTH channels prod-style — `request.ip`
+                // reads the masked form (ip_mask.zig, the worker's rule) and
+                // `request.unmaskedIp()` the raw. A malformed authored ip
+                // masks to null (empty entry → `request.ip === null`) but
+                // stays reachable raw — the prod disposition for a malformed
+                // transport header.
+                var mask_buf: [64]u8 = undefined;
+                const masked = ip_mask.maskIp(&mask_buf, ip) orelse "";
+                try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = try a.dupe(u8, masked) });
+                try reads.append(a, .{ .kind = .ip_raw, .name = "", .value = ip });
+            }
+        }
 
         // ── kv readset → map ──
         var kv_map = std.StringHashMapUnmanaged([]const u8){};
@@ -302,6 +327,7 @@ pub const Engine = struct {
             .correlation_id = wv.correlation_id,
             .middleware_path = if (is_trust_boundary) mw_path else null,
             .result = result,
+            .captured = wv.captured,
             .warnings = header_warnings.items,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);

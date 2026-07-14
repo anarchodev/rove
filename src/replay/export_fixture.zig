@@ -288,6 +288,11 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.print(",\n  \"seed\": {d}", .{n});
     }
     if (arena_gc) try w.writeAll(",\n  \"arena_gc\": true");
+    // Mark the world's provenance: transcoded-from-capture worlds keep the
+    // strict read-your-tape posture and the retired driver-only surfaces
+    // (`request.body`, `on.*`) so pinned old deployments replay; authored
+    // worlds (no flag) mirror the live surface (world.zig `captured`).
+    try w.writeAll(",\n  \"captured\": true");
     if (ts_ns) |s| {
         const ns = std.fmt.parseInt(i64, s, 10) catch 0;
         if (ns > 0) try w.print(",\n  \"now_ms\": {d}", .{@divTrunc(ns, std.time.ns_per_ms)});
@@ -413,6 +418,8 @@ test "transcode: kv reads → closed-world map; not-found is omitted" {
     // no missPolicy / kvAbsent — closed world
     try testing.expect(wo.get("missPolicy") == null);
     try testing.expect(wo.get("kvAbsent") == null);
+    // provenance: a transcoded world is marked captured
+    try testing.expect(wo.get("captured").?.bool);
     // kv: the FIRST value for user/jess, not the re-read
     const kvm = wo.get("kv").?.object;
     try testing.expectEqualStrings("{\"n\":1}", kvm.get("user/jess").?.string);

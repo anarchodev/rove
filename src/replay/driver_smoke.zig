@@ -95,7 +95,9 @@ fn runFetchChunk(a: std.mem.Allocator) !void {
     var world = std.ArrayList(u8){};
     var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
     const w = &aw.writer;
-    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"fetch_chunk\",\"export\":\"onFetchResult\",");
+    // `captured: true` — this world stands in for a transcoded capture (the
+    // handler reads the driver-only `request.body`, retired on authored worlds).
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"fetch_chunk\",\"export\":\"onFetchResult\",\"captured\":true,");
     try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"\",");
     try w.writeAll("\"status\":502,\"done\":true,\"fetchId\":\"ftch_1\",\"body\":\"boom\"},");
     try w.writeAll("\"ctx\":{\"attempt\":2},\"seed\":1,");

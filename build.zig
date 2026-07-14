@@ -231,6 +231,10 @@ pub fn build(b: *std.Build) void {
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
+            // The prod ip-mask rule (`request.ip`) — shared with the sim's
+            // world build (root.zig derives the masked channel from an
+            // authored ip) so the two surfaces can't drift.
+            mod.addAnonymousImport("ip_mask", .{ .root_source_file = bb.path("src/js/ip_mask.zig") });
             // The prod header-filter predicates (reserved prefixes + the
             // IP-transport strip list) — shared with the sim's
             // authored-header hygiene (root.zig) so the filters can't drift.
@@ -1369,6 +1373,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
+        "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone (issue #43)
         "src/replay/testdata/headerhygiene", // authored headers lowercase + pseudo/IP/reserved dropped with a warn (issue #41)
         "src/replay/testdata/pathquery", // request.path excludes ?query; request.query carries it (issue #40)
         "src/replay/testdata/consolefmt", // console formatting: JSON-stringified non-strings + level-prefix lines, sim text ≡ prod line (issue #44)

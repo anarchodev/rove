@@ -109,6 +109,23 @@ function live(effects) {
   return (effects || []).filter((e) => !e.rolledBack);
 }
 
+/** UTF-8 byte length of a chunk (string) or byte array — prod's fetch-chunk
+ *  `byteOffset` counts wire bytes, not JS chars. */
+function byteLen(x) {
+  if (x == null) return 0;
+  if (typeof x !== "string") return x.length;
+  let n = 0;
+  for (let i = 0; i < x.length; i++) {
+    const c = x.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < x.length &&
+             x.charCodeAt(i + 1) >= 0xdc00 && x.charCodeAt(i + 1) <= 0xdfff) { n += 4; i++; }
+    else n += 3;
+  }
+  return n;
+}
+
 /** base kv object, overlaid with a bundle's writes/deletes (read-your-writes). */
 function foldKv(base, effects) {
   const kvOut = Object.assign({}, base || {});
@@ -813,6 +830,11 @@ class FetchHandle {
     let seed = pw.seed || 0;
     let now = pw.now_ms || 0;
     let node = null;
+    // Prod's per-event activation bag stamps `byteOffset` — the cumulative
+    // wire bytes BEFORE this chunk — and the parsed response headers on the
+    // seq-0 event (globals.zig fetch_chunk arm); thread both so the offline
+    // bag matches (`opts.headers` supplies the upstream's headers).
+    let off = 0;
     const step = (body, done, seq) => {
       const t = onTarget(pw.entry, on, done ? "onFetchDone" : "onFetchChunk");
       // Prod stamps status/bodyTruncated ONLY on the terminal event
@@ -820,6 +842,10 @@ class FetchHandle {
       // fetchId/fetchesPending + the payload, nothing else. No `ok` —
       // status is the single success signal (issue #7).
       const request = { done, chunkSeq: seq, body, fetchesPending: pending };
+      const bag = { byteOffset: off };
+      if (seq === 0 && opts.headers) bag.headers = opts.headers;
+      request.activation = bag;
+      off += byteLen(body);
       if (fx.id != null) request.fetchId = fx.id;
       if (done) {
         request.status = opts.status != null ? opts.status : 200;
@@ -1127,6 +1153,9 @@ function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx, pen
   // `response.timeout`); the real engine surfaces NO `request.ok` (issue #7).
   if (done || response.status != null) request.status = status;
   if (done) request.bodyTruncated = response.bodyTruncated != null ? response.bodyTruncated : false;
+  // Prod's seq-0 activation bag carries the upstream's parsed headers
+  // (globals.zig fetch_chunk arm) — a whole-body resolve IS the seq-0 event.
+  if (response.headers) request.activation = { headers: response.headers };
   return carrySources(parentWorld, {
     entry: t.entry,
     activation: "fetch_chunk",
