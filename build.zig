@@ -1373,6 +1373,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
+        "src/replay/testdata/responsevetting", // emit-side response vetting: header/cookie sanitize, status clamp, content-type rule, binary body, stream-prepend (issue #42)
         "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone (issue #43)
         "src/replay/testdata/headerhygiene", // authored headers lowercase + pseudo/IP/reserved dropped with a warn (issue #41)
         "src/replay/testdata/pathquery", // request.path excludes ?query; request.query carries it (issue #40)

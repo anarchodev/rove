@@ -709,10 +709,42 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
         try w.writeAll(",\"ctx\":");
         if (ctx_val) |cv| try std.json.Stringify.value(cv, .{}, w) else try w.writeAll("null");
     } else {
-        try w.writeAll(",\"body\":");
-        if (body_val) |bv| {
-            if (bv == .null) try w.writeAll("null") else try std.json.Stringify.value(bv, .{}, w);
-        } else try w.writeAll("null");
+        // The epilogue emits `body_override` when prod's WIRE body differs
+        // from the plain return value — a returned Uint8Array (raw bytes →
+        // `bodyB64` + `binary:true`, so the harness `body` getter hands back
+        // a byte-exact Uint8Array) or a first-hop terminal after
+        // `stream.write` (chunks prepended → a string body). Otherwise the
+        // body stays the decoded return value.
+        var overrode = false;
+        if (run) |r| {
+            if (r.get("body_override")) |ov| {
+                if (ov == .object) {
+                    if (ov.object.get("b64")) |bv| {
+                        if (bv == .string) {
+                            try w.writeAll(",\"body\":null,\"bodyB64\":");
+                            try jsonStr(w, bv.string);
+                            try w.writeAll(",\"binary\":true");
+                            overrode = true;
+                        }
+                    }
+                    if (!overrode) {
+                        if (ov.object.get("text")) |tv| {
+                            if (tv == .string) {
+                                try w.writeAll(",\"body\":");
+                                try jsonStr(w, tv.string);
+                                overrode = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!overrode) {
+            try w.writeAll(",\"body\":");
+            if (body_val) |bv| {
+                if (bv == .null) try w.writeAll("null") else try std.json.Stringify.value(bv, .{}, w);
+            } else try w.writeAll("null");
+        }
     }
 
     // effects — ONE ordered log (occurrence order), built in the epilogue: reads,

@@ -103,8 +103,18 @@ don't exist in a test or sim run.
 
 ## A node's surface
 
-- `req.status` — the response status (the ambient `response.status`).
+- `req.status` — the response status (the ambient `response.status`, after
+  the worker's coercion + clamp to 100–599).
 - `req.body` — the terminal return value (or, when held, the threaded ctx).
+  When the handler returned a `Uint8Array`, this is a byte-exact
+  `Uint8Array` (prod ships raw bytes); when a first-hop terminal followed
+  `stream.write` calls, the buffered chunks are prepended — the string you
+  read is the full wire body.
+- `req.response` — the vetted response head, exactly what the worker would
+  emit: header names lowercased, reserved/hop-by-hop/`x-rewind-*` names and
+  non-string or CR/LF values silently dropped (32-entry cap), `Set-Cookie`
+  entries `Domain=`-stripped, and `content-type: application/json`
+  auto-stamped on object returns unless the handler set its own.
 - `req.ctx` — the ctx a held activation parked with `next({ctx})`.
 - `req.disposition` — `"terminal"` (it responded) or `"held"` (it called
   `next()` and is waiting).
