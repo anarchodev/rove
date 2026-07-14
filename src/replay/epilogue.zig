@@ -384,10 +384,36 @@ const EPILOGUE_BODY =
     \\  // store-tagged effect entries, so the wrapper neither records nor surfaces
     \\  // those namespaced keys — a tenant read / prefix scan must never see them.
     \\  const __NS = "__rove_store/";
+    \\  // Prod kv guardrails (globals.zig / reserved.zig) enforced offline so a
+    \\  // handler that throws instantly in prod also throws under `rewind test`,
+    \\  // with the same error shapes (`err.code` branches are testable). The
+    \\  // `__rove_store/` facade namespace bypasses them, mirroring prod's
+    \\  // is_system_module / privileged-write exemption. Order matches the worker:
+    \\  // coerce key type, coerce value type, reserved-prefix, then size (key
+    \\  // reported before value). Byte lengths use __utf8Len — the UTF-8 byte
+    \\  // COUNT the worker measures, computed WITHOUT materializing the encoded
+    \\  // array (measuring a 1 MiB value via __utf8Encode would blow the request
+    \\  // arena). It mirrors __utf8Encode's byte output, incl. WTF-8 surrogates.
+    \\  const __KV_KEY_MAX = 256, __KV_VAL_MAX = 1 << 20;
+    \\  const __utf8Len = (s) => { s = String(s == null ? "" : s); let n = 0; for (let i = 0; i < s.length; i++) { let cp = s.charCodeAt(i); if (cp >= 0xD800 && cp <= 0xDBFF) { const lo = i + 1 < s.length ? s.charCodeAt(i + 1) : 0; if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000; i++; } } if (cp < 0x80) n += 1; else if (cp < 0x800) n += 2; else if (cp < 0x10000) n += 3; else n += 4; } return n; };
+    \\  const __SHIM_WRITABLE = ["_send/", "_blob/", "_sched/", "_seg/", "_oidc/", "_rp/"];
+    \\  const __kvReserved = (k) => { if (k.length === 0 || k[0] !== "_") return false; for (const p of __SHIM_WRITABLE) if (k.startsWith(p)) return false; return true; };
+    \\  const __kvErr = (message, code) => { const e = new Error(message); e.code = code; return e; };
+    \\  const __kvCoerce = (x, what) => { if (x === null || x === undefined || typeof x === "object" || typeof x === "function") throw new TypeError("kv: " + what + " must be a string (or number/boolean/bigint); JSON.stringify objects explicitly"); return String(x); };
+    \\  const __kvGuardWrite = (k, hasVal, val) => {
+    \\    const ks = __kvCoerce(k, "key");
+    \\    const vs = hasVal ? __kvCoerce(val, "value") : "";
+    \\    if (!ks.startsWith(__NS)) {
+    \\      if (__kvReserved(ks)) throw __kvErr("kv: '" + ks + "' is in a platform-reserved prefix", "reserved_key");
+    \\      if (__utf8Len(ks) > __KV_KEY_MAX) throw __kvErr("kv: key exceeds the " + __KV_KEY_MAX + "-byte limit", "key_too_large");
+    \\      if (hasVal && __utf8Len(vs) > __KV_VAL_MAX) throw __kvErr("kv: value exceeds the " + __KV_VAL_MAX + "-byte limit", "value_too_large");
+    \\    }
+    \\    return ks;
+    \\  };
     \\  globalThis.kv = {
     \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
-    \\    set(k, val) { if (!k.startsWith(__NS)) __effects.push({ kind: "write", key: k, value: val }); return __kvNative.set(k, val); },
-    \\    delete(k) { if (!k.startsWith(__NS)) __effects.push({ kind: "delete", key: k }); return __kvNative.delete(k); },
+    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val); if (!ks.startsWith(__NS)) __effects.push({ kind: "write", key: ks, value: val }); return __kvNative.set(k, val); },
+    \\    delete(k) { const ks = __kvGuardWrite(k, false); if (!ks.startsWith(__NS)) __effects.push({ kind: "delete", key: ks }); return __kvNative.delete(k); },
     \\    // Adapter: the worker's kv.prefix is positional; the replay
     \\    // NATIVE takes (prefix, {cursor, limit}) — convert here. A scan under the
     \\    // store namespace (a facade call) returns raw for the facade to strip;
