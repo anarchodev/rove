@@ -89,15 +89,17 @@ pub const Engine = struct {
         // Build the base unfrozen, eval the compute-globals prelude into it, then
         // seal — so every handler run gets crypto/base64url/jwt/oidc/sessions/…
         // from a shared frozen base (one install, not per-request).
-        // The request arena runs in GC mode (set below), so its 16 MiB is a
+        // The request arena runs in GC mode (set below), so its size is a
         // PEAK-LIVE-SET ceiling, not a cumulative one — the allocator reclaims
         // mid-run. This mirrors the worker's effective behavior: prod never
         // surfaces a bump-arena OOM to a churny-but-legal handler, it
-        // re-executes under GC first (`dispatcher.zig` bump→GC retry). BigInt-
-        // heavy pure-JS crypto (ES256/RS256 verify) churns far past 16 MiB
-        // cumulative while its live set stays tiny, and GC lets it through
-        // exactly as prod does. Reset per run, so it's a ceiling, not growth.
-        const s = arena_reactor_new_open(8192, 16384) orelse return Error.ArenaInit;
+        // re-executes under GC first (`dispatcher.zig` bump→GC retry). Sized to
+        // prod's request arena (`snap.zig` DEFAULT_REQUEST_SIZE = 100 MiB): the
+        // sim can't match prod's OOM boundary exactly (the sim's own bookkeeping
+        // shares the arena, and there's no CPU budget), but the same 100 MiB
+        // peak ceiling keeps a handler's live-set headroom in the same ballpark.
+        // 102400 KiB = 100 MiB. Reset per run, so it's a ceiling, not growth.
+        const s = arena_reactor_new_open(8192, 102400) orelse return Error.ArenaInit;
         if (arena_reactor_eval_base(s, sim_globals.PRELUDE.ptr) != 0) return Error.ArenaInit;
         arena_reactor_freeze(s);
         // GC mode always: the sim cannot model a bump OOM faithfully (different

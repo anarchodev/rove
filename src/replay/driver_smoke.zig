@@ -127,15 +127,15 @@ fn runMulti(a: std.mem.Allocator) !void {
     std.debug.print("MULTI OK — resettable runtime: 3 runs, 1 process, isolated\n", .{});
 }
 
-/// A handler whose CUMULATIVE allocation (~32 MiB) far exceeds the sim's
-/// 16 MiB request arena while its peak live set stays ~512 KiB — it can only
-/// complete because the GC arena reclaims the dead strings mid-run. This is
-/// the churn prod's bump→GC retry absorbs, and the sim now runs GC always
-/// (issue #70), so it completes offline the same way.
+/// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
+/// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
+/// complete because the GC arena reclaims the dead strings mid-run. Same shape
+/// as prod's own bump/GC discriminator (`snap.zig`), the churn prod's bump→GC
+/// retry absorbs; the sim runs GC always (issue #70), so it completes offline.
 const CHURNY_HANDLER =
     \\export default function () {
     \\  let s = "";
-    \\  for (let i = 0; i < 64; i++) { s = "x".repeat(1 << 19) + i; }
+    \\  for (let i = 0; i < 256; i++) { s = "x".repeat(1 << 20) + i; }
     \\  return "len=" + s.length;
     \\}
 ;
@@ -159,7 +159,7 @@ fn runArenaGc(a: std.mem.Allocator) !void {
 
     var out = std.ArrayList(u8){};
     try root.runWorld(a, world.items, null, &out);
-    check(out.items, &.{"len=524290"}, &.{}, "ARENA_GC (stamped churny world completes under GC)");
+    check(out.items, &.{"len=1048579"}, &.{}, "ARENA_GC (stamped churny world completes under GC)");
 
     // Same execution WITHOUT the stamp: also completes — GC is unconditional,
     // so an authored (unstamped) churny handler is no longer a false OOM.
@@ -175,7 +175,7 @@ fn runArenaGc(a: std.mem.Allocator) !void {
     world2 = aw2.toArrayList();
     var out2 = std.ArrayList(u8){};
     try root.runWorld(a, world2.items, null, &out2);
-    check(out2.items, &.{"len=524290"}, &.{}, "ARENA_GC (unstamped churny world also completes under GC)");
+    check(out2.items, &.{"len=1048579"}, &.{}, "ARENA_GC (unstamped churny world also completes under GC)");
 
     // And a normal world afterwards proves GC neither wedges nor leaks across runs.
     try runInboundUser(a, "eve", &.{}, "ARENA_GC (normal run after churn)");
