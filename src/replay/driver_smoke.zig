@@ -95,7 +95,9 @@ fn runFetchChunk(a: std.mem.Allocator) !void {
     var world = std.ArrayList(u8){};
     var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
     const w = &aw.writer;
-    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"fetch_chunk\",\"export\":\"onFetchResult\",");
+    // `captured: true` — this world stands in for a transcoded capture (the
+    // handler reads the driver-only `request.body`, retired on authored worlds).
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"fetch_chunk\",\"export\":\"onFetchResult\",\"captured\":true,");
     try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"\",");
     try w.writeAll("\"status\":502,\"done\":true,\"fetchId\":\"ftch_1\",\"body\":\"boom\"},");
     try w.writeAll("\"ctx\":{\"attempt\":2},\"seed\":1,");
@@ -127,24 +129,25 @@ fn runMulti(a: std.mem.Allocator) !void {
     std.debug.print("MULTI OK — resettable runtime: 3 runs, 1 process, isolated\n", .{});
 }
 
-/// A handler whose CUMULATIVE allocation (~16 MiB) exceeds the
-/// reactor's 8 MiB request arena while its peak live set stays ~512 KiB
-/// — the bump/GC regime discriminator (mirrors the dispatcher's
-/// arena-oom retry tests).
+/// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
+/// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
+/// complete because the GC arena reclaims the dead strings mid-run. Same shape
+/// as prod's own bump/GC discriminator (`snap.zig`), the churn prod's bump→GC
+/// retry absorbs; the sim runs GC always (issue #70), so it completes offline.
 const CHURNY_HANDLER =
     \\export default function () {
     \\  let s = "";
-    \\  for (let i = 0; i < 32; i++) { s = "x".repeat(1 << 19) + i; }
+    \\  for (let i = 0; i < 256; i++) { s = "x".repeat(1 << 20) + i; }
     \\  return "len=" + s.length;
     \\}
 ;
 
-/// The regime round-trip: a world stamped `arena_gc` (a live churny
-/// request that completed under GC) must replay under GC and succeed;
-/// the SAME world without the stamp must OOM under bump; and a normal
-/// bump world AFTER the GC run must still succeed (the mode does not
-/// leak across runs).
+/// GC-always (issue #70): the churny handler completes under GC whether or
+/// not the world carries the `arena_gc` regime stamp — the stamp no longer
+/// gates the allocator mode — and a normal world afterwards still succeeds
+/// (GC does not wedge or leak across the reactor's per-run resets).
 fn runArenaGc(a: std.mem.Allocator) !void {
+    // Stamped churny world: completes under GC.
     var world = std.ArrayList(u8){};
     var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
     const w = &aw.writer;
@@ -158,11 +161,10 @@ fn runArenaGc(a: std.mem.Allocator) !void {
 
     var out = std.ArrayList(u8){};
     try root.runWorld(a, world.items, null, &out);
-    check(out.items, &.{"len=524290"}, &.{}, "ARENA_GC (churny world replays under GC)");
+    check(out.items, &.{"len=1048579"}, &.{}, "ARENA_GC (stamped churny world completes under GC)");
 
-    // Same execution WITHOUT the stamp: bump regime → arena OOM. The
-    // driver must not silently succeed (that would mean the stamp is
-    // ignored and every replay runs GC).
+    // Same execution WITHOUT the stamp: also completes — GC is unconditional,
+    // so an authored (unstamped) churny handler is no longer a false OOM.
     var world2 = std.ArrayList(u8){};
     var aw2 = std.Io.Writer.Allocating.fromArrayList(a, &world2);
     const w2 = &aw2.writer;
@@ -175,10 +177,10 @@ fn runArenaGc(a: std.mem.Allocator) !void {
     world2 = aw2.toArrayList();
     var out2 = std.ArrayList(u8){};
     try root.runWorld(a, world2.items, null, &out2);
-    check(out2.items, &.{}, &.{"len=524290"}, "ARENA_GC (unstamped world OOMs under bump)");
+    check(out2.items, &.{"len=1048579"}, &.{}, "ARENA_GC (unstamped churny world also completes under GC)");
 
-    // And a normal world afterwards proves no GC leak across runs.
-    try runInboundUser(a, "eve", &.{}, "ARENA_GC (bump restored after GC run)");
+    // And a normal world afterwards proves GC neither wedges nor leaks across runs.
+    try runInboundUser(a, "eve", &.{}, "ARENA_GC (normal run after churn)");
 }
 
 pub fn main() !void {

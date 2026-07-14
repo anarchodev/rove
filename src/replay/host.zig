@@ -195,10 +195,17 @@ fn kvPrefix(
         keys.append(h.a, k) catch return -1;
     }
     std.mem.sort([]const u8, keys.items, {}, lessThanStr);
-    const n: usize = if (limit > 0 and @as(usize, @intCast(limit)) < keys.items.len)
-        @intCast(limit)
+    // Match prod's page bounds (globals.zig KV_PREFIX_DEFAULT/KV_PREFIX_MAX):
+    // an omitted / non-positive limit defaults to 100, and any request is
+    // capped at 1000. Without this the closed-world scan returns every match,
+    // so a pagination loop written against the sim silently truncates live.
+    const KV_PREFIX_DEFAULT: usize = 100;
+    const KV_PREFIX_MAX: usize = 1000;
+    const cap: usize = if (limit > 0)
+        @min(@as(usize, @intCast(limit)), KV_PREFIX_MAX)
     else
-        keys.items.len;
+        KV_PREFIX_DEFAULT;
+    const n: usize = @min(cap, keys.items.len);
     // The binding parses `out_json` via JS_ParseJSON into the array of
     // {key, value} rows kv.prefix returns. Build it NUL-terminated.
     var buf = std.ArrayList(u8){};

@@ -51,6 +51,30 @@ pub fn isReservedInternalHeader(name: []const u8) bool {
     return false;
 }
 
+/// The IP-transport headers hidden from `request.headers`. The client IP
+/// is personal data under GDPR; it is reachable ONLY via `request.ip`
+/// (masked) / `request.unmaskedIp()` (raw — the deliberate, taped
+/// escalation). Hiding the raw headers is what makes that friction real:
+/// read-taping can't redact (a redacted input breaks replay determinism),
+/// so the surface is minimized instead. Enforced by the worker's inbound
+/// header installer (globals.zig) and mirrored by the sim's
+/// authored-header hygiene (src/replay/root.zig) — one list, no drift.
+pub const STRIPPED_IP_HEADERS = [_][]const u8{
+    "x-forwarded-for",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "forwarded",
+};
+
+/// True when `name` (already-lowercase wire form) is an IP-transport
+/// header hidden from the handler surface.
+pub fn isStrippedIpHeader(name: []const u8) bool {
+    for (STRIPPED_IP_HEADERS) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
+
 test "isReservedInternalHeader: x-rewind-* reserved (any case)" {
     try std.testing.expect(isReservedInternalHeader("x-rewind-tenant"));
     try std.testing.expect(isReservedInternalHeader("x-rewind-move-secret"));

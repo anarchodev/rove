@@ -231,6 +231,14 @@ pub fn build(b: *std.Build) void {
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
+            // The prod ip-mask rule (`request.ip`) — shared with the sim's
+            // world build (root.zig derives the masked channel from an
+            // authored ip) so the two surfaces can't drift.
+            mod.addAnonymousImport("ip_mask", .{ .root_source_file = bb.path("src/js/ip_mask.zig") });
+            // The prod header-filter predicates (reserved prefixes + the
+            // IP-transport strip list) — shared with the sim's
+            // authored-header hygiene (root.zig) so the filters can't drift.
+            mod.addAnonymousImport("reserved_headers", .{ .root_source_file = bb.path("src/js/reserved_headers.zig") });
         }
     }.f;
 
@@ -1366,11 +1374,17 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
         "src/replay/testdata/responsevetting", // emit-side response vetting: header/cookie sanitize, status clamp, content-type rule, binary body, stream-prepend (issue #42)
+        "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone (issue #43)
+        "src/replay/testdata/headerhygiene", // authored headers lowercase + pseudo/IP/reserved dropped with a warn (issue #41)
+        "src/replay/testdata/pathquery", // request.path excludes ?query; request.query carries it (issue #40)
+        "src/replay/testdata/consolefmt", // console formatting: JSON-stringified non-strings + level-prefix lines, sim text ≡ prod line (issue #44)
         "src/replay/testdata/wsmessage", // a WS frame reads back as request.text/.bytes (browser.message)
         "src/replay/testdata/wsfetchloop", // continue a WS conversation past a fetch resume (agent-loop shape)
         "src/replay/testdata/fetchctx", // fetch-resume ctx override: fetch's own ctx if any, else the chain's next() (issue #3, §4.14)
         "src/replay/testdata/errorsemantics", // throw→500+rollback, pending-promise→200 "{}", missing-export 404/no-op/fallback, bad middleware (issue #10)
         "src/replay/testdata/fetchrecorder", // fetch option bag + unique ftch_ ids + fetchId/fetchesPending threading + terminal-only status/ok + stream gating (issue #24)
+        "src/replay/testdata/arenachurn", // >arena cumulative alloc / tiny peak completes under the GC arena (issue #70)
+        "src/replay/testdata/kvguardrails", // kv.set/delete type + reserved-prefix + size guards, kv.prefix 100/1000 paging (issue #12)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

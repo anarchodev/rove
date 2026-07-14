@@ -62,6 +62,14 @@ extern fn arena_reactor_freeze(r: *ArenaReactor) void;
 extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
 
 const sim_globals = @import("sim_globals.zig");
+// The prod ip-mask rule (src/js/ip_mask.zig, registered as an anonymous
+// import in build.zig) — the SAME rule the worker applies to `request.ip`,
+// so the sim's derived masked channel can't drift.
+const ip_mask = @import("ip_mask");
+// The prod header-filter predicates (src/js/reserved_headers.zig, registered
+// as an anonymous import in build.zig) — the SAME lists the worker's inbound
+// header installer enforces, so the sim's authored-header hygiene can't drift.
+const reserved_headers = @import("reserved_headers");
 extern fn arena_set_trace_mode_r(r: *ArenaReactor, mode: c_int) void;
 extern fn arena_set_date_now_r(r: *ArenaReactor, ms: i64) void;
 extern fn arena_set_random_seed_r(r: *ArenaReactor, seed: u64) void;
@@ -89,14 +97,24 @@ pub const Engine = struct {
         // Build the base unfrozen, eval the compute-globals prelude into it, then
         // seal — so every handler run gets crypto/base64url/jwt/oidc/sessions/…
         // from a shared frozen base (one install, not per-request).
-        // A 16 MiB request arena (vs the worker's 8): the bump allocator never
-        // frees mid-run, so BigInt-heavy pure-JS crypto (ES256/RS256 verify)
-        // churns more than a typical handler. The worker survives such churn via
-        // its GC-on-OOM fallback, which the sim lacks — this headroom stands in
-        // for it. Reset per run, so it's a ceiling, not steady growth.
-        const s = arena_reactor_new_open(8192, 16384) orelse return Error.ArenaInit;
+        // The request arena runs in GC mode (set below), so its size is a
+        // PEAK-LIVE-SET ceiling, not a cumulative one — the allocator reclaims
+        // mid-run. This mirrors the worker's effective behavior: prod never
+        // surfaces a bump-arena OOM to a churny-but-legal handler, it
+        // re-executes under GC first (`dispatcher.zig` bump→GC retry). Sized to
+        // prod's request arena (`snap.zig` DEFAULT_REQUEST_SIZE = 100 MiB): the
+        // sim can't match prod's OOM boundary exactly (the sim's own bookkeeping
+        // shares the arena, and there's no CPU budget), but the same 100 MiB
+        // peak ceiling keeps a handler's live-set headroom in the same ballpark.
+        // 102400 KiB = 100 MiB. Reset per run, so it's a ceiling, not growth.
+        const s = arena_reactor_new_open(8192, 102400) orelse return Error.ArenaInit;
         if (arena_reactor_eval_base(s, sim_globals.PRELUDE.ptr) != 0) return Error.ArenaInit;
         arena_reactor_freeze(s);
+        // GC mode always: the sim cannot model a bump OOM faithfully (different
+        // arena size, no CPU budget) and prod's effective ceiling is the GC
+        // one, so predicting prod means running GC. Sticky on the reactor; the
+        // per-run set in `simulate` reaffirms it (see the note there).
+        arena_set_request_mode_r(s, 0);
         return .{ .sim = s };
     }
 
@@ -146,6 +164,44 @@ pub const Engine = struct {
             return Error.BadFixture;
         const wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
 
+        // ── authored-header hygiene (prod parity) ──
+        // Prod's wire is lowercase (HTTP/2), and the worker's header installer
+        // (src/js/globals.zig installHeaders) strips pseudo-headers, the
+        // IP-transport set, and platform-reserved names before a handler can
+        // observe them. Mirror that here so an authored "Content-Type" reads
+        // back as request.headers["content-type"] (and an authored "Cookie"
+        // parses into request.cookies), while a header that can never reach a
+        // prod handler can't exist offline either — each drop leaves a warn
+        // entry in the bundle's effect log so the author learns why. A
+        // CAPTURED world's headers are the tape (already post-filter, already
+        // lowercase) — they pass through untouched.
+        var headers = std.ArrayList(world.Header){};
+        var header_warnings = std.ArrayList([]const u8){};
+        for (wv.headers) |hh| {
+            if (wv.captured) {
+                try headers.append(a, hh);
+                continue;
+            }
+            const lower = try std.ascii.allocLowerString(a, hh.name);
+            const why: ?[]const u8 = if (lower.len > 0 and lower[0] == ':')
+                "an HTTP/2 pseudo-header (request.method/path/host carry these)"
+            else if (reserved_headers.isStrippedIpHeader(lower))
+                "the client IP is reachable only via request.ip / request.unmaskedIp()"
+            else if (reserved_headers.isReservedInternalHeader(lower))
+                "platform-reserved (x-rewind-* / x-rove-internal-*)"
+            else
+                null;
+            if (why) |reason| {
+                try header_warnings.append(a, try std.fmt.allocPrint(
+                    a,
+                    "authored request header \"{s}\" dropped: {s} — prod strips it before the handler runs",
+                    .{ hh.name, reason },
+                ));
+                continue;
+            }
+            try headers.append(a, .{ .name = lower, .value = hh.value });
+        }
+
         // ── synthesize request_reads from the declared request ──
         var reads = std.ArrayList(decode.RequestReadEntry){};
         // header_names: a JSON array of the declared header names.
@@ -154,7 +210,7 @@ pub const Engine = struct {
             var aw = std.Io.Writer.Allocating.fromArrayList(a, &names_buf);
             const w = &aw.writer;
             try w.writeByte('[');
-            for (wv.headers, 0..) |hh, i| {
+            for (headers.items, 0..) |hh, i| {
                 if (i != 0) try w.writeByte(',');
                 try jsonStr(w, hh.name);
             }
@@ -162,12 +218,28 @@ pub const Engine = struct {
             names_buf = aw.toArrayList();
         }
         try reads.append(a, .{ .kind = .header_names, .name = "", .value = names_buf.items });
-        for (wv.headers) |hh|
+        for (headers.items) |hh|
             try reads.append(a, .{ .kind = .header_value, .name = hh.name, .value = hh.value });
         if (wv.body != null)
             try reads.append(a, .{ .kind = .body_read, .name = "", .value = "" });
-        if (wv.ip) |ip|
-            try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+        if (wv.ip) |ip| {
+            if (wv.captured) {
+                // A transcoded capture's `ip` IS the recorded masked value —
+                // pass it through; the raw channel stays tape-only.
+                try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+            } else {
+                // Authored ip: derive BOTH channels prod-style — `request.ip`
+                // reads the masked form (ip_mask.zig, the worker's rule) and
+                // `request.unmaskedIp()` the raw. A malformed authored ip
+                // masks to null (empty entry → `request.ip === null`) but
+                // stays reachable raw — the prod disposition for a malformed
+                // transport header.
+                var mask_buf: [64]u8 = undefined;
+                const masked = ip_mask.maskIp(&mask_buf, ip) orelse "";
+                try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = try a.dupe(u8, masked) });
+                try reads.append(a, .{ .kind = .ip_raw, .name = "", .value = ip });
+            }
+        }
 
         // ── kv readset → map ──
         var kv_map = std.StringHashMapUnmanaged([]const u8){};
@@ -255,6 +327,8 @@ pub const Engine = struct {
             .correlation_id = wv.correlation_id,
             .middleware_path = if (is_trust_boundary) mw_path else null,
             .result = result,
+            .captured = wv.captured,
+            .warnings = header_warnings.items,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
         const entry_z = try a.dupeZ(u8, wv.entry);
@@ -270,10 +344,14 @@ pub const Engine = struct {
         };
         host.install();
 
-        // Replay under the regime the live request completed under (mode binds
-        // at the entry reset). Set EVERY run — the choice is sticky on the
-        // reactor, so a GC world must not leak GC mode into the next bump world.
-        arena_set_request_mode_r(self.sim, if (wv.arena_gc) 0 else 1);
+        // GC mode, every run (issue #70). Set on each run because the mode
+        // binds at the entry reset. Forward sim and replay both run GC: the sim
+        // can't model a bump OOM faithfully, and GC is transparent to a pure
+        // handler, so replaying a bump-recorded request under GC reproduces its
+        // output while a GC-recorded (churny) one needs GC not to OOM. The
+        // recorded `wv.arena_gc` regime bit is retained through the tape as a
+        // diagnostic of prod's actual regime; it no longer selects the mode.
+        arena_set_request_mode_r(self.sim, 0);
         arena_set_random_seed_r(self.sim, wv.seed);
         // Reinterpret the u64 ms bit-pattern as the i64 the API takes; a plain
         // @intCast would panic on a pathological now_ms ≥ 2^63.

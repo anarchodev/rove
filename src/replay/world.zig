@@ -75,6 +75,15 @@ pub const World = struct {
     /// (under bump the same execution would OOM). Carried from the
     /// record's engine word by export_fixture; absent = bump.
     arena_gc: bool = false,
+    /// The world was TRANSCODED FROM A CAPTURE (`export_fixture` stamps it),
+    /// not authored. Captured worlds replay pinned deployments, so they keep
+    /// the strict read-your-tape posture (a read the original run never made
+    /// is a REPLAY DIVERGENCE) and the retired driver-only surfaces
+    /// (`request.body`, the pre-rename `on.*` alias). Authored worlds mirror
+    /// the LIVE surface instead — payload accessors read `undefined` on
+    /// payload-less kinds, identity is always pinned, and the retired
+    /// surfaces don't exist.
+    captured: bool = false,
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
@@ -138,6 +147,7 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     w.seed = jU64(obj, "seed") orelse 0;
     w.now_ms = jU64(obj, "now_ms") orelse 0;
     if (obj.get("arena_gc")) |gv| w.arena_gc = (gv == .bool and gv.bool);
+    if (obj.get("captured")) |cv| w.captured = (cv == .bool and cv.bool);
 
     // ── request surface ──
     if (obj.get("request")) |rv| {
