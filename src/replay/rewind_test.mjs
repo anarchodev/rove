@@ -511,9 +511,22 @@ class Node {
   get response() { return this.force().response; }
   /** The terminal body (or, when held, the ctx). Already a decoded JSON value
    *  in the bundle — NOT re-parsed, so a string body like "42" stays the string
-   *  "42" the response actually carries. */
+   *  "42" the response actually carries. A BINARY body (the handler returned a
+   *  Uint8Array — raw bytes on the wire) rides the bundle as base64
+   *  (`bodyB64` + `binary`) and reads back here as a byte-exact Uint8Array. */
   get body() {
     const b = this.force();
+    if (b.binary && b.bodyB64 != null) {
+      const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      const s = b.bodyB64.replace(/=+$/, "");
+      const out = [];
+      let bits = 0, acc = 0;
+      for (let i = 0; i < s.length; i++) {
+        acc = (acc << 6) | A.indexOf(s[i]); bits += 6;
+        if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 0xff); }
+      }
+      return new Uint8Array(out);
+    }
     return b.disposition === "held" ? b.ctx : b.body;
   }
   get ctx() { const b = this.force(); return b.disposition === "held" ? b.ctx : undefined; }

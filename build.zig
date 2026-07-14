@@ -1365,6 +1365,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
+        "src/replay/testdata/responsevetting", // emit-side response vetting: header/cookie sanitize, status clamp, content-type rule, binary body, stream-prepend (issue #42)
         "src/replay/testdata/wsmessage", // a WS frame reads back as request.text/.bytes (browser.message)
         "src/replay/testdata/wsfetchloop", // continue a WS conversation past a fetch resume (agent-loop shape)
         "src/replay/testdata/fetchctx", // fetch-resume ctx override: fetch's own ctx if any, else the chain's next() (issue #3, §4.14)

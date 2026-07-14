@@ -477,11 +477,103 @@ const EPILOGUE_BODY =
     \\    }
     \\  }
     \\  globalThis.kv = __kvNative;   // restore before the native OUTPUT_KEY write
+    \\  // ── response vetting (prod parity) — the emit-side rules the worker
+    \\  // applies to everything the handler set on `response`, mirrored from
+    \\  // src/js/response_building.zig (extractResponseMetadata /
+    \\  // isEmittableHeaderName / isCleanHeaderValue / sanitizeSetCookie) and
+    \\  // worker_dispatch's status clamp. Drops are silent — handler bugs
+    \\  // don't 500 the request — exactly as live.
+    \\  const __vetResponse = () => {
+    \\    const raw = globalThis.response || {};
+    \\    // status: ToInt32 coercion (x|0) then clamp 100..599.
+    \\    let st = raw.status;
+    \\    st = (st === undefined || st === null) ? 200 : (st | 0);
+    \\    if (st < 100) st = 100; else if (st > 599) st = 599;
+    \\    // headers: the first 32 own enumerable props, then filter — pseudo
+    \\    // (:*), token-invalid, hop-by-hop, platform-managed (set-cookie /
+    \\    // content-length), and x-rewind-*/x-rove-internal-* names dropped;
+    \\    // non-string or CR/LF/NUL values dropped; names lowercased (HTTP/2).
+    \\    const RESERVED = ["connection", "transfer-encoding", "upgrade", "keep-alive", "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "content-length"];
+    \\    const emittable = (n) => {
+    \\      if (!n.length || n[0] === ":") return false;
+    \\      for (let i = 0; i < n.length; i++) { const c = n.charCodeAt(i); if (c <= 0x20 || c === 0x7f) return false; }
+    \\      const l = n.toLowerCase();
+    \\      if (RESERVED.includes(l)) return false;
+    \\      if (l.startsWith("x-rewind-") || l.startsWith("x-rove-internal-")) return false;
+    \\      return true;
+    \\    };
+    \\    const cleanVal = (v) => { for (let i = 0; i < v.length; i++) { const c = v.charCodeAt(i); if (c === 13 || c === 10 || c === 0) return false; } return true; };
+    \\    const hdrs = {};
+    \\    const hsrc = (raw.headers && typeof raw.headers === "object") ? raw.headers : {};
+    \\    for (const k of Object.keys(hsrc).slice(0, 32)) {
+    \\      if (!emittable(k)) continue;
+    \\      const v = hsrc[k];
+    \\      if (typeof v !== "string" || !cleanVal(v)) continue;
+    \\      hdrs[k.toLowerCase()] = v;
+    \\    }
+    \\    // cookies: strings only, first 32, `Domain=` stripped (a handler must
+    \\    // not push a cookie onto the parent domain — sanitizeSetCookie).
+    \\    const cookies = [];
+    \\    const csrc = Array.isArray(raw.cookies) ? raw.cookies : [];
+    \\    for (let i = 0; i < Math.min(csrc.length, 32); i++) {
+    \\      const c0 = csrc[i];
+    \\      if (typeof c0 !== "string" || !c0.length) continue;
+    \\      const segs = c0.split(";");
+    \\      let cout = segs[0].trim();
+    \\      for (let j = 1; j < segs.length; j++) {
+    \\        const seg = segs[j].trim();
+    \\        if (!seg.length) continue;
+    \\        const eq = seg.indexOf("=");
+    \\        const an = (eq < 0 ? seg : seg.slice(0, eq)).trim().toLowerCase();
+    \\        if (an === "domain") continue;
+    \\        cout += "; " + seg;
+    \\      }
+    \\      if (cout.length) cookies.push(cout);
+    \\    }
+    \\    return { status: st, headers: hdrs, cookies };
+    \\  };
+    \\  const __vet = __vetResponse();
+    \\  // ── terminal body derivation (response_building.bodyFromReturn +
+    \\  // dispatcher.prependStreamChunks): a returned Uint8Array is RAW BYTES
+    \\  // (base64 through the bundle — `bodyB64` + `binary`); a non-string
+    \\  // non-bytes return is JSON and auto-stamps `content-type:
+    \\  // application/json` unless the handler set its own; a first-hop
+    \\  // terminal after `stream.write` ships the buffered chunks AHEAD of the
+    \\  // body. `__bodyOverride` rides the bundle only when prod's wire body
+    \\  // differs from the plain return value.
+    \\  let __bodyOverride = null;
+    \\  {
+    \\    const held = __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
+    \\    if (!held && !__err) {
+    \\      const isBytes = __result instanceof Uint8Array;
+    \\      let isJson = false, text = null;
+    \\      if (typeof __result === "string") text = __result;
+    \\      else if (__result === undefined || __result === null || isBytes) text = null;
+    \\      else { const j = JSON.stringify(__result); if (j !== undefined) { text = j; isJson = true; } }
+    \\      if (isJson && !("content-type" in __vet.headers)) __vet.headers["content-type"] = "application/json";
+    \\      // First-hop HTTP terminals only — a WS frame goes to the socket and
+    \\      // a resume's chunks are already on the open stream.
+    \\      const frames = (D.kind === "inbound" || D.kind === "inbound_headers")
+    \\        ? __effects.filter((e) => e.kind === "stream" && !e.rolledBack).map((e) => e.data)
+    \\        : [];
+    \\      const b64 = (u) => { const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let s = ""; for (let i = 0; i < u.length; i += 3) { const b0 = u[i], b1 = i + 1 < u.length ? u[i + 1] : 0, b2 = i + 2 < u.length ? u[i + 2] : 0; s += A[b0 >> 2] + A[((b0 & 3) << 4) | (b1 >> 4)] + (i + 1 < u.length ? A[((b1 & 15) << 2) | (b2 >> 6)] : "=") + (i + 2 < u.length ? A[b2 & 63] : "="); } return s; };
+    \\      if (isBytes && frames.length) {
+    \\        const head = __utf8Encode(frames.join(""));
+    \\        const all = new Uint8Array(head.length + __result.length);
+    \\        all.set(head, 0); all.set(__result, head.length);
+    \\        __bodyOverride = { b64: b64(all) };
+    \\      } else if (isBytes) {
+    \\        __bodyOverride = { b64: b64(__result) };
+    \\      } else if (frames.length) {
+    \\        __bodyOverride = { text: frames.join("") + (text === null ? "" : text) };
+    \\      }
+    \\    }
+    \\  }
     \\  let __out;
     \\  try {
-    \\    __out = JSON.stringify({ response: globalThis.response, result: __result, error: __err, effects: __effects });
+    \\    __out = JSON.stringify({ response: __vet, result: __result, body_override: __bodyOverride, error: __err, effects: __effects });
     \\  } catch (e) {
-    \\    __out = JSON.stringify({ response: null, result: null, effects: __effects,
+    \\    __out = JSON.stringify({ response: __vet, result: null, body_override: __bodyOverride, effects: __effects,
     \\      error: { message: "replay result not JSON-serialisable: " + String((e && e.message) || e), stack: "" } });
     \\  }
     \\
