@@ -62,6 +62,10 @@ extern fn arena_reactor_freeze(r: *ArenaReactor) void;
 extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
 
 const sim_globals = @import("sim_globals.zig");
+// The prod ip-mask rule (src/js/ip_mask.zig, registered as an anonymous
+// import in build.zig) — the SAME rule the worker applies to `request.ip`,
+// so the sim's derived masked channel can't drift.
+const ip_mask = @import("ip_mask");
 extern fn arena_set_trace_mode_r(r: *ArenaReactor, mode: c_int) void;
 extern fn arena_set_date_now_r(r: *ArenaReactor, ms: i64) void;
 extern fn arena_set_random_seed_r(r: *ArenaReactor, seed: u64) void;
@@ -166,8 +170,24 @@ pub const Engine = struct {
             try reads.append(a, .{ .kind = .header_value, .name = hh.name, .value = hh.value });
         if (wv.body != null)
             try reads.append(a, .{ .kind = .body_read, .name = "", .value = "" });
-        if (wv.ip) |ip|
-            try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+        if (wv.ip) |ip| {
+            if (wv.captured) {
+                // A transcoded capture's `ip` IS the recorded masked value —
+                // pass it through; the raw channel stays tape-only.
+                try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+            } else {
+                // Authored ip: derive BOTH channels prod-style — `request.ip`
+                // reads the masked form (ip_mask.zig, the worker's rule) and
+                // `request.unmaskedIp()` the raw. A malformed authored ip
+                // masks to null (empty entry → `request.ip === null`) but
+                // stays reachable raw — the prod disposition for a malformed
+                // transport header.
+                var mask_buf: [64]u8 = undefined;
+                const masked = ip_mask.maskIp(&mask_buf, ip) orelse "";
+                try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = try a.dupe(u8, masked) });
+                try reads.append(a, .{ .kind = .ip_raw, .name = "", .value = ip });
+            }
+        }
 
         // ── kv readset → map ──
         var kv_map = std.StringHashMapUnmanaged([]const u8){};
@@ -255,6 +275,7 @@ pub const Engine = struct {
             .correlation_id = wv.correlation_id,
             .middleware_path = if (is_trust_boundary) mw_path else null,
             .result = result,
+            .captured = wv.captured,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
         const entry_z = try a.dupeZ(u8, wv.entry);

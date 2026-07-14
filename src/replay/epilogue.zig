@@ -65,6 +65,15 @@ pub const Opts = struct {
     middleware_path: ?[]const u8 = null,
     /// The flattened fetch/callback result → top-level `request.*`.
     result: ?Result = null,
+    /// The world was transcoded from a CAPTURE (world.zig `captured`), not
+    /// authored. Captured worlds keep the strict read-your-tape posture
+    /// (unread payload/ip → REPLAY DIVERGENCE) and the retired driver-only
+    /// surfaces (`request.body`, the pre-rename `on.*` alias) so pinned old
+    /// deployments replay. Authored worlds mirror the LIVE surface: payload
+    /// accessors read `undefined` on payload-less kinds, identity is always
+    /// pinned (`session` null / `tenant` / `correlation_id` ""), the ip
+    /// channels default to null, and the retired surfaces don't exist.
+    captured: bool = false,
 };
 
 /// The flattened fetch/callback result surface (handler-shape §7) — the fields
@@ -220,6 +229,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try jsonStr(w, opts.export_name);
     try w.writeAll(",\"kind\":");
     try jsonStr(w, opts.activation);
+    try w.writeAll(",\"captured\":");
+    try w.writeAll(if (opts.captured) "true" else "false");
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
@@ -280,8 +291,21 @@ const EPILOGUE_BODY =
     \\  // same recorded fact the original run's body-read flag captured.
     \\  // `request.body` stays available on the DRIVER (only) so records
     \\  // from pre-retirement deployments still replay their pinned code.
+    \\  // Payload-carrying kinds (prod installRequest / globals/request.js):
+    \\  // every OTHER kind (wakes, durable targets, disconnect,
+    \\  // subscription_fire) has no `bytes` live, so its accessors read
+    \\  // undefined. A CAPTURED world keeps the read-your-tape miss() instead —
+    \\  // an unread payload surfacing on replay is a divergence, not a value.
+    \\  const __PAYLOAD_KINDS = ["inbound", "inbound_headers", "inbound_chunk", "fetch_chunk", "ws_message", "send_callback"];
     \\  const __rawPayload = () => {
-    \\    if (!D.bodyRead) miss("request payload (bytes/text/json/body)");
+    \\    if (!D.bodyRead) {
+    \\      if (D.captured) miss("request payload (bytes/text/json/body)");
+    \\      // Authored: a payload kind with no declared body reads EMPTY (prod's
+    \\      // buffered inbound / terminal fetch event always has bytes); a
+    \\      // payload-less kind reads undefined.
+    \\      if (!__PAYLOAD_KINDS.includes(D.kind)) return undefined;
+    \\      return new Uint8Array(0);
+    \\    }
     \\    if (D.bodyB64 != null) {
     \\      const bin = atob(D.bodyB64);
     \\      const u = new Uint8Array(bin.length);
@@ -306,9 +330,12 @@ const EPILOGUE_BODY =
     \\      return v;
     \\    } });
     \\  __defPayload("bytes", () => __rawPayload());
-    \\  __defPayload("text", () => __utf8Decode(__rawPayload()));
-    \\  __defPayload("json", () => JSON.parse(request.text));
-    \\  __defPayload("body", () => (D.bodyB64 != null) ? __rawPayload() : (D.body ?? ""));
+    \\  __defPayload("text", () => { const b = __rawPayload(); return b === undefined ? undefined : __utf8Decode(b); });
+    \\  __defPayload("json", () => { const t = request.text; return t === undefined ? undefined : JSON.parse(t); });
+    \\  // `request.body` is RETIRED live (globals/request.js) — it exists only
+    \\  // on the captured driver so pre-retirement deployments replay their
+    \\  // pinned code.
+    \\  if (D.captured) __defPayload("body", () => (D.bodyB64 != null) ? __rawPayload() : (D.body ?? ""));
     \\  Object.defineProperty(request, "cookies", { enumerable: true, configurable: true,
     \\    get() {
     \\      const out = {};
@@ -324,30 +351,64 @@ const EPILOGUE_BODY =
     \\      Object.defineProperty(request, "cookies", { enumerable: true, configurable: true, writable: true, value: out });
     \\      return out;
     \\    } });
+    \\  // The ip channels: prod returns null when no edge proxy reported a
+    \\  // client IP — an authored world without `ip` reads null the same way;
+    \\  // a captured world misses (the original run never read the channel).
     \\  Object.defineProperty(request, "ip", { enumerable: true, configurable: true,
-    \\    get() { if (!D.ipMasked) miss("request.ip"); return D.ipMasked.value || null; } });
-    \\  request.unmaskedIp = function () { if (!D.ipRaw) miss("request.unmaskedIp()"); return D.ipRaw.value || null; };
+    \\    get() { if (!D.ipMasked) { if (D.captured) miss("request.ip"); return null; } return D.ipMasked.value || null; } });
+    \\  request.unmaskedIp = function () { if (!D.ipRaw) { if (D.captured) miss("request.unmaskedIp()"); return null; } return D.ipRaw.value || null; };
     \\  // Non-inbound activation surface (null for inbound → no-ops):
     \\  // the threaded ctx, the request.activation metadata bag, and the
     \\  // flattened fetch/callback result (request.status/.done/...; the
     \\  // single success signal is `status`, 2xx = ok — no request.ok, #7).
     \\  if (D.ctx !== null) request.ctx = D.ctx;
-    \\  // Injected request.session (worker-resolved in prod — no code to run).
-    \\  if (D.session !== null) request.session = D.session;
-    \\  // Per-chain identity the engine pins (worker-set — no code to run): the
-    \\  // handler's tenant id and the correlation id inbound mints + resumes inherit.
-    \\  if (D.tenant !== null) request.tenant = D.tenant;
-    \\  if (D.correlationId !== null) request.correlation_id = D.correlationId;
-    \\  if (D.activation !== null) {
+    \\  // Engine-pinned identity (worker-set — no code to run): prod ALWAYS
+    \\  // sets these on every activation (globals.zig installRequest) —
+    \\  // `session` null when no cookie resolved, `correlation_id` "" when no
+    \\  // chain context, `tenant` = the instance id ("sim" is the
+    \\  // authored-world placeholder). A captured world sets only what its
+    \\  // tape carries.
+    \\  if (D.captured) {
+    \\    if (D.session !== null) request.session = D.session;
+    \\    if (D.tenant !== null) request.tenant = D.tenant;
+    \\    if (D.correlationId !== null) request.correlation_id = D.correlationId;
+    \\  } else {
+    \\    request.session = D.session;
+    \\    request.tenant = D.tenant !== null ? D.tenant : "sim";
+    \\    request.correlation_id = D.correlationId !== null ? D.correlationId : "";
+    \\  }
+    \\  // request.activation = { kind, ...payload }: prod installs the bag on
+    \\  // EVERY activation, so the sim does too — the authored bag (if any)
+    \\  // wins field-by-field over the synthesized defaults. The world's
+    \\  // `kv_wake` kind surfaces as prod's `"kv"`.
+    \\  {
+    \\    const __a = D.activation !== null ? D.activation : {};
     \\    // A binary WS frame carries its bytes as base64 → rebuild the
     \\    // Uint8Array on request.activation.data (a text frame keeps its string).
-    \\    if (D.activation.dataB64 != null) {
-    \\      const bin = atob(D.activation.dataB64);
+    \\    if (__a.dataB64 != null) {
+    \\      const bin = atob(__a.dataB64);
     \\      const u = new Uint8Array(bin.length);
     \\      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-    \\      D.activation.data = u; delete D.activation.dataB64;
+    \\      __a.data = u; delete __a.dataB64;
     \\    }
-    \\    request.activation = D.activation;
+    \\    if (__a.kind == null) __a.kind = D.kind === "kv_wake" ? "kv" : D.kind;
+    \\    // Bound-fetch resumes: fill prod's per-event bag (globals.zig
+    \\    // fetch_chunk arm — fetchId/seq/byteOffset/bytes/final, + terminal
+    \\    // status/bodyTruncated) from the flattened result where the authored
+    \\    // bag left gaps. Authored worlds only — a captured bag is the tape.
+    \\    if (!D.captured && D.kind === "fetch_chunk") {
+    \\      const r = D.result !== null ? D.result : {};
+    \\      if (__a.fetchId === undefined && r.fetchId != null) __a.fetchId = r.fetchId;
+    \\      if (__a.seq === undefined) __a.seq = r.chunkSeq != null ? r.chunkSeq : 0;
+    \\      if (__a.byteOffset === undefined) __a.byteOffset = 0;
+    \\      if (__a.final === undefined) __a.final = r.done != null ? r.done : true;
+    \\      if (__a.bytes === undefined) { const b = request.bytes; __a.bytes = b === undefined ? new Uint8Array(0) : b; }
+    \\      if (__a.final) {
+    \\        if (__a.status === undefined && r.status != null) __a.status = r.status;
+    \\        if (__a.bodyTruncated === undefined) __a.bodyTruncated = r.bodyTruncated != null ? r.bodyTruncated : false;
+    \\      }
+    \\    }
+    \\    request.activation = __a;
     \\  }
     \\  if (D.result !== null) {
     \\    if (D.result.status !== null) request.status = D.result.status;
@@ -373,9 +434,10 @@ const EPILOGUE_BODY =
     \\    globalThis.TextEncoder = function () {};
     \\    globalThis.TextEncoder.prototype.encode = function (s) { return __utf8Encode(s); };
     \\  }
-    \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from pre-rename
-    \\  // deployments still replay their pinned code. Aliases the base `after`.
-    \\  globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
+    \\  // Pre-rename `on.*` — the captured driver only, so records from
+    \\  // pre-rename deployments still replay their pinned code. Aliases the
+    \\  // base `after`. Authored worlds never see it (retired live).
+    \\  if (D.captured) globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
     \\  // Wrap the native kv so reads/writes interleave with the cmds above in true
     \\  // occurrence order. Restored before the OUTPUT_KEY write (which stays native).
     \\  const __kvNative = globalThis.kv;
@@ -394,7 +456,30 @@ const EPILOGUE_BODY =
     \\    // any other scan filters the namespaced keys out.
     \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, { cursor, limit }); if (p.startsWith(__NS)) return r; __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return (r || []).filter((e) => !e.key.startsWith(__NS)); },
     \\  };
-    \\  if (typeof request.tag !== "function") request.tag = function () { return request; };
+    \\  // request.tag(key, value) — prod's validation verbatim (globals.zig
+    \\  // jsRequestTag): two strings; key 1..32 BYTES of [a-z0-9_], non-'_'
+    \\  // leading; value 1..64 BYTES, no control chars; max 4 distinct keys
+    \\  // per activation (re-tagging a key updates in place); returns
+    \\  // undefined. Each accepted call lands in the effect log as
+    \\  // {kind:"tag"} so tests can assert what would index the log record.
+    \\  const __tags = [];
+    \\  request.tag = function (k, v) {
+    \\    if (arguments.length < 2 || typeof k !== "string" || typeof v !== "string") throw new TypeError("request.tag(key, value) requires two string arguments");
+    \\    const kb = __utf8Encode(k).length, vb = __utf8Encode(v).length;
+    \\    if (kb < 1 || kb > 32) throw new TypeError("request.tag: key length must be 1..32 bytes");
+    \\    if (k[0] === "_") throw new TypeError("request.tag: keys starting with '_' are reserved");
+    \\    if (!/^[a-z0-9_]+$/.test(k)) throw new TypeError("request.tag: key must match [a-z0-9_]");
+    \\    if (vb < 1 || vb > 64) throw new TypeError("request.tag: value length must be 1..64 bytes");
+    \\    for (let i = 0; i < v.length; i++) if (v.charCodeAt(i) < 0x20) throw new TypeError("request.tag: value must not contain control characters");
+    \\    const hit = __tags.find((t) => t.key === k);
+    \\    if (hit) hit.value = v;
+    \\    else {
+    \\      if (__tags.length >= 4) throw new TypeError("request.tag: too many tags (max 4 per request)");
+    \\      __tags.push({ key: k, value: v });
+    \\    }
+    \\    __effects.push({ kind: "tag", key: k, value: v });
+    \\    return undefined;
+    \\  };
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  let __result = null, __err = null, __short = false;

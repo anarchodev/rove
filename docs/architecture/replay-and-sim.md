@@ -146,6 +146,15 @@ request surface is **read-recorded** (`handler-shape.md` §7.1): names always
 recorded, values/body/ip on access; an unrecorded read on replay is a loud
 `REPLAY DIVERGENCE`.
 
+A world carries its **provenance**: `export-fixture` stamps `"captured": true`
+on transcoded records, and the strict read-your-tape posture above applies to
+those. An *authored* world (no flag — everything `rewind test`/`sim` builds)
+mirrors the LIVE surface instead: payload accessors read `undefined` on
+payload-less kinds, identity is always pinned (`session` `null` / `tenant` /
+`correlation_id` `""`), the ip channels read `null` when un-authored, and the
+retired driver-only surfaces (`request.body`, the pre-rename `on.*` alias)
+exist only under `captured` so pinned old deployments still replay.
+
 ## 4. The five tape channels (capture) vs what the driver decodes (replay)
 
 Capture writes five channels (`src/tape/root.zig:127`):

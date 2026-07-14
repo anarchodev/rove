@@ -231,6 +231,10 @@ pub fn build(b: *std.Build) void {
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
+            // The prod ip-mask rule (`request.ip`) — shared with the sim's
+            // world build (root.zig derives the masked channel from an
+            // authored ip) so the two surfaces can't drift.
+            mod.addAnonymousImport("ip_mask", .{ .root_source_file = bb.path("src/js/ip_mask.zig") });
         }
     }.f;
 
@@ -1365,6 +1369,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
+        "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone (issue #43)
         "src/replay/testdata/wsmessage", // a WS frame reads back as request.text/.bytes (browser.message)
         "src/replay/testdata/wsfetchloop", // continue a WS conversation past a fetch resume (agent-loop shape)
         "src/replay/testdata/fetchctx", // fetch-resume ctx override: fetch's own ctx if any, else the chain's next() (issue #3, §4.14)
