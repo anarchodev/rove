@@ -417,7 +417,7 @@ pub const module_loader = struct {
         /// Package-manager resolution (PM P0). Maps `@scope/pkg` bare
         /// specifiers to package-virtual keys (`/pkg/<pkg_hash>/index.mjs`)
         /// per-importer. Null ⇒ no packages ⇒ plain path resolution (every
-        /// current deployment). See `docs/plans/pm-p0-resolution-spec.md`.
+        /// current deployment). See `docs/architecture/package-resolution.md`.
         resolver: ?*const PackageResolver = null,
     };
 
@@ -569,7 +569,7 @@ fn resolveSpecifier(base: []const u8, specifier: []const u8, scratch: []u8) []co
 /// the deployment bytecode map under `/pkg/<pkg_hash>/…`; this maps a
 /// bare specifier to the resolved package's entry key. Resolution is
 /// keyed on the *importer* (`base`) — which is the whole flat-surface /
-/// encapsulated-internals guarantee (`docs/plans/pm-p0-resolution-spec.md`
+/// encapsulated-internals guarantee (`docs/architecture/package-resolution.md`
 /// §2, §4): the same specifier resolves to the app's pinned version from
 /// an app handler, and to the package's own frozen dep from inside a
 /// package. Owned by the tenant snapshot; slices returned by `resolve`
@@ -759,7 +759,7 @@ test "PM: compile validates resolution but does NOT bake it — same source+file
     // AS-WRITTEN specifiers; JS_ReadModule re-resolves through the live
     // loader on every load. So bytecode = f(source, filename) — the pin
     // lives in the snapshot resolver, never in the handler bytes. This
-    // test is the teeth on that claim (pm-compile-cache-fix.md).
+    // test is the teeth on that claim (package-compile-caching.md).
     const a = testing.allocator;
     const J19 = "b" ** 64;
     const J14 = "c" ** 64;

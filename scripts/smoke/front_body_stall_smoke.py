@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Front-door inbound body-stall timeout smoke (plan A5,
-docs/plans/front-door-hardening.md).
+docs/architecture/front-door-hardening.md).
 
 A client that starts a request body and stops sending held its front
 flow and worker stream forever: the per-connection idle reap never

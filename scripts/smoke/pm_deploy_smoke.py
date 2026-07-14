@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """PM P1 deploy smoke — packages through the REAL deploy path.
 
-Proves the package-manager P1 vertical end to end (docs/plans/
-pm-p0-resolution-spec.md + pm-compile-cache-fix.md):
+Proves the package-manager P1 vertical end to end (docs/architecture/
+package-resolution.md + package-compile-caching.md):
 
   - stage two versions of @rewind/jwt + an @rewind/oidc that PINS jwt@1.4,
     while the app pins jwt@1.9 → multi-version coexistence + encapsulation

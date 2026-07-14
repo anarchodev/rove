@@ -231,7 +231,7 @@ pub fn jsCryptoSha256(
 
 // ── Streaming sha256 (midstate tokens) ─────────────────────────────
 //
-// `blob-write-over-segments.md` §3: an accumulation that spans
+// `blob-write-recipes.md` §3: an accumulation that spans
 // activations needs its hash state to live in kv, so the streaming
 // surface is three PURE functions over an opaque serialized midstate
 // token — no context handles, nothing process-local, replay-exact:

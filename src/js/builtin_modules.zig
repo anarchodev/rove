@@ -79,13 +79,13 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_blob_onresult_mjs"),
     },
     .{
-        // blob-write-over-segments.md §4: the seal-time prompt compose —
+        // blob-write-recipes.md §4: the seal-time prompt compose —
         // assembles the recipe rows and hands the payload to blob.put.
         .path = "__system/blob_compose.mjs",
         .src = @embedFile("builtin_blob_compose_mjs"),
     },
     .{
-        // blob-write-over-segments.md §4–5: the flip (delete recipe +
+        // blob-write-recipes.md §4–5: the flip (delete recipe +
         // pending row) and the customer {on} handoff.
         .path = "__system/blob_compose_onresult.mjs",
         .src = @embedFile("builtin_blob_compose_onresult_mjs"),

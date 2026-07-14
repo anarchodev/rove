@@ -1,5 +1,5 @@
 // Public `kv` surface — the documentation source of truth for the
-// tenant key/value store (docs/builtin-libs-docs-plan.md Phase A).
+// tenant key/value store (docs/architecture/builtin-libs.md Phase A).
 //
 // This is a thin shim over the native `_system.kv` binding. The
 // top-level name customers call (`kv.get`, `kv.set`, …) is unchanged;

@@ -1,5 +1,5 @@
 // Public `crypto` surface — the documentation source of truth for
-// handler cryptography (docs/builtin-libs-docs-plan.md Phase A).
+// handler cryptography (docs/architecture/builtin-libs.md Phase A).
 //
 // Thin shim over the native `_system.crypto` binding. Top-level
 // `crypto.*` names are unchanged; `_system.*` is the internal ABI and

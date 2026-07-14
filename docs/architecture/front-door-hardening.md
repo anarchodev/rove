@@ -1,10 +1,12 @@
 # Front-door hardening — reverse-proxy best-practice gaps
 
-> 🟡 **In-flight plan** (2026-07-04). Audit of `src/front/` against
-> established reverse-proxy practice (nginx / HAProxy / Envoy), motivated
-> by ongoing front-door reliability issues. Each finding names the gap,
-> the mechanism, and the conventional cure. Phasing at the bottom.
-> As-built reference: [`../architecture/routing-and-ingress.md`](../architecture/routing-and-ingress.md).
+> **Shipped** (graduated from `plans/`). Audit of `src/front/` against
+> established reverse-proxy practice (nginx / HAProxy / Envoy); every
+> phase-1/phase-2 finding below is built, each with a dedicated teeth
+> smoke (`scripts/smoke/front_*.py`, which cite these findings by label).
+> Kept as the design-of-record for the front door's protections — each
+> finding names the gap, the mechanism, and the cure as built.
+> Subsystem doc: [`routing-and-ingress.md`](routing-and-ingress.md).
 
 ## Scope
 

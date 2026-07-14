@@ -1,5 +1,5 @@
 // Public `platform` surface — the documentation source of truth for
-// the admin control plane (docs/builtin-libs-docs-plan.md Phase A;
+// the admin control plane (docs/architecture/builtin-libs.md Phase A;
 // auth-domain-plan.md for the admin handler context).
 //
 // Thin shim over the native `_system.platform` binding. Top-level

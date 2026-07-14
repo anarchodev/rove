@@ -48,7 +48,7 @@ export default function () {
   check("blob.write", () => {
     throws(() => blob.write(42), /bytes must be a string or Uint8Array/);
     // The recipe substrate: appends are kv rows + a sha256 midstate —
-    // replicated, replayable, no worker RAM (blob-write-over-segments.md).
+    // replicated, replayable, no worker RAM (blob-write-recipes.md).
     // Chain-less dispatch uses the "local" sid.
     eq(blob.write("hel"), 3);
     eq(blob.write(new TextEncoder().encode("lo")), 5); // running total

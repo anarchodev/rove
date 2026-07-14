@@ -1,5 +1,5 @@
 // Public `console` surface — the documentation source of truth for
-// handler logging (docs/builtin-libs-docs-plan.md Phase A).
+// handler logging (docs/architecture/builtin-libs.md Phase A).
 //
 // Thin shim over the native `_system.console` binding. The top-level
 // name (`console.log`) is unchanged; `_system.*` is the internal ABI

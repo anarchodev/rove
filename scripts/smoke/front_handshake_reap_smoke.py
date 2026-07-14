@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Front-door TLS-handshake reap smoke (plan A4,
-docs/plans/front-door-hardening.md).
+docs/architecture/front-door-hardening.md).
 
 The idle reaper only covered `_conn_active`: a peer that opened TCP
 against the TLS listener and stalled mid-handshake sat in

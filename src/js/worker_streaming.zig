@@ -1865,7 +1865,7 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
     }, module_path, corr_full, tenant_id, "");
 }
 
-// ── blob compose door (blob-write-over-segments.md §4) ─────────────
+// ── blob compose door (blob-write-recipes.md §4) ─────────────
 
 const COMPOSE_URL_PREFIX = "http://rove-compose.internal/";
 

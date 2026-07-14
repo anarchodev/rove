@@ -45,7 +45,7 @@ unpushed):
    real and unblocks the B4 *delivery* (move-secret off the operator shell).
 2. **B5 customer-auth crux** — the `rewind` CLI + the cap-mint fork + the
    customer deploy surface (partly gated on §4.1). Design holistically; see B5.
-3. **`cp-desired-state-target.md`** — the north star (CP owns all desired-state
+3. **The CP desired-state north star (issue #90)** — CP owns all desired-state
    incl. release; one S2S key; root token retires). The largest arc.
 4. `web/admin/_static/api.js` files-server cleanup (separate, pre-existing).
 
@@ -266,9 +266,9 @@ The remaining *delivery* (actually removing `REWIND_MOVE_SECRET` from the
 operator's `prod.env`, leaving `rewind-ops` break-glass with the root token)
 rides the **prod dashboard deploy** — the day-to-day path is the dashboard, so
 the shift lands when it's live. The full retirement of the root token is the
-`cp-desired-state-target.md` arc (release reconciler + reset-via-CP).
+CP desired-state arc (issue #90: release reconciler + reset-via-CP).
 
-> **North star (`cp-desired-state-target.md`):** B4 is one step toward the CP
+> **North star (issue #90):** B4 is one step toward the CP
 > owning *all* per-tenant desired-state (incl. release) with workers
 > reconciling — one S2S key, root token retired. B4 routes the operator's CP
 > ops through the dashboard; the release-reconciler + reset-via-CP (which retire
