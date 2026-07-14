@@ -65,6 +65,11 @@ pub const Opts = struct {
     middleware_path: ?[]const u8 = null,
     /// The flattened fetch/callback result → top-level `request.*`.
     result: ?Result = null,
+    /// World-build warnings (e.g. an authored header the prod filter would
+    /// strip, root.zig's authored-header hygiene) — surfaced as
+    /// `{kind:"log", level:"warn"}` entries at the head of the bundle's
+    /// effect log. Empty for replayed (captured) worlds.
+    warnings: []const []const u8 = &.{},
 };
 
 /// The flattened fetch/callback result surface (handler-shape §7) — the fields
@@ -216,6 +221,12 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
         try optBool(w, r.body_truncated);
         try w.writeByte('}');
     } else try w.writeAll("null");
+    try w.writeAll(",\"warnings\":[");
+    for (opts.warnings, 0..) |warning, i| {
+        if (i != 0) try w.writeByte(',');
+        try jsonStr(w, warning);
+    }
+    try w.writeByte(']');
     try w.writeAll(",\"fn\":");
     try jsonStr(w, opts.export_name);
     try w.writeAll(",\"kind\":");
@@ -259,6 +270,9 @@ const EPILOGUE_BODY =
     \\  globalThis.__rove_fetch_seq = 0;
     \\  const __mklog = (level) => (...a) => { __effects.push({ kind: "log", level, message: a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ") }); };
     \\  globalThis.console = { log: __mklog("info"), warn: __mklog("warn"), error: __mklog("error"), info: __mklog("info"), debug: __mklog("debug") };
+    \\  // World-build warnings (dropped authored headers, …) lead the effect
+    \\  // log so the author sees them before the handler's own output.
+    \\  for (const m of D.warnings) __effects.push({ kind: "log", level: "warn", message: m });
     \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
     \\  // Real UTF-8 codec (issue #11). The sim base ships no native
     \\  // TextEncoder/Decoder; the old latin1 (`charCodeAt & 0xff` / escape) hack
