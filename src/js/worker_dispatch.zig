@@ -3454,7 +3454,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // attempt entirely.
             .arena_mode = if (worker_mod.isChurny(worker, scope_inst.id, dep_id, route.module_base)) .gc else .auto,
             .method = method,
-            .path = path,
+            // `request.path` excludes the query string — the query lives
+            // ONLY on `request.query` (handler-shape.md). Log records and
+            // routing keep the raw wire `:path`; the JS surface never sees
+            // the `?`.
+            .path = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path,
             .host = authority,
             .body = body,
             .query = route.query,

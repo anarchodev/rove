@@ -728,7 +728,10 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   activation kind — is RETIRED; the accessors are the only payload
   surface.)
 - **`default`:** the payload views above, plus `.headers`, `.method`,
-  `.path`, `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
+  `.path`, `.query`, `.cookies`, `.ip`, `.unmaskedIp()`. `request.path`
+  never includes the query string: for `GET /a/b?x=1`, `path` is
+  `"/a/b"` and the query lives only on `request.query` (`"x=1"`, or
+  `null` when the URL has none).
 - **`onChunk`:** `request.bytes` = THIS chunk; `request.done`;
   `request.chunkSeq` (from 0).
 - **`next()` continuations — one ctx rule (`decisions.md §4.9`):** every

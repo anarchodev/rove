@@ -54,8 +54,7 @@ TENANT = "blobtest"
 # request/response routes can.
 GET_SRC = """
 export default function () {
-  const qpos = request.path.indexOf("?");
-  const hash = request.path.slice(request.path.indexOf("hash=") + 5);
+  const hash = new URLSearchParams(request.query || "").get("hash");
   blob.get(hash, { on: "onBlob" });
   return next();
 }
@@ -93,7 +92,7 @@ export default function () {
 MIRROR_SRC = """
 export default function () {
   const src = new TextDecoder().decode(
-    hex.decode(request.path.slice(request.path.indexOf("src=") + 4)));
+    hex.decode(new URLSearchParams(request.query || "").get("src")));
   after.fetch(src, { stream: true, maxChunkBytes: 16384, on: "onChunk" });
   return next();
 }
@@ -158,13 +157,8 @@ export default function () {{
 # slices via the recipe helper.
 SEGGET_SRC = """
 export default function () {
-  const qpos = request.path.indexOf("?");
-  const q = {};
-  for (const pair of request.path.slice(qpos + 1).split("&")) {
-    const eq = pair.indexOf("=");
-    if (eq > 0) q[pair.slice(0, eq)] = pair.slice(eq + 1);
-  }
-  const v = segments.get(q.stream, Number(q.seq), { on: "onSeg" });
+  const qp = new URLSearchParams(request.query || "");
+  const v = segments.get(qp.get("stream"), Number(qp.get("seq")), { on: "onSeg" });
   if (typeof v === "string") return "hot:" + v;
   if (v === null) { response.status = 404; return "missing"; }
   return next();
@@ -179,15 +173,10 @@ export function onSeg() {
 
 HANDLER_SRC = """
 export default function () {
-  const qpos = request.path.indexOf("?");
-  const path = qpos < 0 ? request.path : request.path.slice(0, qpos);
+  const path = request.path;
+  const qp = new URLSearchParams(request.query || "");
   const q = {};
-  if (qpos >= 0) {
-    for (const pair of request.path.slice(qpos + 1).split("&")) {
-      const eq = pair.indexOf("=");
-      if (eq > 0) q[pair.slice(0, eq)] = pair.slice(eq + 1);
-    }
-  }
+  for (const [k, v] of qp) q[k] = v;
   if (path === "/put") {
     const body = request.text || "";
     const hash = blob.put(body, {
