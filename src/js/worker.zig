@@ -3337,6 +3337,7 @@ pub const captureTapesWithActivation = worker_log.captureTapesWithActivation;
 pub const captureFetchChunkTapes = worker_log.captureFetchChunkTapes;
 pub const captureWsFrameTapes = worker_log.captureWsFrameTapes;
 pub const captureWakeBatchTapes = worker_log.captureWakeBatchTapes;
+pub const captureSendCallbackTapes = worker_log.captureSendCallbackTapes;
 pub const FetchEvent = worker_log.FetchEvent;
 pub const captureLog = worker_log.captureLog;
 pub const captureLogWithId = worker_log.captureLogWithId;
@@ -3732,6 +3733,9 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
     try fake.tenant_logs.put(allocator, tl.instance_id, tl);
 
     const empty: []u8 = &.{};
+    // A successful send_callback must carry its Msg — the callee-outcome
+    // envelope on trigger_payload — or the L3 assert fires (issue #67).
+    const tp_bytes = try allocator.dupe(u8, "tp");
     captureLog(
         &fake,
         "acme",
@@ -3744,7 +3748,7 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
         .ok,
         empty,
         empty,
-        .{},
+        .{ .trigger_payload_tape_bytes = tp_bytes },
         "chain-abc-123",
         &.{},
         .send_callback,

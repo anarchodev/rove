@@ -306,6 +306,44 @@ pub fn captureWakeBatchTapes(
     return payloads;
 }
 
+/// Record a `send_callback` activation's Msg — the callee outcome
+/// (issue #67, the last resume kind whose Msg reaches the tape). The whole
+/// synthesized `{"ctx":…}` body envelope IS the Msg: `{"ctx":{result,
+/// context}}` for a result delivery (a `webhook.send`/`blob.put` `{on}` hop
+/// or a §6.4 held-sync resume — `installRequest`'s hoist flattens `result`
+/// onto `request.bytes`/`.status` and lifts `context` → `request.ctx`), or
+/// a bare `{"ctx":…}` payload for an internal chained hop. It records once
+/// on `trigger_payload`; `ctx_payload` keeps it past the read-taping
+/// elision (the hoist consumes it unconditionally at install — `body_read`
+/// never flips for it). An envelope over `REQUEST_BODY_CAP` records a
+/// metadata-only entry (BodyRef len, no inline bytes) — the record still
+/// says an envelope existed (so the L3 guard holds) but offline replay
+/// lacks the outcome, mirroring the >16 KB fetch-chunk posture.
+/// `export_name` is the resolved callback export when the hop named one
+/// (`next({fn})` / a `module.method` target), "" for the default export.
+pub fn captureSendCallbackTapes(
+    worker: anytype,
+    readset: *tape_mod.Readset,
+    envelope: []const u8,
+    export_name: []const u8,
+) log_mod.TapePayloads {
+    const allocator = worker.allocator;
+    if (envelope.len > 0) {
+        readset.trigger_payload.appendTriggerPayload(
+            .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(envelope.len) },
+            if (envelope.len <= REQUEST_BODY_CAP) envelope else "",
+        ) catch |err| {
+            std.log.warn("rove-js send-callback envelope capture failed: {s}", .{@errorName(err)});
+        };
+        readset.ctx_payload = true;
+    }
+    var payloads = captureTapes(worker, readset, envelope);
+    if (export_name.len > 0) {
+        payloads.export_name = allocator.dupe(u8, export_name) catch &.{};
+    }
+    return payloads;
+}
+
 /// The fetch-event fields a `fetch_chunk` activation must record so replay can
 /// rebuild `request.body` (the chunk bytes) + the flattened result surface
 /// (`request.status/.ok/.done/.fetchId`). Decoupled from `UpstreamFetchEvent`
@@ -425,6 +463,17 @@ pub fn l3MissingChannel(
             "activation_bytes (the wake batch)"
         else
             null,
+        // issue #67: a send_callback's Msg is the `{"ctx":…}` body
+        // envelope, recorded on trigger_payload. Both producers (the
+        // held resume and the chained fire) always synthesize a
+        // non-empty envelope — at minimum `{"ctx":null}` — and
+        // `captureSendCallbackTapes` records at least a metadata-only
+        // entry for it, so an empty channel here means the capture was
+        // skipped, never "there was no envelope".
+        .send_callback => if (tapes.trigger_payload_tape_bytes.len == 0)
+            "trigger_payload (the callee-outcome envelope)"
+        else
+            null,
         else => null,
     };
 }
@@ -439,7 +488,7 @@ fn l3AssertMsgRecorded(
             "rove-js L3 VIOLATION: '{s}' activation recorded no Msg — {s} is empty; " ++
                 "this record is UNREPLAYABLE (docs/architecture/replay-and-sim.md §5). " ++
                 "A resume path passed empty tapes — wire its captureFetchChunkTapes/" ++
-                "captureWsFrameTapes/captureTapes.",
+                "captureWsFrameTapes/captureWakeBatchTapes/captureSendCallbackTapes/captureTapes.",
             .{ @tagName(activation), what },
         );
         if (std.debug.runtime_safety)
@@ -938,6 +987,15 @@ test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + 
     try testing.expect(l3MissingChannel(.wake_batch, .ok, empty) != null);
     try testing.expect(l3MissingChannel(.wake_batch, .ok, ab) == null);
     try testing.expect(l3MissingChannel(.wake_batch, .handler_error, empty) == null);
+
+    // issue #67: a send_callback's Msg is the `{"ctx":…}` envelope on
+    // trigger_payload — both producers always synthesize one, so an
+    // empty channel on a successful callback IS a missed capture.
+    var tp = log_mod.TapePayloads{};
+    tp.trigger_payload_tape_bytes = "x";
+    try testing.expect(l3MissingChannel(.send_callback, .ok, empty) != null);
+    try testing.expect(l3MissingChannel(.send_callback, .ok, tp) == null);
+    try testing.expect(l3MissingChannel(.send_callback, .handler_error, empty) == null);
 }
 
 test "wakesToJson matches the JS-facing encoding (prefix escape, ms, empty batch)" {

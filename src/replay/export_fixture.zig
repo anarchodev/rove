@@ -15,12 +15,15 @@
 //! key isn't in the map, so replay resolves it to not_found (a *new* read the
 //! original never made surfaces the same way, visible in the effect log).
 //!
-//! Scope: faithful for `inbound` activations and `wake_batch` (issue #62 —
+//! Scope: faithful for `inbound` activations, `wake_batch` (issue #62 —
 //! the fired-watch batch rides `activation_bytes`, ctx rides
-//! `trigger_payload`, the resolved export rides `export`). `fetch_chunk`
-//! transcodes its whole-body case (the matrix smoke proves it) but streamed
-//! multi-chunk stays best-effort; other non-inbound activations lose their
-//! result surface (`replay-and-sim.md` §5 G1/G3) — the caller is warned via
+//! `trigger_payload`, the resolved export rides `export`), and
+//! `send_callback` (issue #67 — the whole callee-outcome envelope rides
+//! `trigger_payload`; split here into the flattened result surface + the
+//! metadata bag + the bare threaded ctx). `fetch_chunk` transcodes its
+//! whole-body case (the matrix smoke proves it) but streamed multi-chunk
+//! stays best-effort; other non-inbound activations lose their result
+//! surface (`replay-and-sim.md` §5 G1/G3) — the caller is warned via
 //! `isFaithfulTranscode`.
 
 const std = @import("std");
@@ -34,11 +37,14 @@ pub const Error = error{
 /// True when the pulled fixture's activation can be transcoded faithfully
 /// — its whole input rides the decoded channels. The inbound family, plus
 /// `wake_batch` since issue #62 (ctx via trigger_payload, the fired-watch
-/// batch via activation_bytes, the resolved export via `export`).
+/// batch via activation_bytes, the resolved export via `export`) and
+/// `send_callback` since issue #67 (the callee-outcome envelope via
+/// trigger_payload, the resolved export via `export`).
 pub fn isFaithfulTranscode(activation: []const u8) bool {
     return std.mem.eql(u8, activation, "inbound") or
         std.mem.eql(u8, activation, "inbound_headers") or
-        std.mem.eql(u8, activation, "wake_batch");
+        std.mem.eql(u8, activation, "wake_batch") or
+        std.mem.eql(u8, activation, "send_callback");
 }
 
 /// Parse the activation field of a pulled fixture (for the caller's warning).
@@ -175,6 +181,35 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         break :blk null;
     };
 
+    // ── send_callback: the trigger_payload envelope IS the Msg (issue #67)
+    // — `{"ctx":{result, context}}` for a result delivery (a `webhook.send`
+    // / `blob.put` `{on}` hop or a held-sync resume). Split it exactly the
+    // way prod's install hoist does (globals.zig): `result` → the flattened
+    // surface (`request.status`/`done`/body + the `request.activation`
+    // metadata bag), `context` → the world `ctx`. A bare-ctx envelope (no
+    // `result` object — an internal chained hop) keeps the whole-ctx lift
+    // `ctx_json` already did, matching the hoist's fallback. ──
+    var scb_result: ?std.json.ObjectMap = null;
+    var scb_ctx_json: ?[]const u8 = null;
+    if (std.mem.eql(u8, activation, "send_callback") and
+        trigger.len != 0 and trigger[0].batch_id == decode.NO_BATCH and
+        trigger[0].inline_bytes.len != 0)
+    scb: {
+        const env = std.json.parseFromSlice(std.json.Value, a, trigger[0].inline_bytes, .{}) catch break :scb;
+        if (env.value != .object) break :scb;
+        const cv = env.value.object.get("ctx") orelse break :scb;
+        if (cv != .object) break :scb;
+        const rv = cv.object.get("result") orelse break :scb;
+        if (rv != .object) break :scb;
+        scb_result = rv.object;
+        if (cv.object.get("context")) |cx| {
+            scb_ctx_json = std.json.Stringify.valueAlloc(a, cx, .{}) catch null;
+        }
+    }
+    // With a result split, the world ctx is the bare threaded `context`
+    // (prod's `request.ctx`), not the whole `{result, context}` envelope.
+    const eff_ctx_json: ?[]const u8 = if (scb_result != null) scb_ctx_json else ctx_json;
+
     // ── ws_message frame: activation_bytes = [opcode][data] ──
     var ws_opcode: ?u8 = null;
     var ws_data: ?[]const u8 = null;
@@ -250,6 +285,56 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll(wj);
         try w.writeAll(" }");
     }
+    // send_callback result → the flattened callee-outcome surface +
+    // the request.activation metadata bag (issue #67) — the same shape
+    // an authored `rewind:test` sendCallback world carries. The result
+    // bytes ride base64url-no-pad in the envelope (`body_b64`); the
+    // world carries them as standard-base64 `bodyB64` so replay's
+    // `request.bytes` is byte-exact. A `body`-string-only producer
+    // (held-sync deadline events) passes through as a string body.
+    if (scb_result) |res| {
+        if (res.get("status")) |sv| {
+            if (sv == .integer) try w.print(",\n    \"status\": {d}", .{sv.integer});
+        }
+        try w.writeAll(",\n    \"done\": true");
+        if (res.get("body_truncated")) |btv| {
+            if (btv == .bool) try w.writeAll(if (btv.bool) ",\n    \"bodyTruncated\": true" else ",\n    \"bodyTruncated\": false");
+        }
+        body: {
+            if (res.get("body_b64")) |bv| {
+                if (bv == .string) {
+                    const dec = std.base64.url_safe_no_pad.Decoder;
+                    const n = dec.calcSizeForSlice(bv.string) catch break :body;
+                    const raw = try a.alloc(u8, n);
+                    dec.decode(raw, bv.string) catch break :body;
+                    try w.writeAll(",\n    \"bodyB64\": ");
+                    try jsonB64(a, w, raw);
+                    break :body;
+                }
+            }
+            if (res.get("body")) |bv| {
+                if (bv == .string) {
+                    try w.writeAll(",\n    \"body\": ");
+                    try jsonStr(w, bv.string);
+                }
+            }
+        }
+        // Delivery metadata → the bag, passed through as recorded
+        // (absent fields stay absent → `undefined` on replay, matching
+        // prod's hoist; `ok` is deliberately NOT surfaced — status is
+        // the single success signal, issue #7).
+        try w.writeAll(",\n    \"activation\": { \"kind\": \"send_callback\"");
+        const meta_keys = [_][]const u8{ "attempts", "error", "id", "headers", "hash" };
+        for (meta_keys) |mk| {
+            if (res.get(mk)) |mv| {
+                try w.writeAll(", ");
+                try jsonStr(w, mk);
+                try w.writeAll(": ");
+                try std.json.Stringify.value(mv, .{}, w);
+            }
+        }
+        try w.writeAll(" }");
+    }
     // ws frame → request.activation {opcode, data | dataB64}
     if (ws_opcode) |op| {
         try w.print(",\n    \"activation\": {{ \"opcode\": {d}, ", .{op});
@@ -263,7 +348,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll(" }");
     }
     try w.writeAll("\n  }");
-    if (ctx_json) |cj| {
+    if (eff_ctx_json) |cj| {
         try w.writeAll(",\n  \"ctx\": ");
         try w.writeAll(cj);
     }
@@ -462,6 +547,111 @@ test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue 
     try testing.expectEqualStrings("timer", w1.get("kind").?.string);
 }
 
+/// Build a base64 trigger_payload tape carrying one inline envelope
+/// (mirrors the encodeEntry format `decodeTriggerPayload` reads).
+fn b64TriggerTape(a: std.mem.Allocator, envelope: []const u8) ![]const u8 {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(a);
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
+    std.mem.writeInt(u16, hdr[4..6], decode.VERSION, .big);
+    std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.trigger_payload), .big);
+    std.mem.writeInt(u32, hdr[8..12], 1, .big);
+    try buf.appendSlice(a, &hdr);
+    var ent = std.ArrayList(u8){};
+    defer ent.deinit(a);
+    var b8: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b8, decode.NO_BATCH, .big); // batch_id
+    try ent.appendSlice(a, &b8);
+    std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
+    try ent.appendSlice(a, &b8);
+    var b4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b4, @intCast(envelope.len), .big); // body_ref.len
+    try ent.appendSlice(a, &b4);
+    try putLen(&ent, a, envelope);
+    std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
+    try buf.appendSlice(a, &b4);
+    try buf.appendSlice(a, ent.items);
+    const enc = std.base64.standard.Encoder;
+    const out = try a.alloc(u8, enc.calcSize(buf.items.len));
+    _ = enc.encode(out, buf.items);
+    return out;
+}
+
+test "transcode: send_callback envelope -> flattened result surface + bag + bare ctx (issue #67)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // body_b64 is base64url-no-pad("pong") — the envelope's wire encoding.
+    const envelope =
+        \\{"ctx":{"result":{"status":202,"body_b64":"cG9uZw","attempts":2,"error":null,"id":"snd_1","headers":{"x":"y"},"body_truncated":false},"context":{"orderId":7}}}
+    ;
+    const tp_b64 = try b64TriggerTape(a, envelope);
+
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"hooks.mjs", "activation":"send_callback",
+        \\   "request": {{ "method":"POST", "path":"/hooks", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "trigger_payload_b64":"{s}" }}, "sources":[] }}
+    , .{tp_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const wo = wp.value.object;
+    try testing.expectEqualStrings("send_callback", wo.get("activation").?.string);
+    // result → the flattened surface: status/done + byte-exact bodyB64
+    // (standard base64 of the decoded body_b64 bytes).
+    const req = wo.get("request").?.object;
+    try testing.expectEqual(@as(i64, 202), req.get("status").?.integer);
+    try testing.expectEqual(true, req.get("done").?.bool);
+    try testing.expectEqual(false, req.get("bodyTruncated").?.bool);
+    try testing.expectEqualStrings("cG9uZw==", req.get("bodyB64").?.string);
+    // delivery metadata → the request.activation bag (the same shape an
+    // authored rewind:test sendCallback world carries).
+    const bag = req.get("activation").?.object;
+    try testing.expectEqualStrings("send_callback", bag.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 2), bag.get("attempts").?.integer);
+    try testing.expect(bag.get("error").? == .null);
+    try testing.expectEqualStrings("snd_1", bag.get("id").?.string);
+    try testing.expectEqualStrings("y", bag.get("headers").?.object.get("x").?.string);
+    try testing.expect(bag.get("hash") == null); // absent in the envelope → absent in the bag
+    // context → the BARE world ctx (not the whole {result, context}).
+    const ctx = wo.get("ctx").?.object;
+    try testing.expectEqual(@as(i64, 7), ctx.get("orderId").?.integer);
+    try testing.expect(ctx.get("result") == null);
+}
+
+test "transcode: send_callback bare-ctx envelope (no result) lifts ctx whole (issue #67)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tp_b64 = try b64TriggerTape(a, "{\"ctx\":{\"step\":1}}");
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"send_callback",
+        \\   "request": {{ "method":"POST", "path":"/x", "host":"h" }},
+        \\   "seed":"1", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "trigger_payload_b64":"{s}" }}, "sources":[] }}
+    , .{tp_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const wo = wp.value.object;
+    // No result → no flattened surface, no bag; the envelope's ctx IS
+    // the hop's payload (prod's hoist lifts it whole to request.ctx).
+    const req = wo.get("request").?.object;
+    try testing.expect(req.get("status") == null);
+    try testing.expect(req.get("activation") == null);
+    try testing.expectEqual(@as(i64, 1), wo.get("ctx").?.object.get("step").?.integer);
+}
+
 test "isFaithfulTranscode" {
     try testing.expect(isFaithfulTranscode("inbound"));
     try testing.expect(isFaithfulTranscode("inbound_headers"));
@@ -469,4 +659,7 @@ test "isFaithfulTranscode" {
     // issue #62: a wake_batch's whole input is recorded (ctx + wakes),
     // so it transcodes faithfully.
     try testing.expect(isFaithfulTranscode("wake_batch"));
+    // issue #67: a send_callback's whole input is recorded (the callee-
+    // outcome envelope + the resolved export), so it transcodes faithfully.
+    try testing.expect(isFaithfulTranscode("send_callback"));
 }

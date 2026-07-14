@@ -698,8 +698,9 @@ fn doOutput(a: std.mem.Allocator, verb: []const u8, world_path: []const u8, bund
 /// `rewind export-fixture <pulled-fixture.json> [-o world.json]` — transcode a
 /// captured recording (a `rewind pull` fixture) into an editable, offline,
 /// fail-loud declarative sim **world** that `rewind sim` reproduces. Offline.
-/// Faithful for inbound + wake_batch activations; warns on the rest (the
-/// pulled fixture lacks the fetch-result surface — replay-and-sim.md §5).
+/// Faithful for inbound + wake_batch + send_callback activations; warns on
+/// the rest (the pulled fixture lacks the streamed fetch-result surface —
+/// replay-and-sim.md §5).
 fn cmdExportFixture(a: std.mem.Allocator, fixture_path: []const u8, out_file: ?[]const u8) void {
     const bytes = std.fs.cwd().readFileAlloc(a, fixture_path, 64 << 20) catch |e|
         c.fatal("export-fixture: read {s}: {s}", .{ fixture_path, @errorName(e) });

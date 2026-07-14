@@ -1312,9 +1312,17 @@ const FinishSpec = struct {
     /// commit (chained/fetch posture) vs rollback (disconnect/
     /// subscription posture); both end a read-only txn.
     readonly_cont_commits: bool = false,
-    /// fetch_chunk: capture tape payloads on every log record.
-    with_tape: bool = false,
+    /// Which Msg-tape every log record carries (see `fireTapes`):
+    /// `.activation` (fetch_chunk — the upstream chunk bytes),
+    /// `.callback` (send_callback — the `{"ctx":…}` body envelope,
+    /// issue #67), or `.none` for kinds whose Msg needs no dedicated
+    /// capture here.
+    tape: FireTape = .none,
 };
+
+/// The Msg-tape a connectionless fire records (the fire-family sibling
+/// of worker_drain's `ContTape`).
+const FireTape = enum { none, activation, callback };
 
 /// The LogHeader every propose path ships. Also used by the WS seam
 /// (`worker_ws.zig`) with its own activation tags.
@@ -1342,15 +1350,22 @@ pub fn fireLogHeader(
 
 /// Tape payloads for one log record. Fresh per call —
 /// `captureLogWithId` takes ownership of the byte allocations.
+/// `.callback` records the fire's whole body envelope (the callee
+/// outcome) plus the resolved export (issue #67); `.activation`
+/// records the input bytes as `activation_bytes` (fetch chunks).
 fn fireTapes(
     worker: anytype,
-    comptime with_tape: bool,
+    comptime tape: FireTape,
     readset: *tape_mod.Readset,
     body: []const u8,
     activation_bytes: []const u8,
+    export_name: []const u8,
 ) log_mod.TapePayloads {
-    if (!with_tape) return .{};
-    return captureTapesWithActivation(worker, readset, body, activation_bytes);
+    return switch (tape) {
+        .none => .{},
+        .activation => captureTapesWithActivation(worker, readset, body, activation_bytes),
+        .callback => worker_mod.captureSendCallbackTapes(worker, readset, body, export_name),
+    };
 }
 
 /// Commit a read-only fire txn. kvexp `NotChainHead` (surfaced as
@@ -1380,8 +1395,9 @@ fn commitReadOnlyFire(p: *FirePrep, comptime site: []const u8) void {
 /// connectionless fire. `log_path` is the module path on log records
 /// (no leading slash); `corr` must match `req.trace.correlation_id`;
 /// `label` identifies the firer in warn messages (name / module /
-/// tenant); `activation_bytes` feeds tape capture when
-/// `spec.with_tape` (fetch chunk payloads) — pass "" otherwise.
+/// tenant); `activation_bytes` feeds tape capture when `spec.tape ==
+/// .activation` (fetch chunk payloads) — pass "" otherwise (a
+/// `.callback` tape reads `req.body` + `req.fn_override` instead).
 pub fn runFire(
     worker: anytype,
     p: *FirePrep,
@@ -1421,7 +1437,7 @@ pub fn runFire(
         worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
+        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0);
         return;
     };
 
@@ -1440,7 +1456,7 @@ pub fn runFire(
                 );
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, 0);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1466,21 +1482,21 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false; // helper rolled back + destroyed the txn
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1517,12 +1533,12 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): cont-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, cval.tags, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, cval.tags, spec.act, 0);
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, cval.tags, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, cval.tags, spec.act, fw_seq);
                 return;
             }
             if (comptime spec.readonly_cont_commits) {
@@ -1532,7 +1548,7 @@ pub fn runFire(
                 p.txn.rollback() catch {};
                 p.txn_done = true;
             }
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, cval.tags, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, cval.tags, spec.act, 0);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
@@ -1555,17 +1571,17 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0);
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, fw_seq);
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; connectionless fires never dispatch as one.
@@ -1573,7 +1589,7 @@ pub fn runFire(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0);
         },
     }
 }
@@ -2137,12 +2153,17 @@ fn fireChainedActivation(
     // `.enqueue`: chained-from-chained re-enqueues another
     // SendCallback hop on the next tick (bounded recursion via the
     // dispatch BATCH cap), inheriting the same correlation_id.
+    // `.tape = .callback`: the body envelope IS this hop's Msg — the
+    // callee outcome for an on_result delivery, the bare threaded ctx
+    // for an internal chained hop — recorded (with the resolved
+    // export) so the activation is replayable (issue #67).
     runFire(worker, &p, req, .{
         .act = .send_callback,
         .site = "chained-dispatch",
         .on_cont = .enqueue,
         .on_stream = .warn,
         .readonly_cont_commits = true,
+        .tape = .callback,
     }, module_path, corr_full, module_path, "");
 }
 
@@ -3374,7 +3395,7 @@ pub fn fireFetchEventActivation(
 
     // The activation's input bytes (the upstream chunk
     // payload) get taped on `TapePayloads.activation_bytes` —
-    // `runFire` captures them on every log record (with_tape) so
+    // `runFire` captures them on every log record (`spec.tape = .activation`) so
     // replay reconstitutes the same handler invocation from the same
     // captured bytes.
     runFire(worker, &p, req, .{
@@ -3383,6 +3404,6 @@ pub fn fireFetchEventActivation(
         .on_cont = .enqueue,
         .on_stream = .warn,
         .readonly_cont_commits = true,
-        .with_tape = true,
+        .tape = .activation,
     }, module_path, corr_full, module_path, event.bytes);
 }
