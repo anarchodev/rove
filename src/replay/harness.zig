@@ -27,6 +27,7 @@ const hostmod = @import("host.zig");
 const decode = @import("tape_decode.zig");
 
 extern fn arena_reactor_new(base_kb: c_int, request_kb: c_int) ?*root.ArenaReactor;
+extern fn arena_set_request_mode_r(r: *root.ArenaReactor, mode: c_int) void;
 extern fn arena_run_module_r(r: *root.ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
 extern fn arena_replay_set_host(host: *const hostmod.ReplayHost, user: ?*anyopaque) void;
 
@@ -340,6 +341,12 @@ pub fn runTests(gpa: std.mem.Allocator, dir: []const u8, opts: Options) !Report 
     // runtime mid-process would trip `JS_FreeRuntime`'s leak check. `rewind
     // test` is one-shot, so they are reclaimed at exit.
     const H = arena_reactor_new(8192, 8192) orelse return error.ArenaInit;
+    // The harness reactor runs the `_tests/*.mjs` driver code (assertions,
+    // world construction) in GC mode too, matching the sim reactor (issue #70)
+    // — a driver that builds a large fixture world reclaims to peak-live-set
+    // instead of OOMing the bump arena. `eng`'s sim reactor is GC via
+    // `Engine.init`.
+    arena_set_request_mode_r(H, 0);
     var eng = try root.Engine.init();
 
     const tests_dir = try std.fs.path.join(gpa, &.{ dir, "_tests" });

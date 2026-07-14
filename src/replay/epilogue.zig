@@ -257,8 +257,14 @@ const EPILOGUE_BODY =
     \\  // `ftch_<seq>`/`sub_<seq>` from it) — reset here so ids are deterministic
     \\  // per activation, like prod's per-request derived ids.
     \\  globalThis.__rove_fetch_seq = 0;
-    \\  const __mklog = (level) => (...a) => { __effects.push({ kind: "log", level, message: a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ") }); };
-    \\  globalThis.console = { log: __mklog("info"), warn: __mklog("warn"), error: __mklog("error"), info: __mklog("info"), debug: __mklog("debug") };
+    \\  // Prod's console formatter (globals/console.js `fmt`) — byte-identical
+    \\  // here so a log assertion transfers between a bundle and a live request
+    \\  // log: the message text INCLUDES the level prefix exactly as the worker
+    \\  // writes the line ("[warn] retrying 2"); the `level` field is
+    \\  // bundle-internal filtering sugar. Change one formatter, change both.
+    \\  const __fmtLog = (x) => { if (typeof x === "string") return x; try { const s = JSON.stringify(x); return s === undefined ? String(x) : s; } catch (_) { return String(x); } };
+    \\  const __mklog = (level, prefix) => (...a) => { const parts = a.map(__fmtLog); if (prefix) parts.unshift(prefix); __effects.push({ kind: "log", level, message: parts.join(" ") }); };
+    \\  globalThis.console = { log: __mklog("info", ""), warn: __mklog("warn", "[warn]"), error: __mklog("error", "[error]"), info: __mklog("info", "[info]"), debug: __mklog("debug", "[debug]") };
     \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
     \\  // Real UTF-8 codec (issue #11). The sim base ships no native
     \\  // TextEncoder/Decoder; the old latin1 (`charCodeAt & 0xff` / escape) hack
