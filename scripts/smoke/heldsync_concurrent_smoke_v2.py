@@ -41,8 +41,10 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 N_CONCURRENT = 20
 
-# Handlers verbatim from the V1 demo tenant (heldsync open + onResult resume,
-# wb echo) — same JS the heldsync_smoke_v2 template provisions.
+# Handlers in today's public spelling (heldsync open + onresult resume, wb
+# echo) — same JS the heldsync_smoke_v2 template provisions: the
+# cross-module continuation is `next(targetModule, ctx)`, resuming the
+# target's default export.
 HELDSYNC_SRC = r"""export default function () {
     const req = request.json;
     const opts = {
@@ -52,14 +54,11 @@ HELDSYNC_SRC = r"""export default function () {
         maxAttempts: 1,
     };
     webhook.send(req.target, opts);
-    return __rove_next("heldsync/onresult", {
-        fn: "onResult",
-        ctx: { tag: req.tag, tries: 0, retry_to: req.retry_to || null },
-    });
+    return next("heldsync/onresult", { tag: req.tag, tries: 0, retry_to: req.retry_to || null });
 }
 """
 
-ONRESULT_SRC = r"""export function onResult() {
+ONRESULT_SRC = r"""export default function () {
     // Endpoint A: ctx IS request.ctx; result flattened on request.*.
     const ctx = request.ctx || {};
     if (request.status < 200 || request.status >= 300) {
