@@ -417,7 +417,10 @@ class ActivityPubActor {
     }
     const snapshot = {
       method: request.method,
-      path: request.path,
+      // `(request-target)` covers the full origin-form target — path AND
+      // query — while `request.path` excludes the query (handler-shape.md),
+      // so recompose it here or signatures over query-carrying URLs fail.
+      path: request.path + (request.query ? "?" + request.query : ""),
       headers: snapHeaders,
       body: request.text || "",
     };

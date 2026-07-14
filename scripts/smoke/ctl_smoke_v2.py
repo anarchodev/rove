@@ -26,7 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 ROOT_SRC = 'export function handler() { return "ctl-root\\n"; }\n'
-API_SRC = 'export function handler() { return "ctl-api\\n"; }\n'
+API_SRC = (
+    'export function handler() { return "ctl-api\\n"; }\n'
+    # request.path excludes the query string; request.query carries it
+    # (handler-shape.md) — pathq echoes both for the step-3 assertion.
+    'export function pathq() { return request.path + "|" + (request.query || ""); }\n'
+)
 
 
 def main() -> int:
@@ -63,6 +68,10 @@ def main() -> int:
                                       "404", "error", "warn"])
             r = c.get("acme", "/api?fn=handler")
             check("GET /api?fn=handler → ctl-api", r.status == 200 and "ctl-api" in r.body,
+                  f"got {r.status} {r.body!r}")
+            r = c.get("acme", "/api?fn=pathq&x=1")
+            check("request.path excludes ?query (on request.query)",
+                  r.status == 200 and r.body == "/api|fn=pathq&x=1",
                   f"got {r.status} {r.body!r}")
 
         print("step 4: a wrong token is rejected by the deploy app (401)")

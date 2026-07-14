@@ -302,7 +302,7 @@ class OIDCProvider {
    * export default () => oidc.provider().handle();
    */
   handle() {
-    const path = (request.path || "").split("?")[0];
+    const path = request.path || "";
     const m = request.method;
     if (m === "GET" && path === "/.well-known/openid-configuration") {
       return this._discovery();

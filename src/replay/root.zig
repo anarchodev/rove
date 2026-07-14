@@ -62,6 +62,10 @@ extern fn arena_reactor_freeze(r: *ArenaReactor) void;
 extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
 
 const sim_globals = @import("sim_globals.zig");
+// The prod header-filter predicates (src/js/reserved_headers.zig, registered
+// as an anonymous import in build.zig) — the SAME lists the worker's inbound
+// header installer enforces, so the sim's authored-header hygiene can't drift.
+const reserved_headers = @import("reserved_headers");
 extern fn arena_set_trace_mode_r(r: *ArenaReactor, mode: c_int) void;
 extern fn arena_set_date_now_r(r: *ArenaReactor, ms: i64) void;
 extern fn arena_set_random_seed_r(r: *ArenaReactor, seed: u64) void;
@@ -156,6 +160,39 @@ pub const Engine = struct {
             return Error.BadFixture;
         const wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
 
+        // ── authored-header hygiene (prod parity) ──
+        // Prod's wire is lowercase (HTTP/2), and the worker's header installer
+        // (src/js/globals.zig installHeaders) strips pseudo-headers, the
+        // IP-transport set, and platform-reserved names before a handler can
+        // observe them. Mirror that here so an authored "Content-Type" reads
+        // back as request.headers["content-type"] (and an authored "Cookie"
+        // parses into request.cookies), while a header that can never reach a
+        // prod handler can't exist offline either — each drop leaves a warn
+        // entry in the bundle's effect log so the author learns why. Captured
+        // worlds don't pass through here (capture is already post-filter).
+        var headers = std.ArrayList(world.Header){};
+        var header_warnings = std.ArrayList([]const u8){};
+        for (wv.headers) |hh| {
+            const lower = try std.ascii.allocLowerString(a, hh.name);
+            const why: ?[]const u8 = if (lower.len > 0 and lower[0] == ':')
+                "an HTTP/2 pseudo-header (request.method/path/host carry these)"
+            else if (reserved_headers.isStrippedIpHeader(lower))
+                "the client IP is reachable only via request.ip / request.unmaskedIp()"
+            else if (reserved_headers.isReservedInternalHeader(lower))
+                "platform-reserved (x-rewind-* / x-rove-internal-*)"
+            else
+                null;
+            if (why) |reason| {
+                try header_warnings.append(a, try std.fmt.allocPrint(
+                    a,
+                    "authored request header \"{s}\" dropped: {s} — prod strips it before the handler runs",
+                    .{ hh.name, reason },
+                ));
+                continue;
+            }
+            try headers.append(a, .{ .name = lower, .value = hh.value });
+        }
+
         // ── synthesize request_reads from the declared request ──
         var reads = std.ArrayList(decode.RequestReadEntry){};
         // header_names: a JSON array of the declared header names.
@@ -164,7 +201,7 @@ pub const Engine = struct {
             var aw = std.Io.Writer.Allocating.fromArrayList(a, &names_buf);
             const w = &aw.writer;
             try w.writeByte('[');
-            for (wv.headers, 0..) |hh, i| {
+            for (headers.items, 0..) |hh, i| {
                 if (i != 0) try w.writeByte(',');
                 try jsonStr(w, hh.name);
             }
@@ -172,7 +209,7 @@ pub const Engine = struct {
             names_buf = aw.toArrayList();
         }
         try reads.append(a, .{ .kind = .header_names, .name = "", .value = names_buf.items });
-        for (wv.headers) |hh|
+        for (headers.items) |hh|
             try reads.append(a, .{ .kind = .header_value, .name = hh.name, .value = hh.value });
         if (wv.body != null)
             try reads.append(a, .{ .kind = .body_read, .name = "", .value = "" });
@@ -265,6 +302,7 @@ pub const Engine = struct {
             .correlation_id = wv.correlation_id,
             .middleware_path = if (is_trust_boundary) mw_path else null,
             .result = result,
+            .warnings = header_warnings.items,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
         const entry_z = try a.dupeZ(u8, wv.entry);
