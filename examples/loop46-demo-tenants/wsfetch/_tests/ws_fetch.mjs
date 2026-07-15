@@ -11,7 +11,7 @@ const m1 = ws.receive("hello");
 expect(m1).toHaveSentFrame("echo:hello");
 
 // A "fetch:<url>" frame: onMessage binds after.fetch to the held chain and parks.
-const fm = ws.receive("fetch:http://stub/data");
+const fm = ws.receive("fetch:https://stub/data");
 expect(fm.disposition).toBe("held");
 expect(fm).toHaveFetched(/stub/);
 

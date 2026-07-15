@@ -2,7 +2,7 @@
 // activation-bag fields (seq/byteOffset/final + seq-0 headers) so the test
 // can assert the per-event bag matches prod's fetch_chunk arm.
 export default function () {
-  after.fetch("http://upstream.example/s", { stream: true, maxChunkBytes: 4, on: "onChunk" });
+  after.fetch("https://upstream.example/s", { stream: true, maxChunkBytes: 4, on: "onChunk" });
   return next();
 }
 

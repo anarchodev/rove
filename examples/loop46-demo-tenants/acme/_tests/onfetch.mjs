@@ -14,7 +14,7 @@ const EXPECTED = Array.from({ length: 10 }, (_, i) => `bulk-line-${String(i).pad
 // returns the reconstructed body on the terminal chunk.
 {
   const s = scenario({ entry: "onfetch/index.mjs" });
-  const req = s.inbound({ method: "GET", path: "/onfetch?url=http://wb/bulk" });
+  const req = s.inbound({ method: "GET", path: "/onfetch?url=https://wb/bulk" });
   expect(req.disposition).toBe("held");
   expect(req).toHaveFetched(/bulk/);
   // Deliver the body in ≤64B chunks, as the engine would under maxChunkBytes:64.
@@ -28,7 +28,7 @@ const EXPECTED = Array.from({ length: 10 }, (_, i) => `bulk-line-${String(i).pad
 // Mirrors the smoke's "/onfetchbuf" — whole body in one result activation.
 {
   const s = scenario({ entry: "onfetchbuf/index.mjs" });
-  const req = s.inbound({ method: "GET", path: "/onfetchbuf?url=http://wb/bulk" });
+  const req = s.inbound({ method: "GET", path: "/onfetchbuf?url=https://wb/bulk" });
   expect(req.disposition).toBe("held");
   const res = req.fetch(/bulk/).resolve({ status: 200, body: EXPECTED });
   expect(res.status).toBe(200);

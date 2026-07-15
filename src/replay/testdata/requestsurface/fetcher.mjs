@@ -2,7 +2,7 @@
 // (globals.zig fetch_chunk arm): fetchId/seq/byteOffset/bytes/final +
 // terminal status, with the upstream's headers on the seq-0 event.
 export default function () {
-  after.fetch("http://upstream.example/data", { on: "onDone" });
+  after.fetch("https://upstream.example/data", { on: "onDone" });
   return next();
 }
 

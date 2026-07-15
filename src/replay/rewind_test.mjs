@@ -111,6 +111,131 @@ function live(effects) {
   return (effects || []).filter((e) => !e.rolledBack && !e.dropped);
 }
 
+// ── prod's outbound-policy classifier (offline mirror) ─────────────────────
+// A pure, DNS-free mirror of the classes prod's outbound gate ALWAYS blocks
+// (`src/ssrf/root.zig` parseUrl scheme policy + isBlockedV4/isBlockedV6 with
+// the customer posture — no test hatches; change one side, change both).
+// Only LITERAL addresses classify: a hostname the sim can't resolve returns
+// null (reachable as far as offline knowledge goes). Hosts under the reserved
+// `.internal` TLD are platform doors the fetch engine rewrites BEFORE the
+// gate (fetch_engine.zig), so they're exempt. Used to fail a test loud when
+// it scripts a SUCCESS outcome for a fetch prod would never let leave the
+// node — the only outcome prod delivers for these is the terminal transport
+// failure (status 0).
+
+/** Blocked-IPv4 ranges, prod's exact octet tests (isBlockedV4). */
+function v4Blocked(o) {
+  const a = o[0], b = o[1];
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && (b === 0 || b === 168)) return true;
+  if (a === 198 && (b === 18 || b === 19 || b === 51)) return true;
+  if (a === 203 && b === 0) return true;
+  if (a >= 224) return true;
+  return false;
+}
+
+/** Parse an IPv6 literal → 16 bytes, or null when it isn't one. */
+function parseV6(s) {
+  const zone = s.indexOf("%");
+  if (zone >= 0) s = s.slice(0, zone);
+  const parts = s.split("::");
+  if (parts.length > 2) return null;
+  const expand = (str) => {
+    if (!str.length) return [];
+    const out = [];
+    for (const g of str.split(":")) {
+      if (g.includes(".")) { // trailing embedded IPv4 → two groups
+        const o = g.split(".").map(Number);
+        if (o.length !== 4 || o.some((x) => !(x >= 0 && x <= 255))) return null;
+        out.push((o[0] << 8) | o[1], (o[2] << 8) | o[3]);
+      } else {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+        out.push(parseInt(g, 16));
+      }
+    }
+    return out;
+  };
+  const head = expand(parts[0]);
+  const tail = parts.length === 2 ? expand(parts[1]) : [];
+  if (head === null || tail === null) return null;
+  const fill = 8 - head.length - tail.length;
+  if (parts.length === 2 ? fill < 0 : fill !== 0) return null;
+  const groups = head.concat(new Array(Math.max(fill, 0)).fill(0), tail);
+  if (groups.length !== 8) return null;
+  const bytes = [];
+  for (const g of groups) bytes.push((g >> 8) & 0xff, g & 0xff);
+  return bytes;
+}
+
+/** Blocked-IPv6 classes, prod's exact byte tests (isBlockedV6). */
+function v6Blocked(b) {
+  let zero15 = true;
+  for (let i = 0; i < 15; i++) if (b[i] !== 0) { zero15 = false; break; }
+  if (zero15) return true; // :: (unspecified) and ::1 (loopback) both blocked
+  const mapped = b.slice(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff;
+  if (mapped) return v4Blocked([b[12], b[13], b[14], b[15]]);
+  if ((b[0] & 0xfe) === 0xfc) return true; // fc00::/7 unique local
+  if (b[0] === 0xfe && (b[1] & 0xc0) === 0x80) return true; // fe80::/10 link-local
+  if (b[0] === 0xff) return true; // ff00::/8 multicast
+  return false;
+}
+
+/** The reason prod categorically blocks `url`, or null when it could reach
+ *  prod's engine (including any hostname — offline never resolves DNS). */
+function prodBlockedUrl(url) {
+  const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)/.exec(String(url == null ? "" : url));
+  if (!m) return null; // relative/unparseable — prod fails these differently, not the gate
+  const scheme = m[1].toLowerCase();
+  let hostport = m[2];
+  const at = hostport.lastIndexOf("@");
+  if (at >= 0) hostport = hostport.slice(at + 1); // userinfo never fools host extraction
+  let host = hostport;
+  if (host.startsWith("[")) {
+    const close = host.indexOf("]");
+    host = host.slice(1, close < 0 ? host.length : close);
+  } else {
+    const colon = host.indexOf(":");
+    if (colon >= 0) host = host.slice(0, colon);
+  }
+  host = host.toLowerCase();
+  if (host.endsWith(".internal")) return null; // reserved platform-door TLD, engine-rewritten pre-gate
+  if (scheme !== "http" && scheme !== "https")
+    return "the `" + scheme + ":` scheme is not http(s) (prod: UnsupportedScheme)";
+  if (scheme === "http")
+    return "plaintext http:// outbound is blocked (prod: PlaintextBlocked — https only)";
+  if (!host.length) return null;
+  if (host === "localhost" || host.endsWith(".localhost"))
+    return "localhost resolves to loopback (prod: BlockedAddress)";
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const o = v4.slice(1).map(Number);
+    if (o.some((x) => x > 255)) return null; // not an IP literal — a resolvable name
+    if (v4Blocked(o)) return "the address " + host + " is in a blocked range (prod: BlockedAddress — SSRF blocklist)";
+    return null;
+  }
+  if (host.includes(":")) {
+    const b = parseV6(host);
+    if (b && v6Blocked(b)) return "the address " + host + " is in a blocked range (prod: BlockedAddress — SSRF blocklist)";
+  }
+  return null;
+}
+
+/** Throw when a test scripts a SUCCESS outcome for a fetch prod always
+ *  blocks — such a fetch never leaves the node, so the success path being
+ *  tested is categorically unreachable live. The transport failure prod
+ *  actually delivers (`status: 0`) stays authorable. */
+function requireProdReachable(verb, fx, response) {
+  const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
+  if (status === 0) return;
+  const why = prodBlockedUrl(fx.url);
+  if (why) throw new Error(verb + ": prod categorically blocks this fetch — " + why + ". " +
+    JSON.stringify(String(fx.url)) + " never leaves the engine, so a " + status +
+    " response is unreachable in prod; the handler only ever observes the terminal transport failure (resolve with { status: 0 })");
+}
+
 /** UTF-8 byte length of a chunk (string) or byte array — prod's fetch-chunk
  *  `byteOffset` counts wire bytes, not JS chars. */
 function byteLen(x) {
@@ -807,6 +932,7 @@ class FetchHandle {
   resolve(response = {}) {
     const parent = this.node;
     const pb = parent.force();
+    requireProdReachable("resolve()", this.fx, response);
     // A stream:true fetch never delivers one whole-body event in prod — it
     // arrives as per-chunk onFetchChunk events + a terminal done. Warn (a
     // passing record, visible in the run output) rather than fail: the fold
@@ -839,6 +965,9 @@ class FetchHandle {
     // offline would pass a shape prod never sends. Fail loud (issue #24).
     if (!this.fx.stream)
       throw new Error(`stream(): this fetch was issued WITHOUT stream:true (${this.fx.url}) — prod delivers one whole-body result; use .resolve({...}) or issue the fetch with { stream: true }`);
+    // Delivering chunks IS a success outcome — a blocked fetch only ever
+    // produces its terminal transport failure.
+    requireProdReachable("stream()", this.fx, { status: opts.status != null ? opts.status : 200 });
     const parentNode = this.node;
     const pw = this.node.world;
     const fx = this.fx;
@@ -1048,6 +1177,7 @@ class Interleaving {
     for (const i of order) {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
+      requireProdReachable("whenConcurrent", fx, spec.resolve || {});
       node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
       pending--;
       kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
