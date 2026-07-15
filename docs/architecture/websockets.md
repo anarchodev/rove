@@ -9,7 +9,7 @@
 > [`handler-shape.md`](../handler-shape.md) and
 > [`effects-and-handlers.md`](effects-and-handlers.md). **Outbound** WS
 > (a handler as a *client* of an upstream WS server — atproto firehose,
-> Pub/Sub) is a separate, unbuilt plan: [`../websocket-plan.md`](../plans/websocket-plan.md).
+> Pub/Sub) is separate and unbuilt — tracked in issue #94.
 
 ## The shape in one paragraph
 
@@ -233,4 +233,4 @@ mapping in both directions.
 Real-time chat / presence, collaborative editing (CRDT sync), ActivityPub
 C2S streams, an atproto PDS server — all the **inbound** rows of the
 use-case table. The **outbound** consumer cases (atproto firehose, Pub/Sub)
-need the separate outbound transport — `../websocket-plan.md`.
+need the separate outbound transport — unbuilt, issue #94.

@@ -1,8 +1,12 @@
-# PM — compile caching vs module resolution (decision, verified)
+# Packages — compile caching vs module resolution (decision, verified)
 
-Status: **decided + shipped with P1-deploy, 2026-07-09.** This file went
-through three states as the model got re-grounded; only this version is
-current. Superseded along the way:
+> **Shipped** (graduated from `plans/`; decided + built with P1-deploy).
+> Design-of-record for why the deploy path keeps NO source-keyed compile
+> cache and how quickjs resolution interacts with bytecode. Sibling:
+> [`package-resolution.md`](package-resolution.md); arc tracker issue #130.
+
+The model went through three states as it got re-grounded; only this
+version is current. Superseded along the way:
 
 1. The original proposal assumed the deploy path had a source-keyed
    compile cache that would serve stale package resolutions → "key it by

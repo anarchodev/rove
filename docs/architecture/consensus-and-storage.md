@@ -219,7 +219,7 @@ promote, driven by the RC-6 CP membership reconciler (`cp/directory.zig`
 desired-state iteration, `cp/main.zig` `reconcileMembership`) when
 `REWIND_CP_RECONCILE_MEMBERSHIP=1`; additive-only, learner-first. With the
 reconciler off, clusters are born full (cold-multi) and never grow. See
-`cp-membership-reconciler-plan.md` for the reconciler design.
+`cp-membership-reconciler.md` for the reconciler design.
 
 ## Hibernation (active-set)
 

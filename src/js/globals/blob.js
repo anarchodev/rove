@@ -43,7 +43,7 @@ function assertHash(hash, verb) {
     throw new TypeError(verb + ": hash must be 64 lowercase hex chars (a sha256 digest)");
 }
 
-// ── The recipe substrate (blob-write-over-segments.md) ─────────────
+// ── The recipe substrate (blob-write-recipes.md) ─────────────
 //
 // An open accumulation is kv rows, not worker RAM: `write` appends a
 // row + advances a sha256 midstate, `seal` freezes the recipe (the
@@ -250,7 +250,7 @@ globalThis.blob = {
    * {@link blob.seal} freezes the recipe into one content-addressed
    * object.
    *
-   * Caps (policy, blob-write-over-segments.md §12): 4096 rows and
+   * Caps (policy, blob-write-recipes.md §12): 4096 rows and
    * 1 GiB per recipe, 256 KiB per inline append, 16 MiB inline total
    * — exceeding any throws. A recipe whose chain dies without
    * sealing is swept after ~15 min idle; nothing reaches storage

@@ -1369,8 +1369,10 @@ fn resumeErrStatus(worker: anytype) u16 {
 const ContTape = enum { wake, chunk, fetch };
 
 /// Comptime per-site axes of `finishContResume` — everything else the
-/// three cont-family sites do is identical (that identity is the point —
-/// see docs/plans/refactor-audit-2026-07.md §2.3).
+/// three cont-family sites do is identical. That identity is the point:
+/// each family's outcome switch exists exactly once, so a fix to one arm
+/// cannot drift out of a sibling copy. Keep any new per-site behavior in
+/// this spec, never open-coded at a call site.
 const ContFinishSpec = struct {
     /// Operator warn-log tag ("cont-resume" / "bound-fetch" / "inbound-chunk").
     site: []const u8,

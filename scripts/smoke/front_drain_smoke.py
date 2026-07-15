@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Front-door graceful-drain smoke (plan C10,
-docs/plans/front-door-hardening.md).
+docs/architecture/front-door-hardening.md).
 
 SIGTERM used to exit the poll loop immediately, cutting every in-flight
 request mid-response — every rolling deploy of the front was

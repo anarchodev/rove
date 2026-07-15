@@ -168,7 +168,7 @@ customer's kv *is* the event log they choose to keep; cross-node correctness
 rides raft. SSE is the default push channel (HTTP/2-native, browser
 auto-reconnect with `Last-Event-ID`); inbound WebSocket is shipped
 ([architecture/websockets.md](architecture/websockets.md); outbound WS remains
-[websocket-plan.md](plans/websocket-plan.md)). Surviving locked decision: notification
+unbuilt — issue #94). Surviving locked decision: notification
 ≠ state store, reconnect → state-refetch from kv. Mechanics:
 `architecture/effects-and-handlers.md` + `architecture/routing-and-ingress.md`.
 
@@ -351,15 +351,14 @@ The sim-test framework **SHIPPED**; the as-built reference is
 Fixture authoring/editing tooling (`rewind kv` / `rewind fixture` families,
 the `--auto-fix-from` recovery flow) plus the worker-side
 `POST /_system/dry-run/{id}` always-rollback dispatch mode (the one worker
-piece). **[fixture-lifecycle.md](plans/fixture-lifecycle.md) is the authoritative
-plan.**
+piece). **Tracker issue #127 (leaves #83–#86) is the authoritative plan.**
 
 ### Phase 14 — AI agent surface (§10.10) — UNBUILT (skill file pulled forward to beta)
 
 Skill file (`docs/skills/rewind.md` — a §10.16 beta item) + `--json` CLI
 audit + `rewind doctor` + scoped capability tokens. No MCP server in v1;
-hosted MCP deferred until remote-agent demand. **[agent-surface.md](plans/agent-surface.md)
-is the authoritative plan.**
+hosted MCP deferred until remote-agent demand. **Tracker issue #126 (leaves
+#79–#82) is the authoritative plan.**
 
 ## 4. Deferred to v2
 
@@ -536,9 +535,9 @@ labels** other docs cite and points to the current home. Launch sequencing
 | 10.6 | `dispatchOnce` refactored into phase-shaped helpers | V1 mechanics — superseded by the V2 single-re-entry `runOutcome` dispatcher in `architecture/effects-and-handlers.md` |
 | 10.7 | Simulator primitive (purely client-side, KV-less) | [architecture/replay-and-sim.md](architecture/replay-and-sim.md); decisions.md §8 |
 | 10.8 | Sim test framework (deterministic, local-only) | [architecture/replay-and-sim.md](architecture/replay-and-sim.md); decisions.md §8 |
-| 10.9 | Fixture lifecycle (curated observations) | [fixture-lifecycle.md](plans/fixture-lifecycle.md) |
-| 10.10 | AI agent surface — CLI + skill file in v1, hosted MCP deferred | [agent-surface.md](plans/agent-surface.md); decisions.md §8 |
-| 10.11 | Worker dry-run dispatch mode | [fixture-lifecycle.md](plans/fixture-lifecycle.md) |
+| 10.9 | Fixture lifecycle (curated observations) | tracker issue #127 |
+| 10.10 | AI agent surface — CLI + skill file in v1, hosted MCP deferred | tracker issue #126; decisions.md §8 |
+| 10.11 | Worker dry-run dispatch mode | issue #86 (tracker #127) |
 | 10.12 | Replay — two paths (browser page + DAP CLI), one per audience | replay-wasm-plan.md (moved to the private rewind-apps repo, `replay/replay-wasm-plan.md`); decisions.md §8 |
 | 10.13 | files-server + log-server detached to their own processes | `architecture/deployment-and-logs.md`; §13 here |
 | 10.14 | Distributed Elm ports (webhook + callback + streaming) | [effect-algebra.md](effect-algebra.md); `architecture/effects-and-handlers.md` |

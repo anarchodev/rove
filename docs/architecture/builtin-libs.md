@@ -1,9 +1,16 @@
-# Built-in JS libraries — reference docs plan
+# Built-in JS libraries — the `_system.*` / `globals/` model
+
+> **Phase A shipped** (graduated from `plans/`): the `_system.*` internal
+> ABI + `globals/*.js` public-shim model below is as-built, including the
+> CI lints (`scripts/ops/globals_lint.py`, the Phase-A lint tests in
+> `src/js/globals.zig`). Phases B–D (doctests, the docs worker app, replay
+> links + agent JSON) are tracked in issues #87 / #88 / #89. The privileged
+> half of the surface is [`privileged-surface.md`](privileged-surface.md).
 
 Elaborates PLAN §13 (surface map) and complements
-`architecture/auth-and-domains.md` (the customer-facing JS surface). Goal: reference
-documentation for every built-in JS library, generated from a single
-source of truth, hosted on rewindjs itself.
+[`auth-and-domains.md`](auth-and-domains.md) (the customer-facing JS
+surface). Goal: reference documentation for every built-in JS library,
+generated from a single source of truth, hosted on rewindjs itself.
 
 ## Problem
 
@@ -54,7 +61,7 @@ dual-expose hot primitives. Harness:
 
 ## Phases
 
-**A — `_system` + `globals/` refactor.** Move native registrations
+**A — `_system` + `globals/` refactor (SHIPPED).** Move native registrations
 under `_system.*`; create `globals/*.js` public shims with JSDoc +
 `@example`; move + repoint `src/js/bindings/*.js`. CI lint: customer
 code never references `_system`; every `globals/*.js` export has a
@@ -63,15 +70,15 @@ the `build.zig` embed list has a `globals/` entry (catches
 undocumented bindings — can't validate signatures, but catches
 *missing* ones). Reviewable without UI.
 
-**B — Doctests.** Each `@example` becomes a fixture in the
+**B — Doctests (issue #87).** Each `@example` becomes a fixture in the
 sim-test / fixture-lifecycle framework; CI fails if a documented
 example's behavior changes. Docs true-by-construction.
 
-**C — Docs worker app (the dogfood).** A rewindjs deployment: pure
-handler renders the extracted JSDoc → HTML; assets content-addressed;
+**C — Docs worker app (the dogfood; issue #88).** A rewindjs deployment:
+pure handler renders the extracted JSDoc → HTML; assets content-addressed;
 deployed through the same `_deploy/current` flow customers use.
 
-**D — Replay links + agent endpoint.** Each Phase-B fixture run
+**D — Replay links + agent endpoint (issue #89).** Each Phase-B fixture run
 produces a tape; the docs page links the example to the replay shell
 (`web/replay/_static/`) on that tape — read a doc, scrub its
 execution. Same JSDoc source served as JSON for CLI/MCP/agents

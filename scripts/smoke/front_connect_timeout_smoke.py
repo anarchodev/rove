@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Front-door upstream connect timeout smoke (plan A1,
-docs/plans/front-door-hardening.md).
+docs/architecture/front-door-hardening.md).
 
 A backend that blackholes SYNs (node down hard, partition, firewall
 drop) used to pin every flow aimed at it for the kernel SYN-retry

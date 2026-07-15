@@ -24,14 +24,18 @@ Three durable layers, plus working docs:
 | **What / roadmap** | `PLAN.md` | Product direction, phases. |
 | **How it works (as-built)** | `architecture/` | One doc per subsystem, kept current. |
 | Customer contracts | `effect-algebra.md`, `handler-shape.md` | The effect model + handler API surface. |
-| In-flight | `plans/` | Active work; folds into `architecture/` on ship, then deleted. |
+| In-flight | **GitHub issues** | Active work. `gh issue list` / the tracker issues below. |
 | Product / strategy | `strategy/` | Not engine mechanics. |
 | Guides | `guides/` | Tutorials. |
 
-**Lifecycle:** a plan, once shipped, has its *why* harvested into `decisions.md`
-and its *mechanics* folded into the owning `architecture/` doc — then the plan is
-deleted (it survives in git history). That is what keeps this folder from
-re-accumulating. ~20 finished plans were folded and removed in the first pass.
+**Lifecycle:** in-flight work lives in GitHub issues (a tracker issue per
+arc, leaf issues per discrete item — the pattern the sim-parity audit
+established). Before an issue closes, its durable residue graduates into
+the repo: the *why* into `decisions.md`, the *mechanics* into the owning
+`architecture/` doc. Long-form design content an issue was distilled from
+survives at a SHA-pinned permalink in the issue body. (The former
+`docs/plans/` folder was migrated to issues 2026-07-14; before that, ~20
+finished plans had already been folded into `architecture/` and deleted.)
 
 ## Architecture (as-built references)
 
@@ -53,34 +57,41 @@ The maintained set. Subsystem-owned, kept current with the code.
 >
 > Cross-cutting reference (cited by ~17 source files via its `§`-anchors): [format-versioning.md](architecture/format-versioning.md) — the as-built wire/on-disk/key-schema version scheme, the JS-engine-version tag, and the pre-launch freeze rules (shipped; the locked rules are also in `decisions.md` §14).
 >
-> Design-of-record references (graduated from `plans/`; cited by source + downstream plans via their `§`/label anchors):
+> Design-of-record references (graduated from `plans/`; cited by source + smoke scripts via their `§`/label anchors):
 > - [cli-and-deploy.md](architecture/cli-and-deploy.md) — the `rewind-ops`/`rewind` CLIs + the deploy/publish split + the in-tenant `/_system/deploy` seam (shipped).
 > - [auth-consolidation.md](architecture/auth-consolidation.md) — the two auth planes + the `rewind-logs.internal`/`rewind-cp.internal` trusted doors + tenant-scoped caps (shipped; cited by `A*`/`B*` labels). Subsystem doc is `auth-and-domains.md`.
 > - [raft-best-practices.md](architecture/raft-best-practices.md) — election/heartbeat sizing (the `configuration-and-network.md` sizing authority) + the RawNode-FFI hardening backlog.
+> - [consensus-robustness.md](architecture/consensus-robustness.md) — the error-classification + pin-coordination conventions, the fold-gate invariant, the shipped-proof record; open backlog = tracker #128.
+> - [front-door-hardening.md](architecture/front-door-hardening.md) — the reverse-proxy protection set (all shipped; cited by the `front_*` teeth smokes).
+> - [cp-membership-reconciler.md](architecture/cp-membership-reconciler.md) — the additive-only learner-first membership reconciler (shipped, live; follow-ons #125).
+> - [package-resolution.md](architecture/package-resolution.md) + [package-compile-caching.md](architecture/package-compile-caching.md) — the `@scope/pkg` seam, manifest v2, and the no-compile-cache decision (shipped; PM tracker #130).
+> - [builtin-libs.md](architecture/builtin-libs.md) + [privileged-surface.md](architecture/privileged-surface.md) — the `_system.*`/`globals/` shim model and the `__rove.*` privileged-ops surface (shipped; docs phases #87–#89, ratelimit #120).
+> - [blob-write-recipes.md](architecture/blob-write-recipes.md) — the blob recipe substrate + `blob.seal` completion contract (phases A–C shipped; D–F = #93/#96/#97).
 
 ### Customer-facing contracts (kept alongside)
 
 - **[effect-algebra.md](effect-algebra.md)** — the four-primitive effect model + the trigger-scope axes
 - **[handler-shape.md](handler-shape.md)** — the customer handler API surface
 
-## In-flight plans
+## In-flight work (GitHub issues)
 
-Active work on the current (V2) line. Each folds into `architecture/` on ship.
-(Folded + deleted 2026-06-10, all shipped: `v2-build-order`,
-`v2-cutover-checklist`, `durable-wake-plan`, `blob-storage-plan`,
-`plan-tiers` — they survive in git history. `inbound-chunk-plan` joined
-them 2026-06-29: its as-built mechanism folded into
-`architecture/effects-and-handlers.md`, "Streaming inbound body".)
+Active work on the current (V2) line lives in GitHub issues: a **tracker
+issue per arc** holding a checklist of **leaf issues per discrete item**
+(`gh issue list`; long-form design text survives at SHA-pinned permalinks
+in the issue bodies). Before an issue closes, durable residue graduates
+into `decisions.md` / `architecture/` (see Lifecycle above). The current
+tracker map:
 
-- _The operator deploy plan (this operator's topology, hardware spec, DNS/TLS distribution, rollout history) moved to the private `rewind-infra` repo. The operator-neutral binary/port/firewall/TLS reference is [architecture/configuration-and-network.md](architecture/configuration-and-network.md)._
-- [cp-desired-state-target.md](plans/cp-desired-state-target.md) — north-star (not yet built): CP owns all per-tenant desired-state incl. release; workers reconcile; one S2S key (move-secret); root token retires. The arc B3/B4 point at
-- [websocket-plan.md](plans/websocket-plan.md) — **outbound** WS only (a handler as client of an upstream WS server — atproto firehose / Pub/Sub; unbuilt, ~1–2 weeks). Inbound WS shipped → `architecture/websockets.md`
-- [retention-and-gc.md](plans/retention-and-gc.md) — the one compacting GC across log-blobs / kv pages / `_pool` bodies / tape blobs; capacity-based retention; the input-home pinning obligation (unbuilt). The minimal-tape four-record-kinds synthesis now lives in `decisions.md` §3.9
-- [builtin-libs-docs-plan.md](plans/builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
-- replay-wasm-plan.md — WASM replay UI (§8.6+ deferred); **moved 2026-07-01 to the private rewind-apps repo (`replay/replay-wasm-plan.md`), alongside the porcelain it describes**
-- [fixture-lifecycle.md](plans/fixture-lifecycle.md) · [agent-surface.md](plans/agent-surface.md) — fixture-lifecycle + agent surface (Phase 13–14). The sim/test framework (Phase 12) SHIPPED → as-built in [architecture/replay-and-sim.md](architecture/replay-and-sim.md) + [guides/testing.md](guides/testing.md)
-- [consensus-robustness-backlog.md](plans/consensus-robustness-backlog.md) — open consensus hardening residue (fail-loud fixes, a CP move/provision UAF, the power-loss/`dm-flakey` crash-consistency validation gap) + the governing error-classification + pin-coordination conventions. Consolidates the retired `raft-correctness-plan` + 2026-06-20 storage triage
-- [refactor-audit-2026-07.md](plans/refactor-audit-2026-07.md) — whole-codebase correctness/clarity audit: 4 latent drift bugs (§1), the finishOutcome unification (§2), god-struct/file splits + cross-binary dedup per subsystem, Zig→JS status ("no new lifts"), verified non-findings (§9), sequenced waves (§10)
+- **#126** — AI agent surface: `--json` audit, `rewind doctor`, scoped tokens, skill file (PLAN §10.10; leaves #79–#82)
+- **#127** — fixture lifecycle + worker dry-run (PLAN §10.9 + §10.11; leaves #83–#86)
+- **#128** — consensus robustness backlog (leaves #99–#108; conventions in [architecture/consensus-robustness.md](architecture/consensus-robustness.md))
+- **#129** — refactor audit 2026-07, wave 4 (leaves #109–#118; waves 1–3 landed)
+- **#130** — package manager: P-Wake/P-Rate/P-Reg/P-CLI/P-Lift/P-Nest (leaves #119–#124 + #4; engine shipped through P2)
+- **#13–#19** — sim↔prod parity audit trackers (`sim-parity` label)
+- `design`-labeled issues — north-stars / unscheduled designs: CP desired-state #90, retention & GC #91, staging/preview releases #92, blob phase-D redesign #93, the consensus scrutiny pair #107/#108
+- singles: outbound WebSocket #94, users-lib #95, blob phases E/F #96/#97, reconciler follow-ons #125
+
+- _The operator deploy plan (this operator's topology, hardware spec, DNS/TLS distribution, rollout history) lives in the private `rewind-infra` repo. The operator-neutral binary/port/firewall/TLS reference is [architecture/configuration-and-network.md](architecture/configuration-and-network.md). The WASM replay UI plan lives in the private rewind-apps repo (`replay/replay-wasm-plan.md`), alongside the porcelain it describes._
 
 ## Product & strategy
 
@@ -88,7 +99,7 @@ them 2026-06-29: its as-built mechanism folded into
 - [platform-accounts-model.md](strategy/platform-accounts-model.md) — accounts/orgs/users (product layer, not the engine)
 - [saas-in-a-box.md](strategy/saas-in-a-box.md) — the author-platform shape: per-end-customer tenants + the first-party library suite (users/billing/jobs/webhooks/flags/…)
 - [dashboard-design-brief.md](strategy/dashboard-design-brief.md) — dashboard/replay UI brief
-- [users-lib-plan.md](plans/users-lib-plan.md) — B2C passwordless auth library
+- users-lib — B2C passwordless auth library (issue #95)
 
 ## Guides
 

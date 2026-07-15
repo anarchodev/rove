@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Front-door upstream connection pool smoke (plan A3,
-docs/plans/front-door-hardening.md).
+docs/architecture/front-door-hardening.md).
 
 One pooled h2c conn per backend node meant one congestion window for
 every tenant, one conn death failing everything in flight, and

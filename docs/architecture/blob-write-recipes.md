@@ -1,18 +1,20 @@
 # Blob write over segments — the recipe substrate
 
-Status: **design note, not scheduled.** Drafted 2026-07-07 out of the
-surface-test arc. Nothing here is built; the point of writing it down
-now is that `blob_sessions` (the worker-RAM upload session) is a shape
-we should stop building on, and the replacement touches the customer
-contract (`blob.seal`'s completion semantics), so it wants agreement
-before code.
+> **Phases A–C shipped** (graduated from `plans/`): streaming sha256, the
+> `blob.write`/`seal` shim cutover onto `_blob/recipe/*` rows, and the
+> compose door + durable completion are built — green in-process (surface
+> suite) and on a live cluster (blob smoke). Design-of-record for the
+> recipe substrate and `blob.seal`'s completion contract. Open work:
+> phase D (>16 MiB, needs the §14 redesign) → issue #93; phase E
+> (materializer + GC guard + deletions + resume-if-held) → #96; phase F
+> (segments re-base) → #97; the replay-shell blob-stub fixes (§10) → #98.
 
-Relates to: `docs/effect-algebra.md` §5 (the durability rule this
-reuses), `docs/decisions.md` §3.3 (durability composed as marker +
-sweep), `docs/architecture/replay-and-sim.md` (the purity contract this
-restores), `docs/architecture/routing-and-ingress.md` (the blob doors
-this extends), `docs/plans/retention-and-gc.md` (the pass this must
-coordinate with).
+Relates to: `../effect-algebra.md` §5 (the durability rule this
+reuses), `../decisions.md` §3.3 (durability composed as marker +
+sweep), [`replay-and-sim.md`](replay-and-sim.md) (the purity contract this
+restores), [`routing-and-ingress.md`](routing-and-ingress.md) (the blob
+doors this extends), and the retention/GC design (issue #91 — the pass
+the phase-E materializer guard must coordinate with).
 
 ## 1. What's wrong with the current shape
 
@@ -213,7 +215,7 @@ A **dedicated pass**, not part of GC. Actor and guard stay separate:
   longer than N minutes ago that the prompt path didn't finish. Same
   compose code, second trigger. Its progress defines a high-water
   mark: "all recipes sealed before T are materialized."
-- **GC** (retention-and-gc): stays pure deletion, with one added
+- **GC** (the retention/GC design, issue #91): stays pure deletion, with one added
   *check*: never delete a tape batch newer than the materializer's
   high-water mark. If the constraint would bind (materializer wedged,
   horizon catching up), **fail loud and stop deleting** — retention
@@ -336,12 +338,12 @@ log to the effect bundle or return values — contradicting the
 Each phase lands green on its own; no coexisting old/new customer
 semantics (the shim cutover in B is atomic).
 
-- **A — streaming sha256.** `crypto.sha256Init() → token`,
+- **A (shipped) — streaming sha256.** `crypto.sha256Init() → token`,
   `sha256Update(token, bytes) → token`, `sha256Final(token) → hex`:
   pure functions over an opaque serializable midstate token
   (base64url of Zig's Sha256 struct state). Surface tests + reflect
   entry in the same change.
-- **B — the shim cutover (inline recipes).** `blob.write`/`seal`
+- **B (shipped) — the shim cutover (inline recipes).** `blob.write`/`seal`
   rewritten as JS over `_blob/recipe/*` rows + midstate; seal writes
   the marker, emits the compose Cmd, returns the hash. The
   `blob_sessions` trampolines stop being called by the shim (deleted
@@ -349,13 +351,13 @@ semantics (the shim cutover in B is atomic).
   surface-testable in-process** — rows, midstate progression, marker
   contents, Cmd emission, synchronous hash, early-dereference
   fail-loud all pin under `zig build test`.
-- **C — the compose door + completion.** Worker-side: intercept the
+- **C (shipped) — the compose door + completion.** Worker-side: intercept the
   compose fetch (the `armBlobReceive` posture), read the recipe rows
   on-thread (bounded by the inline caps), run the PUT job off-thread,
   flip on success, deliver the completion through the existing
   `_blob/owed`-style callback machinery (`__system` builtin → customer
   `{on}` module). Smoke: upload → onStored → blob.url serves.
-- **D — >16 MiB via part-blobs — NEEDS REDESIGN (2026-07-07), see
+- **D — >16 MiB via part-blobs — NEEDS REDESIGN (issue #93), see
   §14.** The intended shape: `blob.write` flushes accumulated inline
   rows into content-addressed part-blobs at an 8 MiB threshold (bulk
   leaves raft), and a native S3 multipart-copy compose job assembles
@@ -364,14 +366,14 @@ semantics (the shim cutover in B is atomic).
   O(n²) arena bug (now fixed, `2b29873`) plus the deeper design smell
   that chunk bytes shouldn't be base64url-encoded into kv rows at all.
   §14 has the corrected root cause + the redesign direction.
-- **E — materializer + GC guard + deletions.** The dedicated pass,
+- **E — materializer + GC guard + deletions (issue #96).** The dedicated pass,
   the high-water-mark check in retention/GC, the backstop metric;
   delete `blob_sessions.zig` + trampolines + DispatchState fields.
   Plus **resume-if-held for the seal completion**: generalize the
   held-sync bind (today keyed on `_send/owed` markers) so a chain
   held after seal resumes from the completion instead of hanging to
   its deadline.
-- **F — segments re-base.** `segments.seal` onto the substrate
+- **F — segments re-base (issue #97).** `segments.seal` onto the substrate
   (record-index emission in the compose flip, hot-row deletes atomic
   with the sealed pointer); retire the in-arena assembly and the
   bookkeeping half of `__system/segments_onsealed`.

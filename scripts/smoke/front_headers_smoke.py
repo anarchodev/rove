@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Front-door forwarding-header hygiene smoke (plan B7+B8,
-docs/plans/front-door-hardening.md).
+docs/architecture/front-door-hardening.md).
 
 The front is the trust boundary: it must (a) stamp the true client
 identity upstream (`x-forwarded-for` from the peer address,

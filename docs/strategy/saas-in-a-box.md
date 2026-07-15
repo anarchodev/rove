@@ -7,7 +7,7 @@
 > the standard SaaS vendor stack. Companions:
 > [`platform-accounts-model.md`](platform-accounts-model.md) (accounts/orgs;
 > the dashboard-app pattern this productizes),
-> [`users-lib-plan.md`](../plans/users-lib-plan.md) (the auth library; already
+> the users-lib plan (issue #95; the auth library; already
 > planned, P1a–P5), [`pricing-model.md`](pricing-model.md) +
 > [`architecture/control-plane.md`](../architecture/control-plane.md) "Operational state" (per-tenant caps/enforcement),
 > `architecture/auth-and-domains.md` §4.2 (dogfooded customer libraries —
@@ -102,7 +102,7 @@ durability inherited from commit-gated effects), not merely cheaper.*
 
 | Lib | Replaces | Composition | Notes |
 |---|---|---|---|
-| `users` | Clerk (auth) | per `users-lib-plan.md` | Already planned (B2C, passwordless, TOTP MFA). **Orgs/teams/RBAC promoted from "deferred" to users-lib v2** — see below. |
+| `users` | Clerk (auth) | per issue #95 | Already planned (B2C, passwordless, TOTP MFA). **Orgs/teams/RBAC promoted from "deferred" to users-lib v2** — see below. |
 | `billing` | Clerk Billing / Stripe glue | checkout sessions over `http.fetch`; inbound webhook signature verify via `crypto.hmacSha256` (shipped, `src/js/bindings/crypto.zig`); entitlements = kv keys; Stripe specifics stay in the shim | **Unblocked today** — no missing primitive. |
 
 Orgs/teams/RBAC: the users-lib deferral was B2C scoping, which is the
@@ -219,7 +219,7 @@ three rungs** — never fork an app's shape per rung.
 
 ## §7 — Scope guards (rejected up front)
 
-- **No Clerk parity.** v1 auth scope stays `users-lib-plan.md`'s locked
+- **No Clerk parity.** v1 auth scope stays issue #95's locked
   scope. The pitch is "users and billing without a vendor and without a
   sync layer," not feature-matrix parity.
 - **No policy-language RBAC engine.** Roles-as-data only, until a

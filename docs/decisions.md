@@ -213,7 +213,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   while aggregate traffic outpaces any single chain by 2–3 orders of magnitude.
   The cap traded a small bound for node-wide mutex traffic on the dispatch hot
   path. Per-tenant retention/sampling (a deferred `tape_mode` knob) is the
-  correct lever — see `retention-and-gc.md` §4.
+  correct lever — see the retention/GC design, issue #91 (the `tape_mode` lever).
 
 ### 3.7 Durable scheduled wake: one-shot, absolute-time, at-least-once *firing*
 - **Decision** (gap 2.6, P0–P7 shipped in full 2026-06-10): the platform's only
@@ -364,7 +364,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   `pipe_to` was retired (Phase 5 PR-1, see §3.5 note), there is no longer any
   structurally-untaped streaming path. The one remaining piece is **pinning
   the referenced `_pool/` bytes against GC** for the tape's lifetime —
-  tracked in `retention-and-gc.md` §3, not here.
+  tracked in issue #91 (input-home pinning), not here.
 - **LLM-stream replay** (the worst CAS-extent case: non-reproducible by
   re-execution, re-calling the API costs money and returns different tokens)
   is captured by this same `on_chunk` + `BodyRef` path; making it an explicit
@@ -1510,7 +1510,7 @@ memory.
     {no-silent-loss · no resolve-once complexity · N-way (no funnel)}. The
     shipped choice keeps no-silent-loss and N-way, and pays resolve-once.
 
-**Still open (tracked in `websocket-plan.md`, not decisions):** push
+**Still open (tracked in issues, not decisions — outbound WS is issue #94):** push
 projections (the centralized fan-out side-process) are unbuilt; outbound
 WebSocket is unstarted; the fairness policy for the callback execution phase
 (a held-sync continuation is a user waiting synchronously — plain FIFO against

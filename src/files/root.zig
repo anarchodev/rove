@@ -35,7 +35,7 @@
 //! package vs an app copy). Every deploy recompiles; blob PUTs dedup
 //! content-addressed (`putBlobIfMissingTo`) and the runtime
 //! `BytecodeCache` dedups in memory by bytecode hash. See
-//! docs/plans/pm-compile-cache-fix.md before adding any compile
+//! docs/architecture/package-compile-caching.md before adding any compile
 //! memoization here.
 //!
 //! ## Compile hook

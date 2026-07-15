@@ -5,10 +5,14 @@ DP raft-group membership to the directory's desired state (`cluster.nodes`), via
 **learner-first** joins — so growing a cluster + backfilling a new node becomes a
 non-event, and the `REWIND_VOTERS` / `REWIND_CLUSTERS` drift class disappears.
 
-Status: design locked (this doc), not yet built. Substrate it builds on
-(conf_change, snapshot/baseline bootstrap, `voter_progress`) is **already
-shipped** — see `../architecture/raft-best-practices.md` and the promote-back work
-(`27beb49`, `b1367ee`).
+> **Shipped** (graduated from `plans/`): phases 1–5 are built and the
+> reconciler runs live in production behind
+> `REWIND_CP_RECONCILE_MEMBERSHIP=1`. Kept as the design-of-record for the
+> reconciler's model and invariants — the phase gates below are cited by
+> `membership_reconciler_smoke_v2.py` / `fresh_voter_join_smoke_v2.py`.
+> Subsystem doc: [`control-plane.md`](control-plane.md); substrate:
+> [`raft-best-practices.md`](raft-best-practices.md). Phase-6 follow-ons
+> are tracked in issue #125.
 
 ## Why
 
@@ -179,7 +183,7 @@ replicates to all 3; then kill a node, confirm 2-of-3 holds. Inject: node down
 during backfill (retries, no corruption), CP-leader flip mid-`ensureMember`
 (idempotent resume), `cluster.set` racing a `move` (skipped via `moving`).
 
-### Phase 6 — follow-on (not blocking)
+### Phase 6 — follow-on (not blocking; tracked in issue #125)
 Single-source-of-truth completion: derive raft membership from `cluster.nodes`,
 retire `REWIND_VOTERS`; runtime transport peer add/remove for a *truly new* host
 not in the static peer set (the bigger "Path A" — CP voter add/retire + runtime

@@ -68,7 +68,7 @@ pub const ImportEntry = struct {
 /// A resolved package version. `pkg_hash_hex` is its content identity +
 /// the `/pkg/<pkg_hash>/` virtual dir its files live under. `imports`
 /// values point at *dep* pkg_hashes (encapsulated, frozen-at-publish);
-/// see `docs/plans/pm-p0-resolution-spec.md`.
+/// see `docs/architecture/package-resolution.md`.
 pub const Package = struct {
     spec: []const u8,
     version: []const u8,

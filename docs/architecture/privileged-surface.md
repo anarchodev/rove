@@ -1,14 +1,13 @@
-# Principled privileged surface + generic rate limiting — spec
+# The privileged surface — the `_system.*` / `__rove.*` model
 
-Status: **proposal, 2026-07-09.** No code yet. Two coupled cleanups that
-support the package manager (`docs/plans/package-manager-plan.md`):
-(A) collapse the `_system.*` / `__rove_*` duality into ONE principled
-privileged surface with a clear assignment rule (no gated getter — see
-§0), and (B) remove the email-specific `__rove_check_email_rate`,
-replacing it with generic rate limiting + platform-quota enforcement that
-survives email becoming a pinnable package.
-
-Supersedes package-manager-plan §1.C.10 (chore 2) with a sharper design.
+> **Shipped** (graduated from `plans/`): the two-surface model, the
+> assignment rule, and the `__rove_*` → `__rove.*` holder collapse
+> (§0–§2, §4 steps 1/4/5) are as-built in `src/js/globals.zig`, which
+> cites this doc. The rate-limiting half (§3 — remove
+> `__rove_check_email_rate`, plan-quota at the frozen outbound boundary,
+> `@rewind/ratelimit`) is open work, tracked in issue #120 (P-Rate;
+> package-manager tracker #130). The public-shim half of the surface is
+> [`builtin-libs.md`](builtin-libs.md).
 
 ---
 
@@ -85,7 +84,7 @@ the public shim, and the bare native disappears. `resumeIfBound`,
 `wake.set`, `wake.fire`, `fetch` are genuinely baked-only → the gated
 `__rove.*` holder. `check_email_rate` → §3.
 
-## 3. `check_email_rate` → generic rate limiting + platform quota
+## 3. `check_email_rate` → generic rate limiting + platform quota (open — issue #120)
 
 `__rove_check_email_rate` tangles two different things into one
 email-specific native (`email_rate.zig`): it's a **per-worker in-memory
@@ -153,32 +152,29 @@ ratelimit` (3b); per-worker primitive deferred (3c).
 
 1. **Collapse `__rove_*` → `__rove.*`** (globals.zig `GLOBAL_BUILTINS` →
    one holder object, like `installNamespace`); rewrite baked-module +
-   shim call sites (`__rove_next` → `__rove.next`, etc.).
+   shim call sites (`__rove_next` → `__rove.next`, etc.). **Done.**
 2. **Delete `__rove_check_email_rate`** + `email_rate.zig`'s shim entry;
-   move the plan-rate check to the outbound boundary (3a).
+   move the plan-rate check to the outbound boundary (3a). **Open — #120.**
 3. **Update `email.js`** — drop the `check_email_rate` call; (if email
    stays a frozen shim for now) it no longer self-limits. Customer-facing
-   limiting → the kv recipe/package.
-4. **Update lint/determinism allowlist** (`globals.zig:3465`) to the one
-   `__rove` name; update the "`_system` unreachable" test (`:3587`) — no
-   behavior change to the delete.
-5. **Docs:** the two-surface model + assignment rule (§1) into
-   `decisions.md` (they're one ABI, split by the mechanical rule, secured
-   by self-gate/tenant-scope — not by the names).
+   limiting → the kv recipe/package. **Open — #120.**
+4. **Update lint/determinism allowlist** (`globals.zig`) to the one
+   `__rove` name; update the "`_system` unreachable" test — no behavior
+   change to the delete. **Done.**
+5. **Docs:** the two-surface model + assignment rule (§1) recorded — this
+   doc is the design-of-record (one ABI, split by the mechanical rule,
+   secured by self-gate/tenant-scope — not by the names).
 
 Keep every `is_system_module` self-gate and `state.platform` gate exactly
 as-is — this cleanup does not touch the enforcement mechanism.
 
-## 5. Open questions
+## 5. Open questions (the open ones ride issue #120)
 
 1. **Outbound plan-rate** (3a) — does a per-tenant outbound limit already
    exist at `webhook.send`/`http.fetch`? Determines whether 3a *moves* the
    email bucket or *adds* a general outbound limit. Verify before coding.
-2. **Collapse churn vs. keep bare** — is the `__rove_*` → `__rove.*`
-   holder worth the call-site churn, or is "principled assignment rule +
-   docs + the check_email_rate fix" enough with the bare-global shape
-   kept? Lean: do the collapse (one clear surface object is the point),
-   but it's severable from the rest.
+2. ~~Collapse churn vs. keep bare~~ — resolved: the collapse shipped (one
+   clear surface object is the point).
 3. **`@rewind/ratelimit` package vs. recipe** — ship the token bucket as a
    first-party package or just document the recipe. Lean: package (it's a
    real reusable lib; rung-1 of saas-in-a-box §6).

@@ -2,11 +2,11 @@
 //
 // Dogfic customer library, the oidc.js / oauth.js model: owns no
 // platform.*, every kv path is a plain key in the calling tenant.
-// Scope: B2C, passwordless (docs/users-lib-plan.md). This file is
+// Scope: B2C, passwordless (issue #95). This file is
 // P2a — record schema + CRUD + email index. Account linking (P2b),
 // sessions/revocation (P2c) and webhooks (P4b) layer on top.
 //
-// kv layout (see users-lib-plan.md):
+// kv layout (issue #95):
 //   users/{uid}                 → the JSON record
 //   idx/email/{sha256(email)}   → uid           (lookup + link join)
 // Record:
@@ -52,7 +52,7 @@ function _writeRec(rec) {
 /**
  * Managed user store. B2C, passwordless. The library owns no
  * namespace — all keys are plain kv in the calling tenant
- * (docs/users-lib-plan.md).
+ * (issue #95).
  *
  * @namespace users
  */

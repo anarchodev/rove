@@ -93,7 +93,7 @@ is *allowed* to grow.
 This is the engine-side half of determinism. arenajs handles
 within-activation; L3 handles between. Tape volume is bounded by per-tenant
 retention, not a per-chain cap (`decisions.md` §3.6; the reclamation engine is
-`retention-and-gc.md`) — recorded, not recorded *forever*.
+the retention/GC design, issue #91) — recorded, not recorded *forever*.
 
 The inbound request surface satisfies L3 by **read-recording** (the
 `request_reads` tape channel; `decisions.md` §4): header names are
@@ -483,7 +483,7 @@ of.
 - **`decisions.md` §3.9** — L3's tape reduced to four record kinds
   (minimal read set, timestamp, seed, CAS extent); tape-by-reference for
   streamed bytes is shipped (`BodyRef` extents), its remaining GC-pinning
-  piece is `retention-and-gc.md` §3. The retired `primitive-gaps.md` §4
+  piece is the input-home pinning obligation (issue #91). The retired `primitive-gaps.md` §4
   rejections live in `decisions.md` §12.
 - **`handler-shape.md`** — the customer surface §6.5 implies: the
   connection-scoped `stream.*` / `after.*` / `next()` surface is the

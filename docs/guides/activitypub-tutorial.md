@@ -19,7 +19,7 @@ It exists to show off three things rewind.js is uniquely good at:
 
 The library it uses (`activitypub`) is built in; nothing to install or
 import. It owns no kv namespace and ships full JSDoc — see
-`src/js/globals/activitypub.js` and `docs/plans/builtin-libs-docs-plan.md`.
+`src/js/globals/activitypub.js` and `docs/architecture/builtin-libs.md`.
 
 ---
 

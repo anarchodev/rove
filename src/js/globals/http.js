@@ -1,5 +1,5 @@
 // Public `http` surface — the documentation source of truth for the
-// outbound HTTP primitive (docs/builtin-libs-docs-plan.md Phase A,
+// outbound HTTP primitive (docs/architecture/builtin-libs.md Phase A,
 // docs/effect-reification-plan.md Phase 5).
 //
 // Thin shim over the native `_system.http` binding. Durability is

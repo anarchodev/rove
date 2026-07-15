@@ -108,7 +108,7 @@ pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 pub const LOGS_ORIGIN_PREFIX = "http://rewind-logs.internal/";
 
 /// The `rewind-cp.internal` trusted door (docs/architecture/auth-consolidation.md B4;
-/// cp-desired-state-target.md). The `__admin__` chokepoint fetches
+/// the CP desired-state north star, issue #90). The `__admin__` chokepoint fetches
 /// `http://rewind-cp.internal/_control/…` (or `/_cp/…` reads); the fetch engine
 /// attaches the platform move-secret (`X-Rewind-Move-Secret`) and rewrites the
 /// host to the configured CP base. So the operator does CP control ops

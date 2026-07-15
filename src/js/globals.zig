@@ -1982,7 +1982,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     //   - webhook.js: webhook.send shim on http.send.
     //   - email.js: Resend wrapper that calls webhook.send (the shim).
     //   - kv/console/crypto/http/events/platform .js: public shims
-    //     over `_system.*` (docs/plans/builtin-libs-docs-plan.md Phase A).
+    //     over `_system.*` (docs/architecture/builtin-libs.md Phase A).
     //     Evaluated FIRST so the dependent snippets below (jwt/oauth/
     //     oidc/sessions use `crypto`; retry/webhook/email use `http`)
     //     and customer handlers see the documented top-level names
@@ -2040,7 +2040,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // kv + URLSearchParams + TextEncoder (all evaluated above).
     evalSnippet(ctx, "activitypub.js", ACTIVITYPUB_JS);
 
-    // Reachability hardening (docs/plans/builtin-libs-docs-plan.md).
+    // Reachability hardening (docs/architecture/builtin-libs.md).
     // Every native shim above captured its slice as
     // `const sys = _system.X` at eval time, so the `_system.*` objects
     // stay alive through those closures — the global holder is dead
@@ -2076,7 +2076,7 @@ const NamespaceBindings = struct {
 };
 
 const STATIC_NAMESPACES = [_]NamespaceBindings{
-    // `_system` is the internal native ABI (docs/plans/builtin-libs-docs-plan.md
+    // `_system` is the internal native ABI (docs/architecture/builtin-libs.md
     // Phase A). Unstable, undocumented, never referenced by customer
     // code — every public name is a doc-commented JS shim in
     // `globals/*.js` layered over `_system.*`. Empty holder so the
@@ -2133,7 +2133,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
         // Streaming sha256 over serializable midstate tokens — pure
         // functions, so an accumulation spanning activations can keep
-        // its hash state in kv (blob-write-over-segments.md §3).
+        // its hash state in kv (blob-write-recipes.md §3).
         .{ .name = "sha256Init",      .cfunc = crypto_b.jsCryptoSha256Init,      .argc = 0 },
         .{ .name = "sha256Update",    .cfunc = crypto_b.jsCryptoSha256Update,    .argc = 2 },
         .{ .name = "sha256Final",     .cfunc = crypto_b.jsCryptoSha256Final,     .argc = 1 },
@@ -2233,7 +2233,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // captured closure. Every entry is `is_system_module`-gated: a
     // customer naming `__rove.X` gets a throw at call time. No
     // customer-facing shim touches this surface. See
-    // `docs/plans/privileged-surface-and-ratelimit-spec.md`.
+    // `docs/architecture/privileged-surface.md`.
     .{ .path = &.{"__rove"}, .fns = &.{
         // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
         // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
@@ -2271,7 +2271,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // called by the base-eval `email.js` shim (so by the surface rule
     // it should be `_system.email`, not `__rove.*`), and the
     // rate-limit rework that removes it is deferred
-    // (`docs/plans/privileged-surface-and-ratelimit-spec.md` §3). Every
+    // (`docs/architecture/privileged-surface.md` §3). Every
     // other privileged op reached by baked `__system/` modules lives
     // under `_system.continuation.*` (the widened `next`) or the gated
     // `__rove.*` holder (STATIC_NAMESPACES), not a scattered bare
@@ -2279,7 +2279,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
 };
 
-// Public shims (docs/plans/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
+// Public shims (docs/architecture/builtin-libs.md Phase A). JSDoc-carrying
 // JS over `_system.*`; this is the documentation source of truth.
 const KV_JS = @embedFile("kv_js");
 const CONSOLE_JS = @embedFile("console_js");
@@ -3400,7 +3400,7 @@ pub fn install(
     installRequest(ctx, state, request);
 }
 
-// ── Phase A documentation lints (docs/plans/builtin-libs-docs-plan.md) ──
+// ── Phase A documentation lints (docs/architecture/builtin-libs.md) ──
 //
 // Run under `zig build test`. (a) — "no customer code references
 // `_system`" — is a repo-tree scan and lives in
@@ -3426,7 +3426,7 @@ fn lintPrecededByJsdoc(src: []const u8, decl_start: usize) bool {
 }
 
 test "lint(c): every native binding has a globals/ shim (Phase A)" {
-    // Documented exceptions (builtin-libs-docs-plan.md): Date.now /
+    // Documented exceptions (builtin-libs.md): Date.now /
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is the one
     // remaining internal GLOBAL_BUILTIN (called only by globals/email.js;

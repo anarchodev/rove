@@ -461,7 +461,7 @@ pub fn build(b: *std.Build) void {
     const h1_test_step = b.step("h1-test", "Run the HTTP/1.1 codec unit tests");
     h1_test_step.dependOn(&b.addRunArtifact(h1_tests).step);
 
-    // rove-h2 RFC 6455 WebSocket codec (websocket-plan §4.6 piece B) — pure std.
+    // rove-h2 RFC 6455 WebSocket codec (inbound WS — docs/architecture/websockets.md) — pure std.
     const ws_test_mod = b.createModule(.{
         .root_source_file = b.path("src/h2/ws.zig"),
         .target = target,
@@ -522,7 +522,7 @@ pub fn build(b: *std.Build) void {
     // textcodec.js polyfills TextEncoder/Decoder.
     const js_runtime_files: []const struct { name: []const u8, path: []const u8 } = &.{
         // Public doc-carrying shims over `_system.*`
-        // (docs/plans/builtin-libs-docs-plan.md Phase A).
+        // (docs/architecture/builtin-libs.md Phase A).
         .{ .name = "kv_js", .path = "src/js/globals/kv.js" },
         .{ .name = "console_js", .path = "src/js/globals/console.js" },
         .{ .name = "crypto_js", .path = "src/js/globals/crypto.js" },
@@ -572,7 +572,7 @@ pub fn build(b: *std.Build) void {
         // blob-storage P1 (docs/architecture/routing-and-ingress.md) — blob.put's marker-settling
         // result handler.
         .{ .name = "builtin_blob_onresult_mjs", .path = "src/js/builtin_modules/blob_onresult.mjs" },
-        // blob-write-over-segments.md §4 — the seal-time prompt compose + its flip.
+        // blob-write-recipes.md §4 — the seal-time prompt compose + its flip.
         .{ .name = "builtin_blob_compose_mjs", .path = "src/js/builtin_modules/blob_compose.mjs" },
         .{ .name = "builtin_blob_compose_onresult_mjs", .path = "src/js/builtin_modules/blob_compose_onresult.mjs" },
         // blob-storage §6 (docs/architecture/routing-and-ingress.md) — segments.seal's swap half.
@@ -788,7 +788,7 @@ pub fn build(b: *std.Build) void {
     const h2_stream_step = b.step("h2-stream-test", "Run the streaming echo server example (h2 + h1 chunked)");
     h2_stream_step.dependOn(&h2_stream_run.step);
 
-    // ws-echo: inbound WebSocket transport proof (websocket-plan §4.6 A/C/E-h2).
+    // ws-echo: inbound WebSocket transport proof (docs/architecture/websockets.md).
     const ws_echo_mod = b.addModule("ws-echo", .{
         .root_source_file = b.path("examples/ws_echo_test.zig"),
         .target = target,
@@ -919,7 +919,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(h2_limit_test);
 
-    // Extended-CONNECT WS tunnel test (websocket-plan §8.5): in-process
+    // Extended-CONNECT WS tunnel test (docs/architecture/websockets.md, front Extended CONNECT): in-process
     // client+server pair over RFC 8441. `zig build h2-ws-connect-test` runs it.
     const h2_ws_connect_mod = b.addModule("h2-ws-connect-test", .{
         .root_source_file = b.path("examples/h2_ws_connect_test.zig"),

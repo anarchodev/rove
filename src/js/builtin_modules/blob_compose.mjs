@@ -1,4 +1,4 @@
-// blob-write-over-segments.md §4: the seal-time prompt compose. The
+// blob-write-recipes.md §4: the seal-time prompt compose. The
 // rove-compose.internal door fires this with ctx {sid, hash, on, ctx}
 // after the seal's writeset committed. It assembles the recipe's
 // inline rows and hands the payload to blob.put — reusing the owed

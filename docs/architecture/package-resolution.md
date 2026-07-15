@@ -1,10 +1,14 @@
-# PM P0 — `@scope/pkg` resolution seam + manifest v2 (spec)
+# Packages — the `@scope/pkg` resolution seam + manifest v2
 
-Status: **proposal, 2026-07-09.** No code yet. The first package-manager
-*engine* piece (`docs/plans/package-manager-plan.md` §9 P0): teach the
-module loader to resolve `@scope/pkg` imports against a manifest-declared
-package set, and extend the deployment manifest to carry that set. **No
-behavior change for package-less deployments.**
+> **Shipped** (graduated from `plans/`; the P0 seam and the P1 deploy-time
+> population are built — `scripts/smoke/pm_deploy_smoke.py` proves the
+> flat-surface / encapsulated-internals model end to end). Design-of-record
+> for how the module loader resolves `@scope/pkg` imports against a
+> manifest-declared package set, and for the manifest-v2 schema. The
+> compile/bytecode-caching half is
+> [`package-compile-caching.md`](package-compile-caching.md); the arc
+> tracker for the remaining package-manager work is issue #130. **No
+> behavior change for package-less deployments.**
 
 ## 0. Scope — the seam only
 
@@ -21,8 +25,8 @@ or produce them.
 handler's `import { x } from "@rewind/oidc"` resolves and runs, and
 `@rewind/oidc`'s own `import "@rewind/jwt"` resolves to a *different*
 pinned version — proving the flat-surface / encapsulated-internals model
-(`package-manager-plan.md` §4). A deployment with no packages behaves
-byte-identically to today.
+(the resolution model's encapsulation guarantee). A deployment with no
+packages behaves byte-identically to today.
 
 ## 1. The package path scheme
 

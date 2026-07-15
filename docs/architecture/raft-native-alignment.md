@@ -6,7 +6,7 @@
 > [`../decisions.md`](../decisions.md) §10.12); the phase sections below carry
 > their own landing commits and read as history. The still-open *scrutiny* items
 > this doc used to track moved to
-> [`../plans/consensus-robustness-backlog.md`](../plans/consensus-robustness-backlog.md).
+> [`consensus-robustness.md`](consensus-robustness.md).
 > Kept here (not deleted) because ~10 source files cite it by name for the
 > rationale behind live mechanisms (the snapshot trigger, mechanism-A
 > compaction, the topology lens).
@@ -119,7 +119,7 @@ pool.**
   the divergence is no longer clearly justified — see Phase 1.
 - **Speculative overlay (apply-before-commit) and leader-only reads vs
   `read_index` → OPEN, moved.** These two standing scrutiny questions now live in
-  [`../plans/consensus-robustness-backlog.md`](../plans/consensus-robustness-backlog.md),
+  [`consensus-robustness.md`](consensus-robustness.md),
   "Open architectural scrutiny" — this doc is no longer their tracker.
 - **Epoch fencing on the transport → tied to #4.** raft has no epochs; ours
   exists for cross-cluster moves. If #4 goes conf-change-native, this may
@@ -558,7 +558,7 @@ This is the consensus engine. Every phase:
   `learner_add`, `fresh_voter_join`, `three_node`, `membership_reconciler`,
   `leader_failover`, `graceful_transfer`, `snap_catchup`, `dispatch_gate`) +
   `v2-test` + `test`, plus a soak on real disk;
-- coordinated fork↔rove via the pin protocol (`../plans/consensus-robustness-backlog.md`):
+- coordinated fork↔rove via the pin protocol (`consensus-robustness.md`):
   land fork FFI + push, then bump the rove pin with the caller change together;
 - reverts a prior decision (snapshot-free) deliberately — the new path is
   follower-sourced (leader off the data path), which was the stated preference.
