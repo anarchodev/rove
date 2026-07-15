@@ -77,19 +77,15 @@ The maintained set. Subsystem-owned, kept current with the code.
 
 Active work on the current (V2) line lives in GitHub issues: a **tracker
 issue per arc** holding a checklist of **leaf issues per discrete item**
-(`gh issue list`; long-form design text survives at SHA-pinned permalinks
-in the issue bodies). Before an issue closes, durable residue graduates
-into `decisions.md` / `architecture/` (see Lifecycle above). The current
-tracker map:
+(long-form design text survives at SHA-pinned permalinks in the issue
+bodies). Before an issue closes, durable residue graduates into
+`decisions.md` / `architecture/` (see Lifecycle above). Issues are the
+source of truth — this doc deliberately names none, so it never needs a
+commit when one opens or closes. Find them live:
 
-- **#126** — AI agent surface: `--json` audit, `rewind doctor`, scoped tokens, skill file (PLAN §10.10; leaves #79–#82)
-- **#127** — fixture lifecycle + worker dry-run (PLAN §10.9 + §10.11; leaves #83–#86)
-- **#128** — consensus robustness backlog (leaves #99–#108; conventions in [architecture/consensus-robustness.md](architecture/consensus-robustness.md))
-- **#129** — refactor audit 2026-07, wave 4 (leaves #109–#118; waves 1–3 landed)
-- **#130** — package manager: P-Wake/P-Rate/P-Reg/P-CLI/P-Lift/P-Nest (leaves #119–#124 + #4; engine shipped through P2)
-- **#13–#19** — sim↔prod parity audit trackers (`sim-parity` label)
-- `design`-labeled issues — north-stars / unscheduled designs: CP desired-state #90, retention & GC #91, staging/preview releases #92, blob phase-D redesign #93, the consensus scrutiny pair #107/#108
-- singles: outbound WebSocket #94, users-lib #95, blob phases E/F #96/#97, reconciler follow-ons #125
+- `gh issue list --label epic` — the tracker issues, one per arc
+- `gh issue list --label design` — north-stars / unscheduled designs
+- `gh issue list` — everything, including single-item issues under no arc
 
 - _The operator deploy plan (this operator's topology, hardware spec, DNS/TLS distribution, rollout history) lives in the private `rewind-infra` repo. The operator-neutral binary/port/firewall/TLS reference is [architecture/configuration-and-network.md](architecture/configuration-and-network.md). The WASM replay UI plan lives in the private rewind-apps repo (`replay/replay-wasm-plan.md`), alongside the porcelain it describes._
 
