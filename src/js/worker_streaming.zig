@@ -731,7 +731,7 @@ fn finishStreamResume(
                 ctx.txn.rollback() catch {};
                 ctx.txn_done.* = true;
                 markStreamDrainingAnywhere(server, ctx.ent);
-                const msg = allocator.dupe(u8, "next({fn}) is not supported on a streaming chain — name the resume export via after.*(..., {on})") catch @constCast("");
+                const msg = allocator.dupe(u8, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch @constCast("");
                 captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
                 return;
             }
@@ -767,7 +767,7 @@ fn finishStreamResume(
                 ctx.txn_done.* = true;
                 markStreamDrainingAnywhere(server, ctx.ent);
                 std.log.warn("rove-js " ++ spec.site ++ ": held with no wake source tenant={s} module={s}", .{ tid, mpath });
-                const msg = allocator.dupe(u8, "held with no wake source — next() kept the chain parked but no after.* arm or in-flight fetch can resume it") catch @constCast("");
+                const msg = allocator.dupe(u8, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch @constCast("");
                 captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
                 return;
             }
@@ -835,7 +835,7 @@ fn finishStreamResume(
                 ctx.txn.rollback() catch {};
                 ctx.txn_done.* = true;
                 markStreamDrainingAnywhere(server, ctx.ent);
-                const msg = allocator.dupe(u8, "next({fn}) is not supported on a streaming chain — name the resume export via after.*(..., {on})") catch @constCast("");
+                const msg = allocator.dupe(u8, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch @constCast("");
                 captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
                 return;
             }
@@ -951,10 +951,11 @@ fn finishStreamResume(
                 allocator.free(ctx.chain_st.module_path);
                 ctx.chain_st.module_path = s2.path;
                 s2.path = &.{};
-            } else if (s2.path.len > 0) {
-                allocator.free(s2.path);
-                s2.path = &.{};
             }
+            // Every transferred field is cleared above; deinit frees the
+            // residue (a same-module explicit path) so a future Stream
+            // field can't leak here.
+            s2.deinit(allocator);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations produce
         // these; stream resumes never dispatch as one. Defined failure.

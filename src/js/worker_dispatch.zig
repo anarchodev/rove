@@ -3773,7 +3773,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         "tenant={s} err={s}",
                         .{ scope_inst.id, @errorName(re) },
                     );
-                    try respb.setSimpleResponse(server, ent, sid, sess, 500, "next({fn}) is not supported on a streaming chain — name the resume export via after.*(..., {on})\n", allocator);
+                    try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY, allocator);
                     worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), correlation_id, &.{}, .inbound, 0);
                     processed += 1;
                     continue;
@@ -3959,7 +3959,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     "tenant={s} err={s}",
                     .{ scope_inst.id, @errorName(re) },
                 );
-                try respb.setSimpleResponse(server, ent, sid, sess, 500, "held with no wake source: next() parked this chain but nothing can resume it — arm after.* or bind a fetch/send before holding\n", allocator);
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY, allocator);
                 worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), correlation_id, &.{}, .inbound, 0);
                 processed += 1;
                 continue;

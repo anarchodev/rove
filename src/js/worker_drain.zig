@@ -1024,6 +1024,16 @@ fn proposeAndParkContResume(
                 for (arms) |arm| allocator.free(arm.prefix);
                 if (arms.len > 0) allocator.free(arms);
             }
+            // reg.set overwrites in place without deiniting the prior
+            // component — free the cont's old arms/export first (the
+            // parked continuation may have armed on.kv/on.timer before
+            // this hop opened the stream).
+            if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+                for (old.kv_prefixes) |arm| allocator.free(arm.prefix);
+                if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+                if (old.wake_to) |t| allocator.free(t);
+                old.* = .{};
+            } else |_| {}
             try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
                 .interval_ms = s.interval_ms,
                 .next_wake_ns = next_wake_ns,
@@ -1130,6 +1140,15 @@ fn installStreamComponentsInline(
         const empty: []components_mod.KvArm = &.{};
         break :blk empty;
     };
+    // reg.set overwrites in place without deiniting the prior component —
+    // free the cont's old arms/export first (the parked continuation may
+    // have armed on.kv/on.timer before the bound fetch opened the stream).
+    if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+        for (old.kv_prefixes) |arm| allocator.free(arm.prefix);
+        if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+        if (old.wake_to) |t| allocator.free(t);
+        old.* = .{};
+    } else |_| {}
     server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
@@ -1212,7 +1231,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         s.deinit(allocator);
         ctx.txn.rollback() catch {};
         ctx.txn_done.* = true;
-        resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "next({fn}) is not supported on a streaming chain — name the resume export via after.*(..., {on})\n") catch {};
+        resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch {};
         captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
         return;
     }
@@ -1657,8 +1676,8 @@ fn finishContResume(
                 c2m.deinit(allocator);
                 ctx.txn.rollback() catch {};
                 ctx.txn_done.* = true;
-                resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "held with no wake source: next() re-parked this chain but nothing can resume it — arm after.* or bind a fetch/send before holding\n") catch {};
-                const errmsg = allocator.dupe(u8, "held with no wake source — next() re-parked the chain but no arm, binding, or in-flight fetch can resume it") catch @constCast("");
+                resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch {};
+                const errmsg = allocator.dupe(u8, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch @constCast("");
                 captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, errmsg, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
                 return;
             }

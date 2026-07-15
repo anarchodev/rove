@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""One `next()` semantic on every held chain (issue #139): a returned
-continuation's cross-module target re-aims the chain — WS and stream
-families included — and a park with no possible resume source fails loud
-at park time instead of hanging to the 25 s hold-deadline 504.
+"""One `next()` semantic on every held chain: a returned continuation's
+cross-module target re-aims the chain — WS and stream families included —
+and a park with no possible resume source fails loud at park time instead
+of hanging to the 25 s hold-deadline 504 (docs/handler-shape.md §2.1).
 
 Legs:
   A. WS module handoff — a lobby `onMessage` returns
