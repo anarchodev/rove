@@ -1386,6 +1386,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/arenachurn", // >arena cumulative alloc / tiny peak completes under the GC arena (issue #70)
         "src/replay/testdata/kvguardrails", // kv.set/delete type + reserved-prefix + size guards, kv.prefix 100/1000 paging (issue #12)
         "src/replay/testdata/droppedeffects", // connection-scoped effects on terminal/connectionless activations tagged dropped + warned; durable verbs survive (issue #20)
+        "src/replay/testdata/argvalidation", // prod's synchronous effect-argument throw table fires offline with the same error types/messages (issue #21)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

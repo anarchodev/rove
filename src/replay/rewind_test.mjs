@@ -290,6 +290,10 @@ class Scenario {
     for (const id of Object.keys(this.instances)) {
       const ikv = (this.instances[id] && this.instances[id].kv) || {};
       for (const k of Object.keys(ikv)) kv["__rove_store/i/" + id + "/" + k] = ikv[k];
+      // Declaring an instance makes it RESOLVABLE: platform.scope(id) throws
+      // InstanceNotFound (like prod's eager resolve) for any id not declared
+      // here or created via platform.instances.create in the run.
+      kv["__rove_store/exists/i/" + id] = "1";
     }
     for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
     if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;

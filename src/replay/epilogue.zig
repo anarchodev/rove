@@ -279,6 +279,13 @@ const EPILOGUE_BODY =
     \\  // `ftch_<seq>`/`sub_<seq>` from it) — reset here so ids are deterministic
     \\  // per activation, like prod's per-request derived ids.
     \\  globalThis.__rove_fetch_seq = 0;
+    \\  // Per-activation recorder state for the prod-parity argument checks
+    \\  // (sim_globals): stream.write's 4 MiB cumulative cap, blob.receive's
+    \\  // once-per-request gate, and the activation kind (blob.receive is
+    \\  // onHeaders-only).
+    \\  globalThis.__rove_stream_bytes = 0;
+    \\  globalThis.__rove_blob_receive_used = false;
+    \\  globalThis.__rove_activation_kind = D.kind;
     \\  // Prod's console formatter (globals/console.js `fmt`) — byte-identical
     \\  // here so a log assertion transfers between a bundle and a live request
     \\  // log: the message text INCLUDES the level prefix exactly as the worker

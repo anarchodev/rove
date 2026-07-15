@@ -13,8 +13,9 @@ expect(denied.body.compile).toBe("ok");
 // A rejected call logs no platform effect (it throws before recording).
 expect(denied.effects.some((e) => e.kind === "platform")).toBe(false);
 
-// Admin run: every method is allowed.
-const ok = scenario({ admin: true }).inbound({ method: "GET", path: "/" });
+// Admin run: every method is allowed. The scoped instance must be declared —
+// platform.scope resolves eagerly (ghost id ⇒ InstanceNotFound, like prod).
+const ok = scenario({ admin: true, instances: { acme: {} } }).inbound({ method: "GET", path: "/" });
 for (const k of GATED) expect(ok.body[k]).toBe("ok");
 expect(ok.body.compile).toBe("ok");
 expect(ok.effects.some((e) => e.kind === "platform" && e.op === "scope")).toBe(true);
