@@ -39,6 +39,11 @@
 //!   fe80::/10        — link-local
 //!   ff00::/8         — multicast
 //!   ::ffff:0:0/96    — IPv4-mapped (re-check against v4 rules)
+//!
+//! The offline test harness mirrors these always-blocked classes in
+//! `src/replay/rewind_test.mjs` (`prodBlockedUrl`) so a test cannot
+//! script a success outcome for a URL this gate rejects — change the
+//! scheme policy or a range here, change that mirror too.
 
 const std = @import("std");
 

@@ -7,7 +7,9 @@
 // operator root token.
 import { scenario, expect } from "rewind:test";
 
-const s = scenario({ admin: true, rootToken: "root-secret", now: "2026-07-01T00:00:00Z" });
+// `instances` declares the scope target — platform.scope resolves eagerly
+// (ghost id ⇒ InstanceNotFound, like prod).
+const s = scenario({ admin: true, rootToken: "root-secret", now: "2026-07-01T00:00:00Z", instances: { acme: {} } });
 
 function upload(query, auth) {
   return s.inboundHeaders({

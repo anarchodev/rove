@@ -45,12 +45,59 @@ const SYSTEM_SHIM =
     \\  var no = function(n){ return function(){ throw new Error("crypto." + n + " is not available in `rewind test` (the offline sim has SHA-256/HMAC + random only — no streaming sha, RSA or ECDSA)"); }; };
     \\  var push = function(e){ (globalThis.__rove_effects || (globalThis.__rove_effects = [])).push(e); };
     \\  var b2s = function(c){ if (typeof c === "string") return c; var s = ""; for (var i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
+    \\  // ── prod's synchronous effect-argument validation, mirrored so a call
+    \\  // shape that throws live also throws offline with the same error type and
+    \\  // message (customer `catch` branches keyed on them are testable). Each
+    \\  // check names its prod source; change one side, change both. ──
+    \\  // http_b.isValidExportName (bindings/http.zig): ASCII alnum/_/$, first
+    \\  // char non-digit — gates every bound-export override ({on}/name).
+    \\  var isExportName = function(s){ return typeof s === "string" && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(s); };
+    \\  // JS_ToInt64-style coercion (after.ms): ToNumber, then NaN/±Infinity → 0,
+    \\  // fraction truncated. The ToInt32 sites (randomBytes n, blob.url ttl) use
+    \\  // JS's own `| 0` — the exact ECMA ToInt32 incl. the mod-2^32 wrap prod's
+    \\  // JS_ToInt32 performs, so out-of-range wrapping accepts/rejects the same
+    \\  // values as prod.
+    \\  var toInt = function(x){ var n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : 0; };
+    \\  // UTF-8 byte length of a string chunk / byte length of a Uint8Array —
+    \\  // the wire size prod's caps measure (surrogate pairs 4 bytes, lone 3).
+    \\  var u8len = function(s){ if (typeof s !== "string") return s.length; var n = 0; for (var i = 0; i < s.length; i++) { var cp = s.charCodeAt(i); if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xDC00 && s.charCodeAt(i + 1) <= 0xDFFF) { n += 4; i++; } else if (cp < 0x80) n += 1; else if (cp < 0x800) n += 2; else n += 3; } return n; };
+    \\  // dupeJsStringOrBytes (bindings/http.zig): a fetch body is a string or
+    \\  // Uint8Array; absent (undefined) defaults — anything else (incl. null)
+    \\  // throws. Shared by http.fetch / after.fetch / http.subscribe.
+    \\  var checkFetchBody = function(o){ if (o.body !== undefined && typeof o.body !== "string" && !(o.body instanceof Uint8Array)) throw new TypeError("fetch: `body` must be a string or Uint8Array"); };
+    \\  // buildFetchRow (bindings/http.zig) — the shared unbound-fetch option
+    \\  // validation jsHttpFetch AND jsHttpSubscribe run: url required, body
+    \\  // shape, `name` identifier, `on_chunk` (module path) required. The
+    \\  // native reads ONLY `on_chunk` (the public shims lower `on` to it), so
+    \\  // no `on` fallback here. Returns the module path.
+    \\  var checkFetchOpts = function(o){
+    \\    if (typeof o.url !== "string") throw new TypeError("http.fetch requires a `url` string");
+    \\    checkFetchBody(o);
+    \\    var nm = o.name === undefined ? "" : String(o.name);
+    \\    if (nm.length > 0 && !isExportName(nm)) throw new TypeError("http.fetch: `name` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)");
+    \\    if (!o.on_chunk) throw new TypeError("http.fetch: `on_chunk` (module path) is required");
+    \\    return o.on_chunk;
+    \\  };
     \\  // Native rate-limit builtin the email global bottoms out on
-    \\  // (worker-native — no-op offline: there's no per-worker bucket to
-    \\  // exhaust). The continuation native lives on `_system.continuation`
-    \\  // below (next.js captures it at base-eval — privileged-surface
-    \\  // unification; the bare `__rove_next` global is gone).
-    \\  globalThis.__rove_check_email_rate = function(){};
+    \\  // (worker-native: a per-instance plan-tier token bucket,
+    \\  // bindings/email_rate.zig). Offline sends are UNMETERED by default —
+    \\  // there is no bucket to exhaust — but `scenario({ emailBudget: N })`
+    \\  // arms a per-activation allowance (carried as a hidden reserved kv key)
+    \\  // so the N+1-th send in a run throws prod's exact error shape and the
+    \\  // customer's `catch (e) { e.code === "rate_limited" }` branch is
+    \\  // testable. The epilogue resets the per-activation counter. The
+    \\  // continuation native lives on `_system.continuation` below (next.js
+    \\  // captures it at base-eval — privileged-surface unification; the bare
+    \\  // `__rove_next` global is gone).
+    \\  globalThis.__rove_check_email_rate = function(){
+    \\    var b = globalThis.kv.get("__rove_store/email_budget");
+    \\    if (b === undefined || b === null) return;
+    \\    var n = Number(b);
+    \\    if (!Number.isFinite(n)) return;
+    \\    var used = globalThis.__rove_email_sends || 0;
+    \\    if (used >= n) { var e = new Error("email rate limit exceeded, retry after 1s"); e.code = "rate_limited"; throw e; }
+    \\    globalThis.__rove_email_sends = used + 1;
+    \\  };
     \\  // Streaming SHA-256 in pure JS (the portable replay engine has one-shot
     \\  // `nat.sha256` only). Same posture as the RSA/ECDSA verify above; drives
     \\  // `crypto.sha256Init/Update/Final` so `blob.write`/`blob.seal` (recipe
@@ -201,9 +248,14 @@ const SYSTEM_SHIM =
     \\  // stream, timeoutMs, … })` matches what the handler wrote and `.not.`
     \\  // variants aren't vacuous.
     \\  var nextSeq = function(){ return (globalThis.__rove_fetch_seq = (globalThis.__rove_fetch_seq || 0) + 1); };
-    \\  var recFetch = function(url, o, on){
+    \\  // `bound` distinguishes the connection-scoped `after.fetch` (binds to the
+    \\  // held socket or is DROPPED at the success seam — http.zig jsOnFetch)
+    \\  // from the unbound `http.fetch` primitive (fires regardless — what
+    \\  // webhook.send/blob compose on). The epilogue's drop-tagging pass and the
+    \\  // harness's fetchesPending count both key on it.
+    \\  var recFetch = function(url, o, on, bound){
     \\    var id = "ftch_" + nextSeq();
-    \\    push({ kind: "fetch", id: id, url: url, method: (o && o.method) || "GET",
+    \\    push({ kind: "fetch", id: id, url: url, bound: !!bound, method: (o && o.method) || "GET",
     \\      body: (o && o.body !== undefined) ? o.body : null,
     \\      headers: (o && o.headers) || {},
     \\      ctx: (o && o.ctx !== undefined) ? o.ctx : null,
@@ -229,7 +281,8 @@ const SYSTEM_SHIM =
     \\    },
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
-    \\      randomBytes: function(n){ return nat.randomBytes(n); },
+    \\      // jsCryptoRandomBytes (bindings/crypto.zig): ToInt32(n) ∈ [0, 65536].
+    \\      randomBytes: function(n){ var v = Number(n) | 0; if (v < 0 || v > 65536) throw new RangeError("crypto.randomBytes: n must be in [0, 65536]"); return nat.randomBytes(v); },
     \\      randomUUID: function(){ return nat.randomUUID(); },
     \\      sha256: function(d){ return nat.sha256(d); },
     \\      hmacSha256: function(k,d){ return nat.hmacSha256(k,d); },
@@ -242,40 +295,122 @@ const SYSTEM_SHIM =
     \\      oidcGenerateKey: no("oidcGenerateKey"), oidcSign: no("oidcSign"),
     \\    },
     \\    http: {
-    \\      fetch: function(o){ o = o || {}; return recFetch(o.url, o, o.on_chunk || o.on || null); },
+    \\      // Validation mirrors jsHttpFetch → buildFetchRow (bindings/http.zig).
+    \\      fetch: function(o){
+    \\        if (o === null || o === undefined || typeof o !== "object") throw new TypeError("http.fetch requires an options object");
+    \\        return recFetch(o.url, o, checkFetchOpts(o), false);
+    \\      },
     \\      cancelFetch: function(){},
-    \\      subscribe: function(o){ o = o || {}; var id = "sub_" + nextSeq(); push({ kind: "subscribe", id: id, url: o.url, headers: o.headers || {}, on: o.on_chunk || o.on || null }); return id; },
+    \\      // jsHttpSubscribe reuses buildFetchRow, so the inner throws keep the
+    \\      // http.fetch spelling — matched verbatim.
+    \\      subscribe: function(o){
+    \\        if (o === null || o === undefined || typeof o !== "object") throw new TypeError("http.subscribe requires an options object");
+    \\        var oc = checkFetchOpts(o);
+    \\        var id = "sub_" + nextSeq(); push({ kind: "subscribe", id: id, url: o.url, headers: o.headers || {}, on: oc }); return id;
+    \\      },
     \\      cancelSubscription: function(){},
     \\    },
     \\    after: {
     \\      // `on` is the ONE spelling end to end — the after.js shim passes the
     \\      // opts bag through and the worker bindings read `opts.on` the same way.
-    \\      fetch: function(url, o){ return recFetch(url, o, (o && o.on) || null); },
-    \\      kv: function(prefix, o){ push({ kind: "kv-wake", prefix: prefix, on: (o && o.on) || null }); },
-    \\      timer: function(ms, o){ push({ kind: "timer", ms: ms, on: (o && o.on) || null }); },
+    \\      // Validation mirrors jsOnFetch/buildOnFetchRow: url string required;
+    \\      // the bound `{on}` must be a bare identifier (a `/` or `.` module
+    \\      // path is rejected at issue time — cross-module continuations are
+    \\      // webhook.send's `on`, not a bound fetch's).
+    \\      fetch: function(url, o){
+    \\        if (typeof url !== "string") throw new TypeError("after.fetch(url, opts?) requires a url string");
+    \\        o = o || {};
+    \\        checkFetchBody(o);
+    \\        var onv = o.on === undefined ? "" : String(o.on);
+    \\        if (onv.length > 0 && !isExportName(onv)) throw new TypeError("after.fetch: `on` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)");
+    \\        return recFetch(url, o, o.on || null, true);
+    \\      },
+    \\      // jsOnKv: string prefix required. jsOnTimer: ToInt64(ms) must be > 0
+    \\      // (so undefined/NaN/0/negative/fractional-below-1 all throw) — with
+    \\      // JS_ToInt64's mod-2^64 wrap, so an overflowing delay (≥ 2^63 wraps
+    \\      // negative) throws here exactly as live.
+    \\      kv: function(prefix, o){ if (typeof prefix !== "string") throw new TypeError("after.kv(prefix, opts?) requires a string prefix"); push({ kind: "kv-wake", prefix: prefix, on: (o && o.on) || null }); },
+    \\      timer: function(ms, o){ ms = Number(BigInt.asIntN(64, BigInt(toInt(ms)))); if (ms <= 0) throw new TypeError("after.ms(ms): ms must be > 0"); push({ kind: "timer", ms: ms, on: (o && o.on) || null }); },
     \\    },
     \\    blob: {
-    \\      presign: function(hash, ttl, ct){ return "https://sim.invalid/blob/" + hash + (ttl != null ? "?ttl=" + ttl : ""); },
+    \\      // jsBlobPresign (bindings/blob.zig): hash = 64 lowercase hex; a
+    \\      // present ttl must land in 1..604800 after ToInt32.
+    \\      presign: function(hash, ttl, ct){
+    \\        if (typeof hash !== "string") throw new TypeError("blob.url requires a hash string");
+    \\        if (!/^[0-9a-f]{64}$/.test(hash)) throw new TypeError("blob.url: hash must be 64 lowercase hex chars");
+    \\        if (ttl !== undefined && ttl !== null) { var t = Number(ttl) | 0; if (t < 1 || t > 604800) throw new TypeError("blob.url: ttl must be 1..604800 seconds"); }
+    \\        return "https://sim.invalid/blob/" + hash + (ttl != null ? "?ttl=" + ttl : "");
+    \\      },
     \\      write: function(){}, seal: function(){ return {}; },
     \\      // `blob.receive(on)` (own-tenant) and `platform.scope(id).blob.receive`
     \\      // (which lowers to `receive(on, id, JSON.stringify(ctx))`) both bottom
     \\      // out here. Record `scope` + the issue-time `app` ctx so a
     \\      // `.receive().stored({...})` continuation can echo `app` back exactly
     \\      // as `emitTerminal` does (`request.ctx = {hash, len, app}`).
-    \\      receive: function(on, scope, appJson){ var app = null; if (appJson !== undefined && appJson !== null) { try { app = JSON.parse(appJson); } catch (_) { app = null; } } push({ kind: "blob", op: "receive", on: on || null, scope: (scope !== undefined ? scope : null), app: app }); },
+    \\      // jsBlobReceive gates, in prod's order: onHeaders-only (the body is
+    \\      // still at the door), once per request (a receive consumes THE
+    \\      // body), then the `on` export-name checks. The epilogue stamps
+    \\      // `__rove_activation_kind` and resets the once-gate per run.
+    \\      receive: function(on, scope, appJson){
+    \\        if (globalThis.__rove_activation_kind !== "inbound_headers") throw new TypeError("blob.receive: only callable from an onHeaders activation");
+    \\        if (globalThis.__rove_blob_receive_used) throw new TypeError("blob.receive: already called for this request (one inbound body)");
+    \\        if (typeof on !== "string" || !on.length) throw new TypeError("blob.receive requires an `on` export name");
+    \\        if (!isExportName(on)) throw new TypeError("blob.receive: `on` must be a JS identifier");
+    \\        globalThis.__rove_blob_receive_used = true;
+    \\        var app = null; if (appJson !== undefined && appJson !== null) { try { app = JSON.parse(appJson); } catch (_) { app = null; } } push({ kind: "blob", op: "receive", on: on, scope: (scope !== undefined ? scope : null), app: app });
+    \\      },
     \\    },
     \\    stream: {
     \\      start: function(){},
-    \\      write: function(c){ var t = b2s(c); push({ kind: "stream", bytes: t.length, data: t }); },
+    \\      // jsStreamWrite (bindings/stream.zig): chunk must be a string or
+    \\      // Uint8Array (no String() fallback — "[object Object]" must never
+    \\      // ship as a wire chunk), and one activation's cumulative writes are
+    \\      // capped at StreamChunks.QUEUE_HARD_CAP (4 MiB) — a synchronous
+    \\      // flood throws; paginate with next(). The epilogue resets the
+    \\      // per-activation counter.
+    \\      write: function(c){
+    \\        if (typeof c !== "string" && !(c instanceof Uint8Array)) throw new TypeError("stream.write: chunk must be a string or Uint8Array");
+    \\        var prev = globalThis.__rove_stream_bytes || 0;
+    \\        // UTF-8 length ≥ UTF-16 code-unit count, so an over-cap chunk can be
+    \\        // rejected on .length alone; the per-char scan only runs for chunks
+    \\        // that could fit, and an all-ASCII chunk short-circuits via one
+    \\        // native regex test (its UTF-8 length IS .length).
+    \\        var nbytes = (typeof c !== "string" || !/[^\x00-\x7F]/.test(c)) ? c.length
+    \\          : (prev + c.length > 4194304 ? c.length : u8len(c));
+    \\        var tot = prev + nbytes;
+    \\        if (tot > 4194304) throw new RangeError("stream.write: too many bytes buffered in one activation; emit fewer per activation and continue with next()");
+    \\        globalThis.__rove_stream_bytes = tot;
+    \\        // `bytes` is the WIRE size (what the cap counts and prod ships).
+    \\        push({ kind: "stream", bytes: nbytes, data: b2s(c) });
+    \\      },
     \\    },
     \\    platform: {
     \\      // scope(id).kv → instance `id`'s isolated store; `blob` is a bare object
     \\      // the real platform.js augments (receive/get). root → the __root__ store.
     \\      // Each is admin-gated (see `gate` above); the returned scope/root handle
     \\      // is then a granted capability (its ops aren't re-checked).
-    \\      scope: gate(function(id){ push({ kind: "platform", op: "scope", id: id }); return { kv: storeKv(NS_STORE + "i/" + id + "/", "i/" + id), blob: {} }; }),
+    \\      // jsPlatformScope (globals.zig): id required + non-empty (ToString
+    \\      // coerced), and the instance must RESOLVE — prod throws
+    \\      // Error{code:"InstanceNotFound"} at the call site for a ghost id.
+    \\      // Known offline = declared via `scenario({instances})` or created by
+    \\      // `instances.create` this run (both set the hidden exists marker).
+    \\      scope: gate(function(id){
+    \\        if (id === undefined) throw new TypeError("platform.scope requires (instance_id)");
+    \\        id = String(id);
+    \\        if (!id.length) throw new TypeError("platform.scope: instance_id must be non-empty");
+    \\        // The exists marker is harness-seeded, so a CAPTURED tape (which
+    \\        // carries no scenario) skips the resolve check — the tape already
+    \\        // proves the instance resolved live.
+    \\        if (!globalThis.__rove_captured && globalThis.kv.get(NS_STORE + "exists/i/" + id) !== "1") { var e = new Error("instance not found"); e.code = "InstanceNotFound"; throw e; }
+    \\        push({ kind: "platform", op: "scope", id: id });
+    \\        return { kv: storeKv(NS_STORE + "i/" + id + "/", "i/" + id), blob: {} };
+    \\      }),
     \\      root: { get: gate(rootStore_r.get), set: gate(rootStore_r.set), delete: gate(rootStore_r.delete), prefix: gate(rootStore_r.prefix) },
-    \\      instances: { create: gate(function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); return (spec && spec.id) || "inst_sim"; }), deployStarter: gate(function(){ push({ kind: "platform", op: "instances.deployStarter" }); }) },
+    \\      // instances.create records the exists marker as a STORE-TAGGED write
+    \\      // (not just a hidden native set): resumes rebuild kv from the folded
+    \\      // effect log, and only recorded writes fold forward — so an instance
+    \\      // created in one activation stays scope-resolvable in the next.
+    \\      instances: { create: gate(function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); var id = (spec && spec.id) || "inst_sim"; push({ kind: "write", store: "exists", key: "i/" + id, value: "1" }); globalThis.kv.set(NS_STORE + "exists/i/" + id, "1"); return id; }), deployStarter: gate(function(){ push({ kind: "platform", op: "instances.deployStarter" }); }) },
     \\      releases: { publish: gate(function(){ push({ kind: "platform", op: "releases.publish" }); }) },
     \\      // checkRootToken(token) → true iff it matches the operator root token
     \\      // (env-supplied in prod); the sim carries it as a hidden reserved kv key

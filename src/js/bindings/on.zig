@@ -1,6 +1,6 @@
-//! `_system.on` — connection wake triggers (`docs/handler-shape.md`
-//! §2.3). `on.timer(ms)` /
-//! `on.kv(prefix, {on?})` register a wake **for the current
+//! `_system.after` — connection wake triggers (`docs/handler-shape.md`
+//! §2.3). `after.ms(ms)` /
+//! `after.kv(prefix, {on?})` register a wake **for the current
 //! connection**: a body-builder effect (not a return verb) that
 //! accumulates onto `DispatchState.pending_wakes` during the
 //! activation. At end-of-activation the worker arms the accumulated
@@ -9,11 +9,11 @@
 //! while it still holds the socket.
 //!
 //! Ephemeral + node-local (never touch raft) — the held continuation
-//! is the wake's owner by construction, nothing addressable. `on.*` is
-//! a **connection** trigger: on a connectionless activation
+//! is the wake's owner by construction, nothing addressable. `after.*`
+//! is a **connection** trigger: on a connectionless activation
 //! (subscription / durable_wake / test path) the accumulator is null
-//! and these calls are inert no-ops, per the model (all `on.*` wakes
-//! are for the current connection).
+//! and these calls are inert no-ops, per the model (all `after.*`
+//! wakes are for the current connection).
 //!
 //! `{ on: "module.method" | "method" }` routes the wake to a specific
 //! export; the default is `onWake` (the generic "edge wake — go look"
@@ -50,7 +50,7 @@ fn readOn(state: *globals.DispatchState, ctx: ?*c.JSContext, opts: c.JSValue) ?[
     return state.allocator.dupe(u8, s[0..len]) catch null;
 }
 
-/// `on.timer(ms, opts?)` — wake the held connection after `ms`
+/// `after.ms(ms, opts?)` — wake the held connection after `ms`
 /// milliseconds. Inert (no-op) when there is no held connection.
 pub fn jsOnTimer(
     ctx: ?*c.JSContext,
@@ -79,8 +79,8 @@ pub fn jsOnTimer(
     return js_undefined;
 }
 
-/// `on.kv(prefix, opts?)` — wake the held connection when any key under
-/// `prefix` changes since the version this activation read. Inert
+/// `after.kv(prefix, opts?)` — wake the held connection when any key
+/// under `prefix` changes since the version this activation read. Inert
 /// (no-op) when there is no held connection.
 pub fn jsOnKv(
     ctx: ?*c.JSContext,
@@ -90,7 +90,7 @@ pub fn jsOnKv(
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
     if (argc < 1 or !c.JS_IsString(argv[0])) {
-        _ = c.JS_ThrowTypeError(ctx, "on.kv(prefix, opts?) requires a string prefix");
+        _ = c.JS_ThrowTypeError(ctx, "after.kv(prefix, opts?) requires a string prefix");
         return js_exception;
     }
     var len: usize = 0;

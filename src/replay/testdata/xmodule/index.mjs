@@ -1,14 +1,20 @@
-// A handler whose fetch continuation lives in a SEPARATE module — the `on` of
-// the after.fetch names `hooks/onFetched.mjs` (a different file), not a bare
-// same-module export. This is the cross-module continuation shape (admin's
-// `_rp/*.mjs` modules); before the harness resolved a module-path `on` to its
-// own entry, `.resolve()` ran the WRONG file (the parent's).
+// A handler that tries to point a BOUND fetch's `on` at a separate module
+// file. Prod rejects that at issue time (`after.fetch`'s `{on}` selects a bare
+// export on the SAME held chain — bindings/http.zig isValidExportName; the
+// cross-module continuation surfaces are `webhook.send`'s `on` and the
+// system-internal unbound fetch's `on_chunk`), so the sim recorder throws the
+// same TypeError. The continuation module itself (hooks/onFetched.mjs) stays
+// testable standalone via `scenario.fetchResult`.
 export default function () {
   const key = new URLSearchParams(request.query || "").get("k") || "k";
-  after.fetch("https://api.example.com/data", {
-    method: "GET",
-    ctx: { key: key },
-    on: "hooks/onFetched.mjs",
-  });
+  try {
+    after.fetch("https://api.example.com/data", {
+      method: "GET",
+      ctx: { key: key },
+      on: "hooks/onFetched.mjs",
+    });
+  } catch (e) {
+    return { threw: e.message, type: e.constructor.name };
+  }
   return next();
 }

@@ -7,7 +7,7 @@ import { scenario, expect } from "rewind:test";
 const s = scenario({
   admin: true, // platform.* is admin-only
   kv: { "seed-own": "own-seed" },
-  instances: { acme: { kv: { profile: "acme-old" } } },
+  instances: { acme: { kv: { profile: "acme-old" } }, beta: {} },
   root: { kv: { cfg: "root-old" } },
 });
 const r = s.inbound({ method: "POST", path: "/admin" });

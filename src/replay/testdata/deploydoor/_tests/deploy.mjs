@@ -14,6 +14,9 @@ const s = scenario({
   admin: true,
   rootToken: "root-secret",
   now: "2026-07-01T00:00:00Z",
+  // platform.scope resolves eagerly (ghost id ⇒ InstanceNotFound, like
+  // prod) — declare every tenant the handler scopes.
+  instances: { acme: {}, other: {} },
 });
 
 function post(path, body, auth = "Bearer root-secret") {

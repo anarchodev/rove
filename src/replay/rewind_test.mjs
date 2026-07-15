@@ -103,10 +103,146 @@ function subsetMatch(obj, subset) {
 
 /** Effects that SURVIVED the activation. A thrown handler rolls its txn back
  *  in prod (500 "handler threw"), so the sim marks that activation's
- *  writes/cmds `rolledBack` — they must not fold forward or satisfy matchers
- *  (issue #10). They stay on `node.effects` for debugging. */
+ *  writes/cmds `rolledBack`; a connection-scoped effect on a terminal or
+ *  connectionless activation is marked `dropped` (prod discards it — the
+ *  epilogue's drop-tagging pass). Neither must fold forward or satisfy
+ *  matchers. They stay on `node.effects` for debugging. */
 function live(effects) {
-  return (effects || []).filter((e) => !e.rolledBack);
+  return (effects || []).filter((e) => !e.rolledBack && !e.dropped);
+}
+
+// ── prod's outbound-policy classifier (offline mirror) ─────────────────────
+// A pure, DNS-free mirror of the classes prod's outbound gate ALWAYS blocks
+// (`src/ssrf/root.zig` parseUrl scheme policy + isBlockedV4/isBlockedV6 with
+// the customer posture — no test hatches; change one side, change both).
+// Only LITERAL addresses classify: a hostname the sim can't resolve returns
+// null (reachable as far as offline knowledge goes). Hosts under the reserved
+// `.internal` TLD are platform doors the fetch engine rewrites BEFORE the
+// gate (fetch_engine.zig), so they're exempt. Used to fail a test loud when
+// it scripts a SUCCESS outcome for a fetch prod would never let leave the
+// node — the only outcome prod delivers for these is the terminal transport
+// failure (status 0).
+
+/** Blocked-IPv4 ranges, prod's exact octet tests (isBlockedV4). */
+function v4Blocked(o) {
+  const a = o[0], b = o[1];
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && (b === 0 || b === 168)) return true;
+  if (a === 198 && (b === 18 || b === 19 || b === 51)) return true;
+  if (a === 203 && b === 0) return true;
+  if (a >= 224) return true;
+  return false;
+}
+
+/** Parse an IPv6 literal → 16 bytes, or null when it isn't one. */
+function parseV6(s) {
+  const zone = s.indexOf("%");
+  if (zone >= 0) s = s.slice(0, zone);
+  const parts = s.split("::");
+  if (parts.length > 2) return null;
+  const expand = (str) => {
+    if (!str.length) return [];
+    const out = [];
+    for (const g of str.split(":")) {
+      if (g.includes(".")) { // trailing embedded IPv4 → two groups
+        const o = g.split(".").map(Number);
+        if (o.length !== 4 || o.some((x) => !(x >= 0 && x <= 255))) return null;
+        out.push((o[0] << 8) | o[1], (o[2] << 8) | o[3]);
+      } else {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+        out.push(parseInt(g, 16));
+      }
+    }
+    return out;
+  };
+  const head = expand(parts[0]);
+  const tail = parts.length === 2 ? expand(parts[1]) : [];
+  if (head === null || tail === null) return null;
+  const fill = 8 - head.length - tail.length;
+  if (parts.length === 2 ? fill < 0 : fill !== 0) return null;
+  const groups = head.concat(new Array(Math.max(fill, 0)).fill(0), tail);
+  if (groups.length !== 8) return null;
+  const bytes = [];
+  for (const g of groups) bytes.push((g >> 8) & 0xff, g & 0xff);
+  return bytes;
+}
+
+/** Blocked-IPv6 classes, prod's exact byte tests (isBlockedV6). */
+function v6Blocked(b) {
+  let zero15 = true;
+  for (let i = 0; i < 15; i++) if (b[i] !== 0) { zero15 = false; break; }
+  if (zero15) return true; // :: (unspecified) and ::1 (loopback) both blocked
+  const mapped = b.slice(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff;
+  if (mapped) return v4Blocked([b[12], b[13], b[14], b[15]]);
+  if ((b[0] & 0xfe) === 0xfc) return true; // fc00::/7 unique local
+  if (b[0] === 0xfe && (b[1] & 0xc0) === 0x80) return true; // fe80::/10 link-local
+  if (b[0] === 0xff) return true; // ff00::/8 multicast
+  return false;
+}
+
+/** The reason prod categorically blocks `url`, or null when it could reach
+ *  prod's engine (including any hostname — offline never resolves DNS). */
+function prodBlockedUrl(url) {
+  const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)/.exec(String(url == null ? "" : url));
+  if (!m) return null; // relative/unparseable — prod fails these differently, not the gate
+  const scheme = m[1].toLowerCase();
+  let hostport = m[2];
+  const at = hostport.lastIndexOf("@");
+  if (at >= 0) hostport = hostport.slice(at + 1); // userinfo never fools host extraction
+  let host = hostport;
+  if (host.startsWith("[")) {
+    const close = host.indexOf("]");
+    host = host.slice(1, close < 0 ? host.length : close);
+  } else {
+    const colon = host.indexOf(":");
+    if (colon >= 0) host = host.slice(0, colon);
+  }
+  host = host.toLowerCase();
+  // Scheme policy first (prod's gate rejects a non-http(s) scheme for ANY
+  // host); the reserved platform-door TLD is exempt only from the plaintext
+  // rule — the fetch engine's door rewrite consumes `http://*.internal/`
+  // before the gate ever sees it.
+  if (scheme !== "http" && scheme !== "https")
+    return "the `" + scheme + ":` scheme is not http(s) (prod: UnsupportedScheme)";
+  if (host.endsWith(".internal")) return null;
+  if (scheme === "http")
+    return "plaintext http:// outbound is blocked (prod: PlaintextBlocked — https only)";
+  if (!host.length) return null;
+  if (host === "localhost" || host.endsWith(".localhost"))
+    return "localhost resolves to loopback (prod: BlockedAddress)";
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const parts = v4.slice(1);
+    // Only CANONICAL dotted-decimal classifies. A leading-zero octet is
+    // octal to the resolver (010.0.0.1 → 8.0.0.1) and an out-of-range one
+    // is a hostname — both classify null rather than mis-map to decimal.
+    if (parts.some((s) => s.length > 1 && s[0] === "0")) return null;
+    const o = parts.map(Number);
+    if (o.some((x) => x > 255)) return null;
+    if (v4Blocked(o)) return "the address " + host + " is in a blocked range (prod: BlockedAddress — SSRF blocklist)";
+    return null;
+  }
+  if (host.includes(":")) {
+    const b = parseV6(host);
+    if (b && v6Blocked(b)) return "the address " + host + " is in a blocked range (prod: BlockedAddress — SSRF blocklist)";
+  }
+  return null;
+}
+
+/** Throw when a test scripts a SUCCESS outcome for a fetch prod always
+ *  blocks — such a fetch never leaves the node, so the success path being
+ *  tested is categorically unreachable live. The transport failure prod
+ *  actually delivers (`status: 0`) stays authorable. */
+function requireProdReachable(verb, fx, response) {
+  const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
+  if (status === 0) return;
+  const why = prodBlockedUrl(fx.url);
+  if (why) throw new Error(verb + ": prod categorically blocks this fetch — " + why + ". " +
+    JSON.stringify(String(fx.url)) + " never leaves the engine, so a " + status +
+    " response is unreachable in prod; the handler only ever observes the terminal transport failure (resolve with { status: 0 })");
 }
 
 /** UTF-8 byte length of a chunk (string) or byte array — prod's fetch-chunk
@@ -261,6 +397,12 @@ class Scenario {
     // closed: a run is admin only when opted in, so a non-admin handler that
     // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
     this.admin = cfg.admin || false;
+    // Per-activation `email.send` allowance. Prod meters sends through a
+    // per-instance plan-tier token bucket (bindings/email_rate.zig); offline
+    // sends are unmetered unless this is set, in which case the N+1-th send
+    // in an activation throws prod's Error{code:"rate_limited"} — so the
+    // rate-limit catch branch is testable. Carried as a hidden reserved key.
+    this.emailBudget = cfg.emailBudget != null ? cfg.emailBudget : null;
     // Per-chain identity the engine pins on EVERY activation (worker-set in
     // prod). `tenant` is this handler's tenant id; `correlationId` is minted by
     // inbound and inherited by every resume — so it's scenario-level (set once,
@@ -288,10 +430,15 @@ class Scenario {
     for (const id of Object.keys(this.instances)) {
       const ikv = (this.instances[id] && this.instances[id].kv) || {};
       for (const k of Object.keys(ikv)) kv["__rove_store/i/" + id + "/" + k] = ikv[k];
+      // Declaring an instance makes it RESOLVABLE: platform.scope(id) throws
+      // InstanceNotFound (like prod's eager resolve) for any id not declared
+      // here or created via platform.instances.create in the run.
+      kv["__rove_store/exists/i/" + id] = "1";
     }
     for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
     if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
     if (this.admin) kv["__rove_store/admin"] = "1";
+    if (this.emailBudget != null) kv["__rove_store/email_budget"] = String(this.emailBudget);
     const w = Object.assign(
       { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
@@ -552,8 +699,10 @@ class Node {
 
   /** Outbound frames/chunks this activation wrote (`stream.write`), in order —
    *  the content, not just the byte count. WS replies and SSE lines both land
-   *  here. */
-  get frames() { return this._byKind("stream").map((e) => e.data); }
+   *  here. A frame from a connectionless activation is `dropped` (no socket
+   *  exists — prod's stream.write is inert there) and excluded; rolled-back
+   *  frames stay (prod flushes them eagerly, so they were already on the wire). */
+  get frames() { return this._byKind("stream").filter((e) => !e.dropped).map((e) => e.data); }
 
   /** Effective value of `key` after this activation (base kv + its writes).
    *  Absent/deleted keys read `null` — the same `kv.get` returns to the handler
@@ -818,6 +967,7 @@ class FetchHandle {
   resolve(response = {}) {
     const parent = this.node;
     const pb = parent.force();
+    requireProdReachable("resolve()", this.fx, response);
     // A stream:true fetch never delivers one whole-body event in prod — it
     // arrives as per-chunk onFetchChunk events + a terminal done. Warn (a
     // passing record, visible in the run output) rather than fail: the fold
@@ -850,6 +1000,14 @@ class FetchHandle {
     // offline would pass a shape prod never sends. Fail loud (issue #24).
     if (!this.fx.stream)
       throw new Error(`stream(): this fetch was issued WITHOUT stream:true (${this.fx.url}) — prod delivers one whole-body result; use .resolve({...}) or issue the fetch with { stream: true }`);
+    // Delivering chunks is itself unreachable for a blocked fetch — prod
+    // emits only the single terminal transport-failure event, never chunk
+    // activations — so the gate fires regardless of the scripted status.
+    {
+      const why = prodBlockedUrl(this.fx.url);
+      if (why) throw new Error("stream(): prod categorically blocks this fetch — " + why + ". " +
+        JSON.stringify(String(this.fx.url)) + " never leaves the engine and delivers no chunk events; the only authorable outcome is the whole-body transport failure, .resolve({ status: 0 })");
+    }
     const parentNode = this.node;
     const pw = this.node.world;
     const fx = this.fx;
@@ -1062,8 +1220,11 @@ class Interleaving {
     for (const i of order) {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
+      requireProdReachable("whenConcurrent", fx, spec.resolve || {});
       node = resumeNode(parent, fetchResumeWorld(parent, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
-      pending--;
+      // Only a BOUND arrival retires a bound-pending slot — an unbound
+      // (webhook.send-composed) leg was never pending on the connection.
+      if (fx.bound) pending--;
       kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
     }
     return node;
@@ -1211,9 +1372,11 @@ function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending)
 
 /** Bound fetches a node armed that are still outstanding — prod's
  *  `request.fetchesPending` base ("including this one"). Rolled-back arms never
- *  issued, so they don't count. */
+ *  issued, so they don't count; nor do unbound `http.fetch` primitives
+ *  (`bound:false` — e.g. webhook.send's decomposed fetch), which never resume
+ *  the connection and so are never pending on it. */
 function armedFetches(node) {
-  return live(node.force().effects).filter((e) => e.kind === "fetch").length;
+  return live(node.force().effects).filter((e) => e.kind === "fetch" && e.bound).length;
 }
 
 // ── WebSocket held-socket fold ────────────────────────────────────────────

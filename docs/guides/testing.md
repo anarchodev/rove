@@ -71,6 +71,11 @@ expect(req).toHaveFetched(/stripe/);
 - `rootToken` — the operator token `platform.auth.checkRootToken` validates against.
 - `admin` — mark the run as the admin handler so `platform.*` is allowed. It's
   admin-only and **off by default**, so a normal handler that touches it throws.
+- `emailBudget` — a per-activation `email.send` allowance. Production meters
+  sends through a per-instance token bucket; offline they're unmetered unless
+  this is set, in which case the N+1-th send in an activation throws the same
+  `Error` prod does (`e.code === "rate_limited"`), so the catch branch is
+  testable.
 - `tenant` / `correlationId` — the per-chain identity the engine pins on every
   activation (`request.tenant` and `request.correlation_id`). The worker sets them
   in prod — inbound mints the correlation id, every resume inherits it — so a
@@ -207,11 +212,23 @@ const done = req.fetch(/upstream/).stream(["chunk-1", "chunk-2", "chunk-3"]);
 expect(done.body).toBe("chunk-1chunk-2chunk-3");   // an accumulate-in-kv handler reconstructs it
 ```
 
-When the fetch's `on` names a **different module** (a path like `hooks/onX.mjs`,
-not a bare same-module export), `.resolve()` runs that module at its `default`
-export — the same entry-switch `sendCallback`/`wake` use. So a continuation that
-lives in its own file (an `oidc.rp()` internal, a shared hook) resolves correctly,
-and you can also drive one in isolation with `scenario.fetchResult` (below).
+A bound fetch's `on` is a **bare export in the same module** — a `/` or `.`
+module path throws at the call site, offline exactly as live (the cross-module
+continuation surfaces are `webhook.send`'s `on` and the durable `schedule`
+targets). A continuation module that lives in its own file is driven in
+isolation with `scenario.fetchResult` (below).
+
+Two outcomes are not yours to script. An effect that **never fires in prod**
+is excluded from matchers and folds: a connection-scoped effect (`after.ms` /
+`after.kv` / `after.fetch` / `stream.write`) recorded by an activation that
+returned a terminal body instead of `next()`, or by a connectionless one (a
+`schedule`/`webhook` callback, a disconnect), is tagged `dropped` in the
+bundle with a warning naming it — so `.not.toHaveFetched(...)` passes, as it
+should. And resolving a **success** for a URL prod categorically blocks
+(plain `http://`, localhost, an SSRF-blocklisted address like
+`169.254.169.254`) fails the test loudly naming the policy — the only
+outcome such a fetch ever delivers live is the terminal transport failure,
+`.resolve({ status: 0 })`, which stays authorable.
 
 ### Concurrent effects that race
 
@@ -391,6 +408,11 @@ Each store is isolated, exactly like production: a tenant's own `kv`, another
 instance's store (`platform.scope(id).kv`), and the root store (`platform.root`)
 never bleed into one another. Seed the other stores on the scenario, and read
 their post-state back with `instanceKv` / `rootKv`:
+
+Declaring an instance also makes it **resolvable**: `platform.scope(id)`
+resolves eagerly, so an id the scenario didn't declare (and the run didn't
+`instances.create`) throws `Error{code:"InstanceNotFound"}` at the call site —
+the same ghost-id behavior as production.
 
 ```js
 const s = scenario({
