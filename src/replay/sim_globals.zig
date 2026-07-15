@@ -217,10 +217,15 @@ const SYSTEM_SHIM =
     \\  globalThis._system = {
     \\    // The park/continue native (`next.js` captures this at base-eval).
     \\    // Mirrors the worker's disposition: target "" = same-module;
-    \\    // non-empty = cross-module re-entry (recorded for fidelity; the
-    \\    // sim consumer keys on `__rove_disposition` + `ctx`).
+    \\    // non-empty = cross-module re-entry — the worker parks the target
+    \\    // as the continuation's path and dispatches every later resume on
+    \\    // the held chain there, so the epilogue surfaces it on the bundle
+    \\    // (`target`) and the harness resume folds re-enter it
+    \\    // (`heldEntry`). `fn` is the native's optional named-export
+    \\    // override (`next(path, { fn?, ctx? })`), carried for the same
+    \\    // reason.
     \\    continuation: {
-    \\      next: function(target, o){ return { __rove_disposition: "next", target: (target ? target : null), ctx: (o && o.ctx !== undefined) ? o.ctx : null }; },
+    \\      next: function(target, o){ return { __rove_disposition: "next", target: (target ? target : null), fn: (o && typeof o.fn === "string") ? o.fn : null, ctx: (o && o.ctx !== undefined) ? o.ctx : null }; },
     \\    },
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
