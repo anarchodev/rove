@@ -689,6 +689,8 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     // close) or `next({ctx})` (hold the connection). handler-shape §2.1.
     var held = false;
     var ctx_val: ?std.json.Value = null;
+    var target_val: ?std.json.Value = null;
+    var fn_val: ?std.json.Value = null;
     var body_val: ?std.json.Value = null;
     if (run) |r| {
         if (r.get("result")) |res| {
@@ -697,6 +699,13 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
                     if (disp == .string and std.mem.eql(u8, disp.string, "next")) {
                         held = true;
                         ctx_val = res.object.get("ctx");
+                        // A cross-module `next(target, ctx)` parks `target` as
+                        // the continuation's module (and `fn` as its export
+                        // override) — the worker dispatches every resume on
+                        // the held chain there, so the harness needs both on
+                        // the bundle to fold resumes at the right module.
+                        target_val = res.object.get("target");
+                        fn_val = res.object.get("fn");
                     }
                 }
             }
@@ -708,6 +717,17 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     if (held) {
         try w.writeAll(",\"ctx\":");
         if (ctx_val) |cv| try std.json.Stringify.value(cv, .{}, w) else try w.writeAll("null");
+        // Emitted only for a cross-module park (the recorder stores null on
+        // the ambient same-module `next()`), so same-module bundles are
+        // byte-identical with or without this field.
+        if (target_val) |tv| if (tv == .string) {
+            try w.writeAll(",\"target\":");
+            try std.json.Stringify.value(tv, .{}, w);
+        };
+        if (fn_val) |fv| if (fv == .string) {
+            try w.writeAll(",\"fn\":");
+            try std.json.Stringify.value(fv, .{}, w);
+        };
     } else {
         // The epilogue emits `body_override` when prod's WIRE body differs
         // from the plain return value — a returned Uint8Array (raw bytes →
