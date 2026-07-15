@@ -1,5 +1,5 @@
 // Connection-scoped effects on a terminal or connectionless activation are
-// DROPPED, exactly as prod drops them (issue #20): `after.ms`/`after.kv` arm —
+// DROPPED, exactly as prod drops them: `after.ms`/`after.kv` arm —
 // and `after.fetch` binds — only when the activation ends held; `stream.write`
 // needs a live socket. The sim tags the discarded entries `dropped`, excludes
 // them from matchers/folds, and warns — while the durable verbs

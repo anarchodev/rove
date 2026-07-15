@@ -5,8 +5,10 @@
 // what the offline harness must police is which OUTCOMES are authorable.
 export default function () {
   after.fetch("https://169.254.169.254/latest/meta-data/", { on: "onMeta" });
-  after.fetch("http://api.example.test/plain", { on: "onPlain" });
-  after.fetch("https://localhost:8080/svc", { on: "onLocal" });
+  // The blocked-class arms share onMeta: their only authorable outcome is
+  // the transport failure, which resumes there like the metadata arm's.
+  after.fetch("http://api.example.test/plain", { on: "onMeta" });
+  after.fetch("https://localhost:8080/svc", { on: "onMeta" });
   after.fetch("https://api.example.test/ok", { on: "onOk" });
   return next({});
 }

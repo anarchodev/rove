@@ -1,5 +1,5 @@
 // Resolving a SUCCESS outcome for a fetch prod categorically blocks fails
-// loud (issue #22): the blocked classes (SSRF ranges, plain http, localhost)
+// loud: the blocked classes (SSRF ranges, plain http, localhost)
 // never leave the engine, so a scripted 200 exercises a path no handler can
 // reach live. The outcome prod actually delivers — the terminal transport
 // failure, status 0 — stays authorable, and public https URLs are untouched.

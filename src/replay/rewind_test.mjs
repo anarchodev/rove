@@ -201,9 +201,13 @@ function prodBlockedUrl(url) {
     if (colon >= 0) host = host.slice(0, colon);
   }
   host = host.toLowerCase();
-  if (host.endsWith(".internal")) return null; // reserved platform-door TLD, engine-rewritten pre-gate
+  // Scheme policy first (prod's gate rejects a non-http(s) scheme for ANY
+  // host); the reserved platform-door TLD is exempt only from the plaintext
+  // rule — the fetch engine's door rewrite consumes `http://*.internal/`
+  // before the gate ever sees it.
   if (scheme !== "http" && scheme !== "https")
     return "the `" + scheme + ":` scheme is not http(s) (prod: UnsupportedScheme)";
+  if (host.endsWith(".internal")) return null;
   if (scheme === "http")
     return "plaintext http:// outbound is blocked (prod: PlaintextBlocked — https only)";
   if (!host.length) return null;
@@ -211,8 +215,13 @@ function prodBlockedUrl(url) {
     return "localhost resolves to loopback (prod: BlockedAddress)";
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
   if (v4) {
-    const o = v4.slice(1).map(Number);
-    if (o.some((x) => x > 255)) return null; // not an IP literal — a resolvable name
+    const parts = v4.slice(1);
+    // Only CANONICAL dotted-decimal classifies. A leading-zero octet is
+    // octal to the resolver (010.0.0.1 → 8.0.0.1) and an out-of-range one
+    // is a hostname — both classify null rather than mis-map to decimal.
+    if (parts.some((s) => s.length > 1 && s[0] === "0")) return null;
+    const o = parts.map(Number);
+    if (o.some((x) => x > 255)) return null;
     if (v4Blocked(o)) return "the address " + host + " is in a blocked range (prod: BlockedAddress — SSRF blocklist)";
     return null;
   }
@@ -972,9 +981,14 @@ class FetchHandle {
     // offline would pass a shape prod never sends. Fail loud (issue #24).
     if (!this.fx.stream)
       throw new Error(`stream(): this fetch was issued WITHOUT stream:true (${this.fx.url}) — prod delivers one whole-body result; use .resolve({...}) or issue the fetch with { stream: true }`);
-    // Delivering chunks IS a success outcome — a blocked fetch only ever
-    // produces its terminal transport failure.
-    requireProdReachable("stream()", this.fx, { status: opts.status != null ? opts.status : 200 });
+    // Delivering chunks is itself unreachable for a blocked fetch — prod
+    // emits only the single terminal transport-failure event, never chunk
+    // activations — so the gate fires regardless of the scripted status.
+    {
+      const why = prodBlockedUrl(this.fx.url);
+      if (why) throw new Error("stream(): prod categorically blocks this fetch — " + why + ". " +
+        JSON.stringify(String(this.fx.url)) + " never leaves the engine and delivers no chunk events; the only authorable outcome is the whole-body transport failure, .resolve({ status: 0 })");
+    }
     const parentNode = this.node;
     const pw = this.node.world;
     const fx = this.fx;
@@ -1186,7 +1200,9 @@ class Interleaving {
       const fx = this._locate(spec.match);
       requireProdReachable("whenConcurrent", fx, spec.resolve || {});
       node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
-      pending--;
+      // Only a BOUND arrival retires a bound-pending slot — an unbound
+      // (webhook.send-composed) leg was never pending on the connection.
+      if (fx.bound) pending--;
       kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
     }
     return node;

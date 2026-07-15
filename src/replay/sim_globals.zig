@@ -52,8 +52,11 @@ const SYSTEM_SHIM =
     \\  // http_b.isValidExportName (bindings/http.zig): ASCII alnum/_/$, first
     \\  // char non-digit — gates every bound-export override ({on}/name).
     \\  var isExportName = function(s){ return typeof s === "string" && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(s); };
-    \\  // JS_ToInt32/ToInt64-style coercion: ToNumber, then NaN/±Infinity → 0,
-    \\  // fraction truncated — so the range checks below reject the same values.
+    \\  // JS_ToInt64-style coercion (after.ms): ToNumber, then NaN/±Infinity → 0,
+    \\  // fraction truncated. The ToInt32 sites (randomBytes n, blob.url ttl) use
+    \\  // JS's own `| 0` — the exact ECMA ToInt32 incl. the mod-2^32 wrap prod's
+    \\  // JS_ToInt32 performs, so out-of-range wrapping accepts/rejects the same
+    \\  // values as prod.
     \\  var toInt = function(x){ var n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : 0; };
     \\  // UTF-8 byte length of a string chunk / byte length of a Uint8Array —
     \\  // the wire size prod's caps measure (surrogate pairs 4 bytes, lone 3).
@@ -62,6 +65,19 @@ const SYSTEM_SHIM =
     \\  // Uint8Array; absent (undefined) defaults — anything else (incl. null)
     \\  // throws. Shared by http.fetch / after.fetch / http.subscribe.
     \\  var checkFetchBody = function(o){ if (o.body !== undefined && typeof o.body !== "string" && !(o.body instanceof Uint8Array)) throw new TypeError("fetch: `body` must be a string or Uint8Array"); };
+    \\  // buildFetchRow (bindings/http.zig) — the shared unbound-fetch option
+    \\  // validation jsHttpFetch AND jsHttpSubscribe run: url required, body
+    \\  // shape, `name` identifier, `on_chunk` (module path) required. The
+    \\  // native reads ONLY `on_chunk` (the public shims lower `on` to it), so
+    \\  // no `on` fallback here. Returns the module path.
+    \\  var checkFetchOpts = function(o){
+    \\    if (typeof o.url !== "string") throw new TypeError("http.fetch requires a `url` string");
+    \\    checkFetchBody(o);
+    \\    var nm = o.name === undefined ? "" : String(o.name);
+    \\    if (nm.length > 0 && !isExportName(nm)) throw new TypeError("http.fetch: `name` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)");
+    \\    if (!o.on_chunk) throw new TypeError("http.fetch: `on_chunk` (module path) is required");
+    \\    return o.on_chunk;
+    \\  };
     \\  // Native rate-limit builtin the email global bottoms out on
     \\  // (worker-native: a per-instance plan-tier token bucket,
     \\  // bindings/email_rate.zig). Offline sends are UNMETERED by default —
@@ -261,7 +277,7 @@ const SYSTEM_SHIM =
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
     \\      // jsCryptoRandomBytes (bindings/crypto.zig): ToInt32(n) ∈ [0, 65536].
-    \\      randomBytes: function(n){ var v = toInt(n); if (v < 0 || v > 65536) throw new RangeError("crypto.randomBytes: n must be in [0, 65536]"); return nat.randomBytes(v); },
+    \\      randomBytes: function(n){ var v = Number(n) | 0; if (v < 0 || v > 65536) throw new RangeError("crypto.randomBytes: n must be in [0, 65536]"); return nat.randomBytes(v); },
     \\      randomUUID: function(){ return nat.randomUUID(); },
     \\      sha256: function(d){ return nat.sha256(d); },
     \\      hmacSha256: function(k,d){ return nat.hmacSha256(k,d); },
@@ -274,25 +290,17 @@ const SYSTEM_SHIM =
     \\      oidcGenerateKey: no("oidcGenerateKey"), oidcSign: no("oidcSign"),
     \\    },
     \\    http: {
-    \\      // Validation mirrors jsHttpFetch/buildFetchRow (bindings/http.zig):
-    \\      // options object, body shape, `name` identifier, `on_chunk` required.
+    \\      // Validation mirrors jsHttpFetch → buildFetchRow (bindings/http.zig).
     \\      fetch: function(o){
     \\        if (o === null || o === undefined || typeof o !== "object") throw new TypeError("http.fetch requires an options object");
-    \\        checkFetchBody(o);
-    \\        var nm = o.name === undefined ? "" : String(o.name);
-    \\        if (nm.length > 0 && !isExportName(nm)) throw new TypeError("http.fetch: `name` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)");
-    \\        var oc = o.on_chunk || o.on || null;
-    \\        if (!oc) throw new TypeError("http.fetch: `on_chunk` (module path) is required");
-    \\        return recFetch(o.url, o, oc, false);
+    \\        return recFetch(o.url, o, checkFetchOpts(o), false);
     \\      },
     \\      cancelFetch: function(){},
     \\      // jsHttpSubscribe reuses buildFetchRow, so the inner throws keep the
     \\      // http.fetch spelling — matched verbatim.
     \\      subscribe: function(o){
     \\        if (o === null || o === undefined || typeof o !== "object") throw new TypeError("http.subscribe requires an options object");
-    \\        checkFetchBody(o);
-    \\        var oc = o.on_chunk || o.on || null;
-    \\        if (!oc) throw new TypeError("http.fetch: `on_chunk` (module path) is required");
+    \\        var oc = checkFetchOpts(o);
     \\        var id = "sub_" + nextSeq(); push({ kind: "subscribe", id: id, url: o.url, headers: o.headers || {}, on: oc }); return id;
     \\      },
     \\      cancelSubscription: function(){},
@@ -313,9 +321,11 @@ const SYSTEM_SHIM =
     \\        return recFetch(url, o, o.on || null, true);
     \\      },
     \\      // jsOnKv: string prefix required. jsOnTimer: ToInt64(ms) must be > 0
-    \\      // (so undefined/NaN/0/negative/fractional-below-1 all throw).
+    \\      // (so undefined/NaN/0/negative/fractional-below-1 all throw) — with
+    \\      // JS_ToInt64's mod-2^64 wrap, so an overflowing delay (≥ 2^63 wraps
+    \\      // negative) throws here exactly as live.
     \\      kv: function(prefix, o){ if (typeof prefix !== "string") throw new TypeError("after.kv(prefix, opts?) requires a string prefix"); push({ kind: "kv-wake", prefix: prefix, on: (o && o.on) || null }); },
-    \\      timer: function(ms, o){ ms = toInt(ms); if (ms <= 0) throw new TypeError("after.ms(ms): ms must be > 0"); push({ kind: "timer", ms: ms, on: (o && o.on) || null }); },
+    \\      timer: function(ms, o){ ms = Number(BigInt.asIntN(64, BigInt(toInt(ms)))); if (ms <= 0) throw new TypeError("after.ms(ms): ms must be > 0"); push({ kind: "timer", ms: ms, on: (o && o.on) || null }); },
     \\    },
     \\    blob: {
     \\      // jsBlobPresign (bindings/blob.zig): hash = 64 lowercase hex; a
@@ -323,7 +333,7 @@ const SYSTEM_SHIM =
     \\      presign: function(hash, ttl, ct){
     \\        if (typeof hash !== "string") throw new TypeError("blob.url requires a hash string");
     \\        if (!/^[0-9a-f]{64}$/.test(hash)) throw new TypeError("blob.url: hash must be 64 lowercase hex chars");
-    \\        if (ttl !== undefined && ttl !== null) { var t = toInt(ttl); if (t < 1 || t > 604800) throw new TypeError("blob.url: ttl must be 1..604800 seconds"); }
+    \\        if (ttl !== undefined && ttl !== null) { var t = Number(ttl) | 0; if (t < 1 || t > 604800) throw new TypeError("blob.url: ttl must be 1..604800 seconds"); }
     \\        return "https://sim.invalid/blob/" + hash + (ttl != null ? "?ttl=" + ttl : "");
     \\      },
     \\      write: function(){}, seal: function(){ return {}; },
@@ -355,10 +365,18 @@ const SYSTEM_SHIM =
     \\      // per-activation counter.
     \\      write: function(c){
     \\        if (typeof c !== "string" && !(c instanceof Uint8Array)) throw new TypeError("stream.write: chunk must be a string or Uint8Array");
-    \\        var tot = (globalThis.__rove_stream_bytes || 0) + u8len(c);
+    \\        var prev = globalThis.__rove_stream_bytes || 0;
+    \\        // UTF-8 length ≥ UTF-16 code-unit count, so an over-cap chunk can be
+    \\        // rejected on .length alone; the per-char scan only runs for chunks
+    \\        // that could fit, and an all-ASCII chunk short-circuits via one
+    \\        // native regex test (its UTF-8 length IS .length).
+    \\        var nbytes = (typeof c !== "string" || !/[^\x00-\x7F]/.test(c)) ? c.length
+    \\          : (prev + c.length > 4194304 ? c.length : u8len(c));
+    \\        var tot = prev + nbytes;
     \\        if (tot > 4194304) throw new RangeError("stream.write: too many bytes buffered in one activation; emit fewer per activation and continue with next()");
     \\        globalThis.__rove_stream_bytes = tot;
-    \\        var t = b2s(c); push({ kind: "stream", bytes: t.length, data: t });
+    \\        // `bytes` is the WIRE size (what the cap counts and prod ships).
+    \\        push({ kind: "stream", bytes: nbytes, data: b2s(c) });
     \\      },
     \\    },
     \\    platform: {
@@ -375,12 +393,19 @@ const SYSTEM_SHIM =
     \\        if (id === undefined) throw new TypeError("platform.scope requires (instance_id)");
     \\        id = String(id);
     \\        if (!id.length) throw new TypeError("platform.scope: instance_id must be non-empty");
-    \\        if (globalThis.kv.get(NS_STORE + "exists/i/" + id) !== "1") { var e = new Error("instance not found"); e.code = "InstanceNotFound"; throw e; }
+    \\        // The exists marker is harness-seeded, so a CAPTURED tape (which
+    \\        // carries no scenario) skips the resolve check — the tape already
+    \\        // proves the instance resolved live.
+    \\        if (!globalThis.__rove_captured && globalThis.kv.get(NS_STORE + "exists/i/" + id) !== "1") { var e = new Error("instance not found"); e.code = "InstanceNotFound"; throw e; }
     \\        push({ kind: "platform", op: "scope", id: id });
     \\        return { kv: storeKv(NS_STORE + "i/" + id + "/", "i/" + id), blob: {} };
     \\      }),
     \\      root: { get: gate(rootStore_r.get), set: gate(rootStore_r.set), delete: gate(rootStore_r.delete), prefix: gate(rootStore_r.prefix) },
-    \\      instances: { create: gate(function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); var id = (spec && spec.id) || "inst_sim"; globalThis.kv.set(NS_STORE + "exists/i/" + id, "1"); return id; }), deployStarter: gate(function(){ push({ kind: "platform", op: "instances.deployStarter" }); }) },
+    \\      // instances.create records the exists marker as a STORE-TAGGED write
+    \\      // (not just a hidden native set): resumes rebuild kv from the folded
+    \\      // effect log, and only recorded writes fold forward — so an instance
+    \\      // created in one activation stays scope-resolvable in the next.
+    \\      instances: { create: gate(function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); var id = (spec && spec.id) || "inst_sim"; push({ kind: "write", store: "exists", key: "i/" + id, value: "1" }); globalThis.kv.set(NS_STORE + "exists/i/" + id, "1"); return id; }), deployStarter: gate(function(){ push({ kind: "platform", op: "instances.deployStarter" }); }) },
     \\      releases: { publish: gate(function(){ push({ kind: "platform", op: "releases.publish" }); }) },
     \\      // checkRootToken(token) → true iff it matches the operator root token
     \\      // (env-supplied in prod); the sim carries it as a hidden reserved kv key

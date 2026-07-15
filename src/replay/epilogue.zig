@@ -286,6 +286,9 @@ const EPILOGUE_BODY =
     \\  globalThis.__rove_stream_bytes = 0;
     \\  globalThis.__rove_blob_receive_used = false;
     \\  globalThis.__rove_activation_kind = D.kind;
+    \\  // Captured tapes replay trust-the-tape: recorder checks that depend on
+    \\  // harness-seeded state (platform.scope's exists marker) stand down.
+    \\  globalThis.__rove_captured = D.captured;
     \\  globalThis.__rove_email_sends = 0;
     \\  // Prod's console formatter (globals/console.js `fmt`) — byte-identical
     \\  // here so a log assertion transfers between a bundle and a live request
@@ -615,6 +618,11 @@ const EPILOGUE_BODY =
     \\      if (__e.kind !== "read" && __e.kind !== "log" && __e.kind !== "stream") __e.rolledBack = true;
     \\    }
     \\  }
+    \\  // The one held/terminal disposition read: the handler parked with
+    \\  // `next()` (a thrown handler's __result is the 500 body string, so it
+    \\  // reads terminal). Shared by the drop-tagging pass below and the
+    \\  // terminal-body derivation — one bind-or-drop decision, like the worker.
+    \\  const __held = __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
     \\  // ── connection-scoped effect disposition (prod parity) ──
     \\  // `after.ms`/`after.kv` arm — and a connection-scoped `after.fetch`
     \\  // binds — only at the handler-success seam, and only when the activation
@@ -627,11 +635,16 @@ const EPILOGUE_BODY =
     \\  // entries `dropped` — excluded from matchers/kv-folds like `rolledBack`,
     \\  // kept on the log for debugging — and warn, so a test can't green on an
     \\  // effect prod never ships. Rolled-back entries are already excluded.
-    \\  {
-    \\    const __held = !__err && __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
-    \\    const __connless = D.kind === "durable_wake" || D.kind === "send_callback" || D.kind === "disconnect";
+    \\  // Authored worlds only: a captured tape is the record of what prod
+    \\  // actually did (including resume shapes whose accumulators differ from
+    \\  // the authored kinds, e.g. a held send_callback hop that binds fetches)
+    \\  // — replay must not re-litigate it. Same posture as the authored-header
+    \\  // hygiene warnings.
+    \\  if (!D.captured) {
+    \\    const __connless = D.kind === "durable_wake" || D.kind === "send_callback" || D.kind === "disconnect" || D.kind === "subscription_fire";
     \\    const __dropWakes = __connless || !__held;
-    \\    const __dropWarns = [];
+    \\    // Warns append to __effects mid-iteration: for..of visits the new tail,
+    \\    // but a {kind:"log"} entry matches no branch below, so this terminates.
     \\    for (const __e of __effects) {
     \\      if (__e.rolledBack) continue;
     \\      let __what = null;
@@ -641,9 +654,8 @@ const EPILOGUE_BODY =
     \\      else if (__e.kind === "stream" && __connless) __what = "stream.write";
     \\      if (__what === null) continue;
     \\      __e.dropped = true;
-    \\      __dropWarns.push({ kind: "log", level: "warn", message: "dropped connection-scoped effect: " + __what + " — " + (__connless ? "a " + D.kind + " activation has no connection" : "the handler returned a terminal response instead of next(), so the socket was not held") + "; prod discards it and it never fires" });
+    \\      __effects.push({ kind: "log", level: "warn", message: "dropped connection-scoped effect: " + __what + " — " + (__connless ? "a " + D.kind + " activation has no connection" : "the handler returned a terminal response instead of next(), so the socket was not held") + "; prod discards it and it never fires" });
     \\    }
-    \\    for (const __w of __dropWarns) __effects.push(__w);
     \\  }
     \\  globalThis.kv = __kvNative;   // restore before the native OUTPUT_KEY write
     \\  // ── response vetting (prod parity) — the emit-side rules the worker
@@ -712,8 +724,7 @@ const EPILOGUE_BODY =
     \\  // differs from the plain return value.
     \\  let __bodyOverride = null;
     \\  {
-    \\    const held = __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
-    \\    if (!held && !__err) {
+    \\    if (!__held && !__err) {
     \\      const isBytes = __result instanceof Uint8Array;
     \\      let isJson = false, text = null;
     \\      if (typeof __result === "string") text = __result;

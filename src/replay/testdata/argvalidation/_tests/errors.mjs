@@ -1,4 +1,4 @@
-// Prod's synchronous effect-argument validation fires offline too (issue #21):
+// Prod's synchronous effect-argument validation fires offline too:
 // each row pins the exact error type + message the worker binding throws
 // (bindings/{on,http,stream,blob,crypto}.zig + globals.zig), so a customer
 // `catch` branch keyed on them is testable under `rewind test`.
@@ -24,6 +24,7 @@ row("fetchBadBody", "TypeError", "fetch: `body` must be a string or Uint8Array")
 row("fetchNullBody", "TypeError", "fetch: `body` must be a string or Uint8Array");
 row("fetchPathOn", "TypeError", "after.fetch: `on` must be a JS identifier");
 row("subscribeNoOn", "TypeError", "http.fetch: `on_chunk` (module path) is required");
+row("subscribeBadName", "TypeError", "http.fetch: `name` must be a JS identifier");
 row("streamBadChunk", "TypeError", "stream.write: chunk must be a string or Uint8Array");
 row("streamFlood", "RangeError", "too many bytes buffered in one activation");
 row("blobTtlZero", "TypeError", "blob.url: ttl must be 1..604800 seconds");

@@ -17,6 +17,7 @@ export default function () {
   probe("fetchNullBody", () => after.fetch("https://api.example.test/x", { body: null }));
   probe("fetchPathOn", () => after.fetch("https://api.example.test/x", { on: "hooks/next.mjs" }));
   probe("subscribeNoOn", () => http.subscribe({ url: "https://feed.example.test/x" }));
+  probe("subscribeBadName", () => http.subscribe({ url: "https://feed.example.test/x", on: "ingest", name: "9bad" }));
   probe("streamBadChunk", () => stream.write({}));
   // One 5 MiB chunk crosses the 4 MiB per-activation buffered cap in a single
   // call, so nothing is recorded before the throw.

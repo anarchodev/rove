@@ -1,7 +1,7 @@
-// scenario({ emailBudget: N }) arms prod's email rate limit offline
-// (issue #23): the N+1-th email.send in an activation throws prod's exact
+// scenario({ emailBudget: N }) arms prod's email rate limit offline:
+// the N+1-th email.send in an activation throws prod's exact
 // Error{code:"rate_limited"} shape, so the catch branch is testable; unset,
-// offline sends stay unmetered (today's default).
+// offline sends stay unmetered (the default).
 import { scenario, expect } from "rewind:test";
 
 // Budget 2: two sends land, the third trips the limiter.
