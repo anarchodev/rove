@@ -733,9 +733,11 @@ class Node {
   // Every `after.*` wake fires ONLY while the connection is held (the handler
   // returned `next()` or is streaming) — inert otherwise. So each resume below
   // requires this node to be held, and threads the held continuation forward:
-  // the parent's writes fold into the child's KV overlay, and the child's
+  // the parent's writes fold into the child's KV overlay, the child's
   // `request.ctx` is the effect's own ctx (fetch) or the held `next({ctx})`
-  // (timer/kv/disconnect — they carry no ctx of their own).
+  // (timer/kv/disconnect — they carry no ctx of their own), and the resume
+  // re-enters the module the chain is parked at — the held `next(target)`'s
+  // cross-module target when one was parked, else this module (`heldEntry`).
 
   /** Locate an emitted `after.fetch` by url matcher → a handle that resolves
    *  its upstream result into the dependent `fetch_chunk` resume. */
@@ -853,7 +855,7 @@ class Node {
     if (!entries.length)
       throw new Error(`wakeKv(): no change key falls under an armed after.kv prefix (armed: ${armed.map((e) => JSON.stringify(e.prefix)).join(", ")})`);
     return resumeNode(parent, carrySources(parent.world, {
-      entry: parent.world.entry,
+      entry: heldEntry(parent),
       activation: "wake_batch",
       export: kw.on || "onWake",
       ctx: heldCtx(parent),
@@ -871,7 +873,7 @@ class Node {
     const parent = this;
     const pb = parent.force();
     return resumeNode(parent, carrySources(parent.world, {
-      entry: parent.world.entry,
+      entry: heldEntry(parent),
       activation: "disconnect",
       export: "onDisconnect",
       ctx: heldCtx(parent),
@@ -896,6 +898,23 @@ function heldCtx(node) {
   const b = node.force();
   const c = b.disposition === "held" ? b.ctx : null;
   return c === undefined ? null : c;
+}
+
+/** The module a resume on this held chain re-enters. Prod dispatches every
+ *  resume at the parked continuation's own path: an ambient `next()` parks the
+ *  module that held, a cross-module `next(target, ctx)` parks `target` — and
+ *  timer/kv wakes, bound-fetch chunks (via the cont→stream transition), and
+ *  disconnect all resume there. So the fold's entry is the held `next(target)`
+ *  target when the bundle carries one, else the module that held. A WS chain
+ *  is the exception: its resumes dispatch at the CONNECTION's module, which a
+ *  cross-module target never updates — so a WsNode always re-enters its own
+ *  entry. */
+function heldEntry(node) {
+  if (node instanceof WsNode) return node.world.entry;
+  const b = node.force();
+  return (b.disposition === "held" && typeof b.target === "string" && b.target)
+    ? b.target
+    : node.world.entry;
 }
 
 /** The `request.ctx` a located `after.fetch`'s resume observes (decisions.md
@@ -928,7 +947,7 @@ class Clock {
     const t = timers[0];
     const now = (parent.world.now_ms || 0) + this.ms;
     return resumeNode(parent, carrySources(parent.world, {
-      entry: parent.world.entry,
+      entry: heldEntry(parent),
       activation: "wake_batch",
       export: t.on || "onWake",
       ctx: heldCtx(parent),
@@ -956,7 +975,7 @@ class FetchHandle {
     if (this.fx.stream)
       record("warn: .resolve() on a streaming fetch (stream:true) — prod delivers per-chunk events; use .stream([...])", true, { url: this.fx.url });
     const world = fetchResumeWorld(
-      parent.world, this.fx, response,
+      parent, this.fx, response,
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + (response.latencyMs || 1),
@@ -993,6 +1012,9 @@ class FetchHandle {
     const pw = this.node.world;
     const fx = this.fx;
     const on = fx.on;
+    // The chain's parked module — fixed for every chunk (prod pins it at the
+    // cont→stream transition), so a held next(target) routes the whole stream.
+    const parkedEntry = heldEntry(parentNode);
     const ctx = fetchResumeCtx(parentNode, fx);
     // The fetch stays pending through every chunk INCLUDING its terminal done
     // event (prod counts "including this one").
@@ -1007,7 +1029,7 @@ class FetchHandle {
     // bag matches (`opts.headers` supplies the upstream's headers).
     let off = 0;
     const step = (body, done, seq) => {
-      const t = onTarget(pw.entry, on, done ? "onFetchDone" : "onFetchChunk");
+      const t = onTarget(parkedEntry, on, done ? "onFetchDone" : "onFetchChunk");
       // Prod stamps status/bodyTruncated ONLY on the terminal event
       // (globals.zig `if (fc.final)`); non-final chunks carry done/chunkSeq/
       // fetchId/fetchesPending + the payload, nothing else. No `ok` —
@@ -1076,7 +1098,7 @@ class ReceiveHandle {
       ? { hash: spec.hash, len: spec.len != null ? spec.len : 0, app }
       : { error: spec.error != null ? spec.error : "receive failed", app };
     const world = carrySources(parent.world, {
-      entry: parent.world.entry,
+      entry: heldEntry(parent),
       // Receive completions resume through the FetchEngine router (a bound
       // terminal event) — the same continuation shape as a fetch result.
       activation: "fetch_chunk",
@@ -1123,7 +1145,7 @@ class CompileHandle {
       ? { ok: true, results: spec.results != null ? spec.results : [], app }
       : { ok: false, status, error: spec.error != null ? spec.error : "compile failed" };
     const world = fetchResumeWorld(
-      parent.world, this.fx, { status, body: null },
+      parent, this.fx, { status, body: null },
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
@@ -1151,7 +1173,7 @@ class StampHandle {
     const status = spec.status != null ? spec.status : (ok ? 200 : 502);
     const ctx = { ok, dep_id: spec.dep_id != null ? spec.dep_id : "0000000000000000" };
     const world = fetchResumeWorld(
-      parent.world, this.fx, { status, body: null },
+      parent, this.fx, { status, body: null },
       foldKv(parent.world.kv, pb.effects),
       (parent.world.seed || 0) + 1,
       (parent.world.now_ms || 0) + 1,
@@ -1199,7 +1221,7 @@ class Interleaving {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
       requireProdReachable("whenConcurrent", fx, spec.resolve || {});
-      node = resumeNode(parent, fetchResumeWorld(parent.world, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
+      node = resumeNode(parent, fetchResumeWorld(parent, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
       // Only a BOUND arrival retires a bound-pending slot — an unbound
       // (webhook.send-composed) leg was never pending on the connection.
       if (fx.bound) pending--;
@@ -1303,11 +1325,15 @@ function onTarget(parentEntry, on, fallbackExport) {
 /** Build the `fetch_chunk` resume world for a located fetch effect against an
  *  EXPLICIT kv/seed/now base — the shared core of `FetchHandle.resolve` and the
  *  `whenConcurrent` interleaving fold (which threads a running overlay through a
- *  chosen arrival order rather than always folding from the one parent). */
-function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx, pending) {
+ *  chosen arrival order rather than always folding from the one parent). Takes
+ *  the parent NODE (not its world): a bare-export `on` resumes in the module the
+ *  chain is parked at — the held `next(target)`'s module when one was parked
+ *  (`heldEntry`), like prod's cont→stream transition. */
+function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending) {
+  const parentWorld = parent.world;
   const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
   const done = response.done != null ? response.done : true;
-  const t = onTarget(parentWorld.entry, fx.on, "onFetchResult");
+  const t = onTarget(heldEntry(parent), fx.on, "onFetchResult");
   const request = {
     done,
     body: response.body != null ? response.body : null,
@@ -1577,11 +1603,17 @@ class Matcher {
 function snapshotFacets(b) {
   const cmds = live(b.effects).filter((e) =>
     e.kind !== "read" && e.kind !== "log");
-  return {
+  const facets = {
     response: b.response || null,
     disposition: b.disposition,
     body: b.disposition === "held" ? b.ctx : (b.body === undefined ? null : b.body),
     effects: cmds,
     ok: b.ok,
   };
+  // A cross-module park's target is part of the held state (it decides which
+  // module every resume runs) — pin it. Absent on a same-module hold, so
+  // existing snapshots compare unchanged.
+  if (b.disposition === "held" && typeof b.target === "string" && b.target)
+    facets.target = b.target;
+  return facets;
 }
