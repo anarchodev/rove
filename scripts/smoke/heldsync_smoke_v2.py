@@ -5,11 +5,12 @@ call on the `V2Cluster` harness (branch `v2`).
 ONE synchronous client request to acme's `/heldsync`:
 
   client ──POST /heldsync {target,tag}──▶ acme open hop
-     open: webhook.send(target) + return __rove_next(heldsync/onresult#onResult)
+     open: webhook.send(target) + return next("heldsync/onresult", ctx)
         → the §6.4 binding stamps the lone `_send/owed/` put's completion
           as this continuation's resume; the entity parks (held; no response)
      webhook libcurl fires → wb echoes → webhook_onresult → resumeIfBound
-        → onResult runs → terminal → resolveParked flushes to the open socket
+        → onresult's default export runs → terminal → resolveParked flushes
+          to the open socket
   ◀── 200 "heldsync:v:echoed:v"  (the one request returns, resumed)
 
 Single-node V2 (the open hop park + the webhook completion + the resume are
@@ -41,9 +42,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
-# Handlers verbatim from the V1 demo tenant
-# (examples/loop46-demo-tenants/acme/heldsync/{index,onresult}.mjs and
-# examples/loop46-demo-tenants/wb/index.mjs).
+# Handlers in today's public spelling — the cross-module continuation is
+# `next(targetModule, ctx)` (the widened public `next`; there is no bare
+# `__rove_next` for customer code), which resumes the target's DEFAULT
+# export on the send_callback activation.
 HELDSYNC_SRC = r"""export default function () {
     const req = request.json;
     const opts = {
@@ -54,16 +56,13 @@ HELDSYNC_SRC = r"""export default function () {
     };
     if (req.send_timeout_ms) opts.timeout_ms = req.send_timeout_ms;
     webhook.send(req.target, opts);
-    return __rove_next("heldsync/onresult", {
-        fn: "onResult",
-        ctx: { tag: req.tag, tries: 0, retry_to: req.retry_to || null },
-    });
+    return next("heldsync/onresult", { tag: req.tag, tries: 0, retry_to: req.retry_to || null });
 }
 """
 
-ONRESULT_SRC = r"""export function onResult() {
+ONRESULT_SRC = r"""export default function () {
     // Endpoint A: threaded ctx IS request.ctx; the webhook result is
-    // flattened on request.status/.body (2xx = delivered; no request.ok,
+    // flattened on request.status/.text (2xx = delivered; no request.ok,
     // issue #7); delivery metadata (error) is on request.activation.*.
     const ctx = request.ctx || {};
     if (request.status < 200 || request.status >= 300) {
@@ -74,10 +73,7 @@ ONRESULT_SRC = r"""export function onResult() {
                 headers: { "content-type": "application/json" },
                 maxAttempts: 1,
             });
-            return __rove_next("heldsync/onresult", {
-                fn: "onResult",
-                ctx: { tag: ctx.tag, tries: ctx.tries + 1, retry_to: null },
-            });
+            return next("heldsync/onresult", { tag: ctx.tag, tries: ctx.tries + 1, retry_to: null });
         }
         response.status = 502;
         return "heldsync upstream failed: " + (request.activation.error || request.status);

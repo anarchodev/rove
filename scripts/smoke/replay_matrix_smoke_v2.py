@@ -9,8 +9,10 @@ assert (`worker_log.l3AssertMsgRecorded`), which fires in ANY debug smoke.
 Kinds covered: `inbound` (request surface), `fetch_chunk` (on.fetch →
 onFetchResult), `ws_message` (WS frame → onMessage), `wake_batch` (after.kv →
 {on} export; the fired-watch batch + ctx + resolved export all recorded —
-issue #62). disconnect captures readset+ctx (covered by the L3 assert; its
-end-to-end replay is a follow-up).
+issue #62), `send_callback` (webhook.send {on} → the callee-outcome envelope
+recorded on trigger_payload and split into the flattened result surface +
+ctx on replay — issue #67). disconnect captures readset+ctx (covered by the
+L3 assert; its end-to-end replay is a follow-up).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -85,6 +87,35 @@ export function onFired() {
   return "woke:" + fired + ":" + String(ms_ok) + ":" + String(request.ctx && request.ctx.armed === true);
 }
 """
+# send_callback (issue #67): index arms a webhook.send at the tenant's own
+# echo route with an `{on}` result module + threaded ctx; hooks.mjs (the on
+# module, default export — send_callback's conventional dispatch) reads the
+# whole flattened surface. Reproduction on replay proves the recorded
+# envelope carries the callee outcome (status + bytes), the bare threaded
+# ctx, and the delivery metadata bag.
+SCB_INDEX_SRC = """
+export default function () {
+  const q = request.query || "";
+  if (q.includes("op=echo")) { response.status = 202; return "echo-payload"; }
+  if (q.includes("op=read")) { response.status = 200; return kv.get("delivered") || ""; }
+  let url = null;
+  for (const p of q.split("&")) { const i = p.indexOf("="); if (i<0) continue;
+    if (decodeURIComponent(p.slice(0,i)) === "url") url = decodeURIComponent(p.slice(i+1)); }
+  if (!url) { response.status = 400; return "no url"; }
+  webhook.send(url, { on: "hooks.mjs", ctx: { orderId: 7 } });
+  response.status = 200;
+  return "sent";
+}
+"""
+SCB_HOOKS_SRC = """
+export default function () {
+  const a = request.activation;
+  kv.set("delivered", String(request.status) + ":" + request.text + ":"
+    + String(request.ctx && request.ctx.orderId === 7) + ":" + String(a.attempts));
+  response.status = 200;
+  return "cb:" + request.status;
+}
+"""
 BULK_SRC = (REPO_ROOT / "examples" / "loop46-demo-tenants" / "wb" / "bulk" / "index.mjs").read_text()
 EXPECTED_BODY = "".join(f"bulk-line-{i:02d}-zzz\n" for i in range(10))
 
@@ -110,17 +141,18 @@ def find_record(c, tenant, activation, tries=60):
     return None
 
 
-def replay(rec, tenant, activation, source):
+def replay(rec, tenant, activation, source, entry="index.mjs", sources=None):
     tapes = rec.get("tapes", {})
+    src_map = sources if sources is not None else {"index.mjs": source}
     fixture = {
         "request_id": rec.get("request_id", ""), "tenant": tenant,
-        "activation": activation, "entry": "index.mjs",
+        "activation": activation, "entry": entry,
         "request": {"method": rec.get("method", "GET"), "path": rec.get("path", "/"),
                     "host": rec.get("host", "")},
         "recorded": {"status": rec.get("status", 0)},
         "seed": tapes.get("seed", "0"), "timestamp_ns": tapes.get("timestamp_ns", "0"),
         "tapes": {fx: tapes[rf] for rf, fx in _REMAP if tapes.get(rf)},
-        "sources": [{"path": "index.mjs", "kind": "handler", "source": source}],
+        "sources": [{"path": p, "kind": "handler", "source": s} for p, s in src_map.items()],
     }
     if tapes.get("export"):  # the recorded resolved export ({on}) — G3
         fixture["export"] = tapes["export"]
@@ -151,9 +183,16 @@ def main() -> int:
 
     with V2Cluster.spawn("replaymatrix", nodes=1) as c:
         c.spawn_log_server()
-        for t, src in (("inb", INBOUND_SRC), ("fch", FETCH_SRC), ("wsm", WS_SRC), ("wak", WAKE_SRC), ("up", BULK_SRC)):
+        for t, files in (
+            ("inb", {"index.mjs": INBOUND_SRC}),
+            ("fch", {"index.mjs": FETCH_SRC}),
+            ("wsm", {"index.mjs": WS_SRC}),
+            ("wak", {"index.mjs": WAKE_SRC}),
+            ("scb", {"index.mjs": SCB_INDEX_SRC, "hooks.mjs": SCB_HOOKS_SRC}),
+            ("up", {"index.mjs": BULK_SRC}),
+        ):
             c.provision(t)
-            c.deploy_handlers(t, {"index.mjs": src})
+            c.deploy_handlers(t, files)
         c.wait_for_handler("up", "/", want_status=200, want_body=EXPECTED_BODY, timeout_s=25.0)
 
         # ── inbound ──
@@ -223,10 +262,38 @@ def main() -> int:
               and obs and obs.get("value") == "wk/",
               f"body={art.get('body') if art else None} writes={writes!r} div={art.get('divergence') if art else None}")
 
+        # ── send_callback (issue #67) ──
+        echo_url = f"http://scb.{PUBLIC_SUFFIX}:{c.front_port}/?op=echo"
+        r = c.request("scb", f"/?url={up.quote(echo_url)}", method="POST", data="{}", timeout=15.0)
+        check("[send_callback] webhook.send armed", r.status == 200 and r.body == "sent", f"{r.status} {r.body!r}")
+        # The delivery + on-module hop are asynchronous (fire on commit,
+        # chained dispatch next tick) — poll the kv the callback wrote.
+        scb_expected = "202:echo-payload:true:1"
+        got = ""
+        for _ in range(60):
+            rr = c.get("scb", "/?op=read", timeout=10.0)
+            got = rr.body if rr.status == 200 else ""
+            if got:
+                break
+            time.sleep(0.5)
+        check("[send_callback] live {on} callback saw status+bytes+ctx+attempts", got == scb_expected, f"{got!r}")
+        rec = find_record(c, "scb", "send_callback")
+        check("[send_callback] recorded (the outcome envelope on trigger_payload)",
+              bool(rec and rec.get("tapes", {}).get("trigger_payload_tape_b64")),
+              f"tapes keys={sorted((rec or {}).get('tapes', {}).keys())}")
+        art = replay(rec, "scb", "send_callback", None, entry="hooks.mjs",
+                     sources={"index.mjs": SCB_INDEX_SRC, "hooks.mjs": SCB_HOOKS_SRC}) if rec else None
+        writes = [e for e in ((art.get("effects") if art else None) or []) if e.get("kind") == "write"]
+        dlv = next((w for w in writes if w.get("key") == "delivered"), None)
+        check("[send_callback] replay reproduces the flattened outcome surface (body + write)",
+              art and art.get("divergence") is None and art.get("body") == "cb:202"
+              and dlv and dlv.get("value") == scb_expected,
+              f"body={art.get('body') if art else None} writes={writes!r} div={art.get('divergence') if art else None}")
+
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print("\n✅ replay matrix: inbound + fetch_chunk + ws_message + wake_batch all reproduce from real recordings")
+    print("\n✅ replay matrix: inbound + fetch_chunk + ws_message + wake_batch + send_callback all reproduce from real recordings")
     return 0
 
 

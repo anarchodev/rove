@@ -1159,9 +1159,8 @@ const StreamResumeCtx = struct {
     /// P5(a): the resume hop's `http.fetch` accumulator (see
     /// `proposeAndParkContResume.fetches_opt`).
     pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
-    /// Pre-built tape payloads for this transition hop's log record, or
-    /// null for kinds whose Msg needs no dedicated capture (wakes /
-    /// send_callback — L3-exempt). `resumeIntoStream` CONSUMES it: the
+    /// Pre-built tape payloads for this transition hop's log record.
+    /// `resumeIntoStream` CONSUMES it: the
     /// `.ok` capture hands it to captureLogWithId; every other exit
     /// deinits it. Callers with a taped Msg (`.fetch_chunk` — the
     /// bound-fetch cont→stream transition — and `.inbound_chunk`) MUST
@@ -1365,8 +1364,10 @@ fn resumeErrStatus(worker: anytype) u16 {
 /// materialization — the capture may append the activation's Msg to the
 /// readset, and the write arms serialize the readset into the propose,
 /// so materialization order is part of the wire format; keep it exactly
-/// where each capture runs).
-const ContTape = enum { wake, chunk, fetch };
+/// where each capture runs). `.cont` is the cont-resume site's
+/// runtime-kind dispatch: wake_batch and send_callback share the site
+/// (`resumeContinuation`) but tape different Msgs.
+const ContTape = enum { cont, chunk, fetch };
 
 /// Comptime per-site axes of `finishContResume` — everything else the
 /// three cont-family sites do is identical. That identity is the point:
@@ -1420,27 +1421,30 @@ const ContFinishCtx = struct {
     allow_repark: bool = true,
     pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
     /// Tape sources, read per `ContFinishSpec.tape`: `.chunk` reads
-    /// `tape_bytes`; `.fetch` reads `tape_body` + `tape_ev`; `.wake`
-    /// reads `tape_body` (the `{"ctx":…}` envelope) + `wakes` (the
-    /// drained fired-watch batch) + `wake_export` (issue #62).
+    /// `tape_bytes`; `.fetch` reads `tape_body` + `tape_ev`; `.cont`
+    /// reads `tape_body` (the `{"ctx":…}` envelope — for a
+    /// send_callback it carries the whole callee outcome) + `wakes`
+    /// (the drained fired-watch batch, wake resumes only) +
+    /// `resume_export` (the resolved resume export).
     tape_bytes: []const u8 = "",
     tape_body: []const u8 = "",
     tape_ev: ?worker_mod.FetchEvent = null,
     wakes: []const components_mod.WakeEntry = &.{},
-    wake_export: []const u8 = "",
+    resume_export: []const u8 = "",
 };
 
 inline fn contTapes(worker: anytype, comptime tape: ContTape, ctx: *const ContFinishCtx) log_mod.TapePayloads {
     return switch (tape) {
-        // issue #62: a wake resume's Msg is the drained fired-watch
-        // batch — tape it (+ readset/ctx + the resolved export) so the
-        // hop is replayable. The same site also handles send_callback
-        // resumes, which stay untaped for now (their Msg is the callee
-        // outcome; taping it is a follow-up) — hence the runtime guard.
-        .wake => if (ctx.act == .wake_batch)
-            worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, ctx.wake_export)
-        else
-            .{},
+        // The cont-resume site's Msg depends on the runtime kind:
+        // a wake resume's Msg is the drained fired-watch batch
+        // (issue #62); a send_callback's Msg is the callee outcome —
+        // the whole `{"ctx":…}` body envelope (issue #67). Both tape
+        // readset + ctx + the resolved export so the hop is replayable.
+        .cont => switch (ctx.act) {
+            .wake_batch => worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, ctx.resume_export),
+            .send_callback => worker_mod.captureSendCallbackTapes(worker, ctx.readset, ctx.tape_body, ctx.resume_export),
+            else => .{},
+        },
         .chunk => worker_mod.captureTapes(worker, ctx.readset, ctx.tape_bytes),
         .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
     };
@@ -1788,15 +1792,16 @@ fn resumeContinuation(
         batch_owned = sw.drainFired(allocator) catch &.{};
         break :blk if (sw.wake_to) |t| t else "onWake";
     } else cont_fn_name;
-    // Owned snapshot of the wake export for the tape (issue #62 — G3):
-    // `resume_fn` borrows StreamWakes.wake_to, which a repark arm can
-    // rewrite before the post-repark log capture runs (the same UAF
-    // class `cont_path_log` guards).
-    const wake_export_owned: []const u8 = if (wake)
-        allocator.dupe(u8, resume_fn.?) catch ""
+    // Owned snapshot of the resume export for the tape (G3 — replay must
+    // invoke the same export): `resume_fn` borrows StreamWakes.wake_to
+    // (wake) or desc.cont.fn_name (send_callback), either of which a
+    // repark arm frees before the post-repark log capture runs (the same
+    // UAF class `cont_path_log` guards). Empty ⇒ the default export.
+    const resume_export_owned: []const u8 = if (resume_fn) |rf|
+        allocator.dupe(u8, rf) catch ""
     else
         "";
-    defer if (wake_export_owned.len > 0) allocator.free(wake_export_owned);
+    defer if (resume_export_owned.len > 0) allocator.free(resume_export_owned);
     const named: bool = wake or cont_fn_name != null;
     // Endpoint A (decisions.md): the resume's threaded ctx + (for a
     // callback) the effect outcome ride the synthesized body envelope —
@@ -1882,7 +1887,7 @@ fn resumeContinuation(
         .site = "cont-resume",
         .noun = "continuation",
         .cancel_binds = false,
-        .tape = .wake,
+        .tape = .cont,
     }, &oc, .{
         .ent = ent,
         .sid = sid,
@@ -1905,7 +1910,7 @@ fn resumeContinuation(
         .pending_fetches = &pending_fetches,
         .tape_body = body,
         .wakes = batch_owned,
-        .wake_export = wake_export_owned,
+        .resume_export = resume_export_owned,
     });
 }
 

@@ -20,7 +20,7 @@ Cluster B (smoke default — `REWIND_UNSAFE_OUTBOUND=1`):
      covers exactly the smoke topology; the metadata range stays blocked
      even with the hatch on — checked as 7).
 
-Uses the heldsync fixture (webhook.send + onResult → response) so each
+Uses the heldsync fixture (webhook.send + onresult resume → response) so each
 outcome comes back synchronously in one POST.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
@@ -46,14 +46,11 @@ HELDSYNC_SRC = r"""export default function () {
         maxAttempts: 1,
         timeoutMs: 8000,
     });
-    return __rove_next("probe/onresult", {
-        fn: "onResult",
-        ctx: { tag: req.tag },
-    });
+    return next("probe/onresult", { tag: req.tag });
 }
 """
 
-ONRESULT_SRC = r"""export function onResult() {
+ONRESULT_SRC = r"""export default function () {
     // Endpoint A flattened surface: threaded ctx on request.ctx, the
     // send outcome on request.status/.text (2xx = ok; status 0 = never
     // reached; no request.ok, issue #7), delivery metadata on

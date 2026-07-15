@@ -284,8 +284,9 @@ callback kind lands**. Because smokes run Debug workers, *every* smoke is now an
 L3 checker — it caught a deliberately-regressed capture site (fired during the
 deploy flow, before the test even ran). (2) A **per-kind replay matrix**
 (`scripts/smoke/replay_matrix_smoke_v2.py`) captures + replays a real `inbound` /
-`fetch_chunk` / `ws_message` / `wake_batch` recording and asserts each
-reproduces. The pure predicate `l3MissingChannel` has an inline unit test.
+`fetch_chunk` / `ws_message` / `wake_batch` / `send_callback` recording and
+asserts each reproduces. The pure predicate `l3MissingChannel` has an inline
+unit test.
 
 **Update 2026-07-12 — `wake_batch` fully recorded (issue #62).** A wake
 resume's Msg is the drained fired-watch batch (`request.activation.wakes[]`,
@@ -304,8 +305,35 @@ replay matrix: a live `after.kv` resume replays offline reproducing
 Known limitation: the ctx/wakes capture runs at log time (post-propose), so
 the RAFT copy of a writing wake's readset lacks the ctx entry — follower-side
 record rebuild (Phase 5c) would miss `request.ctx`; the leader's log record
-(what `pull`/replay consume) carries everything. `send_callback` resumes
-remain untaped (their Msg is the callee outcome) — the remaining kind.
+(what `pull`/replay consume) carries everything.
+
+**Update 2026-07-13 — `send_callback` fully recorded (issue #67): every
+resume kind's Msg now reaches the tape.** A send_callback's Msg is the callee
+outcome — the whole synthesized `{"ctx":…}` body envelope
+(`{"ctx":{result, context}}` for a result delivery, whose `result` the
+install hoist flattens onto `request.bytes`/`.status` + the
+`request.activation.*` metadata bag and whose `context` lands bare on
+`request.ctx`; a bare `{"ctx":…}` payload for an internal chained hop). Taped
+on both producers — the held resume (`resumeContinuation` via `contTapes`)
+and the connectionless chained fire (`fireChainedActivation` via `runFire`'s
+`.callback` tape) — as one `trigger_payload` entry
+(`captureSendCallbackTapes`; kept past the read-taping elision via
+`Readset.ctx_payload`, and recorded as a metadata-only entry when the
+envelope exceeds the 16 KB inline cap — the >16 KB fetch-chunk posture),
+alongside the resolved callback export on `export` (G3). The L3 guard
+asserts it: both producers always synthesize a non-empty envelope, so a
+successful send_callback with an empty `trigger_payload` channel is a missed
+capture. `export-fixture` splits the envelope the way prod's hoist does —
+`result` → the world's flattened surface (`request.{status, done, bodyB64,
+bodyTruncated}` + the `request.activation` `{kind, attempts, error, id,
+headers, hash}` bag, the same shape an authored `rewind:test` `sendCallback`
+world carries), `context` → the bare world `ctx` — so `send_callback` joins
+the faithful-transcode set (`isFaithfulTranscode`). Validated end-to-end in
+the replay matrix: a live `webhook.send` `{on}` callback replays offline
+reproducing `request.status`/`.text`, `request.ctx`, `attempts`, and the
+hop's kv write. The wake known-limitation above applies identically (the
+envelope lands on the leader's log record; the raft copy of a writing hop's
+readset predates it).
 
 ## 6. Implications for the sim / export-fixture plan
 
@@ -313,8 +341,9 @@ remain untaped (their Msg is the callee outcome) — the remaining kind.
   alone** — the author/transcoder declares the activation kind, the export, the
   Msg, `ctx`, and the fetch-result fields. No recording change. This is the
   cheap, high-leverage path.
-- **Replay (captured world)** is faithful for `inbound` today; non-`inbound`
-  needs G1+G2 (decode the taped channels) and G3 (persist the dispatch target).
+- **Replay (captured world)** is faithful for the inbound family, `wake_batch`,
+  `send_callback`, and `fetch_chunk`'s whole-body case (the §5 updates closed
+  G1/G2/G3 for those kinds); streamed multi-chunk fetches stay best-effort.
 - **`export-fixture` (capture → authored world)** transcodes a `rewind pull`
   fixture into a declarative world. The within-activation KV correctness it
   needs — a **write-through overlay** (read-your-writes) plus an explicit
@@ -325,9 +354,10 @@ remain untaped (their Msg is the callee outcome) — the remaining kind.
   initial-snapshot map + `kvAbsent` (the first taped read per key; re-reads /
   post-write reads are reproduced by the sim overlay), the `request_reads` fold
   → `request` surface, sources passed through (self-contained), `missPolicy:
-  "fail"`. Non-inbound activations warn — the pulled fixture lacks `ctx` /
-  fetch-result / the resolved export (G1/G3 above), so their worlds are
-  incomplete until the recording-side fix.
+  "fail"`. `wake_batch` and `send_callback` transcode faithfully
+  (`isFaithfulTranscode` — the §5 issue-#62/#67 updates); the remaining
+  non-faithful kinds warn (a streamed multi-chunk fetch's full event
+  sequence isn't reconstructible offline), so their worlds are incomplete.
 
 Landed 2026-06-30: the declarative-world sim path (`world.zig`, the host's
 `.map` mode + miss policy, `runWorld`, `rewind sim`), now covering **all
