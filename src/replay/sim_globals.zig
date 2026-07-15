@@ -63,11 +63,25 @@ const SYSTEM_SHIM =
     \\  // throws. Shared by http.fetch / after.fetch / http.subscribe.
     \\  var checkFetchBody = function(o){ if (o.body !== undefined && typeof o.body !== "string" && !(o.body instanceof Uint8Array)) throw new TypeError("fetch: `body` must be a string or Uint8Array"); };
     \\  // Native rate-limit builtin the email global bottoms out on
-    \\  // (worker-native — no-op offline: there's no per-worker bucket to
-    \\  // exhaust). The continuation native lives on `_system.continuation`
-    \\  // below (next.js captures it at base-eval — privileged-surface
-    \\  // unification; the bare `__rove_next` global is gone).
-    \\  globalThis.__rove_check_email_rate = function(){};
+    \\  // (worker-native: a per-instance plan-tier token bucket,
+    \\  // bindings/email_rate.zig). Offline sends are UNMETERED by default —
+    \\  // there is no bucket to exhaust — but `scenario({ emailBudget: N })`
+    \\  // arms a per-activation allowance (carried as a hidden reserved kv key)
+    \\  // so the N+1-th send in a run throws prod's exact error shape and the
+    \\  // customer's `catch (e) { e.code === "rate_limited" }` branch is
+    \\  // testable. The epilogue resets the per-activation counter. The
+    \\  // continuation native lives on `_system.continuation` below (next.js
+    \\  // captures it at base-eval — privileged-surface unification; the bare
+    \\  // `__rove_next` global is gone).
+    \\  globalThis.__rove_check_email_rate = function(){
+    \\    var b = globalThis.kv.get("__rove_store/email_budget");
+    \\    if (b === undefined || b === null) return;
+    \\    var n = Number(b);
+    \\    if (!Number.isFinite(n)) return;
+    \\    var used = globalThis.__rove_email_sends || 0;
+    \\    if (used >= n) { var e = new Error("email rate limit exceeded, retry after 1s"); e.code = "rate_limited"; throw e; }
+    \\    globalThis.__rove_email_sends = used + 1;
+    \\  };
     \\  // Streaming SHA-256 in pure JS (the portable replay engine has one-shot
     \\  // `nat.sha256` only). Same posture as the RSA/ECDSA verify above; drives
     \\  // `crypto.sha256Init/Update/Final` so `blob.write`/`blob.seal` (recipe

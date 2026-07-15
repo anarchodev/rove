@@ -286,6 +286,7 @@ const EPILOGUE_BODY =
     \\  globalThis.__rove_stream_bytes = 0;
     \\  globalThis.__rove_blob_receive_used = false;
     \\  globalThis.__rove_activation_kind = D.kind;
+    \\  globalThis.__rove_email_sends = 0;
     \\  // Prod's console formatter (globals/console.js `fmt`) — byte-identical
     \\  // here so a log assertion transfers between a bundle and a live request
     \\  // log: the message text INCLUDES the level prefix exactly as the worker

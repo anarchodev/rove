@@ -1388,6 +1388,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/droppedeffects", // connection-scoped effects on terminal/connectionless activations tagged dropped + warned; durable verbs survive (issue #20)
         "src/replay/testdata/argvalidation", // prod's synchronous effect-argument throw table fires offline with the same error types/messages (issue #21)
         "src/replay/testdata/ssrfgate", // resolving a success outcome for a prod-blocked fetch URL (SSRF/plain-http/localhost) fails loud; status 0 stays authorable (issue #22)
+        "src/replay/testdata/emailbudget", // scenario({emailBudget}) arms the email rate limiter offline — N+1-th send throws code:"rate_limited"; unset stays unmetered (issue #23)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

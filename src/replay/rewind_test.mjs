@@ -388,6 +388,12 @@ class Scenario {
     // closed: a run is admin only when opted in, so a non-admin handler that
     // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
     this.admin = cfg.admin || false;
+    // Per-activation `email.send` allowance. Prod meters sends through a
+    // per-instance plan-tier token bucket (bindings/email_rate.zig); offline
+    // sends are unmetered unless this is set, in which case the N+1-th send
+    // in an activation throws prod's Error{code:"rate_limited"} — so the
+    // rate-limit catch branch is testable. Carried as a hidden reserved key.
+    this.emailBudget = cfg.emailBudget != null ? cfg.emailBudget : null;
     // Per-chain identity the engine pins on EVERY activation (worker-set in
     // prod). `tenant` is this handler's tenant id; `correlationId` is minted by
     // inbound and inherited by every resume — so it's scenario-level (set once,
@@ -423,6 +429,7 @@ class Scenario {
     for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
     if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
     if (this.admin) kv["__rove_store/admin"] = "1";
+    if (this.emailBudget != null) kv["__rove_store/email_budget"] = String(this.emailBudget);
     const w = Object.assign(
       { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
