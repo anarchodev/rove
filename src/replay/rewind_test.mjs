@@ -103,10 +103,12 @@ function subsetMatch(obj, subset) {
 
 /** Effects that SURVIVED the activation. A thrown handler rolls its txn back
  *  in prod (500 "handler threw"), so the sim marks that activation's
- *  writes/cmds `rolledBack` — they must not fold forward or satisfy matchers
- *  (issue #10). They stay on `node.effects` for debugging. */
+ *  writes/cmds `rolledBack`; a connection-scoped effect on a terminal or
+ *  connectionless activation is marked `dropped` (prod discards it — the
+ *  epilogue's drop-tagging pass). Neither must fold forward or satisfy
+ *  matchers. They stay on `node.effects` for debugging. */
 function live(effects) {
-  return (effects || []).filter((e) => !e.rolledBack);
+  return (effects || []).filter((e) => !e.rolledBack && !e.dropped);
 }
 
 /** UTF-8 byte length of a chunk (string) or byte array — prod's fetch-chunk
@@ -552,8 +554,10 @@ class Node {
 
   /** Outbound frames/chunks this activation wrote (`stream.write`), in order —
    *  the content, not just the byte count. WS replies and SSE lines both land
-   *  here. */
-  get frames() { return this._byKind("stream").map((e) => e.data); }
+   *  here. A frame from a connectionless activation is `dropped` (no socket
+   *  exists — prod's stream.write is inert there) and excluded; rolled-back
+   *  frames stay (prod flushes them eagerly, so they were already on the wire). */
+  get frames() { return this._byKind("stream").filter((e) => !e.dropped).map((e) => e.data); }
 
   /** Effective value of `key` after this activation (base kv + its writes).
    *  Absent/deleted keys read `null` — the same `kv.get` returns to the handler
@@ -1185,9 +1189,11 @@ function fetchResumeWorld(parentWorld, fx, response, kvBase, seed, now, ctx, pen
 
 /** Bound fetches a node armed that are still outstanding — prod's
  *  `request.fetchesPending` base ("including this one"). Rolled-back arms never
- *  issued, so they don't count. */
+ *  issued, so they don't count; nor do unbound `http.fetch` primitives
+ *  (`bound:false` — e.g. webhook.send's decomposed fetch), which never resume
+ *  the connection and so are never pending on it. */
 function armedFetches(node) {
-  return live(node.force().effects).filter((e) => e.kind === "fetch").length;
+  return live(node.force().effects).filter((e) => e.kind === "fetch" && e.bound).length;
 }
 
 // ── WebSocket held-socket fold ────────────────────────────────────────────

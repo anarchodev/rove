@@ -201,9 +201,14 @@ const SYSTEM_SHIM =
     \\  // stream, timeoutMs, … })` matches what the handler wrote and `.not.`
     \\  // variants aren't vacuous.
     \\  var nextSeq = function(){ return (globalThis.__rove_fetch_seq = (globalThis.__rove_fetch_seq || 0) + 1); };
-    \\  var recFetch = function(url, o, on){
+    \\  // `bound` distinguishes the connection-scoped `after.fetch` (binds to the
+    \\  // held socket or is DROPPED at the success seam — http.zig jsOnFetch)
+    \\  // from the unbound `http.fetch` primitive (fires regardless — what
+    \\  // webhook.send/blob compose on). The epilogue's drop-tagging pass and the
+    \\  // harness's fetchesPending count both key on it.
+    \\  var recFetch = function(url, o, on, bound){
     \\    var id = "ftch_" + nextSeq();
-    \\    push({ kind: "fetch", id: id, url: url, method: (o && o.method) || "GET",
+    \\    push({ kind: "fetch", id: id, url: url, bound: !!bound, method: (o && o.method) || "GET",
     \\      body: (o && o.body !== undefined) ? o.body : null,
     \\      headers: (o && o.headers) || {},
     \\      ctx: (o && o.ctx !== undefined) ? o.ctx : null,
@@ -237,7 +242,7 @@ const SYSTEM_SHIM =
     \\      oidcGenerateKey: no("oidcGenerateKey"), oidcSign: no("oidcSign"),
     \\    },
     \\    http: {
-    \\      fetch: function(o){ o = o || {}; return recFetch(o.url, o, o.on_chunk || o.on || null); },
+    \\      fetch: function(o){ o = o || {}; return recFetch(o.url, o, o.on_chunk || o.on || null, false); },
     \\      cancelFetch: function(){},
     \\      subscribe: function(o){ o = o || {}; var id = "sub_" + nextSeq(); push({ kind: "subscribe", id: id, url: o.url, headers: o.headers || {}, on: o.on_chunk || o.on || null }); return id; },
     \\      cancelSubscription: function(){},
@@ -245,7 +250,7 @@ const SYSTEM_SHIM =
     \\    after: {
     \\      // `on` is the ONE spelling end to end — the after.js shim passes the
     \\      // opts bag through and the worker bindings read `opts.on` the same way.
-    \\      fetch: function(url, o){ return recFetch(url, o, (o && o.on) || null); },
+    \\      fetch: function(url, o){ return recFetch(url, o, (o && o.on) || null, true); },
     \\      kv: function(prefix, o){ push({ kind: "kv-wake", prefix: prefix, on: (o && o.on) || null }); },
     \\      timer: function(ms, o){ push({ kind: "timer", ms: ms, on: (o && o.on) || null }); },
     \\    },

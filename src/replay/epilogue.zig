@@ -607,6 +607,36 @@ const EPILOGUE_BODY =
     \\      if (__e.kind !== "read" && __e.kind !== "log" && __e.kind !== "stream") __e.rolledBack = true;
     \\    }
     \\  }
+    \\  // ── connection-scoped effect disposition (prod parity) ──
+    \\  // `after.ms`/`after.kv` arm — and a connection-scoped `after.fetch`
+    \\  // binds — only at the handler-success seam, and only when the activation
+    \\  // ends HELD (returns `next()`); a terminal return discards them
+    \\  // (on.zig / worker_dispatch's bind-or-drop). A connectionless activation
+    \\  // (durable_wake / send_callback / disconnect) has no socket at all, which
+    \\  // also drops stream frames (stream.zig's `pending_stream_chunks orelse
+    \\  // return`). The unbound `http.fetch` primitive (bound:false — what
+    \\  // webhook.send/blob compose on) fires regardless. Tag the discarded
+    \\  // entries `dropped` — excluded from matchers/kv-folds like `rolledBack`,
+    \\  // kept on the log for debugging — and warn, so a test can't green on an
+    \\  // effect prod never ships. Rolled-back entries are already excluded.
+    \\  {
+    \\    const __held = !__err && __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
+    \\    const __connless = D.kind === "durable_wake" || D.kind === "send_callback" || D.kind === "disconnect";
+    \\    const __dropWakes = __connless || !__held;
+    \\    const __dropWarns = [];
+    \\    for (const __e of __effects) {
+    \\      if (__e.rolledBack) continue;
+    \\      let __what = null;
+    \\      if (__e.kind === "timer" && __dropWakes) __what = "after.ms(" + __e.ms + ")";
+    \\      else if (__e.kind === "kv-wake" && __dropWakes) __what = "after.kv(" + JSON.stringify(__e.prefix) + ")";
+    \\      else if (__e.kind === "fetch" && __e.bound && __dropWakes) __what = "after.fetch(" + JSON.stringify(__e.url) + ")";
+    \\      else if (__e.kind === "stream" && __connless) __what = "stream.write";
+    \\      if (__what === null) continue;
+    \\      __e.dropped = true;
+    \\      __dropWarns.push({ kind: "log", level: "warn", message: "dropped connection-scoped effect: " + __what + " — " + (__connless ? "a " + D.kind + " activation has no connection" : "the handler returned a terminal response instead of next(), so the socket was not held") + "; prod discards it and it never fires" });
+    \\    }
+    \\    for (const __w of __dropWarns) __effects.push(__w);
+    \\  }
     \\  globalThis.kv = __kvNative;   // restore before the native OUTPUT_KEY write
     \\  // ── response vetting (prod parity) — the emit-side rules the worker
     \\  // applies to everything the handler set on `response`, mirrored from

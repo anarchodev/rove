@@ -496,11 +496,24 @@ fn emitFail(a: std.mem.Allocator, w: *std.Io.Writer, nf: usize, facet: []const u
     return nf + 1;
 }
 
+/// An effect entry that never left the node — rolled back (thrown handler) or
+/// dropped (connection-scoped on a terminal/connectionless activation). Such
+/// an entry satisfies no expectation and is not projected into a golden.
+fn effectDiscarded(e: std.json.ObjectMap) bool {
+    for ([_][]const u8{ "rolledBack", "dropped" }) |flag| {
+        if (e.get(flag)) |v| {
+            if (v == .bool and v.bool) return true;
+        }
+    }
+    return false;
+}
+
 /// A `write` expectation `{key, value?}` must match some `{kind:"write"}` effect.
 fn matchWrite(a: std.mem.Allocator, effects: []const std.json.Value, want: std.json.Value) bool {
     if (want != .object) return false;
     for (effects) |e| {
         if (e != .object) continue;
+        if (effectDiscarded(e.object)) continue;
         const kind = e.object.get("kind") orelse continue;
         if (kind != .string or !std.mem.eql(u8, kind.string, "write")) continue;
         if (want.object.get("key")) |wk| {
@@ -521,6 +534,7 @@ fn matchCmd(a: std.mem.Allocator, effects: []const std.json.Value, want: std.jso
     if (want != .object) return false;
     for (effects) |e| {
         if (e != .object) continue;
+        if (effectDiscarded(e.object)) continue;
         const kind = e.object.get("kind") orelse continue;
         if (want.object.get("kind")) |wk| {
             if (!valEq(a, kind, wk)) continue;
@@ -597,6 +611,7 @@ fn buildExpected(a: std.mem.Allocator, w: *std.Io.Writer, bundle_json: []const u
     var nw: usize = 0;
     for (effects) |e| {
         if (e != .object) continue;
+        if (effectDiscarded(e.object)) continue;
         const kind = e.object.get("kind") orelse continue;
         if (kind != .string or !std.mem.eql(u8, kind.string, "write")) continue;
         if (nw != 0) try w.writeByte(',');
@@ -614,6 +629,7 @@ fn buildExpected(a: std.mem.Allocator, w: *std.Io.Writer, bundle_json: []const u
     var nc: usize = 0;
     for (effects) |e| {
         if (e != .object) continue;
+        if (effectDiscarded(e.object)) continue;
         const kind = e.object.get("kind") orelse continue;
         if (kind != .string or !isCmdKind(kind.string)) continue;
         if (nc != 0) try w.writeByte(',');
