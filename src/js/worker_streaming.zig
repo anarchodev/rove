@@ -119,6 +119,7 @@ pub fn setStreamComponents(
     initial_chunks: []const []const u8,
     kv_prefixes: []const []const u8,
     interval_ms: i64,
+    wake_to: ?[]const u8,
 ) !void {
     // Each block builds clones for one component then transfers
     // ownership via `reg.set`. The errdefer inside each block fires
@@ -186,10 +187,13 @@ pub fn setStreamComponents(
             @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
         else
             std.math.maxInt(i64);
+        const wt: ?[]u8 = if (wake_to) |t| try allocator.dupe(u8, t) else null;
+        errdefer if (wt) |t| allocator.free(t);
         try server.reg.set(ent, current_coll, components_mod.StreamWakes, .{
             .interval_ms = interval_ms,
             .next_wake_ns = next_wake_ns,
             .kv_prefixes = spine,
+            .wake_to = wt,
         });
     }
 }
@@ -420,6 +424,54 @@ fn matchEventsToWakes(
     }
 }
 
+/// Replace a stream chain's `StreamWakes` registration from one hop's
+/// `on.*` accumulator: timer interval + next-wake, kv arms, and the
+/// wake export (last `{on}` wins). `read_version` is left untouched
+/// (same posture as the `.stream` arm's historical re-arm). On OOM the
+/// old arms stay — the chain keeps its previous watches rather than
+/// none.
+fn rearmStreamWakes(
+    worker: anytype,
+    wakes_st: *components_mod.StreamWakes,
+    regs: []const globals.PendingWakeReg,
+    now_ns: i64,
+) void {
+    const allocator = worker.allocator;
+    var interval_ms: i64 = 0;
+    var wake_to: ?[]u8 = null;
+    var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
+    for (regs) |reg| {
+        switch (reg.kind) {
+            .timer => interval_ms = reg.interval_ms,
+            .kv => if (reg.prefix.len > 0) {
+                const dup = allocator.dupe(u8, reg.prefix) catch continue;
+                arms.append(allocator, .{ .prefix = dup }) catch allocator.free(dup);
+            },
+        }
+        if (reg.on) |t| {
+            if (wake_to) |old| allocator.free(old);
+            wake_to = allocator.dupe(u8, t) catch null;
+        }
+    }
+    const kv_prefixes = arms.toOwnedSlice(allocator) catch {
+        for (arms.items) |arm| allocator.free(arm.prefix);
+        arms.deinit(allocator);
+        if (wake_to) |t| allocator.free(t);
+        std.log.warn("rove-js stream wake rearm alloc failed; keeping prior arms", .{});
+        return;
+    };
+    for (wakes_st.kv_prefixes) |arm| allocator.free(arm.prefix);
+    if (wakes_st.kv_prefixes.len > 0) allocator.free(wakes_st.kv_prefixes);
+    wakes_st.kv_prefixes = kv_prefixes;
+    if (wakes_st.wake_to) |old| allocator.free(old);
+    wakes_st.wake_to = wake_to;
+    wakes_st.interval_ms = interval_ms;
+    wakes_st.next_wake_ns = if (interval_ms > 0)
+        now_ns + interval_ms * std.time.ns_per_ms
+    else
+        std.math.maxInt(i64);
+}
+
 /// Run the next handler activation for a parked stream.
 /// Structural twin of `resumeContinuation` — same dispatch surface
 /// (re-enter `Dispatcher.runOutcome` with a synthesized `Request`),
@@ -447,8 +499,10 @@ fn matchEventsToWakes(
 ///         transfer chunks now. On wrote: stage chunks on the
 ///         parked unit; commit arm transfers them onto StreamChunks
 ///         after raft commits.
-///       • continuation → 501 + markStreamDraining (`__rove_next`
-///         from a stream-resume hop is out of scope).
+///       • continuation → stay parked: thread ctx, re-aim on an
+///         explicit target, re-arm this hop's `on.*` (none ⇒ the
+///         existing arms ride). A park with no possible resume
+///         source is a defined 500 (`held with no wake source`).
 ///
 /// The write path resumes `proposeForgetfulWrites` the txn
 /// AND stage their chunks on the parked unit so the chunks reach the
@@ -466,7 +520,7 @@ inline fn streamTapes(worker: anytype, comptime tape: StreamTape, ctx: *const St
         // Guarded on the runtime kind: resumeStream only fires
         // `.wake_batch` today, but the activation param is runtime.
         .wake => if (ctx.act == .wake_batch)
-            worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, "")
+            worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, ctx.wake_export)
         else
             .{},
         .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
@@ -508,6 +562,16 @@ const StreamFinishCtx = struct {
     /// the bound-fetch site is always `.fetch_chunk`).
     act: log_mod.ActivationSource,
     pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
+    /// This hop's `on.*` registrations. The `.continuation` arm (a
+    /// held hop with no `stream.*` output) re-arms from them; empty
+    /// ⇒ the chain's existing arms ride untouched. (The `.stream`
+    /// arm gets its copy folded into the descriptor by the
+    /// dispatcher bridge instead.)
+    pending_wakes: *std.ArrayListUnmanaged(globals.PendingWakeReg),
+    /// The resolved wake export this activation dispatched to (G3 —
+    /// the tape must record it so replay invokes the same export).
+    /// Empty = the default for the activation kind.
+    wake_export: []const u8 = "",
     /// Tape sources: `.fetch` reads `tape_body` + `tape_ev`; `.wake`
     /// reads `tape_body` (the `{"ctx":…}` envelope) + `wakes` (the
     /// drained fired-watch batch, issue #62).
@@ -526,7 +590,8 @@ const StreamFinishCtx = struct {
 /// writes → stage body + draining flag on the parked unit, propose via
 /// `proposeForgetfulWrites` (commit-gated release, streaming-model.md §2);
 /// terminal-read-only → commit + flush + final chunk + drain;
-/// continuation → 501 (stream→cont transition out of scope); stream →
+/// continuation → stay parked (the `.stream` arm minus chunks: thread
+/// ctx, re-aim on explicit target, re-arm this hop's `on.*`); stream →
 /// stage/ship chunks + swap ctx/interval/kv-prefix registrations;
 /// no-export probe → defined 500. Draining always via
 /// `markStreamDrainingAnywhere` (it handles both the steady-state
@@ -652,15 +717,107 @@ fn finishStreamResume(
             r.exception = &.{};
         },
         .continuation => |*cval| {
-            // Stream-resume → __rove_next: would transition the chain from
-            // a stream into a one-shot continuation, which requires moving
-            // the entity out of the stream pipeline and into
-            // parked_continuations. Out of scope — a defined 501.
+            // One `next()` semantic on every held chain: a resume hop
+            // with no `stream.*` output stays parked — thread ctx,
+            // re-aim the module when the target is explicit, re-arm
+            // this hop's `on.*` registrations (none ⇒ the existing
+            // arms ride untouched). This is the `.stream` arm minus
+            // chunks; no cont↔stream transition is involved.
+            if (cval.fn_name != null) {
+                // fn has no slot on a stream chain (the wake arm's
+                // `{on}` names the resume export) — defined author
+                // error, never a silent free.
+                cval.deinit(allocator);
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                markStreamDrainingAnywhere(server, ctx.ent);
+                const msg = allocator.dupe(u8, "next({fn}) is not supported on a streaming chain — name the resume export via after.*(..., {on})") catch @constCast("");
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                return;
+            }
+            // Park-time vigilance (docs/handler-shape.md §2.1): the
+            // re-park must leave ≥1 possible resume source — an arm
+            // registered this hop, an arm riding from an earlier hop,
+            // or an in-flight bound fetch. An empty set can never
+            // resume: fail loud now instead of holding the socket
+            // forever (streams have no deadline sweep).
+            const has_source = blk: {
+                for (ctx.pending_wakes.items) |reg| switch (reg.kind) {
+                    .timer => if (reg.interval_ms > 0) break :blk true,
+                    .kv => if (reg.prefix.len > 0) break :blk true,
+                };
+                if (ctx.pending_wakes.items.len == 0) {
+                    // No re-arm this hop — the existing arms ride.
+                    if (ctx.wakes_st.interval_ms > 0 or ctx.wakes_st.kv_prefixes.len > 0) break :blk true;
+                }
+                // The entity is in stream_data_out (steady state) or
+                // stream_response_in (bound-fetch chunk during the
+                // one-tick post-commit window) — probe both.
+                if (server.reg.get(ctx.ent, &server.stream_data_out, components_mod.BoundFetchCount)) |cnt| {
+                    if (cnt.pending > 0) break :blk true;
+                } else |_| {}
+                if (server.reg.get(ctx.ent, &server.stream_response_in, components_mod.BoundFetchCount)) |cnt| {
+                    if (cnt.pending > 0) break :blk true;
+                } else |_| {}
+                break :blk false;
+            };
+            if (!has_source) {
+                cval.deinit(allocator);
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                markStreamDrainingAnywhere(server, ctx.ent);
+                std.log.warn("rove-js " ++ spec.site ++ ": held with no wake source tenant={s} module={s}", .{ tid, mpath });
+                const msg = allocator.dupe(u8, "held with no wake source — next() kept the chain parked but no after.* arm or in-flight fetch can resume it") catch @constCast("");
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                return;
+            }
+            var fw_seq: u64 = 0;
+            if (ctx.wrote) {
+                // Same commit-gating as the `.stream` wrote path, with
+                // no chunks to stage.
+                var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = false };
+                defer stage.chunks.deinit(allocator);
+                const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr);
+                fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh) catch |perr| {
+                    std.log.warn("rove-js " ++ spec.site ++ " (held + writes): propose failed: {s}", .{@errorName(perr)});
+                    cval.deinit(allocator);
+                    ctx.txn_owned.* = false;
+                    ctx.txn_done.* = true;
+                    markStreamDrainingAnywhere(server, ctx.ent);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                    return;
+                };
+                ctx.txn_owned.* = false;
+                ctx.txn_done.* = true;
+            } else {
+                ctx.txn.commit() catch |e| panic_mod.invariantViolated(
+                    spec.panic_site ++ ".commit(held_ro)",
+                    "err={s}",
+                    .{@errorName(e)},
+                );
+                ctx.txn_done.* = true;
+                flushFireFetches(worker, ctx.pending_fetches);
+            }
+            // Thread ctx forward (ownership transfers from the
+            // descriptor, same as the `.stream` arm).
+            if (ctx.chain_st.ctx_json.len > 0) allocator.free(ctx.chain_st.ctx_json);
+            ctx.chain_st.ctx_json = cval.ctx_json;
+            cval.ctx_json = &.{};
+            // Re-arm from this hop's registrations; empty ⇒ existing
+            // arms (and wake_to) ride untouched, so a quiet re-hold
+            // keeps listening without the re-arm ritual.
+            if (ctx.pending_wakes.items.len > 0) rearmStreamWakes(worker, ctx.wakes_st, ctx.pending_wakes.items, ctx.now_ns);
+            ctx.chain_st.activation_count += 1;
+            // Log with the module that RAN (pre-re-aim path), then
+            // re-aim the chain for the NEXT activation — an explicit
+            // cross-module target moves every later resume there.
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, cval.tags, ctx.act, fw_seq);
+            if (cval.path.len > 0 and !std.mem.eql(u8, cval.path, ctx.chain_st.module_path)) {
+                allocator.free(ctx.chain_st.module_path);
+                ctx.chain_st.module_path = cval.path;
+                cval.path = &.{};
+            }
             cval.deinit(allocator);
-            ctx.txn.rollback() catch {};
-            ctx.txn_done.* = true;
-            markStreamDrainingAnywhere(server, ctx.ent);
-            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 501, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
         },
         .stream => |*s2| {
             // stream + writes — stage `s2.chunks` on the parked unit so
@@ -670,6 +827,18 @@ fn finishStreamResume(
             // reaching the wire, not per-stream runtime state; handlers
             // re-read kv every activation so a fault leaving ctx ahead of
             // durable kv is recoverable by the customer.
+            if (s2.fn_name != null) {
+                // fn has no slot on a stream chain (the wake arm's
+                // `{on}` names the resume export) — defined author
+                // error, never a silent free.
+                s2.deinit(allocator);
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                markStreamDrainingAnywhere(server, ctx.ent);
+                const msg = allocator.dupe(u8, "next({fn}) is not supported on a streaming chain — name the resume export via after.*(..., {on})") catch @constCast("");
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                return;
+            }
             var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = false };
             defer {
                 for (stage.chunks.items) |c| allocator.free(c);
@@ -766,8 +935,26 @@ fn finishStreamResume(
                 if (s2.kv_prefixes.len > 0) allocator.free(s2.kv_prefixes);
                 s2.kv_prefixes = &.{};
             }
+            // The wake export re-arms with the registrations (last
+            // `{on}` wins; a hop with no `{on}` falls back to the
+            // conventional `onWake`).
+            if (ctx.wakes_st.wake_to) |old| allocator.free(old);
+            ctx.wakes_st.wake_to = s2.wake_to;
+            s2.wake_to = null;
             ctx.chain_st.activation_count += 1;
+            // Log with the module that RAN, then re-aim the chain for
+            // the NEXT activation — the one `next()` semantic: an
+            // explicit cross-module target moves every later resume
+            // there.
             captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, fw_seq);
+            if (s2.path.len > 0 and !std.mem.eql(u8, s2.path, ctx.chain_st.module_path)) {
+                allocator.free(ctx.chain_st.module_path);
+                ctx.chain_st.module_path = s2.path;
+                s2.path = &.{};
+            } else if (s2.path.len > 0) {
+                allocator.free(s2.path);
+                s2.path = &.{};
+            }
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations produce
         // these; stream resumes never dispatch as one. Defined failure.
@@ -855,6 +1042,18 @@ fn resumeStream(
         batch_owned = wakes_st.drainFired(allocator) catch
             return error.ResumeWakeDrain;
     }
+    // Wake resume targets the registrations' `{on}` export (`wake_to`,
+    // null → the conventional `onWake` via parseDispatch) — same
+    // routing as the cont (resumeContinuation) and WS
+    // (resumeWakeChainWs) wake paths. Owned snapshot: `wake_to`
+    // borrows StreamWakes, which the outcome arms' re-arm frees
+    // before the post-outcome tape capture runs (G3 — replay must
+    // invoke the same export).
+    const wake_export_owned: []const u8 = if (wakes_st.wake_to) |t|
+        allocator.dupe(u8, t) catch ""
+    else
+        "";
+    defer if (wake_export_owned.len > 0) allocator.free(wake_export_owned);
     // A resumed stream handler re-arms its
     // wakes via `on.*` and emits more output via `stream.write()`, just
     // like the first hop. Wire both accumulators so `finishResponse`
@@ -885,6 +1084,7 @@ fn resumeStream(
         .path = spath,
         .body = body,
         .query = null,
+        .fn_override = if (wake_export_owned.len > 0) wake_export_owned else null,
         // `activation` is a runtime source (wake_batch / send_callback /
         // other stream-wake kinds) — build the payload arm for wake_batch,
         // fall back to the payload-less arm for the rest.
@@ -928,6 +1128,7 @@ fn resumeStream(
         .readset = &readset,
         .tape_body = body,
         .wakes = batch_owned,
+        .wake_export = wake_export_owned,
         .chain_ctx = chain_ctx,
         .chain_st = chain_st,
         .chunks_st = chunks_st,
@@ -940,6 +1141,7 @@ fn resumeStream(
         .txn_done = &txn_done,
         .act = activation,
         .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
     });
 }
 
@@ -956,8 +1158,8 @@ fn resumeStream(
 /// assumes that and reads chain components from there. Outcome
 /// handling mirrors `resumeStream`: Response → terminal chunk-drain
 /// then close; stream → append chunks + update wakes; continuation
-/// → 501 (stream → cont transition is out of scope, same as the
-/// existing stream-resume `.continuation` arm).
+/// → stay parked (thread ctx, re-aim on explicit target — the shared
+/// `finishStreamResume` `.continuation` arm).
 ///
 /// `ev` is consumed — every exit path deinits via the caller's
 /// outer defer (mirrors `resumeBoundFetchChain`'s ownership).
@@ -1073,6 +1275,14 @@ pub fn resumeBoundFetchStream(
         for (pending_fetches.items) |*pf| pf.deinit(allocator);
         pending_fetches.deinit(allocator);
     }
+    // `after.*` re-arms from a bound-fetch chunk hop land here and are
+    // installed by the outcome arms (a held hop with no re-arm keeps
+    // the chain's existing arms).
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
 
     // The fetch result is this activation's Msg (an input — L3) → tape it so the
     // fetch_chunk is replayable. Fed to `captureFetchChunkTapes` at the capture
@@ -1128,6 +1338,7 @@ pub fn resumeBoundFetchStream(
         .effects = .{
             .pending_stream_chunks = &stream_chunks,
             .pending_fetches = &pending_fetches,
+            .pending_wakes = &pending_wakes,
         },
     };
 
@@ -1163,6 +1374,7 @@ pub fn resumeBoundFetchStream(
         .txn_done = &txn_done,
         .act = .fetch_chunk,
         .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
         .tape_body = body,
         .tape_ev = fetch_ev,
     });
@@ -1279,22 +1491,28 @@ pub fn firePrep(
     };
 }
 
-/// What a `.continuation` return does, per firer.
+/// What a `.continuation` return does, per firer. The one `next()`
+/// semantic applies to HELD chains (stay parked, thread ctx, honor the
+/// target); the firers here are CONNECTIONLESS activations, where
+/// "held" is not expressible — each residue below is principled and
+/// LOUD, never a silent free:
 const ContAction = enum {
-    /// Deinit silently (a disconnect hop has nowhere to resume).
-    drop,
-    /// Warn — held continuations aren't expressible from this origin
-    /// (v1); customers compose multi-step via webhook.send on_result.
+    /// Warn naming the mistake — this origin cannot hold (a
+    /// disconnect hop's connection is already gone; a durable wake /
+    /// subscription fire holds no socket). Customers compose
+    /// multi-step from these origins via webhook.send on_result.
     warn,
-    /// Treat as a bug in our own module: warn, roll back (writes
+    /// Treat as a bug in our own baked module (scheduler_tick /
+    /// blob_compose never return next()): warn, roll back (writes
     /// included), skip the log record entirely.
     rollback_silent,
-    /// Enqueue the named module as a chained SendCallback hop on the
-    /// next tick (bounded recursion via the dispatch BATCH cap),
-    /// inheriting this chain's correlation_id.
+    /// Honor it: enqueue the target module as a chained SendCallback
+    /// hop on the next tick (bounded recursion via the dispatch BATCH
+    /// cap), inheriting this chain's correlation_id — the
+    /// connectionless meaning of "re-enter the target module".
     enqueue,
 };
-const StreamAction = enum { drop, warn, rollback_silent };
+const StreamAction = enum { warn, rollback_silent };
 
 /// The per-firer behavior axes of `runFire`'s outcome switch.
 /// Comptime so each firer compiles its own lean switch.
@@ -1503,9 +1721,8 @@ pub fn runFire(
         .continuation => |*cval| {
             defer cval.deinit(allocator);
             switch (comptime spec.on_cont) {
-                .drop => {},
                 .warn => std.log.warn(
-                    "rove-js " ++ spec.site ++ " ({s}): __rove_next from this origin is a no-op (v1)",
+                    "rove-js " ++ spec.site ++ " ({s}): next() from a connectionless activation cannot hold — the return is ignored (compose multi-step via webhook.send on_result)",
                     .{label},
                 ),
                 .rollback_silent => {
@@ -1553,9 +1770,8 @@ pub fn runFire(
         .stream => |*s2| {
             s2.deinit(allocator);
             switch (comptime spec.on_stream) {
-                .drop => {},
                 .warn => std.log.warn(
-                    "rove-js " ++ spec.site ++ " ({s}): __rove_stream from this origin is a no-op (v1)",
+                    "rove-js " ++ spec.site ++ " ({s}): stream output from a connectionless activation has no socket — the output is dropped",
                     .{label},
                 ),
                 .rollback_silent => {
@@ -1697,8 +1913,8 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     runFire(worker, &p, request, .{
         .act = .disconnect,
         .site = "stream-disconnect",
-        .on_cont = .drop,
-        .on_stream = .drop,
+        .on_cont = .warn,
+        .on_stream = .warn,
     }, path, chain_ctx.correlation_id, chain_ctx.tenant_id, "");
 }
 
