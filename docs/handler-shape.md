@@ -139,7 +139,23 @@ disconnect lives in `kv`.
 
 `next` is an **ambient global** (like `stream`, `after`, `kv`, `response`) —
 no import. `next()` resumes THIS module's conventional export for the
-activation kind; you never name the module or export.
+activation kind; you never name the export. The two-argument form
+`next(target, ctx)` is the **cross-module continuation**: it re-aims the
+held chain to `target`, so every later resume — timer/kv wake, bound
+fetch chunk, the next WebSocket frame, disconnect — dispatches at the
+target module's conventional export. One semantic on every held chain
+(plain hold, streaming, WebSocket); there is no family where the target
+is ignored.
+
+**A park must be resumable.** At park time the chain must have ≥1
+possible resume source — an `after.*` arm (this activation's, or one
+riding from an earlier hop), an in-flight bound fetch / `blob.receive`,
+a lone owed send (§6.4), the connection's own inbound traffic (a
+WebSocket's next frame; a streaming body's remaining chunks). A `next()`
+that parks with none is a defined `500 held with no wake source` at the
+park site — nothing could ever resume it, so failing loud beats
+surfacing 25 s later as the generic hold-deadline 504 (which remains the
+backstop for armed-but-never-fires).
 
 ### 2.2 Connection output — `stream.start` / `stream.write`
 
@@ -155,14 +171,11 @@ verb. It produces the streaming response over time:
   (the one rule — `architecture/routing-and-ingress.md`). Call it as many times per activation as you
   like; raw bytes (SSE `data:` framing is yours to write).
 
-**In a continuing activation (`onWake` etc.), call `stream.start()`
-unconditionally, before any conditional writes.** The runtime classifies
-an activation as streaming by whether it touched `stream.*`
-(`finishResponse`, the one classification point): a wake that happens to
-write zero frames and returns `next()` without `stream.start()` is parked
-as a plain continuation — not a stream re-park — and the stream closes.
-`stream.start()` is idempotent on an already-started stream, so the
-unconditional call is free.
+A continuing activation (`onWake` etc.) that has nothing to write this
+hop just returns `next()` — a zero-frame wake keeps the stream parked
+with its arms riding (re-`after.*` only to CHANGE what you're watching;
+re-arming replaces the arm set). No `stream.start()` ritual is needed to
+stay held.
 
 Pair `stream.*` with `next()` to keep producing across activations;
 close with a terminal return:

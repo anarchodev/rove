@@ -60,9 +60,25 @@ pub const Stream = struct {
     /// Allocator-owned: each prefix is its own dup'd buffer, and
     /// the spine `[][]u8` is allocator-owned too.
     kv_prefixes: [][]u8 = &.{},
+    /// The wake-resume export from the `on.*` registrations' `{on}`
+    /// (last one wins — one edge-wake export per held connection,
+    /// same rule as the cont family's `armContWakesIfAny`). null →
+    /// the conventional `onWake`. Owned when present.
+    wake_to: ?[]u8 = null,
     /// Author's `ctx`, JSON-serialized. Threaded forward to the next
     /// activation as `request.ctx`.
     ctx_json: []u8,
+    /// Cross-module target from the `next(path, …)` disposition —
+    /// one `next()` semantic on every held chain: when non-empty, the
+    /// chain re-aims to this module (all later resumes dispatch
+    /// there). Empty = ambient `next()` (the chain stays where it
+    /// is). Owned when non-empty.
+    path: []u8 = &.{},
+    /// `next(path, {fn})` on a stream chain has no slot to land in —
+    /// the wake arm's `{on}` names the resume export — so the family
+    /// arms reject it loudly (never free it silently). Owned when
+    /// present.
+    fn_name: ?[]u8 = null,
 
     pub fn deinit(self: *Stream, allocator: std.mem.Allocator) void {
         if (self.headers) |h| allocator.free(h);
@@ -70,7 +86,10 @@ pub const Stream = struct {
         allocator.free(self.chunks);
         for (self.kv_prefixes) |p| allocator.free(p);
         if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
+        if (self.wake_to) |t| allocator.free(t);
         allocator.free(self.ctx_json);
+        if (self.path.len > 0) allocator.free(self.path);
+        if (self.fn_name) |f| allocator.free(f);
     }
 };
 

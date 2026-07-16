@@ -663,9 +663,9 @@ const ContResumeNext = union(enum) {
     /// from a cont-parked entity (bound-fetch onFetchChunk
     /// resume that opens a streaming response). All slices owned
     /// and transferred onto the entity's stream components +
-    /// h2 components. Module path is duped from the resume's
-    /// cont module path (the chain's named-export module stays
-    /// fixed across activations).
+    /// h2 components. Module path is the cont's current path,
+    /// unless the disposition named a cross-module target — the
+    /// one `next()` semantic: an explicit target re-aims the chain.
     stream: struct {
         status: u16,
         /// Response headers parsed from the stream Cmd. Caller-
@@ -689,6 +689,9 @@ const ContResumeNext = union(enum) {
         /// Timer-wake interval (0 = no timer wake — fetch chunks
         /// are the wake source).
         interval_ms: i64,
+        /// Wake-resume export from the registrations' `{on}` (last
+        /// one wins); null → the conventional `onWake`. Owned.
+        wake_to: ?[]u8,
     },
 };
 
@@ -722,6 +725,7 @@ fn discardContResume(
             allocator.free(s.module_path);
             for (s.kv_prefixes) |p| allocator.free(p);
             if (s.kv_prefixes.len > 0) allocator.free(s.kv_prefixes);
+            if (s.wake_to) |t| allocator.free(t);
         },
     }
 }
@@ -1020,10 +1024,21 @@ fn proposeAndParkContResume(
                 for (arms) |arm| allocator.free(arm.prefix);
                 if (arms.len > 0) allocator.free(arms);
             }
+            // reg.set overwrites in place without deiniting the prior
+            // component — free the cont's old arms/export first (the
+            // parked continuation may have armed on.kv/on.timer before
+            // this hop opened the stream).
+            if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+                for (old.kv_prefixes) |arm| allocator.free(arm.prefix);
+                if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+                if (old.wake_to) |t| allocator.free(t);
+                old.* = .{};
+            } else |_| {}
             try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
                 .interval_ms = s.interval_ms,
                 .next_wake_ns = next_wake_ns,
                 .kv_prefixes = arms,
+                .wake_to = s.wake_to,
             });
 
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
@@ -1057,7 +1072,10 @@ fn proposeAndParkContResume(
 ///         raft_pending_cont; the drainEntityArm re-parks on commit
 ///         (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
 ///       • continuation + !allow_repark → defined 504 (deadline).
-///       • stream → defined 501 (`cont → stream` is a later phase).
+///       • continuation re-parks re-aim the chain's module when the
+///         target is explicit; a re-park with no possible resume
+///         source is a defined 500 (`held with no wake source`).
+///       • stream → cont→stream transition (`resumeIntoStream`).
 /// Install the cont→stream transition's components on a held entity
 /// (still in `parked_continuations`) and move it into the streaming
 /// pipeline (`stream_response_in`). Shared read-only-path tail of both
@@ -1088,6 +1106,7 @@ fn installStreamComponentsInline(
     chunks: [][]u8,
     kv_prefixes: [][]u8,
     interval_ms: i64,
+    wake_to: ?[]u8,
 ) void {
     const server = worker.h2;
     const allocator = worker.allocator;
@@ -1121,10 +1140,20 @@ fn installStreamComponentsInline(
         const empty: []components_mod.KvArm = &.{};
         break :blk empty;
     };
+    // reg.set overwrites in place without deiniting the prior component —
+    // free the cont's old arms/export first (the parked continuation may
+    // have armed on.kv/on.timer before the bound fetch opened the stream).
+    if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+        for (old.kv_prefixes) |arm| allocator.free(arm.prefix);
+        if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+        if (old.wake_to) |t| allocator.free(t);
+        old.* = .{};
+    } else |_| {}
     server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = arms,
+        .wake_to = wake_to,
     }) catch {};
 
     server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
@@ -1195,6 +1224,18 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     var hop_tapes_consumed = false;
     defer if (!hop_tapes_consumed) hop_tapes.deinit(allocator);
 
+    // `next(path, {fn})` has no slot on a stream chain — the wake
+    // arm's `{on}` names the resume export. Defined author error,
+    // never a silent free.
+    if (s.fn_name != null) {
+        s.deinit(allocator);
+        ctx.txn.rollback() catch {};
+        ctx.txn_done.* = true;
+        resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch {};
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+        return;
+    }
+
     // Parse the stream({headers}) wire-format buffer (`Key: Val\r\n…`)
     // into the typed list shape proposeAndParkContResume expects; the
     // buffer is consumed (entries copy the bytes) so free the original.
@@ -1205,9 +1246,10 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     if (s.headers) |h| allocator.free(h);
     s.headers = null;
 
-    // Module path duped from the cont's current path so subsequent
-    // fetch chunks find the same module.
-    const module_path_dup = allocator.dupe(u8, ctx.cont_path) catch {
+    // Module path for the chain's later resumes: the one `next()`
+    // semantic — an explicit cross-module target re-aims the chain;
+    // the ambient (empty) path keeps the cont's current path.
+    const module_path_dup = allocator.dupe(u8, if (s.path.len > 0) s.path else ctx.cont_path) catch {
         // Alloc failure before ownership transfer: `s` still owns its
         // slices, so `s.deinit` frees them.
         for (parsed_headers) |h| {
@@ -1230,9 +1272,13 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     const stream_ctx_json = s.ctx_json;
     const stream_kv_prefixes = s.kv_prefixes;
     const stream_interval = s.interval_ms orelse 0;
+    const stream_wake_to = s.wake_to;
+    if (s.path.len > 0) allocator.free(s.path);
+    s.path = &.{};
     s.chunks = &.{};
     s.ctx_json = &.{};
     s.kv_prefixes = &.{};
+    s.wake_to = null;
 
     if (ctx.wrote) {
         // status=0: parked-hop convention (matches repark).
@@ -1253,6 +1299,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
                 .module_path = module_path_dup,
                 .kv_prefixes = stream_kv_prefixes,
                 .interval_ms = stream_interval,
+                .wake_to = stream_wake_to,
             } },
             ctx.pending_fetches,
             ctx.readset,
@@ -1324,6 +1371,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         if (stream_chunks.len > 0) allocator.free(stream_chunks);
         for (stream_kv_prefixes) |p| allocator.free(p);
         if (stream_kv_prefixes.len > 0) allocator.free(stream_kv_prefixes);
+        if (stream_wake_to) |t| allocator.free(t);
         resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume header build failed\n") catch {};
         captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
         return;
@@ -1334,7 +1382,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     }
     if (parsed_headers.len > 0) allocator.free(parsed_headers);
 
-    installStreamComponentsInline(worker, ctx.ent, ctx.sid, ctx.sess, stream_status, handler_resp_hdrs, module_path_dup, stream_ctx_json, stream_chunks, stream_kv_prefixes, stream_interval);
+    installStreamComponentsInline(worker, ctx.ent, ctx.sid, ctx.sess, stream_status, handler_resp_hdrs, module_path_dup, stream_ctx_json, stream_chunks, stream_kv_prefixes, stream_interval, stream_wake_to);
     // P5(a): read-only cont→stream transition committed above — flush
     // the hop's unbound fetches now. Connection-scoped binds from this
     // transition stay unwired (the entity just moved to the stream
@@ -1584,6 +1632,53 @@ fn finishContResume(
                 ctx.txn.rollback() catch {};
                 ctx.txn_done.* = true;
                 resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 504, "hold deadline exceeded\n") catch {};
+                return;
+            }
+            // Park-time vigilance (docs/handler-shape.md §2.1): the
+            // re-park must leave ≥1 possible resume source — a send
+            // binding (kept across read-only hops / re-scanned on a
+            // writing hop), an armed `after.*` riding the chain, an
+            // in-flight bound fetch, a fetch this hop issues that
+            // will bind, remaining inbound body chunks, or the open
+            // WS socket. An empty set can never resume: fail loud
+            // now, naming the mistake, instead of the generic 504
+            // when the deadline sweeps 25 s later. (Fetches from a
+            // WRITING repark are dropped — bind-from-writing-resume
+            // is unwired — so they do NOT count; a park whose only
+            // source was those surfaces that gap here.)
+            const will_have_source = blk: {
+                if (ctx.wrote) {
+                    if (worker_mod.scanLoneOwedSendId(ctx.ws.ops.items) != null) break :blk true;
+                } else if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.ContDescriptor)) |d| {
+                    if (d.bound_schedule_id != null) break :blk true;
+                } else |_| {}
+                if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.StreamWakes)) |sw| {
+                    if (sw.interval_ms > 0 or sw.kv_prefixes.len > 0) break :blk true;
+                } else |_| {}
+                if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+                    if (cnt.pending > 0) break :blk true;
+                } else |_| {}
+                if (!ctx.wrote) {
+                    for (ctx.pending_fetches.items) |pf| {
+                        if (pf.connection_scoped) break :blk true;
+                    }
+                }
+                // A live inbound-chunk job resumes the chain with its next
+                // staged fire — presence alone counts (eof only means the
+                // BYTES all arrived; fires may still be queued behind this
+                // hop). A handler that next()s past the final fire falls to
+                // the deadline backstop, like any armed-but-idle park.
+                if (worker.inbound_chunk_jobs.get(ctx.ent) != null) break :blk true;
+                if (worker_ws.wsConnForChain(worker, ctx.ent) != null) break :blk true;
+                break :blk false;
+            };
+            if (!will_have_source) {
+                c2m.deinit(allocator);
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch {};
+                const errmsg = allocator.dupe(u8, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch @constCast("");
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, errmsg, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
                 return;
             }
             if (ctx.wrote) {

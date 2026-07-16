@@ -503,6 +503,24 @@ fn finishWsResume(
             tearDownWsChain(worker, conn_ent);
         },
         .continuation => |*cval| {
+            // One `next()` semantic on every held chain: stay held,
+            // thread ctx, and — when the target is explicit — re-aim
+            // the chain's module so every later frame/wake dispatches
+            // there (the module-handoff shape: a lobby's `onMessage`
+            // returning `next("rooms/chat.mjs", {room})`).
+            if (cval.fn_name != null) {
+                // fn has no slot on a WS chain (frames dispatch to
+                // `onMessage`; wakes to the arm's `{on}`) — defined
+                // author error, never a silent free.
+                cval.deinit(allocator);
+                p.txn.rollback() catch {};
+                p.txn_done = true;
+                const errmsg = allocator.dupe(u8, "next({fn}) is not supported on a WebSocket chain — frames dispatch to onMessage; name a wake export via after.*(..., {on})") catch @constCast("");
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, errmsg, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            }
             const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, path, chain_ctx.correlation_id);
             const wrote = p.ws.ops.items.len > 0;
             // Snap the §8.4 read baseline before shipWsFrames may transfer txn.
@@ -529,6 +547,15 @@ fn finishWsResume(
             // browser-agent capture path — without it the per-frame
             // activations carry no `session` tag.
             captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, cval.tags, act, fw_seq);
+            // Re-aim on an explicit cross-module target — every later
+            // frame/wake on this connection dispatches at the target
+            // module. AFTER the capture above: the `path` local
+            // borrows `chain_st.module_path`'s backing memory.
+            if (cval.path.len > 0 and !std.mem.eql(u8, cval.path, chain_st.module_path)) {
+                allocator.free(chain_st.module_path);
+                chain_st.module_path = cval.path;
+                cval.path = &.{};
+            }
             cval.deinit(allocator);
             // §4.5 input gate: a writing frame's output is commit-gated — close
             // the gate so later frames queue behind it in arrival order.
@@ -544,15 +571,18 @@ fn finishWsResume(
             // Arm any on.kv/on.timer this frame registered (rides the chain).
             if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, pending_wakes, read_version);
         },
-        .stream => |*s2| {
-            // A streamed-response descriptor is out of scope on WS (the
-            // connection IS the stream): roll back, close, tear down.
-            s2.deinit(allocator);
-            p.txn.rollback() catch {};
-            p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 501, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
-            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-            tearDownWsChain(worker, conn_ent);
+        .stream => {
+            // Unreachable by construction: every WS resume wires the
+            // opcode accumulator, so the dispatcher classifies stream
+            // output as `ws_frame_output` and never lowers to
+            // `.stream` (dispatcher.zig's bridge gate). Reaching here
+            // means the wiring broke — a platform bug, not a customer
+            // error.
+            panic_mod.invariantViolated(
+                "finishWsResume.stream",
+                "ws chain produced a .stream outcome (opcode accumulator unwired?) tenant={s}",
+                .{chain_ctx.tenant_id},
+            );
         },
         // Only `.inbound_headers`/`.inbound_chunk` activations produce these;
         // a WS resume never dispatches as one. Defined failure: close + tear down.

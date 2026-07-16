@@ -9,6 +9,11 @@ export default function () {
     throw new Error("boom");
   }
   if (request.path === "/pending") return new Promise(() => {});
-  if (request.path === "/hold") return next({ n: 1 });
+  if (request.path === "/hold") {
+    // A park needs ≥1 possible resume source ("held with no wake source" is
+    // a defined 500) — a presence-style hold arms a heartbeat timer.
+    after.ms(30_000);
+    return next({ n: 1 });
+  }
   return { ok: true };
 }

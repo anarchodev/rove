@@ -27,10 +27,18 @@
    * kind. Close the connection by returning a terminal body instead.
    *
    * Called with two arguments, it continues into a DIFFERENT module:
-   * `next(targetModule, ctx)` parks and re-enters `targetModule`'s
-   * conventional export instead of this one — the cross-module
-   * continuation (the same "name a target module" shape as
-   * `schedule(when, target)` / `webhook.send({ on })`).
+   * `next(targetModule, ctx)` re-aims the held chain to `targetModule`,
+   * so EVERY later resume — timer/kv wake, bound fetch chunk, the next
+   * WebSocket frame, disconnect — dispatches at the target's
+   * conventional export instead of this one. One semantic on every held
+   * chain (plain hold, streaming, WebSocket); the same "name a target
+   * module" shape as `schedule(when, target)` / `webhook.send({ on })`.
+   *
+   * A park must be resumable: at park time the chain needs ≥1 possible
+   * resume source (an `after.*` arm — this hop's or riding from an
+   * earlier one — an in-flight bound fetch / `blob.receive`, a lone owed
+   * send, or the connection's own inbound traffic). A `next()` with
+   * none is a defined `500 held with no wake source` at the park site.
    *
    * @param {*} [ctx] - Per-connection state for the next activation.
    *   (When two args are given, this first argument is the target

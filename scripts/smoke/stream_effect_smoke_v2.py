@@ -69,9 +69,9 @@ STREAMKV_SRC = r"""export default function () {
 }
 
 export function onWake() {
-    stream.start();
     // Go-look drain (issue #8): the wake names the fired prefix, never
-    // the matched keys; emit everything past the ctx cursor.
+    // the matched keys; emit everything past the ctx cursor. A zero-frame
+    // wake re-holds via the plain next() — no stream.start() ritual.
     const cursor = request.ctx ? request.ctx.cursor : null;
     const rows = kv.prefix("streamkv/in/", cursor);
     for (const r of rows) {
@@ -163,6 +163,18 @@ def main() -> int:
         if not failures:
             print("  ok  three writes posted (direct to node)")
 
+        # Zero-frame wake hop: a write that sorts BEFORE the drained cursor
+        # fires the arm but drains no new rows — onWake emits nothing and
+        # re-holds via the plain next() (no stream.start() ritual). The
+        # chain must survive it: the next past-cursor write still frames.
+        for key, value in (("streamkv/in/0", "zero"), ("streamkv/in/4", "delta")):
+            w = c.node_request("/writekv", method="POST", host=c.host_for("acme"),
+                               headers={"content-type": "application/json"},
+                               data=json.dumps({"key": key, "value": value}))
+            if w.status != 204:
+                check(f"writekv {key} → 204", False, f"got {w.status} {w.body!r}")
+            time.sleep(0.3)
+
         try:
             stdout, stderr = watcher.communicate(timeout=8.0)
         except subprocess.TimeoutExpired:
@@ -214,6 +226,18 @@ def main() -> int:
         if seen < 2:
             c.dump_node_log(grep=["stream", "kv", "wake", "park", "resolve",
                                   "404", "error", "warn"])
+
+        # 4. The chain survived the zero-frame wake hop: the in/0 write woke
+        #    the handler past its cursor (no frame emitted), and the in/4
+        #    write STILL framed — the plain next() re-held the stream.
+        check("zero-frame wake emitted nothing",
+              "streamkv/in/0=zero" not in body, f"body={body!r}")
+        check("chain survived the zero-frame hop (in/4 framed)",
+              "event: update\ndata: streamkv/in/4=delta\n\n" in body,
+              f"body={body!r}")
+        if "streamkv/in/4=delta" not in body:
+            c.dump_node_log(grep=["stream", "kv", "wake", "park", "held",
+                                  "error", "warn"])
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

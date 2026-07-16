@@ -652,17 +652,21 @@ class Scenario {
   }
 }
 
-/** One activation — a lazy thunk over `simulate(world)`, memoized on force. */
+/** One activation — a lazy thunk over `simulate(world)`, memoized on force.
+ *  `parent` links a resume fold back to the held node it resumed from, so the
+ *  wake-source check can see arms riding from earlier hops (`ridingWakeArms`).
+ *  Detached-authored nodes (sendCallback / wake / inbound) have none. */
 class Node {
-  constructor(scn, world) {
+  constructor(scn, world, parent = null) {
     this[NODE] = true;
     this.scenario = scn;
     this.world = world;
+    this._parent = parent;
     this._b = null;
   }
 
   force() {
-    if (this._b === null) this._b = simulate(this.world);
+    if (this._b === null) this._b = enforceWakeSource(this, simulate(this.world));
     return this._b;
   }
 
@@ -900,21 +904,83 @@ function heldCtx(node) {
   return c === undefined ? null : c;
 }
 
-/** The module a resume on this held chain re-enters. Prod dispatches every
- *  resume at the parked continuation's own path: an ambient `next()` parks the
- *  module that held, a cross-module `next(target, ctx)` parks `target` — and
- *  timer/kv wakes, bound-fetch chunks (via the cont→stream transition), and
- *  disconnect all resume there. So the fold's entry is the held `next(target)`
- *  target when the bundle carries one, else the module that held. A WS chain
- *  is the exception: its resumes dispatch at the CONNECTION's module, which a
- *  cross-module target never updates — so a WsNode always re-enters its own
- *  entry. */
+/** The module a resume on this held chain re-enters — the one `next()`
+ *  semantic on every held chain (cont, stream, AND WS): an ambient `next()`
+ *  parks the module that held, a cross-module `next(target, ctx)` re-aims the
+ *  chain to `target` — and timer/kv wakes, bound-fetch chunks, later WS
+ *  frames, and disconnect all resume there. So the fold's entry is the held
+ *  `next(target)` target when the bundle carries one, else the module that
+ *  held. */
 function heldEntry(node) {
-  if (node instanceof WsNode) return node.world.entry;
   const b = node.force();
   return (b.disposition === "held" && typeof b.target === "string" && b.target)
     ? b.target
     : node.world.entry;
+}
+
+/** Park-time vigilance, mirroring the worker (docs/handler-shape.md §2.1): a
+ *  held chain must have ≥1 possible resume source. When a bundle holds with
+ *  none — no `after.*` arm (this hop's or riding from an earlier hop), no
+ *  bound fetch / blob.receive, no lone owed send (§6.4), no implicit source
+ *  (an open WS socket; an inbound body still streaming) — prod fails the park
+ *  loud at its site (500 `held with no wake source`) instead of a generic 504
+ *  when the hold deadline sweeps 25 s later. Rewrite the bundle to that same
+ *  terminal, with the hop's effects rolled back, so the mistake is caught
+ *  offline at `rewind test` time. A held hop that emitted stream frames with
+ *  no arms is exempt: prod closes that chain after the chunks drain (the
+ *  finite-batch shape), which the fold already models as the chain ending. */
+function enforceWakeSource(node, b) {
+  if (b.disposition !== "held") return b;
+  if (node instanceof WsNode) return b; // the socket is the source (next frame)
+  const kind = node.world.activation;
+  // The request body's remaining chunks resume a headers-first hold; a
+  // disconnect hop never parks (prod ignores its next() with a warn); a
+  // detached-authored node (sendCallback / durable wake — no parent, not
+  // inbound) models prod's connectionless chained dispatch, which holds
+  // nothing.
+  if (kind === "inbound_headers" || kind === "inbound_chunk" || kind === "disconnect") return b;
+  if (!node._parent && kind !== "inbound") return b;
+  const fx = live(b.effects);
+  const owedSends = fx.filter((e) => e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")).length;
+  const hasSource =
+    fx.some((e) =>
+      (e.kind === "timer" && (e.ms == null || e.ms > 0)) ||
+      (e.kind === "kv-wake" && e.prefix) ||
+      (e.kind === "fetch" && e.bound) ||
+      (e.kind === "blob" && e.op === "receive") ||
+      (e.kind === "stream")) ||
+    owedSends === 1 || // exactly one binds (§6.4); 0 or >1 ⇒ deadline-only
+    ridingWakeArms(node) ||
+    stillStreamingFetch(node);
+  if (hasSource) return b;
+  for (const e of b.effects || []) e.rolledBack = true;
+  b.disposition = "terminal";
+  b.ok = false;
+  b.body = "held with no wake source: next() parked this chain but nothing can resume it — arm after.* or bind a fetch/send before holding\n";
+  b.response = Object.assign({}, b.response, { status: 500 });
+  return b;
+}
+
+/** Arms ride forward across hops: a resume that re-arms nothing keeps the
+ *  chain's existing `after.*` watches; a hop that re-arms REPLACES them. So
+ *  the chain's effective arms are the nearest ancestor hop's (self included)
+ *  that registered any. */
+function ridingWakeArms(node) {
+  for (let n = node._parent; n; n = n._parent || null) {
+    const arms = live(n.force().effects).filter((e) =>
+      (e.kind === "timer" && (e.ms == null || e.ms > 0)) || (e.kind === "kv-wake" && e.prefix));
+    if (arms.length) return true;
+  }
+  return false;
+}
+
+/** An in-flight bound fetch still resumes the chain: a fetch_chunk fold that
+ *  isn't the fetch's final event (`done: false`), or with other binds still
+ *  outstanding (`fetchesPending > 1`, prod's including-this-one count). */
+function stillStreamingFetch(node) {
+  const r = node.world.request || {};
+  if (node.world.activation !== "fetch_chunk") return false;
+  return r.done === false || (typeof r.fetchesPending === "number" && r.fetchesPending > 1);
 }
 
 /** The `request.ctx` a located `after.fetch`'s resume observes (decisions.md
@@ -1306,7 +1372,7 @@ function carrySources(parentWorld, world) {
 function resumeNode(parent, world) {
   return parent instanceof WsNode
     ? new WsNode(parent.scenario, world, parent._conn)
-    : new Node(parent.scenario, world);
+    : new Node(parent.scenario, world, parent);
 }
 
 /** Resolve a continuation `on` to its `{entry, export}`. A bare name (no `/`,
@@ -1393,17 +1459,20 @@ class WsConnection {
   /** Deliver an inbound frame → the `onMessage` activation for it. Text by
    *  default; `{ binary: true }` delivers `data` as a binary frame. */
   receive(data, opts = {}) {
-    return this._frame(this.scenario.baseKv, {}, 0, data, opts);
+    return this._frame(this.scenario.baseKv, {}, 0, data, opts, this.scenario.entry);
   }
 
   /** Client close before any frame → `onDisconnect` (ctx `{}`). */
   disconnect() {
-    return this._disc(this.scenario.baseKv, {}, 0);
+    return this._disc(this.scenario.baseKv, {}, 0, this.scenario.entry);
   }
 
   // Build one ws_message world. `ctx` is the connection ctx this frame runs
-  // under; `kv` is the folded overlay; `seed` is the prior activation's seed.
-  _frame(kv, ctx, seed, data, opts) {
+  // under; `kv` is the folded overlay; `seed` is the prior activation's seed;
+  // `entry` is the chain's CURRENT module — the connection's module until a
+  // frame re-aims it via a cross-module `next(target, ctx)` (the one `next()`
+  // semantic; `heldEntry` folds it forward frame-to-frame).
+  _frame(kv, ctx, seed, data, opts, entry) {
     const binary = !!(opts && opts.binary);
     const activation = binary
       ? { kind: "ws_message", opcode: 2, dataB64: b64(data) }
@@ -1417,7 +1486,7 @@ class WsConnection {
       ? { activation, bodyB64: b64(data) }
       : { activation, body: String(data) };
     const world = this.scenario._base({
-      entry: this.scenario.entry,
+      entry,
       activation: "ws_message",
       export: "onMessage",
       ctx,
@@ -1428,9 +1497,9 @@ class WsConnection {
     return new WsNode(this.scenario, world, this);
   }
 
-  _disc(kv, ctx, seed) {
+  _disc(kv, ctx, seed, entry) {
     const world = this.scenario._base({
-      entry: this.scenario.entry,
+      entry,
       activation: "disconnect",
       export: "onDisconnect",
       ctx,
@@ -1456,10 +1525,10 @@ class WsNode extends Node {
     return this.world.ctx; // terminal onMessage: connection ctx unchanged
   }
   receive(data, opts) {
-    return this._conn._frame(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, data, opts);
+    return this._conn._frame(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, data, opts, heldEntry(this));
   }
   disconnect() {
-    return this._conn._disc(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0);
+    return this._conn._disc(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, heldEntry(this));
   }
 }
 

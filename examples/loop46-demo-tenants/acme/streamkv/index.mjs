@@ -25,9 +25,10 @@ export default function () {
 
 // A kv write under the watched prefix landed (§8.4-gated) — the wake
 // names the FIRED PREFIX (issue #8); drain past the ctx cursor and emit
-// one frame per new entry, then re-arm.
+// one frame per new entry, then re-arm. A zero-frame wake (woke, nothing
+// new past the cursor) re-holds via the plain `next()` below — no
+// `stream.start()` ritual needed to stay parked.
 export function onWake() {
-    stream.start(); // keep the stream alive even on a zero-frame wake
     const cursor = request.ctx ? request.ctx.cursor : null;
     const rows = kv.prefix("streamkv/in/", cursor);
     for (const r of rows) {
