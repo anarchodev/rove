@@ -267,6 +267,21 @@ const gone   = held.disconnect();                        // client closed → on
 Resolving on an activation that already responded (didn't hold) throws — `after.*`
 only fires while the connection is held, so the test mirrors reality.
 
+Each armed wake resumes into its OWN `{on}` export — an `after.ms(..,{on:"onTick"})`
+fires `onTick`, an `after.kv("x/",{on:"onData"})` fires `onData`. Two matching
+constraints on the fold keep it honest with the worker:
+
+- **`clock.advance(d).fire()` only fires a timer the clock has reached.** Advancing
+  by less than the armed `after.ms(N)` throws, rather than delivering a wake prod
+  wouldn't. When a handler arms several `after.ms` on one connection, the worker
+  keeps just the LAST — a single timer slot — so `.fire()` resolves the
+  last-registered interval and `{on}`.
+- **`wakeKv(changes)` only fires when a change key falls under an armed prefix.** A
+  change entirely outside every `after.kv` prefix throws (it would validate a
+  resume the worker never triggers). Keys outside the prefixes still fold into the
+  KV overlay — they just can't be the trigger. Pass `{prefix}` to pick which armed
+  `after.kv`'s export resumes when several are watching.
+
 ### A WebSocket
 
 A WS connection runs no code at upgrade; each frame runs `onMessage`. Drive it
