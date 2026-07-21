@@ -1,6 +1,6 @@
 //! rove-acme — in-tree ACME (RFC 8555) HTTP-01 issuance.
 //!
-//! See `docs/auth-domain-plan.md` §3.2. Public surface:
+//! See `docs/architecture/auth-and-domains.md`. Public surface:
 //!   - `crypto` — EC P-256 keys, ES256 JWS, JWK thumbprint, CSR.
 //!   - `Responder` — the dedicated :80 HTTP-01 challenge server.
 //!   - `Client` — the RFC 8555 order→challenge→finalize state machine.

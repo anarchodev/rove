@@ -1,5 +1,6 @@
 //! Per-worker durable "last raft seq I've uploaded a log batch for"
-//! checkpoint (`docs/readset-replication-plan.md` Phase 5b).
+//! checkpoint — the resume mark for readset replication's promotion
+//! walker (`docs/architecture/effects-and-handlers.md`).
 //!
 //! The leader's existing `flushLogs` pipeline is "best effort early
 //! visibility": it drains the in-memory `log_buffer` into one

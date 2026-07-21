@@ -3,7 +3,7 @@
 //! the request surface, a **closed-world** key→value KV map, ctx, the flattened
 //! fetch/callback result, the resolved export, seed, and optionally the
 //! `recorded` output. KV reads resolve BY KEY with a write-through overlay
-//! (order-independent — `replay-and-sim.md` §1); a key not in the map is
+//! (order-independent — `docs/architecture/replay-and-sim.md` §1); a key not in the map is
 //! `not_found`, never a divergence. Faithfulness is the output-level
 //! `status_match` + the ordered effect log, not a per-read check. It emits one
 //! LLM-JSON bundle: the response head, disposition, body/ctx, the ordered
@@ -278,7 +278,7 @@ pub const Engine = struct {
         // Resolvable = inline in `sources`, or on disk under `src_dir` —
         // probing BOTH spellings in prod's order, `.mjs` then `.js`
         // (dispatcher.zig's bytecode lookup), so a `.js`-spelled middleware
-        // gates offline exactly as it does live (issue #51).
+        // gates offline exactly as it does live.
         const MW_PATHS = [_][]const u8{ "_middlewares/index.mjs", "_middlewares/index.js" };
         const is_trust_boundary = std.mem.eql(u8, wv.activation, "inbound") or
             std.mem.eql(u8, wv.activation, "inbound_headers") or
@@ -344,7 +344,7 @@ pub const Engine = struct {
         };
         host.install();
 
-        // GC mode, every run (issue #70). Set on each run because the mode
+        // GC mode, every run. Set on each run because the mode
         // binds at the entry reset. Forward sim and replay both run GC: the sim
         // can't model a bump OOM faithfully, and GC is transparent to a pure
         // handler, so replaying a bump-recorded request under GC reproduces its
@@ -803,7 +803,7 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
 
     // ok = the activation completed CLEANLY: output parked, no divergence, no
     // thrown handler. A thrown handler is a 500 in prod — `ok:true` on it
-    // misled error-path tests (issue #10).
+    // misled error-path tests.
     const ok_run = args.run_json != null and args.divergence == null and !has_err;
     try w.print(",\"ok\":{s}", .{if (ok_run) "true" else "false"});
 

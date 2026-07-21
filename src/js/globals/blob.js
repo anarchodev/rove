@@ -122,8 +122,8 @@ globalThis.blob = {
    *   returned on direct GETs of the object.
    * @param {string} [opts.on] - Module path receiving the
    *   terminal result on the unified flattened surface (handler-shape
-   *   §7): `request.status` top-level (2xx = stored; no `request.ok`,
-   *   issue #7), the echoed
+   *   §7): `request.status` top-level (2xx = stored; no `request.ok`),
+   *   the echoed
    *   `context` (the threaded value) IS `request.ctx`, and the stored
    *   `hash` is on `request.activation.hash`.
    * @param {*} [opts.ctx] - Opaque payload echoed to the `on` module
@@ -415,7 +415,7 @@ globalThis.blob = {
    * failure (client disconnect, storage error) `to` runs with
    * `request.status === 0` and nothing was stored — S3 multipart is
    * commit-gated, so a torn upload is invisible. (`status` is the
-   * single result signal; no `request.ok`, issue #7.)
+   * single result signal; no `request.ok`.)
    *
    * The litmus (vs `onChunk` + blob.write): does your logic depend
    * on the CONTENT of the bytes? No → this, one PUT. Yes → the

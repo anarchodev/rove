@@ -55,7 +55,7 @@ pub const PeerMode = enum {
     /// quorum. willemt calls these "non-voting nodes" — added via
     /// `raft_add_non_voting_node` instead of `raft_add_node`.
     /// Used for read replicas and geographic DR replicas
-    /// (`docs/production.md` #1.2). Operator promotes to voter
+    /// (`docs/architecture/configuration-and-network.md`). Operator promotes to voter
     /// via `raft_become_voter` on regional failure.
     learner,
 };
@@ -69,8 +69,8 @@ pub const PeerAddr = struct {
 };
 
 /// Resolves a raft node id to its transport address on demand. This is the
-/// seam (consensus-and-storage.md "Cluster genesis & membership", peer-address
-/// resolution) that lets the peer table be fed
+/// seam (`docs/architecture/consensus-and-storage.md`, "Cluster genesis & membership",
+/// peer-address resolution) that lets the peer table be fed
 /// by the CP node-address registry instead of a static positional peer array:
 /// the transport consults the resolver the first time it has a message for a
 /// node id it hasn't dialed yet, and registers the peer via `addPeer`. Returns

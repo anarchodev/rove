@@ -1,7 +1,7 @@
 // Fetch-resume ctx override (decisions.md §4.14) — the sim matches prod
 // (worker_streaming.fetchResumeCtx): a held-chain after.fetch resume reads the
 // fetch's own ctx if present, else the chain's next({ctx}). Regression guard
-// for issue #3 (sim/prod disagreed on a WS fetch resume's request.ctx).
+// for the sim/prod disagreement on a WS fetch resume's request.ctx.
 import { scenario, expect } from "rewind:test";
 
 const s = scenario({});

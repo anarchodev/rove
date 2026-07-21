@@ -16,7 +16,7 @@ const c = @import("nghttp2_c.zig").c;
 // Component types
 // =============================================================================
 
-// ── Connection/stream leaf state (refactor-audit §4.6) ──────────────
+// ── Connection/stream leaf state ────────────────────────────────────
 // The non-generic per-connection / per-stream types (Conn, Http1Conn +
 // its lifecycle arms, Stream, WsReassembler, HeaderBuf, BodySink, …)
 // live in conn_state.zig; re-exported here so call sites — internal or
@@ -3059,7 +3059,7 @@ pub fn H2(comptime opts: Options) type {
         }
 
         // =============================================================
-        // HTTP/1.1 ingress (docs/v2-edge-http1-ingress.md, Phase 2)
+        // HTTP/1.1 ingress (`docs/architecture/routing-and-ingress.md`)
         // =============================================================
 
         /// A plaintext server connection's first read looked like HTTP/1.x.
@@ -4497,8 +4497,8 @@ pub fn H2(comptime opts: Options) type {
                         // Plaintext server connections: sniff for an HTTP/1.x
                         // request on the very first read. nghttp2 would reject
                         // non-h2 bytes and we'd close silently; instead route
-                        // the connection to the h1 codec (Phase 2,
-                        // docs/v2-edge-http1-ingress.md). Only the first read
+                        // the connection to the h1 codec (HTTP/1.1 ingress,
+                        // docs/architecture/routing-and-ingress.md). Only the first read
                         // can be a non-h2 preface, so the sniff is gated on
                         // first_read_seen.
                         if (conn_ptr.direction == .server and !conn_ptr.first_read_seen and

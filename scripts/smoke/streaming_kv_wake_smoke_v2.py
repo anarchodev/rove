@@ -62,7 +62,7 @@ export default function () {
 
 export function onWake() {
     stream.start(); // keep the stream alive even on a zero-frame wake
-    // Go-look drain (issue #8): the wake names the fired prefix, never
+    // Go-look drain: the wake names the fired prefix, never
     // the matched keys; emit everything past the ctx cursor.
     const cursor = request.ctx ? request.ctx.cursor : null;
     const rows = kv.prefix("watch/", cursor);

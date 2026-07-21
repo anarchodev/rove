@@ -69,7 +69,7 @@ STREAMKV_SRC = r"""export default function () {
 }
 
 export function onWake() {
-    // Go-look drain (issue #8): the wake names the fired prefix, never
+    // Go-look drain: the wake names the fired prefix, never
     // the matched keys; emit everything past the ctx cursor. A zero-frame
     // wake re-holds via the plain next() — no stream.start() ritual.
     const cursor = request.ctx ? request.ctx.cursor : null;

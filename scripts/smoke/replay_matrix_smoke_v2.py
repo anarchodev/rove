@@ -8,10 +8,9 @@ assert (`worker_log.l3AssertMsgRecorded`), which fires in ANY debug smoke.
 
 Kinds covered: `inbound` (request surface), `fetch_chunk` (on.fetch →
 onFetchResult), `ws_message` (WS frame → onMessage), `wake_batch` (after.kv →
-{on} export; the fired-watch batch + ctx + resolved export all recorded —
-issue #62), `send_callback` (webhook.send {on} → the callee-outcome envelope
+{on} export; the fired-watch batch + ctx + resolved export all recorded), `send_callback` (webhook.send {on} → the callee-outcome envelope
 recorded on trigger_payload and split into the flattened result surface +
-ctx on replay — issue #67). disconnect captures readset+ctx (covered by the
+ctx on replay). disconnect captures readset+ctx (covered by the
 L3 assert; its end-to-end replay is a follow-up).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
@@ -87,7 +86,7 @@ export function onFired() {
   return "woke:" + fired + ":" + String(ms_ok) + ":" + String(request.ctx && request.ctx.armed === true);
 }
 """
-# send_callback (issue #67): index arms a webhook.send at the tenant's own
+# send_callback: index arms a webhook.send at the tenant's own
 # echo route with an `{on}` result module + threaded ctx; hooks.mjs (the on
 # module, default export — send_callback's conventional dispatch) reads the
 # whole flattened surface. Reproduction on replay proves the recorded
@@ -240,7 +239,7 @@ def main() -> int:
               art and art.get("divergence") is None and last and last.get("value") == "hello-ws",
               f"writes={writes!r} div={art.get('divergence') if art else None}")
 
-        # ── wake_batch (issue #62) ──
+        # ── wake_batch ──
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             fut = pool.submit(lambda: c.request("wak", "/?op=hold", method="POST", data="{}", timeout=30.0))
@@ -262,7 +261,7 @@ def main() -> int:
               and obs and obs.get("value") == "wk/",
               f"body={art.get('body') if art else None} writes={writes!r} div={art.get('divergence') if art else None}")
 
-        # ── send_callback (issue #67) ──
+        # ── send_callback ──
         echo_url = f"http://scb.{PUBLIC_SUFFIX}:{c.front_port}/?op=echo"
         r = c.request("scb", f"/?url={up.quote(echo_url)}", method="POST", data="{}", timeout=15.0)
         check("[send_callback] webhook.send armed", r.status == 200 and r.body == "sent", f"{r.status} {r.body!r}")

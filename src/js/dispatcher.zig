@@ -252,7 +252,7 @@ pub const Dispatcher = struct {
             .console = &console_buf,
             .tags = &tags_buf,
             .readset = request.trace.readset,
-            // `docs/primitive-gaps.md` §9 — arenajs's per-request
+            // Deterministic replay (`docs/architecture/replay-and-sim.md`): arenajs's per-request
             // xorshift64star state is the single PRNG (no Zig-side
             // PRNG); seeded by `installRequest` from
             // `state.readset.?.seed`.
@@ -718,7 +718,7 @@ fn finishResponse(
     // is preserved: `next()` ⇒ `.stream` (re-arm); a terminal ⇒ keep the
     // terminal but prepend the buffered chunks so the final frames ship
     // before END_STREAM.
-    // WS frame output (architecture/websockets.md, piece D) skips this bridge
+    // WS frame output (`docs/architecture/websockets.md`, piece D) skips this bridge
     // entirely: the chunks stay in `pending_stream_chunks` for the worker's
     // `shipWsFrames` (→ `ws_send_in`), `next()` falls through to the plain
     // continuation below, and a terminal keeps its own body (the frames

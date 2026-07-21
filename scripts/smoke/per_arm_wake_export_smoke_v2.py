@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Per-arm `{on}` wake exports — each armed `after.*` resumes into its OWN
-export (issue #142).
+export.
 
 A held chain that arms `after.ms(..,{on:onTimeout})` + `after.kv(..,{on:onMsg})`
 must route the timer fire to `onTimeout` and a kv fire to `onMsg`. Prod used

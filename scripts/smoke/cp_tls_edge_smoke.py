@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Front-door TLS termination + CP cert pull smoke (gap #3 slice 2;
-docs/v2-front-door-architecture.md "TLS termination is ours").
+the front door — docs/architecture/routing-and-ingress.md).
 
 The front door used to be h2c (TLS terminated upstream). Slice 2 makes it
 terminate public TLS and SNI-select a per-host cert pulled from the CP

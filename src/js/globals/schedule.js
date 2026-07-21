@@ -43,7 +43,7 @@
   // 20 digits covers i64-ns (max ~9.22e18, 19 digits) with headroom.
   const PAD_WIDTH = 20;
 
-  // ── Caps (docs/primitive-gaps.md §2.6.1) — fail-loud, operator notes ──
+  // ── Caps (the durable-wake primitive, docs/effect-algebra.md) — fail-loud, operator notes ──
   // SCHED_MAX_OUTSTANDING is a depth ceiling (boot-recovery scan cost
   // scales linearly past it); SCHED_MAX_MSG_BYTES bounds the
   // durable+taped payload.

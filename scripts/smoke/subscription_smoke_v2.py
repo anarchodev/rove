@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """V2 port of `subscription_smoke.py` — held outbound subscription via
-`http.subscribe` (`docs/curl-multi-plan.md` Phase 3 / gap 2.5), on the
+`http.subscribe` (held-subscription outbound fetch —
+docs/architecture/configuration-and-network.md), on the
 `V2Cluster` harness (`smoke_lib_v2`).
 
 Two tenants on a single node:
@@ -17,7 +18,8 @@ Flow / essential assertions (unchanged from V1):
      streaming + on_chunk activations fire).
   3. POST acme/cancel_subscribe?id=… → cancels the subscription.
   4. Assert no `sub/done/<id>` marker (cooperative cancel doesn't
-     synthesize a terminal — curl-multi-plan §5 invariant 3).
+     synthesize a terminal — the cooperative-cancel invariant,
+     docs/architecture/configuration-and-network.md).
   5. Confirm chunk count stops growing past the cancel.
 
 Dropped from V1: TLS/https, 3-node leader election / discover_leader

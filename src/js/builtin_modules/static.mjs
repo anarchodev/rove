@@ -67,7 +67,7 @@ export function onChunk() {
   // (missing blob / S3 error / timeout → status 0 or non-2xx) or
   // truncated file-blobs read must NOT be served — and strong-ETag
   // cached — as a well-formed 200. Gate on `status` (the single result
-  // truth; no `request.ok`, issue #7). (`status`/`bodyTruncated` are
+  // truth; no `request.ok`). (`status`/`bodyTruncated` are
   // only set on the final event.)
   if (a.final && (a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
     if (a.seq === 0) {

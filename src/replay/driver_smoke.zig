@@ -133,7 +133,7 @@ fn runMulti(a: std.mem.Allocator) !void {
 /// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
 /// complete because the GC arena reclaims the dead strings mid-run. Same shape
 /// as prod's own bump/GC discriminator (`snap.zig`), the churn prod's bump→GC
-/// retry absorbs; the sim runs GC always (issue #70), so it completes offline.
+/// retry absorbs; the sim runs GC always, so it completes offline.
 const CHURNY_HANDLER =
     \\export default function () {
     \\  let s = "";
@@ -142,7 +142,7 @@ const CHURNY_HANDLER =
     \\}
 ;
 
-/// GC-always (issue #70): the churny handler completes under GC whether or
+/// GC-always: the churny handler completes under GC whether or
 /// not the world carries the `arena_gc` regime stamp — the stamp no longer
 /// gates the allocator mode — and a normal world afterwards still succeeds
 /// (GC does not wedge or leak across the reactor's per-run resets).

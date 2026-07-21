@@ -1,5 +1,6 @@
 //! `log_index.db` — local SQLite store the log-server polls into.
-//! Schema mirrors `docs/logs-plan.md` §4.2: one row per
+//! Schema mirrors the log-server index model
+//! (`docs/architecture/deployment-and-logs.md`): one row per
 //! batch (for the indexer's idempotency + sidecar bookkeeping) and
 //! one row per record (for the dashboard's list / show queries).
 //!

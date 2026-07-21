@@ -1,6 +1,6 @@
 // Public `http` surface — the documentation source of truth for the
 // outbound HTTP primitive (docs/architecture/builtin-libs.md Phase A,
-// docs/effect-reification-plan.md Phase 5).
+// the reified primitives in docs/architecture/effects-and-handlers.md).
 //
 // Thin shim over the native `_system.http` binding. Durability is
 // JS-shim'd in `webhook.send` (and `email.send`) on top of the
@@ -28,8 +28,8 @@
      * Open a held outbound subscription — `after.fetch`'s held
      * symmetric twin for long-lived upstreams (atproto firehose, Pub/Sub
      * long-poll, SSE consumers, any third-party push where the
-     * provider holds the connection). Closes
-     * `docs/primitive-gaps.md` §2.5.
+     * provider holds the connection). Closes the held-upstream
+     * subscription primitive gap (`docs/effect-algebra.md`).
      *
      * Same options as `after.fetch` minus `timeoutMs` (held
      * subscriptions don't time out — they end on cancel or

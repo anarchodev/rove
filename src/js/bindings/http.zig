@@ -1,11 +1,12 @@
 //! `http.fetch` / `http.cancelFetch` (transient streaming HTTP —
-//! `docs/upstream-streaming-plan.md`, Gap 2.3) JS bindings.
+//! upstream streaming, `docs/architecture/routing-and-ingress.md`) JS
+//! bindings.
 //!
 //! Durability is composed in JS by `globals/webhook.js` (kv.set
 //! marker → http.fetch → baked `__system/webhook_onresult` shim →
 //! optional `__rove_next` to customer `on_result`), not by a durable
-//! Zig primitive (see `docs/effect-reification-plan.md` Phase 5 PR-3
-//! for the locked design).
+//! Zig primitive (see the reified primitives in
+//! `docs/architecture/effects-and-handlers.md` for the locked design).
 //!
 //!   http.fetch — transient, best-effort, fire-immediately. No
 //!     raft involvement; the fetch-pool thread issues libcurl as
@@ -51,7 +52,7 @@ const js_exception = globals.js_exception;
 /// (sha256 hex = 64 chars; randomUUID = 36 chars) with headroom.
 const FETCH_ID_MAX_LEN: usize = 256;
 
-// ── http.fetch / http.cancelFetch — Gap 2.3 ──────────────────────────────
+// ── http.fetch / http.cancelFetch — transient streaming HTTP ─────────────
 
 /// `http.fetch(opts) -> fetch_id` — transient streaming HTTP.
 pub fn jsHttpFetch(
@@ -109,7 +110,7 @@ pub fn jsHttpFetch(
 }
 
 /// `__rove.fetch(opts)` — gated twin of `_system.http.fetch` for baked
-/// `__system/` modules (durable-wake-plan P5(a)). Baked modules eval
+/// `__system/` modules. Baked modules eval
 /// AFTER the `_harden.js` `delete globalThis._system` step, so they
 /// can't reach `_system.http`; this persistent, `is_system_module`-gated
 /// op (in the `__rove.*` holder, same posture as `__rove.wake.set`) is
@@ -310,7 +311,8 @@ fn buildOnFetchRow(
 /// trampoline. Cooperative: a chunk already in-flight at the
 /// engine level may still land in `on_chunk` after the cancel
 /// returns; the customer's chain ctx is the place to track "we
-/// moved on" (see `docs/curl-multi-plan.md` §5 invariant 3).
+/// moved on" (the cooperative-cancel invariant for outbound fetch —
+/// `docs/architecture/configuration-and-network.md`).
 pub fn jsHttpCancelFetch(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -353,11 +355,12 @@ pub fn jsHttpCancelFetch(
     return js_undefined;
 }
 
-// ── http.subscribe / http.cancelSubscription — gap 2.5 ────────────────
+// ── http.subscribe / http.cancelSubscription — held subscription ──────
 
 /// `http.subscribe(opts) -> subscription_id` — held outbound
-/// subscription (`docs/curl-multi-plan.md` Phase 3; closes
-/// `docs/primitive-gaps.md` §2.5).
+/// subscription (outbound fetch / libcurl multi,
+/// `docs/architecture/configuration-and-network.md`; the held-transfer
+/// slot of the four-primitive effect model, `docs/effect-algebra.md`).
 ///
 /// Same options shape as `http.fetch` minus `timeout_ms` (held
 /// transfers don't time out — they end on cancel or upstream close)
@@ -452,12 +455,13 @@ const BuiltFetch = struct {
     stream: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
-    /// `docs/curl-multi-plan.md` Phase 3: set true by
+    /// Held-transfer flag (outbound fetch / libcurl multi,
+    /// `docs/architecture/configuration-and-network.md`): set true by
     /// `jsHttpSubscribe`; false for `jsHttpFetch`. Threaded into
     /// the `PendingFetch` the engine reads.
     held: bool = false,
-    /// `docs/cross-worker-held-state-plan.md` Phase 2B: webhook.send
-    /// shim passes the send_id (the `_send/owed/{id}` suffix) so the
+    /// Cross-worker held state (`docs/architecture/effects-and-handlers.md`):
+    /// webhook.send shim passes the send_id (the `_send/owed/{id}` suffix) so the
     /// FetchEngine's chunk router can consult `bound_send_owners` to
     /// route the callback to the cont's owning worker. Platform-only
     /// (the webhook.send JS shim sets it); customers don't reach

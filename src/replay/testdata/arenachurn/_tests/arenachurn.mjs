@@ -1,8 +1,9 @@
-// GC arena ≡ prod's effective ceiling (issue #70). A churny-but-legal handler
+// GC arena ≡ prod's effective ceiling. A churny-but-legal handler
 // whose cumulative allocation (~256 MiB) dwarfs the 100 MiB request arena, but
 // whose peak live set is ~1 MiB, completes offline because the sim runs GC
-// always — the same outcome prod produces via its bump→GC retry. Before #70 the
-// sim ran a bump arena and this OOM'd offline while passing in production.
+// always — the same outcome prod produces via its bump→GC retry. Before the
+// switch to GC-always the sim ran a bump arena and this OOM'd offline while
+// passing in production.
 import { scenario, expect } from "rewind:test";
 
 const r = scenario({}).inbound({ path: "/" });

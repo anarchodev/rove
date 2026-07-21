@@ -1,9 +1,9 @@
-// Fetch recorder ≡ prod (issue #24): the effect entry carries the full option
+// Fetch recorder ≡ prod: the effect entry carries the full option
 // bag prod reads (headers/stream/timeoutMs/maxChunkBytes/maxTotalBytes, in
 // the public spellings), arms return unique ftch_
 // ids that resumes echo as request.fetchId, fetchesPending threads through the
-// folds, status/bodyTruncated are terminal-only (request.ok does not exist,
-// issue #7), and .stream() of a fetch
+// folds, status/bodyTruncated are terminal-only (request.ok does not exist),
+// and .stream() of a fetch
 // issued WITHOUT stream:true fails loud.
 import { scenario, expect } from "rewind:test";
 const s = scenario({});

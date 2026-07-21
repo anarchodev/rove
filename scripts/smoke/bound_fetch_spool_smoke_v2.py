@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """V2 port of `bound_fetch_spool_smoke.py` — chunk-spool Phase 3 multi-bind
-(`docs/chunk-spool-plan.md`) on the `V2Cluster` harness (`smoke_lib_v2`).
+(the chunk-spool / blob-coordinator substrate,
+`docs/architecture/routing-and-ingress.md`) on the `V2Cluster` harness
+(`smoke_lib_v2`).
 
 TWO bound, streaming fetches on a single held entity, each consumed
 writes-per-chunk (`next()` + kv write → a raft round-trip per chunk).

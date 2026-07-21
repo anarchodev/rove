@@ -19,8 +19,8 @@
 //! separate `.idx.json`).
 //! The orphan-on-crash story is bounded by the BatchStore's atomic
 //! semantics — partial PUTs surface as 4xx/5xx and the in-memory
-//! records are dropped per the lossy-on-failure semantics in
-//! `docs/logs-plan.md`.
+//! records are dropped per the log-server's lossy-on-failure
+//! contract (`docs/architecture/deployment-and-logs.md`).
 //!
 //! The writer is allocator-agnostic + stateless; one call per flush.
 
@@ -71,7 +71,8 @@ pub fn writeBatch(
 ) Error!?[]u8 {
     if (records.len == 0) return null;
 
-    // Per `docs/logs-plan.md` §2.2: records ordered by ascending
+    // The log-batch ordering contract (`docs/architecture/deployment-and-logs.md`):
+    // records ordered by ascending
     // received_ns. The buffer is appended in dispatch order, which
     // IS receive order for a single worker thread, so sorting is
     // normally a no-op. Sort defensively in case a future code path
@@ -393,8 +394,9 @@ fn writeTapePayloads(
     t: *const log_mod.TapePayloads,
 ) !void {
     try w.writeByte('{');
-    // `docs/primitive-gaps.md` §9: per-request scalars used at
-    // capture time. Replay reseeds the per-context PRNG
+    // Per-request scalars captured at request time so replay is deterministic
+    // (the seed / timestamp reseeding contract, `docs/architecture/replay-and-sim.md`).
+    // Replay reseeds the per-context PRNG
     // with `seed` and pins `Date.now()` to
     // `@divTrunc(timestamp_ns, ns_per_ms)` so `Math.random` /
     // `crypto.*` / `Date.now()` / `new Date()` reproduce the

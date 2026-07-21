@@ -1,13 +1,15 @@
 //! Process-global write coordinator for object-storage PUTs.
 //!
-//! See `docs/streaming-model.md §7` for the full design. Submissions
+//! See the blob coordinator / chunk spool in
+//! `docs/architecture/routing-and-ingress.md` for the full design.
+//! Submissions
 //! land in a single cross-tenant pool under
 //! `{key_prefix_base}_pool/{batch_id:0>20}` — there are no per-
 //! (tenant, worker) lanes; workers freely mix in one pool object.
 //! `batch_id` is globally unique by construction — minted from a
-//! raft-reserved block (`_system/coord_next_pool_batch`, plan §3.5b).
+//! raft-reserved block (`_system/coord_next_pool_batch`).
 //!
-//! Architecture (plan §3.2):
+//! Architecture:
 //!
 //!   worker N ──push──▶ per-worker queue ──┐
 //!                                         ▼
@@ -21,16 +23,16 @@
 //!                                         │
 //!                                         ▼
 //!                                  advance per-worker durable_seq
-//!                                  (contiguous-prefix rule, §5.1)
+//!                                  (contiguous-prefix rule)
 //!
-//! API (plan §3.1) mirrors raft's commit_index:
+//! API mirrors raft's commit_index:
 //!   - `submit` → monotonic per-worker `seq` starting at 0
 //!   - `durableSeq(worker)` → count of resolved-as-durable seqs in
 //!     the contiguous prefix from 0. Caller checks
 //!     `my_seq < durableSeq(worker)` to determine durability.
 //!   - `bodyRef(worker, seq)` → BodyRef once `seq < durableSeq`
 //!
-//! Count semantics (vs plan's "seq <= hwm" framing) avoids the
+//! Count semantics (vs a "seq <= hwm" framing) avoids the
 //! sentinel-or-underflow problem when seq 0 is in flight or
 //! terminally failed. `durableSeq() == 0` means "nothing durable
 //! yet"; `== 1` means "seq 0 is durable"; etc.
@@ -43,7 +45,7 @@ const std = @import("std");
 const root = @import("root.zig");
 
 /// Pointer into the bytes a coordinator submission stored. `batch_id`
-/// is globally unique (raft-reserved per plan §3.5b); the full S3
+/// is globally unique (raft-reserved); the full S3
 /// key is `{key_prefix_base}_pool/{batch_id:0>20}` and the backend
 /// supplied to `init` already carries the `_pool/` prefix.
 pub const BodyRef = struct {
@@ -78,15 +80,15 @@ pub const Config = struct {
     /// Each worker's `worker_id` must be in `[0, worker_count)`.
     worker_count: u8,
 
-    /// K — number of concurrent PUTs in flight (plan §3.5).
+    /// K — number of concurrent PUTs in flight.
     executor_size: u8 = 32,
 
-    /// Per-batch byte cap (plan §3.4 safety cap). A single
+    /// Per-batch byte cap (safety cap). A single
     /// submission larger than this is rejected with
     /// error.SubmissionTooLarge.
     max_batch_bytes: usize = 16 * 1024 * 1024,
 
-    /// Plan §3.6 — bounded exponential backoff on transient
+    /// Bounded exponential backoff on transient
     /// `Error.SlowDown` (503 / 429). Total attempts including the
     /// first one; once exhausted, the batch terminally fails.
     retry_max_attempts: u8 = 5,
@@ -97,11 +99,11 @@ pub const Config = struct {
     /// timing.
     retry_jitter_pct: u8 = 20,
 
-    /// Plan §3.5b — block size for batch_id reservation. Default
+    /// Block size for batch_id reservation. Default
     /// 10000. At sustained 100 batches/sec the prefetch fires every
     /// ~80 s.
     reservation_block_size: u32 = 10_000,
-    /// Plan §3.5b — low-watermark percentage (0..100). When
+    /// Low-watermark percentage (0..100). When
     /// `consumed >= block_size * pct/100` the refill kicks off
     /// asynchronously.
     reservation_low_watermark_pct: u8 = 80,
@@ -137,8 +139,8 @@ const WorkerState = struct {
 
     /// Sorted ascending set of seqs that block durable_seq advance.
     /// Includes (a) in-flight seqs (submitted, not yet committed)
-    /// and (b) terminally-failed seqs (kept forever — plan §3.6
-    /// "durable_seq sticks past a failed seq").
+    /// and (b) terminally-failed seqs (kept forever, so
+    /// durable_seq sticks past a failed seq).
     ///
     /// durable_seq = min(unfinished) if non-empty, else next_seq.
     unfinished: std.ArrayListUnmanaged(u64) = .empty,
@@ -185,7 +187,7 @@ const RefSlot = union(enum) {
 /// `SealedSubEntry.bytes` (alive for the coordinator's lifetime).
 /// `readBody` dupes from `bytes` so callers needing the chunk back —
 /// e.g. the bound-fetch chunk spool reading an evicted entry
-/// (`docs/chunk-spool-plan.md` Phase 3) — get it from RAM, with no
+/// (`docs/architecture/routing-and-ingress.md`) — get it from RAM, with no
 /// `store.get` / S3 round-trip.
 const DurableSlot = struct {
     ref: BodyRef,
@@ -204,7 +206,7 @@ const SealedBatch = struct {
     /// nul-terminator slack). Passed to `BlobStore.put`; the backend
     /// supplies the `_pool/` prefix.
     leaf_key: []u8,
-    /// One submission's worker. Plan §3.7: a submission carries the
+    /// One submission's worker: a submission carries the
     /// originating worker so the executor can advance THAT worker's
     /// durable_seq on commit. Per-submission, not per-batch, since
     /// the cross-tenant pool intentionally mixes workers in one PUT.
@@ -214,8 +216,8 @@ const SealedBatch = struct {
     /// passed to BlobStore.put. Freed after PUT completes
     /// (committed OR failed — no longer needed).
     payload: ?[]u8 = null,
-    /// `docs/chunk-spool-plan.md` P6 (coordinator retained-RAM
-    /// cleanup): count of entries not yet `release`d by their
+    /// Coordinator retained-RAM cleanup (the chunk spool,
+    /// `docs/architecture/routing-and-ingress.md`): count of entries not yet `release`d by their
     /// consumer. Initialized to `entries.len` at retain; each
     /// `release` decrements it and frees that entry's bytes; when it
     /// hits 0 the whole batch is freed. Guarded by `retained_mu`.
@@ -283,7 +285,8 @@ pub const BlobCoordinator = struct {
     exec_slack_cond: std.Thread.Condition = .{},
 
     /// Sealed batches awaiting consumption, retained for `bodyRef` /
-    /// `readBody` dereference. `docs/chunk-spool-plan.md` P6: each
+    /// `readBody` dereference. The chunk spool
+    /// (`docs/architecture/routing-and-ingress.md`): each
     /// batch is refcounted by its un-`release`d entries (`SealedBatch
     /// .live`) and freed when fully consumed.
     /// `retained_by_batch` is the O(1) `batch_id → *SealedBatch` index
@@ -297,7 +300,7 @@ pub const BlobCoordinator = struct {
     /// is null. Starts at 1 (skips the `NO_BATCH = 0` sentinel).
     local_batch_ctr: std.atomic.Value(u64) = .init(1),
 
-    /// Plan §3.5b reservation state. Guarded by `res_mu`. Only used
+    /// Batch_id reservation state. Guarded by `res_mu`. Only used
     /// when `config.reservation` is non-null.
     res_mu: std.Thread.Mutex = .{},
     res_id_avail: std.Thread.Condition = .{},
@@ -428,7 +431,7 @@ pub const BlobCoordinator = struct {
         self.allocator.destroy(self);
     }
 
-    /// Submit one Msg-worth of bytes (plan §3.7 — submission boundary
+    /// Submit one Msg-worth of bytes (submission boundary
     /// = handler activation boundary). Returns the submission's
     /// monotonic per-worker seq.
     ///
@@ -456,9 +459,9 @@ pub const BlobCoordinator = struct {
         // `pending_count >= (collectable submissions)`. `pending_count`
         // is only a wake hint — a transient over-count (incremented but
         // not yet appended) just risks one empty drain pass, which
-        // early-returns without decrementing. See
-        // `docs/chunk-spool-plan.md` (the high-rate per-chunk
-        // bound-fetch submits first exposed this).
+        // early-returns without decrementing. The chunk spool's
+        // high-rate per-chunk bound-fetch submit path stresses this
+        // (`docs/architecture/routing-and-ingress.md`).
         self.drain_mu.lock();
         self.pending_count += 1;
         self.drain_mu.unlock();
@@ -506,7 +509,8 @@ pub const BlobCoordinator = struct {
     }
 
     /// Count of retained (sealed-but-not-fully-consumed) batches —
-    /// `docs/chunk-spool-plan.md` P6 RAM diagnostic. With refcount
+    /// the chunk spool RAM diagnostic
+    /// (`docs/architecture/routing-and-ingress.md`). With refcount
     /// release this stays at the live submitted-but-unconsumed
     /// backlog. Exposed on `/_system/metrics` as
     /// `coord_retained_batches`.
@@ -549,7 +553,7 @@ pub const BlobCoordinator = struct {
     /// slot is populated. `Error.PutFailed` if the seq terminally
     /// failed, `Error.UnknownSeq` if it was never submitted.
     ///
-    /// `docs/chunk-spool-plan.md` Phase 3: the bound-fetch chunk spool
+    /// The bound-fetch chunk spool (`docs/architecture/routing-and-ingress.md`)
     /// evicts inline bytes for chunks beyond its K-deep RAM window and
     /// reads them back through here when the held chain is finally
     /// ready to consume them.
@@ -570,7 +574,7 @@ pub const BlobCoordinator = struct {
         };
     }
 
-    /// `docs/chunk-spool-plan.md` P6: a consumer is DONE with a
+    /// The chunk spool (`docs/architecture/routing-and-ingress.md`): a consumer is DONE with a
     /// submission — it has called `bodyRef`/`readBody` for the last
     /// time. Drop the `refs` entry, free the submission's retained
     /// bytes, and free the whole `SealedBatch` once all its entries are
@@ -819,7 +823,7 @@ pub const BlobCoordinator = struct {
 
     /// Mark every submission in the slice as failed on its worker.
     /// Used when the drain pass can't proceed (OOM, seal failure) —
-    /// matches plan §3.6 "PUT failure surfaces visibly" so the
+    /// PUT failure surfaces visibly so the
     /// worker observes `durable_seq` sticking + `bodyRef` returning
     /// `PutFailed`. Frees byte ownership.
     fn failCollected(self: *Self, subs: []const CollectedSubmission) void {
@@ -837,7 +841,7 @@ pub const BlobCoordinator = struct {
         }
     }
 
-    // ── batch_id reservation (plan §3.5b) ──────────────────────────
+    // ── batch_id reservation ───────────────────────────────────────
 
     /// Mint one batch_id. In test mode (`config.reservation == null`)
     /// returns from a local atomic counter starting at 1. In
@@ -934,7 +938,7 @@ pub const BlobCoordinator = struct {
                 // upcoming already exists (shouldn't normally —
                 // refill only kicks one at a time), drop the new
                 // block (we'd otherwise leak the gap; new block's
-                // ids end up unused, which is harmless per §3.5b).
+                // ids end up unused, which is harmless).
                 if (self.upcoming == null) self.upcoming = block;
             }
             self.refill_in_progress = false;
@@ -974,7 +978,7 @@ pub const BlobCoordinator = struct {
         self.allocator.free(payload);
         batch.payload = null;
 
-        // P6 ordering: retain + index the batch BEFORE advancing any
+        // Ordering: retain + index the batch BEFORE advancing any
         // worker's `durable_seq` below. A consumer that observes the
         // HWM advance may call `release` immediately; if the batch
         // weren't indexed yet, that release would miss it and `live`
@@ -1382,7 +1386,7 @@ test "coordinator: release frees retained batch when fully consumed" {
     const b1 = try coord.readBody(0, s1, testing.allocator);
     testing.allocator.free(b1);
 
-    // Releasing EVERY submitted seq frees all retained state — the P6
+    // Releasing EVERY submitted seq frees all retained state — the
     // invariant: no batch outlives consumption (regardless of how they
     // were batched).
     try testing.expect(coord.release(0, s1));

@@ -1,4 +1,4 @@
-//! rewind-cp — the V2 control plane (docs/v2-front-door-architecture.md).
+//! rewind-cp — the V2 control plane (docs/architecture/control-plane.md).
 //!
 //! The CP is the authoritative, replicated directory: it owns placement
 //! (tenant → cluster), the host→tenant index, and orchestrates moves. It
@@ -100,7 +100,8 @@ fn methodFrom(s: []const u8) ?curl.Method {
 const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 const TENANT_HEADER = "X-Rewind-Tenant";
 /// Carries a tenant's opaque plan blob on `v2-attach` (delivery rides the move
-/// handshake) and `v2-plan` (live push). See docs/v2-cp-operational-state.md.
+/// handshake) and `v2-plan` (live push). See the CP operational-state model
+/// (docs/architecture/control-plane.md).
 const PLAN_HEADER = "X-Rewind-Plan";
 
 /// One backend response the orchestrator cares about: status + an owned
@@ -497,7 +498,7 @@ const Router = struct {
 
     /// `POST /_control/node-address {cluster, id, raft_addr, cp_raft_addr?,
     /// http_url?}` — register a node's transport addresses in the directory
-    /// node-address registry (consensus-and-storage.md "Cluster genesis &
+    /// node-address registry (docs/architecture/consensus-and-storage.md "Cluster genesis &
     /// membership", node-address registry). The explicit
     /// raft id → address binding that replaces the static positional
     /// `REWIND_PEERS`; the peer resolver reads it so a node configured with only
@@ -894,7 +895,8 @@ const Router = struct {
     /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`, plus the
     /// tenant's `X-Rewind-Plan` blob when set) out to every destination node.
     /// The plan rides attach so the destination enforces the right limits from
-    /// the first post-move request (docs/v2-cp-operational-state.md). True only
+    /// the first post-move request (CP operational-state model,
+    /// docs/architecture/control-plane.md). True only
     /// if all returned 204 (idempotent re-attach included). On the first
     /// failure returns false; the caller evicts the partially-attached set.
     /// The cluster's voter set as a comma-separated raft-id list `1,2,…,n` (raft
@@ -1716,7 +1718,7 @@ const parseUrlList = boot.parseUrlList;
 const freeUrlList = boot.freeUrlList;
 
 /// Render the CP operator metrics in Prometheus text (caller frees). Two
-/// halves, both node-wide with no per-tenant labels (the observability.md
+/// halves, both node-wide with no per-tenant labels (the docs/architecture/observability.md
 /// active-series rule):
 ///
 ///   1. The directory raft group's health — leadership + the dial-mesh — via
@@ -1806,7 +1808,8 @@ pub fn main() !void {
     const port = try std.fmt.parseInt(u16, port_str, 10);
 
     // Control-plane directory — durable, backed by the CP `bridge` (one
-    // "directory" raft group; docs/v2-cp-directory-replication.md Slice 1).
+    // "directory" raft group; directory replication,
+    // docs/architecture/control-plane.md).
     // The store at `REWIND_CP_DATA_DIR` persists placement across restarts;
     // `initReplicated` replays it before the pump thread starts. Required: a
     // CP without durable storage loses every committed move on restart, which

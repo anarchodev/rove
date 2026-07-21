@@ -73,8 +73,8 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 }
 
 /// Carries a tenant's opaque CP plan blob (`{tier, overrides}` JSON) on the
-/// `v2-attach` handshake (docs/v2-cp-operational-state.md "Delivery to the
-/// DP" — the plan rides attach on a move). Absent header ⇒ no plan delivered
+/// `v2-attach` handshake (operational state — docs/architecture/control-plane.md;
+/// the plan rides attach on a move). Absent header ⇒ no plan delivered
 /// (the tenant stays free until a live push / the next attach).
 const PLAN_HEADER = "x-rewind-plan";
 // Optional atomic-baseline headers on v2-attach: when both are present the group
@@ -463,8 +463,8 @@ fn handleAttach(
             return reply(server, allocator, ent, sid, sess, 400, "bundle load failed\n");
     }
 
-    // The tenant's plan rides the attach handshake (docs/v2-cp-operational-
-    // state.md): cache the resolved limits on its slot so enforcement is local
+    // The tenant's plan rides the attach handshake (operational state,
+    // docs/architecture/control-plane.md): cache the resolved limits on its slot so enforcement is local
     // from the first post-move request. Non-fatal — a bad/absent plan leaves
     // the tenant on the free tier until a live push corrects it; it must not
     // fail the move.
@@ -598,7 +598,7 @@ fn handleEvict(
 
 /// `POST /_system/v2-plan {tenant, plan}` — install a tenant's resolved plan
 /// limits on its hot-path slot (the CP's single-target push on a live tier
-/// change; docs/v2-cp-operational-state.md "Live tier change"). `plan` is the
+/// change; docs/architecture/control-plane.md "Live tier change"). `plan` is the
 /// opaque `{tier, overrides}` blob the CP stores. 204 on success; 409 if the
 /// tenant is not active on this cluster (the CP pushes to the serving cluster,
 /// so that is a routing bug worth surfacing).
@@ -957,7 +957,7 @@ fn handleConfChange(
     var parsed = std.json.parseFromSlice(
         // `raft_addr` (optional `host:port`) is the joining node's transport
         // address, carried so the leader can dial it the moment the add commits
-        // (consensus-and-storage.md "Cluster genesis & membership", peer-address
+        // (docs/architecture/consensus-and-storage.md "Cluster genesis & membership", peer-address
         // resolution) instead of relying on static
         // config. Absent for a demote/remove or a still-static cluster.
         struct { tenant: []const u8, node_id: u64, op: []const u8, raft_addr: []const u8 = "" },

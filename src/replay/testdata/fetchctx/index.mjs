@@ -1,5 +1,5 @@
-// The fetch-resume ctx override (decisions.md §4.14), regression guard for
-// issue #3: on a held WS chain, `request.ctx` on an after.fetch resume is the
+// The fetch-resume ctx override (decisions.md §4.14), regression guard:
+// on a held WS chain, `request.ctx` on an after.fetch resume is the
 // fetch's OWN ctx if it carried one, else the chain's parked next({ctx}) — one
 // rule, and the same as HTTP. (Before the fix the sim always used the fetch's
 // ctx while prod-WS always used the chain ctx; they disagreed.)

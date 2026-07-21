@@ -1,7 +1,7 @@
 // A `.js`-spelled `_middlewares/index.js` runs offline exactly like prod
 // (which probes `.mjs` THEN `.js` — dispatcher.zig): before runs, its
 // request mutation is visible, it short-circuits, and the missing-`before`
-// 500 fires for the `.js` spelling too (issue #51).
+// 500 fires for the `.js` spelling too.
 import { scenario, expect } from "rewind:test";
 const s = scenario({});
 

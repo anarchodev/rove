@@ -84,7 +84,7 @@ pub const FetchChunk = struct {
     body_truncated: bool = false,
 };
 
-/// Wake-batch payload (issue #8: fired-prefix contract). One entry per
+/// Wake-batch payload (the fired-prefix contract). One entry per
 /// fired arm — `{kind:"kv", prefix, firedAt}` / `{kind:"timer", firedAt}`
 /// — drained via `StreamWakes.nextWakeBatch`. Surfaces as
 /// `request.activation.wakes`. Borrowed slice — the resuming caller owns
@@ -155,14 +155,14 @@ pub const InboundChunk = struct {
 /// both `__rove_next` resumes (§6.4) and the plain on_result callback.
 pub const Activation = union(enum) {
     inbound,
-    /// Headers-first inbound (blob-storage-plan §3.5; `docs/architecture/routing-and-ingress.md`): the
+    /// Headers-first inbound (the `blob.receive` transport, `docs/architecture/routing-and-ingress.md`): the
     /// body is still inbound; the handler's `onHeaders` export runs
     /// with an empty body to decide the disposition.
     inbound_headers,
     send_callback,
-    /// Timer wake on a held stream (streaming-handlers-plan §4.5).
+    /// Timer wake on a held stream (streaming handlers, `docs/architecture/effects-and-handlers.md`).
     timer,
-    /// Client disconnect on a held stream (streaming-handlers-plan §4.4).
+    /// Client disconnect on a held stream (streaming handlers, `docs/architecture/effects-and-handlers.md`).
     disconnect,
     /// Single-slot kv-write wake. `wake_batch` is the live shape; this
     /// variant is kept so replay can decode old tapes.
@@ -252,7 +252,7 @@ pub const PlanLimits = struct {
     instance_id: []const u8 = "",
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
-    /// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the node's S3 backend config
+    /// `_system.blob.presign` (`docs/architecture/routing-and-ingress.md`): the node's S3 backend config
     /// for `_system.blob.presign` (borrowed from
     /// `NodeState.blob_backend_cfg`). Null outside a worker context —
     /// presign throws "not configured".
@@ -265,14 +265,14 @@ pub const Trace = struct {
     /// non-determinism (`kv.*`, `Date.now`, `Math.random`, crypto, the
     /// module loader's `(specifier, source_hash)` resolutions) is captured
     /// so the worker can persist it and replay can re-drive the handler.
-    /// Owned by the caller. See `docs/readset-replication-plan.md`.
+    /// Owned by the caller. See readset replication (`docs/architecture/effects-and-handlers.md`).
     readset: ?*tape_mod.Readset = null,
     /// Pre-minted per-request identifier. `webhook.send` derives a stable
     /// outbox id (`sha256(request_id || call_index)`) from it; the log
     /// record + outbox rows share it.
     request_id: u64 = 0,
     /// Per-chain identifier; the same string on every activation of one
-    /// logical interaction (streaming-handlers-plan §5/§6). Inbound mints
+    /// logical interaction (streaming handlers, `docs/architecture/effects-and-handlers.md`). Inbound mints
     /// it (accepting an `X-Rove-Correlation-Id` header when present);
     /// resumes inherit. Null on test paths that don't care.
     correlation_id: ?[]const u8 = null,
@@ -309,7 +309,7 @@ pub const Trampolines = struct {
         event_json: []const u8,
     ) bool = null,
     resume_if_bound_ctx: ?*anyopaque = null,
-    /// `docs/curl-multi-plan.md` Phase 2: cancel-fetch trampoline. Wired to
+    /// Cancel-fetch trampoline (outbound fetch / libcurl multi, `docs/architecture/configuration-and-network.md`). Wired to
     /// `FetchEngine.cancel`.
     cancel_fetch: ?*const fn (ctx: *anyopaque, id: []const u8) void = null,
     cancel_fetch_ctx: ?*anyopaque = null,
@@ -321,7 +321,7 @@ pub const Trampolines = struct {
     set_wake_ctx: ?*anyopaque = null,
     fire_wake: ?*const fn (ctx: *anyopaque, input: globals.FireWakeInput) bool = null,
     fire_wake_ctx: ?*anyopaque = null,
-    /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: blob upload sessions.
+    /// `docs/architecture/routing-and-ingress.md`: blob upload sessions.
     /// `blob_write` appends to (creating on first write) the chain's
     /// session; `blob_seal` finalizes it and hands back hash + bytes
     /// for the binding's seal-PUT PendingFetch. Wired to the worker's
@@ -408,7 +408,7 @@ pub const Request = struct {
     /// bypass the `isCustomerWriteReserved` check and skip middleware.
     is_system_module: bool = false,
 
-    /// `docs/streaming-model.md` §7 item 1: the entity owning the chain
+    /// The streaming substrate (`docs/architecture/routing-and-ingress.md`): the entity owning the chain
     /// this activation runs against. The http.fetch binding reads it when
     /// `bind: true` to register the held entity. Cross-source: set on every
     /// activation path that can host a bound fetch; null on test paths and
@@ -502,7 +502,7 @@ pub const Response = struct {
 pub const RunOutcome = union(enum) {
     terminal: Response,
     continuation: continuation_mod.Continuation,
-    /// Iterative streaming descriptor (streaming-handlers-plan §3.3).
+    /// Iterative streaming descriptor (streaming handlers, `docs/architecture/effects-and-handlers.md`).
     /// The handler returned `__rove_stream(...)`. The worker's success
     /// path drives the held h2 entity through the chunked-write lifecycle.
     stream: stream_mod.Stream,

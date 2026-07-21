@@ -1,4 +1,4 @@
-//! `docs/chunk-spool-plan.md` — per-fetch chunk spool.
+//! Per-fetch chunk spool (the blob coordinator / chunk spool; `docs/architecture/routing-and-ingress.md`).
 //!
 //! Decouples bound-fetch chunk *arrival* (producer rate, set by the
 //! upstream) from chunk *consumption* (the held chain's raft commit

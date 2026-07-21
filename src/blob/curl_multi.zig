@@ -1,4 +1,5 @@
-//! libcurl multi-interface engine (`docs/curl-multi-plan.md`).
+//! libcurl multi-interface engine — the outbound-fetch / libcurl-multi
+//! substrate (`docs/architecture/configuration-and-network.md`).
 //!
 //! One `Multi` handle drives many concurrent `Transfer`s on a single
 //! thread. This file declares the surface; `FetchEngine`
@@ -382,9 +383,9 @@ pub const Multi = struct {
     }
 
     /// Cancel an in-flight transfer + destroy it WITHOUT firing
-    /// `on_done`. Caller's view: the transfer never completed (the
-    /// cooperative-cancel posture from curl-multi-plan §5
-    /// invariant 3). Cleanup is synchronous.
+    /// `on_done`. Caller's view: the transfer never completed — the
+    /// cooperative-cancel invariant: a cancelled transfer never
+    /// surfaces a completion callback. Cleanup is synchronous.
     pub fn cancel(self: *Multi, transfer: *Transfer) void {
         const key = @intFromPtr(transfer.handle);
         if (self.transfers.remove(key)) {

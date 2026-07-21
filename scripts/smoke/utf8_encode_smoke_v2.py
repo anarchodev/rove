@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TextEncoder/base64url/hash over non-ASCII — prod values (issue #11).
+"""TextEncoder/base64url/hash over non-ASCII — prod values.
 
 The offline sim's TextEncoder was latin1-truncating; the fix gives it a real
 UTF-8 codec. This smoke deploys the SAME handler as the `utf8encode` sim

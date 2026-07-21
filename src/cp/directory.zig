@@ -1,6 +1,5 @@
-//! V2 control plane — the tenant→cluster directory (v2-build-order
-//! §Phase 3 "a minimal control plane — the tenant→cluster directory";
-//! docs/v2-cp-directory-replication.md Slice 1).
+//! V2 control plane — the tenant→cluster directory; directory replication
+//! (`docs/architecture/control-plane.md`).
 //!
 //! This is the routing source of truth: given a tenant's store id, which
 //! cluster currently serves it. The **front-door** (`src/front/`)
@@ -159,11 +158,12 @@ pub const Directory = struct {
     /// upload) writes here; every stateless front-door pulls a host's cert via
     /// `/_cp/cert` for SNI termination. Admin-authored + placement-independent
     /// (survives moves), so it's a sibling axis here, not per-cluster
-    /// `__root__.db` (v2-front-door-architecture.md). Owned key + value.
+    /// `__root__.db` (`docs/architecture/auth-and-domains.md` — cert state).
+    /// Owned key + value.
     certs: std.StringHashMapUnmanaged([]u8) = .empty,
     /// `{cluster}/{id}` → packed node transport address (`packNodeAddr`:
     /// `raft_addr \t cp_raft_addr \t http_url`) — the node-address registry, the
-    /// rove analog of PD's store-address table (consensus-and-storage.md
+    /// rove analog of PD's store-address table (docs/architecture/consensus-and-storage.md
     /// "Cluster genesis & membership", node-address registry). The single
     /// source of truth for raft id → transport address, for
     /// both worker tenant groups and the CP directory group; it lets a node be
@@ -915,8 +915,8 @@ pub const Directory = struct {
     //
     // The rove analog of PD's store-address table: raft id → transport address,
     // keyed `node/{cluster}/{id}`. A node configured with only its own identity
-    // (consensus-and-storage.md "Cluster genesis & membership", node-address
-    // registry) registers itself here; peers resolve
+    // (docs/architecture/consensus-and-storage.md "Cluster genesis & membership",
+    // node-address registry) registers itself here; peers resolve
     // each other's addresses from here instead of a static positional
     // `REWIND_PEERS`. The CP directory group uses it for its own membership too.
 

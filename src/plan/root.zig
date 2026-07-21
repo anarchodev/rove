@@ -10,7 +10,7 @@
 //! A tenant's plan is `{tier, overrides}`: a named tier (the comptime table
 //! baked here) plus optional per-field overrides for enterprise custom deals.
 //! The CP stores the `{tier, overrides}` JSON blob verbatim and replicates it
-//! (docs/v2-cp-operational-state.md); each consumer parses it into the
+//! (operational state — docs/architecture/control-plane.md); each consumer parses it into the
 //! resolved limits it cares about — the worker caches `PlanLimits` on the
 //! tenant's hot-path slot; the log-server reads `retention_days` per query.
 //!

@@ -1,4 +1,4 @@
-// Error semantics ≡ prod (issue #10). Each case asserts the outcome the
+// Error semantics ≡ prod. Each case asserts the outcome the
 // WORKER produces (worker_dispatch.zig / module_execution.zig), so a test
 // written offline predicts the live response:
 //   throw          → 500 "handler threw: {ToString}\n", head discarded, txn

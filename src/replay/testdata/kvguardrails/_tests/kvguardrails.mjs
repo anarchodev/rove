@@ -1,4 +1,4 @@
-// kv guardrails ≡ prod (issue #12). Prod enforces these at the kv.* binding
+// kv guardrails ≡ prod. Prod enforces these at the kv.* binding
 // (globals.zig / reserved.zig); offline they must fire identically so a
 // handler that throws instantly in prod also throws — and with the SAME
 // `err.code`/`err.name` — under `rewind test`:

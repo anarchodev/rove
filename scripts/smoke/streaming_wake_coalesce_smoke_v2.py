@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wake-batch COALESCING — issue #8 fired-prefix contract
+"""Wake-batch COALESCING — the fired-prefix contract
 (decisions.md §3.10), on the `V2Cluster` harness. Supersedes the
 retired `streaming_overflow_smoke_v2.py` (the K=32 ring + `lost_oldest`
 it asserted are deleted).

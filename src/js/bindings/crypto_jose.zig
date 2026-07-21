@@ -346,7 +346,7 @@ pub fn jsCryptoVerifyEcdsa(
 }
 
 // =============================================================================
-// OIDC RS256 key custody (auth-domain-plan §4.7 fork A: HYBRID).
+// OIDC RS256 key custody (the HYBRID key-custody model, `docs/architecture/auth-and-domains.md`).
 //
 // Generation + signing are Zig/OpenSSL; the RSA private key is handed to
 // JS only as an opaque PKCS#8 PEM string it stores in kv and passes back

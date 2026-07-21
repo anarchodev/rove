@@ -85,8 +85,8 @@ pub const WriteSet = struct {
     }
 
     /// True iff the writeset has a `put` or `delete` op targeting
-    /// exactly `key`. `docs/primitive-gaps.md` §8 — the capture-side
-    /// "minimal read set" gate uses this to decide whether a kv.get
+    /// exactly `key`. The capture-side "minimal read set" gate
+    /// (`docs/effect-algebra.md`) uses this to decide whether a kv.get
     /// is a foreign read (record) or an own-read (skip; replay will
     /// resolve from its own writeset overlay).
     ///

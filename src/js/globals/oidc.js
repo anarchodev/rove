@@ -1,7 +1,7 @@
 // @rove/oidc — OIDC authorization-code + PKCE *provider* (the
 // issuance analog of oauth.js's client helper). Dogfooded: the
 // platform's own __auth__ IdP runs this exact library; customers can
-// run their own IdP with it (auth-domain-plan.md §4).
+// run their own IdP with it (docs/architecture/auth-and-domains.md).
 //
 // §0 invariant: `iss` and every endpoint are derived from
 // `request.host` — NO compiled-in domain. The same deployment serves
@@ -127,7 +127,7 @@ class OIDCProvider {
   // §0: a registered redirect_uri may use host-relative placeholders
   // resolved from the IdP's OWN request host — never a compiled
   // literal. The SAME config a customer writes for their own IdP
-  // (auth-domain-plan §4.7 "redirect_uri templating"):
+  // (docs/architecture/auth-and-domains.md, "redirect_uri templating"):
   //   ${ISSUER_ORIGIN} → https://{host}      (RP same-host as IdP)
   //   ${ISSUER_HOST}    → {host}             (host inside a URL)
   //   ${ISSUER_PARENT}  → {host} minus its first DNS label, port
@@ -161,7 +161,7 @@ class OIDCProvider {
     // §4.6 genesis-capture workaround is retired — `request.host` is
     // now the issuer on EVERY path, including the internal rotate
     // fire (the platform sets the synthesized request's authority
-    // to the routed host — auth-domain-plan §4.7 "Option B").
+    // to the routed host — docs/architecture/auth-and-domains.md "Option B").
     const now = Date.now();
     const k = crypto.oidcGenerateKey(); // { priv, jwk, kid }
     const keyset = {
@@ -181,8 +181,8 @@ class OIDCProvider {
     return null;
   }
 
-  // Self-scheduled rotation tick (§4.6 / http-send-plan §10.5
-  // order-timeout pattern): stable handle ⇒ a re-arm overwrites the
+  // Self-scheduled rotation tick (§4.6; the durable order-timeout
+  // pattern): stable handle ⇒ a re-arm overwrites the
   // prior row. Self-URL is host-relative — `request.host` is the
   // issuer on a real wire request AND on the internal fire (Option B
   // sets the synthesized request's authority to the routed host), so
@@ -250,7 +250,7 @@ class OIDCProvider {
   // POST /_oidc/rotate — the scheduled fire. Deadline-gated + single
   // kv key (last-write-wins) ⇒ a concurrent leadership double-fire
   // is safe with no header dedupe (§4.6 grounded correction). kv.set
-  // + the webhook.send re-arm commit atomically (http-send-plan §6).
+  // + the webhook.send re-arm commit atomically (docs/architecture/effects-and-handlers.md — durable send).
   /**
    * Scheduled key-rotation tick (§4.6). Reached only via the
    * in-cluster `webhook.send` self-fire routed through {@link
@@ -773,11 +773,11 @@ class OIDCProvider {
 //
 // `oidc.rp()` is to `oidc.provider()` what `oauth.js` is to a generic
 // OAuth2 server: the dogfooded client. The platform's own admin
-// dashboard uses it (auth-domain-plan §4.7 "3-6 part 2"); customers
+// dashboard uses it (docs/architecture/auth-and-domains.md); customers
 // and the future replay/logs RPs reuse the same code.
 //
-// Grounded constraints this shape encodes (auth-domain-plan §4.7
-// "Grounded correction 2026-05-16"):
+// Grounded constraints this shape encodes
+// (docs/architecture/auth-and-domains.md):
 //   - `on_result` modules run platform-driven in dispatchCallbacks
 //     with a SYNTHESIZED request: no browser response (can't set a
 //     cookie / 302), and crucially NO `request.session`. So the
@@ -982,7 +982,7 @@ class OIDCRelyingParty {
     // Endpoint A: result flattened on `request.*`; delivery metadata on
     // `request.activation.*`; `request.ctx` IS the echoed customer context.
     const a = request.activation || {};
-    // No `ok` — `status` is the single result signal (issue #7); the
+    // No `ok` — `status` is the single result signal; the
     // readers below treat 2xx as success (`status === 0` = transport
     // failure).
     return {
@@ -1015,7 +1015,7 @@ class OIDCRelyingParty {
     const ctx = ev.context || {};
     // Not a 2xx exchange → failure. Written as `!(2xx)` so a missing
     // status (an inbound activation with no fetch result) is treated as
-    // failure too — `undefined < 200` would be false. (No request.ok, #7.)
+    // failure too — `undefined < 200` would be false. (No request.ok.)
     if (!(ev.status >= 200 && ev.status < 300)) {
       // Token exchange failed; nothing to do — the poll page keeps
       // polling and the user can retry login. Log via response body
@@ -1270,7 +1270,7 @@ globalThis.oidc = {
   provider(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
-      // Precedence (auth-domain-plan §4.7): the live admin-managed
+      // Precedence (docs/architecture/auth-and-domains.md): the live admin-managed
       // `_oidc/config/{name}` wins (runtime-mutable — operators add
       // RP clients without a redeploy). When absent, fall through to
       // the per-deploy template `_config/oidc/{name}`, which the

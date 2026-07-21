@@ -198,7 +198,7 @@ fn suffixCovers(host: []const u8, suffix: []const u8) bool {
 
 /// Load the long-lived account key from `{data_dir}/acme/account.key`,
 /// generating + persisting it (mode 0600) on first use. Leader-owned per
-/// auth-domain-plan.md §3.2.
+/// the custom-domain ACME model (`docs/architecture/auth-and-domains.md`).
 fn ensureAccountKey(a: std.mem.Allocator, data_dir: []const u8) !acme.crypto.Key {
     var pb: [std.fs.max_path_bytes]u8 = undefined;
     const adir = try std.fmt.bufPrint(&pb, "{s}/acme", .{data_dir});

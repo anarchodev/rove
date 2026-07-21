@@ -84,8 +84,9 @@ pub const DeployHooks = struct {
 /// One row in a tenant's subscription registry — chain origins that
 /// fire WITHOUT an inbound HTTP request. Built at deploy-load time
 /// from `_subscriptions/<name>/spec.json` + `_subscriptions/<name>
-/// /index.mjs` pairs. Implements `docs/primitive-gaps.md` §2.1 +
-/// `streaming-handlers-plan.md` §5.
+/// /index.mjs` pairs. Chain origins under the four-primitive effect
+/// model (`docs/effect-algebra.md`), run as streaming handlers
+/// (`docs/architecture/effects-and-handlers.md`).
 ///
 /// One kind (see `Spec` below): kv (apply-time fan-out from a
 /// watched tenant prefix). Recurrence is instead the
@@ -142,8 +143,8 @@ pub const ScopeKvOp = enum { put, delete };
 /// written to kv/raft, so no wire-format codec is needed. The
 /// durable sibling (`webhook.send`) lives entirely in JS shims
 /// (`globals/webhook.js` + the baked `__system/webhook_onresult`
-/// module) layered on top of this primitive — see
-/// `docs/effect-reification-plan.md` Phase 5.
+/// module) layered on top of this primitive — see the reified
+/// primitives (`docs/architecture/effects-and-handlers.md`).
 pub const PendingFetch = struct {
     /// The tenant that issued this fetch — needed so the fetch
     /// pool can hash-route chunks to the right worker's inbox.
@@ -170,8 +171,10 @@ pub const PendingFetch = struct {
     stream: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
-    /// `docs/curl-multi-plan.md` Phase 3: held outbound subscription
-    /// (gap 2.5). When true, the FetchEngine treats this as a
+    /// Held outbound subscription (gap 2.5) on the outbound fetch /
+    /// libcurl-multi engine
+    /// (`docs/architecture/configuration-and-network.md`). When true,
+    /// the FetchEngine treats this as a
     /// long-lived transfer: no timeout, counted against the
     /// per-tenant held-subscription cap, terminal event always
     /// signals `ok=false` so the customer's handler interprets
@@ -179,8 +182,9 @@ pub const PendingFetch = struct {
     /// it back." Held=false → normal `http.fetch` semantics.
     held: bool = false,
 
-    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
-    /// §5.5: bound fetch. When true, upstream chunks resume the
+    /// The streaming substrate (`docs/architecture/routing-and-ingress.md`)
+    /// + `docs/handler-shape.md` §5.5: bound fetch. When true, upstream
+    /// chunks resume the
     /// **calling chain** (the entity that issued the fetch from a
     /// handler returning `next()`/`stream()`) instead of firing a
     /// separate `fetch-<id>` chain. The held client's response
@@ -188,10 +192,12 @@ pub const PendingFetch = struct {
     /// resume engine dispatches the held module's `onFetchChunk`
     /// named export per chunk. `bind=false` → Pattern A
     /// (`fireFetchEventActivation`, separate chain, no held socket).
-    /// `docs/auto-bind-plan.md`: COMPUTED at the handler-success seam
-    /// (only `connection_scoped` on.fetch binds), not a JS keyword.
+    /// Held state (`docs/architecture/effects-and-handlers.md`):
+    /// COMPUTED at the handler-success seam (only `connection_scoped`
+    /// on.fetch binds), not a JS keyword.
     bind: bool = false,
-    /// `docs/cross-worker-held-state-plan.md` Phase 2B: when the
+    /// Cross-worker held state
+    /// (`docs/architecture/effects-and-handlers.md`): when the
     /// `webhook.send` JS shim issues an `http.fetch` to drive a
     /// held-sync send, it stamps the send_id here so the chunk
     /// router (`enqueueFetchEventForTenant`) can consult
@@ -257,8 +263,9 @@ pub const PlatformCaps = struct {
     ) anyerror!void = null,
     /// `platform.scope(id).kv.{set,delete}`: self-contained cross-
     /// tenant write+commit+raft-propose to the target (envelope-0),
-    /// deliberately OUTSIDE the dispatch batch txn (auth-domain-plan
-    /// §4.7). Reads go direct via `state.platform.getInstance`.
+    /// deliberately OUTSIDE the dispatch batch txn — the scoped
+    /// cross-tenant write (`docs/architecture/auth-and-domains.md`).
+    /// Reads go direct via `state.platform.getInstance`.
     scope_kv_write: ?*const fn (
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
@@ -360,8 +367,9 @@ pub const DispatchState = struct {
     /// state. Production worker sites always set it
     /// (search `.readset = &tapes`); the null default is for unit
     /// tests that exercise binding behaviour without a readset buffer.
-    /// See `docs/readset-replication-plan.md` for the cross-activation
-    /// persistence story; tape channels are defined in
+    /// See readset replication
+    /// (`docs/architecture/effects-and-handlers.md`) for the
+    /// cross-activation persistence story; tape channels are defined in
     /// `src/tape/root.zig:Readset`.
     readset: ?*tape_mod.Readset = null,
     /// The activation's wire headers, borrowed for the lifetime of
@@ -378,7 +386,8 @@ pub const DispatchState = struct {
     /// what keeps the body's tape/log reference alive
     /// (`Readset.elideUnreadBody`).
     req_body: []const u8 = "",
-    // `docs/primitive-gaps.md` §9 — arenajs's per-request
+    // Within-activation non-determinism replay
+    // (`docs/architecture/replay-and-sim.md`): arenajs's per-request
     // `xorshift64star` state (in `js_random_state_active(ctx)`) is the
     // single PRNG. The dispatcher seeds it once via `JS_SetRandomSeed`
     // in `installRequest`; Math.random + crypto.* draw from it.
@@ -414,7 +423,7 @@ pub const DispatchState = struct {
     /// pipeline entry. Connection-only — `stream.*` is inert (and this
     /// stays false) when `pending_stream_chunks` is null.
     stream_started: bool = false,
-    /// architecture/websockets.md (piece D): true when this activation's
+    /// `docs/architecture/websockets.md` (piece D): true when this activation's
     /// `stream.write` output is WS frames, not a streamed HTTP response.
     /// Set by the dispatcher for `.ws_message` activations. Bypasses the
     /// stream bridge (`stream_started` → `Stream` descriptor /
@@ -437,7 +446,7 @@ pub const DispatchState = struct {
     /// arena-OOM bump→GC retry (dispatcher.runOutcome) refuses to
     /// rerun an attempt that raised this.
     side_effects_flag: ?*bool = null,
-    /// architecture/websockets.md: per-chunk RFC 6455 data opcode, pushed in
+    /// `docs/architecture/websockets.md`: per-chunk RFC 6455 data opcode, pushed in
     /// lockstep with `pending_stream_chunks` (1 = text, the arg was a
     /// string; 2 = binary, an ArrayBuffer/TypedArray). Non-null only on
     /// a WebSocket connection activation (the worker's `fireWsMessage`
@@ -518,13 +527,13 @@ pub const DispatchState = struct {
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
     instance_id: []const u8 = "",
-    /// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the node's S3 backend config,
+    /// The node's S3 backend config (`docs/architecture/routing-and-ingress.md`),
     /// borrowed from `NodeState.blob_backend_cfg` for the
     /// `_system.blob.presign` binding (the one blob verb that needs
     /// the signing keys natively). Null on test paths without a
     /// node — presign then throws "not configured".
     blob_cfg: ?*const blob_mod.BackendConfig = null,
-    /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: blob upload-session
+    /// Blob upload-session (`docs/architecture/routing-and-ingress.md`)
     /// trampolines (worker `blobWriteTrampoline` /
     /// `blobSealTrampoline`). Null where there is no worker —
     /// `blob.write` / `blob.seal` then throw.
@@ -577,7 +586,9 @@ pub const DispatchState = struct {
     ) bool = null,
     resume_if_bound_ctx: ?*anyopaque = null,
 
-    /// `docs/curl-multi-plan.md` Phase 2: cancel-fetch trampoline.
+    /// Outbound fetch / libcurl multi
+    /// (`docs/architecture/configuration-and-network.md`): cancel-fetch
+    /// trampoline.
     /// The binding (`bindings/http.zig:jsHttpCancelFetch`) calls
     /// this to ask `FetchEngine.cancel` to drop an in-flight
     /// transfer by id. Null on test paths / non-worker dispatches;
@@ -629,7 +640,7 @@ pub const DispatchState = struct {
     /// activations.
     activation_fetches_pending: u32 = 0,
 
-    /// blob-storage-plan §3.5; `docs/architecture/routing-and-ingress.md`: `blob.receive` is only
+    /// `blob.receive` (`docs/architecture/routing-and-ingress.md`) is only
     /// meaningful when the body is still at the door — set iff this
     /// dispatch is an `.inbound_headers` activation.
     allow_blob_receive: bool = false,
@@ -798,7 +809,8 @@ fn jsKvGet(
     const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key_str);
 
-    // `docs/primitive-gaps.md` §8 — minimal read set. A `kv.get(k)`
+    // The minimal readset (`docs/architecture/effects-and-handlers.md`,
+    // readset replication). A `kv.get(k)`
     // where `k` is in this activation's own writeset reads a value
     // the activation itself produced, reproducible by replay re-
     // running the handler against its own overlay. Only FOREIGN
@@ -897,7 +909,8 @@ fn jsKvSet(
         return throwKvTooLarge(ctx, which);
     }
 
-    // `docs/primitive-gaps.md` §8 — kv.set is an OUTPUT, not an
+    // The minimal readset (`docs/architecture/effects-and-handlers.md`):
+    // kv.set is an OUTPUT, not an
     // input. Replay re-runs the handler and re-issues the write
     // (against its writeset overlay); the value is a pure function
     // of the recorded foreign reads + the pinned bytecode hash.
@@ -1000,7 +1013,7 @@ fn jsKvDelete(
     }
 
     // Fast path mirrors jsKvSet — no triggers means no savepoint, no
-    // previousValue lookup, no chain machinery. Per §8, kv.delete
+    // previousValue lookup, no chain machinery. kv.delete
     // (like kv.set) is an OUTPUT and isn't taped — replay re-runs
     // the handler against its overlay.
     if (!td.anyTriggerMatches(state, key_str)) {
@@ -1157,7 +1170,8 @@ fn jsKvPrefix(
 
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
-// `docs/primitive-gaps.md` §9 + fold-in: per-request non-determinism
+// Within-activation non-determinism replay
+// (`docs/architecture/replay-and-sim.md`): per-request non-determinism
 // is collapsed to two scalars in the readset header — `seed`
 // (xorshift64star PRNG) and `timestamp_ns` (Date.now / new Date()).
 // Neither has a per-call tape channel. arenajs's native
@@ -1176,7 +1190,8 @@ fn jsKvPrefix(
 // reactor exports for the WASM build, direct API calls for the
 // server build).
 
-// `docs/primitive-gaps.md` §9 — arenajs's native `js_math_random`
+// Within-activation non-determinism replay
+// (`docs/architecture/replay-and-sim.md`): arenajs's native `js_math_random`
 // runs against the per-request
 // xorshift64star state (seeded once per request via
 // `JS_SetRandomSeed` in `installRequest`). crypto.* draws from the
@@ -1681,8 +1696,8 @@ fn jsPlatformReleasesPublish(
 // (per-call txn + envelope-0 propose, the `handleAdminKv` shape). A
 // dedicated accessor rather than rebinding the global `kv` keeps "who
 // is the principal" separate from "which store" so auth stays
-// expressible in a scoped dispatch (auth-domain-plan §4.7
-// "Primitive-fix pivot"). Gated on `state.platform != null` like the
+// expressible in a scoped dispatch — the scoped cross-tenant write
+// (`docs/architecture/auth-and-domains.md`). Gated on `state.platform != null` like the
 // rest of `platform.*`. Unknown instance → a coded `InstanceNotFound`
 // JS error so the admin handler can map it to 404.
 
@@ -2025,10 +2040,10 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     // blob depends on crypto.sha256 + http (both above) +
-    // _system.blob.presign (blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`).
+    // _system.blob.presign (`docs/architecture/routing-and-ingress.md`, customer blob storage).
     evalSnippet(ctx, "blob.js", BLOB_JS);
     // segments composes kv + blob + TextDecoder (all above) — pure
-    // JS, no natives of its own (blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`).
+    // JS, no natives of its own (`docs/architecture/routing-and-ingress.md`, customer blob storage).
     evalSnippet(ctx, "segments.js", SEGMENTS_JS);
     // browser.* is pure protocol/formatting over the ambient `stream`
     // global (referenced lazily at call time, so order-independent) —
@@ -2133,7 +2148,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
         // Streaming sha256 over serializable midstate tokens — pure
         // functions, so an accumulation spanning activations can keep
-        // its hash state in kv (blob-write-recipes.md §3).
+        // its hash state in kv (`docs/architecture/blob-write-recipes.md` §3).
         .{ .name = "sha256Init",      .cfunc = crypto_b.jsCryptoSha256Init,      .argc = 0 },
         .{ .name = "sha256Update",    .cfunc = crypto_b.jsCryptoSha256Update,    .argc = 2 },
         .{ .name = "sha256Final",     .cfunc = crypto_b.jsCryptoSha256Final,     .argc = 1 },
@@ -2146,8 +2161,9 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
         // R||S concatenation (the binding converts to DER internally).
         .{ .name = "verifyEcdsa",     .cfunc = crypto_jose_b.jsCryptoVerifyEcdsa, .argc = 4 },
-        // OIDC RS256 key custody (auth-domain-plan §4.7, fork A
-        // HYBRID): keygen + sign are Zig/OpenSSL; the IdP JS holds
+        // OIDC RS256 key custody
+        // (`docs/architecture/auth-and-domains.md`): keygen + sign are
+        // Zig/OpenSSL; the IdP JS holds
         // the private key only as an opaque PEM string it never
         // parses.
         .{ .name = "oidcGenerateKey", .cfunc = crypto_jose_b.jsCryptoOidcGenerateKey, .argc = 0 },
@@ -2162,27 +2178,29 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     } },
     // http.fetch / http.cancelFetch — the platform's outbound HTTP
     // primitive. Transient + best-effort; durability is composed in
-    // JS by `webhook.send` (effect-reification-plan.md Phase 5 PR-3).
+    // JS by `webhook.send` (the reified primitives,
+    // `docs/architecture/effects-and-handlers.md`).
     .{ .path = &.{ "_system", "http" }, .fns = &.{
         .{ .name = "fetch",              .cfunc = http_b.jsHttpFetch,              .argc = 1 },
         .{ .name = "cancelFetch",        .cfunc = http_b.jsHttpCancelFetch,        .argc = 1 },
-        // `docs/curl-multi-plan.md` Phase 3 (gap 2.5): held
-        // outbound subscription. Same engine, different
+        // Held outbound subscription (gap 2.5) on the outbound fetch /
+        // libcurl-multi engine
+        // (`docs/architecture/configuration-and-network.md`). Same engine, different
         // lifecycle: no timeout, per-tenant cap, terminal is
         // always `ok=false` ("subscription ended").
         .{ .name = "subscribe",          .cfunc = http_b.jsHttpSubscribe,          .argc = 1 },
         .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
     } },
-    // blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: tenant blob storage. Only
+    // Tenant blob storage (`docs/architecture/routing-and-ingress.md`). Only
     // `presign` is native (needs the platform-held signing keys);
     // `blob.put` / `blob.get` are JS compositions in globals/blob.js
     // over the fetch engine's `rove-blob.internal` trusted door.
     .{ .path = &.{ "_system", "blob" }, .fns = &.{
         .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
-        // P2 upload sessions (blob-storage-plan §3.4; `docs/architecture/routing-and-ingress.md`).
+        // Upload sessions (`docs/architecture/routing-and-ingress.md`, customer blob storage).
         .{ .name = "write",   .cfunc = blob_b.jsBlobWrite,   .argc = 1 },
         .{ .name = "seal",    .cfunc = blob_b.jsBlobSeal,    .argc = 2 },
-        // P3 `blob.receive` (blob-storage-plan §3.5; `docs/architecture/routing-and-ingress.md`):
+        // `blob.receive` (`docs/architecture/routing-and-ingress.md`, blob ingress):
         // headers-first inbound pipe — only callable from an
         // `onHeaders` activation.
         .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
@@ -2254,7 +2272,8 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
 };
 
 const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
-    // `docs/primitive-gaps.md` §9 + fold-in: neither `Date.now` nor
+    // Within-activation non-determinism replay
+    // (`docs/architecture/replay-and-sim.md`): neither `Date.now` nor
     // `Math.random` is overridden here. arenajs's native
     // implementations run against per-context state (`date_now_pinned`
     // + `xorshift64star`), both reseeded once per request in
@@ -2426,7 +2445,8 @@ pub fn installRequest(
 ) void {
     c.JS_SetContextOpaque(ctx, state);
 
-    // `docs/primitive-gaps.md` §9 — seed arenajs's per-request
+    // Within-activation non-determinism replay
+    // (`docs/architecture/replay-and-sim.md`): seed arenajs's per-request
     // xorshift64star with this dispatch's seed. Math.random and
     // crypto.* both draw from this state, so replay reproduces the
     // entire random stream by re-seeding with the recorded value.
@@ -2435,7 +2455,8 @@ pub fn installRequest(
     const seed: u64 = if (state.readset) |rs| rs.seed else 0;
     c.JS_SetRandomSeed(ctx, seed);
 
-    // `docs/primitive-gaps.md` §9 fold-in — pin Date.now() to the
+    // Within-activation non-determinism replay
+    // (`docs/architecture/replay-and-sim.md`): pin Date.now() to the
     // request's start time in ms. Every `Date.now()` and `new Date()`
     // (no args) inside the handler returns this scalar — same
     // posture as Cloudflare Workers / Lambda SnapStart, and the
@@ -2560,7 +2581,8 @@ pub fn installRequest(
     }
 
     // request.activation = { kind, ...payload }
-    // — streaming-handlers-plan §2: every handler run is a recorded
+    // — streaming handlers (`docs/architecture/effects-and-handlers.md`):
+    // every handler run is a recorded
     // "request," and the activation source is one field on the
     // request shape the handler can branch on. The `wake_batch`
     // variant (fired-prefix contract) carries
@@ -2583,19 +2605,20 @@ pub fn installRequest(
         .fetch_chunk => "fetch_chunk",
         // §2.6 durable scheduled wake.
         .durable_wake => "durable_wake",
-        // architecture/websockets.md: one inbound WS data frame.
+        // `docs/architecture/websockets.md`: one inbound WS data frame.
         .ws_message => "ws_message",
-        // blob-storage-plan §3.5: headers-first inbound — body still
+        // blob ingress (`docs/architecture/routing-and-ingress.md`):
+        // headers-first inbound — body still
         // inbound, handler decides from headers alone.
         .inbound_headers => "inbound_headers",
-        // gap 2.4 (architecture/effects-and-handlers.md): streaming inbound body chunk.
+        // gap 2.4 (`docs/architecture/effects-and-handlers.md`): streaming inbound body chunk.
         .inbound_chunk => "inbound_chunk",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation == .wake_batch) {
         const wb = request.activation.wake_batch;
         // wakes: [{kind:"kv",prefix,firedAt}|{kind:"timer",firedAt}, ...]
-        // — one entry per fired ARM (issue #8), identical on every
+        // — one entry per fired ARM, identical on every
         // resume path (stream / held / WS). No overflow signal: a
         // bit-per-arm can't lose fires.
         const wakes_arr = c.JS_NewArray(ctx);
@@ -2713,7 +2736,7 @@ pub fn installRequest(
             // success, `status === 0` is a hard transport failure (no HTTP
             // response reached us). There is deliberately no derived `ok`
             // boolean — it was redundant with `status` and drifted into
-            // three disagreeing definitions (issue #7).
+            // three disagreeing definitions.
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
         }
@@ -2796,7 +2819,7 @@ pub fn installRequest(
             // non-2xx), and "transport failure" (status 0) — the same
             // `status` fields that ride on the unbound
             // `request.activation.{status,body_truncated}`, hoisted to
-            // the top level for the bound surface. No derived `ok` (#7).
+            // the top level for the bound surface. No derived `ok`.
             if (fc.final) {
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
@@ -2804,7 +2827,7 @@ pub fn installRequest(
         }
     }
 
-    // architecture/websockets.md: one inbound WS data frame →
+    // `docs/architecture/websockets.md`: one inbound WS data frame →
     // `request.activation = { kind:"ws_message", opcode, data }`.
     // opcode 1 (text) surfaces `data` as a string; opcode 2 (binary)
     // as a fresh Uint8Array copy the handler owns outright (no lifetime
@@ -2850,7 +2873,7 @@ pub fn installRequest(
         liftThreadedCtx(ctx, req_obj, request.body, state.allocator);
     }
 
-    // gap 2.4 (architecture/effects-and-handlers.md): streaming inbound body chunk.
+    // gap 2.4 (`docs/architecture/effects-and-handlers.md`): streaming inbound body chunk.
     // `Request.body` carries the raw chunk; re-surface it as a
     // Uint8Array (chunks are arbitrary bytes — same posture as the
     // bound-fetch chunk surface above), add the documented top-level
@@ -2997,7 +3020,7 @@ pub fn installRequest(
             }
             c.JS_FreeValue(ctx, legacy_body);
         }
-        // `status` is the single success signal (#7 — no derived `ok`).
+        // `status` is the single success signal — no derived `ok`.
         // A shim result's own `ok`/`error` (webhook delivery `< 400`,
         // etc.) rides `request.activation.error` for diagnosis; the
         // handler branches on `request.status` (0 = transport failure).
@@ -3426,7 +3449,7 @@ fn lintPrecededByJsdoc(src: []const u8, decl_start: usize) bool {
 }
 
 test "lint(c): every native binding has a globals/ shim (Phase A)" {
-    // Documented exceptions (builtin-libs.md): Date.now /
+    // Documented exceptions (docs/architecture/builtin-libs.md): Date.now /
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is the one
     // remaining internal GLOBAL_BUILTIN (called only by globals/email.js;

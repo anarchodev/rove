@@ -1,6 +1,7 @@
 """Shared spawn helpers for the V2 two-process edge topology.
 
-After the front-door / control-plane split (docs/v2-front-door-architecture.md),
+After the front-door / control-plane split (the front door —
+`docs/architecture/routing-and-ingress.md`),
 the edge is two binaries:
 
   - `rewind-cp`    — the control plane: owns the replicated directory

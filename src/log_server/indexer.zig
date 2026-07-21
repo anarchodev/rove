@@ -19,8 +19,9 @@
 //!
 //! ## Per-node `start-after` cursor
 //!
-//! `docs/logs-plan.md` §4.3 sketches an `S3 LIST --start-after last`
-//! optimization. The `_logs/{node}/{batch}` key shape IS lex-monotonic
+//! The per-node cursor is an `S3 LIST --start-after last` optimization
+//! (log-server, `docs/architecture/deployment-and-logs.md`). The
+//! `_logs/{node}/{batch}` key shape IS lex-monotonic
 //! per node because the batch_id leads with the FLUSH-TIME nanos
 //! (`flush_writer.writeBatch`): the per-node flusher runs sequentially,
 //! so a later flush always sorts after an earlier one regardless of
@@ -48,7 +49,7 @@
 //! PUT, list-after-write lag) is recovered by the worker→log-server
 //! push path (`indexOneKey`), which indexes by direct GET independent
 //! of this cursor; missing both is within the logs' lossy-on-failure
-//! contract (`docs/logs-plan.md`).
+//! contract (log-server, `docs/architecture/deployment-and-logs.md`).
 //!
 //! Two surfaces:
 //!   - `pollOnce` runs a single pass and returns. Useful for tests
@@ -422,7 +423,7 @@ pub const Config = struct {
     store: batch_store_mod.BatchStore,
     db: *index_db_mod.IndexDb,
     /// How long to sleep between passes when there's nothing to do.
-    /// Per `docs/logs-plan.md` §4.3 the default cadence is 5s; tests
+    /// The default cadence is 5s (log-server, `docs/architecture/deployment-and-logs.md`); tests
     /// override to something smaller so they finish quickly.
     poll_interval_ms: u32 = 5_000,
     page_size: u32 = 256,

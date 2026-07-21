@@ -67,7 +67,7 @@ fn proposeEncoded(
 /// a synchronization point for downstream parking.
 ///
 /// `rs_bytes` rides the envelope's readset section
-/// (`docs/readset-replication-plan.md` Phase 3). Pass `""` from
+/// (readset replication, `docs/architecture/effects-and-handlers.md`). Pass `""` from
 /// non-handler producers (ACME, config mirror, internal admin
 /// endpoints); pass `tape_mod.Readset.serialize(...)` bytes from
 /// dispatched-handler paths.
@@ -199,8 +199,8 @@ pub fn proposeBatch(
     // The admin handler's cross-tenant trampoline writes (per target,
     // type-0 with the target id) and `platform.root.*` writes (type-2)
     // ride the SAME multi-envelope → one raft seq the calling admin
-    // request is parked on by finalizeBatch (docs/proposer-audit.md
-    // Addendum 3). `apply` routes each inner to its per-target store;
+    // request is parked on by finalizeBatch (the proposer invariant,
+    // docs/architecture/consensus-robustness.md). `apply` routes each inner to its per-target store;
     // the inners share one raft entry (atomic replication), but each
     // commits its own kvexp txn — apply is not cross-inner
     // transactional, so recovery is via idempotent replay, not

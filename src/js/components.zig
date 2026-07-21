@@ -2,7 +2,8 @@
 //!
 //! Per-entity cont/stream state lives as components on the entity's Row,
 //! not in entity-keyed side stores — `~/.claude/memory/rove-library.md`
-//! principle #2 forbids those (`docs/streaming-handlers-plan.md`). rove's
+//! principle #2 forbids those (held state, see
+//! `docs/architecture/effects-and-handlers.md`). rove's
 //! auto-deinit on entity-move / entity-destroy handles cleanup
 //! structurally instead of via manual cleanup sites.
 //!
@@ -179,7 +180,7 @@ pub const StreamChunks = struct {
 /// `kv_prefixes` arm slice is rewritten on every `__rove_stream(...)`
 /// return (a rearm starts unfired by construction). Fired state rides
 /// ON the arm (`KvArm.fired_at_ns`) plus the scalar `timer_fired_ns`
-/// — issue #8: the wake contract is "which armed prefix fired", never
+/// — the fired-prefix wake contract is "which armed prefix fired", never
 /// the matched keys, so there is no per-match accumulator, no ring
 /// cap, and no overflow signal. `drainKvWakeInbox` marks kv arms
 /// fired; the per-tick timer-due detection (`serviceParkedStreams` /
@@ -477,7 +478,7 @@ pub const UpstreamFetchEvent = struct {
     /// JS. The customer-facing result contract is `terminal_status`
     /// alone (`request.status`): `200 ≤ status < 300` is success,
     /// `status === 0` is a hard transport failure. There is no derived
-    /// `request.ok` (issue #7 — it was redundant with `status`). The
+    /// `request.ok` (it was redundant with `status`). The
     /// transport bit is folded into `terminal_status == 0` on a hard
     /// failure, which is what JS reads.
     terminal_ok: bool = false,
@@ -500,14 +501,14 @@ pub const UpstreamFetchEvent = struct {
     /// allocation, so `deinitItem` skips it.
     stream: bool = false,
 
-    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
-    /// §5.5: this event belongs to a bound fetch
+    /// The streaming substrate (`docs/architecture/routing-and-ingress.md`)
+    /// + `docs/handler-shape.md` §5.5: this event belongs to a bound fetch
     /// (`http.fetch({bind: true})`). The dispatcher routes bound
     /// events into the held chain's `onFetchChunk` resume instead
     /// of firing a separate `fireFetchEventActivation` chain.
     /// Carried from `PendingFetch.bind` by the FetchEngine.
     bind: bool = false,
-    /// `docs/cross-worker-held-state-plan.md` Phase 2B: webhook.send
+    /// Cross-worker held state (`docs/architecture/effects-and-handlers.md`): webhook.send
     /// shim's send_id. Set when the fetch was issued by
     /// `webhook.send` (via the `bound_send_id` option); empty
     /// otherwise. The chunk router consults
@@ -521,7 +522,8 @@ pub const UpstreamFetchEvent = struct {
     /// owned dupe; freed in `deinitItem`.
     name: []u8 = &.{},
 
-    /// `docs/chunk-spool-plan.md` Phase 1: for bound-fetch chunks,
+    /// The blob coordinator / chunk spool
+    /// (`docs/architecture/routing-and-ingress.md`): for bound-fetch chunks,
     /// the producer (`fetch_engine`) writes the chunk bytes to the
     /// process-global blob coordinator at upstream rate — durable
     /// ground truth decoupled from the held chain's raft cadence —

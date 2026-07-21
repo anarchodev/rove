@@ -1,4 +1,4 @@
-// blob-write-recipes.md §4–5: the flip + customer handoff.
+// docs/architecture/blob-write-recipes.md §4–5: the flip + customer handoff.
 // Arrives as the send_callback of blob_compose's PUT (via
 // __system/blob_onresult): request.status hoisted top-level (2xx = ok),
 // request.ctx = {sid, hash, on, ctx, totalBytes}.
@@ -20,8 +20,8 @@ export default function () {
     if (!sid || !hash) return { status: 400 };
 
     // 2xx = stored; anything else (incl. status 0 transport failure) is
-    // a failed PUT. `status` is the single result truth (no `request.ok`,
-    // issue #7).
+    // a failed PUT. `status` is the single result truth (no
+    // `request.ok`).
     if (request.status < 200 || request.status >= 300) {
         console.error("blob_compose_onresult: PUT for " + hash + " failed (status " +
             request.status + ") — recipe " + sid + " left for the materializer");

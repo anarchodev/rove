@@ -37,7 +37,7 @@ const occurrence = s.wake({ on: "jobs/reminder.mjs", ctx: { user: "cron", count:
 expect(occurrence.body).toEqual({ ok: true, count: 1 });
 expect(occurrence).toHaveWritten("reminder/cron", { key: "cron/reminder" });
 
-// issue #9: a `module.method` target fires the NAMED export, not `default`.
+// A `module.method` target fires the NAMED export, not `default`.
 // The combined string ("module.method") resolves the same way the worker's
 // `splitDurableTarget` does — the `.mjs`/`.js` module part, then the export.
 const named = s.wake({ on: "jobs/reminder.mjs.weekly", ctx: { user: "zoe" } });

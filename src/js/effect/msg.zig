@@ -84,12 +84,14 @@ pub const SendCallback = struct {
     }
 };
 
-/// Held-stream timer wake (`streaming-handlers-plan` §4.5). The
+/// Held-stream timer wake (streaming handlers,
+/// `docs/architecture/routing-and-ingress.md`). The
 /// `serviceParkedStreams` sweep detects timer expiry and resumes the
 /// stream directly.
 pub const Timer = struct {};
 
-/// Held-stream client disconnect (`streaming-handlers-plan` §4.4).
+/// Held-stream client disconnect (streaming handlers,
+/// `docs/architecture/routing-and-ingress.md`).
 /// h2 detects FIN/RST and `cleanupResponses` fires one final
 /// activation.
 pub const Disconnect = struct {};
@@ -106,13 +108,16 @@ pub const WsMessage = struct {};
 /// `wake_batch` is the live shape.
 pub const KvWake = struct {};
 
-/// Batched kv-wake (`streaming-handlers-plan` §9.4 + primitive-gaps
-/// §2.2). `StreamWakes` per-arm fired state → fired-prefix batch on
+/// Batched kv-wake (the batched-wake shape of the four-primitive
+/// effect model, `docs/effect-algebra.md`; streaming handlers in
+/// `docs/architecture/routing-and-ingress.md`). `StreamWakes` per-arm
+/// fired state → fired-prefix batch on
 /// resume (decisions.md §3.10).
 pub const WakeBatch = struct {};
 
-/// Subscription chain origin — kv-react (primitive-gaps §2.1;
-/// decisions §4.13). Recurrence is a `durable_wake`, not a
+/// Subscription chain origin — kv-react (subscriptions / fan-out,
+/// `docs/architecture/websockets.md`; decisions §4.13). Recurrence is
+/// a `durable_wake`, not a
 /// subscription fire.
 pub const SubscriptionFire = struct {};
 // ^ Empty placeholder: kv-react rides the durable dirty-marker path
@@ -121,7 +126,8 @@ pub const SubscriptionFire = struct {};
 // for the Msg-over-ActivationSource exhaustiveness contract (same
 // posture as Inbound / Timer / KvWake).
 
-/// `http.fetch` `on_chunk` activation (primitive-gaps §2.3).
+/// `http.fetch` `on_chunk` activation (the fetch primitive of the
+/// four-primitive effect model, `docs/effect-algebra.md`).
 /// FetchPool libcurl → `enqueueFetchEventForTenant` → MsgQueue →
 /// dispatch fires `on_chunk` activation. The chunk bytes get taped
 /// via `TapePayloads.activation_bytes`. One tag covers terminal
@@ -130,7 +136,8 @@ pub const SubscriptionFire = struct {};
 /// `body_truncated` fields.
 pub const FetchChunk = components_mod.UpstreamFetchEvent;
 
-/// Durable scheduled-wake activation (`docs/primitive-gaps.md` §2.6 +
+/// Durable scheduled-wake activation (the durable-wake primitive of
+/// the four-primitive effect model, `docs/effect-algebra.md`;
 /// `docs/architecture/effects-and-handlers.md`). Produced by the baked
 /// `__system/scheduler_tick`'s `__rove_fire_wake` fan-out: one of
 /// these per due `_sched/by_time` entry, enqueued for the entry's

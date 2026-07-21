@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""V2 Phase-5 exit smoke ⭐ (v2-build-order §Phase 5,
-docs/v2-phase5-multinode.md §5d/5e).
+"""V2 multi-node exit smoke ⭐ — multi-node raft HA + the move fan-out
+(`docs/architecture/consensus-and-storage.md`).
 
 Proves multi-node HA + the move fan-out end to end:
 

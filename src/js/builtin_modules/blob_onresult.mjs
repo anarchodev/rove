@@ -1,4 +1,4 @@
-// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: blob.put's on_chunk handler. The
+// `docs/architecture/routing-and-ingress.md`: blob.put's on_chunk handler. The
 // shim wrote a durable `_blob/owed/{hash}` marker (riding the
 // handler's writeset, envelope-0 atomic) and fired the signed PUT
 // through the fetch engine's rove-blob.internal door; this module
@@ -39,7 +39,7 @@ export default function () {
     const status = (a.kind === "fetch_chunk") ? a.status : 0;
     // Success is a 2xx PUT. `status === 0` is a hard transport failure
     // (no HTTP response) — also not-ok. `status` is the single truth;
-    // there is no `request.ok` (issue #7).
+    // there is no `request.ok`.
     const ok = status >= 200 && status < 300;
 
     if (ok) {

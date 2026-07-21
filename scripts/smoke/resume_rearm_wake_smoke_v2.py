@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A wake armed FROM A RESUME activation actually arms (issue #140).
+"""A wake armed FROM A RESUME activation actually arms.
 
 `after.ms` / `after.kv` append to `pending_wakes`, which the inbound dispatch
 wired but the three `worker_drain` resume sites (bound-fetch chunk,
@@ -53,7 +53,7 @@ FETCHED_LEN = len(EXPECTED_BODY)  # 170
 
 # The default hop binds a buffered on.fetch and holds. The result lands in
 # `onFetchResult` (the bound-fetch chunk resume) — which arms a FRESH kv wake
-# and re-parks. That arm is exactly the one issue #140 dropped.
+# and re-parks. That arm is exactly the one a resume-armed wake must not drop.
 HOLDFETCH_SRC = """\
 export default function () {
     const q = request.query || "";

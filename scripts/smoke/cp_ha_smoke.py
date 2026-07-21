@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""3-node control-plane HA (docs/v2-cp-directory-replication.md Slice 2).
+"""3-node control-plane HA (directory replication, Slice 2;
+`docs/architecture/control-plane.md`).
 
 The control plane is now a 3-node cluster: the routing directory is one raft
 group spanning three `rewind-cp` nodes. This proves the Slice-2 exit:

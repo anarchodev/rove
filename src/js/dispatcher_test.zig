@@ -315,7 +315,7 @@ test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)
     try testing.expectEqualStrings("POST", obj.get("method").?.string);
     try testing.expectEqualStrings("x", obj.get("body").?.string);
     try testing.expectEqual(@as(i64, 0), obj.get("attempts").?.integer);
-    // durable-wake-plan P5(a): timing left the marker — the scheduler
+    // Timing left the marker — the scheduler
     // entry under key `_send/{id}` is the durable next-fire authority.
     try testing.expectEqual(@as(?std.json.Value, null), obj.get("next_at_ns"));
 
@@ -454,7 +454,7 @@ test "dispatch: ambient retry.shouldRetry / retry.ctx logic" {
 // `.send_callback` whose body is `{"ctx":{result,context}}`. The runtime
 // hoists it onto the SAME flattened surface a bound fetch resume uses:
 // `request.body` = response bytes, top-level `request.status`/`.done`
-// (`status` is the single success signal; no `request.ok`, issue #7),
+// (`status` is the single success signal; no `request.ok`),
 // the THREADED ctx (the echoed `context`) on `request.ctx` (bare), and the
 // per-delivery metadata on `request.activation.*`. There is NO
 // `request.result` and no positional `outcome`.
@@ -1912,7 +1912,8 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     }, &budget);
     defer resp.deinit(testing.allocator);
 
-    // `docs/primitive-gaps.md` §8: only foreign reads land on the
+    // The read-taping contract (`docs/architecture/effects-and-handlers.md`,
+    // readset replication): only foreign reads land on the
     // tape. The handler does two `kv.get`s (both foreign — writeset
     // is empty at both call sites), one `kv.set` (own-write, no
     // tape entry), one `kv.delete` (own-write, no tape entry).
@@ -1931,7 +1932,7 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     try testing.expectEqualStrings("missing", e1.key);
     try testing.expectEqual(tape_mod.KvOutcome.not_found, e1.outcome);
 
-    // §8 invariant: the writeset still records the writes so the
+    // Read-taping invariant: the writeset still records the writes so the
     // dispatch path can replicate + apply them. Tape minimization
     // is purely a capture-side compression.
     try testing.expectEqual(@as(usize, 2), ws.ops.items.len);

@@ -1,5 +1,5 @@
 //! rove-js `effect/` — the four primitives of `docs/effect-algebra.md`
-//! as concrete code artifacts, per `docs/effect-reification-plan.md`.
+//! as concrete code artifacts, per `docs/architecture/effects-and-handlers.md`.
 //!
 //! In this model, a named effect (`http.send`, streaming, a
 //! subscription) is a *declaration* — one `Cmd` variant, one `Msg`
@@ -21,7 +21,7 @@
 //!   (`continuation.zig`) — comptime-generic commit-gated parked-unit
 //!   primitive over parked sites (ParkedUnit, the three
 //!   raft_pending_* siblings, parked_continuations, stream_*). See
-//!   `docs/effect-reification-plan.md` Phase 3 sub-plan.
+//!   the reified primitives in `docs/architecture/effects-and-handlers.md`.
 
 pub const cmd = @import("cmd.zig");
 pub const msg = @import("msg.zig");

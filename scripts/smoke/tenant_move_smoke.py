@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""V2 Phase-4 exit smoke ⭐ THE MILESTONE (v2-build-order §Phase 4,
-docs/v2-phase4-tenant-move.md).
+"""V2 tenant-move exit smoke ⭐ THE MILESTONE — the zero-downtime
+cross-cluster tenant-move mechanism (`docs/architecture/consensus-and-storage.md`;
+move orchestration in `docs/architecture/control-plane.md`).
 
 Moves a live tenant from one single-node cluster to another (zero-downtime —
 the source serves throughout) and proves the data survives + the new cluster

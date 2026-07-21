@@ -514,8 +514,9 @@ pub const TlsConfig = struct {
         _: ?*anyopaque,
     ) callconv(.c) c_int {
         // Server preference order: prefer h2, fall back to http/1.1 (the edge
-        // accepts h1-only clients — webhooks, ACME — without Cloudflare;
-        // docs/v2-edge-http1-ingress.md phase 3). Return the first server
+        // accepts h1-only clients — webhooks, ACME — without Cloudflare; the
+        // HTTP/1.1 ingress path, docs/architecture/routing-and-ingress.md).
+        // Return the first server
         // preference the client offered.
         const prefs = [_][]const u8{ "h2", "http/1.1" };
         for (prefs) |pref| {

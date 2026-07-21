@@ -1,4 +1,5 @@
-//! `http.fetch` engine — Phase 2 of `docs/curl-multi-plan.md`.
+//! `http.fetch` engine — outbound fetch driven by a libcurl multi
+//! handle (`docs/architecture/configuration-and-network.md`).
 //!
 //! A single thread drives a `curl_multi` handle that holds many
 //! concurrent transfers, so there is no fixed worker-thread ceiling —
@@ -46,7 +47,8 @@
 //! its state. An in-flight chunk that already landed in on_chunk
 //! before the cancel ran is delivered as if the cancel hadn't
 //! happened (the customer's chain ctx is the place to track "we
-//! moved on" — see `curl-multi-plan.md` §5 invariant 3). The
+//! moved on" — the fetch-cancellation chain-ctx invariant,
+//! `docs/architecture/configuration-and-network.md`). The
 //! terminal `final: true` event does NOT fire after a cancel — the
 //! customer's chain just stops.
 
@@ -79,17 +81,19 @@ const ENGINE_POLL_TIMEOUT_MS: c_int = 1000;
 /// well above any plausible legitimate concurrent load.
 const ENGINE_MAX_INFLIGHT: usize = 10_000;
 
-/// `docs/curl-multi-plan.md` Phase 3 (gap 2.5): per-tenant cap on
-/// simultaneous held subscriptions. Mirrors
-/// `connection-actor-plan.md` §9.2's posture: bounded resource
+/// Per-tenant cap on simultaneous held subscriptions (the
+/// held-subscription cap; see
+/// `docs/architecture/configuration-and-network.md`). Mirrors the
+/// connection/tenant actor's bounded-resource posture
+/// (`docs/architecture/websockets.md`): bounded resource
 /// per tenant so one chatty customer can't exhaust the node's
 /// outbound socket / fd budget. Exceeded submissions emit a
 /// defined `final: true, ok: false` rejection event so the
 /// customer's `on_chunk` handler fires once and can take action.
 const HELD_MAX_PER_TENANT: u32 = 16;
 
-/// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the special origin the `blob.*`
-/// JS shims target. Never resolved — `startTransfer` rewrites it to
+/// The special origin the `blob.*` JS shims target — the blob trusted
+/// door (`docs/architecture/routing-and-ingress.md`). Never resolved — `startTransfer` rewrites it to
 /// the real S3 endpoint + tenant `app-blobs/` prefix and signs the
 /// request before libcurl sees it. The `.internal` TLD is reserved
 /// (RFC 8375-adjacent ICANN reservation), so the placeholder can
@@ -108,7 +112,7 @@ pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 pub const LOGS_ORIGIN_PREFIX = "http://rewind-logs.internal/";
 
 /// The `rewind-cp.internal` trusted door (docs/architecture/auth-consolidation.md B4;
-/// the CP desired-state north star, issue #90). The `__admin__` chokepoint fetches
+/// the CP desired-state north star). The `__admin__` chokepoint fetches
 /// `http://rewind-cp.internal/_control/…` (or `/_cp/…` reads); the fetch engine
 /// attaches the platform move-secret (`X-Rewind-Move-Secret`) and rewrites the
 /// host to the configured CP base. So the operator does CP control ops
@@ -157,8 +161,8 @@ const MAX_DOOR_ADDRS = 4;
 /// address. The door declines any other port (see `tenantDoorPin`), so
 /// reaching an internal port is impossible by construction rather than
 /// resting on the coincidence that those ports speak plaintext while the
-/// door is https-only. Matches the front's `:443` listener (deploy plan
-/// §2.5); test topologies set `REWIND_INTERNAL_FRONT_PORT` to the front's
+/// door is https-only. Matches the front's `:443` listener (the front
+/// door, `docs/architecture/routing-and-ingress.md`); test topologies set `REWIND_INTERNAL_FRONT_PORT` to the front's
 /// high port.
 const FRONT_TLS_PORT: u16 = 443;
 
@@ -574,7 +578,7 @@ pub const FetchEngine = struct {
         if (self.inflight_by_id.count() >= ENGINE_MAX_INFLIGHT) {
             return error.TooManyInflight;
         }
-        // Per-tenant held-subscription cap (gap 2.5). Check
+        // Per-tenant held-subscription cap. Check
         // BEFORE allocating any state so the rejection path is
         // cheap. The defined rejection (a single `final: true,
         // ok: false` event with `body_truncated = false`) fires
@@ -597,7 +601,7 @@ pub const FetchEngine = struct {
 
         const method = parseMethod(pf.method) orelse return error.UnsupportedMethod;
 
-        // blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the blob.* trusted door.
+        // The blob.* trusted door (`docs/architecture/routing-and-ingress.md`).
         // The JS shims fetch `http://rove-blob.internal/{hash}`; the
         // engine rewrites that to the calling tenant's `app-blobs/`
         // key on the real S3 endpoint and SigV4-signs it natively.
@@ -608,7 +612,7 @@ pub const FetchEngine = struct {
         // the standard single `final: true, ok: false` event via
         // `drainInbound`'s catch.
         //
-        // SSRF gate (PLAN §2.6): every CUSTOMER-supplied URL is
+        // SSRF gate (`docs/architecture/configuration-and-network.md`): every CUSTOMER-supplied URL is
         // policy-checked per attempt (scheme ∈ http(s), TLS-always
         // unless the test hatch, no blocklisted resolution — see
         // rove-ssrf), and the vetted address is pinned via
@@ -767,7 +771,7 @@ pub const FetchEngine = struct {
         if (ctx.held) self.bumpHeldCount(ctx.pf.tenant_id, 1);
     }
 
-    /// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: rewrite a `rove-blob.internal`
+    /// The blob.* door (`docs/architecture/routing-and-ingress.md`): rewrite a `rove-blob.internal`
     /// placeholder URL to the calling tenant's content-addressed key
     /// on the real S3 endpoint and attach SigV4 auth headers.
     ///
@@ -776,7 +780,7 @@ pub const FetchEngine = struct {
     ///   hash from the URL tail (validated 64 lowercase hex), so JS
     ///   cannot escape its own prefix by construction.
     /// - Method allowlist GET / PUT / HEAD. No DELETE through this
-    ///   door (plan §7.1 — no customer delete at launch).
+    ///   door — no customer delete at launch.
     /// - JS-supplied headers are dropped except `content-type`
     ///   (useful on PUT, not signed — only host / x-amz-date /
     ///   x-amz-content-sha256 enter the signature). Anything else a
@@ -1158,7 +1162,8 @@ pub const FetchEngine = struct {
 
     fn routeEvent(self: *FetchEngine, tenant_id: []const u8, ev: UpstreamFetchEvent) !void {
         var event = ev;
-        // `docs/chunk-spool-plan.md` Phase 1: bound-fetch chunk bytes
+        // The blob coordinator / chunk spool
+        // (`docs/architecture/routing-and-ingress.md`): bound-fetch chunk bytes
         // become durable via the process-global blob coordinator at
         // upstream rate, decoupled from the held chain's raft commit
         // cadence. This stamps `coord_seq`/`coord_worker_id` on the
@@ -1177,7 +1182,8 @@ pub const FetchEngine = struct {
         };
     }
 
-    /// `docs/chunk-spool-plan.md` Phase 1: write a bound-fetch chunk's
+    /// The blob coordinator / chunk spool
+    /// (`docs/architecture/routing-and-ingress.md`): write a bound-fetch chunk's
     /// bytes to the process-global blob coordinator and stamp the
     /// resulting `(worker_id, seq)` on the event. The coordinator dups
     /// the bytes internally, so the event retains ownership of `bytes`
@@ -1228,8 +1234,8 @@ const FetchCtx = struct {
     max_chunk: usize,
     max_total: u64,
     effective_total_cap: u64,
-    /// `docs/curl-multi-plan.md` Phase 3: held subscription. When
-    /// true the engine counts this against the per-tenant held cap
+    /// Held subscription (`docs/architecture/configuration-and-network.md`):
+    /// when true the engine counts this against the per-tenant held cap
     /// and treats completion as "subscription ended" rather than
     /// "fetch succeeded."
     held: bool,

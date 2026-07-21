@@ -239,7 +239,7 @@ const SYSTEM_SHIM =
     \\  // Fetch/subscribe recorder. Ids are unique per run (`ftch_<seq>` — the
     \\  // epilogue resets the counter each activation), NOT prod's ftch_<64hex>:
     \\  // determinism over realism, but distinct so a handler can correlate the
-    \\  // returned id with the `request.fetchId` its resume observes (issue #24).
+    \\  // returned id with the `request.fetchId` its resume observes.
     \\  // The effect entry carries the FULL option bag prod reads
     \\  // (http.zig buildFetchRow), defaults applied, in the PUBLIC spellings
     \\  // (timeoutMs/maxChunkBytes/maxTotalBytes — this recorder sits under the

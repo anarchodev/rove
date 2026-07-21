@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""CP cert-state axis smoke (gap #3 slice 1; docs/v2-front-door-architecture.md
-"Certs: issuance + state").
+"""CP cert-state axis smoke (gap #3 slice 1; TLS cert issuance + state,
+`docs/architecture/auth-and-domains.md`).
 
 TLS certs are admin-authored + placement-independent, so cert state is a sibling
 axis in the CP `__directory__` group (`cert/{host}` → packed `[4B cert_len]
