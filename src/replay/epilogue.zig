@@ -503,10 +503,32 @@ const EPILOGUE_BODY =
     \\    }
     \\    return ks;
     \\  };
+    \\  // Durable kv subscriptions (issue #38): scenario({subscriptions}) carries
+    \\  // the registration (name + watched kv prefix) prod derives from
+    \\  // `_subscriptions/<name>/spec.json`. A customer write under a watched
+    \\  // prefix injects ONE durable `_sub/dirty/{name}` marker — coalesced +
+    \\  // deduped per activation, atomic with the write, recursion-guarded on
+    \\  // `_sub/` keys — the marker that feeds `onSubscription`
+    \\  // (globals.zig markSubscriptionsDirty). It's an ordinary write in the
+    \\  // effect log; as a platform injection it bypasses the reserved-prefix
+    \\  // guard (`__kvNative` directly). Cleared before the fire runs
+    \\  // (scenario.subscriptionFire).
+    \\  const __subs = (() => { try { const s = __kvNative.get(__NS + "subscriptions"); return s ? JSON.parse(s) : []; } catch (_) { return []; } })();
+    \\  const __subsMarked = new Set();
+    \\  const __markDirty = (ks) => {
+    \\    if (__subs.length === 0 || ks.startsWith("_sub/")) return;
+    \\    for (const sub of __subs) {
+    \\      if (!ks.startsWith(sub.prefix) || __subsMarked.has(sub.name)) continue;
+    \\      __subsMarked.add(sub.name);
+    \\      const mkey = "_sub/dirty/" + sub.name;
+    \\      __kvNative.set(mkey, sub.prefix);
+    \\      __effects.push({ kind: "write", key: mkey, value: sub.prefix });
+    \\    }
+    \\  };
     \\  globalThis.kv = {
     \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
-    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val); if (!ks.startsWith(__NS)) __effects.push({ kind: "write", key: ks, value: val }); return __kvNative.set(k, val); },
-    \\    delete(k) { const ks = __kvGuardWrite(k, false); if (!ks.startsWith(__NS)) __effects.push({ kind: "delete", key: ks }); return __kvNative.delete(k); },
+    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val); const r = __kvNative.set(k, val); if (!ks.startsWith(__NS)) { __effects.push({ kind: "write", key: ks, value: val }); __markDirty(ks); } return r; },
+    \\    delete(k) { const ks = __kvGuardWrite(k, false); const r = __kvNative.delete(k); if (!ks.startsWith(__NS)) { __effects.push({ kind: "delete", key: ks }); __markDirty(ks); } return r; },
     \\    // Adapter: the worker's kv.prefix is positional; the replay
     \\    // NATIVE takes (prefix, {cursor, limit}) — convert here. A scan under the
     \\    // store namespace (a facade call) returns raw for the facade to strip;

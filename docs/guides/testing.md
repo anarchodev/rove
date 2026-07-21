@@ -445,6 +445,12 @@ const fired = s.subscriptionFire({ on: "watchers/orders.mjs", name: "orders/watc
 expect(fired.body.fired).toBe("orders/watch");
 ```
 
+The *produce* side — the `_sub/dirty/{name}` marker that a watched write injects —
+is modeled by registering the subscriptions on the scenario:
+`scenario({ subscriptions: [{ name, prefix }] })`. A `kv.set`/`kv.delete` of a key
+under a watched `prefix` then leaves one coalesced `_sub/dirty/{name}` write in the
+effect log (assert with `toHaveWritten`), exactly as production injects it.
+
 A bare **fetch continuation module** — the `on` of an `after.fetch`/`http.fetch`,
 in its own file — is drivable the same way with `scenario.fetchResult`, given an
 upstream result on the flattened `request.{status, ok, done, body}` surface:
