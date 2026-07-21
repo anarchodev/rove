@@ -9,3 +9,13 @@ expect(req.body.tampered).toBe(false); // tampered signing input rejected
 expect(req.body.valid).toBe(true);     // jwt.verify agrees
 expect(req.body.sub).toBe("jess");
 expect(req.body.iss).toBe("https://idp.test");
+
+// #45: unsupported algs/curves throw a loud declared-gap error (not silent false).
+const gaps = scenario({}).inbound({ method: "GET", path: "/gaps", export: "gaps" }).body;
+expect(gaps.rs512).toMatch(/not available in `rewind test`/);
+expect(gaps.es384).toMatch(/not available in `rewind test`/);
+expect(gaps.p521).toMatch(/not available in `rewind test`/);
+// And the message names the alg/curve so the gap is actionable.
+expect(gaps.rs512).toMatch(/sha512/);
+expect(gaps.es384).toMatch(/sha384/);
+expect(gaps.p521).toMatch(/P-521/);

@@ -43,6 +43,12 @@ const SYSTEM_SHIM =
     \\;(function(){
     \\  var nat = globalThis.crypto;
     \\  var no = function(n){ return function(){ throw new Error("crypto." + n + " is not available in `rewind test` (the offline sim has SHA-256/HMAC + random only — no streaming sha, RSA or ECDSA)"); }; };
+    \\  // A verify path reached an alg/curve the offline sim doesn't implement.
+    \\  // THROW (a loud, declared gap) rather than return a silent `valid:false`
+    \\  // — a wrong verdict on a valid token is the worst offline failure (it
+    \\  // greens a login-rejection prod would accept). Verify those against a live
+    \\  // cluster until the sim grows the alg. Issue #45.
+    \\  var __cryptoGap = function(what){ throw new Error("crypto." + what + " is not available in `rewind test` (the offline sim implements RS256 + ES256/P-256 verify + SHA-256/HMAC only) — verify this alg against a live cluster"); };
     \\  var push = function(e){ (globalThis.__rove_effects || (globalThis.__rove_effects = [])).push(e); };
     \\  var b2s = function(c){ if (typeof c === "string") return c; var s = ""; for (var i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
     \\  // ── prod's synchronous effect-argument validation, mirrored so a call
@@ -134,9 +140,10 @@ const SYSTEM_SHIM =
     \\  // RS256 verify (RSASSA-PKCS1-v1.5 + SHA-256) in pure JS over BigInt — the
     \\  // common OIDC alg. Portable (no OpenSSL). sha384/512 + ECDSA not covered.
     \\  var __sim_verifyRsa = function(jwk, alg, data, sig){
+    \\    var a = (alg || "sha256").toLowerCase();
+    \\    if (a !== "sha256") __cryptoGap("verifyRsa(" + a + ")"); // RS384/RS512 → loud gap, not silent false
     \\    try {
     \\      if (!jwk || jwk.kty !== "RSA") return false;
-    \\      if ((alg || "sha256").toLowerCase() !== "sha256") return false;
     \\      var b64u = globalThis.base64url;
     \\      var toBig = function(b){ var x = 0n; for (var i = 0; i < b.length; i++) x = (x << 8n) | BigInt(b[i]); return x; };
     \\      var n = toBig(b64u.decode(jwk.n)), e = toBig(b64u.decode(jwk.e));
@@ -165,9 +172,13 @@ const SYSTEM_SHIM =
     \\  // (at the end) instead of one per point op — affine would churn the bump
     \\  // arena past any sane ceiling. Accepts JWS raw r||s (64B) or DER.
     \\  var __sim_verifyEcdsa = function(jwk, alg, data, sig){
+    \\    var a = (alg || "sha256").toLowerCase();
+    \\    var crv = jwk && jwk.crv;
+    \\    // ES384/ES512 (sha384/512) and their curves (P-384/P-521) → loud gap.
+    \\    if (a !== "sha256") __cryptoGap("verifyEcdsa(" + a + ")");
+    \\    if (crv === "P-384" || crv === "P-521") __cryptoGap("verifyEcdsa(" + crv + ")");
     \\    try {
     \\      if (!jwk || jwk.kty !== "EC" || jwk.crv !== "P-256") return false;
-    \\      if ((alg || "sha256").toLowerCase() !== "sha256") return false;
     \\      var b64u = globalThis.base64url;
     \\      var toBig = function(b){ var x = 0n; for (var i = 0; i < b.length; i++) x = (x << 8n) | BigInt(b[i]); return x; };
     \\      var p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
