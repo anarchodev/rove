@@ -123,6 +123,10 @@ const Harness = struct {
     /// updated on `SNAP_PREFIX` set.
     snapshots: std.StringHashMapUnmanaged([]const u8) = .{},
     snap_dirty: bool = false,
+    /// Snapshot names ASSERTED this run (the `get` side of every
+    /// `toMatchSnapshot`). A loaded name absent here is stale — a deleted or
+    /// renamed assertion (or a shifted positional auto-name) left it behind.
+    snap_asserted: std.StringHashMapUnmanaged(void) = .{},
 
     fn install(self: *Harness) void {
         arena_replay_set_host(&VTABLE, self);
@@ -196,6 +200,9 @@ fn kvGet(
 
     if (std.mem.startsWith(u8, k, SNAP_PREFIX)) {
         const name = k[SNAP_PREFIX.len..];
+        // Every assertion reads its snapshot first (new or not) — record the
+        // name so a loaded-but-unread entry surfaces as stale after the run.
+        h.snap_asserted.put(h.a, h.a.dupe(u8, name) catch return -1, {}) catch return -1;
         if (h.snapshots.get(name)) |v| {
             out_val.* = dupC(v, false) orelse return -1;
             out_val_len.* = @intCast(v.len);
@@ -423,8 +430,15 @@ fn runOneFile(
     const name_z = try a.dupeZ(u8, name);
     const rc = arena_run_module_r(H, name_z.ptr, full.ptr);
 
-    // The library only marks snapshots dirty in the allowed cases (a new
-    // snapshot, or a mismatch under --update), so persist whenever dirty.
+    // On a clean full-file run, reconcile stale snapshots — a name loaded from
+    // the sidecar but not asserted this run (a deleted/renamed assertion, or a
+    // positional auto-name that shifted). Under --update prune it; else warn (a
+    // stale baseline can silently pass OR fail). Gated on `completed`: a
+    // mid-file abort leaves later assertions unrun, so their entries aren't
+    // stale — just unreached.
+    if (h.completed) reconcileStaleSnapshots(a, name, &h);
+    // The library marks snapshots dirty on the allowed cases (a new snapshot, a
+    // mismatch under --update) and reconcile marks it on a prune — persist then.
     if (h.snap_dirty) try writeSnapshots(a, tests_dir, name, &h);
 
     // Copy the result out to `gpa` (the per-file arena is about to be freed).
@@ -454,6 +468,30 @@ fn loadSnapshots(a: std.mem.Allocator, tests_dir: []const u8, name: []const u8, 
     while (it.next()) |e| {
         if (e.value_ptr.* != .string) continue;
         try h.snapshots.put(a, try a.dupe(u8, e.key_ptr.*), try a.dupe(u8, e.value_ptr.*.string));
+    }
+}
+
+/// Stale = a loaded snapshot name no assertion read this run. Warn about each
+/// (visible in the report); under `--update` prune them and mark dirty so the
+/// rewritten sidecar holds exactly the live entries.
+fn reconcileStaleSnapshots(a: std.mem.Allocator, name: []const u8, h: *Harness) void {
+    var stale = std.ArrayList([]const u8){};
+    var kit = h.snapshots.keyIterator();
+    while (kit.next()) |k| {
+        if (!h.snap_asserted.contains(k.*)) stale.append(a, k.*) catch return;
+    }
+    for (stale.items) |k| {
+        if (h.update) {
+            std.log.info("rewind test: pruned stale snapshot '{s}' ({s})", .{ k, name });
+        } else {
+            std.log.warn("rewind test: stale snapshot '{s}' ({s}) — no assertion used it; run with --update to prune", .{ k, name });
+        }
+    }
+    if (h.update and stale.items.len > 0) {
+        // The key slices live in the file arena (dup'd at load), not the map's
+        // storage, so they stay valid across removes.
+        for (stale.items) |k| _ = h.snapshots.remove(k);
+        h.snap_dirty = true;
     }
 }
 
