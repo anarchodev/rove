@@ -40,6 +40,10 @@ expect(h.effects.some((e) => e.kind === "blob" && e.op === "receive")).toBe(true
 // ── the object lands durably → onStored writes the workspace row + returns the hash ──
 const stored = h.receive().stored({ hash: "abc123def", len: 4096 });
 expect(stored.status).toBe(200);
+// The completion resumes as a BOUND fetch_chunk (blob_receive.zig emitTerminal
+// bind:true, final:true) — not a bespoke "blob_stored" kind — with the
+// top-level `done` flatten, matching what onStored sees in prod.
+expect(stored.kv("probe/resume")).toEqual({ kind: "fetch_chunk", done: true });
 expect(JSON.parse(stored.body)).toEqual({ ok: true, path: "logo.png", hash: "abc123def" });
 // The write went to the TARGET tenant's isolated store (platform.scope("acme")),
 // with {tenant, path, content_type} threaded from the issue-time ctx via app.

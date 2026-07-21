@@ -1173,18 +1173,22 @@ class ReceiveHandle {
     const ctx = ok
       ? { hash: spec.hash, len: spec.len != null ? spec.len : 0, app }
       : { error: spec.error != null ? spec.error : "receive failed", app };
-    const world = carrySources(parent.world, {
-      entry: heldEntry(parent),
-      // Receive completions resume through the FetchEngine router (a bound
-      // terminal event) — the same continuation shape as a fetch result.
-      activation: "fetch_chunk",
-      export: this.fx.on || "onStored",
+    // A completed blob.receive resumes as a BOUND fetch_chunk — blob_receive.zig
+    // emitTerminal sets `bind:true, final:true`, so the worker builds the same
+    // terminal-fetch surface as compile/stamp: the completion on `request.ctx`,
+    // the flatten (`request.status`/`request.done`) at the top level, and
+    // `request.activation.kind === "fetch_chunk"`. Success → status 200,
+    // failure → status 0 (nothing stored). Reuse the shared fold rather than a
+    // bespoke `blob_stored` shape the worker never produces.
+    const world = fetchResumeWorld(
+      parent, this.fx, { status: ok ? 200 : 0, body: null },
+      foldKv(parent.world.kv, pb.effects),
+      (parent.world.seed || 0) + 1,
+      (parent.world.now_ms || 0) + 1,
       ctx,
-      kv: foldKv(parent.world.kv, pb.effects),
-      seed: (parent.world.seed || 0) + 1,
-      now_ms: (parent.world.now_ms || 0) + 1,
-      request: { status: ok ? 200 : 0, activation: { kind: "blob_stored" } },
-    });
+      armedFetches(parent),
+      "onStored",
+    );
     return resumeNode(parent, world);
   }
 }
@@ -1398,6 +1402,18 @@ function onTarget(parentEntry, on, fallbackExport) {
   return { entry: parentEntry, export: on || fallbackExport };
 }
 
+/** Resolve a BOUND fetch/receive `{on}` to a same-module export name. Unlike
+ *  `onTarget` (the UNBOUND on_chunk router, which sends a path-shaped `on` to a
+ *  different module's default export), a bound resume treats `on` as a verbatim
+ *  export identifier and a path-shaped name is invalid — the worker rejects it
+ *  at issue time. The recorder already throws there; this guards a
+ *  hand-authored world that skipped the recorder. */
+function boundExport(on, fallbackExport) {
+  if (typeof on === "string" && (on.includes("/") || on.includes(".")))
+    throw new Error(`bound fetch/receive {on:${JSON.stringify(on)}}: {on} names an export on the same held chain, not a module path — the worker rejects "/" and "." at issue time`);
+  return on || fallbackExport;
+}
+
 /** Build the `fetch_chunk` resume world for a located fetch effect against an
  *  EXPLICIT kv/seed/now base — the shared core of `FetchHandle.resolve` and the
  *  `whenConcurrent` interleaving fold (which threads a running overlay through a
@@ -1405,11 +1421,17 @@ function onTarget(parentEntry, on, fallbackExport) {
  *  the parent NODE (not its world): a bare-export `on` resumes in the module the
  *  chain is parked at — the held `next(target)`'s module when one was parked
  *  (`heldEntry`), like prod's cont→stream transition. */
-function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending) {
+function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending, fallbackExport = "onFetchResult") {
   const parentWorld = parent.world;
   const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
   const done = response.done != null ? response.done : true;
-  const t = onTarget(heldEntry(parent), fx.on, "onFetchResult");
+  // A BOUND fetch/receive resumes an EXPORT on the module the chain is parked
+  // at — never a separate module (that is the UNBOUND on_chunk / webhook.send
+  // `on` surface). `{on}` is an export NAME: the worker rejects a `/`- or
+  // `.`-bearing name at issue time (bindings/http.zig isValidExportName,
+  // components.zig resolvedExport looks it up as `ns[fn]`) and the recorder
+  // throws to match, so a valid world never carries a path-shaped bound `on`.
+  const t = { entry: heldEntry(parent), export: boundExport(fx.on, fallbackExport) };
   const request = {
     done,
     body: response.body != null ? response.body : null,

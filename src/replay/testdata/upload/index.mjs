@@ -31,6 +31,13 @@ export function onHeaders() {
 export function onStored() {
   const ctx = request.ctx || {};
   const app = ctx.app || {};
+  // A completed receive resumes as a BOUND fetch_chunk — record the surface
+  // the worker actually delivers so the fold can't drift back to a bespoke
+  // shape (kind "fetch_chunk", the top-level `done` flatten).
+  kv.set("probe/resume", JSON.stringify({
+    kind: request.activation && request.activation.kind,
+    done: request.done,
+  }));
   // blob.receive completion: 2xx = stored, status 0 = failed (no
   // request.ok — status is the single signal).
   const ok = request.status >= 200 && request.status < 300;
