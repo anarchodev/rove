@@ -526,6 +526,71 @@ class Scenario {
     return new Node(this, w);
   }
 
+  /** Drive a STREAMING inbound body → per-chunk `onChunk` activations — the raw
+   *  streaming-upload trust boundary (distinct from the headers-first
+   *  `blob.receive` path). One `inbound_chunk` activation per chunk: the payload
+   *  on `request.bytes`/`.text`, `request.chunkSeq`, `request.done` on the last,
+   *  and `request.activation.{seq, byteOffset, done}` (`byteOffset` = cumulative
+   *  WIRE bytes before this chunk). Per-connection ctx threads via each chunk's
+   *  `next({ctx})` — null on the first fire (prod: no continuation yet) unless
+   *  authored — and kv writes fold forward, so an accumulate-in-kv handler
+   *  reconstructs the body. Middleware `before` runs on each chunk (the trust
+   *  boundary). `chunks` are strings, or bytes via `{ binary: true }`. Returns
+   *  the terminal node (the chunk that responded). */
+  inboundChunks(req = {}, chunks = [], opts = {}) {
+    if (!Array.isArray(chunks) || chunks.length === 0)
+      throw new Error("inboundChunks(req, chunks): pass a non-empty array of chunks");
+    const binary = !!(opts && opts.binary);
+    const baseReq = {
+      method: req.method || "POST",
+      path: req.path || "/",
+      host: req.host || "",
+      headers: req.headers || {},
+      ip: req.ip,
+      session: req.session,
+      tenant: req.tenant,
+      correlationId: req.correlationId,
+    };
+    let node = null;
+    let kv = null;
+    let seed = 0;
+    let now = 0;
+    let off = 0; // cumulative wire bytes BEFORE the current chunk
+    let ctx = req.ctx !== undefined ? req.ctx : null;
+    for (let i = 0; i < chunks.length; i++) {
+      const done = i === chunks.length - 1;
+      const request = Object.assign({}, baseReq, {
+        chunkSeq: i,
+        done,
+        activation: { seq: i, byteOffset: off, done },
+      });
+      if (binary) request.bodyB64 = b64(chunks[i]);
+      else request.body = String(chunks[i]);
+      let world;
+      if (i === 0) {
+        world = this._base({ activation: "inbound_chunk", request });
+        if (ctx !== null) world.ctx = ctx; // an authored first-chunk ctx (rare)
+        seed = world.seed;
+        now = world.now_ms;
+      } else {
+        world = carrySources(node.world, {
+          activation: "inbound_chunk",
+          request,
+          ctx,
+          kv,
+          seed: ++seed,
+          now_ms: ++now,
+        });
+      }
+      node = new Node(this, world, node);
+      const nb = node.force();
+      kv = foldKv(i === 0 ? node.world.kv : kv, nb.effects);
+      ctx = nb.disposition === "held" ? (nb.ctx === undefined ? null : nb.ctx) : ctx;
+      off += byteLen(chunks[i]);
+    }
+    return node;
+  }
+
   /** A DETACHED durable delivery callback (`webhook.send` / `email.send` `on`),
    *  authored directly — NOT folded from an emitter. The send fires after the
    *  handler commits and its `on` module runs later as its own activation, so
