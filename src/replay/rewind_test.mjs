@@ -635,43 +635,53 @@ class Scenario {
     }));
   }
 
-  /** A bare fetch-continuation MODULE authored in isolation — the `on` module of
-   *  an `after.fetch`/`http.fetch`, driven standalone given an upstream result
-   *  (parallel to `sendCallback`, but the fetch-result surface rather than the
-   *  send-callback one). The response lands flattened on `request.{status,
-   *  done, body}` and the echoed `ctx` bare on `request.ctx` — the same shape a
-   *  folded `FetchHandle.resolve` produces, so a `_rp/complete.mjs`-style module
-   *  is testable without standing up the emitter that would reach it. `status`
-   *  is the single success signal (2xx = ok, 0 = transport failure) — there is
-   *  no `request.ok`.
+  /** A bare fetch-continuation MODULE authored in isolation — the `on_chunk`
+   *  module of an UNBOUND `http.fetch`/`http.subscribe` (or a `_rp/complete.mjs`
+   *  internal continuation), driven standalone given an upstream result. Unlike
+   *  a BOUND `after.fetch` `{on}` (which resumes an export in the SAME held
+   *  module — that's `fetch().resolve()`), an unbound cross-module continuation
+   *  is a SEPARATE chain: the worker delivers NO top-level flatten
+   *  (`fireFetchEventActivation`, `activation_entity == null`). The result rides
+   *  `request.activation.{status, final, bytes}` (the chunk payload is on
+   *  `request.activation.bytes`, a Uint8Array — decode it for text), and the
+   *  echoed `ctx` is bare on `request.ctx`. `status` is the single success
+   *  signal (2xx = ok, 0 = transport failure) — there is no `request.ok`, and no
+   *  top-level `request.status`/`.done`/`.body`.
    *
    *  spec: { on: "<continuation module path>", ctx?: <echoed context>,
-   *          status?, done?, body? }
-   */
+   *          status?, done?, body?, chunkSeq?, byteOffset?, fetchId? } */
   fetchResult(spec = {}) {
     if (typeof spec.on !== "string")
       throw new Error("fetchResult({ on }): `on` must be the continuation module path");
-    const status = spec.status != null ? spec.status : 200;
     const done = spec.done != null ? spec.done : true;
-    // Mirror the bound-resume surface prod builds (globals.zig): chunkSeq /
-    // fetchesPending / fetchId on every event; status/bodyTruncated
-    // TERMINAL-only (defaulted only when done — an explicit spec still wins;
-    // no `ok` — status is the single success signal).
-    const request = {
-      done,
-      body: spec.body != null ? spec.body : null,
-      chunkSeq: spec.chunkSeq != null ? spec.chunkSeq : 0,
-      fetchesPending: spec.fetchesPending != null ? spec.fetchesPending : 1,
+    // The unbound activation bag: seq/byteOffset/final on every event, the
+    // chunk payload as base64 (→ request.activation.bytes), and status/
+    // bodyTruncated TERMINAL-only. NO top-level fields (leaving status/done/
+    // chunkSeq/fetchId off `request` keeps the worker's no-flatten shape —
+    // root.zig gates `result` on their presence).
+    const activation = {
+      kind: "fetch_chunk",
+      seq: spec.chunkSeq != null ? spec.chunkSeq : 0,
+      byteOffset: spec.byteOffset != null ? spec.byteOffset : 0,
+      final: done,
     };
-    if (spec.fetchId != null) request.fetchId = spec.fetchId;
-    if (done || spec.status != null) request.status = status;
-    if (done) request.bodyTruncated = spec.bodyTruncated != null ? spec.bodyTruncated : false;
+    if (spec.body != null) {
+      const bytes = spec.body instanceof Uint8Array ? spec.body : utf8Bytes(typeof spec.body === "string" ? spec.body : JSON.stringify(spec.body));
+      activation.bytesB64 = b64(bytes);
+    }
+    if (spec.fetchId != null) activation.fetchId = spec.fetchId;
+    if (done) {
+      activation.status = spec.status != null ? spec.status : 200;
+      activation.bodyTruncated = spec.bodyTruncated != null ? spec.bodyTruncated : false;
+    } else if (spec.status != null) {
+      activation.status = spec.status;
+    }
     return new Node(this, this._base({
       entry: spec.on, // the continuation module IS this activation's entry
       activation: "fetch_chunk",
       export: "default",
       ctx: spec.ctx === undefined ? null : spec.ctx,
-      request,
+      request: { activation },
     }));
   }
 
@@ -1730,6 +1740,25 @@ class ClosedWsNode extends Node {
   force() { return { disposition: "terminal", effects: [], response: null, ok: true }; }
   receive() { throw new Error("receive(): the WS connection closed before any frame ran — the worker established no chain (it is lazy on the first frame), so nothing can receive"); }
   disconnect() { throw new Error("disconnect(): the WS connection is already closed"); }
+}
+
+/** UTF-8 encode a JS string to a byte array — the wire bytes a handler reads
+ *  back (so `b64(utf8Bytes(s))` round-trips a multibyte body byte-exact, not the
+ *  latin1 truncation `b64(string)` would give). */
+function utf8Bytes(s) {
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    let c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00); i++; }
+    }
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+  }
+  return out;
 }
 
 /** Standard base64 (matches the epilogue's `atob`) — for binary WS frames,

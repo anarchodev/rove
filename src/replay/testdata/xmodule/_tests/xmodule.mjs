@@ -23,6 +23,8 @@ const solo = s.fetchResult({
 });
 expect(solo).toHaveWritten("result/beta", { ok: false, status: 502, body: "nope" });
 expect(solo.body).toEqual({ done: true, key: "beta" });
+// The surface is UNBOUND: no top-level flatten; the result is on request.activation.*
+expect(solo).toHaveWritten("surface/beta", { topStatus: true, activationKind: "fetch_chunk", bytesLen: 4 });
 
 // …and given a success.
 const soloOk = s.fetchResult({

@@ -451,15 +451,22 @@ is modeled by registering the subscriptions on the scenario:
 under a watched `prefix` then leaves one coalesced `_sub/dirty/{name}` write in the
 effect log (assert with `toHaveWritten`), exactly as production injects it.
 
-A bare **fetch continuation module** — the `on` of an `after.fetch`/`http.fetch`,
-in its own file — is drivable the same way with `scenario.fetchResult`, given an
-upstream result on the flattened `request.{status, ok, done, body}` surface:
+A bare **fetch continuation module** — the `on_chunk` of an UNBOUND
+`http.fetch`/`http.subscribe`, in its own file — is drivable with
+`scenario.fetchResult`. An unbound cross-module continuation is a *separate*
+chain, so it carries NO top-level flatten: the result rides
+`request.activation.{status, final, bytes}` (the payload is a `Uint8Array` on
+`request.activation.bytes` — decode with `TextDecoder`) and the echoed `ctx` is
+bare on `request.ctx`. (A BOUND `after.fetch` `{on}` resumes an export in the
+*same* held module — drive that with `fetch().resolve()`, which does carry the
+flatten.)
 
 ```js
 const done = s.fetchResult({
   on: "hooks/onFetched.mjs",
-  status: 502,                  // 5xx → the handler derives ok:false (no request.ok, #7)
-  ctx: { key: "beta" },        // arrives as request.ctx
+  status: 502,                 // on request.activation.status (5xx → the handler derives ok:false, #7)
+  body: "nope",                // on request.activation.bytes (Uint8Array)
+  ctx: { key: "beta" },        // arrives bare on request.ctx
 });
 expect(done).toHaveWritten("result/beta", { ok: false, status: 502 });
 ```
