@@ -422,6 +422,18 @@ const EPILOGUE_BODY =
     \\      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
     \\      __a.data = u; delete __a.dataB64;
     \\    }
+    \\    // An UNBOUND fetch/subscription continuation (http.fetch/http.subscribe
+    \\    // `on_chunk` → a separate module chain) carries the chunk payload as
+    \\    // base64 on the activation bag — there is no top-level flatten, so the
+    \\    // handler reads `request.activation.bytes`. Rebuild the Uint8Array
+    \\    // (parallel to `dataB64`; the JSON-serialized world can't carry raw
+    \\    // bytes otherwise).
+    \\    if (__a.bytesB64 != null) {
+    \\      const bin = atob(__a.bytesB64);
+    \\      const u = new Uint8Array(bin.length);
+    \\      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    \\      __a.bytes = u; delete __a.bytesB64;
+    \\    }
     \\    if (__a.kind == null) __a.kind = D.kind === "kv_wake" ? "kv" : D.kind;
     \\    // Bound-fetch resumes: fill prod's per-event bag (globals.zig
     \\    // fetch_chunk arm — fetchId/seq/byteOffset/bytes/final, + terminal
