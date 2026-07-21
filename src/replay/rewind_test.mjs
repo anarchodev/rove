@@ -1011,7 +1011,16 @@ class Clock {
     const pb = parent.force();
     const timers = parent._byKind("timer");
     if (!timers.length) throw new Error("clock.advance().fire(): the activation armed no after.ms timer wake");
-    const t = timers[0];
+    // The worker arms ONE timer slot per held connection — multiple after.ms
+    // calls overwrite it, so the LAST-registered interval/{on} is what fires
+    // (worker_dispatch.zig armCont: "last timer wins for the single timer
+    // slot"). Fire that one, not the first.
+    const t = timers[timers.length - 1];
+    // The timer fires only once the clock has reached its armed interval; prod
+    // never delivers a wake before then. An under-advanced .fire() is an
+    // authoring mistake (it would validate a resume prod can't produce).
+    if (this.ms < t.ms)
+      throw new Error(`clock.advance(${this.ms}ms).fire(): the clock has not reached the armed after.ms(${t.ms}) — advance by ≥ ${t.ms}ms`);
     const now = (parent.world.now_ms || 0) + this.ms;
     return resumeNode(parent, carrySources(parent.world, {
       entry: heldEntry(parent),
