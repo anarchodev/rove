@@ -117,9 +117,9 @@ pub fn setStreamComponents(
     module_path: []const u8,
     ctx_json: []const u8,
     initial_chunks: []const []const u8,
-    kv_prefixes: []const []const u8,
+    kv_prefixes: []const components_mod.KvArm,
     interval_ms: i64,
-    wake_to: ?[]const u8,
+    timer_on: ?[]const u8,
 ) !void {
     // Each block builds clones for one component then transfers
     // ownership via `reg.set`. The errdefer inside each block fires
@@ -178,22 +178,28 @@ pub fn setStreamComponents(
             &.{};
         errdefer if (kv_prefixes.len > 0) allocator.free(spine);
         var built: usize = 0;
-        errdefer for (spine[0..built]) |arm| allocator.free(arm.prefix);
-        for (kv_prefixes, 0..) |p, i| {
-            spine[i] = .{ .prefix = try allocator.dupe(u8, p) };
+        errdefer for (spine[0..built]) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        };
+        for (kv_prefixes, 0..) |src, i| {
+            const pfx = try allocator.dupe(u8, src.prefix);
+            errdefer allocator.free(pfx);
+            const on: ?[]u8 = if (src.on) |t| try allocator.dupe(u8, t) else null;
+            spine[i] = .{ .prefix = pfx, .on = on };
             built = i + 1;
         }
         const next_wake_ns: i64 = if (interval_ms > 0)
             @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
         else
             std.math.maxInt(i64);
-        const wt: ?[]u8 = if (wake_to) |t| try allocator.dupe(u8, t) else null;
-        errdefer if (wt) |t| allocator.free(t);
+        const to: ?[]u8 = if (timer_on) |t| try allocator.dupe(u8, t) else null;
+        errdefer if (to) |t| allocator.free(t);
         try server.reg.set(ent, current_coll, components_mod.StreamWakes, .{
             .interval_ms = interval_ms,
             .next_wake_ns = next_wake_ns,
             .kv_prefixes = spine,
-            .wake_to = wt,
+            .timer_on = to,
         });
     }
 }
@@ -438,33 +444,46 @@ fn rearmStreamWakes(
 ) void {
     const allocator = worker.allocator;
     var interval_ms: i64 = 0;
-    var wake_to: ?[]u8 = null;
+    var timer_on: ?[]u8 = null;
     var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     for (regs) |reg| {
         switch (reg.kind) {
-            .timer => interval_ms = reg.interval_ms,
+            // Per-arm routing: each arm keeps its own `{on}`; last timer wins.
+            .timer => {
+                interval_ms = reg.interval_ms;
+                if (timer_on) |old| allocator.free(old);
+                timer_on = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
+            },
             .kv => if (reg.prefix.len > 0) {
                 const dup = allocator.dupe(u8, reg.prefix) catch continue;
-                arms.append(allocator, .{ .prefix = dup }) catch allocator.free(dup);
+                const on: ?[]u8 = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
+                arms.append(allocator, .{ .prefix = dup, .on = on }) catch {
+                    allocator.free(dup);
+                    if (on) |t| allocator.free(t);
+                };
             },
-        }
-        if (reg.on) |t| {
-            if (wake_to) |old| allocator.free(old);
-            wake_to = allocator.dupe(u8, t) catch null;
         }
     }
     const kv_prefixes = arms.toOwnedSlice(allocator) catch {
-        for (arms.items) |arm| allocator.free(arm.prefix);
+        for (arms.items) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         arms.deinit(allocator);
-        if (wake_to) |t| allocator.free(t);
+        if (timer_on) |t| allocator.free(t);
         std.log.warn("rove-js stream wake rearm alloc failed; keeping prior arms", .{});
         return;
     };
-    for (wakes_st.kv_prefixes) |arm| allocator.free(arm.prefix);
+    // In-place mutation preserves `pending_batches` (undispatched groups)
+    // automatically — only the arm slice + exports are replaced.
+    for (wakes_st.kv_prefixes) |arm| {
+        allocator.free(arm.prefix);
+        if (arm.on) |t| allocator.free(t);
+    }
     if (wakes_st.kv_prefixes.len > 0) allocator.free(wakes_st.kv_prefixes);
     wakes_st.kv_prefixes = kv_prefixes;
-    if (wakes_st.wake_to) |old| allocator.free(old);
-    wakes_st.wake_to = wake_to;
+    if (wakes_st.timer_on) |old| allocator.free(old);
+    wakes_st.timer_on = timer_on;
     wakes_st.interval_ms = interval_ms;
     wakes_st.next_wake_ns = if (interval_ms > 0)
         now_ns + interval_ms * std.time.ns_per_ms
@@ -482,7 +501,7 @@ fn rearmStreamWakes(
 ///                non-empty StreamChain.module_path AND
 ///                StreamWakes.anyFired())`.
 ///   - **prep**:  read four stream components on the entity; resolve
-///                deployment; drain the fired arms (`drainFired`) into
+///                deployment; drain the fired arms (`nextWakeBatch`) into
 ///                the Request's wake_batch slice (fired prefixes,
 ///                issue #8); build request body = `{ctx}` with
 ///                `.wake_batch` activation.
@@ -804,8 +823,8 @@ fn finishStreamResume(
             ctx.chain_st.ctx_json = cval.ctx_json;
             cval.ctx_json = &.{};
             // Re-arm from this hop's registrations; empty ⇒ existing
-            // arms (and wake_to) ride untouched, so a quiet re-hold
-            // keeps listening without the re-arm ritual.
+            // arms (and their per-arm exports) ride untouched, so a quiet
+            // re-hold keeps listening without the re-arm ritual.
             if (ctx.pending_wakes.items.len > 0) rearmStreamWakes(worker, ctx.wakes_st, ctx.pending_wakes.items, ctx.now_ns);
             ctx.chain_st.activation_count += 1;
             // Log with the module that RAN (pre-re-aim path), then
@@ -919,28 +938,22 @@ fn finishStreamResume(
                 ctx.wakes_st.next_wake_ns = std.math.maxInt(i64);
             }
             // Replace the StreamWakes kv-wake registration with whatever
-            // the handler returned: free old arms, take ownership of the
-            // new prefixes as unfired arms (the (tenant, prefix) registry
-            // is a derived view recomputed on every match scan — no
-            // unregister step). On OOM keep the old arms — the chain
-            // stays armed with its previous watches rather than none.
-            if (components_mod.armsFromPrefixes(allocator, s2.kv_prefixes)) |arms| {
-                for (ctx.wakes_st.kv_prefixes) |arm| allocator.free(arm.prefix);
-                if (ctx.wakes_st.kv_prefixes.len > 0) allocator.free(ctx.wakes_st.kv_prefixes);
-                ctx.wakes_st.kv_prefixes = arms;
-                s2.kv_prefixes = &.{};
-            } else |_| {
-                std.log.warn("rove-js " ++ spec.site ++ ": wake rearm alloc failed; keeping prior arms", .{});
-                for (s2.kv_prefixes) |p| allocator.free(p);
-                if (s2.kv_prefixes.len > 0) allocator.free(s2.kv_prefixes);
-                s2.kv_prefixes = &.{};
+            // the handler returned: the arms already carry per-arm `{on}`,
+            // so transfer directly (the (tenant, prefix) registry is a
+            // derived view recomputed on every match scan — no unregister
+            // step). In-place mutation preserves `pending_batches`.
+            for (ctx.wakes_st.kv_prefixes) |arm| {
+                allocator.free(arm.prefix);
+                if (arm.on) |t| allocator.free(t);
             }
-            // The wake export re-arms with the registrations (last
-            // `{on}` wins; a hop with no `{on}` falls back to the
-            // conventional `onWake`).
-            if (ctx.wakes_st.wake_to) |old| allocator.free(old);
-            ctx.wakes_st.wake_to = s2.wake_to;
-            s2.wake_to = null;
+            if (ctx.wakes_st.kv_prefixes.len > 0) allocator.free(ctx.wakes_st.kv_prefixes);
+            ctx.wakes_st.kv_prefixes = s2.kv_prefixes;
+            s2.kv_prefixes = &.{};
+            // Per-arm routing: the timer + each kv arm re-arm into their
+            // own export.
+            if (ctx.wakes_st.timer_on) |old| allocator.free(old);
+            ctx.wakes_st.timer_on = s2.timer_on;
+            s2.timer_on = null;
             ctx.chain_st.activation_count += 1;
             // Log with the module that RAN, then re-aim the chain for
             // the NEXT activation — the one `next()` semantic: an
@@ -1039,22 +1052,20 @@ fn resumeStream(
         for (batch_owned) |*w| w.deinit(allocator);
         allocator.free(batch_owned);
     };
-    if (activation == .wake_batch) {
-        batch_owned = wakes_st.drainFired(allocator) catch
-            return error.ResumeWakeDrain;
-    }
-    // Wake resume targets the registrations' `{on}` export (`wake_to`,
-    // null → the conventional `onWake` via parseDispatch) — same
-    // routing as the cont (resumeContinuation) and WS
-    // (resumeWakeChainWs) wake paths. Owned snapshot: `wake_to`
-    // borrows StreamWakes, which the outcome arms' re-arm frees
-    // before the post-outcome tape capture runs (G3 — replay must
-    // invoke the same export).
-    const wake_export_owned: []const u8 = if (wakes_st.wake_to) |t|
-        allocator.dupe(u8, t) catch ""
-    else
-        "";
+    // Per-arm routing: a wake dispatches ONE export GROUP per tick (the
+    // earliest-fired arms sharing one `{on}`); other groups ride
+    // `pending_batches` and dispatch on later ticks — same as the cont
+    // (resumeContinuation) and WS (resumeWakeChainWs) paths. The group's
+    // export is an owned snapshot for the tape (G3 — replay invokes the
+    // same export), since the outcome arms' re-arm frees the component.
+    var wake_export_owned: []const u8 = "";
     defer if (wake_export_owned.len > 0) allocator.free(wake_export_owned);
+    if (activation == .wake_batch) {
+        const wb = (wakes_st.nextWakeBatch(allocator) catch
+            return error.ResumeWakeDrain) orelse components_mod.PendingWakeBatch{};
+        batch_owned = wb.entries;
+        wake_export_owned = wb.export_name;
+    }
     // A resumed stream handler re-arms its
     // wakes via `on.*` and emits more output via `stream.write()`, just
     // like the first hop. Wire both accumulators so `finishResponse`

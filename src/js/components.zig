@@ -184,7 +184,7 @@ pub const StreamChunks = struct {
 /// cap, and no overflow signal. `drainKvWakeInbox` marks kv arms
 /// fired; the per-tick timer-due detection (`serviceParkedStreams` /
 /// `sweepParkedContinuations`) stamps `timer_fired_ns`; every resume
-/// path drains via `drainFired`.
+/// path drains via `nextWakeBatch`.
 /// `next_wake_ns == maxInt(i64)` is the "no timer pending"
 /// sentinel; we never compare against it as an active deadline.
 pub const StreamWakes = struct {
@@ -201,15 +201,23 @@ pub const StreamWakes = struct {
     /// after the read view), so a watch never fires for state the handler
     /// already saw. 0 = unanchored (matches on any post-arm event).
     read_version: u64 = 0,
-    /// The `on.*` export a wake routes to — `"module.method"` or a bare
-    /// `"method"`, or null → the default `onWake` (the generic "edge
-    /// wake — go look" export). Allocator-owned; set from the last
-    /// `on.*` registration's `{on}` selector.
-    wake_to: ?[]u8 = null,
+    /// The interval timer's own `{on}` export (null → `onWake`).
+    /// Allocator-owned. Per-arm routing: the timer resumes into its own
+    /// export independent of the kv arms' exports.
+    timer_on: ?[]u8 = null,
+    /// Fired export groups awaiting dispatch, materialized at drain time
+    /// (`drainFiredGroup`). One `wake_batch` activation is dispatched per
+    /// batch, one per sweep tick, so a tick that fired several distinct
+    /// exports serializes across ticks (the "one resume per held chain
+    /// per tick" invariant). Materialized (not left on the arms) because
+    /// the resume's re-arm seam frees + rebuilds `kv_prefixes` — fired
+    /// state left on the arms would be clobbered by the very activation
+    /// that consumed the first group. Owned; freed in `deinit`.
+    pending_batches: std.ArrayListUnmanaged(PendingWakeBatch) = .empty,
 
-    /// True when at least one arm (kv or timer) fired since the last
-    /// drain — the "a resume is due" Msg predicate.
+    /// True when a resume is due — a queued batch, or any arm fired.
     pub fn anyFired(self: *const StreamWakes) bool {
+        if (self.pending_batches.items.len > 0) return true;
         if (self.timer_fired_ns != 0) return true;
         for (self.kv_prefixes) |arm| {
             if (arm.fired_at_ns != 0) return true;
@@ -217,59 +225,129 @@ pub const StreamWakes = struct {
         return false;
     }
 
-    /// Drain the fired arms into an owned `WakeEntry` slice (prefix
-    /// bytes duped; entries sorted by fire time) and reset the fired
-    /// state so nothing re-fires next sweep. Empty slice when nothing
-    /// fired (a `drainFired` on an idle chain is a no-op). On OOM the
-    /// fired state is left intact — the wake re-fires next tick, which
-    /// is safe under edge ("go look") semantics.
-    pub fn drainFired(
+    /// The next wake batch to dispatch, or null when nothing is due.
+    /// Queued batches (materialized on an earlier tick) drain first, in
+    /// order; otherwise partition this tick's freshly-fired arms by
+    /// export via `drainFiredGroup`. The returned batch is OWNED by the
+    /// caller — `deinit` it after dispatch. Call once per resume.
+    pub fn nextWakeBatch(
         self: *StreamWakes,
         allocator: std.mem.Allocator,
-    ) error{OutOfMemory}![]WakeEntry {
-        var count: usize = 0;
-        for (self.kv_prefixes) |arm| {
-            if (arm.fired_at_ns != 0) count += 1;
-        }
-        if (self.timer_fired_ns != 0) count += 1;
-        if (count == 0) return &.{};
+    ) error{OutOfMemory}!?PendingWakeBatch {
+        if (self.pending_batches.items.len > 0)
+            return self.pending_batches.orderedRemove(0);
+        return self.drainFiredGroup(allocator);
+    }
 
-        const out = try allocator.alloc(WakeEntry, count);
-        var built: usize = 0;
-        errdefer {
-            for (out[0..built]) |*w| w.deinit(allocator);
-            allocator.free(out);
-        }
+    /// The resolved export a fired arm routes to (`onWake` default applied).
+    fn armExport(on: ?[]const u8) []const u8 {
+        return if (on) |t| (if (t.len > 0) t else "onWake") else "onWake";
+    }
+
+    /// Partition ALL fired arms (kv + timer) by resolved export, return
+    /// the EARLIEST-fired group as an owned batch, and enqueue the rest
+    /// on `pending_batches` (one activation per group, one per tick).
+    /// Groups are ordered by their earliest member's `(fired_at_ns, arm
+    /// index)` — a single inbox drain stamps every matched arm with the
+    /// same `now_ns`, so the arm-index tiebreak keeps selection
+    /// deterministic (and replay-faithful). All-or-nothing on OOM: every
+    /// dup is built into locals first; on failure the fired state is left
+    /// intact so the wake retries next tick (the retry-safe drain contract).
+    fn drainFiredGroup(
+        self: *StreamWakes,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}!?PendingWakeBatch {
+        var fired_count: usize = 0;
         for (self.kv_prefixes) |arm| {
+            if (arm.fired_at_ns != 0) fired_count += 1;
+        }
+        if (self.timer_fired_ns != 0) fired_count += 1;
+        if (fired_count == 0) return null;
+
+        // Gather fired refs (borrowed) in a deterministic order key
+        // `(fired_at_ns, order)`: kv arms carry their arm index; the timer
+        // sorts last on an exact tie.
+        const Ref = struct { export_name: []const u8, tag: WakeEntry.Tag, prefix: []const u8, fired_at_ns: i64, order: usize };
+        const refs = try allocator.alloc(Ref, fired_count);
+        defer allocator.free(refs);
+        var ri: usize = 0;
+        for (self.kv_prefixes, 0..) |arm, idx| {
             if (arm.fired_at_ns == 0) continue;
-            out[built] = .{
-                .tag = .kv,
-                .prefix = try allocator.dupe(u8, arm.prefix),
-                .fired_at_ns = arm.fired_at_ns,
-            };
-            built += 1;
+            refs[ri] = .{ .export_name = armExport(arm.on), .tag = .kv, .prefix = arm.prefix, .fired_at_ns = arm.fired_at_ns, .order = idx };
+            ri += 1;
         }
         if (self.timer_fired_ns != 0) {
-            out[built] = .{ .tag = .timer, .fired_at_ns = self.timer_fired_ns };
-            built += 1;
+            refs[ri] = .{ .export_name = armExport(self.timer_on), .tag = .timer, .prefix = "", .fired_at_ns = self.timer_fired_ns, .order = std.math.maxInt(usize) };
+            ri += 1;
         }
-        // Every dupe landed — reset fired state now (not before: an
-        // OOM above must leave the arms fired so the wake retries).
-        for (self.kv_prefixes) |*arm| arm.fired_at_ns = 0;
-        self.timer_fired_ns = 0;
-        std.mem.sort(WakeEntry, out, {}, struct {
-            fn lessThan(_: void, a: WakeEntry, b: WakeEntry) bool {
-                return a.fired_at_ns < b.fired_at_ns;
+        std.mem.sort(Ref, refs, {}, struct {
+            fn lessThan(_: void, a: Ref, b: Ref) bool {
+                if (a.fired_at_ns != b.fired_at_ns) return a.fired_at_ns < b.fired_at_ns;
+                return a.order < b.order;
             }
         }.lessThan);
-        return out;
+
+        // Build the owned batches — group refs by resolved export in
+        // first-appearance (== earliest-fired) order. All-or-nothing:
+        // `batches` frees fully on any error; fired state untouched.
+        var batches: std.ArrayListUnmanaged(PendingWakeBatch) = .empty;
+        errdefer {
+            for (batches.items) |*b| b.deinit(allocator);
+            batches.deinit(allocator);
+        }
+        for (refs) |ref| {
+            // Find this export's batch (linear — the arm count is small).
+            var batch: ?*PendingWakeBatch = null;
+            for (batches.items) |*b| {
+                if (std.mem.eql(u8, b.export_name, ref.export_name)) {
+                    batch = b;
+                    break;
+                }
+            }
+            if (batch == null) {
+                const exp = try allocator.dupe(u8, ref.export_name);
+                errdefer allocator.free(exp);
+                try batches.append(allocator, .{ .export_name = exp, .entries = &.{} });
+                batch = &batches.items[batches.items.len - 1];
+            }
+            const b = batch.?;
+            // Grow the batch's entries by one (owned). Alloc grown first,
+            // then dup the prefix — free grown if the dup OOMs so nothing
+            // orphans (the outer errdefer frees `prev` via the batch).
+            const prev = b.entries;
+            const grown = try allocator.alloc(WakeEntry, prev.len + 1);
+            errdefer allocator.free(grown);
+            @memcpy(grown[0..prev.len], prev);
+            const pfx: []u8 = if (ref.tag == .kv) try allocator.dupe(u8, ref.prefix) else &.{};
+            grown[prev.len] = .{ .tag = ref.tag, .prefix = pfx, .fired_at_ns = ref.fired_at_ns };
+            if (prev.len > 0) allocator.free(prev);
+            b.entries = grown;
+        }
+
+        // Reserve room for the enqueued remainder BEFORE committing — the
+        // last fallible step.
+        try self.pending_batches.ensureUnusedCapacity(allocator, batches.items.len - 1);
+
+        // Commit (infallible from here): reset fired state, enqueue the
+        // non-earliest groups, hand back the earliest.
+        for (self.kv_prefixes) |*arm| arm.fired_at_ns = 0;
+        self.timer_fired_ns = 0;
+        const first = batches.items[0];
+        for (batches.items[1..]) |b| self.pending_batches.appendAssumeCapacity(b);
+        batches.deinit(allocator); // spine only — entries moved out
+        return first;
     }
 
     pub fn deinit(allocator: std.mem.Allocator, items: []StreamWakes) void {
         for (items) |*item| {
-            for (item.kv_prefixes) |arm| allocator.free(arm.prefix);
+            for (item.kv_prefixes) |arm| {
+                allocator.free(arm.prefix);
+                if (arm.on) |t| allocator.free(t);
+            }
             if (item.kv_prefixes.len > 0) allocator.free(item.kv_prefixes);
-            if (item.wake_to) |t| allocator.free(t);
+            if (item.timer_on) |t| allocator.free(t);
+            for (item.pending_batches.items) |*b| b.deinit(allocator);
+            item.pending_batches.deinit(allocator);
             item.* = .{};
         }
     }
@@ -283,6 +361,30 @@ pub const StreamWakes = struct {
 pub const KvArm = struct {
     prefix: []u8 = &.{},
     fired_at_ns: i64 = 0,
+    /// This arm's `{on}` resume export — `"module.method"` / a bare
+    /// `"method"`, or null → the default `onWake`. Allocator-owned.
+    /// Per-arm so a chain arming `after.kv(a,{on:onA})` + `after.kv(b,
+    /// {on:onB})` routes each fired prefix to its own export, not a
+    /// single chain-level last-wins target.
+    on: ?[]u8 = null,
+};
+
+/// A fired export GROUP materialized at drain time. One `wake_batch`
+/// activation is dispatched per batch (one per sweep tick). Materialized
+/// (export + entries owned) so it survives the arm slice being freed +
+/// rebuilt by the resume's re-arm seam — fired state left ON the arms
+/// would be clobbered by the very activation that consumed the first
+/// group. `export_name` has the `onWake` default already resolved.
+pub const PendingWakeBatch = struct {
+    export_name: []u8 = &.{},
+    entries: []WakeEntry = &.{},
+
+    pub fn deinit(self: *PendingWakeBatch, allocator: std.mem.Allocator) void {
+        if (self.export_name.len > 0) allocator.free(self.export_name);
+        for (self.entries) |*e| e.deinit(allocator);
+        if (self.entries.len > 0) allocator.free(self.entries);
+        self.* = .{};
+    }
 };
 
 /// Wrap freshly-registered prefix strings into unfired arms. Takes
@@ -689,7 +791,7 @@ test "StreamWakes deinit frees kv arm spine + prefixes" {
     try testing.expectEqual(@as(usize, 0), items[0].kv_prefixes.len);
 }
 
-test "StreamWakes.drainFired surfaces fired PREFIXES (not keys), sorted, and resets" {
+test "nextWakeBatch surfaces fired PREFIXES (not keys), sorted, and resets (default export coalesces)" {
     const a = testing.allocator;
     const prefixes = try a.alloc([]u8, 3);
     prefixes[0] = try a.dupe(u8, "orders/");
@@ -705,27 +807,24 @@ test "StreamWakes.drainFired surfaces fired PREFIXES (not keys), sorted, and res
     sw.timer_fired_ns = 100;
     try testing.expect(sw.anyFired());
 
-    const drained = try sw.drainFired(a);
-    defer {
-        for (drained) |*w| w.deinit(a);
-        a.free(drained);
-    }
-    // quiet/ never fired → 2 kv entries + 1 timer, sorted by fire time.
-    try testing.expectEqual(@as(usize, 3), drained.len);
-    try testing.expectEqual(WakeEntry.Tag.kv, drained[0].tag);
-    try testing.expectEqualStrings("alerts/", drained[0].prefix);
-    try testing.expectEqual(WakeEntry.Tag.timer, drained[1].tag);
-    try testing.expectEqual(@as(i64, 100), drained[1].fired_at_ns);
-    try testing.expectEqual(WakeEntry.Tag.kv, drained[2].tag);
-    try testing.expectEqualStrings("orders/", drained[2].prefix);
+    // All default onWake → one group; entries sorted by fire time.
+    var wb = (try sw.nextWakeBatch(a)).?;
+    defer wb.deinit(a);
+    try testing.expectEqualStrings("onWake", wb.export_name);
+    try testing.expectEqual(@as(usize, 3), wb.entries.len);
+    try testing.expectEqual(WakeEntry.Tag.kv, wb.entries[0].tag);
+    try testing.expectEqualStrings("alerts/", wb.entries[0].prefix);
+    try testing.expectEqual(WakeEntry.Tag.timer, wb.entries[1].tag);
+    try testing.expectEqual(@as(i64, 100), wb.entries[1].fired_at_ns);
+    try testing.expectEqual(WakeEntry.Tag.kv, wb.entries[2].tag);
+    try testing.expectEqualStrings("orders/", wb.entries[2].prefix);
 
-    // Fired state fully reset — a second drain is empty.
+    // Fired state fully reset — nothing else due.
     try testing.expect(!sw.anyFired());
-    const again = try sw.drainFired(a);
-    try testing.expectEqual(@as(usize, 0), again.len);
+    try testing.expectEqual(@as(?PendingWakeBatch, null), try sw.nextWakeBatch(a));
 }
 
-test "StreamWakes.drainFired dedupes per arm — N matches surface once" {
+test "nextWakeBatch dedupes per arm — N matches surface once" {
     const a = testing.allocator;
     const prefixes = try a.alloc([]u8, 1);
     prefixes[0] = try a.dupe(u8, "feed/");
@@ -739,14 +838,70 @@ test "StreamWakes.drainFired dedupes per arm — N matches surface once" {
     sw.kv_prefixes[0].fired_at_ns = 20;
     sw.kv_prefixes[0].fired_at_ns = 30;
 
-    const drained = try sw.drainFired(a);
-    defer {
-        for (drained) |*w| w.deinit(a);
-        a.free(drained);
-    }
-    try testing.expectEqual(@as(usize, 1), drained.len);
-    try testing.expectEqualStrings("feed/", drained[0].prefix);
-    try testing.expectEqual(@as(i64, 30), drained[0].fired_at_ns);
+    var wb = (try sw.nextWakeBatch(a)).?;
+    defer wb.deinit(a);
+    try testing.expectEqual(@as(usize, 1), wb.entries.len);
+    try testing.expectEqualStrings("feed/", wb.entries[0].prefix);
+    try testing.expectEqual(@as(i64, 30), wb.entries[0].fired_at_ns);
+}
+
+test "nextWakeBatch: arms sharing the default export coalesce into ONE batch" {
+    const a = testing.allocator;
+    const prefixes = try a.alloc([]u8, 2);
+    prefixes[0] = try a.dupe(u8, "orders/");
+    prefixes[1] = try a.dupe(u8, "alerts/");
+    var items = [_]StreamWakes{.{ .kv_prefixes = try armsFromPrefixes(a, prefixes) }};
+    defer StreamWakes.deinit(a, &items);
+    const sw = &items[0];
+    sw.kv_prefixes[0].fired_at_ns = 50;
+    sw.kv_prefixes[1].fired_at_ns = 60;
+    sw.timer_fired_ns = 55; // all default onWake (no {on})
+
+    var b0 = (try sw.nextWakeBatch(a)).?;
+    defer b0.deinit(a);
+    try testing.expectEqualStrings("onWake", b0.export_name);
+    try testing.expectEqual(@as(usize, 3), b0.entries.len); // 2 kv + timer, one group
+    try testing.expect(!sw.anyFired()); // fully drained, nothing queued
+    try testing.expectEqual(@as(?PendingWakeBatch, null), try sw.nextWakeBatch(a));
+}
+
+test "nextWakeBatch: distinct exports → earliest returned, rest queued (per-arm routing)" {
+    const a = testing.allocator;
+    const prefixes = try a.alloc([]u8, 2);
+    prefixes[0] = try a.dupe(u8, "msg/");
+    prefixes[1] = try a.dupe(u8, "job/");
+    var items = [_]StreamWakes{.{ .kv_prefixes = try armsFromPrefixes(a, prefixes) }};
+    defer StreamWakes.deinit(a, &items);
+    const sw = &items[0];
+    sw.kv_prefixes[0].on = try a.dupe(u8, "onMsg");
+    sw.kv_prefixes[1].on = try a.dupe(u8, "onJob");
+    sw.timer_on = try a.dupe(u8, "onTimeout");
+    // job/ fired first (t=10), then the timer (t=20), then msg/ (t=30).
+    sw.kv_prefixes[1].fired_at_ns = 10;
+    sw.timer_fired_ns = 20;
+    sw.kv_prefixes[0].fired_at_ns = 30;
+
+    // First dispatch: the earliest group (onJob).
+    var b0 = (try sw.nextWakeBatch(a)).?;
+    try testing.expectEqualStrings("onJob", b0.export_name);
+    try testing.expectEqual(@as(usize, 1), b0.entries.len);
+    try testing.expectEqualStrings("job/", b0.entries[0].prefix);
+    b0.deinit(a);
+    try testing.expect(sw.anyFired()); // two groups still queued
+
+    // Next tick: onTimeout, then onMsg — fire-time order preserved.
+    var b1 = (try sw.nextWakeBatch(a)).?;
+    try testing.expectEqualStrings("onTimeout", b1.export_name);
+    try testing.expectEqual(WakeEntry.Tag.timer, b1.entries[0].tag);
+    b1.deinit(a);
+
+    var b2 = (try sw.nextWakeBatch(a)).?;
+    try testing.expectEqualStrings("onMsg", b2.export_name);
+    try testing.expectEqualStrings("msg/", b2.entries[0].prefix);
+    b2.deinit(a);
+
+    try testing.expect(!sw.anyFired());
+    try testing.expectEqual(@as(?PendingWakeBatch, null), try sw.nextWakeBatch(a));
 }
 
 test "armsFromPrefixes takes ownership; empty input is a no-op" {
