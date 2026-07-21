@@ -79,7 +79,17 @@ pub const Opts = struct {
     /// `{kind:"log", level:"warn"}` entries at the head of the bundle's
     /// effect log. Empty for replayed (captured) worlds.
     warnings: []const []const u8 = &.{},
+    /// Registered kv triggers (issue #38): `_triggers/<prefix>/index` modules
+    /// whose before/after chains run on a matching customer `kv.set`/`kv.delete`
+    /// (mutate the value, or reject as `Error{code:"trigger_rejected"}`). Each is
+    /// statically imported as a namespace and dispatched from the epilogue kv
+    /// wrapper, so mutation/rejection are shared with the recorder.
+    triggers: []const TriggerReg = &.{},
 };
+
+/// A registered kv trigger: the watched key `prefix` + the resolved `module`
+/// specifier of its `_triggers/<prefix>/index.{mjs,js}` handler.
+pub const TriggerReg = struct { prefix: []const u8, module: []const u8 };
 
 /// The flattened fetch/callback result surface (handler-shape §7) — the fields
 /// a `request.body` already covers (the bytes) live in `Opts.body_bytes`;
@@ -161,6 +171,23 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     var buf = std.ArrayList(u8){};
     var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
     const w = &aw.writer;
+
+    // ── kv trigger registry (issue #38) ──
+    // Set BEFORE the IIFE so the kv wrapper sees it when the handler writes; the
+    // `ns` fields reference the `import * as __rove_trig_N` namespaces appended
+    // below (hoisted, so available here despite source order).
+    if (opts.triggers.len > 0) {
+        try w.writeAll("\n;globalThis.__rove_triggers = [");
+        for (opts.triggers, 0..) |t, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.writeAll("{prefix:");
+            try jsonStr(w, t.prefix);
+            try w.writeAll(",module:");
+            try jsonStr(w, t.module);
+            try w.print(",ns:__rove_trig_{d}}}", .{i});
+        }
+        try w.writeAll("];\n");
+    }
 
     // ── the data object `D` (a JS object literal, JSON-safe) ──
     // Async IIFE — the handler (and middleware `before`) may be async; the
@@ -256,6 +283,14 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     if (opts.middleware_path) |mp| {
         try w.writeAll("import * as __rove_mw from ");
         try jsonStr(w, mp);
+        try w.writeAll(";\n");
+    }
+    // Each registered trigger module, imported as a namespace (like the
+    // middleware) so its before/after exports run synchronously from the kv
+    // wrapper. Hoisted, so the `__rove_triggers` table above resolves them.
+    for (opts.triggers, 0..) |t, i| {
+        try w.print("import * as __rove_trig_{d} from ", .{i});
+        try jsonStr(w, t.module);
         try w.writeAll(";\n");
     }
 
@@ -537,10 +572,46 @@ const EPILOGUE_BODY =
     \\      __effects.push({ kind: "write", key: mkey, value: sub.prefix });
     \\    }
     \\  };
+    \\  // kv triggers (issue #38): `_triggers/<prefix>/index` modules whose
+    \\  // before/after chains run on a matching customer write (trigger_dispatch.zig).
+    \\  // The registry (globalThis.__rove_triggers, set before the IIFE) carries each
+    \\  // trigger's watched prefix + imported namespace. A before-put that returns a
+    \\  // STRING mutates the written value; a handler that THROWS rejects the write as
+    \\  // Error{code:"trigger_rejected"} ("<module>: <message>"). Platform-owned key
+    \\  // prefixes never fire (matches prod isPlatformKey); a depth cap guards
+    \\  // trigger-writes-that-re-fire recursion.
+    \\  const __TRIG_PLATFORM = ["_audit/", "_deploy/", "_callback/", "_magic/", "_triggers/", "_sessions/"];
+    \\  const __triggerHandler = (ns, op, timing) => { const nm = op === "put" ? (timing === "before" ? "beforePut" : "afterPut") : (timing === "before" ? "beforeDelete" : "afterDelete"); if (typeof ns[nm] === "function") return ns[nm]; if (typeof ns.default === "function") return ns.default; return null; };
+    \\  let __triggerDepth = 0;
+    \\  const __runTriggers = (op, timing, key, value) => {
+    \\    const trigs = globalThis.__rove_triggers;
+    \\    if (!trigs || trigs.length === 0 || __triggerDepth >= 16) return value;
+    \\    for (const p of __TRIG_PLATFORM) if (key.startsWith(p)) return value;
+    \\    const matched = trigs.filter((t) => key.startsWith(t.prefix));
+    \\    if (matched.length === 0) return value;
+    \\    // BEFORE: broad→narrow (shortest prefix first); AFTER: narrow→broad.
+    \\    matched.sort((a, b) => a.prefix.length - b.prefix.length);
+    \\    if (timing === "after") matched.reverse();
+    \\    let evValue = value == null ? null : String(value);
+    \\    let prev = __kvNative.get(key); prev = (prev === undefined || prev === null) ? null : String(prev);
+    \\    __triggerDepth++;
+    \\    try {
+    \\      for (const t of matched) {
+    \\        const handler = __triggerHandler(t.ns, op, timing);
+    \\        if (!handler) continue;
+    \\        const event = { key, value: evValue, previousValue: prev, op, timing, timestamp: (D.now_ms || 0), actor: null, depth: __triggerDepth - 1 };
+    \\        let ret;
+    \\        try { ret = handler(event); }
+    \\        catch (e) { const err = new Error(t.module + ": " + ((e && e.message) || String(e))); err.code = "trigger_rejected"; throw err; }
+    \\        if (op === "put" && timing === "before" && typeof ret === "string") { value = ret; evValue = ret; }
+    \\      }
+    \\    } finally { __triggerDepth--; }
+    \\    return value;
+    \\  };
     \\  globalThis.kv = {
     \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
-    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val); const r = __kvNative.set(k, val); if (!ks.startsWith(__NS)) { __effects.push({ kind: "write", key: ks, value: val }); __markDirty(ks); } return r; },
-    \\    delete(k) { const ks = __kvGuardWrite(k, false); const r = __kvNative.delete(k); if (!ks.startsWith(__NS)) { __effects.push({ kind: "delete", key: ks }); __markDirty(ks); } return r; },
+    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val); if (ks.startsWith(__NS)) return __kvNative.set(k, val); const mutated = __runTriggers("put", "before", ks, val); const r = __kvNative.set(k, mutated); __effects.push({ kind: "write", key: ks, value: mutated }); __markDirty(ks); __runTriggers("put", "after", ks, mutated); return r; },
+    \\    delete(k) { const ks = __kvGuardWrite(k, false); if (ks.startsWith(__NS)) return __kvNative.delete(k); __runTriggers("delete", "before", ks, null); const r = __kvNative.delete(k); __effects.push({ kind: "delete", key: ks }); __markDirty(ks); __runTriggers("delete", "after", ks, null); return r; },
     \\    // Adapter: the worker's kv.prefix is positional; the replay
     \\    // NATIVE takes (prefix, {cursor, limit}) — convert here. A scan under the
     \\    // store namespace (a facade call) returns raw for the facade to strip;

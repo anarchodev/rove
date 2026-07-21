@@ -43,6 +43,9 @@ const HASH_HEX_LEN = @import("rove-files").HASH_HEX_LEN;
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
 pub const Source = struct { path: []const u8, kind: []const u8, source: []const u8 };
+/// A registered kv trigger (issue #38): watched key `prefix` + the `module`
+/// specifier of its `_triggers/<prefix>/index` handler.
+pub const TriggerReg = struct { prefix: []const u8, module: []const u8 };
 
 pub const World = struct {
     entry: []const u8 = "index.mjs",
@@ -91,6 +94,10 @@ pub const World = struct {
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
+    /// Registered kv triggers (issue #38): `{ prefix, module }` — the epilogue
+    /// imports each module + dispatches its before/after chain on a matching
+    /// customer write.
+    triggers: []const TriggerReg = &.{},
     /// Per-world working-tree source dir. When present it overrides the
     /// caller's `--source-dir` for this run — the channel the JS test library's
     /// `scenario({ sourceDir })` uses to resolve handler code (the harness reads
@@ -152,7 +159,7 @@ pub const Error = error{BadWorld} || std.mem.Allocator.Error;
 const TOP_KEYS = [_][]const u8{
     "entry",   "activation", "export",  "source_dir", "ctx",     "seed",
     "now_ms",  "arena_gc",   "captured", "request",   "kv",      "expected",
-    "sources", "app_imports", "packages",
+    "sources", "app_imports", "packages", "triggers",
 };
 /// The full set of `request.*` keys (same strictness rationale).
 const REQ_KEYS = [_][]const u8{
@@ -330,6 +337,19 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             try ss.append(a, .{ .path = p, .kind = jStr(e.object, "kind") orelse "handler", .source = src });
         }
         w.sources = try ss.toOwnedSlice(a);
+    }
+
+    // ── kv triggers: [{ prefix, module }] (issue #38) ──
+    if (obj.get("triggers")) |tv| {
+        if (tv != .array) return Error.BadWorld;
+        var ts = std.ArrayList(TriggerReg){};
+        for (tv.array.items) |e| {
+            if (e != .object) continue;
+            const prefix = jStr(e.object, "prefix") orelse continue;
+            const module = jStr(e.object, "module") orelse continue;
+            try ts.append(a, .{ .prefix = prefix, .module = module });
+        }
+        w.triggers = try ts.toOwnedSlice(a);
     }
 
     // ── packages: the resolved graph + inline package sources ──
