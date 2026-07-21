@@ -253,6 +253,21 @@ const SYSTEM_SHIM =
     \\      return mod(mod(R[0] * zi % p * zi, p), n) === r;
     \\    } catch (_) { return false; }
     \\  };
+    \\  // Offline OIDC provider signing (issue #46). Real RSA keygen is slow +
+    \\  // complex offline, so oidcGenerateKey returns a FIXED deterministic 2048-bit
+    \\  // dev key — the determinism contract is same run → same signatures
+    \\  // (replay-exact). The kid derives from the key so it's stable; a
+    \\  // keyset/rotation flow reuses this material (realistic enough for
+    \\  // provider-mode round-trip tests offline). `priv` is a sim-internal JSON
+    \\  // blob {n,d} — oidcGenerateKey/oidcSign are the only producer/consumer.
+    \\  var __OIDC_N = "sk2buuLi4Pv9BoOsn8-0m6TBjKbIDpa54s2JKccxMROnshPPL65yjeV9w7kkeRsXMslRfqwzR4KuOHjoPhhZUje5rmEEiZ5ewP-DB2nES3MLYN5nyA6Cr4-VriOyRQaYYFjWox8N-_d0z_DEEicwJud0sgQPNQltgeglNP4a64TbEZD4E20VnP6LjUXIqfG5_qSeIf9-VZoVFg08tH8K56gQwU9w4dPysMj_jySPev7oTqS7pbrM_J663f9x43ZQRn1cMjXQWCfJp9F6k-Eu4ov0iSu8_gIJWGQA46Sc8nVopsqnTPDu3e9YgU4BddaEBs8ybtKJkYkqSQ840Uj23w";
+    \\  var __OIDC_E = "AQAB";
+    \\  var __OIDC_D = "GVAbQ7TiML6VdU9MOoPqSA5jy-wBitCrIx-60UuOGEGKFSXqzAIgETT7XcXy_55w9KzP_QPFY-mRgkLn9ajPRXTTz4XGdyMcoJmlqG_DhlKW0vHAGg61Tuc7gLVgoZwGFeeG0TGfcp32325253zYwS0qy_r3jbgA6-hhH9zTRYwiRBPZ9ZhHVLyzMbTEEUmENqnNGgmY4vA3jUH0GW0Npaf2g8eQglfViniOo8t3DIMCA8faED3I_nTvThShBEy0Hfz5vPcWR9TvzHvM_5pK1gTslbpIvDaGaRjMzA2PGU3k-4FiFGK1SNGT5tSkRO4CfonydW_I9xNGD3wmYXyTwQ";
+    \\  var __OIDC_KID = "sim-rsa-" + nat.sha256(__OIDC_N).slice(0, 16);
+    \\  var __oidcGenerateKey = function(){ return { priv: JSON.stringify({ n: __OIDC_N, d: __OIDC_D }), jwk: { kty: "RSA", n: __OIDC_N, e: __OIDC_E, kid: __OIDC_KID, use: "sig", alg: "RS256" }, kid: __OIDC_KID }; };
+    \\  // RSASSA-PKCS1-v1.5 sign (RS256) over BigInt: EM = 00 01 FF..FF 00 ‖
+    \\  // DigestInfo(SHA-256(signingInput)); sig = EM^d mod n; return base64url.
+    \\  var __oidcSign = function(priv, signingInput){ var pk = (typeof priv === "string" && priv.charAt(0) === "{") ? JSON.parse(priv) : null; if (!pk || !pk.n || !pk.d) throw new Error("crypto.oidcSign: private key not from crypto.oidcGenerateKey (the offline sim uses its own key format)"); var b64u = globalThis.base64url; var n = __bytesBig(b64u.decode(pk.n)), d = __bytesBig(b64u.decode(pk.d)); var klen = 0, nn = n; while (nn > 0n){ nn >>= 8n; klen++; } var hex = nat.sha256(signingInput); var T = [0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20]; for (var i = 0; i < 32; i++) T.push(parseInt(hex.substr(i*2,2),16)); var em = [0x00, 0x01]; var padLen = klen - 3 - T.length; for (i = 0; i < padLen; i++) em.push(0xff); em.push(0x00); for (i = 0; i < T.length; i++) em.push(T[i]); var m = __bytesBig(em); var r = 1n, base = m % n, ee = d; while (ee > 0n){ if (ee & 1n) r = (r * base) % n; ee >>= 1n; base = (base * base) % n; } var sig = new Uint8Array(klen), mm = r; for (i = klen - 1; i >= 0; i--){ sig[i] = Number(mm & 0xffn); mm >>= 8n; } return b64u.encode(sig); };
     \\  // Per-instance / root kv isolation for `platform.*`. Each store namespaces
     \\  // its keys under `__rove_store/{tag}/` in the one closed-world map, so a
     \\  // scoped or root write never collides with the tenant's own kv (or another
@@ -332,7 +347,7 @@ const SYSTEM_SHIM =
     \\      verifyRsa: function(jwk, alg, data, sig){ return __sim_verifyRsa(jwk, alg, data, sig); },
     \\      verifyEcdsa: function(jwk, alg, data, sig){ return __sim_verifyEcdsa(jwk, alg, data, sig); },
     \\      ecdsaGenerateKey: no("ecdsaGenerateKey"), ecdsaSign: no("ecdsaSign"), ecdsaVerify: no("ecdsaVerify"),
-    \\      oidcGenerateKey: no("oidcGenerateKey"), oidcSign: no("oidcSign"),
+    \\      oidcGenerateKey: function(){ return __oidcGenerateKey(); }, oidcSign: function(priv, si){ return __oidcSign(priv, si); },
     \\    },
     \\    http: {
     \\      // Validation mirrors jsHttpFetch → buildFetchRow (bindings/http.zig).

@@ -1381,6 +1381,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/middlewarejs", // .js-spelled _middlewares runs too, .mjs preferred
         "src/replay/testdata/platformsurface", // http/platform/browser globals (effect recorders)
         "src/replay/testdata/oidcverify", // RS256 crypto.verifyRsa + jwt.verify offline
+        "src/replay/testdata/oidcprovider", // OIDC provider mode: oidcGenerateKey + oidcSign (RS256) → id_token mint + verify round-trip offline
         "src/replay/testdata/ecdsaverify", // ES256 crypto.verifyEcdsa (P-256) + jwt.verify offline
         "src/replay/testdata/effects", // real webhook/schedule shims → primitive effect log
         "src/replay/testdata/email", // email.send → webhook _send/owed marker (Resend)
