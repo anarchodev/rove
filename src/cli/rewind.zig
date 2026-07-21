@@ -24,6 +24,12 @@ const c = @import("common.zig");
 const replay = @import("rove-replay");
 const build_options = @import("build_options");
 
+// libc: pin the process timezone. `setenv` writes the `TZ` env; `tzset`
+// applies it to the timezone state `localtime_r` (quickjs-ng's date impl)
+// reads. Called once at startup to pin TZ=UTC.
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn tzset() void;
+
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
 const Cfg = struct {
@@ -927,6 +933,14 @@ const USAGE =
 ;
 
 pub fn main() void {
+    // Pin the process timezone to UTC before any JS reactor initializes, so the
+    // sim's local-time Date methods (getHours / getTimezoneOffset / toString)
+    // match production — prod servers run UTC. quickjs-ng's date impl goes
+    // through libc `localtime_r`, which reads the `TZ` env; set it + `tzset()`
+    // so handler time is UTC regardless of the developer's host TZ (issue #53).
+    _ = setenv("TZ", "UTC", 1);
+    tzset();
+
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     const gpa = gpa_state.allocator();
     var arena = std.heap.ArenaAllocator.init(gpa);
