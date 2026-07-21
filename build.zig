@@ -1420,6 +1420,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/timezone", // local-time Date methods run in UTC (TZ pinned), matching prod regardless of host TZ
         "src/replay/testdata/importclamp", // over-popped ../ imports clamp to the app root, not escape source_dir (prod resolveSpecifier)
         "src/replay/testdata/worldschema", // scenario() authors a binary inbound body (request.bytes) + an export override
+        "src/replay/testdata/snapshots", // toMatchSnapshot: call-site auto-names + stale-sidecar prune(--update)/warn
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

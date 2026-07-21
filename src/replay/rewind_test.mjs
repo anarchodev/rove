@@ -1635,6 +1635,20 @@ function b64(u) {
 
 let snapCounter = 0;
 
+/** Auto-name an unnamed `toMatchSnapshot()` by its CALL SITE (`file.mjs:line`)
+ *  rather than a global counter. A counter re-keys every later snapshot when an
+ *  assertion is inserted or reordered, so a stale baseline gets compared under a
+ *  shifted name (a spurious pass/fail). The call site is stable under reordering.
+ *  Falls back to the counter if the stack can't be parsed. The harness library's
+ *  own frames aren't `.mjs` (they load under `rewind:test`), so the first
+ *  `*.mjs:line` frame IS the test driver's call. */
+function autoSnapName() {
+  const stack = (new Error()).stack || "";
+  const m = /([A-Za-z0-9_./-]+\.mjs):(\d+):\d+/.exec(stack);
+  if (m) return `${m[1].split("/").pop()}:${m[2]}`;
+  return `snapshot-${++snapCounter}`;
+}
+
 export function expect(value) {
   return new Matcher(value, false);
 }
@@ -1732,7 +1746,7 @@ class Matcher {
   toMatchSnapshot(name) {
     const node = this._node("toMatchSnapshot");
     if (!node) return false;
-    const key = name || `snapshot-${++snapCounter}`;
+    const key = name || autoSnapName();
     const facets = snapshotFacets(node.force());
     const current = stable(facets);
     const stored = kv.get(SNAP_PREFIX + key);

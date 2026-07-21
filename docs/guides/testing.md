@@ -491,6 +491,10 @@ itself worth asserting if a handler is supposed to stay off that surface.
 effects into `_tests/__snapshots__/<file>.json`. The first run writes it; later
 runs compare; a mismatch fails until you re-baseline with `rewind test --update`.
 Useful for pinning a handler's whole behavior without spelling out every field.
+An unnamed `toMatchSnapshot()` is keyed by its call site (`file.mjs:line`), so
+reordering assertions doesn't re-key baselines. A stored snapshot no assertion
+reads (a deleted or renamed one) is warned about on a clean run and pruned by
+`--update` — the sidecar stays exactly the live set.
 
 ## What it does and doesn't tell you
 
