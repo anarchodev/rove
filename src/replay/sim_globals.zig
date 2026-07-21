@@ -143,11 +143,23 @@ const SYSTEM_SHIM =
     \\  var shaInit = function(){ return shaSer({ h: H256_0.slice(), len: 0, buf: [] }); };
     \\  var shaUpdate = function(tok, data){ var st = shaParse(tok); var bytes = shaBytes(data); var buf = st.buf.concat(bytes); var i = 0; while (buf.length - i >= 64) { shaCompress(st.h, buf.slice(i, i + 64)); i += 64; } st.buf = buf.slice(i); st.len += bytes.length; return shaSer(st); };
     \\  var shaFinal = function(tok){ var st = shaParse(tok); var buf = st.buf.slice(); buf.push(0x80); while (buf.length % 64 !== 56) buf.push(0x00); var bitHi = Math.floor(st.len / 0x20000000), bitLo = (st.len * 8) >>> 0; buf.push((bitHi >>> 24) & 0xff, (bitHi >>> 16) & 0xff, (bitHi >>> 8) & 0xff, bitHi & 0xff, (bitLo >>> 24) & 0xff, (bitLo >>> 16) & 0xff, (bitLo >>> 8) & 0xff, bitLo & 0xff); for (var i = 0; i < buf.length; i += 64) shaCompress(st.h, buf.slice(i, i + 64)); var out = ""; for (i = 0; i < 8; i++) out += hx8(st.h[i]); return out; };
-    \\  // RS256 verify (RSASSA-PKCS1-v1.5 + SHA-256) in pure JS over BigInt — the
-    \\  // common OIDC alg. Portable (no OpenSSL). sha384/512 + ECDSA not covered.
+    \\  // SHA-512 / SHA-384 one-shot (BigInt 64-bit words) — the portable engine
+    \\  // has native sha256 only. Drives RS384/RS512 verify (and ES384/512 later).
+    \\  // Round constants + IVs are FIPS 180-4; the compress loop mirrors sha256's
+    \\  // but over 64-bit words with the 512 rotation schedule. `bytes` is a byte
+    \\  // array (shaBytes UTF-8-encodes a string, matching nat.sha256).
+    \\  var __M64 = (1n << 64n) - 1n;
+    \\  var rotr64 = function(x, n){ var b = BigInt(n); return ((x >> b) | (x << (64n - b))) & __M64; };
+    \\  var K512 = [0x428a2f98d728ae22n,0x7137449123ef65cdn,0xb5c0fbcfec4d3b2fn,0xe9b5dba58189dbbcn,0x3956c25bf348b538n,0x59f111f1b605d019n,0x923f82a4af194f9bn,0xab1c5ed5da6d8118n,0xd807aa98a3030242n,0x12835b0145706fben,0x243185be4ee4b28cn,0x550c7dc3d5ffb4e2n,0x72be5d74f27b896fn,0x80deb1fe3b1696b1n,0x9bdc06a725c71235n,0xc19bf174cf692694n,0xe49b69c19ef14ad2n,0xefbe4786384f25e3n,0x0fc19dc68b8cd5b5n,0x240ca1cc77ac9c65n,0x2de92c6f592b0275n,0x4a7484aa6ea6e483n,0x5cb0a9dcbd41fbd4n,0x76f988da831153b5n,0x983e5152ee66dfabn,0xa831c66d2db43210n,0xb00327c898fb213fn,0xbf597fc7beef0ee4n,0xc6e00bf33da88fc2n,0xd5a79147930aa725n,0x06ca6351e003826fn,0x142929670a0e6e70n,0x27b70a8546d22ffcn,0x2e1b21385c26c926n,0x4d2c6dfc5ac42aedn,0x53380d139d95b3dfn,0x650a73548baf63den,0x766a0abb3c77b2a8n,0x81c2c92e47edaee6n,0x92722c851482353bn,0xa2bfe8a14cf10364n,0xa81a664bbc423001n,0xc24b8b70d0f89791n,0xc76c51a30654be30n,0xd192e819d6ef5218n,0xd69906245565a910n,0xf40e35855771202an,0x106aa07032bbd1b8n,0x19a4c116b8d2d0c8n,0x1e376c085141ab53n,0x2748774cdf8eeb99n,0x34b0bcb5e19b48a8n,0x391c0cb3c5c95a63n,0x4ed8aa4ae3418acbn,0x5b9cca4f7763e373n,0x682e6ff3d6b2b8a3n,0x748f82ee5defb2fcn,0x78a5636f43172f60n,0x84c87814a1f0ab72n,0x8cc702081a6439ecn,0x90befffa23631e28n,0xa4506cebde82bde9n,0xbef9a3f7b2c67915n,0xc67178f2e372532bn,0xca273eceea26619cn,0xd186b8c721c0c207n,0xeada7dd6cde0eb1en,0xf57d4f7fee6ed178n,0x06f067aa72176fban,0x0a637dc5a2c898a6n,0x113f9804bef90daen,0x1b710b35131c471bn,0x28db77f523047d84n,0x32caab7b40c72493n,0x3c9ebe0a15c9bebcn,0x431d67c49c100d4cn,0x4cc5d4becb3e42b6n,0x597f299cfc657e2an,0x5fcb6fab3ad6faecn,0x6c44198c4a475817n];
+    \\  var H512_0 = [0x6a09e667f3bcc908n,0xbb67ae8584caa73bn,0x3c6ef372fe94f82bn,0xa54ff53a5f1d36f1n,0x510e527fade682d1n,0x9b05688c2b3e6c1fn,0x1f83d9abfb41bd6bn,0x5be0cd19137e2179n];
+    \\  var H384_0 = [0xcbbb9d5dc1059ed8n,0x629a292a367cd507n,0x9159015a3070dd17n,0x152fecd8f70e5939n,0x67332667ffc00b31n,0x8eb44a8768581511n,0xdb0c2e0d64f98fa7n,0x47b5481dbefa4fa4n];
+    \\  var __sim_sha512 = function(bytes, is384){ var H = (is384 ? H384_0 : H512_0).slice(); var msg = bytes.slice(); var bitLen = BigInt(bytes.length) * 8n; msg.push(0x80); while (msg.length % 128 !== 112) msg.push(0); for (var i = 15; i >= 0; i--) msg.push(Number((bitLen >> BigInt(i*8)) & 0xffn)); for (var off = 0; off < msg.length; off += 128){ var w = new Array(80), t, x, j; for (t = 0; t < 16; t++){ x = 0n; for (j = 0; j < 8; j++) x = (x << 8n) | BigInt(msg[off+t*8+j]); w[t] = x; } for (t = 16; t < 80; t++){ var s0 = rotr64(w[t-15],1) ^ rotr64(w[t-15],8) ^ (w[t-15] >> 7n); var s1 = rotr64(w[t-2],19) ^ rotr64(w[t-2],61) ^ (w[t-2] >> 6n); w[t] = (w[t-16] + s0 + w[t-7] + s1) & __M64; } var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7]; for (t = 0; t < 80; t++){ var S1 = rotr64(e,14) ^ rotr64(e,18) ^ rotr64(e,41); var ch = (e & f) ^ ((~e & __M64) & g); var t1 = (h + S1 + ch + K512[t] + w[t]) & __M64; var S0 = rotr64(a,28) ^ rotr64(a,34) ^ rotr64(a,39); var maj = (a & b) ^ (a & c) ^ (b & c); var t2 = (S0 + maj) & __M64; h=g; g=f; f=e; e=(d+t1)&__M64; d=c; c=b; b=a; a=(t1+t2)&__M64; } H[0]=(H[0]+a)&__M64; H[1]=(H[1]+b)&__M64; H[2]=(H[2]+c)&__M64; H[3]=(H[3]+d)&__M64; H[4]=(H[4]+e)&__M64; H[5]=(H[5]+f)&__M64; H[6]=(H[6]+g)&__M64; H[7]=(H[7]+h)&__M64; } var nwords = is384 ? 6 : 8, out = []; for (i = 0; i < nwords; i++) for (j = 7; j >= 0; j--) out.push(Number((H[i] >> BigInt(j*8)) & 0xffn)); return out; };
+    \\  var __bytesBig = function(b){ var x = 0n; for (var i = 0; i < b.length; i++) x = (x << 8n) | BigInt(b[i]); return x; };
+    \\  // RS256/384/512 verify (RSASSA-PKCS1-v1.5) in pure JS over BigInt — the
+    \\  // common OIDC algs. Portable (no OpenSSL). ECDSA below.
     \\  var __sim_verifyRsa = function(jwk, alg, data, sig){
     \\    var a = (alg || "sha256").toLowerCase();
-    \\    if (a !== "sha256") __cryptoGap("verifyRsa(" + a + ")"); // RS384/RS512 → loud gap, not silent false
+    \\    if (a !== "sha256" && a !== "sha384" && a !== "sha512") __cryptoGap("verifyRsa(" + a + ")");
     \\    try {
     \\      if (!jwk || jwk.kty !== "RSA") return false;
     \\      var b64u = globalThis.base64url;
@@ -164,34 +176,45 @@ const SYSTEM_SHIM =
     \\      if (em[0] !== 0x00 || em[1] !== 0x01) return false;
     \\      var p = 2; while (p < em.length && em[p] === 0xff) p++;
     \\      if (em[p] !== 0x00) return false; p++;
-    \\      var PFX = [0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20];
-    \\      var hex = nat.sha256(data), hash = new Uint8Array(32);
-    \\      for (var j = 0; j < 32; j++) hash[j] = parseInt(hex.substr(j*2, 2), 16);
-    \\      if (em.length - p !== PFX.length + 32) return false;
+    \\      // DigestInfo: the PKCS#1-v1.5 ASN.1 prefix + the digest, per alg
+    \\      // (RFC 8017). sha384/512 hash via the pure-JS __sim_sha512.
+    \\      var hash, PFX;
+    \\      if (a === "sha384") { hash = __sim_sha512(shaBytes(data), true); PFX = [0x30,0x41,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x02,0x05,0x00,0x04,0x30]; }
+    \\      else if (a === "sha512") { hash = __sim_sha512(shaBytes(data), false); PFX = [0x30,0x51,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x03,0x05,0x00,0x04,0x40]; }
+    \\      else { var hex = nat.sha256(data); hash = []; for (var j = 0; j < 32; j++) hash.push(parseInt(hex.substr(j*2, 2), 16)); PFX = [0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20]; }
+    \\      if (em.length - p !== PFX.length + hash.length) return false;
     \\      for (var k = 0; k < PFX.length; k++) if (em[p + k] !== PFX[k]) return false;
-    \\      for (var k2 = 0; k2 < 32; k2++) if (em[p + PFX.length + k2] !== hash[k2]) return false;
+    \\      for (var k2 = 0; k2 < hash.length; k2++) if (em[p + PFX.length + k2] !== hash[k2]) return false;
     \\      return true;
     \\    } catch (_) { return false; }
     \\  };
-    \\  // ES256 verify (ECDSA P-256 + SHA-256) in pure JS over BigInt. Point math
-    \\  // uses Jacobian coordinates so the whole verify costs ONE modular inverse
-    \\  // (at the end) instead of one per point op — affine would churn the bump
-    \\  // arena past any sane ceiling. Accepts JWS raw r||s (64B) or DER.
+    \\  // ES256/384/512 verify (ECDSA P-256/P-384/P-521 + SHA-256/384/512) in pure
+    \\  // JS over BigInt. Point math uses Jacobian coordinates (a = -3, shared by
+    \\  // every NIST P-curve) so the whole verify costs ONE modular inverse at the
+    \\  // end. Accepts JWS raw r||s (2·flen bytes) or DER. The digest is chosen by
+    \\  // `alg`, the curve by the jwk's `crv`.
     \\  var __sim_verifyEcdsa = function(jwk, alg, data, sig){
     \\    var a = (alg || "sha256").toLowerCase();
     \\    var crv = jwk && jwk.crv;
-    \\    // ES384/ES512 (sha384/512) and their curves (P-384/P-521) → loud gap.
-    \\    if (a !== "sha256") __cryptoGap("verifyEcdsa(" + a + ")");
-    \\    if (crv === "P-384" || crv === "P-521") __cryptoGap("verifyEcdsa(" + crv + ")");
+    \\    // Digest → e, by alg. sha384/512 via the pure-JS __sim_sha512.
+    \\    var digestE;
+    \\    if (a === "sha256") digestE = function(){ return BigInt("0x" + nat.sha256(data)); };
+    \\    else if (a === "sha384") digestE = function(){ return __bytesBig(__sim_sha512(shaBytes(data), true)); };
+    \\    else if (a === "sha512") digestE = function(){ return __bytesBig(__sim_sha512(shaBytes(data), false)); };
+    \\    else __cryptoGap("verifyEcdsa(" + a + ")");
+    \\    // Curve params, by crv (a = p-3 for all). flen = field byte length (the
+    \\    // raw r||s half-width). Unknown curve → loud gap.
+    \\    var C;
+    \\    if (crv === "P-256") C = { p: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn, n: 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n, Gx: 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n, Gy: 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n, flen: 32 };
+    \\    else if (crv === "P-384") C = { p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffffn, n: 0xffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973n, Gx: 0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7n, Gy: 0x3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5fn, flen: 48 };
+    \\    else if (crv === "P-521") C = { p: 0x1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn, n: 0x1fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409n, Gx: 0xc6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5bd66n, Gy: 0x11839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd16650n, flen: 66 };
+    \\    else __cryptoGap("verifyEcdsa(crv=" + String(crv) + ")");
     \\    try {
-    \\      if (!jwk || jwk.kty !== "EC" || jwk.crv !== "P-256") return false;
+    \\      if (!jwk || jwk.kty !== "EC") return false;
     \\      var b64u = globalThis.base64url;
-    \\      var toBig = function(b){ var x = 0n; for (var i = 0; i < b.length; i++) x = (x << 8n) | BigInt(b[i]); return x; };
-    \\      var p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+    \\      var toBig = __bytesBig;
+    \\      var p = C.p, n = C.n, Gx = C.Gx, Gy = C.Gy, flen = C.flen;
     \\      var acurve = p - 3n;
-    \\      var n = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
-    \\      var Gx = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n;
-    \\      var Gy = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n;
     \\      var mod = function(x, m){ x %= m; return x < 0n ? x + m : x; };
     \\      var inv = function(x, m){ var r = 1n, b = mod(x, m), e = m - 2n; while (e > 0n){ if (e & 1n) r = (r * b) % m; e >>= 1n; b = (b * b) % m; } return r; };
     \\      // Jacobian point [X, Y, Z]; Z === 0n is the point at infinity.
@@ -218,11 +241,11 @@ const SYSTEM_SHIM =
     \\      var Q = [toBig(b64u.decode(jwk.x)), toBig(b64u.decode(jwk.y)), 1n];
     \\      var sb = (typeof sig === "string") ? b64u.decode(sig) : sig;
     \\      var r, s;
-    \\      if (sb.length === 64){ r = toBig(sb.slice(0, 32)); s = toBig(sb.slice(32, 64)); }
+    \\      if (sb.length === 2 * flen){ r = toBig(sb.slice(0, flen)); s = toBig(sb.slice(flen, 2 * flen)); }
     \\      else if (sb[0] === 0x30){ var i = 2; if (sb[1] & 0x80) i = 2 + (sb[1] & 0x7f); var rl = sb[i + 1]; r = toBig(sb.slice(i + 2, i + 2 + rl)); i = i + 2 + rl; var sl = sb[i + 1]; s = toBig(sb.slice(i + 2, i + 2 + sl)); }
     \\      else return false;
     \\      if (r <= 0n || r >= n || s <= 0n || s >= n) return false;
-    \\      var e = BigInt("0x" + nat.sha256(data));
+    \\      var e = digestE();
     \\      var w = inv(s, n);
     \\      var R = jadd(jmul(mod(e * w, n), [Gx, Gy, 1n]), jmul(mod(r * w, n), Q));
     \\      if (R[2] === 0n) return false;
