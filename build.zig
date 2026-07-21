@@ -670,7 +670,8 @@ pub fn build(b: *std.Build) void {
     // gated on `--sse-listen`; single-node only). Workers hand emits
     // via the in-process `Handle.enqueueEmit` queue — no cross-process
     // rendezvous, no `--sse-public-base`, no `SSE_INTERNAL_TOKEN`.
-    // See `docs/sse-plan.md` + `docs/connection-actor-plan.md` §6.2.
+    // See `docs/architecture/routing-and-ingress.md` (SSE) +
+    // `docs/architecture/websockets.md` (the connection actor).
 
     // rewind-logs: Phase 5.5 (a) step 2 — runs the new
     // S3-direct logs indexer + h2 query API as a standalone process.

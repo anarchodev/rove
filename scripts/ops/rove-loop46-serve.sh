@@ -26,7 +26,7 @@
 #   DATA_DIR, WORKERS
 #   (BASE_DOMAIN = customer wildcard; SYSTEM_DOMAIN = system surfaces
 #    — admin/replay. They MUST be different registrable domains; see
-#    docs/auth-domain-plan.md §1.)
+#    docs/architecture/auth-and-domains.md.)
 #   ROVE_TOKEN  (optional; if set, (re-)installs a root bearer token)
 
 set -euo pipefail

@@ -74,7 +74,8 @@ fn checkProxyWarning(rh: h2.ReqHeaders) void {
                 "rove-h2: no X-Forwarded-For header seen in {d} requests. " ++
                     "rove-h2 is HTTP/2-only; if this worker faces the public " ++
                     "internet you need an edge proxy (Cloudflare / ALB / nginx) " ++
-                    "translating HTTP/1.x → h2. See docs/deployment.md.",
+                    "translating HTTP/1.x → h2. See "
+                    ++ "docs/architecture/configuration-and-network.md.",
                 .{n},
             );
         }
