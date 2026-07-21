@@ -60,7 +60,10 @@ expect(req).toHaveFetched(/stripe/);
   JSON-stringified for you, so you can write `{ item: "book" }` instead of a
   hand-escaped string.
 - `now` — a fixed clock (ISO string or ms). `Date.now()` in the handler returns
-  it, so time-dependent handlers are deterministic.
+  it, so time-dependent handlers are deterministic. Handler time is **UTC**:
+  local-time `Date` methods (`getHours`, `getTimezoneOffset`, `toString`) run in
+  UTC regardless of your machine's timezone, matching production (UTC servers) —
+  so a date-formatting test can't green offline and shift in prod.
 - `seed` — the deterministic seed for `Math.random()` / `crypto.randomUUID()`.
 - `sourceDir` — where handler code resolves from (defaults to the app dir you
   ran `rewind test` in). Use it to point a scenario at a different tree.
