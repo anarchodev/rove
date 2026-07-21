@@ -580,3 +580,8 @@ too: `crypto.oidcGenerateKey()` returns a fixed deterministic RSA dev key and
 keyset → mint → verify round-trip (and an ActivityPub HTTP-Signature delivery)
 runs offline — same run, same signatures. An unsupported alg/curve throws a loud
 "not available in `rewind test`" error rather than a silent wrong verdict.
+
+**CPU budget.** A handler has a wall-clock budget offline (a generous multiple of
+production's 1 s), so an accidental `while(true)` doesn't hang `rewind test` — it
+completes in bounded time with production's outcome: status 504, body `"handler
+exceeded cpu budget"`, `ok:false` (its effects roll back, like a throw).
