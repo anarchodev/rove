@@ -187,13 +187,12 @@ const StreamFirstHopMeta = struct {
     /// semantic: an explicit target re-aims the chain, so every
     /// resume dispatches there.
     module_path: []u8,
-    /// Owned. Tenant-scoped kv-key prefixes registered as wake
-    /// conditions (streaming-handlers-plan §4.6). Each entry is one
-    /// allocator-owned dup; the outer spine is owned too.
-    kv_prefixes: [][]u8,
-    /// Owned. Wake-resume export from the registrations' `{on}` (last
-    /// one wins); null → the conventional `onWake`.
-    wake_to: ?[]u8 = null,
+    /// Owned. Tenant-scoped kv-wake arms (streaming-handlers-plan §4.6).
+    /// Each arm carries its own prefix + `{on}` export (per-arm routing);
+    /// prefix/on and the spine are owned. `fired_at_ns` unused here.
+    kv_prefixes: []components_mod.KvArm,
+    /// Owned. The interval timer's own `{on}` export (null → `onWake`).
+    timer_on: ?[]u8 = null,
     /// Owned. Tenant id the chain is scoped to. Set by
     /// `streamRecordIfAnyAt` before it sets the entity's stream
     /// components. Empty on the read-only commit fast path
@@ -211,9 +210,12 @@ const StreamFirstHopMeta = struct {
         if (self.chunks.len > 0) allocator.free(self.chunks);
         allocator.free(self.ctx_json);
         allocator.free(self.module_path);
-        for (self.kv_prefixes) |p| allocator.free(p);
+        for (self.kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
-        if (self.wake_to) |t| allocator.free(t);
+        if (self.timer_on) |t| allocator.free(t);
         if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
         if (self.correlation_id) |c| allocator.free(c);
         self.* = undefined;
@@ -372,23 +374,33 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
     defer freeContWakes(allocator, s);
     if (s.cont_wakes.len == 0) return;
     var interval_ms: i64 = 0;
-    var wake_to: ?[]u8 = null;
+    var timer_on: ?[]u8 = null;
     var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     errdefer {
-        for (arms.items) |arm| allocator.free(arm.prefix);
+        for (arms.items) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         arms.deinit(allocator);
-        if (wake_to) |t| allocator.free(t);
+        if (timer_on) |t| allocator.free(t);
     }
     for (s.cont_wakes) |reg| {
         switch (reg.kind) {
-            .timer => interval_ms = reg.interval_ms,
-            .kv => try arms.append(allocator, .{ .prefix = try allocator.dupe(u8, reg.prefix) }),
-        }
-        // Last `{on}` wins — `on.*` wakes resume one "edge wake" export
-        // per held connection; a default `onWake` applies when null.
-        if (reg.on) |t| {
-            if (wake_to) |old| allocator.free(old);
-            wake_to = try allocator.dupe(u8, t);
+            // Per-arm routing: each arm carries its own `{on}`. The timer
+            // and each kv prefix resume into their own export; last timer
+            // wins for the single timer slot.
+            .timer => {
+                interval_ms = reg.interval_ms;
+                if (timer_on) |old| allocator.free(old);
+                timer_on = if (reg.on) |t| try allocator.dupe(u8, t) else null;
+            },
+            .kv => {
+                const pfx = try allocator.dupe(u8, reg.prefix);
+                errdefer allocator.free(pfx);
+                const on: ?[]u8 = if (reg.on) |t| try allocator.dupe(u8, t) else null;
+                errdefer if (on) |t| allocator.free(t);
+                try arms.append(allocator, .{ .prefix = pfx, .on = on });
+            },
         }
     }
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -398,7 +410,10 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         std.math.maxInt(i64);
     const kv_prefixes = try arms.toOwnedSlice(allocator);
     errdefer {
-        for (kv_prefixes) |arm| allocator.free(arm.prefix);
+        for (kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
     }
     try server.reg.set(s.ent, &server.request_out, components_mod.StreamWakes, .{
@@ -406,7 +421,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = kv_prefixes,
         .read_version = s.cont_read_version,
-        .wake_to = wake_to,
+        .timer_on = timer_on,
     });
 }
 
@@ -469,7 +484,7 @@ fn streamParkIfAny(
         meta.chunks,
         meta.kv_prefixes,
         meta.interval_ms,
-        meta.wake_to,
+        meta.timer_on,
     );
     meta.deinit(worker.allocator);
     // Move into the streaming pipeline. h2's `consumeStreamResponses`
@@ -520,7 +535,7 @@ fn streamRecordIfAnyAt(
         meta_opt.chunks,
         meta_opt.kv_prefixes,
         meta_opt.interval_ms,
-        meta_opt.wake_to,
+        meta_opt.timer_on,
     );
     meta_opt.deinit(allocator);
 }
@@ -3793,7 +3808,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     s.path = &.{};
                     break :blk p;
                 } else try allocator.dupe(u8, route.module_base);
-                // Transfer chunks + ctx_json + kv_prefixes + wake_to
+                // Transfer chunks + ctx_json + kv_prefixes + timer_on
                 // ownership out of s and into stream_meta_opt; clear
                 // s's fields so its (unused, see no-defer) deinit
                 // would no-op.
@@ -3803,12 +3818,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .ctx_json = s.ctx_json,
                     .module_path = mp_dup,
                     .kv_prefixes = s.kv_prefixes,
-                    .wake_to = s.wake_to,
+                    .timer_on = s.timer_on,
                 };
                 s.chunks = &.{};
                 s.ctx_json = &.{};
                 s.kv_prefixes = &.{};
-                s.wake_to = null;
+                s.timer_on = null;
                 // s is now a husk — no slices left to free; skip deinit.
                 break :stblk dispatcher_mod.Response{
                     .status = @intCast(status_u16),
