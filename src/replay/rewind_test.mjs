@@ -312,14 +312,22 @@ function scheduledEffects(effects) {
 }
 
 /** Durable sends (`webhook.send`, and `email.send` which layers on it) armed by
- *  this activation — the parsed `_send/owed/{id}` marker ({url, method, body,
- *  on_result, context, …}), the durable artifact that actually replicates. */
+ *  this activation — the parsed `_send/owed/{id}` marker, the durable artifact
+ *  that actually replicates. Surfaces the full marker in its PUBLIC spellings
+ *  (`maxAttempts`/`timeoutMs` ← the marker's snake_case `max_attempts`/
+ *  `timeout_ms`) so `toHaveSent("webhook", {headers, maxAttempts, …})` can pin
+ *  the durable delivery options, not just the destination. `timeoutMs` is
+ *  present only when the send set one (the marker omits it otherwise). */
 function sentEffects(effects) {
   const out = [];
   for (const e of live(effects)) {
     if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
-      try { const m = JSON.parse(e.value); out.push({ url: m.url, method: m.method, body: m.body, on: m.on_result, context: m.context }); }
-      catch (_) { /* skip a non-JSON marker */ }
+      try {
+        const m = JSON.parse(e.value);
+        const s = { url: m.url, method: m.method, body: m.body, headers: m.headers, maxAttempts: m.max_attempts, on: m.on_result, context: m.context };
+        if (m.timeout_ms != null) s.timeoutMs = m.timeout_ms;
+        out.push(s);
+      } catch (_) { /* skip a non-JSON marker */ }
     }
   }
   return out;
@@ -338,7 +346,9 @@ function emailSent(effects) {
         const m = JSON.parse(e.value);
         if (m.url !== "https://api.resend.com/emails") continue;
         const b = JSON.parse(m.body);
-        out.push({ to: b.to, from: b.from, subject: b.subject, cc: b.cc, bcc: b.bcc, on: m.on_result, context: m.context });
+        const s = { to: b.to, from: b.from, subject: b.subject, cc: b.cc, bcc: b.bcc, headers: m.headers, maxAttempts: m.max_attempts, on: m.on_result, context: m.context };
+        if (m.timeout_ms != null) s.timeoutMs = m.timeout_ms;
+        out.push(s);
       } catch (_) { /* skip a non-JSON marker */ }
     }
   }
