@@ -25,6 +25,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const hostmod = @import("host.zig");
 const decode = @import("tape_decode.zig");
+const path_confine = @import("path_confine.zig");
 
 extern fn arena_reactor_new(base_kb: c_int, request_kb: c_int) ?*root.ArenaReactor;
 extern fn arena_set_request_mode_r(r: *root.ArenaReactor, mode: c_int) void;
@@ -298,11 +299,17 @@ fn moduleLoad(
         return 0;
     }
     // A sibling helper (`import "./_helpers.mjs"` / `"../lib/x.mjs"`) — resolve
-    // against the test file's own directory. Join verbatim and let the OS
-    // resolve `./` and `../` in the path; do NOT strip leading dots (a char-set
-    // trim would collapse `../lib/x` → `lib/x`, silently loading the wrong
-    // file). A missing helper is a divergence (rc < 0).
-    const path = std.fs.path.join(h.a, &.{ h.test_dir, s }) catch return -1;
+    // against the test file's own directory, but CONFINE resolution to the app
+    // deployment root (the parent of `_tests/`). Prod clamps module resolution
+    // to the deployment root (package_resolver.resolveSpecifier), so an
+    // over-popped `../` that escapes the app tree names a file prod could never
+    // serve — refuse it rather than let the OS read outside the app. A missing
+    // helper (or an escaping one) is a divergence (rc < 0).
+    const app_root = std.fs.path.dirname(h.test_dir) orelse h.test_dir;
+    const path = path_confine.confineUnderRoot(h.a, app_root, h.test_dir, s) orelse {
+        std.log.warn("rewind test: import '{s}' escapes the app root '{s}' — refused (prod confines module resolution to the deployment root)", .{ s, app_root });
+        return -6;
+    };
     const bytes = std.fs.cwd().readFileAlloc(h.a, path, 8 << 20) catch return -6;
     out_src.* = dupC(bytes, true) orelse return -1;
     out_src_len.* = @intCast(bytes.len);

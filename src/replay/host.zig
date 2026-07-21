@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
+const path_confine = @import("path_confine.zig");
 
 /// The C ABI struct (`arena_replay_host`). Field order + signatures mirror the
 /// header exactly; a NULL responder reports "tape not installed" (code 1).
@@ -242,7 +243,13 @@ fn moduleLoad(
     // replayed against the recorded inputs. A missing local file IS a
     // divergence ("your tree doesn't have this module").
     if (h.source_dir) |dir| {
-        const path = std.fs.path.join(h.a, &.{ dir, s }) catch return -1;
+        // Confine to the deployment root — prod clamps module resolution there
+        // (package_resolver.resolveSpecifier), so an over-popped `../` that
+        // escapes `--source-dir` names a file prod could never serve.
+        const path = path_confine.confineUnderRoot(h.a, dir, dir, s) orelse {
+            h.setDiv("module '{s}' escapes --source-dir '{s}' — refused (prod confines resolution to the deployment root)", .{ s, dir });
+            return -6;
+        };
         const bytes = std.fs.cwd().readFileAlloc(h.a, path, 8 << 20) catch {
             h.setDiv("module '{s}' not found under --source-dir '{s}'", .{ s, dir });
             return -6;
