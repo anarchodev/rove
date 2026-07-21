@@ -1418,6 +1418,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/concurrentctx", // whenConcurrent threads the evolving next({ctx}) between legs — a no-ctx leg reads the prior leg's re-held ctx
         "src/replay/testdata/wslifecycle", // WS lifecycle: terminal/errored frame closes the socket (no further frame), pre-frame close runs nothing
         "src/replay/testdata/timezone", // local-time Date methods run in UTC (TZ pinned), matching prod regardless of host TZ
+        "src/replay/testdata/importclamp", // over-popped ../ imports clamp to the app root, not escape source_dir (prod resolveSpecifier)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);
