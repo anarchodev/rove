@@ -563,3 +563,12 @@ routing, real network fetches, the durable retry ladder. You supply each externa
 result; the platform's delivery of it is covered by the platform's own tests. A
 green `rewind test` means "the handler does the right thing with these inputs,"
 which is exactly the layer you own.
+
+**Crypto offline.** `jwt.verify` / `crypto.verifyRsa` / `crypto.verifyEcdsa` run
+for real over RS256/384/512 and ES256/384/512 (pure-JS SHA-256/384/512 + P-256/
+384/521), so an IdP-token verification is faithful. OIDC *provider* mode works
+too: `crypto.oidcGenerateKey()` returns a fixed deterministic RSA dev key and
+`crypto.oidcSign(priv, signingInput)` produces a real RS256 signature, so a
+keyset → mint → verify round-trip (and an ActivityPub HTTP-Signature delivery)
+runs offline — same run, same signatures. An unsupported alg/curve throws a loud
+"not available in `rewind test`" error rather than a silent wrong verdict.
