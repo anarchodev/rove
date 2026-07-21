@@ -15,6 +15,15 @@ expect(r.ok).toBe(true);
 
 // ── the readable matchers still read the same, now over the primitive log ──
 expect(r).toHaveSent("webhook", { url: "https://hooks.example.com/notify" });
+// The durable delivery options (headers / maxAttempts / timeoutMs) live in the
+// marker and are now pinnable through toHaveSent — not just the destination.
+expect(r).toHaveSent("webhook", {
+  headers: { "x-signature": "sig-ada" },
+  maxAttempts: 3,
+  timeoutMs: 5000,
+});
+// A header the send did NOT set must not spuriously match.
+expect(r).not.toHaveSent("webhook", { headers: { "x-signature": "wrong" } });
 expect(r).toHaveScheduled("jobs/followup");            // the explicit one-shot
 expect(r).toHaveFetched(/hooks\.example\.com/);        // webhook fired the fetch
 expect(r).toHaveWritten("signup/ada", "1");            // the handler's own write

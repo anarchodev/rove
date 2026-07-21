@@ -14,6 +14,10 @@ export default function () {
     key: "notify/" + user,
     on: "hooks/onNotified",
     ctx: { user },
+    // Durable delivery options — stored in the marker, so a test can pin them.
+    headers: { "x-signature": "sig-" + user },
+    maxAttempts: 3,
+    timeoutMs: 5000,
   });
 
   // Durable one-shot timer. Real shim: writes _sched/by_id/{id} + the
