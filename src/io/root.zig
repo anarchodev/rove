@@ -347,7 +347,7 @@ pub fn Io(comptime opts: Options) type {
         admission_denied_logged: bool = false,
         admission_denied_last_logged_decade: u64 = 0,
 
-        /// DIAG (task #56 — ENOBUFS-at-low-conn-count investigation):
+        /// DIAG (ENOBUFS-at-low-conn-count investigation):
         /// per-process counters for the buffer-ring balance. The
         /// invariant: at any point in time, the kernel-held buffer
         /// count must be < `buf_count`. If `recv_completions_with_data`

@@ -3,7 +3,7 @@
 //! world** (the authored form `rewind sim` consumes). This is the bridge from
 //! the replay corner to the sim corner: "what happened in prod" becomes an
 //! editable, offline, fail-loud regression scenario
-//! (`architecture/replay-and-sim.md` §6).
+//! (`docs/architecture/replay-and-sim.md` §6).
 //!
 //! A recording and an authored world are the same world, differently sourced
 //! (§1), so this is a transcode, not a re-run. The non-obvious part is the KV
@@ -15,15 +15,15 @@
 //! key isn't in the map, so replay resolves it to not_found (a *new* read the
 //! original never made surfaces the same way, visible in the effect log).
 //!
-//! Scope: faithful for `inbound` activations, `wake_batch` (issue #62 —
+//! Scope: faithful for `inbound` activations, `wake_batch` (
 //! the fired-watch batch rides `activation_bytes`, ctx rides
 //! `trigger_payload`, the resolved export rides `export`), and
-//! `send_callback` (issue #67 — the whole callee-outcome envelope rides
+//! `send_callback` (the whole callee-outcome envelope rides
 //! `trigger_payload`; split here into the flattened result surface + the
 //! metadata bag + the bare threaded ctx). `fetch_chunk` transcodes its
 //! whole-body case (the matrix smoke proves it) but streamed multi-chunk
 //! stays best-effort; other non-inbound activations lose their result
-//! surface (`replay-and-sim.md` §5 G1/G3) — the caller is warned via
+//! surface (`docs/architecture/replay-and-sim.md` §5 G1/G3) — the caller is warned via
 //! `isFaithfulTranscode`.
 
 const std = @import("std");
@@ -36,9 +36,9 @@ pub const Error = error{
 
 /// True when the pulled fixture's activation can be transcoded faithfully
 /// — its whole input rides the decoded channels. The inbound family, plus
-/// `wake_batch` since issue #62 (ctx via trigger_payload, the fired-watch
+/// `wake_batch` (ctx via trigger_payload, the fired-watch
 /// batch via activation_bytes, the resolved export via `export`) and
-/// `send_callback` since issue #67 (the callee-outcome envelope via
+/// `send_callback` (the callee-outcome envelope via
 /// trigger_payload, the resolved export via `export`).
 pub fn isFaithfulTranscode(activation: []const u8) bool {
     return std.mem.eql(u8, activation, "inbound") or
@@ -181,7 +181,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         break :blk null;
     };
 
-    // ── send_callback: the trigger_payload envelope IS the Msg (issue #67)
+    // ── send_callback: the trigger_payload envelope IS the Msg
     // — `{"ctx":{result, context}}` for a result delivery (a `webhook.send`
     // / `blob.put` `{on}` hop or a held-sync resume). Split it exactly the
     // way prod's install hoist does (globals.zig): `result` → the flattened
@@ -220,7 +220,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         };
     }
 
-    // ── wake_batch: activation_bytes = the wakes JSON (issue #62) —
+    // ── wake_batch: activation_bytes = the wakes JSON —
     // the drained fired-watch batch, recorded verbatim in the JS-facing
     // encoding by `captureWakeBatchTapes`. Passed through into the
     // world's `request.activation` bag so replay observes the same
@@ -286,7 +286,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll(" }");
     }
     // send_callback result → the flattened callee-outcome surface +
-    // the request.activation metadata bag (issue #67) — the same shape
+    // the request.activation metadata bag — the same shape
     // an authored `rewind:test` sendCallback world carries. The result
     // bytes ride base64url-no-pad in the envelope (`body_b64`); the
     // world carries them as standard-base64 `bodyB64` so replay's
@@ -322,7 +322,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         // Delivery metadata → the bag, passed through as recorded
         // (absent fields stay absent → `undefined` on replay, matching
         // prod's hoist; `ok` is deliberately NOT surfaced — status is
-        // the single success signal, issue #7).
+        // the single success signal).
         try w.writeAll(",\n    \"activation\": { \"kind\": \"send_callback\"");
         const meta_keys = [_][]const u8{ "attempts", "error", "id", "headers", "hash" };
         for (meta_keys) |mk| {
@@ -663,10 +663,10 @@ test "isFaithfulTranscode" {
     try testing.expect(isFaithfulTranscode("inbound"));
     try testing.expect(isFaithfulTranscode("inbound_headers"));
     try testing.expect(!isFaithfulTranscode("fetch_chunk"));
-    // issue #62: a wake_batch's whole input is recorded (ctx + wakes),
+    // A wake_batch's whole input is recorded (ctx + wakes),
     // so it transcodes faithfully.
     try testing.expect(isFaithfulTranscode("wake_batch"));
-    // issue #67: a send_callback's whole input is recorded (the callee-
+    // A send_callback's whole input is recorded (the callee-
     // outcome envelope + the resolved export), so it transcodes faithfully.
     try testing.expect(isFaithfulTranscode("send_callback"));
 }

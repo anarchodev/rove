@@ -53,7 +53,7 @@ HELDSYNC_SRC = r"""export default function () {
 ONRESULT_SRC = r"""export default function () {
     // Endpoint A flattened surface: threaded ctx on request.ctx, the
     // send outcome on request.status/.text (2xx = ok; status 0 = never
-    // reached; no request.ok, issue #7), delivery metadata on
+    // reached; no request.ok), delivery metadata on
     // request.activation.*.
     const ctx = request.ctx || {};
     if (request.status < 200 || request.status >= 300) {

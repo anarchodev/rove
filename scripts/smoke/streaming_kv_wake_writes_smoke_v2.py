@@ -54,7 +54,7 @@ export default function () {
 
 export function onWake() {
     stream.start(); // keep the stream alive even on a zero-frame wake
-    // Go-look relay (issue #8): the wake names the FIRED PREFIX; scan
+    // Go-look relay: the wake names the FIRED PREFIX; scan
     // under it and relay everything not yet processed (the out-key
     // marker doubles as the dedupe cursor).
     for (const w of request.activation.wakes) {

@@ -19,12 +19,13 @@
 //! non-determinism drifted:
 //!
 //! - `.kv`            — every foreign `kv.get` / `kv.prefix` resolution
-//!                      (§8 minimal kv read set; writes are outputs)
+//!                      (the minimal kv read set; writes are outputs)
 //! - `.module`        — module resolution tree (what deployment id / path
 //!                      resolved to which bytecode hash)
 //!
 //! `Math.random` + `crypto.*` + `Date.now` have no dedicated
-//! channels (`docs/primitive-gaps.md` §9): arenajs's per-context
+//! channels — they're seeded, not taped (the four-primitive effect
+//! model, `docs/effect-algebra.md`): arenajs's per-context
 //! state (`xorshift64star` PRNG + `date_now_pinned`) is set once per
 //! request from `Readset.seed` + `Readset.timestamp_ns` and produces
 //! the same sequence + clock values on capture and replay. Two
@@ -97,14 +98,14 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// are no `.math_random` / `.crypto_random` / `.date` channels —
 /// `Math.random`, `crypto.*`, and `Date.now` are seeded from the two
 /// readset-header scalars (`seed`, `timestamp_ns`), not taped
-/// (`docs/primitive-gaps.md` §8 minimal kv read set + §9
-/// seed-not-draws). The parser accepts exactly this version and
+/// (the four-primitive effect model, `docs/effect-algebra.md`: the
+/// minimal kv read set + seed-not-draws). The parser accepts exactly this version and
 /// rejects anything else loudly — the version byte is a format guard,
 /// not a compatibility band; no older tapes need to remain readable.
 pub const VERSION: u16 = 5;
 
 /// Magic + version for the whole-Readset wire format used by
-/// `Readset.serialize` (`docs/readset-replication-plan.md` Phase 3).
+/// `Readset.serialize` (readset replication, `docs/architecture/effects-and-handlers.md`).
 /// Distinct from per-tape `MAGIC` so a misrouted bytes/payload trips
 /// the wrong-magic check at the decoder.
 pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
@@ -133,18 +134,19 @@ pub const READSET_CHANNEL_COUNT: usize = 5;
 /// There are no `math_random` / `crypto_random` / `date` channels:
 /// `Math.random` / `crypto.*` / `Date.now()` are seeded from the
 /// per-request scalars (`Readset.seed` + `Readset.timestamp_ns`) in
-/// the readset header (`docs/primitive-gaps.md` §9).
+/// the readset header (the four-primitive effect model,
+/// `docs/effect-algebra.md`).
 pub const Channel = enum(u16) {
     kv = 0,
     module = 1,
-    /// `docs/readset-replication-plan.md` Phase 2c-2. One entry per
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`). One entry per
     /// `http.fetch` chunk activation; each entry records the
     /// `BodyRef` naming the bytes in the cross-tenant pool blob
     /// (`_pool/{batch_id}`). Replay resolves the bytes via
     /// `BlobStore.getRange` rather than reading them inline from the
     /// log blob.
     fetch_responses = 2,
-    /// `docs/readset-replication-plan.md` Phase 2d. Zero or one entry
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`). Zero or one entry
     /// per inbound dispatch. Captures the request body's `BodyRef`
     /// (the bytes streamed into the cross-tenant pool blob) so
     /// replay can resolve `request.body` via `BlobStore.getRange`
@@ -329,8 +331,8 @@ pub const Entry = union(Channel) {
 
     /// One inbound request's body — either by-reference into the
     /// cross-tenant pool blob OR carried inline in the entry
-    /// itself (`docs/readset-replication-plan.md` Phase 4 inline
-    /// small-body path). The two modes are discriminated by
+    /// itself (the inline small-body path; readset replication,
+    /// `docs/architecture/effects-and-handlers.md`). The two modes are discriminated by
     /// `body_ref.batch_id`:
     ///
     /// - `body_ref.batch_id != bodies_mod.NO_BATCH`: bytes live
@@ -653,20 +655,21 @@ pub const Tape = struct {
 /// The readset is the single home for every per-request
 /// non-deterministic input the raft entry carries: the per-channel
 /// tapes plus the `timestamp_ns` / `seed` scalars captured once at
-/// dispatch entry (`docs/readset-replication-plan.md` §4.1).
+/// dispatch entry (readset replication, `docs/architecture/effects-and-handlers.md`).
 pub const Readset = struct {
     /// Wall-clock nanosecond timestamp captured once at dispatch
     /// entry — the canonical "when this request was received."
     /// The `installRequest` path derives `Date.now()`'s pinned ms
     /// value from this (`@divTrunc(timestamp_ns, ns_per_ms)`).
     /// `Date.now()` and `new Date()` (no args) both return that
-    /// scalar for every call inside one request (`docs/primitive-gaps.md` §9).
+    /// scalar for every call inside one request (the four-primitive
+    /// effect model, `docs/effect-algebra.md`).
     timestamp_ns: i64,
     /// PRNG seed for arenajs's per-context xorshift64star, set once
     /// per request via `JS_SetRandomSeed` in `installRequest`.
     /// `Math.random` + `crypto.getRandomValues` +
     /// `crypto.randomUUID` all draw from this single state, so the
-    /// scalar IS the entire input for random (§9 seed-not-draws).
+    /// scalar IS the entire input for random (the seed-not-draws contract).
     /// Production callers derive it from `timestamp_ns`; tests pass
     /// a fixed value for determinism.
     seed: u64,
@@ -684,12 +687,12 @@ pub const Readset = struct {
     js_engine_version: u16 = 0,
     kv: Tape,
     module: Tape,
-    /// `docs/readset-replication-plan.md` Phase 2c-2: one entry per
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`): one entry per
     /// `http.fetch` chunk activation. Captures the `BodyRef` naming
     /// the bytes in the per-tenant readset-blob; replay resolves
     /// the bytes via `BlobStore.getRange`.
     fetch_responses: Tape,
-    /// `docs/readset-replication-plan.md` Phase 2d: zero-or-one
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`): zero-or-one
     /// entry for the inbound request body's `BodyRef`. Replay
     /// resolves `request.body` via `BlobStore.getRange` instead of
     /// the inline `request_body_bytes` capture.
@@ -706,7 +709,7 @@ pub const Readset = struct {
     body_read: bool = false,
     /// True when the `trigger_payload` entry is a resume's threaded-ctx
     /// envelope (`{"ctx":…}`) rather than an inbound request body
-    /// (issue #62 — wake resumes). The read-taping elision does not
+    /// (wake resumes). The read-taping elision does not
     /// apply: ctx is an activation input consumed unconditionally at
     /// request install (`request.ctx`), never a lazily-read body, so
     /// `body_read` stays false while the entry must survive.
@@ -770,7 +773,7 @@ pub const Readset = struct {
 
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
-    /// (`docs/readset-replication-plan.md` Phase 3 + 5a). Wire format
+    /// (readset replication, `docs/architecture/effects-and-handlers.md`). Wire format
     /// (READSET_VERSION = 7):
     ///
     /// ```
@@ -778,7 +781,7 @@ pub const Readset = struct {
     /// [u16  version = READSET_VERSION]
     /// [i64  timestamp_ns       big-endian]
     /// [u64  seed               big-endian]
-    /// [u16  js_engine_version  big-endian]   // format-versioning.md §4
+    /// [u16  js_engine_version  big-endian]   // docs/architecture/format-versioning.md §4
     /// for each of the 5 channels in fixed order:
     ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
     /// [u32 log_header_len BE][log_header_bytes]
@@ -852,7 +855,7 @@ pub const Readset = struct {
 ///
 /// The apply path consumes this to validate the readset shape; the
 /// channel blob slices can be materialized into tapes for
-/// follower-side tape upload (`docs/readset-replication-plan.md`).
+/// follower-side tape upload (readset replication, `docs/architecture/effects-and-handlers.md`).
 pub const ParsedReadset = struct {
     timestamp_ns: i64,
     seed: u64,
@@ -864,7 +867,7 @@ pub const ParsedReadset = struct {
     /// fixed order (kv, module, fetch_responses, trigger_payload,
     /// request_reads).
     blobs: [READSET_CHANNEL_COUNT][]const u8,
-    /// `docs/readset-replication-plan.md` Phase 5a — per-request
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`) — per-request
     /// LogRecord metadata. `null` when the producer didn't stamp a
     /// header (non-handler producers, paths that haven't been wired
     /// in yet). Strings inside borrow into the same input buffer the
@@ -916,7 +919,7 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
 
 /// List of `Readset.serialize()` blobs, wire-encoded for the type-0
 /// envelope's `rs_bytes` section
-/// (`docs/readset-replication-plan.md` Phase 3d follow-up — multi-
+/// (readset replication, `docs/architecture/effects-and-handlers.md` — multi-
 /// request batch aggregation). A batched H2 dispatch can run several
 /// successful handlers under one raft entry; each handler owns a
 /// distinct readset, and tape upload on follower-promotion needs to
@@ -1471,7 +1474,8 @@ test "kv tape: prefix capture round-trips inputs and results" {
 }
 
 // There are no math_random / crypto_random / date tape channels
-// (`docs/primitive-gaps.md` §9). `Math.random` + `crypto.*` draw
+// (the four-primitive effect model, `docs/effect-algebra.md`).
+// `Math.random` + `crypto.*` draw
 // from arenajs's per-context xorshift64star (seeded once per
 // request from `Readset.seed`); `Date.now()` returns a pinned
 // scalar (set via `JS_SetDateNow` from

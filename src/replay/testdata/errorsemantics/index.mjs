@@ -1,4 +1,4 @@
-// Error-semantics fixture (issue #10): the sim must report the PROD outcome
+// Error-semantics fixture: the sim must report the PROD outcome
 // for a thrown handler (500 "handler threw: …" + rollback), a pending-promise
 // return (200 "{}"), and a held chain whose module has no onDisconnect (no-op).
 export default function () {

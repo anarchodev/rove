@@ -3,7 +3,8 @@
 //! JSON blob; this module owns the sidecar's JSON shape (parse +
 //! encode), independent of where it lives on disk.
 //!
-//! See `docs/logs-plan.md` §2 for the on-disk layout. Record offsets
+//! See the log-server on-disk layout
+//! (`docs/architecture/deployment-and-logs.md`). Record offsets
 //! in the sidecar are **frame-relative** (into the raw-deflate
 //! frames region only) — the indexer adds `4 + sidecar_size` to
 //! produce the file-relative offsets it stores in `log_index`.

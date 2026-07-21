@@ -7,8 +7,8 @@
 //   • `platform.scope(t).deploy.stampManifest(entries, {on})` → resumes at `on`
 //     with `request.ctx = {ok, dep_id}`.
 //
-// Before the harness gained `node.compile().staged()` / `node.stampManifest().cut()`
-// (issue #6), both resumes were undriveable — a plain `fetch().resolve()` hands
+// Before the harness gained `node.compile().staged()` / `node.stampManifest().cut()`,
+// both resumes were undriveable — a plain `fetch().resolve()` hands
 // the resume the fetch's ISSUE-TIME ctx instead of the door result, so
 // `onFileStaged` / `onCut` were asserted only up to the door emission.
 //

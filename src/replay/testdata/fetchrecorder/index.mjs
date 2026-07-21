@@ -1,10 +1,10 @@
-// Fetch-recorder parity surface (issue #24):
+// Fetch-recorder parity surface:
 //   /        — two concurrent after.fetch with headers + ctx; the returned ids
 //              are stored so each resume can correlate request.fetchId back to
 //              the logical fetch it armed.
 //   /stream  — one stream:true fetch; onChunk records which fields each
 //              chunk event carries (prod stamps status/bodyTruncated only on
-//              the terminal event; request.ok does not exist — issue #7).
+//              the terminal event; request.ok does not exist).
 export default function () {
   if (request.path === "/stream") {
     after.fetch("https://s.example/stream", { stream: true, on: "onChunk" });
@@ -23,7 +23,7 @@ export function onLeg() {
     idMatches: request.fetchId === ids[leg],
     pending: request.fetchesPending,
     status: request.status,
-    hasOk: request.ok !== undefined, // request.ok is GONE (issue #7)
+    hasOk: request.ok !== undefined, // request.ok is GONE
     done: request.done,
   }));
   return { leg };

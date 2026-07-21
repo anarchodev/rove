@@ -118,8 +118,8 @@ pub fn build(b: *std.Build) void {
 
     // ── rove-bodies: transport-layer body streaming buffer ──
     //
-    // Per `docs/readset-replication-plan.md` Phase 2: fetch-response
-    // bodies and inbound request bodies stream into a per-tenant
+    // Readset replication (docs/architecture/effects-and-handlers.md):
+    // fetch-response bodies and inbound request bodies stream into a per-tenant
     // in-memory buffer that periodically flushes to S3 as one object
     // per batch. The raft entry's readset carries a `BodyRef =
     // (batch_id, offset, len)` pointer; the bytes never ride in the
@@ -165,7 +165,7 @@ pub fn build(b: *std.Build) void {
     tape_mod.addImport("rove-blob", blob_mod);
     // Readset's `fetch_responses` channel records `BodyRef` values
     // pointing into the per-tenant readset-blob store
-    // (`docs/readset-replication-plan.md` Phase 2c-2).
+    // (the readset-replication model; docs/architecture/effects-and-handlers.md).
     tape_mod.addImport("rove-bodies", bodies_mod);
     // rove-kv is only used in bundle.zig's tests (to open a fresh
     // LogStore). Production bundle code never touches kv directly.
@@ -304,7 +304,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── rove-acme: in-tree ACME (RFC 8555) HTTP-01 client + :80
-    //    challenge responder (auth-domain-plan.md §3.2). Issues
+    //    challenge responder (docs/architecture/auth-and-domains.md). Issues
     //    per-host certs into the Phase-2c custom-cert dir. OpenSSL
     //    for EC keygen / ES256 / CSR (same libs as rove-h2); libcurl
     //    (rove-blob) for the CA HTTP calls.
@@ -556,12 +556,12 @@ pub fn build(b: *std.Build) void {
 
         // Built-in handler modules — compiled to bytecode at NodeState
         // init, resolved via the `__system/` module-path prefix
-        // (`docs/effect-reification-plan.md` Phase 5 PR-2). Not part
+        // (the reified primitives; docs/architecture/effects-and-handlers.md). Not part
         // of any tenant's deployment files; shared across every
         // tenant's context. Add an entry here AND in
         // `src/js/builtin_modules.zig`'s `MODULES` table.
         .{ .name = "builtin_webhook_onresult_mjs", .path = "src/js/builtin_modules/webhook_onresult.mjs" },
-        // durable-wake-plan P5(a) — webhook.send's wake-fired half.
+        // webhook.send's wake-fired half (durable-wake; docs/architecture/effects-and-handlers.md).
         .{ .name = "builtin_webhook_fire_mjs", .path = "src/js/builtin_modules/webhook_fire.mjs" },
         // §2.6 durable scheduled wake — the `scheduler_tick` baked
         // module (durable-wake P1; docs/architecture/effects-and-handlers.md). Add an entry here AND
@@ -942,7 +942,8 @@ pub fn build(b: *std.Build) void {
     const run_h2_ws_connect = b.addRunArtifact(h2_ws_connect_test);
     b.step("h2-ws-connect-test", "Run the Extended-CONNECT WS tunnel test").dependOn(&run_h2_ws_connect.step);
 
-    // ── rust-ffi-smoke: V2 vendoring spike (docs/v2-vendoring-spike.md).
+    // ── rust-ffi-smoke: V2 build-time cargo→link spike (docs/decisions.md,
+    // deps are pinned-and-fetched at build time).
     // Step 1 — prove `cargo build → linkSystemLibrary` works end-to-end
     // before vendoring raft-rs's full dep tree. The Rust staticlib at
     // examples/rust_ffi_smoke/ exports three C ABI fns (arithmetic,
@@ -1055,7 +1056,7 @@ pub fn build(b: *std.Build) void {
     const v2_node_test = b.addTest(.{ .root_module = v2_node_mod });
 
     // ── V2 Phase 6 — hibernation / active-set pump-cost microbench ─────
-    // (docs/v2-phase6-hibernation.md). Measures node pump cycle time vs.
+    // (hibernation; docs/architecture/consensus-and-storage.md). Measures node pump cycle time vs.
     // active-set size: K idle tenants drain out so a cycle ticks ~nothing.
     // Build with -Doptimize=ReleaseFast; run `v2-hibernation-bench [K] [cycles]`.
     const v2_hib_bench_mod = b.createModule(.{
@@ -1123,8 +1124,8 @@ pub fn build(b: *std.Build) void {
     v2_test_step.dependOn(&run_v2_bridge_test.step);
 
     // ── V2 Phase 3/7 — control plane: the tenant→cluster directory ─────
-    // (v2-build-order Phase 3; docs/architecture/control-plane.md,
-    // docs/v2-cp-directory-replication.md Slice 1). `src/cp/directory.zig`
+    // (directory replication; docs/architecture/control-plane.md).
+    // `src/cp/directory.zig`
     // is the routing source of truth the front-door reads and a move flips.
     // Slice 1 makes it durable: it backs writes with the V2 `bridge`'s
     // directory raft group, so it now imports the bridge (and its test links
@@ -1182,7 +1183,7 @@ pub fn build(b: *std.Build) void {
     const rewind_step = b.step("rewind-worker", "Build the V2 rewind worker binary (Phase 2d)");
     rewind_step.dependOn(&b.addInstallArtifact(rewind_exe, .{}).step);
 
-    // ── rewind-front: the V2 front door (docs/v2-front-door-architecture.md).
+    // ── rewind-front: the V2 front door (docs/architecture/routing-and-ingress.md).
     // A STATELESS HTTP/2 reverse proxy: resolves Host→cluster via the CP's
     // `/_cp/route` (cached) and reverse-proxies to the owning cluster's nodes
     // (leader-aware). Holds NO directory/raft state — that lives in `rewind-cp`
@@ -1212,7 +1213,7 @@ pub fn build(b: *std.Build) void {
     front_test_step.dependOn(&b.addRunArtifact(front_tests).step);
     test_step.dependOn(&b.addRunArtifact(front_tests).step);
 
-    // ── rewind-cp: the V2 control plane (docs/v2-front-door-architecture.md).
+    // ── rewind-cp: the V2 control plane (docs/architecture/control-plane.md).
     // The authoritative, replicated directory: owns placement + the host→tenant
     // index, hosts the directory raft group (its OWN small cluster), and
     // orchestrates moves (`/_control/move`) + serves `/_cp/route` + `/_cp/leader`.
@@ -1355,7 +1356,7 @@ pub fn build(b: *std.Build) void {
         "examples/loop46-demo-tenants/wswake", // ↔ ws_wake_smoke_v2 (WS+wake)
         "src/replay/testdata/authsurface", // compute globals (crypto/base64url/jwt/oidc/sessions) in the sim base
         "src/replay/testdata/middleware", // real _middlewares/before + request.session injection
-        "src/replay/testdata/middlewarejs", // .js-spelled _middlewares runs too, .mjs preferred (issue #51)
+        "src/replay/testdata/middlewarejs", // .js-spelled _middlewares runs too, .mjs preferred
         "src/replay/testdata/platformsurface", // http/platform/browser globals (effect recorders)
         "src/replay/testdata/oidcverify", // RS256 crypto.verifyRsa + jwt.verify offline
         "src/replay/testdata/ecdsaverify", // ES256 crypto.verifyEcdsa (P-256) + jwt.verify offline
@@ -1363,29 +1364,29 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/email", // email.send → webhook _send/owed marker (Resend)
         "src/replay/testdata/blobrecipe", // blob put/write/seal/url — streaming sha256 offline
         "src/replay/testdata/utf8body", // multibyte UTF-8 request body round-trips (json/text/bytes)
-        "src/replay/testdata/utf8encode", // TextEncoder/base64url/hash over non-ASCII ↔ utf8_encode_smoke_v2 (issue #11)
+        "src/replay/testdata/utf8encode", // TextEncoder/base64url/hash over non-ASCII ↔ utf8_encode_smoke_v2
         "src/replay/testdata/platformkv", // platform.scope(id)/root per-store kv isolation
         "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
         "src/replay/testdata/platformadmin", // platform.* admin-only gating (fail-closed)
         "src/replay/testdata/upload", // headers-first onHeaders + blob.receive → onStored continuation
-        "src/replay/testdata/deploydoor", // result-in-ctx bound doors: platform.compile → onFileStaged / stampManifest → onCut (issue #6)
+        "src/replay/testdata/deploydoor", // result-in-ctx bound doors: platform.compile → onFileStaged / stampManifest → onCut
         "src/replay/testdata/concurrent", // whenConcurrent: cross-order fetch interleavings + invariant
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
-        "src/replay/testdata/nexttarget", // cross-module next(target, ctx) parks the target: timer/kv/fetch/disconnect resumes re-enter it (issue #27)
+        "src/replay/testdata/nexttarget", // cross-module next(target, ctx) parks the target: timer/kv/fetch/disconnect resumes re-enter it
         "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
-        "src/replay/testdata/responsevetting", // emit-side response vetting: header/cookie sanitize, status clamp, content-type rule, binary body, stream-prepend (issue #42)
-        "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone (issue #43)
-        "src/replay/testdata/headerhygiene", // authored headers lowercase + pseudo/IP/reserved dropped with a warn (issue #41)
-        "src/replay/testdata/pathquery", // request.path excludes ?query; request.query carries it (issue #40)
-        "src/replay/testdata/consolefmt", // console formatting: JSON-stringified non-strings + level-prefix lines, sim text ≡ prod line (issue #44)
+        "src/replay/testdata/responsevetting", // emit-side response vetting: header/cookie sanitize, status clamp, content-type rule, binary body, stream-prepend
+        "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone
+        "src/replay/testdata/headerhygiene", // authored headers lowercase + pseudo/IP/reserved dropped with a warn
+        "src/replay/testdata/pathquery", // request.path excludes ?query; request.query carries it
+        "src/replay/testdata/consolefmt", // console formatting: JSON-stringified non-strings + level-prefix lines, sim text ≡ prod line
         "src/replay/testdata/wsmessage", // a WS frame reads back as request.text/.bytes (browser.message)
         "src/replay/testdata/wsfetchloop", // continue a WS conversation past a fetch resume (agent-loop shape)
-        "src/replay/testdata/fetchctx", // fetch-resume ctx override: fetch's own ctx if any, else the chain's next() (issue #3, §4.14)
-        "src/replay/testdata/errorsemantics", // throw→500+rollback, pending-promise→200 "{}", missing-export 404/no-op/fallback, bad middleware (issue #10)
-        "src/replay/testdata/fetchrecorder", // fetch option bag + unique ftch_ ids + fetchId/fetchesPending threading + terminal-only status/ok + stream gating (issue #24)
-        "src/replay/testdata/arenachurn", // >arena cumulative alloc / tiny peak completes under the GC arena (issue #70)
-        "src/replay/testdata/kvguardrails", // kv.set/delete type + reserved-prefix + size guards, kv.prefix 100/1000 paging (issue #12)
+        "src/replay/testdata/fetchctx", // fetch-resume ctx override: fetch's own ctx if any, else the chain's next()
+        "src/replay/testdata/errorsemantics", // throw→500+rollback, pending-promise→200 "{}", missing-export 404/no-op/fallback, bad middleware
+        "src/replay/testdata/fetchrecorder", // fetch option bag + unique ftch_ ids + fetchId/fetchesPending threading + terminal-only status/ok + stream gating
+        "src/replay/testdata/arenachurn", // >arena cumulative alloc / tiny peak completes under the GC arena
+        "src/replay/testdata/kvguardrails", // kv.set/delete type + reserved-prefix + size guards, kv.prefix 100/1000 paging
         "src/replay/testdata/droppedeffects", // connection-scoped effects on terminal/connectionless activations tagged dropped + warned; durable verbs survive
         "src/replay/testdata/argvalidation", // prod's synchronous effect-argument throw table fires offline with the same error types/messages
         "src/replay/testdata/ssrfgate", // resolving a success outcome for a prod-blocked fetch URL (SSRF/plain-http/localhost) fails loud; status 0 stays authorable

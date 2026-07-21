@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """V2 port of `bound_fetch_smoke.py` — `http.fetch`/`on.fetch` auto-bind
-streaming (docs/streaming-model.md §7 item 1 + docs/handler-shape.md §5.5)
+streaming (the streaming substrate, docs/architecture/routing-and-ingress.md;
+handler surface in docs/handler-shape.md §5.5)
 on the `V2Cluster` harness (`smoke_lib_v2`).
 
 Two tenants on a single node:

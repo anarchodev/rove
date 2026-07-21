@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """`request.status` is the single fetch-result signal — no `request.ok`
-(issue #7, handler-shape.md §7).
+(handler-shape.md §7).
 
 Regression guard for the fetch/callback result surface: the handler must
 derive success from `request.status` (`200 ≤ status < 300`), and there must be

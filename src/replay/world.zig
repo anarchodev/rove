@@ -114,7 +114,7 @@ pub const World = struct {
     correlation_id: ?[]const u8 = null,
     /// The flattened fetch/callback result surface — top-level on `request`.
     /// `status` is the single success signal (2xx = ok, 0 = transport
-    /// failure); there is no `ok` (issue #7).
+    /// failure); there is no `ok`.
     status: ?i64 = null,
     done: ?bool = null,
     fetch_id: ?[]const u8 = null,
@@ -171,7 +171,7 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             w.body_is_binary = true;
         }
         // Flattened fetch/callback result surface (`request.status` etc.;
-        // no `ok` — status is the single success signal, issue #7).
+        // no `ok` — status is the single success signal).
         w.status = jInt(r, "status");
         if (r.get("done")) |v| {
             if (v == .bool) w.done = v.bool;

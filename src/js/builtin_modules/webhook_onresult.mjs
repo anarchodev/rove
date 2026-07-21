@@ -9,7 +9,7 @@
 //          send's scheduler entry (the webhook_fire watchdog).
 //        - retryable (status >= 500 OR transport !ok): bump attempts,
 //          keep the marker, re-arm the scheduler entry to the backoff
-//          time (durable-wake-plan P5(a)).
+//          time (the durable-wake backoff re-arm; docs/architecture/effects-and-handlers.md).
 //        - give-up (status 4xx, or attempts >= max): delete the
 //          marker + cancel the entry, record the give-up.
 //   3. Hands off to the customer's on_result module via __rove_next
@@ -72,7 +72,7 @@ export default function () {
     // Raw transport bit — did the delivery attempt reach an HTTP
     // response at all? The retry classifier below must keep an upstream
     // 5xx distinct from a hard transport failure, so it can't lean on a
-    // single 2xx/not-2xx flag. Convention (issue #7): `status === 0` ⟺
+    // single 2xx/not-2xx flag. Convention: `status === 0` ⟺
     // no HTTP response reached us; 4xx/5xx are transport-ok with a real
     // status.
     const transport_ok = (a.kind === "fetch_chunk") ? (result_status !== 0) : !!ctx.result_ok;

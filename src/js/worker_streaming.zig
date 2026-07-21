@@ -293,7 +293,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
 
         // Any arm fired? Fire one wake_batch activation (drains the
         // fired kv arms + timer into `request.activation.wakes[]` —
-        // fired PREFIXES, issue #8).
+        // fired PREFIXES).
         if (wakes_comp.anyFired()) {
             if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
                 std.log.warn(
@@ -319,7 +319,8 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // that the initial chunks have shipped — UNLESS an in-flight
         // bound fetch is still feeding this stream. A chain opened via
         // `on.fetch({stream}) → stream.write()` in onChunk + `next()`
-        // (the `__system/static` streamer, docs/streaming-model.md §7)
+        // (the `__system/static` streamer — the streaming substrate,
+        // `docs/architecture/routing-and-ingress.md`)
         // registers no timer/kv wake; its subsequent chunks arrive
         // through `resumeBoundFetchStream`, NOT a wake. Auto-closing the
         // instant the queue first drains races the next bound chunk and
@@ -344,7 +345,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
 /// Drain the worker's `wake_inbox` of kv-write events. For every
 /// stream entity (in one of the h2 stream-pipeline collections,
 /// not draining), stamp `fired_at_ns` on every armed `kv_prefixes`
-/// arm that prefixes the event's key (issue #8: a match marks the
+/// arm that prefixes the event's key (the fired-prefix contract: a match marks the
 /// ARM fired; keys are never accumulated, so a burst of matches is
 /// one re-stamp — nothing to overflow, nothing lost).
 /// Events whose tenant_id matches no held stream are simply
@@ -394,7 +395,7 @@ fn drainKvWakeInbox(worker: anytype) !void {
 }
 
 /// Walk events oldest-first; stamp every armed prefix that matches an
-/// event's key as fired (issue #8 fired-prefix contract). EVERY
+/// event's key as fired (the fired-prefix contract). EVERY
 /// matching arm fires — a key under two armed prefixes marks both.
 /// No allocation, no accumulation: N matches on one arm are one
 /// re-stamp (latest fire time wins), so nothing can overflow.
@@ -431,8 +432,8 @@ fn matchEventsToWakes(
 ///                StreamWakes.anyFired())`.
 ///   - **prep**:  read four stream components on the entity; resolve
 ///                deployment; drain the fired arms (`drainFired`) into
-///                the Request's wake_batch slice (fired prefixes,
-///                issue #8); build request body = `{ctx}` with
+///                the Request's wake_batch slice (fired prefixes —
+///                the fired-prefix contract); build request body = `{ctx}` with
 ///                `.wake_batch` activation.
 ///   - **run**:   `dispatcher.runOutcome` (chain-tail txn).
 ///   - **apply (Cmd-list)**: switch on outcome:
@@ -440,7 +441,8 @@ fn matchEventsToWakes(
 ///         markStreamDraining immediately. On wrote: stage body
 ///         chunk + mark_draining=true on `BufferedSendKvOps`;
 ///         `proposeForgetfulWrites`'s parked unit applies them
-///         from the commit arm (`streaming-model.md` §2 rule).
+///         from the commit arm (the commit-gated release rule,
+///         `routing-and-ingress.md`).
 ///       • stream → update StreamChain.ctx_json + StreamWakes
 ///         (kv_prefixes / interval / next_wake) + increment
 ///         activation_count (eager — internal state). On read-only:
@@ -461,7 +463,7 @@ const StreamTape = enum { wake, fetch };
 
 inline fn streamTapes(worker: anytype, comptime tape: StreamTape, ctx: *const StreamFinishCtx) log_mod.TapePayloads {
     return switch (tape) {
-        // issue #62: a wake resume's Msg is the drained fired-watch
+        // A wake resume's Msg is the drained fired-watch
         // batch — tape it (+ readset/ctx) so the hop is replayable.
         // Guarded on the runtime kind: resumeStream only fires
         // `.wake_batch` today, but the activation param is runtime.
@@ -510,7 +512,7 @@ const StreamFinishCtx = struct {
     pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
     /// Tape sources: `.fetch` reads `tape_body` + `tape_ev`; `.wake`
     /// reads `tape_body` (the `{"ctx":…}` envelope) + `wakes` (the
-    /// drained fired-watch batch, issue #62).
+    /// drained fired-watch batch).
     tape_body: []const u8 = "",
     tape_ev: ?worker_mod.FetchEvent = null,
     wakes: []const components_mod.WakeEntry = &.{},
@@ -524,7 +526,7 @@ const StreamFinishCtx = struct {
 ///
 /// Arms: terminal-with-exception → rollback + drain + log; terminal-with-
 /// writes → stage body + draining flag on the parked unit, propose via
-/// `proposeForgetfulWrites` (commit-gated release, streaming-model.md §2);
+/// `proposeForgetfulWrites` (commit-gated release, `routing-and-ingress.md`);
 /// terminal-read-only → commit + flush + final chunk + drain;
 /// continuation → 501 (stream→cont transition out of scope); stream →
 /// stage/ship chunks + swap ctx/interval/kv-prefix registrations;
@@ -562,7 +564,8 @@ fn finishStreamResume(
             if (ctx.wrote) {
                 // Terminal + writes — stage the body chunk + the draining
                 // flag on the parked unit so they apply only after raft
-                // commits (`streaming-model.md` §2 rule): the parked_units
+                // commits (the commit-gated release rule,
+                // `routing-and-ingress.md`): the parked_units
                 // commit arm (via `transferStagedChunks`) is the single
                 // release point; a raft fault during the commit-wait window
                 // must not ship a terminal frame whose writes never landed.
@@ -842,7 +845,7 @@ fn resumeStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    // wake_batch activation: drain the fired arms (issue #8 — fired
+    // wake_batch activation: drain the fired arms (fired
     // PREFIXES, fire-time order) so nothing re-fires next sweep;
     // resumeStream owns the slice + each entry's `prefix` for the
     // dispatch's lifetime.
@@ -865,7 +868,7 @@ fn resumeStream(
         for (pending_wakes.items) |*pw| pw.deinit(allocator);
         pending_wakes.deinit(allocator);
     }
-    // durable-wake-plan P5(a): the resumed hop's `http.fetch`es
+    // Commit-gated fetch effects: the resumed hop's `http.fetch`es
     // (webhook.send inline fire, blob.put). Write arms commit-gate
     // them via proposeForgetfulWrites; read-only commits flush
     // directly; error arms free via the defer.
@@ -943,7 +946,7 @@ fn resumeStream(
     });
 }
 
-/// `docs/streaming-model.md` §7 item 1:
+/// Upstream bound-fetch streaming (`docs/architecture/routing-and-ingress.md`):
 /// bound-fetch chunk arriving on an entity that already transitioned
 /// cont→stream. Sibling of `resumeStream` — same stream-chain
 /// machinery, but the activation kind is `.fetch_chunk` (carrying
@@ -1066,7 +1069,7 @@ pub fn resumeBoundFetchStream(
         for (stream_chunks.items) |ch| allocator.free(ch);
         stream_chunks.deinit(allocator);
     }
-    // durable-wake-plan P5(a): see resumeStream — same accumulator,
+    // Commit-gated fetch effects: see resumeStream — same accumulator,
     // same release discipline.
     var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
     defer {
@@ -1314,8 +1317,8 @@ const FinishSpec = struct {
     readonly_cont_commits: bool = false,
     /// Which Msg-tape every log record carries (see `fireTapes`):
     /// `.activation` (fetch_chunk — the upstream chunk bytes),
-    /// `.callback` (send_callback — the `{"ctx":…}` body envelope,
-    /// issue #67), or `.none` for kinds whose Msg needs no dedicated
+    /// `.callback` (send_callback — the `{"ctx":…}` body envelope),
+    /// or `.none` for kinds whose Msg needs no dedicated
     /// capture here.
     tape: FireTape = .none,
 };
@@ -1351,7 +1354,7 @@ pub fn fireLogHeader(
 /// Tape payloads for one log record. Fresh per call —
 /// `captureLogWithId` takes ownership of the byte allocations.
 /// `.callback` records the fire's whole body envelope (the callee
-/// outcome) plus the resolved export (issue #67); `.activation`
+/// outcome) plus the resolved export; `.activation`
 /// records the input bytes as `activation_bytes` (fetch chunks).
 fn fireTapes(
     worker: anytype,
@@ -1412,7 +1415,7 @@ pub fn runFire(
     const tenant_id = p.dep.inst.id;
     const dep_id = p.dep.tc.snap.deployment_id;
 
-    // durable-wake-plan P5(a): every fire origin gets an `http.fetch`
+    // Commit-gated fetch effects: every fire origin gets an `http.fetch`
     // accumulator so a fetch issued from a wake / subscription /
     // chained activation (`__system/webhook_fire`'s deferred fire, a
     // customer `webhook.send` from an on_result handler) is not
@@ -1594,7 +1597,7 @@ pub fn runFire(
     }
 }
 
-/// durable-wake-plan P5(a): submit a read-only fire's accumulated
+/// Commit-gated fetch effects: submit a read-only fire's accumulated
 /// fetches once its txn committed. Connection-scoped (`on.fetch`)
 /// entries drop — a fire never holds a connection, so they're inert
 /// by the handler-shape scope rule (mirrors `finalizeBatch`'s
@@ -1630,7 +1633,8 @@ fn flushFireFetches(
     fetches.clearRetainingCapacity();
 }
 
-/// Streaming-handlers-plan §4.4: client disconnect on a held stream.
+/// Streaming handlers (`docs/architecture/effects-and-handlers.md`): client
+/// disconnect on a held stream.
 /// h2's `serverStreamClose` routes the entity to `response_out`
 /// (FIN/RST observed) without our drain-then-close path firing —
 /// `cleanupResponses` notices the populated StreamChain on the
@@ -1881,7 +1885,7 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
     }, module_path, corr_full, tenant_id, "");
 }
 
-// ── blob compose door (blob-write-recipes.md §4) ─────────────
+// ── blob compose door (`docs/architecture/blob-write-recipes.md` §4) ─────────────
 
 const COMPOSE_URL_PREFIX = "http://rove-compose.internal/";
 
@@ -1961,7 +1965,7 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
 const DurableTarget = struct { module: []const u8, method: ?[]const u8 };
 
 /// Split a durable-wake target `"module.method"` into its module path and
-/// optional export (handler-shape.md §2.4, issue #9). The method suffix is
+/// optional export (handler-shape.md §2.4). The method suffix is
 /// recognized ONLY when the module part ends in `.mjs`/`.js` — so a bare
 /// `"reports.mjs"` module, a slash path `"jobs/reminder"`, or a `__system/`
 /// baked module stays whole (fires `default`), and only the documented
@@ -2019,7 +2023,7 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
     const allocator = worker.allocator;
     const tenant_id = dw.tenant_id;
     // A `schedule`/`cron` target may name `"module.method"` — fire the
-    // named export instead of `default` (handler-shape.md §2.4, issue #9).
+    // named export instead of `default` (handler-shape.md §2.4).
     // Both verbs land here (`cron` re-dispatches through `schedule({in:0},
     // target)`), so this is the one split site. Mirrors the sim's `wake()`.
     const dt = splitDurableTarget(dw.module_path);
@@ -2156,7 +2160,7 @@ fn fireChainedActivation(
     // `.tape = .callback`: the body envelope IS this hop's Msg — the
     // callee outcome for an on_result delivery, the bare threaded ctx
     // for an internal chained hop — recorded (with the resolved
-    // export) so the activation is replayable (issue #67).
+    // export) so the activation is replayable.
     runFire(worker, &p, req, .{
         .act = .send_callback,
         .site = "chained-dispatch",
@@ -2223,11 +2227,12 @@ pub const StreamResumeStage = struct {
 /// parked_units commit arm transfers them onto the entity's
 /// `StreamChunks` (and, if `stage.mark_draining`, sets the
 /// terminal-draining flag) AFTER the txn commits — closing
-/// `streaming-model.md` §2's pre-commit chunk leak. Disconnect,
+/// the pre-commit chunk leak (the commit-gated release rule,
+/// `routing-and-ingress.md`). Disconnect,
 /// subscription, and fetch-event callers pass `null`; they're
 /// either entity-less or already disconnect-tolerant.
 ///
-/// durable-wake-plan P5(a): the optional `fetches_opt` parameter is
+/// Commit-gated fetch effects: the optional `fetches_opt` parameter is
 /// the commit-gated `http.fetch` payload for forgetful fires. When
 /// non-null, each accumulated PendingFetch becomes a `Cmd.http_fetch`
 /// on the parked unit, released by `interpretCmd` strictly after raft
@@ -2286,8 +2291,8 @@ pub fn proposeForgetfulWrites(
     // Serialize the activation's readset (with the caller-supplied
     // LogHeader stamped into it) wrapped as the 1-item
     // readset list the anchor envelope's rs_bytes section expects
-    // (`docs/readset-replication-plan.md` Phase 3d-fetch + multi-
-    // readset aggregation). Best-effort: any failure logs and we
+    // (readset replication + multi-readset aggregation,
+    // `docs/architecture/effects-and-handlers.md`). Best-effort: any failure logs and we
     // propose with empty rs_bytes — the chain just doesn't get
     // readset-replicated for this entry.
     const rs_bytes: []u8 = if (readset_opt) |rs|
@@ -2674,7 +2679,8 @@ pub fn serviceSubscriptionFires(worker: anytype) void {
 
 // ── Bound-fetch chunk spool ───────────────────────────────────────────
 //
-// `docs/chunk-spool-plan.md`. The data structure lives in
+// The chunk-spool substrate (blob coordinator / chunk spool,
+// `docs/architecture/routing-and-ingress.md`). The data structure lives in
 // `chunk_spool.zig`; the push/dispatch/drain policy lives here next to
 // the resume engines it drives.
 
@@ -2736,13 +2742,13 @@ fn updateSpoolPeaks(worker: anytype) void {
 /// Pub so the cleanup paths in `worker.zig`
 /// (`scanAndCancelBoundFetches`, `cancelFetchTrampoline`) can drop a
 /// spool when its bound fetch is cancelled / its held entity is
-/// destroyed (`docs/chunk-spool-plan.md` Phase 4).
+/// destroyed (the chunk-spool cleanup path, `routing-and-ingress.md`).
 pub fn dropSpool(worker: anytype, fetch_id: []const u8) void {
     const entry = worker.bound_fetch_spools.fetchRemove(fetch_id) orelse return;
     // Count chunks discarded unconsumed (cancel / disconnect). A clean
     // terminal drop has already popped every entry, so this is 0 there.
     worker.bound_fetch_spool_dropped_total += entry.value.len();
-    // P6 (docs/chunk-spool-plan.md): release the coordinator-retained
+    // Coordinator-retained release (`routing-and-ingress.md`): release the coordinator-retained
     // copy of every still-spooled chunk we're discarding, so a
     // cancel/disconnect of a backed-up fetch doesn't leak its backlog
     // in coordinator RAM.
@@ -2793,7 +2799,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
             // Held chain gone (terminal already drained, or client
             // disconnected) but chunks still spooled — drop them.
             // Matches the stale-registry posture in
-            // `docs/chunk-spool-plan.md` §Risks.
+            // the chunk-spool substrate (`routing-and-ingress.md`).
             std.log.info(
                 "rove-js chunk-spool: no held entity for fetch_id={s}; dropping {d} spooled chunk(s)",
                 .{ key, sp.len() },
@@ -2864,7 +2870,8 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         // coordinator first — durability-gated: the bytes are only
         // resolvable once the submission seq is durable. If not yet
         // durable, leave the head spooled; `drainSpools` retries once
-        // the coord HWM advances (docs/chunk-spool-plan.md Phase 3).
+        // the coord HWM advances (the chunk-spool durability gate,
+        // `routing-and-ingress.md`).
         {
             const h = sp.head().?;
             if (h.evicted) {
@@ -2913,7 +2920,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         // already gone).
         var ev = sp.popHead();
         const final = ev.final;
-        // P6 (docs/chunk-spool-plan.md): capture the coord identity
+        // Coordinator-retained release (`routing-and-ingress.md`): capture the coord identity
         // before resume consumes `ev`, so we can release the
         // coordinator's retained copy of this chunk after it's
         // consumed (every bound chunk was submitted, inline
@@ -2955,7 +2962,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
     }
 }
 
-/// `docs/chunk-spool-plan.md` P6: queue a consumed/dropped bound
+/// Coordinator-retained release (`routing-and-ingress.md`): queue a consumed/dropped bound
 /// chunk's coordinator release for retry. Deferred (not direct)
 /// because in-window chunks are consumed before their submit is
 /// durable; `drainSpools` retries `coord.release` until it succeeds.
@@ -2999,7 +3006,7 @@ fn drainCoordReleases(worker: anytype) void {
     }
 }
 
-/// Worker-tick system (`docs/chunk-spool-plan.md` Phase 2): retry
+/// Worker-tick system (the chunk-spool dispatch retry, `routing-and-ingress.md`): retry
 /// dispatch for every spool whose held entity has returned to a
 /// receivable state since the last tick (e.g. after a prior chunk's
 /// writeset committed in `drainRaftPending`). Snapshots duped keys
@@ -3073,7 +3080,8 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 // to worker.fetch_pending_durability for the park
                 // branch. No external deinit needed.
                 //
-                // `docs/streaming-model.md` §7 item 1: bound fetch
+                // Upstream bound-fetch streaming
+                // (`docs/architecture/routing-and-ingress.md`): bound fetch
                 // refit. When `ev.bind`, route the chunk into the
                 // calling chain's `onFetchChunk` resume instead of
                 // firing a separate `fetch-<id>` activation. The
@@ -3086,7 +3094,7 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 var ev = ev_const;
                 if (ev.bind) {
                     if (worker.lookupBoundFetch(ev.fetch_id) != null) {
-                        // `docs/chunk-spool-plan.md` Phase 2: a bound
+                        // The chunk-spool dispatch path (`routing-and-ingress.md`): a bound
                         // chunk for a live held chain goes onto the
                         // per-fetch spool instead of dispatching (or
                         // re-enqueueing a Msg) inline. `pushToSpool`
@@ -3337,7 +3345,8 @@ pub fn fireFetchEventActivation(
         inline_bytes_for_tape = event.bytes;
     } else if (event.bytes.len > 0) {
         // Larger-than-threshold chunk — coord submit + park.
-        // docs/streaming-model.md §7: submit returns a
+        // the streaming substrate (`docs/architecture/routing-and-ingress.md`):
+        // submit returns a
         // seq; durability is observed via the coord's per-worker
         // HWM. Always park (no fast-durable bypass — submit is
         // strictly async, durable_seq can't have advanced past

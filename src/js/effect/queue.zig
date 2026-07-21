@@ -1,6 +1,6 @@
 //! effect.MsgQueue — the single Msg ingress
-//! (`docs/effect-algebra.md` §2.3; `docs/effect-reification-plan.md`
-//! Phase 2 §3.4).
+//! (`docs/effect-algebra.md` §2.3; the reified primitives,
+//! `docs/architecture/effects-and-handlers.md`).
 //!
 //! One in-thread ingress (`MsgQueue`) fed from one cross-thread inbox
 //! (`MsgInbox`) per worker, rather than per-origin staging areas, so:

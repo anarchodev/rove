@@ -2,7 +2,7 @@
 """V2 port of `streaming_resume_fault_inj_smoke.py` — effect-reification
 Phase 4.0.b regression gate on the `V2Cluster` harness.
 
-`docs/streaming-model.md` §2: "a chunk reaches the wire only after the
+The streaming commit-gate (`docs/architecture/routing-and-ingress.md`): "a chunk reaches the wire only after the
 activation that produced it has committed." The resume/wake path must NOT
 let a `tick` chunk escape while its `kv.set` propose is parked awaiting a
 quorum it can never reach.

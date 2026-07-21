@@ -62,8 +62,8 @@ HELDSYNC_SRC = r"""export default function () {
 
 ONRESULT_SRC = r"""export default function () {
     // Endpoint A: threaded ctx IS request.ctx; the webhook result is
-    // flattened on request.status/.text (2xx = delivered; no request.ok,
-    // issue #7); delivery metadata (error) is on request.activation.*.
+    // flattened on request.status/.text (2xx = delivered; no request.ok);
+    // delivery metadata (error) is on request.activation.*.
     const ctx = request.ctx || {};
     if (request.status < 200 || request.status >= 300) {
         if (ctx.retry_to && ctx.tries < 1) {

@@ -804,8 +804,9 @@ pub const KvStore = struct {
     /// caller frees. Unlike `vacuumInto`/`dumpManifestToFile` (whole-file
     /// kvexp snapshots), a bundle is the minimal shippable form of one
     /// store's committed pairs — what a tenant MOVE ships from the source
-    /// cluster's `cluster.kv` to the destination's (v2-build-order
-    /// §Phase 4). The bundle stamps `self.store_id`, so the destination
+    /// cluster's `cluster.kv` to the destination's (the tenant-move
+    /// mechanism, `docs/architecture/consensus-and-storage.md`). The bundle
+    /// stamps `self.store_id`, so the destination
     /// reconstructs the same store id (both clusters hash the tenant id to
     /// the same `store_id`). Durabilize first so the snapshot reflects
     /// every in-memory write.
@@ -1024,7 +1025,8 @@ pub const KvStore = struct {
         /// set by `markSawSpeculationLocked` on the top-level Txn).
         /// A read-only batch for which this is true must NOT release
         /// its response at local commit — the value it read is not
-        /// durable yet (docs/proposer-audit.md Addendum, idiom-0).
+        /// durable yet (the proposer / fold-gate invariant,
+        /// `docs/architecture/consensus-robustness.md`).
         ///
         /// Read post-handler-walk on the owning worker thread; the
         /// per-tenant dispatch lease serialised every writer to this
@@ -1183,7 +1185,8 @@ pub const KvStore = struct {
     // The speculative overlay is volatile (→ LMDB only at raft-apply),
     // so a pre-quorum crash loses it with no on-disk divergence and
     // nothing to recover; the live rollback primitive is
-    // `TrackedTxn.rollback()`. See docs/proposer-audit.md.
+    // `TrackedTxn.rollback()`. See the proposer / fold-gate invariant
+    // (`docs/architecture/consensus-robustness.md`).
 };
 
 /// Collect entries from a kvexp prefix cursor into `list`, honoring

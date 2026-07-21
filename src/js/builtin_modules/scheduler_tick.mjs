@@ -1,5 +1,5 @@
-// §2.6 durable scheduled wake — the baked `__system/scheduler_tick`
-// module (durable-wake P1; docs/architecture/effects-and-handlers.md). Fired by the engine
+// Durable scheduled wake — the baked `__system/scheduler_tick`
+// module (the durable-wake mechanism; docs/architecture/effects-and-handlers.md). Fired by the engine
 // (`durable_wake.sweepDurableWakes`) in a tenant's context whenever
 // that tenant's `next_wake_ns` watermark falls due, and once per
 // tenant on leadership gain to reconstruct the watermark.
@@ -29,8 +29,9 @@ const BY_ID_PREFIX = "_sched/by_id/";
 
 // Thundering-herd bound: at most this many wakes fire per tick when
 // many share a due-time; the remainder carries to the next tick.
-// (docs/primitive-gaps.md §2.6.1 — P4 surfaces this as an operator
-// knob; for now it's a baked constant matching the spec default.)
+// (the per-tick fire cap in the durable scheduler,
+// docs/architecture/effects-and-handlers.md; a baked constant for now,
+// a possible future operator knob.)
 const MAX_FIRES_PER_TICK = 256;
 
 // `_sched/by_time/` key = BY_TIME_PREFIX + <whenNs zero-padded to

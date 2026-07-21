@@ -126,8 +126,8 @@ pub fn decodeMultiInner(
     return out;
 }
 
-/// Type-0 envelope payload layout (`docs/readset-replication-plan.md`
-/// Phase 3):
+/// Type-0 envelope payload layout (readset replication —
+/// `docs/architecture/effects-and-handlers.md`):
 ///
 ///   `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`
 ///

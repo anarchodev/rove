@@ -341,9 +341,9 @@ test "subscriptionPathParts: handler + spec + rejects" {
 /// Immutable per-deployment-version snapshot. Refcounted; freed when
 /// the last reference drops (slot reload + any in-flight request).
 ///
-/// Phase 2 of `docs/deployment-snapshots-plan.md`: snapshot pinning
-/// guarantees a request sees one deployment version completely or
-/// another completely, never a mid-reload mix.
+/// Snapshot pinning (`docs/architecture/deployment-and-logs.md`,
+/// deployment snapshots): a request sees one deployment version
+/// completely or another completely, never a mid-reload mix.
 pub const TenantFilesSnapshot = struct {
     allocator: std.mem.Allocator,
     /// Borrowed pointer to the node-wide content-addressed cache.
@@ -466,8 +466,8 @@ pub const TenantSlot = struct {
     app_kv: *kv_mod.KvStore,
     /// Borrowed process raft node. The loader's `reloadDeployment`
     /// uses it to leader-gate + propose the `_config/**.json` mirror
-    /// (auth-domain-plan §9: the release/loader path must mirror
-    /// per-deploy config to kv). Optional/`null` only in unit-test
+    /// (the per-deploy config mirror, `docs/architecture/auth-and-domains.md`:
+    /// the release/loader path mirrors config to kv). Optional/`null` only in unit-test
     /// slot literals — a slot with no raft handle just skips the
     /// config mirror.
     raft: ?*Bridge = null,
@@ -493,8 +493,8 @@ pub const TenantSlot = struct {
     /// Atomic pointer to the current snapshot. Null until first load.
     current: std.atomic.Value(?*TenantFilesSnapshot),
 
-    /// Resolved per-tenant plan limits (docs/architecture/control-plane.md,
-    /// docs/v2-cp-operational-state.md). Null until the CP delivers a plan
+    /// Resolved per-tenant plan limits (docs/architecture/control-plane.md —
+    /// operational state). Null until the CP delivers a plan
     /// (via the attach handshake on a move, or a live single-target push);
     /// null ⇒ the free tier. An atomic pointer so a live plan change swaps it
     /// without locking the dispatch read — readers do a lock-free load and
@@ -708,8 +708,8 @@ pub const DeploymentCache = struct {
     /// Per-tenant slot cache, keyed by instance id (the slot's owned
     /// `instance_id`). `tenant_files_lock` guards inserts; the
     /// TenantSlot entries' deployment-version content is served via an
-    /// atomic-pointer-swapped `TenantFilesSnapshot` (phase 2 of
-    /// `docs/deployment-snapshots-plan.md`), so reload doesn't race
+    /// atomic-pointer-swapped `TenantFilesSnapshot` (snapshot pinning,
+    /// `docs/architecture/deployment-and-logs.md`), so reload doesn't race
     /// with the dispatcher.
     ///
     /// A plain map (not the `TenantMap` lifecycle generic): slot
@@ -722,9 +722,9 @@ pub const DeploymentCache = struct {
     tenant_files_map: std.StringHashMapUnmanaged(*TenantSlot) = .empty,
     tenant_files_lock: std.Thread.Mutex = .{},
 
-    /// Phase 3 of `docs/deployment-snapshots-plan.md`: content-
-    /// addressed cache of bytecode blobs shared across every tenant
-    /// snapshot on this node. Loader does `acquire(hash)` per
+    /// Content-addressed cache of bytecode blobs shared across every
+    /// tenant snapshot on this node (deployment snapshots —
+    /// `docs/architecture/deployment-and-logs.md`). Loader does `acquire(hash)` per
     /// manifest entry; only fetches the misses. Cross-tenant blob
     /// sharing falls out automatically. Snapshot `deinit` releases
     /// leases through this cache.
@@ -1250,7 +1250,8 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
 
     const bs = slot.blob_backend.blobStore();
 
-    // Mirror `_config/**.json` → tenant kv (auth-domain-plan §9: the
+    // Mirror `_config/**.json` → tenant kv (the per-deploy config
+    // mirror, `docs/architecture/auth-and-domains.md`: the
     // release/loader path MUST mirror per-deploy user config).
     // Leader-gated + proposed exactly like `_deploy/current`:
     // the leader writes locally + proposes an envelope-0 writeset

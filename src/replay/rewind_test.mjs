@@ -359,7 +359,7 @@ function stable(v) {
 }
 
 // Split a durable-wake target `"module.method"` into module + optional export
-// (handler-shape.md §2.4, issue #9). The method suffix is recognized ONLY when
+// (handler-shape.md §2.4). The method suffix is recognized ONLY when
 // the module part ends in `.mjs`/`.js` — so a bare `"reports.mjs"`, a slash
 // path, or a `__system/` module stays whole (default export). MUST match the
 // worker's `splitDurableTarget` in `src/js/worker_streaming.zig`.
@@ -515,7 +515,7 @@ class Scenario {
    *  `request.status`/`.bytes`, the echoed `ctx` bare on `request.ctx`,
    *  and delivery metadata on `request.activation.*`. `status` is the
    *  single success signal (2xx = delivered, 0 = never reached) — there
-   *  is no `request.ok` (issue #7).
+   *  is no `request.ok`.
    *
    *  spec: { on: "<result-module path>", result?: {status, body?, attempts?,
    *          error?, id?, headers?}, ctx?: <echoed context> }
@@ -553,7 +553,7 @@ class Scenario {
    *  folded `FetchHandle.resolve` produces, so a `_rp/complete.mjs`-style module
    *  is testable without standing up the emitter that would reach it. `status`
    *  is the single success signal (2xx = ok, 0 = transport failure) — there is
-   *  no `request.ok` (issue #7).
+   *  no `request.ok`.
    *
    *  spec: { on: "<continuation module path>", ctx?: <echoed context>,
    *          status?, done?, body? }
@@ -566,7 +566,7 @@ class Scenario {
     // Mirror the bound-resume surface prod builds (globals.zig): chunkSeq /
     // fetchesPending / fetchId on every event; status/bodyTruncated
     // TERMINAL-only (defaulted only when done — an explicit spec still wins;
-    // no `ok` — status is the single success signal, issue #7).
+    // no `ok` — status is the single success signal).
     const request = {
       done,
       body: spec.body != null ? spec.body : null,
@@ -603,7 +603,7 @@ class Scenario {
    *  `on` is the target as passed to `schedule`/`cron`: a bare module
    *  (`"jobs/reminder"` → `default` export) or the `module.method` form
    *  (`"reports.mjs.weekly"` → the `weekly` export — the method suffix is
-   *  only recognized after a `.mjs`/`.js` module, issue #9). You may also
+   *  only recognized after a `.mjs`/`.js` module). You may also
    *  split it explicitly with `method`.
    *
    *  spec: { on: "<target>", ctx?: <payload>, method?: "<export>",
@@ -634,7 +634,7 @@ class Scenario {
       entry: _t.module, // the scheduled target module IS this activation's entry
       activation: "durable_wake",
       // durable_wake dispatches at the target's default export (rpc_dispatch);
-      // a `module.method` target overrides the export (issue #9).
+      // a `module.method` target overrides the export.
       export: spec.method || _t.method || "default",
       ctx: spec.ctx === undefined ? null : spec.ctx,
       now_ms: fireMs,
@@ -827,7 +827,8 @@ class Node {
    *  connection. `changes` is a `{ key: value | null }` map folded into the KV
    *  overlay (null = delete). The resume surfaces the FIRED PREFIXES — one
    *  `{kind:"kv", prefix, firedAt}` per armed `after.kv` a change key falls
-   *  under, never the keys themselves (issue #8; the handler re-reads kv).
+   *  under, never the keys themselves (the fired-prefix contract; the handler
+   *  re-reads kv).
    *  `opts.prefix` selects which armed `after.kv`'s `{on}` export resumes
    *  when several are armed. */
   wakeKv(changes = {}, opts = {}) {
@@ -997,7 +998,7 @@ class FetchHandle {
   stream(chunks, opts = {}) {
     // Prod only chunk-delivers a fetch issued with `stream: true` — one issued
     // without it arrives as a single whole-body onFetchResult, so streaming it
-    // offline would pass a shape prod never sends. Fail loud (issue #24).
+    // offline would pass a shape prod never sends. Fail loud.
     if (!this.fx.stream)
       throw new Error(`stream(): this fetch was issued WITHOUT stream:true (${this.fx.url}) — prod delivers one whole-body result; use .resolve({...}) or issue the fetch with { stream: true }`);
     // Delivering chunks is itself unreachable for a blocked fetch — prod
@@ -1033,7 +1034,7 @@ class FetchHandle {
       // Prod stamps status/bodyTruncated ONLY on the terminal event
       // (globals.zig `if (fc.final)`); non-final chunks carry done/chunkSeq/
       // fetchId/fetchesPending + the payload, nothing else. No `ok` —
-      // status is the single success signal (issue #7).
+      // status is the single success signal.
       const request = { done, chunkSeq: seq, body, fetchesPending: pending };
       const bag = { byteOffset: off };
       if (seq === 0 && opts.headers) bag.headers = opts.headers;
@@ -1075,7 +1076,7 @@ class FetchHandle {
  *  resume at the receive's `on` export. Parallel to `FetchHandle.resolve`: the
  *  parent's writes/ctx/clock fold forward; the completion arrives on
  *  `request.ctx` (NOT `request.body`) and durability on `request.status`
- *  (2xx = stored, 0 = failed; no `request.ok`, issue #7) — the exact
+ *  (2xx = stored, 0 = failed; no `request.ok`) — the exact
  *  `emitTerminal` contract (`blob_receive.zig`, which emits status 200/0):
  *    success → `request.ctx = { hash, len, app }`, `request.status === 200`
  *    failure → `request.ctx = { error, app }`,        `request.status === 0`
@@ -1121,7 +1122,7 @@ class ReceiveHandle {
  *  `routeCompileEvent` shape (`deploy_thread.zig`, terminal `UpstreamFetchEvent`):
  *  The compile OUTCOME rides `request.ctx.ok` (a door can HTTP-200 yet
  *  fail to compile); the door's HTTP status is `request.status` (no
- *  `request.ok`, issue #7):
+ *  `request.ok`):
  *    success → `request.ctx = { ok:true, results:[{path, source_hex,
  *              bytecode_hex}, …], app }`, `request.status === 200`
  *    failure → `request.ctx = { ok:false, status, error }`, `request.status === 500`
@@ -1340,7 +1341,7 @@ function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending)
     // Prod stamps chunkSeq + fetchesPending on EVERY bound fetch event, and the
     // ftch_ id the arm returned (globals.zig) — thread the recorded id so the
     // documented correlate-by-id and `done && fetchesPending === 1` patterns
-    // work offline (issue #24).
+    // work offline.
     chunkSeq: response.chunkSeq != null ? response.chunkSeq : 0,
     fetchesPending: response.fetchesPending != null ? response.fetchesPending
       : (pending != null ? pending : 1),
@@ -1350,7 +1351,7 @@ function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending)
   // globals.zig) — default them only on the final event; honor an explicit
   // override so a deliberate off-spec world stays authorable. `status` is
   // the single success signal (2xx = ok, 0 = transport failure — here
-  // `response.timeout`); the real engine surfaces NO `request.ok` (issue #7).
+  // `response.timeout`); the real engine surfaces NO `request.ok`.
   if (done || response.status != null) request.status = status;
   if (done) request.bodyTruncated = response.bodyTruncated != null ? response.bodyTruncated : false;
   // Prod's seq-0 activation bag carries the upstream's parsed headers

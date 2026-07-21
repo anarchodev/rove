@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CP plan/limits axis smoke (gap #1, step 1; docs/v2-cp-operational-state.md,
+"""CP plan/limits axis smoke (gap #1, step 1; operational state,
 docs/architecture/control-plane.md).
 
 Per-tenant operational state (plan/limits) lives in the CP `__directory__`

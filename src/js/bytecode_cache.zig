@@ -1,6 +1,6 @@
 //! Process-wide content-addressed cache for compiled module bytecode.
 //!
-//! `docs/deployment-snapshots-plan.md` Phase 3. A standalone module so
+//! The runtime `BytecodeCache` (`docs/architecture/package-compile-caching.md`). A standalone module so
 //! `globals`, `dispatcher`, and `worker` can all reference `BlobBytes`
 //! without cycling through each other:
 //!

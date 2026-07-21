@@ -55,9 +55,9 @@ const raw = JSON.parse(fs.readFileSync(bundlePath, "utf-8"));
 // The orchestrator writes tape_blobs as base64 strings (since JSON
 // can't hold raw bytes). Decode each channel to a Uint8Array; null
 // when the channel had no entries in the captured record.
-// `docs/primitive-gaps.md` §9 + fold-in: only kv + module remain
-// on the wire. `Math.random` + `crypto.*` + `Date.now()` reseed
-// from `raw.seed` + `raw.timestamp_ns`, no per-call tape entries.
+// The four-primitive effect model (`docs/effect-algebra.md`): only kv +
+// module remain on the wire. `Math.random` + `crypto.*` + `Date.now()`
+// reseed from `raw.seed` + `raw.timestamp_ns`, no per-call tape entries.
 const tape_blobs = {};
 for (const k of ["kv", "module", "request_reads"]) {
     const b64 = raw.tape_blobs?.[k];
@@ -86,7 +86,7 @@ try {
     fail("buildTapesFromBlobs: " + err.message);
 }
 
-// §9 seed-not-draws: reseed the per-context PRNG from the captured
+// seed-not-draws: reseed the per-context PRNG from the captured
 // request's seed before running the handler. `Math.random` /
 // `crypto.*` then reproduce the original draw sequence.
 const seed_bi = BigInt(raw.seed ?? 0);
@@ -95,7 +95,7 @@ arena_set_random_seed(
     Number((seed_bi >> 32n) & 0xFFFFFFFFn),
 );
 
-// §9 fold-in: pin `Date.now()` and `new Date()` (no args) to the
+// fold-in: pin `Date.now()` and `new Date()` (no args) to the
 // captured request's `timestamp_ns` (converted to ms). Both Date
 // reads inside the replay return the same scalar — matching the
 // original request's behavior.

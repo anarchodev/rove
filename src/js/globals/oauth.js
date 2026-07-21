@@ -270,7 +270,7 @@ globalThis.oauth = {
    * alg-confusion-safe (RS/ES only). On a cache miss / unknown `kid`
    * the caller must run the async {@link oauth.fetchJwks} hop and,
    * retry; this mirrors `oidc.rp`'s `completeToken → completeJwks →
-   * _finish` chain (auth-domain-plan §4.8).
+   * _finish` chain (docs/architecture/auth-and-domains.md).
    *
    * @param {string} id_token - The compact JWS from the token
    *   endpoint response.
@@ -348,7 +348,7 @@ globalThis.oauth = {
     const req = globalThis.request;
     // Only cache a 2xx JWKS fetch. Written as `!(2xx)` so a missing
     // status (no fetch result) is treated as not-ok too. `status` is the
-    // single result signal — no request.ok, issue #7.
+    // single result signal — no request.ok.
     if (!req || !(req.status >= 200 && req.status < 300)) return false;
     let jwks = null;
     try { jwks = JSON.parse(req.text || "{}"); } catch (_) {}

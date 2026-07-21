@@ -75,7 +75,7 @@ export function onBlob() {
 PUTRESULT_SRC = """
 export default function () {
   // Unified flattened on_result surface (handler-shape §7, Endpoint A):
-  // request.status top-level (2xx = stored; no request.ok, issue #7),
+  // request.status top-level (2xx = stored; no request.ok),
   // blob hash on request.activation.hash, echoed context IS request.ctx.
   kv.set("put_result", JSON.stringify({
     result: { ok: request.status >= 200 && request.status < 300, status: request.status, hash: request.activation.hash },

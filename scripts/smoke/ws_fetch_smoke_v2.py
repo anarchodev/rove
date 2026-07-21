@@ -166,7 +166,7 @@ def main():
             check("on.fetch resumed onUpstream", False, repr(e))
             c.dump_node_log(grep=["fetch", "onUpstream", "ws-fetch", "error", "warn"])
 
-        # issue #3 / §4.14: a WS fetch with NO ctx → request.ctx is the
+        # §4.14: a WS fetch with NO ctx → request.ctx is the
         # connection's next({tag}) — the same value HTTP delivers (the fix).
         print("step: WS fetch resume — no fetch ctx → request.ctx = the connection's next({tag})")
         send_text(sock, f"fetchctx:http://127.0.0.1:{stub_port}/x")

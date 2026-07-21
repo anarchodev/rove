@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""CP directory durability across a front-door restart (Slice 1 exit;
-docs/v2-cp-directory-replication.md).
+"""CP directory durability across a front-door restart (directory
+replication — docs/architecture/control-plane.md).
 
 The front door's routing directory is now durable — backed by a single-node
 CP `bridge` (one "directory" raft group, store at REWIND_CP_DATA_DIR). A

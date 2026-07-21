@@ -1,4 +1,5 @@
-//! HTTP/1.1 codec for the rove-h2 edge listener (docs/v2-edge-http1-ingress.md).
+//! HTTP/1.1 codec for the rove-h2 edge listener — HTTP/1.1 ingress
+//! (docs/architecture/routing-and-ingress.md).
 //!
 //! The pure, I/O-free parser + serializer. `parseHead` turns an
 //! accumulated request buffer into a `Head` (request line + headers + the body

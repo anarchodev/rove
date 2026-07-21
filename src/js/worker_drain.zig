@@ -76,7 +76,7 @@ const CONT_HOLD_DEADLINE_NS = worker_mod.CONT_HOLD_DEADLINE_NS;
 /// the entity's commit-time move is the parked_units arm's job via
 /// `interpretCmd .respond` (every path that parks an entity in
 /// raft_pending_X also emits a Cmd.respond on the parked_units
-/// unit — see effect-reification-plan.md Phase 4.1.3 Option-2).
+/// unit — the Cmd pattern, `docs/architecture/effects-and-handlers.md`).
 ///
 /// Fault arm: rollback the txn, overwrite the response body to 503,
 /// move the entity to `server.response_in` for h2 to ship.
@@ -232,8 +232,8 @@ pub fn drainRaftPending(worker: anytype) !void {
     try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_cont, "raft_pending_cont");
     try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_stream, "raft_pending_stream");
 
-    // ── Non-entity parked units (idiom-1 SSE-emit gating,
-    //    docs/unified-effect-gating.md).
+    // ── Non-entity parked units (idiom-1 SSE-emit gating —
+    //    effect gating, docs/architecture/effects-and-handlers.md).
     //
     // Iterates a snapshot of entity ids so that re-entrant park-*
     // calls (e.g. via firePendingKvWakes → kv-react fire path) that
@@ -658,7 +658,8 @@ const ContResumeNext = union(enum) {
         new_cont: Continuation,
         new_bound_sched_id: ?[]u8,
     },
-    /// `docs/streaming-model.md` §7 item 1: cont→stream resume.
+    /// The cont→stream resume transition (the streaming substrate,
+    /// `docs/architecture/routing-and-ingress.md`).
     /// The handler returned `stream({write, status?, headers?})`
     /// from a cont-parked entity (bound-fetch onFetchChunk
     /// resume that opens a streaming response). All slices owned
@@ -843,7 +844,8 @@ fn proposeAndParkContResume(
     //     resume/sweep ships the body" — true for chains that get a
     //     follow-up event, but a bound-fetch chain whose fetches are
     //     all done has none, so the response never shipped (the
-    //     multi-bind writes-per-chunk case, docs/chunk-spool-plan.md).
+    //     multi-bind writes-per-chunk case — the chunk spool,
+        //     `docs/architecture/routing-and-ingress.md`).
     //   - repark → `parked_continuations`: the chain awaits its next
     //     bound-fetch chunk / callback.
     //   - cont→stream → `stream_response_in`: h2 picks up the stream.
@@ -911,7 +913,7 @@ fn proposeAndParkContResume(
             if (desc.cont) |*old_c| old_c.deinit(allocator);
             desc.cont = r.new_cont;
             if (desc.bound_schedule_id) |old_b| {
-                // `docs/cross-worker-held-state-plan.md` Phase 1:
+                // Held state (`docs/architecture/effects-and-handlers.md`):
                 // drop the NodeState owner mirror for the OLD
                 // send_id; the new one was registered above when
                 // the repark scanned the writeset.
@@ -933,8 +935,8 @@ fn proposeAndParkContResume(
             try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
         },
         .stream => |s| {
-            // `docs/streaming-model.md` §7 item 1:
-            // cont→stream transition. The entity moves from
+            // The cont→stream transition (the streaming substrate,
+            // `docs/architecture/routing-and-ingress.md`). The entity moves from
             // parked_continuations → raft_pending_cont → (commit
             // Cmd.respond) → stream_response_in. We install the
             // stream components (StreamChain / StreamChunks /
@@ -1173,8 +1175,8 @@ const StreamResumeCtx = struct {
     tapes: ?log_mod.TapePayloads = null,
 };
 
-/// `docs/streaming-model.md` §7 item 1: the cont→stream
-/// transition on resume, shared by `resumeContinuation` and
+/// The cont→stream transition on resume (the streaming substrate,
+/// `docs/architecture/routing-and-ingress.md`), shared by `resumeContinuation` and
 /// `resumeBoundFetchChain`. Parse the customer's `stream({headers})`
 /// wire buffer, take ownership of the payload slices out of `s`, then
 /// either propose+park via raft (write path) or commit+install
@@ -1436,9 +1438,9 @@ const ContFinishCtx = struct {
 inline fn contTapes(worker: anytype, comptime tape: ContTape, ctx: *const ContFinishCtx) log_mod.TapePayloads {
     return switch (tape) {
         // The cont-resume site's Msg depends on the runtime kind:
-        // a wake resume's Msg is the drained fired-watch batch
-        // (issue #62); a send_callback's Msg is the callee outcome —
-        // the whole `{"ctx":…}` body envelope (issue #67). Both tape
+        // a wake resume's Msg is the drained fired-watch batch;
+        // a send_callback's Msg is the callee outcome —
+        // the whole `{"ctx":…}` body envelope. Both tape
         // readset + ctx + the resolved export so the hop is replayable.
         .cont => switch (ctx.act) {
             .wake_batch => worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, ctx.resume_export),
@@ -1598,7 +1600,7 @@ fn finishContResume(
                     const only = worker_mod.scanLoneOwedSendId(ctx.ws.ops.items) orelse break :blk null;
                     break :blk allocator.dupe(u8, only) catch null;
                 };
-                // `docs/cross-worker-held-state-plan.md` Phase 1: repark
+                // Held state (`docs/architecture/effects-and-handlers.md`): repark
                 // re-binds to a (possibly new) send_id — stamp the owner
                 // (same dependency as the worker_dispatch open-hop site).
                 if (new_bound_sched_id) |send_id| {
@@ -1914,8 +1916,9 @@ fn resumeContinuation(
     });
 }
 
-/// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
-/// §5.5: bound-fetch resume engine. Sibling of `resumeContinuation`:
+/// The bound-fetch resume engine (the streaming substrate,
+/// `docs/architecture/routing-and-ingress.md`; handler surface in
+/// `docs/handler-shape.md` §5.5). Sibling of `resumeContinuation`:
 /// an upstream chunk for a fetch issued from a held chain wakes the
 /// chain via its module's `onFetchChunk` named export.
 ///
@@ -2277,8 +2280,8 @@ pub fn resumeBoundContinuation(
     // Fallback scan. The bound_send_entities map is supposed to
     // be canonical; a hit here means the registry got out of sync
     // (component freed without unregister, double-bind collision,
-    // etc.) and the scan is the safety net per the
-    // cross-worker-held-state-plan §3 Phase 3 design.
+    // etc.) and the scan is the safety net for the held-state
+    // design (`docs/architecture/effects-and-handlers.md`).
     const ents = worker.parked_continuations.entitySlice();
     if (ents.len == 0) return false;
     const sids = worker.parked_continuations.column(h2.StreamId);
@@ -2416,13 +2419,13 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     }
 }
 
-/// `docs/readset-replication-plan.md` Phase 4 park-on-durability
-/// drain.
+/// The park-on-durability drain (readset replication,
+/// `docs/architecture/effects-and-handlers.md`).
 ///
 /// Walks `worker.body_pending`, polling each parked entity's
 /// submission against the process-global blob coordinator's HWM
-/// (`node.blob_coordinator.durableSeq(worker_id)` — docs/streaming-model.md
-/// §7). Once the seq is durable we materialize the wire `BodyRef` via
+/// (`node.blob_coordinator.durableSeq(worker_id)` — the streaming substrate,
+/// `docs/architecture/routing-and-ingress.md`). Once the seq is durable we materialize the wire `BodyRef` via
 /// `coord.bodyRef()`, stamp it onto the entity's `BodyDurabilityWait`
 /// (so `dispatchPending` can stamp the readset on resume), and
 /// `coord.release()` the coordinator's retained copy (P6).
@@ -2515,7 +2518,8 @@ pub fn drainBodyPending(worker: anytype) !void {
     }
 }
 
-/// `docs/readset-replication-plan.md` Phase 4-fetch-park drain.
+/// The fetch-park-on-durability drain (readset replication,
+/// `docs/architecture/effects-and-handlers.md`).
 ///
 /// Walks `worker.fetch_pending_durability` (parked outbound-fetch
 /// chunk activations), polls the blob coordinator's HWM, and re-fires
@@ -2730,8 +2734,8 @@ pub fn cleanupResponses(worker: anytype) !void {
         if (chain.module_path.len > 0) {
             worker_streaming.fireDisconnectActivation(worker, ent);
         }
-        // `docs/streaming-model.md` §7 item 1: cancel any bound
-        // fetches still associated with this entity. The held
+        // The streaming substrate (`docs/architecture/routing-and-ingress.md`):
+        // cancel any bound fetches still associated with this entity. The held
         // client is gone; upstream chunks would land on a destroyed
         // entity. cancel_fetch is cooperative — the FetchEngine
         // tears down the libcurl handle; the unregister drops the
@@ -2760,7 +2764,7 @@ pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
     }
     for (doomed.items) |fetch_id| {
         if (worker.node.fetch_engine) |engine| engine.cancel(fetch_id);
-        // `docs/chunk-spool-plan.md` Phase 4: drop any spooled chunks
+        // The chunk spool (`docs/architecture/routing-and-ingress.md`): drop any spooled chunks
         // for this fetch — the held client is gone (disconnect) or the
         // chain is terminating, so they'll never be consumed. Done
         // BEFORE `unregisterBoundFetch`: `fetch_id` aliases the

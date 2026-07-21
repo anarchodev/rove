@@ -4,7 +4,7 @@
 //! Owns the singleton `BlobCoordinator` (one drainer + K=32 executor
 //! pool), the shared `_pool/` S3 backend it writes against, and the
 //! heap-owned raft-backed reservation context.
-//! See `docs/streaming-model.md §7` Phases 3 + 5.
+//! See the blob coordinator / chunk spool (`docs/architecture/routing-and-ingress.md`).
 //!
 //! All worker bodies > 16 KB (inbound + outbound fetch chunks) submit
 //! to `coordinator`; the coordinator demuxes them into the one `_pool/`
@@ -21,7 +21,7 @@ const blob_mod = @import("rove-blob");
 // Single-node uses the coordinator's local atomic counter for
 // cross-tenant `batch_id` reservation, which is correct for one node.
 // Cluster-wide reservation (multi-node) goes through the bridge's
-// `__root__` group — see docs/streaming-model.md §7 Phase 5.
+// `__root__` group — see the blob coordinator (`docs/architecture/routing-and-ingress.md`).
 
 pub const BlobCoordination = struct {
     allocator: std.mem.Allocator,
@@ -32,14 +32,14 @@ pub const BlobCoordination = struct {
     /// backend on the node points at.
     blob_backend_cfg: blob_mod.BackendConfig,
 
-    /// `docs/streaming-model.md §7` Phase 3: process-global write
-    /// coordinator for readset blob PUTs. All worker bodies (inbound +
+    /// The blob coordinator (`docs/architecture/routing-and-ingress.md`):
+    /// process-global write coordinator for readset blob PUTs. All worker bodies (inbound +
     /// outbound fetch chunks > 16 KB) submit here; the coord runs one
     /// drainer + K=32 executor pool. Lazy init via `start` after the
     /// node is wired + `num_workers` is known.
     coordinator: ?*blob_mod.BlobCoordinator = null,
 
-    /// `docs/streaming-model.md §7` Phase 5: backend that owns the
+    /// The blob coordinator (`docs/architecture/routing-and-ingress.md`): backend that owns the
     /// cross-tenant `_pool/` prefix the coordinator writes against.
     /// Opened once in `start`, deinit'd in `deinit` (after the coord
     /// itself shuts down + joins).
@@ -52,7 +52,7 @@ pub const BlobCoordination = struct {
         return .{ .allocator = allocator, .blob_backend_cfg = blob_backend_cfg };
     }
 
-    /// `docs/streaming-model.md §7` Phase 3 + Phase 5: spawn the
+    /// The blob coordinator (`docs/architecture/routing-and-ingress.md`): spawn the
     /// process-global blob coordinator. Idempotent. Called once from
     /// `main.zig` after the node is wired + `num_workers` is known
     /// (the coord allocates per-worker queues up front).

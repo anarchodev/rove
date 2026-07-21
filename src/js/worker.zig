@@ -202,13 +202,13 @@ pub const ForwardWait = struct {
 };
 
 /// Per-entity park record for park-on-durability
-/// (`docs/readset-replication-plan.md`). When `dispatchPending` parks an
+/// (readset replication; `docs/architecture/effects-and-handlers.md`). When `dispatchPending` parks an
 /// entity waiting for its inbound request body's batch to flush,
 /// it sets this component with the coordinator's `(worker_id,
 /// worker_seq)` durability key and the owning tenant id, then
 /// `reg.move`s the entity from `request_out` to `body_pending`.
 ///
-/// docs/streaming-model.md §7: durability is observed
+/// The streaming substrate (`docs/architecture/routing-and-ingress.md`): durability is observed
 /// via `node.blob_coordinator.durableSeq(worker_id) > worker_seq`.
 /// `drainBodyPending` polls that atomic and, on advance, looks up
 /// `coord.bodyRef(worker_id, worker_seq)` to materialize the wire
@@ -295,7 +295,7 @@ pub fn onChunkRemember(worker: anytype, dep_id: u64, module_base: []const u8, ha
     gop.value_ptr.* = has_onchunk;
 }
 
-/// headers_first dispatch state (blob-storage-plan §3.5.1; `docs/architecture/routing-and-ingress.md`).
+/// headers_first dispatch state (`docs/architecture/routing-and-ingress.md`).
 /// `drainRequestReceiving` moves an early-emitted request (body still
 /// inbound) from h2's `request_receiving` into `request_out` with
 /// `receiving = true`; `dispatchOnce` runs it as an
@@ -334,7 +334,7 @@ pub const BodyDurabilityWait = struct {
 /// when `fireFetchEventActivation` flipped its `parked_to_durability`
 /// flag).
 ///
-/// docs/streaming-model.md §7: durability is observed
+/// The streaming substrate (`docs/architecture/routing-and-ingress.md`): durability is observed
 /// via the process-global coordinator. `drainFetchPendingDurability`
 /// polls `coord.durableSeq(worker_id) > worker_seq` each tick. On
 /// advance, it looks up `coord.bodyRef(worker_id, worker_seq)`,
@@ -364,14 +364,14 @@ pub const ParkedFetchEvent = struct {
 /// `BufferedCmds.releaseAll` → `interpretCmd` per Cmd); discarded
 /// on fault/timeout/leadership-loss (`BufferedCmds.deinit` walks
 /// each Cmd's per-variant deinit). The §9.4 "spurious + overflow"
-/// thesis tolerates dropped kv_wakes; `streaming-model.md` §2's
+/// thesis tolerates dropped kv_wakes; the streaming substrate's
 /// "a chunk reaches the wire only after the activation that
 /// produced it has committed" makes a fault-arm chunk-discard the
 /// rule, not the exception.
 pub const BufferedSendKvOps = effect_mod.cmd.BufferedCmds;
 
 /// A post-propose parked unit (divergence workstream,
-/// `docs/unified-effect-gating.md` idiom-1) — the parked-unit half
+/// effect gating, `docs/architecture/effects-and-handlers.md`) — the parked-unit half
 /// of the Cmd-buffer commit gate. The H2 entity path parks ECS
 /// entities in `raft_pending_X` and emits a `Cmd.respond` on the
 /// matching unit; non-entity paths (the streaming kv-wake gate in
@@ -393,7 +393,7 @@ pub const BufferedSendKvOps = effect_mod.cmd.BufferedCmds;
 pub const ParkedUnit = effect_mod.Continuation(BufferedSendKvOps, *kv_mod.KvStore.TrackedTxn);
 
 /// One inbound WS frame held behind its connection's input gate
-/// (architecture/websockets.md strict reply ordering). `payload` is an owned
+/// (`docs/architecture/websockets.md`, strict reply ordering). `payload` is an owned
 /// copy — the transport's `ws_message_out` entity is destroyed in the
 /// same tick the frame queues.
 pub const WsQueuedFrame = struct {
@@ -403,7 +403,7 @@ pub const WsQueuedFrame = struct {
 
 /// Per-WS-connection worker state (the `ws_conns` map value).
 ///
-/// `gate_seq != 0` is the **input gate** (architecture/websockets.md, the DO
+/// `gate_seq != 0` is the **input gate** (`docs/architecture/websockets.md`, the DO
 /// input-gate analog): a writing frame's forgetful unit is awaiting
 /// raft at that per-tenant seq, so newly-arriving frames queue on
 /// `queue` instead of activating. `flushWsGates` re-opens the gate
@@ -553,14 +553,14 @@ pub const KvWakeInbox = struct {
 /// shuts down cleanly.
 pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 
-/// `docs/chunk-spool-plan.md` Phase 3: default per-fetch chunk-spool
+/// The chunk spool (`docs/architecture/routing-and-ingress.md`): default per-fetch chunk-spool
 /// RAM window depth (K). At the 64KB default `max_response_chunk_bytes`
 /// this caps inline RAM at ~256KB per in-flight bound fetch; chunks
 /// beyond the window read their bytes back from the coordinator.
 /// Override via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
 pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH: usize = 4;
 
-/// `docs/chunk-spool-plan.md` P6: a deferred `coord.release(worker_id,
+/// The chunk spool (`docs/architecture/routing-and-ingress.md`): a deferred `coord.release(worker_id,
 /// seq)` for a consumed/dropped bound chunk whose coordinator submit
 /// wasn't durable yet at consume time. Retried in `drainSpools`.
 pub const CoordPendingRelease = struct { worker_id: u8, seq: u64 };
@@ -594,8 +594,8 @@ const TargetWrite = struct {
 /// `platform.root.*` (→ `root_ws`, a type-2 root writeset) and the
 /// cross-tenant trampolines `platform.scope(id).kv.*` /
 /// `platform.releases.publish` / signup→`deployStarter` (→ a
-/// per-target type-0 writeset). Option-A (docs/proposer-audit.md
-/// Addendum 3): these ride the **same atomic raft entry** as the
+/// per-target type-0 writeset). Option-A (the proposer fold-gate,
+/// `docs/architecture/consensus-robustness.md`): these ride the **same atomic raft entry** as the
 /// batch and the caller is parked on that one seq, instead of
 /// fire-and-forget proposes the caller never gated on. Lives on the
 /// worker (single-threaded per tick, like `pending_txns`); reset at
@@ -697,7 +697,7 @@ pub const BlockedTenants = struct {
 /// Record buffering lives on the worker-wide `log_buffer:
 /// NodeLogBuffer` (one buffer per node, not per tenant), since every
 /// flush combines all tenants' records into one batch anyway. See
-/// `docs/logs-plan.md` §3.1 / §6.9.
+/// the log-server (`docs/architecture/deployment-and-logs.md`).
 pub const TenantLog = struct {
     allocator: std.mem.Allocator,
     instance_id: []u8,
@@ -797,7 +797,7 @@ pub const Options = struct {
 /// Owned by `main.zig`; workers borrow `*NodeState`.
 ///
 /// Process-wide placement of these fields avoids three problems (see
-/// `docs/deployment-snapshots-plan.md`):
+/// deployment snapshots, `docs/architecture/deployment-and-logs.md`):
 ///
 ///   1. Per-worker bytecode duplication. The deployment cache is
 ///      pure read-only bytes between releases; one copy per process
@@ -898,7 +898,7 @@ pub const NodeState = struct {
     // builds the appropriate `effect.Msg` and routes through the same
     // hash-by-tenant registry as subscriptions and (future) inbound HTTP.
 
-    /// `docs/curl-multi-plan.md` Phase 2: the outbound-fetch engine.
+    /// Outbound fetch / libcurl multi (`docs/architecture/configuration-and-network.md`): the outbound-fetch engine.
     /// One thread + one `curl_multi` handle drives many concurrent
     /// transfers.
     /// Lazy init via `startFetchEngine` after NodeState is wired +
@@ -930,7 +930,7 @@ pub const NodeState = struct {
     /// handle the reservation provider needs. Extracted from NodeState
     /// into `blob_coordination.zig`. Lazy-started via
     /// `blob_coord.start(num_workers)` after `blob_coord.setCluster`.
-    /// See `docs/streaming-model.md §7` Phases 3 + 5.
+    /// See the streaming substrate (`docs/architecture/routing-and-ingress.md`).
     blob_coord: BlobCoordination,
 
     pub fn init(
@@ -969,7 +969,7 @@ pub const NodeState = struct {
         self.deploy.router = &self.router;
     }
 
-    /// `docs/curl-multi-plan.md` Phase 2: hand each PendingFetch to
+    /// Outbound fetch (`docs/architecture/configuration-and-network.md`): hand each PendingFetch to
     /// `FetchEngine.submit`. The handler accumulated these into a
     /// caller-owned list during its run; the worker calls this at
     /// batch-finalize time (handler completed without throwing).
@@ -1049,7 +1049,7 @@ pub const NodeState = struct {
         self.deploy.deinit();
     }
 
-    /// `docs/curl-multi-plan.md` Phase 2: spawn the outbound
+    /// Outbound fetch (`docs/architecture/configuration-and-network.md`): spawn the outbound
     /// `http.fetch` engine (one thread + one curl_multi handle).
     /// Idempotent. Called once from `main.zig` after NodeState is
     /// wired + workers have spawned (so their fetch-chunk inboxes
@@ -1193,7 +1193,7 @@ pub const WorkerConfig = struct {
     /// otherwise. Required because `flushLogs` shouldn't have to
     /// reason about a missing observability backend.
     log_batch_store: log_server_mod.batch_store.BatchStore,
-    /// `docs/readset-replication-plan.md` Phase 5b — node's data
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`) — node's data
     /// directory. The worker reads its per-worker
     /// `last_uploaded_seq` checkpoint at startup from
     /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`
@@ -1214,7 +1214,7 @@ pub fn Worker(comptime opts: Options) type {
     // `/_system/*` proxies.
     //
     // Cont + stream state components
-    // (`docs/handler-cmds-refactor-plan.md`) ride on every h2 stream
+    // (the Cmd pattern, `docs/architecture/effects-and-handlers.md`) ride on every h2 stream
     // collection + worker `parked_continuations` + worker
     // `raft_pending`. Non-cont / non-stream entities carry
     // default-empty instances; the SoA cost is the per-entity
@@ -1267,7 +1267,7 @@ pub fn Worker(comptime opts: Options) type {
     const ParkedUnitRow = rove.Row(&.{ParkedUnit});
     const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
 
-    // blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: open blob upload sessions —
+    // Blob upload-session collection (`docs/architecture/routing-and-ingress.md`): open blob upload sessions —
     // one entity per (tenant, chain) accumulating `blob.write`
     // bytes until `blob.seal`. Per-worker (a chain's activations
     // all run on its owning worker). Session strings + buffer
@@ -1324,7 +1324,7 @@ pub fn Worker(comptime opts: Options) type {
         /// `stream_response_in` (after the entity's stream components
         /// are set). Same Row.
         raft_pending_stream: StreamColl,
-        /// `docs/readset-replication-plan.md` Phase 4 park-on-
+        /// Readset replication (`docs/architecture/effects-and-handlers.md`) park-on-
         /// durability. Entities `dispatchPending` parked after
         /// submitting their inbound body (> 16 KB) to the process-
         /// global blob coordinator (`coord.submit` → seq), waiting for
@@ -1422,7 +1422,7 @@ pub fn Worker(comptime opts: Options) type {
         // too); the raft_pending_stream drainEntityArm just moves the
         // entity to stream_response_in on commit — no side-table
         // consume, no `pending_stream_meta`.
-        /// Per-worker kv-wake inbox (streaming-handlers-plan §4.6).
+        /// Per-worker kv-wake inbox (streaming handlers, `docs/architecture/routing-and-ingress.md`).
         /// Producers (apply.zig + leader-side worker_dispatch) push
         /// events here via `worker.node.broadcastKvWake`;
         /// `serviceParkedStreams` drains it at the start of each
@@ -1453,7 +1453,7 @@ pub fn Worker(comptime opts: Options) type {
         /// State-as-membership: presence in the collection IS the
         /// "awaiting raft commit" state.
         parked_units: ParkedUnitColl,
-        /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: open blob upload sessions
+        /// Blob upload-session collection (`docs/architecture/routing-and-ingress.md`): open blob upload sessions
         /// (`blob.write` / `blob.seal`). TTL-swept via
         /// `blob_sessions.sweepBlobSessions` in the worker tick.
         blob_sessions: BlobSessionColl,
@@ -1506,12 +1506,12 @@ pub fn Worker(comptime opts: Options) type {
         /// tick drains this after `dispatchPendingMsgs` — by then
         /// the shim's txn is committed.
         pending_bound_resumes: std.ArrayListUnmanaged(PendingBoundResume) = .empty,
-        /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+        /// The streaming substrate (`docs/architecture/routing-and-ingress.md`) + `docs/handler-shape.md`
         /// §5.5: registry for `http.fetch({bind: true})` — maps
         /// `fetch_id` to the entity that issued the fetch. Populated
         /// at the handler-success seam (`worker_dispatch`'s direct
         /// `registerBoundFetchTrampoline` call, where `bind = held and
-        /// !detach` is computed — docs/auto-bind-plan.md); consulted
+        /// !detach` is computed, the fetch auto-bind rule); consulted
         /// in `dispatchPendingMsgs`'s `.fetch_chunk` arm to route
         /// upstream chunks into the held chain's `onFetchChunk`
         /// resume; cleared on terminal (`ev.final`) or on held-client
@@ -1546,7 +1546,7 @@ pub fn Worker(comptime opts: Options) type {
         /// the rest off `parked_continuations` membership and janitors
         /// stale entries.
         inbound_chunk_jobs: std.AutoHashMapUnmanaged(rove.Entity, *inbound_chunk_mod.Job) = .empty,
-        /// `docs/chunk-spool-plan.md` Phase 2: per-fetch chunk spool,
+        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): per-fetch chunk spool,
         /// keyed by `fetch_id`, sibling to `bound_fetch_entities`.
         /// Decouples bound-fetch chunk arrival from the held chain's
         /// raft commit cadence — arriving chunks push onto the spool;
@@ -1556,7 +1556,7 @@ pub fn Worker(comptime opts: Options) type {
         /// stability across rehash. Keys are allocator-owned fetch_id
         /// dupes; freed on `dropSpool` + on shutdown (`destroy`).
         bound_fetch_spools: std.StringHashMapUnmanaged(*chunk_spool_mod.ChunkSpool) = .empty,
-        /// `docs/chunk-spool-plan.md` P6: deferred coordinator releases
+        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): deferred coordinator releases
         /// for consumed/dropped bound chunks. The spool consumes
         /// in-window chunks from their inline bytes BEFORE their
         /// coordinator submit is durable (its ref isn't set yet), so a
@@ -1566,7 +1566,7 @@ pub fn Worker(comptime opts: Options) type {
         /// at shutdown are dropped (lossy-on-shutdown, like the log
         /// flusher). Touched only by the worker thread.
         coord_pending_releases: std.ArrayListUnmanaged(CoordPendingRelease) = .empty,
-        /// `docs/chunk-spool-plan.md` Phase 3: K, the per-fetch RAM
+        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): K, the per-fetch RAM
         /// window depth. Chunks within K of a spool's head keep their
         /// inline bytes; chunks pushed beyond K evict their inline
         /// bytes (read back from the coordinator at dispatch). Default
@@ -1581,7 +1581,7 @@ pub fn Worker(comptime opts: Options) type {
         /// Peak total queued entries summed across all live spools —
         /// how far the producer (upstream chunk arrival) ran ahead of
         /// the raft-rate consumer. A peak ≫ K is the decoupling
-        /// evidence (`docs/chunk-spool-plan.md` Phase 5): chunks pile
+        /// evidence (chunk spool, `docs/architecture/routing-and-ingress.md`): chunks pile
         /// into the spool at upstream rate while activations drain at
         /// raft rate. Exposed as `bound_fetch_spool_depth_peak`.
         bound_fetch_spool_depth_peak: usize = 0,
@@ -1595,8 +1595,8 @@ pub fn Worker(comptime opts: Options) type {
         /// Count of spooled-but-unconsumed chunks discarded by
         /// `dropSpool` when a bound fetch is cancelled
         /// (`http.cancelFetch`) or its held client disconnects
-        /// (`scanAndCancelBoundFetches`) — `docs/chunk-spool-plan.md`
-        /// Phase 4. Excludes the clean terminal drop (the spool is
+        /// (`scanAndCancelBoundFetches`) — the chunk spool
+        /// (`docs/architecture/routing-and-ingress.md`). Excludes the clean terminal drop (the spool is
         /// empty by then). Exposed as
         /// `bound_fetch_spool_dropped_total`. Never reset.
         bound_fetch_spool_dropped_total: u64 = 0,
@@ -1604,12 +1604,12 @@ pub fn Worker(comptime opts: Options) type {
         /// `flushLogs` — the batch was drained from `log_buffer` before
         /// the S3 PUT, so a writeBatch failure or a lost-leadership
         /// mid-tick loses those records for good (lossy-on-failure by
-        /// design — `docs/logs-plan.md` §1). Logged AND counted so the
+        /// design — the log-server, `docs/architecture/deployment-and-logs.md`). Logged AND counted so the
         /// permanent data-loss volume is visible over time, not just a
         /// transient warn line. Exposed as `log_records_dropped_total`.
         /// Never reset.
         log_records_dropped_total: u64 = 0,
-        /// `docs/cross-worker-held-state-plan.md` Phase 3: worker-
+        /// Cross-worker held state (`docs/architecture/effects-and-handlers.md`): worker-
         /// local mirror of NodeState's `bound_send_owners`. Maps
         /// send_id → the parked cont entity bound to it.
         /// Populated alongside `bound_send_owners` (the
@@ -1640,7 +1640,7 @@ pub fn Worker(comptime opts: Options) type {
         /// Per-tick accumulator for admin-handler side effects
         /// (`platform.root.*` + cross-tenant trampolines). Folded
         /// into the batch's single raft entry by `finalizeBatch`
-        /// (Option-A, docs/proposer-audit.md Addendum 3). Reset at
+        /// (Option-A, the proposer fold-gate, `docs/architecture/consensus-robustness.md`). Reset at
         /// `dispatchOnce` entry and `finalizeBatch` exit.
         batch_side: BatchSideEffects = .{},
         /// Last-tick leader state. A true→false transition triggers
@@ -1698,13 +1698,13 @@ pub fn Worker(comptime opts: Options) type {
         /// `WorkerConfig.log_worker_id` (or the raft node id as a
         /// fallback).
         log_worker_id: u16,
-        /// `docs/readset-replication-plan.md` Phase 5b — node data
+        /// Readset replication (`docs/architecture/effects-and-handlers.md`) — node data
         /// directory borrowed from `WorkerConfig.data_dir`. Used by
         /// the per-worker `last_uploaded_seq` checkpoint file at
         /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`.
         /// Null disables the checkpoint (test fixtures).
         data_dir: ?[]const u8,
-        /// `docs/readset-replication-plan.md` Phase 5b — the highest
+        /// Readset replication (`docs/architecture/effects-and-handlers.md`) — the highest
         /// raft seq this worker has covered with a successful
         /// `flushLogs`. Read at startup from the checkpoint file
         /// (0 if missing); advanced after each successful flush.
@@ -1912,7 +1912,7 @@ pub fn Worker(comptime opts: Options) type {
                 try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
-            // docs/streaming-model.md §7: body flush is the process-
+            // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is the process-
             // global BlobCoordinator's job (NodeState.blob_coordinator);
             // this per-worker flusher_thread runs only the log flush.
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
@@ -1944,12 +1944,12 @@ pub fn Worker(comptime opts: Options) type {
         /// block the worker process on a multi-second S3 PUT (which
         /// would in turn block whatever supervisor is waiting on the
         /// child). This matches the stated lossy-on-node-failure
-        /// semantics in `docs/logs-plan.md`: in-flight log records
+        /// semantics of the log-server (`docs/architecture/deployment-and-logs.md`): in-flight log records
         /// can be lost on shutdown.
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
             while (!self.flusher_should_stop.load(.acquire)) {
-                // docs/streaming-model.md §7: body flush is now driven by
+                // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is driven by
                 // the process-global coordinator's own drainer + executor
                 // threads — no per-tick call from the worker. The per-tick
                 // log flush drains the local fast path's records and advances
@@ -1979,7 +1979,7 @@ pub fn Worker(comptime opts: Options) type {
                 t.join();
                 self.flusher_thread = null;
             }
-            // docs/streaming-model.md §7: the blob coordinator lives on
+            // The streaming substrate (`docs/architecture/routing-and-ingress.md`): the blob coordinator lives on
             // NodeState and shuts down there (not here).
             // Stop the push thread AFTER the flusher: the flusher
             // enqueues to push_queue, so stopping push first would
@@ -2060,7 +2060,7 @@ pub fn Worker(comptime opts: Options) type {
                 while (it.next()) |entry| allocator.free(entry.key_ptr.*);
                 self.bound_fetch_entities.deinit(allocator);
             }
-            // architecture/websockets.md (piece D): the chain entities themselves
+            // `docs/architecture/websockets.md` (piece D): the chain entities themselves
             // are reaped via `parked_continuations`/registry teardown on
             // shutdown; free each connection's gated-frame queue, then
             // the map's own storage.
@@ -2086,7 +2086,7 @@ pub fn Worker(comptime opts: Options) type {
                 }
                 self.inbound_chunk_jobs.deinit(allocator);
             }
-            // `docs/chunk-spool-plan.md` Phase 2: free every spool +
+            // Chunk spool (`docs/architecture/routing-and-ingress.md`): free every spool +
             // its still-pending entries + the duped fetch_id key.
             // Best-effort drain at shutdown, same lossy posture as
             // `fetch_pending_durability` below.
@@ -2188,7 +2188,7 @@ pub fn Worker(comptime opts: Options) type {
         /// per-target side writeset so `proposeBatch` replicates
         /// them in the batch's single atomic raft entry and
         /// `finalizeBatch` parks the calling admin request on that
-        /// seq (docs/proposer-audit.md Addendum 3).
+        /// seq (the proposer fold-gate, `docs/architecture/consensus-robustness.md`).
         fn applyTargetWrite(
             self: *Self,
             allocator: std.mem.Allocator,
@@ -2337,8 +2337,8 @@ pub fn Worker(comptime opts: Options) type {
         /// dep_id)`. Stamps `_deploy/current = hex(dep_id)` on the
         /// target tenant's app.db (one-shot kvexp speculative
         /// commit) and folds that writeset into the batch's single
-        /// atomic raft entry (Option-A, docs/proposer-audit.md
-        /// Addendum 3), then enqueues the deployment loader.
+        /// atomic raft entry (Option-A, the proposer fold-gate,
+        /// `docs/architecture/consensus-robustness.md`), then enqueues the deployment loader.
         ///
         /// Returns `error.InstanceNotFound` if the target doesn't
         /// resolve. The caller's response is **gated on commit**:
@@ -2421,7 +2421,7 @@ pub fn Worker(comptime opts: Options) type {
         /// Deliberately its own txn (NOT the dispatch batch
         /// txn) so the admin handler's home-`__admin__` dispatch and a
         /// cross-tenant write never hold two open txns at once
-        /// (auth-domain-plan §4.7 "Primitive-fix pivot").
+        /// (the never-two-open-txns discipline).
         pub fn scopeKvWriteTrampoline(
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -2704,7 +2704,7 @@ pub fn Worker(comptime opts: Options) type {
             return true;
         }
 
-        /// `docs/curl-multi-plan.md` Phase 2: trampoline wired into
+        /// Outbound fetch (`docs/architecture/configuration-and-network.md`): trampoline wired into
         /// `DispatchState.cancel_fetch`. The JS binding's
         /// `http.cancelFetch({id})` lands here; we forward to the
         /// node's `FetchEngine.cancel`. Silently no-ops when the
@@ -2712,7 +2712,7 @@ pub fn Worker(comptime opts: Options) type {
         /// match an in-flight transfer (already complete).
         pub fn cancelFetchTrampoline(ctx: *anyopaque, id: []const u8) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            // `docs/chunk-spool-plan.md` Phase 4: a customer
+            // Chunk spool (`docs/architecture/routing-and-ingress.md`): a customer
             // `http.cancelFetch(id)` tears down the libcurl transfer
             // AND retires the held-state for the fetch — unregister the
             // bound-fetch registry entry (decrements fetchesPending,
@@ -2748,7 +2748,7 @@ pub fn Worker(comptime opts: Options) type {
             return true;
         }
 
-        /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: blob upload-session
+        /// Blob upload sessions (`docs/architecture/routing-and-ingress.md`): blob upload-session
         /// trampolines, wired into `Request.trampolines` so the
         /// `_system.blob.write` / `.seal` bindings reach this
         /// worker's `blob_sessions` collection through the same
@@ -2786,7 +2786,7 @@ pub fn Worker(comptime opts: Options) type {
             );
         }
 
-        /// blob-storage-plan §3.5.1 slice B; `docs/architecture/routing-and-ingress.md`: arm a
+        /// Blob receive (`docs/architecture/routing-and-ingress.md`): arm a
         /// `blob.receive` at its commit point. The receive-door
         /// PendingFetch (intercepted before the FetchEngine by
         /// `interpretCmd`'s http_fetch arm and `finalizeBatch`'s
@@ -2877,7 +2877,7 @@ pub fn Worker(comptime opts: Options) type {
             return false;
         }
 
-        /// `platform.compile` submit door (`rove-cli-plan.md` §4.1). The
+        /// `platform.compile` submit door (`docs/architecture/cli-and-deploy.md` §4.1). The
         /// shim issues an `on.fetch` to `rove-compile.internal`; the
         /// finalize seam binds it (connection_scoped + held); `interpretCmd`
         /// routes the URL here instead of libcurl. We parse `{scope, files}`
@@ -3152,10 +3152,10 @@ pub fn Worker(comptime opts: Options) type {
             return .{ .conn = sess.entity, .sid = sid.id };
         }
 
-        /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+        /// The streaming substrate (`docs/architecture/routing-and-ingress.md`) + `docs/handler-shape.md`
         /// §5.5: bound-fetch registration. Called DIRECTLY at the
         /// handler-success seam (`worker_dispatch`, where `bind = held
-        /// and !detach` is computed per docs/auto-bind-plan.md) — not
+        /// and !detach` is computed, the fetch auto-bind rule) — not
         /// via a Request/DispatchState fn-pointer field. We dupe
         /// `fetch_id` (the registry owns the key) and stamp the entity
         /// handle. Subsequent
@@ -3186,7 +3186,7 @@ pub fn Worker(comptime opts: Options) type {
             };
             gop.key_ptr.* = key_dup;
             gop.value_ptr.* = entity;
-            // `docs/cross-worker-held-state-plan.md` Phase 1: mirror
+            // Cross-worker held state (`docs/architecture/effects-and-handlers.md`): mirror
             // the registration onto the NodeState owner map so a
             // future chunk arriving on a different worker can find
             // the owner. Failures here are non-fatal — the routing
@@ -3734,7 +3734,7 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
 
     const empty: []u8 = &.{};
     // A successful send_callback must carry its Msg — the callee-outcome
-    // envelope on trigger_payload — or the L3 assert fires (issue #67).
+    // envelope on trigger_payload — or the L3 assert fires.
     const tp_bytes = try allocator.dupe(u8, "tp");
     captureLog(
         &fake,

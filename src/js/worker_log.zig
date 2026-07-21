@@ -215,7 +215,7 @@ pub fn captureTapesWithActivation(
 }
 
 /// Serialize a drained wake batch to the EXACT JSON the handler saw on
-/// `request.activation.wakes` (globals.zig's wake_batch block, issue #62):
+/// `request.activation.wakes` (globals.zig's wake_batch block):
 /// one `{"kind":"kv","prefix":…,"firedAt":<ms>}` / `{"kind":"timer",
 /// "firedAt":<ms>}` per entry, fire-time order preserved, `firedAt` in
 /// milliseconds (the JS-facing encoding — `fired_at_ns` is internal).
@@ -264,13 +264,13 @@ pub fn wakesToJson(
 }
 
 /// Record a `wake_batch` activation's Msg — the drained fired-watch batch
-/// (issue #62, follow-on to the #8 fired-prefix contract) — so a wake
+/// (follow-on to the fired-prefix contract) — so a wake
 /// resume is replayable. The batch tapes as `activation_bytes` (the wakes
 /// JSON, always at least `[]`); `ctx_body` is the `{"ctx":…}` envelope →
 /// trigger_payload (→ `request.ctx`); `export_name` is the resolved wake
 /// export when the arm carried an `{on}` override (G3 — replay must
 /// invoke the same export), "" when the default `onWake` applies.
-/// Bounded input: post-#8 the batch is one entry per armed watch, so the
+/// Bounded input: the batch is one entry per armed watch, so the
 /// JSON is always far under `REQUEST_BODY_CAP`.
 pub fn captureWakeBatchTapes(
     worker: anytype,
@@ -307,7 +307,7 @@ pub fn captureWakeBatchTapes(
 }
 
 /// Record a `send_callback` activation's Msg — the callee outcome
-/// (issue #67, the last resume kind whose Msg reaches the tape). The whole
+/// (the last resume kind whose Msg reaches the tape). The whole
 /// synthesized `{"ctx":…}` body envelope IS the Msg: `{"ctx":{result,
 /// context}}` for a result delivery (a `webhook.send`/`blob.put` `{on}` hop
 /// or a §6.4 held-sync resume — `installRequest`'s hoist flattens `result`
@@ -360,7 +360,7 @@ pub const FetchEvent = struct {
     body_truncated: bool = false,
     /// The resolved export this fetch resume dispatched to (`ev.resolvedExport()`
     /// — a `{on}` override, or onFetchResult/Chunk/Done). Recorded so replay
-    /// invokes the same export (`replay-and-sim.md` §5 G3).
+    /// invokes the same export (`docs/architecture/replay-and-sim.md` §5 G3).
     export_name: []const u8 = "",
 };
 
@@ -455,7 +455,7 @@ pub fn l3MissingChannel(
             "activation_bytes (the WS frame)"
         else
             null,
-        // issue #62: the drained fired-watch batch is the wake's Msg.
+        // The drained fired-watch batch is the wake's Msg.
         // `captureWakeBatchTapes` always emits at least `[]`, so an
         // empty `activation_bytes` here means the capture was skipped,
         // never "the batch was empty".
@@ -463,7 +463,7 @@ pub fn l3MissingChannel(
             "activation_bytes (the wake batch)"
         else
             null,
-        // issue #67: a send_callback's Msg is the `{"ctx":…}` body
+        // A send_callback's Msg is the `{"ctx":…}` body
         // envelope, recorded on trigger_payload. Both producers (the
         // held resume and the chained fire) always synthesize a
         // non-empty envelope — at minimum `{"ctx":null}` — and
@@ -720,8 +720,8 @@ fn freeTags(allocator: std.mem.Allocator, tags: []log_mod.Tag) void {
 /// configured `BatchStore`. Runs on the leader only — followers'
 /// buffer is always empty because `dispatchPending` early-returns 503
 /// on followers. Lossy on PUT failure: records already left the
-/// buffer; per `docs/logs-plan.md` §1 a node-failure window may drop
-/// one batch.
+/// buffer, so a node-failure window may drop one batch (the
+/// log-server delivery model — `docs/architecture/deployment-and-logs.md`).
 ///
 /// Interleaved-per-node flush: every record carries its `tenant_id`;
 /// the indexer demuxes on read. One S3 object per flush window per
@@ -981,14 +981,14 @@ test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + 
     try testing.expect(l3MissingChannel(.inbound, .ok, empty) == null);
     try testing.expect(l3MissingChannel(.disconnect, .ok, empty) == null);
 
-    // issue #62: a wake_batch's Msg is the fired-watch batch —
+    // A wake_batch's Msg is the fired-watch batch —
     // `captureWakeBatchTapes` always tapes at least `[]`, so empty
     // activation_bytes on a successful wake IS a missed capture.
     try testing.expect(l3MissingChannel(.wake_batch, .ok, empty) != null);
     try testing.expect(l3MissingChannel(.wake_batch, .ok, ab) == null);
     try testing.expect(l3MissingChannel(.wake_batch, .handler_error, empty) == null);
 
-    // issue #67: a send_callback's Msg is the `{"ctx":…}` envelope on
+    // A send_callback's Msg is the `{"ctx":…}` envelope on
     // trigger_payload — both producers always synthesize one, so an
     // empty channel on a successful callback IS a missed capture.
     var tp = log_mod.TapePayloads{};

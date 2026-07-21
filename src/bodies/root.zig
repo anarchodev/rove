@@ -3,7 +3,8 @@
 //! This module holds the on-wire shape (`BodyRef`, `NO_BATCH`) and the
 //! leaf-key formatters that replay needs to reconstruct S3 keys from
 //! raft entry readsets. Body flush itself lives in the process-global
-//! `blob.BlobCoordinator` (`docs/streaming-model.md §7`).
+//! `blob.BlobCoordinator` — the blob coordinator / chunk spool
+//! (`docs/architecture/routing-and-ingress.md`).
 //!
 //! `batch_id` is globally unique (via raft reservation) and keys live
 //! under a single cross-tenant `_pool/` prefix. The wire `BodyRef`

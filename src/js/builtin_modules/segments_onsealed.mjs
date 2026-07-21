@@ -1,4 +1,4 @@
-// blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`: segments.seal's on_result — the
+// `docs/architecture/blob-write-recipes.md` (the `segments.seal` recipe): segments.seal's on_result — the
 // SWAP half of the seal. The shim serialized the hot rows and fired
 // a durable blob.put; this module runs when that PUT settled and,
 // only on success, performs the pointer swap in ONE atomic writeset:
@@ -27,7 +27,7 @@ function pad(seq) {
 export default function () {
     // Unified effect-result surface (handler-shape §7, Endpoint A): a
     // blob.put on_result arrives flattened — `request.status` top-level
-    // (the single success signal; 2xx = ok, no `request.ok`, issue #7),
+    // (the single success signal; 2xx = ok, no `request.ok`),
     // the echoed `context` (the threaded value) IS `request.ctx`, and
     // the stored blob `hash` is on `request.activation.hash`.
     const c = request.ctx || {};

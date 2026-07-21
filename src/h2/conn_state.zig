@@ -1,8 +1,7 @@
-//! Connection/stream leaf state for the h2 runtime (refactor-audit
-//! §4.6): the non-generic per-connection and per-stream types —
-//! `Conn`, `Http1Conn` (with its lifecycle arms, §4.1), the `Stream`
-//! accumulator, the shared `HeaderBuf` (§4.2) and `WsFragments` (§4.3)
-//! cores, `WsReassembler`, `BodySink`/`BodyData`. root.zig re-exports
+//! Connection/stream leaf state for the h2 runtime: the non-generic
+//! per-connection and per-stream types — `Conn`, `Http1Conn` (with its
+//! lifecycle arms), the `Stream` accumulator, the shared `HeaderBuf`
+//! and `WsFragments` cores, `WsReassembler`, `BodySink`/`BodyData`. root.zig re-exports
 //! these types; the generic `H2(opts)` runtime (poll loop, nghttp2
 //! callbacks, public API) lives in root.zig.
 //!
@@ -26,7 +25,7 @@ pub const HeaderField = struct {
 
 /// What an `headers_first` server does with inbound DATA on a stream
 /// whose request entity was early-emitted at the HEADERS frame
-/// (blob-storage-plan §3.5.1; `docs/architecture/routing-and-ingress.md`, the `blob.receive`
+/// (`docs/architecture/routing-and-ingress.md`, the `blob.receive`
 /// transport). The entity's lifecycle state is collection
 /// membership, not this flag: `request_receiving` (early-emitted,
 /// consumer hasn't decided) → `request_buffering`
@@ -89,7 +88,7 @@ pub const Conn = struct {
     /// Set when the first-read sniff (or ALPN) routes a server
     /// connection to the h1 codec instead of nghttp2. While this
     /// is non-null the connection is driven entirely by `http1Feed` /
-    /// `http1WriteResponse` (docs/v2-edge-http1-ingress.md).
+    /// `http1WriteResponse` (HTTP/1.1 ingress, `docs/architecture/routing-and-ingress.md`).
     h1: ?*Http1Conn = null,
     /// Graceful idle reap. When the idle GC decides to close an h2
     /// connection it queues a GOAWAY and sets `draining` instead of
@@ -106,7 +105,7 @@ pub const Conn = struct {
     /// one ordered byte stream, and for TLS every record's MAC binds an
     /// implicit sequence number — so two concurrent `prep_send` SQEs for
     /// the same conn that reach the socket out of order desync the peer's
-    /// record layer (`bad record mac`, anarchodev/rove#2). We therefore
+    /// record layer (`bad record mac`). We therefore
     /// keep AT MOST ONE io write in flight per connection and queue the
     /// rest in FIFO order; `writesAccount` submits the next on completion.
     /// `send_queue` owns each buffer until it is handed to `submitWrite`
@@ -145,12 +144,12 @@ pub const Conn = struct {
     }
 };
 
-/// Per-connection HTTP/1.1 state (docs/v2-edge-http1-ingress.md, Phase 2).
+/// Per-connection HTTP/1.1 state (HTTP/1.1 ingress, `docs/architecture/routing-and-ingress.md`).
 /// Accumulates inbound bytes, drives the pure `http1` codec, and tracks the
 /// single in-flight request (no pipelining). Heap-owned; freed by `Conn.deinit`.
 ///
 /// A connection lives in exactly ONE of three lifecycles, structural via
-/// `state` (refactor-audit §4.1): plain HTTP/1.1 request/response (including
+/// `state`: plain HTTP/1.1 request/response (including
 /// the parked websocket_surface Upgrade — a SUB-state, see
 /// `Http1State.pending_upgrade`), RFC 6455 framed WebSocket (worker
 /// `websocket_upgrades` instances), or the raw-relay tunnel (front
@@ -275,7 +274,7 @@ pub const Http1Conn = struct {
         }
     };
 
-    /// RFC 6455 fragmentation core (refactor-audit §4.3): reassembles one
+    /// RFC 6455 fragmentation core: reassembles one
     /// fragmented data message at a time. `feed` enforces the §5.4 rules (no
     /// nested opener, no orphan continuation) plus the running size cap, and
     /// yields the completed message at FIN. Deliberately transport-free so the
@@ -480,7 +479,7 @@ pub const WsReassembler = struct {
     allocator: std.mem.Allocator,
     buf: std.ArrayList(u8) = .empty,
     /// Fragmented-message reassembly — the same `WsFragments` core the h1
-    /// framed arm uses (§4.3: ONE fragmentation state machine, not two).
+    /// framed arm uses (ONE fragmentation state machine, not two).
     frag: Http1Conn.WsFragments = .{},
     send_buf: std.ArrayList(u8) = .empty,
     /// Our side is done after `send_buf` drains (Close sent / END_STREAM
@@ -722,7 +721,7 @@ pub const Stream = struct {
         return self.hdr.finalize(self.allocator, out_fields, out_count, out_buf_len);
     }
 
-    /// Outcome of routing one inbound body chunk per `body_mode` — §4.4:
+    /// Outcome of routing one inbound body chunk per `body_mode` —
     /// the ONE routing decision both protocols share (`onDataChunkRecvCb`
     /// for h2 DATA, `http1RouteBody` for h1 wire bytes). Callers own the
     /// transport-specific flow-control repayment and failure verbs (h2:

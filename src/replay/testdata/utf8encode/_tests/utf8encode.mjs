@@ -1,4 +1,4 @@
-// Offline cross-check of utf8_encode_smoke_v2.py (issue #11): TextEncoder now
+// Offline cross-check of utf8_encode_smoke_v2.py: TextEncoder now
 // emits real UTF-8, so every non-ASCII byte / hash / base64url matches prod.
 // The expected values are the authoritative UTF-8 of "héllo €🚀" (and the
 // U+FFFD replacement for a lone surrogate) — identical in the worker.

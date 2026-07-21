@@ -174,7 +174,7 @@ globalThis.retry = {
     const req = globalThis.request;
     // Retry a non-2xx result (includes `status === 0` transport
     // failure). Success (2xx) never retries. `status` is the single
-    // result signal — there is no `request.ok` (issue #7).
+    // result signal — there is no `request.ok`.
     if (!req || (req.status >= 200 && req.status < 300)) return false;
     const r = req.ctx && req.ctx[RETRY_KEY];
     if (!r) return false;

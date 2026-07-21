@@ -2,7 +2,8 @@
 //! an h2 query API in one process.
 //!
 //! Reachable at `logs.{public_suffix}` with TLS + JWT handoff. The
-//! wire shape follows `docs/logs-plan.md` §5:
+//! wire shape follows the log-server query surface
+//! (`docs/architecture/deployment-and-logs.md`):
 //!
 //!   GET /v1/{tenant_id}/list
 //!         ?limit=N&after_received_ns=X&after_request_id=Y

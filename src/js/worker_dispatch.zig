@@ -134,7 +134,8 @@ const SuccessRec = struct {
     /// the entity's `ContDescriptor` (`bound_schedule_id`) by the cont
     /// helpers. null = hop fired 0 or >1 sends → deadline-only resume.
     cont_bound_sched_id: ?[]const u8 = null,
-    /// Per-chain correlation id (streaming-handlers-plan §6). Borrows
+    /// Per-chain correlation id (streaming handlers;
+    /// `docs/architecture/routing-and-ingress.md`). Borrows
     /// from the dispatch `Request`; duped into the entity's
     /// `ChainContext` component by the cont helpers so the resume
     /// inherits the same chain id.
@@ -186,7 +187,8 @@ const StreamFirstHopMeta = struct {
     /// reaches the same handler that returned `__rove_stream(...)`.
     module_path: []u8,
     /// Owned. Tenant-scoped kv-key prefixes registered as wake
-    /// conditions (streaming-handlers-plan §4.6). Each entry is one
+    /// conditions (streaming handlers;
+    /// `docs/architecture/routing-and-ingress.md`). Each entry is one
     /// allocator-owned dup; the outer spine is owned too.
     kv_prefixes: [][]u8,
     /// Owned. Tenant id the chain is scoped to. Set by
@@ -267,7 +269,7 @@ pub fn parseStreamHeaders(
     return headers;
 }
 
-// ── Trampoline (connection-actor §6.1/§6.4) finalize helpers ───────
+// ── Trampoline (the connection/tenant actor, `docs/architecture/websockets.md`) finalize helpers ──
 // The txn/writeset/raft machinery is identical for a continuation;
 // these only redirect the FINAL entity destination + own the
 // descriptor handoff onto the entity's `ContDescriptor` +
@@ -690,8 +692,8 @@ fn finalizeBatch(
     /// On propose-fail / handler-error → caller's defer frees the
     /// list.
     batch_pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
-    /// `docs/readset-replication-plan.md` Phase 3d (multi-readset
-    /// aggregation): `tape_mod.encodeReadsetList` blob covering every
+    /// readset replication (`docs/architecture/effects-and-handlers.md`;
+    /// multi-readset aggregation): `tape_mod.encodeReadsetList` blob covering every
     /// successful request in this batch — one
     /// `Readset.serialize` entry per request, length-prefixed inside
     /// a `[u32 count BE][...]` outer wrapper. Empty (`""`) when no
@@ -721,8 +723,9 @@ fn finalizeBatch(
     // must NOT take the read-only fast path — its response has to be
     // parked until the side-effect inners commit.
     if (!has_writes and !has_side) {
-        // idiom-0 read-side gate (docs/proposer-audit.md Addendum,
-        // docs/unified-effect-gating.md §2 scope clarification). If a
+        // idiom-0 read-side gate (the proposer / fold-gate invariant,
+        // `docs/architecture/consensus-robustness.md`; effect gating in
+        // `docs/architecture/effects-and-handlers.md`). If a
         // read in this batch crossed a chain predecessor's still-
         // uncommitted speculative overlay (kvexp set
         // `Txn.saw_speculation`), the value read is NOT durable:
@@ -991,7 +994,7 @@ fn finalizeBatch(
     // partitioned retry sweep (`sweepOwedRetries`) is the fire
     // mechanism (there is no dedicated send commit-gate).
 
-    // streaming-handlers-plan §4.6:
+    // streaming handlers (`docs/architecture/routing-and-ingress.md`):
     // park the kv-wake fan-out intents (one per writeset op) AND
     // the batch's accumulated `http.fetch` Cmds on the same seq.
     // `drainRaftPending`'s parked_units commit arm runs
@@ -1194,7 +1197,7 @@ fn tryHandleSystem(
     }
 
     // Raft snapshot fetch — out-of-band catchup for far-behind
-    // followers (production.md #1.1 step 3). Cap-gated above so any
+    // followers. Cap-gated above so any
     // peer holding the shared services JWT can pull. Streams a
     // bundle of the leader's app.dbs + __root__.db + schedules.db
     // captured via VACUUM INTO for consistency. Path:
@@ -1482,7 +1485,7 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
     // leader-side propose-batch/linger histograms to emit here
     // (per-pump-cycle histograms on the bridge are future work).
 
-    // `docs/cross-worker-held-state-plan.md`: routing observability.
+    // cross-worker held state (`docs/architecture/effects-and-handlers.md`): routing observability.
     // cross_worker counts wake events routed to a worker different
     // from hash(tenant_id) — the cross-worker held-state path. A
     // non-zero count means the SO_REUSEPORT vs hash(tenant_id) gap is
@@ -1500,7 +1503,7 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         worker.node.router.bound_fetch_same_worker_routes.load(.monotonic),
     });
 
-    // `docs/chunk-spool-plan.md` Phase 3: peak inline RAM held by this
+    // blob coordinator / chunk spool (`docs/architecture/routing-and-ingress.md`): peak inline RAM held by this
     // worker's bound-fetch chunk spools. Bounded by K × chunk_size per
     // in-flight fetch — the large-body smoke asserts the watermark
     // stays under the window cap even for a multi-MB upstream body.
@@ -1532,7 +1535,7 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         worker.log_records_dropped_total,
     });
 
-    // `docs/chunk-spool-plan.md` P6: live retained (sealed-but-not-
+    // chunk spool (`docs/architecture/routing-and-ingress.md`): live retained (sealed-but-not-
     // fully-consumed) coordinator batches. Refcount-release keeps this
     // at the live backlog.
     if (worker.node.blob_coord.coordinator) |coord| {
@@ -1723,8 +1726,8 @@ const SNAP_BUNDLE_MAGIC = "ROVSNAP1";
 /// Stream the leader's `cluster.kv` (the consolidated kvexp
 /// manifest holding every store this node serves) as a single HTTP
 /// response body so a far-behind follower can install it as its
-/// new starting state. Per production.md #1.1 step 3, under the
-/// kvexp consolidation.
+/// new starting state — the far-behind follower catchup model, under
+/// the kvexp consolidation.
 ///
 /// Consistency model: `KvStore.dumpManifestToFile` durabilizes the
 /// source manifest, opens a kvexp Snapshot, dumps it through a
@@ -1985,8 +1988,8 @@ fn handleRelease(
         // so there is no local undo to perform (kvexp has no
         // kv_undo table). NotLeader → 421 (the retry-safe re-aim
         // status, decisions.md §10.5c) so callers hunt the leader;
-        // anything else → 503 without parking;
-        // docs/proposer-audit.md (kvexp volatility).
+        // anything else → 503 without parking; the proposer
+        // invariant (kvexp volatility; `docs/architecture/consensus-robustness.md`).
         const status: u16 = if (err == error.NotLeader) 421 else 503;
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -2188,8 +2191,9 @@ fn handleAdminKv(
     // fault would leave it acting on a write the cluster rolled
     // back). Mirrors the Class-B-correct release handler above:
     // drainRaftPending delivers the staged 204 at committedSeq>=seq
-    // / 503 on fault/timeout. docs/proposer-audit.md idiom-2,
-    // docs/unified-effect-gating.md.
+    // / 503 on fault/timeout. The idiom-2 park-on-commit rule
+    // (`docs/architecture/consensus-robustness.md`; effect gating in
+    // `docs/architecture/effects-and-handlers.md`).
     // System endpoint with no dispatched-handler readset; empty
     // rs_bytes is the right value here.
     const seq = (raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID, "") catch |err| {
@@ -2199,7 +2203,8 @@ fn handleAdminKv(
         // that never reached raft leaves nothing durable to undo
         // (kvexp has no kv_undo table). NotLeader → 421 (re-aim,
         // decisions.md §10.5c); anything else → 503 without parking;
-        // docs/proposer-audit.md (kvexp volatility).
+        // the proposer invariant (kvexp volatility;
+        // `docs/architecture/consensus-robustness.md`).
         const status: u16 = if (err == error.NotLeader) 421 else 503;
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -2584,7 +2589,7 @@ fn resolveRequest(
     // `platform.scope(id).kv` accessor, which resolves the target
     // itself and throws a coded `InstanceNotFound` (→ admin handler
     // 404) on an unknown id, keeping unknown-scope a JS-layer 404. See
-    // auth-domain-plan §4.7 "Primitive-fix pivot (2026-05-16)".
+    // the cross-tenant scope-resolution rule (`docs/architecture/auth-and-domains.md`).
     return .{ .dispatch = .{
         .handler_inst = handler_inst,
         .scope_inst = handler_inst,
@@ -2592,7 +2597,7 @@ fn resolveRequest(
     } };
 }
 
-/// headers_first front half (blob-storage-plan §3.5.1; `docs/architecture/routing-and-ingress.md`):
+/// headers_first front half (`docs/architecture/routing-and-ingress.md`):
 /// EVERY h2 body-carrying request is emitted into
 /// `request_receiving` at the HEADERS frame (h2 never auto-completes
 /// it — uniform dispatch regardless of body timing). Pull each one
@@ -2664,7 +2669,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
-    // `docs/readset-replication-plan.md`: every successful
+    // readset replication (`docs/architecture/effects-and-handlers.md`): every successful
     // request in the batch contributes its serialized readset to the
     // raft entry's `rs_bytes` section. Each readset blob is appended
     // to `batch_readset_blobs` as the handler finishes; at
@@ -3213,7 +3218,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // must not read body bytes that aren't yet in stable storage.
         // Bodies-less requests skip this entirely (empty channel).
         //
-        // Two paths by size (docs/streaming-model.md §7 + the
+        // Two paths by size (the streaming substrate,
+        // `docs/architecture/routing-and-ingress.md`, + the
         // INBOUND_INLINE_THRESHOLD below):
         //   - Inline (≤ 16 KB): the bytes ride inline in the readset's
         //     `trigger_payload` entry. The raft entry's fsync IS the
@@ -3317,7 +3323,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     };
                 } else if (body.len > 0) {
                     // Large body (> INBOUND_INLINE_THRESHOLD) — coord
-                    // submit + park. docs/streaming-model.md §7:
+                    // submit + park. The streaming substrate
+                    // (`docs/architecture/routing-and-ingress.md`):
                     // bytes flow to the process-global coord,
                     // we park on the resulting seq, drain materializes
                     // the BodyRef once the seq is durable.
@@ -3375,7 +3382,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         // Admin-handler `platform.root.set/delete` writes accumulate
         // into the *batch* root writeset
-        // (docs/proposer-audit.md Addendum 3) so they ride the
+        // (the proposer / fold-gate invariant,
+        // `docs/architecture/consensus-robustness.md`) so they ride the
         // batch's single atomic raft entry and the caller is parked
         // on that seq — no per-request fire-and-forget. Stable
         // pointer for the whole walk (worker-owned, reset at
@@ -3392,11 +3400,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // points where SSE event-routing identity matters. If the
         // browser sent no `__Host-rove_sid` (or sent a malformed one),
         // we mint a fresh sid and append a `Set-Cookie` to the response
-        // below. See docs/sse-plan.md §1.
+        // below. See SSE / server-sent events (`docs/architecture/routing-and-ingress.md`).
         var sid_prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
         const session_resolved = session_mod.resolve(rh, sid_prng.random());
 
-        // Per-chain correlation id (streaming-handlers-plan §6).
+        // Per-chain correlation id (streaming handlers;
+        // `docs/architecture/routing-and-ingress.md`).
         // Honor `X-Rove-Correlation-Id` from the wire when present
         // (≤256 bytes, no NUL — distributed-tracing posture); else
         // synthesize the 16-char hex of `request_id` so the id is
@@ -3819,7 +3828,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // duping.
             break :blk worker_mod.scanLoneOwedSendId(writeset.ops.items[ws_pre_len..]);
         };
-        // `docs/cross-worker-held-state-plan.md` Phase 1: when this
+        // Cross-worker held state (`docs/architecture/effects-and-handlers.md`): when this
         // open hop bound to exactly one send, register the
         // (send_id → this worker's idx) owner mapping on NodeState.
         // Phase 2's wake routing will consult this to send the
@@ -3901,7 +3910,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // finalizeBatch as a type-2 inner of the batch's single
         // atomic raft entry — the calling admin request is parked on
         // that seq, so its response is gated on the root write
-        // committing. docs/proposer-audit.md Addendum 3.)
+        // committing. The proposer / fold-gate invariant,
+        // `docs/architecture/consensus-robustness.md`.)
 
         // Stamp response components on the entity. They ride through
         // `raft_pending` → `response_in` (or straight to `response_in`
@@ -4015,7 +4025,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 );
                 break :transfer;
             };
-            // `docs/auto-bind-plan.md`: decide bind at handler SUCCESS,
+            // Fetch auto-bind (`docs/architecture/effects-and-handlers.md`): decide bind at handler SUCCESS,
             // when the outcome is known. A fetch binds (its chunks resume
             // this chain's `onFetchChunk`) only when it is an `on.fetch`
             // from a held activation (`next()`/`stream()`); the exact rule

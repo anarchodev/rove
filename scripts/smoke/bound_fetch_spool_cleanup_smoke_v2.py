@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """V2 port of `bound_fetch_spool_cleanup_smoke.py` — chunk-spool Phase 4
-spool-drop on the two non-terminal exits (`docs/chunk-spool-plan.md`) on
-the `V2Cluster` harness (`smoke_lib_v2`).
+spool-drop on the two non-terminal exits (the chunk-spool / blob-coordinator
+substrate, `docs/architecture/routing-and-ingress.md`) on the `V2Cluster`
+harness (`smoke_lib_v2`).
 
 Proves spooled-but-unconsumed chunks are discarded (no leak, no panic,
 node survives) on the two non-terminal exits:

@@ -44,7 +44,7 @@ pub const Opts = struct {
     /// (binary), not a decoded string.
     binary_body: bool = false,
 
-    // ── non-inbound activation surface (`architecture/replay-and-sim.md` §3) ──
+    // ── non-inbound activation surface (`docs/architecture/replay-and-sim.md` §3) ──
     /// The threaded `Ctx` as JSON text → `request.ctx`. null on the first
     /// activation of a chain (and for inbound, which has no ctx).
     ctx_json: ?[]const u8 = null,
@@ -109,7 +109,7 @@ pub fn exportForActivation(activation: []const u8) []const u8 {
         .{ "inbound_chunk", "onChunk" },
         // A fetch result's *real* export is the resolved name (onFetchResult /
         // onFetchChunk / onFetchDone) carried on the wake, not derivable from
-        // the kind (`architecture/replay-and-sim.md` §2). For an authored world
+        // the kind (`docs/architecture/replay-and-sim.md` §2). For an authored world
         // we default to the whole-body case; an explicit `export` overrides for
         // chunk/done. (At runtime this kind is dispatched by `resolvedExport`,
         // never this fallback.)
@@ -302,7 +302,7 @@ const EPILOGUE_BODY =
     \\  // log so the author sees them before the handler's own output.
     \\  for (const m of D.warnings) __effects.push({ kind: "log", level: "warn", message: m });
     \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
-    \\  // Real UTF-8 codec (issue #11). The sim base ships no native
+    \\  // Real UTF-8 codec. The sim base ships no native
     \\  // TextEncoder/Decoder; the old latin1 (`charCodeAt & 0xff` / escape) hack
     \\  // diverged from prod (bindings/textcodec.zig) on EVERY non-ASCII byte —
     \\  // so every hash/HMAC/JWT/base64url/signature over non-ASCII was wrong.

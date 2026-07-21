@@ -1,7 +1,7 @@
 // The two RESULT-IN-CTX bound door ops — `platform.compile(files, {on})` and
 // `platform.scope(t).deploy.stampManifest(entries, {on})` — driven offline
 // (docs/architecture/replay-and-sim.md). Before the harness gained
-// `node.compile().staged()` / `node.stampManifest().cut()` (issue #6), both
+// `node.compile().staged()` / `node.stampManifest().cut()`, both
 // resumes were undriveable: a plain `fetch().resolve()` hands the resume the
 // fetch's ISSUE-TIME ctx instead of the door result, so `onFileStaged` / `onCut`
 // saw `request.ctx.ok === undefined` → 500. These drivers place the door result

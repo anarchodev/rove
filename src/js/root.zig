@@ -16,8 +16,8 @@
 //! effects are reified rather than performed inline, so they can be made
 //! durable (parked until raft-committed) and replayed. See
 //! `docs/effect-algebra.md` for the four-primitive effect frame and
-//! `docs/effect-reification-plan.md` §3.3 for the Continuation primitive
-//! backing the parked Msg queue.
+//! `docs/architecture/effects-and-handlers.md` (the Continuation
+//! primitive) for the parked Msg queue.
 //!
 //! ## Per-request context
 //!

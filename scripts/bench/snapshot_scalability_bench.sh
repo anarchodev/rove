@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Snapshot scalability benchmark — verifies the stamp-and-compact
-# log compaction (docs/production.md #1.1) stays well under the
-# willemt heartbeat budget across tenant scales.
+# log compaction (the compaction sizing invariant,
+# docs/architecture/raft-best-practices.md) stays well under the
+# raft heartbeat budget across tenant scales.
 #
 # The proof point: after warmup (where every tenant gets at least one
 # write so it appears in apply_ctx.tenant_apply_idx), drive writes

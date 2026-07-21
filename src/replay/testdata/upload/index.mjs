@@ -32,7 +32,7 @@ export function onStored() {
   const ctx = request.ctx || {};
   const app = ctx.app || {};
   // blob.receive completion: 2xx = stored, status 0 = failed (no
-  // request.ok — status is the single signal, issue #7).
+  // request.ok — status is the single signal).
   const ok = request.status >= 200 && request.status < 300;
   if (!ok || !ctx.hash) {
     response.status = 502;

@@ -432,7 +432,7 @@ const WsMsgTape = union(enum) {
     none,
     fetch: worker_mod.FetchEvent,
     frame: struct { opcode: u8, data: []const u8 },
-    /// A wake resume's Msg (issue #62): the drained fired-watch batch +
+    /// A wake resume's Msg: the drained fired-watch batch +
     /// the resolved wake export (G3 — an `{on}` override must replay to
     /// the same export).
     wakes: struct { batch: []const components_mod.WakeEntry, export_name: []const u8 },
@@ -760,7 +760,7 @@ pub fn resumeBoundFetchChainWs(
     // its `{ctx}` option / a platform door's result) if it carried one, else the
     // held chain's `next({ctx})` memory (`chain_st.ctx_json`). A WS fetch resume
     // now reads its fetch data on `request.ctx` — matching HTTP — instead of
-    // silently swapping the chain ctx in (the issue-#3 bug); a no-ctx fetch
+    // silently swapping the chain ctx in (the ctx-swap bug); a no-ctx fetch
     // still threads the connection's `next()` state.
     const ws_ctx_src = worker_streaming.fetchResumeCtx(ev.ctx_json, chain_st.ctx_json);
     const body = worker_streaming.synthCtxBody(allocator, ws_ctx_src) catch return;
@@ -867,7 +867,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     // Drain the fired arms — this resume consumes the "go look" edge, so
     // nothing re-fires next sweep (onWake re-reads authoritative kv).
     // The entries surface on `request.activation.wakes[]` as fired
-    // PREFIXES (issue #8) — same contract as the held (worker_drain) and
+    // PREFIXES (the fired-prefix contract) — same contract as the held (worker_drain) and
     // stream (worker_streaming) resume paths. Owned for the dispatch's
     // lifetime; freed after the JS copies them. OOM → empty batch, arms
     // stay fired and re-fire next tick (safe under edge semantics).
@@ -891,7 +891,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     // `request.ctx`, so `onWake` reads `request.ctx` like every other
     // continuation. No positional args.
     const resume_fn: []const u8 = if (wakes_st.wake_to) |t| t else "onWake";
-    // Owned snapshot for the tape (issue #62 — G3): `resume_fn` borrows
+    // Owned snapshot for the tape (G3 — an `{on}` override must replay to the same export): `resume_fn` borrows
     // StreamWakes.wake_to, which finishWsResume's re-arm (installWsWakes)
     // frees before the post-outcome tape capture runs.
     const wake_export_owned: []const u8 = allocator.dupe(u8, resume_fn) catch "";

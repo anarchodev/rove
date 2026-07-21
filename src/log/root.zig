@@ -70,19 +70,20 @@ pub const Outcome = enum(u8) {
     unknown_domain = 6,
 };
 
-/// What caused this handler activation (streaming-handlers-plan §2,
-/// the wire enum behind `request.Activation` (via its `source()`) and
-/// `LogRecord.activation`).
+/// What caused this handler activation — the activation-source model
+/// (`docs/architecture/effects-and-handlers.md`). The wire enum behind
+/// `request.Activation` (via its `source()`) and `LogRecord.activation`.
 pub const ActivationSource = enum(u8) {
     inbound = 0,
     send_callback = 1,
-    /// Timer wake on a held stream (streaming-handlers-plan §4.5).
-    /// The streaming-handler primitive's `waitFor.timer`
-    /// fires this when its `intervalMs` (or absMs) reaches the
-    /// sweep's check.
+    /// Timer wake on a held stream — a streaming-handler activation
+    /// (`docs/architecture/effects-and-handlers.md`). The streaming-handler
+    /// primitive's `waitFor.timer` fires this when its `intervalMs`
+    /// (or absMs) reaches the sweep's check.
     timer = 2,
-    /// Client disconnect on a held stream (streaming-handlers-plan
-    /// §4.4). Implicit on every parked chain — h2 detects FIN/RST,
+    /// Client disconnect on a held stream — a streaming-handler
+    /// activation (`docs/architecture/effects-and-handlers.md`). Implicit on
+    /// every parked chain — h2 detects FIN/RST,
     /// routes the entity to `response_out`, and `cleanupResponses`
     /// fires one final handler run with this activation so the
     /// customer can do cleanup (release resources, log a "session
@@ -90,29 +91,31 @@ pub const ActivationSource = enum(u8) {
     /// tape but no bytes reach the wire — the socket is already
     /// gone.
     disconnect = 3,
-    /// kv-write match wake on a held stream (streaming-handlers-plan
-    /// §4.6). The cell registered one or more tenant-scoped prefixes
+    /// kv-write match wake on a held stream — a streaming-handler
+    /// activation (`docs/architecture/effects-and-handlers.md`). The cell
+    /// registered one or more tenant-scoped prefixes
     /// via `waitFor: { kv: { prefix } }`; `apply.zig`'s writeset
     /// hook fired on a matching `put`/`delete` and `resumeStream`
     /// runs the handler with `request.activation = { kind: "kv",
-    /// key, op }`. Prefix-only — predicate filters out of scope
-    /// (§4.6 + §11.1).
+    /// key, op }`. Prefix-only — predicate filters are out of scope.
     ///
     /// A single-slot activation source; live held streams use
     /// `wake_batch` instead. Retained in the enum so replay can
     /// still decode older tapes.
     kv_wake = 4,
-    /// Wake-batch activation (streaming-handlers-plan §9.4 +
-    /// `docs/primitive-gaps.md` §2.2; fired-prefix contract per
-    /// decisions.md §3.10). The held chain's fired arms drained
+    /// Wake-batch activation — the wake-batch fold for held streams
+    /// (`docs/architecture/effects-and-handlers.md`; four-primitive effect
+    /// model in `docs/effect-algebra.md`; fired-prefix contract per
+    /// `decisions.md` §3.10). The held chain's fired arms drained
     /// into a batch of fired-prefix + timer entries; the handler
     /// sees `request.activation = { kind: "wake_batch",
     /// wakes: [{kind:"kv",prefix,firedAt}|{kind:"timer",firedAt}] }`.
     /// Used for held streams instead of the per-wake `kv_wake` /
     /// `timer` activation sources.
     wake_batch = 5,
-    /// Subscription chain origin (`docs/primitive-gaps.md` §2.1 +
-    /// `docs/subscriptions-plan.md`). A `_subscriptions/<name>/`
+    /// Subscription chain origin — the subscriptions / fan-out model
+    /// (`docs/architecture/websockets.md`; four-primitive effect model in
+    /// `docs/effect-algebra.md`). A `_subscriptions/<name>/`
     /// handler is firing without an inbound HTTP request — driven
     /// by a cron schedule, an apply-time kv-write match, or a
     /// once-per-deployment-activation boot. The handler sees
@@ -120,8 +123,9 @@ pub const ActivationSource = enum(u8) {
     /// source: { kind:"cron"|"kv"|"boot", ... } }`. There's no
     /// held socket; `Response` is recorded but not transmitted.
     subscription_fire = 6,
-    /// `http.fetch` event (`docs/primitive-gaps.md` §2.3 +
-    /// `docs/effect-reification-plan.md` Phase 5 PR-1). Single
+    /// `http.fetch` event — the reified fetch primitive
+    /// (`docs/architecture/effects-and-handlers.md`; four-primitive effect
+    /// model in `docs/effect-algebra.md`). Single
     /// activation kind covering both non-streaming (one event with
     /// `final: true`) and streaming (`stream: true`, multiple events,
     /// last one `final: true`). Activation shape: `{ kind:
@@ -129,13 +133,14 @@ pub const ActivationSource = enum(u8) {
     /// final, status? (final), ok? (final), body_truncated? (final),
     /// ctx }`.
     fetch_chunk = 7,
-    /// Durable scheduled wake (`docs/primitive-gaps.md` §2.6 +
-    /// `docs/architecture/effects-and-handlers.md`). A `scheduler.at(whenNs, target,
+    /// Durable scheduled wake — the reified scheduler primitive
+    /// (`docs/architecture/effects-and-handlers.md`; four-primitive effect
+    /// model in `docs/effect-algebra.md`). A `scheduler.at(whenNs, target,
     /// msg)` entry fell due: the baked `__system/scheduler_tick`
     /// fanned out to `target` via `__rove_fire_wake`, and the target
     /// handler runs with `request.activation = { kind: "durable_wake",
     /// id, key, scheduled_at_ns, msg }`. At-least-once *firing* — the
-    /// target owns dedup (the §2.6 firing contract). No held socket;
+    /// target owns dedup (the at-least-once firing contract). No held socket;
     /// the fired entry's two `_sched/` keys are deleted in this
     /// activation's own writeset (exactly-once on the normal path).
     durable_wake = 8,
@@ -183,7 +188,8 @@ pub const ActivationSource = enum(u8) {
 /// per channel, serialized on a single connection that drops mid-write
 /// under concurrent load).
 pub const TapePayloads = struct {
-    /// `docs/primitive-gaps.md` §9 seed-not-draws. The PRNG seed
+    /// Seed-not-draws (`docs/effect-algebra.md`, the four-primitive
+    /// effect model). The PRNG seed
     /// used to initialize arenajs's per-context xorshift64star for
     /// this request's `Math.random` / `crypto.*` draws. Replay
     /// seeds the same value via `arena_set_random_seed` before
@@ -192,7 +198,8 @@ pub const TapePayloads = struct {
     /// non-handler paths that build payloads without a Readset
     /// (early-error records, paths still being wired).
     seed: u64 = 0,
-    /// `docs/primitive-gaps.md` §9 fold-in. Wall-clock nanoseconds
+    /// Clock fold-in (`docs/effect-algebra.md`, the four-primitive
+    /// effect model). Wall-clock nanoseconds
     /// captured at dispatch entry. Replay pins arenajs's per-
     /// context `Date.now()` to `@divTrunc(timestamp_ns, ns_per_ms)`
     /// via `arena_set_date_now`, so every `Date.now()` and
@@ -210,12 +217,14 @@ pub const TapePayloads = struct {
     js_engine_version: u16 = 0,
     kv_tape_bytes: []const u8 = &.{},
     module_tree_bytes: []const u8 = &.{},
-    /// `docs/readset-replication-plan.md` Phase 2c-2. Per-`http.fetch`
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`):
+    /// the per-`http.fetch`
     /// chunk-activation tape: each entry carries a `BodyRef` into the
     /// per-tenant readset-blob store. Empty when the chain made no
     /// outbound fetches.
     fetch_responses_tape_bytes: []const u8 = &.{},
-    /// `docs/readset-replication-plan.md` Phase 2d. Zero-or-one entry
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`):
+    /// zero-or-one entry
     /// carrying the inbound request body's `BodyRef`. Empty when the
     /// request had no body — or when the handler never READ the body
     /// (read-taping: `Readset.elideUnreadBody` drops the reference;
@@ -251,7 +260,8 @@ pub const TapePayloads = struct {
     /// The **resolved export** the activation dispatched to (a callback's
     /// `{on}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
     /// derivable from the activation kind alone. Lets replay invoke the SAME
-    /// export instead of the conventional one (`replay-and-sim.md` §5 G3).
+    /// export instead of the conventional one — export-name resolution
+    /// (`docs/architecture/replay-and-sim.md` §5 G3).
     /// Empty when the conventional export applies. Allocator-owned.
     export_name: []const u8 = &.{},
     // Response body is NOT captured — deterministic replay
@@ -367,17 +377,20 @@ pub const LogRecord = struct {
     /// readset-replication path, which has no `LogHeader` tag field)
     /// omit them — tags are leader-captured observability.
     tags: []Tag = &.{},
-    /// Per-chain identifier (streaming-handlers-plan §6). Empty
+    /// Per-chain identifier — the streaming-handler chain model
+    /// (`docs/architecture/effects-and-handlers.md`). Empty
     /// string when the record has no chain context (paths where the
     /// runtime couldn't synthesize one
     /// — early-error captures before request handling started).
     /// Allocator-owned alongside the other `[]const u8` fields.
     correlation_id: []const u8 = "",
-    /// What caused this activation (streaming-handlers-plan §2).
+    /// What caused this activation — the activation-source model
+    /// (`docs/architecture/effects-and-handlers.md`).
     /// Defaults to `.inbound` for code paths that don't set it
     /// explicitly; inbound is by far the dominant case.
     activation: ActivationSource = .inbound,
-    /// `docs/readset-replication-plan.md` Phase 5b: the raft seq
+    /// Readset replication (`docs/architecture/effects-and-handlers.md`):
+    /// the raft seq
     /// the envelope carrying this request's writeset was proposed at.
     /// Zero is a sentinel for "no associated raft seq" (early-error
     /// paths, read-only batches that never proposed, paths not yet
@@ -405,7 +418,8 @@ pub const LogRecord = struct {
 
 /// Per-request scalar + string metadata needed to reconstruct a
 /// `LogRecord` from a raft entry. Lives on the readset wire format
-/// (`docs/readset-replication-plan.md` Phase 5a) so any node — not
+/// (readset replication, `docs/architecture/effects-and-handlers.md`) so any
+/// node — not
 /// just the leader that originally served the request — can build
 /// the LogRecord and push it to the customer-facing log path on
 /// follower-promotion.

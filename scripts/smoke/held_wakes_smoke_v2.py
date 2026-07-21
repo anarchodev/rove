@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """`request.activation.wakes[]` surfaces the FIRED PREFIX on a HELD (buffered
-`next()`) resume — issue #8 (decisions.md §3.10).
+`next()`) resume (decisions.md §3.10).
 
 Two things under test on the worker_drain resume path (which used to deliver
 an EMPTY `wakes[]`):

@@ -2,7 +2,8 @@
 // the reified primitives: `kv.set` (durable marker), `http.fetch`
 // (transient transport), `__system/webhook_onresult` (the baked
 // on_chunk shim that classifies + retries + chains to the customer's
-// on_result), and the durable `scheduler` (durable-wake-plan P5(a)):
+// on_result), and the durable `scheduler` (the durable-wake primitive
+// of the four-primitive effect model, docs/effect-algebra.md):
 // scheduled fires, retry re-arms, and the crash-recovery watchdog are
 // all ONE `scheduler` entry under the idempotency key `_send/{id}`,
 // fired as the baked `__system/webhook_fire`. The privileged Zig owed
@@ -131,7 +132,7 @@ globalThis.webhook = {
    *   surface (handler-shape §7): the response on `request.bytes` /
    *   `.text` / `.json`, and `request.status` / `.bodyTruncated`
    *   (2xx = delivered; `status === 0` = never reached the endpoint;
-   *   no derived `request.ok`, issue #7); the threaded `ctx` value bare
+   *   no derived `request.ok`); the threaded `ctx` value bare
    *   on `request.ctx`; delivery metadata (`attempts`, `error?`, `id`,
    *   `headers`) on `request.activation.*`. There is no `request.result`.
    * @param {*} [opts.ctx] - Opaque customer payload echoed back as
@@ -259,8 +260,9 @@ globalThis.webhook = {
     // marker committed — `webhook_onresult` would open a fresh
     // `beginTrackedImmediate`, see `owed_raw == null`, and bail.
     //
-    // The fix landed in `effect-reification-plan.md` Phase 4.1.2:
-    // the worker now stages every `http.fetch` issued from a
+    // The commit gate comes from the reified primitives / Cmd pattern
+    // (docs/architecture/effects-and-handlers.md): the worker stages
+    // every `http.fetch` issued from a
     // write-path handler as a `Cmd.http_fetch` on the parked
     // unit's `BufferedCmds`; `drainRaftPending`'s commit arm runs
     // `interpretCmd` on each, which submits to the engine STRICTLY
@@ -281,7 +283,7 @@ globalThis.webhook = {
           "X-Rove-Schedule-Version": "1",
         }),
         on_chunk: "__system/webhook_onresult",
-        // docs/cross-worker-held-state-plan.md Phase 2B: stamp the
+        // Held state (docs/architecture/effects-and-handlers.md): stamp the
         // send_id so the chunk router (Zig) consults
         // bound_send_owners[id] and routes the callback to the
         // cont's owning worker (instead of hash(tenant_id), which

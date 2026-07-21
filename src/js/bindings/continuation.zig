@@ -1,6 +1,7 @@
 //! `_system.next` — the trampoline continuation primitive
-//! (connection-actor §6.1/§6.4, the unified return-as-continuation
-//! model). A handler returns `next(path, { fn?, ctx? })` instead of a
+//! (the unified return-as-continuation model — the Continuation
+//! primitive; `docs/architecture/effects-and-handlers.md`). A handler
+//! returns `next(path, { fn?, ctx? })` instead of a
 //! response value to mean "I am not done — invoke this module next."
 //! Returning a normal value stays terminal, exactly as today; the
 //! trampoline only engages when a continuation is returned.
@@ -13,7 +14,7 @@
 //! taped output; the next hop is a fresh pure invocation).
 //!
 //! There is deliberately NO connection handle in this surface
-//! (project-connection-actor-unified-trigger): the continuation IS
+//! (the connection/tenant actor model — `docs/architecture/websockets.md`): the continuation IS
 //! the connection's next step by construction; nothing is addressable.
 //!
 //! The brand is a per-process random nonce. Its only job is to stop a
@@ -250,7 +251,7 @@ test "BENCH tryExtract per-request hot-path tax (ROVE_BENCH=1)" {
 
 // ── `_system.continuation.resumeIfBound(send_id, event_json)` ──────
 //
-// The §6.4 held-sync resume hook from the JS shim.
+// The held-sync resume hook from the JS shim.
 // The `__system/webhook_onresult` baked module calls this on
 // terminal — if any parked continuation on this worker has
 // `bound_schedule_id == send_id`, the call dispatches a

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Canonical dev TLS cert for local smokes / benches.
 #
-# rove-h2 serves ONE cert pair (single SSL_CTX — per-host SNI
-# selection is Phase 2 of docs/auth-domain-plan.md). The two-domain
+# rove-h2 serves ONE cert pair (single SSL_CTX — no per-host SNI
+# selection; see docs/architecture/auth-and-domains.md, the
+# two-domain TLS model). The two-domain
 # split means that one cert must carry SANs for BOTH registrable
 # domains the tests mirror from production:
 #

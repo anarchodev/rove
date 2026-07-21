@@ -18,7 +18,8 @@
 //!     registered itself by id at binding time; routing consults the
 //!     owner registry and bypasses the hash via `enqueueMsgToWorker`.
 //!     This is the correction for the SO_REUSEPORT vs hash(tenant_id)
-//!     divergence — see `docs/cross-worker-held-state-plan.md`.
+//!     divergence — see held state in
+//!     `docs/architecture/effects-and-handlers.md`.
 //!
 //! Dependency surface is intentionally tiny: `allocator` only. The
 //! typed input/payload types come from `effect`, `components`, and the
@@ -37,12 +38,13 @@ const KvWakeInbox = worker_mod.KvWakeInbox;
 pub const MsgRouter = struct {
     allocator: std.mem.Allocator,
 
-    /// streaming-handlers-plan §4.6: registry of per-worker kv-wake
-    /// inboxes. Workers register their inbox at startup; producers
+    /// Registry of per-worker kv-wake inboxes — the kv-wake fan-out
+    /// path (`docs/architecture/effects-and-handlers.md`). Workers
+    /// register their inbox at startup; producers
     /// (apply.zig writeset apply on followers + worker_dispatch.zig
     /// leader-side eager fire) call `broadcastKvWake` to fan out.
     /// Per-worker (not node-wide) so each worker only scans cells it
-    /// owns — matches plan §4.1's "registry is per-worker" rule. The
+    /// owns — the registry-is-per-worker invariant. The
     /// `mutex` guards the registry vector itself (registration races
     /// at worker startup); individual inboxes have their own mutex.
     wake_inboxes_mutex: std.Thread.Mutex = .{},
@@ -59,8 +61,9 @@ pub const MsgRouter = struct {
     msg_inboxes_mutex: std.Thread.Mutex = .{},
     msg_inboxes: std.ArrayListUnmanaged(*effect_mod.MsgInbox) = .empty,
 
-    /// `docs/cross-worker-held-state-plan.md`: held-state ownership
-    /// registries. The accept worker (SO_REUSEPORT pick) can differ
+    /// Held-state ownership registries (held state in
+    /// `docs/architecture/effects-and-handlers.md`). The accept worker
+    /// (SO_REUSEPORT pick) can differ
     /// from the async-wake worker (`hash(tenant_id) % N`). These maps
     /// record which worker holds the held state for a given
     /// async-effect id, so wake routing can target the owning worker
@@ -74,7 +77,7 @@ pub const MsgRouter = struct {
     /// `bound_send_owners` is keyed by `send_id` (the
     /// `_send/owed/{id}` suffix) and populated when a `webhook.send` +
     /// `next()` writes the `_send/owed/` marker; drained when the cont
-    /// resumes or its §6.4 deadline fires.
+    /// resumes or its held-send deadline fires.
     ///
     /// Keys are allocator-owned dupes. Values are the owning worker's
     /// `msg_inbox_idx`. Mutex-guarded.
@@ -108,8 +111,9 @@ pub const MsgRouter = struct {
         self.wake_inboxes.deinit(self.allocator);
         self.msg_inboxes.deinit(self.allocator);
 
-        // `docs/cross-worker-held-state-plan.md`: free every owned key
-        // in the held-state registries. Values are POD usize, no
+        // Free every owned key in the held-state registries (held
+        // state in `docs/architecture/effects-and-handlers.md`). Values
+        // are POD usize, no
         // per-entry cleanup. The owning workers' local registries were
         // drained in their own deinit paths; this is the catchall for
         // any straggler keys at shutdown.
@@ -200,8 +204,8 @@ pub const MsgRouter = struct {
         try inbox.push(msg);
     }
 
-    // ── docs/cross-worker-held-state-plan.md ───────────────────────
-    // Held-state ownership registries.
+    // ── Held-state ownership registries ────────────────────────────
+    // Held state in `docs/architecture/effects-and-handlers.md`.
 
     /// Register `fetch_id → owner_worker_idx` for a bound
     /// `http.fetch({bind: true})`. Idempotent on owner-collision
@@ -297,7 +301,8 @@ pub const MsgRouter = struct {
     /// in `ev` transfers in on success; on `error.NoWorkers` the caller
     /// retains and is responsible for `UpstreamFetchEvent.deinitItem`.
     ///
-    /// `docs/cross-worker-held-state-plan.md` Phase 2A: when `ev.bind`
+    /// Owner routing (held state in
+    /// `docs/architecture/effects-and-handlers.md`): when `ev.bind`
     /// is true AND `bound_fetch_owners[ev.fetch_id]` resolves, route
     /// directly to the owning worker's inbox. Otherwise fall back to
     /// `hash(tenant_id)` — the behavior for unbound (Pattern A)
@@ -308,7 +313,7 @@ pub const MsgRouter = struct {
     /// kernel-chosen worker (SO_REUSEPORT) different from
     /// `hash(tenant_id) % N`; without owner routing the chunk arrives
     /// on the wrong worker and the bound resume fails silently until
-    /// the §6.4 25s deadline.
+    /// the held-fetch 25s deadline.
     pub fn enqueueFetchEventForTenant(
         self: *MsgRouter,
         tenant_id: []const u8,
@@ -352,7 +357,8 @@ pub const MsgRouter = struct {
         try self.enqueueMsgForTenant(tenant_id, msg);
     }
 
-    /// `docs/cross-worker-held-state-plan.md` Phase 2A: push a Msg
+    /// Owner-routing helper (held state in
+    /// `docs/architecture/effects-and-handlers.md`): push a Msg
     /// directly to the worker at `worker_idx` (bypassing
     /// `hash(tenant_id)`). Used by the held-state owner routing path:
     /// when a bound fetch's chunk arrives, we know which worker holds
@@ -412,7 +418,7 @@ pub const MsgRouter = struct {
         try self.enqueueMsgForTenant(tenant_id, .{ .send_callback = payload });
     }
 
-    /// §2.6 durable-wake: hash-route a `durable_wake` activation — one
+    /// Durable-wake: hash-route a `durable_wake` activation — one
     /// due `_sched/by_time` entry the baked `__system/scheduler_tick`
     /// fanned out via `__rove_fire_wake` — to the entry's owning
     /// worker's MsgInbox. The target handler runs there with
@@ -466,10 +472,10 @@ pub const MsgRouter = struct {
     /// Called from `apply.zig` (follower path) and `worker_dispatch.zig`
     /// (leader path) so a write on any node reaches every locally-held
     /// stream regardless of which node + worker hosts it. A per-inbox
-    /// push failure is logged and swallowed — the §9.4 "spurious +
+    /// push failure is logged and swallowed — the "spurious +
     /// overflow" thesis lets us drop a wake; the worker that lost it
     /// will refetch authoritative state on its next activation anyway.
-    /// `write_version` is the producer store's §8.4 write clock for
+    /// `write_version` is the producer store's write clock for
     /// this write (or the `maxInt` fire-always sentinel); it rides each
     /// event so `matchEventsToWakes` can gate on the watch baseline.
     pub fn broadcastKvWake(

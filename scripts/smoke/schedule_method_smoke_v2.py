@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`schedule(..., "module.method")` fires the NAMED export (issue #9).
+"""`schedule(..., "module.method")` fires the NAMED export.
 
 Regression guard for the durable-wake target resolution: a `schedule`/`cron`
 target of the form `"module.method"` must fire that export, not `default`

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""V2 port of `bound_fetch_large_body_smoke.py` — chunk-spool Phase 3
-large-body path (`docs/chunk-spool-plan.md`) on the `V2Cluster` harness
+"""V2 port of `bound_fetch_large_body_smoke.py` — the chunk-spool
+large-body path (the blob coordinator / chunk spool,
+`docs/architecture/routing-and-ingress.md`) on the `V2Cluster` harness
 (`smoke_lib_v2`).
 
 A bound, streaming `on.fetch` whose upstream body is far larger than the

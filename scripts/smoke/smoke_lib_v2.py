@@ -343,7 +343,7 @@ class V2Cluster:
                                      {"exp": int((time.time() + 3600) * 1000)})
 
     def _boot_genesis(self, nodes: int) -> None:
-        """Genesis bring-up (cold-multi, consensus-and-storage.md "Cluster genesis & membership"): every
+        """Genesis bring-up (cold-multi, docs/architecture/consensus-and-storage.md "Cluster genesis & membership"): every
         worker boots cold-multi (the full static voter/peer set), a single-node CP
         runs with the membership reconciler OFF, and every node's raft address is
         registered with the CP. A later `provision` then births the tenant group
@@ -447,12 +447,12 @@ class V2Cluster:
         env["REWIND_NODE_ID"] = str(i + 1)
         # Cold-multi: every node carries the full static voter/peer set, so each
         # raft group is born {1..N} and elects on its own (genesis and steady
-        # state are the same boot — see consensus-and-storage.md "Cluster genesis & membership" (genesis).
+        # state are the same boot — see docs/architecture/consensus-and-storage.md "Cluster genesis & membership" (genesis).
         env["REWIND_VOTERS"] = voters
         env["REWIND_PEERS"] = peers
         # Peer HTTP base URLs indexed by raft id − 1 (the worker analog of CP's
         # REWIND_CP_PEER_URLS): the leader-push target for the out-of-band
-        # snapshot catch-up driver (raft-native-alignment Phase 1). Distinct from
+        # snapshot catch-up driver (docs/architecture/raft-native-alignment.md). Distinct from
         # REWIND_PEERS (the raft transport host:ports).
         env["REWIND_PEER_URLS"] = ",".join(
             f"http://127.0.0.1:{p}" for p in self.node_ports)
@@ -866,7 +866,7 @@ class V2Cluster:
                 timeout: float = 15.0) -> HttpResponse:
         """Any method through the FRONT door (Host→cluster routing). Pass a
         larger `timeout` for held requests (on.* wakes can ride up to the
-        §6.4 ~25s deadline before resolving)."""
+        ~25s held-request deadline before resolving)."""
         return _curl(f"{self.front_url()}{path}", method=method, data=data,
                      host=host or self.host_for(tenant), headers=headers,
                      timeout=timeout)
@@ -940,7 +940,7 @@ class V2Cluster:
     def set_plan(self, tenant: str, plan_blob: str, *, node: int = 0) -> HttpResponse:
         """Install a tenant's resolved plan limits on its hot-path slot via the
         worker's `/_system/v2-plan` (move-secret gated) — the CP's live
-        single-target push (docs/v2-cp-operational-state.md "Live tier
+        single-target push (docs/architecture/control-plane.md "Live tier
         change"). `plan_blob` is the opaque `{tier, overrides}` JSON the CP
         stores; an empty/malformed blob resolves to the free tier. 204 on
         success. Bumps `plan_gen` so the rate limiter re-snapshots caps — used

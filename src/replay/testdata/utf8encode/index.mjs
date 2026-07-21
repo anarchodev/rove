@@ -1,4 +1,4 @@
-// UTF-8 TextEncoder / TextDecoder parity (issue #11). The sim base ships no
+// UTF-8 TextEncoder / TextDecoder parity. The sim base ships no
 // native TextEncoder; the fix gives it a real WHATWG UTF-8 codec so bytes /
 // hashes / base64url / signatures over non-ASCII match prod byte-for-byte.
 // Every value below is the same offline (rewind test) and online (worker).

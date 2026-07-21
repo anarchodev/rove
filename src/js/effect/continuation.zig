@@ -1,6 +1,6 @@
 //! effect.Continuation — the generalized commit-gated parked unit
-//! (`docs/effect-algebra.md` §2.2; `docs/effect-reification-plan.md`
-//! Phase 3).
+//! (`docs/effect-algebra.md` §2.2; the reified primitives,
+//! `docs/architecture/effects-and-handlers.md`).
 //!
 //! The "parked on raft seq" sites this primitive unifies:
 //!
@@ -18,8 +18,8 @@
 //! One `Continuation` + one `reconcile` system covers these. The H2
 //! reference path is the dragon — it must generalize with byte-identical
 //! H2 behavior, proven via smokes + a perf gate, before non-H2
-//! registrants attach. See `docs/effect-reification-plan.md` Phase 3
-//! sub-plan.
+//! registrants attach. See the reified primitives in
+//! `docs/architecture/effects-and-handlers.md`.
 //!
 //! ## Comptime-generic
 //!

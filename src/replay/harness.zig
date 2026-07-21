@@ -342,7 +342,7 @@ pub fn runTests(gpa: std.mem.Allocator, dir: []const u8, opts: Options) !Report 
     // test` is one-shot, so they are reclaimed at exit.
     const H = arena_reactor_new(8192, 8192) orelse return error.ArenaInit;
     // The harness reactor runs the `_tests/*.mjs` driver code (assertions,
-    // world construction) in GC mode too, matching the sim reactor (issue #70)
+    // world construction) in GC mode too, matching the sim reactor
     // — a driver that builds a large fixture world reclaims to peak-live-set
     // instead of OOMing the bump arena. `eng`'s sim reactor is GC via
     // `Engine.init`.

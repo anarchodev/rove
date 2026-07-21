@@ -1,4 +1,4 @@
-//! rewind-front — the V2 front door (docs/v2-front-door-architecture.md).
+//! rewind-front — the V2 front door (docs/architecture/routing-and-ingress.md).
 //!
 //! A STATELESS HTTP/2 reverse proxy. Per customer request:
 //!
@@ -31,7 +31,7 @@
 //!
 //! WebSocket terminates at the edge and tunnels upstream as an RFC
 //! 8441 Extended CONNECT stream on the pooled h2c conn
-//! (architecture/websockets.md): the Upgrade head surfaces to the proxy
+//! (docs/architecture/websockets.md): the Upgrade head surfaces to the proxy
 //! (`websocket_surface`), the downstream 101 waits for the upstream
 //! 200, then bytes relay verbatim (the worker unmasks).
 
@@ -561,7 +561,7 @@ pub fn main() !void {
         .initial_window_size = 1024 * 1024,
         .max_concurrent_streams = 512,
         // WS terminates at the edge and tunnels upstream over Extended
-        // CONNECT (architecture/websockets.md): Upgrade heads surface to the
+        // CONNECT (docs/architecture/websockets.md): Upgrade heads surface to the
         // proxy; the 101 waits for the upstream 200.
         .websocket_upgrades = false,
         .websocket_surface = true,

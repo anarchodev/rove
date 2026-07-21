@@ -1,4 +1,4 @@
-//! `__rove.wake.set` / `__rove.wake.fire` — the §2.6 durable-wake
+//! `__rove.wake.set` / `__rove.wake.fire` — the durable-wake
 //! engine primitive, gated to baked `__system/` modules (durable-wake
 //! P0; `docs/architecture/effects-and-handlers.md`). Registered under the
 //! `__rove.*` privileged-ops holder (STATIC_NAMESPACES, globals.zig).
@@ -92,7 +92,7 @@ pub fn jsSetWake(
 /// per due `_sched/by_time` entry by `scheduler_tick`. Args:
 ///   0 target        — handler target (string): a module path, or the
 ///                     `"module.method"` form (split in
-///                     `fireDurableWakeActivation`, issue #9)
+///                     `fireDurableWakeActivation`)
 ///   1 id            — scheduler entry id (string)
 ///   2 key           — idempotency key (string | null)
 ///   3 scheduledAtNs — absolute fire time, decimal string

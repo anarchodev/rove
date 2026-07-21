@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """V2 port of `subscription_cap_smoke.py` — per-tenant held-subscription cap
-(`docs/curl-multi-plan.md` Phase 3 / gap 2.5), on the `V2Cluster` harness.
+(held-subscription outbound fetch — docs/architecture/configuration-and-network.md),
+on the `V2Cluster` harness.
 
 The engine caps simultaneous held subscriptions at `HELD_MAX_PER_TENANT = 16`
 (src/js/fetch_engine.zig). Submissions over the cap fire a single

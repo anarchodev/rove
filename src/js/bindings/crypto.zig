@@ -2,7 +2,7 @@
 //!
 //! Randomness draws from arenajs's per-context xorshift64star via
 //! `JS_FillRandomBytes` — seeded once per request from `readset.seed`
-//! in `globals.installRequest` (§9 seed-not-draws). Replay reproduces
+//! in `globals.installRequest` (seed-not-draws). Replay reproduces
 //! the same byte sequence by reseeding the PRNG with the captured
 //! request's seed; no per-draw tape entries. Hashes are pure (no
 //! readset capture needed) and use Zig std.crypto — no OpenSSL.
@@ -36,7 +36,7 @@ pub fn jsCryptoGetRandomValues(
     const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, argv[0]);
     if (buf_ptr == null) return js_exception;
 
-    // `docs/primitive-gaps.md` §9 — bytes come from arenajs's per-
+    // seed-not-draws (`docs/effect-algebra.md`) — bytes come from arenajs's per-
     // request xorshift64star state (seeded once per request via
     // JS_SetRandomSeed). Same PRNG Math.random draws from, so replay
     // reproduces by re-seeding with the recorded request seed. No
@@ -54,7 +54,7 @@ pub fn jsCryptoGetRandomValues(
 /// Uint8Array. Deterministic — does NOT tape-capture (HMAC of known
 /// inputs is a pure function, so replay reproduces the same digest).
 ///
-/// PLAN §2.6: we keep `webhook.send` vendor-neutral and expose this
+/// We keep `webhook.send` vendor-neutral and expose this
 /// as the primitive customers compose into Stripe-Signature,
 /// Slack X-Slack-Signature, AWS SigV4 derivations, etc.
 pub fn jsCryptoHmacSha256(
@@ -131,7 +131,7 @@ pub fn jsCryptoRandomUuid(
     _: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
     var raw: [16]u8 = undefined;
-    // §9: bytes from arenajs's per-request PRNG, same stream as
+    // seed-not-draws: bytes from arenajs's per-request PRNG, same stream as
     // Math.random + crypto.*. Replay reproduces by re-seeding.
     c.JS_FillRandomBytes(ctx, &raw, raw.len);
     // RFC 4122 v4: set the version and variant bits.
@@ -156,8 +156,8 @@ pub fn jsCryptoRandomUuid(
 /// `crypto.randomBytes(n) → Uint8Array` — n cryptographically random
 /// bytes drawn from the per-context PRNG (xorshift64star, seeded
 /// once per request from `readset.seed`). Replay reproduces the
-/// same sequence by reseeding before the handler runs (§9
-/// seed-not-draws — no per-draw tape entries).
+/// same sequence by reseeding before the handler runs
+/// (seed-not-draws — no per-draw tape entries).
 ///
 /// `n` must be a non-negative integer ≤ 65536 (Web Crypto's typical
 /// per-call cap). Throws RangeError otherwise.
@@ -187,7 +187,7 @@ pub fn jsCryptoRandomBytes(
     };
     defer state.allocator.free(bytes);
 
-    // §9: same xorshift64star state as Math.random.
+    // seed-not-draws: same xorshift64star state as Math.random.
     c.JS_FillRandomBytes(ctx, bytes.ptr, bytes.len);
 
     return c.JS_NewUint8ArrayCopy(ctx, bytes.ptr, bytes.len);
@@ -231,7 +231,7 @@ pub fn jsCryptoSha256(
 
 // ── Streaming sha256 (midstate tokens) ─────────────────────────────
 //
-// `blob-write-recipes.md` §3: an accumulation that spans
+// `docs/architecture/blob-write-recipes.md` §3: an accumulation that spans
 // activations needs its hash state to live in kv, so the streaming
 // surface is three PURE functions over an opaque serialized midstate
 // token — no context handles, nothing process-local, replay-exact:
