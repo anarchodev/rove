@@ -418,6 +418,15 @@ class Scenario {
     // under a watched prefix injects a `_sub/dirty/{name}` marker into the
     // effect log (see the epilogue kv wrapper). Carried as a hidden reserved key.
     this.subscriptions = Array.isArray(cfg.subscriptions) ? cfg.subscriptions : [];
+    // kv trigger registrations (issue #38): `[{ prefix, module? }]` (or a bare
+    // prefix string). `module` defaults to prod's `_triggers/<prefix>/index.mjs`
+    // path — the module must exist in the app tree. The epilogue imports each and
+    // runs its before/after chain on a matching write (mutate value / reject).
+    const __trigModOf = (prefix) => "_triggers/" + String(prefix).replace(/\/+$/, "") + "/index.mjs";
+    this.triggers = (Array.isArray(cfg.triggers) ? cfg.triggers : []).map((t) =>
+      typeof t === "string"
+        ? { prefix: t, module: __trigModOf(t) }
+        : { prefix: t.prefix, module: t.module || __trigModOf(t.prefix) });
     // Per-chain identity the engine pins on EVERY activation (worker-set in
     // prod). `tenant` is this handler's tenant id; `correlationId` is minted by
     // inbound and inherited by every resume — so it's scenario-level (set once,
@@ -459,6 +468,7 @@ class Scenario {
       { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
     );
+    if (this.triggers.length) w.triggers = this.triggers;
     if (this.sourceDir) w.source_dir = this.sourceDir;
     if (this.inlineSources) {
       w.sources = Object.keys(this.inlineSources).map((path) => ({

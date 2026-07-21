@@ -1425,6 +1425,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/inboundchunks", // streaming inbound body: per-chunk onChunk folds, ctx threads chunk-to-chunk, request.done ends
         "src/replay/testdata/shamidstate", // streaming-sha256 midstate: decode+emit the worker s2: token (prod-compatible), still read legacy js2:
         "src/replay/testdata/subscription", // http.subscribe recorder bag + detached onSubscription (subscription_fire) activation
+        "src/replay/testdata/kvtriggers", // _triggers/<prefix>/index before/after chains run offline: mutate value / reject as trigger_rejected
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

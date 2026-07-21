@@ -328,6 +328,10 @@ pub const Engine = struct {
             }
         else
             null;
+        // kv trigger registrations → epilogue (issue #38): the epilogue imports
+        // each module + dispatches its before/after chain on a matching write.
+        const trigs = try a.alloc(epilogue.TriggerReg, wv.triggers.len);
+        for (wv.triggers, 0..) |t, i| trigs[i] = .{ .prefix = t.prefix, .module = t.module };
         const epi = try epilogue.build(a, .{
             .method = wv.method,
             .path = wv.path,
@@ -346,6 +350,7 @@ pub const Engine = struct {
             .result = result,
             .captured = wv.captured,
             .warnings = header_warnings.items,
+            .triggers = trigs,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
         const entry_z = try a.dupeZ(u8, wv.entry);

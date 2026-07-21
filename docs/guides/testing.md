@@ -451,6 +451,14 @@ is modeled by registering the subscriptions on the scenario:
 under a watched `prefix` then leaves one coalesced `_sub/dirty/{name}` write in the
 effect log (assert with `toHaveWritten`), exactly as production injects it.
 
+**kv triggers.** Register a `_triggers/<prefix>/index.mjs` module with
+`scenario({ triggers: [{ prefix: "users/" }] })` (`module` defaults to that path).
+Its `beforePut`/`afterPut`/`beforeDelete`/`afterDelete` exports run on a matching
+`kv.set`/`kv.delete`, receiving `{ key, value, previousValue, op, timing, … }`. A
+`beforePut` that returns a string **mutates** the stored value; a handler that
+**throws** rejects the write as `Error{code:"trigger_rejected"}` — testable with
+the same `err.code` branch the handler ships.
+
 An **outbound `http.subscribe`** (a held upstream that pushes) is separate: it's
 fire-and-forget on the connection (its events fire to the `on` module as an
 UNBOUND chain), so it doesn't hold `next()`. Drive its event stream from the node
