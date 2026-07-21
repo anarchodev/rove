@@ -1416,6 +1416,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/instancefold", // instances.create's exists marker folds across resumes — create-then-scope-in-continuation resolves
         "src/replay/testdata/timerwakes", // held wake-fold: multiple after.ms → last-armed slot wins + due-time gate, per-arm {on} routing, after.kv prefix containment
         "src/replay/testdata/concurrentctx", // whenConcurrent threads the evolving next({ctx}) between legs — a no-ctx leg reads the prior leg's re-held ctx
+        "src/replay/testdata/wslifecycle", // WS lifecycle: terminal/errored frame closes the socket (no further frame), pre-frame close runs nothing
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);
