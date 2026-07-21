@@ -91,7 +91,12 @@ expect(req).toHaveFetched(/stripe/);
   injected, so the documented `session === null` branch is reachable offline.
 
 The **request body** is whatever you pass as `inbound({ body })` (JSON-stringified
-if it's not a string). Omit it and the request is bodyless — reading `request.text`
+if it's not a string). For a **binary** request body pass `inbound({ bodyBinary })`
+(a `Uint8Array` or a base64 string) — it round-trips byte-exact on `request.bytes`.
+Pass `inbound({ export })` to drive a specific export directly (an authored-dispatch
+test) instead of the activation's default. (Misspelling a world/`scenario()` field
+now fails loud with a "did you mean" hint, rather than being silently ignored.)
+Omit the body and the request is bodyless — reading `request.text`
 / `.bytes` / `.json` returns empty (`""`, 0-length), exactly as a real bodyless
 request (a GET, an empty POST) does. On a payload-less **resume** (a wake, a
 `cron`/`schedule` target, `onDisconnect`) all three read `undefined`, exactly as
