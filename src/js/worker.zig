@@ -88,6 +88,7 @@ const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
 const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const worker_fire = @import("worker_fire.zig");
 const worker_ws = @import("worker_ws.zig");
 const worker_drain = @import("worker_drain.zig");
 const deploy_thread_mod = @import("deploy_thread.zig");
@@ -2869,8 +2870,8 @@ pub fn Worker(comptime opts: Options) type {
                 self.armBlobReceive(pf);
                 return true;
             }
-            if (worker_streaming.isComposeUrl(pf.url)) {
-                worker_streaming.fireBlobCompose(self, pf);
+            if (worker_fire.isComposeUrl(pf.url)) {
+                worker_fire.fireBlobCompose(self, pf);
                 return true;
             }
             if (deploy_thread_mod.isCompileUrl(pf.url)) {
@@ -3392,7 +3393,7 @@ pub const StreamResumeStage = worker_streaming.StreamResumeStage;
 pub const setStreamComponents = worker_streaming.setStreamComponents;
 pub const serviceParkedStreams = worker_streaming.serviceParkedStreams;
 pub const serviceWsMessages = worker_ws.serviceWsMessages;
-pub const fireSubscriptionActivation = worker_streaming.fireSubscriptionActivation;
+pub const fireSubscriptionActivation = worker_fire.fireSubscriptionActivation;
 pub const proposeForgetfulWrites = worker_streaming.proposeForgetfulWrites;
 pub const serviceSubscriptionFires = worker_streaming.serviceSubscriptionFires;
 pub const dispatchPendingMsgs = worker_streaming.dispatchPendingMsgs;
@@ -3400,7 +3401,7 @@ pub const drainSpools = worker_streaming.drainSpools;
 pub const dispatchSubscriptionFires = worker_streaming.dispatchSubscriptionFires;
 pub const dispatchFetchEvents = worker_streaming.dispatchFetchEvents;
 pub const serviceFetchEvents = worker_streaming.serviceFetchEvents;
-pub const fireFetchEventActivation = worker_streaming.fireFetchEventActivation;
+pub const fireFetchEventActivation = worker_fire.fireFetchEventActivation;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 

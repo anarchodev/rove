@@ -51,6 +51,7 @@ const respb = @import("response_builder.zig");
 
 const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const worker_fire = @import("worker_fire.zig");
 const worker_ws = @import("worker_ws.zig");
 const durable_wake = @import("durable_wake.zig");
 const bodies_mod = @import("rove-bodies");
@@ -2994,7 +2995,7 @@ pub fn cleanupResponses(worker: anytype) !void {
         // StreamChain.module_path is a client-disconnect on a held
         // stream — fire the disconnect activation before destroy.
         if (chain.module_path.len > 0) {
-            worker_streaming.fireDisconnectActivation(worker, ent);
+            worker_fire.fireDisconnectActivation(worker, ent);
         }
         // The streaming substrate (`docs/architecture/routing-and-ingress.md`):
         // cancel any bound fetches still associated with this entity. The held
