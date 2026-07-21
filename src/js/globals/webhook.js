@@ -198,7 +198,7 @@ globalThis.webhook = {
       // base64url(no pad)(sha256(key)). 43 chars, URL-safe, no
       // collisions in practice; deterministic so two webhook.sends
       // with the same key land on the same `_send/owed/{id}`.
-      id = base64url.encode(hex.decode(crypto.sha256(opts.key)));
+      id = crypto.sha256b64url(opts.key);
     } else {
       id = crypto.randomUUID();
     }

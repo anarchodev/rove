@@ -100,7 +100,7 @@ class OAuthProvider {
       const verifier_bytes = new Uint8Array(32);
       crypto.getRandomValues(verifier_bytes);
       verifier = base64url.encode(verifier_bytes);
-      challenge = base64url.encode(hex.decode(crypto.sha256(verifier)));
+      challenge = crypto.sha256b64url(verifier);
     }
 
     kv.set(this.cfg.state_path + "/" + state, JSON.stringify({

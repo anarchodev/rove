@@ -71,7 +71,7 @@
   // 43 chars (mirrors webhook.send's `handle`). Same key ⇒ same id ⇒
   // last-write-wins.
   function _idFromKey(key) {
-    return base64url.encode(hex.decode(crypto.sha256(key)));
+    return crypto.sha256b64url(key);
   }
 
   // Count outstanding schedules, throwing once the cap is reached. Pages
