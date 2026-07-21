@@ -306,7 +306,20 @@ const SYSTEM_SHIM =
     \\      subscribe: function(o){
     \\        if (o === null || o === undefined || typeof o !== "object") throw new TypeError("http.subscribe requires an options object");
     \\        var oc = checkFetchOpts(o);
-    \\        var id = "sub_" + nextSeq(); push({ kind: "subscribe", id: id, url: o.url, headers: o.headers || {}, on: oc }); return id;
+    \\        // A held subscription reuses buildFetchRow (http.zig jsHttpSubscribe),
+    \\        // so record the FULL option bag prod reads — minus timeout_ms/stream
+    \\        // (held transfers always stream and never time out). Public spellings,
+    \\        // like recFetch, so `toHaveSent("subscribe", { headers, maxChunkBytes,
+    \\        // … })` matches and `.not.` isn't vacuous.
+    \\        var id = "sub_" + nextSeq();
+    \\        push({ kind: "subscribe", id: id, url: o.url, method: (o && o.method) || "GET",
+    \\          body: (o && o.body !== undefined) ? o.body : null,
+    \\          headers: (o && o.headers) || {},
+    \\          ctx: (o && o.ctx !== undefined) ? o.ctx : null,
+    \\          on: oc,
+    \\          maxChunkBytes: (o && o.max_response_chunk_bytes != null) ? o.max_response_chunk_bytes : 262144,
+    \\          maxTotalBytes: (o && o.max_total_response_bytes != null) ? o.max_total_response_bytes : 52428800 });
+    \\        return id;
     \\      },
     \\      cancelSubscription: function(){},
     \\    },

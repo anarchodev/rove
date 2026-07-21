@@ -433,6 +433,18 @@ Both `schedule` and `cron` deliver a target this way, so one `wake(...)` is one
 firing. As with `sendCallback`, the target is tested in isolation — the
 scheduler's own queueing and at-least-once firing aren't re-run.
 
+A **kv-reactive subscription** target — the `onSubscription` a watched-name
+change fires — is driven by `scenario.subscriptionFire({ on, name })`: a fresh
+connectionless activation with `request.activation = { kind: "subscription_fire",
+name, source }` and an empty ctx (subscription chains carry no platform ctx —
+state lives in the handler's own kv). The platform retires the `_sub/dirty/{name}`
+marker before the handler runs, so the handler observes it already cleared.
+
+```js
+const fired = s.subscriptionFire({ on: "watchers/orders.mjs", name: "orders/watch" });
+expect(fired.body.fired).toBe("orders/watch");
+```
+
 A bare **fetch continuation module** — the `on` of an `after.fetch`/`http.fetch`,
 in its own file — is drivable the same way with `scenario.fetchResult`, given an
 upstream result on the flattened `request.{status, ok, done, body}` surface:

@@ -726,6 +726,42 @@ class Scenario {
     }));
   }
 
+  /** A DETACHED kv-reactive subscription fire → the `onSubscription` activation
+   *  (`http.subscribe`'s durable-kv side, distinct from the outbound event
+   *  stream). When a watched name is written, the platform sets a
+   *  `_sub/dirty/{name}` marker; a sweep then fires the subscription's module at
+   *  `onSubscription` as a FRESH connectionless chain — empty ctx, a fresh
+   *  correlation id, and `request.activation = {kind:"subscription_fire", name,
+   *  source}` (worker_streaming.fireSubscriptionActivation). The platform deletes
+   *  the dirty marker BEFORE the handler runs, so the handler observes it already
+   *  cleared. Test that module in isolation given a fire — like `sendCallback` /
+   *  `wake`.
+   *
+   *  spec: { on: "<subscription module path>", name?: "<subscription name>",
+   *          source?: <activation.source>, now? } */
+  subscriptionFire(spec = {}) {
+    if (typeof spec.on !== "string")
+      throw new Error("subscriptionFire({ on }): `on` must be the subscription module path");
+    const name = spec.name != null ? spec.name : "sub_test";
+    const fireMs = spec.now !== undefined ? toMs(spec.now) : this.now;
+    const activation = { kind: "subscription_fire", name };
+    if (spec.source !== undefined) activation.source = spec.source;
+    const w = this._base({
+      entry: spec.on, // the subscription module IS this activation's entry
+      activation: "subscription_fire",
+      export: "onSubscription",
+      // Prod synthesizes an empty ctx ("{}") — subscription chains carry no
+      // platform ctx (the handler persists any state in its own kv).
+      ctx: {},
+      now_ms: fireMs,
+      request: { activation },
+    });
+    // The platform retires the dirty marker before the handler runs — clear it
+    // from the readset so the handler observes it already gone (read-your-deletes).
+    if (w.kv) delete w.kv["_sub/dirty/" + name];
+    return new Node(this, w);
+  }
+
   /** A held WebSocket connection. The upgrade runs NO code (the chain parks
    *  with ctx `{}`); each inbound frame runs `onMessage`, so the fold starts at
    *  the first `.receive(frame)`. Per-connection ctx threads via each frame's
