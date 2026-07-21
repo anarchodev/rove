@@ -86,7 +86,7 @@ pub const FetchChunk = struct {
 
 /// Wake-batch payload (the fired-prefix contract). One entry per
 /// fired arm — `{kind:"kv", prefix, firedAt}` / `{kind:"timer", firedAt}`
-/// — drained via `StreamWakes.drainFired`. Surfaces as
+/// — drained via `StreamWakes.nextWakeBatch`. Surfaces as
 /// `request.activation.wakes`. Borrowed slice — the resuming caller owns
 /// the entries + their `prefix` bytes for the duration of the dispatch.
 pub const WakeBatch = struct {

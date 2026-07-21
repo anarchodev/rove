@@ -53,24 +53,46 @@ pub const Stream = struct {
     /// after chunks drain unless a kv-prefix wake fires first).
     interval_ms: ?i64 = null,
     /// streaming-handlers-plan §4.6: prefix-only kv-write wakes.
-    /// Each entry is a tenant-scoped key prefix; when any key with
-    /// that prefix is `put`/`delete`'d by ANY request on the cell's
-    /// owning tenant, the apply-time hook fires a `kv_wake`
-    /// activation. Empty slice = no kv wakes registered.
-    /// Allocator-owned: each prefix is its own dup'd buffer, and
-    /// the spine `[][]u8` is allocator-owned too.
-    kv_prefixes: [][]u8 = &.{},
+    /// Each arm is a tenant-scoped key prefix + its own `{on}` export;
+    /// when any key with that prefix is `put`/`delete`'d by ANY request
+    /// on the cell's owning tenant, the apply-time hook fires a
+    /// `kv_wake` activation that resumes THAT arm's export. Empty slice =
+    /// no kv wakes. Allocator-owned: each arm's `prefix`/`on` and the
+    /// spine are owned (the `fired_at_ns` field is unused here — always
+    /// 0 in a descriptor; it maps straight into `StreamWakes`).
+    kv_prefixes: []components.KvArm = &.{},
+    /// The interval timer's own `{on}` export (null → `onWake`), so the
+    /// timer resumes into its own export independent of the kv arms.
+    /// Owned when present.
+    timer_on: ?[]u8 = null,
     /// Author's `ctx`, JSON-serialized. Threaded forward to the next
     /// activation as `request.ctx`.
     ctx_json: []u8,
+    /// Cross-module target from the `next(path, …)` disposition —
+    /// one `next()` semantic on every held chain: when non-empty, the
+    /// chain re-aims to this module (all later resumes dispatch
+    /// there). Empty = ambient `next()` (the chain stays where it
+    /// is). Owned when non-empty.
+    path: []u8 = &.{},
+    /// `next(path, {fn})` on a stream chain has no slot to land in —
+    /// the wake arm's `{on}` names the resume export — so the family
+    /// arms reject it loudly (never free it silently). Owned when
+    /// present.
+    fn_name: ?[]u8 = null,
 
     pub fn deinit(self: *Stream, allocator: std.mem.Allocator) void {
         if (self.headers) |h| allocator.free(h);
         for (self.chunks) |ch| allocator.free(ch);
         allocator.free(self.chunks);
-        for (self.kv_prefixes) |p| allocator.free(p);
+        for (self.kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
+        if (self.timer_on) |t| allocator.free(t);
         allocator.free(self.ctx_json);
+        if (self.path.len > 0) allocator.free(self.path);
+        if (self.fn_name) |f| allocator.free(f);
     }
 };
 
@@ -262,15 +284,16 @@ test "Stream.deinit frees all owned slices" {
 
 test "Stream.deinit frees kv_prefixes (streaming-handlers Phase 3)" {
     const a = testing.allocator;
-    const prefixes = try a.alloc([]u8, 2);
-    prefixes[0] = try a.dupe(u8, "orders/alice/");
-    prefixes[1] = try a.dupe(u8, "notifications/");
+    const arms = try a.alloc(components.KvArm, 2);
+    arms[0] = .{ .prefix = try a.dupe(u8, "orders/alice/"), .on = try a.dupe(u8, "onOrder") };
+    arms[1] = .{ .prefix = try a.dupe(u8, "notifications/") }; // default onWake
     var s: Stream = .{
         .status = 200,
         .headers = null,
         .chunks = try a.alloc([]u8, 0),
         .interval_ms = null,
-        .kv_prefixes = prefixes,
+        .kv_prefixes = arms,
+        .timer_on = try a.dupe(u8, "onTimeout"),
         .ctx_json = try a.dupe(u8, "null"),
     };
     s.deinit(a);
