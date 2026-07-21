@@ -354,6 +354,24 @@ runs with `request.status === 0` (a hard failure — `status` is the single
 success signal, no `request.ok`; issue #7) and `request.ctx = { error, app }`,
 nothing stored.
 
+### A streamed upload (raw onChunk)
+
+A handler that exports `onChunk` sees the body as a sequence of `inbound_chunk`
+activations (the trust-boundary streaming path, distinct from `blob.receive`).
+Drive it with `scenario.inboundChunks({ method, path, headers }, chunks)` — one
+activation per chunk, with `request.chunkSeq`, `request.done` on the last, and
+the payload on `request.bytes` / `.text`. Per-connection ctx threads via each
+chunk's `next({ctx})` (null on the first) and KV writes fold forward, so an
+accumulate-in-kv handler reconstructs the body. Pass `{ binary: true }` for byte
+chunks (`Uint8Array`).
+
+```js
+const r = s.inboundChunks({ method: "POST", path: "/upload" },
+                          ["Hello, ", "streaming ", "world!"]);
+expect(r.disposition).toBe("terminal");
+expect(r.body.assembled).toBe("Hello, streaming world!"); // folded across 3 chunks
+```
+
 ### The deploy doors (result-in-ctx)
 
 `platform.compile(files, { on })` and `platform.scope(t).deploy.stampManifest(
