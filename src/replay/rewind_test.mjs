@@ -1091,7 +1091,12 @@ class FetchHandle {
     // The chain's parked module — fixed for every chunk (prod pins it at the
     // cont→stream transition), so a held next(target) routes the whole stream.
     const parkedEntry = heldEntry(parentNode);
-    const ctx = fetchResumeCtx(parentNode, fx);
+    // A streaming fetch that carried its OWN ctx delivers it on every chunk;
+    // one without reads the CURRENT chain ctx, which the handler can REPLACE by
+    // re-holding with next({ctx}) between chunks (prod replaces the chain ctx on
+    // each re-park). Thread it: seed from the parent's held next({ctx}), adopt
+    // each re-held chunk's ctx.
+    let curCtx = heldCtx(parentNode);
     // The fetch stays pending through every chunk INCLUDING its terminal done
     // event (prod counts "including this one").
     const pending = opts.fetchesPending != null ? opts.fetchesPending : armedFetches(parentNode);
@@ -1124,13 +1129,15 @@ class FetchHandle {
         entry: t.entry,
         activation: "fetch_chunk",
         export: t.export,
-        ctx,
+        ctx: fx.ctx != null ? fx.ctx : curCtx,
         kv,
         seed: ++seed,
         now_ms: ++now,
         request,
       }));
-      kv = foldKv(kv, node.force().effects); // thread writes to the next chunk
+      const nb = node.force();
+      kv = foldKv(kv, nb.effects); // thread writes to the next chunk
+      if (nb.disposition === "held") curCtx = heldCtx(node); // adopt the re-held ctx
     };
     chunks.forEach((c, i) => step(c, false, i));
     step(null, true, chunks.length); // terminal empty done event
@@ -1297,15 +1304,25 @@ class Interleaving {
     // Each arrival retires one outstanding fetch: the first leg sees every
     // armed fetch pending (including itself), the last sees only itself.
     let pending = armedFetches(parent);
+    // The chain ctx evolves across the race: prod REPLACES it on every re-hold
+    // (worker re-park), and a no-ctx fetch resume reads the CURRENT chain ctx.
+    // Seed with the parent's held next({ctx}); after a leg re-holds, adopt its
+    // new next({ctx}) so a later leg observes an earlier leg's ctx transition.
+    let curCtx = heldCtx(parent);
     for (const i of order) {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
       requireProdReachable("whenConcurrent", fx, spec.resolve || {});
-      node = resumeNode(parent, fetchResumeWorld(parent, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
+      // A fetch with its own ctx keeps it (§4.14); a no-ctx fetch reads the
+      // current chain ctx (which an earlier leg in this order may have replaced).
+      const ctx = fx.ctx != null ? fx.ctx : curCtx;
+      node = resumeNode(parent, fetchResumeWorld(parent, fx, spec.resolve || {}, kv, ++seed, ++now, ctx, Math.max(pending, 1)));
       // Only a BOUND arrival retires a bound-pending slot — an unbound
       // (webhook.send-composed) leg was never pending on the connection.
       if (fx.bound) pending--;
-      kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
+      const nb = node.force();
+      kv = foldKv(kv, nb.effects); // thread this leg's writes to the next
+      if (nb.disposition === "held") curCtx = heldCtx(node); // adopt the re-held ctx
     }
     return node;
   }
