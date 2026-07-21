@@ -921,6 +921,21 @@ class Node {
     return new ReceiveHandle(this, hit);
   }
 
+  /** Locate an `http.subscribe` this activation opened → a handle that drives its
+   *  UNBOUND event stream: `.event(chunk)` delivers one per-writeback
+   *  `fetch_chunk` event at the subscription's `on` module, and `.ended({status?})`
+   *  the terminal `final:true` close (default status 0 = "subscription ended;
+   *  reconnect if desired"). A subscription is fire-and-forget on the connection
+   *  (events fire to a SEPARATE unbound chain), so this needs no held node.
+   *  `matcher` selects by url when several were opened. */
+  subscription(matcher) {
+    const sx = this.effects.filter((e) => e.kind === "subscribe");
+    if (!sx.length) throw new Error("subscription(): the activation opened no http.subscribe");
+    const hit = matcher != null ? sx.find((e) => matchUrl(e.url, matcher)) : sx[0];
+    if (!hit) throw new Error(`subscription(${matcher}): no http.subscribe matched`);
+    return new SubscriptionHandle(this, hit);
+  }
+
   /** Locate the `platform.compile` door this held activation armed (a bound
    *  after.fetch to `rove-compile.internal`) → a handle whose `.staged()`
    *  delivers the compile result on the resume's `request.ctx` (NOT
@@ -1300,6 +1315,65 @@ class FetchHandle {
  *    failure → `request.ctx = { error, app }`,        `request.status === 0`
  *  where `app` echoes the issue-time ctx the caller threaded (recorded on the
  *  receive effect); the test may override it with `spec.app`. */
+/** Drives an `http.subscribe`'s UNBOUND event stream. Each `.event(chunk)` is a
+ *  per-writeback `fetch_chunk` fire at the subscription's `on` MODULE (a separate
+ *  chain — the connection was never held for it), with the payload on
+ *  `request.activation.bytes` and the issue-time ctx on `request.ctx`; kv writes
+ *  fold forward across events (durable read-your-writes). `.ended({status?})` is
+ *  the terminal `final:true` close (default status 0 = upstream closed). Each
+ *  returns the fired node. */
+class SubscriptionHandle {
+  constructor(node, sx) {
+    this.node = node;
+    this.sx = sx;
+    this._seq = 0;
+    this._off = 0; // cumulative wire bytes before the current event
+    this._kv = foldKv(node.world.kv, node.force().effects);
+    this._seed = node.world.seed || 0;
+    this._now = node.world.now_ms || 0;
+  }
+
+  _fire(chunk, binary, final, status) {
+    const activation = { kind: "fetch_chunk", seq: this._seq, byteOffset: this._off, final };
+    let payloadLen = 0;
+    if (chunk != null) {
+      const bytes = binary ? Array.from(chunk) : utf8Bytes(String(chunk));
+      activation.bytesB64 = b64(bytes);
+      payloadLen = bytes.length;
+    }
+    if (final) {
+      activation.status = status;
+      activation.bodyTruncated = false;
+    }
+    // The `on` is a module path (unbound cross-module) → its default export.
+    const t = onTarget(this.node.world.entry, this.sx.on, "default");
+    const world = carrySources(this.node.world, {
+      entry: t.entry,
+      activation: "fetch_chunk",
+      export: t.export,
+      // The subscription's issue-time ctx is echoed on every event.
+      ctx: this.sx.ctx != null ? this.sx.ctx : null,
+      kv: this._kv,
+      seed: ++this._seed,
+      now_ms: ++this._now,
+      request: { activation },
+    });
+    const node = new Node(this.node.scenario, world);
+    this._kv = foldKv(this._kv, node.force().effects);
+    this._seq += 1;
+    this._off += payloadLen;
+    return node;
+  }
+
+  /** One per-writeback event (`final:false`). `chunk` is a string, or bytes via
+   *  `{ binary: true }`. */
+  event(chunk, opts = {}) { return this._fire(chunk, !!(opts && opts.binary), false, undefined); }
+
+  /** The terminal "subscription ended" event (`final:true`). `opts.status`
+   *  defaults to 0 (upstream closed); the handler reads it as end-of-stream. */
+  ended(opts = {}) { return this._fire(null, false, true, opts.status != null ? opts.status : 0); }
+}
+
 class ReceiveHandle {
   constructor(node, fx) { this.node = node; this.fx = fx; }
 
