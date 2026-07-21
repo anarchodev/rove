@@ -413,6 +413,11 @@ class Scenario {
     // in an activation throws prod's Error{code:"rate_limited"} — so the
     // rate-limit catch branch is testable. Carried as a hidden reserved key.
     this.emailBudget = cfg.emailBudget != null ? cfg.emailBudget : null;
+    // Durable kv-subscription registrations (issue #38): `[{ name, prefix }]`,
+    // the shape prod derives from `_subscriptions/<name>/spec.json`. A write
+    // under a watched prefix injects a `_sub/dirty/{name}` marker into the
+    // effect log (see the epilogue kv wrapper). Carried as a hidden reserved key.
+    this.subscriptions = Array.isArray(cfg.subscriptions) ? cfg.subscriptions : [];
     // Per-chain identity the engine pins on EVERY activation (worker-set in
     // prod). `tenant` is this handler's tenant id; `correlationId` is minted by
     // inbound and inherited by every resume — so it's scenario-level (set once,
@@ -449,6 +454,7 @@ class Scenario {
     if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
     if (this.admin) kv["__rove_store/admin"] = "1";
     if (this.emailBudget != null) kv["__rove_store/email_budget"] = String(this.emailBudget);
+    if (this.subscriptions.length) kv["__rove_store/subscriptions"] = JSON.stringify(this.subscriptions);
     const w = Object.assign(
       { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
