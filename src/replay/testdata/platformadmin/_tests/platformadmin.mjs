@@ -19,3 +19,7 @@ const ok = scenario({ admin: true, instances: { acme: {} } }).inbound({ method: 
 for (const k of GATED) expect(ok.body[k]).toBe("ok");
 expect(ok.body.compile).toBe("ok");
 expect(ok.effects.some((e) => e.kind === "platform" && e.op === "scope")).toBe(true);
+// The recorders carry their real arguments — the effect log distinguishes which
+// deployment was published on which tenant, and which instance was created.
+expect(ok.effects.some((e) => e.op === "releases.publish" && e.tenant === "acme" && e.depId === "0123456789abcdef")).toBe(true);
+expect(ok.effects.some((e) => e.op === "instances.create" && e.name === "x")).toBe(true);

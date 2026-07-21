@@ -4,6 +4,8 @@ import { scenario, expect } from "rewind:test";
 const req = scenario({ admin: true, root: { kv: { "cfg/x": "hello" } } }).inbound({ method: "GET", path: "/" });
 expect(req.status).toBe(200);
 expect(req.body.surface).toEqual({ http: "object", platform: "object", browser: "object" });
-expect(req.body.created).toBe("acme");
+expect(req.body.created).toBe(undefined); // prod's instances.create returns undefined
 expect(req.body.rootRead).toBe("hello");
-expect(req.effects.some((e) => e.kind === "platform" && e.op === "instances.create")).toBe(true);
+// The recorder carries the real argument (the instance name), so the effect log
+// distinguishes which instance was created.
+expect(req.effects.some((e) => e.kind === "platform" && e.op === "instances.create" && e.name === "acme")).toBe(true);

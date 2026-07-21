@@ -410,8 +410,11 @@ const SYSTEM_SHIM =
     \\      // (not just a hidden native set): resumes rebuild kv from the folded
     \\      // effect log, and only recorded writes fold forward — so an instance
     \\      // created in one activation stays scope-resolvable in the next.
-    \\      instances: { create: gate(function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); var id = (spec && spec.id) || "inst_sim"; push({ kind: "write", store: "exists", key: "i/" + id, value: "1" }); globalThis.kv.set(NS_STORE + "exists/i/" + id, "1"); return id; }), deployStarter: gate(function(){ push({ kind: "platform", op: "instances.deployStarter" }); }) },
-    \\      releases: { publish: gate(function(){ push({ kind: "platform", op: "releases.publish" }); }) },
+    \\      // create(name): prod takes a NAME string (valueToOwnedString) and
+    \\      // returns undefined — the instance id IS the name. Record it, and seed
+    \\      // the exists marker keyed by name so a later platform.scope(name) folds.
+    \\      instances: { create: gate(function(name){ push({ kind: "platform", op: "instances.create", name: name }); push({ kind: "write", store: "exists", key: "i/" + name, value: "1" }); globalThis.kv.set(NS_STORE + "exists/i/" + name, "1"); }), deployStarter: gate(function(name){ push({ kind: "platform", op: "instances.deployStarter", name: name }); }) },
+    \\      releases: { publish: gate(function(tenant, depId){ push({ kind: "platform", op: "releases.publish", tenant: tenant, depId: depId }); }) },
     \\      // checkRootToken(token) → true iff it matches the operator root token
     \\      // (env-supplied in prod); the sim carries it as a hidden reserved kv key
     \\      // seeded by `scenario({ rootToken })`. Unconfigured → nothing is root.
