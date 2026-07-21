@@ -204,5 +204,65 @@ pub fn main() !void {
         try runArenaGc(a);
         return;
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "packages")) {
+        try runPackages(a);
+        return;
+    }
     try runInbound(a);
+}
+
+/// Multi-version package encapsulation offline (issue #50), mirroring
+/// scripts/smoke/pm_deploy_smoke.py: the app pins @rewind/jwt@1.9 and imports
+/// @rewind/oidc@2.0, which pins its OWN @rewind/jwt@1.4. The app must see
+/// jwt19 while the encapsulated oidc sees jwt14 — proving the sim resolves
+/// per-importer through the shared PackageResolver, exactly as deploy does.
+fn runPackages(a: std.mem.Allocator) !void {
+    const JWT19 = "b" ** 64;
+    const JWT14 = "c" ** 64;
+    const OIDC = "a" ** 64;
+    const PKG_HANDLER =
+        \\import { v as jwtv } from '@rewind/jwt';
+        \\import { jwtv as oidcJwt } from '@rewind/oidc';
+        \\export default function () {
+        \\  return { status: 200, body: { app: jwtv, oidc: oidcJwt } };
+        \\}
+    ;
+    const JWT19_SRC = "export const v = 'jwt19';";
+    const JWT14_SRC = "export const v = 'jwt14';";
+    const OIDC_SRC = "import { v } from '@rewind/jwt'; export const jwtv = v;";
+
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(PKG_HANDLER, .{}, w);
+    try w.writeAll("}],");
+    // App pins jwt 1.9; oidc pins its own jwt 1.4.
+    try w.print("\"app_imports\":{{\"@rewind/oidc\":\"{s}\",\"@rewind/jwt\":\"{s}\"}},", .{ OIDC, JWT19 });
+    try w.writeAll("\"packages\":[");
+    try w.print("{{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{JWT19});
+    try std.json.Stringify.value(JWT19_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/jwt\",\"version\":\"1.4.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{JWT14});
+    try std.json.Stringify.value(JWT14_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/oidc\",\"version\":\"2.0.0\",\"pkg_hash\":\"{s}\",\"imports\":{{\"@rewind/jwt\":\"{s}\"}},\"files\":{{\"index.mjs\":", .{ OIDC, JWT14 });
+    try std.json.Stringify.value(OIDC_SRC, .{}, w);
+    try w.writeAll("}}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("PACKAGES: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    // The app sees jwt 1.9; the encapsulated oidc sees its own jwt 1.4.
+    check(out.items, &.{
+        "\"app\":\"jwt19\"", "\"oidc\":\"jwt14\"",
+        "\"verify\":{\"pass\":true", "\"ok\":true",
+    }, &.{"jwt14\",\"oidc\":\"jwt19"}, "PACKAGES SCENARIO");
 }
