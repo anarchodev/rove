@@ -68,6 +68,7 @@ extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_s
 
 const sim_globals = @import("sim_globals.zig");
 const mod_loader = @import("mod_loader.zig");
+const package_resolver = @import("package_resolver");
 // The prod ip-mask rule (src/js/ip_mask.zig, registered as an anonymous
 // import in build.zig) — the SAME rule the worker applies to `request.ip`,
 // so the sim's derived masked channel can't drift.
@@ -264,6 +265,9 @@ pub const Engine = struct {
             if (!std.mem.eql(u8, s.kind, "handler")) continue;
             try sources.put(a, s.path, s.source);
         }
+        // Package files are addressed by their resolved `/pkg/<hash>/<path>`
+        // key — the loader reaches them after `normalize` maps a specifier.
+        for (wv.pkg_sources) |s| try sources.put(a, s.path, s.source);
 
         // Source resolution (see the doc-comment): world source_dir / explicit
         // override win over inline `sources`, which win over the `base_dir`
@@ -370,6 +374,17 @@ pub const Engine = struct {
         // @intCast would panic on a pathological now_ms ≥ 2^63.
         arena_set_date_now_r(self.sim, @bitCast(wv.now_ms));
         arena_set_trace_mode_r(self.sim, 0);
+
+        // Per-world package resolver: `normalize` (via mod_ctx) maps bare
+        // `@scope/pkg` specifiers to their `/pkg/<hash>/` keys during this run.
+        // Empty graph ⇒ no resolver ⇒ bare specifiers pass through unchanged.
+        var resolver: ?package_resolver.PackageResolver = if (wv.packages.len != 0 or wv.app_imports.len != 0)
+            try package_resolver.buildResolver(a, wv.packages, wv.app_imports)
+        else
+            null;
+        defer if (resolver) |*r| r.deinit(a);
+        self.mod_ctx.resolver = if (resolver) |*r| r else null;
+        defer self.mod_ctx.resolver = null;
 
         const rc = arena_run_module_r(self.sim, entry_z.ptr, full_src.ptr);
 

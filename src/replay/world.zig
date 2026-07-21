@@ -35,6 +35,10 @@
 //! are allocated from `a`.
 
 const std = @import("std");
+// Manifest types (Package / ImportEntry) — the sim builds its package resolver
+// from the same shapes deploy does, via the shared `package_resolver`.
+const manifest = @import("rove-files").manifest_json;
+const HASH_HEX_LEN = @import("rove-files").HASH_HEX_LEN;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
@@ -92,6 +96,17 @@ pub const World = struct {
     /// `scenario({ sourceDir })` uses to resolve handler code (the harness reads
     /// each world's own dir before dispatching to the shared sim reactor).
     source_dir: ?[]const u8 = null,
+
+    // ── `@scope/pkg` packages (offline resolution, issue #50) ──
+    /// The resolved package graph — `spec`/`pkg_hash`/per-package `imports` —
+    /// fed to `package_resolver.buildResolver` (same as deploy). Empty ⇒ no
+    /// packages ⇒ bare specifiers pass through unchanged.
+    packages: []const manifest.Package = &.{},
+    /// The app's flat import surface: `{ specifier: pkg_hash }`.
+    app_imports: []const manifest.ImportEntry = &.{},
+    /// Each resolved package file's source, keyed `/pkg/<hash>/<path>` — merged
+    /// into the sim's module sources so the loader serves it after `normalize`.
+    pkg_sources: []const Source = &.{},
 
     // ── non-inbound activation surface (`architecture/replay-and-sim.md` §3) ──
     /// The threaded `Ctx` → `request.ctx`. JSON text (any value). `undefined`
@@ -233,7 +248,66 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         w.sources = try ss.toOwnedSlice(a);
     }
 
+    // ── packages: the resolved graph + inline package sources ──
+    w.app_imports = try parseImports(a, obj.get("app_imports"));
+    if (obj.get("packages")) |pv| {
+        if (pv != .array) return Error.BadWorld;
+        var pkgs = std.ArrayList(manifest.Package){};
+        var psrc = std.ArrayList(Source){};
+        for (pv.array.items) |e| {
+            if (e != .object) continue;
+            const po = e.object;
+            const spec = jStr(po, "spec") orelse continue;
+            const hash = jStr(po, "pkg_hash") orelse continue;
+            if (hash.len != HASH_HEX_LEN) return Error.BadWorld;
+            var hh: [HASH_HEX_LEN]u8 = undefined;
+            @memcpy(&hh, hash[0..HASH_HEX_LEN]);
+            const imports = try parseImports(a, po.get("imports"));
+            try pkgs.append(a, .{
+                .spec = spec,
+                .version = jStr(po, "version") orelse "",
+                .pkg_hash_hex = hh,
+                .files = &.{}, // buildResolver ignores files; sources carried below
+                .imports = imports,
+                .capabilities = &.{},
+                .private = false,
+            });
+            // `files`: { path → source } → `/pkg/<hash>/<path>` module sources.
+            if (po.get("files")) |fv| {
+                if (fv == .object) {
+                    var it = fv.object.iterator();
+                    while (it.next()) |kv| {
+                        if (kv.value_ptr.* != .string) continue;
+                        const key = try std.fmt.allocPrint(a, "/pkg/{s}/{s}", .{ hash, kv.key_ptr.* });
+                        try psrc.append(a, .{ .path = key, .kind = "handler", .source = kv.value_ptr.*.string });
+                    }
+                }
+            }
+        }
+        w.packages = try pkgs.toOwnedSlice(a);
+        w.pkg_sources = try psrc.toOwnedSlice(a);
+    }
+
     return w;
+}
+
+/// Parse a `{ specifier: "<64-hex>" }` object into `[]ImportEntry` (empty when
+/// absent or not an object). A malformed entry (non-string value / wrong hash
+/// length) is skipped.
+fn parseImports(a: std.mem.Allocator, val: ?std.json.Value) Error![]manifest.ImportEntry {
+    var out = std.ArrayList(manifest.ImportEntry){};
+    if (val) |v| if (v == .object) {
+        var it = v.object.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* != .string) continue;
+            const h = kv.value_ptr.*.string;
+            if (h.len != HASH_HEX_LEN) continue;
+            var hh: [HASH_HEX_LEN]u8 = undefined;
+            @memcpy(&hh, h[0..HASH_HEX_LEN]);
+            try out.append(a, .{ .specifier = kv.key_ptr.*, .pkg_hash_hex = hh });
+        }
+    };
+    return out.toOwnedSlice(a);
 }
 
 /// A string value passes through verbatim; any other JSON value is serialized
