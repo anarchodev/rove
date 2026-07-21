@@ -38,3 +38,47 @@ const bye = held.disconnect();
 expect(bye).toHaveWritten("step2/bye", { ctx: { job: "j1" } });
 expect(bye).not.toHaveWritten("index/bye");
 expect(bye.body).toEqual({ done: "bye" });
+
+// ── WS module handoff: the join frame re-aims the chain; every later frame
+// runs the TARGET module with the threaded ctx (one next() semantic — the WS
+// family honors the cross-module target like every other held chain). ──
+const wss = scenario({ entry: "lobby.mjs", now: "2026-07-01T00:00:00Z" });
+const conn = wss.ws({ path: "/lobby" });
+const join = conn.receive("join");
+expect(join.disposition).toBe("held");
+expect(join).toHaveWritten("lobby/joined", "1");
+expect(join).toHaveSentFrame("lobby:ok");
+const hello = join.receive("hello");
+expect(hello).toHaveWritten("chat/got", "hello:r1");
+expect(hello).toHaveSentFrame("chat:hello:r1");
+expect(hello).not.toHaveWritten("lobby/decoy");
+// The re-aim sticks: a third frame still runs chat, with chat's own ctx.
+const again = hello.receive("again");
+expect(again).toHaveWritten("chat/got", "again:r1");
+expect(again).not.toHaveWritten("lobby/decoy");
+
+// ── streaming activation: the SSE first hop parks the chain at the
+// cross-module target; the kv wake runs the target's onWake. ──
+const sses = scenario({ entry: "sse.mjs", now: "2026-07-01T00:00:00Z" });
+const sse = sses.inbound({ method: "GET", path: "/sse" });
+expect(sse.disposition).toBe("held");
+expect(sse.bundle.target).toBe("flows/sink.mjs");
+expect(sse).toHaveSentFrame("event: ready\n\n");
+const sunk = sse.wakeKv({ "job/1": "go" });
+expect(sunk).toHaveWritten("sink/woke", "sse");
+expect(sunk).toHaveSentFrame("event: sink\n\n");
+expect(sunk).not.toHaveWritten("sse/decoy");
+expect(sunk.disposition).toBe("held"); // sink re-armed + re-held
+
+// ── wake-less park: a next() with no possible resume source is prod's
+// immediate defined 500 naming the mistake (never a silent 25 s 504) — the
+// hop's writes roll back with it. ──
+const orphans = scenario({
+  sources: { "index.mjs": "export default function () { kv.set(\"orphan/wrote\", \"1\"); return next({ n: 1 }); }" },
+});
+const orphan = orphans.inbound({ path: "/" });
+expect(orphan.disposition).toBe("terminal");
+expect(orphan.status).toBe(500);
+expect(orphan.body).toMatch(/held with no wake source/);
+expect(orphan).not.toHaveWritten("orphan/wrote");
+expect(orphan.kv("orphan/wrote")).toBe(null);

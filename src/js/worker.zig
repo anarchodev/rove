@@ -460,6 +460,13 @@ pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
 /// timeout reaps genuinely dead clients long before this.
 pub const RECEIVE_HOLD_DEADLINE_NS: i64 = 15 * 60 * std.time.ns_per_s;
 
+/// Park-time vigilance (docs/handler-shape.md §2.1): the customer-facing
+/// bodies for the two defined `next()` author errors, shared across the
+/// family arms so the wording can't drift — the sim mirrors the
+/// wake-source body verbatim (rewind_test.mjs `enforceWakeSource`).
+pub const HELD_NO_WAKE_SOURCE_BODY = "held with no wake source: next() parked this chain but nothing can resume it — arm after.* or bind a fetch/send before holding\n";
+pub const NEXT_FN_UNSUPPORTED_BODY = "next({fn}) is not supported on a streaming chain — name the resume export via after.*(..., {on})\n";
+
 // Continuation state lives on the entity's `ContDescriptor` +
 // `ChainContext` components, which deinit structurally on entity
 // destroy (no separate `ParkedCont` struct).

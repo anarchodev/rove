@@ -183,14 +183,18 @@ const StreamFirstHopMeta = struct {
     /// activation's synthesized request body.
     ctx_json: []u8,
     /// Owned. Module path the resume engine invokes on each wake.
-    /// Derived from the dispatch route's `module_base` so the resume
-    /// reaches the same handler that returned `__rove_stream(...)`.
+    /// The dispatch route's `module_base`, unless the `next(path, …)`
+    /// disposition named a cross-module target — the one `next()`
+    /// semantic: an explicit target re-aims the chain, so every
+    /// resume dispatches there.
     module_path: []u8,
-    /// Owned. Tenant-scoped kv-key prefixes registered as wake
-    /// conditions (streaming handlers;
-    /// `docs/architecture/routing-and-ingress.md`). Each entry is one
-    /// allocator-owned dup; the outer spine is owned too.
-    kv_prefixes: [][]u8,
+    /// Owned. Tenant-scoped kv-wake arms (streaming handlers;
+    /// `docs/architecture/routing-and-ingress.md`). Each arm carries its own
+    /// prefix + `{on}` export (per-arm routing); prefix/on and the spine are
+    /// owned. `fired_at_ns` unused here.
+    kv_prefixes: []components_mod.KvArm,
+    /// Owned. The interval timer's own `{on}` export (null → `onWake`).
+    timer_on: ?[]u8 = null,
     /// Owned. Tenant id the chain is scoped to. Set by
     /// `streamRecordIfAnyAt` before it sets the entity's stream
     /// components. Empty on the read-only commit fast path
@@ -208,8 +212,12 @@ const StreamFirstHopMeta = struct {
         if (self.chunks.len > 0) allocator.free(self.chunks);
         allocator.free(self.ctx_json);
         allocator.free(self.module_path);
-        for (self.kv_prefixes) |p| allocator.free(p);
+        for (self.kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
+        if (self.timer_on) |t| allocator.free(t);
         if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
         if (self.correlation_id) |c| allocator.free(c);
         self.* = undefined;
@@ -368,23 +376,33 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
     defer freeContWakes(allocator, s);
     if (s.cont_wakes.len == 0) return;
     var interval_ms: i64 = 0;
-    var wake_to: ?[]u8 = null;
+    var timer_on: ?[]u8 = null;
     var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     errdefer {
-        for (arms.items) |arm| allocator.free(arm.prefix);
+        for (arms.items) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         arms.deinit(allocator);
-        if (wake_to) |t| allocator.free(t);
+        if (timer_on) |t| allocator.free(t);
     }
     for (s.cont_wakes) |reg| {
         switch (reg.kind) {
-            .timer => interval_ms = reg.interval_ms,
-            .kv => try arms.append(allocator, .{ .prefix = try allocator.dupe(u8, reg.prefix) }),
-        }
-        // Last `{on}` wins — `on.*` wakes resume one "edge wake" export
-        // per held connection; a default `onWake` applies when null.
-        if (reg.on) |t| {
-            if (wake_to) |old| allocator.free(old);
-            wake_to = try allocator.dupe(u8, t);
+            // Per-arm routing: each arm carries its own `{on}`. The timer
+            // and each kv prefix resume into their own export; last timer
+            // wins for the single timer slot.
+            .timer => {
+                interval_ms = reg.interval_ms;
+                if (timer_on) |old| allocator.free(old);
+                timer_on = if (reg.on) |t| try allocator.dupe(u8, t) else null;
+            },
+            .kv => {
+                const pfx = try allocator.dupe(u8, reg.prefix);
+                errdefer allocator.free(pfx);
+                const on: ?[]u8 = if (reg.on) |t| try allocator.dupe(u8, t) else null;
+                errdefer if (on) |t| allocator.free(t);
+                try arms.append(allocator, .{ .prefix = pfx, .on = on });
+            },
         }
     }
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -394,7 +412,10 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         std.math.maxInt(i64);
     const kv_prefixes = try arms.toOwnedSlice(allocator);
     errdefer {
-        for (kv_prefixes) |arm| allocator.free(arm.prefix);
+        for (kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
     }
     try server.reg.set(s.ent, &server.request_out, components_mod.StreamWakes, .{
@@ -402,7 +423,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = kv_prefixes,
         .read_version = s.cont_read_version,
-        .wake_to = wake_to,
+        .timer_on = timer_on,
     });
 }
 
@@ -465,6 +486,7 @@ fn streamParkIfAny(
         meta.chunks,
         meta.kv_prefixes,
         meta.interval_ms,
+        meta.timer_on,
     );
     meta.deinit(worker.allocator);
     // Move into the streaming pipeline. h2's `consumeStreamResponses`
@@ -515,6 +537,7 @@ fn streamRecordIfAnyAt(
         meta_opt.chunks,
         meta_opt.kv_prefixes,
         meta_opt.interval_ms,
+        meta_opt.timer_on,
     );
     meta_opt.deinit(allocator);
 }
@@ -3764,28 +3787,52 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // `worker.serviceParkedStreams` then drives the
                 // chunked-write lifecycle + timer-wake re-activation.
                 var s = sval;
+                // `next(path, {fn})` has no slot on a stream chain —
+                // the wake arm's `{on}` names the resume export.
+                // Defined author error, never a silent free.
+                if (s.fn_name != null) {
+                    s.deinit(allocator);
+                    txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                        "dispatchOnce.rollbackTo(stream_fn_reject)",
+                        "tenant={s} err={s}",
+                        .{ scope_inst.id, @errorName(re) },
+                    );
+                    try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY, allocator);
+                    worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), correlation_id, &.{}, .inbound, 0);
+                    processed += 1;
+                    continue;
+                }
                 const status_u16: u16 = @intCast(@max(@min(s.status, 599), 100));
                 const parsed_hdrs: []dispatcher_mod.ResponseHeader =
                     if (s.headers) |hbuf| try parseStreamHeaders(allocator, hbuf) else &.{};
                 if (s.headers) |h| allocator.free(h);
                 s.headers = null;
-                // Module path for resume — duped now so route's
-                // defer-deinit doesn't take it out from under us.
-                const mp_dup = try allocator.dupe(u8, route.module_base);
-                // Transfer chunks + ctx_json + kv_prefixes ownership
-                // out of s and into stream_meta_opt; clear s's
-                // fields so its (unused, see no-defer) deinit would
-                // no-op.
+                // Module path for resume: the one `next()` semantic —
+                // an explicit cross-module target re-aims the chain;
+                // the ambient (empty) path parks this handler's own
+                // module (duped so route's defer-deinit doesn't take
+                // it out from under us).
+                const mp_dup = if (s.path.len > 0) blk: {
+                    const p = s.path;
+                    s.path = &.{};
+                    break :blk p;
+                } else try allocator.dupe(u8, route.module_base);
+                // Transfer chunks + ctx_json + kv_prefixes + timer_on
+                // ownership out of s and into stream_meta_opt; clear
+                // s's fields so its (unused, see no-defer) deinit
+                // would no-op.
                 stream_meta_opt = .{
                     .chunks = s.chunks,
                     .interval_ms = s.interval_ms orelse 0,
                     .ctx_json = s.ctx_json,
                     .module_path = mp_dup,
                     .kv_prefixes = s.kv_prefixes,
+                    .timer_on = s.timer_on,
                 };
                 s.chunks = &.{};
                 s.ctx_json = &.{};
                 s.kv_prefixes = &.{};
+                s.timer_on = null;
                 // s is now a husk — no slices left to free; skip deinit.
                 break :stblk dispatcher_mod.Response{
                     .status = @intCast(status_u16),
@@ -3897,6 +3944,50 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
             processed += 1;
             continue;
+        }
+
+        // Park-time vigilance (docs/handler-shape.md §2.1): a held
+        // chain must have ≥1 possible resume source — a bound send
+        // (§6.4), an `after.*` arm, a fetch that will bind, or the
+        // request body's remaining inbound chunks. An empty set can
+        // NEVER resume; failing loud here names the author's mistake
+        // at its site instead of surfacing it 25 s later as a generic
+        // `504 hold deadline exceeded` (the deadline stays as the
+        // backstop for armed-but-never-fires).
+        if (cont_opt != null and stream_meta_opt == null) {
+            const has_wake_source = blk: {
+                if (cont_bound_sched_id != null) break :blk true;
+                for (pending_wakes.items) |reg| switch (reg.kind) {
+                    .timer => if (reg.interval_ms > 0) break :blk true,
+                    .kv => if (reg.prefix.len > 0) break :blk true,
+                };
+                for (pending_fetches.items) |pf| {
+                    // Mirrors the bind rule below: only a held
+                    // `on.fetch` resumes this chain. blob.receive
+                    // holds for the client upload's duration.
+                    if (pf.connection_scoped and pf.bound_send_id.len == 0) break :blk true;
+                    if (blob_receive_mod.isReceiveUrl(pf.url)) break :blk true;
+                }
+                // A live inbound-chunk job resumes the chain with its next
+                // staged fire — presence alone counts (eof only means the
+                // bytes all arrived; fires may still be queued).
+                if (worker.inbound_chunk_jobs.get(ent) != null) break :blk true;
+                break :blk false;
+            };
+            if (!has_wake_source) {
+                var c = cont_opt.?;
+                c.deinit(allocator);
+                cont_opt = null;
+                txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                    "dispatchOnce.rollbackTo(wakeless_park)",
+                    "tenant={s} err={s}",
+                    .{ scope_inst.id, @errorName(re) },
+                );
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY, allocator);
+                worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), correlation_id, &.{}, .inbound, 0);
+                processed += 1;
+                continue;
+            }
         }
 
         txn.?.release() catch |err| panic_mod.invariantViolated(

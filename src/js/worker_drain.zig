@@ -664,9 +664,9 @@ const ContResumeNext = union(enum) {
     /// from a cont-parked entity (bound-fetch onFetchChunk
     /// resume that opens a streaming response). All slices owned
     /// and transferred onto the entity's stream components +
-    /// h2 components. Module path is duped from the resume's
-    /// cont module path (the chain's named-export module stays
-    /// fixed across activations).
+    /// h2 components. Module path is the cont's current path,
+    /// unless the disposition named a cross-module target — the
+    /// one `next()` semantic: an explicit target re-aims the chain.
     stream: struct {
         status: u16,
         /// Response headers parsed from the stream Cmd. Caller-
@@ -685,11 +685,14 @@ const ContResumeNext = union(enum) {
         /// Module path for resume — typically the same path the
         /// cont was parked against. Allocator-owned dup.
         module_path: []u8,
-        /// kv-react wake prefixes. Spine + entries owned.
-        kv_prefixes: [][]u8,
+        /// kv-react wake arms — each carries its own prefix + `{on}`
+        /// export (per-arm routing). Spine + entries owned.
+        kv_prefixes: []components_mod.KvArm,
         /// Timer-wake interval (0 = no timer wake — fetch chunks
         /// are the wake source).
         interval_ms: i64,
+        /// The interval timer's own `{on}` export (null → `onWake`). Owned.
+        timer_on: ?[]u8,
     },
 };
 
@@ -721,8 +724,12 @@ fn discardContResume(
             if (s.chunks.len > 0) allocator.free(s.chunks);
             allocator.free(s.ctx_json);
             allocator.free(s.module_path);
-            for (s.kv_prefixes) |p| allocator.free(p);
+            for (s.kv_prefixes) |arm| {
+                allocator.free(arm.prefix);
+                if (arm.on) |t| allocator.free(t);
+            }
             if (s.kv_prefixes.len > 0) allocator.free(s.kv_prefixes);
+            if (s.timer_on) |t| allocator.free(t);
         },
     }
 }
@@ -1017,15 +1024,41 @@ fn proposeAndParkContResume(
                 @as(i64, @intCast(std.time.nanoTimestamp())) + s.interval_ms * std.time.ns_per_ms
             else
                 std.math.maxInt(i64);
-            const arms = try components_mod.armsFromPrefixes(allocator, s.kv_prefixes);
+            // The arms already carry per-arm `{on}`; transfer directly.
+            // errdefer covers the transfer window (the next fallible op IS
+            // the StreamWakes set) — same posture as the prior
+            // armsFromPrefixes path.
+            const arms = s.kv_prefixes;
             errdefer {
-                for (arms) |arm| allocator.free(arm.prefix);
+                for (arms) |arm| {
+                    allocator.free(arm.prefix);
+                    if (arm.on) |t| allocator.free(t);
+                }
                 if (arms.len > 0) allocator.free(arms);
             }
+            // reg.set overwrites in place without deiniting the prior
+            // component — free the cont's old arms/exports first (the
+            // parked continuation may have armed on.kv/on.timer before
+            // this hop opened the stream), while carrying its pending
+            // wake-batch queue across the swap.
+            var carried_batches: std.ArrayListUnmanaged(components_mod.PendingWakeBatch) = .empty;
+            if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+                for (old.kv_prefixes) |arm| {
+                    allocator.free(arm.prefix);
+                    if (arm.on) |t| allocator.free(t);
+                }
+                if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+                if (old.timer_on) |t| allocator.free(t);
+                carried_batches = old.pending_batches;
+                old.pending_batches = .empty;
+                old.* = .{};
+            } else |_| {}
             try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
                 .interval_ms = s.interval_ms,
                 .next_wake_ns = next_wake_ns,
                 .kv_prefixes = arms,
+                .timer_on = s.timer_on,
+                .pending_batches = carried_batches,
             });
 
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
@@ -1059,7 +1092,10 @@ fn proposeAndParkContResume(
 ///         raft_pending_cont; the drainEntityArm re-parks on commit
 ///         (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
 ///       • continuation + !allow_repark → defined 504 (deadline).
-///       • stream → defined 501 (`cont → stream` is a later phase).
+///       • continuation re-parks re-aim the chain's module when the
+///         target is explicit; a re-park with no possible resume
+///         source is a defined 500 (`held with no wake source`).
+///       • stream → cont→stream transition (`resumeIntoStream`).
 /// Install the cont→stream transition's components on a held entity
 /// (still in `parked_continuations`) and move it into the streaming
 /// pipeline (`stream_response_in`). Shared read-only-path tail of both
@@ -1088,8 +1124,9 @@ fn installStreamComponentsInline(
     module_path: []u8,
     ctx_json: []u8,
     chunks: [][]u8,
-    kv_prefixes: [][]u8,
+    kv_prefixes: []components_mod.KvArm,
     interval_ms: i64,
+    timer_on: ?[]u8,
 ) void {
     const server = worker.h2;
     const allocator = worker.allocator;
@@ -1115,18 +1152,30 @@ fn installStreamComponentsInline(
         @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
     else
         std.math.maxInt(i64);
-    const arms = components_mod.armsFromPrefixes(allocator, kv_prefixes) catch blk: {
-        // OOM — chain proceeds unarmed for kv (matches this function's
-        // best-effort `catch {}` posture); free the untransferred strings.
-        for (kv_prefixes) |p| allocator.free(p);
-        if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
-        const empty: []components_mod.KvArm = &.{};
-        break :blk empty;
-    };
+    // The arms already carry per-arm `{on}`; transfer directly.
+    const arms = kv_prefixes;
+    // reg.set overwrites in place without deiniting the prior component —
+    // free the cont's old arms/exports first (the parked continuation may
+    // have armed on.kv/on.timer before the bound fetch opened the stream),
+    // carrying its pending wake-batch queue across the swap.
+    var carried_batches: std.ArrayListUnmanaged(components_mod.PendingWakeBatch) = .empty;
+    if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+        for (old.kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
+        if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+        if (old.timer_on) |t| allocator.free(t);
+        carried_batches = old.pending_batches;
+        old.pending_batches = .empty;
+        old.* = .{};
+    } else |_| {}
     server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = arms,
+        .timer_on = timer_on,
+        .pending_batches = carried_batches,
     }) catch {};
 
     server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
@@ -1197,6 +1246,18 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     var hop_tapes_consumed = false;
     defer if (!hop_tapes_consumed) hop_tapes.deinit(allocator);
 
+    // `next(path, {fn})` has no slot on a stream chain — the wake
+    // arm's `{on}` names the resume export. Defined author error,
+    // never a silent free.
+    if (s.fn_name != null) {
+        s.deinit(allocator);
+        ctx.txn.rollback() catch {};
+        ctx.txn_done.* = true;
+        resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch {};
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+        return;
+    }
+
     // Parse the stream({headers}) wire-format buffer (`Key: Val\r\n…`)
     // into the typed list shape proposeAndParkContResume expects; the
     // buffer is consumed (entries copy the bytes) so free the original.
@@ -1207,9 +1268,10 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     if (s.headers) |h| allocator.free(h);
     s.headers = null;
 
-    // Module path duped from the cont's current path so subsequent
-    // fetch chunks find the same module.
-    const module_path_dup = allocator.dupe(u8, ctx.cont_path) catch {
+    // Module path for the chain's later resumes: the one `next()`
+    // semantic — an explicit cross-module target re-aims the chain;
+    // the ambient (empty) path keeps the cont's current path.
+    const module_path_dup = allocator.dupe(u8, if (s.path.len > 0) s.path else ctx.cont_path) catch {
         // Alloc failure before ownership transfer: `s` still owns its
         // slices, so `s.deinit` frees them.
         for (parsed_headers) |h| {
@@ -1232,9 +1294,13 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     const stream_ctx_json = s.ctx_json;
     const stream_kv_prefixes = s.kv_prefixes;
     const stream_interval = s.interval_ms orelse 0;
+    const stream_timer_on = s.timer_on;
+    if (s.path.len > 0) allocator.free(s.path);
+    s.path = &.{};
     s.chunks = &.{};
     s.ctx_json = &.{};
     s.kv_prefixes = &.{};
+    s.timer_on = null;
 
     if (ctx.wrote) {
         // status=0: parked-hop convention (matches repark).
@@ -1255,6 +1321,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
                 .module_path = module_path_dup,
                 .kv_prefixes = stream_kv_prefixes,
                 .interval_ms = stream_interval,
+                .timer_on = stream_timer_on,
             } },
             ctx.pending_fetches,
             ctx.readset,
@@ -1324,8 +1391,12 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         allocator.free(stream_ctx_json);
         for (stream_chunks) |chunk_bytes| allocator.free(chunk_bytes);
         if (stream_chunks.len > 0) allocator.free(stream_chunks);
-        for (stream_kv_prefixes) |p| allocator.free(p);
+        for (stream_kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         if (stream_kv_prefixes.len > 0) allocator.free(stream_kv_prefixes);
+        if (stream_timer_on) |t| allocator.free(t);
         resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume header build failed\n") catch {};
         captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
         return;
@@ -1336,7 +1407,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     }
     if (parsed_headers.len > 0) allocator.free(parsed_headers);
 
-    installStreamComponentsInline(worker, ctx.ent, ctx.sid, ctx.sess, stream_status, handler_resp_hdrs, module_path_dup, stream_ctx_json, stream_chunks, stream_kv_prefixes, stream_interval);
+    installStreamComponentsInline(worker, ctx.ent, ctx.sid, ctx.sess, stream_status, handler_resp_hdrs, module_path_dup, stream_ctx_json, stream_chunks, stream_kv_prefixes, stream_interval, stream_timer_on);
     // P5(a): read-only cont→stream transition committed above — flush
     // the hop's unbound fetches now. Connection-scoped binds from this
     // transition stay unwired (the entity just moved to the stream
@@ -1422,6 +1493,13 @@ const ContFinishCtx = struct {
     /// not extend). Only resumeContinuation's sweep passes false.
     allow_repark: bool = true,
     pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
+    /// This hop's `after.*` (`on.kv`/`on.timer`) registrations. A `next()`
+    /// repark installs them onto the chain's `StreamWakes` via
+    /// `installContWakes` BEFORE the wake-source vigilance check, so a
+    /// resume that arms a fresh wake (the failure the bound-fetch /
+    /// inbound-chunk / send_callback resumes used to drop into the null
+    /// accumulator) both counts as a resume source and actually fires.
+    pending_wakes: *std.ArrayListUnmanaged(globals.PendingWakeReg),
     /// Tape sources, read per `ContFinishSpec.tape`: `.chunk` reads
     /// `tape_bytes`; `.fetch` reads `tape_body` + `tape_ev`; `.cont`
     /// reads `tape_body` (the `{"ctx":…}` envelope — for a
@@ -1450,6 +1528,90 @@ inline fn contTapes(worker: anytype, comptime tape: ContTape, ctx: *const ContFi
         .chunk => worker_mod.captureTapes(worker, ctx.readset, ctx.tape_bytes),
         .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
     };
+}
+
+/// Install (or replace) a parked continuation's `StreamWakes` from one
+/// resume hop's `on.kv`/`on.timer` registrations — the cont-family analog
+/// of `worker_ws.installWsWakes` / worker_dispatch's `armContWakesIfAny`.
+/// A held chain re-arms its wakes per activation (`docs/handler-shape.md`
+/// §2.3: call `after.*` again to keep listening — the SSE-loop shape), so a
+/// resume that armed any `after.*` REPLACES the chain's prior arms. Frees
+/// the old registration's owned memory first (reg.set overwrites in place,
+/// it does NOT deinit the prior component). Call only when
+/// `pending.items.len > 0`: an empty hop leaves the existing arms untouched
+/// so they ride the chain across resumes. Operates on the entity while it
+/// is still in `parked_continuations` — for a writing repark the component
+/// then rides the raft_pending_cont round-trip back into the collection.
+/// OOM leaves the chain unarmed rather than leaking (the §6.4 deadline is
+/// the backstop).
+fn installContWakes(
+    worker: anytype,
+    ent: rove.Entity,
+    pending: *std.ArrayListUnmanaged(globals.PendingWakeReg),
+    read_version: u64,
+) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+
+    // Carry the pending wake-batch queue across the re-arm — undispatched
+    // export groups ride to the next sweep tick, not the freed arm slice.
+    var carried: std.ArrayListUnmanaged(components_mod.PendingWakeBatch) = .empty;
+    if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+        for (old.kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
+        if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+        if (old.timer_on) |t| allocator.free(t);
+        carried = old.pending_batches;
+        old.pending_batches = .empty;
+        old.* = .{};
+    } else |_| {}
+
+    var interval_ms: i64 = 0;
+    var timer_on: ?[]u8 = null;
+    var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
+    for (pending.items) |reg| {
+        switch (reg.kind) {
+            // Per-arm routing: each arm keeps its own `{on}`; last timer wins.
+            .timer => {
+                interval_ms = reg.interval_ms;
+                if (timer_on) |old_to| allocator.free(old_to);
+                timer_on = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
+            },
+            .kv => if (reg.prefix.len > 0) {
+                const dup = allocator.dupe(u8, reg.prefix) catch continue;
+                const on: ?[]u8 = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
+                arms.append(allocator, .{ .prefix = dup, .on = on }) catch {
+                    allocator.free(dup);
+                    if (on) |t| allocator.free(t);
+                };
+            },
+        }
+    }
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const next_wake_ns: i64 = if (interval_ms > 0)
+        now_ns + interval_ms * std.time.ns_per_ms
+    else
+        std.math.maxInt(i64);
+    const kv_prefixes = arms.toOwnedSlice(allocator) catch {
+        for (arms.items) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
+        arms.deinit(allocator);
+        if (timer_on) |t| allocator.free(t);
+        server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{ .pending_batches = carried }) catch {};
+        return; // OOM — leave the chain unarmed (but keep the queue)
+    };
+    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+        .interval_ms = interval_ms,
+        .next_wake_ns = next_wake_ns,
+        .kv_prefixes = kv_prefixes,
+        .read_version = read_version,
+        .timer_on = timer_on,
+        .pending_batches = carried,
+    }) catch {};
 }
 
 /// §2.2 (refactor-audit): the ONE outcome-finishing switch for the three
@@ -1588,6 +1750,64 @@ fn finishContResume(
                 resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 504, "hold deadline exceeded\n") catch {};
                 return;
             }
+            // Re-arm this hop's `after.*` onto the chain's `StreamWakes`
+            // BEFORE the vigilance check below reads it — a resume that
+            // arms a fresh `on.kv`/`on.timer` (bound-fetch / inbound-chunk
+            // / send_callback hops, whose accumulator used to be null)
+            // must both count as a resume source and actually fire. An
+            // empty hop leaves the prior arms untouched (they ride the
+            // chain). The read-view baseline is this hop's readVersion
+            // (matches `armContWakesIfAny`); the write-repark install
+            // rides the raft_pending_cont round-trip back via the Row.
+            if (ctx.pending_wakes.items.len > 0)
+                installContWakes(worker, ctx.ent, ctx.pending_wakes, ctx.txn.readVersion());
+            // Park-time vigilance (docs/handler-shape.md §2.1): the
+            // re-park must leave ≥1 possible resume source — a send
+            // binding (kept across read-only hops / re-scanned on a
+            // writing hop), an armed `after.*` riding the chain, an
+            // in-flight bound fetch, a fetch this hop issues that
+            // will bind, remaining inbound body chunks, or the open
+            // WS socket. An empty set can never resume: fail loud
+            // now, naming the mistake, instead of the generic 504
+            // when the deadline sweeps 25 s later. (Fetches from a
+            // WRITING repark are dropped — bind-from-writing-resume
+            // is unwired — so they do NOT count; a park whose only
+            // source was those surfaces that gap here.)
+            const will_have_source = blk: {
+                if (ctx.wrote) {
+                    if (worker_mod.scanLoneOwedSendId(ctx.ws.ops.items) != null) break :blk true;
+                } else if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.ContDescriptor)) |d| {
+                    if (d.bound_schedule_id != null) break :blk true;
+                } else |_| {}
+                if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.StreamWakes)) |sw| {
+                    if (sw.interval_ms > 0 or sw.kv_prefixes.len > 0) break :blk true;
+                } else |_| {}
+                if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+                    if (cnt.pending > 0) break :blk true;
+                } else |_| {}
+                if (!ctx.wrote) {
+                    for (ctx.pending_fetches.items) |pf| {
+                        if (pf.connection_scoped) break :blk true;
+                    }
+                }
+                // A live inbound-chunk job resumes the chain with its next
+                // staged fire — presence alone counts (eof only means the
+                // BYTES all arrived; fires may still be queued behind this
+                // hop). A handler that next()s past the final fire falls to
+                // the deadline backstop, like any armed-but-idle park.
+                if (worker.inbound_chunk_jobs.get(ctx.ent) != null) break :blk true;
+                if (worker_ws.wsConnForChain(worker, ctx.ent) != null) break :blk true;
+                break :blk false;
+            };
+            if (!will_have_source) {
+                c2m.deinit(allocator);
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch {};
+                const errmsg = allocator.dupe(u8, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch @constCast("");
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, errmsg, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+                return;
+            }
             if (ctx.wrote) {
                 // Repark + writes — propose, park on `raft_pending_cont`;
                 // at commit the entity routes back to
@@ -1714,8 +1934,8 @@ fn resumeContinuation(
     allow_repark: bool,
     /// true ⇒ this is an `on.*` connection-wake
     /// resume (timer expiry / kv match), not a `send_callback`. Routes to
-    /// the `StreamWakes.wake_to` export (default `onWake`) with a body of
-    /// `{fn, args:[ctx]}` (no callee outcome) and a `.wake_batch`
+    /// the fired arm's own `{on}` export (per-arm; default `onWake`) with a
+    /// body of `{fn, args:[ctx]}` (no callee outcome) and a `.wake_batch`
     /// activation. Everything downstream (terminal / continuation / write
     /// handling, re-park) is identical — and on a `next()` re-park the
     /// entity's `StreamWakes` rides along untouched, so a recurring
@@ -1773,9 +1993,9 @@ fn resumeContinuation(
     // A `{fn,args}` body envelope is never synthesized
     // (decisions.md §4.5 — dispatch targeting is first-class;
     // formatting fn names into a JSON envelope is an escaping
-    // hazard). A wake resume routes to the StreamWakes `wake_to`
-    // export (default `onWake`) and drains the entity's fired arms so
-    // they don't re-fire on the next sweep.
+    // hazard). A wake resume routes to the fired arm's own `{on}`
+    // export (per-arm; default `onWake`) and drains that export's fired
+    // arms so they don't re-fire on the next sweep.
     // The drained fired arms are surfaced on `request.activation.wakes[]`
     // as fired PREFIXES — same contract as the stream (resumeStream) and
     // WS (resumeWakeChainWs) resume paths. `onWake` stays a "go look"
@@ -1787,17 +2007,29 @@ fn resumeContinuation(
         for (batch_owned) |*w| w.deinit(allocator);
         allocator.free(batch_owned);
     };
+    // Per-arm routing: the wake dispatches ONE export GROUP per tick (the
+    // earliest-fired), its own `{on}` export; other groups ride
+    // `pending_batches` and dispatch on later ticks. Owned export string
+    // freed after `resume_export_owned` dupes it.
+    var wake_export: ?[]u8 = null;
+    defer if (wake_export) |t| allocator.free(t);
     const resume_fn: ?[]const u8 = if (wake) blk: {
         const sw = server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
         // OOM → empty batch, arms stay fired and re-fire next tick
         // (safe under edge semantics).
-        batch_owned = sw.drainFired(allocator) catch &.{};
-        break :blk if (sw.wake_to) |t| t else "onWake";
+        const wb_opt = sw.nextWakeBatch(allocator) catch null;
+        if (wb_opt) |wb| {
+            batch_owned = wb.entries;
+            wake_export = wb.export_name;
+            break :blk wb.export_name;
+        }
+        break :blk "onWake";
     } else cont_fn_name;
     // Owned snapshot of the resume export for the tape (G3 — replay must
-    // invoke the same export): `resume_fn` borrows StreamWakes.wake_to
-    // (wake) or desc.cont.fn_name (send_callback), either of which a
-    // repark arm frees before the post-repark log capture runs (the same
+    // invoke the same export): `resume_fn` borrows the drained group's
+    // export `wake_export` (wake) or desc.cont.fn_name (send_callback),
+    // either of which a repark arm frees before the post-repark log
+    // capture runs (the same
     // UAF class `cont_path_log` guards). Empty ⇒ the default export.
     const resume_export_owned: []const u8 = if (resume_fn) |rf|
         allocator.dupe(u8, rf) catch ""
@@ -1851,13 +2083,27 @@ fn resumeContinuation(
         for (pending_fetches.items) |*pf| pf.deinit(allocator);
         pending_fetches.deinit(allocator);
     }
+    // A send_callback / wake resume re-arms its `after.*` (installed onto
+    // the chain's StreamWakes at the repark seam) and may open a stream
+    // (`stream.write` → cont→stream transition). Both accumulators were
+    // null here, so those effects silently dropped — wire them.
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
     const request: Request = .{
         .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
         .query = null,
-        // First-class resume target: the named export (wake_to /
+        // First-class resume target: the named export (the wake group's export /
         // cont_fn_name). Null → the default export. The threaded ctx +
         // outcome ride `body` (Endpoint A); the resume export reads
         // `request.ctx` / `request.body` — no positional args.
@@ -1870,7 +2116,11 @@ fn resumeContinuation(
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
-        .effects = .{ .pending_fetches = &pending_fetches },
+        .effects = .{
+            .pending_wakes = &pending_wakes,
+            .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
+        },
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -1910,6 +2160,7 @@ fn resumeContinuation(
         .act = act_src,
         .allow_repark = allow_repark,
         .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
         .tape_body = body,
         .wakes = batch_owned,
         .resume_export = resume_export_owned,
@@ -2056,6 +2307,15 @@ pub fn resumeBoundFetchChain(
         for (pending_fetches.items) |*pf| pf.deinit(allocator);
         pending_fetches.deinit(allocator);
     }
+    // A chunk handler that re-arms `after.kv`/`after.ms` (e.g. an
+    // `onFetchResult` that arms a timer deadline before `next()`) —
+    // installed onto the chain's StreamWakes at the repark seam. Was a
+    // null accumulator, so the arm silently dropped and the chain 504'd.
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
 
     // The fetch result is this activation's Msg (an input — L3), so it must be
     // taped or the fetch_chunk can't be replayed. The capture sites below feed
@@ -2106,6 +2366,7 @@ pub fn resumeBoundFetchChain(
             .cancel_fetch_ctx = @ptrCast(worker),
         },
         .effects = .{
+            .pending_wakes = &pending_wakes,
             .pending_stream_chunks = &stream_chunks,
             .pending_fetches = &pending_fetches,
         },
@@ -2155,6 +2416,7 @@ pub fn resumeBoundFetchChain(
         .txn_done = &txn_done,
         .act = .fetch_chunk,
         .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
         .tape_body = body,
         .tape_ev = fetch_ev,
     });
@@ -3047,6 +3309,14 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         for (pending_fetches.items) |*pf| pf.deinit(allocator);
         pending_fetches.deinit(allocator);
     }
+    // An inbound-chunk handler that re-arms `after.kv`/`after.ms` before
+    // `next()` — installed onto the chain's StreamWakes at the repark
+    // seam. Was a null accumulator, so the arm silently dropped.
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
 
     // The inbound request's headers ride the held entity (ReqHeaders is
     // in the base Row) — every chunk activation sees the same
@@ -3085,6 +3355,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             .cancel_fetch_ctx = @ptrCast(worker),
         },
         .effects = .{
+            .pending_wakes = &pending_wakes,
             .pending_stream_chunks = &stream_chunks,
             .pending_fetches = &pending_fetches,
         },
@@ -3130,6 +3401,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .txn_done = &txn_done,
         .act = .inbound_chunk,
         .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
         .tape_bytes = chunk_bytes,
     });
     return true;

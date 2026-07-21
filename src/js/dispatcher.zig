@@ -727,11 +727,19 @@ fn finishResponse(
         if (pending.continuation) |cont| {
             var c2 = cont;
             pending.continuation = null; // take ownership
-            const s = buildStreamFromEffects(d.allocator, state, pending, c2.ctx_json) catch |e| {
+            var s = buildStreamFromEffects(d.allocator, state, pending, c2.ctx_json) catch |e| {
                 c2.deinit(d.allocator);
                 return e;
             };
-            c2.deinit(d.allocator); // path/fn_name/ctx_json — ctx was dup'd into `s`
+            // One `next()` semantic on every held chain: the target +
+            // fn ride the descriptor to the stream-family arms (which
+            // re-aim the chain / reject the fn loudly) instead of
+            // being freed unread here. Move ownership out of c2.
+            s.path = c2.path;
+            c2.path = &.{};
+            s.fn_name = c2.fn_name;
+            c2.fn_name = null;
+            c2.deinit(d.allocator); // ctx_json/tags — ctx was dup'd into `s`
             console_buf.deinit(d.allocator);
             // Streams don't carry a tag set (no log record per chunk
             // write); drop what the handler set.
@@ -833,22 +841,44 @@ fn buildStreamFromEffects(
         if (chunks.len > 0) allocator.free(chunks);
     }
 
-    // Wakes: dup the on.* registrations into kv_prefixes + interval_ms.
+    // Wakes: dup the on.* registrations into per-arm kv arms + the
+    // interval + each arm's own `{on}` export (per-arm routing — the
+    // timer and each kv prefix resume into their own export).
     var interval_ms: ?i64 = null;
-    var prefixes: std.ArrayListUnmanaged([]u8) = .empty;
+    var timer_on: ?[]u8 = null;
+    var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     errdefer {
-        for (prefixes.items) |p| allocator.free(p);
-        prefixes.deinit(allocator);
+        for (arms.items) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
+        arms.deinit(allocator);
+        if (timer_on) |t| allocator.free(t);
     }
     if (state.pending_wakes) |wl| {
-        for (wl.items) |reg| switch (reg.kind) {
-            .timer => interval_ms = reg.interval_ms,
-            .kv => try prefixes.append(allocator, try allocator.dupe(u8, reg.prefix)),
-        };
+        for (wl.items) |reg| {
+            switch (reg.kind) {
+                .timer => {
+                    interval_ms = reg.interval_ms;
+                    if (timer_on) |old| allocator.free(old);
+                    timer_on = if (reg.on) |t| try allocator.dupe(u8, t) else null;
+                },
+                .kv => {
+                    const pfx = try allocator.dupe(u8, reg.prefix);
+                    errdefer allocator.free(pfx);
+                    const on: ?[]u8 = if (reg.on) |t| try allocator.dupe(u8, t) else null;
+                    errdefer if (on) |t| allocator.free(t);
+                    try arms.append(allocator, .{ .prefix = pfx, .on = on });
+                },
+            }
+        }
     }
-    const kv_prefixes = try prefixes.toOwnedSlice(allocator);
+    const kv_prefixes = try arms.toOwnedSlice(allocator);
     errdefer {
-        for (kv_prefixes) |p| allocator.free(p);
+        for (kv_prefixes) |arm| {
+            allocator.free(arm.prefix);
+            if (arm.on) |t| allocator.free(t);
+        }
         if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
     }
 
@@ -860,6 +890,7 @@ fn buildStreamFromEffects(
         .chunks = chunks,
         .interval_ms = interval_ms,
         .kv_prefixes = kv_prefixes,
+        .timer_on = timer_on,
         .ctx_json = ctx_json,
     };
 }
