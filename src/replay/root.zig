@@ -57,11 +57,17 @@ extern fn arena_reactor_new(base_kb: c_int, request_kb: c_int) ?*ArenaReactor;
 // arenajs 0.3.4 deferred-freeze construction — lets us install the compute
 // globals (`sim_globals.PRELUDE`) into the base before it freezes.
 extern fn arena_reactor_new_open(base_kb: c_int, request_kb: c_int) ?*ArenaReactor;
+// The embedder-agnostic constructor (arenajs #151): `setup` installs the base
+// surface pre-freeze. The sim passes `mod_loader.simSetup` (replay bindings +
+// the package-resolving module loader) with `user` = its `*SimModCtx`.
+const BaseSetupFn = fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) c_int;
+extern fn arena_reactor_new_open_with(base_kb: c_int, request_kb: c_int, setup: ?*const BaseSetupFn, user: ?*anyopaque) ?*ArenaReactor;
 extern fn arena_reactor_eval_base(r: *ArenaReactor, src: [*c]const u8) c_int;
 extern fn arena_reactor_freeze(r: *ArenaReactor) void;
 extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
 
 const sim_globals = @import("sim_globals.zig");
+const mod_loader = @import("mod_loader.zig");
 // The prod ip-mask rule (src/js/ip_mask.zig, registered as an anonymous
 // import in build.zig) — the SAME rule the worker applies to `request.ip`,
 // so the sim's derived masked channel can't drift.
@@ -92,6 +98,9 @@ pub const Error = error{
 /// for `rewind sim` / `rewind replay`.
 pub const Engine = struct {
     sim: *ArenaReactor,
+    /// Heap-owned so its address is stable for the module loader's opaque
+    /// (installed once at construction). `simulate` sets `.resolver` per run.
+    mod_ctx: *mod_loader.SimModCtx,
 
     pub fn init() Error!Engine {
         // Build the base unfrozen, eval the compute-globals prelude into it, then
@@ -107,7 +116,11 @@ pub const Engine = struct {
         // shares the arena, and there's no CPU budget), but the same 100 MiB
         // peak ceiling keeps a handler's live-set headroom in the same ballpark.
         // 102400 KiB = 100 MiB. Reset per run, so it's a ceiling, not growth.
-        const s = arena_reactor_new_open(8192, 102400) orelse return Error.ArenaInit;
+        // Heap the module context so the loader's opaque (installed inside the
+        // base-setup hook, below) has a stable address for the engine's life.
+        const mc = std.heap.page_allocator.create(mod_loader.SimModCtx) catch return Error.ArenaInit;
+        mc.* = .{};
+        const s = arena_reactor_new_open_with(8192, 102400, &mod_loader.simSetup, mc) orelse return Error.ArenaInit;
         if (arena_reactor_eval_base(s, sim_globals.PRELUDE.ptr) != 0) return Error.ArenaInit;
         arena_reactor_freeze(s);
         // GC mode always: the sim cannot model a bump OOM faithfully (different
@@ -115,7 +128,7 @@ pub const Engine = struct {
         // one, so predicting prod means running GC. Sticky on the reactor; the
         // per-run set in `simulate` reaffirms it (see the note there).
         arena_set_request_mode_r(s, 0);
-        return .{ .sim = s };
+        return .{ .sim = s, .mod_ctx = mc };
     }
 
     /// The sim reactor is **process-lived** and deliberately NOT torn down here.

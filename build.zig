@@ -102,6 +102,18 @@ pub fn build(b: *std.Build) void {
     files_mod.addImport("raft-kv", kv_mod);
     files_mod.addImport("rove-blob", blob_mod);
 
+    // The pure `@scope/pkg` resolution logic (src/js/package_resolver.zig),
+    // shared by the worker (via module_execution's relative import) and the
+    // offline sim (which imports it here as a module) so the two can't drift.
+    // A separate compilation for the sim is fine — it's pure (std + manifest
+    // types), no shared state.
+    const pkgres_mod = b.createModule(.{
+        .root_source_file = b.path("src/js/package_resolver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pkgres_mod.addImport("rove-files", files_mod);
+
     // ── rove-log: per-tenant request log store ──
     //
     // Phase 3. Mirrors rove-files's "per-tenant SQLite index + rove-blob
@@ -1281,6 +1293,7 @@ pub fn build(b: *std.Build) void {
     });
     linkReplayEngine(replay_mod, arenajs_dep);
     addSimGlobalEmbeds(b, replay_mod);
+    replay_mod.addImport("package_resolver", pkgres_mod);
 
     const replay_tests = b.addTest(.{ .root_module = replay_mod });
     const replay_test_step = b.step("replay-test", "Run the native replay driver unit tests");
@@ -1296,6 +1309,7 @@ pub fn build(b: *std.Build) void {
     });
     linkReplayEngine(driver_smoke_mod, arenajs_dep);
     addSimGlobalEmbeds(b, driver_smoke_mod);
+    driver_smoke_mod.addImport("package_resolver", pkgres_mod);
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
