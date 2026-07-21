@@ -457,25 +457,34 @@ class Scenario {
    *  `request.auth` or short-circuit). `session` is injected (the worker
    *  resolves it from a cookie in prod — no code to run offline). */
   inbound(req = {}) {
-    return new Node(this, this._base({
-      activation: "inbound",
-      request: {
-        method: req.method || "GET",
-        path: req.path || "/",
-        host: req.host || "",
-        headers: req.headers || {},
-        // An AUTHORED bodyless request reads as empty in prod (request.text ===
-        // "", 0-length bytes), NOT "missing" — so default to "" when the caller
-        // omits `body`. (Only the initial authored activation; the replay path's
-        // read-your-tape `miss()` is untouched, and a supplied body is kept.)
-        body: req.body !== undefined ? req.body : "",
-        ip: req.ip,
-        session: req.session,
-        // Per-activation override (undefined ⇒ inherit the scenario default).
-        tenant: req.tenant,
-        correlationId: req.correlationId,
-      },
-    }));
+    const request = {
+      method: req.method || "GET",
+      path: req.path || "/",
+      host: req.host || "",
+      headers: req.headers || {},
+      ip: req.ip,
+      session: req.session,
+      // Per-activation override (undefined ⇒ inherit the scenario default).
+      tenant: req.tenant,
+      correlationId: req.correlationId,
+    };
+    // A binary inbound body rides base64 (`bodyB64`) so arbitrary bytes survive
+    // JSON and read back byte-exact on `request.bytes` — the same channel a
+    // binary WS frame uses. `bodyBinary` is a Uint8Array or a base64 string.
+    if (req.bodyBinary !== undefined) {
+      request.bodyB64 = typeof req.bodyBinary === "string" ? req.bodyBinary : b64(req.bodyBinary);
+    } else {
+      // An AUTHORED bodyless request reads as empty in prod (request.text ===
+      // "", 0-length bytes), NOT "missing" — so default to "" when the caller
+      // omits `body`. (Only the initial authored activation; the replay path's
+      // read-your-tape `miss()` is untouched, and a supplied body is kept.)
+      request.body = req.body !== undefined ? req.body : "";
+    }
+    const partial = { activation: "inbound", request };
+    // An explicit export override for an authored-dispatch test (drive a
+    // specific export directly instead of the kind's default).
+    if (req.export !== undefined) partial.export = req.export;
+    return new Node(this, this._base(partial));
   }
 
   /** A headers-first inbound activation → the root node at `onHeaders`. The
