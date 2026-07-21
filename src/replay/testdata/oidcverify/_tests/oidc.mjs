@@ -10,12 +10,22 @@ expect(req.body.valid).toBe(true);     // jwt.verify agrees
 expect(req.body.sub).toBe("jess");
 expect(req.body.iss).toBe("https://idp.test");
 
-// #45: unsupported algs/curves throw a loud declared-gap error (not silent false).
+// #45 step 2: RS384/RS512 verify for real (pure-JS SHA-384/512). Real tokens
+// signed with a 2048-bit RSA key (Python cryptography), verified via jwt.verify
+// which dispatches the header alg → crypto.verifyRsa(jwk, "sha512"/"sha384", …).
+const JWK = {"kty":"RSA","n":"raeMvCV5dKW0ENAb9M7Pp6q-S6tZ4XRVQ89sqUCXwhGQf5cojbTVjFw2BlDPs-uhOZSCuATfe_BczJKEI7HFnZq3btP3a57okIPoIyI8gDAJOtn7nCS_Q_Vp-TrumIjpoBNUmA9DHXi_4EUzeOltuySXTX-sUoVOAbkul7v-Tq_B4eGODmInSqbXriStBdKBuK_uFxcACvGU7nCWpJT4yI7Z5o6OZjsu28XHICTbWH3iZSORujYbXyzg-eXKucBw_oAfYnLCJVIn2B1FKsAtBdEf-QIoH_gvWQyuPy7IrNZ6KN3Koy2PMQiwqSP5dqY19eok8PRJm9xyCdHuGQkifw","e":"AQAB"};
+const RS512 = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJqZXNzIiwiaXNzIjoiaHR0cHM6Ly9pZHAudGVzdCJ9.JY1_nEDcOHXy4KgJ7M0d3dsCgumgp_0July14nREHSY__RSkTycKJaWiBqqedR6_C6nIz2ULJ3qmwDQmPINvFomol0MrJzhWfvt2r7GC0yIE0kF6cgqEaHqSxcnzHR9zbvmf7mn9nJUoxttM1tSL5qGxQ4-YFyAKNXyHYO6jSDuQCH86cS80Y3OsEnvaskGOpp_hDdu-PvlK8qX9fGsafUVravJuOBEjUBrO8FZG-lQq1PmqvVbVrO0nrO86D93uMS6ree7F7Bm3h3oArgC-MG_bAk0hfHzkUiZ4c0YU1CeMsa4Rbd2lgLs62M44PdnhIGzmbkhVF5io4kR-uSzuvw";
+const RS384 = "eyJhbGciOiJSUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJqZXNzIiwiaXNzIjoiaHR0cHM6Ly9pZHAudGVzdCJ9.DANUKncTGVBfFBgR0xSv77RQTLPLbXKGZ9RmPSSE0OpXCyAt6bFdqvGimtQRb5lDi-X_AqFII_VwwgIXacT3lQJAh3Dcan428SRxlVW1MFHVNt2BWbZSAVOqni7J-mqxY4MYSAQCV_hq-rMi2pQrt5hNxSGEfbT07GLlkFKLdDMnVodsqYGzXLGMXhQvzu4KDYgd4RHsYywdcffXnTVziGEvBRYB3zR-MfKolgb5lodzllohYepwb6yKRPS1MeW3kQPS3kFYxC4tWXDmRWbq9OJD2y3ey86pdpUM5tQjZyJlYRVkvpEg45j4B1KvTdFWRskYlsa7eBxc-Phg4GujPw";
+const rs512 = scenario({}).inbound({ method: "POST", path: "/", body: { token: RS512, jwk: JWK } });
+expect(rs512.body.valid).toBe(true);
+expect(rs512.body.sub).toBe("jess");
+const rs384 = scenario({}).inbound({ method: "POST", path: "/", body: { token: RS384, jwk: JWK } });
+expect(rs384.body.valid).toBe(true);
+// A tampered RS512 token is rejected (still valid:false, not a throw).
+const badRs512 = scenario({}).inbound({ method: "POST", path: "/", body: { token: RS512.slice(0, -4) + "AAAA", jwk: JWK } });
+expect(badRs512.body.valid).toBe(false);
+
+// A genuinely-unsupported alg/curve is STILL a loud declared-gap throw.
 const gaps = scenario({}).inbound({ method: "GET", path: "/gaps", export: "gaps" }).body;
-expect(gaps.rs512).toMatch(/not available in `rewind test`/);
-expect(gaps.es384).toMatch(/not available in `rewind test`/);
-expect(gaps.p521).toMatch(/not available in `rewind test`/);
-// And the message names the alg/curve so the gap is actionable.
-expect(gaps.rs512).toMatch(/sha512/);
-expect(gaps.es384).toMatch(/sha384/);
-expect(gaps.p521).toMatch(/P-521/);
+expect(gaps.sha1).toMatch(/not available in `rewind test`/);
+expect(gaps.unknownCurve).toMatch(/crv=secp256k1/);
