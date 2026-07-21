@@ -301,6 +301,14 @@ frame text (what `browser.message()` parses as JSON), a binary frame's
 `request.bytes` is the decoded bytes, and the frame is on
 `request.activation.data` too — read whichever the handler uses.
 
+A frame stays live for the next frame only if it re-held via `next()`. A frame
+that returns a terminal value, or throws, closes the socket and destroys the
+chain — so `.receive()`/`.disconnect()` on that node throw (the worker cannot
+deliver another frame). A throwing frame closes *without* running
+`onDisconnect`. And a client close *before any frame* (`s.ws(...).disconnect()`
+with no prior `.receive()`) runs nothing at all — the chain is established
+lazily on the first frame, so there is no `onDisconnect` to fire.
+
 A WS handler can issue an `after.fetch` (or arm a timer / `after.kv`) mid-chain
 and keep going: resolve the fetch, then call `.receive(nextFrame)` on the
 resolved node to run the next `onMessage` on the same connection, seeing the

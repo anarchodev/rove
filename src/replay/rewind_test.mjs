@@ -1511,9 +1511,13 @@ class WsConnection {
     return this._frame(this.scenario.baseKv, {}, 0, data, opts, this.scenario.entry);
   }
 
-  /** Client close before any frame → `onDisconnect` (ctx `{}`). */
+  /** Client close BEFORE any frame. The worker establishes the WS chain lazily
+   *  on the first data frame (worker_ws.zig establishWsChain), so a close with
+   *  no chain tears down silently — prod runs NOTHING, not even onDisconnect. A
+   *  queryable no-op node (empty effect log); a disconnect AFTER a held frame
+   *  DOES run onDisconnect (WsNode.disconnect). */
   disconnect() {
-    return this._disc(this.scenario.baseKv, {}, 0, this.scenario.entry);
+    return new ClosedWsNode(this.scenario);
   }
 
   // Build one ws_message world. `ctx` is the connection ctx this frame runs
@@ -1574,11 +1578,32 @@ class WsNode extends Node {
     return this.world.ctx; // terminal onMessage: connection ctx unchanged
   }
   receive(data, opts) {
+    requireWsOpen(this, "receive");
     return this._conn._frame(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, data, opts, heldEntry(this));
   }
   disconnect() {
+    requireWsOpen(this, "disconnect");
     return this._conn._disc(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, heldEntry(this));
   }
+}
+
+/** A WS frame stays live for the NEXT frame only if it re-held via `next()`. A
+ *  terminal return, or a throw, tears the chain down (worker_ws.zig: terminal →
+ *  tearDownWsChain; an exception sends close + tears down WITHOUT onDisconnect),
+ *  so the socket is gone — no further frame or disconnect is deliverable. */
+function requireWsOpen(node, verb) {
+  if (node.force().disposition !== "held")
+    throw new Error(`${verb}: the previous WS frame returned a terminal response or threw, which closes the socket and destroys the chain — prod cannot deliver another ${verb === "receive" ? "frame" : "close"}`);
+}
+
+/** A closed WS socket with no chain (a pre-frame client close). Prod ran no
+ *  code, so this exposes an empty terminal bundle and refuses any further
+ *  frame/disconnect — the socket is gone. */
+class ClosedWsNode extends Node {
+  constructor(scn) { super(scn, { entry: scn.entry, kv: scn.baseKv }); }
+  force() { return { disposition: "terminal", effects: [], response: null, ok: true }; }
+  receive() { throw new Error("receive(): the WS connection closed before any frame ran — the worker established no chain (it is lazy on the first frame), so nothing can receive"); }
+  disconnect() { throw new Error("disconnect(): the WS connection is already closed"); }
 }
 
 /** Standard base64 (matches the epilogue's `atob`) — for binary WS frames,
