@@ -14,6 +14,9 @@ const BackendResp = bc.BackendResp;
 const TENANT_HEADER = bc.TENANT_HEADER;
 const PLAN_HEADER = bc.PLAN_HEADER;
 
+/// The cluster's voter set as a comma-separated raft-id list `1,2,…,n` (raft
+/// ids are positional — node index i → id i+1, the `REWIND_PEERS` convention).
+/// Caller frees. The cluster node-set SSOT for a fresh tenant group.
 pub fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(a);
@@ -25,6 +28,13 @@ pub fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
     return buf.toOwnedSlice(a);
 }
 
+/// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`, plus the tenant's
+/// `X-Rewind-Plan` blob when set) out to every destination node. The plan
+/// rides attach so the destination enforces the right limits from the first
+/// post-move request (CP operational-state model,
+/// docs/architecture/control-plane.md). True only if all returned 204
+/// (idempotent re-attach included). On the first failure returns false; the
+/// caller evicts the partially-attached set.
 pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8) bool {
     const a = router.allocator;
     var hdrs: [3]curl.Header = undefined;
@@ -91,13 +101,9 @@ pub fn evictAll(router: anytype, tenant: []const u8, nodes: []const []const u8, 
     }
 }
 
-/// Additive membership reconciler (opt-in `reconcile_membership`).
-/// On the directory leader, converge each placed tenant's DP group
-/// membership to its cluster's node set: for the first not-caught-up node
-/// per group per pass, take a LEARNER-FIRST `ensureMember` step. ADDITIVE
-/// ONLY — never removes/migrates/destroys. Blocking HTTP on the loop,
-/// bounded to one node per group per pass.
-
+/// Pick a serving leader URL for `tenant` from `dest_nodes` — the forward
+/// target for a live move. Returns the first node that self-reports as the
+/// group leader, or null if none does yet.
 pub fn findDestLeaderUrl(router: anytype, dest_nodes: []const []const u8, tenant: []const u8) ?[]u8 {
     const a = router.allocator;
     const suffix = std.fmt.allocPrint(a, "/_system/v2-leader?tenant={s}", .{tenant}) catch return null;
