@@ -1551,3 +1551,54 @@ re-genesis'd under the frozen v1 formats 2026-06-26.
 - **Crypto algorithm agility** (`§7.8`): the signing algorithm is detectable in
   the artifact; verifiers ignore an unknown alg rather than hard-failing, so a
   new alg can roll without a flag day.
+
+## 15. Code organization & refactoring
+
+### 15.1 Decouple before you split — invert two-way logic coupling to a DAG *first*
+
+- **Decision** (2026-07-22, from the front `proxy.zig` and `js/worker`
+  decompositions): before decomposing a god-struct or god-file across multiple
+  files, first **invert any two-way *logic* coupling** between the would-be
+  clusters into a one-way edge — then the file split is a mechanical move. The
+  ordering is load-bearing: **decouple, then split**, never the reverse.
+- **What "invert to a one-way edge" means**: pick the natural DAG direction (the
+  heavily-depended-on cluster is the base) and remove the light back-edges by one
+  of — emitting **outcomes as data** the caller dispatches (front pool →
+  `dispatchWaiterOutcomes` instead of the pool calling into flow/ws); making the
+  cross-cluster handle **opaque** (the pool's `Waiter` became `{ kind, ptr:
+  *anyopaque }`, so the pool never names `*Flow`/`*WsTunnel`); **relocating** a
+  primitive to the base layer so both sides call it downward (`flushResumeFetches`
+  moved into `worker_streaming`); or routing an up-call **through a hub** the
+  caller already holds (`worker_streaming` dispatches held-chain resume via
+  `worker.resumeHeldBoundFetch` instead of importing `worker_ws`/`worker_drain`).
+- **Why**: a mechanical split of a cyclically-coupled cluster does not remove the
+  cycle — it **relocates it behind an import cycle** and adds hot-path
+  indirection (or, if done with `worker: anytype` to dodge naming the type, it
+  *also erases the type-checking* that would have caught a mis-wire). The result
+  compiles and looks decomposed but the dependency graph is unchanged. Inverting
+  the logic edge first turns the split into a pure relocation whose moved bodies
+  are byte-identical — verifiable and low-risk, even on the request hot path.
+  Evidence: the front pool/ws_tunnel split was **blocked** until the pool↔flow↔ws
+  decouple landed (opaque `Waiter` + outcomes-as-data); afterward the file moves
+  were mechanical. The `worker_streaming↔ws↔drain` triangle inverted the same way
+  (four back-edge call sites) with no behaviour change.
+- **The distinction that scopes the work** (see the audit residue in the
+  refactor tracker): an **import cycle is not automatically a logic cycle.** A
+  reexport hub — one struct whose methods are split across sibling files, where
+  the siblings import the core *for the type only* and the core re-exports the
+  siblings' functions — is a **benign** import cycle (comptime-concrete, zero
+  runtime cost) and is **left as-is** (`consensus/node_*`, the `globals`/
+  `bindings` reexport hub, a module's `root.zig`). Only a genuine **two-way logic
+  cycle** — each side *calling into the other's behaviour* — earns a decouple,
+  and each is a deliberate, hot-path-gated change, not a mechanical sweep. An
+  `@import`-graph scan finds the *former*; it **misses** the latter when it lives
+  inside a single not-yet-split file (the front pool cycle was invisible until
+  the split attempt surfaced it), so this is a per-cluster design judgement, not
+  a lint.
+- **Rejected**: (a) a blanket "make every module a strict DAG" sweep — most
+  cycles are benign reexport hubs, so the sweep is churn; the cost lives in the
+  few genuine logic cycles. (b) Splitting a god-struct via `self: anytype` / a
+  reexport hub *without* first decoupling — it papers the cycle over and drops
+  type-checking. (c) Dissolving a god-hub itself (e.g. `worker.zig`'s coupling to
+  every spoke) as part of a cycle pass — that is the separate, larger
+  illegal-states / owned-sub-struct goal, not decoupling.
