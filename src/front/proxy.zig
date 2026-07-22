@@ -252,11 +252,11 @@ pub fn normalizeHost(buf: *[255]u8, authority: []const u8) ?[]const u8 {
 /// in front of the front, this needs a trusted-hops config instead.)
 fn dropFromRequest(name: []const u8) bool {
     const hop = [_][]const u8{
-        "connection",          "keep-alive",        "proxy-authenticate",
-        "proxy-authorization", "te",                "trailer",
-        "transfer-encoding",   "upgrade",           "expect",
-        "host",                "x-forwarded-for",   "x-forwarded-proto",
-        "x-forwarded-host",    "x-real-ip",         "forwarded",
+        "connection",          "keep-alive",      "proxy-authenticate",
+        "proxy-authorization", "te",              "trailer",
+        "transfer-encoding",   "upgrade",         "expect",
+        "host",                "x-forwarded-for", "x-forwarded-proto",
+        "x-forwarded-host",    "x-real-ip",       "forwarded",
     };
     for (hop) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
     return false;
@@ -353,6 +353,11 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// mapping (checked BEFORE flows_by_up: an unmapped receiving
         /// stream is reset, which must never hit a tunnel).
         tunnels_by_up: std.AutoHashMapUnmanaged(StreamKey, *WsTunnel) = .empty,
+        /// Connect verdicts the pool drained from `up.waiters` this turn,
+        /// awaiting resume by `dispatchWaiterOutcomes`. Buffered (not
+        /// dispatched inline) so `drainWaiters` stays free of the request
+        /// state machines.
+        waiter_outcomes: std.ArrayListUnmanaged(WaiterOutcome) = .empty,
         /// Live-flow count (operator visibility / leak canary).
         live_flows: usize = 0,
         live_tunnels: usize = 0,
@@ -424,10 +429,23 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         // ── Upstream pool ─────────────────────────────────────────────
 
-        const Waiter = union(enum) {
-            flow: *Flow,
-            tunnel: *WsTunnel,
-        };
+        const WaiterKind = enum { flow, tunnel };
+
+        /// A parked request awaiting an upstream connect (`up.waiters`) or
+        /// a cold-route resolve (`route_waiters`). Opaque to the
+        /// connection pool: `ptr` is a `*Flow` (kind=.flow) or `*WsTunnel`
+        /// (kind=.tunnel), which the request layer casts back in
+        /// `dispatchWaiterOutcomes` / `resumeRouteWaiters`. Keeping it
+        /// opaque is what lets the pool (`acquireLeg`/`dialLeg`/
+        /// `drainWaiters`/`consumeConnects`/…) resume a connect without
+        /// naming the request state machines — the pool→request edge runs
+        /// one way only (request layer → pool).
+        const Waiter = struct { kind: WaiterKind, ptr: *anyopaque };
+
+        /// A waiter the pool drained from `up.waiters` with its connect
+        /// verdict, queued by `drainWaiters` and resumed by the request
+        /// layer in `dispatchWaiterOutcomes`.
+        const WaiterOutcome = struct { waiter: Waiter, ok: bool };
 
         /// One pooled h2c connection to a backend node (plan A3). Legs
         /// live inline in their heap-allocated `Upstream`, so `*Leg`
@@ -701,6 +719,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.allocator.destroy(up.*);
             }
             self.pool.deinit(self.allocator);
+            self.waiter_outcomes.deinit(self.allocator);
             self.flows_by_up.deinit(self.allocator);
             self.tunnels_by_up.deinit(self.allocator);
             // Parked flows themselves leak at shutdown (like live flows
@@ -734,10 +753,16 @@ pub fn Proxy(comptime FrontH2: type) type {
             try self.intakeWsUpgrades(now_ns);
             try self.reg.flush();
             try self.consumeConnects(now_ns);
+            // Resume connect verdicts BEFORE the settle sweep so a tunnel
+            // that re-parks awaiting ENABLE_CONNECT_PROTOCOL is visible to
+            // `drainSettledTunnels` this same turn (the pool defers these
+            // resumes rather than dispatching them inline).
+            self.dispatchWaiterOutcomes();
             // Resume tunnels parked on a live conn awaiting its peer
             // ENABLE_CONNECT_PROTOCOL SETTINGS (cold-leg race), now that this
             // cycle's server poll may have landed that frame.
             self.drainSettledTunnels(now_ns);
+            self.dispatchWaiterOutcomes();
             try self.reg.flush();
             try self.consumeResponseHeaders();
             try self.reg.flush();
@@ -756,6 +781,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.expireStalledBodies(now_ns);
             // Fail over waiters whose upstream connect blew its deadline.
             self.expireStalledConnects(now_ns);
+            self.dispatchWaiterOutcomes();
             try self.reg.flush();
         }
 
@@ -933,7 +959,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     .pending => {
                         t.awaiting_route = true;
                         t.route_deadline_ns = now_ns + ROUTE_WAIT_NS;
-                        self.parkRouteWaiter(host, .{ .tunnel = t }) catch {
+                        self.parkRouteWaiter(host, .{ .kind = .tunnel, .ptr = t }) catch {
                             self.allocator.free(t.authority);
                             self.allocator.free(t.host);
                             self.allocator.destroy(t);
@@ -955,35 +981,16 @@ pub fn Proxy(comptime FrontH2: type) type {
             t.up_sid = 0;
             t.up_sess = Entity.nil;
             t.chunk_inflight = 0;
-            const origin = t.nodes[t.node_idx];
-            const up = self.poolEntry(origin) catch {
-                self.tunnelAttemptFailed(t);
-                return;
-            };
-            const now = std.time.nanoTimestamp();
-            if (self.pickLeg(up)) |leg| {
-                self.submitTunnel(t, leg);
-                return;
-            }
-            if (up.anyConnecting()) {
-                up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+            switch (self.acquireLeg(t.nodes[t.node_idx], .{ .kind = .tunnel, .ptr = t })) {
+                .submit => |leg| self.submitTunnel(t, leg),
+                .parked => t.waiting_conn = true,
+                .shed => {
+                    // Saturated: refuse the Upgrade retryably (plan A3).
+                    self.count_upstream_sheds += 1;
                     self.tunnelAttemptFailed(t);
-                    return;
-                };
-                t.waiting_conn = true;
-                return;
+                },
+                .fail_over, .err => self.tunnelAttemptFailed(t),
             }
-            if (dialableLeg(up, now)) |leg| {
-                self.dialLeg(leg, .{ .tunnel = t });
-                return;
-            }
-            if (self.anyLegUp(up)) {
-                // Saturated: refuse the Upgrade retryably (plan A3).
-                self.count_upstream_sheds += 1;
-                self.tunnelAttemptFailed(t);
-                return;
-            }
-            self.tunnelAttemptFailed(t);
         }
 
         /// Open the Extended-CONNECT stream on a live pool leg. RFC 8441
@@ -997,7 +1004,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // awaiting connect) rather than failing; drainSettledTunnels
                 // resumes it once the bit lands. The old immediate give-up
                 // surfaced a transient 502 on cold upstream connections.
-                leg.up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+                leg.up.waiters.append(self.allocator, .{ .kind = .tunnel, .ptr = t }) catch {
                     self.tunnelAttemptFailed(t);
                     return;
                 };
@@ -1317,7 +1324,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     // until the resolve lands or the deadline fires.
                     flow.awaiting_route = true;
                     flow.route_deadline_ns = now_ns + ROUTE_WAIT_NS;
-                    self.parkRouteWaiter(flow.host, .{ .flow = flow }) catch |e| {
+                    self.parkRouteWaiter(flow.host, .{ .kind = .flow, .ptr = flow }) catch |e| {
                         self.allocator.free(flow.authority);
                         self.allocator.free(flow.host);
                         return e;
@@ -1346,45 +1353,70 @@ pub fn Proxy(comptime FrontH2: type) type {
             flow.up_sess = Entity.nil;
             flow.up_chunk_inflight = 0;
 
-            const origin = flow.nodes[flow.node_idx];
-            const up = self.poolEntry(origin) catch {
-                self.attemptFailed(flow, false, false);
-                return;
-            };
+            switch (self.acquireLeg(flow.nodes[flow.node_idx], .{ .kind = .flow, .ptr = flow })) {
+                .submit => |leg| self.submitAttempt(flow, leg),
+                .parked => flow.waiting_conn = true,
+                .shed => {
+                    // Every leg live but saturated: SHED with a retryable
+                    // 503 (nothing submitted) — a bounded, visible shed
+                    // rather than an invisible queue in nghttp2 (plan A3).
+                    self.count_upstream_sheds += 1;
+                    std.log.warn("front: all leg(s) to {s} saturated — shedding", .{flow.nodes[flow.node_idx]});
+                    self.finishWithStatus(flow, 503);
+                },
+                // All legs down inside backoff (fail_over) or pool
+                // bookkeeping failed (err) — fail over to the next node.
+                .fail_over, .err => self.attemptFailed(flow, false, false),
+            }
+        }
+
+        /// Outcome of `acquireLeg` — what the request layer does with its
+        /// attempt. The one leg-acquire path shared by Flow
+        /// (`startAttempt`) and WsTunnel (`startTunnelAttempt`) attempts.
+        const AcquireResult = union(enum) {
+            /// Submit the attempt on this live leg.
+            submit: *Leg,
+            /// Parked on the node's waiter list (a dial is in flight or
+            /// was just started); the caller sets its `waiting_conn`. The
+            /// connect result resumes it via `dispatchWaiterOutcomes`.
+            parked,
+            /// Every leg is live but saturated — shed retryably (nothing
+            /// submitted).
+            shed,
+            /// Every leg is down inside its reconnect backoff — re-aim at
+            /// the next node.
+            fail_over,
+            /// Pool bookkeeping failed (OOM / unresolvable origin) — fail
+            /// the attempt.
+            err,
+        };
+
+        /// Pick or dial an upstream leg on `origin` for one attempt,
+        /// parking `waiter` if a connect must complete first. Opaque to
+        /// which request (`waiter` is a `*Flow`/`*WsTunnel` token) — this
+        /// keeps the leg-pick in the pool without naming the request
+        /// state machines.
+        fn acquireLeg(self: *Self, origin: []const u8, waiter: Waiter) AcquireResult {
+            const up = self.poolEntry(origin) catch return .err;
             const now = std.time.nanoTimestamp();
             if (self.pickLeg(up)) |leg| {
-                // Background scale-out: the chosen leg is getting busy
-                // and a spare leg exists — dial it for FUTURE submits;
-                // this flow rides the live leg now.
+                // Background scale-out: the chosen leg is getting busy and
+                // a spare leg exists — dial it for FUTURE submits; this
+                // attempt rides the live leg now.
                 if (leg.inflight >= LEG_GROW_THRESHOLD and !up.anyConnecting()) {
-                    if (dialableLeg(up, now)) |spare| self.dialLeg(spare, null);
+                    if (dialableLeg(up, now)) |spare| _ = self.dialLeg(spare, null);
                 }
-                self.submitAttempt(flow, leg);
-                return;
+                return .{ .submit = leg };
             }
             if (up.anyConnecting()) {
-                up.waiters.append(self.allocator, .{ .flow = flow }) catch {
-                    self.attemptFailed(flow, false, false);
-                    return;
-                };
-                flow.waiting_conn = true;
-                return;
+                up.waiters.append(self.allocator, waiter) catch return .err;
+                return .parked;
             }
             if (dialableLeg(up, now)) |leg| {
-                self.dialLeg(leg, .{ .flow = flow });
-                return;
+                return if (self.dialLeg(leg, waiter)) .parked else .err;
             }
-            if (self.anyLegUp(up)) {
-                // Every leg live but saturated: SHED with a retryable
-                // 503 (nothing submitted) — a bounded, visible shed
-                // rather than an invisible queue in nghttp2 (plan A3).
-                self.count_upstream_sheds += 1;
-                std.log.warn("front: all {d} leg(s) to {s} saturated — shedding", .{ up.n_legs, up.origin });
-                self.finishWithStatus(flow, 503);
-                return;
-            }
-            // All legs down inside backoff — fail over to the next node.
-            self.attemptFailed(flow, false, false);
+            if (self.anyLegUp(up)) return .shed;
+            return .fail_over;
         }
 
         fn poolEntry(self: *Self, origin: []const u8) !*Upstream {
@@ -1452,25 +1484,26 @@ pub fn Proxy(comptime FrontH2: type) type {
         }
 
         /// Dial one down leg (caller checked backoff via `dialableLeg`).
-        /// `waiter` (if any) parks on the NODE's waiter list until any
-        /// leg comes up. A null waiter is the background scale-out dial.
-        fn dialLeg(self: *Self, leg: *Leg, waiter: ?Waiter) void {
+        /// `waiter` (if any) parks on the NODE's waiter list until any leg
+        /// comes up; returns true when it was parked (the caller then sets
+        /// its `waiting_conn`). Returns false when the dial couldn't start
+        /// or the waiter couldn't be parked — the caller fails the waiter
+        /// over. A null waiter is the background scale-out dial; its return
+        /// is ignored. `waiter` is opaque here (a `*Flow`/`*WsTunnel`
+        /// token) — the pool never touches the request state machines.
+        fn dialLeg(self: *Self, leg: *Leg, waiter: ?Waiter) bool {
             const up = leg.up;
             const now = std.time.nanoTimestamp();
             const addr = up.addr orelse blk: {
                 const a = resolveOrigin(up.origin) catch {
                     leg.last_fail_ns = now;
-                    if (waiter) |w| self.waiterFailed(w);
-                    return;
+                    return false;
                 };
                 up.addr = a;
                 break :blk a;
             };
 
-            const ce = self.reg.create(&self.server.client_connect_in) catch {
-                if (waiter) |w| self.waiterFailed(w);
-                return;
-            };
+            const ce = self.reg.create(&self.server.client_connect_in) catch return false;
             self.reg.set(ce, &self.server.client_connect_in, h2.ConnectTarget, .{ .addr = addr }) catch {};
             self.reg.set(ce, &self.server.client_connect_in, h2.Session, .{}) catch {};
             self.reg.set(ce, &self.server.client_connect_in, h2.H2IoResult, .{ .err = 0 }) catch {};
@@ -1482,21 +1515,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                 up.waiters.append(self.allocator, w) catch {
                     // The connect proceeds (other waiters may join); this
                     // one fails over.
-                    self.waiterFailed(w);
-                    return;
+                    return false;
                 };
-                switch (w) {
-                    .flow => |f| f.waiting_conn = true,
-                    .tunnel => |t| t.waiting_conn = true,
-                }
+                return true;
             }
-        }
-
-        fn waiterFailed(self: *Self, waiter: Waiter) void {
-            switch (waiter) {
-                .flow => |f| self.attemptFailed(f, false, false),
-                .tunnel => |t| self.tunnelAttemptFailed(t),
-            }
+            return false;
         }
 
         /// Submit the current attempt's request head on `leg` via the
@@ -1695,35 +1718,61 @@ pub fn Proxy(comptime FrontH2: type) type {
             }
         }
 
+        /// Queue the node's parked waiters for resume with connect verdict
+        /// `ok`. The request layer drains the queue in
+        /// `dispatchWaiterOutcomes` — the pool itself never calls into the
+        /// Flow/WsTunnel state machines, so a connect resume can't reach
+        /// back into the request cluster.
         fn drainWaiters(self: *Self, up: *Upstream, ok: bool) void {
-            // Take the list — submit/fail paths may re-append to it.
+            // Take the list — the queued resumes may re-append to it later.
             var waiters = up.waiters;
             up.waiters = .empty;
             defer waiters.deinit(self.allocator);
-            for (waiters.items) |w| switch (w) {
-                .flow => |flow| {
+            for (waiters.items) |w| {
+                self.waiter_outcomes.append(self.allocator, .{ .waiter = w, .ok = ok }) catch {
+                    // OOM queuing an outcome drops this waiter's resume. It
+                    // stays bounded by its connect/response/route deadline
+                    // (not stranded), and OOM here means the process is
+                    // already failing — preferable to unbounded retry
+                    // mid-drain.
+                };
+            }
+        }
+
+        /// Resume the waiters the pool drained this turn (`drainWaiters`) —
+        /// the sole connect-path bridge from the pool back into the Flow /
+        /// WsTunnel state machines, casting each opaque waiter to its
+        /// concrete type. Dispatch never enqueues (`drainWaiters` runs only
+        /// from the connect / settle / connect-expiry sweeps), so iterating
+        /// in place then clearing is safe.
+        fn dispatchWaiterOutcomes(self: *Self) void {
+            for (self.waiter_outcomes.items) |o| switch (o.waiter.kind) {
+                .flow => {
+                    const flow: *Flow = @ptrCast(@alignCast(o.waiter.ptr));
                     flow.waiting_conn = false;
                     if (flow.down_gone or !flow.down_alive) {
                         self.teardownFlow(flow);
-                    } else if (ok) {
-                        // Re-enter the pick (least-loaded leg / shed),
-                        // not a direct submit on any one session.
+                    } else if (o.ok) {
+                        // Re-enter the pick (least-loaded leg / shed), not
+                        // a direct submit on any one session.
                         self.startAttempt(flow);
                     } else {
                         self.attemptFailed(flow, false, false);
                     }
                 },
-                .tunnel => |t| {
+                .tunnel => {
+                    const t: *WsTunnel = @ptrCast(@alignCast(o.waiter.ptr));
                     t.waiting_conn = false;
                     if (t.down_gone or self.reg.isStale(t.down_conn)) {
                         self.finishTunnel(t);
-                    } else if (ok) {
+                    } else if (o.ok) {
                         self.startTunnelAttempt(t);
                     } else {
                         self.tunnelAttemptFailed(t);
                     }
                 },
             };
+            self.waiter_outcomes.clearRetainingCapacity();
         }
 
         /// Resume tunnels re-parked in `up.waiters` on a live conn that hadn't
@@ -2582,8 +2631,9 @@ pub fn Proxy(comptime FrontH2: type) type {
             var list = kv.value;
             self.allocator.free(kv.key);
             defer list.deinit(self.allocator);
-            for (list.items) |w| switch (w) {
-                .flow => |flow| {
+            for (list.items) |w| switch (w.kind) {
+                .flow => {
+                    const flow: *Flow = @ptrCast(@alignCast(w.ptr));
                     flow.awaiting_route = false;
                     if (flow.down_gone or !flow.down_alive) {
                         self.teardownFlow(flow);
@@ -2601,7 +2651,8 @@ pub fn Proxy(comptime FrontH2: type) type {
                     flow.node_idx = self.leaders.startIdx(flow.host, flow.nodes);
                     self.startAttempt(flow);
                 },
-                .tunnel => |t| {
+                .tunnel => {
+                    const t: *WsTunnel = @ptrCast(@alignCast(w.ptr));
                     t.awaiting_route = false;
                     if (t.down_gone or self.reg.isStale(t.down_conn)) {
                         self.finishTunnel(t);
@@ -2625,8 +2676,9 @@ pub fn Proxy(comptime FrontH2: type) type {
             var list = kv.value;
             self.allocator.free(kv.key);
             defer list.deinit(self.allocator);
-            for (list.items) |w| switch (w) {
-                .flow => |flow| {
+            for (list.items) |w| switch (w.kind) {
+                .flow => {
+                    const flow: *Flow = @ptrCast(@alignCast(w.ptr));
                     flow.awaiting_route = false;
                     if (flow.down_gone or !flow.down_alive) {
                         self.teardownFlow(flow);
@@ -2634,7 +2686,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.finishWithStatus(flow, code);
                     }
                 },
-                .tunnel => |t| self.failParkedTunnel(t, code),
+                .tunnel => self.failParkedTunnel(@ptrCast(@alignCast(w.ptr)), code),
             };
         }
 
@@ -2649,15 +2701,16 @@ pub fn Proxy(comptime FrontH2: type) type {
                 var i: usize = 0;
                 while (i < list.items.len) {
                     const w = list.items[i];
-                    const deadline = switch (w) {
-                        .flow => |flow| flow.route_deadline_ns,
-                        .tunnel => |t| t.route_deadline_ns,
+                    const deadline = switch (w.kind) {
+                        .flow => @as(*Flow, @ptrCast(@alignCast(w.ptr))).route_deadline_ns,
+                        .tunnel => @as(*WsTunnel, @ptrCast(@alignCast(w.ptr))).route_deadline_ns,
                     };
                     if (now_ns >= deadline) {
                         _ = list.swapRemove(i);
                         self.count_route_expired += 1;
-                        switch (w) {
-                            .flow => |flow| {
+                        switch (w.kind) {
+                            .flow => {
+                                const flow: *Flow = @ptrCast(@alignCast(w.ptr));
                                 flow.awaiting_route = false;
                                 if (flow.down_gone or !flow.down_alive) {
                                     self.teardownFlow(flow);
@@ -2665,7 +2718,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                                     self.finishWithStatus(flow, 503);
                                 }
                             },
-                            .tunnel => |t| self.failParkedTunnel(t, 503),
+                            .tunnel => self.failParkedTunnel(@ptrCast(@alignCast(w.ptr)), 503),
                         }
                     } else {
                         i += 1;
