@@ -42,17 +42,7 @@ const _cronHelpers = {
    * cron.toFireAtNs("2026-06-01T03:00:00Z");   // absolute
    */
   toFireAtNs(input) {
-    if (input == null) return 0n;
-    if (typeof input === "bigint") return input;
-    if (typeof input === "number") return BigInt(Math.floor(input)) * NS_PER_MS;
-    if (input instanceof Date) return BigInt(input.getTime()) * NS_PER_MS;
-    if (typeof input === "string") {
-      const dur = _parseDuration(input);
-      if (dur != null) return BigInt(Date.now() + dur) * NS_PER_MS;
-      const ms = Date.parse(input);
-      if (!Number.isNaN(ms)) return BigInt(ms) * NS_PER_MS;
-    }
-    throw new TypeError("cron.toFireAtNs: unrecognized time input");
+    return time.toNs(input);
   },
 
   /**
@@ -66,7 +56,7 @@ const _cronHelpers = {
    * cron.parseDuration("2h"); // 7200000
    */
   parseDuration(s) {
-    return _parseDuration(s);
+    return time.parseDuration(s);
   },
 
   /**
@@ -80,7 +70,7 @@ const _cronHelpers = {
    * webhook.send("https://hooks.example.com/x", { at: cron.fromNow("30m") });
    */
   fromNow(s) {
-    const dur_ms = _parseDuration(s);
+    const dur_ms = time.parseDuration(s);
     if (dur_ms == null) throw new TypeError("cron.fromNow: not a duration: " + s);
     return BigInt(Date.now() + dur_ms) * NS_PER_MS;
   },
@@ -237,21 +227,6 @@ const _cronHelpers = {
     throw new Error("cron.next: no match within 4-year window for " + expr);
   },
 };
-
-function _parseDuration(s) {
-  if (typeof s !== "string") return null;
-  const m = s.match(/^(\d+)([smhdw])$/);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  switch (m[2]) {
-    case "s": return n * 1000;
-    case "m": return n * 60 * 1000;
-    case "h": return n * 60 * 60 * 1000;
-    case "d": return n * 24 * 60 * 60 * 1000;
-    case "w": return n * 7 * 24 * 60 * 60 * 1000;
-  }
-  return null;
-}
 
 function _parseField(field, min, max) {
   // Returns a Set of integer values the field matches.

@@ -37,7 +37,7 @@ export default function () {
     // Fail-loud contract.
     throws(() => schedule({}, "jobs/x"), /when must be \{ at \} or \{ in \}/);
     throws(() => schedule({ in: 5000 }, ""), /target must be a non-empty module specifier/);
-    throws(() => schedule({ at: {} }, "jobs/x"), /at must be a bigint/);
+    throws(() => schedule({ at: {} }, "jobs/x"), /unrecognized time input/);
     throws(() => schedule({ in: "sooner" }, "jobs/x"), /not a duration: sooner/);
     throws(() => schedule({ in: 0 }, "jobs/x", "y".repeat(17000)), /SCHED_MAX_MSG_BYTES/);
   });

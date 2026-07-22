@@ -239,7 +239,7 @@ pub fn build(b: *std.Build) void {
     // them registered (replay_mod, driver_smoke_mod).
     const addSimGlobalEmbeds = struct {
         fn f(bb: *std.Build, mod: *std.Build.Module) void {
-            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "platform", "retry", "segments", "browser", "users", "activitypub", "cron", "schedule", "webhook", "email", "after", "stream", "next", "blob" };
+            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "platform", "retry", "segments", "browser", "users", "activitypub", "time", "cron", "schedule", "webhook", "email", "after", "stream", "next", "blob" };
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
@@ -546,6 +546,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "oauth_js", .path = "src/js/globals/oauth.js" },
         .{ .name = "oidc_js", .path = "src/js/globals/oidc.js" },
         .{ .name = "sessions_js", .path = "src/js/globals/sessions.js" },
+        .{ .name = "time_js", .path = "src/js/globals/time.js" },
         .{ .name = "cron_js", .path = "src/js/globals/cron.js" },
         .{ .name = "retry_js", .path = "src/js/globals/retry.js" },
         .{ .name = "schedule_js", .path = "src/js/globals/schedule.js" },
@@ -715,7 +716,6 @@ pub fn build(b: *std.Build) void {
     // each shipped binary by name).
     const ls_step = b.step("rewind-logs", "Build the V2 log-server / tape indexer binary");
     ls_step.dependOn(&b.addInstallArtifact(ls_standalone, .{}).step);
-
 
     // V1→V2 cutover: `kv-maelstrom` (examples/kv_maelstrom.zig) drove
     // Maelstrom linearizability against the V1 willemt `RaftNode` — RETIRED.

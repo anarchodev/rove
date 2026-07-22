@@ -45,7 +45,6 @@ pub const installRequest = request_bindings.installRequest;
 const platform_bindings = @import("globals_platform.zig");
 const kv_bindings = @import("globals_kv.zig");
 
-
 const c = qjs.c;
 
 // Zig's @cImport can't translate quickjs-ng's designated-initializer
@@ -667,7 +666,6 @@ pub const DispatchState = struct {
 /// PLAN §2.5 cascade depth ceiling.
 pub const MAX_TRIGGER_DEPTH: u32 = 8;
 
-
 // ── C helpers ──────────────────────────────────────────────────────────
 
 pub fn getState(ctx: ?*c.JSContext) *DispatchState {
@@ -799,7 +797,6 @@ pub fn throwReservedKey(ctx: ?*c.JSContext, key: []const u8) c.JSValue {
     return c.JS_Throw(ctx, err);
 }
 
-
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
 // Within-activation non-determinism replay
@@ -851,8 +848,6 @@ fn jsConsoleLog(
     state.console.append(state.allocator, '\n') catch return js_exception;
     return js_undefined;
 }
-
-
 
 // ── Installation ──────────────────────────────────────────────────────
 
@@ -931,6 +926,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // sessions is standalone (kv + crypto.randomUUID + cookie parsing).
     evalSnippet(ctx, "sessions.js", SESSIONS_JS);
     // cron is standalone.
+    evalSnippet(ctx, "time.js", TIME_JS);
     evalSnippet(ctx, "cron.js", CRON_JS);
     evalSnippet(ctx, "retry.js", RETRY_JS);
     // §2.6 durable scheduled wake. After base64/crypto/kv (its deps).
@@ -1006,8 +1002,8 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // parent-before-child rule as `platform`).
     .{ .path = &.{"_system"}, .fns = &.{} },
     .{ .path = &.{ "_system", "kv" }, .fns = &.{
-        .{ .name = "get",    .cfunc = kv_bindings.jsKvGet,    .argc = 1 },
-        .{ .name = "set",    .cfunc = kv_bindings.jsKvSet,    .argc = 2 },
+        .{ .name = "get", .cfunc = kv_bindings.jsKvGet, .argc = 1 },
+        .{ .name = "set", .cfunc = kv_bindings.jsKvSet, .argc = 2 },
         .{ .name = "delete", .cfunc = kv_bindings.jsKvDelete, .argc = 1 },
         .{ .name = "prefix", .cfunc = kv_bindings.jsKvPrefix, .argc = 3 },
     } },
@@ -1018,15 +1014,18 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // accumulate onto `DispatchState.pending_wakes`; the worker arms
     // them on the held entity at park. Inert when there's no held
     // connection (the accumulator is null).
-    .{ .path = &.{ "_system", "after" }, .fns = &.{
-        .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },
-        .{ .name = "kv",    .cfunc = on_b.jsOnKv,      .argc = 2 },
-        // Connection-scoped outbound. Binds the
-        // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
-        // held; inert when not. Lives in the http binding (composes the
-        // same fetch primitive as `http.fetch`).
-        .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 2 },
-    } },
+    .{
+        .path = &.{ "_system", "after" },
+        .fns = &.{
+            .{ .name = "timer", .cfunc = on_b.jsOnTimer, .argc = 2 },
+            .{ .name = "kv", .cfunc = on_b.jsOnKv, .argc = 2 },
+            // Connection-scoped outbound. Binds the
+            // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
+            // held; inert when not. Lives in the http binding (composes the
+            // same fetch primitive as `http.fetch`).
+            .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 2 },
+        },
+    },
     // Connection output effects. `stream.start`
     // / `stream.write` accumulate onto `DispatchState`; the worker
     // drives the stream-pipeline entry + stages chunks as commit-gated
@@ -1048,70 +1047,79 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // Stripe / Slack / AWS style signatures (PLAN §2.6); randomBytes +
     // sha256 are what admin's JS handler composes into magic-link /
     // session token mint and hash-at-rest.
-    .{ .path = &.{ "_system", "crypto" }, .fns = &.{
-        .{ .name = "getRandomValues", .cfunc = crypto_b.jsCryptoGetRandomValues, .argc = 1 },
-        .{ .name = "randomUUID",      .cfunc = crypto_b.jsCryptoRandomUuid,      .argc = 0 },
-        .{ .name = "randomBytes",     .cfunc = crypto_b.jsCryptoRandomBytes,     .argc = 1 },
-        .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
-        // Streaming sha256 over serializable midstate tokens — pure
-        // functions, so an accumulation spanning activations can keep
-        // its hash state in kv (`docs/architecture/blob-write-recipes.md` §3).
-        .{ .name = "sha256Init",      .cfunc = crypto_b.jsCryptoSha256Init,      .argc = 0 },
-        .{ .name = "sha256Update",    .cfunc = crypto_b.jsCryptoSha256Update,    .argc = 2 },
-        .{ .name = "sha256Final",     .cfunc = crypto_b.jsCryptoSha256Final,     .argc = 1 },
-        .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
-        // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
-        // composes JWT/OIDC verification on top — see retry.js +
-        // base64url.* helpers.
-        .{ .name = "verifyRsa",       .cfunc = crypto_jose_b.jsCryptoVerifyRsa,  .argc = 4 },
-        // ECDSA verify (ES256 / ES384 / ES512). Required for Sign in
-        // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
-        // R||S concatenation (the binding converts to DER internally).
-        .{ .name = "verifyEcdsa",     .cfunc = crypto_jose_b.jsCryptoVerifyEcdsa, .argc = 4 },
-        // OIDC RS256 key custody
-        // (`docs/architecture/auth-and-domains.md`): keygen + sign are
-        // Zig/OpenSSL; the IdP JS holds
-        // the private key only as an opaque PEM string it never
-        // parses.
-        .{ .name = "oidcGenerateKey", .cfunc = crypto_jose_b.jsCryptoOidcGenerateKey, .argc = 0 },
-        .{ .name = "oidcSign",        .cfunc = crypto_jose_b.jsCryptoOidcSign,   .argc = 2 },
-        // Raw-key ECDSA over secp256k1 / P-256: keygen + sign + verify
-        // with SHA-256, 64-byte compact R||S, low-S enforced. The
-        // primitive atproto.js builds did:key/did:plc + signed repo
-        // commits on (separate from the JOSE verifyEcdsa path above).
-        .{ .name = "ecdsaGenerateKey", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaGenerateKey, .argc = 1 },
-        .{ .name = "ecdsaSign",        .cfunc = crypto_ecdsa_b.jsCryptoEcdsaSign,        .argc = 3 },
-        .{ .name = "ecdsaVerify",      .cfunc = crypto_ecdsa_b.jsCryptoEcdsaVerify,      .argc = 4 },
-    } },
+    .{
+        .path = &.{ "_system", "crypto" },
+        .fns = &.{
+            .{ .name = "getRandomValues", .cfunc = crypto_b.jsCryptoGetRandomValues, .argc = 1 },
+            .{ .name = "randomUUID", .cfunc = crypto_b.jsCryptoRandomUuid, .argc = 0 },
+            .{ .name = "randomBytes", .cfunc = crypto_b.jsCryptoRandomBytes, .argc = 1 },
+            .{ .name = "sha256", .cfunc = crypto_b.jsCryptoSha256, .argc = 1 },
+            // Streaming sha256 over serializable midstate tokens — pure
+            // functions, so an accumulation spanning activations can keep
+            // its hash state in kv (`docs/architecture/blob-write-recipes.md` §3).
+            .{ .name = "sha256Init", .cfunc = crypto_b.jsCryptoSha256Init, .argc = 0 },
+            .{ .name = "sha256Update", .cfunc = crypto_b.jsCryptoSha256Update, .argc = 2 },
+            .{ .name = "sha256Final", .cfunc = crypto_b.jsCryptoSha256Final, .argc = 1 },
+            .{ .name = "hmacSha256", .cfunc = crypto_b.jsCryptoHmacSha256, .argc = 2 },
+            // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
+            // composes JWT/OIDC verification on top — see retry.js +
+            // base64url.* helpers.
+            .{ .name = "verifyRsa", .cfunc = crypto_jose_b.jsCryptoVerifyRsa, .argc = 4 },
+            // ECDSA verify (ES256 / ES384 / ES512). Required for Sign in
+            // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
+            // R||S concatenation (the binding converts to DER internally).
+            .{ .name = "verifyEcdsa", .cfunc = crypto_jose_b.jsCryptoVerifyEcdsa, .argc = 4 },
+            // OIDC RS256 key custody
+            // (`docs/architecture/auth-and-domains.md`): keygen + sign are
+            // Zig/OpenSSL; the IdP JS holds
+            // the private key only as an opaque PEM string it never
+            // parses.
+            .{ .name = "oidcGenerateKey", .cfunc = crypto_jose_b.jsCryptoOidcGenerateKey, .argc = 0 },
+            .{ .name = "oidcSign", .cfunc = crypto_jose_b.jsCryptoOidcSign, .argc = 2 },
+            // Raw-key ECDSA over secp256k1 / P-256: keygen + sign + verify
+            // with SHA-256, 64-byte compact R||S, low-S enforced. The
+            // primitive atproto.js builds did:key/did:plc + signed repo
+            // commits on (separate from the JOSE verifyEcdsa path above).
+            .{ .name = "ecdsaGenerateKey", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaGenerateKey, .argc = 1 },
+            .{ .name = "ecdsaSign", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaSign, .argc = 3 },
+            .{ .name = "ecdsaVerify", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaVerify, .argc = 4 },
+        },
+    },
     // http.fetch / http.cancelFetch — the platform's outbound HTTP
     // primitive. Transient + best-effort; durability is composed in
     // JS by `webhook.send` (the reified primitives,
     // `docs/architecture/effects-and-handlers.md`).
-    .{ .path = &.{ "_system", "http" }, .fns = &.{
-        .{ .name = "fetch",              .cfunc = http_b.jsHttpFetch,              .argc = 1 },
-        .{ .name = "cancelFetch",        .cfunc = http_b.jsHttpCancelFetch,        .argc = 1 },
-        // Held outbound subscription (gap 2.5) on the outbound fetch /
-        // libcurl-multi engine
-        // (`docs/architecture/configuration-and-network.md`). Same engine, different
-        // lifecycle: no timeout, per-tenant cap, terminal is
-        // always `ok=false` ("subscription ended").
-        .{ .name = "subscribe",          .cfunc = http_b.jsHttpSubscribe,          .argc = 1 },
-        .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
-    } },
+    .{
+        .path = &.{ "_system", "http" },
+        .fns = &.{
+            .{ .name = "fetch", .cfunc = http_b.jsHttpFetch, .argc = 1 },
+            .{ .name = "cancelFetch", .cfunc = http_b.jsHttpCancelFetch, .argc = 1 },
+            // Held outbound subscription (gap 2.5) on the outbound fetch /
+            // libcurl-multi engine
+            // (`docs/architecture/configuration-and-network.md`). Same engine, different
+            // lifecycle: no timeout, per-tenant cap, terminal is
+            // always `ok=false` ("subscription ended").
+            .{ .name = "subscribe", .cfunc = http_b.jsHttpSubscribe, .argc = 1 },
+            .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
+        },
+    },
     // Tenant blob storage (`docs/architecture/routing-and-ingress.md`). Only
     // `presign` is native (needs the platform-held signing keys);
     // `blob.put` / `blob.get` are JS compositions in globals/blob.js
     // over the fetch engine's `rove-blob.internal` trusted door.
-    .{ .path = &.{ "_system", "blob" }, .fns = &.{
-        .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
-        // Upload sessions (`docs/architecture/routing-and-ingress.md`, customer blob storage).
-        .{ .name = "write",   .cfunc = blob_b.jsBlobWrite,   .argc = 1 },
-        .{ .name = "seal",    .cfunc = blob_b.jsBlobSeal,    .argc = 2 },
-        // `blob.receive` (`docs/architecture/routing-and-ingress.md`, blob ingress):
-        // headers-first inbound pipe — only callable from an
-        // `onHeaders` activation.
-        .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
-    } },
+    .{
+        .path = &.{ "_system", "blob" },
+        .fns = &.{
+            .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
+            // Upload sessions (`docs/architecture/routing-and-ingress.md`, customer blob storage).
+            .{ .name = "write", .cfunc = blob_b.jsBlobWrite, .argc = 1 },
+            .{ .name = "seal", .cfunc = blob_b.jsBlobSeal, .argc = 2 },
+            // `blob.receive` (`docs/architecture/routing-and-ingress.md`, blob ingress):
+            // headers-first inbound pipe — only callable from an
+            // `onHeaders` activation.
+            .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
+        },
+    },
     // `resumeIfBound` can't live under `_system.*` — the
     // `_harden.js` `delete globalThis._system` runs BEFORE baked modules
     // eval, so `__system/webhook_onresult.mjs` can't reach a
@@ -1120,19 +1128,22 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
     // handlers.
-    .{ .path = &.{ "_system", "platform" }, .fns = &.{
-        // platform.scope(id) → { kv: { get, prefix, set, delete } }
-        // bound to instance `id`. The explicit cross-tenant accessor.
-        .{ .name = "scope", .cfunc = platform_bindings.jsPlatformScope, .argc = 1 },
-    } },
+    .{
+        .path = &.{ "_system", "platform" },
+        .fns = &.{
+            // platform.scope(id) → { kv: { get, prefix, set, delete } }
+            // bound to instance `id`. The explicit cross-tenant accessor.
+            .{ .name = "scope", .cfunc = platform_bindings.jsPlatformScope, .argc = 1 },
+        },
+    },
     .{ .path = &.{ "_system", "platform", "root" }, .fns = &.{
-        .{ .name = "get",    .cfunc = platform_bindings.jsPlatformRootGet,    .argc = 1 },
-        .{ .name = "set",    .cfunc = platform_bindings.jsPlatformRootSet,    .argc = 2 },
+        .{ .name = "get", .cfunc = platform_bindings.jsPlatformRootGet, .argc = 1 },
+        .{ .name = "set", .cfunc = platform_bindings.jsPlatformRootSet, .argc = 2 },
         .{ .name = "delete", .cfunc = platform_bindings.jsPlatformRootDelete, .argc = 1 },
         .{ .name = "prefix", .cfunc = platform_bindings.jsPlatformRootPrefix, .argc = 3 },
     } },
     .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
-        .{ .name = "create",        .cfunc = platform_bindings.jsPlatformInstancesCreate,        .argc = 1 },
+        .{ .name = "create", .cfunc = platform_bindings.jsPlatformInstancesCreate, .argc = 1 },
         .{ .name = "deployStarter", .cfunc = platform_bindings.jsPlatformInstancesDeployStarter, .argc = 1 },
     } },
     .{ .path = &.{ "_system", "platform", "releases" }, .fns = &.{
@@ -1159,21 +1170,24 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // customer naming `__rove.X` gets a throw at call time. No
     // customer-facing shim touches this surface. See
     // `docs/architecture/privileged-surface.md`.
-    .{ .path = &.{"__rove"}, .fns = &.{
-        // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
-        // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
-        .{ .name = "resumeIfBound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
-        // Raw privileged outbound fetch for baked delivery modules
-        // (`__system/webhook_fire`); delegates to `_system.http.fetch`
-        // internals so staging/commit-gating/limits are identical.
-        .{ .name = "fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
-    } },
+    .{
+        .path = &.{"__rove"},
+        .fns = &.{
+            // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
+            // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
+            .{ .name = "resumeIfBound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
+            // Raw privileged outbound fetch for baked delivery modules
+            // (`__system/webhook_fire`); delegates to `_system.http.fetch`
+            // internals so staging/commit-gating/limits are identical.
+            .{ .name = "fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
+        },
+    },
     // §2.6 durable-wake tick ops — only `__system/scheduler_tick` calls
     // them. `set` installs the tenant's single next-fire watermark;
     // `fire` enqueues one `durable_wake` activation per due entry. Both
     // gated (throw unless is_system_module).
     .{ .path = &.{ "__rove", "wake" }, .fns = &.{
-        .{ .name = "set",  .cfunc = scheduler_b.jsSetWake,  .argc = 1 },
+        .{ .name = "set", .cfunc = scheduler_b.jsSetWake, .argc = 1 },
         .{ .name = "fire", .cfunc = scheduler_b.jsFireWake, .argc = 6 },
     } },
 };
@@ -1218,6 +1232,7 @@ const JWT_JS = @embedFile("jwt_js");
 const OAUTH_JS = @embedFile("oauth_js");
 const OIDC_JS = @embedFile("oidc_js");
 const SESSIONS_JS = @embedFile("sessions_js");
+const TIME_JS = @embedFile("time_js");
 const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");
 const SCHEDULE_JS = @embedFile("schedule_js");
@@ -1253,6 +1268,7 @@ pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "oauth", .src = OAUTH_JS },
     .{ .name = "oidc", .src = OIDC_JS },
     .{ .name = "sessions", .src = SESSIONS_JS },
+    .{ .name = "time", .src = TIME_JS },
     .{ .name = "cron", .src = CRON_JS },
     .{ .name = "retry", .src = RETRY_JS },
     .{ .name = "schedule", .src = SCHEDULE_JS },
