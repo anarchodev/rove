@@ -1325,13 +1325,7 @@ fn resolveRequest(
                 try respb.setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
             } else {
                 const hdrs = try respb.buildSystemRespHeaders(allocator, o, true, null);
-                try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
-                try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-                try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-                try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-                try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-                try server.reg.set(ent, &server.request_out, h2.Session, sess);
-                try server.reg.move(ent, &server.request_out, &server.response_in);
+                try respb.finalizeResponse(server, ent, sid, sess, 204, hdrs, null, 0);
             }
         } else {
             try respb.setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
@@ -2828,12 +2822,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             handler_ct,
             resp.headers,
         );
-        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, handler_resp_hdrs);
-        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = body_ptr, .len = body_len });
-        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-        try server.reg.set(ent, &server.request_out, h2.Session, sess);
+        try respb.stageResponse(server, ent, sid, sess, status_code, handler_resp_hdrs, body_ptr, body_len);
 
         // Capture tapes now — bytes are owned by the LogRecord and
         // ride inline in the next ndjson flush. Inbound `body` is
