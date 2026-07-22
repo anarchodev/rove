@@ -290,6 +290,38 @@ pub const ApplyMode = enum {
     worker_overlay,
 };
 
+/// The apply policy — how a committed entry applies on this node. Six knobs
+/// that jointly define bare-node vs worker-overlay behavior: the bridge sets
+/// the worker-overlay hooks (commit_hook / skip_query / durabilize_floor) +
+/// apply_mode together, and independently installs apply_observer (the CP
+/// directory group) + store_resolver (a follower's serving store). Bare-node
+/// tests keep every default. Grouped so the two legal configurations are one
+/// value, not six fields smeared across the Node struct.
+pub const ApplyPolicy = struct {
+    /// Optional per-committed-entry notification (see `CommitHook`). Set by
+    /// the bridge; left null by the inline tests.
+    commit_hook: ?CommitHook = null,
+    /// Optional worker-overlay skip oracle (see `SkipQuery`). Set alongside
+    /// `commit_hook`; when null, `worker_overlay` falls back to the role-keyed
+    /// `isLeader` skip (bare-node tests only).
+    skip_query: ?SkipQuery = null,
+    /// Optional durabilize floor (see `DurabilizeFloor`). Set alongside
+    /// `commit_hook`; trivially unconstrained (`maxInt`) outside worker_overlay.
+    durabilize_floor: ?DurabilizeFloor = null,
+    /// Optional per-applied-put notification (see `ApplyObserver`). Set by the
+    /// bridge for the CP directory group so a node's projection tracks
+    /// replicated applies (leader + follower). Null everywhere else.
+    apply_observer: ?ApplyObserver = null,
+    /// Optional follower-apply store resolver (see `StoreResolver`). Set in
+    /// worker_overlay mode so a follower's replicated writes land in the
+    /// worker's own serving store. Null in bare-node tests.
+    store_resolver: ?StoreResolver = null,
+    /// How committed entries apply (see `ApplyMode`): write the store
+    /// (`apply_on_commit`, default) vs. role-aware skip-on-leader
+    /// (`worker_overlay`, set when the bridge fronts a worker's overlay).
+    apply_mode: ApplyMode = .apply_on_commit,
+};
+
 pub const Error = error{
     /// A malformed config value — e.g. a peer-registry `host:port` with no
     /// colon or an unparseable port (`PeerRegistry.learnAddr`).
@@ -494,39 +526,18 @@ pub const Node = struct {
     /// it must not run ahead of the fsync (see `pump`). Reused per cycle.
     commit_notify: std.ArrayListUnmanaged(CommitNotify) = .empty,
 
-    /// Optional per-committed-entry notification (see `CommitHook`).
-    /// Set by the bridge; left null by the inline tests.
-    commit_hook: ?CommitHook = null,
+    /// How committed entries apply here (see `ApplyPolicy`): the worker-overlay
+    /// hooks + apply_observer + store_resolver, grouped. Bare-node = defaults.
+    apply: ApplyPolicy = .{},
 
-    /// Optional worker-overlay skip oracle (see `SkipQuery`). Set by the
-    /// bridge alongside `commit_hook`. When null, `worker_overlay` falls
-    /// back to the role-keyed `isLeader` skip (bare-node tests only —
-    /// every worker-fronted deployment sets it).
-    skip_query: ?SkipQuery = null,
 
-    /// Optional durabilize floor (see `DurabilizeFloor`). Set by the
-    /// bridge alongside `commit_hook`; trivially unconstrained
-    /// (`maxInt`) outside `worker_overlay` mode.
-    durabilize_floor: ?DurabilizeFloor = null,
 
     /// Count of transport tick failures (rate-limited logging in `pump`
     /// — a persistently broken transport must be operator-visible, not a
     /// silently-swallowed partition).
     transport_err_count: u64 = 0,
 
-    /// Optional per-applied-put notification (see `ApplyObserver`). Set by
-    /// the bridge for the control-plane directory group so a CP node's
-    /// in-memory projection tracks replicated applies (leader + follower).
-    /// Null everywhere else — decoding the writeset twice is only worth it
-    /// for the tiny directory writes.
-    apply_observer: ?ApplyObserver = null,
 
-    /// How committed entries apply (see `ApplyMode`): write the store
-    /// (`apply_on_commit`, default) vs. role-aware skip-on-leader
-    /// (`worker_overlay`, which the bridge sets when it fronts a worker
-    /// owning the speculative overlay). The node + bridge unit tests keep
-    /// the default so a read after commit sees the pump's write.
-    apply_mode: ApplyMode = .apply_on_commit,
 
     /// Hibernation idle window. Overridable per node (tests use a
     /// short value); production keeps `DEFAULT_HIBERNATE_NS`.
@@ -545,11 +556,6 @@ pub const Node = struct {
     /// Owned; reused to avoid per-cycle allocation.
     woke_scratch: std.ArrayListUnmanaged(u64) = .empty,
 
-    /// Optional follower-apply store resolver (see `StoreResolver`). Set by
-    /// the bridge in `worker_overlay` mode so a follower's replicated writes
-    /// land in the worker's own serving store. Null in
-    /// the bare-node tests, which read the node's own `slot.store`.
-    store_resolver: ?StoreResolver = null,
 
     /// Stand up a single-node node (voter id 1, voter set `{1}`).
     pub fn initSingleNode(allocator: std.mem.Allocator, data_dir: []const u8) Error!*Node {
@@ -1570,7 +1576,7 @@ pub const Node = struct {
                 // notifications are DROPPED: parked workers time out →
                 // 503, the correct "unknown outcome" signal (never a
                 // false durable ack).
-                if (self.commit_hook) |h| {
+                if (self.apply.commit_hook) |h| {
                     for (self.commit_notify.items) |n| h.func(h.ctx, n.gid, n.origin, n.seq, n.idx);
                 }
             }
@@ -1690,7 +1696,7 @@ pub const Node = struct {
             // already truncated). The bridge's floor is `maxInt` when
             // nothing is awaited.
             var target = slot.applied_idx;
-            if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
+            if (self.apply.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
             // Mechanism-A WAL compaction (raft-native-alignment §I4): truncate to
             // a FIXED catch-up buffer below the durable apply watermark, PER NODE
             // INDEPENDENTLY — no cross-node min-match floor, no propagated floor,
@@ -1893,7 +1899,7 @@ pub const Node = struct {
         // undecodable entry (apply_err, returned above) never advance a
         // tenant's watermark. A staging failure (OOM) is surfaced as an
         // apply error rather than silently losing the waiter's wakeup.
-        if (self.commit_hook != null) {
+        if (self.apply.commit_hook != null) {
             self.commit_notify.append(self.allocator, .{
                 .gid = group_id,
                 .origin = frame.origin,
@@ -1922,11 +1928,11 @@ pub const Node = struct {
             // Replaying the WAL at restart: there is no worker to have written
             // the store, so the pump MUST write it (and durabilize the tail).
             false
-        else switch (self.apply_mode) {
+        else switch (self.apply.apply_mode) {
             .apply_on_commit => false,
             .leader_skip => true,
             .worker_overlay => blk: {
-                if (self.skip_query) |q|
+                if (self.apply.skip_query) |q|
                     break :blk q.func(q.ctx, group_id, frame.origin, frame.seq);
                 // No bridge (bare-node tests): the role-keyed skip.
                 break :blk self.mgr.isLeader(group_id);
@@ -2014,7 +2020,7 @@ pub const Node = struct {
     /// surfaces as null (→ `UnroutedApply`, an invariant violation: those
     /// producers only exist on worker-fronted nodes, which set a resolver).
     fn storeFor(self: *Node, slot: *TenantSlot, id_str: []const u8) ?*KvStore {
-        if (self.store_resolver) |r| return r.func(r.ctx, slot.tenant_id, id_str);
+        if (self.apply.store_resolver) |r| return r.func(r.ctx, slot.tenant_id, id_str);
         if (std.mem.eql(u8, id_str, slot.id_str)) return slot.store;
         return null;
     }
@@ -2028,7 +2034,7 @@ pub const Node = struct {
     /// only mean a stale projection, recovered on the next apply / restart
     /// scan).
     fn notifyApply(self: *Node, group_id: u64, id_str: []const u8, ws_bytes: []const u8) void {
-        const obs = self.apply_observer orelse return;
+        const obs = self.apply.apply_observer orelse return;
         var ops: std.ArrayListUnmanaged(writeset.Op) = .empty;
         defer ops.deinit(self.allocator);
         writeset.decodeOps(ws_bytes, self.allocator, &ops) catch return;
@@ -2800,7 +2806,7 @@ test "multi: inner writesets route by INNER id (cross-tenant + root) through the
         }
     };
     var res: Resolver = .{ .anchor = anchor_store, .target = target_store, .root = root_store };
-    node.store_resolver = .{ .ctx = &res, .func = Resolver.resolve };
+    node.apply.store_resolver = .{ .ctx = &res, .func = Resolver.resolve };
 
     const gid: u64 = 77;
     const slot = try node.ensureGroup(gid, "admin");
