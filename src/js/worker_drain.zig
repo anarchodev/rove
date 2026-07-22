@@ -1414,7 +1414,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     // transition stay unwired (the entity just moved to the stream
     // collections; flushResumeFetches' parked_continuations count bump
     // soft-fails there) — they drop with a register failure.
-    if (ctx.pending_fetches) |pf| flushResumeFetches(worker, ctx.ent, pf, false);
+    if (ctx.pending_fetches) |pf| worker_streaming.flushResumeFetches(worker, ctx.ent, pf, false);
     hop_tapes_consumed = true;
     captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.correlation_id, &.{}, ctx.activation, 0);
 }
@@ -1724,7 +1724,7 @@ fn finishContResume(
             ctx.txn_done.* = true;
             // Terminal ⇒ the connection is closing: connection-scoped
             // fetches drop (scope rule), unbound ones still fire.
-            flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, false);
+            worker_streaming.flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, false);
             resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st, r.body) catch {};
             captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, 0);
             r.console = &.{};
@@ -1883,7 +1883,7 @@ fn finishContResume(
             desc.deadline_ns = ctx.now_ns + CONT_HOLD_DEADLINE_NS;
             // Still held (repark) + committed (read-only): bind + submit
             // any fetches this resume issued (handler-shape §5.3).
-            flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, true);
+            worker_streaming.flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, true);
             // A read-only repark is still a recorded activation — without
             // this record the hop is unreplayable (a ctx-only accumulating
             // handler hops read-only on EVERY chunk). Status 0 = the
@@ -2423,72 +2423,6 @@ pub fn resumeBoundFetchChain(
     });
 }
 
-/// blob-storage-plan P2 (+ handler-shape §5.3; `docs/architecture/routing-and-ingress.md`): submit the
-/// fetches a bound-fetch RESUME activation issued. Mirrors the
-/// worker_dispatch success-seam bind/drop logic for the resume case:
-///
-/// - `still_held = true` (repark): a `connection_scoped` fetch binds
-///   to the held entity (chunks resume this chain) — register the
-///   trampoline + bump the chain's BoundFetchCount (the entity is in
-///   `parked_continuations` here, not `request_out`, so the
-///   register-time bump soft-fails and we do it directly).
-/// - `still_held = false` (terminal): connection-scoped fetches drop
-///   (scope rule — the socket is closing); unbound ones still fire.
-///
-/// Caller invariant: READ-ONLY arms only, called AFTER `txn.commit`
-/// — no effect escapes before its activation committed (L4).
-pub fn flushResumeFetches(
-    worker: anytype,
-    ent: rove.Entity,
-    pending: *std.ArrayListUnmanaged(globals.PendingFetch),
-    still_held: bool,
-) void {
-    const allocator = worker.allocator;
-    if (pending.items.len == 0) return;
-    var submit: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
-    defer submit.deinit(allocator);
-    for (pending.items) |*pf| {
-        if (pf.connection_scoped) {
-            if (!still_held) {
-                pf.deinit(allocator);
-                continue;
-            }
-            pf.bind = true;
-            if (!@TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, ent)) {
-                pf.deinit(allocator);
-                continue;
-            }
-            // The trampoline's own count bump targets `request_out`
-            // (the open-hop home); on the resume path the entity is
-            // parked — bump where it actually lives.
-            if (worker.h2.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
-                cnt.pending +%= 1;
-            } else |_| {}
-        }
-        // Trusted internal doors (compile / stampManifest / receive) go to
-        // the worker-local subsystem, never the engine — AFTER the bind
-        // registration above so the door's completion event resumes THIS
-        // held chain. `tryDoorFetch` consumes the fetch.
-        if (worker.tryDoorFetch(pf.*)) continue;
-        submit.append(allocator, pf.*) catch {
-            pf.deinit(allocator);
-            continue;
-        };
-    }
-    // Ownership of every surviving item moved into `submit`; the
-    // caller's defer must not double-free.
-    pending.clearRetainingCapacity();
-    worker.node.enqueuePendingFetches(submit.items) catch |err| {
-        // Partial-transfer hazard: items before the failing one are
-        // already engine-owned, so freeing here risks a double-free.
-        // OOM-only path — accept the leak, log loud.
-        std.log.warn(
-            "rove-js bound-fetch resume: enqueuePendingFetches failed: {s} ({d} fetch(es) may leak)",
-            .{ @errorName(err), submit.items.len },
-        );
-    };
-    submit.clearRetainingCapacity();
-}
 
 /// §6.4 Part B: an `http.send` bound to a parked continuation
 /// completed — resume the held stream with the result as the outcome
