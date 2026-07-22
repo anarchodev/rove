@@ -16,6 +16,12 @@ const curl = blob.curl;
 /// `/_system/*` call and checked on the CP's own `/_control/*` writes.
 pub const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 
+/// Names the tenant a CP→worker `/_system/*` call targets.
+pub const TENANT_HEADER = "X-Rewind-Tenant";
+
+/// Carries a tenant's serving plan on the move-attach / birth calls.
+pub const PLAN_HEADER = "X-Rewind-Plan";
+
 /// One backend response the orchestrator cares about: status + an owned
 /// copy of the body (the source bundle, relayed into the attach call).
 pub const BackendResp = struct {

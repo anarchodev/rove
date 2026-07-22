@@ -30,6 +30,8 @@ const blob = @import("rove-blob");
 
 const curl = blob.curl;
 const bc = @import("backend_client.zig");
+const move = @import("move.zig");
+const reconciler = @import("reconciler.zig");
 const BackendResp = bc.BackendResp;
 const MOVE_SECRET_HEADER = bc.MOVE_SECRET_HEADER;
 const directory_mod = @import("cp-directory");
@@ -100,11 +102,9 @@ fn methodFrom(s: []const u8) ?curl.Method {
     return null;
 }
 
-const TENANT_HEADER = "X-Rewind-Tenant";
 /// Carries a tenant's opaque plan blob on `v2-attach` (delivery rides the move
 /// handshake) and `v2-plan` (live push). See the CP operational-state model
 /// (docs/architecture/control-plane.md).
-const PLAN_HEADER = "X-Rewind-Plan";
 
 const Router = struct {
     allocator: std.mem.Allocator,
@@ -585,27 +585,27 @@ const Router = struct {
         //    `/_control/plan`. Raft ids are positional (node i ↔ id i+1).
         const grow = self.reconcile_membership;
         const birth_nodes: []const []const u8 = if (grow) nodes[0..1] else nodes;
-        const birth_voters = (if (grow) a.dupe(u8, "1") else clusterVotersCsv(a, nodes.len)) catch {
+        const birth_voters = (if (grow) a.dupe(u8, "1") else move.clusterVotersCsv(a, nodes.len)) catch {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
         defer a.free(birth_voters);
-        if (!self.attachToAll(birth_nodes, "", tenant, null, birth_voters)) {
-            self.evictAll(tenant, birth_nodes, tbody);
+        if (!move.attachToAll(self, birth_nodes, "", tenant, null, birth_voters)) {
+            move.evictAll(self, tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
         // 2. Await the formed group's leader so the first request finds one. A
         //    born-`{self}` group auto-leads, so this returns at once; a born-multi
         //    group waits out its election.
-        if (!self.awaitDestLeader(birth_nodes, tenant)) {
-            self.evictAll(tenant, birth_nodes, tbody);
+        if (!move.awaitDestLeader(self, birth_nodes, tenant)) {
+            move.evictAll(self, tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 504);
             return;
         }
         // 3. Write the placement — the commit point that makes it routable.
         self.directory.assign(tenant, cluster) catch {
-            self.evictAll(tenant, nodes, tbody);
+            move.evictAll(self, tenant, nodes, tbody);
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
@@ -884,135 +884,6 @@ const Router = struct {
         return null;
     }
 
-    /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`, plus the
-    /// tenant's `X-Rewind-Plan` blob when set) out to every destination node.
-    /// The plan rides attach so the destination enforces the right limits from
-    /// the first post-move request (CP operational-state model,
-    /// docs/architecture/control-plane.md). True only
-    /// if all returned 204 (idempotent re-attach included). On the first
-    /// failure returns false; the caller evicts the partially-attached set.
-    /// The cluster's voter set as a comma-separated raft-id list `1,2,…,n` (raft
-    /// ids are positional — node index i → id i+1, the `REWIND_PEERS` convention).
-    /// Caller frees. The cluster node-set SSOT for a fresh tenant group.
-    fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer buf.deinit(a);
-        var i: usize = 1;
-        while (i <= n) : (i += 1) {
-            if (i != 1) try buf.append(a, ',');
-            try buf.writer(a).print("{d}", .{i});
-        }
-        return buf.toOwnedSlice(a);
-    }
-
-    fn attachToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8) bool {
-        const a = self.allocator;
-        var hdrs: [3]curl.Header = undefined;
-        hdrs[0] = .{ .name = TENANT_HEADER, .value = tenant };
-        var nh: usize = 1;
-        if (plan) |p| {
-            hdrs[nh] = .{ .name = PLAN_HEADER, .value = p };
-            nh += 1;
-        }
-        // Cluster node-set SSOT: the cluster's node set as the born
-        // group's voter set, the CP-owned single source of truth — the SAME set
-        // for every node, so the group forms consistently without depending on
-        // each node's static `REWIND_VOTERS`. Null → the node falls back to its env.
-        if (birth_voters) |v| {
-            hdrs[nh] = .{ .name = "X-Rewind-Voters", .value = v };
-            nh += 1;
-        }
-        for (dest_nodes) |base| {
-            const resp = bc.call(self, base, "/_system/v2-attach", .POST, bundle, hdrs[0..nh]) catch |err| {
-                std.log.warn("rewind-cp: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
-                return false;
-            };
-            var r = resp;
-            defer r.deinit(a);
-            if (r.status != 204) {
-                std.log.warn("rewind-cp: v2-attach on {s} → {d}", .{ base, r.status });
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /// Poll every destination node's `/_system/v2-leader?tenant=…` until one
-    /// reports 200 (the formed group elected a leader), bounded by a wall
-    /// deadline. True once a leader is seen; false on timeout.
-    fn awaitDestLeader(self: *Router, dest_nodes: []const []const u8, tenant: []const u8) bool {
-        const a = self.allocator;
-        const suffix = std.fmt.allocPrint(a, "/_system/v2-leader?tenant={s}", .{tenant}) catch return false;
-        defer a.free(suffix);
-        const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
-        while (std.time.nanoTimestamp() < deadline) {
-            for (dest_nodes) |base| {
-                const resp = bc.call(self, base, suffix, .GET, "", &.{}) catch continue;
-                var r = resp;
-                r.deinit(a);
-                if (r.status == 200) return true;
-            }
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-        }
-        return false;
-    }
-
-    /// Best-effort `/_system/v2-evict` to every node of a cluster (the move
-    /// committed, or we are unwinding a partial attach). Logs failures.
-    fn evictAll(self: *Router, tenant: []const u8, nodes: []const []const u8, tbody: []const u8) void {
-        const a = self.allocator;
-        for (nodes) |base| {
-            if (bc.call(self, base, "/_system/v2-evict", .POST, tbody, &.{})) |ev| {
-                var e2 = ev;
-                e2.deinit(a);
-            } else |err| {
-                std.log.warn("rewind-cp: evict {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
-            }
-        }
-    }
-
-    /// Additive membership reconciler (opt-in `reconcile_membership`).
-    /// On the directory leader, converge each placed tenant's DP group
-    /// membership to its cluster's node set: for the first not-caught-up node
-    /// per group per pass, take a LEARNER-FIRST `ensureMember` step. ADDITIVE
-    /// ONLY — never removes/migrates/destroys. Blocking HTTP on the loop,
-    /// bounded to one node per group per pass.
-    fn reconcileMembership(self: *Router) void {
-        if (!self.reconcile_membership) return;
-        if (!self.directory.isLeader()) return; // single writer
-        self.reconcile_passes += 1;
-        const a = self.allocator;
-        const tenants = self.directory.listPlacements(a) catch return;
-        defer {
-            for (tenants) |t| a.free(t);
-            a.free(tenants);
-        }
-        for (tenants) |tenant| {
-            // resolveOwned (not resolve): the node set is held across the blocking
-            // backendCalls below, and a concurrent re-address (applyClusterLocal on
-            // the pump thread — exactly the /_control/cluster grow that adds a
-            // node) frees `resolve`'s projection-aliased slice → use-after-free.
-            // The owned copy is taken under the directory lock.
-            var res = (self.directory.resolveOwned(a, tenant) catch continue) orelse continue;
-            defer res.deinit(a);
-            const nodes = res.nodes;
-            if (nodes.len == 0) continue;
-            const leader_url = self.findDestLeaderUrl(nodes, tenant) orelse continue;
-            defer a.free(leader_url);
-            // One membership CHANGE per group per pass: a node that's already
-            // good (.done) → check the next; a transient failure (.failed) →
-            // try the NEXT node (a single unreachable node must not starve the
-            // rest of the cluster from being backfilled); a real mutation
-            // (.progressed) → stop and re-observe next pass.
-            for (nodes, 0..) |node_url, i| {
-                const node_id: u64 = @intCast(i + 1); // POSITIONAL id (nodes[i] ↔ raft id i+1)
-                switch (self.ensureMember(tenant, node_url, node_id, leader_url, res.id)) {
-                    .done, .failed => continue,
-                    .progressed => break,
-                }
-            }
-        }
-    }
 
     // ── Zero-downtime move ───────────────────────────────────────────
 
@@ -1079,8 +950,8 @@ const Router = struct {
         //    from the first forwarded write onward.
         const plan_blob = self.directory.planForOwned(a, tenant) catch null;
         defer if (plan_blob) |p| a.free(p);
-        if (!self.attachToAll(dest_nodes, "", tenant, plan_blob, null)) {
-            self.evictAll(tenant, dest_nodes, tbody);
+        if (!move.attachToAll(self, dest_nodes, "", tenant, plan_blob, null)) {
+            move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
@@ -1088,22 +959,22 @@ const Router = struct {
         //    dest node list, leader first — the source tries it in order and
         //    re-aims past 421s, so a dest leader change mid-overlap costs a
         //    retry hop instead of failing acked source writes.
-        const dest_leader = self.findDestLeaderUrl(dest_nodes, tenant) orelse {
-            self.evictAll(tenant, dest_nodes, tbody);
+        const dest_leader = move.findDestLeaderUrl(self, dest_nodes, tenant) orelse {
+            move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 504);
             return;
         };
         defer a.free(dest_leader);
-        const fwd_targets = csvLeaderFirst(a, dest_leader, dest_nodes) orelse {
-            self.evictAll(tenant, dest_nodes, tbody);
+        const fwd_targets = move.csvLeaderFirst(a, dest_leader, dest_nodes) orelse {
+            move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
         defer a.free(fwd_targets);
 
         // 3. forward-begin on the source leader (dual-write to the dest).
-        if (!self.forwardBeginOnLeader(src_nodes, tenant, fwd_targets)) {
-            self.evictAll(tenant, dest_nodes, tbody);
+        if (!move.forwardBeginOnLeader(self, src_nodes, tenant, fwd_targets)) {
+            move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
@@ -1112,9 +983,9 @@ const Router = struct {
         //      every dest node in merge mode (insert-if-absent). The source
         //      pushes peer→peer; the CP never buffers the bundle, so a
         //      multi-GB tenant moves with bounded memory on all three parties.
-        if (!self.streamMergeToAll(src_nodes, dest_nodes, tenant)) {
-            self.forwardEndOnLeader(src_nodes, tenant);
-            self.evictAll(tenant, dest_nodes, tbody);
+        if (!move.streamMergeToAll(self, src_nodes, dest_nodes, tenant)) {
+            move.forwardEndOnLeader(self, src_nodes, tenant);
+            move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
@@ -1128,507 +999,13 @@ const Router = struct {
         // 7. Evict the source (drops instance + group + forward marker → it
         //    stops serving + forwarding; serve-or-forward routes stragglers
         //    to the dest). Evict subsumes forward-end on the happy path.
-        self.evictAll(tenant, src_nodes, tbody);
+        move.evictAll(self, tenant, src_nodes, tbody);
 
         const msg = std.fmt.allocPrint(a, "moved-live {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
             try replyStatus(server, ent, sid, sess, 200);
             return;
         };
         try replyText(server, ent, sid, sess, 200, msg);
-    }
-
-    /// Poll every destination node's `/_system/v2-leader?tenant=` until one
-    /// reports 200, and return that node's base URL (owned) — the source's
-    /// forward target. Null on timeout.
-    fn findDestLeaderUrl(self: *Router, dest_nodes: []const []const u8, tenant: []const u8) ?[]u8 {
-        const a = self.allocator;
-        const suffix = std.fmt.allocPrint(a, "/_system/v2-leader?tenant={s}", .{tenant}) catch return null;
-        defer a.free(suffix);
-        const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
-        while (std.time.nanoTimestamp() < deadline) {
-            for (dest_nodes) |base| {
-                const resp = bc.call(self, base, suffix, .GET, "", &.{}) catch continue;
-                var r = resp;
-                r.deinit(a);
-                if (r.status == 200) return a.dupe(u8, base) catch null;
-            }
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-        }
-        return null;
-    }
-
-    /// The forward-target list for `v2-forward-begin`: every dest node's base
-    /// URL, comma-separated, with the current leader first (the common case
-    /// is then one forward attempt). Null on OOM.
-    fn csvLeaderFirst(a: std.mem.Allocator, leader: []const u8, nodes: []const []const u8) ?[]u8 {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        defer out.deinit(a);
-        out.appendSlice(a, leader) catch return null;
-        for (nodes) |base| {
-            if (std.mem.eql(u8, base, leader)) continue;
-            out.append(a, ',') catch return null;
-            out.appendSlice(a, base) catch return null;
-        }
-        return out.toOwnedSlice(a) catch null;
-    }
-
-    /// forward-begin on the source leader: try each source node's leader-gated
-    /// `/_system/v2-forward-begin {tenant,dest}` until one 204s (the leader).
-    fn forwardBeginOnLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8, dest_url: []const u8) bool {
-        const a = self.allocator;
-        const fb = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"dest\":\"{s}\"}}", .{ tenant, dest_url }) catch return false;
-        defer a.free(fb);
-        for (src_nodes) |base| {
-            const resp = bc.call(self, base, "/_system/v2-forward-begin", .POST, fb, &.{}) catch continue;
-            const ok = resp.status == 204;
-            var r = resp;
-            r.deinit(a);
-            if (ok) return true;
-        }
-        return false;
-    }
-
-    /// forward-end on the source leader (abort cleanup): best-effort.
-    fn forwardEndOnLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8) void {
-        const a = self.allocator;
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return;
-        defer a.free(tbody);
-        for (src_nodes) |base| {
-            if (bc.call(self, base, "/_system/v2-forward-end", .POST, tbody, &.{})) |r| {
-                const ok = r.status == 204;
-                var rr = r;
-                rr.deinit(a);
-                if (ok) return;
-            } else |_| {}
-        }
-    }
-
-    /// STREAM the source leader's non-quiescing snapshot directly to every
-    /// destination node in merge mode (insert-if-absent) — the source pushes
-    /// peer→peer, so the CP never buffers a (multi-GB) bundle.
-    fn streamMergeToAll(self: *Router, src_nodes: []const []const u8, dest_nodes: []const []const u8, tenant: []const u8) bool {
-        for (dest_nodes) |dest| {
-            if (!self.snapshotPushToLeader(src_nodes, tenant, dest)) return false;
-        }
-        return true;
-    }
-
-    /// Try each source node's leader-gated `/_system/v2-snapshot-push` until one
-    /// accepts (the leader streams its held snapshot to `dest` in merge mode and
-    /// only then responds). Blocks for the whole transfer — generous timeout; the
-    /// source's own page-pinning deadline aborts first if the tenant is too big.
-    fn snapshotPushToLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8, dest: []const u8) bool {
-        const a = self.allocator;
-        const hdrs = [_]curl.Header{
-            .{ .name = TENANT_HEADER, .value = tenant },
-            .{ .name = "x-rewind-dest", .value = dest },
-            .{ .name = "x-rewind-snapshot-mode", .value = "merge" },
-        };
-        for (src_nodes) |base| {
-            const resp = bc.callTimeout(self, base, "/_system/v2-snapshot-push", .POST, "", &hdrs, 40 * 60 * 1000) catch |err| {
-                std.log.warn("rewind-cp: v2-snapshot-push on {s} → {s}", .{ base, @errorName(err) });
-                continue;
-            };
-            var r = resp;
-            defer r.deinit(a);
-            switch (r.status) {
-                // 204 = streamed + merged; 409 = dest already had it (benign).
-                204, 409 => return true,
-                // 421 = this source node isn't the leader; try the next.
-                421 => continue,
-                else => {
-                    std.log.warn("rewind-cp: v2-snapshot-push on {s} → {d}", .{ base, r.status });
-                    return false;
-                },
-            }
-        }
-        return false;
-    }
-
-    /// Blocking libcurl call to a backend's move surface, presenting the
-    /// move secret plus any `extra_headers` (e.g. `X-Rewind-Tenant`,
-    /// `X-Rewind-Plan`). Returns status + an owned copy of the response body.
-    // ── membership reconciler: ensureMember ─────────────────────────────────
-    //
-    // Composes the proven out-of-band endpoints into a LEARNER-FIRST step
-    // machine that converges a node toward a caught-up voter. Additive/safe:
-    // the only voting-power removal is a demote-to-learner of a STUCK voter (so
-    // it can't disrupt elections while it catches up — the __admin__ lesson);
-    // it never shrinks/migrates/destroys. All over the private CP network via
-    // backendCall (move-secret auto-added). Blocking HTTP on the CP loop; the
-    // reconciler does one node per group per pass.
-    const EnsureResult = enum { done, progressed, failed };
-    /// caught-up tolerance: matched/applied within this of leader_last counts as
-    /// caught up (raft replicates the tail in well under this; avoids flapping
-    /// as leader_last advances on a live group).
-    const RECONCILE_SLACK: u64 = 16;
-    const PeerJson = struct { id: u64 = 0, matched: u64 = 0, recent_active: bool = false };
-    const MemberStatusJson = struct {
-        leader_last: u64 = 0,
-        voters: []const u64 = &.{},
-        learners: []const u64 = &.{},
-        peers: []const PeerJson = &.{},
-    };
-    fn idIn(list: []const u64, id: u64) bool {
-        for (list) |x| if (x == id) return true;
-        return false;
-    }
-
-    /// RC-6 hysteresis: true iff `node_id` of `tenant` has been a continuous
-    /// demote candidate (`!recent_active`, still a hosted voter) for at least
-    /// `demote_grace_ns`. The FIRST call starts the timer and returns false, so a
-    /// single `!recent_active` reading (a transient restart) never demotes.
-    fn demoteGraceElapsed(self: *Router, tenant: []const u8, node_id: u64) bool {
-        var kbuf: [512]u8 = undefined;
-        const key = std.fmt.bufPrint(&kbuf, "{s}|{d}", .{ tenant, node_id }) catch return false;
-        const now = std.time.nanoTimestamp();
-        if (self.demote_inactive_since.getPtr(key)) |since|
-            return now - since.* >= self.demote_grace_ns;
-        // First observation — start the grace window; never demote on it.
-        const owned = self.allocator.dupe(u8, key) catch return false;
-        self.demote_inactive_since.put(self.allocator, owned, now) catch {
-            self.allocator.free(owned);
-            return false;
-        };
-        return false;
-    }
-
-    /// Clear `node_id` of `tenant`'s demote grace timer — the voter recovered
-    /// (recent_active) or left the hosted-voter state, so the window resets.
-    fn clearDemoteTimer(self: *Router, tenant: []const u8, node_id: u64) void {
-        var kbuf: [512]u8 = undefined;
-        const key = std.fmt.bufPrint(&kbuf, "{s}|{d}", .{ tenant, node_id }) catch return;
-        if (self.demote_inactive_since.fetchRemove(key)) |kv| self.allocator.free(kv.key);
-    }
-
-    /// Advance node `node_id` (at `node_url`) ONE step toward being a caught-up
-    /// voter of `tenant`'s group, talking to `leader_url`. `.done` when already a
-    /// caught-up voter, `.progressed` after a step (re-check next pass), `.failed`
-    /// on a transient error (retry next pass).
-    fn ensureMember(self: *Router, tenant: []const u8, node_url: []const u8, node_id: u64, leader_url: []const u8, cluster_id: []const u8) EnsureResult {
-        const a = self.allocator;
-        // The leader is trivially a caught-up voter of its own group.
-        if (std.mem.eql(u8, node_url, leader_url)) return .done;
-
-        // The joining node's raft transport address from the registry (genesis
-        // §3.3), carried on the add/promote conf-change so the leader can dial
-        // it. Empty when the node isn't registered (a still-static cluster —
-        // the leader falls back to its static peers). Owned; freed below.
-        const raft_addr_owned: ?[]u8 = self.raftAddrFor(cluster_id, node_id);
-        defer if (raft_addr_owned) |ra| a.free(ra);
-        const raft_addr: []const u8 = raft_addr_owned orelse "";
-
-        // 1. Observe the leader's per-peer view.
-        const ms_path = std.fmt.allocPrint(a, "/_system/v2-member-status?tenant={s}", .{tenant}) catch return .failed;
-        defer a.free(ms_path);
-        const ms_resp = bc.call(self, leader_url, ms_path, .GET, "", &.{}) catch return .failed;
-        defer a.free(ms_resp.body);
-        if (ms_resp.status != 200) return .failed;
-        var parsed = std.json.parseFromSlice(MemberStatusJson, a, ms_resp.body, .{ .ignore_unknown_fields = true }) catch return .failed;
-        defer parsed.deinit();
-        const ms = parsed.value;
-
-        const is_voter = idIn(ms.voters, node_id);
-        const is_learner = idIn(ms.learners, node_id);
-        var voter_recent_active = false;
-        if (is_voter) {
-            for (ms.peers) |p| {
-                if (p.id == node_id) {
-                    voter_recent_active = p.recent_active;
-                    if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) {
-                        self.clearDemoteTimer(tenant, node_id); // responsive + caught up → reset grace
-                        return .done;
-                    }
-                    break;
-                }
-            }
-        }
-
-        // OBSERVE whether the node holds a local instance. CRITICAL: distinguish
-        // a CONFIRMED-absent (a clean 404 from a reachable node) from an UNKNOWN
-        // (unreachable / errored / 5xx). A configured voter is removed ONLY when
-        // its absence is confirmed — never on a probe failure, or a merely
-        // rebooting/partitioned healthy voter gets torn out of the config (and a
-        // rolling deploy makes voters transiently unreachable by design).
-        const host = self.nodeGroupState(node_url, tenant);
-        if (host == .unknown) return .failed; // can't observe → never mutate; retry next pass
-
-        // RC-6 hysteresis bookkeeping: keep a demote grace timer ONLY while the
-        // node is an actual demote candidate (a hosted voter the leader hasn't
-        // heard from). Any other observed state resets it, so a transient
-        // inactivity long ago can't carry into a later window and demote instantly.
-        if (!(is_voter and host == .hosted and !voter_recent_active))
-            self.clearDemoteTimer(tenant, node_id);
-
-        if (is_voter) {
-            if (host == .hosted) {
-                // DEMOTE only a STUCK voter — one the leader has NOT heard from
-                // within an election timeout (recent_active=false under
-                // check_quorum: partitioned / dead / campaigning without acking
-                // appends — the __admin__ wall). Demoting it stops it disrupting
-                // elections while it catches up. A RESPONSIVE voter that is merely
-                // BEHIND (recent_active but lagging under write load) is catching
-                // up fine via normal replication and is NOT disrupting elections —
-                // demoting it just churns healthy voters on a busy group (B1).
-                // Leave it; raft replicates the tail.
-                if (!voter_recent_active) {
-                    // RC-6: demote only after SUSTAINED inactivity
-                    // (REWIND_CP_DEMOTE_GRACE_MS). A single !recent_active reading
-                    // is a transient restart, not a stuck voter, and tearing out a
-                    // healthy-but-restarting voter shrinks the voter set →
-                    // sub-majority commit (RC-1's trigger). Wait out the grace; a
-                    // genuinely stuck voter stays inactive across it and is demoted.
-                    if (!self.demoteGraceElapsed(tenant, node_id)) return .done;
-                    self.clearDemoteTimer(tenant, node_id);
-                    return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote", raft_addr)) .progressed else .failed;
-                }
-                return .done; // responsive, just behind — no membership change needed
-            }
-            // host == .absent: a CONFIRMED phantom voter (configured voter,
-            // reachable, NO local instance — wiped or never-formed) is REMOVED,
-            // not bootstrapped in place. Bootstrapping a voter relies on the
-            // leader's Progress.match (stale-HIGH from before the wipe) lining up
-            // with the new baseline EXACTLY — and the leader's heartbeat carries
-            // commit = min(match, committed), so if the node is reborn below that
-            // match raft fatal!s (commit_to out of range). Removing the node drops
-            // the leader's Progress entirely; the next pass re-adds it as a
-            // LEARNER with a FRESH match=0, so the leader can never send a commit
-            // beyond the node's log. The manager's ConfChangeQuorumGuard refuses
-            // any remove that would drop below 2 voters, so this can't lose
-            // quorum. Structural fix — the panic becomes impossible, not unlikely.
-            return if (self.reconcileConfChange(leader_url, tenant, node_id, "remove", raft_addr)) .progressed else .failed;
-        }
-        if (is_learner) {
-            if (host == .absent)
-                return if (self.bootstrapMember(leader_url, node_url, tenant, node_id, true, cluster_id)) .progressed else .failed;
-            const last_idx = self.nodeLastIndex(node_url, tenant) orelse return .progressed;
-            if (last_idx + RECONCILE_SLACK >= ms.leader_last)
-                return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote", raft_addr)) .progressed else .failed;
-            return .progressed; // catching up
-        }
-        // Absent from the config entirely: bootstrap as a learner (only if the
-        // node doesn't already host the group) then AddLearner on the leader. The
-        // born-learner idles (no campaign) until the leader's AddLearner lets it
-        // replicate, then it catches up + is promoted next pass.
-        if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, node_id, true, cluster_id)) return .failed;
-        return if (self.reconcileConfChange(leader_url, tenant, node_id, "add", raft_addr)) .progressed else .failed;
-    }
-
-    const HostState = enum { hosted, absent, unknown };
-    /// Observe whether `node_url` holds a local group instance for `tenant`:
-    /// `.hosted` (confstate 200), `.absent` (a clean 404 — reachable, no
-    /// instance), or `.unknown` (unreachable / error / unexpected status). The
-    /// hosted-vs-absent-vs-unknown distinction is load-bearing: the reconciler
-    /// must never treat "can't reach the node" as "the node is empty".
-    fn nodeGroupState(self: *Router, node_url: []const u8, tenant: []const u8) HostState {
-        const a = self.allocator;
-        const path = std.fmt.allocPrint(a, "/_system/v2-confstate?tenant={s}", .{tenant}) catch return .unknown;
-        defer a.free(path);
-        const resp = bc.call(self, node_url, path, .GET, "", &.{}) catch return .unknown;
-        defer a.free(resp.body);
-        return switch (resp.status) {
-            200 => .hosted,
-            404 => .absent,
-            else => .unknown,
-        };
-    }
-
-    /// `node_url`'s own raft LOG last index for `tenant` (the learner→promote
-    /// catch-up signal), or null. Read from the NON-leader-gated `v2-last-index`
-    /// (a learner is never the leader, so the leader-gated `v2-applied-baseline`
-    /// would 421). This is the raft log's `last_index()` — entries RECEIVED into
-    /// the log, which is the right promote gate: it is compared against the
-    /// leader's own `leader_last` (also `last_index()`), so like is compared with
-    /// like, and a node whose LOG has caught up is a valid voter (raft votes on
-    /// log position, not apply). An out-of-band baseline (`apply_local_snapshot`)
-    /// advances `last_index` directly, unlike the commit-seq atomic or the
-    /// bundle-seeded store watermark, so a quiescent caught-up learner still trips
-    /// the gate.
-    fn nodeLastIndex(self: *Router, node_url: []const u8, tenant: []const u8) ?u64 {
-        const a = self.allocator;
-        const path = std.fmt.allocPrint(a, "/_system/v2-last-index?tenant={s}", .{tenant}) catch return null;
-        defer a.free(path);
-        const resp = bc.call(self, node_url, path, .GET, "", &.{}) catch return null;
-        defer a.free(resp.body);
-        if (resp.status != 200) return null;
-        var p = std.json.parseFromSlice(struct { last_index: u64 = 0 }, a, resp.body, .{ .ignore_unknown_fields = true }) catch return null;
-        defer p.deinit();
-        return p.value.last_index;
-    }
-
-    /// Propose a conf-change (`add`/`promote`/`demote`/`remove`) on `leader_url`.
-    /// The joining node's raft transport address (`host:port`) from the
-    /// directory registry, OWNED (caller frees), or null if unregistered. The
-    /// genesis §3.3 address the reconciler carries on a conf-change add/promote.
-    fn raftAddrFor(self: *Router, cluster_id: []const u8, node_id: u64) ?[]u8 {
-        const a = self.allocator;
-        const packed_bytes = (self.directory.nodeAddrOwned(a, cluster_id, node_id) catch return null) orelse return null;
-        defer a.free(packed_bytes);
-        const na = Directory.unpackNodeAddr(packed_bytes) orelse return null;
-        if (na.raft_addr.len == 0) return null;
-        return a.dupe(u8, na.raft_addr) catch null;
-    }
-
-    fn reconcileConfChange(self: *Router, leader_url: []const u8, tenant: []const u8, node_id: u64, op: []const u8, raft_addr: []const u8) bool {
-        const a = self.allocator;
-        // Carry the address only when known (add/promote of a registered node);
-        // a demote/remove or a still-static cluster sends the bare body.
-        const body = if (raft_addr.len > 0)
-            std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\",\"raft_addr\":\"{s}\"}}", .{ tenant, node_id, op, raft_addr }) catch return false
-        else
-            std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\"}}", .{ tenant, node_id, op }) catch return false;
-        defer a.free(body);
-        self.confchange_total += 1;
-        const resp = bc.call(self, leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch {
-            self.confchange_failed += 1;
-            return false;
-        };
-        defer a.free(resp.body);
-        if (resp.status != 204) {
-            self.confchange_failed += 1;
-            std.log.warn("rewind-cp: reconcile confchange {s} node={d} {s} → {d}", .{ op, node_id, tenant, resp.status });
-            return false;
-        }
-        std.log.info("rewind-cp: reconcile confchange {s} node={d} on {s}", .{ op, node_id, tenant });
-        return true;
-    }
-
-    /// Out-of-band bootstrap of `tenant`'s group onto `node_url`: pull the
-    /// leader's baseline {index,term} + snapshot bundle, attach (create group +
-    /// load) on the node, then install the data-free raft baseline so the leader
-    /// replicates the tail.
-    /// Format a raft-id list as `a,b,c`, optionally appending one more id. Caller
-    /// frees. Builds the augmented-ConfState membership headers.
-    fn joinIdsAug(a: std.mem.Allocator, ids: []const u64, extra: ?u64) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer buf.deinit(a);
-        for (ids, 0..) |id, i| {
-            if (i != 0) try buf.append(a, ',');
-            try buf.writer(a).print("{d}", .{id});
-        }
-        if (extra) |e| {
-            if (ids.len != 0) try buf.append(a, ',');
-            try buf.writer(a).print("{d}", .{e});
-        }
-        return buf.toOwnedSlice(a);
-    }
-
-    /// Build the genesis §4d attach-carry header — `id@raft_addr,…` for every
-    /// REGISTERED cluster node EXCEPT `skip_id` (the joiner itself) — so a
-    /// genesis-booted joiner learns the existing members' transport addresses and
-    /// can ACK the leader's appends. Owned; null/empty when nothing is registered
-    /// (a static-`REWIND_PEERS` cluster), in which case the header is omitted.
-    fn peerAddrsHeader(self: *Router, cluster_id: []const u8, skip_id: u64) ?[]u8 {
-        const a = self.allocator;
-        const entries = self.directory.listClusterNodeAddrs(a, cluster_id) catch return null;
-        defer {
-            for (entries) |*e| e.deinit(a);
-            a.free(entries);
-        }
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        defer out.deinit(a);
-        for (entries) |e| {
-            if (e.id == skip_id) continue;
-            const na = Directory.unpackNodeAddr(e.bytes) orelse continue;
-            if (na.raft_addr.len == 0) continue;
-            if (out.items.len != 0) out.append(a, ',') catch return null;
-            out.writer(a).print("{d}@{s}", .{ e.id, na.raft_addr }) catch return null;
-        }
-        if (out.items.len == 0) return null;
-        return out.toOwnedSlice(a) catch null;
-    }
-
-    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8, node_id: u64, as_learner: bool, cluster_id: []const u8) bool {
-        const a = self.allocator;
-        const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
-        defer a.free(bpath);
-        const bresp = bc.call(self, leader_url, bpath, .GET, "", &.{}) catch return false;
-        defer a.free(bresp.body);
-        if (bresp.status != 200) return false;
-        var bp = std.json.parseFromSlice(
-            struct { index: u64 = 0, term: u64 = 0, epoch: u64 = 1, voters: []const u64 = &.{}, learners: []const u64 = &.{} },
-            a,
-            bresp.body,
-            .{ .ignore_unknown_fields = true },
-        ) catch return false;
-        defer bp.deinit();
-
-        // The leader's ConfState must be non-empty for a live group. An EMPTY
-        // voter set means the leader's group is mid-birth (ConfState not yet
-        // committed/applied) — bootstrapping a joiner from it would send an empty
-        // `X-Rewind-Voters`, and the joiner would fall back to `{self}` (a rogue
-        // sole-self group). Refuse + retry next pass rather than birth a split.
-        if (bp.value.voters.len == 0) {
-            std.log.warn("rewind-cp: bootstrap {s} onto {s}: leader baseline has EMPTY voters (index={d} term={d} epoch={d}); retrying", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch });
-            return false;
-        }
-
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
-        defer a.free(tbody);
-        const snap = bc.call(self, leader_url, "/_system/v2-snapshot", .POST, tbody, &.{}) catch return false;
-        defer a.free(snap.body);
-        if (snap.status != 200) return false;
-
-        // Attach AND install the baseline atomically (X-Rewind-Baseline-* headers
-        // → createGroupAtBaseline on the worker). A separate v2-apply-snapshot
-        // POST would leave a window where the freshly-attached empty group
-        // (last_index 0) is reachable; a leader heartbeat carrying commit > 0
-        // arriving in that window crashes raft (commit_to out of range). One
-        // atomic op closes it. The store bundle (snap.body) is loaded by attach
-        // before the group is created, so the baseline's data is already present.
-        const bidx = std.fmt.allocPrint(a, "{d}", .{bp.value.index}) catch return false;
-        defer a.free(bidx);
-        const bterm = std.fmt.allocPrint(a, "{d}", .{bp.value.term}) catch return false;
-        defer a.free(bterm);
-        // Birth the joining group at the LEADER's epoch, not a hard-coded 1, or
-        // the leader's epoch-stamped messages are fenced out and the join stalls
-        // (the genesis `__admin__` group is epoch 0; a moved tenant is >1).
-        const bepoch = std.fmt.allocPrint(a, "{d}", .{bp.value.epoch}) catch return false;
-        defer a.free(bepoch);
-        // Membership SSOT, the AUGMENTED-ConfState approach: the
-        // baseline carries the leader's CURRENT ConfState PLUS this node as a
-        // learner, so the joiner learns its membership from the snapshot
-        // (raft.rs:2629) AND satisfies the recipient-must-be-in-the-ConfState rule
-        // (raft.rs:2581) WITHOUT requiring the leader's AddLearner to commit first.
-        // Crucially this keeps the panic-safe bootstrap-THEN-add ORDER: the leader
-        // does not track/commit-to this node until the AddLearner that FOLLOWS this
-        // bootstrap, so it can never send a commit past the node's just-installed
-        // baseline (the `to_commit out of range` abort the add-FIRST reorder hit).
-        // `add_self` augments only when the leader's view doesn't already list the
-        // node (the absent-from-config first touch); when it is already a learner
-        // (re-bootstrap) the set is the leader's as-is.
-        const add_self = !idIn(bp.value.voters, node_id) and !idIn(bp.value.learners, node_id);
-        const voters_csv = joinIdsAug(a, bp.value.voters, null) catch return false;
-        defer a.free(voters_csv);
-        const learners_csv = joinIdsAug(a, bp.value.learners, if (add_self) node_id else null) catch return false;
-        defer a.free(learners_csv);
-
-        // Join as a non-voting learner (born-learner) when ADDING this node to
-        // the group — a learner doesn't campaign, so it follows the leader and
-        // catches up instead of deadlocking a high-term group. The baseline's
-        // ConfState (above) is authoritative for the final role; this seeds the
-        // pre-baseline born state.
-        // Genesis §4d (attach-carry): the existing members' raft addresses, so a
-        // genesis joiner can ACK the leader. Null on a static cluster → header
-        // omitted. Lives until the call below.
-        const peer_addrs = self.peerAddrsHeader(cluster_id, node_id);
-        defer if (peer_addrs) |pa| a.free(pa);
-        var th_buf = [_]curl.Header{
-            .{ .name = TENANT_HEADER, .value = tenant },
-            .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
-            .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
-            .{ .name = "X-Rewind-Epoch", .value = bepoch },
-            .{ .name = "X-Rewind-Join-As-Learner", .value = if (as_learner) "1" else "0" },
-            .{ .name = "X-Rewind-Voters", .value = voters_csv },
-            .{ .name = "X-Rewind-Learners", .value = learners_csv },
-            .{ .name = "X-Rewind-Peer-Addrs", .value = peer_addrs orelse "" },
-        };
-        const th: []const curl.Header = if (peer_addrs != null) th_buf[0..8] else th_buf[0..7];
-        const ar = bc.call(self, node_url, "/_system/v2-attach", .POST, snap.body, th) catch return false;
-        defer a.free(ar.body);
-        if (ar.status != 204) return false;
-        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={}, conf_state voters=[{s}] learners=[{s}])", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner, voters_csv, learners_csv });
-        return true;
     }
 
 };
@@ -1980,7 +1357,7 @@ pub fn main() !void {
             const now_ns = std.time.nanoTimestamp();
             if (now_ns - last_reconcile_ns > reconcile_period_ns) {
                 last_reconcile_ns = now_ns;
-                router.reconcileMembership();
+                reconciler.reconcileMembership(&router);
             }
         }
 
@@ -1998,48 +1375,3 @@ pub fn main() !void {
     std.log.info("rewind-cp: shut down", .{});
 }
 
-// ── RC-6 demote hysteresis ───────────────────────────────────────────────────
-
-test "RC-6: demote needs sustained inactivity — a recovery before the grace resets it" {
-    const a = std.testing.allocator;
-    // Only the demote-timer fields are exercised by demoteGraceElapsed /
-    // clearDemoteTimer; the rest of Router is never touched here.
-    var r: Router = undefined;
-    r.allocator = a;
-    r.demote_inactive_since = .empty;
-    defer {
-        var it = r.demote_inactive_since.iterator();
-        while (it.next()) |e| a.free(e.key_ptr.*);
-        r.demote_inactive_since.deinit(a);
-    }
-
-    // grace 0: the SECOND consecutive inactive observation is already past the
-    // window. Even so, a demote NEVER fires on the FIRST observation — a single
-    // !recent_active reading is always treated as a transient.
-    r.demote_grace_ns = 0;
-
-    // SUSTAINED candidate (the genuinely-stuck voter): obs #1 starts the timer
-    // (no demote), obs #2 is past the (zero) grace → demote. This proves the
-    // mechanism still demotes a real stuck voter.
-    try std.testing.expect(!r.demoteGraceElapsed("stuck", 2)); // obs #1 — never on first sight
-    try std.testing.expect(r.demoteGraceElapsed("stuck", 2)); // obs #2 — sustained → demote
-
-    // TRANSIENT-THEN-RECOVER (the rolling-restart hazard): SAME grace (0), SAME
-    // two inactive observations — but the voter RECOVERS (timer cleared) in
-    // between, so the post-recovery observation is a fresh "first" and must NOT
-    // demote. The recovery is the only difference from the sustained case above,
-    // and it flips the outcome demote → no-demote.
-    try std.testing.expect(!r.demoteGraceElapsed("flap", 3)); // obs #1 inactive (transient)
-    r.clearDemoteTimer("flap", 3); //                            recovered: recent_active again
-    try std.testing.expect(!r.demoteGraceElapsed("flap", 3)); // obs after recovery — NOT demoted
-
-    // Distinct (tenant,node) keys never share a window.
-    try std.testing.expect(!r.demoteGraceElapsed("flap", 4)); // different node → own fresh timer
-    try std.testing.expect(!r.demoteGraceElapsed("other", 3)); // different tenant → own fresh timer
-
-    // A real (non-zero) grace never demotes within the window, across repeated
-    // observations — a voter inactive for < grace is left a voter.
-    r.demote_grace_ns = 60 * std.time.ns_per_s;
-    try std.testing.expect(!r.demoteGraceElapsed("slow", 5));
-    try std.testing.expect(!r.demoteGraceElapsed("slow", 5)); // still within 60s → no demote
-}
