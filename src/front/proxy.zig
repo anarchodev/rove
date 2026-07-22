@@ -155,31 +155,8 @@ pub const SETTLE_WAIT_NS: i128 = 2000 * std.time.ns_per_ms;
 
 // ── Small shared helpers ──────────────────────────────────────────────
 
-pub fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
-    const fields = rh.fields orelse return null;
-    var i: u32 = 0;
-    while (i < rh.count) : (i += 1) {
-        const f = fields[i];
-        if (std.ascii.eqlIgnoreCase(f.name[0..f.name_len], name)) {
-            return f.value[0..f.value_len];
-        }
-    }
-    return null;
-}
-
-/// Same lookup over a RESPONSE header set (worker → front). Used to read the
-/// `x-rewind-leader` redirect hint off a 421.
-pub fn respHeaderValue(rh: h2.RespHeaders, name: []const u8) ?[]const u8 {
-    const fields = rh.fields orelse return null;
-    var i: u32 = 0;
-    while (i < rh.count) : (i += 1) {
-        const f = fields[i];
-        if (std.ascii.eqlIgnoreCase(f.name[0..f.name_len], name)) {
-            return f.value[0..f.value_len];
-        }
-    }
-    return null;
-}
+pub const headerValue = util.headerValue;
+pub const respHeaderValue = util.respHeaderValue;
 
 /// Map the worker's `x-rewind-leader` raft id to a serving origin in `nodes`.
 /// The cluster node list is ordered by raft node id (the `REWIND_CLUSTERS` /
@@ -305,6 +282,7 @@ fn dropFromResponse(name: []const u8) bool {
 }
 
 const pool = @import("proxy/pool.zig");
+const util = @import("proxy/util.zig");
 const route_cache = @import("proxy/route_cache.zig");
 const dupNodes = route_cache.dupNodes;
 const freeNodes = route_cache.freeNodes;
@@ -316,6 +294,7 @@ const RouteResult = route_cache.RouteResult;
 // (main.zig references proxy.zig, which references these).
 test {
     _ = pool;
+    _ = util;
     _ = route_cache;
 }
 
@@ -2136,45 +2115,11 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         // ── Header packing ────────────────────────────────────────────
 
-        const PackedFields = struct {
-            fields: ?[*]h2.HeaderField,
-            count: u32,
-            buf: ?[*]u8,
-            buf_len: u32,
-        };
-
-        const NameValue = struct { name: []const u8, value: []const u8 };
-
-        fn packFields(a: std.mem.Allocator, list: []const NameValue) !PackedFields {
-            if (list.len == 0) return .{ .fields = null, .count = 0, .buf = null, .buf_len = 0 };
-            const HF = h2.HeaderField;
-            var strbytes: usize = 0;
-            for (list) |nv| strbytes += nv.name.len + nv.value.len;
-            const fields_size = list.len * @sizeOf(HF);
-            const total = fields_size + strbytes;
-            const buf = try a.alloc(u8, total);
-            const fields: [*]HF = @ptrCast(@alignCast(buf.ptr));
-            const sb = buf.ptr + fields_size;
-            var off: usize = 0;
-            for (list, 0..) |nv, i| {
-                const noff = off;
-                @memcpy(sb[noff .. noff + nv.name.len], nv.name);
-                // HTTP/2 requires lowercase field names (h1 ingress may
-                // carry mixed case).
-                for (sb[noff .. noff + nv.name.len]) |*ch| ch.* = std.ascii.toLower(ch.*);
-                off += nv.name.len;
-                const voff = off;
-                @memcpy(sb[voff .. voff + nv.value.len], nv.value);
-                off += nv.value.len;
-                fields[i] = .{
-                    .name = sb + noff,
-                    .name_len = @intCast(nv.name.len),
-                    .value = sb + voff,
-                    .value_len = @intCast(nv.value.len),
-                };
-            }
-            return .{ .fields = fields, .count = @intCast(list.len), .buf = buf.ptr, .buf_len = @intCast(total) };
-        }
+        // Header pack/read primitives live in `proxy/util.zig` (pure, no
+        // Proxy state) — shared with proxy/ws_tunnel.zig.
+        const PackedFields = util.PackedFields;
+        const NameValue = util.NameValue;
+        const packFields = util.packFields;
 
         /// Build the upstream request head: pseudo-headers first
         /// (nghttp2 requires it), then the filtered originals, then the
