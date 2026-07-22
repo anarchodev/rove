@@ -516,22 +516,33 @@ pub const Directory = struct {
         };
     }
 
+    /// One replicated directory axis: a key prefix and the applier that
+    /// materializes a committed `{suffix}=value` write of that axis into the
+    /// in-memory projection. The single table drives the write dispatch (and
+    /// documents the axis set) so adding an axis is one row, not another
+    /// hand-wired `startsWith` + prefix-strip branch (the strip is centralized
+    /// in `applyDirKv`, killing the per-branch off-by-one risk).
+    const DirAxis = struct {
+        prefix: []const u8,
+        apply: *const fn (*Directory, []const u8, []const u8) Error!void,
+    };
+    const dir_axes = [_]DirAxis{
+        .{ .prefix = "cluster/", .apply = applyClusterFromJoined },
+        .{ .prefix = "placement/", .apply = applyPlacementFromValue },
+        .{ .prefix = "plan/", .apply = applyPlanLocal },
+        .{ .prefix = "host/", .apply = applyHostLocal },
+        .{ .prefix = "cert/", .apply = applyCertLocal },
+        .{ .prefix = "node/", .apply = applyNodeAddrLocal },
+    };
+
     /// Route a committed directory `key=value` to the projection by key
     /// prefix. Caller holds `self.mutex`. Unknown keys are ignored
     /// (forward-compatible with a later host-index axis).
     fn applyDirKv(self: *Directory, key: []const u8, value: []const u8) Error!void {
-        if (std.mem.startsWith(u8, key, "cluster/")) {
-            try self.applyClusterFromJoined(key["cluster/".len..], value);
-        } else if (std.mem.startsWith(u8, key, "placement/")) {
-            try self.applyPlacementFromValue(key["placement/".len..], value);
-        } else if (std.mem.startsWith(u8, key, "plan/")) {
-            try self.applyPlanLocal(key["plan/".len..], value);
-        } else if (std.mem.startsWith(u8, key, "host/")) {
-            try self.applyHostLocal(key["host/".len..], value);
-        } else if (std.mem.startsWith(u8, key, "cert/")) {
-            try self.applyCertLocal(key["cert/".len..], value);
-        } else if (std.mem.startsWith(u8, key, "node/")) {
-            try self.applyNodeAddrLocal(key["node/".len..], value);
+        for (dir_axes) |ax| {
+            if (std.mem.startsWith(u8, key, ax.prefix)) {
+                return ax.apply(self, key[ax.prefix.len..], value);
+            }
         }
     }
 

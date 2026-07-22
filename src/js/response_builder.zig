@@ -206,13 +206,33 @@ pub fn finalizeResponse(
     if (status_code >= 500) {
         std.log.warn("rove-5xx: status={d} body_len={d} (canned response on send path)", .{ status_code, body_len });
     }
+    try stageResponse(server, ent, sid, sess, status_code, hdrs, body_ptr, body_len);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// Set the six response components on `ent` in `request_out` WITHOUT
+/// moving it. This is the shared core of every reply: `finalizeResponse`
+/// adds the move to `response_in`; the handler-success path and
+/// `stageSystemResponse` stage the components here and let `finalizeBatch`
+/// perform the move once the batch commits. Routing every reply through
+/// this one place kills the "forgot H2IoResult / forgot a component /
+/// forgot the move" bug class that inline hand-rolled dances invited.
+pub fn stageResponse(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status_code: u16,
+    hdrs: h2.RespHeaders,
+    body_ptr: ?[*]u8,
+    body_len: u32,
+) !void {
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
     try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = body_ptr, .len = body_len });
     try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
     try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
 }
 
 /// Overwrite an entity in `request_out` with a `421 Misdirected
@@ -329,12 +349,7 @@ pub fn stageSystemResponse(
 ) !void {
     const copy = try allocator.dupe(u8, body);
     const resp_hdrs = try buildSystemRespHeaders(allocator, cors_origin, false, content_type);
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, resp_hdrs);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = copy.ptr, .len = @intCast(copy.len) });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try stageResponse(server, ent, sid, sess, status_code, resp_hdrs, copy.ptr, @intCast(copy.len));
 }
 
 /// Same as `setSystemResponse` but takes ownership of `body` (no

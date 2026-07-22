@@ -59,13 +59,7 @@ pub fn tryHandleSystem(
                 try respb.setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
             } else {
                 const hdrs = try respb.buildSystemRespHeaders(allocator, o, true, null);
-                try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
-                try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-                try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-                try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-                try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-                try server.reg.set(ent, &server.request_out, h2.Session, sess);
-                try server.reg.move(ent, &server.request_out, &server.response_in);
+                try respb.finalizeResponse(server, ent, sid, sess, 204, hdrs, null, 0);
             }
         } else {
             try respb.setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);

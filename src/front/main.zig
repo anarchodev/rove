@@ -79,16 +79,7 @@ const CertSync = struct {
         for (self.cp_urls) |base| {
             const url = std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix }) catch continue;
             defer a.free(url);
-            var easy = curl.Easy.init(a) catch continue;
-            defer easy.deinit();
-            var resp = easy.request(a, .{
-                .method = .GET,
-                .url = url,
-                .headers = &[_]curl.Header{},
-                .body = "",
-                .http_version = .h2c_prior_knowledge,
-                .verify_tls = false,
-            }) catch continue;
+            var resp = curl.cpGet(a, url, .{}) catch continue;
             defer resp.deinit(a);
             if (resp.status != 200) continue;
             const body = resp.body orelse "";
@@ -264,20 +255,9 @@ fn acmeChallengeLookup(a: std.mem.Allocator, cp_urls: []const []const u8, token:
     for (cp_urls) |base| {
         const url = std.fmt.allocPrint(a, "{s}/_cp/acme-challenge?token={s}", .{ base, token }) catch continue;
         defer a.free(url);
-        var easy = curl.Easy.init(a) catch continue;
-        defer easy.deinit();
-        var resp = easy.request(a, .{
-            .method = .GET,
-            .url = url,
-            .headers = &[_]curl.Header{},
-            .body = "",
-            .http_version = .h2c_prior_knowledge,
-            .verify_tls = false,
-            // Runs on the :80 thread (off the :443 loop), but still
-            // bound tight so a slow CP can't pile up other :80 requests.
-            .connect_timeout_ms = 1000,
-            .timeout_ms = 2000,
-        }) catch continue;
+        // Runs on the :80 thread (off the :443 loop), but still bound tight
+        // so a slow CP can't pile up other :80 requests.
+        var resp = curl.cpGet(a, url, .{ .connect_timeout_ms = 1000, .timeout_ms = 2000 }) catch continue;
         defer resp.deinit(a);
         if (resp.status != 200) continue;
         return a.dupe(u8, resp.body orelse "") catch null;
