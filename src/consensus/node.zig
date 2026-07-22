@@ -53,6 +53,13 @@ pub const PeerResolver = transport_mod.PeerResolver;
 /// Bridge; nothing in `Node` touches it.
 pub const PeerRegistry = @import("peer_registry.zig").PeerRegistry;
 
+/// The hibernating active set — the pump's per-node gid worklists (`active` /
+/// `dirty` / `persist_ack` / `woke_scratch`) + the dedup-append invariant.
+/// `Node` embeds `ActiveSet`; `TenantSlot` embeds `SlotHib`.
+const active_set_mod = @import("active_set.zig");
+pub const ActiveSet = active_set_mod.ActiveSet;
+pub const SlotHib = active_set_mod.SlotHib;
+
 pub const KvStore = kvstore.KvStore;
 pub const WriteSet = writeset.WriteSet;
 pub const Envelope = envelope.Envelope;
@@ -362,42 +369,16 @@ pub const TenantSlot = struct {
     /// Highest raft index whose committed entry has been applied to
     /// `store`. 0 until the first apply.
     applied_idx: u64 = 0,
-    /// Hibernation: wall-clock deadline past which this group is
-    /// considered idle and swept out of the active tick set. Refreshed by
-    /// `bumpActive` on every propose + non-heartbeat inbound step (NOT on
-    /// heartbeats). 0 = never bumped (a fresh slot not yet active).
-    active_until_ns: i64 = 0,
-    /// Whether this group is currently in `Node.active` (ticked each pump
-    /// cycle). Lets `bumpActive` add it at most once and the sweep drop it.
-    in_active: bool = false,
-    /// Pinned ALWAYS-active (never hibernated). The control-plane directory
-    /// group sets this: it must keep ticking so a follower runs its election
-    /// timer and re-elects on leader death — a directory read never proposes,
-    /// so a hibernated directory group would never wake to re-elect. One
-    /// always-ticking group is O(1), unlike the K-tenant data groups.
-    pinned: bool = false,
+    /// Hibernation / active-set state (see `SlotHib`): the idle deadline, the
+    /// three dedup guard bits (`in_active` / `in_dirty` / `in_persist_ack`), the
+    /// always-active `pinned` flag, and the leaderless-escalation cursor —
+    /// grouped so the active-set machine's per-slot fields sit behind one name.
+    hib: SlotHib = .{},
     /// Highest raft index durabilized into the store's LMDB (folded out of the
     /// in-memory overlay + stamped as `lastAppliedRaftIdx`) by `durabilizeTick`.
     /// `applied_idx > durabilized_idx` ⇒ this group has committed-but-not-yet-
     /// durable writes (it is "dirty"). Single-node compacts the WAL up to here.
     durabilized_idx: u64 = 0,
-    /// Whether this slot is in `Node.dirty` (committed since last durabilize),
-    /// so `applyEntry` enqueues it at most once.
-    in_dirty: bool = false,
-    /// Whether this slot is in `Node.persist_ack` (a `processReady` ran
-    /// whose buffered writes await the next fsync's `onPersist` ack), so
-    /// the pump enqueues it at most once per ack round.
-    in_persist_ack: bool = false,
-    /// Wall-clock at which this group was first observed leaderless (this node
-    /// not the leader AND `leaderId == 0`) while in the active set; 0 while a
-    /// leader is known. `escalateLeaderless` arms it and, once the group has
-    /// stayed leaderless past `Node.leaderless_escalate_ns`, FORCE-campaigns
-    /// (`mgr.campaignForce`) — the TiKV wake-to-elect recovery for a hard
-    /// (SIGKILL) leader loss, where a hibernated survivor's normal pre-vote is
-    /// ignored by peers still inside their `check_quorum` lease. Reset to `now`
-    /// after each force so the escalation re-arms (a cooldown), and to 0 the
-    /// moment a leader appears.
-    leaderless_since_ns: i64 = 0,
     /// Borrowed `GroupedFileStorage` for this group — the Manager owns it (via
     /// the storage vtable) and frees it on `destroyGroup`, but we keep the
     /// pointer to drive WAL compaction (`gfs.compact`) without a Manager API.
@@ -442,34 +423,18 @@ pub const Node = struct {
     /// tenant_id → slot. Iterated on deinit; looked up in the apply
     /// callback by `group_id`.
     groups: std.AutoHashMapUnmanaged(u64, *TenantSlot) = .empty,
-    /// Group ids ticked every pump cycle — the HIBERNATING active set.
-    /// A group enters via `bumpActive` (propose / formation /
-    /// non-heartbeat step) and leaves when its `active_until_ns` passes
-    /// (`sweepHibernated`). NOT pre-seeded with every created group: an idle
-    /// group is not ticked, so the pump cost is O(active), not O(all groups)
-    /// — the multiraft-scaling-learnings §3.1 win at K = thousands.
-    active: std.ArrayListUnmanaged(u64) = .empty,
+    /// The pump's hibernating active set + its derived worklists (see
+    /// `ActiveSet`): `active` (ticked each cycle), `dirty`, `persist_ack`, and
+    /// `woke_scratch`, plus the dedup-append invariant guarding the per-slot
+    /// guard bits. O(active) pump cost, not O(all groups) — the
+    /// multiraft-scaling-learnings §3.1 win at K = thousands.
+    active_set: ActiveSet = .{},
     /// `pollReady` scratch, grown to `groups.count()` as groups are added.
     ready_buf: []u64 = &.{},
     /// Second `pollReady` scratch for the post-fsync apply pass (pass 2
     /// of `pump` — `ready_buf` still holds pass 1's ids at that point).
     ready_buf2: []u64 = &.{},
 
-    /// Groups whose `processReady` buffered writes this (or a previous)
-    /// cycle and now await the post-fsync `mgr.onPersist` ack — the
-    /// async-append handshake (raft only counts this node's entries
-    /// toward the commit quorum once acked, and the persistence-
-    /// asserting messages stay stashed until then). Deduped via
-    /// `TenantSlot.in_persist_ack`; retained across a failed flush so
-    /// the ack retries after the next successful one. Pump-thread only.
-    persist_ack: std.ArrayListUnmanaged(u64) = .empty,
-
-    /// Gids with committed-but-not-yet-durabilized writes (`applied_idx >
-    /// durabilized_idx`). Enqueued by `applyEntry`, drained by
-    /// `durabilizeTick` — so durabilize cost is O(dirty), not O(all groups).
-    /// All dirty groups are durabilized together each tick so the shared WAL
-    /// can be compacted to a floor (their commits interleave in the one WAL).
-    dirty: std.ArrayListUnmanaged(u64) = .empty,
     /// Wall-clock of the last `durabilizeTick`; the tick is interval-gated
     /// (`durabilize_interval_ns`) — folding the overlay into LMDB is an
     /// fsync, amortized over many commits.
@@ -551,10 +516,6 @@ pub const Node = struct {
     /// hard (SIGKILL) failover deterministic instead of relying on the peers'
     /// leases happening to expire in time. Tests override with a short value.
     leaderless_escalate_ns: i64 = DEFAULT_LEADERLESS_ESCALATE_NS,
-    /// Scratch for draining the transport's woke-group list each pump cycle
-    /// (the gids that received a non-heartbeat message → `bumpActive`).
-    /// Owned; reused to avoid per-cycle allocation.
-    woke_scratch: std.ArrayListUnmanaged(u64) = .empty,
 
 
     /// Stand up a single-node node (voter id 1, voter set `{1}`).
@@ -712,11 +673,8 @@ pub const Node = struct {
             a.destroy(slot);
         }
         self.groups.deinit(a);
-        self.active.deinit(a);
-        self.dirty.deinit(a);
-        self.woke_scratch.deinit(a);
+        self.active_set.deinit(a);
         self.commit_notify.deinit(a);
-        self.persist_ack.deinit(a);
         a.free(self.ready_buf);
         a.free(self.ready_buf2);
         a.free(self.voters);
@@ -1300,12 +1258,9 @@ pub const Node = struct {
     /// round — see `persist_ack`). Pump-thread only.
     fn notePersistAck(self: *Node, gid: u64) void {
         const slot = self.groups.get(gid) orelse return;
-        if (slot.in_persist_ack) return;
-        slot.in_persist_ack = true;
-        self.persist_ack.append(self.allocator, gid) catch {
+        self.active_set.addPersistAck(slot, gid, self.allocator) catch {
             // Dropping the ack would stall the group's commits forever
             // (raft never counts its entries); surface loudly instead.
-            slot.in_persist_ack = false;
             self.apply_err = self.apply_err orelse Error.OutOfMemory;
         };
     }
@@ -1323,11 +1278,8 @@ pub const Node = struct {
     /// Pump-thread only (mutates `active` + the slot).
     pub fn bumpActive(self: *Node, gid: u64) Error!void {
         const slot = self.groups.get(gid) orelse return;
-        slot.active_until_ns = nowNs() + self.hibernate_ns;
-        if (!slot.in_active) {
-            self.active.append(self.allocator, gid) catch return Error.OutOfMemory;
-            slot.in_active = true;
-        }
+        slot.hib.active_until_ns = nowNs() + self.hibernate_ns;
+        self.active_set.addActive(slot, gid, self.allocator) catch return Error.OutOfMemory;
     }
 
     /// Pin a group as ALWAYS-active: never hibernated, so it keeps ticking
@@ -1339,24 +1291,21 @@ pub const Node = struct {
     /// (or pre-pump). A no-op for an unknown gid.
     pub fn pinActive(self: *Node, gid: u64) Error!void {
         const slot = self.groups.get(gid) orelse return;
-        slot.pinned = true;
-        slot.active_until_ns = nowNs() + self.hibernate_ns;
-        if (!slot.in_active) {
-            self.active.append(self.allocator, gid) catch return Error.OutOfMemory;
-            slot.in_active = true;
-        }
+        slot.hib.pinned = true;
+        slot.hib.active_until_ns = nowNs() + self.hibernate_ns;
+        self.active_set.addActive(slot, gid, self.allocator) catch return Error.OutOfMemory;
     }
 
     /// Remove a group from the active set (destroy / errdefer). Clears its
     /// `in_active` flag. O(active); the active set is small by design.
     fn dropActive(self: *Node, gid: u64) void {
-        for (self.active.items, 0..) |g, i| {
+        for (self.active_set.active.items, 0..) |g, i| {
             if (g == gid) {
-                _ = self.active.swapRemove(i);
+                _ = self.active_set.active.swapRemove(i);
                 break;
             }
         }
-        if (self.groups.get(gid)) |slot| slot.in_active = false;
+        if (self.groups.get(gid)) |slot| slot.hib.in_active = false;
     }
 
     /// Drop every group whose hibernate deadline has passed from the active
@@ -1365,10 +1314,10 @@ pub const Node = struct {
     /// step wakes it. Run once per pump cycle. Pump-thread only.
     fn sweepHibernated(self: *Node, now: i64) void {
         var i: usize = 0;
-        while (i < self.active.items.len) {
-            const gid = self.active.items[i];
+        while (i < self.active_set.active.items.len) {
+            const gid = self.active_set.active.items[i];
             const slot = self.groups.get(gid) orelse {
-                _ = self.active.swapRemove(i);
+                _ = self.active_set.active.swapRemove(i);
                 continue;
             };
             // Keep ticking a LEADERLESS group even past its idle deadline: a
@@ -1378,9 +1327,9 @@ pub const Node = struct {
             // before electing. A group with a live leader (leaderId != 0,
             // including this node as leader) hibernates normally.
             const leaderless = !self.mgr.isLeader(gid) and self.mgr.leaderId(gid) == 0;
-            if (!slot.pinned and !leaderless and now > slot.active_until_ns) {
-                slot.in_active = false;
-                _ = self.active.swapRemove(i);
+            if (!slot.hib.pinned and !leaderless and now > slot.hib.active_until_ns) {
+                slot.hib.in_active = false;
+                _ = self.active_set.active.swapRemove(i);
             } else i += 1;
         }
     }
@@ -1405,21 +1354,21 @@ pub const Node = struct {
     /// completes first; `campaignForce` itself is a safe no-op on a leader,
     /// learner, or pending-conf-change group. Pump-thread only; O(active).
     fn escalateLeaderless(self: *Node, now: i64) void {
-        for (self.active.items) |gid| {
+        for (self.active_set.active.items) |gid| {
             const slot = self.groups.get(gid) orelse continue;
             const leaderless = !self.mgr.isLeader(gid) and self.mgr.leaderId(gid) == 0;
             if (!leaderless) {
-                slot.leaderless_since_ns = 0;
+                slot.hib.leaderless_since_ns = 0;
                 continue;
             }
-            if (slot.leaderless_since_ns == 0) {
-                slot.leaderless_since_ns = now;
-            } else if (now - slot.leaderless_since_ns >= self.leaderless_escalate_ns) {
+            if (slot.hib.leaderless_since_ns == 0) {
+                slot.hib.leaderless_since_ns = now;
+            } else if (now - slot.hib.leaderless_since_ns >= self.leaderless_escalate_ns) {
                 self.mgr.campaignForce(gid);
                 // Re-arm the window (cooldown) so the next escalation, if the
                 // forced campaign also loses (split vote), waits another window
                 // rather than force-campaigning every cycle.
-                slot.leaderless_since_ns = now;
+                slot.hib.leaderless_since_ns = now;
             }
         }
     }
@@ -1506,14 +1455,14 @@ pub const Node = struct {
             const now = nowNs();
             if (now - self.last_tick_ns >= self.tick_interval_ns) {
                 self.last_tick_ns = now;
-                _ = self.mgr.tickGroups(self.active.items);
+                _ = self.mgr.tickGroups(self.active_set.active.items);
             }
         }
         const ready = self.mgr.pollReady(self.ready_buf);
 
         self.apply_err = null;
         var ready2: []u64 = self.ready_buf2[0..0];
-        if (ready.len > 0 or self.persist_ack.items.len > 0) {
+        if (ready.len > 0 or self.active_set.persist_ack.items.len > 0) {
             self.commit_notify.clearRetainingCapacity();
             // Pass 1: append this round's writes (BUFFERED — the fsync is
             // below) and apply committed entries that were already durable
@@ -1546,11 +1495,11 @@ pub const Node = struct {
                 // no ack, no acks on the wire, commits stay locked until
                 // a later successful fsync — never durability claimed for
                 // volatile bytes.
-                for (self.persist_ack.items) |g| {
+                for (self.active_set.persist_ack.items) |g| {
                     self.mgr.onPersist(g);
-                    if (self.groups.get(g)) |slot| slot.in_persist_ack = false;
+                    if (self.groups.get(g)) |slot| slot.hib.in_persist_ack = false;
                 }
-                self.persist_ack.clearRetainingCapacity();
+                self.active_set.persist_ack.clearRetainingCapacity();
 
                 // Pass 2: the acks commonly unlock a commit advance — the
                 // newly-committed entries surface as fresh readies. Apply
@@ -1626,9 +1575,9 @@ pub const Node = struct {
             // Wake any group that received a NON-heartbeat message this cycle
             // (real raft traffic = work). Heartbeats are skipped on purpose
             // (§3.1) so a quiet group can't keep itself awake.
-            self.woke_scratch.clearRetainingCapacity();
-            t.drainWoke(&self.woke_scratch, self.allocator) catch {};
-            for (self.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
+            self.active_set.woke_scratch.clearRetainingCapacity();
+            t.drainWoke(&self.active_set.woke_scratch, self.allocator) catch {};
+            for (self.active_set.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
         }
 
         // Hibernate: stop ticking any group idle past its deadline (but keep a
@@ -1669,7 +1618,7 @@ pub const Node = struct {
     /// groups are flushed in one tick so the shared WAL's interleaved commits
     /// clear together.
     fn durabilizeTick(self: *Node, now: i64) void {
-        if (self.dirty.items.len == 0) return;
+        if (self.active_set.dirty.items.len == 0) return;
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
         self.last_durabilize_ns = now;
         // Under the async-append flow the durable HardState.commit lags
@@ -1686,7 +1635,7 @@ pub const Node = struct {
         // this, a one-shot stamp left the un-foldable tail volatile
         // forever (an idle tenant's last write never re-folded).
         var keep: usize = 0;
-        for (self.dirty.items) |gid| {
+        for (self.active_set.dirty.items) |gid| {
             const slot = self.groups.get(gid) orelse continue;
             // The fold target: how far the store's overlay actually covers.
             // In worker_overlay mode a skipped entry's writes sit in the
@@ -1712,20 +1661,20 @@ pub const Node = struct {
             if (target <= slot.durabilized_idx) {
                 // Nothing foldable yet — keep the slot dirty and retry
                 // next tick (the worker ack raises the floor).
-                self.dirty.items[keep] = gid;
+                self.active_set.dirty.items[keep] = gid;
                 keep += 1;
                 continue;
             }
             const store = self.storeFor(slot, slot.id_str) orelse {
                 // Resolver failure — retry next tick rather than
                 // stranding an in_dirty=true slot outside the list.
-                self.dirty.items[keep] = gid;
+                self.active_set.dirty.items[keep] = gid;
                 keep += 1;
                 continue;
             };
             store.setLastAppliedRaftIdx(target) catch |e| {
                 std.log.warn("v2 durabilize gid={d}: {s}", .{ gid, @errorName(e) });
-                self.dirty.items[keep] = gid;
+                self.active_set.dirty.items[keep] = gid;
                 keep += 1;
                 continue;
             };
@@ -1742,9 +1691,9 @@ pub const Node = struct {
                         std.log.warn("v2 wal pre-compact flush: {s}", .{@errorName(e)});
                         slot.durabilized_idx = target;
                         if (slot.applied_idx > target) {
-                            self.dirty.items[keep] = gid;
+                            self.active_set.dirty.items[keep] = gid;
                             keep += 1;
-                        } else slot.in_dirty = false;
+                        } else slot.hib.in_dirty = false;
                         continue;
                     };
                     compaction_flushed = true;
@@ -1760,13 +1709,13 @@ pub const Node = struct {
             slot.durabilized_idx = target;
             if (slot.applied_idx > target) {
                 // Partially folded (floor held back the tail): stay dirty.
-                self.dirty.items[keep] = gid;
+                self.active_set.dirty.items[keep] = gid;
                 keep += 1;
             } else {
-                slot.in_dirty = false;
+                slot.hib.in_dirty = false;
             }
         }
-        self.dirty.shrinkRetainingCapacity(keep);
+        self.active_set.dirty.shrinkRetainingCapacity(keep);
     }
 
     /// Leader-side auto-demote policy. For each group this
@@ -1782,7 +1731,7 @@ pub const Node = struct {
     /// `auto_demote_lag`. Pump-thread only.
     fn autoDemoteTick(self: *Node, now: i64) void {
         if (self.auto_demote_lag == 0 or !self.compact_wal) return;
-        if (self.dirty.items.len == 0) return;
+        if (self.active_set.dirty.items.len == 0) return;
         // Warmup: the first pass after start/elect just stamps the clock and
         // returns, so peers get a full interval to report in before we judge
         // them dead (`last_auto_demote_ns` starts at 0 ⇒ would fire immediately).
@@ -1797,7 +1746,7 @@ pub const Node = struct {
         var matched_buf: [16]u64 = undefined;
         var active_buf: [16]u8 = undefined;
         var prog_buf: [16]raft.Manager.VoterProgress = undefined;
-        for (self.dirty.items) |gid| {
+        for (self.active_set.dirty.items) |gid| {
             if (!self.mgr.isLeader(gid)) continue;
             const view = self.mgr.voterProgress(gid, &ids_buf, &matched_buf, &active_buf, &prog_buf) orelse continue;
             for (view.peers) |p| {
@@ -1829,11 +1778,9 @@ pub const Node = struct {
     /// Enqueue `slot` for the next `durabilizeTick` if not already (its
     /// `applied_idx` just advanced past `durabilized_idx`). Pump-thread only.
     fn markDirty(self: *Node, slot: *TenantSlot) void {
-        if (slot.in_dirty) return;
-        slot.in_dirty = true;
-        self.dirty.append(self.allocator, slot.tenant_id) catch {
-            slot.in_dirty = false; // best-effort; recovery still covers it
-        };
+        // Best-effort; on OOM the guard bit stays clear and recovery still
+        // covers it (the fold retries once the group next commits).
+        self.active_set.addDirty(slot, slot.tenant_id, self.allocator) catch {};
     }
 
     /// Read a committed key from a tenant's store. Caller owns the
@@ -2182,7 +2129,7 @@ test "durabilize: the pump checkpoints the store + stamps the raft watermark" {
     // stamped up to the applied index (so a restart replays only past here).
     try testing.expectEqual(applied, try slot.store.lastAppliedRaftIdx());
     try testing.expectEqual(applied, slot.durabilized_idx);
-    try testing.expect(slot.in_dirty == false); // drained from the dirty set
+    try testing.expect(slot.hib.in_dirty == false); // drained from the dirty set
 
     // Data is still readable after durabilize.
     const got = try node.get(tenant, "k");
@@ -2924,17 +2871,17 @@ test "Phase 6: an idle group hibernates out of the active set, a propose re-wake
 
     // A just-proposed group is active (ticked).
     const slot = node.groups.get(tenant).?;
-    try testing.expect(slot.in_active);
+    try testing.expect(slot.hib.in_active);
 
     // Let it idle past the hibernate window, pumping all the while — the
     // sweep drops it from the active set, so the pump stops ticking it.
     var spins: u32 = 0;
-    while (slot.in_active and spins < 200) : (spins += 1) {
+    while (slot.hib.in_active and spins < 200) : (spins += 1) {
         _ = try node.pump();
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
-    try testing.expect(!slot.in_active);
-    try testing.expectEqual(@as(usize, 0), node.active.items.len);
+    try testing.expect(!slot.hib.in_active);
+    try testing.expectEqual(@as(usize, 0), node.active_set.active.items.len);
 
     // A new propose wakes it — it ticks again and commits (single-node it is
     // still the leader; hibernation froze the term, did not drop it).
@@ -2942,7 +2889,7 @@ test "Phase 6: an idle group hibernates out of the active set, a propose re-wake
     defer ws2.deinit();
     try ws2.addPut("k", "v2");
     _ = try node.proposeWriteSet(tenant, "t9", &ws2);
-    try testing.expect(slot.in_active);
+    try testing.expect(slot.hib.in_active);
 
     const got = try node.get(tenant, "k");
     defer a.free(got);
@@ -2978,11 +2925,11 @@ test "Phase 6: many idle groups all drain from the active set (O(active) tick co
     // Idle past the window: every group hibernates, so a pump cycle ticks
     // NOTHING — the cost is O(active), not O(K).
     var spins: u32 = 0;
-    while (node.active.items.len > 0 and spins < 200) : (spins += 1) {
+    while (node.active_set.active.items.len > 0 and spins < 200) : (spins += 1) {
         _ = try node.pump();
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
-    try testing.expectEqual(@as(usize, 0), node.active.items.len);
+    try testing.expectEqual(@as(usize, 0), node.active_set.active.items.len);
     // All K groups still exist (hibernated ≠ destroyed) — a read still works.
     const got = try node.get(K, "k");
     defer a.free(got);
@@ -3101,7 +3048,7 @@ test "Phase 6: an idle 3-node group hibernates with no spurious leader change, t
     }
     // Every node hibernated this group (active set empty), and leadership is
     // unchanged — the original leader still leads, no one else campaigned.
-    for (nodes) |n| try testing.expectEqual(@as(usize, 0), n.active.items.len);
+    for (nodes) |n| try testing.expectEqual(@as(usize, 0), n.active_set.active.items.len);
     try testing.expect(nodes[ld].isLeader(tenant));
     for (nodes, 0..) |n, i| if (i != ld) try testing.expect(!n.isLeader(tenant));
 

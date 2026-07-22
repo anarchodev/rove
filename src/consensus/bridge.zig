@@ -1108,7 +1108,7 @@ pub const Bridge = struct {
     /// out-of-band catch-up for each. The baseline {index, term} is computed HERE
     /// (pump-only `baselineIndex` + `logTerm`); the worker's `SnapshotCatchupThread`
     /// dumps the store + pushes it to the peer. Interval-gated; reads pump-owned
-    /// `node.active` + node accessors with the bridge mutex NOT held (enqueue takes
+    /// `node.active_set.active` + node accessors with the bridge mutex NOT held (enqueue takes
     /// it internally). O(active peers).
     fn snapshotTriggerTick(self: *Bridge) void {
         if (self.node.isSingleNode()) return;
@@ -1116,7 +1116,7 @@ pub const Bridge = struct {
         if (now_ns - self.last_snapshot_trigger_ns < SNAPSHOT_TRIGGER_INTERVAL_NS) return;
         self.last_snapshot_trigger_ns = now_ns;
         var ids_buf: [16]u64 = undefined;
-        for (self.node.active.items) |gid| {
+        for (self.node.active_set.active.items) |gid| {
             const peers = self.node.snapshotPendingPeers(gid, &ids_buf) orelse continue; // not leader / unknown
             if (peers.len == 0) continue;
             // Baseline the peer will install: the leader's live applied index +
@@ -1154,7 +1154,7 @@ pub const Bridge = struct {
     /// group every cycle under the bridge mutex would be an O(N_tenants)
     /// per-cycle hot-path cost that nullifies hibernation's O(active) win at
     /// K=thousands. Pump-thread only (reads the Manager
-    /// + `node.active`). The worker reads the atomics lock-free via
+    /// + `node.active_set.active`). The worker reads the atomics lock-free via
     /// `isLeaderOf`.
     fn refreshLeadership(self: *Bridge) void {
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -1169,7 +1169,7 @@ pub const Bridge = struct {
                 self.refreshOneLocked(e.value_ptr.*, e.key_ptr.*, single);
             }
         } else {
-            for (self.node.active.items) |gid| {
+            for (self.node.active_set.active.items) |gid| {
                 const sig = self.groups.get(gid) orelse continue;
                 self.refreshOneLocked(sig, gid, single);
             }
@@ -1956,7 +1956,7 @@ test "bridge: a hibernated group whose leader died re-elects on a requestWake nu
     }
     // The group hibernated everywhere — without this the rest of the test is
     // vacuous (an active group would re-elect on its own, no wake needed).
-    for (bridges) |b| try testing.expectEqual(@as(usize, 0), b.node.active.items.len);
+    for (bridges) |b| try testing.expectEqual(@as(usize, 0), b.node.active_set.active.items.len);
 
     // Leader dies: stop pumping it. From here only the two survivors run.
     const s0 = (ld + 1) % 3;
@@ -2137,7 +2137,7 @@ test "bridge: durabilize floor holds until the worker acks the skipped entry's t
     while (spins < 10) : (spins += 1) _ = try bridge.pumpOnce();
     const slot = bridge.node.groups.get(gid).?;
     try testing.expect(slot.durabilized_idx < slot.applied_idx);
-    try testing.expect(slot.in_dirty); // retained for a later tick
+    try testing.expect(slot.hib.in_dirty); // retained for a later tick
 
     // Worker ack: the txn promoted. The next durabilize folds + stamps
     // through the entry and the slot drains from the dirty set.
@@ -2147,7 +2147,7 @@ test "bridge: durabilize floor holds until the worker acks the skipped entry's t
         _ = try bridge.pumpOnce();
     }
     try testing.expectEqual(slot.applied_idx, slot.durabilized_idx);
-    try testing.expect(!slot.in_dirty);
+    try testing.expect(!slot.hib.in_dirty);
 }
 
 test "bridge: catch-up baseline index never exceeds the durable snapshot content watermark" {
