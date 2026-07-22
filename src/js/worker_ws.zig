@@ -564,7 +564,7 @@ fn finishWsResume(
             // read-only arm). A WRITING frame can't (commit-gated bind from a
             // resume isn't wired — same limit as the HTTP path).
             if (!wrote) {
-                worker_drain.flushResumeFetches(worker, chain_ent, pending_fetches, true);
+                worker_streaming.flushResumeFetches(worker, chain_ent, pending_fetches, true);
             } else if (pending_fetches.items.len > 0) {
                 std.log.warn("rove-js {s}: {d} on.fetch from a WRITING resume dropped (issue on.fetch from a read-only frame) tenant={s}", .{ tag, pending_fetches.items.len, chain_ctx.tenant_id });
             }

@@ -55,8 +55,11 @@ const panic_mod = @import("panic.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
 
 const worker_mod = @import("worker.zig");
+// worker_drain is imported for the `ChainDeployment` type only — the
+// streaming/ws/drain resume cycle was broken by routing the held-chain
+// bound-fetch resume through the worker hub (worker.resumeHeldBoundFetch),
+// so this base layer no longer calls up into worker_ws / worker_drain.
 const worker_drain = @import("worker_drain.zig");
-const worker_ws = @import("worker_ws.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_fire = @import("worker_fire.zig");
 const bodies_mod = @import("rove-bodies");
@@ -2661,12 +2664,10 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         if (ready_cont) {
             // A held WS chain reparks in place (no h2 response) — route its
             // bound-fetch resume through the ws-aware path that ships frames
-            // via shipWsFrames instead of resolveParked.
-            if (worker_ws.wsConnForChain(worker, held_ent)) |conn_ent| {
-                worker_ws.resumeBoundFetchChainWs(worker, held_ent, conn_ent, &ev);
-            } else {
-                worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
-            }
+            // via shipWsFrames instead of resolveParked. The WS-vs-drain
+            // dispatch lives on the worker hub (resumeHeldBoundFetch) so this
+            // base-layer spool driver doesn't reach up into worker_ws/drain.
+            worker_mod.resumeHeldBoundFetch(worker, held_ent, &ev);
         } else {
             // Steady-state stream (stream_data_out) OR the brief
             // post-commit window in stream_response_in before h2's
@@ -2917,4 +2918,74 @@ pub fn dispatchFetchEvents(worker: anytype) void {
 pub fn serviceFetchEvents(worker: anytype) void {
     drainMsgInbox(worker);
     dispatchPendingMsgs(worker);
+}
+
+/// Bind + submit the on.fetch a bound-fetch RESUME activation issued
+/// (moved here from worker_drain so the WS + drain resume paths call it
+/// downward, not across — keeps the streaming/ws/drain layer a DAG).
+/// blob-storage-plan P2 (+ handler-shape §5.3; `docs/architecture/routing-and-ingress.md`): submit the
+/// fetches a bound-fetch RESUME activation issued. Mirrors the
+/// worker_dispatch success-seam bind/drop logic for the resume case:
+///
+/// - `still_held = true` (repark): a `connection_scoped` fetch binds
+///   to the held entity (chunks resume this chain) — register the
+///   trampoline + bump the chain's BoundFetchCount (the entity is in
+///   `parked_continuations` here, not `request_out`, so the
+///   register-time bump soft-fails and we do it directly).
+/// - `still_held = false` (terminal): connection-scoped fetches drop
+///   (scope rule — the socket is closing); unbound ones still fire.
+///
+/// Caller invariant: READ-ONLY arms only, called AFTER `txn.commit`
+/// — no effect escapes before its activation committed (L4).
+pub fn flushResumeFetches(
+    worker: anytype,
+    ent: rove.Entity,
+    pending: *std.ArrayListUnmanaged(globals.PendingFetch),
+    still_held: bool,
+) void {
+    const allocator = worker.allocator;
+    if (pending.items.len == 0) return;
+    var submit: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer submit.deinit(allocator);
+    for (pending.items) |*pf| {
+        if (pf.connection_scoped) {
+            if (!still_held) {
+                pf.deinit(allocator);
+                continue;
+            }
+            pf.bind = true;
+            if (!@TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, ent)) {
+                pf.deinit(allocator);
+                continue;
+            }
+            // The trampoline's own count bump targets `request_out`
+            // (the open-hop home); on the resume path the entity is
+            // parked — bump where it actually lives.
+            if (worker.h2.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+                cnt.pending +%= 1;
+            } else |_| {}
+        }
+        // Trusted internal doors (compile / stampManifest / receive) go to
+        // the worker-local subsystem, never the engine — AFTER the bind
+        // registration above so the door's completion event resumes THIS
+        // held chain. `tryDoorFetch` consumes the fetch.
+        if (worker.tryDoorFetch(pf.*)) continue;
+        submit.append(allocator, pf.*) catch {
+            pf.deinit(allocator);
+            continue;
+        };
+    }
+    // Ownership of every surviving item moved into `submit`; the
+    // caller's defer must not double-free.
+    pending.clearRetainingCapacity();
+    worker.node.enqueuePendingFetches(submit.items) catch |err| {
+        // Partial-transfer hazard: items before the failing one are
+        // already engine-owned, so freeing here risks a double-free.
+        // OOM-only path — accept the leak, log loud.
+        std.log.warn(
+            "rove-js bound-fetch resume: enqueuePendingFetches failed: {s} ({d} fetch(es) may leak)",
+            .{ @errorName(err), submit.items.len },
+        );
+    };
+    submit.clearRetainingCapacity();
 }

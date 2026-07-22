@@ -1216,6 +1216,21 @@ pub const WorkerConfig = struct {
 pub const dispatchOnce = dispatch.dispatchOnce;
 pub const drainRequestReceiving = dispatch.drainRequestReceiving;
 
+/// Resume a held continuation (WS chain or bound HTTP chain) with a
+/// spooled bound-fetch chunk, routing to the WS-aware or the plain-drain
+/// resume path. Lives here on the hub (which already imports both) so the
+/// spool driver in worker_streaming dispatches through the worker it
+/// already holds instead of importing worker_ws/worker_drain — that back
+/// reach is what made streaming/ws/drain a dependency cycle. `ev` is
+/// consumed by the resume.
+pub fn resumeHeldBoundFetch(worker: anytype, held_ent: rove.Entity, ev: *components_mod.UpstreamFetchEvent) void {
+    if (worker_ws.wsConnForChain(worker, held_ent)) |conn_ent| {
+        worker_ws.resumeBoundFetchChainWs(worker, held_ent, conn_ent, ev);
+    } else {
+        worker_drain.resumeBoundFetchChain(worker, held_ent, ev);
+    }
+}
+
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
     // park entities in `raft_pending` without allocating side state.
