@@ -46,6 +46,14 @@ const MetricsServer = @import("metrics-server").MetricsServer;
 
 const curl = blob.curl;
 
+// Pull the front module's inline tests into the `front-test` artifact (rooted
+// here): a `zig test` root runs only its own file's tests unless it references
+// the imported files. proxy.zig chains on to its `proxy/` split files.
+test {
+    _ = proxy_mod;
+    _ = route_resolver_mod;
+}
+
 const FrontH2 = h2.H2(.{
     .client = true,
     .request_row = rove.Row(&.{proxy_mod.FlowRef}),
