@@ -511,10 +511,10 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         \\log_records_dropped_total {d}
         \\
     , .{
-        worker.bound_fetch_spool_inline_bytes_peak,
-        worker.bound_fetch_spool_readback_total,
-        worker.bound_fetch_spool_dropped_total,
-        worker.bound_fetch_spool_depth_peak,
+        worker.spools.bound_fetch_spool_inline_bytes_peak,
+        worker.spools.bound_fetch_spool_readback_total,
+        worker.spools.bound_fetch_spool_dropped_total,
+        worker.spools.bound_fetch_spool_depth_peak,
         worker.log_records_dropped_total,
     });
 

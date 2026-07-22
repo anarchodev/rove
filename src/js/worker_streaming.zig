@@ -2423,23 +2423,23 @@ fn pushToSpool(
     ev: components_mod.UpstreamFetchEvent,
 ) !*chunk_spool_mod.ChunkSpool {
     const allocator = worker.allocator;
-    const gop = try worker.bound_fetch_spools.getOrPut(allocator, ev.fetch_id);
+    const gop = try worker.spools.bound_fetch_spools.getOrPut(allocator, ev.fetch_id);
     if (!gop.found_existing) {
         const sp = allocator.create(chunk_spool_mod.ChunkSpool) catch |e| {
-            _ = worker.bound_fetch_spools.remove(ev.fetch_id);
+            _ = worker.spools.bound_fetch_spools.remove(ev.fetch_id);
             return e;
         };
         sp.* = .{};
         const key_dup = allocator.dupe(u8, ev.fetch_id) catch |e| {
             allocator.destroy(sp);
-            _ = worker.bound_fetch_spools.remove(ev.fetch_id);
+            _ = worker.spools.bound_fetch_spools.remove(ev.fetch_id);
             return e;
         };
         gop.key_ptr.* = key_dup;
         gop.value_ptr.* = sp;
     }
     const sp = gop.value_ptr.*;
-    try sp.push(allocator, ev, worker.bound_fetch_spool_depth);
+    try sp.push(allocator, ev, worker.spools.bound_fetch_spool_depth);
     // Track peak inline RAM (K-window bound) + peak queued
     // depth (decoupling evidence: how far the producer ran ahead of
     // the raft-rate consumer) across all spools.
@@ -2454,16 +2454,16 @@ fn pushToSpool(
 fn updateSpoolPeaks(worker: anytype) void {
     var total_bytes: usize = 0;
     var total_entries: usize = 0;
-    var it = worker.bound_fetch_spools.valueIterator();
+    var it = worker.spools.bound_fetch_spools.valueIterator();
     while (it.next()) |sp_ptr| {
         total_bytes += sp_ptr.*.inlineBytes();
         total_entries += sp_ptr.*.len();
     }
-    if (total_bytes > worker.bound_fetch_spool_inline_bytes_peak) {
-        worker.bound_fetch_spool_inline_bytes_peak = total_bytes;
+    if (total_bytes > worker.spools.bound_fetch_spool_inline_bytes_peak) {
+        worker.spools.bound_fetch_spool_inline_bytes_peak = total_bytes;
     }
-    if (total_entries > worker.bound_fetch_spool_depth_peak) {
-        worker.bound_fetch_spool_depth_peak = total_entries;
+    if (total_entries > worker.spools.bound_fetch_spool_depth_peak) {
+        worker.spools.bound_fetch_spool_depth_peak = total_entries;
     }
 }
 
@@ -2474,10 +2474,10 @@ fn updateSpoolPeaks(worker: anytype) void {
 /// spool when its bound fetch is cancelled / its held entity is
 /// destroyed (the chunk-spool cleanup path, `routing-and-ingress.md`).
 pub fn dropSpool(worker: anytype, fetch_id: []const u8) void {
-    const entry = worker.bound_fetch_spools.fetchRemove(fetch_id) orelse return;
+    const entry = worker.spools.bound_fetch_spools.fetchRemove(fetch_id) orelse return;
     // Count chunks discarded unconsumed (cancel / disconnect). A clean
     // terminal drop has already popped every entry, so this is 0 there.
-    worker.bound_fetch_spool_dropped_total += entry.value.len();
+    worker.spools.bound_fetch_spool_dropped_total += entry.value.len();
     // Coordinator-retained release (`routing-and-ingress.md`): release the coordinator-retained
     // copy of every still-spooled chunk we're discarding, so a
     // cancel/disconnect of a backed-up fetch doesn't leak its backlog
@@ -2517,12 +2517,12 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
     // key. A private dupe is immune to all of these; `dropSpool` frees
     // the map's own key, never this one.
     const key: []u8 = blk: {
-        const e = worker.bound_fetch_spools.getEntry(fetch_id) orelse return;
+        const e = worker.spools.bound_fetch_spools.getEntry(fetch_id) orelse return;
         break :blk worker.allocator.dupe(u8, e.key_ptr.*) catch return;
     };
     defer worker.allocator.free(key);
     while (true) {
-        const sp = worker.bound_fetch_spools.get(key) orelse return;
+        const sp = worker.spools.bound_fetch_spools.get(key) orelse return;
         if (sp.isEmpty()) return;
 
         const held_ent = worker.lookupBoundFetch(key) orelse {
@@ -2638,7 +2638,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
                 // (resume frees it on consume).
                 h.event.bytes = bytes;
                 h.evicted = false;
-                worker.bound_fetch_spool_readback_total += 1;
+                worker.spools.bound_fetch_spool_readback_total += 1;
             }
         }
 
@@ -2706,14 +2706,14 @@ fn queueCoordRelease(worker: anytype, worker_id: u8, seq: u64) void {
     // `coord_pending_releases` unboundedly. Catch the double-queue at
     // the source rather than chasing the symptom downstream.
     if (std.debug.runtime_safety) {
-        for (worker.coord_pending_releases.items) |p| {
+        for (worker.spools.coord_pending_releases.items) |p| {
             if (p.worker_id == worker_id and p.seq == seq) std.debug.panic(
                 "queueCoordRelease: double queue of worker={d} seq={d} (would retry forever)",
                 .{ worker_id, seq },
             );
         }
     }
-    worker.coord_pending_releases.append(worker.allocator, .{ .worker_id = worker_id, .seq = seq }) catch {
+    worker.spools.coord_pending_releases.append(worker.allocator, .{ .worker_id = worker_id, .seq = seq }) catch {
         // OOM: drop the deferred release. The coordinator batch leaks
         // until coord deinit — rare, bounded by this one chunk.
         std.log.warn("rove-js chunk-spool: coord_pending_releases append OOM; release dropped", .{});
@@ -2726,10 +2726,10 @@ fn queueCoordRelease(worker: anytype, worker_id: u8, seq: u64) void {
 fn drainCoordReleases(worker: anytype) void {
     const coord = worker.node.blob_coord.coordinator orelse return;
     var i: usize = 0;
-    while (i < worker.coord_pending_releases.items.len) {
-        const p = worker.coord_pending_releases.items[i];
+    while (i < worker.spools.coord_pending_releases.items.len) {
+        const p = worker.spools.coord_pending_releases.items[i];
         if (coord.release(p.worker_id, p.seq)) {
-            _ = worker.coord_pending_releases.swapRemove(i); // freed — drop
+            _ = worker.spools.coord_pending_releases.swapRemove(i); // freed — drop
         } else {
             i += 1; // not durable yet — retry next tick
         }
@@ -2748,14 +2748,14 @@ pub fn drainSpools(worker: anytype) void {
     // P6: always retry deferred coord releases (a dropped spool may
     // have queued some even when no spool is currently active).
     drainCoordReleases(worker);
-    if (worker.bound_fetch_spools.count() == 0) return;
+    if (worker.spools.bound_fetch_spools.count() == 0) return;
 
     var keys: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (keys.items) |k| allocator.free(k);
         keys.deinit(allocator);
     }
-    var it = worker.bound_fetch_spools.iterator();
+    var it = worker.spools.bound_fetch_spools.iterator();
     while (it.next()) |entry| {
         const kd = allocator.dupe(u8, entry.key_ptr.*) catch return;
         keys.append(allocator, kd) catch {
@@ -2766,7 +2766,7 @@ pub fn drainSpools(worker: anytype) void {
     for (keys.items) |k| {
         // Skip spools dropped by an earlier iteration; the duped key
         // is safe to hash even after the live spool/key was freed.
-        if (worker.bound_fetch_spools.get(k) == null) continue;
+        if (worker.spools.bound_fetch_spools.get(k) == null) continue;
         dispatchSpoolHead(worker, k);
     }
 }
