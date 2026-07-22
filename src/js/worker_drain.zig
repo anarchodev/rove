@@ -3019,7 +3019,7 @@ pub fn cleanupResponses(worker: anytype) !void {
 pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
     var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
     defer doomed.deinit(worker.allocator);
-    var it = worker.bound_fetch_entities.iterator();
+    var it = worker.spools.bound_fetch_entities.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.*.eql(ent)) {
             doomed.append(worker.allocator, entry.key_ptr.*) catch break;

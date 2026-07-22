@@ -78,6 +78,7 @@ const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
 const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
+const spool_registry = @import("spool_registry.zig");
 const effect_mod = @import("effect/root.zig");
 const globals = @import("globals.zig");
 const raft_propose = @import("raft_propose.zig");
@@ -566,12 +567,12 @@ pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 /// this caps inline RAM at ~256KB per in-flight bound fetch; chunks
 /// beyond the window read their bytes back from the coordinator.
 /// Override via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
-pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH: usize = 4;
+pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH = spool_registry.DEFAULT_BOUND_FETCH_SPOOL_DEPTH;
 
 /// The chunk spool (`docs/architecture/routing-and-ingress.md`): a deferred `coord.release(worker_id,
 /// seq)` for a consumed/dropped bound chunk whose coordinator submit
 /// wasn't durable yet at consume time. Retried in `drainSpools`.
-pub const CoordPendingRelease = struct { worker_id: u8, seq: u64 };
+pub const CoordPendingRelease = spool_registry.CoordPendingRelease;
 
 /// Read the `ROVE_BOUND_FETCH_SPOOL_DEPTH` env override, falling back
 /// to `DEFAULT_BOUND_FETCH_SPOOL_DEPTH`. A 0 / unparseable value is
@@ -1514,23 +1515,13 @@ pub fn Worker(comptime opts: Options) type {
         /// tick drains this after `dispatchPendingMsgs` — by then
         /// the shim's txn is committed.
         pending_bound_resumes: std.ArrayListUnmanaged(PendingBoundResume) = .empty,
-        /// The streaming substrate (`docs/architecture/routing-and-ingress.md`) + `docs/handler-shape.md`
-        /// §5.5: registry for `http.fetch({bind: true})` — maps
-        /// `fetch_id` to the entity that issued the fetch. Populated
-        /// at the handler-success seam (`worker_dispatch`'s direct
-        /// `registerBoundFetchTrampoline` call, where `bind = held and
-        /// !detach` is computed, the fetch auto-bind rule); consulted
-        /// in `dispatchPendingMsgs`'s `.fetch_chunk` arm to route
-        /// upstream chunks into the held chain's `onFetchChunk`
-        /// resume; cleared on terminal (`ev.final`) or on held-client
-        /// disconnect.
-        ///
-        /// Keys are allocator-owned dupes of the fetch_id; freed
-        /// when the entry is removed (or by `destroy` on shutdown).
-        /// Entity handles are stable across `reg.move` per
-        /// rove-library principle #8, so a chain transitioning
-        /// cont→stream doesn't invalidate the map entry.
-        bound_fetch_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
+        /// Bound-fetch / chunk-spool state (`docs/architecture/routing-and-ingress.md`
+        /// + `docs/handler-shape.md` §5.5): the `http.fetch({bind: true})`
+        /// entity registry, per-fetch chunk spools, bound-send index, the
+        /// deferred coord-release queue, and the K-window depth + peaks.
+        /// Grouped so its three key-owning maps are freed together on
+        /// shutdown (`SpoolRegistry.deinit`). Driven by `worker_streaming.zig`.
+        spools: spool_registry.SpoolRegistry = .{},
         /// `docs/architecture/websockets.md` (piece D): per-connection
         /// held WebSocket chain locator. Maps the h2 connection `Entity`
         /// (the `Session.entity` carried on every `ws_message_out` /
@@ -1554,60 +1545,6 @@ pub fn Worker(comptime opts: Options) type {
         /// the rest off `parked_continuations` membership and janitors
         /// stale entries.
         inbound_chunk_jobs: std.AutoHashMapUnmanaged(rove.Entity, *inbound_chunk_mod.Job) = .empty,
-        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): per-fetch chunk spool,
-        /// keyed by `fetch_id`, sibling to `bound_fetch_entities`.
-        /// Decouples bound-fetch chunk arrival from the held chain's
-        /// raft commit cadence — arriving chunks push onto the spool;
-        /// `worker_streaming.dispatchSpoolHead` / `drainSpools` pop
-        /// the head once the held entity is back in a receivable
-        /// collection. Heap-allocated `*ChunkSpool` for pointer
-        /// stability across rehash. Keys are allocator-owned fetch_id
-        /// dupes; freed on `dropSpool` + on shutdown (`destroy`).
-        bound_fetch_spools: std.StringHashMapUnmanaged(*chunk_spool_mod.ChunkSpool) = .empty,
-        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): deferred coordinator releases
-        /// for consumed/dropped bound chunks. The spool consumes
-        /// in-window chunks from their inline bytes BEFORE their
-        /// coordinator submit is durable (its ref isn't set yet), so a
-        /// release-at-consume can't free them. Instead the (worker_id,
-        /// seq) is queued here and `drainSpools` retries `coord.release`
-        /// each tick until it succeeds (durableSeq advances). Leftovers
-        /// at shutdown are dropped (lossy-on-shutdown, like the log
-        /// flusher). Touched only by the worker thread.
-        coord_pending_releases: std.ArrayListUnmanaged(CoordPendingRelease) = .empty,
-        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): K, the per-fetch RAM
-        /// window depth. Chunks within K of a spool's head keep their
-        /// inline bytes; chunks pushed beyond K evict their inline
-        /// bytes (read back from the coordinator at dispatch). Default
-        /// `DEFAULT_BOUND_FETCH_SPOOL_DEPTH` (≈ K×64KB inline RAM per
-        /// fetch); overridable via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
-        bound_fetch_spool_depth: usize = DEFAULT_BOUND_FETCH_SPOOL_DEPTH,
-        /// Peak `inlineBytes()` summed across all live spools observed
-        /// on this worker. Diagnostic for the K-window RAM bound;
-        /// exposed via `/_system/metrics` (`bound_fetch_spool_inline_bytes_peak`).
-        /// Never reset (per the diagnostic-state-stays convention).
-        bound_fetch_spool_inline_bytes_peak: usize = 0,
-        /// Peak total queued entries summed across all live spools —
-        /// how far the producer (upstream chunk arrival) ran ahead of
-        /// the raft-rate consumer. A peak ≫ K is the decoupling
-        /// evidence (chunk spool, `docs/architecture/routing-and-ingress.md`): chunks pile
-        /// into the spool at upstream rate while activations drain at
-        /// raft rate. Exposed as `bound_fetch_spool_depth_peak`.
-        bound_fetch_spool_depth_peak: usize = 0,
-        /// Count of spool-head chunks whose evicted inline bytes were
-        /// read back from the coordinator (`coord.readBody`) at
-        /// dispatch. Non-zero proves the eviction → coord
-        /// read-back path actually ran (vs. the consumer keeping up so
-        /// the window never overflowed). Exposed on `/_system/metrics`
-        /// as `bound_fetch_spool_readback_total`. Never reset.
-        bound_fetch_spool_readback_total: u64 = 0,
-        /// Count of spooled-but-unconsumed chunks discarded by
-        /// `dropSpool` when a bound fetch is cancelled
-        /// (`http.cancelFetch`) or its held client disconnects
-        /// (`scanAndCancelBoundFetches`) — the chunk spool
-        /// (`docs/architecture/routing-and-ingress.md`). Excludes the clean terminal drop (the spool is
-        /// empty by then). Exposed as
-        /// `bound_fetch_spool_dropped_total`. Never reset.
-        bound_fetch_spool_dropped_total: u64 = 0,
         /// Count of per-request log records permanently dropped by
         /// `flushLogs` — the batch was drained from `log_buffer` before
         /// the S3 PUT, so a writeBatch failure or a lost-leadership
@@ -1617,25 +1554,6 @@ pub fn Worker(comptime opts: Options) type {
         /// transient warn line. Exposed as `log_records_dropped_total`.
         /// Never reset.
         log_records_dropped_total: u64 = 0,
-        /// Cross-worker held state (`docs/architecture/effects-and-handlers.md`): worker-
-        /// local mirror of NodeState's `bound_send_owners`. Maps
-        /// send_id → the parked cont entity bound to it.
-        /// Populated alongside `bound_send_owners` (the
-        /// cont_bound_sched_id scan sites in `worker_dispatch.zig`
-        /// + `worker_drain.zig`); read in `resumeIfBoundTrampoline`
-        /// + `resumeBoundContinuation` for O(1) lookup instead of
-        /// scanning every entity in `parked_continuations`.
-        ///
-        /// The routing guarantees: a chunk arriving here has
-        /// `bound_send_owners[send_id] == this worker's idx`, so
-        /// the entity IS in this worker's `parked_continuations`
-        /// (modulo the brief window between unregister and entity
-        /// destroy). Lookup miss falls back to the linear scan as
-        /// a safety net — costs O(N parked) only on the rare
-        /// stale-registry case.
-        ///
-        /// Keys allocator-owned; freed on remove + on shutdown.
-        bound_send_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
         /// This worker's slot index in
         /// `node.msg_inboxes`. Set from `registerMsgInbox`'s
         /// return value at `create`. The per-worker partitioned
@@ -1835,7 +1753,7 @@ pub fn Worker(comptime opts: Options) type {
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
-                .bound_fetch_spool_depth = readBoundFetchSpoolDepth(),
+                .spools = .{ .bound_fetch_spool_depth = readBoundFetchSpoolDepth() },
                 .tenant_logs = .empty,
                 .log_buffer = log_mod.NodeLogBuffer.init(allocator),
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
@@ -2058,16 +1976,12 @@ pub fn Worker(comptime opts: Options) type {
             // change drain would have surfaced these, but be defensive.
             for (self.pending_bound_resumes.items) |*p| p.deinit(allocator);
             self.pending_bound_resumes.deinit(allocator);
-            // Free every fetch_id key in the bound-fetch registry.
-            // Values are entity handles (POD), no per-value cleanup.
-            // The registry never owns the underlying fetch in
-            // FetchEngine — that's released through normal terminal
-            // events or http.cancelFetch.
-            {
-                var it = self.bound_fetch_entities.iterator();
-                while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-                self.bound_fetch_entities.deinit(allocator);
-            }
+            // Free the bound-fetch/spool state in one place — every key in the
+            // three maps, each live spool, the deferred-release queue. The
+            // registry never owns the underlying fetch in FetchEngine (released
+            // through normal terminal events / http.cancelFetch); entity-handle
+            // values are POD.
+            self.spools.deinit(allocator);
             // `docs/architecture/websockets.md` (piece D): the chain entities themselves
             // are reaped via `parked_continuations`/registry teardown on
             // shutdown; free each connection's gated-frame queue, then
@@ -2093,28 +2007,6 @@ pub fn Worker(comptime opts: Options) type {
                     jp.*.unref();
                 }
                 self.inbound_chunk_jobs.deinit(allocator);
-            }
-            // Chunk spool (`docs/architecture/routing-and-ingress.md`): free every spool +
-            // its still-pending entries + the duped fetch_id key.
-            // Best-effort drain at shutdown, same lossy posture as
-            // `fetch_pending_durability` below.
-            {
-                var it = self.bound_fetch_spools.iterator();
-                while (it.next()) |entry| {
-                    entry.value_ptr.*.deinit(allocator);
-                    allocator.destroy(entry.value_ptr.*);
-                    allocator.free(entry.key_ptr.*);
-                }
-                self.bound_fetch_spools.deinit(allocator);
-            }
-            // Deferred coord releases — drop at shutdown (the coord
-            // is torn down separately; lossy-on-shutdown is fine).
-            self.coord_pending_releases.deinit(allocator);
-            // Same pattern for the bound_send_entities map.
-            {
-                var it = self.bound_send_entities.iterator();
-                while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-                self.bound_send_entities.deinit(allocator);
             }
             self.parked_continuations.deinit();
             self.parked_units.deinit();
@@ -3180,7 +3072,7 @@ pub fn Worker(comptime opts: Options) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const a = self.allocator;
-            const gop = self.bound_fetch_entities.getOrPut(a, fetch_id) catch return false;
+            const gop = self.spools.bound_fetch_entities.getOrPut(a, fetch_id) catch return false;
             if (gop.found_existing) {
                 std.log.warn(
                     "rove-js bound-fetch: registry collision for fetch_id={s}; dropping new bind",
@@ -3189,7 +3081,7 @@ pub fn Worker(comptime opts: Options) type {
                 return false;
             }
             const key_dup = a.dupe(u8, fetch_id) catch {
-                _ = self.bound_fetch_entities.remove(fetch_id);
+                _ = self.spools.bound_fetch_entities.remove(fetch_id);
                 return false;
             };
             gop.key_ptr.* = key_dup;
@@ -3224,14 +3116,14 @@ pub fn Worker(comptime opts: Options) type {
         /// path) — robust against late-arriving chunks for a chain
         /// whose terminal already drained the registry.
         pub fn lookupBoundFetch(self: *Self, fetch_id: []const u8) ?rove.Entity {
-            return self.bound_fetch_entities.get(fetch_id);
+            return self.spools.bound_fetch_entities.get(fetch_id);
         }
 
         /// Unregister + free the registry key. Idempotent — a no-op
         /// when the id isn't present (the cleanup path runs on every
         /// terminal chunk; double-fire is benign).
         pub fn unregisterBoundFetch(self: *Self, fetch_id: []const u8) void {
-            const entry = self.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
+            const entry = self.spools.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
             const entity = entry.value;
             self.allocator.free(entry.key);
             // Mirror the NodeState owner-map drop, paired with the
@@ -3276,7 +3168,7 @@ pub fn Worker(comptime opts: Options) type {
         /// chain). Caller's slice is duped; the registry owns the
         /// key.
         pub fn registerBoundSendEntity(self: *Self, send_id: []const u8, entity: rove.Entity) void {
-            const gop = self.bound_send_entities.getOrPut(self.allocator, send_id) catch return;
+            const gop = self.spools.bound_send_entities.getOrPut(self.allocator, send_id) catch return;
             if (gop.found_existing) {
                 std.log.warn(
                     "rove-js bound-send: registry collision for send_id={s}; dropping new bind",
@@ -3285,7 +3177,7 @@ pub fn Worker(comptime opts: Options) type {
                 return;
             }
             const key_dup = self.allocator.dupe(u8, send_id) catch {
-                _ = self.bound_send_entities.remove(send_id);
+                _ = self.spools.bound_send_entities.remove(send_id);
                 return;
             };
             gop.key_ptr.* = key_dup;
@@ -3297,7 +3189,7 @@ pub fn Worker(comptime opts: Options) type {
         /// place of a linear scan. Returns null on miss → caller falls
         /// back to the scan (stale-registry safety net).
         pub fn lookupBoundSendEntity(self: *Self, send_id: []const u8) ?rove.Entity {
-            return self.bound_send_entities.get(send_id);
+            return self.spools.bound_send_entities.get(send_id);
         }
 
         /// Remove + free the registry key. Idempotent.
@@ -3305,7 +3197,7 @@ pub fn Worker(comptime opts: Options) type {
         /// fires alongside the bsid free sites in
         /// `worker_drain.zig`'s repark + stream-transition arms.
         pub fn unregisterBoundSendEntity(self: *Self, send_id: []const u8) void {
-            const entry = self.bound_send_entities.fetchRemove(send_id) orelse return;
+            const entry = self.spools.bound_send_entities.fetchRemove(send_id) orelse return;
             self.allocator.free(entry.key);
         }
     };
