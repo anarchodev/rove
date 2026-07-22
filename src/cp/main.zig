@@ -29,6 +29,9 @@ const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 
 const curl = blob.curl;
+const bc = @import("backend_client.zig");
+const BackendResp = bc.BackendResp;
+const MOVE_SECRET_HEADER = bc.MOVE_SECRET_HEADER;
 const directory_mod = @import("cp-directory");
 const Directory = directory_mod.Directory;
 const bridge_mod = @import("bridge");
@@ -97,22 +100,11 @@ fn methodFrom(s: []const u8) ?curl.Method {
     return null;
 }
 
-const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 const TENANT_HEADER = "X-Rewind-Tenant";
 /// Carries a tenant's opaque plan blob on `v2-attach` (delivery rides the move
 /// handshake) and `v2-plan` (live push). See the CP operational-state model
 /// (docs/architecture/control-plane.md).
 const PLAN_HEADER = "X-Rewind-Plan";
-
-/// One backend response the orchestrator cares about: status + an owned
-/// copy of the body (the source bundle, relayed into the attach call).
-const BackendResp = struct {
-    status: u16,
-    body: []u8,
-    fn deinit(self: BackendResp, a: std.mem.Allocator) void {
-        a.free(self.body);
-    }
-};
 
 const Router = struct {
     allocator: std.mem.Allocator,
@@ -781,7 +773,7 @@ const Router = struct {
         const payload = std.json.Stringify.valueAlloc(a, .{ .tenant = tenant, .plan = plan }, .{}) catch return;
         defer a.free(payload);
         for (res.cluster.nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-plan", .POST, payload, &.{})) |resp| {
+            if (bc.call(self, base, "/_system/v2-plan", .POST, payload, &.{})) |resp| {
                 var r = resp;
                 defer r.deinit(a);
                 if (r.status != 204)
@@ -818,7 +810,7 @@ const Router = struct {
         const payload = std.json.Stringify.valueAlloc(a, .{ .host = host, .tenant = tenant }, .{}) catch return false;
         defer a.free(payload);
         for (nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-domain", .POST, payload, &.{})) |resp| {
+            if (bc.call(self, base, "/_system/v2-domain", .POST, payload, &.{})) |resp| {
                 var r = resp;
                 defer r.deinit(a);
                 if (r.status == 204) return true; // the leader took it
@@ -853,7 +845,7 @@ const Router = struct {
         defer a.free(leader);
         const method = methodFrom(headerValue(rh, ":method") orelse "POST") orelse .POST;
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-        const resp = self.backendCall(leader, path, method, body, &.{}) catch |err| {
+        const resp = bc.call(self, leader, path, method, body, &.{}) catch |err| {
             std.log.warn("rewind-cp: forward control to CP leader {s} failed: {s}", .{ leader, @errorName(err) });
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -883,7 +875,7 @@ const Router = struct {
             if (self.self_cp_idx) |self_i| {
                 if (i == self_i) continue;
             }
-            const resp = self.backendCall(base, "/_cp/leader", .GET, "", &.{}) catch continue;
+            const resp = bc.call(self, base, "/_cp/leader", .GET, "", &.{}) catch continue;
             const ok = resp.status == 200;
             var r = resp;
             r.deinit(a);
@@ -931,7 +923,7 @@ const Router = struct {
             nh += 1;
         }
         for (dest_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-attach", .POST, bundle, hdrs[0..nh]) catch |err| {
+            const resp = bc.call(self, base, "/_system/v2-attach", .POST, bundle, hdrs[0..nh]) catch |err| {
                 std.log.warn("rewind-cp: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
                 return false;
             };
@@ -955,7 +947,7 @@ const Router = struct {
         const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
         while (std.time.nanoTimestamp() < deadline) {
             for (dest_nodes) |base| {
-                const resp = self.backendCall(base, suffix, .GET, "", &.{}) catch continue;
+                const resp = bc.call(self, base, suffix, .GET, "", &.{}) catch continue;
                 var r = resp;
                 r.deinit(a);
                 if (r.status == 200) return true;
@@ -970,7 +962,7 @@ const Router = struct {
     fn evictAll(self: *Router, tenant: []const u8, nodes: []const []const u8, tbody: []const u8) void {
         const a = self.allocator;
         for (nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-evict", .POST, tbody, &.{})) |ev| {
+            if (bc.call(self, base, "/_system/v2-evict", .POST, tbody, &.{})) |ev| {
                 var e2 = ev;
                 e2.deinit(a);
             } else |err| {
@@ -1155,7 +1147,7 @@ const Router = struct {
         const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
         while (std.time.nanoTimestamp() < deadline) {
             for (dest_nodes) |base| {
-                const resp = self.backendCall(base, suffix, .GET, "", &.{}) catch continue;
+                const resp = bc.call(self, base, suffix, .GET, "", &.{}) catch continue;
                 var r = resp;
                 r.deinit(a);
                 if (r.status == 200) return a.dupe(u8, base) catch null;
@@ -1187,7 +1179,7 @@ const Router = struct {
         const fb = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"dest\":\"{s}\"}}", .{ tenant, dest_url }) catch return false;
         defer a.free(fb);
         for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-forward-begin", .POST, fb, &.{}) catch continue;
+            const resp = bc.call(self, base, "/_system/v2-forward-begin", .POST, fb, &.{}) catch continue;
             const ok = resp.status == 204;
             var r = resp;
             r.deinit(a);
@@ -1202,7 +1194,7 @@ const Router = struct {
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return;
         defer a.free(tbody);
         for (src_nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-forward-end", .POST, tbody, &.{})) |r| {
+            if (bc.call(self, base, "/_system/v2-forward-end", .POST, tbody, &.{})) |r| {
                 const ok = r.status == 204;
                 var rr = r;
                 rr.deinit(a);
@@ -1233,7 +1225,7 @@ const Router = struct {
             .{ .name = "x-rewind-snapshot-mode", .value = "merge" },
         };
         for (src_nodes) |base| {
-            const resp = self.backendCallTimeout(base, "/_system/v2-snapshot-push", .POST, "", &hdrs, 40 * 60 * 1000) catch |err| {
+            const resp = bc.callTimeout(self, base, "/_system/v2-snapshot-push", .POST, "", &hdrs, 40 * 60 * 1000) catch |err| {
                 std.log.warn("rewind-cp: v2-snapshot-push on {s} → {s}", .{ base, @errorName(err) });
                 continue;
             };
@@ -1329,7 +1321,7 @@ const Router = struct {
         // 1. Observe the leader's per-peer view.
         const ms_path = std.fmt.allocPrint(a, "/_system/v2-member-status?tenant={s}", .{tenant}) catch return .failed;
         defer a.free(ms_path);
-        const ms_resp = self.backendCall(leader_url, ms_path, .GET, "", &.{}) catch return .failed;
+        const ms_resp = bc.call(self, leader_url, ms_path, .GET, "", &.{}) catch return .failed;
         defer a.free(ms_resp.body);
         if (ms_resp.status != 200) return .failed;
         var parsed = std.json.parseFromSlice(MemberStatusJson, a, ms_resp.body, .{ .ignore_unknown_fields = true }) catch return .failed;
@@ -1432,7 +1424,7 @@ const Router = struct {
         const a = self.allocator;
         const path = std.fmt.allocPrint(a, "/_system/v2-confstate?tenant={s}", .{tenant}) catch return .unknown;
         defer a.free(path);
-        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return .unknown;
+        const resp = bc.call(self, node_url, path, .GET, "", &.{}) catch return .unknown;
         defer a.free(resp.body);
         return switch (resp.status) {
             200 => .hosted,
@@ -1456,7 +1448,7 @@ const Router = struct {
         const a = self.allocator;
         const path = std.fmt.allocPrint(a, "/_system/v2-last-index?tenant={s}", .{tenant}) catch return null;
         defer a.free(path);
-        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return null;
+        const resp = bc.call(self, node_url, path, .GET, "", &.{}) catch return null;
         defer a.free(resp.body);
         if (resp.status != 200) return null;
         var p = std.json.parseFromSlice(struct { last_index: u64 = 0 }, a, resp.body, .{ .ignore_unknown_fields = true }) catch return null;
@@ -1487,7 +1479,7 @@ const Router = struct {
             std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\"}}", .{ tenant, node_id, op }) catch return false;
         defer a.free(body);
         self.confchange_total += 1;
-        const resp = self.backendCall(leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch {
+        const resp = bc.call(self, leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch {
             self.confchange_failed += 1;
             return false;
         };
@@ -1550,7 +1542,7 @@ const Router = struct {
         const a = self.allocator;
         const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
         defer a.free(bpath);
-        const bresp = self.backendCall(leader_url, bpath, .GET, "", &.{}) catch return false;
+        const bresp = bc.call(self, leader_url, bpath, .GET, "", &.{}) catch return false;
         defer a.free(bresp.body);
         if (bresp.status != 200) return false;
         var bp = std.json.parseFromSlice(
@@ -1573,7 +1565,7 @@ const Router = struct {
 
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
         defer a.free(tbody);
-        const snap = self.backendCall(leader_url, "/_system/v2-snapshot", .POST, tbody, &.{}) catch return false;
+        const snap = bc.call(self, leader_url, "/_system/v2-snapshot", .POST, tbody, &.{}) catch return false;
         defer a.free(snap.body);
         if (snap.status != 200) return false;
 
@@ -1632,56 +1624,13 @@ const Router = struct {
             .{ .name = "X-Rewind-Peer-Addrs", .value = peer_addrs orelse "" },
         };
         const th: []const curl.Header = if (peer_addrs != null) th_buf[0..8] else th_buf[0..7];
-        const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, th) catch return false;
+        const ar = bc.call(self, node_url, "/_system/v2-attach", .POST, snap.body, th) catch return false;
         defer a.free(ar.body);
         if (ar.status != 204) return false;
         std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={}, conf_state voters=[{s}] learners=[{s}])", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner, voters_csv, learners_csv });
         return true;
     }
 
-    fn backendCall(
-        self: *Router,
-        base_url: []const u8,
-        path_suffix: []const u8,
-        method: curl.Method,
-        body: []const u8,
-        extra_headers: []const curl.Header,
-    ) !BackendResp {
-        return self.backendCallTimeout(base_url, path_suffix, method, body, extra_headers, 15_000);
-    }
-
-    /// `backendCall` with an explicit total-transfer deadline. A streamed move
-    /// push (`v2-snapshot-push`) holds the CP↔source call open for the WHOLE
-    /// transfer (the source parks until its off-loop push lands), so it needs a
-    /// generous timeout — the source's own `REWIND_SNAPSHOT_XFER_MAX_MS` deadline
-    /// aborts + responds first; this is the wedged-source backstop.
-    fn backendCallTimeout(
-        self: *Router,
-        base_url: []const u8,
-        path_suffix: []const u8,
-        method: curl.Method,
-        body: []const u8,
-        extra_headers: []const curl.Header,
-        timeout_ms: u32,
-    ) !BackendResp {
-        const a = self.allocator;
-        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base_url, path_suffix });
-        defer a.free(url);
-
-        var headers: std.ArrayListUnmanaged(curl.Header) = .empty;
-        defer headers.deinit(a);
-        try headers.append(a, .{ .name = MOVE_SECRET_HEADER, .value = self.move_secret.? });
-        for (extra_headers) |h| try headers.append(a, h);
-
-        var resp = try curl.cpRequest(a, method, url, body, .{
-            .headers = headers.items,
-            .timeout_ms = timeout_ms,
-        });
-        defer resp.deinit(a);
-
-        const body_copy = if (resp.body) |b| try a.dupe(u8, b) else try a.dupe(u8, "");
-        return .{ .status = resp.status, .body = body_copy };
-    }
 };
 
 /// Read a single query-string value (`/p?a=b&c=d`) by key. Values taken
