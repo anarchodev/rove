@@ -870,16 +870,7 @@ fn forwardWriteOne(allocator: std.mem.Allocator, secret: []const u8, dest: []con
     try headers.append(allocator, .{ .name = "X-Rewind-Move-Secret", .value = secret });
     try headers.append(allocator, .{ .name = "Content-Type", .value = "application/json" });
 
-    var easy = try curl.Easy.init(allocator);
-    defer easy.deinit();
-    var resp = try easy.request(allocator, .{
-        .method = .POST,
-        .url = url,
-        .headers = headers.items,
-        .body = payload,
-        .http_version = .h2c_prior_knowledge,
-        .verify_tls = false,
-    });
+    var resp = try curl.cpPost(allocator, url, payload, .{ .headers = headers.items });
     defer resp.deinit(allocator);
     return resp.status;
 }

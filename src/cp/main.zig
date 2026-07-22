@@ -1673,15 +1673,8 @@ const Router = struct {
         try headers.append(a, .{ .name = MOVE_SECRET_HEADER, .value = self.move_secret.? });
         for (extra_headers) |h| try headers.append(a, h);
 
-        var easy = try curl.Easy.init(a);
-        defer easy.deinit();
-        var resp = try easy.request(a, .{
-            .method = method,
-            .url = url,
+        var resp = try curl.cpRequest(a, method, url, body, .{
             .headers = headers.items,
-            .body = body,
-            .http_version = .h2c_prior_knowledge,
-            .verify_tls = false,
             .timeout_ms = timeout_ms,
         });
         defer resp.deinit(a);

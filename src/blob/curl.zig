@@ -136,6 +136,50 @@ pub const Request = struct {
     verify_tls: bool = true,
 };
 
+// ── Control-plane one-shot helpers ─────────────────────────────────────
+
+/// Options for a `cpGet` / `cpPost` / `cpRequest` call. Timeouts default
+/// to the `Request` defaults; callers override per site.
+pub const CpOpts = struct {
+    headers: []const Header = &.{},
+    timeout_ms: u32 = 15_000,
+    connect_timeout_ms: u32 = 5_000,
+};
+
+/// One-shot request to the internal V2 control-plane mesh
+/// (`rewind-cp.internal`). The internal hop is cleartext h2c
+/// prior-knowledge, so this is the ONE place the plaintext-CP transport
+/// defaults live — `verify_tls = false` is centralized here rather than
+/// hand-set at each of the ~five CP-lookup call sites. Creates a one-shot
+/// Easy handle, issues the request, tears the handle down, and returns the
+/// caller-owned Response (the body outlives the handle — see `Response`).
+/// Fanout across CP nodes, retry, 404 handling, and body parsing stay at
+/// the call site.
+pub fn cpRequest(allocator: std.mem.Allocator, method: Method, url: []const u8, body: []const u8, opts: CpOpts) Error!Response {
+    var easy = try Easy.init(allocator);
+    defer easy.deinit();
+    return easy.request(allocator, .{
+        .method = method,
+        .url = url,
+        .headers = opts.headers,
+        .body = body,
+        .http_version = .h2c_prior_knowledge,
+        .verify_tls = false,
+        .timeout_ms = opts.timeout_ms,
+        .connect_timeout_ms = opts.connect_timeout_ms,
+    });
+}
+
+/// `cpRequest` with `.GET` and an empty body.
+pub fn cpGet(allocator: std.mem.Allocator, url: []const u8, opts: CpOpts) Error!Response {
+    return cpRequest(allocator, .GET, url, "", opts);
+}
+
+/// `cpRequest` with `.POST`.
+pub fn cpPost(allocator: std.mem.Allocator, url: []const u8, body: []const u8, opts: CpOpts) Error!Response {
+    return cpRequest(allocator, .POST, url, body, opts);
+}
+
 /// Caller-supplied producer for a STREAMED request body (`requestUpload`).
 /// libcurl pulls via the read callback only as fast as the wire drains, so the
 /// producer is naturally backpressured and the body is never materialized whole
