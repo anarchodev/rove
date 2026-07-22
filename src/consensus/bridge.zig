@@ -409,9 +409,12 @@ pub const Bridge = struct {
         var origin: u64 = 0;
         while (origin == 0) origin = std.crypto.random.int(u64);
         self.* = .{ .allocator = allocator, .node = node, .origin_id = origin };
-        node.commit_hook = .{ .ctx = self, .func = onCommitted };
-        node.skip_query = .{ .ctx = self, .func = skipQuery };
-        node.durabilize_floor = .{ .ctx = self, .func = durabilizeFloor };
+        // The worker-overlay commit hooks are one atomic config (apply_mode is
+        // flipped later by setWorkerOverlay; apply_observer / store_resolver are
+        // installed independently for the CP directory + follower serving store).
+        node.apply.commit_hook = .{ .ctx = self, .func = onCommitted };
+        node.apply.skip_query = .{ .ctx = self, .func = skipQuery };
+        node.apply.durabilize_floor = .{ .ctx = self, .func = durabilizeFloor };
         return self;
     }
 
@@ -424,7 +427,7 @@ pub const Bridge = struct {
     /// The unit tests, which read the pump's own store, keep the
     /// default `apply_on_commit`.
     pub fn setWorkerOverlay(self: *Bridge) void {
-        self.node.apply_mode = .worker_overlay;
+        self.node.apply.apply_mode = .worker_overlay;
     }
 
     /// Pin a group as always-active (never hibernated) on the node — see
@@ -442,7 +445,7 @@ pub const Bridge = struct {
     /// there). Call before serving. Safe to leave unset (every non-CP bridge
     /// does).
     pub fn setApplyObserver(self: *Bridge, observer: node_mod.ApplyObserver) void {
-        self.node.apply_observer = observer;
+        self.node.apply.apply_observer = observer;
     }
 
     /// Install a runtime peer-address resolver (a CP-fed `PeerRegistry`) on the
@@ -509,7 +512,7 @@ pub const Bridge = struct {
     /// slot store. Call before serving; safe to leave unset (the bare-node
     /// tests do). See `node_mod.StoreResolver`.
     pub fn setStoreResolver(self: *Bridge, resolver: node_mod.StoreResolver) void {
-        self.node.store_resolver = resolver;
+        self.node.apply.store_resolver = resolver;
     }
 
     /// Stop the pump (if running), then free the node + all bridge state.
@@ -1372,7 +1375,7 @@ pub const Bridge = struct {
             // the floor is simply NOT raised conservatively… it must be
             // the opposite — failing to record would let durabilize run
             // PAST the entry. Surface it as a pump apply error instead.
-            if (self.node.apply_mode == .worker_overlay and seq > sig.worker_acked_seq) {
+            if (self.node.apply.apply_mode == .worker_overlay and seq > sig.worker_acked_seq) {
                 sig.awaiting_worker.append(self.allocator, .{ .seq = seq, .idx = raft_index }) catch {
                     // OOM recording this entry's durabilize-floor cap. We must
                     // NOT fall through to advance `committed_seq`: the worker
