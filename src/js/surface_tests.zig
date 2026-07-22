@@ -51,6 +51,7 @@ const SURFACE_TESTS = [_]SurfaceTest{
     .{ .name = "oauth", .src = @embedFile("surface_tests/oauth.surface.mjs") },
     .{ .name = "oidc", .src = @embedFile("surface_tests/oidc.surface.mjs") },
     .{ .name = "sessions", .src = @embedFile("surface_tests/sessions.surface.mjs") },
+    .{ .name = "time", .src = @embedFile("surface_tests/time.surface.mjs") },
     .{ .name = "cron", .src = @embedFile("surface_tests/cron.surface.mjs") },
     .{ .name = "retry", .src = @embedFile("surface_tests/retry.surface.mjs") },
     .{ .name = "schedule", .src = @embedFile("surface_tests/schedule.surface.mjs") },
@@ -83,20 +84,20 @@ const ALLOWED_UNCOVERED = [_]AllowedUncovered{};
 /// against these; inline-config shapes need no seeding.
 const SeedRow = struct { key: []const u8, value: []const u8 };
 const SEED_ROWS = [_]SeedRow{
-    .{ .key = "_config/oauth/default", .value =
-        \\{"authorization_url":"https://idp.example/authorize","token_url":"https://idp.example/token","client_id":"cid","client_secret":"sec","redirect_uri":"https://app.example/cb","on_complete_module":"onLogin","scopes":["openid"]}
+    .{ .key = "_config/oauth/default", .value = 
+    \\{"authorization_url":"https://idp.example/authorize","token_url":"https://idp.example/token","client_id":"cid","client_secret":"sec","redirect_uri":"https://app.example/cb","on_complete_module":"onLogin","scopes":["openid"]}
     },
-    .{ .key = "_config/sessions/default", .value =
-        \\{"state_path":"sess"}
+    .{ .key = "_config/sessions/default", .value = 
+    \\{"state_path":"sess"}
     },
-    .{ .key = "_config/activitypub", .value =
-        \\{"domain":"ap.example","username":"svc","verified_module":"onVerified"}
+    .{ .key = "_config/activitypub", .value = 
+    \\{"domain":"ap.example","username":"svc","verified_module":"onVerified"}
     },
-    .{ .key = "_config/oidc/default", .value =
-        \\{"clients":[]}
+    .{ .key = "_config/oidc/default", .value = 
+    \\{"clients":[]}
     },
-    .{ .key = "_oidc/rp/default", .value =
-        \\{"issuer":"https://idp.example","client_id":"cid","redirect_uri":"https://app.example/cb"}
+    .{ .key = "_oidc/rp/default", .value = 
+    \\{"issuer":"https://idp.example","client_id":"cid","redirect_uri":"https://app.example/cb"}
     },
 };
 

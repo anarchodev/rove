@@ -525,8 +525,9 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     // The durable-effect shims — the real webhook/schedule/cron/email verbs, so
     // they decompose to primitives (`_send/owed` + `_sched/*` kv writes +
     // `http.fetch`) in the effect log; the epilogue does not stub them.
-    // Order mirrors the worker's GLOBALS_FILES: `cron` (fire-time helpers + the
-    // recurring verb) → `schedule` (reuses `cron.parseDuration`) → `webhook`
+    // Order mirrors the worker's GLOBALS_FILES: `time` (the shared time-
+    // coercion library) → `cron` (fire-time helpers + the recurring verb) →
+    // `schedule` (coerces `{at}`/`{in}` through `time`) → `webhook`
     // (composes over `kv`+`schedule`+the `_system.http` fetch primitive it
     // captures at eval — so it MUST land before the `delete globalThis._system`
     // below) → `email` (layers on `webhook.send`). `webhook.js` isn't IIFE-wrapped
@@ -534,6 +535,7 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     // base-snapshot's global lexical scope (the freeze corrupts on bare top-level
     // bindings — see globals-shim-iife-required); `email.js` is a plain
     // `globalThis.email = {…}` assignment, freeze-safe as-is.
+    "\n;" ++ @embedFile("g_time") ++
     "\n;" ++ @embedFile("g_cron") ++
     "\n;" ++ @embedFile("g_schedule") ++
     "\n;(function(){\n" ++ @embedFile("g_webhook") ++ "\n})();" ++

@@ -203,17 +203,15 @@ globalThis.webhook = {
       id = crypto.randomUUID();
     }
 
-    // Resolve the fire time: {at} (absolute, schedule's coercions via
-    // cron.toFireAtNs) or {in} (delay: ms or duration string).
+    // Resolve the fire time via the shared `time` library: {at}
+    // (absolute — bigint ns | ms | Date | duration | ISO) or {in}
+    // (delay — ms | duration string).
     const now_ns = BigInt(Date.now()) * 1_000_000n;
     let fire_at_ns_big = 0n;
     if (opts.at != null) {
-      fire_at_ns_big = cron.toFireAtNs(opts.at);
+      fire_at_ns_big = time.toNs(opts.at);
     } else if (opts.in != null) {
-      const ms = typeof opts.in === "number" ? Math.floor(opts.in) : cron.parseDuration(opts.in);
-      if (ms == null || typeof ms !== "number")
-        throw new TypeError('webhook.send: `in` must be a number (ms) or a duration string ("30s", "5m")');
-      fire_at_ns_big = now_ns + BigInt(ms) * 1_000_000n;
+      fire_at_ns_big = time.inToNs(opts.in);
     }
     const scheduled = fire_at_ns_big > now_ns;
 
