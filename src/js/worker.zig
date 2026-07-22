@@ -66,6 +66,7 @@ const snapshot_catchup_mod = @import("snapshot_catchup.zig");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
+const log_subsystem_mod = @import("log_subsystem.zig");
 const jwt_mod = @import("rove-jwt");
 const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
@@ -713,7 +714,7 @@ pub const TenantLog = struct {
     id_minter: log_mod.RequestIdMinter,
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantLog {
-        return worker_log.openTenantLog(worker, inst, worker.log_worker_id);
+        return worker_log.openTenantLog(worker, inst, worker.log.log_worker_id);
     }
 
     pub fn free(allocator: std.mem.Allocator, tl: *TenantLog) void {
@@ -1545,15 +1546,6 @@ pub fn Worker(comptime opts: Options) type {
         /// the rest off `parked_continuations` membership and janitors
         /// stale entries.
         inbound_chunk_jobs: std.AutoHashMapUnmanaged(rove.Entity, *inbound_chunk_mod.Job) = .empty,
-        /// Count of per-request log records permanently dropped by
-        /// `flushLogs` — the batch was drained from `log_buffer` before
-        /// the S3 PUT, so a writeBatch failure or a lost-leadership
-        /// mid-tick loses those records for good (lossy-on-failure by
-        /// design — the log-server, `docs/architecture/deployment-and-logs.md`). Logged AND counted so the
-        /// permanent data-loss volume is visible over time, not just a
-        /// transient warn line. Exposed as `log_records_dropped_total`.
-        /// Never reset.
-        log_records_dropped_total: u64 = 0,
         /// This worker's slot index in
         /// `node.msg_inboxes`. Set from `registerMsgInbox`'s
         /// return value at `create`. The per-worker partitioned
@@ -1589,11 +1581,11 @@ pub fn Worker(comptime opts: Options) type {
         /// ids across workers. Same lazy-open lifecycle as
         /// `tenant_files_map` but populated per-worker.
         tenant_logs: TenantMap(TenantLog),
-        /// Per-node in-memory `LogRecord` buffer. Every tenant's
-        /// dispatch tick appends here; `flushLogs` drains the whole
-        /// buffer into one combined batch per flush window. One node
-        /// buffer, not per-tenant.
-        log_buffer: log_mod.NodeLogBuffer,
+        /// Log subsystem (`worker_log.zig`): per-request buffer + S3-batch
+        /// flusher + log-server push threads. Grouped so its shutdown
+        /// teardown ordering (join flusher → join push → free push_queue)
+        /// is local + auditable (`LogSubsystem.deinit`).
+        log: log_subsystem_mod.LogSubsystem,
         /// Circuit breaker for handlers that blow past their CPU
         /// budget. A tenant with `kill_threshold` interrupts inside a
         /// single `window_ns` gets bounced with 503 for
@@ -1618,23 +1610,12 @@ pub fn Worker(comptime opts: Options) type {
         /// routing entirely. Cross-tenant scoping uses the
         /// `X-Rove-Scope: <id>` header on this host.
         admin_api_domain: ?[]const u8,
-        /// Upper 16 bits every `RequestIdMinter.nextRequestId()`
-        /// minted by this worker stamps onto ids so they don't
-        /// collide with other workers' ids. Copied from
-        /// `WorkerConfig.log_worker_id` (or the raft node id as a
-        /// fallback).
-        log_worker_id: u16,
         /// Readset replication (`docs/architecture/effects-and-handlers.md`) — node data
         /// directory borrowed from `WorkerConfig.data_dir`. Used by
         /// the per-worker `last_uploaded_seq` checkpoint file at
         /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`.
         /// Null disables the checkpoint (test fixtures).
         data_dir: ?[]const u8,
-        /// Readset replication (`docs/architecture/effects-and-handlers.md`) — the highest
-        /// raft seq this worker has covered with a successful
-        /// `flushLogs`. Read at startup from the checkpoint file
-        /// (0 if missing); advanced after each successful flush.
-        last_uploaded_seq: u64 = 0,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
@@ -1643,10 +1624,6 @@ pub fn Worker(comptime opts: Options) type {
         // manifest_http, manifest_easy, manifest_prefetch) lives on
         // `node`. Reach via `worker.node.blob_backend_cfg`, etc.
 
-        /// Store the worker flushes log batches into. Lives for the
-        /// worker's full lifetime; the embedding binary picks S3 vs
-        /// in-memory at startup.
-        log_batch_store: log_server_mod.batch_store.BatchStore,
         /// JWT secret + public origins for the standalone services.
         /// Returned to the dashboard via `/_system/services-token`.
         services_jwt_secret: ?[]const u8,
@@ -1657,45 +1634,12 @@ pub fn Worker(comptime opts: Options) type {
         /// `cp_urls`. cluster_id null or cp_urls empty → forwarding disabled.
         cluster_id: ?[]const u8,
         cp_urls: []const []const u8,
-        log_public_base: ?[]const u8,
-        /// Push fan-out targets (see `WorkerConfig.log_push_bases`). Empty →
-        /// no push thread; `pushBatchKey` short-circuits. Borrowed.
-        log_push_bases: []const []const u8,
         files_public_base: ?[]const u8,
         /// Internal-service POST insecure-TLS toggle (log-push
         /// only — see the worker struct field doc).
         internal_insecure_tls: bool,
-        /// libcurl handle for log-server push (`POST /v1/_internal/
-        /// batch-pushed`), reused sequentially across all `log_push_bases`.
-        /// Lazily created when `log_push_bases` is non-empty. Null disables the
-        /// push path; each indexer's LIST poll is the catch-up.
-        log_push_curl: ?*blob_mod.curl.Easy,
 
-        /// Background log flusher — owns its own thread, sleeps on
-        /// `flusher_wake` between ticks, drains the worker's
-        /// `log_buffer` via `flushLogs`, and PUTs each batch into
-        /// `log_batch_store`. Decouples request latency from S3 RTT:
-        /// the dispatch path's `captureLog` is now a mutex-protected
-        /// ArrayList.append, with the multi-millisecond S3 round-
-        /// trip happening asynchronously on this thread. `null` when
-        /// the worker is configured without a log backend.
-        flusher_thread: ?std.Thread = null,
-        flusher_should_stop: std.atomic.Value(bool) = .init(false),
-        flusher_wake: std.Thread.ResetEvent = .{},
 
-        /// Async batched log-server push. Flushers append the S3 batch
-        /// key they just PUT to `push_queue`; the `push_thread` drains
-        /// the queue and POSTs all queued keys as one body to
-        /// `/v1/_internal/batch-pushed`. Decouples the synchronous-
-        /// curl cost from the flusher so a slow / unreachable
-        /// log-server stops back-pressuring the dispatch path.
-        /// `push_queue` owns each `[]u8` (allocator-duped from the
-        /// flusher's local key).
-        push_queue: std.ArrayList([]u8) = .empty,
-        push_queue_mutex: std.Thread.Mutex = .{},
-        push_wake: std.Thread.ResetEvent = .{},
-        push_should_stop: std.atomic.Value(bool) = .init(false),
-        push_thread: ?std.Thread = null,
 
         // Background deployment loader lives on `node` (single per
         // process, shared across workers). Reach via
@@ -1755,36 +1699,38 @@ pub fn Worker(comptime opts: Options) type {
                 .raft = config.raft,
                 .spools = .{ .bound_fetch_spool_depth = readBoundFetchSpoolDepth() },
                 .tenant_logs = .empty,
-                .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+                .log = .{
+                    .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+                    .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
+                    .last_uploaded_seq = if (config.data_dir) |dd|
+                        worker_upload_checkpoint.readCheckpoint(allocator, dd, config.log_worker_id orelse @intCast(config.raft.config.node_id))
+                    else
+                        0,
+                    .log_batch_store = config.log_batch_store,
+                    .log_public_base = config.log_public_base,
+                    .log_push_bases = config.log_push_bases,
+                    .log_push_curl = blk: {
+                        if (config.log_push_bases.len == 0) break :blk null;
+                        break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
+                            std.log.warn("rove-js: log-push libcurl init failed: {s}; batch push disabled", .{@errorName(err)});
+                            break :blk null;
+                        };
+                    },
+                },
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
-                .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
                 .data_dir = config.data_dir,
-                .last_uploaded_seq = if (config.data_dir) |dd|
-                    worker_upload_checkpoint.readCheckpoint(allocator, dd, config.log_worker_id orelse @intCast(config.raft.config.node_id))
-                else
-                    0,
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
-                .log_batch_store = config.log_batch_store,
                 .services_jwt_secret = config.services_jwt_secret,
                 .move_secret = config.move_secret,
                 .cluster_id = config.cluster_id,
                 .cp_urls = config.cp_urls,
-                .log_public_base = config.log_public_base,
-                .log_push_bases = config.log_push_bases,
                 .files_public_base = config.files_public_base,
                 .internal_insecure_tls = config.internal_insecure_tls,
-                .log_push_curl = blk: {
-                    if (config.log_push_bases.len == 0) break :blk null;
-                    break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
-                        std.log.warn("rove-js: log-push libcurl init failed: {s}; batch push disabled", .{@errorName(err)});
-                        break :blk null;
-                    };
-                },
                 .wake_inbox = KvWakeInbox.init(allocator),
             };
             errdefer self.raft_pending_response.deinit();
@@ -1841,14 +1787,14 @@ pub fn Worker(comptime opts: Options) type {
             // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is the process-
             // global BlobCoordinator's job (NodeState.blob_coordinator);
             // this per-worker flusher_thread runs only the log flush.
-            self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
+            self.log.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
             // Spawn the push thread only if a libcurl handle was
             // built (i.e. `log_push_bases` is non-empty). Without it
             // pushBatchKey would short-circuit anyway; the thread
             // would just spin.
-            if (self.log_push_curl != null) {
-                self.push_thread = try std.Thread.spawn(.{}, worker_log.pushLoop, .{self});
+            if (self.log.log_push_curl != null) {
+                self.log.push_thread = try std.Thread.spawn(.{}, worker_log.pushLoop, .{self});
             }
 
             return self;
@@ -1874,7 +1820,7 @@ pub fn Worker(comptime opts: Options) type {
         /// can be lost on shutdown.
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
-            while (!self.flusher_should_stop.load(.acquire)) {
+            while (!self.log.flusher_should_stop.load(.acquire)) {
                 // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is driven by
                 // the process-global coordinator's own drainer + executor
                 // threads — no per-tick call from the worker. The per-tick
@@ -1883,8 +1829,8 @@ pub fn Worker(comptime opts: Options) type {
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
                 };
-                self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
-                self.flusher_wake.reset();
+                self.log.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
+                self.log.flusher_wake.reset();
             }
         }
 
@@ -1893,36 +1839,12 @@ pub fn Worker(comptime opts: Options) type {
             // NodeState owns the deployment loader + tenant_files_map
             // + manifest_prefetch. Tenant-files cleanup runs from
             // `NodeState.deinit`, not here.
-            // Signal the flusher thread to stop, wake it, and join.
-            // The flusher's only blocking call is libcurl's
-            // `curl_easy_perform`, which is bounded by `Easy`'s
-            // 15 s `CURLOPT_TIMEOUT_MS` — so join can never wait
-            // longer than one in-flight PUT plus the libcurl
-            // ceiling. No detach / leak path needed.
-            if (self.flusher_thread) |t| {
-                self.flusher_should_stop.store(true, .release);
-                self.flusher_wake.set();
-                t.join();
-                self.flusher_thread = null;
-            }
-            // The streaming substrate (`docs/architecture/routing-and-ingress.md`): the blob coordinator lives on
+            // Stop + join the flusher and push threads in order, then free the
+            // queued keys — the ordering (flusher first, since it enqueues to
+            // push_queue on its final tick; free only after both joined) is
+            // owned by LogSubsystem.deinit. The blob coordinator lives on
             // NodeState and shuts down there (not here).
-            // Stop the push thread AFTER the flusher: the flusher
-            // enqueues to push_queue, so stopping push first would
-            // leak whatever the flusher emitted on its final tick.
-            if (self.push_thread) |t| {
-                self.push_should_stop.store(true, .release);
-                self.push_wake.set();
-                t.join();
-                self.push_thread = null;
-            }
-            // Free any keys still queued at shutdown. Same
-            // best-effort posture as flushLogs's final partial batch:
-            // log-server will pick them up on its LIST poll.
-            self.push_queue_mutex.lock();
-            for (self.push_queue.items) |k| allocator.free(k);
-            self.push_queue.deinit(allocator);
-            self.push_queue_mutex.unlock();
+            self.log.deinit(allocator);
             {
                 var it = self.onheaders_cache.keyIterator();
                 while (it.next()) |kp| allocator.free(kp.*);
@@ -1936,7 +1858,7 @@ pub fn Worker(comptime opts: Options) type {
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
-            self.log_buffer.deinit();
+            self.log.log_buffer.deinit();
             // SharedTxnPool.deinit walks any leftover
             // txns (best-effort rollback) before freeing the
             // hashmap. Non-empty means we're exiting with
@@ -2034,7 +1956,7 @@ pub fn Worker(comptime opts: Options) type {
                 components_mod.UpstreamFetchEvent.deinitItem(&pe.event, allocator);
             self.fetch_pending_durability.deinit(allocator);
             self.dispatcher.deinit();
-            if (self.log_push_curl) |easy| easy.deinit();
+            if (self.log.log_push_curl) |easy| easy.deinit();
             // `manifest_easy` lives on NodeState — main.zig owns it.
             self.h2.destroy();
             allocator.destroy(self);
@@ -3544,15 +3466,15 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
-        log_buffer: log_mod.NodeLogBuffer,
+        log: struct { log_buffer: log_mod.NodeLogBuffer },
     };
     var fake = FakeWorker{
         .allocator = allocator,
         .tenant_logs = .empty,
-        .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+        .log = .{ .log_buffer = log_mod.NodeLogBuffer.init(allocator) },
     };
     defer fake.tenant_logs.deinit(allocator);
-    defer fake.log_buffer.deinit();
+    defer fake.log.log_buffer.deinit();
 
     const tl = try worker_log.openTenantLog(&fake, inst, 7);
     defer worker_log.freeTenantLog(allocator, tl);
@@ -3580,8 +3502,8 @@ test "captureLog appends a record to the worker's node-wide buffer" {
         12345,
     );
 
-    try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
-    const buffered = &fake.log_buffer.buffer.items[0];
+    try testing.expectEqual(@as(usize, 1), fake.log.log_buffer.buffer.items.len);
+    const buffered = &fake.log.log_buffer.buffer.items[0];
     try testing.expectEqual(@as(u64, 200), @as(u64, buffered.status));
     try testing.expectEqualStrings("/test", buffered.path);
     try testing.expectEqual(@as(u64, 42), buffered.deployment_id);
@@ -3618,15 +3540,15 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
-        log_buffer: log_mod.NodeLogBuffer,
+        log: struct { log_buffer: log_mod.NodeLogBuffer },
     };
     var fake = FakeWorker{
         .allocator = allocator,
         .tenant_logs = .empty,
-        .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+        .log = .{ .log_buffer = log_mod.NodeLogBuffer.init(allocator) },
     };
     defer fake.tenant_logs.deinit(allocator);
-    defer fake.log_buffer.deinit();
+    defer fake.log.log_buffer.deinit();
 
     const tl = try worker_log.openTenantLog(&fake, inst, 9);
     defer worker_log.freeTenantLog(allocator, tl);
@@ -3655,8 +3577,8 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
         0,
     );
 
-    try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
-    const buffered = &fake.log_buffer.buffer.items[0];
+    try testing.expectEqual(@as(usize, 1), fake.log.log_buffer.buffer.items.len);
+    const buffered = &fake.log.log_buffer.buffer.items[0];
     try testing.expectEqualStrings("chain-abc-123", buffered.correlation_id);
     try testing.expectEqual(log_mod.ActivationSource.send_callback, buffered.activation);
 }

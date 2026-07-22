@@ -272,7 +272,7 @@ fn handleServicesTokenMint(
         try respb.setSystemResponse(server, ent, sid, sess, 503, "services jwt not configured\n", allocator, cors_origin, null);
         return;
     };
-    const log_base = worker.log_public_base orelse {
+    const log_base = worker.log.log_public_base orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 503, "log-server public base not configured\n", allocator, cors_origin, null);
         return;
     };
@@ -515,7 +515,7 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         worker.spools.bound_fetch_spool_readback_total,
         worker.spools.bound_fetch_spool_dropped_total,
         worker.spools.bound_fetch_spool_depth_peak,
-        worker.log_records_dropped_total,
+        worker.log.log_records_dropped_total,
     });
 
     // chunk spool (`docs/architecture/routing-and-ingress.md`): live retained (sealed-but-not-

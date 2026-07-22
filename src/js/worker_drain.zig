@@ -3101,7 +3101,7 @@ fn advanceInboundChunkGate(worker: anytype, job: anytype) bool {
     for (job.prepared.items) |*pf| {
         switch (pf.coord) {
             .unsubmitted => {
-                const wid: u8 = @intCast(worker.log_worker_id);
+                const wid: u8 = @intCast(worker.log.log_worker_id);
                 if (coord.submit(wid, pf.bytes)) |seq| {
                     pf.wid = wid;
                     pf.seq = seq;
