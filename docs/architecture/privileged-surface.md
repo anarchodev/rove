@@ -3,11 +3,15 @@
 > **Shipped** (graduated from `plans/`): the two-surface model, the
 > assignment rule, and the `__rove_*` → `__rove.*` holder collapse
 > (§0–§2, §4 steps 1/4/5) are as-built in `src/js/globals.zig`, which
-> cites this doc. The rate-limiting half (§3 — remove
-> `__rove_check_email_rate`, plan-quota at the frozen outbound boundary,
-> `@rewind/ratelimit`) is open work, tracked in issue #120 (P-Rate;
-> package-manager tracker #130). The public-shim half of the surface is
-> [`builtin-libs.md`](builtin-libs.md).
+> cites this doc. The rate-limiting half (§3) is now shipped too: the
+> email-specific `__rove_check_email_rate` native + `email_rate.zig` are
+> deleted, and the per-tenant plan-quota moved to a **general outbound
+> limit** enforced at the frozen fetch primitive (`bindings/http.zig`
+> `outboundRateOk`, the `.outbound` limiter action). Customer-facing
+> rate limiting is the kv token-bucket recipe (§3b); shipping it as a
+> first-party `@rewind/ratelimit` package waits for the registry (#121).
+> After this, no bare `__rove_*` globals remain. The public-shim half of
+> the surface is [`builtin-libs.md`](builtin-libs.md).
 
 ---
 
@@ -84,31 +88,50 @@ the public shim, and the bare native disappears. `resumeIfBound`,
 `wake.set`, `wake.fire`, `fetch` are genuinely baked-only → the gated
 `__rove.*` holder. `check_email_rate` → §3.
 
-## 3. `check_email_rate` → generic rate limiting + platform quota (open — issue #120)
+## 3. `check_email_rate` → generic rate limiting + platform quota (shipped — issue #120)
 
-`__rove_check_email_rate` tangles two different things into one
-email-specific native (`email_rate.zig`): it's a **per-worker in-memory
-bucket sized by the tenant's PLAN** (`state.plan_rate`). Untangle them.
+`__rove_check_email_rate` tangled two different things into one
+email-specific native (`email_rate.zig`): a **per-worker in-memory bucket
+sized by the tenant's PLAN** (`state.plan_rate`). Both the native and
+`email_rate.zig` are now deleted; the two concerns are untangled as below.
 
-### 3a. Platform plan-quota (the part that must not be bypassable)
+### 3a. Platform plan-quota — a general OUTBOUND limit (shipped)
 
 The plan-rate check is the **platform** limiting the tenant per their
-plan. Once `email` is a **tenant-pinnable package** (package-manager-plan
-§2), a package that simply *doesn't call* the quota native would bypass
-it. So plan-quota enforcement **must move out of the email lib to a
-platform enforcement point** the tenant can't replace:
+plan. Once `email` becomes a **tenant-pinnable package** (#123), a package
+that simply *doesn't call* the quota native would bypass it. So
+enforcement moved out of the email lib to a point the tenant can't
+replace: **the frozen fetch primitive** (`bindings/http.zig`
+`outboundRateOk`), a new `.outbound` action on the per-worker
+`state.limiter`.
 
-- Email composes over the frozen `webhook.send` / outbound primitive
-  (durability-as-JS-shim, `decisions.md §3.3`). Enforce the per-tenant
-  outbound plan-rate **there**, at the frozen boundary — it already runs
-  with platform trust and already sees `state.plan_rate`. This subsumes
-  the email-specific bucket into a general per-tenant *outbound* limit
-  that covers email because email *is* outbound.
-- **Open question (§5.1):** is there already a per-tenant outbound rate
-  limit at `webhook.send`/`http.fetch`, or only the inbound request-side
-  check + this email bucket? If only the latter, this adds a general
-  outbound limit (reusing the existing per-worker `state.limiter`
-  machinery, just keyed generally rather than `.email`).
+- **Verify-first (was §5.1), answered:** there was NO per-tenant outbound
+  limit anywhere — the limiter had only `.request` (inbound) and `.email`.
+  So this *adds* a general outbound limit rather than moving one. The
+  `.email` action + its `email_capacity`/`email_refill_per_sec` caps were
+  renamed to `.outbound` / `outbound_capacity` / `outbound_refill_per_sec`
+  (`src/plan/root.zig`); the launch tier numbers are unchanged (a product
+  call — decisions.md §10.9).
+- **Un-bypassable by construction.** A tenant-pinnable email/webhook
+  package can only reach third-party egress through the frozen verbs
+  (`webhook.send`, `after.fetch`, `http.subscribe`) — it cannot name the
+  raw `_system.http`/`__rove.fetch` natives (deleted / `is_system_module`-
+  gated). All of those verbs funnel through `jsHttpFetch`/`jsOnFetch`/
+  `jsHttpSubscribe`, where the check lives. `email.send` composes over
+  `webhook.send`, so it inherits the limit with no email-specific code.
+- **Two carve-outs, both correct-by-construction.** (1) Deferred platform
+  delivery — the baked `__system/webhook_fire` retry / scheduled fire
+  (`is_system_module == true`) — is exempt: it re-issues an
+  already-admitted send, is bounded by the webhook retry budget + backoff,
+  and re-counting it would burn a retry attempt / hot-loop the watchdog.
+  (2) Fetches to platform-internal doors (`*.internal` — `blob.*`,
+  `platform.*`, logs storage/control-plane I/O) are exempt
+  (`targetsInternalDoor`); they aren't third-party egress.
+- **Atomic rejection.** `webhook.send` now attempts its immediate fire
+  *before* writing the durable `_send/owed` marker + watchdog, so a
+  rate-limited send throws `Error{code:"rate_limited"}` leaving no durable
+  residue — otherwise the watchdog would still deliver it and a caught +
+  retried `rate_limited` would double-send.
 
 ### 3b. Generic customer rate limiting (the part the user wants)
 
@@ -153,14 +176,16 @@ ratelimit` (3b); per-worker primitive deferred (3c).
 1. **Collapse `__rove_*` → `__rove.*`** (globals.zig `GLOBAL_BUILTINS` →
    one holder object, like `installNamespace`); rewrite baked-module +
    shim call sites (`__rove_next` → `__rove.next`, etc.). **Done.**
-2. **Delete `__rove_check_email_rate`** + `email_rate.zig`'s shim entry;
-   move the plan-rate check to the outbound boundary (3a). **Open — #120.**
-3. **Update `email.js`** — drop the `check_email_rate` call; (if email
-   stays a frozen shim for now) it no longer self-limits. Customer-facing
-   limiting → the kv recipe/package. **Open — #120.**
-4. **Update lint/determinism allowlist** (`globals.zig`) to the one
-   `__rove` name; update the "`_system` unreachable" test — no behavior
-   change to the delete. **Done.**
+2. **Delete `__rove_check_email_rate`** + `email_rate.zig`; move the
+   plan-rate check to the outbound boundary as the `.outbound` limiter
+   action enforced in `bindings/http.zig` `outboundRateOk` (3a). **Done.**
+3. **Update `email.js`** — drop the `check_email_rate` call; it no longer
+   self-limits (the outbound boundary does, un-bypassably). Customer-facing
+   limiting → the kv recipe/package. **Done.**
+4. **Update lint/determinism allowlist** (`globals.zig`) — the
+   `builtin_exceptions` list is now empty (`GLOBAL_BUILTINS` is empty); the
+   sim `__rove_check_email_rate` stub is gone, its budget check relocated
+   to the sim's `recFetch` chokepoint. **Done.**
 5. **Docs:** the two-surface model + assignment rule (§1) recorded — this
    doc is the design-of-record (one ABI, split by the mechanical rule,
    secured by self-gate/tenant-scope — not by the names).
@@ -168,11 +193,11 @@ ratelimit` (3b); per-worker primitive deferred (3c).
 Keep every `is_system_module` self-gate and `state.platform` gate exactly
 as-is — this cleanup does not touch the enforcement mechanism.
 
-## 5. Open questions (the open ones ride issue #120)
+## 5. Open questions
 
-1. **Outbound plan-rate** (3a) — does a per-tenant outbound limit already
-   exist at `webhook.send`/`http.fetch`? Determines whether 3a *moves* the
-   email bucket or *adds* a general outbound limit. Verify before coding.
+1. ~~**Outbound plan-rate** (3a) — does a per-tenant outbound limit already
+   exist?~~ — resolved: it did NOT (only `.request` inbound + the `.email`
+   bucket), so 3a *added* a general `.outbound` limit. Shipped.
 2. ~~Collapse churn vs. keep bare~~ — resolved: the collapse shipped (one
    clear surface object is the point).
 3. **`@rewind/ratelimit` package vs. recipe** — ship the token bucket as a

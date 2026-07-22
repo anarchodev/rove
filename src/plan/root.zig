@@ -34,10 +34,15 @@ pub const RateLimitCaps = struct {
     request_capacity: u32 = 1000,
     /// Sustained rate: requests per second the bucket refills at.
     request_refill_per_sec: u32 = 500,
-    /// Burst cap on `email.send` calls from a handler.
-    email_capacity: u32 = 100,
-    /// 10/sec → 600/min sustained — well under any sane Resend quota.
-    email_refill_per_sec: u32 = 10,
+    /// Burst cap on customer-initiated OUTBOUND calls from a handler —
+    /// `on.fetch`, `http.fetch`, and the immediate fire of `webhook.send`
+    /// / `email.send` (which composes over it). The platform's egress /
+    /// third-party-bill guard, enforced at the frozen fetch primitive
+    /// (`bindings/http.zig`) so a tenant-pinnable email/webhook package
+    /// can't bypass it. Deferred webhook retries don't re-count.
+    outbound_capacity: u32 = 100,
+    /// 10/sec → 600/min sustained — well under any sane provider quota.
+    outbound_refill_per_sec: u32 = 10,
 };
 
 /// The named tiers. Free is the default for any tenant with no CP plan blob.
@@ -84,8 +89,8 @@ pub fn table(t: Tier) PlanLimits {
             .rate = .{
                 .request_capacity = 1000,
                 .request_refill_per_sec = 500,
-                .email_capacity = 100,
-                .email_refill_per_sec = 10,
+                .outbound_capacity = 100,
+                .outbound_refill_per_sec = 10,
             },
             // A few MB — generous-but-finite, coherent with the 256 KB
             // streaming QUEUE_BYTES_CAP (docs/architecture/control-plane.md Lever 2).
@@ -97,8 +102,8 @@ pub fn table(t: Tier) PlanLimits {
             .rate = .{
                 .request_capacity = 10_000,
                 .request_refill_per_sec = 5_000,
-                .email_capacity = 1_000,
-                .email_refill_per_sec = 100,
+                .outbound_capacity = 1_000,
+                .outbound_refill_per_sec = 100,
             },
             .max_body_bytes = 32 * 1024 * 1024,
             .max_resident_html_bytes = 32 * 1024 * 1024,
@@ -108,8 +113,8 @@ pub fn table(t: Tier) PlanLimits {
             .rate = .{
                 .request_capacity = 100_000,
                 .request_refill_per_sec = 50_000,
-                .email_capacity = 10_000,
-                .email_refill_per_sec = 1_000,
+                .outbound_capacity = 10_000,
+                .outbound_refill_per_sec = 1_000,
             },
             .max_body_bytes = 256 * 1024 * 1024,
             .max_resident_html_bytes = 256 * 1024 * 1024,
@@ -124,8 +129,8 @@ pub fn table(t: Tier) PlanLimits {
 pub const Overrides = struct {
     request_capacity: ?u32 = null,
     request_refill_per_sec: ?u32 = null,
-    email_capacity: ?u32 = null,
-    email_refill_per_sec: ?u32 = null,
+    outbound_capacity: ?u32 = null,
+    outbound_refill_per_sec: ?u32 = null,
     max_body_bytes: ?u32 = null,
     max_resident_html_bytes: ?u32 = null,
     retention_days: ?u32 = null,
@@ -136,8 +141,8 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     var p = table(tier);
     if (ov.request_capacity) |v| p.rate.request_capacity = v;
     if (ov.request_refill_per_sec) |v| p.rate.request_refill_per_sec = v;
-    if (ov.email_capacity) |v| p.rate.email_capacity = v;
-    if (ov.email_refill_per_sec) |v| p.rate.email_refill_per_sec = v;
+    if (ov.outbound_capacity) |v| p.rate.outbound_capacity = v;
+    if (ov.outbound_refill_per_sec) |v| p.rate.outbound_refill_per_sec = v;
     if (ov.max_body_bytes) |v| p.max_body_bytes = v;
     if (ov.max_resident_html_bytes) |v| p.max_resident_html_bytes = v;
     if (ov.retention_days) |v| p.retention_days = v;
@@ -192,7 +197,7 @@ test "plan: effective folds sparse overrides over the table" {
     try testing.expectEqual(@as(u32, 7), p.rate.request_capacity); // overridden
     // Unset fields fall through to the pro table.
     try testing.expectEqual(table(.pro).retention_days, p.retention_days);
-    try testing.expectEqual(table(.pro).rate.email_capacity, p.rate.email_capacity);
+    try testing.expectEqual(table(.pro).rate.outbound_capacity, p.rate.outbound_capacity);
 }
 
 test "plan: Tier.parse unknown → free" {

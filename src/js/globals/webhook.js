@@ -141,6 +141,11 @@ globalThis.webhook = {
    *   supplied, in which case it is base64url(sha256(handle)) (stable:
    *   the same handle always yields the same id).
    * @throws {TypeError} If `url` is missing/wrong type.
+   * @throws {Error} `code:"rate_limited"` when the per-tenant outbound
+   *   rate limit is exhausted (email.send / webhook.send / after.fetch
+   *   share one per-tenant outbound budget). The immediate fire is
+   *   attempted before the durable marker is written, so a rejected send
+   *   leaves nothing queued — catch and retry later.
    *
    * Lifecycle: enumerate in-flight sends with
    * `kv.prefix("_send/owed/")` (each value is the marker JSON). To
@@ -236,41 +241,28 @@ globalThis.webhook = {
       context: ctx_val,
     };
     if (opts.timeoutMs != null) marker.timeout_ms = Math.floor(opts.timeoutMs);
-    kv.set("_send/owed/" + id, JSON.stringify(marker));
 
-    // The durable next-fire entry (one per send, idempotency key
-    // `_send/{id}` — re-sends with the same handle MOVE it, mirroring
-    // the marker's last-write-wins). Scheduled: the customer's fire
-    // time. Immediate: the crash-recovery watchdog (onresult cancels
-    // it on the terminal event; a retry re-arm moves it to the
-    // backoff time).
-    if (scheduled) {
-      schedule({ at: fire_at_ns_big }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
-    } else {
-      schedule({ in: WEBHOOK_WATCHDOG_MS }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
-    }
-
-    // Phase 4.1.2 (re-enabled inline fire). The earlier sweep-only
-    // path was a workaround for the marker-commit race: the marker
-    // was in the handler's writeset (not committed until raft
-    // replicates ~10-20ms later) but `http.fetch` enqueued
-    // immediately, so a fast upstream could complete BEFORE the
-    // marker committed — `webhook_onresult` would open a fresh
-    // `beginTrackedImmediate`, see `owed_raw == null`, and bail.
+    // Immediate path: attempt the inline fire FIRST, BEFORE writing the
+    // durable marker / watchdog. The per-tenant outbound rate limit is
+    // enforced at the fetch primitive (bindings/http.zig `outboundRateOk`);
+    // if it throws `rate_limited`, this send must leave NO durable residue
+    // — otherwise the crash-recovery watchdog below would still deliver it,
+    // and a customer who catches `rate_limited` and retries would
+    // double-send. Ordering the fetch ahead of the `kv.set`/`schedule`
+    // writes makes a rejected send atomic (nothing written). The fetch is
+    // buffered as a `Cmd.http_fetch` and released post-commit, so it still
+    // shares the marker's commit gate (docs/architecture/effects-and-handlers.md);
+    // moving it earlier in the handler body doesn't change WHEN it fires,
+    // only that a rate-limit throw pre-empts the writes.
     //
-    // The commit gate comes from the reified primitives / Cmd pattern
-    // (docs/architecture/effects-and-handlers.md): the worker stages
-    // every `http.fetch` issued from a
-    // write-path handler as a `Cmd.http_fetch` on the parked
-    // unit's `BufferedCmds`; `drainRaftPending`'s commit arm runs
-    // `interpretCmd` on each, which submits to the engine STRICTLY
-    // AFTER raft commits the writeset. The fetch + the marker
-    // share one commit gate. No more race.
-    //
-    // Scheduled fires (`fire_at_ns > now`) go wake-only — the baked
-    // `__system/webhook_fire` issues the fetch when the durable wake
-    // fires. The held-sync §6.4 path stays correct either way (the
-    // 25s mandatory deadline covers both paths).
+    // Phase 4.1.2 (inline fire): the earlier sweep-only path was a
+    // workaround for a marker-commit race, resolved by the Cmd-pattern
+    // commit gate — the worker stages every `http.fetch` from a write-path
+    // handler on the parked unit's `BufferedCmds` and `drainRaftPending`
+    // submits it STRICTLY AFTER raft commits the writeset. Scheduled fires
+    // (`fire_at_ns > now`) go wake-only — the baked `__system/webhook_fire`
+    // issues the fetch when the durable wake fires; the held-sync path
+    // stays correct either way (the 25s mandatory deadline covers both).
     if (!scheduled) {
       sysHttp.fetch({
         url: opts.url,
@@ -296,6 +288,20 @@ globalThis.webhook = {
           context: ctx_val,
         },
       });
+    }
+
+    kv.set("_send/owed/" + id, JSON.stringify(marker));
+
+    // The durable next-fire entry (one per send, idempotency key
+    // `_send/{id}` — re-sends with the same handle MOVE it, mirroring
+    // the marker's last-write-wins). Scheduled: the customer's fire
+    // time. Immediate: the crash-recovery watchdog (onresult cancels
+    // it on the terminal event; a retry re-arm moves it to the
+    // backoff time).
+    if (scheduled) {
+      schedule({ at: fire_at_ns_big }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+    } else {
+      schedule({ in: WEBHOOK_WATCHDOG_MS }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
     }
     return id;
   },

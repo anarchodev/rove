@@ -10,7 +10,7 @@ expect(limited.status).toBe(200);
 expect(limited.body.results[0]).toBe("sent");
 expect(limited.body.results[1]).toBe("sent");
 expect(limited.body.results[2].code).toBe("rate_limited");
-expect(limited.body.results[2].message).toMatch("email rate limit exceeded");
+expect(limited.body.results[2].message).toMatch("outbound rate limit exceeded");
 // Only the two allowed sends produced durable _send/owed markers.
 expect(limited).toHaveSent("email", { subject: "hello 0" });
 expect(limited).toHaveSent("email", { subject: "hello 1" });
