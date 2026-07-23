@@ -90,6 +90,17 @@ expect(req).toHaveFetched(/stripe/);
   are still pinned — prod always sets them — with the placeholders `"sim"`
   (tenant) and `""` (correlation id), and `request.session` is `null` unless
   injected, so the documented `session === null` branch is reachable offline.
+- `packages` / `app_imports` — a first-party `@rewind/*` package graph, so a
+  handler that `import`s a package by bare specifier resolves **offline**
+  (there is no registry in the sim). `packages` is
+  `[{ spec, version, pkg_hash, imports?, files: { path: source } }]` and
+  `app_imports` is `{ specifier: pkg_hash }` — the same resolved-lockfile shape
+  the deploy produces, with each package's source carried inline (offline there
+  is no blob store). The sim resolves through the SAME `PackageResolver` prod
+  uses at deploy: `app_imports` is the app's flat surface; a package's own
+  `imports` encapsulate its (possibly different-version) deps. `pkg_hash` is the
+  content-addressed `/pkg/<hash>/` namespace — any 64-hex works (the engine
+  treats it as opaque). Use this to test a consumer of a lifted `@rewind` lib.
 
 The **request body** is whatever you pass as `inbound({ body })` (JSON-stringified
 if it's not a string). For a **binary** request body pass `inbound({ bodyBinary })`

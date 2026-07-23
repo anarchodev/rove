@@ -239,6 +239,20 @@ fn moduleLoad(
 ) callconv(.c) c_int {
     const h = hostOf(user);
     const s = spec[0..@intCast(spec_len)];
+    // Content-addressed package modules (`/pkg/<hash>/…`, issue #50) live ONLY
+    // inline in the world's package sources — they have no on-disk home. Serve
+    // them from the `sources` map even under a working-tree `--source-dir`
+    // override (which otherwise reads app modules from disk); else the offline
+    // resolver would look for `{source_dir}/pkg/<hash>/…` and diverge.
+    if (std.mem.startsWith(u8, s, "/pkg/")) {
+        if (h.sources.get(s)) |src| {
+            out_src.* = dupC(src, true) orelse return -1;
+            out_src_len.* = @intCast(src.len);
+            return 0;
+        }
+        h.setDiv("package module '{s}' not in the world's package sources", .{s});
+        return -6;
+    }
     // Working-tree override: serve the local file so a changed handler can be
     // replayed against the recorded inputs. A missing local file IS a
     // divergence ("your tree doesn't have this module").

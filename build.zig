@@ -1312,6 +1312,21 @@ pub fn build(b: *std.Build) void {
     addSimGlobalEmbeds(b, driver_smoke_mod);
     driver_smoke_mod.addImport("package_resolver", pkgres_mod);
     driver_smoke_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
+    // The lifted first-party @rewind/* package sources (P-Lift, rove#123),
+    // embedded so the driver smoke can prove the real libs resolve + run
+    // offline as packages — incl. the oauth→jwt intra-set dependency graph.
+    driver_smoke_mod.addAnonymousImport("pkg_jwt", .{ .root_source_file = b.path("src/js/packages/@rewind/jwt/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_oauth", .{ .root_source_file = b.path("src/js/packages/@rewind/oauth/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_cron", .{ .root_source_file = b.path("src/js/packages/@rewind/cron/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_sessions", .{ .root_source_file = b.path("src/js/packages/@rewind/sessions/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_retry", .{ .root_source_file = b.path("src/js/packages/@rewind/retry/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_activitypub", .{ .root_source_file = b.path("src/js/packages/@rewind/activitypub/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_email", .{ .root_source_file = b.path("src/js/packages/@rewind/email/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_users", .{ .root_source_file = b.path("src/js/packages/@rewind/users/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_oidc", .{ .root_source_file = b.path("src/js/packages/@rewind/oidc/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_schedule", .{ .root_source_file = b.path("src/js/packages/@rewind/schedule/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_segments", .{ .root_source_file = b.path("src/js/packages/@rewind/segments/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_browser", .{ .root_source_file = b.path("src/js/packages/@rewind/browser/index.mjs") });
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
@@ -1338,6 +1353,31 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_pkgs = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_pkgs.addArg("packages");
     driver_smoke_step.dependOn(&driver_smoke_pkgs.step);
+    // `oauthjwt`: the real lifted @rewind/oauth package imports the real lifted
+    // @rewind/jwt package (a nested/private dep) and calls into it — proving
+    // the first intra-set package dependency graph resolves + runs offline
+    // (P-Lift, rove#123).
+    const driver_smoke_oauth = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_oauth.addArg("oauthjwt");
+    driver_smoke_step.dependOn(&driver_smoke_oauth.step);
+    // `cronpkg`: the lifted @rewind/cron package — an IIFE-wrapped ambient lib
+    // lifted to a module (the IIFE wrapper drops, module scope takes over) —
+    // resolves + runs offline, its static helpers composing over ambient `time`
+    // (P-Lift, rove#123).
+    const driver_smoke_cron = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_cron.addArg("cronpkg");
+    driver_smoke_step.dependOn(&driver_smoke_cron.step);
+    // `leafpkgs`: the object-literal leaf libs (sessions/retry/activitypub)
+    // lifted to packages resolve + load offline (P-Lift, rove#123).
+    const driver_smoke_leaf = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_leaf.addArg("leafpkgs");
+    driver_smoke_step.dependOn(&driver_smoke_leaf.step);
+    // `morepkgs`: the rest of the lifted libs — users (leaf), oidc (→ nested
+    // @rewind/jwt), and the IIFE-wrapped schedule/segments/browser — all
+    // resolve + load offline (P-Lift, rove#123).
+    const driver_smoke_more = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_more.addArg("morepkgs");
+    driver_smoke_step.dependOn(&driver_smoke_more.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
@@ -1424,6 +1464,9 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/argvalidation", // prod's synchronous effect-argument throw table fires offline with the same error types/messages
         "src/replay/testdata/ssrfgate", // resolving a success outcome for a prod-blocked fetch URL (SSRF/plain-http/localhost) fails loud; status 0 stays authorable
         "src/replay/testdata/emailbudget", // scenario({emailBudget}) arms the outbound rate limiter offline — N+1-th send throws code:"rate_limited"; unset stays unmetered
+        "src/replay/testdata/pkgimport", // scenario({packages, app_imports}) resolves a first-party @rewind/* package offline through the shared PackageResolver (P-Lift enabler)
+        "src/replay/testdata/jwtpkg", // the lifted @rewind/jwt package (globalThis.jwt → ES exports) resolves + runs offline through a consumer (P-Lift lib #1)
+        "src/replay/testdata/emailpkg", // the lifted @rewind/email package composes over the ambient webhook primitive offline (P-Lift lib #2)
         "src/replay/testdata/instancefold", // instances.create's exists marker folds across resumes — create-then-scope-in-continuation resolves
         "src/replay/testdata/timerwakes", // held wake-fold: multiple after.ms → last-armed slot wins + due-time gate, per-arm {on} routing, after.kv prefix containment
         "src/replay/testdata/concurrentctx", // whenConcurrent threads the evolving next({ctx}) between legs — a no-ctx leg reads the prior leg's re-held ctx

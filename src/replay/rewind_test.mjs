@@ -439,6 +439,17 @@ class Scenario {
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
+    // Offline `@scope/pkg` package graph (issue #50 resolver): the same
+    // `[{spec, version, pkg_hash, imports?, files:{path:source}}]` +
+    // `app_imports:{spec:pkg_hash}` shape the deploy/registry produce,
+    // declared inline so a handler that `import`s a package resolves offline
+    // (there is no registry in the sim). Passed through to the world; the
+    // sim's `PackageResolver` (the SAME one prod uses) does the rest. Package
+    // files carry their source inline (`files:{path:source}`) — offline there
+    // is no blob store. `app_imports` is the app's flat surface; a package's
+    // own `imports` encapsulate its (possibly different-version) deps.
+    this.packages = Array.isArray(cfg.packages) ? cfg.packages : null;
+    this.appImports = cfg.app_imports || cfg.appImports || null;
   }
 
   /** Stamp the scenario's per-chain identity onto a world's `request`, without
@@ -477,6 +488,8 @@ class Scenario {
         path, kind: "handler", source: this.inlineSources[path],
       }));
     }
+    if (this.packages) w.packages = this.packages;
+    if (this.appImports) w.app_imports = this.appImports;
     return this._stampIdentity(w);
   }
 
@@ -1603,6 +1616,11 @@ class Interleaving {
 function carrySources(parentWorld, world) {
   if (parentWorld.source_dir) world.source_dir = parentWorld.source_dir;
   if (parentWorld.sources) world.sources = parentWorld.sources;
+  // The `@scope/pkg` graph threads to every resume too — a package-importing
+  // handler that parks on a fetch/timer/kv wake must still resolve its imports
+  // when it resumes (e.g. an OIDC callback that imports `@rewind/oidc`).
+  if (parentWorld.packages) world.packages = parentWorld.packages;
+  if (parentWorld.app_imports) world.app_imports = parentWorld.app_imports;
   // Per-chain identity (tenant / correlation_id) threads to every resume, like
   // the connection ctx — inbound mints, resumes inherit. The parent world always
   // carries it (stamped at construction), so copy it into the resume's request.
