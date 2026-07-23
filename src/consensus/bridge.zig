@@ -196,7 +196,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, transfer_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, transfer_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, first_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -296,6 +296,11 @@ const CatchupJob = struct {
     index: u64,
     term: u64,
 };
+
+/// One drained follower→leader promotion: the group's `gid` (for the
+/// promotion-time log walker's raft-log reads) + its tenant `id_str`
+/// (borrowed, bridge-lifetime stable; for the deployment reload).
+pub const Promotion = struct { gid: u64, id_str: []const u8 };
 
 /// Worker-facing resolved form of a `CatchupJob` (`drainSnapshotCatchup` adds
 /// the gid's pointer-stable `id_str`). The `SnapshotCatchupThread` consumes it.
@@ -1125,6 +1130,16 @@ pub const Bridge = struct {
         return cmd.snap_index;
     }
 
+    /// This group's first (uncompacted) local raft log index — the lowest index
+    /// still recoverable from the live log. The promotion-time LogRecord walker
+    /// (`docs/architecture/deployment-and-logs.md`) walks `[firstIndex..lastIndex]`
+    /// on leader promotion. Pump op. 0 on unknown group / pump failure.
+    pub fn firstIndex(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .first_index, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
     /// This group's LIVE applied index on the leader (`slot.applied_idx`) — the
     /// out-of-band baseline a new member is born at. Always >= the leader's first
     /// (compacted) log index, so the baseline points at an entry the leader still
@@ -1275,6 +1290,10 @@ pub const Bridge = struct {
                 },
                 .last_index => blk: {
                     cmd.snap_index = self.node.lastIndex(cmd.gid);
+                    break :blk null;
+                },
+                .first_index => blk: {
+                    cmd.snap_index = self.node.firstIndex(cmd.gid);
                     break :blk null;
                 },
                 .baseline_index => blk: {
@@ -1615,14 +1634,14 @@ pub const Bridge = struct {
         return sig.id_str;
     }
 
-    pub fn drainPromotions(self: *Bridge, out: [][]const u8) usize {
+    pub fn drainPromotions(self: *Bridge, out: []Promotion) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         var n: usize = 0;
         while (n < out.len) {
             const gid = self.promoted.pop() orelse break;
             const sig = self.groups.get(gid) orelse continue;
-            out[n] = sig.id_str;
+            out[n] = .{ .gid = gid, .id_str = sig.id_str };
             n += 1;
         }
         return n;

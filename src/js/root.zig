@@ -134,6 +134,8 @@ test {
     _ = session;
     _ = deployment_loader;
     _ = @import("worker_inbound_chunk.zig");
+    _ = @import("worker_upload_walker.zig");
+    _ = @import("log_walker.zig");
     _ = @import("static_cache.zig");
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");

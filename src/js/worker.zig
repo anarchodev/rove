@@ -87,6 +87,7 @@ const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
 const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
+const log_walker_mod = @import("log_walker.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_ws = @import("worker_ws.zig");
 const worker_drain = @import("worker_drain.zig");
@@ -1109,6 +1110,14 @@ pub const WorkerConfig = struct {
     /// Upper bound on how long a parked raft proposal can wait before
     /// we compensate-rollback and return 503. See `RaftWait` docs.
     commit_wait_timeout_ns: u64 = 2 * std.time.ns_per_s,
+    /// Log-flush cadence overrides for `NodeLogBuffer.shouldFlush`. Null
+    /// keeps the module defaults (1024 records / 1 MB / 1 s). Operational
+    /// knobs (`REWIND_LOG_FLUSH_INTERVAL_MS` / `REWIND_LOG_FLUSH_RECORDS`);
+    /// the failover-log smoke widens the interval + lowers the record
+    /// threshold to hold a record unflushed across a leader kill, proving
+    /// the promotion walker (not the original flush) surfaces it.
+    log_flush_interval_ns: ?i64 = null,
+    log_flush_threshold_records: ?u32 = null,
     /// HMAC-SHA256 secret used to sign JWTs minted at
     /// `/_system/services-token`.
     /// The standalone log-server + files-server (separate threads /
@@ -1675,6 +1684,11 @@ pub fn Worker(comptime opts: Options) type {
         /// buffer into one combined batch per flush window. One node
         /// buffer, not per-tenant.
         log_buffer: log_mod.NodeLogBuffer,
+        /// Promotion-time LogRecord catch-up state. On a follower→leader
+        /// edge it walks the group's live raft log, re-deriving LogRecords
+        /// a crashed prior leader buffered but never flushed, and appends
+        /// them to `log_buffer` (`docs/architecture/deployment-and-logs.md`).
+        log_walker: log_walker_mod.LogWalker = .{},
         /// Circuit breaker for handlers that blow past their CPU
         /// budget. A tenant with `kill_threshold` interrupts inside a
         /// single `window_ns` gets bounced with 503 for
@@ -1836,7 +1850,12 @@ pub fn Worker(comptime opts: Options) type {
                 .raft = config.raft,
                 .bound_fetch_spool_depth = readBoundFetchSpoolDepth(),
                 .tenant_logs = .empty,
-                .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+                .log_buffer = blk: {
+                    var lb = log_mod.NodeLogBuffer.init(allocator);
+                    if (config.log_flush_interval_ns) |v| lb.flush_interval_ns = v;
+                    if (config.log_flush_threshold_records) |v| lb.flush_threshold_records = v;
+                    break :blk lb;
+                },
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
@@ -2018,6 +2037,7 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
             self.log_buffer.deinit();
+            self.log_walker.deinit(allocator);
             // SharedTxnPool.deinit walks any leftover
             // txns (best-effort rollback) before freeing the
             // hashmap. Non-empty means we're exiting with

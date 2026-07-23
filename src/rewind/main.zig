@@ -181,16 +181,25 @@ fn drainSnapshotCatchupJobs(worker: anytype, catchup: *rjs.SnapshotCatchupThread
 }
 
 fn runPromotionHook(worker: anytype) void {
-    var buf: [64][]const u8 = undefined;
+    var buf: [64]bridge_mod.Promotion = undefined;
     const n = worker.raft.drainPromotions(&buf);
-    if (n == 0) return;
-    for (buf[0..n]) |tenant_id| {
-        worker.node.deploy.enqueueCurrentDeployment(tenant_id);
+    for (buf[0..n]) |promo| {
+        worker.node.deploy.enqueueCurrentDeployment(promo.id_str);
+        // Seed the promotion-time LogRecord catch-up for this group — walk
+        // its live raft log to recover records a crashed prior leader
+        // buffered but never flushed (rove #77;
+        // docs/architecture/deployment-and-logs.md).
+        worker.log_walker.seed(worker.allocator, worker.raft, promo.gid);
     }
-    // The wake sweep is partitioned by `hash(tenant) % N_inboxes`, so every
-    // worker covers its own slice exactly once.
-    rjs.sweepDurableWakesOnPromotion(worker);
-    rjs.sweepDirtySubscriptionsOnPromotion(worker);
+    if (n > 0) {
+        // The wake sweep is partitioned by `hash(tenant) % N_inboxes`, so every
+        // worker covers its own slice exactly once.
+        rjs.sweepDurableWakesOnPromotion(worker);
+        rjs.sweepDirtySubscriptionsOnPromotion(worker);
+    }
+    // Advance any open catch-up cursors (bounded per tick) — runs every tick,
+    // not just on a fresh edge, so a long backlog drains across ticks.
+    worker.log_walker.drive(worker);
 }
 
 fn workerThreadEntry(args: *WorkerCtx) void {
@@ -245,6 +254,16 @@ fn workerMain(args: *WorkerCtx) !void {
             .websocket_upgrades = false,
         },
         .log_worker_id = args.worker_idx,
+        // Operational log-flush cadence overrides (null → module defaults).
+        .log_flush_interval_ns = blk: {
+            const s = std.posix.getenv("REWIND_LOG_FLUSH_INTERVAL_MS") orelse break :blk null;
+            const ms = std.fmt.parseInt(i64, s, 10) catch break :blk null;
+            break :blk ms * std.time.ns_per_ms;
+        },
+        .log_flush_threshold_records = blk: {
+            const s = std.posix.getenv("REWIND_LOG_FLUSH_RECORDS") orelse break :blk null;
+            break :blk std.fmt.parseInt(u32, s, 10) catch null;
+        },
         .admin_api_domain = args.admin_api_domain,
         .rate_limit_caps = .{},
         .compile_fn = QjsCompiler.compile,
