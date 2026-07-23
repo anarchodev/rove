@@ -55,6 +55,15 @@ pub const PkgFile = struct {
     bytecode_hash: ?[]const u8 = null,
 };
 
+/// A file the deploy has staged (`/v1/deploy/pkgfile` returned the
+/// server-authoritative pair). The wire's `files` entries during staging are
+/// these — accumulated per package as each file stages, empty until then.
+pub const StagedFile = struct {
+    path: []const u8,
+    source_hash: []const u8,
+    bytecode_hash: []const u8,
+};
+
 /// A resolved package version. `pkg_hash` is its content identity + the
 /// `/pkg/<pkg_hash>/` virtual dir its files stage under. `imports` values
 /// point at *dep* pkg_hashes (frozen at publish); `private` = not on the app
@@ -259,18 +268,72 @@ fn dupField(a: std.mem.Allocator, o: std.json.ObjectMap, key: []const u8) Error!
     return a.dupe(u8, v.string);
 }
 
+// ── leaves-first ordering ───────────────────────────────────────────────────
+
+/// Reorder `res.packages` leaves-first: every package's in-set dependencies
+/// (its `imports` values that name another package in the set) precede it, so
+/// the deploy stages a package only after the deps it imports are staged +
+/// compilable (quickjs resolves imports at compile — `pm_deploy_smoke.py`).
+/// Errors on a cycle (packages are a content-addressed DAG).
+pub fn topoSort(res: *Resolution) Error!void {
+    const a = res.arena.allocator();
+    const n = res.packages.len;
+
+    var idx = std.StringHashMap(usize).init(a);
+    for (res.packages, 0..) |p, i| try idx.put(p.pkg_hash, i);
+
+    const state = try a.alloc(VisitState, n);
+    @memset(state, .unvisited);
+    var order: std.ArrayListUnmanaged(usize) = .empty;
+    try order.ensureTotalCapacity(a, n);
+    for (0..n) |i| try dfsVisit(res, &idx, state, &order, a, i);
+
+    const sorted = try a.alloc(Package, n);
+    for (order.items, 0..) |src, dst| sorted[dst] = res.packages[src];
+    res.packages = sorted;
+}
+
+const VisitState = enum { unvisited, visiting, done };
+
+fn dfsVisit(
+    res: *const Resolution,
+    idx: *const std.StringHashMap(usize),
+    state: []VisitState,
+    order: *std.ArrayListUnmanaged(usize),
+    a: std.mem.Allocator,
+    i: usize,
+) Error!void {
+    switch (state[i]) {
+        .done => return,
+        .visiting => return Error.BadResolution, // cycle
+        .unvisited => {},
+    }
+    state[i] = .visiting;
+    for (res.packages[i].imports) |imp| {
+        if (idx.get(imp.pkg_hash)) |di| try dfsVisit(res, idx, state, order, a, di);
+    }
+    state[i] = .done;
+    try order.append(a, i);
+}
+
 // ── wire emission ───────────────────────────────────────────────────────────
 
-/// Emit the `resolution` JSON the deploy app consumes. With `include_files`
-/// each package carries its staged `files:[{path,source_hash,bytecode_hash}]`
-/// (for `/v1/deploy/{pkgfile,file}`, where imports validate at compile);
-/// without, files are omitted (for `/v1/deploy/cut`, which joins the staged
-/// rows server-side). Shape per `pm_deploy_smoke.py`: packages are
-/// `{spec, version, pkg_hash, imports[, files]}` + a top-level `app_imports`.
-///
-/// When `include_files` is set, every file MUST have `bytecode_hash` filled
-/// (staging done) — a null there is a caller bug (`Error.BadResolution`).
-pub fn emitResolution(a: std.mem.Allocator, res: *const Resolution, include_files: bool) Error![]u8 {
+/// Emit the `resolution` JSON the deploy app consumes. Every package carries
+/// `{spec, version, pkg_hash, imports}`; `staged` selects the mode:
+///   - `null` → the `/v1/deploy/cut` lockfile skeleton (no `files` key; the
+///     deploy app joins the staged rows server-side).
+///   - non-null → the `/v1/deploy/{pkgfile,file}` compile-validation shape:
+///     each package i also carries `files` = `staged[i]` (empty `[]` until its
+///     files stage; growing as they do). `staged` is indexed parallel to
+///     `res.packages` (so call `topoSort` first, then keep them aligned).
+/// Shape + growing-resolution semantics per `pm_deploy_smoke.py`; no
+/// `capabilities`/`private` on the wire (the deploy app defaults them).
+pub fn emitResolution(
+    a: std.mem.Allocator,
+    res: *const Resolution,
+    staged: ?[]const []const StagedFile,
+) Error![]u8 {
+    if (staged) |st| std.debug.assert(st.len == res.packages.len);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
 
@@ -285,17 +348,16 @@ pub fn emitResolution(a: std.mem.Allocator, res: *const Resolution, include_file
         try writeJsonString(&out, a, p.pkg_hash);
         try out.appendSlice(a, ",\"imports\":");
         try writeImportObject(&out, a, p.imports);
-        if (include_files) {
+        if (staged) |st| {
             try out.appendSlice(a, ",\"files\":[");
-            for (p.files, 0..) |f, fi| {
+            for (st[pi], 0..) |f, fi| {
                 if (fi != 0) try out.append(a, ',');
-                const bc = f.bytecode_hash orelse return Error.BadResolution;
                 try out.appendSlice(a, "{\"path\":");
                 try writeJsonString(&out, a, f.path);
                 try out.appendSlice(a, ",\"source_hash\":");
                 try writeJsonString(&out, a, f.source_hash);
                 try out.appendSlice(a, ",\"bytecode_hash\":");
-                try writeJsonString(&out, a, bc);
+                try writeJsonString(&out, a, f.bytecode_hash);
                 try out.append(a, '}');
             }
             try out.append(a, ']');
@@ -449,7 +511,7 @@ test "parseResolveResponse: an error body → Unresolved" {
     ));
 }
 
-test "emitResolution: cut skeleton omits files; staging includes them" {
+test "emitResolution: cut skeleton omits files; staging carries the staged set" {
     const json =
         \\{"packages":[
         \\ {"spec":"@rewind/jwt","version":"1.9.0","pkg_hash":"aa","files":[{"path":"index.mjs","source_hash":"s9"}],"imports":{}}
@@ -458,9 +520,9 @@ test "emitResolution: cut skeleton omits files; staging includes them" {
     var res = try parseResolveResponse(testing.allocator, json);
     defer res.deinit();
 
-    // cut: no files.
+    // cut: no files (staged = null).
     {
-        const wire = try emitResolution(testing.allocator, &res, false);
+        const wire = try emitResolution(testing.allocator, &res, null);
         defer testing.allocator.free(wire);
         try testing.expectEqualStrings(
             "{\"packages\":[{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\"," ++
@@ -469,10 +531,23 @@ test "emitResolution: cut skeleton omits files; staging includes them" {
             wire,
         );
     }
-    // staging: files with the bytecode filled in (as the pkgfile response would).
+    // staging, before this package's file is staged → empty files array.
     {
-        res.packages[0].files[0].bytecode_hash = "b9";
-        const wire = try emitResolution(testing.allocator, &res, true);
+        const staged = [_][]const StagedFile{&.{}};
+        const wire = try emitResolution(testing.allocator, &res, &staged);
+        defer testing.allocator.free(wire);
+        try testing.expectEqualStrings(
+            "{\"packages\":[{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\"," ++
+                "\"pkg_hash\":\"aa\",\"imports\":{},\"files\":[]}]," ++
+                "\"app_imports\":{\"@rewind/jwt\":\"aa\"}}",
+            wire,
+        );
+    }
+    // staging, after the file staged (as a pkgfile response would fill).
+    {
+        const files = [_]StagedFile{.{ .path = "index.mjs", .source_hash = "s9", .bytecode_hash = "b9" }};
+        const staged = [_][]const StagedFile{&files};
+        const wire = try emitResolution(testing.allocator, &res, &staged);
         defer testing.allocator.free(wire);
         try testing.expectEqualStrings(
             "{\"packages\":[{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\"," ++
@@ -484,11 +559,30 @@ test "emitResolution: cut skeleton omits files; staging includes them" {
     }
 }
 
-test "emitResolution: include_files with an unstaged file is a caller bug" {
+test "topoSort: orders deps before importers (leaves first)" {
+    // oidc (hash bb) imports jwt (hash aa); the response lists oidc first.
     const json =
-        \\{"packages":[{"spec":"@rewind/jwt","version":"1.9.0","pkg_hash":"aa","files":[{"path":"index.mjs","source_hash":"s9"}],"imports":{}}],"app_imports":{"@rewind/jwt":"aa"}}
+        \\{"packages":[
+        \\ {"spec":"@rewind/oidc","version":"2.0.0","pkg_hash":"bb","files":[{"path":"index.mjs","source_hash":"so"}],"imports":{"@rewind/jwt":"aa"}},
+        \\ {"spec":"@rewind/jwt","version":"1.9.0","pkg_hash":"aa","files":[{"path":"index.mjs","source_hash":"s9"}],"imports":{}}
+        \\],"app_imports":{"@rewind/oidc":"bb"}}
     ;
     var res = try parseResolveResponse(testing.allocator, json);
     defer res.deinit();
-    try testing.expectError(Error.BadResolution, emitResolution(testing.allocator, &res, true));
+    try topoSort(&res);
+    // jwt (leaf) must come before oidc (its importer).
+    try testing.expectEqualStrings("aa", res.packages[0].pkg_hash);
+    try testing.expectEqualStrings("bb", res.packages[1].pkg_hash);
+}
+
+test "topoSort: a cycle is rejected" {
+    const json =
+        \\{"packages":[
+        \\ {"spec":"@x/a","version":"1.0.0","pkg_hash":"aa","files":[{"path":"i.mjs","source_hash":"s1"}],"imports":{"@x/b":"bb"}},
+        \\ {"spec":"@x/b","version":"1.0.0","pkg_hash":"bb","files":[{"path":"i.mjs","source_hash":"s2"}],"imports":{"@x/a":"aa"}}
+        \\],"app_imports":{"@x/a":"aa"}}
+    ;
+    var res = try parseResolveResponse(testing.allocator, json);
+    defer res.deinit();
+    try testing.expectError(Error.BadResolution, topoSort(&res));
 }
