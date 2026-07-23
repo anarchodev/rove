@@ -208,7 +208,71 @@ pub fn main() !void {
         try runPackages(a);
         return;
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "oauthjwt")) {
+        try runOauthJwt(a);
+        return;
+    }
     try runInbound(a);
+}
+
+/// The first REAL intra-set package dependency (P-Lift, rove#123): the lifted
+/// `@rewind/oauth` package `import`s the lifted `@rewind/jwt` package (nested /
+/// private — reachable only through oauth, not on the app surface) and calls
+/// `jwt.verify` from `oauth.verifyIdToken`. A malformed token drives
+/// `jwt.verify` to throw, and oauth surfaces jwt's error text — proving the
+/// dep graph resolved AND jwt executed inside the encapsulated importer. The
+/// package sources are the REAL embedded lifted libs, not synthetic stubs.
+fn runOauthJwt(a: std.mem.Allocator) !void {
+    const JWT_HASH = "1" ** 64;
+    const OAUTH_HASH = "2" ** 64;
+    const JWT_SRC = @embedFile("pkg_jwt");
+    const OAUTH_SRC = @embedFile("pkg_oauth");
+    const OAUTH_HANDLER =
+        \\import oauth from '@rewind/oauth';
+        \\export default function () {
+        \\  kv.set('cache/oauth/test/jwks', JSON.stringify({ keys: [{ kty: 'RSA', kid: 'k1' }] }));
+        \\  const r = oauth.verifyIdToken('not-a-jwt', {
+        \\    issuer: 'https://issuer.test', client_id: 'client-x',
+        \\    jwks_uri: 'https://jwks.test', cache_path: 'cache/oauth/test',
+        \\  });
+        \\  return { status: 200, body: r };
+        \\}
+    ;
+
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(OAUTH_HANDLER, .{}, w);
+    try w.writeAll("}],");
+    // The app imports ONLY oauth; jwt is nested (private) via oauth's imports.
+    try w.print("\"app_imports\":{{\"@rewind/oauth\":\"{s}\"}},", .{OAUTH_HASH});
+    try w.writeAll("\"packages\":[");
+    try w.print("{{\"spec\":\"@rewind/oauth\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"imports\":{{\"@rewind/jwt\":\"{s}\"}},\"files\":{{\"index.mjs\":", .{ OAUTH_HASH, JWT_HASH });
+    try std.json.Stringify.value(OAUTH_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/jwt\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{JWT_HASH});
+    try std.json.Stringify.value(JWT_SRC, .{}, w);
+    try w.writeAll("}}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("OAUTH_JWT: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    // oauth loaded (its `import @rewind/jwt` resolved) AND jwt.verify ran — the
+    // error text is jwt's, surfaced through oauth's encapsulated dep. (`"ok"`
+    // appears twice in the bundle — the handler result `body:{"ok":false,…}`
+    // and the run's own top-level `"ok":true`; assert the former's shape.)
+    check(out.items, &.{
+        "\"body\":{\"ok\":false,\"error\":\"verify: jwt.verify: malformed token\"}",
+        "\"verify\":{\"pass\":true",
+    }, &.{"\"claims\""}, "OAUTH->JWT SCENARIO");
 }
 
 /// Multi-version package encapsulation offline (issue #50), mirroring

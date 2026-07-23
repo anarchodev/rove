@@ -1312,6 +1312,11 @@ pub fn build(b: *std.Build) void {
     addSimGlobalEmbeds(b, driver_smoke_mod);
     driver_smoke_mod.addImport("package_resolver", pkgres_mod);
     driver_smoke_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
+    // The lifted first-party @rewind/* package sources (P-Lift, rove#123),
+    // embedded so the driver smoke can prove the real libs resolve + run
+    // offline as packages — incl. the oauth→jwt intra-set dependency graph.
+    driver_smoke_mod.addAnonymousImport("pkg_jwt", .{ .root_source_file = b.path("src/js/packages/@rewind/jwt/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_oauth", .{ .root_source_file = b.path("src/js/packages/@rewind/oauth/index.mjs") });
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
@@ -1338,6 +1343,13 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_pkgs = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_pkgs.addArg("packages");
     driver_smoke_step.dependOn(&driver_smoke_pkgs.step);
+    // `oauthjwt`: the real lifted @rewind/oauth package imports the real lifted
+    // @rewind/jwt package (a nested/private dep) and calls into it — proving
+    // the first intra-set package dependency graph resolves + runs offline
+    // (P-Lift, rove#123).
+    const driver_smoke_oauth = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_oauth.addArg("oauthjwt");
+    driver_smoke_step.dependOn(&driver_smoke_oauth.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
