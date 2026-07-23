@@ -1317,6 +1317,7 @@ pub fn build(b: *std.Build) void {
     // offline as packages — incl. the oauth→jwt intra-set dependency graph.
     driver_smoke_mod.addAnonymousImport("pkg_jwt", .{ .root_source_file = b.path("src/js/packages/@rewind/jwt/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_oauth", .{ .root_source_file = b.path("src/js/packages/@rewind/oauth/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_cron", .{ .root_source_file = b.path("src/js/packages/@rewind/cron/index.mjs") });
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
@@ -1350,6 +1351,13 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_oauth = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_oauth.addArg("oauthjwt");
     driver_smoke_step.dependOn(&driver_smoke_oauth.step);
+    // `cronpkg`: the lifted @rewind/cron package — an IIFE-wrapped ambient lib
+    // lifted to a module (the IIFE wrapper drops, module scope takes over) —
+    // resolves + runs offline, its static helpers composing over ambient `time`
+    // (P-Lift, rove#123).
+    const driver_smoke_cron = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_cron.addArg("cronpkg");
+    driver_smoke_step.dependOn(&driver_smoke_cron.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session

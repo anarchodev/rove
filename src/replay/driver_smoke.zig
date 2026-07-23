@@ -212,7 +212,63 @@ pub fn main() !void {
         try runOauthJwt(a);
         return;
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "cronpkg")) {
+        try runCronPkg(a);
+        return;
+    }
     try runInbound(a);
+}
+
+/// The IIFE-wrapped conversion shape (P-Lift, rove#123): `@rewind/cron` was an
+/// ambient global wrapped in an IIFE (to keep its top-level locals out of the
+/// base-snapshot's global scope); lifted to a module, the IIFE drops and module
+/// scope takes over. Proves the lifted module resolves + runs offline and its
+/// static helpers (module-level `_cronHelpers` over the ambient `time` global)
+/// still work. Real embedded lifted source.
+fn runCronPkg(a: std.mem.Allocator) !void {
+    const CRON_HASH = "3" ** 64;
+    const CRON_SRC = @embedFile("pkg_cron");
+    const CRON_HANDLER =
+        \\import cron from '@rewind/cron';
+        \\export default function () {
+        \\  return { status: 200, body: {
+        \\    isFunc: typeof cron === 'function',
+        \\    hasNext: typeof cron.next === 'function',
+        \\    parseDur: cron.parseDuration('2h'),
+        \\    dailyAtOk: cron.dailyAt(3, 0) > 0n,
+        \\    hourlyOk: cron.hourly() > 0n,
+        \\  } };
+        \\}
+    ;
+
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,\"now_ms\":1700000000000,");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(CRON_HANDLER, .{}, w);
+    try w.writeAll("}],");
+    try w.print("\"app_imports\":{{\"@rewind/cron\":\"{s}\"}},", .{CRON_HASH});
+    try w.writeAll("\"packages\":[");
+    try w.print("{{\"spec\":\"@rewind/cron\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{CRON_HASH});
+    try std.json.Stringify.value(CRON_SRC, .{}, w);
+    try w.writeAll("}}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("CRON_PKG: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    // The IIFE lib lifted to a module: callable, static helpers work over the
+    // ambient `time` global (parseDuration("2h") = 7200000).
+    check(out.items, &.{
+        "\"isFunc\":true", "\"hasNext\":true", "\"parseDur\":7200000",
+        "\"dailyAtOk\":true", "\"hourlyOk\":true", "\"verify\":{\"pass\":true",
+    }, &.{"\"error\":\"handler"}, "CRON PKG SCENARIO");
 }
 
 /// The first REAL intra-set package dependency (P-Lift, rove#123): the lifted
