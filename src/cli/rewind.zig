@@ -15,12 +15,17 @@
 //! lines. Keys: REWIND_ADMIN_URL (dashboard origin), REWIND_IDP_URL (the IdP
 //! origin), REWIND_CLIENT_ID (default admin-dashboard), REWIND_SESSION
 //! (cookie-jar path, default ~/.config/rewind/rewind.session).
-//! For self-hosted clusters with a private CA / split-horizon DNS:
-//! REWIND_CACERT (curl --cacert) and REWIND_RESOLVE (curl --resolve entries,
-//! comma-separated host:port:addr).
+//! REWIND_REGISTRY_URL — the @rewind package registry origin, consulted only
+//! when a bundle's manifest.json declares `dependencies` (P-CLI, rove#122).
+//! REWIND_ROOT_TOKEN — headless auth: present the operator root token as a
+//! Bearer instead of the interactive OIDC session (CI / automation / smokes;
+//! deploy/release/CP accept it). For self-hosted clusters with a private CA /
+//! split-horizon DNS: REWIND_CACERT (curl --cacert) and REWIND_RESOLVE (curl
+//! --resolve entries, comma-separated host:port:addr).
 
 const std = @import("std");
 const c = @import("common.zig");
+const packages = @import("packages.zig");
 const replay = @import("rove-replay");
 const build_options = @import("build_options");
 
@@ -40,6 +45,16 @@ const Cfg = struct {
     session_file: []const u8,
     cacert: ?[]const u8,
     resolves: [][]const u8, // curl --resolve entries
+    /// The `@rewind` package registry origin (`REWIND_REGISTRY_URL`), for a
+    /// bundle that declares `dependencies`. Optional — a package-free deploy
+    /// never touches it; required (with a clear error) once deps are declared.
+    registry_url: ?[]const u8,
+    /// Operator root token (`REWIND_ROOT_TOKEN`) for HEADLESS auth — CI /
+    /// automation / smokes, where the interactive OIDC `login` flow isn't
+    /// available. When set, the session-bearing verbs (deploy/release/CP)
+    /// present it as `Authorization: Bearer …` instead of the cookie jar (the
+    /// deploy + release doors accept it). Unset → the normal OIDC session.
+    root_token: ?[]const u8,
 };
 
 fn cfgVar(env: *const c.Env, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
@@ -75,6 +90,8 @@ fn loadCfg(gpa: std.mem.Allocator, a: std.mem.Allocator, env_path: ?[]const u8) 
         .session_file = session,
         .cacert = cfgVar(&env, a, "REWIND_CACERT"),
         .resolves = resolves.items,
+        .registry_url = if (cfgVar(&env, a, "REWIND_REGISTRY_URL")) |u| std.mem.trimRight(u8, u, "/") else null,
+        .root_token = cfgVar(&env, a, "REWIND_ROOT_TOKEN"),
     };
 }
 
@@ -141,10 +158,17 @@ fn httpCall(
         push(&args, a, r);
     }
     if (use_jar) {
-        push(&args, a, "--cookie");
-        push(&args, a, cfg.session_file);
-        push(&args, a, "--cookie-jar");
-        push(&args, a, cfg.session_file);
+        if (cfg.root_token) |tok| {
+            // Headless auth: the operator root token as a Bearer, in place of
+            // the interactive OIDC cookie (REWIND_ROOT_TOKEN).
+            push(&args, a, "-H");
+            push(&args, a, std.fmt.allocPrint(a, "Authorization: Bearer {s}", .{tok}) catch c.oom());
+        } else {
+            push(&args, a, "--cookie");
+            push(&args, a, cfg.session_file);
+            push(&args, a, "--cookie-jar");
+            push(&args, a, cfg.session_file);
+        }
     }
     push(&args, a, "-X");
     push(&args, a, method);
@@ -290,6 +314,9 @@ fn uploadStep(a: std.mem.Allocator, cfg: *const Cfg, upath: []const u8, body: []
 }
 
 /// `rewind deploy <tenant> <bundle> [--release]` — per-file workspace deploy.
+/// A bundle whose `manifest.json` declares `dependencies` resolves them
+/// against the `@rewind` registry and stages the resolved package graph
+/// (P-CLI, rove#122); a package-free bundle takes the plain path.
 fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: []const u8, release: bool) void {
     const b = c.classify(a, bundle);
     if (b.skipped.len != 0) {
@@ -300,14 +327,202 @@ fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: 
     if (b.handlers.len == 0 and b.statics.len == 0) c.fatal("bundle {s} has nothing to publish", .{bundle});
     std.debug.print("bundle: {d} handler(s), {d} static(s)\n", .{ b.handlers.len, b.statics.len });
 
-    // reset workspace → handlers (JSON) + statics (streamed raw PUT) → cut.
+    // Package graph: the bundle's declared `dependencies`, plus the auto-pin
+    // of undeclared @rewind/* imports the handlers actually use.
+    const declared = readBundleDependencies(a, bundle);
+    const deps = augmentDependencies(a, declared, b.handlers);
+
     _ = deployStep(a, cfg, "reset", c.tenantBody(a, tenant), "reset");
-    for (b.handlers) |h| _ = deployStep(a, cfg, "file", c.fileBodyHandler(a, tenant, h), h.path);
+
+    // With packages: resolve → stage leaves-first → handlers/cut carry the
+    // resolution; the deploy app compiles + links against the pinned graph.
+    var resolution_json: ?[]const u8 = null; // the full staged resolution for handlers
+    var cut_body: []const u8 = c.tenantBody(a, tenant);
+    if (deps.len != 0) {
+        var rr = registryResolve(a, cfg, deps);
+        packages.topoSort(&rr.res) catch c.fatal("resolved packages form a dependency cycle", .{});
+        const staged = stagePackages(a, cfg, tenant, &rr.res);
+        resolution_json = packages.emitResolution(a, &rr.res, staged) catch c.oom();
+        const lock = packages.emitResolution(a, &rr.res, null) catch c.oom();
+        cut_body = cutBody(a, tenant, lock);
+        writeLockfile(bundle, rr.body);
+        std.debug.print("resolved {d} package(s) against the registry\n", .{rr.res.packages.len});
+    }
+
+    for (b.handlers) |h| {
+        const body = if (resolution_json) |r| fileBodyWithResolution(a, tenant, h, r) else c.fileBodyHandler(a, tenant, h);
+        _ = deployStep(a, cfg, "file", body, h.path);
+    }
     for (b.statics) |s| _ = uploadStep(a, cfg, c.uploadPath(a, tenant, s), s.bytes, s.path);
-    const cut = deployStep(a, cfg, "cut", c.tenantBody(a, tenant), "cut");
+    const cut = deployStep(a, cfg, "cut", cut_body, "cut");
     const dep_id = c.extractDepId(a, cut.body) orelse c.fatal("cut: 200 but no dep_id: {s}", .{cut.body});
     std.debug.print("deployment staged: {s} ({d} file(s)) — NOT released\n", .{ dep_id, b.handlers.len + b.statics.len });
     if (release) cmdRelease(a, cfg, tenant, dep_id);
+}
+
+/// Read the bundle's `manifest.json` `dependencies` map (absent file → none).
+fn readBundleDependencies(a: std.mem.Allocator, bundle: []const u8) []const packages.Dependency {
+    const path = std.fs.path.join(a, &.{ bundle, "manifest.json" }) catch c.oom();
+    const bytes = std.fs.cwd().readFileAlloc(a, path, 1 << 20) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => c.fatal("read {s}: {s}", .{ path, @errorName(err) }),
+    };
+    return packages.readDependencies(a, bytes) catch |err|
+        c.fatal("manifest.json dependencies: {s}", .{@errorName(err)});
+}
+
+/// The asymmetric auto-pin: scan handler sources for `@scope/pkg` imports and
+/// fold undeclared ones into `declared`. An undeclared `@rewind/*` import is
+/// auto-added (range `"*"` — resolved to latest; the lockfile then pins the
+/// exact version); an undeclared THIRD-PARTY import is fatal (it must be
+/// declared in manifest.json). Declared specs pass through untouched.
+fn augmentDependencies(a: std.mem.Allocator, declared: []const packages.Dependency, handlers: []const c.Handler) []const packages.Dependency {
+    var out = std.ArrayList(packages.Dependency){};
+    out.appendSlice(a, declared) catch c.oom();
+    var have = std.StringHashMap(void).init(a);
+    for (declared) |d| have.put(d.spec, {}) catch c.oom();
+    for (handlers) |h| {
+        const specs = packages.extractPackageImports(a, h.source) catch c.oom();
+        for (specs) |spec| {
+            if (have.contains(spec)) continue;
+            have.put(spec, {}) catch c.oom();
+            if (std.mem.startsWith(u8, spec, "@rewind/")) {
+                out.append(a, .{ .spec = spec, .range = "*" }) catch c.oom();
+                std.debug.print("  auto-pinned {s} (undeclared @rewind import)\n", .{spec});
+            } else {
+                c.fatal("handler {s} imports undeclared third-party package `{s}` — add it to manifest.json `dependencies`", .{ h.path, spec });
+            }
+        }
+    }
+    return out.items;
+}
+
+const ResolveResult = struct {
+    res: packages.Resolution,
+    body: []const u8, // the raw `/v1/resolve` response → the bundle's rewind.lock
+};
+
+/// Resolve the bundle's declared `dependencies` against the `@rewind` registry
+/// (`POST {registry}/v1/resolve`, public — no session). Returns the parsed,
+/// arena-owned resolution + the raw body (for the lockfile). Fatals on a
+/// missing registry URL or an unresolvable/bad response.
+fn registryResolve(a: std.mem.Allocator, cfg: *const Cfg, deps: []const packages.Dependency) ResolveResult {
+    const base = cfg.registry_url orelse c.fatal(
+        "this bundle declares `dependencies` but REWIND_REGISTRY_URL is unset — point it at your @rewind registry origin",
+        .{},
+    );
+    const req = packages.buildResolveRequest(a, deps, &.{}) catch c.oom();
+    const url = std.fmt.allocPrint(a, "{s}/v1/resolve", .{base}) catch c.oom();
+    const r = httpCall(a, cfg, "POST", url, &.{JSON_CT}, req, false, 60);
+    if (r.code == 422) c.fatal("registry could not resolve dependencies: {s}", .{c.trunc(r.body)});
+    if (r.code != 200) c.fatal("registry resolve failed: {d} {s}", .{ r.code, c.trunc(r.body) });
+    const res = packages.parseResolveResponse(a, r.body) catch |err| switch (err) {
+        error.Unresolved => c.fatal("registry could not resolve dependencies: {s}", .{c.trunc(r.body)}),
+        else => c.fatal("registry resolve: bad response ({s}): {s}", .{ @errorName(err), c.trunc(r.body) }),
+    };
+    return .{ .res = res, .body = r.body };
+}
+
+/// Fetch a package source blob by content hash (`GET {registry}/v1/blobs/…`,
+/// public). Fatals on non-200.
+fn registryBlob(a: std.mem.Allocator, cfg: *const Cfg, hash: []const u8) []const u8 {
+    const base = cfg.registry_url.?; // checked in registryResolve
+    const url = std.fmt.allocPrint(a, "{s}/v1/blobs/{s}", .{ base, hash }) catch c.oom();
+    const r = httpCall(a, cfg, "GET", url, &.{}, null, false, 60);
+    if (r.code != 200) c.fatal("registry blob {s}: {d} {s}", .{ hash, r.code, c.trunc(r.body) });
+    return r.body;
+}
+
+/// Stage every resolved package's files leaves-first (`topoSort` first). Each
+/// file: fetch its source from the registry, POST `/v1/deploy/pkgfile` with
+/// the growing resolution, record the server-authoritative `{source_hex,
+/// bytecode_hex}` so later files/handlers compile against the pinned graph.
+/// Returns the final staged set (parallel to `res.packages`) for the handler
+/// resolution.
+fn stagePackages(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, res: *const packages.Resolution) []const []const packages.StagedFile {
+    const lists = a.alloc(std.ArrayListUnmanaged(packages.StagedFile), res.packages.len) catch c.oom();
+    for (lists) |*s| s.* = .empty;
+
+    for (res.packages, 0..) |p, pi| {
+        for (p.files) |f| {
+            const source = registryBlob(a, cfg, f.source_hash);
+            const reso = packages.emitResolution(a, res, snapshotStaged(a, lists)) catch c.oom();
+            const body = pkgfileBody(a, tenant, p.pkg_hash, f.path, source, reso);
+            const r = deployStep(a, cfg, "pkgfile", body, f.path);
+            const src_hex = c.extractField(a, r.body, "source_hex") orelse c.fatal("pkgfile {s}: no source_hex: {s}", .{ f.path, c.trunc(r.body) });
+            const bc_hex = c.extractField(a, r.body, "bytecode_hex") orelse c.fatal("pkgfile {s}: no bytecode_hex: {s}", .{ f.path, c.trunc(r.body) });
+            lists[pi].append(a, .{ .path = f.path, .source_hash = src_hex, .bytecode_hash = bc_hex }) catch c.oom();
+        }
+    }
+    return snapshotStaged(a, lists);
+}
+
+/// Snapshot the growing per-package staged-file `lists` into the
+/// `[][]const StagedFile` shape `emitResolution` wants.
+fn snapshotStaged(a: std.mem.Allocator, lists: []const std.ArrayListUnmanaged(packages.StagedFile)) []const []const packages.StagedFile {
+    const out = a.alloc([]const packages.StagedFile, lists.len) catch c.oom();
+    for (out, 0..) |*o, i| o.* = lists[i].items;
+    return out;
+}
+
+/// `{"tenant","pkg_hash","path","source","resolution":<raw json>}` for
+/// `/v1/deploy/pkgfile`.
+fn pkgfileBody(a: std.mem.Allocator, tenant: []const u8, pkg_hash: []const u8, path: []const u8, source: []const u8, resolution: []const u8) []const u8 {
+    var out = std.ArrayList(u8){};
+    out.appendSlice(a, "{\"tenant\":") catch c.oom();
+    c.writeJsonString(&out, a, tenant);
+    out.appendSlice(a, ",\"pkg_hash\":") catch c.oom();
+    c.writeJsonString(&out, a, pkg_hash);
+    out.appendSlice(a, ",\"path\":") catch c.oom();
+    c.writeJsonString(&out, a, path);
+    out.appendSlice(a, ",\"source\":") catch c.oom();
+    c.writeJsonString(&out, a, source);
+    out.appendSlice(a, ",\"resolution\":") catch c.oom();
+    out.appendSlice(a, resolution) catch c.oom();
+    out.append(a, '}') catch c.oom();
+    return out.items;
+}
+
+/// `{"tenant","path","kind":"handler","source","resolution":<raw json>}` for
+/// `/v1/deploy/file` (imports validate at compile against the resolution).
+fn fileBodyWithResolution(a: std.mem.Allocator, tenant: []const u8, h: c.Handler, resolution: []const u8) []const u8 {
+    var out = std.ArrayList(u8){};
+    out.appendSlice(a, "{\"tenant\":") catch c.oom();
+    c.writeJsonString(&out, a, tenant);
+    out.appendSlice(a, ",\"path\":") catch c.oom();
+    c.writeJsonString(&out, a, h.path);
+    out.appendSlice(a, ",\"kind\":\"handler\",\"source\":") catch c.oom();
+    c.writeJsonString(&out, a, h.source);
+    out.appendSlice(a, ",\"resolution\":") catch c.oom();
+    out.appendSlice(a, resolution) catch c.oom();
+    out.append(a, '}') catch c.oom();
+    return out.items;
+}
+
+/// `{"tenant","resolution":<raw json>}` for `/v1/deploy/cut` (the files-less
+/// lockfile skeleton; the deploy app joins staged rows).
+fn cutBody(a: std.mem.Allocator, tenant: []const u8, resolution: []const u8) []const u8 {
+    var out = std.ArrayList(u8){};
+    out.appendSlice(a, "{\"tenant\":") catch c.oom();
+    c.writeJsonString(&out, a, tenant);
+    out.appendSlice(a, ",\"resolution\":") catch c.oom();
+    out.appendSlice(a, resolution) catch c.oom();
+    out.append(a, '}') catch c.oom();
+    return out.items;
+}
+
+/// Persist the registry's resolution verbatim as the bundle's `rewind.lock`
+/// (the hash-locked graph, for the record / future reuse). Best-effort — a
+/// write failure warns but doesn't fail the deploy.
+fn writeLockfile(bundle: []const u8, body: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/rewind.lock", .{bundle}) catch return;
+    const f = std.fs.cwd().createFile(path, .{}) catch |err| {
+        std.debug.print("  ! could not write {s}: {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer f.close();
+    f.writeAll(body) catch {};
 }
 
 /// `rewind release <tenant> <dep_id_hex>` — flip the live pointer via the admin
@@ -1196,4 +1411,11 @@ pub fn main() void {
         }
         cmdPull(a, &cfg, rest[0], rest[1], out_file);
     } else unreachable; // verb validated above (replay handled before loadCfg)
+}
+
+test {
+    // Pull the CLI's unit-tested modules into this test root so
+    // `zig build test` (via the `cli_tests` step) runs them.
+    _ = @import("packages.zig");
+    _ = @import("common.zig");
 }

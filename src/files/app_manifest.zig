@@ -5,15 +5,21 @@
 //! marketplace (a community-installable app = a tenant; see the
 //! marketplace plan).
 //!
-//! **RESERVED + INERT.** The deploy path validates this structurally
-//! (author feedback) and it ships content-addressed in the deployment
-//! bundle like any static file, so it travels with the app for free.
-//! Nothing *consumes* it yet: no install-time capability grants, no
-//! registry, no runtime `_deploy/manifest` pointer. The shape is
-//! deliberately permissive — required `name` + `version`, everything
-//! else optional, unknown top-level fields accepted — while it is
-//! still wet. Retrofitting later would mean re-authoring every app, so
-//! the seam is reserved now even though the consumer is post-launch.
+//! **Mostly RESERVED + INERT.** The deploy path validates this
+//! structurally (author feedback) and it ships content-addressed in the
+//! deployment bundle like any static file, so it travels with the app
+//! for free. The `config` / `effects` / `metadata` sections have no
+//! consumer yet (no install-time capability grants, no runtime
+//! `_deploy/manifest` pointer). The exception is **`dependencies`** — the
+//! `{ "@scope/pkg": "<range>" }` map the customer `rewind` CLI's package
+//! resolver (P-CLI, `src/cli/packages.zig` `readDependencies`) reads to
+//! resolve the app's package graph against the registry. Validated here
+//! for shape only (the engine consumes the resolved *lockfile*, not the
+//! loose ranges); the CLI owns reading the values. The shape stays
+//! deliberately permissive — required `name` + `version`, everything else
+//! optional, unknown top-level fields accepted — while it is still wet.
+//! Retrofitting later would mean re-authoring every app, so the seam is
+//! reserved now even though most consumers are post-launch.
 
 const std = @import("std");
 
@@ -37,6 +43,9 @@ pub const Error = error{
     BadEffects,
     /// `metadata` present but not an object.
     BadMetadata,
+    /// `dependencies` present but not an object, or a value that isn't a
+    /// non-empty string range.
+    BadDependencies,
     /// Not valid JSON.
     ParseFailed,
     OutOfMemory,
@@ -73,6 +82,13 @@ pub fn validate(allocator: std.mem.Allocator, json_bytes: []const u8) Error!void
     }
     if (obj.get("metadata")) |v| {
         if (v != .object) return Error.BadMetadata;
+    }
+    if (obj.get("dependencies")) |v| {
+        if (v != .object) return Error.BadDependencies;
+        var it = v.object.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .string or e.value_ptr.string.len == 0) return Error.BadDependencies;
+        }
     }
 }
 
@@ -140,5 +156,26 @@ test "validate: rejects non-object effects" {
 test "validate: rejects malformed json" {
     try std.testing.expectError(Error.ParseFailed, validate(std.testing.allocator,
         \\{"name": "x", "version":
+    ));
+}
+
+test "validate: accepts a dependencies map of string ranges" {
+    try validate(std.testing.allocator,
+        \\{"name":"x","version":"1","dependencies":{"@rewind/jwt":"^1.9","@rewind/oidc":"1.4.2"}}
+    );
+}
+
+test "validate: rejects non-object dependencies" {
+    try std.testing.expectError(Error.BadDependencies, validate(std.testing.allocator,
+        \\{"name":"x","version":"1","dependencies":["@rewind/jwt"]}
+    ));
+}
+
+test "validate: rejects a non-string / empty dependency range" {
+    try std.testing.expectError(Error.BadDependencies, validate(std.testing.allocator,
+        \\{"name":"x","version":"1","dependencies":{"@rewind/jwt":42}}
+    ));
+    try std.testing.expectError(Error.BadDependencies, validate(std.testing.allocator,
+        \\{"name":"x","version":"1","dependencies":{"@rewind/jwt":""}}
     ));
 }

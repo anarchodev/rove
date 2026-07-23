@@ -1362,6 +1362,15 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 
+    // CLI unit tests (`src/cli/*.zig` — e.g. the P-CLI package resolver in
+    // packages.zig). Folded into the aggregate `test` step; also runnable in
+    // isolation via `zig build cli-test`.
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    test_step.dependOn(&run_cli_tests.step);
+    const cli_test_step = b.step("cli-test", "Run the rewind CLI unit tests");
+    cli_test_step.dependOn(&run_cli_tests.step);
+
     // ── rewind-test-smoke: drive `rewind test` end-to-end (offline, no cluster)
     // over the checkout fixture (proves the two-reactor saga runner) PLUS the
     // smoke cross-checks — the SAME first-party handlers the `*_smoke_v2.py`
