@@ -1426,6 +1426,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/emailbudget", // scenario({emailBudget}) arms the outbound rate limiter offline — N+1-th send throws code:"rate_limited"; unset stays unmetered
         "src/replay/testdata/pkgimport", // scenario({packages, app_imports}) resolves a first-party @rewind/* package offline through the shared PackageResolver (P-Lift enabler)
         "src/replay/testdata/jwtpkg", // the lifted @rewind/jwt package (globalThis.jwt → ES exports) resolves + runs offline through a consumer (P-Lift lib #1)
+        "src/replay/testdata/emailpkg", // the lifted @rewind/email package composes over the ambient webhook primitive offline (P-Lift lib #2)
         "src/replay/testdata/instancefold", // instances.create's exists marker folds across resumes — create-then-scope-in-continuation resolves
         "src/replay/testdata/timerwakes", // held wake-fold: multiple after.ms → last-armed slot wins + due-time gate, per-arm {on} routing, after.kv prefix containment
         "src/replay/testdata/concurrentctx", // whenConcurrent threads the evolving next({ctx}) between legs — a no-ctx leg reads the prior leg's re-held ctx
