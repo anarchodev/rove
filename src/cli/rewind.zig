@@ -15,9 +15,13 @@
 //! lines. Keys: REWIND_ADMIN_URL (dashboard origin), REWIND_IDP_URL (the IdP
 //! origin), REWIND_CLIENT_ID (default admin-dashboard), REWIND_SESSION
 //! (cookie-jar path, default ~/.config/rewind/rewind.session).
-//! For self-hosted clusters with a private CA / split-horizon DNS:
-//! REWIND_CACERT (curl --cacert) and REWIND_RESOLVE (curl --resolve entries,
-//! comma-separated host:port:addr).
+//! REWIND_REGISTRY_URL — the @rewind package registry origin, consulted only
+//! when a bundle's manifest.json declares `dependencies` (P-CLI, rove#122).
+//! REWIND_ROOT_TOKEN — headless auth: present the operator root token as a
+//! Bearer instead of the interactive OIDC session (CI / automation / smokes;
+//! deploy/release/CP accept it). For self-hosted clusters with a private CA /
+//! split-horizon DNS: REWIND_CACERT (curl --cacert) and REWIND_RESOLVE (curl
+//! --resolve entries, comma-separated host:port:addr).
 
 const std = @import("std");
 const c = @import("common.zig");
@@ -45,6 +49,12 @@ const Cfg = struct {
     /// bundle that declares `dependencies`. Optional — a package-free deploy
     /// never touches it; required (with a clear error) once deps are declared.
     registry_url: ?[]const u8,
+    /// Operator root token (`REWIND_ROOT_TOKEN`) for HEADLESS auth — CI /
+    /// automation / smokes, where the interactive OIDC `login` flow isn't
+    /// available. When set, the session-bearing verbs (deploy/release/CP)
+    /// present it as `Authorization: Bearer …` instead of the cookie jar (the
+    /// deploy + release doors accept it). Unset → the normal OIDC session.
+    root_token: ?[]const u8,
 };
 
 fn cfgVar(env: *const c.Env, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
@@ -81,6 +91,7 @@ fn loadCfg(gpa: std.mem.Allocator, a: std.mem.Allocator, env_path: ?[]const u8) 
         .cacert = cfgVar(&env, a, "REWIND_CACERT"),
         .resolves = resolves.items,
         .registry_url = if (cfgVar(&env, a, "REWIND_REGISTRY_URL")) |u| std.mem.trimRight(u8, u, "/") else null,
+        .root_token = cfgVar(&env, a, "REWIND_ROOT_TOKEN"),
     };
 }
 
@@ -147,10 +158,17 @@ fn httpCall(
         push(&args, a, r);
     }
     if (use_jar) {
-        push(&args, a, "--cookie");
-        push(&args, a, cfg.session_file);
-        push(&args, a, "--cookie-jar");
-        push(&args, a, cfg.session_file);
+        if (cfg.root_token) |tok| {
+            // Headless auth: the operator root token as a Bearer, in place of
+            // the interactive OIDC cookie (REWIND_ROOT_TOKEN).
+            push(&args, a, "-H");
+            push(&args, a, std.fmt.allocPrint(a, "Authorization: Bearer {s}", .{tok}) catch c.oom());
+        } else {
+            push(&args, a, "--cookie");
+            push(&args, a, cfg.session_file);
+            push(&args, a, "--cookie-jar");
+            push(&args, a, cfg.session_file);
+        }
     }
     push(&args, a, "-X");
     push(&args, a, method);
