@@ -1318,6 +1318,15 @@ pub fn build(b: *std.Build) void {
     driver_smoke_mod.addAnonymousImport("pkg_jwt", .{ .root_source_file = b.path("src/js/packages/@rewind/jwt/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_oauth", .{ .root_source_file = b.path("src/js/packages/@rewind/oauth/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_cron", .{ .root_source_file = b.path("src/js/packages/@rewind/cron/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_sessions", .{ .root_source_file = b.path("src/js/packages/@rewind/sessions/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_retry", .{ .root_source_file = b.path("src/js/packages/@rewind/retry/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_activitypub", .{ .root_source_file = b.path("src/js/packages/@rewind/activitypub/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_email", .{ .root_source_file = b.path("src/js/packages/@rewind/email/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_users", .{ .root_source_file = b.path("src/js/packages/@rewind/users/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_oidc", .{ .root_source_file = b.path("src/js/packages/@rewind/oidc/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_schedule", .{ .root_source_file = b.path("src/js/packages/@rewind/schedule/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_segments", .{ .root_source_file = b.path("src/js/packages/@rewind/segments/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_browser", .{ .root_source_file = b.path("src/js/packages/@rewind/browser/index.mjs") });
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
@@ -1358,6 +1367,17 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_cron = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_cron.addArg("cronpkg");
     driver_smoke_step.dependOn(&driver_smoke_cron.step);
+    // `leafpkgs`: the object-literal leaf libs (sessions/retry/activitypub)
+    // lifted to packages resolve + load offline (P-Lift, rove#123).
+    const driver_smoke_leaf = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_leaf.addArg("leafpkgs");
+    driver_smoke_step.dependOn(&driver_smoke_leaf.step);
+    // `morepkgs`: the rest of the lifted libs — users (leaf), oidc (→ nested
+    // @rewind/jwt), and the IIFE-wrapped schedule/segments/browser — all
+    // resolve + load offline (P-Lift, rove#123).
+    const driver_smoke_more = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_more.addArg("morepkgs");
+    driver_smoke_step.dependOn(&driver_smoke_more.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
