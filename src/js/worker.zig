@@ -86,7 +86,6 @@ const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
-const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const log_walker_mod = @import("log_walker.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_ws = @import("worker_ws.zig");
@@ -1209,13 +1208,7 @@ pub const WorkerConfig = struct {
     /// otherwise. Required because `flushLogs` shouldn't have to
     /// reason about a missing observability backend.
     log_batch_store: log_server_mod.batch_store.BatchStore,
-    /// Readset replication (`docs/architecture/effects-and-handlers.md`) — node's data
-    /// directory. The worker reads its per-worker
-    /// `last_uploaded_seq` checkpoint at startup from
-    /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`
-    /// and writes after each successful `flushLogs`. Null disables
-    /// the checkpoint (some unit-test fixtures that don't need
-    /// readset-replication persistence).
+    /// Node's data directory. Null in some unit-test fixtures.
     data_dir: ?[]const u8 = null,
 };
 
@@ -1719,17 +1712,12 @@ pub fn Worker(comptime opts: Options) type {
         /// `WorkerConfig.log_worker_id` (or the raft node id as a
         /// fallback).
         log_worker_id: u16,
-        /// Readset replication (`docs/architecture/effects-and-handlers.md`) — node data
-        /// directory borrowed from `WorkerConfig.data_dir`. Used by
-        /// the per-worker `last_uploaded_seq` checkpoint file at
-        /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`.
-        /// Null disables the checkpoint (test fixtures).
+        /// Node data directory borrowed from `WorkerConfig.data_dir`.
+        /// Null in test fixtures. (Post-flush LogRecord durability across a
+        /// leader crash is the promotion walker's job now, driven off the
+        /// live raft log, not a durable per-worker mark — see
+        /// `docs/architecture/deployment-and-logs.md`.)
         data_dir: ?[]const u8,
-        /// Readset replication (`docs/architecture/effects-and-handlers.md`) — the highest
-        /// raft seq this worker has covered with a successful
-        /// `flushLogs`. Read at startup from the checkpoint file
-        /// (0 if missing); advanced after each successful flush.
-        last_uploaded_seq: u64 = 0,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
@@ -1863,10 +1851,6 @@ pub fn Worker(comptime opts: Options) type {
                 .admin_api_domain = config.admin_api_domain,
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
                 .data_dir = config.data_dir,
-                .last_uploaded_seq = if (config.data_dir) |dd|
-                    worker_upload_checkpoint.readCheckpoint(allocator, dd, config.log_worker_id orelse @intCast(config.raft.config.node_id))
-                else
-                    0,
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
                 .log_batch_store = config.log_batch_store,
@@ -1978,8 +1962,7 @@ pub fn Worker(comptime opts: Options) type {
                 // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is driven by
                 // the process-global coordinator's own drainer + executor
                 // threads — no per-tick call from the worker. The per-tick
-                // log flush drains the local fast path's records and advances
-                // `last_uploaded_seq`.
+                // log flush drains the local fast path's records to S3.
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
                 };

@@ -579,9 +579,6 @@ fn captureSuccess(
     /// The raft seq this success was proposed at. Pass 0
     /// for the read-only commit path (no propose, no seq) and for
     /// the propose-fail downgrade (entry never made it to raft).
-    /// The leader's flushLogs uses `max(record.raft_seq across the
-    /// drained batch)` to advance the per-worker `last_uploaded_seq`
-    /// checkpoint.
     raft_seq: u64,
 ) void {
     const console_owned = s.console_owned;
