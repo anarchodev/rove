@@ -309,8 +309,13 @@ pub const Engine = struct {
         // Source resolution (see the doc-comment): world source_dir / explicit
         // override win over inline `sources`, which win over the `base_dir`
         // fallback. `src_dir` non-null ⇒ resolve from disk; null ⇒ inline.
+        // The inline-vs-disk decision hinges on the app's own HANDLER sources
+        // (`wv.sources`), not the combined map — package sources
+        // (`wv.pkg_sources`) are additive `/pkg/<hash>/` modules and must not
+        // flip an app that lives on disk into inline mode (else its entry,
+        // which is NOT inline, reads as missing).
         const explicit_dir = wv.source_dir orelse source_dir;
-        const src_dir = explicit_dir orelse (if (sources.count() != 0) null else base_dir);
+        const src_dir = explicit_dir orelse (if (wv.sources.len != 0) null else base_dir);
 
         // Entry source: working tree (if a source dir) else the inline world.
         const entry_src = blk: {

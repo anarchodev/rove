@@ -1424,6 +1424,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/argvalidation", // prod's synchronous effect-argument throw table fires offline with the same error types/messages
         "src/replay/testdata/ssrfgate", // resolving a success outcome for a prod-blocked fetch URL (SSRF/plain-http/localhost) fails loud; status 0 stays authorable
         "src/replay/testdata/emailbudget", // scenario({emailBudget}) arms the outbound rate limiter offline — N+1-th send throws code:"rate_limited"; unset stays unmetered
+        "src/replay/testdata/pkgimport", // scenario({packages, app_imports}) resolves a first-party @rewind/* package offline through the shared PackageResolver (P-Lift enabler)
         "src/replay/testdata/instancefold", // instances.create's exists marker folds across resumes — create-then-scope-in-continuation resolves
         "src/replay/testdata/timerwakes", // held wake-fold: multiple after.ms → last-armed slot wins + due-time gate, per-arm {on} routing, after.kv prefix containment
         "src/replay/testdata/concurrentctx", // whenConcurrent threads the evolving next({ctx}) between legs — a no-ctx leg reads the prior leg's re-held ctx
