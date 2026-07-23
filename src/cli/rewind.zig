@@ -1197,3 +1197,10 @@ pub fn main() void {
         cmdPull(a, &cfg, rest[0], rest[1], out_file);
     } else unreachable; // verb validated above (replay handled before loadCfg)
 }
+
+test {
+    // Pull the CLI's unit-tested modules into this test root so
+    // `zig build test` (via the `cli_tests` step) runs them.
+    _ = @import("packages.zig");
+    _ = @import("common.zig");
+}
