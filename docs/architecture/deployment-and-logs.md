@@ -166,6 +166,43 @@ storage's blob-replication rule).
   the customer-facing replay store (page-encrypted at rest); operator signals go
   to Grafana Cloud — the two-sink split is decisions.md §7.
 
+### Promotion-time LogRecord recovery (the walker)
+
+The flush above is best-effort *early visibility*: it drains the RAM buffer to S3
+**unordered against raft commit**. A leader that dies between proposing a
+writeset and flushing loses those buffered records from RAM — the followers hold
+the replicated entries (KV state is safe) but no `LogRecord` ever reaches S3, so
+the request would vanish from the customer's logs. The **promotion walker** closes
+that window.
+
+- **Invariant.** A request whose **writes persist** has a log record that survives
+  failover; read-only requests are best-effort (a pre-flush crash may drop them).
+  This falls out of the mechanism: the walker rebuilds only from raft entries, and
+  an entry exists iff a writeset committed — so a read-only or pre-quorum-crash
+  request has nothing to walk.
+- **Mechanism** (`src/js/worker_upload_walker.zig` + `src/js/log_walker.zig`): on a
+  follower→leader edge (the `Bridge.drainPromotions` promotion signal, drained by
+  `runPromotionHook`), the new leader walks its group's live log
+  `[firstIndex .. lastIndex]`, bounded `WALKER_BATCH_CAP` entries per poll tick
+  (each read is a pump control op, so the cap bounds pump contention). Each entry's
+  readset carries a trailing `LogHeader` (`src/tape/root.zig`) precisely so any
+  node can rebuild the customer `LogRecord` from the entry alone; the rebuilt
+  records append to the normal flush buffer.
+- **Resume derives from the live log, not a durable mark.** A node-local checkpoint
+  can't say how far a *different* dead leader's flusher got, so there is none —
+  correctness rests on the indexer's idempotent `(tenant_id, request_id)`
+  `INSERT OR IGNORE` (a re-derived record the dead leader had already flushed is a
+  harmless duplicate) plus the compaction-window bound (flush lag ≪ compaction
+  lag, so the live log always still holds anything unflushed). `firstIndex` is the
+  first uncompacted index, exposed through `Bridge.firstIndex` → `Node.firstIndex`
+  → raft-rs `raft_manager_first_index`.
+- **Faithful replay needs the input in the raft copy.** A writing *resume* hop
+  (`send_callback` / `wake` / `fetch_chunk` / `ws`) tapes its activation Msg into
+  the readset (`ctx`/Msg → `trigger_payload`, fetch event → `fetch_responses`)
+  **before** the propose serializes it, so the walker rebuilds a replay-faithful
+  record — not just the log line. (The stamp-before-propose ordering is the same
+  discipline `resumeIntoStream` already followed via `StreamResumeCtx.tapes`.)
+
 ## Known limitations (as-built)
 
 - **No log retention/GC compactor** yet (design locked, operator-policy default
@@ -177,3 +214,9 @@ storage's blob-replication rule).
 - **The log index is a single SQLite file** (cluster-scoped); sharding by
   `hash(tenant) % N` is a future lever, and the indexer full-scans each poll
   (a per-node `start-after` cursor is the obvious optimization).
+- **Walker fidelity gap for `wake_batch` / `ws_message`** — their activation Msg
+  (the `wakes[]` fired-watch bag; the WS frame) rides `activation_bytes`, which is
+  NOT one of the five readset channels, so it reaches only the flushed S3 copy, not
+  the raft entry. A walker-recovered writing wake/ws hop replays with its `ctx` but
+  without `request.activation.wakes` / `.data` (issue #199). Survival of the log
+  line is unaffected — the `LogHeader` rides raft regardless.
