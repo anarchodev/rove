@@ -327,8 +327,10 @@ fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: 
     if (b.handlers.len == 0 and b.statics.len == 0) c.fatal("bundle {s} has nothing to publish", .{bundle});
     std.debug.print("bundle: {d} handler(s), {d} static(s)\n", .{ b.handlers.len, b.statics.len });
 
-    // Optional package graph from the bundle's manifest.json `dependencies`.
-    const deps = readBundleDependencies(a, bundle);
+    // Package graph: the bundle's declared `dependencies`, plus the auto-pin
+    // of undeclared @rewind/* imports the handlers actually use.
+    const declared = readBundleDependencies(a, bundle);
+    const deps = augmentDependencies(a, declared, b.handlers);
 
     _ = deployStep(a, cfg, "reset", c.tenantBody(a, tenant), "reset");
 
@@ -367,6 +369,32 @@ fn readBundleDependencies(a: std.mem.Allocator, bundle: []const u8) []const pack
     };
     return packages.readDependencies(a, bytes) catch |err|
         c.fatal("manifest.json dependencies: {s}", .{@errorName(err)});
+}
+
+/// The asymmetric auto-pin: scan handler sources for `@scope/pkg` imports and
+/// fold undeclared ones into `declared`. An undeclared `@rewind/*` import is
+/// auto-added (range `"*"` — resolved to latest; the lockfile then pins the
+/// exact version); an undeclared THIRD-PARTY import is fatal (it must be
+/// declared in manifest.json). Declared specs pass through untouched.
+fn augmentDependencies(a: std.mem.Allocator, declared: []const packages.Dependency, handlers: []const c.Handler) []const packages.Dependency {
+    var out = std.ArrayList(packages.Dependency){};
+    out.appendSlice(a, declared) catch c.oom();
+    var have = std.StringHashMap(void).init(a);
+    for (declared) |d| have.put(d.spec, {}) catch c.oom();
+    for (handlers) |h| {
+        const specs = packages.extractPackageImports(a, h.source) catch c.oom();
+        for (specs) |spec| {
+            if (have.contains(spec)) continue;
+            have.put(spec, {}) catch c.oom();
+            if (std.mem.startsWith(u8, spec, "@rewind/")) {
+                out.append(a, .{ .spec = spec, .range = "*" }) catch c.oom();
+                std.debug.print("  auto-pinned {s} (undeclared @rewind import)\n", .{spec});
+            } else {
+                c.fatal("handler {s} imports undeclared third-party package `{s}` — add it to manifest.json `dependencies`", .{ h.path, spec });
+            }
+        }
+    }
+    return out.items;
 }
 
 const ResolveResult = struct {

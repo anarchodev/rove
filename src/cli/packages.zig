@@ -127,6 +127,78 @@ pub fn readDependencies(a: std.mem.Allocator, manifest_bytes: []const u8) Error!
     return out;
 }
 
+// ── import scanning (auto-pin) ───────────────────────────────────────────────
+
+fn isIdentByte(b: u8) bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or
+        (b >= '0' and b <= '9') or b == '_' or b == '$';
+}
+
+/// True for a `@scope/name` package specifier (what the resolver routes). The
+/// registry validates precisely; this is the loose CLI-side shape test that
+/// distinguishes a package import from a relative (`./`), `__system/*`, or
+/// non-`@` bare specifier.
+fn isPackageSpec(s: []const u8) bool {
+    if (s.len < 4 or s[0] != '@') return false;
+    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return false;
+    if (slash < 2 or slash + 1 >= s.len) return false;
+    for (s) |ch| if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') return false;
+    return true;
+}
+
+/// The quoted specifier a `from` / `import` keyword introduces, if any: skip
+/// whitespace, an optional `(` (dynamic import), whitespace, then read a
+/// single- or double-quoted string. Null if what follows isn't a quoted
+/// specifier (so `important`, `arr.from(x)`, etc. don't match).
+fn specifierAfter(source: []const u8, pos: usize) ?[]const u8 {
+    var j = pos;
+    while (j < source.len and (source[j] == ' ' or source[j] == '\t' or source[j] == '\n' or source[j] == '\r')) j += 1;
+    if (j < source.len and source[j] == '(') {
+        j += 1;
+        while (j < source.len and (source[j] == ' ' or source[j] == '\t' or source[j] == '\n' or source[j] == '\r')) j += 1;
+    }
+    if (j >= source.len) return null;
+    const q = source[j];
+    if (q != '"' and q != '\'') return null;
+    j += 1;
+    const start = j;
+    while (j < source.len and source[j] != q) j += 1;
+    if (j >= source.len) return null; // unterminated
+    return source[start..j];
+}
+
+/// The distinct `@scope/pkg` package specifiers `source` imports — the targets
+/// of `import`/`export … from "…"`, bare `import "…"`, and dynamic
+/// `import("…")`. A heuristic scan (not a full JS parse): finds the `from` /
+/// `import` keywords at identifier boundaries and reads the specifier each
+/// introduces. Relative / `__system/*` / non-`@` specifiers are ignored (not
+/// packages). Owned by `a`; order is unspecified (grouped by keyword,
+/// deduped) — the resolver consumes the set. The engine's compile-time import
+/// validation is the real gate — a missed import fails the deploy loudly
+/// rather than resolving wrong.
+pub fn extractPackageImports(a: std.mem.Allocator, source: []const u8) Error![][]const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var seen = std.StringHashMap(void).init(a);
+    inline for (.{ "from", "import" }) |kw| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, source, i, kw)) |idx| {
+            i = idx + kw.len;
+            const before: u8 = if (idx == 0) ' ' else source[idx - 1];
+            // Left boundary: not mid-identifier, and not a member access
+            // (`obj.from(...)` is a call, not an import).
+            if (isIdentByte(before) or before == '.') continue;
+            if (specifierAfter(source, idx + kw.len)) |spec| {
+                if (isPackageSpec(spec) and !seen.contains(spec)) {
+                    const owned = try a.dupe(u8, spec);
+                    try seen.put(owned, {});
+                    try out.append(a, owned);
+                }
+            }
+        }
+    }
+    return out.toOwnedSlice(a) catch Error.OutOfMemory;
+}
+
 // ── request ───────────────────────────────────────────────────────────────
 
 /// Build the `POST /v1/resolve` request body:
@@ -433,6 +505,45 @@ test "readDependencies: parses the manifest dependencies map; absent → empty" 
 
     const none = try readDependencies(a, "{\"name\":\"x\",\"version\":\"1\"}");
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "extractPackageImports: finds @scope/pkg imports, ignores the rest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\import { greet } from "@rewind/greet";
+        \\import "@rewind/side";
+        \\const dyn = await import('@rewind/dyn');
+        \\export { thing } from "@scope/re";
+        \\import local from "./local.mjs";
+        \\import sys from "__system/next";
+        \\import { greet as g2 } from "@rewind/greet"; // duplicate
+        \\const s = "@fake/notimported";           // a bare string, not an import
+        \\const x = arr.from("@method/call");        // member call, not an import
+    ;
+    // Order is keyword-grouped (all `from`-clauses, then bare/dynamic
+    // `import`s), deduped — the resolver consumes the set, not the order.
+    const got = try extractPackageImports(a, src);
+    try testing.expectEqual(@as(usize, 4), got.len);
+    var set = std.StringHashMap(void).init(a);
+    for (got) |s| try set.put(s, {});
+    try testing.expect(set.contains("@rewind/greet"));
+    try testing.expect(set.contains("@rewind/side"));
+    try testing.expect(set.contains("@rewind/dyn"));
+    try testing.expect(set.contains("@scope/re"));
+    try testing.expect(!set.contains("@fake/notimported"));
+    try testing.expect(!set.contains("@method/call"));
+}
+
+test "extractPackageImports: none in a package-free handler" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const got = try extractPackageImports(arena.allocator(),
+        \\export default function () { return "hi"; }
+        \\import "./util.mjs";
+    );
+    try testing.expectEqual(@as(usize, 0), got.len);
 }
 
 test "readDependencies: malformed dependencies → BadResolution" {

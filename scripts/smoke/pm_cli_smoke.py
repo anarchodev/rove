@@ -71,11 +71,11 @@ FAKE_REGISTRY = (
     "}\n"
 )
 
-# The consumer: a handler that imports the @rewind/greet package.
-CONSUMER_MANIFEST = json.dumps({
-    "name": "consumer", "version": "1.0.0",
-    "dependencies": {"@rewind/greet": "^1.0"},
-})
+# The consumer: a handler that imports the @rewind/greet package. NOTE: the
+# manifest deliberately does NOT declare the dependency — the CLI's auto-pin
+# must add it from the `import` in the handler source (undeclared @rewind/* →
+# auto-added; an undeclared third-party import would be a hard error instead).
+CONSUMER_MANIFEST = json.dumps({"name": "consumer", "version": "1.0.0"})
 CONSUMER_INDEX = (
     'import { greet } from "@rewind/greet";\n'
     "export default function () { return greet(\"world\"); }\n"
@@ -132,6 +132,7 @@ def main() -> int:
             for line in p.stdout.splitlines():
                 print("  | " + line)
             assert p.returncode == 0, f"rewind deploy exited {p.returncode}"
+            assert "auto-pinned @rewind/greet" in p.stdout, "CLI did not auto-pin the undeclared @rewind import"
             assert "resolved 1 package(s)" in p.stdout, "CLI did not report resolving the package"
 
             # The CLI writes the hash-locked lockfile alongside the bundle.
