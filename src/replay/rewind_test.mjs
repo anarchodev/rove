@@ -407,11 +407,13 @@ class Scenario {
     // closed: a run is admin only when opted in, so a non-admin handler that
     // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
     this.admin = cfg.admin || false;
-    // Per-activation `email.send` allowance. Prod meters sends through a
-    // per-instance plan-tier token bucket (bindings/email_rate.zig); offline
-    // sends are unmetered unless this is set, in which case the N+1-th send
-    // in an activation throws prod's Error{code:"rate_limited"} — so the
-    // rate-limit catch branch is testable. Carried as a hidden reserved key.
+    // Per-activation outbound-send allowance. Prod meters customer-initiated
+    // outbound through a per-tenant plan-tier token bucket at the fetch
+    // primitive (bindings/http.zig `outboundRateOk`); email.send composes over
+    // the metered webhook.send. Offline sends are unmetered unless this is set,
+    // in which case the N+1-th outbound in an activation throws prod's
+    // Error{code:"rate_limited"} — so the rate-limit catch branch is testable.
+    // Carried as a hidden reserved key.
     this.emailBudget = cfg.emailBudget != null ? cfg.emailBudget : null;
     // Durable kv-subscription registrations (issue #38): `[{ name, prefix }]`,
     // the shape prod derives from `_subscriptions/<name>/spec.json`. A write

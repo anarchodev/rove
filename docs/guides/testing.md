@@ -74,11 +74,12 @@ expect(req).toHaveFetched(/stripe/);
 - `rootToken` — the operator token `platform.auth.checkRootToken` validates against.
 - `admin` — mark the run as the admin handler so `platform.*` is allowed. It's
   admin-only and **off by default**, so a normal handler that touches it throws.
-- `emailBudget` — a per-activation `email.send` allowance. Production meters
-  sends through a per-instance token bucket; offline they're unmetered unless
-  this is set, in which case the N+1-th send in an activation throws the same
-  `Error` prod does (`e.code === "rate_limited"`), so the catch branch is
-  testable.
+- `emailBudget` — a per-activation outbound-send allowance. Production meters
+  customer-initiated outbound (`email.send` / `webhook.send` / `after.fetch`)
+  through a per-tenant token bucket at the fetch primitive; offline sends are
+  unmetered unless this is set, in which case the N+1-th outbound in an
+  activation throws the same `Error` prod does (`e.code === "rate_limited"`),
+  so the catch branch is testable.
 - `tenant` / `correlationId` — the per-chain identity the engine pins on every
   activation (`request.tenant` and `request.correlation_id`). The worker sets them
   in prod — inbound mints the correlation id, every resume inherits it — so a

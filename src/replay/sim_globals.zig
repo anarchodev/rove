@@ -84,26 +84,13 @@ const SYSTEM_SHIM =
     \\    if (!o.on_chunk) throw new TypeError("http.fetch: `on_chunk` (module path) is required");
     \\    return o.on_chunk;
     \\  };
-    \\  // Native rate-limit builtin the email global bottoms out on
-    \\  // (worker-native: a per-instance plan-tier token bucket,
-    \\  // bindings/email_rate.zig). Offline sends are UNMETERED by default —
-    \\  // there is no bucket to exhaust — but `scenario({ emailBudget: N })`
-    \\  // arms a per-activation allowance (carried as a hidden reserved kv key)
-    \\  // so the N+1-th send in a run throws prod's exact error shape and the
-    \\  // customer's `catch (e) { e.code === "rate_limited" }` branch is
-    \\  // testable. The epilogue resets the per-activation counter. The
-    \\  // continuation native lives on `_system.continuation` below (next.js
-    \\  // captures it at base-eval — privileged-surface unification; the bare
-    \\  // `__rove_next` global is gone).
-    \\  globalThis.__rove_check_email_rate = function(){
-    \\    var b = globalThis.kv.get("__rove_store/email_budget");
-    \\    if (b === undefined || b === null) return;
-    \\    var n = Number(b);
-    \\    if (!Number.isFinite(n)) return;
-    \\    var used = globalThis.__rove_email_sends || 0;
-    \\    if (used >= n) { var e = new Error("email rate limit exceeded, retry after 1s"); e.code = "rate_limited"; throw e; }
-    \\    globalThis.__rove_email_sends = used + 1;
-    \\  };
+    \\  // The outbound rate limit (prod's per-tenant OUTBOUND budget) is armed
+    \\  // by `scenario({ emailBudget: N })` and enforced in `recFetch` below
+    \\  // (the sim's fetch chokepoint), mirroring prod's move off the retired
+    \\  // email-specific `__rove_check_email_rate` native onto the fetch
+    \\  // primitive. No bare `__rove_*` global remains — the continuation native
+    \\  // lives on `_system.continuation` below (next.js captures it at
+    \\  // base-eval; the bare `__rove_next` global is gone).
     \\  // Streaming SHA-256 in pure JS (the portable replay engine has one-shot
     \\  // `nat.sha256` only). Same posture as the RSA/ECDSA verify above; drives
     \\  // `crypto.sha256Init/Update/Final` so `blob.write`/`blob.seal` (recipe
@@ -309,6 +296,32 @@ const SYSTEM_SHIM =
     \\  // webhook.send/blob compose on). The epilogue's drop-tagging pass and the
     \\  // harness's fetchesPending count both key on it.
     \\  var recFetch = function(url, o, on, bound){
+    \\    // Outbound rate limit — prod enforces a per-tenant OUTBOUND budget at
+    \\    // the fetch primitive (bindings/http.zig `outboundRateOk`): every
+    \\    // customer-initiated egress (on.fetch / http.fetch / the immediate
+    \\    // fire of webhook.send / email.send) shares one bucket. Offline the
+    \\    // bucket is UNMETERED by default; `scenario({ emailBudget: N })` arms
+    \\    // a per-activation allowance (hidden reserved kv key) so the N+1-th
+    \\    // outbound in a run throws prod's exact Error{code:"rate_limited"} and
+    \\    // the customer's `catch (e){ e.code === "rate_limited" }` branch is
+    \\    // testable. Enforced HERE (the shared recorder = the sim's fetch
+    \\    // chokepoint) so a rejected send throws before its durable _send/owed
+    \\    // marker is recorded — mirroring prod's fetch-before-marker order. The
+    \\    // epilogue resets the per-activation counter.
+    \\    // Platform-internal doors (`*.internal` — blob/compose/platform/logs
+    \\    // storage + control-plane I/O) are exempt, matching prod's
+    \\    // `targetsInternalDoor` (bindings/http.zig) — they aren't third-party
+    \\    // egress.
+    \\    var __isInternal = (function(u){ var s = String(u || "").indexOf("://"); if (s < 0) return false; var a = String(u).slice(s + 3); var h = a.split(/[\/:?#]/)[0]; return h.slice(-9) === ".internal"; })(url);
+    \\    var __ob = __isInternal ? null : globalThis.kv.get("__rove_store/email_budget");
+    \\    if (__ob !== undefined && __ob !== null) {
+    \\      var __n = Number(__ob);
+    \\      if (Number.isFinite(__n)) {
+    \\        var __used = globalThis.__rove_email_sends || 0;
+    \\        if (__used >= __n) { var __e = new Error("outbound rate limit exceeded, retry after 1s"); __e.code = "rate_limited"; throw __e; }
+    \\        globalThis.__rove_email_sends = __used + 1;
+    \\      }
+    \\    }
     \\    var id = "ftch_" + nextSeq();
     \\    push({ kind: "fetch", id: id, url: url, bound: !!bound, method: (o && o.method) || "GET",
     \\      body: (o && o.body !== undefined) ? o.body : null,

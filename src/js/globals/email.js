@@ -34,8 +34,10 @@ globalThis.email = {
    *   webhook.send retry budget (default 5).
    * @param {number} [opts.timeoutMs] - Per-attempt timeout.
    * @returns {string} The marker id from {@link webhook.send}.
-   * @throws {Error} `code:"rate_limited"` when the per-instance
-   *   email bucket is exhausted.
+   * @throws {Error} `code:"rate_limited"` when the per-instance outbound
+   *   rate limit is exhausted (enforced by the platform at the outbound
+   *   boundary — `email.send`, `webhook.send`, and `fetch` share one
+   *   per-tenant outbound budget).
    * @throws {TypeError} On missing/invalid `apiKey`/`from`/`subject`/`to`.
    *
    * @example
@@ -50,7 +52,6 @@ globalThis.email = {
    * });
    */
   send(opts) {
-    __rove_check_email_rate();
     if (!opts || typeof opts !== "object")
       throw new TypeError("email.send requires an options object");
     for (const pair of [["key", "apiKey"], ["reply_to", "replyTo"], ["max_attempts", "maxAttempts"], ["timeout_ms", "timeoutMs"]]) {

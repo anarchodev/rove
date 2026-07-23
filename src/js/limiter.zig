@@ -18,14 +18,17 @@
 //! resolved plan (test paths, async activations that never ran a request-rate
 //! check) fall back to a default `RateLimitCaps{}`.
 //!
-//! Actions covered in v1: `request` (per-instance HTTP request budget,
-//! protects the worker from a single noisy tenant) and `email`
-//! (per-instance Resend send budget, protects the platform's
-//! reputation/bill). Other actions in PLAN §2.10 (`deploy`,
-//! `webhook_attempt`, `kv_write`) are deferred — webhooks are already
-//! paced by webhooks.db depth + per-destination cap + exponential
-//! backoff; deploys are low-volume; kv_write is a hot path with real
-//! per-call cost to add bucket math.
+//! Actions covered: `request` (per-instance inbound HTTP request budget,
+//! protects the worker from a single noisy tenant) and `outbound`
+//! (per-instance customer-initiated outbound-HTTP budget — `on.fetch`,
+//! `http.fetch`, and the immediate fire of `webhook.send` / `email.send`;
+//! protects the platform's egress reputation + third-party bill). The
+//! outbound bucket is enforced at the frozen fetch primitive
+//! (`bindings/http.zig`), not in a pinnable email/webhook shim, so a
+//! tenant-pinnable package can't bypass it; deferred webhook retries
+//! (`is_system_module` fires) don't re-count. Other actions in PLAN §2.10
+//! (`deploy`, `kv_write`) are deferred — deploys are low-volume; kv_write
+//! is a hot path with real per-call cost to add bucket math.
 //!
 //! Thread safety: not synchronized; each worker thread owns its own
 //! RateLimiter. Same model as `penalty.zig`.
@@ -35,7 +38,7 @@ const plan_mod = @import("rove-plan");
 
 pub const Action = enum(u8) {
     request,
-    email,
+    outbound,
 };
 
 const ACTION_COUNT: usize = std.meta.fields(Action).len;
@@ -118,9 +121,9 @@ const InstanceBuckets = struct {
             caps.request_refill_per_sec,
             now_ns,
         );
-        bs[@intFromEnum(Action.email)] = TokenBucket.init(
-            caps.email_capacity,
-            caps.email_refill_per_sec,
+        bs[@intFromEnum(Action.outbound)] = TokenBucket.init(
+            caps.outbound_capacity,
+            caps.outbound_refill_per_sec,
             now_ns,
         );
         return .{ .buckets = bs, .gen = gen };
@@ -277,8 +280,8 @@ test "limiter: per-instance isolation" {
     var rl = RateLimiter.init(testing.allocator, .{
         .request_capacity = 2,
         .request_refill_per_sec = 0,
-        .email_capacity = 1,
-        .email_refill_per_sec = 0,
+        .outbound_capacity = 1,
+        .outbound_refill_per_sec = 0,
     });
     defer rl.deinit();
 
@@ -296,24 +299,24 @@ test "limiter: actions are independent within an instance" {
     var rl = RateLimiter.init(testing.allocator, .{
         .request_capacity = 1,
         .request_refill_per_sec = 0,
-        .email_capacity = 1,
-        .email_refill_per_sec = 0,
+        .outbound_capacity = 1,
+        .outbound_refill_per_sec = 0,
     });
     defer rl.deinit();
 
     try testing.expect(try rl.check("acme", .request, rl.caps, 0, 0));
     try testing.expect(!(try rl.check("acme", .request, rl.caps, 0, 0)));
     // request bucket exhausted but email bucket still has tokens.
-    try testing.expect(try rl.check("acme", .email, rl.caps, 0, 0));
-    try testing.expect(!(try rl.check("acme", .email, rl.caps, 0, 0)));
+    try testing.expect(try rl.check("acme", .outbound, rl.caps, 0, 0));
+    try testing.expect(!(try rl.check("acme", .outbound, rl.caps, 0, 0)));
 }
 
 test "limiter: retryAfterSeconds returns at least 1 + caps inf at 60" {
     var rl = RateLimiter.init(testing.allocator, .{
         .request_capacity = 1,
         .request_refill_per_sec = 5, // 0.2s/token
-        .email_capacity = 1,
-        .email_refill_per_sec = 0, // disabled
+        .outbound_capacity = 1,
+        .outbound_refill_per_sec = 0, // disabled
     });
     defer rl.deinit();
 
@@ -322,10 +325,10 @@ test "limiter: retryAfterSeconds returns at least 1 + caps inf at 60" {
     // 0.2s away in real terms, but we round up to 1s minimum.
     try testing.expectEqual(@as(u32, 1), rl.retryAfterSeconds("acme", .request));
 
-    _ = try rl.check("acme", .email, rl.caps, 0, 0);
-    _ = try rl.check("acme", .email, rl.caps, 0, 0);
+    _ = try rl.check("acme", .outbound, rl.caps, 0, 0);
+    _ = try rl.check("acme", .outbound, rl.caps, 0, 0);
     // Refill rate 0 → infinite wait → fallback 60s.
-    try testing.expectEqual(@as(u32, 60), rl.retryAfterSeconds("acme", .email));
+    try testing.expectEqual(@as(u32, 60), rl.retryAfterSeconds("acme", .outbound));
 }
 
 test "limiter: retryAfterSeconds = 1 for unknown instance" {

@@ -28,7 +28,6 @@ const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const crypto_jose_b = @import("bindings/crypto_jose.zig");
 const crypto_ecdsa_b = @import("bindings/crypto_ecdsa.zig");
-const email_rate_b = @import("bindings/email_rate.zig");
 const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
@@ -520,10 +519,11 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
-    /// Per-worker rate limiter. Used by the `__rove_check_email_rate`
-    /// builtin (called from the `email.send` JS wrapper) to take
-    /// from the email bucket before queuing the webhook row. Null in
-    /// test paths that don't care.
+    /// Per-worker rate limiter. Used at the inbound request boundary
+    /// (`worker_dispatch.zig`, the `.request` action) and at the frozen
+    /// outbound fetch primitive (`bindings/http.zig` `outboundRateOk`, the
+    /// `.outbound` action — every customer-initiated egress). Null in test
+    /// paths that don't care.
     limiter: ?*limiter_mod.RateLimiter = null,
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
@@ -1201,23 +1201,15 @@ const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
     // `installRequest` via `JS_SetDateNow` + `JS_SetRandomSeed`.
 };
 
-const GLOBAL_BUILTINS = [_]FnBinding{
-    // Take from the email rate-limit bucket. Called from the
-    // email.send JS wrapper before queuing the webhook row. Throws
-    // Error{code:"rate_limited"} on exhaustion; no-op (returns
-    // undefined) when state.limiter is null (test paths).
-    //
-    // The one remaining bare `__rove_*` global — kept because it's
-    // called by the base-eval `email.js` shim (so by the surface rule
-    // it should be `_system.email`, not `__rove.*`), and the
-    // rate-limit rework that removes it is deferred
-    // (`docs/architecture/privileged-surface.md` §3). Every
-    // other privileged op reached by baked `__system/` modules lives
-    // under `_system.continuation.*` (the widened `next`) or the gated
-    // `__rove.*` holder (STATIC_NAMESPACES), not a scattered bare
-    // global.
-    .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
-};
+// No bare `__rove_*` globals remain. The per-tenant OUTBOUND plan-rate
+// (formerly `__rove_check_email_rate`, an email-specific bare global) is
+// now enforced at the frozen fetch primitive `bindings/http.zig`
+// (`outboundRateOk`), covering every customer-initiated egress; every other
+// privileged op reached by baked `__system/` modules lives under
+// `_system.continuation.*` (the widened `next`) or the gated `__rove.*`
+// holder (STATIC_NAMESPACES). See docs/architecture/privileged-surface.md
+// (the outbound-boundary rule).
+const GLOBAL_BUILTINS = [_]FnBinding{};
 
 // Public shims (docs/architecture/builtin-libs.md Phase A). JSDoc-carrying
 // JS over `_system.*`; this is the documentation source of truth.
@@ -1374,11 +1366,11 @@ fn lintPrecededByJsdoc(src: []const u8, decl_start: usize) bool {
 test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Documented exceptions (docs/architecture/builtin-libs.md): Date.now /
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
-    // determinism overrides); __rove_check_email_rate is the one
-    // remaining internal GLOBAL_BUILTIN (called only by globals/email.js;
-    // the other privileged ops live under `__rove.*` /
-    // `_system.continuation.*`).
-    const builtin_exceptions = [_][]const u8{"__rove_check_email_rate"};
+    // determinism overrides). No bare `__rove_*` GLOBAL_BUILTINS remain —
+    // the privileged ops live under `__rove.*` / `_system.continuation.*`,
+    // and the outbound plan-rate moved to the frozen fetch primitive
+    // (`bindings/http.zig`), so this list is empty.
+    const builtin_exceptions = [_][]const u8{};
 
     // Documented namespace exceptions: `_system.continuation.next` backs
     // the public `next()` disposition (shim is next.js, not
