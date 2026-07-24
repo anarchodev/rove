@@ -1,13 +1,25 @@
-// A cross-module fetch continuation: reached only as the `on` of the index.mjs
-// after.fetch (folded via `.fetch().resolve()`), and also drivable standalone
-// via `scenario.fetchResult`. Records the upstream result under the threaded ctx
-// key — proving the RIGHT module ran (only this file writes `result/*`).
+// A cross-module fetch continuation — the `on_chunk` module of an UNBOUND
+// http.fetch/http.subscribe (a SEPARATE chain), drivable standalone via
+// scenario.fetchResult. An unbound continuation gets NO top-level flatten: the
+// result rides request.activation.* — the terminal status on
+// request.activation.status and the chunk payload on request.activation.bytes
+// (a Uint8Array; decode for text). Records it under the threaded ctx key —
+// proving the RIGHT module ran (only this file writes result/*).
 export default function () {
   const ctx = request.ctx || {};
+  const a = request.activation;
+  const body = new TextDecoder().decode(a.bytes);
   kv.set("result/" + ctx.key, JSON.stringify({
-    ok: request.status >= 200 && request.status < 300,
-    status: request.status,
-    body: request.text,
+    ok: a.status >= 200 && a.status < 300,
+    status: a.status,
+    body: body,
+  }));
+  // Prove the surface is UNBOUND: the flatten a bound resume would carry is
+  // absent (no top-level request.status), the payload is on the activation bag.
+  kv.set("surface/" + ctx.key, JSON.stringify({
+    topStatus: request.status === undefined,
+    activationKind: a.kind,
+    bytesLen: a.bytes.length,
   }));
   return { done: true, key: ctx.key };
 }

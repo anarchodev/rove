@@ -648,7 +648,7 @@ test "referencesPrivilegedSurface: catches _system + __rove*, not lookalikes" {
     // hits
     try testing.expect(referencesPrivilegedSurface("const h = _system.http;"));
     try testing.expect(referencesPrivilegedSurface("globalThis.__rove.fetch(u)"));
-    try testing.expect(referencesPrivilegedSurface("__rove_check_email_rate()"));
+    try testing.expect(referencesPrivilegedSurface("__rove_internal_op()"));
     try testing.expect(referencesPrivilegedSurface("x=_system"));
     try testing.expect(referencesPrivilegedSurface("// mentions _system in a comment"));
     // misses (identifier boundaries)

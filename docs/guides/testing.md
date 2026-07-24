@@ -60,7 +60,10 @@ expect(req).toHaveFetched(/stripe/);
   JSON-stringified for you, so you can write `{ item: "book" }` instead of a
   hand-escaped string.
 - `now` — a fixed clock (ISO string or ms). `Date.now()` in the handler returns
-  it, so time-dependent handlers are deterministic.
+  it, so time-dependent handlers are deterministic. Handler time is **UTC**:
+  local-time `Date` methods (`getHours`, `getTimezoneOffset`, `toString`) run in
+  UTC regardless of your machine's timezone, matching production (UTC servers) —
+  so a date-formatting test can't green offline and shift in prod.
 - `seed` — the deterministic seed for `Math.random()` / `crypto.randomUUID()`.
 - `sourceDir` — where handler code resolves from (defaults to the app dir you
   ran `rewind test` in). Use it to point a scenario at a different tree.
@@ -71,11 +74,12 @@ expect(req).toHaveFetched(/stripe/);
 - `rootToken` — the operator token `platform.auth.checkRootToken` validates against.
 - `admin` — mark the run as the admin handler so `platform.*` is allowed. It's
   admin-only and **off by default**, so a normal handler that touches it throws.
-- `emailBudget` — a per-activation `email.send` allowance. Production meters
-  sends through a per-instance token bucket; offline they're unmetered unless
-  this is set, in which case the N+1-th send in an activation throws the same
-  `Error` prod does (`e.code === "rate_limited"`), so the catch branch is
-  testable.
+- `emailBudget` — a per-activation outbound-send allowance. Production meters
+  customer-initiated outbound (`email.send` / `webhook.send` / `after.fetch`)
+  through a per-tenant token bucket at the fetch primitive; offline sends are
+  unmetered unless this is set, in which case the N+1-th outbound in an
+  activation throws the same `Error` prod does (`e.code === "rate_limited"`),
+  so the catch branch is testable.
 - `tenant` / `correlationId` — the per-chain identity the engine pins on every
   activation (`request.tenant` and `request.correlation_id`). The worker sets them
   in prod — inbound mints the correlation id, every resume inherits it — so a
@@ -86,9 +90,25 @@ expect(req).toHaveFetched(/stripe/);
   are still pinned — prod always sets them — with the placeholders `"sim"`
   (tenant) and `""` (correlation id), and `request.session` is `null` unless
   injected, so the documented `session === null` branch is reachable offline.
+- `packages` / `app_imports` — a first-party `@rewind/*` package graph, so a
+  handler that `import`s a package by bare specifier resolves **offline**
+  (there is no registry in the sim). `packages` is
+  `[{ spec, version, pkg_hash, imports?, files: { path: source } }]` and
+  `app_imports` is `{ specifier: pkg_hash }` — the same resolved-lockfile shape
+  the deploy produces, with each package's source carried inline (offline there
+  is no blob store). The sim resolves through the SAME `PackageResolver` prod
+  uses at deploy: `app_imports` is the app's flat surface; a package's own
+  `imports` encapsulate its (possibly different-version) deps. `pkg_hash` is the
+  content-addressed `/pkg/<hash>/` namespace — any 64-hex works (the engine
+  treats it as opaque). Use this to test a consumer of a lifted `@rewind` lib.
 
 The **request body** is whatever you pass as `inbound({ body })` (JSON-stringified
-if it's not a string). Omit it and the request is bodyless — reading `request.text`
+if it's not a string). For a **binary** request body pass `inbound({ bodyBinary })`
+(a `Uint8Array` or a base64 string) — it round-trips byte-exact on `request.bytes`.
+Pass `inbound({ export })` to drive a specific export directly (an authored-dispatch
+test) instead of the activation's default. (Misspelling a world/`scenario()` field
+now fails loud with a "did you mean" hint, rather than being silently ignored.)
+Omit the body and the request is bodyless — reading `request.text`
 / `.bytes` / `.json` returns empty (`""`, 0-length), exactly as a real bodyless
 request (a GET, an empty POST) does. On a payload-less **resume** (a wake, a
 `cron`/`schedule` target, `onDisconnect`) all three read `undefined`, exactly as
@@ -267,6 +287,21 @@ const gone   = held.disconnect();                        // client closed → on
 Resolving on an activation that already responded (didn't hold) throws — `after.*`
 only fires while the connection is held, so the test mirrors reality.
 
+Each armed wake resumes into its OWN `{on}` export — an `after.ms(..,{on:"onTick"})`
+fires `onTick`, an `after.kv("x/",{on:"onData"})` fires `onData`. Two matching
+constraints on the fold keep it honest with the worker:
+
+- **`clock.advance(d).fire()` only fires a timer the clock has reached.** Advancing
+  by less than the armed `after.ms(N)` throws, rather than delivering a wake prod
+  wouldn't. When a handler arms several `after.ms` on one connection, the worker
+  keeps just the LAST — a single timer slot — so `.fire()` resolves the
+  last-registered interval and `{on}`.
+- **`wakeKv(changes)` only fires when a change key falls under an armed prefix.** A
+  change entirely outside every `after.kv` prefix throws (it would validate a
+  resume the worker never triggers). Keys outside the prefixes still fold into the
+  KV overlay — they just can't be the trigger. Pass `{prefix}` to pick which armed
+  `after.kv`'s export resumes when several are watching.
+
 ### A WebSocket
 
 A WS connection runs no code at upgrade; each frame runs `onMessage`. Drive it
@@ -285,6 +320,14 @@ The frame is the request payload: inside `onMessage`, `request.text` is the
 frame text (what `browser.message()` parses as JSON), a binary frame's
 `request.bytes` is the decoded bytes, and the frame is on
 `request.activation.data` too — read whichever the handler uses.
+
+A frame stays live for the next frame only if it re-held via `next()`. A frame
+that returns a terminal value, or throws, closes the socket and destroys the
+chain — so `.receive()`/`.disconnect()` on that node throw (the worker cannot
+deliver another frame). A throwing frame closes *without* running
+`onDisconnect`. And a client close *before any frame* (`s.ws(...).disconnect()`
+with no prior `.receive()`) runs nothing at all — the chain is established
+lazily on the first frame, so there is no `onDisconnect` to fire.
 
 A WS handler can issue an `after.fetch` (or arm a timer / `after.kv`) mid-chain
 and keep going: resolve the fetch, then call `.receive(nextFrame)` on the
@@ -322,6 +365,24 @@ recovers the target path). A torn upload is `stored({ ok: false })` — the resu
 runs with `request.status === 0` (a hard failure — `status` is the single
 success signal, no `request.ok`; issue #7) and `request.ctx = { error, app }`,
 nothing stored.
+
+### A streamed upload (raw onChunk)
+
+A handler that exports `onChunk` sees the body as a sequence of `inbound_chunk`
+activations (the trust-boundary streaming path, distinct from `blob.receive`).
+Drive it with `scenario.inboundChunks({ method, path, headers }, chunks)` — one
+activation per chunk, with `request.chunkSeq`, `request.done` on the last, and
+the payload on `request.bytes` / `.text`. Per-connection ctx threads via each
+chunk's `next({ctx})` (null on the first) and KV writes fold forward, so an
+accumulate-in-kv handler reconstructs the body. Pass `{ binary: true }` for byte
+chunks (`Uint8Array`).
+
+```js
+const r = s.inboundChunks({ method: "POST", path: "/upload" },
+                          ["Hello, ", "streaming ", "world!"]);
+expect(r.disposition).toBe("terminal");
+expect(r.body.assembled).toBe("Hello, streaming world!"); // folded across 3 chunks
+```
 
 ### The deploy doors (result-in-ctx)
 
@@ -384,15 +445,63 @@ Both `schedule` and `cron` deliver a target this way, so one `wake(...)` is one
 firing. As with `sendCallback`, the target is tested in isolation — the
 scheduler's own queueing and at-least-once firing aren't re-run.
 
-A bare **fetch continuation module** — the `on` of an `after.fetch`/`http.fetch`,
-in its own file — is drivable the same way with `scenario.fetchResult`, given an
-upstream result on the flattened `request.{status, ok, done, body}` surface:
+A **kv-reactive subscription** target — the `onSubscription` a watched-name
+change fires — is driven by `scenario.subscriptionFire({ on, name })`: a fresh
+connectionless activation with `request.activation = { kind: "subscription_fire",
+name, source }` and an empty ctx (subscription chains carry no platform ctx —
+state lives in the handler's own kv). The platform retires the `_sub/dirty/{name}`
+marker before the handler runs, so the handler observes it already cleared.
+
+```js
+const fired = s.subscriptionFire({ on: "watchers/orders.mjs", name: "orders/watch" });
+expect(fired.body.fired).toBe("orders/watch");
+```
+
+The *produce* side — the `_sub/dirty/{name}` marker that a watched write injects —
+is modeled by registering the subscriptions on the scenario:
+`scenario({ subscriptions: [{ name, prefix }] })`. A `kv.set`/`kv.delete` of a key
+under a watched `prefix` then leaves one coalesced `_sub/dirty/{name}` write in the
+effect log (assert with `toHaveWritten`), exactly as production injects it.
+
+**kv triggers.** Register a `_triggers/<prefix>/index.mjs` module with
+`scenario({ triggers: [{ prefix: "users/" }] })` (`module` defaults to that path).
+Its `beforePut`/`afterPut`/`beforeDelete`/`afterDelete` exports run on a matching
+`kv.set`/`kv.delete`, receiving `{ key, value, previousValue, op, timing, … }`. A
+`beforePut` that returns a string **mutates** the stored value; a handler that
+**throws** rejects the write as `Error{code:"trigger_rejected"}` — testable with
+the same `err.code` branch the handler ships.
+
+An **outbound `http.subscribe`** (a held upstream that pushes) is separate: it's
+fire-and-forget on the connection (its events fire to the `on` module as an
+UNBOUND chain), so it doesn't hold `next()`. Drive its event stream from the node
+that opened it: `node.subscription(urlMatcher).event(chunk)` delivers one
+per-writeback event (payload on `request.activation.bytes`), and `.ended({status?})`
+the terminal close (default status 0). Events fold their KV writes forward.
+
+```js
+const sub = r.subscription(/feed\.example/);
+sub.event('{"item":"a"}');            // request.activation.bytes = the chunk
+const last = sub.event('{"item":"b"}');
+expect(last.kv("feed/count")).toBe("2");
+const end = sub.ended();              // final:true, status 0 → "subscription ended"
+```
+
+A bare **fetch continuation module** — the `on_chunk` of an UNBOUND
+`http.fetch`/`http.subscribe`, in its own file — is drivable with
+`scenario.fetchResult`. An unbound cross-module continuation is a *separate*
+chain, so it carries NO top-level flatten: the result rides
+`request.activation.{status, final, bytes}` (the payload is a `Uint8Array` on
+`request.activation.bytes` — decode with `TextDecoder`) and the echoed `ctx` is
+bare on `request.ctx`. (A BOUND `after.fetch` `{on}` resumes an export in the
+*same* held module — drive that with `fetch().resolve()`, which does carry the
+flatten.)
 
 ```js
 const done = s.fetchResult({
   on: "hooks/onFetched.mjs",
-  status: 502,                  // 5xx → the handler derives ok:false (no request.ok, #7)
-  ctx: { key: "beta" },        // arrives as request.ctx
+  status: 502,                 // on request.activation.status (5xx → the handler derives ok:false, #7)
+  body: "nope",                // on request.activation.bytes (Uint8Array)
+  ctx: { key: "beta" },        // arrives bare on request.ctx
 });
 expect(done).toHaveWritten("result/beta", { ok: false, status: 502 });
 ```
@@ -460,6 +569,10 @@ itself worth asserting if a handler is supposed to stay off that surface.
 effects into `_tests/__snapshots__/<file>.json`. The first run writes it; later
 runs compare; a mismatch fails until you re-baseline with `rewind test --update`.
 Useful for pinning a handler's whole behavior without spelling out every field.
+An unnamed `toMatchSnapshot()` is keyed by its call site (`file.mjs:line`), so
+reordering assertions doesn't re-key baselines. A stored snapshot no assertion
+reads (a deleted or renamed one) is warned about on a clean run and pruned by
+`--update` — the sidecar stays exactly the live set.
 
 ## What it does and doesn't tell you
 
@@ -470,3 +583,17 @@ routing, real network fetches, the durable retry ladder. You supply each externa
 result; the platform's delivery of it is covered by the platform's own tests. A
 green `rewind test` means "the handler does the right thing with these inputs,"
 which is exactly the layer you own.
+
+**Crypto offline.** `jwt.verify` / `crypto.verifyRsa` / `crypto.verifyEcdsa` run
+for real over RS256/384/512 and ES256/384/512 (pure-JS SHA-256/384/512 + P-256/
+384/521), so an IdP-token verification is faithful. OIDC *provider* mode works
+too: `crypto.oidcGenerateKey()` returns a fixed deterministic RSA dev key and
+`crypto.oidcSign(priv, signingInput)` produces a real RS256 signature, so a
+keyset → mint → verify round-trip (and an ActivityPub HTTP-Signature delivery)
+runs offline — same run, same signatures. An unsupported alg/curve throws a loud
+"not available in `rewind test`" error rather than a silent wrong verdict.
+
+**CPU budget.** A handler has a wall-clock budget offline (a generous multiple of
+production's 1 s), so an accidental `while(true)` doesn't hang `rewind test` — it
+completes in bounded time with production's outcome: status 504, body `"handler
+exceeded cpu budget"`, `ok:false` (its effects roll back, like a throw).

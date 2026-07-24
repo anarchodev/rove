@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
+const path_confine = @import("path_confine.zig");
 
 /// The C ABI struct (`arena_replay_host`). Field order + signatures mirror the
 /// header exactly; a NULL responder reports "tape not installed" (code 1).
@@ -238,11 +239,31 @@ fn moduleLoad(
 ) callconv(.c) c_int {
     const h = hostOf(user);
     const s = spec[0..@intCast(spec_len)];
+    // Content-addressed package modules (`/pkg/<hash>/…`, issue #50) live ONLY
+    // inline in the world's package sources — they have no on-disk home. Serve
+    // them from the `sources` map even under a working-tree `--source-dir`
+    // override (which otherwise reads app modules from disk); else the offline
+    // resolver would look for `{source_dir}/pkg/<hash>/…` and diverge.
+    if (std.mem.startsWith(u8, s, "/pkg/")) {
+        if (h.sources.get(s)) |src| {
+            out_src.* = dupC(src, true) orelse return -1;
+            out_src_len.* = @intCast(src.len);
+            return 0;
+        }
+        h.setDiv("package module '{s}' not in the world's package sources", .{s});
+        return -6;
+    }
     // Working-tree override: serve the local file so a changed handler can be
     // replayed against the recorded inputs. A missing local file IS a
     // divergence ("your tree doesn't have this module").
     if (h.source_dir) |dir| {
-        const path = std.fs.path.join(h.a, &.{ dir, s }) catch return -1;
+        // Confine to the deployment root — prod clamps module resolution there
+        // (package_resolver.resolveSpecifier), so an over-popped `../` that
+        // escapes `--source-dir` names a file prod could never serve.
+        const path = path_confine.confineUnderRoot(h.a, dir, dir, s) orelse {
+            h.setDiv("module '{s}' escapes --source-dir '{s}' — refused (prod confines resolution to the deployment root)", .{ s, dir });
+            return -6;
+        };
         const bytes = std.fs.cwd().readFileAlloc(h.a, path, 8 << 20) catch {
             h.setDiv("module '{s}' not found under --source-dir '{s}'", .{ s, dir });
             return -6;

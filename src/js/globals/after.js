@@ -121,6 +121,8 @@ function _rejectRenamed(verb, opts, renames) {
      *   per-event-shape defaults for every event of this fetch.
      * @returns {string} The fetch id (`ftch_…`, opaque — compare to
      *   `request.fetchId`).
+     * @throws {Error} `code:"rate_limited"` when the per-tenant outbound
+     *   rate limit is exhausted (shared with `webhook.send`/`email.send`).
      * @example
      * after.fetch('https://api.example.com/stream',
      *             { stream: true, on: 'onUpstream' });

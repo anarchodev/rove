@@ -60,7 +60,7 @@ function _escHtml(s) {
 // S256: base64url(SHA-256(ascii(verifier))). crypto.sha256 returns
 // hex; reuse oauth.js's hex.decode bridge.
 function _s256(verifier) {
-  return base64url.encode(hex.decode(crypto.sha256(verifier)));
+  return crypto.sha256b64url(verifier);
 }
 
 /**

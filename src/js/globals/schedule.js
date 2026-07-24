@@ -26,12 +26,11 @@
 //   _sched/by_id/{id}                    -> {when_ns, target, msg, key?}
 //   _sched/by_time/{when_ns_padded}/{id} -> ""   (time-ordered index)
 //
-// Evaluated as a global script after `cron.js` (it reuses
-// `cron.parseDuration` for `{ in }` duration strings; `cron.*` fire-
-// time helpers feed `{ at }`).
+// Evaluated as a global script after `time.js` (it coerces `{ at }` /
+// `{ in }` through the shared `time` library; `cron.*` fire-time helpers
+// are still handy inputs to `{ at }`).
 
 (function () {
-  const NS_PER_MS = 1_000_000n;
 
   // 1 s tick resolution (SCHED_TICK_RESOLUTION). Fire times round UP to
   // the next tick; sub-second scheduling is unsupported (matches the
@@ -71,7 +70,7 @@
   // 43 chars (mirrors webhook.send's `handle`). Same key ⇒ same id ⇒
   // last-write-wins.
   function _idFromKey(key) {
-    return base64url.encode(hex.decode(crypto.sha256(key)));
+    return crypto.sha256b64url(key);
   }
 
   // Count outstanding schedules, throwing once the cap is reached. Pages
@@ -98,35 +97,16 @@
     }
   }
 
-  // Absolute time → ns-since-epoch. bigint = ns (passthrough); number =
-  // ms-since-epoch; Date; string = ISO-8601.
+  // Absolute `{at}` and delay `{in}` both coerce through the shared
+  // `time` library (bigint ns | ms-since-epoch | Date | duration | ISO
+  // for `at`; ms | duration for `in`). Date.now() is replay-
+  // deterministic (pinned per activation).
   function _coerceAt(x) {
-    if (typeof x === "bigint") return x;
-    if (typeof x === "number" && Number.isFinite(x)) return BigInt(Math.floor(x)) * NS_PER_MS;
-    if (x instanceof Date) return BigInt(x.getTime()) * NS_PER_MS;
-    if (typeof x === "string") {
-      const ms = Date.parse(x);
-      if (!Number.isNaN(ms)) return BigInt(ms) * NS_PER_MS;
-    }
-    throw new TypeError(
-      "schedule({ at }): at must be a bigint (ns), number (ms-since-epoch), Date, or ISO-8601 string",
-    );
+    return time.toNs(x);
   }
 
-  // Delay from now → absolute ns. number = ms; string = duration
-  // ("30s"/"5m"/"2h"/"1d"/"1w", via cron.parseDuration).
-  // Date.now() is replay-deterministic (pinned per activation).
   function _coerceIn(x) {
-    let ms;
-    if (typeof x === "number" && Number.isFinite(x)) {
-      ms = Math.floor(x);
-    } else if (typeof x === "string") {
-      ms = cron.parseDuration(x);
-      if (ms == null) throw new TypeError("schedule({ in }): not a duration: " + x);
-    } else {
-      throw new TypeError("schedule({ in }): in must be a number (ms) or a duration string");
-    }
-    return BigInt(Date.now() + ms) * NS_PER_MS;
+    return time.inToNs(x);
   }
 
   // The arm: validate, cap, write the two `_sched/` rows. Shared by the

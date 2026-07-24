@@ -84,6 +84,23 @@
     },
 
     /**
+     * SHA-256 of `data`, URL-safe base64 (no padding) — one call for the
+     * `base64url.encode(hex.decode(crypto.sha256(x)))` idiom. Both a PKCE S256
+     * code challenge (RFC 7636) and a stable content-addressed id are exactly
+     * this digest-of-a-secret-or-key.
+     *
+     * @param {string|Uint8Array} data - String (hashed as UTF-8 bytes) or raw
+     *   bytes.
+     * @returns {string} URL-safe base64, 43 characters, no padding.
+     *
+     * @example
+     * const challenge = crypto.sha256b64url(codeVerifier); // PKCE S256
+     */
+    sha256b64url(data) {
+      return base64url.encode(hex.decode(sys.sha256(data)));
+    },
+
+    /**
      * Begin a streaming SHA-256. Returns an opaque midstate token —
      * a plain string, so hash state can ride kv across activations
      * (an accumulation built over many chunks finalizes to the same

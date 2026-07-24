@@ -627,11 +627,11 @@ fn handlePlan(
             return reply(server, allocator, ent, sid, sess, 500, "slot open failed\n");
         const p = slot.effectivePlan();
         const gen = slot.plan_gen.load(.acquire);
-        const json = std.fmt.allocPrint(allocator, "{{\"request_capacity\":{d},\"request_refill_per_sec\":{d},\"email_capacity\":{d},\"email_refill_per_sec\":{d},\"max_body_bytes\":{d},\"retention_days\":{d},\"plan_gen\":{d}}}", .{
+        const json = std.fmt.allocPrint(allocator, "{{\"request_capacity\":{d},\"request_refill_per_sec\":{d},\"outbound_capacity\":{d},\"outbound_refill_per_sec\":{d},\"max_body_bytes\":{d},\"retention_days\":{d},\"plan_gen\":{d}}}", .{
             p.rate.request_capacity,
             p.rate.request_refill_per_sec,
-            p.rate.email_capacity,
-            p.rate.email_refill_per_sec,
+            p.rate.outbound_capacity,
+            p.rate.outbound_refill_per_sec,
             p.max_body_bytes,
             p.retention_days,
             gen,
@@ -870,16 +870,7 @@ fn forwardWriteOne(allocator: std.mem.Allocator, secret: []const u8, dest: []con
     try headers.append(allocator, .{ .name = "X-Rewind-Move-Secret", .value = secret });
     try headers.append(allocator, .{ .name = "Content-Type", .value = "application/json" });
 
-    var easy = try curl.Easy.init(allocator);
-    defer easy.deinit();
-    var resp = try easy.request(allocator, .{
-        .method = .POST,
-        .url = url,
-        .headers = headers.items,
-        .body = payload,
-        .http_version = .h2c_prior_knowledge,
-        .verify_tls = false,
-    });
+    var resp = try curl.cpPost(allocator, url, payload, .{ .headers = headers.items });
     defer resp.deinit(allocator);
     return resp.status;
 }

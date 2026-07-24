@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const worker_streaming = @import("worker_streaming.zig");
+const worker_fire = @import("worker_fire.zig");
 const deployment_cache = @import("deployment_cache.zig");
 
 /// `_sched/by_time/` kv prefix — the `scheduler` lib's time-ordered
@@ -71,7 +72,7 @@ pub fn sweepDurableWakes(worker: anytype) void {
         // watermark so the next sweep doesn't re-fire. A crash before
         // that commit leaves the watermark due and self-heals on the
         // next tick.
-        worker_streaming.fireSchedulerTick(worker, slot.instance_id);
+        worker_fire.fireSchedulerTick(worker, slot.instance_id);
     }
 }
 
@@ -119,7 +120,7 @@ pub fn sweepDurableWakesOnPromotion(worker: anytype) void {
         page.deinit();
         if (!has_any) continue;
 
-        worker_streaming.fireSchedulerTick(worker, slot.instance_id);
+        worker_fire.fireSchedulerTick(worker, slot.instance_id);
     }
 }
 

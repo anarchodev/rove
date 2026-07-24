@@ -28,7 +28,6 @@ const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const crypto_jose_b = @import("bindings/crypto_jose.zig");
 const crypto_ecdsa_b = @import("bindings/crypto_ecdsa.zig");
-const email_rate_b = @import("bindings/email_rate.zig");
 const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
@@ -38,11 +37,12 @@ const blob_b = @import("bindings/blob.zig");
 const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
 const textcodec_b = @import("bindings/textcodec.zig");
-const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
-const reserved_headers = @import("reserved_headers.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
-
+const request_bindings = @import("globals_request.zig");
+pub const installRequest = request_bindings.installRequest;
+const platform_bindings = @import("globals_platform.zig");
+const kv_bindings = @import("globals_kv.zig");
 
 const c = qjs.c;
 
@@ -519,10 +519,11 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
-    /// Per-worker rate limiter. Used by the `__rove_check_email_rate`
-    /// builtin (called from the `email.send` JS wrapper) to take
-    /// from the email bucket before queuing the webhook row. Null in
-    /// test paths that don't care.
+    /// Per-worker rate limiter. Used at the inbound request boundary
+    /// (`worker_dispatch.zig`, the `.request` action) and at the frozen
+    /// outbound fetch primitive (`bindings/http.zig` `outboundRateOk`, the
+    /// `.outbound` action — every customer-initiated egress). Null in test
+    /// paths that don't care.
     limiter: ?*limiter_mod.RateLimiter = null,
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
@@ -665,7 +666,6 @@ pub const DispatchState = struct {
 /// PLAN §2.5 cascade depth ceiling.
 pub const MAX_TRIGGER_DEPTH: u32 = 8;
 
-
 // ── C helpers ──────────────────────────────────────────────────────────
 
 pub fn getState(ctx: ?*c.JSContext) *DispatchState {
@@ -675,7 +675,7 @@ pub fn getState(ctx: ?*c.JSContext) *DispatchState {
 
 /// Convert a JS value to a Zig-owned string via the state allocator.
 /// Caller frees.
-fn valueToOwnedString(
+pub fn valueToOwnedString(
     state: *DispatchState,
     ctx: ?*c.JSContext,
     val: c.JSValue,
@@ -697,7 +697,7 @@ fn valueToOwnedString(
 /// corrupting the durable store
 /// (docs/decisions.md §4.11). JSON encoding stays
 /// the handler's explicit choice (`kv.set(k, JSON.stringify(v))`).
-fn kvWriteArgToOwnedString(
+pub fn kvWriteArgToOwnedString(
     state: *DispatchState,
     ctx: ?*c.JSContext,
     val: c.JSValue,
@@ -725,12 +725,12 @@ fn kvWriteArgToOwnedString(
 const KV_KEY_MAX: usize = kv_mod.snapshot_stream.STREAM_KEY_MAX;
 const KV_VAL_MAX: usize = kv_mod.snapshot_stream.STREAM_VAL_MAX;
 
-const KvSizeViolation = enum { key, value };
+pub const KvSizeViolation = enum { key, value };
 
 /// Pure size check shared by `jsKvSet` (key + value) and `jsKvDelete` (key
 /// only — pass `null` for `val_len`). Returns which limit was exceeded, or
 /// null if the write is within bounds.
-fn kvSizeViolation(key_len: usize, val_len: ?usize) ?KvSizeViolation {
+pub fn kvSizeViolation(key_len: usize, val_len: ?usize) ?KvSizeViolation {
     if (key_len > KV_KEY_MAX) return .key;
     if (val_len) |vl| if (vl > KV_VAL_MAX) return .value;
     return null;
@@ -739,7 +739,7 @@ fn kvSizeViolation(key_len: usize, val_len: ?usize) ?KvSizeViolation {
 /// Throw `Error{message, code}` for an oversized `kv.set` / `kv.delete`.
 /// `code` is `key_too_large` / `value_too_large` so customer JS can branch on
 /// `err.code` (same shape as the `reserved_key` error).
-fn throwKvTooLarge(ctx: ?*c.JSContext, which: KvSizeViolation) c.JSValue {
+pub fn throwKvTooLarge(ctx: ?*c.JSContext, which: KvSizeViolation) c.JSValue {
     const state = getState(ctx);
     const desc = switch (which) {
         .key => .{ "key", "key_too_large", KV_KEY_MAX },
@@ -780,7 +780,7 @@ test "kvSizeViolation enforces canonical kv limits" {
 /// `kv.set` / `kv.delete` against a platform-reserved namespace. Same
 /// shape as the `rate_limited` error from `email.send` so customer
 /// JS can branch on `err.code`.
-fn throwReservedKey(ctx: ?*c.JSContext, key: []const u8) c.JSValue {
+pub fn throwReservedKey(ctx: ?*c.JSContext, key: []const u8) c.JSValue {
     const state = getState(ctx);
     const msg = std.fmt.allocPrintSentinel(
         state.allocator,
@@ -795,377 +795,6 @@ fn throwReservedKey(ctx: ?*c.JSContext, key: []const u8) c.JSValue {
     _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
     _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, "reserved_key", "reserved_key".len));
     return c.JS_Throw(ctx, err);
-}
-
-fn jsKvGet(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-
-    const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(key_str);
-
-    // The minimal readset (`docs/architecture/effects-and-handlers.md`,
-    // readset replication). A `kv.get(k)`
-    // where `k` is in this activation's own writeset reads a value
-    // the activation itself produced, reproducible by replay re-
-    // running the handler against its own overlay. Only FOREIGN
-    // reads (keys NOT in the writeset) carry replay information,
-    // so only those make it onto the tape. Saves tape size + S3
-    // bytes per request without losing replay determinism.
-    const skip_tape = state.writeset.containsKey(key_str);
-
-    const value = state.kv.get(key_str) catch |err| switch (err) {
-        error.NotFound => {
-            if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .not_found) catch {};
-            return js_null;
-        },
-        else => {
-            state.pending_kv_error = err;
-            if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .err) catch {};
-            return js_null;
-        },
-    };
-    defer state.allocator.free(value);
-
-    if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, value, .ok) catch {};
-    return c.JS_NewStringLen(ctx, value.ptr, value.len);
-}
-
-/// durable-kv-subscriptions: a successful customer write under a
-/// watched subscription prefix injects the durable dirty marker
-/// (`_sub/dirty/{name}` → the watched prefix) into THIS activation's
-/// txn + writeset — atomic with the triggering write, which is the
-/// whole at-least-once guarantee (a commit either carries both or
-/// neither; there is no window where the write is durable but the owed
-/// fire isn't). The marker key is one-per-subscription, so N matching
-/// writes coalesce at the storage level; `subs_marked` also dedups the
-/// redundant rewrites within one activation. `_sub/`-keys themselves
-/// never re-trigger (recursion guard — the fire's own marker delete
-/// must not re-arm it).
-fn markSubscriptionsDirty(state: *DispatchState, key: []const u8) void {
-    if (state.subscriptions.len == 0) return;
-    if (std.mem.startsWith(u8, key, "_sub/")) return;
-    for (state.subscriptions, 0..) |sub, i| {
-        const prefix = switch (sub.spec) {
-            .kv => |k| k.prefix,
-        };
-        if (!std.mem.startsWith(u8, key, prefix)) continue;
-        if (i < 64) {
-            const bit = @as(u64, 1) << @intCast(i);
-            if (state.subs_marked & bit != 0) continue;
-            state.subs_marked |= bit;
-        }
-        const mkey = std.fmt.allocPrint(state.allocator, "_sub/dirty/{s}", .{sub.name}) catch |err| {
-            state.pending_kv_error = err;
-            return;
-        };
-        defer state.allocator.free(mkey);
-        state.txn.put(mkey, prefix) catch |err| {
-            state.pending_kv_error = err;
-            return;
-        };
-        state.writeset.addPut(mkey, prefix) catch |err| {
-            state.pending_kv_error = err;
-            return;
-        };
-    }
-}
-
-fn jsKvSet(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 2) return js_undefined;
-    const state = getState(ctx);
-
-    const key_str = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
-    defer state.allocator.free(key_str);
-    const val_str = kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
-    defer state.allocator.free(val_str);
-
-    // Reject writes into platform-reserved namespaces. Platform writers
-    // (http.send → `_send/owed/` marker, etc.) bypass jsKvSet and write
-    // through state.txn / state.writeset directly, so this guard only
-    // fires when customer JS tries to spoof a platform key.
-    // `__system/` built-in modules (the webhook shim's onresult
-    // handler) are platform-trusted and bypass the check — they need
-    // to write `_send/owed/{id}` markers.
-    if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
-        return throwReservedKey(ctx, key_str);
-    }
-
-    // Reject oversized writes fail-fast with a clean error (see KV_KEY_MAX /
-    // KV_VAL_MAX). Applies to system writes too — anything over the kvexp cap
-    // fails at snapshot regardless, so checking early can't break a working
-    // path, only surface the failure cleanly.
-    if (kvSizeViolation(key_str.len, val_str.len)) |which| {
-        return throwKvTooLarge(ctx, which);
-    }
-
-    // The minimal readset (`docs/architecture/effects-and-handlers.md`):
-    // kv.set is an OUTPUT, not an
-    // input. Replay re-runs the handler and re-issues the write
-    // (against its writeset overlay); the value is a pure function
-    // of the recorded foreign reads + the pinned bytecode hash.
-    // Nothing about a write is a replay input, so it isn't taped.
-
-    // Fast path: no triggers match → write directly, no savepoint, no
-    // previousValue lookup, no chain machinery — no added cost over a
-    // plain write.
-    if (!td.anyTriggerMatches(state, key_str)) {
-        state.txn.put(key_str, val_str) catch |err| {
-            state.pending_kv_error = err;
-            return js_undefined;
-        };
-        state.writeset.addPut(key_str, val_str) catch |err| {
-            state.pending_kv_error = err;
-        };
-        markSubscriptionsDirty(state, key_str);
-        return js_undefined;
-    }
-
-    // Slow path: there's at least one matching trigger. Fetch the
-    // previousValue, open an inner savepoint, run BEFORE chain
-    // (with possible value mutation), do the write, run AFTER chain.
-    // Throw anywhere → rollback the savepoint and rethrow as
-    // `Error{ code: "trigger_rejected" }`.
-    var prev_owned: ?[]u8 = null;
-    defer if (prev_owned) |p| state.allocator.free(p);
-    if (state.kv.get(key_str)) |bytes| {
-        prev_owned = bytes;
-    } else |err| switch (err) {
-        error.NotFound => {},
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    }
-
-    state.txn.savepoint() catch |err| {
-        state.pending_kv_error = err;
-        return js_undefined;
-    };
-
-    // `cur_value` starts as the original `val_str` (borrowed). If a
-    // BEFORE trigger returns a string, the chain helper allocates a
-    // fresh buffer, points `cur_value` at it, and tracks ownership
-    // via `cur_owned` so we can free it before returning.
-    var cur_owned: ?[]u8 = null;
-    defer if (cur_owned) |o| state.allocator.free(o);
-    var cur_value: ?[]const u8 = val_str;
-    if (td.runBeforeChain(state, ctx, key_str, .put, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
-        td.rollbackInnerSavepoint(state);
-        return td.rethrowAsTriggerRejected(state, ctx, trigger_path);
-    }
-
-    const write_value: []const u8 = cur_value.?;
-
-    state.txn.put(key_str, write_value) catch |err| {
-        state.pending_kv_error = err;
-        td.rollbackInnerSavepoint(state);
-        return js_undefined;
-    };
-    state.writeset.addPut(key_str, write_value) catch |err| {
-        state.pending_kv_error = err;
-    };
-    markSubscriptionsDirty(state, key_str);
-
-    if (td.runAfterChain(state, ctx, key_str, .put, write_value, prev_owned)) |trigger_path| {
-        td.rollbackInnerSavepoint(state);
-        return td.rethrowAsTriggerRejected(state, ctx, trigger_path);
-    }
-
-    state.txn.release() catch |err| {
-        state.pending_kv_error = err;
-    };
-    return js_undefined;
-}
-
-fn jsKvDelete(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-
-    const key_str = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
-    defer state.allocator.free(key_str);
-
-    // Same reserved-namespace guard as jsKvSet — see the comment there.
-    // `__system/` built-ins bypass.
-    if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
-        return throwReservedKey(ctx, key_str);
-    }
-
-    // Reject an over-long key (no value to check on delete). A key over the
-    // cap can't exist (puts are capped), so this is mostly contract hygiene.
-    if (kvSizeViolation(key_str.len, null)) |which| {
-        return throwKvTooLarge(ctx, which);
-    }
-
-    // Fast path mirrors jsKvSet — no triggers means no savepoint, no
-    // previousValue lookup, no chain machinery. kv.delete
-    // (like kv.set) is an OUTPUT and isn't taped — replay re-runs
-    // the handler against its overlay.
-    if (!td.anyTriggerMatches(state, key_str)) {
-        state.txn.delete(key_str) catch |err| {
-            state.pending_kv_error = err;
-            return js_undefined;
-        };
-        state.writeset.addDelete(key_str) catch |err| {
-            state.pending_kv_error = err;
-        };
-        markSubscriptionsDirty(state, key_str);
-        return js_undefined;
-    }
-
-    var prev_owned: ?[]u8 = null;
-    defer if (prev_owned) |p| state.allocator.free(p);
-    if (state.kv.get(key_str)) |bytes| {
-        prev_owned = bytes;
-    } else |err| switch (err) {
-        error.NotFound => {},
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    }
-
-    state.txn.savepoint() catch |err| {
-        state.pending_kv_error = err;
-        return js_undefined;
-    };
-
-    // BEFORE chain: deletes don't carry a value, so cur_value stays
-    // null (the helper passes that through to event.value as JS null,
-    // and ignores any string return from a beforeDelete handler).
-    var cur_owned: ?[]u8 = null;
-    defer if (cur_owned) |o| state.allocator.free(o);
-    var cur_value: ?[]const u8 = null;
-    if (td.runBeforeChain(state, ctx, key_str, .delete, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
-        td.rollbackInnerSavepoint(state);
-        return td.rethrowAsTriggerRejected(state, ctx, trigger_path);
-    }
-
-    state.txn.delete(key_str) catch |err| {
-        state.pending_kv_error = err;
-        td.rollbackInnerSavepoint(state);
-        return js_undefined;
-    };
-    state.writeset.addDelete(key_str) catch |err| {
-        state.pending_kv_error = err;
-    };
-    markSubscriptionsDirty(state, key_str);
-
-    if (td.runAfterChain(state, ctx, key_str, .delete, null, prev_owned)) |trigger_path| {
-        td.rollbackInnerSavepoint(state);
-        return td.rethrowAsTriggerRejected(state, ctx, trigger_path);
-    }
-
-    state.txn.release() catch |err| {
-        state.pending_kv_error = err;
-    };
-    return js_undefined;
-}
-
-
-/// `kv.prefix(prefix, cursor?, limit?)` → `[ { key, value }, ... ]`
-///
-/// Prefix scan exposed to handlers. `cursor` is the last key from a
-/// previous page (pass "" to start). `limit` defaults to 100, capped
-/// at 1000 — this is an admin/introspection surface, not a hot read
-/// path, so we err on the side of small pages. Reads go directly
-/// through `state.kv`; writes from the same handler are visible here
-/// because the underlying SQLite connection sees its own uncommitted
-/// txn state.
-///
-/// Tape-captured via `appendKvPrefix` — the captured entry holds the
-/// inputs (prefix/cursor/limit) AND the full result list, so the
-/// replay shell's `kv.prefix` stub can return the same rows without
-/// reaching live KV state.
-fn jsKvPrefix(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-
-    const prefix_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(prefix_str);
-
-    const cursor_str = if (argc >= 2 and !c.JS_IsUndefined(argv[1]) and !c.JS_IsNull(argv[1]))
-        valueToOwnedString(state, ctx, argv[1]) catch return js_exception
-    else
-        state.allocator.dupe(u8, "") catch return js_exception;
-    defer state.allocator.free(cursor_str);
-
-    const KV_PREFIX_MAX: u32 = 1000;
-    const KV_PREFIX_DEFAULT: u32 = 100;
-    const limit: u32 = if (argc >= 3 and !c.JS_IsUndefined(argv[2]) and !c.JS_IsNull(argv[2])) blk: {
-        var n: i32 = 0;
-        _ = c.JS_ToInt32(ctx, &n, argv[2]);
-        if (n <= 0) break :blk KV_PREFIX_DEFAULT;
-        break :blk @min(@as(u32, @intCast(n)), KV_PREFIX_MAX);
-    } else KV_PREFIX_DEFAULT;
-
-    var scan = state.kv.prefix(prefix_str, cursor_str, limit) catch |err| {
-        state.pending_kv_error = err;
-        // Capture the failure path too — replay needs to surface the
-        // same null return, otherwise a defensive `if (page === null)`
-        // branch in the handler would diverge.
-        if (state.readset) |rs| rs.kv.appendKvPrefix(prefix_str, cursor_str, limit, &.{}, .err) catch {};
-        return js_null;
-    };
-    defer scan.deinit();
-
-    if (state.readset) |rs| {
-        // Convert `kv.PrefixScan.entries` (rove-kv's shape) into the
-        // tape's `KvPair`s. Both are the same `(key, value)` pair, but
-        // they belong to different modules so we materialize the
-        // bridge on the stack. `appendKvPrefix` dups everything into
-        // tape storage, so the lifetime of `pairs` and `scan` doesn't
-        // need to extend past this call.
-        var stack_pairs: [256]tape_mod.KvPair = undefined;
-        const heap_pairs: ?[]tape_mod.KvPair = if (scan.entries.len <= stack_pairs.len)
-            null
-        else
-            state.allocator.alloc(tape_mod.KvPair, scan.entries.len) catch null;
-        defer if (heap_pairs) |h| state.allocator.free(h);
-        const pairs: []tape_mod.KvPair = if (heap_pairs) |h| h else stack_pairs[0..scan.entries.len];
-        // Minimal read set (mirrors the kv.get `skip_tape` gate): a row whose
-        // key is in this activation's own writeset is a read-your-write, not a
-        // foreign read. Keep it OUT of the taped readset — replay reproduces it
-        // by re-executing the handler's own write, then reconstructs the scan
-        // from the map. This keeps the readset disjoint from the writeset, so a
-        // refactored read of such a key can't be served a stale write value.
-        var np: usize = 0;
-        for (scan.entries) |e| {
-            if (state.writeset.containsKey(e.key)) continue;
-            pairs[np] = .{ .key = e.key, .value = e.value };
-            np += 1;
-        }
-        rs.kv.appendKvPrefix(prefix_str, cursor_str, limit, pairs[0..np], .ok) catch {};
-    }
-
-    const arr = c.JS_NewArray(ctx);
-    for (scan.entries, 0..) |e, i| {
-        const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
-        _ = c.JS_SetPropertyStr(ctx, obj, "value", c.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
-        _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
-    }
-    return arr;
 }
 
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
@@ -1218,733 +847,6 @@ fn jsConsoleLog(
     }
     state.console.append(state.allocator, '\n') catch return js_exception;
     return js_undefined;
-}
-
-// ── request.tag(key, value) ─────────────────────────────────────────
-//
-// Attach a low-cardinality index tag to this request's log record.
-// Indexed by the log-server so a later query can filter
-// `?tag.<key>=<value>` (and the `/session/{id}` sugar route filters
-// `tag.session`). The browser-agent tags its connection
-// `session = <app sid>` so the brain's `getReplay` pulls just this
-// session's activations. Bounded + fail-loud (a cap/charset violation
-// is a handler bug → throws, surfacing in the record's exception/console
-// rather than silently dropping). Re-tagging an existing key updates it.
-fn jsRequestTag(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    const state = getState(ctx);
-    if (argc < 2 or !c.JS_IsString(argv[0]) or !c.JS_IsString(argv[1])) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag(key, value) requires two string arguments");
-        return js_exception;
-    }
-    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(key);
-    const val = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
-    defer state.allocator.free(val);
-
-    if (key.len == 0 or key.len > log_mod.MAX_TAG_KEY_LEN) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: key length must be 1..32 bytes");
-        return js_exception;
-    }
-    if (key[0] == '_') {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: keys starting with '_' are reserved");
-        return js_exception;
-    }
-    for (key) |ch| {
-        const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '_';
-        if (!ok) {
-            _ = c.JS_ThrowTypeError(ctx, "request.tag: key must match [a-z0-9_]");
-            return js_exception;
-        }
-    }
-    if (val.len == 0 or val.len > log_mod.MAX_TAG_VALUE_LEN) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: value length must be 1..64 bytes");
-        return js_exception;
-    }
-    for (val) |ch| {
-        if (ch < 0x20) {
-            _ = c.JS_ThrowTypeError(ctx, "request.tag: value must not contain control characters");
-            return js_exception;
-        }
-    }
-
-    // Update in place if the key is already set this activation.
-    for (state.tags.items) |*t| {
-        if (std.mem.eql(u8, t.key, key)) {
-            const new_v = state.allocator.dupe(u8, val) catch return js_exception;
-            state.allocator.free(t.value);
-            t.value = new_v;
-            return js_undefined;
-        }
-    }
-    // New key — enforce the per-record cap (fail loud, don't truncate).
-    if (state.tags.items.len >= log_mod.MAX_TAGS) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: too many tags (max 4 per request)");
-        return js_exception;
-    }
-    const k = state.allocator.dupe(u8, key) catch return js_exception;
-    const v = state.allocator.dupe(u8, val) catch {
-        state.allocator.free(k);
-        return js_exception;
-    };
-    state.tags.append(state.allocator, .{ .key = k, .value = v }) catch {
-        state.allocator.free(k);
-        state.allocator.free(v);
-        return js_exception;
-    };
-    return js_undefined;
-}
-
-// ── platform.root.* (admin singleton only) ────────────────────────
-//
-// Only installed when the handler-tenant is `__admin__` — gated on
-// `state.platform` being non-null in `installRequest`. Provides raw
-// access to the platform root store for the admin JS handler's
-// instance / domain / user / account reads. Writes currently land
-// locally on the leader only (no raft propagation of root writes
-// from JS handlers yet); multi-node correctness for admin-handler
-// writes is follow-up work. Signup + other platform-level writes
-// go through the Zig-native HTTP endpoints, which DO replicate.
-
-fn jsPlatformRootGet(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(key);
-
-    const value = tenant.root.get(key) catch |err| switch (err) {
-        error.NotFound => return js_null,
-        else => {
-            state.pending_kv_error = err;
-            return js_null;
-        },
-    };
-    defer state.allocator.free(value);
-    return c.JS_NewStringLen(ctx, value.ptr, value.len);
-}
-
-fn jsPlatformRootSet(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 2) return js_undefined;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
-    defer state.allocator.free(key);
-    const val = kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
-    defer state.allocator.free(val);
-
-    tenant.root.put(key, val) catch |err| {
-        state.pending_kv_error = err;
-    };
-    // Mirror the write into the root writeset so the worker can
-    // propose it through raft. Admin handlers ALWAYS have this
-    // set (dispatcher init checks `platform != null`), so an unset
-    // field here means someone built a DispatchState by hand.
-    if (state.root_writeset) |ws| {
-        ws.addPut(key, val) catch |err| {
-            state.pending_kv_error = err;
-        };
-    }
-    return js_undefined;
-}
-
-fn jsPlatformRootDelete(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
-    defer state.allocator.free(key);
-
-    tenant.root.delete(key) catch |err| switch (err) {
-        error.NotFound => {
-            // Still propagate the delete to followers so their state
-            // converges — a key that's missing locally might exist
-            // on other nodes if propose ordering skewed. The follower
-            // `applyEncodedWriteSet` treats NotFound as a no-op.
-        },
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-    if (state.root_writeset) |ws| {
-        ws.addDelete(key) catch |err| {
-            state.pending_kv_error = err;
-        };
-    }
-    return js_undefined;
-}
-
-fn jsPlatformRootPrefix(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const prefix_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(prefix_str);
-
-    const cursor_str = if (argc >= 2 and !c.JS_IsUndefined(argv[1]) and !c.JS_IsNull(argv[1]))
-        valueToOwnedString(state, ctx, argv[1]) catch return js_exception
-    else
-        state.allocator.dupe(u8, "") catch return js_exception;
-    defer state.allocator.free(cursor_str);
-
-    const ROOT_PREFIX_MAX: u32 = 1000;
-    const ROOT_PREFIX_DEFAULT: u32 = 100;
-    const limit: u32 = if (argc >= 3 and !c.JS_IsUndefined(argv[2]) and !c.JS_IsNull(argv[2])) blk: {
-        var n: i32 = 0;
-        _ = c.JS_ToInt32(ctx, &n, argv[2]);
-        if (n <= 0) break :blk ROOT_PREFIX_DEFAULT;
-        break :blk @min(@as(u32, @intCast(n)), ROOT_PREFIX_MAX);
-    } else ROOT_PREFIX_DEFAULT;
-
-    var scan = tenant.root.prefix(prefix_str, cursor_str, limit) catch |err| {
-        state.pending_kv_error = err;
-        return js_null;
-    };
-    defer scan.deinit();
-
-    const arr = c.JS_NewArray(ctx);
-    for (scan.entries, 0..) |e, i| {
-        const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
-        _ = c.JS_SetPropertyStr(ctx, obj, "value", c.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
-        _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
-    }
-    return arr;
-}
-
-/// `platform.auth.checkRootToken(token_hex)` — admin-only.
-/// Returns `true` iff `token_hex` matches the operator-supplied
-/// root token (read from `LOOP46_ROOT_TOKEN` at worker startup).
-/// Constant-time compare via `tenant.authenticate`. JS handler uses
-/// this from `/v1/login` so the secret never crosses into JS state
-/// or the SQLite root store.
-fn jsPlatformAuthCheckRootToken(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_false;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const token = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(token);
-
-    const auth = tenant.authenticate(token) catch |err| {
-        state.pending_kv_error = err;
-        return js_false;
-    };
-    return if (auth != null) js_true else js_false;
-}
-
-/// `platform.instances.create(name)` — admin-only. Creates the
-/// instance directory, opens its app.db, writes the local
-/// `instance/{name}` marker, and mirrors the marker into the root
-/// writeset for raft replication. Idempotent: re-creating an already
-/// existing instance is a no-op (matches the underlying
-/// `tenant.createInstance`).
-///
-/// Throws `Error{code:"InvalidName"}` if the name fails validation
-/// (empty, too long, bad characters). Other errors land in
-/// `state.pending_kv_error` and surface as a 5xx.
-fn jsPlatformInstancesCreate(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) {
-        _ = c.JS_ThrowTypeError(ctx, "platform.instances.create requires (name)");
-        return js_exception;
-    }
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(name);
-
-    tenant.createInstance(name) catch |err| switch (err) {
-        error.InvalidInstanceId => {
-            const err_obj = c.JS_NewError(ctx);
-            if (c.JS_IsException(err_obj)) return err_obj;
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
-                c.JS_NewStringLen(ctx, "invalid instance name", "invalid instance name".len));
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
-                c.JS_NewStringLen(ctx, "InvalidName", "InvalidName".len));
-            return c.JS_Throw(ctx, err_obj);
-        },
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-
-    if (state.root_writeset) |ws| {
-        var key_buf: [16 + tenant_mod.MAX_INSTANCE_ID_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{name}) catch
-            unreachable; // name was validated by createInstance above
-        ws.addPut(key, "") catch |err| {
-            state.pending_kv_error = err;
-        };
-    }
-    return js_undefined;
-}
-
-/// `platform.instances.deployStarter(name)` — admin-only. Writes
-/// the embedded starter content (`index.mjs` + `_static/index.html`)
-/// into the target instance's `file-blobs/` + writes a manifest
-/// JSON to `deployments/`, then proposes `_deploy/current = 1`
-/// through raft so followers see the active deployment.
-///
-/// Sealed primitive: starter content is platform-baked
-/// (`STARTER_INDEX_MJS` / `STARTER_STATIC_INDEX_HTML` in worker.zig),
-/// not customer-supplied. A general `platform.deploy(name, files)`
-/// is deferred until concrete demand (e.g. a libraries marketplace)
-/// — see PLAN §10.
-///
-/// Throws `Error{code:"InstanceNotFound"}` if `name` doesn't resolve.
-/// Throws `TypeError` when called outside an admin handler or before
-/// the worker has wired the deploy trampoline (test path).
-fn jsPlatformInstancesDeployStarter(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) {
-        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter requires (name)");
-        return js_exception;
-    }
-    const state = getState(ctx);
-    if (state.platform == null) {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    }
-    const caps = state.platform_caps orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter is not configured (no compile callback)");
-        return js_exception;
-    };
-    const fn_ptr = caps.deploy_starter orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter is not configured (no compile callback)");
-        return js_exception;
-    };
-    const fn_ctx = caps.ctx;
-
-    const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(name);
-
-    fn_ptr(fn_ctx, state.allocator, name) catch |err| switch (err) {
-        error.InstanceNotFound => {
-            const err_obj = c.JS_NewError(ctx);
-            if (c.JS_IsException(err_obj)) return err_obj;
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
-                c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
-                c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
-            return c.JS_Throw(ctx, err_obj);
-        },
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-    return js_undefined;
-}
-
-/// `platform.releases.publish(tenant_id, dep_id)` — admin-only.
-/// Stamps `_deploy/current = hex(dep_id)` on the target tenant's
-/// app.db, proposes envelope-0 through raft (no spin / no
-/// blocking on consensus), and enqueues the deployment loader
-/// so it starts fetching dep_id's manifest + bytecodes
-/// immediately. Returns `undefined` once the local commit +
-/// raft queue insert + loader enqueue are done — typically
-/// sub-millisecond.
-///
-/// Customer-visible effect: a release POST returns in <10ms.
-/// Raft consensus + bytecode load run async on the background
-/// loader + raft threads. Eventually (SSE work — future) the
-/// customer gets a completion event.
-///
-/// Throws `Error{code:"InstanceNotFound"}` when `tenant_id`
-/// doesn't resolve. Throws `TypeError` when called outside an
-/// admin handler.
-fn jsPlatformReleasesPublish(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 2) {
-        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish requires (tenant_id, dep_id)");
-        return js_exception;
-    }
-    const state = getState(ctx);
-    if (state.platform == null) {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    }
-    const caps = state.platform_caps orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish is not configured on this worker");
-        return js_exception;
-    };
-    const fn_ptr = caps.release_publish orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish is not configured on this worker");
-        return js_exception;
-    };
-    const fn_ctx = caps.ctx;
-
-    const tenant_id = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(tenant_id);
-
-    // dep_id is a sha256-derived u64 (computeDeploymentId), routinely > 2^53, so
-    // a JS number loses precision (JS_ToFloat64). Prefer a HEX STRING — parsed to
-    // an exact u64 here; the number path handles small-id callers, where
-    // precision isn't at risk.
-    var dep_id: u64 = undefined;
-    if (c.JS_IsString(argv[1])) {
-        const s = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
-        defer state.allocator.free(s);
-        dep_id = std.fmt.parseInt(u64, s, 16) catch {
-            _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id string must be a hex u64");
-            return js_exception;
-        };
-        if (dep_id < 1) {
-            _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id must be a positive integer");
-            return js_exception;
-        }
-    } else {
-        var dep_id_f64: f64 = 0;
-        if (c.JS_ToFloat64(ctx, &dep_id_f64, argv[1]) < 0) return js_exception;
-        if (dep_id_f64 < 1 or dep_id_f64 > @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
-            _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id must be a positive integer");
-            return js_exception;
-        }
-        dep_id = @intFromFloat(dep_id_f64);
-    }
-
-    fn_ptr(fn_ctx, state.allocator, tenant_id, dep_id) catch |err| switch (err) {
-        error.InstanceNotFound => {
-            const err_obj = c.JS_NewError(ctx);
-            if (c.JS_IsException(err_obj)) return err_obj;
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
-                c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
-                c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
-            return c.JS_Throw(ctx, err_obj);
-        },
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-    return js_undefined;
-}
-
-// ── platform.scope(id).kv.* (admin singleton only) ────────────────
-//
-// Explicit, additive cross-tenant accessor.
-// `platform.scope("acme").kv.get/prefix` read the target store
-// directly; `.set/.delete` go through the worker trampoline
-// (per-call txn + envelope-0 propose, the `handleAdminKv` shape). A
-// dedicated accessor rather than rebinding the global `kv` keeps "who
-// is the principal" separate from "which store" so auth stays
-// expressible in a scoped dispatch — the scoped cross-tenant write
-// (`docs/architecture/auth-and-domains.md`). Gated on `state.platform != null` like the
-// rest of `platform.*`. Unknown instance → a coded `InstanceNotFound`
-// JS error so the admin handler can map it to 404.
-
-fn jsThrowInstanceNotFound(ctx: ?*c.JSContext) c.JSValue {
-    const err_obj = c.JS_NewError(ctx);
-    if (c.JS_IsException(err_obj)) return err_obj;
-    _ = c.JS_SetPropertyStr(ctx, err_obj, "message", c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
-    _ = c.JS_SetPropertyStr(ctx, err_obj, "code", c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
-    return c.JS_Throw(ctx, err_obj);
-}
-
-/// Read the `_scope_id` the `platform.scope(id)` factory stamped on
-/// the returned `.kv` object (`this_val` for these methods). Caller
-/// owns the returned slice.
-fn scopeIdFromThis(state: *DispatchState, ctx: ?*c.JSContext, this: c.JSValue) ![]u8 {
-    const v = c.JS_GetPropertyStr(ctx, this, "_scope_id");
-    defer c.JS_FreeValue(ctx, v);
-    return valueToOwnedString(state, ctx, v);
-}
-
-fn scopeResolve(state: *DispatchState, id: []const u8) ?*const tenant_mod.Instance {
-    const tenant = state.platform orelse return null;
-    const inst_opt = tenant.getInstance(id) catch return null;
-    return inst_opt;
-}
-
-fn jsPlatformScope(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) {
-        _ = c.JS_ThrowTypeError(ctx, "platform.scope requires (instance_id)");
-        return js_exception;
-    }
-    const state = getState(ctx);
-    if (state.platform == null) {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    }
-    const id = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(id);
-    if (id.len == 0) {
-        _ = c.JS_ThrowTypeError(ctx, "platform.scope: instance_id must be non-empty");
-        return js_exception;
-    }
-    // Resolve eagerly so `platform.scope("ghost")` throws at the
-    // call site (→ admin handler 404).
-    if (scopeResolve(state, id) == null) return jsThrowInstanceNotFound(ctx);
-
-    const kv_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "_scope_id", c.JS_NewStringLen(ctx, id.ptr, id.len));
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "get", c.JS_NewCFunction2(ctx, jsScopeKvGet, "get", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "prefix", c.JS_NewCFunction2(ctx, jsScopeKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "set", c.JS_NewCFunction2(ctx, jsScopeKvSet, "set", 2, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "delete", c.JS_NewCFunction2(ctx, jsScopeKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
-    // Cross-tenant blob access (the blob twin of scope().kv). `_scope_id` lets
-    // the platform.js shim form scoped `blob.get` reads + `blob.receive`
-    // streamed writes; there is no native sync `put` — cross-tenant writes
-    // stream via `scope(t).blob.receive` (the S3 sink).
-    const blob_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, blob_obj, "_scope_id", c.JS_NewStringLen(ctx, id.ptr, id.len));
-
-    const scope_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, scope_obj, "kv", kv_obj);
-    _ = c.JS_SetPropertyStr(ctx, scope_obj, "blob", blob_obj);
-    // `scope_obj.deploy.stampManifest` is added by the platform.js shim — it
-    // lowers to a bound on.fetch (the staging barrier), not a native sync
-    // call, so it can resume the held chain only once staging is durable.
-    return scope_obj;
-}
-
-fn jsScopeKvGet(
-    ctx: ?*c.JSContext,
-    this: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-    const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
-    defer state.allocator.free(id);
-    const inst = scopeResolve(state, id) orelse return jsThrowInstanceNotFound(ctx);
-
-    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(key);
-
-    const value = inst.kv.get(key) catch |err| switch (err) {
-        error.NotFound => return js_null,
-        else => {
-            state.pending_kv_error = err;
-            return js_null;
-        },
-    };
-    defer state.allocator.free(value);
-    return c.JS_NewStringLen(ctx, value.ptr, value.len);
-}
-
-fn jsScopeKvPrefix(
-    ctx: ?*c.JSContext,
-    this: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-    const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
-    defer state.allocator.free(id);
-    const inst = scopeResolve(state, id) orelse return jsThrowInstanceNotFound(ctx);
-
-    const prefix_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(prefix_str);
-    const cursor_str = if (argc >= 2 and !c.JS_IsUndefined(argv[1]) and !c.JS_IsNull(argv[1]))
-        valueToOwnedString(state, ctx, argv[1]) catch return js_exception
-    else
-        state.allocator.dupe(u8, "") catch return js_exception;
-    defer state.allocator.free(cursor_str);
-
-    const SCOPE_PREFIX_MAX: u32 = 1000;
-    const SCOPE_PREFIX_DEFAULT: u32 = 100;
-    const limit: u32 = if (argc >= 3 and !c.JS_IsUndefined(argv[2]) and !c.JS_IsNull(argv[2])) blk: {
-        var n: i32 = 0;
-        _ = c.JS_ToInt32(ctx, &n, argv[2]);
-        if (n <= 0) break :blk SCOPE_PREFIX_DEFAULT;
-        break :blk @min(@as(u32, @intCast(n)), SCOPE_PREFIX_MAX);
-    } else SCOPE_PREFIX_DEFAULT;
-
-    var scan = inst.kv.prefix(prefix_str, cursor_str, limit) catch |err| {
-        state.pending_kv_error = err;
-        return js_null;
-    };
-    defer scan.deinit();
-
-    const arr = c.JS_NewArray(ctx);
-    for (scan.entries, 0..) |e, i| {
-        const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
-        _ = c.JS_SetPropertyStr(ctx, obj, "value", c.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
-        _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
-    }
-    return arr;
-}
-
-fn scopeKvWrite(
-    ctx: ?*c.JSContext,
-    this: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-    op: ScopeKvOp,
-) c.JSValue {
-    const state = getState(ctx);
-    if (state.platform == null) {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    }
-    const min_args: c_int = if (op == .put) 2 else 1;
-    if (argc < min_args) return js_undefined;
-
-    const caps = state.platform_caps orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.scope().kv writes are not configured on this worker");
-        return js_exception;
-    };
-    const fn_ptr = caps.scope_kv_write orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.scope().kv writes are not configured on this worker");
-        return js_exception;
-    };
-    const fn_ctx = caps.ctx;
-
-    const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
-    defer state.allocator.free(id);
-    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
-    defer state.allocator.free(key);
-    const val = if (op == .put) blk: {
-        break :blk kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
-    } else state.allocator.dupe(u8, "") catch return js_exception;
-    defer state.allocator.free(val);
-
-    // Self-scope (the scope target IS the dispatching tenant, e.g. __admin__
-    // deploying ITSELF via handleWsReset's `scope(__admin__).kv.delete`): route
-    // through THIS dispatch's writeset like other platform writers, NOT the
-    // cross-tenant trampoline. The trampoline opens a second TrackedTxn on a
-    // store this dispatch already holds the single-writer lease for, so
-    // `ensureOpen`'s `tryAcquire` returns null → Error.Conflict → KvFailed (the
-    // __admin__ deploy-reset wedge). Riding the dispatch writeset also commits
-    // atomically with the handler's own batch.
-    if (std.mem.eql(u8, id, state.instance_id)) {
-        // Write to BOTH the dispatch's speculative overlay (`state.txn`) and
-        // the writeset — exactly as `jsKvSet`/`jsKvDelete` do. `state.txn` is
-        // the local durability + read-your-write overlay AND what marks the
-        // batch dirty so `finalizeBatch` proposes it; the writeset is the raft
-        // payload for followers. BOTH are required: writing only the writeset
-        // would leave a standalone self-scope write out of the overlay, so the
-        // dispatch would look clean, the 2xx would be released, and the write
-        // would be silently dropped (never locally durable, never proposed).
-        // `state.txn` is THIS dispatch's already-open txn, so there is no
-        // second `beginTrackedImmediate` acquire — avoiding the trampoline
-        // double-acquire wedge.
-        switch (op) {
-            .put => {
-                state.txn.put(key, val) catch |err| {
-                    state.pending_kv_error = err;
-                    return js_undefined;
-                };
-                state.writeset.addPut(key, val) catch |err| {
-                    state.pending_kv_error = err;
-                };
-            },
-            .delete => {
-                state.txn.delete(key) catch |err| {
-                    state.pending_kv_error = err;
-                    return js_undefined;
-                };
-                state.writeset.addDelete(key) catch |err| {
-                    state.pending_kv_error = err;
-                };
-            },
-        }
-        return js_undefined;
-    }
-
-    fn_ptr(fn_ctx, state.allocator, id, op, key, val) catch |err| switch (err) {
-        error.InstanceNotFound => return jsThrowInstanceNotFound(ctx),
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-    return js_undefined;
-}
-
-fn jsScopeKvSet(
-    ctx: ?*c.JSContext,
-    this: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    return scopeKvWrite(ctx, this, argc, argv, .put);
-}
-
-fn jsScopeKvDelete(
-    ctx: ?*c.JSContext,
-    this: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    return scopeKvWrite(ctx, this, argc, argv, .delete);
 }
 
 // ── Installation ──────────────────────────────────────────────────────
@@ -2024,6 +926,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // sessions is standalone (kv + crypto.randomUUID + cookie parsing).
     evalSnippet(ctx, "sessions.js", SESSIONS_JS);
     // cron is standalone.
+    evalSnippet(ctx, "time.js", TIME_JS);
     evalSnippet(ctx, "cron.js", CRON_JS);
     evalSnippet(ctx, "retry.js", RETRY_JS);
     // §2.6 durable scheduled wake. After base64/crypto/kv (its deps).
@@ -2099,10 +1002,10 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // parent-before-child rule as `platform`).
     .{ .path = &.{"_system"}, .fns = &.{} },
     .{ .path = &.{ "_system", "kv" }, .fns = &.{
-        .{ .name = "get",    .cfunc = jsKvGet,    .argc = 1 },
-        .{ .name = "set",    .cfunc = jsKvSet,    .argc = 2 },
-        .{ .name = "delete", .cfunc = jsKvDelete, .argc = 1 },
-        .{ .name = "prefix", .cfunc = jsKvPrefix, .argc = 3 },
+        .{ .name = "get", .cfunc = kv_bindings.jsKvGet, .argc = 1 },
+        .{ .name = "set", .cfunc = kv_bindings.jsKvSet, .argc = 2 },
+        .{ .name = "delete", .cfunc = kv_bindings.jsKvDelete, .argc = 1 },
+        .{ .name = "prefix", .cfunc = kv_bindings.jsKvPrefix, .argc = 3 },
     } },
     .{ .path = &.{ "_system", "console" }, .fns = &.{
         .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
@@ -2111,15 +1014,18 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // accumulate onto `DispatchState.pending_wakes`; the worker arms
     // them on the held entity at park. Inert when there's no held
     // connection (the accumulator is null).
-    .{ .path = &.{ "_system", "after" }, .fns = &.{
-        .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },
-        .{ .name = "kv",    .cfunc = on_b.jsOnKv,      .argc = 2 },
-        // Connection-scoped outbound. Binds the
-        // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
-        // held; inert when not. Lives in the http binding (composes the
-        // same fetch primitive as `http.fetch`).
-        .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 2 },
-    } },
+    .{
+        .path = &.{ "_system", "after" },
+        .fns = &.{
+            .{ .name = "timer", .cfunc = on_b.jsOnTimer, .argc = 2 },
+            .{ .name = "kv", .cfunc = on_b.jsOnKv, .argc = 2 },
+            // Connection-scoped outbound. Binds the
+            // fetch to the held chain (chunks → `{on}`/`onFetchChunk`) when
+            // held; inert when not. Lives in the http binding (composes the
+            // same fetch primitive as `http.fetch`).
+            .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 2 },
+        },
+    },
     // Connection output effects. `stream.start`
     // / `stream.write` accumulate onto `DispatchState`; the worker
     // drives the stream-pipeline entry + stages chunks as commit-gated
@@ -2141,70 +1047,79 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // Stripe / Slack / AWS style signatures (PLAN §2.6); randomBytes +
     // sha256 are what admin's JS handler composes into magic-link /
     // session token mint and hash-at-rest.
-    .{ .path = &.{ "_system", "crypto" }, .fns = &.{
-        .{ .name = "getRandomValues", .cfunc = crypto_b.jsCryptoGetRandomValues, .argc = 1 },
-        .{ .name = "randomUUID",      .cfunc = crypto_b.jsCryptoRandomUuid,      .argc = 0 },
-        .{ .name = "randomBytes",     .cfunc = crypto_b.jsCryptoRandomBytes,     .argc = 1 },
-        .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
-        // Streaming sha256 over serializable midstate tokens — pure
-        // functions, so an accumulation spanning activations can keep
-        // its hash state in kv (`docs/architecture/blob-write-recipes.md` §3).
-        .{ .name = "sha256Init",      .cfunc = crypto_b.jsCryptoSha256Init,      .argc = 0 },
-        .{ .name = "sha256Update",    .cfunc = crypto_b.jsCryptoSha256Update,    .argc = 2 },
-        .{ .name = "sha256Final",     .cfunc = crypto_b.jsCryptoSha256Final,     .argc = 1 },
-        .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
-        // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
-        // composes JWT/OIDC verification on top — see retry.js +
-        // base64url.* helpers.
-        .{ .name = "verifyRsa",       .cfunc = crypto_jose_b.jsCryptoVerifyRsa,  .argc = 4 },
-        // ECDSA verify (ES256 / ES384 / ES512). Required for Sign in
-        // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
-        // R||S concatenation (the binding converts to DER internally).
-        .{ .name = "verifyEcdsa",     .cfunc = crypto_jose_b.jsCryptoVerifyEcdsa, .argc = 4 },
-        // OIDC RS256 key custody
-        // (`docs/architecture/auth-and-domains.md`): keygen + sign are
-        // Zig/OpenSSL; the IdP JS holds
-        // the private key only as an opaque PEM string it never
-        // parses.
-        .{ .name = "oidcGenerateKey", .cfunc = crypto_jose_b.jsCryptoOidcGenerateKey, .argc = 0 },
-        .{ .name = "oidcSign",        .cfunc = crypto_jose_b.jsCryptoOidcSign,   .argc = 2 },
-        // Raw-key ECDSA over secp256k1 / P-256: keygen + sign + verify
-        // with SHA-256, 64-byte compact R||S, low-S enforced. The
-        // primitive atproto.js builds did:key/did:plc + signed repo
-        // commits on (separate from the JOSE verifyEcdsa path above).
-        .{ .name = "ecdsaGenerateKey", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaGenerateKey, .argc = 1 },
-        .{ .name = "ecdsaSign",        .cfunc = crypto_ecdsa_b.jsCryptoEcdsaSign,        .argc = 3 },
-        .{ .name = "ecdsaVerify",      .cfunc = crypto_ecdsa_b.jsCryptoEcdsaVerify,      .argc = 4 },
-    } },
+    .{
+        .path = &.{ "_system", "crypto" },
+        .fns = &.{
+            .{ .name = "getRandomValues", .cfunc = crypto_b.jsCryptoGetRandomValues, .argc = 1 },
+            .{ .name = "randomUUID", .cfunc = crypto_b.jsCryptoRandomUuid, .argc = 0 },
+            .{ .name = "randomBytes", .cfunc = crypto_b.jsCryptoRandomBytes, .argc = 1 },
+            .{ .name = "sha256", .cfunc = crypto_b.jsCryptoSha256, .argc = 1 },
+            // Streaming sha256 over serializable midstate tokens — pure
+            // functions, so an accumulation spanning activations can keep
+            // its hash state in kv (`docs/architecture/blob-write-recipes.md` §3).
+            .{ .name = "sha256Init", .cfunc = crypto_b.jsCryptoSha256Init, .argc = 0 },
+            .{ .name = "sha256Update", .cfunc = crypto_b.jsCryptoSha256Update, .argc = 2 },
+            .{ .name = "sha256Final", .cfunc = crypto_b.jsCryptoSha256Final, .argc = 1 },
+            .{ .name = "hmacSha256", .cfunc = crypto_b.jsCryptoHmacSha256, .argc = 2 },
+            // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
+            // composes JWT/OIDC verification on top — see retry.js +
+            // base64url.* helpers.
+            .{ .name = "verifyRsa", .cfunc = crypto_jose_b.jsCryptoVerifyRsa, .argc = 4 },
+            // ECDSA verify (ES256 / ES384 / ES512). Required for Sign in
+            // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
+            // R||S concatenation (the binding converts to DER internally).
+            .{ .name = "verifyEcdsa", .cfunc = crypto_jose_b.jsCryptoVerifyEcdsa, .argc = 4 },
+            // OIDC RS256 key custody
+            // (`docs/architecture/auth-and-domains.md`): keygen + sign are
+            // Zig/OpenSSL; the IdP JS holds
+            // the private key only as an opaque PEM string it never
+            // parses.
+            .{ .name = "oidcGenerateKey", .cfunc = crypto_jose_b.jsCryptoOidcGenerateKey, .argc = 0 },
+            .{ .name = "oidcSign", .cfunc = crypto_jose_b.jsCryptoOidcSign, .argc = 2 },
+            // Raw-key ECDSA over secp256k1 / P-256: keygen + sign + verify
+            // with SHA-256, 64-byte compact R||S, low-S enforced. The
+            // primitive atproto.js builds did:key/did:plc + signed repo
+            // commits on (separate from the JOSE verifyEcdsa path above).
+            .{ .name = "ecdsaGenerateKey", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaGenerateKey, .argc = 1 },
+            .{ .name = "ecdsaSign", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaSign, .argc = 3 },
+            .{ .name = "ecdsaVerify", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaVerify, .argc = 4 },
+        },
+    },
     // http.fetch / http.cancelFetch — the platform's outbound HTTP
     // primitive. Transient + best-effort; durability is composed in
     // JS by `webhook.send` (the reified primitives,
     // `docs/architecture/effects-and-handlers.md`).
-    .{ .path = &.{ "_system", "http" }, .fns = &.{
-        .{ .name = "fetch",              .cfunc = http_b.jsHttpFetch,              .argc = 1 },
-        .{ .name = "cancelFetch",        .cfunc = http_b.jsHttpCancelFetch,        .argc = 1 },
-        // Held outbound subscription (gap 2.5) on the outbound fetch /
-        // libcurl-multi engine
-        // (`docs/architecture/configuration-and-network.md`). Same engine, different
-        // lifecycle: no timeout, per-tenant cap, terminal is
-        // always `ok=false` ("subscription ended").
-        .{ .name = "subscribe",          .cfunc = http_b.jsHttpSubscribe,          .argc = 1 },
-        .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
-    } },
+    .{
+        .path = &.{ "_system", "http" },
+        .fns = &.{
+            .{ .name = "fetch", .cfunc = http_b.jsHttpFetch, .argc = 1 },
+            .{ .name = "cancelFetch", .cfunc = http_b.jsHttpCancelFetch, .argc = 1 },
+            // Held outbound subscription (gap 2.5) on the outbound fetch /
+            // libcurl-multi engine
+            // (`docs/architecture/configuration-and-network.md`). Same engine, different
+            // lifecycle: no timeout, per-tenant cap, terminal is
+            // always `ok=false` ("subscription ended").
+            .{ .name = "subscribe", .cfunc = http_b.jsHttpSubscribe, .argc = 1 },
+            .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
+        },
+    },
     // Tenant blob storage (`docs/architecture/routing-and-ingress.md`). Only
     // `presign` is native (needs the platform-held signing keys);
     // `blob.put` / `blob.get` are JS compositions in globals/blob.js
     // over the fetch engine's `rove-blob.internal` trusted door.
-    .{ .path = &.{ "_system", "blob" }, .fns = &.{
-        .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
-        // Upload sessions (`docs/architecture/routing-and-ingress.md`, customer blob storage).
-        .{ .name = "write",   .cfunc = blob_b.jsBlobWrite,   .argc = 1 },
-        .{ .name = "seal",    .cfunc = blob_b.jsBlobSeal,    .argc = 2 },
-        // `blob.receive` (`docs/architecture/routing-and-ingress.md`, blob ingress):
-        // headers-first inbound pipe — only callable from an
-        // `onHeaders` activation.
-        .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
-    } },
+    .{
+        .path = &.{ "_system", "blob" },
+        .fns = &.{
+            .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
+            // Upload sessions (`docs/architecture/routing-and-ingress.md`, customer blob storage).
+            .{ .name = "write", .cfunc = blob_b.jsBlobWrite, .argc = 1 },
+            .{ .name = "seal", .cfunc = blob_b.jsBlobSeal, .argc = 2 },
+            // `blob.receive` (`docs/architecture/routing-and-ingress.md`, blob ingress):
+            // headers-first inbound pipe — only callable from an
+            // `onHeaders` activation.
+            .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
+        },
+    },
     // `resumeIfBound` can't live under `_system.*` — the
     // `_harden.js` `delete globalThis._system` runs BEFORE baked modules
     // eval, so `__system/webhook_onresult.mjs` can't reach a
@@ -2213,26 +1128,29 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
     // handlers.
-    .{ .path = &.{ "_system", "platform" }, .fns = &.{
-        // platform.scope(id) → { kv: { get, prefix, set, delete } }
-        // bound to instance `id`. The explicit cross-tenant accessor.
-        .{ .name = "scope", .cfunc = jsPlatformScope, .argc = 1 },
-    } },
+    .{
+        .path = &.{ "_system", "platform" },
+        .fns = &.{
+            // platform.scope(id) → { kv: { get, prefix, set, delete } }
+            // bound to instance `id`. The explicit cross-tenant accessor.
+            .{ .name = "scope", .cfunc = platform_bindings.jsPlatformScope, .argc = 1 },
+        },
+    },
     .{ .path = &.{ "_system", "platform", "root" }, .fns = &.{
-        .{ .name = "get",    .cfunc = jsPlatformRootGet,    .argc = 1 },
-        .{ .name = "set",    .cfunc = jsPlatformRootSet,    .argc = 2 },
-        .{ .name = "delete", .cfunc = jsPlatformRootDelete, .argc = 1 },
-        .{ .name = "prefix", .cfunc = jsPlatformRootPrefix, .argc = 3 },
+        .{ .name = "get", .cfunc = platform_bindings.jsPlatformRootGet, .argc = 1 },
+        .{ .name = "set", .cfunc = platform_bindings.jsPlatformRootSet, .argc = 2 },
+        .{ .name = "delete", .cfunc = platform_bindings.jsPlatformRootDelete, .argc = 1 },
+        .{ .name = "prefix", .cfunc = platform_bindings.jsPlatformRootPrefix, .argc = 3 },
     } },
     .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
-        .{ .name = "create",        .cfunc = jsPlatformInstancesCreate,        .argc = 1 },
-        .{ .name = "deployStarter", .cfunc = jsPlatformInstancesDeployStarter, .argc = 1 },
+        .{ .name = "create", .cfunc = platform_bindings.jsPlatformInstancesCreate, .argc = 1 },
+        .{ .name = "deployStarter", .cfunc = platform_bindings.jsPlatformInstancesDeployStarter, .argc = 1 },
     } },
     .{ .path = &.{ "_system", "platform", "releases" }, .fns = &.{
-        .{ .name = "publish", .cfunc = jsPlatformReleasesPublish, .argc = 2 },
+        .{ .name = "publish", .cfunc = platform_bindings.jsPlatformReleasesPublish, .argc = 2 },
     } },
     .{ .path = &.{ "_system", "platform", "auth" }, .fns = &.{
-        .{ .name = "checkRootToken", .cfunc = jsPlatformAuthCheckRootToken, .argc = 1 },
+        .{ .name = "checkRootToken", .cfunc = platform_bindings.jsPlatformAuthCheckRootToken, .argc = 1 },
     } },
     // The continuation primitive behind the public `next()` disposition.
     // A `_system.*` capability (deleted after base-eval): the `next.js`
@@ -2252,21 +1170,24 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // customer naming `__rove.X` gets a throw at call time. No
     // customer-facing shim touches this surface. See
     // `docs/architecture/privileged-surface.md`.
-    .{ .path = &.{"__rove"}, .fns = &.{
-        // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
-        // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
-        .{ .name = "resumeIfBound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
-        // Raw privileged outbound fetch for baked delivery modules
-        // (`__system/webhook_fire`); delegates to `_system.http.fetch`
-        // internals so staging/commit-gating/limits are identical.
-        .{ .name = "fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
-    } },
+    .{
+        .path = &.{"__rove"},
+        .fns = &.{
+            // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
+            // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
+            .{ .name = "resumeIfBound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
+            // Raw privileged outbound fetch for baked delivery modules
+            // (`__system/webhook_fire`); delegates to `_system.http.fetch`
+            // internals so staging/commit-gating/limits are identical.
+            .{ .name = "fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
+        },
+    },
     // §2.6 durable-wake tick ops — only `__system/scheduler_tick` calls
     // them. `set` installs the tenant's single next-fire watermark;
     // `fire` enqueues one `durable_wake` activation per due entry. Both
     // gated (throw unless is_system_module).
     .{ .path = &.{ "__rove", "wake" }, .fns = &.{
-        .{ .name = "set",  .cfunc = scheduler_b.jsSetWake,  .argc = 1 },
+        .{ .name = "set", .cfunc = scheduler_b.jsSetWake, .argc = 1 },
         .{ .name = "fire", .cfunc = scheduler_b.jsFireWake, .argc = 6 },
     } },
 };
@@ -2280,23 +1201,15 @@ const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
     // `installRequest` via `JS_SetDateNow` + `JS_SetRandomSeed`.
 };
 
-const GLOBAL_BUILTINS = [_]FnBinding{
-    // Take from the email rate-limit bucket. Called from the
-    // email.send JS wrapper before queuing the webhook row. Throws
-    // Error{code:"rate_limited"} on exhaustion; no-op (returns
-    // undefined) when state.limiter is null (test paths).
-    //
-    // The one remaining bare `__rove_*` global — kept because it's
-    // called by the base-eval `email.js` shim (so by the surface rule
-    // it should be `_system.email`, not `__rove.*`), and the
-    // rate-limit rework that removes it is deferred
-    // (`docs/architecture/privileged-surface.md` §3). Every
-    // other privileged op reached by baked `__system/` modules lives
-    // under `_system.continuation.*` (the widened `next`) or the gated
-    // `__rove.*` holder (STATIC_NAMESPACES), not a scattered bare
-    // global.
-    .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
-};
+// No bare `__rove_*` globals remain. The per-tenant OUTBOUND plan-rate
+// (formerly `__rove_check_email_rate`, an email-specific bare global) is
+// now enforced at the frozen fetch primitive `bindings/http.zig`
+// (`outboundRateOk`), covering every customer-initiated egress; every other
+// privileged op reached by baked `__system/` modules lives under
+// `_system.continuation.*` (the widened `next`) or the gated `__rove.*`
+// holder (STATIC_NAMESPACES). See docs/architecture/privileged-surface.md
+// (the outbound-boundary rule).
+const GLOBAL_BUILTINS = [_]FnBinding{};
 
 // Public shims (docs/architecture/builtin-libs.md Phase A). JSDoc-carrying
 // JS over `_system.*`; this is the documentation source of truth.
@@ -2311,6 +1224,7 @@ const JWT_JS = @embedFile("jwt_js");
 const OAUTH_JS = @embedFile("oauth_js");
 const OIDC_JS = @embedFile("oidc_js");
 const SESSIONS_JS = @embedFile("sessions_js");
+const TIME_JS = @embedFile("time_js");
 const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");
 const SCHEDULE_JS = @embedFile("schedule_js");
@@ -2346,6 +1260,7 @@ pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "oauth", .src = OAUTH_JS },
     .{ .name = "oidc", .src = OIDC_JS },
     .{ .name = "sessions", .src = SESSIONS_JS },
+    .{ .name = "time", .src = TIME_JS },
     .{ .name = "cron", .src = CRON_JS },
     .{ .name = "retry", .src = RETRY_JS },
     .{ .name = "schedule", .src = SCHEDULE_JS },
@@ -2410,1006 +1325,6 @@ fn evalSnippet(ctx: *c.JSContext, name: [*:0]const u8, source: []const u8) void 
     c.JS_FreeValue(ctx, result);
 }
 
-/// Install the per-request pieces of the global surface: attach
-/// `state` as the context opaque, and create `request`/`response`
-/// globals populated from the incoming request. Called AFTER
-/// `Snapshot.restore` on every request. Cheap — just a handful of
-/// `JS_SetPropertyStr` calls.
-/// Lift a held chain's `next({ctx})` payload onto `request.ctx`, given a
-/// synthesized `{"ctx":<ctx_json>}` body. The continuation resumes whose
-/// `Request.body` IS that envelope (`.ws_message`, `.disconnect`) share
-/// this so every held-connection `on*` handler reads ctx the same way the
-/// fetch-resume path does. NUL-terminate before `JS_ParseJSON` (quickjs
-/// requires it); a non-JSON / ctx-less body simply leaves `request.ctx`
-/// unset. The kinds that REPLACE `request.body` (bound fetch, inbound
-/// chunk) lift their ctx inline before the swap instead.
-fn liftThreadedCtx(ctx: *c.JSContext, req_obj: c.JSValue, body: []const u8, allocator: std.mem.Allocator) void {
-    if (body.len == 0) return;
-    const buf = allocator.allocSentinel(u8, body.len, 0) catch return;
-    defer allocator.free(buf);
-    @memcpy(buf, body);
-    const parsed = c.JS_ParseJSON(ctx, buf.ptr, body.len, "<chain ctx>");
-    if (c.JS_IsException(parsed)) {
-        _ = c.JS_GetException(ctx); // clear; leave request.ctx unset
-        return;
-    }
-    defer c.JS_FreeValue(ctx, parsed);
-    // Setter consumes the ctx_val reference.
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_GetPropertyStr(ctx, parsed, "ctx"));
-}
-
-pub fn installRequest(
-    ctx: *c.JSContext,
-    state: *DispatchState,
-    request: anytype,
-) void {
-    c.JS_SetContextOpaque(ctx, state);
-
-    // Within-activation non-determinism replay
-    // (`docs/architecture/replay-and-sim.md`): seed arenajs's per-request
-    // xorshift64star with this dispatch's seed. Math.random and
-    // crypto.* both draw from this state, so replay reproduces the
-    // entire random stream by re-seeding with the recorded value.
-    // Test paths without a readset get `0` (arenajs maps that to
-    // `1` internally — xorshift64 requires non-zero state).
-    const seed: u64 = if (state.readset) |rs| rs.seed else 0;
-    c.JS_SetRandomSeed(ctx, seed);
-
-    // Within-activation non-determinism replay
-    // (`docs/architecture/replay-and-sim.md`): pin Date.now() to the
-    // request's start time in ms. Every `Date.now()` and `new Date()`
-    // (no args) inside the handler returns this scalar — same
-    // posture as Cloudflare Workers / Lambda SnapStart, and the
-    // single input replay needs to reproduce the clock sequence
-    // (no per-call tape entries). Test paths without a readset
-    // pass `-1` which unpins (arenajs falls through to
-    // gettimeofday).
-    const date_now_ms: i64 = if (state.readset) |rs|
-        @divTrunc(rs.timestamp_ns, std.time.ns_per_ms)
-    else
-        -1;
-    c.JS_SetDateNow(ctx, date_now_ms);
-
-    const global = c.JS_GetGlobalObject(ctx);
-    defer c.JS_FreeValue(ctx, global);
-
-    // request = { method, path, host, body, query, headers, cookies,
-    //             ip, unmaskedIp() }
-    //
-    // The request surface is READ-TAPED (`docs/handler-shape.md`):
-    // method/path/host/query are eager data properties (they already
-    // live on the LogRecord's dedicated fields), but everything else
-    // is a lazy accessor that records the read into
-    // `readset.request_reads` on first access — the tape stores
-    // exactly the inputs the handler observed, nothing else.
-    //
-    // `query` is the raw URL query string (everything after `?`) or
-    // null when the URL had none. Parsing is the handler's job —
-    // QuickJS-ng doesn't ship `URL` / `URLSearchParams`, and a
-    // manual `split("&").reduce(...)` is a few lines in the
-    // handler. If customer demand for `URLSearchParams` shows up,
-    // it can land as another polyfill alongside TextEncoder.
-    //
-    // `headers` is a flat object, lowercase keys per HTTP/2, one
-    // recording GETTER per header. Pseudo-headers (`:method`,
-    // `:path`, `:scheme`, `:authority`) are filtered out — they're
-    // already exposed as `request.method` / `request.path` etc. —
-    // and so are the IP transport headers (`x-forwarded-for`,
-    // `x-real-ip`, `cf-connecting-ip`, `forwarded`): the client IP
-    // is reachable ONLY via `request.ip` (masked) /
-    // `request.unmaskedIp()` (raw, the deliberate taped
-    // escalation). Duplicate header names: last value wins,
-    // first-occurrence enumeration position. Assigning to
-    // `request.headers.x` throws in module (strict) code — the
-    // properties are accessors without setters.
-    //
-    // `cookies` is a parsed `{name: value}` from the `cookie` header
-    // (RFC 6265, semicolon-separated), materialized on first access;
-    // the access records the whole `cookie` header as read. Empty /
-    // no-cookie → `{}`.
-    //
-    // `body` is a lazy accessor too: first access records the
-    // body-read marker that keeps the body's tape/log reference
-    // alive (unread bodies are elided from the replay record —
-    // `Readset.elideUnreadBody`).
-    const req_obj = c.JS_NewObject(ctx);
-    // The shared payload prototype (globals/request.js): `text`/`json`
-    // accessors deriving from `request.bytes`
-    // (decisions.md §4.11). Baked into the base snapshot;
-    // one JS_SetPrototype per activation. Test contexts built without
-    // the globals install simply skip it.
-    const payload_proto = c.JS_GetPropertyStr(ctx, global, "__rove_request_proto");
-    if (!c.JS_IsUndefined(payload_proto)) _ = c.JS_SetPrototype(ctx, req_obj, payload_proto);
-    c.JS_FreeValue(ctx, payload_proto);
-    state.req_headers = request.headers;
-    state.req_body = request.body;
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "host", c.JS_NewStringLen(ctx, request.host.ptr, request.host.len));
-    // `bytes` — the uniform payload view. On plain inbound (buffered or
-    // headers-first) `Request.body` IS the customer payload, so `bytes`
-    // is a read-recording lazy accessor exactly like `body`. Every other
-    // payload-carrying kind (`inbound_chunk`, bound `fetch_chunk`,
-    // `ws_message`, `send_callback`) defines its own `bytes` data
-    // property in its arm below; the remaining kinds carry an internal
-    // ctx envelope (or nothing) in `Request.body`, which must NOT leak
-    // through a payload surface — they get no `bytes` at all.
-    if (request.activation == .inbound or request.activation == .inbound_headers) {
-        definePropertyGetter(ctx, req_obj, "bytes", c.JS_NewCFunction2(ctx, @ptrCast(&jsBytesGetter), "bytes", 0, c.JS_CFUNC_getter_magic, 0));
-    }
-    if (request.query) |q| {
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "query", c.JS_NewStringLen(ctx, q.ptr, q.len));
-    } else {
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "query", js_null);
-    }
-    installHeaders(ctx, state, req_obj, request.headers);
-    definePropertyGetter(ctx, req_obj, "cookies", c.JS_NewCFunction2(ctx, @ptrCast(&jsCookiesGetter), "cookies", 0, c.JS_CFUNC_getter_magic, 0));
-    definePropertyGetter(ctx, req_obj, "ip", c.JS_NewCFunction2(ctx, @ptrCast(&jsIpGetter), "ip", 0, c.JS_CFUNC_getter_magic, 0));
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "unmaskedIp", c.JS_NewCFunction2(ctx, jsUnmaskedIp, "unmaskedIp", 0, c.JS_CFUNC_generic, 0));
-    // request.tag(key, value): attach a low-cardinality index tag to
-    // this request's log record (see `jsRequestTag`).
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
-    // request.correlation_id: the engine per-chain id (stable across a
-    // held connection's activations). The reserved `_corr` index tag is
-    // derived from it; a handler can also store it to map its own app
-    // session id ↔ correlation_id across reconnects. Empty string when
-    // the dispatch carries no chain context.
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "correlation_id", c.JS_NewStringLen(ctx, state.correlation_id.ptr, state.correlation_id.len));
-    // request.tenant: the handler's own instance id. Needed to address
-    // the self-tenant `rewind-logs.internal/v1/{tenant}/…` door (the
-    // engine pins the read to this same id, so it can't reach another
-    // tenant's logs). Not a secret — it's the tenant's own id.
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "tenant", c.JS_NewStringLen(ctx, state.instance_id.ptr, state.instance_id.len));
-
-    // request.session = {id: "<64hex>"} when the worker resolved a
-    // session cookie (or freshly minted one) for this request, else
-    // null. Customer JS branches on `request.session === null` for
-    // the "called outside browser context" cases (callbacks, signup,
-    // sim/dry-run). Eager mint on browser-facing handler invocations
-    // means the null branch is rare in production handler code.
-    if (state.session_id) |sid| {
-        const session_obj = c.JS_NewObject(ctx);
-        // Customer-visible: opaque `sess_<64hex>` form (§7.5). The cookie
-        // / internal store keep the bare hex.
-        var sid_buf: [log_mod.SESSION_ID_PREFIX.len + 64]u8 = undefined;
-        @memcpy(sid_buf[0..log_mod.SESSION_ID_PREFIX.len], log_mod.SESSION_ID_PREFIX);
-        @memcpy(sid_buf[log_mod.SESSION_ID_PREFIX.len..], &sid);
-        _ = c.JS_SetPropertyStr(ctx, session_obj, "id", c.JS_NewStringLen(ctx, &sid_buf, sid_buf.len));
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "session", session_obj);
-    } else {
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "session", js_null);
-    }
-
-    // request.activation = { kind, ...payload }
-    // — streaming handlers (`docs/architecture/effects-and-handlers.md`):
-    // every handler run is a recorded
-    // "request," and the activation source is one field on the
-    // request shape the handler can branch on. The `wake_batch`
-    // variant (fired-prefix contract) carries
-    // `wakes: [{kind:"kv",prefix,firedAt} | {kind:"timer",firedAt}]`
-    // — the ARMED prefix that fired, never matched keys (the handler
-    // re-reads authoritative kv; handler-shape.md §7). The singular
-    // `.kv_wake` source maps to `kind:"kv"` but carries no payload;
-    // live kv fan-out rides `.wake_batch`.
-    const activation_obj = c.JS_NewObject(ctx);
-    const kind: []const u8 = switch (request.activation.source()) {
-        .inbound => "inbound",
-        .send_callback => "send_callback",
-        .timer => "timer",
-        .disconnect => "disconnect",
-        .kv_wake => "kv",
-        .wake_batch => "wake_batch",
-        .subscription_fire => "subscription_fire",
-        // Single fetch activation kind; `final` flag
-        // distinguishes streaming intermediates from the terminal.
-        .fetch_chunk => "fetch_chunk",
-        // §2.6 durable scheduled wake.
-        .durable_wake => "durable_wake",
-        // `docs/architecture/websockets.md`: one inbound WS data frame.
-        .ws_message => "ws_message",
-        // blob ingress (`docs/architecture/routing-and-ingress.md`):
-        // headers-first inbound — body still
-        // inbound, handler decides from headers alone.
-        .inbound_headers => "inbound_headers",
-        // gap 2.4 (`docs/architecture/effects-and-handlers.md`): streaming inbound body chunk.
-        .inbound_chunk => "inbound_chunk",
-    };
-    _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
-    if (request.activation == .wake_batch) {
-        const wb = request.activation.wake_batch;
-        // wakes: [{kind:"kv",prefix,firedAt}|{kind:"timer",firedAt}, ...]
-        // — one entry per fired ARM, identical on every
-        // resume path (stream / held / WS). No overflow signal: a
-        // bit-per-arm can't lose fires.
-        const wakes_arr = c.JS_NewArray(ctx);
-        for (wb.wakes, 0..) |w, i| {
-            const entry = c.JS_NewObject(ctx);
-            switch (w.tag) {
-                .kv => {
-                    _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "kv", 2));
-                    _ = c.JS_SetPropertyStr(ctx, entry, "prefix", c.JS_NewStringLen(ctx, w.prefix.ptr, w.prefix.len));
-                },
-                .timer => {
-                    _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "timer", 5));
-                },
-            }
-            // `firedAt` in MILLISECONDS since epoch — matches every other
-            // JS-facing timestamp; `fired_at_ns` stays the internal wall
-            // clock. Mirrored in the sim (rewind_test.mjs).
-            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, @divFloor(w.fired_at_ns, std.time.ns_per_ms)));
-            _ = c.JS_SetPropertyUint32(ctx, wakes_arr, @intCast(i), entry);
-        }
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "wakes", wakes_arr);
-    }
-
-    // stream.write is lossless — the runtime never drops; it backpressures the
-    // producer or throws loudly on a single-activation overrun. So there is no
-    // `write_pressure.dropped_chunks` surface (§9.4) to populate here.
-
-    // Gap 2.1 subscription_fire payload. The activation's `name`
-    // is the subscription's directory name; `source` carries the
-    // kind-specific payload (kv key+op
-    // deployment_id).
-    if (request.activation == .subscription_fire) {
-        const sf = request.activation.subscription_fire;
-        if (sf.name) |n| {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "name", c.JS_NewStringLen(ctx, n.ptr, n.len));
-        }
-        const source_obj = c.JS_NewObject(ctx);
-        if (sf.source) |src| switch (src) {
-            .kv => |kv| {
-                // Coalesced level-trigger (durable-kv-subscriptions):
-                // the fire names the DIRTY PREFIX, never a key/op — N
-                // writes coalesce into ≥1 fire; the handler reads
-                // current committed state under the prefix.
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "kv", 2));
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "prefix", c.JS_NewStringLen(ctx, kv.prefix.ptr, kv.prefix.len));
-            },
-        };
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
-    }
-
-    // Single `fetch_chunk` activation kind. Every
-    // event carries `fetch_id` / `seq` / `byteOffset` / `bytes`
-    // (+ `headers` on seq 0). The LAST event for a fetch has
-    // `final: true` and carries the terminal fields (`status`,
-    // `ok`, `body_truncated`); intermediates have `final: false`
-    // and only the per-chunk fields.
-    if (request.activation == .fetch_chunk) {
-        const fc = request.activation.fetch_chunk;
-        if (fc.id) |fid| {
-            // Customer-visible: opaque `ftch_<hex>` form (§7.5). The
-            // msg-router key / S3 upload key keep the bare hex.
-            var fid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
-            @memcpy(fid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
-            @memcpy(fid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
-            const fid_str = fid_buf[0 .. log_mod.FETCH_ID_PREFIX.len + fid.len];
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetchId", c.JS_NewStringLen(ctx, fid_str.ptr, fid_str.len));
-        }
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(fc.byte_offset)));
-        // `bytes`: a fresh Uint8Array copy — the handler owns it
-        // outright, no lifetime coupling to the event. May be empty
-        // on a transport-error / empty-body final event.
-        _ = c.JS_SetPropertyStr(
-            ctx,
-            activation_obj,
-            "bytes",
-            c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
-        );
-        // `headers` (seq 0 only): the activation carries the
-        // PARSED headers as a JSON-encoded `{"name":"value", ...}`
-        // string — decode back into a JS object here so the
-        // handler sees a plain map. The FetchPool side handles
-        // the wire-format parse + last-wins for repeated headers.
-        if (fc.headers) |hjson| {
-            // `JS_ParseJSON` requires a NUL-terminated buffer
-            // (`buf[buf_len] = '\0'` per vendor/arenajs/quickjs.h:1060).
-            // Our slice doesn't carry the trailing NUL — copy into a
-            // sentinel-terminated buffer before parsing. Without this
-            // the parse silently fails (returns an exception that the
-            // IsException branch swallows) and `a.headers` lands as an
-            // empty `{}` — observable as `content-type` going missing
-            // on the seq-0 chunk activation (fetch_chunk_smoke gate).
-            if (state.allocator.allocSentinel(u8, hjson.len, 0)) |buf| {
-                defer state.allocator.free(buf);
-                @memcpy(buf, hjson);
-                const hdr_val = c.JS_ParseJSON(ctx, buf.ptr, hjson.len, "<fetch headers>");
-                if (c.JS_IsException(hdr_val)) {
-                    _ = c.JS_GetException(ctx); // clear; fall through with empty headers
-                    _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_NewObject(ctx));
-                } else {
-                    _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", hdr_val);
-                }
-            } else |_| {
-                _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_NewObject(ctx));
-            }
-        }
-        // `final` + terminal fields. `JS_NewBool`'s cimport-translated
-        // body is itself non-compilable (translate-c bug — `int != 0`
-        // lands in an i32 field); use the module's prebuilt bool
-        // JSValue constants instead.
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "final", if (fc.final) js_true else js_false);
-        if (fc.final) {
-            // `status` is the SINGLE source of truth for a fetch/callback
-            // result (handler-shape.md §3): `200 ≤ status < 300` is
-            // success, `status === 0` is a hard transport failure (no HTTP
-            // response reached us). There is deliberately no derived `ok`
-            // boolean — it was redundant with `status` and drifted into
-            // three disagreeing definitions.
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
-        }
-        // UNBOUND (Pattern-A `on_chunk:"module"`) fires carry the
-        // synthesized `{"ctx":…}` envelope in `Request.body`; there is
-        // no `request.body`, so lift it so the internal shim modules
-        // (webhook/blob onresult) read `request.ctx` like every other
-        // callback.
-        if (request.activation_entity == null) {
-            liftThreadedCtx(ctx, req_obj, request.body, state.allocator);
-        }
-        // `docs/handler-shape.md` §3 + §7: the customer's
-        // onFetchChunk handler (BOUND fetch path — bind:true) reads
-        // `request.body` (chunk bytes), `request.done` (final),
-        // `request.fetchId`, `request.chunkSeq` at the TOP LEVEL of
-        // request. The UNBOUND fetch path (Pattern A
-        // `on_chunk: "module"`, separate chain) keeps
-        // `request.body` as the synthesized `{"ctx":...}` JSON —
-        // existing handlers read `request.activation.bytes` for the
-        // chunk and `JSON.parse(request.body).ctx.*` for ctx
-        // round-trip. The discriminator is `activation_entity`: set
-        // only by `resumeBoundFetchChain`, null in
-        // `fireFetchEventActivation`'s unbound path.
-        if (request.activation_entity != null) {
-            // handler-shape §7: fetch resumes carry `request.ctx`
-            // (the fetch's `ctx:` option). The resume path
-            // synthesized `Request.body` as `{"ctx":...}` but the
-            // bound surface replaces `request.body` with the chunk
-            // bytes below — lift the ctx to its documented home
-            // first. Same NUL-terminated-buffer rule as the
-            // fetch-headers parse above.
-            if (request.body.len > 0) {
-                if (state.allocator.allocSentinel(u8, request.body.len, 0)) |buf| {
-                    defer state.allocator.free(buf);
-                    @memcpy(buf, request.body);
-                    const parsed = c.JS_ParseJSON(ctx, buf.ptr, request.body.len, "<fetch ctx>");
-                    if (c.JS_IsException(parsed)) {
-                        _ = c.JS_GetException(ctx); // clear; no ctx
-                    } else {
-                        // `request.ctx` = the resume envelope's ctx — the fetch's
-                        // own ctx, or the chain's `next()` ctx when the fetch
-                        // carried none (the override resolved worker-side, see
-                        // worker_streaming.fetchResumeCtx; decisions.md §4.14).
-                        const ctx_val = c.JS_GetPropertyStr(ctx, parsed, "ctx");
-                        // Setter consumes the ctx_val reference.
-                        _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", ctx_val);
-                        c.JS_FreeValue(ctx, parsed);
-                    }
-                } else |_| {}
-            }
-            // The uniform payload view (§2.2): `bytes` = the chunk
-            // payload (the activation's Msg, recorded on the
-            // fetch_responses tape — never read-elided); `text`/`json`
-            // derive on the prototype. (There is no `request.body`.)
-            _ = c.JS_DefinePropertyValueStr(
-                ctx,
-                req_obj,
-                "bytes",
-                c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
-                c.JS_PROP_C_W_E,
-            );
-            _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (fc.final) js_true else js_false);
-            if (fc.id) |fid| {
-                // ftch_-prefixed — the SAME string after.fetch() returned
-                // (decisions.md §4.9).
-                var tfid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
-                @memcpy(tfid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
-                @memcpy(tfid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchId", c.JS_NewStringLen(ctx, &tfid_buf, log_mod.FETCH_ID_PREFIX.len + fid.len));
-            }
-            _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
-            // Pending bound-fetch count including this one.
-            // Customer branches on
-            // `request.done && request.fetchesPending === 1` to
-            // detect "last chunk of last fetch."
-            _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchesPending", c.JS_NewInt64(ctx, @intCast(request.activation_fetches_pending)));
-            // Terminal-only fields. Customer's onFetchChunk branches on
-            // `request.done` and inspects `request.status` to decide
-            // between "all good" (2xx), "upstream error" (non-zero
-            // non-2xx), and "transport failure" (status 0) — the same
-            // `status` fields that ride on the unbound
-            // `request.activation.{status,body_truncated}`, hoisted to
-            // the top level for the bound surface. No derived `ok`.
-            if (fc.final) {
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
-            }
-        }
-    }
-
-    // `docs/architecture/websockets.md`: one inbound WS data frame →
-    // `request.activation = { kind:"ws_message", opcode, data }`.
-    // opcode 1 (text) surfaces `data` as a string; opcode 2 (binary)
-    // as a fresh Uint8Array copy the handler owns outright (no lifetime
-    // coupling to the borrowed frame payload). The handler replies with
-    // `stream.write(...)` and parks for the next frame via `next()`.
-    if (request.activation == .ws_message) {
-        const wm = request.activation.ws_message;
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "opcode", c.JS_NewInt64(ctx, @intCast(wm.opcode)));
-        const data_val = if (wm.opcode == 2)
-            c.JS_NewUint8ArrayCopy(ctx, wm.data.ptr, wm.data.len)
-        else
-            c.JS_NewStringLen(ctx, wm.data.ptr, wm.data.len);
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "data", data_val);
-        // The uniform payload view (§2.2): `bytes` = the frame payload,
-        // raw, regardless of opcode (a text frame's bytes are its
-        // UTF-8); `opcode` stays on request.activation for handlers
-        // that care about text-vs-binary framing.
-        _ = c.JS_DefinePropertyValueStr(
-            ctx,
-            req_obj,
-            "bytes",
-            c.JS_NewUint8ArrayCopy(ctx, wm.data.ptr, wm.data.len),
-            c.JS_PROP_C_W_E,
-        );
-    }
-
-    // Endpoint A — uniform ctx threading (decisions.md): every activation
-    // that is a continuation of a prior
-    // `next({ctx})` reads that payload as `request.ctx`. These kinds carry
-    // it as the synthesized `{"ctx":<ctx_json>}` body (the WS / SSE / wake
-    // / continuation resume paths all build that envelope), so lift it once
-    // here. The kinds that REPLACE `request.body` with their own bytes
-    // (`fetch_chunk`, `inbound_chunk`) lift inline before the swap; the
-    // result-bearing `send_callback` lifts in its hoist below. `request.ctx`
-    // is simply undefined on the first activation of a chain (no prior
-    // `next`).
-    if (request.activation == .ws_message or
-        request.activation == .disconnect or
-        request.activation == .kv_wake or
-        request.activation == .wake_batch or
-        request.activation == .timer)
-    {
-        liftThreadedCtx(ctx, req_obj, request.body, state.allocator);
-    }
-
-    // gap 2.4 (`docs/architecture/effects-and-handlers.md`): streaming inbound body chunk.
-    // `Request.body` carries the raw chunk; re-surface it as a
-    // Uint8Array (chunks are arbitrary bytes — same posture as the
-    // bound-fetch chunk surface above), add the documented top-level
-    // `request.done` + `request.chunkSeq` (handler-shape §7), mirror
-    // the per-chunk fields on the activation object, and lift the
-    // held chain's `next({ctx})` payload to `request.ctx`.
-    if (request.activation == .inbound_chunk) {
-        const ic = request.activation.inbound_chunk;
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(ic.seq)));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(ic.byte_offset)));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "done", if (ic.done) js_true else js_false);
-        // The uniform payload view (§2.2): `bytes` = this chunk.
-        // (There is no `request.body` — the accessors are the payload
-        // surface; decisions.md §4.11.)
-        _ = c.JS_DefinePropertyValueStr(
-            ctx,
-            req_obj,
-            "bytes",
-            c.JS_NewUint8ArrayCopy(ctx, request.body.ptr, request.body.len),
-            c.JS_PROP_C_W_E,
-        );
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (ic.done) js_true else js_false);
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(ic.seq)));
-        if (ic.ctx_json) |cj| {
-            if (state.allocator.allocSentinel(u8, cj.len, 0)) |buf| {
-                defer state.allocator.free(buf);
-                @memcpy(buf, cj);
-                const parsed = c.JS_ParseJSON(ctx, buf.ptr, cj.len, "<chunk ctx>");
-                if (c.JS_IsException(parsed)) {
-                    _ = c.JS_GetException(ctx); // clear; no ctx
-                } else {
-                    _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", parsed);
-                }
-            } else |_| {}
-        }
-    }
-
-    // §2.6 durable-wake payload: `{ id, key, scheduled_at_ns, msg }`.
-    // `msg` is the customer payload, JSON-decoded back to a JS value
-    // (mirrors the fetch-headers decode above). `key` is omitted (not
-    // null) when `at()` was called without one — matches the JS lib's
-    // `get()` shape.
-    if (request.activation == .durable_wake) {
-        const dw = request.activation.durable_wake;
-        if (dw.id) |id| {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "id", c.JS_NewStringLen(ctx, id.ptr, id.len));
-        }
-        if (dw.key) |k| {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "key", c.JS_NewStringLen(ctx, k.ptr, k.len));
-        }
-        // Scheduled fire time fits comfortably in a JS Number until
-        // the year 2262 (Date.now()*1e6); surface as a plain number
-        // for ergonomic `scheduled_at_ns` math.
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduledAtNs", c.JS_NewInt64(ctx, dw.scheduled_at_ns));
-        const mjson = dw.msg_json orelse "null";
-        if (state.allocator.allocSentinel(u8, mjson.len, 0)) |buf| {
-            defer state.allocator.free(buf);
-            @memcpy(buf, mjson);
-            const msg_val = c.JS_ParseJSON(ctx, buf.ptr, mjson.len, "<durable_wake msg>");
-            if (c.JS_IsException(msg_val)) {
-                _ = c.JS_GetException(ctx); // clear; leave request.ctx unset
-            } else {
-                // One-ctx rule (decisions.md §4.9): the
-                // schedule/cron target reads its threaded payload as
-                // `request.ctx` like every other callback.
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", msg_val);
-            }
-        } else |_| {}
-    }
-
-    // ── Unified effect-result surface (handler-shape.md §7, Endpoint A) ──
-    // A customer `on_result` hop (`webhook.send` / `blob.put` / `retry.send`)
-    // AND a §6.4 held-sync resume both arrive as `.send_callback` with
-    // `request.body = {"ctx":{result, context}}` — the held-sync producer
-    // (worker_drain.resumeContinuation) wraps the outcome into the SAME
-    // shape, so there is ONE surface. Present it exactly like a bound-fetch
-    // FINAL: `request.body` = the response bytes, top-level
-    // `request.status`/`.ok`/`.done`; the THREADED ctx (the echoed `context`
-    // for an on_result hop, the held handler's `next({ctx})` for held-sync)
-    // on `request.ctx`; and the per-delivery metadata that is NOT part of the
-    // universal response surface (`attempts`/`error`/`id`/`headers` for
-    // webhook, `hash` for blob) on `request.activation.*` — "why/how this
-    // activation fired." This keeps the one rule whole: `request.ctx` = what
-    // you threaded, `request.body`/`.status` = the result, `request.activation`
-    // = metadata. There is no `request.result`.
-    if (request.activation == .send_callback and request.body.len > 0) hoist: {
-        const buf = state.allocator.allocSentinel(u8, request.body.len, 0) catch break :hoist;
-        defer state.allocator.free(buf);
-        @memcpy(buf, request.body);
-        const parsed = c.JS_ParseJSON(ctx, buf.ptr, request.body.len, "<send_callback>");
-        if (c.JS_IsException(parsed)) {
-            _ = c.JS_GetException(ctx); // not JSON — leave request as-is
-            break :hoist;
-        }
-        defer c.JS_FreeValue(ctx, parsed);
-
-        const cb_ctx = c.JS_GetPropertyStr(ctx, parsed, "ctx");
-        defer c.JS_FreeValue(ctx, cb_ctx);
-        if (!c.JS_IsObject(cb_ctx)) break :hoist;
-        const result = c.JS_GetPropertyStr(ctx, cb_ctx, "result");
-        defer c.JS_FreeValue(ctx, result);
-        if (!c.JS_IsObject(result)) {
-            // Not a result delivery (a webhook_onresult self-hop /
-            // internal chained dispatch): the envelope's ctx IS the
-            // hop's payload — lift it whole so the target reads
-            // `request.ctx` (there is no request.body).
-            _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_DupValue(ctx, cb_ctx));
-            break :hoist;
-        }
-
-        // Result → the universal response surface (§2.2): the envelope
-        // carries the response bytes as base64url-no-pad `body_b64` (a
-        // JSON envelope can't hold raw bytes); decode once onto
-        // `request.bytes` — `text`/`json` derive on the prototype.
-        // (There is no `request.body`.) A producer that only carries a
-        // `body` string (held-sync deadline events) still yields bytes
-        // from its UTF-8.
-        var payload_done = false;
-        const b64_val = c.JS_GetPropertyStr(ctx, result, "body_b64");
-        if (c.JS_IsString(b64_val)) b64: {
-            var b64_len: usize = 0;
-            const b64_c = c.JS_ToCStringLen(ctx, &b64_len, b64_val);
-            if (b64_c == null) break :b64;
-            defer c.JS_FreeCString(ctx, b64_c);
-            const b64_slice = @as([*]const u8, @ptrCast(b64_c))[0..b64_len];
-            const dec = std.base64.url_safe_no_pad.Decoder;
-            const raw_len = dec.calcSizeForSlice(b64_slice) catch break :b64;
-            const raw = state.allocator.alloc(u8, raw_len) catch break :b64;
-            defer state.allocator.free(raw);
-            dec.decode(raw, b64_slice) catch break :b64;
-            _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "bytes", c.JS_NewUint8ArrayCopy(ctx, raw.ptr, raw.len), c.JS_PROP_C_W_E);
-            payload_done = true;
-        }
-        c.JS_FreeValue(ctx, b64_val);
-        if (!payload_done) {
-            const legacy_body = c.JS_GetPropertyStr(ctx, result, "body");
-            if (c.JS_IsString(legacy_body)) {
-                var lb_len: usize = 0;
-                const lb_c = c.JS_ToCStringLen(ctx, &lb_len, legacy_body);
-                if (lb_c != null) {
-                    defer c.JS_FreeCString(ctx, lb_c);
-                    _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "bytes", c.JS_NewUint8ArrayCopy(ctx, @ptrCast(lb_c), lb_len), c.JS_PROP_C_W_E);
-                }
-            }
-            c.JS_FreeValue(ctx, legacy_body);
-        }
-        // `status` is the single success signal — no derived `ok`.
-        // A shim result's own `ok`/`error` (webhook delivery `< 400`,
-        // etc.) rides `request.activation.error` for diagnosis; the
-        // handler branches on `request.status` (0 = transport failure).
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
-
-        // request.ctx = the bare threaded value (what the customer passed
-        // as `context:` / `next({ctx})`) — NOT an envelope.
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_GetPropertyStr(ctx, cb_ctx, "context"));
-
-        // Delivery metadata → request.activation.* (absent fields read
-        // undefined: blob has no attempts/error; webhook has no hash).
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "attempts", c.JS_GetPropertyStr(ctx, result, "attempts"));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "error", c.JS_GetPropertyStr(ctx, result, "error"));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "id", c.JS_GetPropertyStr(ctx, result, "id"));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_GetPropertyStr(ctx, result, "headers"));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "hash", c.JS_GetPropertyStr(ctx, result, "hash"));
-    }
-
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
-
-    _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
-
-    // response = { status: 200, headers: {}, cookies: [] }
-    //
-    // Response body comes from the exported function's return value —
-    // not from `response.body`. The `response` global is ONLY for
-    // metadata: status, custom headers, and Set-Cookie entries.
-    // Handlers mutate these freely; the dispatcher reads them after
-    // the call and merges with the JSON-serialized return value.
-    const resp_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, resp_obj, "status", c.JS_NewInt32(ctx, 200));
-    _ = c.JS_SetPropertyStr(ctx, resp_obj, "headers", c.JS_NewObject(ctx));
-    _ = c.JS_SetPropertyStr(ctx, resp_obj, "cookies", c.JS_NewArray(ctx));
-    _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
-}
-
-// The IP-transport strip list lives in `reserved_headers.zig`
-// (shared with the sim's authored-header hygiene, so the two filters
-// can't drift). The worker's own native XFF uses (proxy warning, the
-// IP derivation below) read the wire directly and are unaffected.
-const isStrippedIpHeader = reserved_headers.isStrippedIpHeader;
-
-/// Record one request-surface read into the readset, if one is
-/// attached (unit-test paths run without). Failure to record is a
-/// warn, not a throw — it can only happen on OOM, and the divergence
-/// error on a later replay points straight back here.
-fn recordRequestRead(
-    state: *DispatchState,
-    kind: tape_mod.RequestReadKind,
-    name: []const u8,
-    value: []const u8,
-) void {
-    const rs = state.readset orelse return;
-    rs.request_reads.appendRequestReadOnce(kind, name, value) catch |err| {
-        std.log.warn("rove-js request_reads: record {s} '{s}': {s}", .{
-            @tagName(kind), name, @errorName(err),
-        });
-    };
-}
-
-/// Define `name` on `obj` as an accessor with the given getter
-/// JSValue and no setter (assignment throws in strict module code).
-/// ENUMERABLE + CONFIGURABLE — configurable is what lets the
-/// self-replacing getters swap themselves for a data property on
-/// first access, and lets duplicate header names re-define (last
-/// value wins, first occurrence keeps the enumeration slot).
-/// Consumes the getter ref (JS_DefinePropertyGetSet frees it).
-fn definePropertyGetter(
-    ctx: *c.JSContext,
-    obj: c.JSValue,
-    name: []const u8,
-    getter: c.JSValue,
-) void {
-    const atom = c.JS_NewAtomLen(ctx, name.ptr, name.len);
-    defer c.JS_FreeAtom(ctx, atom);
-    _ = c.JS_DefinePropertyGetSet(
-        ctx,
-        obj,
-        atom,
-        getter,
-        js_undefined,
-        c.JS_PROP_ENUMERABLE | c.JS_PROP_CONFIGURABLE,
-    );
-}
-
-/// Build `request.headers`: one recording getter per non-pseudo,
-/// non-IP-transport header (flat lowercase names per HTTP/2), plus
-/// the once-per-activation `header_names` tape entry that makes
-/// `Object.keys(request.headers)` replay faithfully without forcing
-/// every value onto the tape. Values are recorded only when a getter
-/// actually fires. Last-write-wins on duplicate header names —
-/// re-defining the accessor keeps the first occurrence's enumeration
-/// position.
-fn installHeaders(
-    ctx: *c.JSContext,
-    state: *DispatchState,
-    req_obj: c.JSValue,
-    hdrs_opt: ?h2.ReqHeaders,
-) void {
-    const headers_obj = c.JS_NewObject(ctx);
-
-    if (hdrs_opt) |hdrs| if (hdrs.fields) |fields_ptr| {
-        const fields = fields_ptr[0..hdrs.count];
-
-        // First-occurrence name list for the `header_names` entry.
-        // Deduped the same way the property table dedupes (duplicate
-        // names re-define in place).
-        var names: std.ArrayList([]const u8) = .empty;
-        defer names.deinit(state.allocator);
-
-        for (fields, 0..) |f, i| {
-            const name = f.name[0..f.name_len];
-
-            // Skip pseudo-headers (`:method`, `:path`, `:scheme`,
-            // `:authority`) — already exposed as `request.method` /
-            // `request.path` etc. — and the IP transport headers
-            // (reserved_headers.zig STRIPPED_IP_HEADERS).
-            if (name.len > 0 and name[0] == ':') continue;
-            if (isStrippedIpHeader(name)) continue;
-
-            // Strip platform-reserved internal headers (`x-rewind-*`,
-            // `x-rove-internal-*`) so the customer handler can neither read
-            // internal topology nor spoof a header an internal endpoint
-            // might trust. See `reserved_headers.zig`. (`x-rove-correlation-id`
-            // is NOT reserved and stays visible.)
-            if (reserved_headers.isReservedInternalHeader(name)) continue;
-
-            // The getter's magic is the FIELD INDEX — no per-getter
-            // heap state; the getter reads name+value back out of
-            // `state.req_headers` on call. Duplicate names: the later
-            // define replaces the accessor → its (later) index wins.
-            definePropertyGetter(
-                ctx,
-                headers_obj,
-                name,
-                c.JS_NewCFunction2(ctx, @ptrCast(&jsHeaderGetter), "header", 0, c.JS_CFUNC_getter_magic, @intCast(i)),
-            );
-
-            if (state.readset != null) {
-                var seen = false;
-                for (names.items) |n| {
-                    if (std.mem.eql(u8, n, name)) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) names.append(state.allocator, name) catch {};
-            }
-        }
-
-        // Record the enumerable name set once per activation —
-        // `Object.keys` / `for..in` observe it without firing any
-        // getter, so replay needs it independently of the values.
-        if (state.readset != null) {
-            const json = stringSliceToJson(state.allocator, names.items) catch |err| blk: {
-                std.log.warn("rove-js request_reads: header_names json: {s}", .{@errorName(err)});
-                break :blk null;
-            };
-            if (json) |j| {
-                defer state.allocator.free(j);
-                recordRequestRead(state, .header_names, "", j);
-            }
-        }
-    };
-
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "headers", headers_obj);
-}
-
-/// JSON-encode a list of strings as a JSON array. Caller frees.
-fn stringSliceToJson(
-    allocator: std.mem.Allocator,
-    items: []const []const u8,
-) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    {
-        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
-        defer buf = aw.toArrayList();
-        try std.json.Stringify.value(items, .{}, &aw.writer);
-    }
-    return try buf.toOwnedSlice(allocator);
-}
-
-/// `request.headers.<name>` accessor (JS_CFUNC_getter_magic). The
-/// magic int is the index into `state.req_headers.fields`. Live mode
-/// only — replay builds its own getter surface in JS from the tape
-/// (web/replay/_static/request-replay.mjs).
-fn jsHeaderGetter(
-    ctx: ?*c.JSContext,
-    this_val: c.JSValue,
-    magic: c_int,
-) callconv(.c) c.JSValue {
-    _ = this_val;
-    const state = getState(ctx);
-    const hdrs = state.req_headers orelse return js_undefined;
-    const fields_ptr = hdrs.fields orelse return js_undefined;
-    const idx: usize = @intCast(magic);
-    std.debug.assert(idx < hdrs.count);
-    const f = fields_ptr[idx];
-    const name = f.name[0..f.name_len];
-    const value = f.value[0..f.value_len];
-    recordRequestRead(state, .header_value, name, value);
-    return c.JS_NewStringLen(ctx, value.ptr, value.len);
-}
-
-/// Self-replace an accessor with a data property holding `value` and
-/// return it. The define consumes one ref; the returned value is a
-/// fresh dup for the caller. Keeps object identity stable across
-/// repeat reads (`request.cookies === request.cookies`) and avoids
-/// re-materializing large bodies per access.
-fn selfReplaceWithValue(
-    ctx: ?*c.JSContext,
-    this_val: c.JSValue,
-    name: [*:0]const u8,
-    value: c.JSValue,
-) c.JSValue {
-    _ = c.JS_DefinePropertyValueStr(ctx, this_val, name, c.JS_DupValue(ctx, value), c.JS_PROP_C_W_E);
-    return value;
-}
-
-/// `request.bytes` accessor (plain inbound only — the other payload
-/// kinds define `bytes` as a data property at install): same
-/// read-recording as `jsBodyGetter` — the two record the SAME body-read
-/// fact, so reading either (or both) keeps the tape/log body reference
-/// alive exactly once — then self-replaces with a Uint8Array of the raw
-/// payload (decisions.md §4.11).
-fn jsBytesGetter(
-    ctx: ?*c.JSContext,
-    this_val: c.JSValue,
-    magic: c_int,
-) callconv(.c) c.JSValue {
-    _ = magic;
-    const state = getState(ctx);
-    if (state.readset) |rs| rs.body_read = true;
-    recordRequestRead(state, .body_read, "", "");
-    const bytes_val = c.JS_NewUint8ArrayCopy(ctx, state.req_body.ptr, state.req_body.len);
-    return selfReplaceWithValue(ctx, this_val, "bytes", bytes_val);
-}
-
-/// `request.cookies` accessor: counts as a read of the whole
-/// `cookie` header (recorded via the same `header_value` kind a
-/// direct `request.headers.cookie` read uses, so the two dedupe
-/// against each other), parses it (RFC 6265), and self-replaces with
-/// the parsed object.
-fn jsCookiesGetter(
-    ctx: ?*c.JSContext,
-    this_val: c.JSValue,
-    magic: c_int,
-) callconv(.c) c.JSValue {
-    _ = magic;
-    const state = getState(ctx);
-    const cookies_obj = c.JS_NewObject(ctx);
-
-    // Last `cookie` field wins — same rule as duplicate header
-    // values generally (RFC 7230 says clients SHOULD send one).
-    var cookie_value: []const u8 = "";
-    var have_cookie = false;
-    if (state.req_headers) |hdrs| if (hdrs.fields) |fields_ptr| {
-        for (fields_ptr[0..hdrs.count]) |f| {
-            if (std.mem.eql(u8, f.name[0..f.name_len], "cookie")) {
-                cookie_value = f.value[0..f.value_len];
-                have_cookie = true;
-            }
-        }
-    };
-    if (have_cookie) {
-        recordRequestRead(state, .header_value, "cookie", cookie_value);
-        parseCookies(ctx.?, state, cookies_obj, cookie_value);
-    }
-    return selfReplaceWithValue(ctx, this_val, "cookies", cookies_obj);
-}
-
-/// `request.ip` accessor — the MASKED client IP (IPv4: last octet
-/// zeroed; IPv6: /48 kept, rest zeroed), or null when no edge proxy
-/// reported one (or it didn't parse). Masked is the default surface:
-/// coarse geo / abuse heuristics work, and the tape stays clear of
-/// precise personal data. The raw IP is `request.unmaskedIp()`.
-fn jsIpGetter(
-    ctx: ?*c.JSContext,
-    this_val: c.JSValue,
-    magic: c_int,
-) callconv(.c) c.JSValue {
-    _ = magic;
-    const state = getState(ctx);
-    var buf: [64]u8 = undefined;
-    const masked: ?[]const u8 = if (deriveClientIp(state.req_headers)) |raw|
-        maskIp(&buf, raw)
-    else
-        null;
-    recordRequestRead(state, .ip_masked, "", masked orelse "");
-    const val = if (masked) |m| c.JS_NewStringLen(ctx, m.ptr, m.len) else js_null;
-    return selfReplaceWithValue(ctx, this_val, "ip", val);
-}
-
-/// `request.unmaskedIp()` — the deliberate raw-IP escalation. A
-/// method, not a property: the call shape is the "do you need this?"
-/// friction, and the call is the taped, controller-responsibility
-/// moment (the raw IP lands on the replay tape). Returns null when
-/// no edge proxy reported a client IP.
-fn jsUnmaskedIp(
-    ctx: ?*c.JSContext,
-    this: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    _ = this;
-    _ = argc;
-    _ = argv;
-    const state = getState(ctx);
-    const raw = deriveClientIp(state.req_headers);
-    recordRequestRead(state, .ip_raw, "", raw orelse "");
-    if (raw) |r| return c.JS_NewStringLen(ctx, r.ptr, r.len);
-    return js_null;
-}
-
-/// Derive the client IP from the wire headers: the last
-/// `cf-connecting-ip` value if present (the edge's authoritative
-/// single-value header), else the RIGHTMOST entry of the last
-/// `x-forwarded-for` header — the entry the trusted edge appended;
-/// anything a spoofing client sent rides further left. Returns a
-/// trimmed slice borrowing the header storage, or null when neither
-/// header is present / the result is empty.
-fn deriveClientIp(hdrs_opt: ?h2.ReqHeaders) ?[]const u8 {
-    const hdrs = hdrs_opt orelse return null;
-    const fields_ptr = hdrs.fields orelse return null;
-    var cf: ?[]const u8 = null;
-    var xff: ?[]const u8 = null;
-    for (fields_ptr[0..hdrs.count]) |f| {
-        const name = f.name[0..f.name_len];
-        if (std.mem.eql(u8, name, "cf-connecting-ip")) {
-            cf = f.value[0..f.value_len];
-        } else if (std.mem.eql(u8, name, "x-forwarded-for")) {
-            xff = f.value[0..f.value_len];
-        }
-    }
-    const candidate: []const u8 = if (cf) |v|
-        v
-    else if (xff) |v| blk: {
-        const comma = std.mem.lastIndexOfScalar(u8, v, ',');
-        break :blk if (comma) |i| v[i + 1 ..] else v;
-    } else return null;
-    const trimmed = std.mem.trim(u8, candidate, " \t");
-    return if (trimmed.len == 0) null else trimmed;
-}
-
-// The mask rule lives in `ip_mask.zig` — shared with the sim's world
-// build (src/replay/root.zig derives the masked channel from an authored
-// ip), so the two surfaces can't drift.
-const maskIp = @import("ip_mask.zig").maskIp;
-
-/// RFC 6265 cookie-string parser: semicolon-separated `name=value`
-/// pairs, optional whitespace around the separator. Sets each into
-/// `cookies_obj` as a string property. Empty `cookie_value` → no-op.
-fn parseCookies(
-    ctx: *c.JSContext,
-    state: *DispatchState,
-    cookies_obj: c.JSValue,
-    cookie_value: []const u8,
-) void {
-    if (cookie_value.len == 0) return;
-
-    var it = std.mem.splitScalar(u8, cookie_value, ';');
-    while (it.next()) |raw| {
-        const pair = std.mem.trim(u8, raw, " \t");
-        if (pair.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        const name = std.mem.trim(u8, pair[0..eq], " \t");
-        // Trim whitespace from the value too. RFC 6265 strictly only
-        // trims when parsing Set-Cookie, but every practical Cookie
-        // parser (browsers, Express, Hono) trims both sides — matches
-        // customer expectations.
-        const value = std.mem.trim(u8, pair[eq + 1 ..], " \t");
-        if (name.len == 0) continue;
-
-        const name_z = state.allocator.allocSentinel(u8, name.len, 0) catch continue;
-        defer state.allocator.free(name_z);
-        @memcpy(name_z, name);
-
-        _ = c.JS_SetPropertyStr(
-            ctx,
-            cookies_obj,
-            name_z.ptr,
-            c.JS_NewStringLen(ctx, value.ptr, value.len),
-        );
-    }
-}
-
 /// Convenience wrapper: install everything at once. Used by tests and
 /// by any caller that doesn't have a pre-built snapshot to restore
 /// from (e.g. the rove-files compile-on-upload path that just needs a
@@ -3451,11 +1366,11 @@ fn lintPrecededByJsdoc(src: []const u8, decl_start: usize) bool {
 test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Documented exceptions (docs/architecture/builtin-libs.md): Date.now /
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
-    // determinism overrides); __rove_check_email_rate is the one
-    // remaining internal GLOBAL_BUILTIN (called only by globals/email.js;
-    // the other privileged ops live under `__rove.*` /
-    // `_system.continuation.*`).
-    const builtin_exceptions = [_][]const u8{"__rove_check_email_rate"};
+    // determinism overrides). No bare `__rove_*` GLOBAL_BUILTINS remain —
+    // the privileged ops live under `__rove.*` / `_system.continuation.*`,
+    // and the outbound plan-rate moved to the frozen fetch primitive
+    // (`bindings/http.zig`), so this list is empty.
+    const builtin_exceptions = [_][]const u8{};
 
     // Documented namespace exceptions: `_system.continuation.next` backs
     // the public `next()` disposition (shim is next.js, not

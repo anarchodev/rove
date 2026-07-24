@@ -312,14 +312,22 @@ function scheduledEffects(effects) {
 }
 
 /** Durable sends (`webhook.send`, and `email.send` which layers on it) armed by
- *  this activation — the parsed `_send/owed/{id}` marker ({url, method, body,
- *  on_result, context, …}), the durable artifact that actually replicates. */
+ *  this activation — the parsed `_send/owed/{id}` marker, the durable artifact
+ *  that actually replicates. Surfaces the full marker in its PUBLIC spellings
+ *  (`maxAttempts`/`timeoutMs` ← the marker's snake_case `max_attempts`/
+ *  `timeout_ms`) so `toHaveSent("webhook", {headers, maxAttempts, …})` can pin
+ *  the durable delivery options, not just the destination. `timeoutMs` is
+ *  present only when the send set one (the marker omits it otherwise). */
 function sentEffects(effects) {
   const out = [];
   for (const e of live(effects)) {
     if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
-      try { const m = JSON.parse(e.value); out.push({ url: m.url, method: m.method, body: m.body, on: m.on_result, context: m.context }); }
-      catch (_) { /* skip a non-JSON marker */ }
+      try {
+        const m = JSON.parse(e.value);
+        const s = { url: m.url, method: m.method, body: m.body, headers: m.headers, maxAttempts: m.max_attempts, on: m.on_result, context: m.context };
+        if (m.timeout_ms != null) s.timeoutMs = m.timeout_ms;
+        out.push(s);
+      } catch (_) { /* skip a non-JSON marker */ }
     }
   }
   return out;
@@ -338,7 +346,9 @@ function emailSent(effects) {
         const m = JSON.parse(e.value);
         if (m.url !== "https://api.resend.com/emails") continue;
         const b = JSON.parse(m.body);
-        out.push({ to: b.to, from: b.from, subject: b.subject, cc: b.cc, bcc: b.bcc, on: m.on_result, context: m.context });
+        const s = { to: b.to, from: b.from, subject: b.subject, cc: b.cc, bcc: b.bcc, headers: m.headers, maxAttempts: m.max_attempts, on: m.on_result, context: m.context };
+        if (m.timeout_ms != null) s.timeoutMs = m.timeout_ms;
+        out.push(s);
       } catch (_) { /* skip a non-JSON marker */ }
     }
   }
@@ -397,12 +407,28 @@ class Scenario {
     // closed: a run is admin only when opted in, so a non-admin handler that
     // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
     this.admin = cfg.admin || false;
-    // Per-activation `email.send` allowance. Prod meters sends through a
-    // per-instance plan-tier token bucket (bindings/email_rate.zig); offline
-    // sends are unmetered unless this is set, in which case the N+1-th send
-    // in an activation throws prod's Error{code:"rate_limited"} — so the
-    // rate-limit catch branch is testable. Carried as a hidden reserved key.
+    // Per-activation outbound-send allowance. Prod meters customer-initiated
+    // outbound through a per-tenant plan-tier token bucket at the fetch
+    // primitive (bindings/http.zig `outboundRateOk`); email.send composes over
+    // the metered webhook.send. Offline sends are unmetered unless this is set,
+    // in which case the N+1-th outbound in an activation throws prod's
+    // Error{code:"rate_limited"} — so the rate-limit catch branch is testable.
+    // Carried as a hidden reserved key.
     this.emailBudget = cfg.emailBudget != null ? cfg.emailBudget : null;
+    // Durable kv-subscription registrations (issue #38): `[{ name, prefix }]`,
+    // the shape prod derives from `_subscriptions/<name>/spec.json`. A write
+    // under a watched prefix injects a `_sub/dirty/{name}` marker into the
+    // effect log (see the epilogue kv wrapper). Carried as a hidden reserved key.
+    this.subscriptions = Array.isArray(cfg.subscriptions) ? cfg.subscriptions : [];
+    // kv trigger registrations (issue #38): `[{ prefix, module? }]` (or a bare
+    // prefix string). `module` defaults to prod's `_triggers/<prefix>/index.mjs`
+    // path — the module must exist in the app tree. The epilogue imports each and
+    // runs its before/after chain on a matching write (mutate value / reject).
+    const __trigModOf = (prefix) => "_triggers/" + String(prefix).replace(/\/+$/, "") + "/index.mjs";
+    this.triggers = (Array.isArray(cfg.triggers) ? cfg.triggers : []).map((t) =>
+      typeof t === "string"
+        ? { prefix: t, module: __trigModOf(t) }
+        : { prefix: t.prefix, module: t.module || __trigModOf(t.prefix) });
     // Per-chain identity the engine pins on EVERY activation (worker-set in
     // prod). `tenant` is this handler's tenant id; `correlationId` is minted by
     // inbound and inherited by every resume — so it's scenario-level (set once,
@@ -413,6 +439,17 @@ class Scenario {
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
+    // Offline `@scope/pkg` package graph (issue #50 resolver): the same
+    // `[{spec, version, pkg_hash, imports?, files:{path:source}}]` +
+    // `app_imports:{spec:pkg_hash}` shape the deploy/registry produce,
+    // declared inline so a handler that `import`s a package resolves offline
+    // (there is no registry in the sim). Passed through to the world; the
+    // sim's `PackageResolver` (the SAME one prod uses) does the rest. Package
+    // files carry their source inline (`files:{path:source}`) — offline there
+    // is no blob store. `app_imports` is the app's flat surface; a package's
+    // own `imports` encapsulate its (possibly different-version) deps.
+    this.packages = Array.isArray(cfg.packages) ? cfg.packages : null;
+    this.appImports = cfg.app_imports || cfg.appImports || null;
   }
 
   /** Stamp the scenario's per-chain identity onto a world's `request`, without
@@ -439,16 +476,20 @@ class Scenario {
     if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
     if (this.admin) kv["__rove_store/admin"] = "1";
     if (this.emailBudget != null) kv["__rove_store/email_budget"] = String(this.emailBudget);
+    if (this.subscriptions.length) kv["__rove_store/subscriptions"] = JSON.stringify(this.subscriptions);
     const w = Object.assign(
       { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
     );
+    if (this.triggers.length) w.triggers = this.triggers;
     if (this.sourceDir) w.source_dir = this.sourceDir;
     if (this.inlineSources) {
       w.sources = Object.keys(this.inlineSources).map((path) => ({
         path, kind: "handler", source: this.inlineSources[path],
       }));
     }
+    if (this.packages) w.packages = this.packages;
+    if (this.appImports) w.app_imports = this.appImports;
     return this._stampIdentity(w);
   }
 
@@ -457,25 +498,34 @@ class Scenario {
    *  `request.auth` or short-circuit). `session` is injected (the worker
    *  resolves it from a cookie in prod — no code to run offline). */
   inbound(req = {}) {
-    return new Node(this, this._base({
-      activation: "inbound",
-      request: {
-        method: req.method || "GET",
-        path: req.path || "/",
-        host: req.host || "",
-        headers: req.headers || {},
-        // An AUTHORED bodyless request reads as empty in prod (request.text ===
-        // "", 0-length bytes), NOT "missing" — so default to "" when the caller
-        // omits `body`. (Only the initial authored activation; the replay path's
-        // read-your-tape `miss()` is untouched, and a supplied body is kept.)
-        body: req.body !== undefined ? req.body : "",
-        ip: req.ip,
-        session: req.session,
-        // Per-activation override (undefined ⇒ inherit the scenario default).
-        tenant: req.tenant,
-        correlationId: req.correlationId,
-      },
-    }));
+    const request = {
+      method: req.method || "GET",
+      path: req.path || "/",
+      host: req.host || "",
+      headers: req.headers || {},
+      ip: req.ip,
+      session: req.session,
+      // Per-activation override (undefined ⇒ inherit the scenario default).
+      tenant: req.tenant,
+      correlationId: req.correlationId,
+    };
+    // A binary inbound body rides base64 (`bodyB64`) so arbitrary bytes survive
+    // JSON and read back byte-exact on `request.bytes` — the same channel a
+    // binary WS frame uses. `bodyBinary` is a Uint8Array or a base64 string.
+    if (req.bodyBinary !== undefined) {
+      request.bodyB64 = typeof req.bodyBinary === "string" ? req.bodyBinary : b64(req.bodyBinary);
+    } else {
+      // An AUTHORED bodyless request reads as empty in prod (request.text ===
+      // "", 0-length bytes), NOT "missing" — so default to "" when the caller
+      // omits `body`. (Only the initial authored activation; the replay path's
+      // read-your-tape `miss()` is untouched, and a supplied body is kept.)
+      request.body = req.body !== undefined ? req.body : "";
+    }
+    const partial = { activation: "inbound", request };
+    // An explicit export override for an authored-dispatch test (drive a
+    // specific export directly instead of the kind's default).
+    if (req.export !== undefined) partial.export = req.export;
+    return new Node(this, this._base(partial));
   }
 
   /** A headers-first inbound activation → the root node at `onHeaders`. The
@@ -505,6 +555,71 @@ class Scenario {
     // it (parity with the documented `{ ctx? }` surface).
     if (req.ctx !== undefined) w.ctx = req.ctx;
     return new Node(this, w);
+  }
+
+  /** Drive a STREAMING inbound body → per-chunk `onChunk` activations — the raw
+   *  streaming-upload trust boundary (distinct from the headers-first
+   *  `blob.receive` path). One `inbound_chunk` activation per chunk: the payload
+   *  on `request.bytes`/`.text`, `request.chunkSeq`, `request.done` on the last,
+   *  and `request.activation.{seq, byteOffset, done}` (`byteOffset` = cumulative
+   *  WIRE bytes before this chunk). Per-connection ctx threads via each chunk's
+   *  `next({ctx})` — null on the first fire (prod: no continuation yet) unless
+   *  authored — and kv writes fold forward, so an accumulate-in-kv handler
+   *  reconstructs the body. Middleware `before` runs on each chunk (the trust
+   *  boundary). `chunks` are strings, or bytes via `{ binary: true }`. Returns
+   *  the terminal node (the chunk that responded). */
+  inboundChunks(req = {}, chunks = [], opts = {}) {
+    if (!Array.isArray(chunks) || chunks.length === 0)
+      throw new Error("inboundChunks(req, chunks): pass a non-empty array of chunks");
+    const binary = !!(opts && opts.binary);
+    const baseReq = {
+      method: req.method || "POST",
+      path: req.path || "/",
+      host: req.host || "",
+      headers: req.headers || {},
+      ip: req.ip,
+      session: req.session,
+      tenant: req.tenant,
+      correlationId: req.correlationId,
+    };
+    let node = null;
+    let kv = null;
+    let seed = 0;
+    let now = 0;
+    let off = 0; // cumulative wire bytes BEFORE the current chunk
+    let ctx = req.ctx !== undefined ? req.ctx : null;
+    for (let i = 0; i < chunks.length; i++) {
+      const done = i === chunks.length - 1;
+      const request = Object.assign({}, baseReq, {
+        chunkSeq: i,
+        done,
+        activation: { seq: i, byteOffset: off, done },
+      });
+      if (binary) request.bodyB64 = b64(chunks[i]);
+      else request.body = String(chunks[i]);
+      let world;
+      if (i === 0) {
+        world = this._base({ activation: "inbound_chunk", request });
+        if (ctx !== null) world.ctx = ctx; // an authored first-chunk ctx (rare)
+        seed = world.seed;
+        now = world.now_ms;
+      } else {
+        world = carrySources(node.world, {
+          activation: "inbound_chunk",
+          request,
+          ctx,
+          kv,
+          seed: ++seed,
+          now_ms: ++now,
+        });
+      }
+      node = new Node(this, world, node);
+      const nb = node.force();
+      kv = foldKv(i === 0 ? node.world.kv : kv, nb.effects);
+      ctx = nb.disposition === "held" ? (nb.ctx === undefined ? null : nb.ctx) : ctx;
+      off += byteLen(chunks[i]);
+    }
+    return node;
   }
 
   /** A DETACHED durable delivery callback (`webhook.send` / `email.send` `on`),
@@ -545,43 +660,53 @@ class Scenario {
     }));
   }
 
-  /** A bare fetch-continuation MODULE authored in isolation — the `on` module of
-   *  an `after.fetch`/`http.fetch`, driven standalone given an upstream result
-   *  (parallel to `sendCallback`, but the fetch-result surface rather than the
-   *  send-callback one). The response lands flattened on `request.{status,
-   *  done, body}` and the echoed `ctx` bare on `request.ctx` — the same shape a
-   *  folded `FetchHandle.resolve` produces, so a `_rp/complete.mjs`-style module
-   *  is testable without standing up the emitter that would reach it. `status`
-   *  is the single success signal (2xx = ok, 0 = transport failure) — there is
-   *  no `request.ok`.
+  /** A bare fetch-continuation MODULE authored in isolation — the `on_chunk`
+   *  module of an UNBOUND `http.fetch`/`http.subscribe` (or a `_rp/complete.mjs`
+   *  internal continuation), driven standalone given an upstream result. Unlike
+   *  a BOUND `after.fetch` `{on}` (which resumes an export in the SAME held
+   *  module — that's `fetch().resolve()`), an unbound cross-module continuation
+   *  is a SEPARATE chain: the worker delivers NO top-level flatten
+   *  (`fireFetchEventActivation`, `activation_entity == null`). The result rides
+   *  `request.activation.{status, final, bytes}` (the chunk payload is on
+   *  `request.activation.bytes`, a Uint8Array — decode it for text), and the
+   *  echoed `ctx` is bare on `request.ctx`. `status` is the single success
+   *  signal (2xx = ok, 0 = transport failure) — there is no `request.ok`, and no
+   *  top-level `request.status`/`.done`/`.body`.
    *
    *  spec: { on: "<continuation module path>", ctx?: <echoed context>,
-   *          status?, done?, body? }
-   */
+   *          status?, done?, body?, chunkSeq?, byteOffset?, fetchId? } */
   fetchResult(spec = {}) {
     if (typeof spec.on !== "string")
       throw new Error("fetchResult({ on }): `on` must be the continuation module path");
-    const status = spec.status != null ? spec.status : 200;
     const done = spec.done != null ? spec.done : true;
-    // Mirror the bound-resume surface prod builds (globals.zig): chunkSeq /
-    // fetchesPending / fetchId on every event; status/bodyTruncated
-    // TERMINAL-only (defaulted only when done — an explicit spec still wins;
-    // no `ok` — status is the single success signal).
-    const request = {
-      done,
-      body: spec.body != null ? spec.body : null,
-      chunkSeq: spec.chunkSeq != null ? spec.chunkSeq : 0,
-      fetchesPending: spec.fetchesPending != null ? spec.fetchesPending : 1,
+    // The unbound activation bag: seq/byteOffset/final on every event, the
+    // chunk payload as base64 (→ request.activation.bytes), and status/
+    // bodyTruncated TERMINAL-only. NO top-level fields (leaving status/done/
+    // chunkSeq/fetchId off `request` keeps the worker's no-flatten shape —
+    // root.zig gates `result` on their presence).
+    const activation = {
+      kind: "fetch_chunk",
+      seq: spec.chunkSeq != null ? spec.chunkSeq : 0,
+      byteOffset: spec.byteOffset != null ? spec.byteOffset : 0,
+      final: done,
     };
-    if (spec.fetchId != null) request.fetchId = spec.fetchId;
-    if (done || spec.status != null) request.status = status;
-    if (done) request.bodyTruncated = spec.bodyTruncated != null ? spec.bodyTruncated : false;
+    if (spec.body != null) {
+      const bytes = spec.body instanceof Uint8Array ? spec.body : utf8Bytes(typeof spec.body === "string" ? spec.body : JSON.stringify(spec.body));
+      activation.bytesB64 = b64(bytes);
+    }
+    if (spec.fetchId != null) activation.fetchId = spec.fetchId;
+    if (done) {
+      activation.status = spec.status != null ? spec.status : 200;
+      activation.bodyTruncated = spec.bodyTruncated != null ? spec.bodyTruncated : false;
+    } else if (spec.status != null) {
+      activation.status = spec.status;
+    }
     return new Node(this, this._base({
       entry: spec.on, // the continuation module IS this activation's entry
       activation: "fetch_chunk",
       export: "default",
       ctx: spec.ctx === undefined ? null : spec.ctx,
-      request,
+      request: { activation },
     }));
   }
 
@@ -640,6 +765,42 @@ class Scenario {
       now_ms: fireMs,
       request: { activation },
     }));
+  }
+
+  /** A DETACHED kv-reactive subscription fire → the `onSubscription` activation
+   *  (`http.subscribe`'s durable-kv side, distinct from the outbound event
+   *  stream). When a watched name is written, the platform sets a
+   *  `_sub/dirty/{name}` marker; a sweep then fires the subscription's module at
+   *  `onSubscription` as a FRESH connectionless chain — empty ctx, a fresh
+   *  correlation id, and `request.activation = {kind:"subscription_fire", name,
+   *  source}` (worker_streaming.fireSubscriptionActivation). The platform deletes
+   *  the dirty marker BEFORE the handler runs, so the handler observes it already
+   *  cleared. Test that module in isolation given a fire — like `sendCallback` /
+   *  `wake`.
+   *
+   *  spec: { on: "<subscription module path>", name?: "<subscription name>",
+   *          source?: <activation.source>, now? } */
+  subscriptionFire(spec = {}) {
+    if (typeof spec.on !== "string")
+      throw new Error("subscriptionFire({ on }): `on` must be the subscription module path");
+    const name = spec.name != null ? spec.name : "sub_test";
+    const fireMs = spec.now !== undefined ? toMs(spec.now) : this.now;
+    const activation = { kind: "subscription_fire", name };
+    if (spec.source !== undefined) activation.source = spec.source;
+    const w = this._base({
+      entry: spec.on, // the subscription module IS this activation's entry
+      activation: "subscription_fire",
+      export: "onSubscription",
+      // Prod synthesizes an empty ctx ("{}") — subscription chains carry no
+      // platform ctx (the handler persists any state in its own kv).
+      ctx: {},
+      now_ms: fireMs,
+      request: { activation },
+    });
+    // The platform retires the dirty marker before the handler runs — clear it
+    // from the readset so the handler observes it already gone (read-your-deletes).
+    if (w.kv) delete w.kv["_sub/dirty/" + name];
+    return new Node(this, w);
   }
 
   /** A held WebSocket connection. The upgrade runs NO code (the chain parks
@@ -783,6 +944,21 @@ class Node {
     const hit = opts.on ? rx.find((e) => e.on === opts.on) : rx[0];
     if (!hit) throw new Error(`receive({on:${opts.on}}): no armed blob.receive matched`);
     return new ReceiveHandle(this, hit);
+  }
+
+  /** Locate an `http.subscribe` this activation opened → a handle that drives its
+   *  UNBOUND event stream: `.event(chunk)` delivers one per-writeback
+   *  `fetch_chunk` event at the subscription's `on` module, and `.ended({status?})`
+   *  the terminal `final:true` close (default status 0 = "subscription ended;
+   *  reconnect if desired"). A subscription is fire-and-forget on the connection
+   *  (events fire to a SEPARATE unbound chain), so this needs no held node.
+   *  `matcher` selects by url when several were opened. */
+  subscription(matcher) {
+    const sx = this.effects.filter((e) => e.kind === "subscribe");
+    if (!sx.length) throw new Error("subscription(): the activation opened no http.subscribe");
+    const hit = matcher != null ? sx.find((e) => matchUrl(e.url, matcher)) : sx[0];
+    if (!hit) throw new Error(`subscription(${matcher}): no http.subscribe matched`);
+    return new SubscriptionHandle(this, hit);
   }
 
   /** Locate the `platform.compile` door this held activation armed (a bound
@@ -1011,7 +1187,16 @@ class Clock {
     const pb = parent.force();
     const timers = parent._byKind("timer");
     if (!timers.length) throw new Error("clock.advance().fire(): the activation armed no after.ms timer wake");
-    const t = timers[0];
+    // The worker arms ONE timer slot per held connection — multiple after.ms
+    // calls overwrite it, so the LAST-registered interval/{on} is what fires
+    // (worker_dispatch.zig armCont: "last timer wins for the single timer
+    // slot"). Fire that one, not the first.
+    const t = timers[timers.length - 1];
+    // The timer fires only once the clock has reached its armed interval; prod
+    // never delivers a wake before then. An under-advanced .fire() is an
+    // authoring mistake (it would validate a resume prod can't produce).
+    if (this.ms < t.ms)
+      throw new Error(`clock.advance(${this.ms}ms).fire(): the clock has not reached the armed after.ms(${t.ms}) — advance by ≥ ${t.ms}ms`);
     const now = (parent.world.now_ms || 0) + this.ms;
     return resumeNode(parent, carrySources(parent.world, {
       entry: heldEntry(parent),
@@ -1082,7 +1267,12 @@ class FetchHandle {
     // The chain's parked module — fixed for every chunk (prod pins it at the
     // cont→stream transition), so a held next(target) routes the whole stream.
     const parkedEntry = heldEntry(parentNode);
-    const ctx = fetchResumeCtx(parentNode, fx);
+    // A streaming fetch that carried its OWN ctx delivers it on every chunk;
+    // one without reads the CURRENT chain ctx, which the handler can REPLACE by
+    // re-holding with next({ctx}) between chunks (prod replaces the chain ctx on
+    // each re-park). Thread it: seed from the parent's held next({ctx}), adopt
+    // each re-held chunk's ctx.
+    let curCtx = heldCtx(parentNode);
     // The fetch stays pending through every chunk INCLUDING its terminal done
     // event (prod counts "including this one").
     const pending = opts.fetchesPending != null ? opts.fetchesPending : armedFetches(parentNode);
@@ -1115,13 +1305,15 @@ class FetchHandle {
         entry: t.entry,
         activation: "fetch_chunk",
         export: t.export,
-        ctx,
+        ctx: fx.ctx != null ? fx.ctx : curCtx,
         kv,
         seed: ++seed,
         now_ms: ++now,
         request,
       }));
-      kv = foldKv(kv, node.force().effects); // thread writes to the next chunk
+      const nb = node.force();
+      kv = foldKv(kv, nb.effects); // thread writes to the next chunk
+      if (nb.disposition === "held") curCtx = heldCtx(node); // adopt the re-held ctx
     };
     chunks.forEach((c, i) => step(c, false, i));
     step(null, true, chunks.length); // terminal empty done event
@@ -1148,6 +1340,65 @@ class FetchHandle {
  *    failure → `request.ctx = { error, app }`,        `request.status === 0`
  *  where `app` echoes the issue-time ctx the caller threaded (recorded on the
  *  receive effect); the test may override it with `spec.app`. */
+/** Drives an `http.subscribe`'s UNBOUND event stream. Each `.event(chunk)` is a
+ *  per-writeback `fetch_chunk` fire at the subscription's `on` MODULE (a separate
+ *  chain — the connection was never held for it), with the payload on
+ *  `request.activation.bytes` and the issue-time ctx on `request.ctx`; kv writes
+ *  fold forward across events (durable read-your-writes). `.ended({status?})` is
+ *  the terminal `final:true` close (default status 0 = upstream closed). Each
+ *  returns the fired node. */
+class SubscriptionHandle {
+  constructor(node, sx) {
+    this.node = node;
+    this.sx = sx;
+    this._seq = 0;
+    this._off = 0; // cumulative wire bytes before the current event
+    this._kv = foldKv(node.world.kv, node.force().effects);
+    this._seed = node.world.seed || 0;
+    this._now = node.world.now_ms || 0;
+  }
+
+  _fire(chunk, binary, final, status) {
+    const activation = { kind: "fetch_chunk", seq: this._seq, byteOffset: this._off, final };
+    let payloadLen = 0;
+    if (chunk != null) {
+      const bytes = binary ? Array.from(chunk) : utf8Bytes(String(chunk));
+      activation.bytesB64 = b64(bytes);
+      payloadLen = bytes.length;
+    }
+    if (final) {
+      activation.status = status;
+      activation.bodyTruncated = false;
+    }
+    // The `on` is a module path (unbound cross-module) → its default export.
+    const t = onTarget(this.node.world.entry, this.sx.on, "default");
+    const world = carrySources(this.node.world, {
+      entry: t.entry,
+      activation: "fetch_chunk",
+      export: t.export,
+      // The subscription's issue-time ctx is echoed on every event.
+      ctx: this.sx.ctx != null ? this.sx.ctx : null,
+      kv: this._kv,
+      seed: ++this._seed,
+      now_ms: ++this._now,
+      request: { activation },
+    });
+    const node = new Node(this.node.scenario, world);
+    this._kv = foldKv(this._kv, node.force().effects);
+    this._seq += 1;
+    this._off += payloadLen;
+    return node;
+  }
+
+  /** One per-writeback event (`final:false`). `chunk` is a string, or bytes via
+   *  `{ binary: true }`. */
+  event(chunk, opts = {}) { return this._fire(chunk, !!(opts && opts.binary), false, undefined); }
+
+  /** The terminal "subscription ended" event (`final:true`). `opts.status`
+   *  defaults to 0 (upstream closed); the handler reads it as end-of-stream. */
+  ended(opts = {}) { return this._fire(null, false, true, opts.status != null ? opts.status : 0); }
+}
+
 class ReceiveHandle {
   constructor(node, fx) { this.node = node; this.fx = fx; }
 
@@ -1164,18 +1415,22 @@ class ReceiveHandle {
     const ctx = ok
       ? { hash: spec.hash, len: spec.len != null ? spec.len : 0, app }
       : { error: spec.error != null ? spec.error : "receive failed", app };
-    const world = carrySources(parent.world, {
-      entry: heldEntry(parent),
-      // Receive completions resume through the FetchEngine router (a bound
-      // terminal event) — the same continuation shape as a fetch result.
-      activation: "fetch_chunk",
-      export: this.fx.on || "onStored",
+    // A completed blob.receive resumes as a BOUND fetch_chunk — blob_receive.zig
+    // emitTerminal sets `bind:true, final:true`, so the worker builds the same
+    // terminal-fetch surface as compile/stamp: the completion on `request.ctx`,
+    // the flatten (`request.status`/`request.done`) at the top level, and
+    // `request.activation.kind === "fetch_chunk"`. Success → status 200,
+    // failure → status 0 (nothing stored). Reuse the shared fold rather than a
+    // bespoke `blob_stored` shape the worker never produces.
+    const world = fetchResumeWorld(
+      parent, this.fx, { status: ok ? 200 : 0, body: null },
+      foldKv(parent.world.kv, pb.effects),
+      (parent.world.seed || 0) + 1,
+      (parent.world.now_ms || 0) + 1,
       ctx,
-      kv: foldKv(parent.world.kv, pb.effects),
-      seed: (parent.world.seed || 0) + 1,
-      now_ms: (parent.world.now_ms || 0) + 1,
-      request: { status: ok ? 200 : 0, activation: { kind: "blob_stored" } },
-    });
+      armedFetches(parent),
+      "onStored",
+    );
     return resumeNode(parent, world);
   }
 }
@@ -1284,15 +1539,25 @@ class Interleaving {
     // Each arrival retires one outstanding fetch: the first leg sees every
     // armed fetch pending (including itself), the last sees only itself.
     let pending = armedFetches(parent);
+    // The chain ctx evolves across the race: prod REPLACES it on every re-hold
+    // (worker re-park), and a no-ctx fetch resume reads the CURRENT chain ctx.
+    // Seed with the parent's held next({ctx}); after a leg re-holds, adopt its
+    // new next({ctx}) so a later leg observes an earlier leg's ctx transition.
+    let curCtx = heldCtx(parent);
     for (const i of order) {
       const spec = this.specs[i];
       const fx = this._locate(spec.match);
       requireProdReachable("whenConcurrent", fx, spec.resolve || {});
-      node = resumeNode(parent, fetchResumeWorld(parent, fx, spec.resolve || {}, kv, ++seed, ++now, fetchResumeCtx(parent, fx), Math.max(pending, 1)));
+      // A fetch with its own ctx keeps it (§4.14); a no-ctx fetch reads the
+      // current chain ctx (which an earlier leg in this order may have replaced).
+      const ctx = fx.ctx != null ? fx.ctx : curCtx;
+      node = resumeNode(parent, fetchResumeWorld(parent, fx, spec.resolve || {}, kv, ++seed, ++now, ctx, Math.max(pending, 1)));
       // Only a BOUND arrival retires a bound-pending slot — an unbound
       // (webhook.send-composed) leg was never pending on the connection.
       if (fx.bound) pending--;
-      kv = foldKv(kv, node.force().effects); // thread this leg's writes to the next
+      const nb = node.force();
+      kv = foldKv(kv, nb.effects); // thread this leg's writes to the next
+      if (nb.disposition === "held") curCtx = heldCtx(node); // adopt the re-held ctx
     }
     return node;
   }
@@ -1351,6 +1616,11 @@ class Interleaving {
 function carrySources(parentWorld, world) {
   if (parentWorld.source_dir) world.source_dir = parentWorld.source_dir;
   if (parentWorld.sources) world.sources = parentWorld.sources;
+  // The `@scope/pkg` graph threads to every resume too — a package-importing
+  // handler that parks on a fetch/timer/kv wake must still resolve its imports
+  // when it resumes (e.g. an OIDC callback that imports `@rewind/oidc`).
+  if (parentWorld.packages) world.packages = parentWorld.packages;
+  if (parentWorld.app_imports) world.app_imports = parentWorld.app_imports;
   // Per-chain identity (tenant / correlation_id) threads to every resume, like
   // the connection ctx — inbound mints, resumes inherit. The parent world always
   // carries it (stamped at construction), so copy it into the resume's request.
@@ -1389,6 +1659,18 @@ function onTarget(parentEntry, on, fallbackExport) {
   return { entry: parentEntry, export: on || fallbackExport };
 }
 
+/** Resolve a BOUND fetch/receive `{on}` to a same-module export name. Unlike
+ *  `onTarget` (the UNBOUND on_chunk router, which sends a path-shaped `on` to a
+ *  different module's default export), a bound resume treats `on` as a verbatim
+ *  export identifier and a path-shaped name is invalid — the worker rejects it
+ *  at issue time. The recorder already throws there; this guards a
+ *  hand-authored world that skipped the recorder. */
+function boundExport(on, fallbackExport) {
+  if (typeof on === "string" && (on.includes("/") || on.includes(".")))
+    throw new Error(`bound fetch/receive {on:${JSON.stringify(on)}}: {on} names an export on the same held chain, not a module path — the worker rejects "/" and "." at issue time`);
+  return on || fallbackExport;
+}
+
 /** Build the `fetch_chunk` resume world for a located fetch effect against an
  *  EXPLICIT kv/seed/now base — the shared core of `FetchHandle.resolve` and the
  *  `whenConcurrent` interleaving fold (which threads a running overlay through a
@@ -1396,11 +1678,17 @@ function onTarget(parentEntry, on, fallbackExport) {
  *  the parent NODE (not its world): a bare-export `on` resumes in the module the
  *  chain is parked at — the held `next(target)`'s module when one was parked
  *  (`heldEntry`), like prod's cont→stream transition. */
-function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending) {
+function fetchResumeWorld(parent, fx, response, kvBase, seed, now, ctx, pending, fallbackExport = "onFetchResult") {
   const parentWorld = parent.world;
   const status = response.status != null ? response.status : (response.timeout ? 0 : 200);
   const done = response.done != null ? response.done : true;
-  const t = onTarget(heldEntry(parent), fx.on, "onFetchResult");
+  // A BOUND fetch/receive resumes an EXPORT on the module the chain is parked
+  // at — never a separate module (that is the UNBOUND on_chunk / webhook.send
+  // `on` surface). `{on}` is an export NAME: the worker rejects a `/`- or
+  // `.`-bearing name at issue time (bindings/http.zig isValidExportName,
+  // components.zig resolvedExport looks it up as `ns[fn]`) and the recorder
+  // throws to match, so a valid world never carries a path-shaped bound `on`.
+  const t = { entry: heldEntry(parent), export: boundExport(fx.on, fallbackExport) };
   const request = {
     done,
     body: response.body != null ? response.body : null,
@@ -1463,9 +1751,13 @@ class WsConnection {
     return this._frame(this.scenario.baseKv, {}, 0, data, opts, this.scenario.entry);
   }
 
-  /** Client close before any frame → `onDisconnect` (ctx `{}`). */
+  /** Client close BEFORE any frame. The worker establishes the WS chain lazily
+   *  on the first data frame (worker_ws.zig establishWsChain), so a close with
+   *  no chain tears down silently — prod runs NOTHING, not even onDisconnect. A
+   *  queryable no-op node (empty effect log); a disconnect AFTER a held frame
+   *  DOES run onDisconnect (WsNode.disconnect). */
   disconnect() {
-    return this._disc(this.scenario.baseKv, {}, 0, this.scenario.entry);
+    return new ClosedWsNode(this.scenario);
   }
 
   // Build one ws_message world. `ctx` is the connection ctx this frame runs
@@ -1526,11 +1818,51 @@ class WsNode extends Node {
     return this.world.ctx; // terminal onMessage: connection ctx unchanged
   }
   receive(data, opts) {
+    requireWsOpen(this, "receive");
     return this._conn._frame(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, data, opts, heldEntry(this));
   }
   disconnect() {
+    requireWsOpen(this, "disconnect");
     return this._conn._disc(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, heldEntry(this));
   }
+}
+
+/** A WS frame stays live for the NEXT frame only if it re-held via `next()`. A
+ *  terminal return, or a throw, tears the chain down (worker_ws.zig: terminal →
+ *  tearDownWsChain; an exception sends close + tears down WITHOUT onDisconnect),
+ *  so the socket is gone — no further frame or disconnect is deliverable. */
+function requireWsOpen(node, verb) {
+  if (node.force().disposition !== "held")
+    throw new Error(`${verb}: the previous WS frame returned a terminal response or threw, which closes the socket and destroys the chain — prod cannot deliver another ${verb === "receive" ? "frame" : "close"}`);
+}
+
+/** A closed WS socket with no chain (a pre-frame client close). Prod ran no
+ *  code, so this exposes an empty terminal bundle and refuses any further
+ *  frame/disconnect — the socket is gone. */
+class ClosedWsNode extends Node {
+  constructor(scn) { super(scn, { entry: scn.entry, kv: scn.baseKv }); }
+  force() { return { disposition: "terminal", effects: [], response: null, ok: true }; }
+  receive() { throw new Error("receive(): the WS connection closed before any frame ran — the worker established no chain (it is lazy on the first frame), so nothing can receive"); }
+  disconnect() { throw new Error("disconnect(): the WS connection is already closed"); }
+}
+
+/** UTF-8 encode a JS string to a byte array — the wire bytes a handler reads
+ *  back (so `b64(utf8Bytes(s))` round-trips a multibyte body byte-exact, not the
+ *  latin1 truncation `b64(string)` would give). */
+function utf8Bytes(s) {
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    let c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00); i++; }
+    }
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+  }
+  return out;
 }
 
 /** Standard base64 (matches the epilogue's `atob`) — for binary WS frames,
@@ -1552,6 +1884,20 @@ function b64(u) {
 // ── expect ────────────────────────────────────────────────────────────────
 
 let snapCounter = 0;
+
+/** Auto-name an unnamed `toMatchSnapshot()` by its CALL SITE (`file.mjs:line`)
+ *  rather than a global counter. A counter re-keys every later snapshot when an
+ *  assertion is inserted or reordered, so a stale baseline gets compared under a
+ *  shifted name (a spurious pass/fail). The call site is stable under reordering.
+ *  Falls back to the counter if the stack can't be parsed. The harness library's
+ *  own frames aren't `.mjs` (they load under `rewind:test`), so the first
+ *  `*.mjs:line` frame IS the test driver's call. */
+function autoSnapName() {
+  const stack = (new Error()).stack || "";
+  const m = /([A-Za-z0-9_./-]+\.mjs):(\d+):\d+/.exec(stack);
+  if (m) return `${m[1].split("/").pop()}:${m[2]}`;
+  return `snapshot-${++snapCounter}`;
+}
 
 export function expect(value) {
   return new Matcher(value, false);
@@ -1650,7 +1996,7 @@ class Matcher {
   toMatchSnapshot(name) {
     const node = this._node("toMatchSnapshot");
     if (!node) return false;
-    const key = name || `snapshot-${++snapCounter}`;
+    const key = name || autoSnapName();
     const facets = snapshotFacets(node.force());
     const current = stable(facets);
     const stored = kv.get(SNAP_PREFIX + key);

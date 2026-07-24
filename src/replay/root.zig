@@ -65,6 +65,33 @@ extern fn arena_reactor_new_open_with(base_kb: c_int, request_kb: c_int, setup: 
 extern fn arena_reactor_eval_base(r: *ArenaReactor, src: [*c]const u8) c_int;
 extern fn arena_reactor_freeze(r: *ArenaReactor) void;
 extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
+// arenajs 0.3.4+: install a QuickJS interrupt handler on the reactor's runtime
+// (the CPU-budget mechanism). The VM polls `cb(rt, opaque)` while a script runs;
+// returning non-zero throws an uncatchable InternalError into it.
+const InterruptFn = fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
+extern fn arena_set_interrupt_r(r: *ArenaReactor, cb: ?*const InterruptFn, opaque_ctx: ?*anyopaque) void;
+
+/// Wall-clock CPU budget for a sim run — the offline analog of the worker's
+/// per-request budget (`dispatcher.Budget`). A runaway `while(true)` handler
+/// would otherwise hang `rewind test` forever instead of surfacing the 504 the
+/// customer would ship (issue #48). Heap-owned (the frozen base is PROT_READ, so
+/// the reactor only holds a pointer to this mutable struct); `simulate` refreshes
+/// `deadline_ns` + clears `fired` per run.
+const CpuBudget = struct { deadline_ns: i64 = 0, fired: bool = false };
+
+/// Generous multiple of prod's 1 s budget: the sim runs debug builds and does
+/// real CPU-only work (pure-JS crypto, big folds) with no network waits, so a
+/// legal handler stays well under this — only a genuine infinite loop trips it.
+const SIM_CPU_BUDGET_NS: i64 = 5 * std.time.ns_per_s;
+
+fn simInterruptHandler(_: ?*anyopaque, opaque_ctx: ?*anyopaque) callconv(.c) c_int {
+    const b: *CpuBudget = @ptrCast(@alignCast(opaque_ctx.?));
+    if (@as(i64, @intCast(std.time.nanoTimestamp())) >= b.deadline_ns) {
+        b.fired = true;
+        return 1;
+    }
+    return 0;
+}
 
 const sim_globals = @import("sim_globals.zig");
 const mod_loader = @import("mod_loader.zig");
@@ -102,6 +129,9 @@ pub const Engine = struct {
     /// Heap-owned so its address is stable for the module loader's opaque
     /// (installed once at construction). `simulate` sets `.resolver` per run.
     mod_ctx: *mod_loader.SimModCtx,
+    /// Heap-owned CPU budget (stable address for the interrupt handler's opaque,
+    /// installed once). `simulate` refreshes it per run.
+    budget: *CpuBudget,
 
     pub fn init() Error!Engine {
         // Build the base unfrozen, eval the compute-globals prelude into it, then
@@ -123,13 +153,20 @@ pub const Engine = struct {
         mc.* = .{};
         const s = arena_reactor_new_open_with(8192, 102400, &mod_loader.simSetup, mc) orelse return Error.ArenaInit;
         if (arena_reactor_eval_base(s, sim_globals.PRELUDE.ptr) != 0) return Error.ArenaInit;
+        // Install the CPU-budget interrupt handler BEFORE freeze — it stores the
+        // cb + opaque on the runtime, which lives in base memory (PROT_READ once
+        // frozen). The budget struct itself is on the heap (mutable), so
+        // `simulate` can refresh the per-run deadline against the frozen base.
+        const budget = std.heap.page_allocator.create(CpuBudget) catch return Error.ArenaInit;
+        budget.* = .{};
+        arena_set_interrupt_r(s, &simInterruptHandler, budget);
         arena_reactor_freeze(s);
         // GC mode always: the sim cannot model a bump OOM faithfully (different
         // arena size, no CPU budget) and prod's effective ceiling is the GC
         // one, so predicting prod means running GC. Sticky on the reactor; the
         // per-run set in `simulate` reaffirms it (see the note there).
         arena_set_request_mode_r(s, 0);
-        return .{ .sim = s, .mod_ctx = mc };
+        return .{ .sim = s, .mod_ctx = mc, .budget = budget };
     }
 
     /// The sim reactor is **process-lived** and deliberately NOT torn down here.
@@ -272,8 +309,13 @@ pub const Engine = struct {
         // Source resolution (see the doc-comment): world source_dir / explicit
         // override win over inline `sources`, which win over the `base_dir`
         // fallback. `src_dir` non-null ⇒ resolve from disk; null ⇒ inline.
+        // The inline-vs-disk decision hinges on the app's own HANDLER sources
+        // (`wv.sources`), not the combined map — package sources
+        // (`wv.pkg_sources`) are additive `/pkg/<hash>/` modules and must not
+        // flip an app that lives on disk into inline mode (else its entry,
+        // which is NOT inline, reads as missing).
         const explicit_dir = wv.source_dir orelse source_dir;
-        const src_dir = explicit_dir orelse (if (sources.count() != 0) null else base_dir);
+        const src_dir = explicit_dir orelse (if (wv.sources.len != 0) null else base_dir);
 
         // Entry source: working tree (if a source dir) else the inline world.
         const entry_src = blk: {
@@ -328,6 +370,10 @@ pub const Engine = struct {
             }
         else
             null;
+        // kv trigger registrations → epilogue (issue #38): the epilogue imports
+        // each module + dispatches its before/after chain on a matching write.
+        const trigs = try a.alloc(epilogue.TriggerReg, wv.triggers.len);
+        for (wv.triggers, 0..) |t, i| trigs[i] = .{ .prefix = t.prefix, .module = t.module };
         const epi = try epilogue.build(a, .{
             .method = wv.method,
             .path = wv.path,
@@ -346,6 +392,7 @@ pub const Engine = struct {
             .result = result,
             .captured = wv.captured,
             .warnings = header_warnings.items,
+            .triggers = trigs,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
         const entry_z = try a.dupeZ(u8, wv.entry);
@@ -386,7 +433,19 @@ pub const Engine = struct {
         self.mod_ctx.resolver = if (resolver) |*r| r else null;
         defer self.mod_ctx.resolver = null;
 
+        // Arm the CPU budget for this run (issue #48): a runaway `while(true)`
+        // trips the interrupt handler → an uncatchable InternalError the epilogue
+        // can't catch, so no OUTPUT_KEY is written and we surface prod's 504.
+        self.budget.fired = false;
+        self.budget.deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) + SIM_CPU_BUDGET_NS;
+
         const rc = arena_run_module_r(self.sim, entry_z.ptr, full_src.ptr);
+
+        if (self.budget.fired) {
+            try emitCpuBudget504(a, out, wv.activation, export_name);
+            if (wv.expected_json) |ej| appendVerify(a, out, ej) catch {};
+            return;
+        }
 
         try emitWorld(a, out, .{
             .entry = wv.entry,
@@ -701,6 +760,21 @@ const EmitWorldArgs = struct {
 /// Emit a sim bundle. Same engine output as `emit`, minus the recorded-vs-
 /// replayed comparison (an authored world has no recording to match), plus the
 /// `miss_policy` it ran under and the typed `holes` a `resolve` run filled.
+/// The CPU-budget 504 bundle (issue #48) — a run the interrupt killed writes no
+/// OUTPUT_KEY, so we synthesize prod's outcome: status 504, body "handler
+/// exceeded cpu budget", `ok:false`. Effects are empty (the interrupt fired
+/// mid-run, nothing committed — the issue #10 rolled-back-effects rule).
+fn emitCpuBudget504(a: std.mem.Allocator, out: *std.ArrayList(u8), activation: []const u8, export_name: []const u8) !void {
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
+    defer out.* = aw.toArrayList();
+    const w = &aw.writer;
+    try w.writeAll("{\"activation\":");
+    try jsonStr(w, activation);
+    try w.writeAll(",\"export\":");
+    try jsonStr(w, export_name);
+    try w.writeAll(",\"response\":{\"status\":504,\"headers\":{},\"cookies\":[]},\"disposition\":\"terminal\",\"body\":\"handler exceeded cpu budget\",\"effects\":[],\"error\":\"handler exceeded cpu budget\",\"ok\":false}");
+}
+
 fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs) !void {
     var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
     defer out.* = aw.toArrayList();

@@ -66,6 +66,7 @@ const snapshot_catchup_mod = @import("snapshot_catchup.zig");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
+const log_subsystem_mod = @import("log_subsystem.zig");
 const jwt_mod = @import("rove-jwt");
 const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
@@ -78,6 +79,7 @@ const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
 const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
+const spool_registry = @import("spool_registry.zig");
 const effect_mod = @import("effect/root.zig");
 const globals = @import("globals.zig");
 const raft_propose = @import("raft_propose.zig");
@@ -88,6 +90,7 @@ const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
 const log_walker_mod = @import("log_walker.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const worker_fire = @import("worker_fire.zig");
 const worker_ws = @import("worker_ws.zig");
 const worker_drain = @import("worker_drain.zig");
 const deploy_thread_mod = @import("deploy_thread.zig");
@@ -565,12 +568,12 @@ pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 /// this caps inline RAM at ~256KB per in-flight bound fetch; chunks
 /// beyond the window read their bytes back from the coordinator.
 /// Override via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
-pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH: usize = 4;
+pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH = spool_registry.DEFAULT_BOUND_FETCH_SPOOL_DEPTH;
 
 /// The chunk spool (`docs/architecture/routing-and-ingress.md`): a deferred `coord.release(worker_id,
 /// seq)` for a consumed/dropped bound chunk whose coordinator submit
 /// wasn't durable yet at consume time. Retried in `drainSpools`.
-pub const CoordPendingRelease = struct { worker_id: u8, seq: u64 };
+pub const CoordPendingRelease = spool_registry.CoordPendingRelease;
 
 /// Read the `ROVE_BOUND_FETCH_SPOOL_DEPTH` env override, falling back
 /// to `DEFAULT_BOUND_FETCH_SPOOL_DEPTH`. A 0 / unparseable value is
@@ -711,7 +714,7 @@ pub const TenantLog = struct {
     id_minter: log_mod.RequestIdMinter,
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantLog {
-        return worker_log.openTenantLog(worker, inst, worker.log_worker_id);
+        return worker_log.openTenantLog(worker, inst, worker.log.log_worker_id);
     }
 
     pub fn free(allocator: std.mem.Allocator, tl: *TenantLog) void {
@@ -1215,6 +1218,21 @@ pub const WorkerConfig = struct {
 pub const dispatchOnce = dispatch.dispatchOnce;
 pub const drainRequestReceiving = dispatch.drainRequestReceiving;
 
+/// Resume a held continuation (WS chain or bound HTTP chain) with a
+/// spooled bound-fetch chunk, routing to the WS-aware or the plain-drain
+/// resume path. Lives here on the hub (which already imports both) so the
+/// spool driver in worker_streaming dispatches through the worker it
+/// already holds instead of importing worker_ws/worker_drain — that back
+/// reach is what made streaming/ws/drain a dependency cycle. `ev` is
+/// consumed by the resume.
+pub fn resumeHeldBoundFetch(worker: anytype, held_ent: rove.Entity, ev: *components_mod.UpstreamFetchEvent) void {
+    if (worker_ws.wsConnForChain(worker, held_ent)) |conn_ent| {
+        worker_ws.resumeBoundFetchChainWs(worker, held_ent, conn_ent, ev);
+    } else {
+        worker_drain.resumeBoundFetchChain(worker, held_ent, ev);
+    }
+}
+
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
     // park entities in `raft_pending` without allocating side state.
@@ -1515,23 +1533,13 @@ pub fn Worker(comptime opts: Options) type {
         /// tick drains this after `dispatchPendingMsgs` — by then
         /// the shim's txn is committed.
         pending_bound_resumes: std.ArrayListUnmanaged(PendingBoundResume) = .empty,
-        /// The streaming substrate (`docs/architecture/routing-and-ingress.md`) + `docs/handler-shape.md`
-        /// §5.5: registry for `http.fetch({bind: true})` — maps
-        /// `fetch_id` to the entity that issued the fetch. Populated
-        /// at the handler-success seam (`worker_dispatch`'s direct
-        /// `registerBoundFetchTrampoline` call, where `bind = held and
-        /// !detach` is computed, the fetch auto-bind rule); consulted
-        /// in `dispatchPendingMsgs`'s `.fetch_chunk` arm to route
-        /// upstream chunks into the held chain's `onFetchChunk`
-        /// resume; cleared on terminal (`ev.final`) or on held-client
-        /// disconnect.
-        ///
-        /// Keys are allocator-owned dupes of the fetch_id; freed
-        /// when the entry is removed (or by `destroy` on shutdown).
-        /// Entity handles are stable across `reg.move` per
-        /// rove-library principle #8, so a chain transitioning
-        /// cont→stream doesn't invalidate the map entry.
-        bound_fetch_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
+        /// Bound-fetch / chunk-spool state (`docs/architecture/routing-and-ingress.md`
+        /// + `docs/handler-shape.md` §5.5): the `http.fetch({bind: true})`
+        /// entity registry, per-fetch chunk spools, bound-send index, the
+        /// deferred coord-release queue, and the K-window depth + peaks.
+        /// Grouped so its three key-owning maps are freed together on
+        /// shutdown (`SpoolRegistry.deinit`). Driven by `worker_streaming.zig`.
+        spools: spool_registry.SpoolRegistry = .{},
         /// `docs/architecture/websockets.md` (piece D): per-connection
         /// held WebSocket chain locator. Maps the h2 connection `Entity`
         /// (the `Session.entity` carried on every `ws_message_out` /
@@ -1555,88 +1563,6 @@ pub fn Worker(comptime opts: Options) type {
         /// the rest off `parked_continuations` membership and janitors
         /// stale entries.
         inbound_chunk_jobs: std.AutoHashMapUnmanaged(rove.Entity, *inbound_chunk_mod.Job) = .empty,
-        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): per-fetch chunk spool,
-        /// keyed by `fetch_id`, sibling to `bound_fetch_entities`.
-        /// Decouples bound-fetch chunk arrival from the held chain's
-        /// raft commit cadence — arriving chunks push onto the spool;
-        /// `worker_streaming.dispatchSpoolHead` / `drainSpools` pop
-        /// the head once the held entity is back in a receivable
-        /// collection. Heap-allocated `*ChunkSpool` for pointer
-        /// stability across rehash. Keys are allocator-owned fetch_id
-        /// dupes; freed on `dropSpool` + on shutdown (`destroy`).
-        bound_fetch_spools: std.StringHashMapUnmanaged(*chunk_spool_mod.ChunkSpool) = .empty,
-        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): deferred coordinator releases
-        /// for consumed/dropped bound chunks. The spool consumes
-        /// in-window chunks from their inline bytes BEFORE their
-        /// coordinator submit is durable (its ref isn't set yet), so a
-        /// release-at-consume can't free them. Instead the (worker_id,
-        /// seq) is queued here and `drainSpools` retries `coord.release`
-        /// each tick until it succeeds (durableSeq advances). Leftovers
-        /// at shutdown are dropped (lossy-on-shutdown, like the log
-        /// flusher). Touched only by the worker thread.
-        coord_pending_releases: std.ArrayListUnmanaged(CoordPendingRelease) = .empty,
-        /// Chunk spool (`docs/architecture/routing-and-ingress.md`): K, the per-fetch RAM
-        /// window depth. Chunks within K of a spool's head keep their
-        /// inline bytes; chunks pushed beyond K evict their inline
-        /// bytes (read back from the coordinator at dispatch). Default
-        /// `DEFAULT_BOUND_FETCH_SPOOL_DEPTH` (≈ K×64KB inline RAM per
-        /// fetch); overridable via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
-        bound_fetch_spool_depth: usize = DEFAULT_BOUND_FETCH_SPOOL_DEPTH,
-        /// Peak `inlineBytes()` summed across all live spools observed
-        /// on this worker. Diagnostic for the K-window RAM bound;
-        /// exposed via `/_system/metrics` (`bound_fetch_spool_inline_bytes_peak`).
-        /// Never reset (per the diagnostic-state-stays convention).
-        bound_fetch_spool_inline_bytes_peak: usize = 0,
-        /// Peak total queued entries summed across all live spools —
-        /// how far the producer (upstream chunk arrival) ran ahead of
-        /// the raft-rate consumer. A peak ≫ K is the decoupling
-        /// evidence (chunk spool, `docs/architecture/routing-and-ingress.md`): chunks pile
-        /// into the spool at upstream rate while activations drain at
-        /// raft rate. Exposed as `bound_fetch_spool_depth_peak`.
-        bound_fetch_spool_depth_peak: usize = 0,
-        /// Count of spool-head chunks whose evicted inline bytes were
-        /// read back from the coordinator (`coord.readBody`) at
-        /// dispatch. Non-zero proves the eviction → coord
-        /// read-back path actually ran (vs. the consumer keeping up so
-        /// the window never overflowed). Exposed on `/_system/metrics`
-        /// as `bound_fetch_spool_readback_total`. Never reset.
-        bound_fetch_spool_readback_total: u64 = 0,
-        /// Count of spooled-but-unconsumed chunks discarded by
-        /// `dropSpool` when a bound fetch is cancelled
-        /// (`http.cancelFetch`) or its held client disconnects
-        /// (`scanAndCancelBoundFetches`) — the chunk spool
-        /// (`docs/architecture/routing-and-ingress.md`). Excludes the clean terminal drop (the spool is
-        /// empty by then). Exposed as
-        /// `bound_fetch_spool_dropped_total`. Never reset.
-        bound_fetch_spool_dropped_total: u64 = 0,
-        /// Count of per-request log records permanently dropped by
-        /// `flushLogs` — the batch was drained from `log_buffer` before
-        /// the S3 PUT, so a writeBatch failure or a lost-leadership
-        /// mid-tick loses those records for good (lossy-on-failure by
-        /// design — the log-server, `docs/architecture/deployment-and-logs.md`). Logged AND counted so the
-        /// permanent data-loss volume is visible over time, not just a
-        /// transient warn line. Exposed as `log_records_dropped_total`.
-        /// Never reset.
-        log_records_dropped_total: u64 = 0,
-        /// Cross-worker held state (`docs/architecture/effects-and-handlers.md`): worker-
-        /// local mirror of NodeState's `bound_send_owners`. Maps
-        /// send_id → the parked cont entity bound to it.
-        /// Populated alongside `bound_send_owners` (the
-        /// cont_bound_sched_id scan sites in `worker_dispatch.zig`
-        /// + `worker_drain.zig`); read in `resumeIfBoundTrampoline`
-        /// + `resumeBoundContinuation` for O(1) lookup instead of
-        /// scanning every entity in `parked_continuations`.
-        ///
-        /// The routing guarantees: a chunk arriving here has
-        /// `bound_send_owners[send_id] == this worker's idx`, so
-        /// the entity IS in this worker's `parked_continuations`
-        /// (modulo the brief window between unregister and entity
-        /// destroy). Lookup miss falls back to the linear scan as
-        /// a safety net — costs O(N parked) only on the rare
-        /// stale-registry case.
-        ///
-        /// Keys allocator-owned; freed on remove + on shutdown.
-        bound_send_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
         /// This worker's slot index in
         /// `node.msg_inboxes`. Set from `registerMsgInbox`'s
         /// return value at `create`. The per-worker partitioned
@@ -1672,15 +1598,15 @@ pub fn Worker(comptime opts: Options) type {
         /// ids across workers. Same lazy-open lifecycle as
         /// `tenant_files_map` but populated per-worker.
         tenant_logs: TenantMap(TenantLog),
-        /// Per-node in-memory `LogRecord` buffer. Every tenant's
-        /// dispatch tick appends here; `flushLogs` drains the whole
-        /// buffer into one combined batch per flush window. One node
-        /// buffer, not per-tenant.
-        log_buffer: log_mod.NodeLogBuffer,
+        /// Log subsystem (`worker_log.zig`): per-request buffer + S3-batch
+        /// flusher + log-server push threads. Grouped so its shutdown
+        /// teardown ordering (join flusher → join push → free push_queue)
+        /// is local + auditable (`LogSubsystem.deinit`).
+        log: log_subsystem_mod.LogSubsystem,
         /// Promotion-time LogRecord catch-up state. On a follower→leader
         /// edge it walks the group's live raft log, re-deriving LogRecords
         /// a crashed prior leader buffered but never flushed, and appends
-        /// them to `log_buffer` (`docs/architecture/deployment-and-logs.md`).
+        /// them to `log.log_buffer` (`docs/architecture/deployment-and-logs.md`).
         log_walker: log_walker_mod.LogWalker = .{},
         /// Circuit breaker for handlers that blow past their CPU
         /// budget. A tenant with `kill_threshold` interrupts inside a
@@ -1706,12 +1632,6 @@ pub fn Worker(comptime opts: Options) type {
         /// routing entirely. Cross-tenant scoping uses the
         /// `X-Rove-Scope: <id>` header on this host.
         admin_api_domain: ?[]const u8,
-        /// Upper 16 bits every `RequestIdMinter.nextRequestId()`
-        /// minted by this worker stamps onto ids so they don't
-        /// collide with other workers' ids. Copied from
-        /// `WorkerConfig.log_worker_id` (or the raft node id as a
-        /// fallback).
-        log_worker_id: u16,
         /// Node data directory borrowed from `WorkerConfig.data_dir`.
         /// Null in test fixtures. (Post-flush LogRecord durability across a
         /// leader crash is the promotion walker's job now, driven off the
@@ -1726,10 +1646,6 @@ pub fn Worker(comptime opts: Options) type {
         // manifest_http, manifest_easy, manifest_prefetch) lives on
         // `node`. Reach via `worker.node.blob_backend_cfg`, etc.
 
-        /// Store the worker flushes log batches into. Lives for the
-        /// worker's full lifetime; the embedding binary picks S3 vs
-        /// in-memory at startup.
-        log_batch_store: log_server_mod.batch_store.BatchStore,
         /// JWT secret + public origins for the standalone services.
         /// Returned to the dashboard via `/_system/services-token`.
         services_jwt_secret: ?[]const u8,
@@ -1740,45 +1656,12 @@ pub fn Worker(comptime opts: Options) type {
         /// `cp_urls`. cluster_id null or cp_urls empty → forwarding disabled.
         cluster_id: ?[]const u8,
         cp_urls: []const []const u8,
-        log_public_base: ?[]const u8,
-        /// Push fan-out targets (see `WorkerConfig.log_push_bases`). Empty →
-        /// no push thread; `pushBatchKey` short-circuits. Borrowed.
-        log_push_bases: []const []const u8,
         files_public_base: ?[]const u8,
         /// Internal-service POST insecure-TLS toggle (log-push
         /// only — see the worker struct field doc).
         internal_insecure_tls: bool,
-        /// libcurl handle for log-server push (`POST /v1/_internal/
-        /// batch-pushed`), reused sequentially across all `log_push_bases`.
-        /// Lazily created when `log_push_bases` is non-empty. Null disables the
-        /// push path; each indexer's LIST poll is the catch-up.
-        log_push_curl: ?*blob_mod.curl.Easy,
 
-        /// Background log flusher — owns its own thread, sleeps on
-        /// `flusher_wake` between ticks, drains the worker's
-        /// `log_buffer` via `flushLogs`, and PUTs each batch into
-        /// `log_batch_store`. Decouples request latency from S3 RTT:
-        /// the dispatch path's `captureLog` is now a mutex-protected
-        /// ArrayList.append, with the multi-millisecond S3 round-
-        /// trip happening asynchronously on this thread. `null` when
-        /// the worker is configured without a log backend.
-        flusher_thread: ?std.Thread = null,
-        flusher_should_stop: std.atomic.Value(bool) = .init(false),
-        flusher_wake: std.Thread.ResetEvent = .{},
 
-        /// Async batched log-server push. Flushers append the S3 batch
-        /// key they just PUT to `push_queue`; the `push_thread` drains
-        /// the queue and POSTs all queued keys as one body to
-        /// `/v1/_internal/batch-pushed`. Decouples the synchronous-
-        /// curl cost from the flusher so a slow / unreachable
-        /// log-server stops back-pressuring the dispatch path.
-        /// `push_queue` owns each `[]u8` (allocator-duped from the
-        /// flusher's local key).
-        push_queue: std.ArrayList([]u8) = .empty,
-        push_queue_mutex: std.Thread.Mutex = .{},
-        push_wake: std.Thread.ResetEvent = .{},
-        push_should_stop: std.atomic.Value(bool) = .init(false),
-        push_thread: ?std.Thread = null,
 
         // Background deployment loader lives on `node` (single per
         // process, shared across workers). Reach via
@@ -1836,39 +1719,42 @@ pub fn Worker(comptime opts: Options) type {
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
-                .bound_fetch_spool_depth = readBoundFetchSpoolDepth(),
+                .spools = .{ .bound_fetch_spool_depth = readBoundFetchSpoolDepth() },
                 .tenant_logs = .empty,
-                .log_buffer = blk: {
-                    var lb = log_mod.NodeLogBuffer.init(allocator);
-                    if (config.log_flush_interval_ns) |v| lb.flush_interval_ns = v;
-                    if (config.log_flush_threshold_records) |v| lb.flush_threshold_records = v;
-                    break :blk lb;
+                .log = .{
+                    .log_buffer = lbb: {
+                        var lb = log_mod.NodeLogBuffer.init(allocator);
+                        // Operational log-flush cadence overrides (null → module defaults).
+                        if (config.log_flush_interval_ns) |v| lb.flush_interval_ns = v;
+                        if (config.log_flush_threshold_records) |v| lb.flush_threshold_records = v;
+                        break :lbb lb;
+                    },
+                    .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
+                    .log_batch_store = config.log_batch_store,
+                    .log_public_base = config.log_public_base,
+                    .log_push_bases = config.log_push_bases,
+                    .log_push_curl = blk: {
+                        if (config.log_push_bases.len == 0) break :blk null;
+                        break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
+                            std.log.warn("rove-js: log-push libcurl init failed: {s}; batch push disabled", .{@errorName(err)});
+                            break :blk null;
+                        };
+                    },
                 },
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
-                .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
                 .data_dir = config.data_dir,
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
-                .log_batch_store = config.log_batch_store,
                 .services_jwt_secret = config.services_jwt_secret,
                 .move_secret = config.move_secret,
                 .cluster_id = config.cluster_id,
                 .cp_urls = config.cp_urls,
-                .log_public_base = config.log_public_base,
-                .log_push_bases = config.log_push_bases,
                 .files_public_base = config.files_public_base,
                 .internal_insecure_tls = config.internal_insecure_tls,
-                .log_push_curl = blk: {
-                    if (config.log_push_bases.len == 0) break :blk null;
-                    break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
-                        std.log.warn("rove-js: log-push libcurl init failed: {s}; batch push disabled", .{@errorName(err)});
-                        break :blk null;
-                    };
-                },
                 .wake_inbox = KvWakeInbox.init(allocator),
             };
             errdefer self.raft_pending_response.deinit();
@@ -1925,14 +1811,14 @@ pub fn Worker(comptime opts: Options) type {
             // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is the process-
             // global BlobCoordinator's job (NodeState.blob_coordinator);
             // this per-worker flusher_thread runs only the log flush.
-            self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
+            self.log.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
             // Spawn the push thread only if a libcurl handle was
             // built (i.e. `log_push_bases` is non-empty). Without it
             // pushBatchKey would short-circuit anyway; the thread
             // would just spin.
-            if (self.log_push_curl != null) {
-                self.push_thread = try std.Thread.spawn(.{}, worker_log.pushLoop, .{self});
+            if (self.log.log_push_curl != null) {
+                self.log.push_thread = try std.Thread.spawn(.{}, worker_log.pushLoop, .{self});
             }
 
             return self;
@@ -1958,7 +1844,7 @@ pub fn Worker(comptime opts: Options) type {
         /// can be lost on shutdown.
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
-            while (!self.flusher_should_stop.load(.acquire)) {
+            while (!self.log.flusher_should_stop.load(.acquire)) {
                 // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is driven by
                 // the process-global coordinator's own drainer + executor
                 // threads — no per-tick call from the worker. The per-tick
@@ -1966,8 +1852,8 @@ pub fn Worker(comptime opts: Options) type {
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
                 };
-                self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
-                self.flusher_wake.reset();
+                self.log.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
+                self.log.flusher_wake.reset();
             }
         }
 
@@ -1976,36 +1862,12 @@ pub fn Worker(comptime opts: Options) type {
             // NodeState owns the deployment loader + tenant_files_map
             // + manifest_prefetch. Tenant-files cleanup runs from
             // `NodeState.deinit`, not here.
-            // Signal the flusher thread to stop, wake it, and join.
-            // The flusher's only blocking call is libcurl's
-            // `curl_easy_perform`, which is bounded by `Easy`'s
-            // 15 s `CURLOPT_TIMEOUT_MS` — so join can never wait
-            // longer than one in-flight PUT plus the libcurl
-            // ceiling. No detach / leak path needed.
-            if (self.flusher_thread) |t| {
-                self.flusher_should_stop.store(true, .release);
-                self.flusher_wake.set();
-                t.join();
-                self.flusher_thread = null;
-            }
-            // The streaming substrate (`docs/architecture/routing-and-ingress.md`): the blob coordinator lives on
+            // Stop + join the flusher and push threads in order, then free the
+            // queued keys — the ordering (flusher first, since it enqueues to
+            // push_queue on its final tick; free only after both joined) is
+            // owned by LogSubsystem.deinit. The blob coordinator lives on
             // NodeState and shuts down there (not here).
-            // Stop the push thread AFTER the flusher: the flusher
-            // enqueues to push_queue, so stopping push first would
-            // leak whatever the flusher emitted on its final tick.
-            if (self.push_thread) |t| {
-                self.push_should_stop.store(true, .release);
-                self.push_wake.set();
-                t.join();
-                self.push_thread = null;
-            }
-            // Free any keys still queued at shutdown. Same
-            // best-effort posture as flushLogs's final partial batch:
-            // log-server will pick them up on its LIST poll.
-            self.push_queue_mutex.lock();
-            for (self.push_queue.items) |k| allocator.free(k);
-            self.push_queue.deinit(allocator);
-            self.push_queue_mutex.unlock();
+            self.log.deinit(allocator);
             {
                 var it = self.onheaders_cache.keyIterator();
                 while (it.next()) |kp| allocator.free(kp.*);
@@ -2019,7 +1881,7 @@ pub fn Worker(comptime opts: Options) type {
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
-            self.log_buffer.deinit();
+            self.log.log_buffer.deinit();
             self.log_walker.deinit(allocator);
             // SharedTxnPool.deinit walks any leftover
             // txns (best-effort rollback) before freeing the
@@ -2060,16 +1922,12 @@ pub fn Worker(comptime opts: Options) type {
             // change drain would have surfaced these, but be defensive.
             for (self.pending_bound_resumes.items) |*p| p.deinit(allocator);
             self.pending_bound_resumes.deinit(allocator);
-            // Free every fetch_id key in the bound-fetch registry.
-            // Values are entity handles (POD), no per-value cleanup.
-            // The registry never owns the underlying fetch in
-            // FetchEngine — that's released through normal terminal
-            // events or http.cancelFetch.
-            {
-                var it = self.bound_fetch_entities.iterator();
-                while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-                self.bound_fetch_entities.deinit(allocator);
-            }
+            // Free the bound-fetch/spool state in one place — every key in the
+            // three maps, each live spool, the deferred-release queue. The
+            // registry never owns the underlying fetch in FetchEngine (released
+            // through normal terminal events / http.cancelFetch); entity-handle
+            // values are POD.
+            self.spools.deinit(allocator);
             // `docs/architecture/websockets.md` (piece D): the chain entities themselves
             // are reaped via `parked_continuations`/registry teardown on
             // shutdown; free each connection's gated-frame queue, then
@@ -2095,28 +1953,6 @@ pub fn Worker(comptime opts: Options) type {
                     jp.*.unref();
                 }
                 self.inbound_chunk_jobs.deinit(allocator);
-            }
-            // Chunk spool (`docs/architecture/routing-and-ingress.md`): free every spool +
-            // its still-pending entries + the duped fetch_id key.
-            // Best-effort drain at shutdown, same lossy posture as
-            // `fetch_pending_durability` below.
-            {
-                var it = self.bound_fetch_spools.iterator();
-                while (it.next()) |entry| {
-                    entry.value_ptr.*.deinit(allocator);
-                    allocator.destroy(entry.value_ptr.*);
-                    allocator.free(entry.key_ptr.*);
-                }
-                self.bound_fetch_spools.deinit(allocator);
-            }
-            // Deferred coord releases — drop at shutdown (the coord
-            // is torn down separately; lossy-on-shutdown is fine).
-            self.coord_pending_releases.deinit(allocator);
-            // Same pattern for the bound_send_entities map.
-            {
-                var it = self.bound_send_entities.iterator();
-                while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-                self.bound_send_entities.deinit(allocator);
             }
             self.parked_continuations.deinit();
             self.parked_units.deinit();
@@ -2144,7 +1980,7 @@ pub fn Worker(comptime opts: Options) type {
                 components_mod.UpstreamFetchEvent.deinitItem(&pe.event, allocator);
             self.fetch_pending_durability.deinit(allocator);
             self.dispatcher.deinit();
-            if (self.log_push_curl) |easy| easy.deinit();
+            if (self.log.log_push_curl) |easy| easy.deinit();
             // `manifest_easy` lives on NodeState — main.zig owns it.
             self.h2.destroy();
             allocator.destroy(self);
@@ -2872,8 +2708,8 @@ pub fn Worker(comptime opts: Options) type {
                 self.armBlobReceive(pf);
                 return true;
             }
-            if (worker_streaming.isComposeUrl(pf.url)) {
-                worker_streaming.fireBlobCompose(self, pf);
+            if (worker_fire.isComposeUrl(pf.url)) {
+                worker_fire.fireBlobCompose(self, pf);
                 return true;
             }
             if (deploy_thread_mod.isCompileUrl(pf.url)) {
@@ -3182,7 +3018,7 @@ pub fn Worker(comptime opts: Options) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const a = self.allocator;
-            const gop = self.bound_fetch_entities.getOrPut(a, fetch_id) catch return false;
+            const gop = self.spools.bound_fetch_entities.getOrPut(a, fetch_id) catch return false;
             if (gop.found_existing) {
                 std.log.warn(
                     "rove-js bound-fetch: registry collision for fetch_id={s}; dropping new bind",
@@ -3191,7 +3027,7 @@ pub fn Worker(comptime opts: Options) type {
                 return false;
             }
             const key_dup = a.dupe(u8, fetch_id) catch {
-                _ = self.bound_fetch_entities.remove(fetch_id);
+                _ = self.spools.bound_fetch_entities.remove(fetch_id);
                 return false;
             };
             gop.key_ptr.* = key_dup;
@@ -3226,14 +3062,14 @@ pub fn Worker(comptime opts: Options) type {
         /// path) — robust against late-arriving chunks for a chain
         /// whose terminal already drained the registry.
         pub fn lookupBoundFetch(self: *Self, fetch_id: []const u8) ?rove.Entity {
-            return self.bound_fetch_entities.get(fetch_id);
+            return self.spools.bound_fetch_entities.get(fetch_id);
         }
 
         /// Unregister + free the registry key. Idempotent — a no-op
         /// when the id isn't present (the cleanup path runs on every
         /// terminal chunk; double-fire is benign).
         pub fn unregisterBoundFetch(self: *Self, fetch_id: []const u8) void {
-            const entry = self.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
+            const entry = self.spools.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
             const entity = entry.value;
             self.allocator.free(entry.key);
             // Mirror the NodeState owner-map drop, paired with the
@@ -3278,7 +3114,7 @@ pub fn Worker(comptime opts: Options) type {
         /// chain). Caller's slice is duped; the registry owns the
         /// key.
         pub fn registerBoundSendEntity(self: *Self, send_id: []const u8, entity: rove.Entity) void {
-            const gop = self.bound_send_entities.getOrPut(self.allocator, send_id) catch return;
+            const gop = self.spools.bound_send_entities.getOrPut(self.allocator, send_id) catch return;
             if (gop.found_existing) {
                 std.log.warn(
                     "rove-js bound-send: registry collision for send_id={s}; dropping new bind",
@@ -3287,7 +3123,7 @@ pub fn Worker(comptime opts: Options) type {
                 return;
             }
             const key_dup = self.allocator.dupe(u8, send_id) catch {
-                _ = self.bound_send_entities.remove(send_id);
+                _ = self.spools.bound_send_entities.remove(send_id);
                 return;
             };
             gop.key_ptr.* = key_dup;
@@ -3299,7 +3135,7 @@ pub fn Worker(comptime opts: Options) type {
         /// place of a linear scan. Returns null on miss → caller falls
         /// back to the scan (stale-registry safety net).
         pub fn lookupBoundSendEntity(self: *Self, send_id: []const u8) ?rove.Entity {
-            return self.bound_send_entities.get(send_id);
+            return self.spools.bound_send_entities.get(send_id);
         }
 
         /// Remove + free the registry key. Idempotent.
@@ -3307,7 +3143,7 @@ pub fn Worker(comptime opts: Options) type {
         /// fires alongside the bsid free sites in
         /// `worker_drain.zig`'s repark + stream-transition arms.
         pub fn unregisterBoundSendEntity(self: *Self, send_id: []const u8) void {
-            const entry = self.bound_send_entities.fetchRemove(send_id) orelse return;
+            const entry = self.spools.bound_send_entities.fetchRemove(send_id) orelse return;
             self.allocator.free(entry.key);
         }
     };
@@ -3395,7 +3231,7 @@ pub const StreamResumeStage = worker_streaming.StreamResumeStage;
 pub const setStreamComponents = worker_streaming.setStreamComponents;
 pub const serviceParkedStreams = worker_streaming.serviceParkedStreams;
 pub const serviceWsMessages = worker_ws.serviceWsMessages;
-pub const fireSubscriptionActivation = worker_streaming.fireSubscriptionActivation;
+pub const fireSubscriptionActivation = worker_fire.fireSubscriptionActivation;
 pub const proposeForgetfulWrites = worker_streaming.proposeForgetfulWrites;
 pub const serviceSubscriptionFires = worker_streaming.serviceSubscriptionFires;
 pub const dispatchPendingMsgs = worker_streaming.dispatchPendingMsgs;
@@ -3403,7 +3239,7 @@ pub const drainSpools = worker_streaming.drainSpools;
 pub const dispatchSubscriptionFires = worker_streaming.dispatchSubscriptionFires;
 pub const dispatchFetchEvents = worker_streaming.dispatchFetchEvents;
 pub const serviceFetchEvents = worker_streaming.serviceFetchEvents;
-pub const fireFetchEventActivation = worker_streaming.fireFetchEventActivation;
+pub const fireFetchEventActivation = worker_fire.fireFetchEventActivation;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -3654,15 +3490,15 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
-        log_buffer: log_mod.NodeLogBuffer,
+        log: struct { log_buffer: log_mod.NodeLogBuffer },
     };
     var fake = FakeWorker{
         .allocator = allocator,
         .tenant_logs = .empty,
-        .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+        .log = .{ .log_buffer = log_mod.NodeLogBuffer.init(allocator) },
     };
     defer fake.tenant_logs.deinit(allocator);
-    defer fake.log_buffer.deinit();
+    defer fake.log.log_buffer.deinit();
 
     const tl = try worker_log.openTenantLog(&fake, inst, 7);
     defer worker_log.freeTenantLog(allocator, tl);
@@ -3690,8 +3526,8 @@ test "captureLog appends a record to the worker's node-wide buffer" {
         12345,
     );
 
-    try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
-    const buffered = &fake.log_buffer.buffer.items[0];
+    try testing.expectEqual(@as(usize, 1), fake.log.log_buffer.buffer.items.len);
+    const buffered = &fake.log.log_buffer.buffer.items[0];
     try testing.expectEqual(@as(u64, 200), @as(u64, buffered.status));
     try testing.expectEqualStrings("/test", buffered.path);
     try testing.expectEqual(@as(u64, 42), buffered.deployment_id);
@@ -3728,15 +3564,15 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
-        log_buffer: log_mod.NodeLogBuffer,
+        log: struct { log_buffer: log_mod.NodeLogBuffer },
     };
     var fake = FakeWorker{
         .allocator = allocator,
         .tenant_logs = .empty,
-        .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+        .log = .{ .log_buffer = log_mod.NodeLogBuffer.init(allocator) },
     };
     defer fake.tenant_logs.deinit(allocator);
-    defer fake.log_buffer.deinit();
+    defer fake.log.log_buffer.deinit();
 
     const tl = try worker_log.openTenantLog(&fake, inst, 9);
     defer worker_log.freeTenantLog(allocator, tl);
@@ -3765,8 +3601,8 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
         0,
     );
 
-    try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
-    const buffered = &fake.log_buffer.buffer.items[0];
+    try testing.expectEqual(@as(usize, 1), fake.log.log_buffer.buffer.items.len);
+    const buffered = &fake.log.log_buffer.buffer.items[0];
     try testing.expectEqualStrings("chain-abc-123", buffered.correlation_id);
     try testing.expectEqual(log_mod.ActivationSource.send_callback, buffered.activation);
 }

@@ -208,7 +208,277 @@ pub fn main() !void {
         try runPackages(a);
         return;
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "oauthjwt")) {
+        try runOauthJwt(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "cronpkg")) {
+        try runCronPkg(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "leafpkgs")) {
+        try runLeafPkgs(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "morepkgs")) {
+        try runMorePkgs(a);
+        return;
+    }
     try runInbound(a);
+}
+
+/// The rest of the lifted libs (P-Lift, rove#123): users (object-literal leaf),
+/// oidc (object-literal → nested `@rewind/jwt`, the 1300-line one), and the
+/// IIFE-wrapped schedule (callable) / segments / browser. A consumer imports
+/// all five and checks each resolved + loaded with its surface intact. oidc's
+/// jwt dep is nested (private, via oidc's `imports`), exercising encapsulation
+/// on a big real lib.
+fn runMorePkgs(a: std.mem.Allocator) !void {
+    const U = "7" ** 64;
+    const O = "8" ** 64;
+    const SC = "9" ** 64;
+    const SE = "a" ** 64;
+    const BR = "d" ** 64;
+    const JW = "e" ** 64; // oidc's nested jwt
+    const HANDLER_SRC =
+        \\import users from '@rewind/users';
+        \\import oidc from '@rewind/oidc';
+        \\import schedule from '@rewind/schedule';
+        \\import segments from '@rewind/segments';
+        \\import browser from '@rewind/browser';
+        \\export default function () {
+        \\  return { status: 200, body: {
+        \\    usersOk: typeof users === 'object' && typeof users.create === 'function',
+        \\    oidcOk: typeof oidc === 'object' && typeof oidc.rp === 'function',
+        \\    scheduleOk: typeof schedule === 'function',
+        \\    segmentsOk: typeof segments === 'object' && typeof segments.append === 'function',
+        \\    browserOk: typeof browser === 'object' && typeof browser.act === 'function',
+        \\  } };
+        \\}
+    ;
+
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(HANDLER_SRC, .{}, w);
+    try w.writeAll("}],");
+    try w.print("\"app_imports\":{{\"@rewind/users\":\"{s}\",\"@rewind/oidc\":\"{s}\",\"@rewind/schedule\":\"{s}\",\"@rewind/segments\":\"{s}\",\"@rewind/browser\":\"{s}\"}},", .{ U, O, SC, SE, BR });
+    try w.writeAll("\"packages\":[");
+    // users (leaf)
+    try w.print("{{\"spec\":\"@rewind/users\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{U});
+    try std.json.Stringify.value(@as([]const u8, @embedFile("pkg_users")), .{}, w);
+    try w.writeAll("}},");
+    // oidc → nested @rewind/jwt (private, via its imports)
+    try w.print("{{\"spec\":\"@rewind/oidc\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"imports\":{{\"@rewind/jwt\":\"{s}\"}},\"files\":{{\"index.mjs\":", .{ O, JW });
+    try std.json.Stringify.value(@as([]const u8, @embedFile("pkg_oidc")), .{}, w);
+    try w.writeAll("}},");
+    // schedule (IIFE callable), segments (IIFE), browser (IIFE)
+    try w.print("{{\"spec\":\"@rewind/schedule\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{SC});
+    try std.json.Stringify.value(@as([]const u8, @embedFile("pkg_schedule")), .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/segments\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{SE});
+    try std.json.Stringify.value(@as([]const u8, @embedFile("pkg_segments")), .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/browser\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{BR});
+    try std.json.Stringify.value(@as([]const u8, @embedFile("pkg_browser")), .{}, w);
+    try w.writeAll("}},");
+    // jwt (the nested dep oidc imports)
+    try w.print("{{\"spec\":\"@rewind/jwt\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{JW});
+    try std.json.Stringify.value(@as([]const u8, @embedFile("pkg_jwt")), .{}, w);
+    try w.writeAll("}}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("MORE_PKGS: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    check(out.items, &.{
+        "\"usersOk\":true", "\"oidcOk\":true", "\"scheduleOk\":true",
+        "\"segmentsOk\":true", "\"browserOk\":true", "\"verify\":{\"pass\":true",
+    }, &.{"\"error\":\"handler"}, "MORE PKGS SCENARIO");
+}
+
+/// The object-literal LEAF libs (P-Lift, rove#123): sessions/retry/activitypub
+/// lifted `globalThis.X = { … }` → `const X = { … }; export default X`. A
+/// consumer imports all three and checks each resolved + loaded with its
+/// surface intact — the mechanical repeat of the jwt shape, proving the batch
+/// conversion didn't break the modules (syntax / undefined top-level ref).
+fn runLeafPkgs(a: std.mem.Allocator) !void {
+    const S_HASH = "4" ** 64;
+    const R_HASH = "5" ** 64;
+    const AP_HASH = "6" ** 64;
+    const EM_HASH = "f" ** 64;
+    const S_SRC = @embedFile("pkg_sessions");
+    const R_SRC = @embedFile("pkg_retry");
+    const AP_SRC = @embedFile("pkg_activitypub");
+    const EM_SRC = @embedFile("pkg_email");
+    const LEAF_HANDLER =
+        \\import sessions from '@rewind/sessions';
+        \\import retry from '@rewind/retry';
+        \\import activitypub from '@rewind/activitypub';
+        \\import email from '@rewind/email';
+        \\export default function () {
+        \\  return { status: 200, body: {
+        \\    sessionsOk: typeof sessions === 'object' && typeof sessions.fromConfig === 'function',
+        \\    retryOk: typeof retry === 'object' && typeof retry.send === 'function' && typeof retry.again === 'function',
+        \\    apOk: typeof activitypub === 'object' && typeof activitypub.fromConfig === 'function',
+        \\    emailOk: typeof email === 'object' && typeof email.send === 'function',
+        \\  } };
+        \\}
+    ;
+
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(LEAF_HANDLER, .{}, w);
+    try w.writeAll("}],");
+    try w.print("\"app_imports\":{{\"@rewind/sessions\":\"{s}\",\"@rewind/retry\":\"{s}\",\"@rewind/activitypub\":\"{s}\",\"@rewind/email\":\"{s}\"}},", .{ S_HASH, R_HASH, AP_HASH, EM_HASH });
+    try w.writeAll("\"packages\":[");
+    try w.print("{{\"spec\":\"@rewind/sessions\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{S_HASH});
+    try std.json.Stringify.value(S_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/retry\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{R_HASH});
+    try std.json.Stringify.value(R_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/activitypub\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{AP_HASH});
+    try std.json.Stringify.value(AP_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/email\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{EM_HASH});
+    try std.json.Stringify.value(EM_SRC, .{}, w);
+    try w.writeAll("}}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("LEAF_PKGS: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    check(out.items, &.{
+        "\"sessionsOk\":true", "\"retryOk\":true", "\"apOk\":true", "\"emailOk\":true", "\"verify\":{\"pass\":true",
+    }, &.{"\"error\":\"handler"}, "LEAF PKGS SCENARIO");
+}
+
+/// The IIFE-wrapped conversion shape (P-Lift, rove#123): `@rewind/cron` was an
+/// ambient global wrapped in an IIFE (to keep its top-level locals out of the
+/// base-snapshot's global scope); lifted to a module, the IIFE drops and module
+/// scope takes over. Proves the lifted module resolves + runs offline and its
+/// static helpers (module-level `_cronHelpers` over the ambient `time` global)
+/// still work. Real embedded lifted source.
+fn runCronPkg(a: std.mem.Allocator) !void {
+    const CRON_HASH = "3" ** 64;
+    const CRON_SRC = @embedFile("pkg_cron");
+    const CRON_HANDLER =
+        \\import cron from '@rewind/cron';
+        \\export default function () {
+        \\  return { status: 200, body: {
+        \\    isFunc: typeof cron === 'function',
+        \\    hasNext: typeof cron.next === 'function',
+        \\    parseDur: cron.parseDuration('2h'),
+        \\    dailyAtOk: cron.dailyAt(3, 0) > 0n,
+        \\    hourlyOk: cron.hourly() > 0n,
+        \\  } };
+        \\}
+    ;
+
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,\"now_ms\":1700000000000,");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(CRON_HANDLER, .{}, w);
+    try w.writeAll("}],");
+    try w.print("\"app_imports\":{{\"@rewind/cron\":\"{s}\"}},", .{CRON_HASH});
+    try w.writeAll("\"packages\":[");
+    try w.print("{{\"spec\":\"@rewind/cron\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{CRON_HASH});
+    try std.json.Stringify.value(CRON_SRC, .{}, w);
+    try w.writeAll("}}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("CRON_PKG: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    // The IIFE lib lifted to a module: callable, static helpers work over the
+    // ambient `time` global (parseDuration("2h") = 7200000).
+    check(out.items, &.{
+        "\"isFunc\":true", "\"hasNext\":true", "\"parseDur\":7200000",
+        "\"dailyAtOk\":true", "\"hourlyOk\":true", "\"verify\":{\"pass\":true",
+    }, &.{"\"error\":\"handler"}, "CRON PKG SCENARIO");
+}
+
+/// The first REAL intra-set package dependency (P-Lift, rove#123): the lifted
+/// `@rewind/oauth` package `import`s the lifted `@rewind/jwt` package (nested /
+/// private — reachable only through oauth, not on the app surface) and calls
+/// `jwt.verify` from `oauth.verifyIdToken`. A malformed token drives
+/// `jwt.verify` to throw, and oauth surfaces jwt's error text — proving the
+/// dep graph resolved AND jwt executed inside the encapsulated importer. The
+/// package sources are the REAL embedded lifted libs, not synthetic stubs.
+fn runOauthJwt(a: std.mem.Allocator) !void {
+    const JWT_HASH = "1" ** 64;
+    const OAUTH_HASH = "2" ** 64;
+    const JWT_SRC = @embedFile("pkg_jwt");
+    const OAUTH_SRC = @embedFile("pkg_oauth");
+    const OAUTH_HANDLER =
+        \\import oauth from '@rewind/oauth';
+        \\export default function () {
+        \\  kv.set('cache/oauth/test/jwks', JSON.stringify({ keys: [{ kty: 'RSA', kid: 'k1' }] }));
+        \\  const r = oauth.verifyIdToken('not-a-jwt', {
+        \\    issuer: 'https://issuer.test', client_id: 'client-x',
+        \\    jwks_uri: 'https://jwks.test', cache_path: 'cache/oauth/test',
+        \\  });
+        \\  return { status: 200, body: r };
+        \\}
+    ;
+
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(OAUTH_HANDLER, .{}, w);
+    try w.writeAll("}],");
+    // The app imports ONLY oauth; jwt is nested (private) via oauth's imports.
+    try w.print("\"app_imports\":{{\"@rewind/oauth\":\"{s}\"}},", .{OAUTH_HASH});
+    try w.writeAll("\"packages\":[");
+    try w.print("{{\"spec\":\"@rewind/oauth\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"imports\":{{\"@rewind/jwt\":\"{s}\"}},\"files\":{{\"index.mjs\":", .{ OAUTH_HASH, JWT_HASH });
+    try std.json.Stringify.value(OAUTH_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/jwt\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{JWT_HASH});
+    try std.json.Stringify.value(JWT_SRC, .{}, w);
+    try w.writeAll("}}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("OAUTH_JWT: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    // oauth loaded (its `import @rewind/jwt` resolved) AND jwt.verify ran — the
+    // error text is jwt's, surfaced through oauth's encapsulated dep. (`"ok"`
+    // appears twice in the bundle — the handler result `body:{"ok":false,…}`
+    // and the run's own top-level `"ok":true`; assert the former's shape.)
+    check(out.items, &.{
+        "\"body\":{\"ok\":false,\"error\":\"verify: jwt.verify: malformed token\"}",
+        "\"verify\":{\"pass\":true",
+    }, &.{"\"claims\""}, "OAUTH->JWT SCENARIO");
 }
 
 /// Multi-version package encapsulation offline (issue #50), mirroring

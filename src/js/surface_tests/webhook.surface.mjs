@@ -49,7 +49,7 @@ export default function () {
     throws(() => webhook.send("https://x.test", "opts"), /opts must be an object/);
     throws(() => webhook.send("https://x.test", { handle: "h" }), /`handle` was renamed/);
     throws(() => webhook.send("https://x.test", { body: new Uint8Array(2) }), /`body` must be a string/);
-    throws(() => webhook.send("https://x.test", { in: {} }), /`in` must be a number/);
+    throws(() => webhook.send("https://x.test", { in: {} }), /expected a number/);
   });
   return done();
 }

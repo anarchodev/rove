@@ -43,6 +43,9 @@ const HASH_HEX_LEN = @import("rove-files").HASH_HEX_LEN;
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
 pub const Source = struct { path: []const u8, kind: []const u8, source: []const u8 };
+/// A registered kv trigger (issue #38): watched key `prefix` + the `module`
+/// specifier of its `_triggers/<prefix>/index` handler.
+pub const TriggerReg = struct { prefix: []const u8, module: []const u8 };
 
 pub const World = struct {
     entry: []const u8 = "index.mjs",
@@ -91,6 +94,10 @@ pub const World = struct {
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
+    /// Registered kv triggers (issue #38): `{ prefix, module }` — the epilogue
+    /// imports each module + dispatches its before/after chain on a matching
+    /// customer write.
+    triggers: []const TriggerReg = &.{},
     /// Per-world working-tree source dir. When present it overrides the
     /// caller's `--source-dir` for this run — the channel the JS test library's
     /// `scenario({ sourceDir })` uses to resolve handler code (the harness reads
@@ -145,11 +152,94 @@ pub const World = struct {
 
 pub const Error = error{BadWorld} || std.mem.Allocator.Error;
 
+/// The full set of top-level world keys. A key outside this set is a typo (or a
+/// stale spelling) — the harness is the only producer of worlds besides
+/// hand-authoring, so rejecting the unknown catches `now` (the `scenario()`
+/// spelling; world.zig reads `now_ms`) instead of silently running at epoch 0.
+const TOP_KEYS = [_][]const u8{
+    "entry",   "activation", "export",  "source_dir", "ctx",     "seed",
+    "now_ms",  "arena_gc",   "captured", "request",   "kv",      "expected",
+    "sources", "app_imports", "packages", "triggers",
+};
+/// The full set of `request.*` keys (same strictness rationale).
+const REQ_KEYS = [_][]const u8{
+    "method",  "path",       "host",          "ip",       "body",   "bodyB64",
+    "status",  "done",       "fetchId",       "chunkSeq", "fetchesPending",
+    "bodyTruncated", "activation", "session",  "tenant",   "correlationId", "headers",
+};
+
+/// Reject any key in `obj` outside `known`, naming the object (`world` /
+/// `request`) and the nearest known key. Cheap here, impossible once fixtures
+/// exist with latent typos silently ignored.
+fn rejectUnknownKeys(obj: std.json.ObjectMap, comptime known: []const []const u8, comptime label: []const u8) Error!void {
+    var it = obj.iterator();
+    outer: while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        inline for (known) |k| {
+            if (std.mem.eql(u8, key, k)) continue :outer;
+        }
+        // Unknown — suggest the closest known key (edit distance ≤ 3), breaking
+        // ties toward the longer shared prefix so `now` → `now_ms`, not `ctx`.
+        var best: ?[]const u8 = null;
+        var best_d: usize = std.math.maxInt(usize);
+        var best_pfx: usize = 0;
+        inline for (known) |k| {
+            const d = editDistance(key, k);
+            const pfx = commonPrefixLen(key, k);
+            if (d < best_d or (d == best_d and pfx > best_pfx)) {
+                best_d = d;
+                best_pfx = pfx;
+                best = k;
+            }
+        }
+        // The failure itself is the returned `BadWorld` (the CLI surfaces it);
+        // `warn` carries the "did you mean" hint without the test runner
+        // treating a deliberately-rejected world as an errored test.
+        if (best != null and best_d <= 3) {
+            std.log.warn("rewind: unknown {s} field '{s}' — did you mean '{s}'?", .{ label, key, best.? });
+        } else {
+            std.log.warn("rewind: unknown {s} field '{s}'", .{ label, key });
+        }
+        return Error.BadWorld;
+    }
+}
+
+/// Length of the shared leading prefix of `a` and `b` — a tie-breaker for the
+/// "did you mean" hint (`now` shares 3 with `now_ms`, 0 with `ctx`).
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    var i: usize = 0;
+    while (i < a.len and i < b.len and a[i] == b[i]) i += 1;
+    return i;
+}
+
+/// Bounded Levenshtein distance (stack DP, keys are short). Used only for the
+/// "did you mean" hint on a rejected field.
+fn editDistance(a: []const u8, b: []const u8) usize {
+    if (a.len == 0) return b.len;
+    if (b.len == 0) return a.len;
+    if (a.len > 64 or b.len > 64) return std.math.maxInt(usize);
+    var prev: [65]usize = undefined;
+    var cur: [65]usize = undefined;
+    for (0..b.len + 1) |j| prev[j] = j;
+    for (a, 0..) |ca, i| {
+        cur[0] = i + 1;
+        for (b, 0..) |cb, j| {
+            const del = prev[j + 1] + 1;
+            const ins = cur[j] + 1;
+            const sub = prev[j] + @as(usize, if (ca == cb) 0 else 1);
+            cur[j + 1] = @min(del, @min(ins, sub));
+        }
+        @memcpy(prev[0 .. b.len + 1], cur[0 .. b.len + 1]);
+    }
+    return prev[b.len];
+}
+
 /// Extract a `World` from an already-parsed JSON value. `a` should be an arena
 /// (the slices are never individually freed).
 pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     if (root != .object) return Error.BadWorld;
     const obj = root.object;
+    try rejectUnknownKeys(obj, &TOP_KEYS, "world");
 
     var w = World{};
     if (jStr(obj, "entry")) |s| w.entry = s;
@@ -168,6 +258,7 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     if (obj.get("request")) |rv| {
         if (rv != .object) return Error.BadWorld;
         const r = rv.object;
+        try rejectUnknownKeys(r, &REQ_KEYS, "request");
         if (jStr(r, "method")) |s| w.method = s;
         if (jStr(r, "path")) |s| w.path = s;
         if (jStr(r, "host")) |s| w.host = s;
@@ -246,6 +337,19 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             try ss.append(a, .{ .path = p, .kind = jStr(e.object, "kind") orelse "handler", .source = src });
         }
         w.sources = try ss.toOwnedSlice(a);
+    }
+
+    // ── kv triggers: [{ prefix, module }] (issue #38) ──
+    if (obj.get("triggers")) |tv| {
+        if (tv != .array) return Error.BadWorld;
+        var ts = std.ArrayList(TriggerReg){};
+        for (tv.array.items) |e| {
+            if (e != .object) continue;
+            const prefix = jStr(e.object, "prefix") orelse continue;
+            const module = jStr(e.object, "module") orelse continue;
+            try ts.append(a, .{ .prefix = prefix, .module = module });
+        }
+        w.triggers = try ts.toOwnedSlice(a);
     }
 
     // ── packages: the resolved graph + inline package sources ──
@@ -447,4 +551,20 @@ test "fromValue: a non-object root fails loud" {
     const a = arena.allocator();
     const parsed = try std.json.parseFromSlice(std.json.Value, a, "[]", .{});
     try testing.expectError(Error.BadWorld, fromValue(a, parsed.value));
+}
+
+test "fromValue: rejects an unknown top-level / request field (typo, did-you-mean)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `now` is the scenario() spelling; world.zig reads `now_ms`. Silently
+    // ignored before, it now fails loud instead of running at epoch 0.
+    const bad_top = try std.json.parseFromSlice(std.json.Value, a, "{\"entry\":\"i.mjs\",\"now\":123}", .{});
+    try testing.expectError(Error.BadWorld, fromValue(a, bad_top.value));
+    // The corrected spelling parses.
+    const ok = try std.json.parseFromSlice(std.json.Value, a, "{\"entry\":\"i.mjs\",\"now_ms\":123}", .{});
+    _ = try fromValue(a, ok.value);
+    // Unknown request key too.
+    const bad_req = try std.json.parseFromSlice(std.json.Value, a, "{\"request\":{\"pathh\":\"/\"}}", .{});
+    try testing.expectError(Error.BadWorld, fromValue(a, bad_req.value));
 }

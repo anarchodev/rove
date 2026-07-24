@@ -43,6 +43,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const reservation = @import("reservation.zig");
 
 /// Pointer into the bytes a coordinator submission stored. `batch_id`
 /// is globally unique (raft-reserved); the full S3
@@ -70,10 +71,11 @@ pub const BodyRef = struct {
 /// `null` in `Config.reservation` disables raft reservation and falls
 /// back to a local atomic counter starting at 1 — used by unit tests
 /// and any caller that doesn't need cross-leader uniqueness.
-pub const ReservationProvider = struct {
-    ctx: *anyopaque,
-    reserveFn: *const fn (ctx: *anyopaque, prev_end: u64, count: u32) anyerror!u64,
-};
+///
+/// The reservation machine itself lives in `reservation.zig` (the
+/// `ReservationAllocator`); this is re-exported so `Config` and callers keep
+/// naming `coordinator.ReservationProvider`.
+pub const ReservationProvider = reservation.ReservationProvider;
 
 pub const Config = struct {
     /// Number of distinct worker threads that will call `submit`.
@@ -247,12 +249,6 @@ const SealedSubEntry = struct {
     bytes: []u8,
 };
 
-const Reservation = struct {
-    base: u64,
-    /// Next id to mint. `next == end` means the block is exhausted.
-    next: u64,
-    end: u64,
-};
 
 pub const BlobCoordinator = struct {
     allocator: std.mem.Allocator,
@@ -296,25 +292,11 @@ pub const BlobCoordinator = struct {
     retained: std.ArrayListUnmanaged(*SealedBatch) = .empty,
     retained_by_batch: std.AutoHashMapUnmanaged(u64, *SealedBatch) = .empty,
 
-    /// Local-mode batch_id source — used when `config.reservation`
-    /// is null. Starts at 1 (skips the `NO_BATCH = 0` sentinel).
-    local_batch_ctr: std.atomic.Value(u64) = .init(1),
-
-    /// Batch_id reservation state. Guarded by `res_mu`. Only used
-    /// when `config.reservation` is non-null.
-    res_mu: std.Thread.Mutex = .{},
-    res_id_avail: std.Thread.Condition = .{},
-    res_refill_cond: std.Thread.Condition = .{},
-    current: Reservation = .{ .base = 0, .next = 0, .end = 0 },
-    upcoming: ?Reservation = null,
-    refill_needed: bool = false,
-    refill_in_progress: bool = false,
-    /// In-memory ceiling of every block we've ever reserved during
-    /// this process lifetime. Refill thread uses this as the floor
-    /// when computing the next propose so multiple back-to-back
-    /// refills never overlap even on a slow propose path.
-    prev_committed_end: u64 = 0,
-    refill_thread: ?std.Thread = null,
+    /// The globally-unique `batch_id` source — the raft-reserved-block machine
+    /// (or a local counter when `config.reservation` is null). Embedded in
+    /// place: its refill thread captures `&self.reservations`, stable because
+    /// the coordinator is heap-allocated. See `reservation.zig`.
+    reservations: reservation.ReservationAllocator = .{},
 
     shutdown_flag: std.atomic.Value(bool) = .init(false),
 
@@ -376,9 +358,13 @@ pub const BlobCoordinator = struct {
             self.drainer_thread.join();
         }
 
-        if (config.reservation != null) {
-            self.refill_thread = try std.Thread.spawn(.{}, refillLoop, .{self});
-        }
+        // Configure + spawn the reservation allocator (its refill thread, in
+        // production). In place — `self` is at its final heap address now.
+        try self.reservations.start(
+            config.reservation,
+            config.reservation_block_size,
+            config.reservation_low_watermark_pct,
+        );
 
         return self;
     }
@@ -398,15 +384,12 @@ pub const BlobCoordinator = struct {
         self.exec_slack_cond.broadcast();
         self.exec_mu.unlock();
 
-        // Wake refill thread + any submitters parked on id-avail.
-        self.res_mu.lock();
-        self.res_refill_cond.broadcast();
-        self.res_id_avail.broadcast();
-        self.res_mu.unlock();
+        // Shut down the reservation allocator (wakes its refill thread + any
+        // submitter parked on id-avail, then joins the thread).
+        self.reservations.deinit();
 
         self.drainer_thread.join();
         for (self.executor_threads) |t| t.join();
-        if (self.refill_thread) |t| t.join();
 
         for (self.workers) |*w| w.deinit(self.allocator);
         self.allocator.free(self.workers);
@@ -783,7 +766,7 @@ pub const BlobCoordinator = struct {
     ) !void {
         if (subs.len == 0) return;
 
-        const batch_id = try self.mintBatchId();
+        const batch_id = try self.reservations.nextBatchId();
         var leaf_buf: [21]u8 = undefined;
         const leaf_str = std.fmt.bufPrint(&leaf_buf, "{d:0>20}", .{batch_id}) catch unreachable;
         const leaf_owned = try self.allocator.dupe(u8, leaf_str);
@@ -841,111 +824,6 @@ pub const BlobCoordinator = struct {
         }
     }
 
-    // ── batch_id reservation ───────────────────────────────────────
-
-    /// Mint one batch_id. In test mode (`config.reservation == null`)
-    /// returns from a local atomic counter starting at 1. In
-    /// production, draws from the current reservation block; blocks
-    /// on `res_id_avail` if the block is exhausted and the refill
-    /// hasn't arrived yet.
-    fn mintBatchId(self: *Self) Error!u64 {
-        if (self.config.reservation == null) {
-            return self.local_batch_ctr.fetchAdd(1, .monotonic);
-        }
-
-        self.res_mu.lock();
-        defer self.res_mu.unlock();
-        while (true) {
-            if (self.shutdown_flag.load(.acquire)) return Error.Shutdown;
-            if (self.current.next < self.current.end) {
-                const id = self.current.next;
-                self.current.next += 1;
-                self.maybeKickRefillLocked();
-                return id;
-            }
-            // Current exhausted; swap upcoming if available.
-            if (self.upcoming) |up| {
-                self.current = up;
-                self.upcoming = null;
-                continue;
-            }
-            // No block available; ensure refill is in flight + wait.
-            if (!self.refill_in_progress and !self.refill_needed) {
-                self.refill_needed = true;
-                self.res_refill_cond.signal();
-            }
-            self.res_id_avail.wait(&self.res_mu);
-        }
-    }
-
-    fn maybeKickRefillLocked(self: *Self) void {
-        if (self.upcoming != null) return;
-        if (self.refill_in_progress or self.refill_needed) return;
-        const consumed = self.current.next - self.current.base;
-        const block_size: u64 = self.config.reservation_block_size;
-        const lwm = block_size * @as(u64, self.config.reservation_low_watermark_pct) / 100;
-        if (consumed >= lwm) {
-            self.refill_needed = true;
-            self.res_refill_cond.signal();
-        }
-    }
-
-    fn refillLoop(self: *Self) void {
-        while (true) {
-            self.res_mu.lock();
-            while (!self.shutdown_flag.load(.acquire) and !self.refill_needed) {
-                self.res_refill_cond.wait(&self.res_mu);
-            }
-            if (self.shutdown_flag.load(.acquire)) {
-                self.res_mu.unlock();
-                return;
-            }
-            self.refill_needed = false;
-            self.refill_in_progress = true;
-            const prev_end: u64 = if (self.upcoming) |up|
-                up.end
-            else if (self.current.end > self.prev_committed_end)
-                self.current.end
-            else
-                self.prev_committed_end;
-            self.res_mu.unlock();
-
-            const provider = self.config.reservation.?;
-            const block_size: u32 = self.config.reservation_block_size;
-            const new_end = provider.reserveFn(provider.ctx, prev_end, block_size) catch |err| {
-                std.log.warn(
-                    "rove-blob coordinator: reservation refill failed: {s}; retrying in 100ms",
-                    .{@errorName(err)},
-                );
-                std.Thread.sleep(100 * std.time.ns_per_ms);
-                self.res_mu.lock();
-                self.refill_in_progress = false;
-                self.refill_needed = true;
-                self.res_refill_cond.signal();
-                self.res_mu.unlock();
-                continue;
-            };
-            std.debug.assert(new_end >= prev_end + block_size);
-            const base = new_end - block_size;
-            const block: Reservation = .{ .base = base, .next = base, .end = new_end };
-
-            self.res_mu.lock();
-            if (new_end > self.prev_committed_end) self.prev_committed_end = new_end;
-            if (self.current.next >= self.current.end) {
-                self.current = block;
-            } else {
-                // Current still has ids — stash as upcoming. If
-                // upcoming already exists (shouldn't normally —
-                // refill only kicks one at a time), drop the new
-                // block (we'd otherwise leak the gap; new block's
-                // ids end up unused, which is harmless).
-                if (self.upcoming == null) self.upcoming = block;
-            }
-            self.refill_in_progress = false;
-            self.res_id_avail.broadcast();
-            self.res_mu.unlock();
-        }
-    }
 
     // ── Executor threads ────────────────────────────────────────────
 

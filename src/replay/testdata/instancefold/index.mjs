@@ -3,7 +3,7 @@
 // activations (prod: the create is durable state; sim: the exists marker is
 // a store-tagged write that folds forward like any other).
 export default function () {
-  platform.instances.create({ id: "neo" });
+  platform.instances.create("neo");
   after.fetch("https://api.example.test/seed", { on: "onSeed" });
   return next();
 }

@@ -227,15 +227,7 @@ pub const RouteResolver = struct {
         for (self.cp_urls) |base| {
             const url = std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix }) catch continue;
             defer a.free(url);
-            var easy = curl.Easy.init(a) catch continue;
-            defer easy.deinit();
-            var resp = easy.request(a, .{
-                .method = .GET,
-                .url = url,
-                .headers = &[_]curl.Header{},
-                .body = "",
-                .http_version = .h2c_prior_knowledge,
-                .verify_tls = false,
+            var resp = curl.cpGet(a, url, .{
                 .connect_timeout_ms = CP_CONNECT_TIMEOUT_MS,
                 .timeout_ms = CP_TOTAL_TIMEOUT_MS,
             }) catch |e| {

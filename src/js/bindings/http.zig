@@ -52,6 +52,83 @@ const js_exception = globals.js_exception;
 /// (sha256 hex = 64 chars; randomUUID = 36 chars) with headroom.
 const FETCH_ID_MAX_LEN: usize = 256;
 
+/// The platform's internal-door TLD. Effect verbs that lower to a fetch at
+/// a platform-internal origin (`blob.*` → `rove-blob.internal` /
+/// `rove-compose.internal`; `platform.*` → `rove-blob-read`/`rove-stage`/
+/// `rove-compile.internal`; `browser`/logs → `rewind-logs.internal`) are
+/// storage / control-plane I/O, NOT third-party egress — the fetch engine
+/// rewrites these hosts to S3/internal targets. The outbound plan-rate
+/// meters third-party egress, so these are exempt. One suffix rule covers
+/// every current and future internal door; a customer can't reach a third
+/// party through a `.internal` host, so exempting it opens no bypass.
+const INTERNAL_DOOR_TLD = ".internal";
+
+/// True when `url`'s host is a platform-internal door (`*.internal`).
+fn targetsInternalDoor(url: []const u8) bool {
+    const scheme = std.mem.indexOf(u8, url, "://") orelse return false;
+    const after = url[scheme + 3 ..];
+    const host_end = std.mem.indexOfAny(u8, after, "/:?#") orelse after.len;
+    return std.mem.endsWith(u8, after[0..host_end], INTERNAL_DOOR_TLD);
+}
+
+/// Enforce the per-tenant OUTBOUND plan-rate at the fetch chokepoint.
+/// Returns true when the fetch may proceed; on bucket exhaustion it
+/// throws `Error{code:"rate_limited"}` into `ctx` and returns false (the
+/// caller returns `js_exception`).
+///
+/// This is THE outbound-quota enforcement point (the outbound-boundary
+/// rule, docs/architecture/privileged-surface.md). Every customer-initiated
+/// third-party egress — `after.fetch`, `http.subscribe`, and the immediate
+/// fire of `webhook.send` / `email.send` (which compose over the internal
+/// fetch primitive) — funnels through these natives, so a tenant-pinnable
+/// email/webhook package can't bypass the limit by not calling some
+/// email-specific native. Enforcing at the native (not in a JS shim) is
+/// what makes the plan quota un-bypassable.
+///
+/// Two carve-outs, both correct-by-construction:
+///   - Deferred platform delivery (the baked `__system/webhook_fire` retry
+///     / scheduled fire runs with `is_system_module == true`) re-issues an
+///     already-admitted send, is bounded by the webhook retry budget +
+///     backoff, and re-counting it would burn a retry attempt / hot-loop
+///     the crash-recovery watchdog.
+///   - Fetches to platform-internal doors (`*.internal`) are storage /
+///     control-plane I/O, not third-party egress (`targetsInternalDoor`).
+///
+/// Fails OPEN on limiter OOM (same posture as the inbound request-rate
+/// check in `worker_dispatch.zig`).
+fn outboundRateOk(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []const u8) bool {
+    if (state.is_system_module) return true; // platform delivery — exempt
+    if (targetsInternalDoor(url)) return true; // internal storage/CP I/O — exempt
+    const lim = state.limiter orelse return true; // test paths
+    if (state.instance_id.len == 0) return true;
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const allowed = lim.check(state.instance_id, .outbound, state.plan_rate, state.plan_gen, now_ns) catch |err| {
+        std.log.warn("rove-js: limiter.check outbound for {s} failed: {s} — fail open", .{ state.instance_id, @errorName(err) });
+        return true;
+    };
+    if (allowed) return true;
+
+    const retry_after = lim.retryAfterSeconds(state.instance_id, .outbound);
+    const msg = std.fmt.allocPrintSentinel(
+        state.allocator,
+        "outbound rate limit exceeded, retry after {d}s",
+        .{retry_after},
+        0,
+    ) catch {
+        _ = c.JS_ThrowOutOfMemory(ctx);
+        return false;
+    };
+    defer state.allocator.free(msg);
+
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return false; // OOM building the Error — pending
+    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, "rate_limited", "rate_limited".len));
+    _ = c.JS_Throw(ctx, err);
+    return false;
+}
+
 // ── http.fetch / http.cancelFetch — transient streaming HTTP ─────────────
 
 /// `http.fetch(opts) -> fetch_id` — transient streaming HTTP.
@@ -75,6 +152,12 @@ pub fn jsHttpFetch(
             return js_exception;
         },
     };
+    // Outbound plan-rate — checked after the row is built (reuses row.url)
+    // but before it is accumulated, so a rejected send has no side effect.
+    if (!outboundRateOk(ctx, state, row.url)) {
+        row.deinit(state.allocator);
+        return js_exception;
+    }
     // Plain `http.fetch` is the always-unbound Pattern-A transient —
     // its `on_chunk` module fires as a separate chain (never binds the
     // calling chain; binding is `on.fetch`'s job). The success seam
@@ -218,6 +301,10 @@ pub fn jsOnFetch(
             return js_exception;
         },
     };
+    if (!outboundRateOk(ctx, state, row.url)) {
+        row.deinit(state.allocator);
+        return js_exception;
+    }
     state.http_fetch_index += 1;
     // Customer-visible: the opaque `ftch_<hex>` form (§7.5) — the SAME
     // string `request.fetchId` carries, so equality comparison works
@@ -394,6 +481,10 @@ pub fn jsHttpSubscribe(
             return js_exception;
         },
     };
+    if (!outboundRateOk(ctx, state, row.url)) {
+        row.deinit(state.allocator);
+        return js_exception;
+    }
     // Held subscriptions are always streaming + don't time out.
     // Force the shape so the customer's `timeout_ms` / `stream`
     // options can't accidentally weaken the contract.
@@ -753,6 +844,29 @@ fn getBoolField(
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "targetsInternalDoor: platform-internal hosts are exempt, third parties are not" {
+    // Internal doors (blob / compose / platform / logs) — the outbound
+    // plan-rate must NOT meter these (storage / control-plane I/O).
+    try testing.expect(targetsInternalDoor("http://rove-blob.internal/deadbeef"));
+    try testing.expect(targetsInternalDoor("http://rove-compose.internal/sid"));
+    try testing.expect(targetsInternalDoor("http://rove-blob-read.internal/id/blob/h"));
+    try testing.expect(targetsInternalDoor("http://rove-compile.internal/"));
+    try testing.expect(targetsInternalDoor("http://rewind-logs.internal/v1/t/x"));
+    try testing.expect(targetsInternalDoor("https://x.internal:8080/p?q=1")); // port + query
+    // Third-party egress — metered.
+    try testing.expect(!targetsInternalDoor("https://api.resend.com/emails"));
+    try testing.expect(!targetsInternalDoor("https://hooks.example.com/notify"));
+    // Not fooled by a path/query segment that merely contains ".internal".
+    try testing.expect(!targetsInternalDoor("https://evil.com/.internal/x"));
+    try testing.expect(!targetsInternalDoor("https://evil.com/?h=.internal"));
+    // A host that merely ends in the literal ".internal" label still matches
+    // (that IS the rule) — but a look-alike TLD like ".internalx" does not.
+    try testing.expect(!targetsInternalDoor("http://host.internalx/y"));
+    // Malformed / no scheme → not internal (metered, fail toward enforcing).
+    try testing.expect(!targetsInternalDoor("rove-blob.internal/x"));
+    try testing.expect(!targetsInternalDoor(""));
+}
 
 test "deriveFetchIdHex: stable across calls with same inputs" {
     const a = testing.allocator;

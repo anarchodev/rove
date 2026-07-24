@@ -19,7 +19,7 @@
 //! `bridge.logEntry` is a pump control op, so the cap bounds the pump
 //! contention a fresh promotion adds — decoding each entry's
 //! `EntryFrame`, hydrating its LogRecords, and appending them to the
-//! worker's `log_buffer` for the normal `flushLogs` → S3 path.
+//! worker's `log.log_buffer` for the normal `flushLogs` → S3 path.
 
 const std = @import("std");
 const walker = @import("worker_upload_walker.zig");
@@ -77,7 +77,7 @@ pub const LogWalker = struct {
 
     /// Advance every open cursor, bounded to `WALKER_BATCH_CAP` entries
     /// total this tick. `worker` must expose `.allocator`, `.raft` (the
-    /// bridge), and `.log_buffer`. Finished cursors are removed.
+    /// bridge), and `.log.log_buffer`. Finished cursors are removed.
     pub fn drive(self: *LogWalker, worker: anytype) void {
         if (self.cursors.items.len == 0) return;
 
@@ -113,7 +113,7 @@ pub const LogWalker = struct {
         defer allocator.free(records);
         for (records) |rec| {
             var r = rec;
-            worker.log_buffer.append(r) catch |err| {
+            worker.log.log_buffer.append(r) catch |err| {
                 // Buffer append failed (OOM) — free the record we can't
                 // enqueue so we don't leak, and stop draining this entry.
                 r.deinit(allocator);

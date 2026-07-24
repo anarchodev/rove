@@ -12,7 +12,7 @@ export default function () {
   };
   probe("scope", () => platform.scope("acme").kv.get("x"));
   probe("root", () => platform.root.get("x"));
-  probe("instances", () => platform.instances.create({ id: "x" }));
+  probe("instances", () => platform.instances.create("x"));
   probe("releases", () => platform.releases.publish("acme", "0123456789abcdef"));
   probe("auth", () => platform.auth.checkRootToken("t"));
   probe("compile", () => platform.compile([{ path: "a.mjs", source: "export default () => {}" }], { scope: "acme" }));

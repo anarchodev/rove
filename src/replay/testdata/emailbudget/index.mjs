@@ -1,7 +1,8 @@
-// A send loop with a rate-limit catch branch — the shape prod's per-instance
-// email token bucket (bindings/email_rate.zig) eventually trips. Offline the
-// bucket is armed by `scenario({ emailBudget })`; each iteration reports
-// "sent" or the caught error surface.
+// A send loop with a rate-limit catch branch — the shape prod's per-tenant
+// outbound token bucket (bindings/http.zig `outboundRateOk`) eventually trips
+// (email.send composes over the metered webhook.send). Offline the bucket is
+// armed by `scenario({ emailBudget })`; each iteration reports "sent" or the
+// caught error surface.
 export default function () {
   const results = [];
   for (let i = 0; i < 3; i++) {

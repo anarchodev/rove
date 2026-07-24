@@ -105,6 +105,7 @@ export default function () {
       addObj("sessions", sessions);
       instance("Sessions", () => sessions.fromConfig({ state_path: "sess" }));
     },
+    time: () => addObj("time", time),
     cron: () => addCallable("cron", cron),
     retry: () => addObj("retry", retry),
     schedule: () => addCallable("schedule", schedule),

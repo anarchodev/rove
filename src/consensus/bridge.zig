@@ -77,6 +77,8 @@
 const std = @import("std");
 const node_mod = @import("node.zig");
 const raft = @import("raft_rs_zig");
+const bridge_control = @import("bridge_control.zig");
+const bridge_pump = @import("bridge_pump.zig");
 /// Re-exported (`pub`) so the format-version registry can read the
 /// entry-frame magic + coalesced-transport frame version through the
 /// worker's `bridge` import (`src/version.zig`).
@@ -96,21 +98,7 @@ pub const PeerRegistry = node_mod.PeerRegistry;
 pub const StoreResolver = node_mod.StoreResolver;
 pub const ApplyObserver = node_mod.ApplyObserver;
 
-pub const Error = error{
-    /// `propose` / `committedSeq` named a gid with no registered tenant.
-    UnknownTenant,
-    /// The bridge is shutting down; no further proposes accepted.
-    ShuttingDown,
-    /// A control command (`createGroupEpoch` / `destroyGroup`) could not
-    /// be serviced because the pump thread is not running.
-    PumpNotRunning,
-    /// This node has the tenant's group but is not its raft leader —
-    /// the propose was refused BEFORE anything entered the log, so the
-    /// caller can safely re-aim at the leader (the worker maps this to
-    /// a 421; the front door / serve-or-forward retry on it).
-    NotLeader,
-    OutOfMemory,
-} || node_mod.Error;
+pub const Error = @import("bridge_error.zig").Error;
 
 /// Per-tenant signaling state, owned by the bridge and reachable from
 /// any thread. Deliberately SEPARATE from `Node.TenantSlot` (which owns
@@ -195,70 +183,7 @@ pub const GroupSig = struct {
 /// the pump thread alongside `processReady`). The caller stack-allocates
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
-const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, transfer_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, first_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
-    kind: Kind,
-    gid: u64,
-    /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
-    /// `create_group_epoch` to open the tenant's group store.
-    id_str: []const u8 = &.{},
-    epoch: u64 = 0,
-    /// `create_group_epoch`: birth the group with THIS node as a learner
-    /// (joining an existing group) rather than a voter — see node.createGroupCore.
-    as_learner: bool = false,
-    /// `propose_conf_change`: the raft node id to change + the op (0 add_voter /
-    /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
-    node_id: u64 = 0,
-    cc_type: u8 = 0,
-    /// `propose_conf_change`: the entry context replicated with the committed
-    /// change (the changing node's transport address), so every replica learns
-    /// id→addr via the conf-change observer on apply. Aliases the caller's slice
-    /// — valid because `runControl` blocks until the pump drains the cmd. Empty
-    /// for a remove/demote or a still-static cluster.
-    cc_context: []const u8 = &.{},
-    /// `apply_local_snapshot`: the baseline {index, term} to install.
-    /// `log_term` / `log_entry`: `snap_index` is the query index, `snap_term` the
-    /// result term.
-    snap_index: u64 = 0,
-    snap_term: u64 = 0,
-    /// `log_entry` (diagnostic): caller buffer (in) for the entry's data + the
-    /// bytes written (out). `lt_ok` flags a resolved entry.
-    entry_buf: ?[]u8 = null,
-    entry_len: usize = 0,
-    /// `apply_local_snapshot` (membership SSOT): the source leader's
-    /// ConfState the baseline carries, so a joiner learns its membership from the
-    /// snapshot. Null → keep the group's current membership (membership-neutral
-    /// promote-back). Borrowed from the caller stack for the call.
-    snap_voters: ?[]const u64 = null,
-    snap_learners: ?[]const u64 = null,
-    /// `create_group_epoch` (cluster node-set SSOT): the initial voter
-    /// set a FRESH group is born with, supplied by the control plane (the cluster
-    /// node set) instead of the node's static `REWIND_VOTERS`. Null → `self.voters`.
-    /// Borrowed from the caller stack for the blocking call.
-    birth_voters: ?[]const u64 = null,
-    /// `conf_state`: caller buffers to fill + the counts written back.
-    cs_voters: []u64 = &.{},
-    cs_learners: []u64 = &.{},
-    cs_voters_len: usize = 0,
-    cs_learners_len: usize = 0,
-    cs_ok: bool = false,
-    /// `voter_progress`: caller buffers (parallel: id/matched/active) filled by
-    /// the pump from the leader's per-peer view; len + leader_last written back.
-    vp_ids: []u64 = &.{},
-    vp_matched: []u64 = &.{},
-    vp_active: []u8 = &.{},
-    vp_len: usize = 0,
-    vp_leader_last: u64 = 0,
-    vp_ok: bool = false,
-    /// `log_term`: true iff a term was resolvable at the index (distinguishes a
-    /// genuine term of 0 from "unknown group / compacted / beyond log").
-    lt_ok: bool = false,
-    /// Result, written by the pump before signaling `done`.
-    err: ?Error = null,
-    /// `transfer_all_leadership` writes the number of groups it handed off here.
-    count: usize = 0,
-    done: std.Thread.ResetEvent = .{},
-};
+const ControlCmd = bridge_control.ControlCmd;
 
 /// One queued commit-wait-timeout fault request (see
 /// `Bridge.requestFault`), handed worker thread → pump thread.
@@ -490,9 +415,12 @@ pub const Bridge = struct {
         var origin: u64 = 0;
         while (origin == 0) origin = std.crypto.random.int(u64);
         self.* = .{ .allocator = allocator, .node = node, .origin_id = origin };
-        node.commit_hook = .{ .ctx = self, .func = onCommitted };
-        node.skip_query = .{ .ctx = self, .func = skipQuery };
-        node.durabilize_floor = .{ .ctx = self, .func = durabilizeFloor };
+        // The worker-overlay commit hooks are one atomic config (apply_mode is
+        // flipped later by setWorkerOverlay; apply_observer / store_resolver are
+        // installed independently for the CP directory + follower serving store).
+        node.apply.commit_hook = .{ .ctx = self, .func = onCommitted };
+        node.apply.skip_query = .{ .ctx = self, .func = skipQuery };
+        node.apply.durabilize_floor = .{ .ctx = self, .func = durabilizeFloor };
         return self;
     }
 
@@ -505,7 +433,7 @@ pub const Bridge = struct {
     /// The unit tests, which read the pump's own store, keep the
     /// default `apply_on_commit`.
     pub fn setWorkerOverlay(self: *Bridge) void {
-        self.node.apply_mode = .worker_overlay;
+        self.node.apply.apply_mode = .worker_overlay;
     }
 
     /// Pin a group as always-active (never hibernated) on the node — see
@@ -523,7 +451,7 @@ pub const Bridge = struct {
     /// there). Call before serving. Safe to leave unset (every non-CP bridge
     /// does).
     pub fn setApplyObserver(self: *Bridge, observer: node_mod.ApplyObserver) void {
-        self.node.apply_observer = observer;
+        self.node.apply.apply_observer = observer;
     }
 
     /// Install a runtime peer-address resolver (a CP-fed `PeerRegistry`) on the
@@ -590,7 +518,7 @@ pub const Bridge = struct {
     /// slot store. Call before serving; safe to leave unset (the bare-node
     /// tests do). See `node_mod.StoreResolver`.
     pub fn setStoreResolver(self: *Bridge, resolver: node_mod.StoreResolver) void {
-        self.node.store_resolver = resolver;
+        self.node.apply.store_resolver = resolver;
     }
 
     /// Stop the pump (if running), then free the node + all bridge state.
@@ -681,7 +609,7 @@ pub const Bridge = struct {
         return self.by_id.get(id_str);
     }
 
-    fn sigFor(self: *Bridge, gid: u64) ?*GroupSig {
+    pub fn sigFor(self: *Bridge, gid: u64) ?*GroupSig {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.groups.get(gid);
@@ -832,7 +760,7 @@ pub const Bridge = struct {
     /// non-leader, or this node lost the group's leadership mid-flight):
     /// raise `faulted_seq` to `next_seq` so parked workers fail fast, clear
     /// the pending FIFO, and drop it from `in_flight`. Takes `mutex`.
-    fn faultTenant(self: *Bridge, gid: u64) void {
+    pub fn faultTenant(self: *Bridge, gid: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const sig = self.groups.get(gid) orelse return;
@@ -989,369 +917,42 @@ pub const Bridge = struct {
     /// fresh group is born with (the CP-supplied cluster node set). Null →
     /// `REWIND_VOTERS`. The plain (no-baseline) formation path, e.g.
     /// provision's empty-attach.
-    pub fn createGroupEpoch(self: *Bridge, gid: u64, epoch: u64, birth_voters: ?[]const u64) Error!void {
-        const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .birth_voters = birth_voters };
-        return self.runControl(&cmd);
-    }
+    // ── Control-command relay (bridge_control.zig) ──────────────────────
+    // The raft Manager is pump-thread-only, so group lifecycle + introspection
+    // ops are blocking RPCs to the pump; the ControlCmd relay lives in
+    // bridge_control.zig. Re-exported here so `bridge.<op>(...)` still resolves
+    // via method-call syntax and the view types keep their `Bridge.X` spelling.
+    pub const createGroupEpoch = bridge_control.createGroupEpoch;
+    pub const createGroupAtBaseline = bridge_control.createGroupAtBaseline;
+    pub const destroyGroup = bridge_control.destroyGroup;
+    pub const transferAllLeadership = bridge_control.transferAllLeadership;
+    pub const transferLeadership = bridge_control.transferLeadership;
+    pub const proposeConfChange = bridge_control.proposeConfChange;
+    pub const ConfStateView = bridge_control.ConfStateView;
+    pub const confState = bridge_control.confState;
+    pub const VoterProgressView = bridge_control.VoterProgressView;
+    pub const voterProgress = bridge_control.voterProgress;
+    pub const logTerm = bridge_control.logTerm;
+    pub const LogEntry = bridge_control.LogEntry;
+    pub const logEntry = bridge_control.logEntry;
+    pub const lastIndex = bridge_control.lastIndex;
+    pub const firstIndex = bridge_control.firstIndex;
+    pub const baselineIndex = bridge_control.baselineIndex;
+    pub const appliedRaw = bridge_control.appliedRaw;
+    pub const durabilizedRaw = bridge_control.durabilizedRaw;
+    pub const groupEpoch = bridge_control.groupEpoch;
+    pub const applyLocalSnapshot = bridge_control.applyLocalSnapshot;
+    pub const drainControl = bridge_control.drainControl;
 
-    /// Create `gid`'s group at `epoch` AND install a data-free raft baseline at
-    /// {index, term} in the SAME pump op — atomic, so the fresh group is never
-    /// reachable at last_index 0 (where a leader heartbeat carrying commit > 0
-    /// would trip raft's commit_to fatal!). The reconciler bootstrap path: the
-    /// kvexp state for `index` must already be loaded into the store. `index` 0
-    /// behaves exactly like `createGroupEpoch` (no baseline). `as_learner` births
-    /// the group with this node as a non-voting learner (joining an existing
-    /// group via the reconciler's learner-first path) — see node.createGroupCore.
-    /// `voters`/`learners` (membership SSOT): the source leader's
-    /// ConfState the installed baseline carries, so the joining node learns its
-    /// real membership from the snapshot rather than the static voter set. Null →
-    /// membership-neutral (the born/current prs). The supplied membership MUST
-    /// contain this node (`Error.SelfNotInConfState` otherwise — the leader must
-    /// have conf-change-added it first).
-    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool, voters: ?[]const u64, learners: ?[]const u64) Error!void {
-        const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        // BIRTH the group with the baseline's membership (`birth_voters = voters`),
-        // not just the post-birth snapshot ConfState (`snap_voters`). Without this
-        // the group is born via the `self.voters` FALLBACK first and the snapshot
-        // only corrects it afterwards — benign on a static cluster (self.voters is
-        // the full set) but FATAL on a genesis node, whose self.voters is `{self}`:
-        // it births a rogue sole-self group (auto-campaign + a half-init group that
-        // errors → double-free crash) before the snapshot can fix it. Born with the
-        // real membership directly, the fallback is never taken (matches the
-        // no-baseline `createGroupEpoch` path, which already births with `voters`).
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .birth_voters = voters, .snap_voters = voters, .snap_learners = learners };
-        return self.runControl(&cmd);
-    }
+    // ── Pump thread (bridge_pump.zig) ──────────────────────────────
+    // Re-exported so `self.X()` resolves; bodies live in bridge_pump.zig.
+    pub const pumpLoop = bridge_pump.pumpLoop;
+    pub const pumpOnce = bridge_pump.pumpOnce;
+    pub const snapshotTriggerTick = bridge_pump.snapshotTriggerTick;
+    pub const refreshLeadership = bridge_pump.refreshLeadership;
+    pub const refreshOneLocked = bridge_pump.refreshOneLocked;
+    pub const sweepLostLeadership = bridge_pump.sweepLostLeadership;
 
-    /// Destroy a tenant's raft group + reclaim its WAL on the pump thread
-    /// (move source cleanup). Blocks until done.
-    pub fn destroyGroup(self: *Bridge, gid: u64) Error!void {
-        var cmd: ControlCmd = .{ .kind = .destroy_group, .gid = gid };
-        return self.runControl(&cmd);
-    }
-
-    /// Graceful shutdown: hand off leadership of every group this node leads
-    /// to a caught-up follower BEFORE stopping the pump, so a rolling restart
-    /// (the `/deploy` path) costs ~one heartbeat per led group instead of a
-    /// full election timeout. Runs on the pump thread (control cmd). Returns
-    /// the number of groups handed off. No-op returning 0 on a single-node
-    /// deployment (the sole voter leads everything with no follower to hand to)
-    /// or if the pump is already stopped. The caller should then poll
-    /// `leadsAnyGroup` for a bounded grace window so the `MsgTimeoutNow` →
-    /// new-leader round-trips land while the pump is still running.
-    pub fn transferAllLeadership(self: *Bridge) usize {
-        if (self.node.isSingleNode()) return 0;
-        var cmd: ControlCmd = .{ .kind = .transfer_all_leadership, .gid = 0 };
-        self.runControl(&cmd) catch return 0;
-        return cmd.count;
-    }
-
-    /// Diagnostic/test: force a leadership handoff of ONE group to its most
-    /// caught-up follower (no-op if this node is not its leader). Returns 1 if a
-    /// handoff was initiated, else 0. Drives the churn soak's leadership flips.
-    pub fn transferLeadership(self: *Bridge, gid: u64) usize {
-        if (self.node.isSingleNode()) return 0;
-        var cmd: ControlCmd = .{ .kind = .transfer_leadership, .gid = gid };
-        self.runControl(&cmd) catch return 0;
-        return cmd.count;
-    }
-
-    /// Operator-triggered membership change on `gid`'s group:
-    /// `cc_type` 0 = add voter / promote, 1 = remove, 2 = add learner / demote.
-    /// Runs on the pump (the only Manager toucher); leader-gated + quorum-guarded
-    /// in the FFI (`Error.NotLeader` / `Error.ConfChangeQuorumGuard`). The
-    /// committed change applies + persists durably via the apply path.
-    /// `context` (the changing node's transport address) rides the committed
-    /// conf-change so every replica learns id→addr via the conf-change observer
-    /// on apply — the address propagates through the log like the membership.
-    /// Empty for a remove/demote / still-static cluster.
-    pub fn proposeConfChange(self: *Bridge, gid: u64, node_id: u64, cc_type: u8, context: []const u8) Error!void {
-        var cmd: ControlCmd = .{ .kind = .propose_conf_change, .gid = gid, .node_id = node_id, .cc_type = cc_type, .cc_context = context };
-        return self.runControl(&cmd);
-    }
-
-    pub const ConfStateView = struct { voters: []const u64, learners: []const u64 };
-
-    /// Read `gid`'s current membership into the caller's buffers (slices into
-    /// them on success). Runs a pump-thread control cmd. Null for an unknown
-    /// group or if the pump is down.
-    pub fn confState(self: *Bridge, gid: u64, voters_buf: []u64, learners_buf: []u64) ?ConfStateView {
-        var cmd: ControlCmd = .{ .kind = .conf_state, .gid = gid, .cs_voters = voters_buf, .cs_learners = learners_buf };
-        self.runControl(&cmd) catch return null;
-        if (!cmd.cs_ok) return null;
-        return .{ .voters = voters_buf[0..cmd.cs_voters_len], .learners = learners_buf[0..cmd.cs_learners_len] };
-    }
-
-    pub const VoterProgressView = struct { len: usize, leader_last: u64 };
-
-    /// Per-peer replication progress on `gid`'s group from the LEADER's view:
-    /// fills the parallel `ids`/`matched`/`active` buffers (same length) and
-    /// returns `{len, leader_last}`. Null on a follower / unknown group / pump
-    /// down. The reconciler's "is node N a caught-up member" truth signal
-    /// (conf_state alone lies — a phantom voter has `matched=0`). Control cmd.
-    pub fn voterProgress(self: *Bridge, gid: u64, ids: []u64, matched: []u64, active: []u8) ?VoterProgressView {
-        var cmd: ControlCmd = .{ .kind = .voter_progress, .gid = gid, .vp_ids = ids, .vp_matched = matched, .vp_active = active };
-        self.runControl(&cmd) catch return null;
-        if (!cmd.vp_ok) return null;
-        return .{ .len = cmd.vp_len, .leader_last = cmd.vp_leader_last };
-    }
-
-    /// The term of the log entry at `index` on `gid`'s group, or `null` when no
-    /// term is resolvable — compacted / beyond the log / unknown group / pump
-    /// down. A leader reports `term(applied)` for a returning learner's
-    /// promote-back baseline. `null` is DISTINCT from a genuine term of 0 (the
-    /// genesis index), so a caller never stamps a fake 0 into a baseline.
-    /// Pump-thread control cmd.
-    pub fn logTerm(self: *Bridge, gid: u64, index: u64) ?u64 {
-        var cmd: ControlCmd = .{ .kind = .log_term, .gid = gid, .snap_index = index };
-        self.runControl(&cmd) catch return null;
-        return if (cmd.lt_ok) cmd.snap_term else null;
-    }
-
-    pub const LogEntry = struct { term: u64, data: []const u8 };
-
-    /// Diagnostic: read the raft LOG entry at `index` for `gid` into `buf` (the
-    /// replicated log content). Null on unknown group / no entry / buf too small.
-    /// `data` slices into `buf`. Pump op.
-    pub fn logEntry(self: *Bridge, gid: u64, index: u64, buf: []u8) ?LogEntry {
-        var cmd: ControlCmd = .{ .kind = .log_entry, .gid = gid, .snap_index = index, .entry_buf = buf };
-        self.runControl(&cmd) catch return null;
-        if (!cmd.lt_ok) return null;
-        return .{ .term = cmd.snap_term, .data = buf[0..cmd.entry_len] };
-    }
-
-    /// This group's local raft last log index (any replica) — the reconciler's
-    /// learner→promote catch-up signal. Pump op (the Manager is pump-only). 0 on
-    /// unknown group / pump failure.
-    pub fn lastIndex(self: *Bridge, gid: u64) u64 {
-        var cmd: ControlCmd = .{ .kind = .last_index, .gid = gid };
-        self.runControl(&cmd) catch return 0;
-        return cmd.snap_index;
-    }
-
-    /// This group's first (uncompacted) local raft log index — the lowest index
-    /// still recoverable from the live log. The promotion-time LogRecord walker
-    /// (`docs/architecture/deployment-and-logs.md`) walks `[firstIndex..lastIndex]`
-    /// on leader promotion. Pump op. 0 on unknown group / pump failure.
-    pub fn firstIndex(self: *Bridge, gid: u64) u64 {
-        var cmd: ControlCmd = .{ .kind = .first_index, .gid = gid };
-        self.runControl(&cmd) catch return 0;
-        return cmd.snap_index;
-    }
-
-    /// This group's LIVE applied index on the leader (`slot.applied_idx`) — the
-    /// out-of-band baseline a new member is born at. Always >= the leader's first
-    /// (compacted) log index, so the baseline points at an entry the leader still
-    /// holds (unlike the durabilized store watermark, which lags under churn).
-    /// Pump op. 0 on unknown group / pump failure.
-    pub fn baselineIndex(self: *Bridge, gid: u64) u64 {
-        var cmd: ControlCmd = .{ .kind = .baseline_index, .gid = gid };
-        self.runControl(&cmd) catch return 0;
-        return cmd.snap_index;
-    }
-
-    /// Diagnostic: this node's RAW apply watermark for `gid` (`slot.applied_idx`).
-    pub fn appliedRaw(self: *Bridge, gid: u64) u64 {
-        var cmd: ControlCmd = .{ .kind = .applied_raw, .gid = gid };
-        self.runControl(&cmd) catch return 0;
-        return cmd.snap_index;
-    }
-
-    /// Diagnostic: this node's durable folded watermark for `gid`.
-    pub fn durabilizedRaw(self: *Bridge, gid: u64) u64 {
-        var cmd: ControlCmd = .{ .kind = .durabilized_raw, .gid = gid };
-        self.runControl(&cmd) catch return 0;
-        return cmd.snap_index;
-    }
-
-    /// This group's migration epoch on the leader — a joining node must birth its
-    /// local group at this exact epoch or the leader's messages are fenced out.
-    /// Pump op. 0 on unknown group / pump failure (also the genuine genesis epoch,
-    /// which is correct — a genesis group IS epoch 0).
-    pub fn groupEpoch(self: *Bridge, gid: u64) u64 {
-        var cmd: ControlCmd = .{ .kind = .group_epoch, .gid = gid };
-        self.runControl(&cmd) catch return 0;
-        return cmd.snap_index;
-    }
-
-    /// Install a DATA-FREE snapshot baseline at {index, term} into `gid`'s LOCAL
-    /// group (conf_change promote-back). The node must be a below-floor learner;
-    /// the KV state for `index` must already be loaded out-of-band (the move
-    /// bundle). Fast-forwards the raft log baseline so the leader can replicate
-    /// the tail and the node can be promoted back. Pump-thread control cmd.
-    /// `Error.NotLeader` if this node leads the group; `Error.SnapshotStale` if
-    /// `index` is not ahead of committed.
-    pub fn applyLocalSnapshot(self: *Bridge, gid: u64, index: u64, term: u64, voters: ?[]const u64, learners: ?[]const u64) Error!void {
-        var cmd: ControlCmd = .{ .kind = .apply_local_snapshot, .gid = gid, .snap_index = index, .snap_term = term, .snap_voters = voters, .snap_learners = learners };
-        return self.runControl(&cmd);
-    }
-
-    /// Enqueue a control command for the pump thread and block until it
-    /// runs. Requires the pump thread (the only `Manager` toucher) to be
-    /// live; the move path always runs under `startPump`.
-    fn runControl(self: *Bridge, cmd: *ControlCmd) Error!void {
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.pump_thread == null) return Error.PumpNotRunning;
-            self.control_inbox.append(self.allocator, cmd) catch return Error.OutOfMemory;
-        }
-        cmd.done.wait();
-        if (cmd.err) |e| return e;
-    }
-
-    /// Drain + execute queued control commands on the pump thread. Run
-    /// from `pumpOnce` with the bridge mutex NOT held (the node ops
-    /// re-enter via the commit hook). Returns true if any ran.
-    fn drainControl(self: *Bridge) bool {
-        var batch: [16]*ControlCmd = undefined;
-        var n: usize = 0;
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            while (n < batch.len and self.control_inbox.items.len > 0) {
-                batch[n] = self.control_inbox.orderedRemove(0);
-                n += 1;
-            }
-        }
-        for (batch[0..n]) |cmd| {
-            cmd.err = switch (cmd.kind) {
-                .create_group_epoch => blk: {
-                    // INVARIANT (enforced both ends): a baseline at index>0 MUST
-                    // carry a real term. A term-0 baseline makes raft-rs's restore
-                    // fast-forward commit_to past an empty log → fatal!. The producer
-                    // (v2-applied-baseline) refuses to emit one (409); refuse to
-                    // install one too rather than silently birthing a crash-prone group.
-                    if (cmd.snap_index > 0 and cmd.snap_term == 0) {
-                        std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
-                        break :blk Error.InvalidBaseline;
-                    }
-                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner, cmd.birth_voters) catch |e| break :blk e;
-                    // Atomic baseline (createGroupAtBaseline): install the data-free
-                    // snapshot in the SAME pump op as group creation so the fresh
-                    // group is never observable at last_index 0 between creation and
-                    // baseline. Without this, a leader heartbeat carrying commit > 0
-                    // can reach the empty group first and trip raft's commit_to
-                    // fatal! (to_commit out of range [last_index 0]). If the install
-                    // fails, TEAR THE HALF-BORN GROUP DOWN — leaving it live at
-                    // last_index 0 is the exact window this path exists to close
-                    // (a labeled break is not an error return, so errdefer won't
-                    // fire here; roll back explicitly).
-                    if (cmd.snap_index > 0) {
-                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term, cmd.snap_voters, cmd.snap_learners) catch |e| {
-                            self.node.destroyGroupAndReclaim(cmd.gid) catch |de|
-                                std.log.err("v2 bridge: rollback of half-born gid {d} failed: {s}", .{ cmd.gid, @errorName(de) });
-                            break :blk e;
-                        };
-                    }
-                    break :blk null;
-                },
-                .destroy_group => blk: {
-                    self.node.destroyGroupAndReclaim(cmd.gid) catch |e| break :blk e;
-                    break :blk null;
-                },
-                .propose_conf_change => blk: {
-                    self.node.proposeConfChange(cmd.gid, cmd.node_id, @enumFromInt(cmd.cc_type), cmd.cc_context) catch |e| break :blk e;
-                    break :blk null;
-                },
-                .conf_state => blk: {
-                    if (self.node.confState(cmd.gid, cmd.cs_voters, cmd.cs_learners)) |cs| {
-                        cmd.cs_voters_len = cs.voters.len;
-                        cmd.cs_learners_len = cs.learners.len;
-                        cmd.cs_ok = true;
-                    }
-                    break :blk null;
-                },
-                .voter_progress => blk: {
-                    if (self.node.voterProgress(cmd.gid, cmd.vp_ids, cmd.vp_matched, cmd.vp_active)) |vp| {
-                        cmd.vp_len = vp.len;
-                        cmd.vp_leader_last = vp.leader_last;
-                        cmd.vp_ok = true;
-                    }
-                    break :blk null;
-                },
-                .log_entry => blk: {
-                    if (cmd.entry_buf) |buf| {
-                        if (self.node.logEntry(cmd.gid, cmd.snap_index, buf)) |e| {
-                            cmd.snap_term = e.term;
-                            cmd.entry_len = e.data.len;
-                            cmd.lt_ok = true;
-                        }
-                    }
-                    break :blk null;
-                },
-                .log_term => blk: {
-                    if (self.node.logTerm(cmd.gid, cmd.snap_index)) |t| {
-                        cmd.snap_term = t;
-                        cmd.lt_ok = true;
-                    }
-                    break :blk null;
-                },
-                .last_index => blk: {
-                    cmd.snap_index = self.node.lastIndex(cmd.gid);
-                    break :blk null;
-                },
-                .first_index => blk: {
-                    cmd.snap_index = self.node.firstIndex(cmd.gid);
-                    break :blk null;
-                },
-                .baseline_index => blk: {
-                    cmd.snap_index = self.node.baselineIndex(cmd.gid);
-                    break :blk null;
-                },
-                .applied_raw => blk: {
-                    cmd.snap_index = self.node.appliedRaw(cmd.gid);
-                    break :blk null;
-                },
-                .durabilized_raw => blk: {
-                    cmd.snap_index = self.node.durabilizedRaw(cmd.gid);
-                    break :blk null;
-                },
-                .group_epoch => blk: {
-                    cmd.snap_index = self.node.groupEpoch(cmd.gid);
-                    break :blk null;
-                },
-                .apply_local_snapshot => blk: {
-                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term, cmd.snap_voters, cmd.snap_learners) catch |e| break :blk e;
-                    break :blk null;
-                },
-                .transfer_all_leadership => blk: {
-                    // Graceful shutdown: hand off leadership of every group
-                    // this node currently leads. Snapshot the led gids under
-                    // the lock (reading each `is_leader` atomic, like
-                    // `leadsAnyGroup`), then release it before driving the
-                    // Manager — `transferLeadershipAway` is pump-side and
-                    // takes no bridge lock.
-                    var gids: std.ArrayListUnmanaged(u64) = .empty;
-                    defer gids.deinit(self.allocator);
-                    {
-                        self.mutex.lock();
-                        defer self.mutex.unlock();
-                        var it = self.groups.iterator();
-                        while (it.next()) |entry| {
-                            if (entry.value_ptr.*.is_leader.load(.acquire))
-                                gids.append(self.allocator, entry.key_ptr.*) catch {};
-                        }
-                    }
-                    cmd.count = 0;
-                    for (gids.items) |gid| {
-                        if (self.node.transferLeadershipAway(gid) != null) cmd.count += 1;
-                    }
-                    break :blk null;
-                },
-                .transfer_leadership => blk: {
-                    // Diagnostic/test: force a leadership handoff of ONE group to
-                    // its most caught-up follower (no-op if not the leader). Used by
-                    // the churn soak to flip leadership under in-flight writes.
-                    cmd.count = if (self.node.transferLeadershipAway(cmd.gid) != null) 1 else 0;
-                    break :blk null;
-                },
-            };
-            cmd.done.set();
-        }
-        return n > 0;
-    }
 
     // ── Pump (pump thread only) ──────────────────────────────────────
 
@@ -1389,230 +990,6 @@ pub const Bridge = struct {
             const sig = sig_ptr.*;
             sig.faulted_seq.store(sig.next_seq, .release);
         }
-    }
-
-    fn pumpLoop(self: *Bridge) void {
-        while (!self.stop.load(.acquire)) {
-            // A pump error is an INFALLIBILITY VIOLATION, not an operational
-            // hiccup: a committed entry failed to decode/apply (raft has
-            // already consumed it via advance_apply — it will never be
-            // redelivered, so this replica is silently diverged from the
-            // log), or the WAL fsync failed (nothing acked from here on
-            // would be durable), or allocation failed on the commit path.
-            // Warn-and-continue would serve a diverged replica that could
-            // later win an election; die loudly instead
-            // — a restart replays the WAL from the last checkpoint and
-            // converges. (Tests drive `pumpOnce` directly and still see
-            // error returns; boot-time recovery has its own retry-from-
-            // scratch semantics in `recoverGroups`.)
-            const did = self.pumpOnce() catch |e| {
-                std.debug.panic("v2 bridge pump: unrecoverable apply/flush failure: {s}", .{@errorName(e)});
-            };
-            // Idle backoff: nothing to drain and nothing committed this
-            // cycle. Single-node has no election/heartbeat traffic to
-            // service, so a short sleep is fine.
-            if (!did) std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-    }
-
-    /// One drain + pump cycle. Returns true if it proposed or committed
-    /// anything this cycle. Pump-thread-only (touches the `Node`). Public
-    /// so tests can drive the bridge deterministically without the thread.
-    pub fn pumpOnce(self: *Bridge) Error!bool {
-        // 1. Drain the inbox under the lock, then release it before any
-        //    `node.*` call (ensureGroup/propose/pump must not run with
-        //    the bridge mutex held — the commit hook re-acquires it).
-        var batch: std.ArrayListUnmanaged(ProposeItem) = .empty;
-        defer batch.deinit(self.allocator);
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.inbox.items.len > 0) {
-                batch.appendSlice(self.allocator, self.inbox.items) catch return Error.OutOfMemory;
-                self.inbox.clearRetainingCapacity();
-            }
-        }
-
-        var did_work = batch.items.len > 0;
-
-        // 1b. Service move-orchestration control ops (group create-at-
-        //     epoch / destroy) on the pump thread before proposes, so an
-        //     attach's group exists before any post-move write lands.
-        if (self.drainControl()) did_work = true;
-
-        // 2. Submit each drained propose to its tenant's group, creating
-        //    the group on first sight. Single-node: this drives it to
-        //    leader. Multi-node: an already-formed group is found; if this
-        //    node is NOT the group's leader, `node.propose` rejects and we
-        //    FAULT the tenant's in-flight so the worker fails fast (503) and
-        //    the client retries against the leader node.
-        for (batch.items) |item| {
-            defer self.allocator.free(item.payload);
-            _ = self.node.ensureGroup(item.gid, item.id_str) catch |e| {
-                std.log.warn("v2 bridge ensureGroup gid={d}: {s}", .{ item.gid, @errorName(e) });
-                self.faultTenant(item.gid);
-                continue;
-            };
-            self.node.proposeFramed(item.gid, self.origin_id, item.seq, item.payload) catch |e| {
-                std.log.warn("v2 bridge propose gid={d}: {s}", .{ item.gid, @errorName(e) });
-                self.faultTenant(item.gid);
-            };
-        }
-
-        // 2b. Service wake requests: re-tick (`bumpActive`) any group the
-        //     worker asked us to wake (a write hit a non-leader gate). Without
-        //     this a hibernated group whose leader died never re-elects. Drain
-        //     under the lock, bump OUTSIDE it (bumpActive mutates pump-owned
-        //     node state and must not run with the bridge mutex held). Done
-        //     before `node.pump()` so a woken group ticks THIS cycle.
-        {
-            var wakes: std.ArrayListUnmanaged(u64) = .empty;
-            defer wakes.deinit(self.allocator);
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                if (self.wake_inbox.items.len > 0) {
-                    wakes.appendSlice(self.allocator, self.wake_inbox.items) catch {};
-                    self.wake_inbox.clearRetainingCapacity();
-                }
-            }
-            if (wakes.items.len > 0) did_work = true;
-            for (wakes.items) |gid| self.node.bumpActive(gid) catch |e|
-                std.log.warn("v2 bridge wake gid={d}: {s}", .{ gid, @errorName(e) });
-        }
-
-        // 3. Drive one ready cycle: commits + applies + fires the commit
-        //    hook (which advances committed_seq via the pending FIFO).
-        const committed = self.node.pump() catch |e| {
-            return e;
-        };
-        if (committed) did_work = true;
-
-        // 4. Leadership-loss sweep: fault in-flight tenants this node no
-        //    longer leads (an entry proposed here that will never commit
-        //    locally because leadership moved). O(in-flight), bounded per
-        //    cycle; the rest are swept next cycle.
-        self.sweepLostLeadership();
-
-        // 4b. Worker commit-wait timeouts, executed HERE so the fault is
-        //     serialized against this thread's skip/commit decisions
-        //     (see `requestFault`).
-        self.drainFaultRequests();
-
-        // 5. Publish each group's leadership for the worker thread (which
-        //    must not touch the Manager). O(groups) per cycle — the same
-        //    order as the active-set tick; pre-hibernation that is fine.
-        self.refreshLeadership();
-
-        // 6. Snapshot-trigger tick: detect peers in `StateSnapshot` (fell below
-        //    the leader's compaction first_index under mechanism-A compaction)
-        //    and enqueue an out-of-band catch-up for the worker thread. The
-        //    native trigger that replaces the lockstep WAL floor.
-        self.snapshotTriggerTick();
-
-        return did_work;
-    }
-
-    /// How often `snapshotTriggerTick` scans the active set for `StateSnapshot`
-    /// peers. The in-flight dedup means a re-scan while a transfer runs is a
-    /// no-op, so this only bounds detection latency for a freshly-stranded peer.
-    const SNAPSHOT_TRIGGER_INTERVAL_NS: i64 = 100 * std.time.ns_per_ms;
-
-    /// Pump thread: over the active groups this node leads, find peers raft holds
-    /// in `ProgressState::Snapshot` (the snapshot-free `snapshotCb` parks a peer
-    /// here once it falls below the leader's compacted first_index) and enqueue an
-    /// out-of-band catch-up for each. The baseline {index, term} is computed HERE
-    /// (pump-only `baselineIndex` + `logTerm`); the worker's `SnapshotCatchupThread`
-    /// dumps the store + pushes it to the peer. Interval-gated; reads pump-owned
-    /// `node.active` + node accessors with the bridge mutex NOT held (enqueue takes
-    /// it internally). O(active peers).
-    fn snapshotTriggerTick(self: *Bridge) void {
-        if (self.node.isSingleNode()) return;
-        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-        if (now_ns - self.last_snapshot_trigger_ns < SNAPSHOT_TRIGGER_INTERVAL_NS) return;
-        self.last_snapshot_trigger_ns = now_ns;
-        var ids_buf: [16]u64 = undefined;
-        for (self.node.active.items) |gid| {
-            const peers = self.node.snapshotPendingPeers(gid, &ids_buf) orelse continue; // not leader / unknown
-            if (peers.len == 0) continue;
-            // Baseline the peer will install: the leader's live applied index +
-            // the term of its log entry there. `logTerm` is null when the leader's
-            // own log can't resolve a term (watermark drifted ahead of the log) —
-            // skip this tick and retry once the log covers it, exactly as
-            // `v2-applied-baseline` refuses rather than hand out a bogus term.
-            const index = self.node.baselineIndex(gid);
-            if (index == 0) continue; // nothing applied yet — nothing to snapshot
-            const term = self.node.logTerm(gid, index) orelse continue;
-            for (peers) |peer| {
-                if (self.enqueueSnapshotCatchup(gid, peer, index, term)) {
-                    std.log.info(
-                        "v2 snapshot-trigger gid={d}: peer {d} in StateSnapshot — queued out-of-band catch-up to baseline {d}/{d}",
-                        .{ gid, peer, index, term },
-                    );
-                }
-            }
-        }
-    }
-
-    /// How often `refreshLeadership` falls back to a FULL all-groups scan.
-    /// Leadership edges on a ticking group are caught same-cycle via the
-    /// active set; the full scan only bounds staleness for the rare edge
-    /// with no wake (e.g. a partition-heal where a hibernated old leader's
-    /// first post-heal message is a plain heartbeat that steps it down).
-    const LEADER_SCAN_INTERVAL_NS: i64 = 50 * std.time.ns_per_ms;
-
-    /// Refresh groups' `is_leader` atomics from the Manager. Per cycle this
-    /// covers only the node's ACTIVE set — leadership can only change when
-    /// a group processes ticks or messages, which (almost always — see
-    /// `LEADER_SCAN_INTERVAL_NS`) implies it was woken into the active set
-    /// earlier in the same pump cycle. A full all-groups scan runs
-    /// interval-gated as the staleness backstop. Scanning every registered
-    /// group every cycle under the bridge mutex would be an O(N_tenants)
-    /// per-cycle hot-path cost that nullifies hibernation's O(active) win at
-    /// K=thousands. Pump-thread only (reads the Manager
-    /// + `node.active`). The worker reads the atomics lock-free via
-    /// `isLeaderOf`.
-    fn refreshLeadership(self: *Bridge) void {
-        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-        const full = now_ns - self.last_leader_scan_ns >= LEADER_SCAN_INTERVAL_NS;
-        if (full) self.last_leader_scan_ns = now_ns;
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const single = self.node.isSingleNode();
-        if (full) {
-            var it = self.groups.iterator();
-            while (it.next()) |e| {
-                self.refreshOneLocked(e.value_ptr.*, e.key_ptr.*, single);
-            }
-        } else {
-            for (self.node.active.items) |gid| {
-                const sig = self.groups.get(gid) orelse continue;
-                self.refreshOneLocked(sig, gid, single);
-            }
-        }
-    }
-
-    /// Refresh one group's published leadership + detect the
-    /// follower→leader promotion edge. Caller holds `mutex`; pump thread.
-    fn refreshOneLocked(self: *Bridge, sig: *GroupSig, gid: u64, single: bool) void {
-        const now = self.node.isLeader(gid);
-        const promoted_edge = now and !sig.was_leader;
-        // Count every false→true promotion edge (incl. single-node formation)
-        // for the spurious-election metric; the reader nets out the expected
-        // one-per-group baseline.
-        if (promoted_edge) _ = self.leadership_acquisitions.fetchAdd(1, .monotonic);
-        // false→true promotion edge: queue for the worker's on-promotion
-        // recovery hook. Skipped on a single node — the sole voter leads
-        // every group from creation and never fails over, so there is no
-        // old-leader RAM state to reconstruct (and the leader already
-        // loaded the deployment + armed watermarks inline at release).
-        if (!single and promoted_edge) {
-            self.promoted.append(self.allocator, sig.gid) catch {};
-        }
-        sig.was_leader = now;
-        sig.is_leader.store(now, .release);
-        sig.leader_id.store(self.node.leaderId(gid), .release);
-        sig.formed.store(self.node.hasGroup(gid), .release);
     }
 
     /// Drain the gids promoted (follower→leader) since the last call into
@@ -1734,29 +1111,6 @@ pub const Bridge = struct {
         return n;
     }
 
-    /// Fault the in-flight proposes of any tenant this node no longer leads.
-    /// Snapshots ALL of `in_flight` under the lock (it is O(in-flight
-    /// tenants) by design — a fixed 32-slot snapshot with no cursor
-    /// silently never checked the tail, so a tenant beyond the first 32
-    /// ate the full commit-wait timeout instead of a fast 503), then
-    /// checks leadership + faults outside it (the Manager call +
-    /// `faultTenant` each take their own short critical sections).
-    /// `sweep_scratch` is reused across cycles to avoid per-cycle
-    /// allocation. Pump-thread only.
-    fn sweepLostLeadership(self: *Bridge) void {
-        self.sweep_scratch.clearRetainingCapacity();
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.sweep_scratch.appendSlice(self.allocator, self.in_flight.items) catch return;
-        }
-        for (self.sweep_scratch.items) |g| {
-            if (!self.node.isLeader(g)) self.faultTenant(g);
-        }
-    }
-
-    // ── Commit hook + skip query (pump thread, via node.applyCb) ─────
-
     /// Bound to `Node.commit_hook`, fired post-fsync per committed real
     /// entry with the entry's IDENTITY (origin frame). Advances the
     /// tenant's committed_seq iff the entry is THIS bridge's own pending
@@ -1791,7 +1145,7 @@ pub const Bridge = struct {
             // the floor is simply NOT raised conservatively… it must be
             // the opposite — failing to record would let durabilize run
             // PAST the entry. Surface it as a pump apply error instead.
-            if (self.node.apply_mode == .worker_overlay and seq > sig.worker_acked_seq) {
+            if (self.node.apply.apply_mode == .worker_overlay and seq > sig.worker_acked_seq) {
                 sig.awaiting_worker.append(self.allocator, .{ .seq = seq, .idx = raft_index }) catch {
                     // OOM recording this entry's durabilize-floor cap. We must
                     // NOT fall through to advance `committed_seq`: the worker
@@ -1903,7 +1257,7 @@ pub const Bridge = struct {
     /// Execute queued timeout-fault requests (pump thread, from
     /// `pumpOnce` after `node.pump`). Bounded batch; the rest run next
     /// cycle. See `requestFault` for the still-pending guard rationale.
-    fn drainFaultRequests(self: *Bridge) void {
+    pub fn drainFaultRequests(self: *Bridge) void {
         var batch: [32]FaultReq = undefined;
         var n: usize = 0;
         {
@@ -2372,7 +1726,7 @@ test "bridge: a hibernated group whose leader died re-elects on a requestWake nu
     }
     // The group hibernated everywhere — without this the rest of the test is
     // vacuous (an active group would re-elect on its own, no wake needed).
-    for (bridges) |b| try testing.expectEqual(@as(usize, 0), b.node.active.items.len);
+    for (bridges) |b| try testing.expectEqual(@as(usize, 0), b.node.active_set.active.items.len);
 
     // Leader dies: stop pumping it. From here only the two survivors run.
     const s0 = (ld + 1) % 3;
@@ -2553,7 +1907,7 @@ test "bridge: durabilize floor holds until the worker acks the skipped entry's t
     while (spins < 10) : (spins += 1) _ = try bridge.pumpOnce();
     const slot = bridge.node.groups.get(gid).?;
     try testing.expect(slot.durabilized_idx < slot.applied_idx);
-    try testing.expect(slot.in_dirty); // retained for a later tick
+    try testing.expect(slot.hib.in_dirty); // retained for a later tick
 
     // Worker ack: the txn promoted. The next durabilize folds + stamps
     // through the entry and the slot drains from the dirty set.
@@ -2563,7 +1917,7 @@ test "bridge: durabilize floor holds until the worker acks the skipped entry's t
         _ = try bridge.pumpOnce();
     }
     try testing.expectEqual(slot.applied_idx, slot.durabilized_idx);
-    try testing.expect(!slot.in_dirty);
+    try testing.expect(!slot.hib.in_dirty);
 }
 
 test "bridge: catch-up baseline index never exceeds the durable snapshot content watermark" {

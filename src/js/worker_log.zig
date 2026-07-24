@@ -658,7 +658,7 @@ fn captureLogInner(
     const id = request_id orelse try tl.id_minter.nextRequestId();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
-    try worker.log_buffer.append(.{
+    try worker.log.log_buffer.append(.{
         .tenant_id = a_tenant,
         .request_id = id,
         .deployment_id = deployment_id,
@@ -729,9 +729,9 @@ pub fn flushLogs(worker: anytype) !void {
     const allocator = worker.allocator;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
-    if (!worker.log_buffer.shouldFlush(now_ns)) return;
+    if (!worker.log.log_buffer.shouldFlush(now_ns)) return;
 
-    const drained = worker.log_buffer.drainRecords(allocator) catch |err| {
+    const drained = worker.log.log_buffer.drainRecords(allocator) catch |err| {
         std.log.warn(
             "rove-js flushLogs: drainRecords failed: {s}",
             .{@errorName(err)},
@@ -759,7 +759,7 @@ pub fn flushLogs(worker: anytype) !void {
 
     const batch_key_opt = log_server_mod.flush_writer.writeBatch(
         allocator,
-        worker.log_batch_store,
+        worker.log.log_batch_store,
         node_id_hex,
         records,
         flush_unix_ns,
@@ -768,7 +768,7 @@ pub fn flushLogs(worker: anytype) !void {
             "rove-js flushLogs: writeBatch ({d} records) failed: {s}",
             .{ records.len, @errorName(err) },
         );
-        worker.log_records_dropped_total += records.len;
+        worker.log.log_records_dropped_total += records.len;
         break :blk null;
     };
     const batch_key = batch_key_opt orelse return;
@@ -797,16 +797,16 @@ fn pushBatchKey(
     allocator: std.mem.Allocator,
     batch_key: []const u8,
 ) !void {
-    if (worker.log_push_curl == null) return;
-    if (worker.log_push_bases.len == 0) return;
+    if (worker.log.log_push_curl == null) return;
+    if (worker.log.log_push_bases.len == 0) return;
     const key_copy = try allocator.dupe(u8, batch_key);
-    worker.push_queue_mutex.lock();
-    defer worker.push_queue_mutex.unlock();
-    worker.push_queue.append(allocator, key_copy) catch |err| {
+    worker.log.push_queue_mutex.lock();
+    defer worker.log.push_queue_mutex.unlock();
+    worker.log.push_queue.append(allocator, key_copy) catch |err| {
         allocator.free(key_copy);
         return err;
     };
-    worker.push_wake.set();
+    worker.log.push_wake.set();
 }
 
 /// Cap on keys per outbound request — keeps the body bounded and
@@ -824,17 +824,17 @@ const PUSH_MAX_KEYS_PER_REQUEST: usize = 1024;
 pub fn pushLoop(worker: anytype) void {
     const PUSH_TICK_NS: u64 = 50 * std.time.ns_per_ms;
     const allocator = worker.allocator;
-    while (!worker.push_should_stop.load(.acquire)) {
-        worker.push_wake.timedWait(PUSH_TICK_NS) catch {};
-        worker.push_wake.reset();
+    while (!worker.log.push_should_stop.load(.acquire)) {
+        worker.log.push_wake.timedWait(PUSH_TICK_NS) catch {};
+        worker.log.push_wake.reset();
 
         // Drain the queue into a local list under the mutex, then
         // release it before doing curl I/O. Workers append while we
         // POST; that's fine — they'll show up on the next tick.
         var drained: std.ArrayList([]u8) = .empty;
-        worker.push_queue_mutex.lock();
-        std.mem.swap(std.ArrayList([]u8), &drained, &worker.push_queue);
-        worker.push_queue_mutex.unlock();
+        worker.log.push_queue_mutex.lock();
+        std.mem.swap(std.ArrayList([]u8), &drained, &worker.log.push_queue);
+        worker.log.push_queue_mutex.unlock();
         if (drained.items.len == 0) continue;
 
         var sent: usize = 0;
@@ -855,7 +855,7 @@ pub fn pushLoop(worker: anytype) void {
 }
 
 /// POST a single chunk of newline-separated batch keys to EVERY configured
-/// log-server (`worker.log_push_bases` — one per node in multi-node prod).
+/// log-server (`worker.log.log_push_bases` — one per node in multi-node prod).
 /// The token + body are built once and reused across targets; the curl handle
 /// is reused sequentially. A per-target failure is SOFT — that node's S3 LIST
 /// poll is the catch-up and the other targets still get the key — so we log and
@@ -865,9 +865,9 @@ fn sendPushChunk(
     allocator: std.mem.Allocator,
     keys: []const []u8,
 ) !void {
-    const easy = worker.log_push_curl orelse return;
+    const easy = worker.log.log_push_curl orelse return;
     const secret = worker.services_jwt_secret orelse return;
-    if (worker.log_push_bases.len == 0) return;
+    if (worker.log.log_push_bases.len == 0) return;
 
     // JWT minted once per chunk (60 s exp) and reused across every fan-out
     // target — the log-servers all verify the same services secret.
@@ -890,7 +890,7 @@ fn sendPushChunk(
         .{ .name = "Content-Type", .value = "text/plain" },
     };
 
-    for (worker.log_push_bases) |base| {
+    for (worker.log.log_push_bases) |base| {
         const url = std.fmt.allocPrint(allocator, "{s}/v1/_internal/batch-pushed", .{base}) catch continue;
         defer allocator.free(url);
         const use_h2c = std.mem.startsWith(u8, url, "http://");

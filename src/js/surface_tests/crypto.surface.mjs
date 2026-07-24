@@ -13,6 +13,16 @@ export default function () {
     throws(() => crypto.sha256(42), /string or Uint8Array/);
   });
 
+  check("crypto.sha256b64url", () => {
+    // RFC 7636 Appendix B PKCE S256 vector (verifier → code_challenge).
+    eq(crypto.sha256b64url("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+      "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    // === base64url.encode(hex.decode(crypto.sha256(x))), the idiom it replaces.
+    eq(crypto.sha256b64url("abc"), "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0");
+    eq(crypto.sha256b64url("abc"),
+      base64url.encode(hex.decode(crypto.sha256("abc"))));
+  });
+
   check("crypto.sha256Init", () => {
     const t = crypto.sha256Init();
     ok(typeof t === "string" && t.startsWith("s2:"), "version-prefixed token");
