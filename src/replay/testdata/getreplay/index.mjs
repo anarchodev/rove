@@ -1,3 +1,4 @@
+import browser from "@rewind/browser";
 // A WS agent handler whose onMessage pulls the session's replay log via
 // browser.getReplay (a bound fetch to rewind-logs.internal keyed on the
 // engine-pinned per-chain identity: request.tenant + request.correlation_id).

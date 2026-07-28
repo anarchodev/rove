@@ -35,6 +35,34 @@
 // 1 Hz sweep, which could re-fire a >1 s in-flight first attempt).
 const WATCHDOG_MS = 40_000;
 
+// Durable-scheduler arm, inlined over the ambient `kv`/`crypto`: a baked
+// `__system/*` module runs post-harden and can't reach the private
+// `_system.sched` closure. Writes the exact `_sched/` rows
+// globals/schedule.js + scheduler_tick.mjs use.
+const SCHED_TICK_NS = 1_000_000_000n;
+function schedByTimeKey(whenNs, id) {
+    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+}
+function schedArm(whenNs, target, msg, key) {
+    const rounded = whenNs <= 0n ? 0n
+        : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
+    const id = key ? crypto.sha256b64url(key) : crypto.randomUUID();
+    const byIdKey = "_sched/by_id/" + id;
+    const prev = kv.get(byIdKey);
+    if (prev !== null) {
+        try {
+            const old = JSON.parse(prev);
+            const oldWhen = BigInt(old.when_ns);
+            if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
+        } catch (_e) { /* corrupt prior record — overwrite below */ }
+    }
+    const rec = { when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
+    if (key) rec.key = key;
+    kv.set(byIdKey, JSON.stringify(rec));
+    kv.set(schedByTimeKey(rounded, id), "");
+    return id;
+}
+
 export default function () {
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
@@ -63,7 +91,7 @@ export default function () {
 
     // (2) watchdog re-arm — covers a crash between this fire and the
     // onresult commit.
-    schedule({ in: WATCHDOG_MS }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+    schedArm(BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
 
     // (3) the attempt.
     const attempts = typeof owed.attempts === "number" ? owed.attempts : 0;

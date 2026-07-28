@@ -21,8 +21,10 @@ export default function () {
     eq(marker.max_attempts, 5);
     eq(marker.on_result, "hooks/onDelivered");
     eq(marker.context, { order: 7 });
-    // The watchdog rides schedule under the idempotency key "_send/{id}".
-    const wake = schedule.get(base64url.encode(hex.decode(crypto.sha256("_send/" + id))));
+    // The watchdog rides the durable scheduler (the private _system.sched,
+    // not an ambient global) under the idempotency key "_send/{id}" — inspect
+    // its `_sched/by_id/` row directly.
+    const wake = JSON.parse(kv.get("_sched/by_id/" + crypto.sha256b64url("_send/" + id)) || "null");
     ok(wake !== null, "watchdog wake missing");
     eq(wake.target, "__system/webhook_fire");
 
@@ -36,9 +38,9 @@ export default function () {
 
     // Scheduled fire: no immediate fetch — the wake carries the fire.
     const s = webhook.send("https://hooks.example.test/z", { in: "5m", key: "later/1" });
-    const sw = schedule.get(base64url.encode(hex.decode(crypto.sha256("_send/" + s))));
+    const sw = JSON.parse(kv.get("_sched/by_id/" + crypto.sha256b64url("_send/" + s)) || "null");
     ok(sw !== null && sw.target === "__system/webhook_fire", "scheduled wake missing");
-    ok(sw.whenNs > BigInt(Date.now()) * 1000000n, "fire time not in the future");
+    ok(BigInt(sw.when_ns) > BigInt(Date.now()) * 1000000n, "fire time not in the future");
 
     // maxAttempts override lands in the marker.
     const m = webhook.send("https://hooks.example.test/m", { key: "m/1", maxAttempts: 2 });

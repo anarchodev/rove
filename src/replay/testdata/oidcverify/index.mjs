@@ -1,3 +1,4 @@
+import jwt from "@rewind/jwt";
 // OIDC RS256 verification offline: crypto.verifyRsa (native SHA-256 + pure-JS
 // RSA in the sim base) + jwt.verify over a real IdP JWK. This is what an auth
 // middleware does — now testable without the IdP.

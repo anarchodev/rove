@@ -47,25 +47,13 @@ const SURFACE_TESTS = [_]SurfaceTest{
     .{ .name = "platform", .src = @embedFile("surface_tests/platform.surface.mjs") },
     .{ .name = "base64", .src = @embedFile("surface_tests/base64.surface.mjs") },
     .{ .name = "urlsearchparams", .src = @embedFile("surface_tests/urlsearchparams.surface.mjs") },
-    .{ .name = "jwt", .src = @embedFile("surface_tests/jwt.surface.mjs") },
-    .{ .name = "oauth", .src = @embedFile("surface_tests/oauth.surface.mjs") },
-    .{ .name = "oidc", .src = @embedFile("surface_tests/oidc.surface.mjs") },
-    .{ .name = "sessions", .src = @embedFile("surface_tests/sessions.surface.mjs") },
     .{ .name = "time", .src = @embedFile("surface_tests/time.surface.mjs") },
-    .{ .name = "cron", .src = @embedFile("surface_tests/cron.surface.mjs") },
-    .{ .name = "retry", .src = @embedFile("surface_tests/retry.surface.mjs") },
-    .{ .name = "schedule", .src = @embedFile("surface_tests/schedule.surface.mjs") },
     .{ .name = "after", .src = @embedFile("surface_tests/after.surface.mjs") },
     .{ .name = "stream", .src = @embedFile("surface_tests/stream.surface.mjs") },
     .{ .name = "next", .src = @embedFile("surface_tests/next.surface.mjs") },
     .{ .name = "webhook", .src = @embedFile("surface_tests/webhook.surface.mjs") },
-    .{ .name = "email", .src = @embedFile("surface_tests/email.surface.mjs") },
     .{ .name = "textcodec", .src = @embedFile("surface_tests/textcodec.surface.mjs") },
-    .{ .name = "users", .src = @embedFile("surface_tests/users.surface.mjs") },
-    .{ .name = "activitypub", .src = @embedFile("surface_tests/activitypub.surface.mjs") },
     .{ .name = "blob", .src = @embedFile("surface_tests/blob.surface.mjs") },
-    .{ .name = "segments", .src = @embedFile("surface_tests/segments.surface.mjs") },
-    .{ .name = "browser", .src = @embedFile("surface_tests/browser.surface.mjs") },
     .{ .name = "request", .src = @embedFile("surface_tests/request.surface.mjs") },
 };
 
@@ -252,6 +240,10 @@ const ReflectOut = struct {
 test "surface tests: one module per shim, GLOBALS_FILES completeness" {
     var failures: usize = 0;
     for (globals.GLOBALS_FILES) |g| {
+        // schedule is in GLOBALS_FILES for the JSDoc lint only — it installs the
+        // PRIVATE `_system.sched` (the customer verb is @rewind/schedule), so it
+        // has no customer surface test / reflector entry.
+        if (std.mem.eql(u8, g.name, "schedule")) continue;
         var found = false;
         for (SURFACE_TESTS) |t| {
             if (std.mem.eql(u8, t.name, g.name)) found = true;
@@ -378,7 +370,9 @@ test "surface tests: behavior + two-way inventory gate" {
     }
     // A reflector regression that quietly drops namespaces must not
     // read as "everything covered" — pin a floor well below reality.
-    if (reflected.names.len < 100) {
+    // (The 12 lifted @rewind/* libs are no longer ambient, so the reflected
+    // surface is ~97 names; keep the floor under that with headroom.)
+    if (reflected.names.len < 80) {
         std.debug.print(
             "\nsurface-tests: reflector found only {d} names — reflector regression?\n",
             .{reflected.names.len},

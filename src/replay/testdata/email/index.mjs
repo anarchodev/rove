@@ -1,3 +1,4 @@
+import email from "@rewind/email";
 // email decomposition fixture. `email.send` layers on `webhook.send`, so it
 // decomposes to the SAME durable primitive webhook does — one `_send/owed/{id}`
 // marker whose url is the Resend API and whose body is the built Resend request.

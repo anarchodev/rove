@@ -916,23 +916,11 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "request.js", REQUEST_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
     evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
-    // jwt depends on base64 + crypto.verifyRsa/Ecdsa.
-    evalSnippet(ctx, "jwt.js", JWT_JS);
-    // oauth depends on base64 + crypto + URLSearchParams.
-    evalSnippet(ctx, "oauth.js", OAUTH_JS);
-    // oidc.js is the IdP/provider analog of oauth.js; needs
-    // crypto.oidc* + base64url + hex + URLSearchParams (all above).
-    evalSnippet(ctx, "oidc.js", OIDC_JS);
-    // sessions is standalone (kv + crypto.randomUUID + cookie parsing).
-    evalSnippet(ctx, "sessions.js", SESSIONS_JS);
-    // cron is standalone.
     evalSnippet(ctx, "time.js", TIME_JS);
-    evalSnippet(ctx, "cron.js", CRON_JS);
-    evalSnippet(ctx, "retry.js", RETRY_JS);
-    // §2.6 durable scheduled wake. After base64/crypto/kv (its deps).
-    // The connectionless `schedule` verb (after scheduler.js + cron.js
-    // — reuses cron.parseDuration). `cron` the recurring verb lives in
-    // cron.js (already eval'd above).
+    // The durable one-shot scheduler CORE — installs the private
+    // `_system.sched` (not a customer global; that's the @rewind/schedule
+    // package). webhook.js captures it below, before the `_harden.js`
+    // `_system` delete. After base64/crypto/kv + time (its deps).
     evalSnippet(ctx, "schedule.js", SCHEDULE_JS);
     // The after.* connection wake triggers (canonical) + the on.* alias.
     evalSnippet(ctx, "after.js", AFTER_JS);
@@ -941,22 +929,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // The public `next` disposition verb.
     evalSnippet(ctx, "next.js", NEXT_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
-    evalSnippet(ctx, "email.js", EMAIL_JS);
     // blob depends on crypto.sha256 + http (both above) +
     // _system.blob.presign (`docs/architecture/routing-and-ingress.md`, customer blob storage).
     evalSnippet(ctx, "blob.js", BLOB_JS);
-    // segments composes kv + blob + TextDecoder (all above) — pure
-    // JS, no natives of its own (`docs/architecture/routing-and-ingress.md`, customer blob storage).
-    evalSnippet(ctx, "segments.js", SEGMENTS_JS);
-    // browser.* is pure protocol/formatting over the ambient `stream`
-    // global (referenced lazily at call time, so order-independent) —
-    // the server side of web/rove-agent.js. No natives of its own.
-    evalSnippet(ctx, "browser.js", BROWSER_JS);
-    // users is standalone (kv + crypto.{randomBytes,sha256}).
-    evalSnippet(ctx, "users.js", USERS_JS);
-    // activitypub depends on base64url/hex/btoa + crypto + http +
-    // kv + URLSearchParams + TextEncoder (all evaluated above).
-    evalSnippet(ctx, "activitypub.js", ACTIVITYPUB_JS);
 
     // Reachability hardening (docs/architecture/builtin-libs.md).
     // Every native shim above captured its slice as
@@ -1220,26 +1195,15 @@ const HTTP_JS = @embedFile("http_js");
 const PLATFORM_JS = @embedFile("platform_js");
 const BASE64_JS = @embedFile("base64_js");
 const URLSEARCHPARAMS_JS = @embedFile("urlsearchparams_js");
-const JWT_JS = @embedFile("jwt_js");
-const OAUTH_JS = @embedFile("oauth_js");
-const OIDC_JS = @embedFile("oidc_js");
-const SESSIONS_JS = @embedFile("sessions_js");
 const TIME_JS = @embedFile("time_js");
-const CRON_JS = @embedFile("cron_js");
-const RETRY_JS = @embedFile("retry_js");
 const SCHEDULE_JS = @embedFile("schedule_js");
 const AFTER_JS = @embedFile("after_js");
 const STREAM_JS = @embedFile("stream_js");
 const NEXT_JS = @embedFile("next_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
-const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
 const REQUEST_JS = @embedFile("request_js");
-const USERS_JS = @embedFile("users_js");
-const ACTIVITYPUB_JS = @embedFile("activitypub_js");
 const BLOB_JS = @embedFile("blob_js");
-const SEGMENTS_JS = @embedFile("segments_js");
-const BROWSER_JS = @embedFile("browser_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
 /// single list the Phase-A lints below pivot on: each `.src` is an
@@ -1256,25 +1220,17 @@ pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "platform", .src = PLATFORM_JS },
     .{ .name = "base64", .src = BASE64_JS },
     .{ .name = "urlsearchparams", .src = URLSEARCHPARAMS_JS },
-    .{ .name = "jwt", .src = JWT_JS },
-    .{ .name = "oauth", .src = OAUTH_JS },
-    .{ .name = "oidc", .src = OIDC_JS },
-    .{ .name = "sessions", .src = SESSIONS_JS },
     .{ .name = "time", .src = TIME_JS },
-    .{ .name = "cron", .src = CRON_JS },
-    .{ .name = "retry", .src = RETRY_JS },
+    // schedule installs the private `_system.sched`, not a customer global;
+    // kept here for the JSDoc lint (lint(b)). lint(c) pivots native→shim
+    // only, so a shim without a matching native namespace is fine.
     .{ .name = "schedule", .src = SCHEDULE_JS },
     .{ .name = "after", .src = AFTER_JS },
     .{ .name = "stream", .src = STREAM_JS },
     .{ .name = "next", .src = NEXT_JS },
     .{ .name = "webhook", .src = WEBHOOK_JS },
-    .{ .name = "email", .src = EMAIL_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },
-    .{ .name = "users", .src = USERS_JS },
-    .{ .name = "activitypub", .src = ACTIVITYPUB_JS },
     .{ .name = "blob", .src = BLOB_JS },
-    .{ .name = "segments", .src = SEGMENTS_JS },
-    .{ .name = "browser", .src = BROWSER_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
@@ -1517,11 +1473,10 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
         \\  if (typeof platform !== "object" ||
         \\      typeof platform.root.get !== "function")
         \\    throw new Error("platform nested shim broke");
-        \\  if (typeof browser !== "object" ||
-        \\      typeof browser.message !== "function" ||
-        \\      typeof browser.act !== "function" ||
-        \\      typeof browser.render !== "function")
-        \\    throw new Error("browser shim broke (IIFE snapshot-freeze regression)");
+        \\  if (typeof webhook !== "object" || typeof webhook.send !== "function")
+        \\    throw new Error("webhook shim broke (lost its captured _system.http / _system.sched)");
+        \\  if (typeof schedule !== "undefined")
+        \\    throw new Error("schedule leaked to customer scope (should be the private _system.sched)");
         \\  return true;
         \\})();
     ;

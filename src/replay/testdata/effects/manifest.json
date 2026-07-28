@@ -1,0 +1,7 @@
+{
+  "name": "effects",
+  "version": "1.0.0",
+  "dependencies": {
+    "@rewind/schedule": "^1.0.0"
+  }
+}

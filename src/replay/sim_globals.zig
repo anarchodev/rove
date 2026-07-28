@@ -518,16 +518,7 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_request") ++
     "\n;" ++ @embedFile("g_base64") ++
     "\n;" ++ @embedFile("g_urlsearchparams") ++
-    "\n;" ++ @embedFile("g_jwt") ++
-    "\n;" ++ @embedFile("g_oauth") ++
-    "\n;" ++ @embedFile("g_oidc") ++
-    "\n;" ++ @embedFile("g_sessions") ++
     "\n;" ++ @embedFile("g_platform") ++
-    "\n;" ++ @embedFile("g_retry") ++
-    "\n;" ++ @embedFile("g_segments") ++
-    "\n;" ++ @embedFile("g_browser") ++
-    "\n;" ++ @embedFile("g_users") ++
-    "\n;" ++ @embedFile("g_activitypub") ++
     // The connection/continuation shims — `after` (wake triggers), `stream`
     // (output frames), `next` (park disposition). Faithful recorders (they don't
     // decompose), installed unconditionally; the epilogue does not stub them.
@@ -535,24 +526,22 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_after") ++
     "\n;" ++ @embedFile("g_stream") ++
     "\n;" ++ @embedFile("g_next") ++
-    // The durable-effect shims — the real webhook/schedule/cron/email verbs, so
-    // they decompose to primitives (`_send/owed` + `_sched/*` kv writes +
-    // `http.fetch`) in the effect log; the epilogue does not stub them.
-    // Order mirrors the worker's GLOBALS_FILES: `time` (the shared time-
-    // coercion library) → `cron` (fire-time helpers + the recurring verb) →
-    // `schedule` (coerces `{at}`/`{in}` through `time`) → `webhook`
-    // (composes over `kv`+`schedule`+the `_system.http` fetch primitive it
-    // captures at eval — so it MUST land before the `delete globalThis._system`
-    // below) → `email` (layers on `webhook.send`). `webhook.js` isn't IIFE-wrapped
-    // (top-level `const sysHttp`), so wrap it here to keep its lexicals out of the
-    // base-snapshot's global lexical scope (the freeze corrupts on bare top-level
-    // bindings — see globals-shim-iife-required); `email.js` is a plain
-    // `globalThis.email = {…}` assignment, freeze-safe as-is.
+    // The durable-effect shims — the real webhook + the private scheduler
+    // core, so webhook.send decomposes to primitives (`_send/owed` +
+    // `_sched/*` kv writes + `http.fetch`) in the effect log; the epilogue
+    // does not stub them. Order: `time` (the shared time-coercion library) →
+    // `schedule` (coerces `{at}`/`{in}` through `time`; installs the PRIVATE
+    // `_system.sched`, NOT a customer global — that's the @rewind/schedule
+    // package, resolved per-request like the other lifted libs) → `webhook`
+    // (captures `_system.http` + `_system.sched` at eval — so it MUST land
+    // before the `delete globalThis._system` below). `schedule.js` is
+    // self-IIFE'd (freeze-safe as embedded); `webhook.js` carries top-level
+    // `const`s (`sysHttp`/`sysSched`), so wrap it to keep those lexicals out
+    // of the base-snapshot's global lexical scope (the freeze corrupts on bare
+    // top-level bindings — see globals-shim-iife-required).
     "\n;" ++ @embedFile("g_time") ++
-    "\n;" ++ @embedFile("g_cron") ++
     "\n;" ++ @embedFile("g_schedule") ++
     "\n;(function(){\n" ++ @embedFile("g_webhook") ++ "\n})();" ++
-    "\n;" ++ @embedFile("g_email") ++
     // `blob` — real shim over the `_system.blob` recorder + `_system.http` (PUT /
     // compose) + the pure-JS streaming sha256; `blob.get` composes on the base
     // `after.fetch`, so it lands after `g_after`. Its recipe rows / owed markers
