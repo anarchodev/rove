@@ -486,6 +486,17 @@ pub fn Proxy(comptime FrontH2: type) type {
             method_len: u8 = 0,
             path: []u8 = &.{}, // owned dupe; empty on alloc failure
             final_status: u16 = 0,
+            // Why `final_status` — distinguishes a relayed upstream code
+            // ("upstream") from a front-synthesized one (connect-fail vs
+            // not-leader vs shed vs timeout), since several of those surface as
+            // the same 502/503 in the access log. Static string label (no
+            // alloc); logged in `recordFlowDone`.
+            reason: []const u8 = "-",
+            // Nodes actually ATTEMPTED (each `startAttempt`, incl. connect
+            // failures) — the true cross-node retry count. `attempt` counts only
+            // heads SUBMITTED, so a connect-fail-then-re-aim reads as attempt=1
+            // while nodes_tried shows the real fan-out.
+            nodes_tried: u32 = 0,
             resp_bytes: u64 = 0,
 
             // Forwarding identity (plan B7), captured at intake from the
@@ -1064,6 +1075,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.teardownFlow(flow);
                 return;
             }
+            // Count every node we actually reach for — the true cross-node retry
+            // fan-out, incl. attempts whose connect fails before a head is
+            // submitted (those never bump `attempt`). See `Flow.nodes_tried`.
+            flow.nodes_tried += 1;
             flow.sent = flow.body_base; // replay from the buffer start
             flow.up_closed = false;
             flow.up_sid = 0;
@@ -1079,7 +1094,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     // rather than an invisible queue in nghttp2 (plan A3).
                     self.count_upstream_sheds += 1;
                     std.log.warn("front: all leg(s) to {s} saturated — shedding", .{flow.nodes[flow.node_idx]});
-                    self.finishWithStatus(flow, 503);
+                    self.finishWithStatus(flow, 503, "overload-shed");
                 },
                 // All legs down inside backoff (fail_over) or pool
                 // bookkeeping failed (err) — fail over to the next node.
@@ -1173,7 +1188,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // index, even though this flow can't re-aim.
                 if (conn_died) self.leaders.drop(self.allocator, flow.host);
                 self.count_ambiguous_502 += 1;
-                self.finishWithStatus(flow, 502);
+                self.finishWithStatus(flow, 502, "write-ambiguous");
                 return;
             }
             if (conn_died and flow.reconnect_budget > 0 and flow.canRetry()) {
@@ -1194,7 +1209,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             // stale (moved/evicted) — drop it so the next request
             // re-resolves against the CP.
             self.cache.invalidate(flow.host);
-            self.finishWithStatus(flow, 502);
+            self.finishWithStatus(flow, 502, "upstream-unreachable");
         }
 
         /// 421 not-leader from the current node: retry-safe by contract
@@ -1237,7 +1252,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.startAttempt(flow);
                 return;
             }
-            self.finishWithStatus(flow, 503);
+            self.finishWithStatus(flow, 503, "no-leader");
         }
 
         /// Abandon the in-flight attempt (RST upstream so the worker
@@ -1332,7 +1347,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // streaming-response mode.
                 const packed_hdrs = self.packDownstreamHeaders(rh) catch {
                     self.abandonAttempt(flow);
-                    self.finishWithStatus(flow, 502);
+                    self.finishWithStatus(flow, 502, "front-internal");
                     continue;
                 };
                 // A 2xx (any non-421 served head) after a 421 in this flow
@@ -1360,6 +1375,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Move the downstream entity into the streaming-response
         /// pipeline with the relayed status + headers.
         fn relayHead(self: *Self, flow: *Flow, code: u16, packed_hdrs: h2.RespHeaders) void {
+            flow.reason = "upstream"; // a real upstream response — its own code, not synthesized
             const src = self.downColl(flow);
             self.reg.set(flow.down_ent, src, h2.Status, .{ .code = code }) catch {};
             self.reg.set(flow.down_ent, src, h2.RespHeaders, packed_hdrs) catch {};
@@ -1611,6 +1627,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     const body: h2.RespBody = .{ .data = rb.data, .len = rb.len };
                     rb.data = null;
                     rb.len = 0;
+                    flow.reason = "upstream"; // a real (buffered) upstream response, not synthesized
                     self.respondFull(flow, status.code, packed_hdrs, body);
                     continue;
                 }
@@ -1681,7 +1698,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             flow.resp_bytes += body.len;
         }
 
-        fn finishWithStatus(self: *Self, flow: *Flow, code: u16) void {
+        fn finishWithStatus(self: *Self, flow: *Flow, code: u16, reason: []const u8) void {
+            flow.reason = reason;
             if (flow.down_alive and !flow.resp_started) {
                 self.respondFull(flow, code, .{ .fields = null, .count = 0 }, .{ .data = null, .len = 0 });
             }
@@ -1749,7 +1767,12 @@ pub fn Proxy(comptime FrontH2: type) type {
                 flow.nodes[@min(flow.node_idx, flow.nodes.len - 1)]
             else
                 "-";
-            std.log.info("front-access: {s} {s} \"{s} {s}\" {d} {d}ms node={s} attempts={d} in={d}B out={d}B", .{
+            // `reason` says WHY final_status — an upstream code vs a synthesized
+            // one (connect-fail/no-leader/shed/timeout), which otherwise collide
+            // as the same 502/503. `nodes_tried` is the true cross-node fan-out
+            // (`attempts` counts only submitted heads, so a connect-fail re-aim
+            // undercounts). See rove#4.
+            std.log.info("front-access: {s} {s} \"{s} {s}\" {d} {d}ms node={s} attempts={d} nodes_tried={d} reason={s} in={d}B out={d}B", .{
                 if (flow.peer_ip_len > 0) flow.peer_ip[0..flow.peer_ip_len] else "-",
                 flow.host,
                 flow.method[0..flow.method_len],
@@ -1758,6 +1781,8 @@ pub fn Proxy(comptime FrontH2: type) type {
                 dur_ms,
                 node,
                 flow.attempt,
+                flow.nodes_tried,
+                flow.reason,
                 flow.body_total,
                 flow.resp_bytes,
             });
@@ -2036,11 +2061,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                         continue;
                     }
                     if (nodes.len == 0) {
-                        self.finishWithStatus(flow, 502);
+                        self.finishWithStatus(flow, 502, "no-route");
                         continue;
                     }
                     flow.nodes = dupNodes(self.allocator, nodes) catch {
-                        self.finishWithStatus(flow, 503);
+                        self.finishWithStatus(flow, 503, "front-oom");
                         continue;
                     };
                     // Start at the cached leader (if any) — skip the scan.
@@ -2079,7 +2104,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     if (flow.down_gone or !flow.down_alive) {
                         self.teardownFlow(flow);
                     } else {
-                        self.finishWithStatus(flow, code);
+                        self.finishWithStatus(flow, code, "route-resolve-fail");
                     }
                 },
                 .tunnel => self.failParkedTunnel(@ptrCast(@alignCast(w.ptr)), code),
@@ -2111,7 +2136,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                                 if (flow.down_gone or !flow.down_alive) {
                                     self.teardownFlow(flow);
                                 } else {
-                                    self.finishWithStatus(flow, 503);
+                                    self.finishWithStatus(flow, 503, "route-timeout");
                                 }
                             },
                             .tunnel => self.failParkedTunnel(@ptrCast(@alignCast(w.ptr)), 503),
@@ -2191,7 +2216,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 std.log.warn("front: upstream response timeout (host={s}) -> 504", .{flow.host});
                 self.count_resp_timeouts += 1;
                 self.abandonAttempt(flow); // RST_STREAM to the stuck upstream
-                self.finishWithStatus(flow, 504); // 504 to the client + teardown
+                self.finishWithStatus(flow, 504, "response-timeout"); // 504 to the client + teardown
             }
         }
     };
