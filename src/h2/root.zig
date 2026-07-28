@@ -119,6 +119,21 @@ fn statusClass(code: u16) usize {
     return if (cls >= 1 and cls <= 5) cls else 0;
 }
 
+/// A bounded, hand-picked set of individually-tracked statuses for
+/// `http_responses_status_total`. The `statusClass` buckets answer "how many
+/// 4xx?"; these answer "401 vs 404 vs 409 vs 421 vs 502 vs 503?" — the
+/// difference between "auth is broken", "route not found", and "not the
+/// leader" (rove#216: a deploy-auth 401 storm was indistinguishable from any
+/// other 4xx in Grafana). The active-series rule still holds — this is a fixed
+/// list, NOT per-route/tenant, and everything not listed rolls up into the
+/// class buckets only.
+const NOTABLE_STATUS = [_]u16{ 400, 401, 403, 404, 409, 421, 429, 499, 500, 502, 503, 504 };
+
+fn notableStatusIndex(code: u16) ?usize {
+    for (NOTABLE_STATUS, 0..) |s, i| if (s == code) return i;
+    return null;
+}
+
 pub const H2IoResult = struct {
     err: i32 = 0,
 };
@@ -450,6 +465,10 @@ pub fn H2(comptime opts: Options) type {
         /// front these are the client-facing statuses it relays (a failed
         /// upstream forward surfaces here as a 5xx).
         http_status_class: [6]u64 = .{ 0, 0, 0, 0, 0, 0 },
+        /// Per-status counters for the hand-picked `NOTABLE_STATUS` set
+        /// (rove#216) — same single-thread, no-atomics discipline as
+        /// `http_status_class`. Rendered as `http_responses_status_total`.
+        http_status_notable: [NOTABLE_STATUS.len]u64 = .{0} ** NOTABLE_STATUS.len,
         /// Consecutive `readsTriage` calls where ENOBUFS fired but
         /// `outstanding` was below half of `buf_count`. Three in a
         /// row aborts the process — see the panic check in
@@ -2170,6 +2189,19 @@ pub fn H2(comptime opts: Options) type {
                 \\http_requests_total{{code="other"}} {d}
                 \\
             , .{ hc[1], hc[2], hc[3], hc[4], hc[5], hc[0] });
+
+            // The bounded exact-status breakdown (rove#216) — complements the
+            // class buckets so an auth-401 storm is distinguishable from a
+            // 404/409/421 storm without SSH-grepping logs.
+            const hn = self.http_status_notable;
+            try w.writeAll(
+                \\# HELP http_responses_status_total responses served for a bounded set of individually-notable statuses (auth/routing/leader diagnosis; complements http_requests_total).
+                \\# TYPE http_responses_status_total counter
+                \\
+            );
+            inline for (NOTABLE_STATUS, 0..) |code, idx| {
+                try w.print("http_responses_status_total{{status=\"{d}\"}} {d}\n", .{ code, hn[idx] });
+            }
         }
 
         pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
@@ -2189,6 +2221,7 @@ pub fn H2(comptime opts: Options) type {
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
             self.http_status_class = .{ 0, 0, 0, 0, 0, 0 };
+            self.http_status_notable = .{0} ** NOTABLE_STATUS.len;
             self.body_sinks = .empty;
 
             // Init every collection field. Disabled (client_only with
@@ -2392,6 +2425,7 @@ pub fn H2(comptime opts: Options) type {
                 // status class BEFORE the per-transport branches, so h1 and h2
                 // (and the early conn-gone bail below) are all counted.
                 self.http_status_class[statusClass(status.code)] += 1;
+                if (notableStatusIndex(status.code)) |ni| self.http_status_notable[ni] += 1;
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
                     try self.reg.move(ent, &self.response_in, &self.response_out);

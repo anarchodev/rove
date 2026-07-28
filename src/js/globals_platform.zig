@@ -188,12 +188,19 @@ pub fn jsPlatformRootPrefix(
     return arr;
 }
 
-/// `platform.auth.checkRootToken(token_hex)` — admin-only.
-/// Returns `true` iff `token_hex` matches the operator-supplied
-/// root token (read from `LOOP46_ROOT_TOKEN` at worker startup).
-/// Constant-time compare via `tenant.authenticate`. JS handler uses
-/// this from `/v1/login` so the secret never crosses into JS state
-/// or the SQLite root store.
+/// `platform.auth.checkRootToken(token_hex)` — admin-only. Returns `true`
+/// iff `token_hex` matches the operator root token supplied to the worker at
+/// startup, constant-time via `tenant.authenticate`. The admin deploy
+/// `_middlewares` M2M gate and `/v1/login` call this, so the secret never
+/// crosses into JS state.
+///
+/// Emits a low-volume auth-audit log (result + token length — NEVER the
+/// token). Root-token traffic is operator-only, so this line is both the
+/// privileged-access audit trail and the FIRST place to look when a deploy
+/// 401s: no line for a request that should have carried a Bearer means the
+/// `authorization` header never reached this native (lost upstream — front
+/// proxy or header ingestion); a `denied` line means the token itself didn't
+/// match (e.g. a per-node token drift). See `docs/architecture/control-plane.md`.
 pub fn jsPlatformAuthCheckRootToken(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -203,6 +210,10 @@ pub fn jsPlatformAuthCheckRootToken(
     if (argc < 1) return js_false;
     const state = getState(ctx);
     const tenant = state.platform orelse {
+        // A root-token check reached this native on a tenant with no platform
+        // binding (not `__admin__`) — a routing / platform-grant gap. Throwing
+        // silently here surfaces upstream as an opaque 401; name it instead.
+        std.log.warn("auth: checkRootToken invoked with no platform binding (non-admin tenant) — denying", .{});
         _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
         return js_exception;
     };
@@ -212,9 +223,12 @@ pub fn jsPlatformAuthCheckRootToken(
 
     const auth = tenant.authenticate(token) catch |err| {
         state.pending_kv_error = err;
+        std.log.warn("auth: root-token check errored: {s}", .{@errorName(err)});
         return js_false;
     };
-    return if (auth != null) js_true else js_false;
+    const granted = auth != null;
+    std.log.info("auth: root-token check {s} (token_len={d})", .{ if (granted) "granted" else "denied", token.len });
+    return if (granted) js_true else js_false;
 }
 
 /// `platform.instances.create(name)` — admin-only. Creates the
