@@ -1272,6 +1272,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The first-party @rewind/* package sources the `seed-packages` verb POSTs
+    // to the registry at genesis (leaves-first). Embedded so the seed is
+    // self-contained (no rewind-apps checkout needed) and the exact bytes are
+    // the frozen package identity. Same source files driver_smoke embeds.
+    inline for (.{
+        .{ "pkg_jwt", "src/js/packages/@rewind/jwt/index.mjs" },
+        .{ "pkg_oauth", "src/js/packages/@rewind/oauth/index.mjs" },
+        .{ "pkg_cron", "src/js/packages/@rewind/cron/index.mjs" },
+        .{ "pkg_sessions", "src/js/packages/@rewind/sessions/index.mjs" },
+        .{ "pkg_retry", "src/js/packages/@rewind/retry/index.mjs" },
+        .{ "pkg_activitypub", "src/js/packages/@rewind/activitypub/index.mjs" },
+        .{ "pkg_email", "src/js/packages/@rewind/email/index.mjs" },
+        .{ "pkg_users", "src/js/packages/@rewind/users/index.mjs" },
+        .{ "pkg_oidc", "src/js/packages/@rewind/oidc/index.mjs" },
+        .{ "pkg_schedule", "src/js/packages/@rewind/schedule/index.mjs" },
+        .{ "pkg_segments", "src/js/packages/@rewind/segments/index.mjs" },
+        .{ "pkg_browser", "src/js/packages/@rewind/browser/index.mjs" },
+    }) |e| ops_mod.addAnonymousImport(e[0], .{ .root_source_file = b.path(e[1]) });
     const ops_exe = b.addExecutable(.{ .name = "rewind-ops", .root_module = ops_mod });
     const ops_step = b.step("rewind-ops", "Build the rewind-ops operator CLI");
     ops_step.dependOn(&b.addInstallArtifact(ops_exe, .{}).step);
