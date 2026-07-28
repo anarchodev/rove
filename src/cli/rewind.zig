@@ -317,7 +317,27 @@ fn uploadStep(a: std.mem.Allocator, cfg: *const Cfg, upath: []const u8, body: []
 /// A bundle whose `manifest.json` declares `dependencies` resolves them
 /// against the `@rewind` registry and stages the resolved package graph
 /// (P-CLI, rove#122); a package-free bundle takes the plain path.
+/// Auth-requiring verbs (deploy/release/rollback/…) need EITHER a root token
+/// (headless / operator) or an interactive login session. With neither, the
+/// transport silently sends an empty cookie jar and the server bounces a bare
+/// 401 → the misleading "not signed in — run rewind login", even when the real
+/// cause is a config that never loaded (classically: `--env` placed AFTER the
+/// command, where it is silently ignored — it is a GLOBAL flag). Fail here,
+/// up front, naming both causes, instead of after a confusing round-trip.
+fn requireAuth(cfg: *const Cfg) void {
+    if (cfg.root_token != null) return;
+    if (std.fs.accessAbsolute(cfg.session_file, .{})) |_| return else |_| {}
+    c.fatal(
+        \\no credentials — this command needs a root token or a login session, and neither is set.
+        \\  • operators: put REWIND_ROOT_TOKEN in a config file and pass it as a GLOBAL flag BEFORE the command:
+        \\      rewind --env <file> deploy <tenant> <bundle>
+        \\    (a `--env` placed AFTER the command is silently ignored — it is global, not per-command.)
+        \\  • interactive: run `rewind login` first (session file: {s}).
+    , .{cfg.session_file});
+}
+
 fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: []const u8, release: bool) void {
+    requireAuth(cfg);
     const b = c.classify(a, bundle);
     if (b.skipped.len != 0) {
         std.debug.print("  ! skipping (non-deployable): ", .{});
@@ -1323,7 +1343,13 @@ pub fn main() void {
         if (rest.len < 2) c.fatal("deploy needs <tenant> <bundle-dir>", .{});
         var release = false;
         for (rest[2..]) |arg| {
-            if (std.mem.eql(u8, arg, "--release")) release = true;
+            if (std.mem.eql(u8, arg, "--release")) {
+                release = true;
+            } else if (std.mem.eql(u8, arg, "--env")) {
+                c.fatal("--env is a GLOBAL flag — put it BEFORE the command: rewind --env <file> deploy <tenant> <bundle>", .{});
+            } else {
+                c.fatal("deploy: unknown option '{s}' (want [--release]; --env goes before the command)", .{arg});
+            }
         }
         cmdDeploy(a, &cfg, rest[0], rest[1], release);
     } else if (std.mem.eql(u8, verb, "release") or std.mem.eql(u8, verb, "rollback")) {
