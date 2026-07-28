@@ -28,6 +28,10 @@ import docs_site  # noqa: E402
 
 ROVE = pathlib.Path(__file__).resolve().parents[2]
 GLOBALS = ROVE / "src" / "js" / "globals"
+# First-party package sources — surface that used to be a global shim and
+# now ships as `@rewind/<name>` (import-gated, same doc conventions). A
+# GROUPS stem resolves to the globals shim first, then the package entry.
+PACKAGES = ROVE / "src" / "js" / "packages" / "@rewind"
 
 # Curated page layout: (group heading, [shim file stems]). A shim absent
 # here is skipped (request/http are contract territory — the Handlers
@@ -56,7 +60,7 @@ GROUPS = [
     ("Browser agent", None, ["browser"]),
     ("Utilities", None,
      ["crypto", "jwt", "base64", "textcodec", "urlsearchparams",
-      "console"]),
+      "console", "time"]),
     ("Identity & federation", None,
      ["users", "sessions", "oauth", "oidc", "activitypub"]),
     ("Admin (the __admin__ tenant only)", None, ["platform"]),
@@ -137,7 +141,9 @@ def member_name(code: str):
 
 def parse_shim(stem: str):
     """→ list of sections: {name, desc, example, members:[{...}]}"""
-    src = (GLOBALS / f"{stem}.js").read_text()
+    g = GLOBALS / f"{stem}.js"
+    src = g.read_text() if g.exists() else \
+        (PACKAGES / stem / "index.mjs").read_text()
     sections = []
     cur = None
     for block, code in parse_jsdoc_blocks(src):
@@ -286,6 +292,7 @@ def main() -> int:
     for _h, _d, stems in GROUPS:
         grouped.update(stems)
     on_disk = {p.stem for p in GLOBALS.glob("*.js")}
+    on_disk |= {p.name for p in PACKAGES.iterdir() if p.is_dir()}
     missing = sorted(on_disk - grouped)
     if missing:
         sys.exit(f"gen_docs_reference: new shim(s) not assigned to a "
