@@ -1,3 +1,4 @@
+import browser from "@rewind/browser";
 // The fetch-resume ctx override (decisions.md §4.14), regression guard:
 // on a held WS chain, `request.ctx` on an after.fetch resume is the
 // fetch's OWN ctx if it carried one, else the chain's parked next({ctx}) — one

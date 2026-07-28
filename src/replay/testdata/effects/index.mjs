@@ -1,3 +1,4 @@
+import schedule from "@rewind/schedule";
 // Effect-global unification prototype fixture. Exercises the two durable verbs
 // the unification converts — `webhook.send` and `schedule` — DIRECTLY, so the
 // `_tests/effects.mjs` test sees them decompose

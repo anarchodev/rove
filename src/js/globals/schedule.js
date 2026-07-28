@@ -1,15 +1,17 @@
-// Public `schedule` verb — THE durable one-shot timer
-// (docs/handler-shape.md §2.4). Run `target` once, at a time. A
-// connectionless trigger: a fresh durable activation with no held
-// socket, surviving leader changes. `schedule`/`cron`/`webhook.send`
-// are the three connectionless verbs.
+// The durable one-shot scheduler core — installed as the PRIVATE
+// `_system.sched` (deleted from customer scope by `_harden.js`, like
+// every other `_system.*` capability). The customer-facing verb is the
+// `@rewind/schedule` package; this ambient core exists only so the
+// engine's own primitives can compose durable wakes: the `webhook.js`
+// shim captures `_system.sched` at eval time (durable send re-arm), and
+// the baked `__system/*` modules that need it (cron_tick, webhook_fire,
+// webhook_onresult) write the same `_sched/` rows directly over kv (they
+// run post-harden and can't see this closure — see those files).
+// `schedule`/`cron`/`webhook.send` are the three connectionless verbs.
 //
-// This file is the whole surface: the former lower-level `scheduler`
-// lib (gap-2.6) was folded in on 2026-07-06 — `schedule(when, target,
-// ctx?, opts?)` absorbs `scheduler.at`/`scheduler.in` (human `{at}`/
-// `{in}` coercions + `opts.key` idempotency), and `schedule.cancel` /
-// `schedule.get` moved over unchanged. One name, one section in the
-// reference.
+// `_arm`/`cancel`/`get` and the `{at}`/`{in}` coercions + `opts.key`
+// idempotency all live here (the former `scheduler` lib folded in
+// 2026-07-06); the `@rewind/schedule` package is the same surface.
 //
 // Pure composition over `kv` + `crypto` + the capability-scoped engine
 // wake (the engine keeps ONE next-fire watermark per tenant; this lib
@@ -204,7 +206,7 @@
    * const id = schedule({ in: 5000 }, "jobs/poll");
    * schedule({ in: "1h" }, "jobs/expire", { leaseId: "l-7" });
    */
-  globalThis.schedule = Object.assign(function schedule(when, target, ctx, opts) {
+  _system.sched = Object.assign(function schedule(when, target, ctx, opts) {
     let whenNs;
     if (when && when.at !== undefined) whenNs = _coerceAt(when.at);
     else if (when && when.in !== undefined) whenNs = _coerceIn(when.in);

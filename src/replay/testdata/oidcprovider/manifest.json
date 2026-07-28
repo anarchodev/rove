@@ -1,0 +1,7 @@
+{
+  "name": "oidcprovider",
+  "version": "1.0.0",
+  "dependencies": {
+    "@rewind/jwt": "^1.0.0"
+  }
+}

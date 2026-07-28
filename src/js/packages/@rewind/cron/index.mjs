@@ -22,6 +22,12 @@
 // A module has its OWN scope (it is evaluated per-request, never baked into
 // the shared base snapshot), so that wrapper is gone — module scope replaces
 // the IIFE's closure. The ambient `time` helpers it composes over stay baked.
+//
+// The one-shot durable scheduler is no longer an ambient global — `cron`
+// composes over the `@rewind/schedule` PACKAGE (a real intra-set dependency,
+// frozen at publish like oauth/oidc → jwt) to arm each recurrence.
+import schedule from "@rewind/schedule";
+
 const NS_PER_MS = 1_000_000n;
 
 // Time helpers that convert human inputs (durations, daily/weekly

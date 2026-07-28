@@ -1,3 +1,4 @@
+import schedule from "@rewind/schedule";
 // A DURABLE scheduled target — fires as its own connectionless `durable_wake`
 // activation (no held socket, survives crashes/leader change), NOT folded from
 // a `schedule()` emitter. Tested standalone via scenario().wake(), the same way

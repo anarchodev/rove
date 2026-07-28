@@ -216,7 +216,8 @@ test "build: leaf package has no imports" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const g = try build(arena.allocator(), &.{"@rewind/cron"});
+    // @rewind/segments is a true leaf (no intra-set imports; cf. cron→schedule).
+    const g = try build(arena.allocator(), &.{"@rewind/segments"});
     try std.testing.expectEqual(@as(usize, 1), g.packages.len);
     try std.testing.expectEqual(@as(usize, 0), g.packages[0].imports.len);
 }

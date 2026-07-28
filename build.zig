@@ -239,7 +239,9 @@ pub fn build(b: *std.Build) void {
     // them registered (replay_mod, driver_smoke_mod).
     const addSimGlobalEmbeds = struct {
         fn f(bb: *std.Build, mod: *std.Build.Module) void {
-            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "platform", "retry", "segments", "browser", "users", "activitypub", "time", "cron", "schedule", "webhook", "email", "after", "stream", "next", "blob" };
+            // schedule stays (installs the private `_system.sched` the sim
+            // webhook shim captures); the 11 lifted customer globals are gone.
+            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "platform", "time", "schedule", "webhook", "after", "stream", "next", "blob" };
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
@@ -542,30 +544,18 @@ pub fn build(b: *std.Build) void {
         .{ .name = "platform_js", .path = "src/js/globals/platform.js" },
         .{ .name = "base64_js", .path = "src/js/globals/base64.js" },
         .{ .name = "urlsearchparams_js", .path = "src/js/globals/urlsearchparams.js" },
-        .{ .name = "jwt_js", .path = "src/js/globals/jwt.js" },
-        .{ .name = "oauth_js", .path = "src/js/globals/oauth.js" },
-        .{ .name = "oidc_js", .path = "src/js/globals/oidc.js" },
-        .{ .name = "sessions_js", .path = "src/js/globals/sessions.js" },
         .{ .name = "time_js", .path = "src/js/globals/time.js" },
-        .{ .name = "cron_js", .path = "src/js/globals/cron.js" },
-        .{ .name = "retry_js", .path = "src/js/globals/retry.js" },
+        // schedule.js stays embedded: it now installs the PRIVATE
+        // `_system.sched` (webhook.js captures it), not a customer global.
         .{ .name = "schedule_js", .path = "src/js/globals/schedule.js" },
         .{ .name = "after_js", .path = "src/js/globals/after.js" },
         .{ .name = "stream_js", .path = "src/js/globals/stream.js" },
         .{ .name = "next_js", .path = "src/js/globals/next.js" },
         .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },
-        .{ .name = "email_js", .path = "src/js/globals/email.js" },
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
         .{ .name = "handler_shape_md", .path = "docs/handler-shape.md" },
         .{ .name = "request_js", .path = "src/js/globals/request.js" },
-        .{ .name = "users_js", .path = "src/js/globals/users.js" },
-        .{ .name = "activitypub_js", .path = "src/js/globals/activitypub.js" },
         .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
-        .{ .name = "segments_js", .path = "src/js/globals/segments.js" },
-        // browser.* — server-side surface for the in-page browser-agent
-        // SDK (web/rove-agent.js). Pure protocol/formatting over the
-        // ambient `stream`; vendor-neutral.
-        .{ .name = "browser_js", .path = "src/js/globals/browser.js" },
 
         // Built-in handler modules — compiled to bytecode at NodeState
         // init, resolved via the `__system/` module-path prefix
@@ -1507,6 +1497,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/subscription", // http.subscribe recorder bag + detached onSubscription (subscription_fire) activation
         "src/replay/testdata/kvtriggers", // _triggers/<prefix>/index before/after chains run offline: mutate value / reject as trigger_rejected
         "src/replay/testdata/manifestpkg", // `rewind test` auto-resolves an app's manifest.json @rewind/* deps offline (P4a enabler) — direct jwt/oidc + transitive oidc→jwt, no inline scenario packages
+        "src/replay/testdata/retrypkg", // @rewind/retry wraps webhook.send (maxAttempts→1 + ctx._retry chain state) + shouldRetry/ctx result logic — the package-model replacement for the retired ambient-retry dispatcher tests
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

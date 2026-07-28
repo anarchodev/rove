@@ -36,6 +36,44 @@ function computeNextAtNs(attempts) {
     return BigInt(Date.now() + delay_ms) * 1_000_000n;
 }
 
+// Durable-scheduler arm/cancel, inlined over the ambient `kv`/`crypto`: a
+// baked `__system/*` module runs post-harden and can't reach the private
+// `_system.sched` closure. Writes the exact `_sched/` rows
+// globals/schedule.js + scheduler_tick.mjs use.
+const SCHED_TICK_NS = 1_000_000_000n;
+function schedByTimeKey(whenNs, id) {
+    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+}
+function schedArm(whenNs, target, msg, key) {
+    const rounded = whenNs <= 0n ? 0n
+        : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
+    const id = key ? crypto.sha256b64url(key) : crypto.randomUUID();
+    const byIdKey = "_sched/by_id/" + id;
+    const prev = kv.get(byIdKey);
+    if (prev !== null) {
+        try {
+            const old = JSON.parse(prev);
+            const oldWhen = BigInt(old.when_ns);
+            if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
+        } catch (_e) { /* corrupt prior record — overwrite below */ }
+    }
+    const rec = { when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
+    if (key) rec.key = key;
+    kv.set(byIdKey, JSON.stringify(rec));
+    kv.set(schedByTimeKey(rounded, id), "");
+    return id;
+}
+function schedCancel(id) {
+    const raw = kv.get("_sched/by_id/" + id);
+    if (raw === null) return false;
+    try {
+        const rec = JSON.parse(raw);
+        kv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
+    } catch (_e) { /* corrupt record — still drop by_id below */ }
+    kv.delete("_sched/by_id/" + id);
+    return true;
+}
+
 export default function () {
     const a = request.activation;
     if (a.kind !== "send_callback" && a.kind !== "fetch_chunk") {
@@ -110,8 +148,8 @@ export default function () {
         owed.attempts += 1;
         delete owed.next_at_ns; // legacy timing field — scheduler owns timing now
         kv.set("_send/owed/" + id, JSON.stringify(owed));
-        schedule({ at: computeNextAtNs(owed.attempts) }, "__system/webhook_fire",
-                     { id: id }, { key: "_send/" + id });
+        schedArm(computeNextAtNs(owed.attempts), "__system/webhook_fire",
+                 { id: id }, "_send/" + id);
         return { status: 200 };
     }
 
@@ -120,7 +158,7 @@ export default function () {
     // deterministic from the key — same recipe as schedule's opts.key
     // opts.key handling (base64url-no-pad(sha256(key))).
     kv.delete("_send/owed/" + id);
-    schedule.cancel(base64url.encode(hex.decode(crypto.sha256("_send/" + id))));
+    schedCancel(crypto.sha256b64url("_send/" + id));
 
     // Mark as a give-up vs success in the result the customer sees.
     if (transport_failed || upstream_5xx) {

@@ -80,56 +80,20 @@ export default function () {
       addObj("hex", hex);
     },
     urlsearchparams: () => addClass("URLSearchParams", URLSearchParams),
-    jwt: () => addObj("jwt", jwt),
-    oauth: () => {
-      addObj("oauth", oauth);
-      instance("OAuth", () => oauth.fromConfig({
-        authorization_url: "https://idp.example/authorize",
-        token_url: "https://idp.example/token",
-        client_id: "cid",
-        redirect_uri: "https://app.example/cb",
-        on_complete_module: "onLogin",
-        scopes: ["openid"],
-      }));
-    },
-    oidc: () => {
-      addObj("oidc", oidc);
-      instance("OIDCProvider", () => oidc.provider({ clients: [] }));
-      instance("OIDCRelyingParty", () => oidc.rp({
-        issuer: "https://idp.example",
-        client_id: "cid",
-        redirect_uri: "https://app.example/cb",
-      }));
-    },
-    sessions: () => {
-      addObj("sessions", sessions);
-      instance("Sessions", () => sessions.fromConfig({ state_path: "sess" }));
-    },
     time: () => addObj("time", time),
-    cron: () => addCallable("cron", cron),
-    retry: () => addObj("retry", retry),
-    schedule: () => addCallable("schedule", schedule),
     after: () => addObj("after", after),
     stream: () => addObj("stream", stream),
     next: () => addCallable("next", next),
     webhook: () => addObj("webhook", webhook),
-    email: () => addObj("email", email),
     textcodec: () => {
       addClass("TextEncoder", TextEncoder);
       addClass("TextDecoder", TextDecoder);
     },
-    users: () => addObj("users", users),
-    activitypub: () => {
-      addObj("activitypub", activitypub);
-      instance("ActivityPubActor", () => activitypub.fromConfig({
-        domain: "ap.example",
-        username: "svc",
-        verified_module: "onVerified",
-      }));
-    },
     blob: () => addObj("blob", blob),
-    segments: () => addObj("segments", segments),
-    browser: () => addObj("browser", browser),
+    // jwt/oauth/oidc/sessions/cron/retry/email/users/activitypub/segments/browser
+    // are no longer ambient globals — they're @rewind/* packages a handler
+    // imports, so they have no ambient surface to reflect. `schedule` is the
+    // private `_system.sched` core (not customer-visible), also not reflected.
   };
 
   for (const name of Object.keys(SHIM_ROOTS)) {
