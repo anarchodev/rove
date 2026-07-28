@@ -1,0 +1,1 @@
+{ "name": "manifestpkg", "version": "1.0.0", "dependencies": { "@rewind/jwt": "^1.0.0", "@rewind/oidc": "^1.0.0" } }
