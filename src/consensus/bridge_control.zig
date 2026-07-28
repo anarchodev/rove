@@ -13,7 +13,7 @@ const raft = @import("raft_rs_zig");
 const Error = @import("bridge_error.zig").Error;
 
 pub const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, transfer_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, transfer_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, first_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -218,6 +218,16 @@ pub fn lastIndex(self: anytype, gid: u64) u64 {
     return cmd.snap_index;
 }
 
+/// This group's first (uncompacted) local raft log index — the lowest index
+/// still recoverable from the live log. The promotion-time LogRecord walker
+/// (`docs/architecture/deployment-and-logs.md`) walks `[firstIndex..lastIndex]`
+/// on leader promotion. Pump op. 0 on unknown group / pump failure.
+pub fn firstIndex(self: anytype, gid: u64) u64 {
+    var cmd: ControlCmd = .{ .kind = .first_index, .gid = gid };
+    runControl(self, &cmd) catch return 0;
+    return cmd.snap_index;
+}
+
 /// This group's LIVE applied index on the leader (`slot.applied_idx`) — the
 /// out-of-band baseline a new member is born at. Always >= the leader's first
 /// (compacted) log index, so the baseline points at an entry the leader still
@@ -368,6 +378,10 @@ pub fn drainControl(self: anytype) bool {
             },
             .last_index => blk: {
                 cmd.snap_index = self.node.lastIndex(cmd.gid);
+                break :blk null;
+            },
+            .first_index => blk: {
+                cmd.snap_index = self.node.firstIndex(cmd.gid);
                 break :blk null;
             },
             .baseline_index => blk: {

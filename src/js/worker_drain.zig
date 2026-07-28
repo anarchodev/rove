@@ -1679,6 +1679,12 @@ fn finishContResume(
                 r.console = &.{};
                 r.exception = &.{};
                 const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, st, ctx.act, ctx.cont_path, ctx.correlation_id);
+                // Tapes before the propose so the input channels (ctx/Msg on
+                // trigger_payload, fetch event on fetch_responses) ride the raft
+                // readset for the promotion walker
+                // (`docs/architecture/deployment-and-logs.md`). Consumed by
+                // exactly one capture below (fault or ok).
+                const tapes = contTapes(worker, spec.tape, &ctx);
                 const seq = proposeAndParkContResume(
                     worker,
                     ctx.ent,
@@ -1700,14 +1706,14 @@ fn finishContResume(
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, console_owned, exception_owned, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, console_owned, exception_owned, tapes, ctx.correlation_id, &.{}, ctx.act, 0);
                     return;
                 };
                 // Helper took ownership of txn (moved into pending_txns)
                 // and body_dup (stamped onto the entity).
                 ctx.txn_owned.* = false;
                 ctx.txn_done.* = true;
-                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, console_owned, exception_owned, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, seq);
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, console_owned, exception_owned, tapes, ctx.correlation_id, r.tags, ctx.act, seq);
                 if (ctx.pending_fetches.items.len > 0) std.log.warn(
                     "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ ctx.pending_fetches.items.len, ctx.tenant_id },
@@ -1832,6 +1838,9 @@ fn finishContResume(
                 // status=0: the parked-hop convention (same shape as the
                 // inbound trampoline open hop) so replay surfaces it.
                 const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, 0, ctx.act, ctx.cont_path, ctx.correlation_id);
+                // Tapes before the propose — input channels ride the raft
+                // readset for the promotion walker (see the terminal arm above).
+                const tapes = contTapes(worker, spec.tape, &ctx);
                 const seq = proposeAndParkContResume(
                     worker,
                     ctx.ent,
@@ -1851,13 +1860,13 @@ fn finishContResume(
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, ctx.correlation_id, &.{}, ctx.act, 0);
                     return;
                 };
                 ctx.txn_owned.* = false;
                 ctx.txn_done.* = true;
                 // The repark hop's tape row: status=0, parked.
-                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, seq);
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, tapes, ctx.correlation_id, &.{}, ctx.act, seq);
                 if (ctx.pending_fetches.items.len > 0) std.log.warn(
                     "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ ctx.pending_fetches.items.len, ctx.tenant_id },

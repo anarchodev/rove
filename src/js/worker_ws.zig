@@ -488,16 +488,22 @@ fn finishWsResume(
                 return;
             }
             const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), act, path, chain_ctx.correlation_id);
+            // Tapes before shipWsFrames' propose so the input channels (ctx on
+            // trigger_payload, fetch event on fetch_responses) ride the raft
+            // readset for the promotion walker
+            // (`docs/architecture/deployment-and-logs.md`). Consumed by exactly
+            // one capture below.
+            const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
                 std.log.warn("rove-js {s} (terminal+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
                 tearDownWsChain(worker, conn_ent);
                 return;
             };
             p.txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, r.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, tapes, chain_ctx.correlation_id, r.tags, act, fw_seq);
             r.console = &.{};
             r.exception = &.{};
             tearDownWsChain(worker, conn_ent);
@@ -525,11 +531,14 @@ fn finishWsResume(
             const wrote = p.ws.ops.items.len > 0;
             // Snap the §8.4 read baseline before shipWsFrames may transfer txn.
             const read_version = p.txn.readVersion();
+            // Tapes before shipWsFrames' propose — input channels ride the raft
+            // readset for the promotion walker (see the terminal arm above).
+            const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
                 std.log.warn("rove-js {s} (next+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 cval.deinit(allocator);
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
@@ -546,7 +555,7 @@ fn finishWsResume(
             // ws_message frames return next(), so this is the dominant
             // browser-agent capture path — without it the per-frame
             // activations carry no `session` tag.
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, cval.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, chain_ctx.correlation_id, cval.tags, act, fw_seq);
             // Re-aim on an explicit cross-module target — every later
             // frame/wake on this connection dispatches at the target
             // module. AFTER the capture above: the `path` local

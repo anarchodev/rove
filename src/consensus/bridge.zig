@@ -222,6 +222,11 @@ const CatchupJob = struct {
     term: u64,
 };
 
+/// One drained follower→leader promotion: the group's `gid` (for the
+/// promotion-time log walker's raft-log reads) + its tenant `id_str`
+/// (borrowed, bridge-lifetime stable; for the deployment reload).
+pub const Promotion = struct { gid: u64, id_str: []const u8 };
+
 /// Worker-facing resolved form of a `CatchupJob` (`drainSnapshotCatchup` adds
 /// the gid's pointer-stable `id_str`). The `SnapshotCatchupThread` consumes it.
 pub const SnapshotCatchup = struct {
@@ -931,6 +936,7 @@ pub const Bridge = struct {
     pub const LogEntry = bridge_control.LogEntry;
     pub const logEntry = bridge_control.logEntry;
     pub const lastIndex = bridge_control.lastIndex;
+    pub const firstIndex = bridge_control.firstIndex;
     pub const baselineIndex = bridge_control.baselineIndex;
     pub const appliedRaw = bridge_control.appliedRaw;
     pub const durabilizedRaw = bridge_control.durabilizedRaw;
@@ -1005,14 +1011,14 @@ pub const Bridge = struct {
         return sig.id_str;
     }
 
-    pub fn drainPromotions(self: *Bridge, out: [][]const u8) usize {
+    pub fn drainPromotions(self: *Bridge, out: []Promotion) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         var n: usize = 0;
         while (n < out.len) {
             const gid = self.promoted.pop() orelse break;
             const sig = self.groups.get(gid) orelse continue;
-            out[n] = sig.id_str;
+            out[n] = .{ .gid = gid, .id_str = sig.id_str };
             n += 1;
         }
         return n;

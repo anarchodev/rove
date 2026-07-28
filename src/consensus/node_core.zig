@@ -545,6 +545,7 @@ pub const Node = struct {
     pub const logEntry = @import("node_membership.zig").logEntry;
     pub const logTerm = @import("node_membership.zig").logTerm;
     pub const lastIndex = @import("node_membership.zig").lastIndex;
+    pub const firstIndex = @import("node_membership.zig").firstIndex;
     pub const snapshotPendingPeers = @import("node_membership.zig").snapshotPendingPeers;
     pub const baselineIndex = @import("node_membership.zig").baselineIndex;
     pub const appliedRaw = @import("node_membership.zig").appliedRaw;

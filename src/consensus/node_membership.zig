@@ -90,6 +90,13 @@ pub fn lastIndex(self: *Node, tenant_id: u64) u64 {
     return self.mgr.lastIndex(tenant_id) orelse 0;
 }
 
+/// This group's first (uncompacted) local raft log index (any replica) — the
+/// low end of the promotion-time LogRecord walker's `[first..last]` range.
+/// 0 on unknown group.
+pub fn firstIndex(self: *Node, tenant_id: u64) u64 {
+    return self.mgr.firstIndex(tenant_id) orelse 0;
+}
+
 /// Peer ids in `StateSnapshot` on this (leader) node for `tenant_id` — peers
 /// that fell below the compaction floor and need an out-of-band catch-up
 /// (the snapshot-free `snapshotCb` parks them here). Writes into `ids`,

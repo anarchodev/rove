@@ -88,7 +88,7 @@ const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
-const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
+const log_walker_mod = @import("log_walker.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_fire = @import("worker_fire.zig");
 const worker_ws = @import("worker_ws.zig");
@@ -1112,6 +1112,14 @@ pub const WorkerConfig = struct {
     /// Upper bound on how long a parked raft proposal can wait before
     /// we compensate-rollback and return 503. See `RaftWait` docs.
     commit_wait_timeout_ns: u64 = 2 * std.time.ns_per_s,
+    /// Log-flush cadence overrides for `NodeLogBuffer.shouldFlush`. Null
+    /// keeps the module defaults (1024 records / 1 MB / 1 s). Operational
+    /// knobs (`REWIND_LOG_FLUSH_INTERVAL_MS` / `REWIND_LOG_FLUSH_RECORDS`);
+    /// the failover-log smoke widens the interval + lowers the record
+    /// threshold to hold a record unflushed across a leader kill, proving
+    /// the promotion walker (not the original flush) surfaces it.
+    log_flush_interval_ns: ?i64 = null,
+    log_flush_threshold_records: ?u32 = null,
     /// HMAC-SHA256 secret used to sign JWTs minted at
     /// `/_system/services-token`.
     /// The standalone log-server + files-server (separate threads /
@@ -1203,13 +1211,7 @@ pub const WorkerConfig = struct {
     /// otherwise. Required because `flushLogs` shouldn't have to
     /// reason about a missing observability backend.
     log_batch_store: log_server_mod.batch_store.BatchStore,
-    /// Readset replication (`docs/architecture/effects-and-handlers.md`) — node's data
-    /// directory. The worker reads its per-worker
-    /// `last_uploaded_seq` checkpoint at startup from
-    /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`
-    /// and writes after each successful `flushLogs`. Null disables
-    /// the checkpoint (some unit-test fixtures that don't need
-    /// readset-replication persistence).
+    /// Node's data directory. Null in some unit-test fixtures.
     data_dir: ?[]const u8 = null,
 };
 
@@ -1601,6 +1603,11 @@ pub fn Worker(comptime opts: Options) type {
         /// teardown ordering (join flusher → join push → free push_queue)
         /// is local + auditable (`LogSubsystem.deinit`).
         log: log_subsystem_mod.LogSubsystem,
+        /// Promotion-time LogRecord catch-up state. On a follower→leader
+        /// edge it walks the group's live raft log, re-deriving LogRecords
+        /// a crashed prior leader buffered but never flushed, and appends
+        /// them to `log.log_buffer` (`docs/architecture/deployment-and-logs.md`).
+        log_walker: log_walker_mod.LogWalker = .{},
         /// Circuit breaker for handlers that blow past their CPU
         /// budget. A tenant with `kill_threshold` interrupts inside a
         /// single `window_ns` gets bounced with 503 for
@@ -1625,11 +1632,11 @@ pub fn Worker(comptime opts: Options) type {
         /// routing entirely. Cross-tenant scoping uses the
         /// `X-Rove-Scope: <id>` header on this host.
         admin_api_domain: ?[]const u8,
-        /// Readset replication (`docs/architecture/effects-and-handlers.md`) — node data
-        /// directory borrowed from `WorkerConfig.data_dir`. Used by
-        /// the per-worker `last_uploaded_seq` checkpoint file at
-        /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`.
-        /// Null disables the checkpoint (test fixtures).
+        /// Node data directory borrowed from `WorkerConfig.data_dir`.
+        /// Null in test fixtures. (Post-flush LogRecord durability across a
+        /// leader crash is the promotion walker's job now, driven off the
+        /// live raft log, not a durable per-worker mark — see
+        /// `docs/architecture/deployment-and-logs.md`.)
         data_dir: ?[]const u8,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
@@ -1715,12 +1722,14 @@ pub fn Worker(comptime opts: Options) type {
                 .spools = .{ .bound_fetch_spool_depth = readBoundFetchSpoolDepth() },
                 .tenant_logs = .empty,
                 .log = .{
-                    .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+                    .log_buffer = lbb: {
+                        var lb = log_mod.NodeLogBuffer.init(allocator);
+                        // Operational log-flush cadence overrides (null → module defaults).
+                        if (config.log_flush_interval_ns) |v| lb.flush_interval_ns = v;
+                        if (config.log_flush_threshold_records) |v| lb.flush_threshold_records = v;
+                        break :lbb lb;
+                    },
                     .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
-                    .last_uploaded_seq = if (config.data_dir) |dd|
-                        worker_upload_checkpoint.readCheckpoint(allocator, dd, config.log_worker_id orelse @intCast(config.raft.config.node_id))
-                    else
-                        0,
                     .log_batch_store = config.log_batch_store,
                     .log_public_base = config.log_public_base,
                     .log_push_bases = config.log_push_bases,
@@ -1839,8 +1848,7 @@ pub fn Worker(comptime opts: Options) type {
                 // The streaming substrate (`docs/architecture/routing-and-ingress.md`): body flush is driven by
                 // the process-global coordinator's own drainer + executor
                 // threads — no per-tick call from the worker. The per-tick
-                // log flush drains the local fast path's records and advances
-                // `last_uploaded_seq`.
+                // log flush drains the local fast path's records to S3.
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
                 };
@@ -1874,6 +1882,7 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
             self.log.log_buffer.deinit();
+            self.log_walker.deinit(allocator);
             // SharedTxnPool.deinit walks any leftover
             // txns (best-effort rollback) before freeing the
             // hashmap. Non-empty means we're exiting with

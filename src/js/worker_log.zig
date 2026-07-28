@@ -31,7 +31,6 @@ const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
 
 const worker_mod = @import("worker.zig");
-const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const components_mod = @import("components.zig");
 const TenantLog = worker_mod.TenantLog;
 
@@ -534,8 +533,8 @@ pub fn captureLog(
     activation: log_mod.ActivationSource,
     /// The raft seq the envelope carrying this request's writeset was
     /// proposed at. Pass 0 for paths with no associated raft entry
-    /// (early-error / read-only). The per-worker `flushLogs` advances
-    /// `last_uploaded_seq` by `max(raft_seq)`.
+    /// (early-error / read-only). The promotion walker stamps it from the
+    /// entry's frame when it rebuilds a record from the raft log.
     raft_seq: u64,
 ) void {
     captureLogWithId(
@@ -787,43 +786,6 @@ pub fn flushLogs(worker: anytype) !void {
             .{ batch_key, @errorName(err) },
         );
     };
-
-    // Advance the per-worker `last_uploaded_seq` checkpoint by
-    // `max(record.raft_seq)` across the drained batch. Records
-    // with raft_seq == 0 (early-error / read-only / not-yet-plumbed
-    // paths) are skipped so they don't reset the watermark. Failure
-    // here is non-fatal — the checkpoint stays at its previous value;
-    // the checkpoint walker re-derives + re-pushes the entries we
-    // would've advanced past, and the indexer's
-    // `INSERT OR IGNORE (tenant_id, request_id)` absorbs the
-    // duplicate.
-    advanceUploadCheckpoint(worker, records) catch |err| {
-        std.log.warn(
-            "rove-js flushLogs: advanceUploadCheckpoint failed: {s}",
-            .{@errorName(err)},
-        );
-    };
-}
-
-/// Per-worker checkpoint advance — `worker.log.last_uploaded_seq =
-/// max(records[].raft_seq)` if it advanced. Skips 0-seq records.
-fn advanceUploadCheckpoint(
-    worker: anytype,
-    records: []const log_mod.LogRecord,
-) !void {
-    if (worker.data_dir == null) return;
-    var batch_max: u64 = 0;
-    for (records) |r| {
-        if (r.raft_seq > batch_max) batch_max = r.raft_seq;
-    }
-    if (batch_max <= worker.log.last_uploaded_seq) return;
-    try worker_upload_checkpoint.writeCheckpoint(
-        worker.allocator,
-        worker.data_dir.?,
-        worker.log.log_worker_id,
-        batch_max,
-    );
-    worker.log.last_uploaded_seq = batch_max;
 }
 
 /// Enqueue a freshly-PUT batch key for the push thread to ship to

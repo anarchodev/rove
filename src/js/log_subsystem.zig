@@ -26,8 +26,6 @@ pub const LogSubsystem = struct {
     log_push_bases: []const []const u8,
     /// libcurl handle owned by the push thread (null when push is disabled).
     log_push_curl: ?*blob_mod.curl.Easy,
-    /// Highest log seq durably uploaded — resumed from the on-disk checkpoint.
-    last_uploaded_seq: u64 = 0,
     /// Count of per-request log records permanently dropped by `flushLogs`
     /// (batch drained before the S3 PUT failed / leadership lost). Lossy by
     /// design; counted so the data-loss volume is visible. Never reset.
