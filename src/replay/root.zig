@@ -39,6 +39,12 @@ pub const exportFixtureActivation = export_fixture.activationOf;
 pub const exportFixtureIsFaithful = export_fixture.isFaithfulTranscode;
 
 // ── the JS-authored test runner (harness reactor + saga library) ──
+const first_party = @import("first_party.zig");
+/// The first-party `@rewind/*` graph `rewind test` auto-resolves from an app's
+/// manifest deps + merges into each scenario's world (offline package imports).
+pub const FirstPartyGraph = first_party.Graph;
+pub const buildFirstParty = first_party.build;
+
 const harness = @import("harness.zig");
 pub const runTests = harness.runTests;
 pub const TestOptions = harness.Options;
@@ -209,11 +215,15 @@ pub const Engine = struct {
         world_json: []const u8,
         source_dir: ?[]const u8,
         base_dir: ?[]const u8,
+        fp_graph: ?*const first_party.Graph,
         out: *std.ArrayList(u8),
     ) Error!void {
         const parsed = std.json.parseFromSlice(std.json.Value, a, world_json, .{}) catch
             return Error.BadFixture;
-        const wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
+        var wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
+        // Fold the app's first-party @rewind/* graph in (rewind test); a
+        // scenario's own inline packages win. No-op when null (sim/replay).
+        if (fp_graph) |g| try first_party.mergeInto(a, &wv, g);
 
         // ── authored-header hygiene (prod parity) ──
         // Prod's wire is lowercase (HTTP/2), and the worker's header installer
@@ -484,7 +494,7 @@ pub fn runWorld(
     out: *std.ArrayList(u8),
 ) Error!void {
     if (g_run_engine == null) g_run_engine = try Engine.init();
-    try g_run_engine.?.simulate(a, world_json, source_dir, null, out);
+    try g_run_engine.?.simulate(a, world_json, source_dir, null, null, out);
 }
 
 /// Partial, order-independent matcher: for each facet the `expected` object

@@ -1295,6 +1295,15 @@ pub fn build(b: *std.Build) void {
     addSimGlobalEmbeds(b, replay_mod);
     replay_mod.addImport("package_resolver", pkgres_mod);
     replay_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
+    // The first-party @rewind/* package sources, so `rewind test` auto-resolves
+    // an app's declared @rewind deps offline (src/replay/first_party.zig) without
+    // per-scenario inlining. Same sources driver_smoke + rewind-ops embed.
+    inline for (.{
+        "jwt", "oauth", "cron", "sessions", "retry", "activitypub",
+        "email", "users", "oidc", "schedule", "segments", "browser",
+    }) |nm| replay_mod.addAnonymousImport("pkg_" ++ nm, .{
+        .root_source_file = b.path("src/js/packages/@rewind/" ++ nm ++ "/index.mjs"),
+    });
 
     const replay_tests = b.addTest(.{ .root_module = replay_mod });
     const replay_test_step = b.step("replay-test", "Run the native replay driver unit tests");
@@ -1479,6 +1488,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/shamidstate", // streaming-sha256 midstate: decode+emit the worker s2: token (prod-compatible), still read legacy js2:
         "src/replay/testdata/subscription", // http.subscribe recorder bag + detached onSubscription (subscription_fire) activation
         "src/replay/testdata/kvtriggers", // _triggers/<prefix>/index before/after chains run offline: mutate value / reject as trigger_rejected
+        "src/replay/testdata/manifestpkg", // `rewind test` auto-resolves an app's manifest.json @rewind/* deps offline (P4a enabler) — direct jwt/oidc + transitive oidc→jwt, no inline scenario packages
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);
