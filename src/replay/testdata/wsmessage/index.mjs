@@ -1,3 +1,4 @@
+import browser from "@rewind/browser";
 // A WS handler that reads the inbound frame via request.text / browser.message()
 // — the canonical agent-SDK pattern. The frame text must be readable as
 // request.text regardless of opcode (the runtime browser.message() contract); a

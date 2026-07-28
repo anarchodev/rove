@@ -1,0 +1,7 @@
+{
+  "name": "email",
+  "version": "1.0.0",
+  "dependencies": {
+    "@rewind/email": "^1.0.0"
+  }
+}

@@ -1,3 +1,4 @@
+import jwt from "@rewind/jwt";
 // OIDC ES256 verification offline: crypto.verifyEcdsa (native SHA-256 + pure-JS
 // P-256 ECDSA in the sim base) + jwt.verify over a real EC IdP JWK. Same shape
 // as the RS256 fixture, exercising the elliptic-curve path an ES256 IdP uses.

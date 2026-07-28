@@ -1,0 +1,7 @@
+{
+  "name": "retrypkg",
+  "version": "1.0.0",
+  "dependencies": {
+    "@rewind/retry": "^1.0.0"
+  }
+}

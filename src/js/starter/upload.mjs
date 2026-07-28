@@ -29,8 +29,23 @@ function authFor(tenant) {
   const hdr = request.headers["authorization"] || "";
   const tok = hdr.indexOf("Bearer ") === 0 ? hdr.slice(7) : "";
   if (tok && platform.auth.checkRootToken(tok)) return { is_root: true };
+  // Inline OIDC RP session read — the oidc lib is now the @rewind/oidc
+  // package, unreachable from this baked genesis module. Mirrors
+  // OIDCRelyingParty.guard: the default (only) session path is
+  // `_rp/sess/{sid}`, keyed by the platform request sid. Genesis never
+  // reaches here (root-token path returns above); the deployed admin
+  // dashboard's non-root tenant-owner uploads ride an RP session.
   let sess = null;
-  try { sess = oidc.rp("default").guard(); } catch (_) { sess = null; }
+  const sid = request.session && request.session.id;
+  if (sid) {
+    const raw = kv.get("_rp/sess/" + sid);
+    if (raw !== null) {
+      try {
+        const s = JSON.parse(raw);
+        if (s && Date.now() < s.exp) sess = { sub: s.sub, is_root: !!s.is_root };
+      } catch (_) { /* corrupt session record — treated as unauthenticated */ }
+    }
+  }
   if (sess && sess.sub) {
     if (sess.is_root || ownsTenant(sess.sub, tenant)) return sess;
     response.status = 403; return null;

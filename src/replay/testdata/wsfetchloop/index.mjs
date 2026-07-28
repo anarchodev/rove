@@ -1,3 +1,4 @@
+import browser from "@rewind/browser";
 // The agent-loop shape: a held WS conversation that issues an after.fetch
 // mid-chain and CONTINUES after the resume. onMessage("start") → fetch(LLM) →
 // hold; onResult → write + re-hold (bumping the connection ctx); the page then

@@ -3,7 +3,9 @@ import { scenario, expect } from "rewind:test";
 // tenant `kv:`. `platform.*` is admin-only, so the run opts in with `admin: true`.
 const req = scenario({ admin: true, root: { kv: { "cfg/x": "hello" } } }).inbound({ method: "GET", path: "/" });
 expect(req.status).toBe(200);
-expect(req.body.surface).toEqual({ http: "object", platform: "object", browser: "object" });
+// browser is no longer an ambient global — it's the @rewind/browser package
+// (a handler must import it). http/platform stay ambient.
+expect(req.body.surface).toEqual({ http: "object", platform: "object", browser: "undefined" });
 expect(req.body.created).toBe(undefined); // prod's instances.create returns undefined
 expect(req.body.rootRead).toBe("hello");
 // The recorder carries the real argument (the instance name), so the effect log

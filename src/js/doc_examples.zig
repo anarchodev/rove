@@ -164,6 +164,10 @@ fn collectJsdocExamples(
 fn collectAll(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(Example)) !void {
     try collectMdFences(a, HANDLER_SHAPE_MD, out);
     for (globals.GLOBALS_FILES) |g| {
+        // schedule.js is the private `_system.sched` core; its @example blocks
+        // show the customer verb, which is now the @rewind/schedule package
+        // (not an ambient global), so they aren't executable against the base.
+        if (std.mem.eql(u8, g.name, "schedule")) continue;
         try collectJsdocExamples(a, g.name, g.src, out);
     }
 }

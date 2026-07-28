@@ -77,6 +77,13 @@
 // the object). Same closure-capture posture as globals/on.js.
 const sysHttp = _system.http;
 
+// The durable scheduler core (globals/schedule.js) installs the private
+// `_system.sched`; capture it here the same way as `sysHttp` (before
+// `_harden.js` deletes `_system`) so webhook.send's durable re-arm keeps
+// working post-harden without exposing an ambient `schedule` to customers
+// (the customer-facing verb is the `@rewind/schedule` package).
+const sysSched = _system.sched;
+
 // Crash-recovery watchdog distance for the immediate-fire path: one
 // attempt timeout (the fetch binding's 30 s cap) + grace. Mirrored in
 // `__system/webhook_fire.mjs` (its per-attempt re-arm) — keep in sync.
@@ -299,9 +306,9 @@ globalThis.webhook = {
     // it on the terminal event; a retry re-arm moves it to the
     // backoff time).
     if (scheduled) {
-      schedule({ at: fire_at_ns_big }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+      sysSched({ at: fire_at_ns_big }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
     } else {
-      schedule({ in: WEBHOOK_WATCHDOG_MS }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+      sysSched({ in: WEBHOOK_WATCHDOG_MS }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
     }
     return id;
   },

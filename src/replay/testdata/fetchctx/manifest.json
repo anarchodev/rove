@@ -1,0 +1,7 @@
+{
+  "name": "fetchctx",
+  "version": "1.0.0",
+  "dependencies": {
+    "@rewind/browser": "^1.0.0"
+  }
+}

@@ -955,12 +955,29 @@ fn cmdExportFixture(a: std.mem.Allocator, fixture_path: []const u8, out_file: ?[
 /// declares its own `sourceDir`. `--update` rebaselines snapshots. Exits
 /// non-zero if any assertion fails or a file aborts (CI-usable).
 fn cmdTest(a: std.mem.Allocator, dir: []const u8, source_dir: ?[]const u8, update: bool) void {
+    // Resolve the app's declared @rewind/* deps from the embedded first-party
+    // set so handler package imports resolve offline (no per-scenario inlining).
+    // Built once here; merged into every scenario's world by the harness.
+    var fp_specs = std.ArrayList([]const u8){};
+    for (readBundleDependencies(a, dir)) |d| {
+        if (std.mem.startsWith(u8, d.spec, "@rewind/")) fp_specs.append(a, d.spec) catch c.oom();
+    }
+    var fp_storage: replay.FirstPartyGraph = undefined;
+    const fp: ?*const replay.FirstPartyGraph = if (fp_specs.items.len == 0) null else blk: {
+        fp_storage = replay.buildFirstParty(a, fp_specs.items) catch |e| switch (e) {
+            error.UnknownFirstParty => c.fatal("test: manifest.json declares an @rewind/* dependency that is not a known first-party package", .{}),
+            else => c.fatal("test: first-party resolve: {s}", .{@errorName(e)}),
+        };
+        break :blk &fp_storage;
+    };
+
     const report = replay.runTests(a, dir, .{
         .update = update,
         // An explicit --source-dir overrides a world's inline sources; `dir` is
         // the fallback for worlds that declare neither sourceDir nor sources.
         .source_dir = source_dir,
         .base_dir = dir,
+        .first_party = fp,
     }) catch |e| switch (e) {
         error.NoTestsDir => c.fatal("test: no _tests/ directory under '{s}'", .{dir}),
         error.ArenaInit => c.fatal("test: JS engine failed to initialise", .{}),

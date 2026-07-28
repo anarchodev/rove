@@ -109,6 +109,10 @@ const Harness = struct {
     /// The `rewind test [dir]` app dir — the source fallback used only when a
     /// world declares neither its own `sourceDir` nor inline `sources`.
     base_dir: ?[]const u8,
+    /// The app's first-party @rewind/* graph (from its manifest deps), merged
+    /// into every scenario's world so package imports resolve offline; null when
+    /// the app declares no @rewind deps.
+    first_party: ?*const root.FirstPartyGraph = null,
     /// Directory holding the test file, for resolving sibling `import`s.
     test_dir: []const u8,
     /// Running under `--update` — the library rewrites mismatched snapshots
@@ -169,7 +173,7 @@ fn kvGet(
         };
         var out = std.ArrayList(u8){};
         const sa = h.sim_arena.allocator();
-        h.eng.simulate(sa, world_json, h.source_dir, h.base_dir, &out) catch |e| {
+        h.eng.simulate(sa, world_json, h.source_dir, h.base_dir, h.first_party, &out) catch |e| {
             // Surface the engine failure to the library as a bundle-shaped error
             // so the test sees a structured result rather than a thrown host op.
             out.clearRetainingCapacity();
@@ -334,6 +338,10 @@ pub const Options = struct {
     /// The `rewind test [dir]` app dir — the source fallback for worlds that
     /// declare neither `sourceDir` nor inline `sources`.
     base_dir: ?[]const u8 = null,
+    /// The app's resolved first-party @rewind/* graph (built once by cmdTest
+    /// from the bundle manifest deps), merged into every scenario's world so
+    /// `import x from "@rewind/x"` resolves offline. Null → no @rewind deps.
+    first_party: ?*const root.FirstPartyGraph = null,
 };
 
 pub const Report = struct {
@@ -418,6 +426,7 @@ fn runOneFile(
         .sim_arena = &sim_arena,
         .source_dir = opts.source_dir,
         .base_dir = opts.base_dir,
+        .first_party = opts.first_party,
         .test_dir = tests_dir,
         .update = opts.update,
     };

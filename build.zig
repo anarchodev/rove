@@ -239,7 +239,9 @@ pub fn build(b: *std.Build) void {
     // them registered (replay_mod, driver_smoke_mod).
     const addSimGlobalEmbeds = struct {
         fn f(bb: *std.Build, mod: *std.Build.Module) void {
-            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "platform", "retry", "segments", "browser", "users", "activitypub", "time", "cron", "schedule", "webhook", "email", "after", "stream", "next", "blob" };
+            // schedule stays (installs the private `_system.sched` the sim
+            // webhook shim captures); the 11 lifted customer globals are gone.
+            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "platform", "time", "schedule", "webhook", "after", "stream", "next", "blob" };
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
@@ -542,30 +544,18 @@ pub fn build(b: *std.Build) void {
         .{ .name = "platform_js", .path = "src/js/globals/platform.js" },
         .{ .name = "base64_js", .path = "src/js/globals/base64.js" },
         .{ .name = "urlsearchparams_js", .path = "src/js/globals/urlsearchparams.js" },
-        .{ .name = "jwt_js", .path = "src/js/globals/jwt.js" },
-        .{ .name = "oauth_js", .path = "src/js/globals/oauth.js" },
-        .{ .name = "oidc_js", .path = "src/js/globals/oidc.js" },
-        .{ .name = "sessions_js", .path = "src/js/globals/sessions.js" },
         .{ .name = "time_js", .path = "src/js/globals/time.js" },
-        .{ .name = "cron_js", .path = "src/js/globals/cron.js" },
-        .{ .name = "retry_js", .path = "src/js/globals/retry.js" },
+        // schedule.js stays embedded: it now installs the PRIVATE
+        // `_system.sched` (webhook.js captures it), not a customer global.
         .{ .name = "schedule_js", .path = "src/js/globals/schedule.js" },
         .{ .name = "after_js", .path = "src/js/globals/after.js" },
         .{ .name = "stream_js", .path = "src/js/globals/stream.js" },
         .{ .name = "next_js", .path = "src/js/globals/next.js" },
         .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },
-        .{ .name = "email_js", .path = "src/js/globals/email.js" },
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
         .{ .name = "handler_shape_md", .path = "docs/handler-shape.md" },
         .{ .name = "request_js", .path = "src/js/globals/request.js" },
-        .{ .name = "users_js", .path = "src/js/globals/users.js" },
-        .{ .name = "activitypub_js", .path = "src/js/globals/activitypub.js" },
         .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
-        .{ .name = "segments_js", .path = "src/js/globals/segments.js" },
-        // browser.* — server-side surface for the in-page browser-agent
-        // SDK (web/rove-agent.js). Pure protocol/formatting over the
-        // ambient `stream`; vendor-neutral.
-        .{ .name = "browser_js", .path = "src/js/globals/browser.js" },
 
         // Built-in handler modules — compiled to bytecode at NodeState
         // init, resolved via the `__system/` module-path prefix
@@ -1272,6 +1262,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The first-party @rewind/* package sources the `seed-packages` verb POSTs
+    // to the registry at genesis (leaves-first). Embedded so the seed is
+    // self-contained (no rewind-apps checkout needed) and the exact bytes are
+    // the frozen package identity. Same source files driver_smoke embeds.
+    inline for (.{
+        .{ "pkg_jwt", "src/js/packages/@rewind/jwt/index.mjs" },
+        .{ "pkg_oauth", "src/js/packages/@rewind/oauth/index.mjs" },
+        .{ "pkg_cron", "src/js/packages/@rewind/cron/index.mjs" },
+        .{ "pkg_sessions", "src/js/packages/@rewind/sessions/index.mjs" },
+        .{ "pkg_retry", "src/js/packages/@rewind/retry/index.mjs" },
+        .{ "pkg_activitypub", "src/js/packages/@rewind/activitypub/index.mjs" },
+        .{ "pkg_email", "src/js/packages/@rewind/email/index.mjs" },
+        .{ "pkg_users", "src/js/packages/@rewind/users/index.mjs" },
+        .{ "pkg_oidc", "src/js/packages/@rewind/oidc/index.mjs" },
+        .{ "pkg_schedule", "src/js/packages/@rewind/schedule/index.mjs" },
+        .{ "pkg_segments", "src/js/packages/@rewind/segments/index.mjs" },
+        .{ "pkg_browser", "src/js/packages/@rewind/browser/index.mjs" },
+    }) |e| ops_mod.addAnonymousImport(e[0], .{ .root_source_file = b.path(e[1]) });
     const ops_exe = b.addExecutable(.{ .name = "rewind-ops", .root_module = ops_mod });
     const ops_step = b.step("rewind-ops", "Build the rewind-ops operator CLI");
     ops_step.dependOn(&b.addInstallArtifact(ops_exe, .{}).step);
@@ -1295,6 +1303,15 @@ pub fn build(b: *std.Build) void {
     addSimGlobalEmbeds(b, replay_mod);
     replay_mod.addImport("package_resolver", pkgres_mod);
     replay_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
+    // The first-party @rewind/* package sources, so `rewind test` auto-resolves
+    // an app's declared @rewind deps offline (src/replay/first_party.zig) without
+    // per-scenario inlining. Same sources driver_smoke + rewind-ops embed.
+    inline for (.{
+        "jwt", "oauth", "cron", "sessions", "retry", "activitypub",
+        "email", "users", "oidc", "schedule", "segments", "browser",
+    }) |nm| replay_mod.addAnonymousImport("pkg_" ++ nm, .{
+        .root_source_file = b.path("src/js/packages/@rewind/" ++ nm ++ "/index.mjs"),
+    });
 
     const replay_tests = b.addTest(.{ .root_module = replay_mod });
     const replay_test_step = b.step("replay-test", "Run the native replay driver unit tests");
@@ -1479,6 +1496,8 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/shamidstate", // streaming-sha256 midstate: decode+emit the worker s2: token (prod-compatible), still read legacy js2:
         "src/replay/testdata/subscription", // http.subscribe recorder bag + detached onSubscription (subscription_fire) activation
         "src/replay/testdata/kvtriggers", // _triggers/<prefix>/index before/after chains run offline: mutate value / reject as trigger_rejected
+        "src/replay/testdata/manifestpkg", // `rewind test` auto-resolves an app's manifest.json @rewind/* deps offline (P4a enabler) — direct jwt/oidc + transitive oidc→jwt, no inline scenario packages
+        "src/replay/testdata/retrypkg", // @rewind/retry wraps webhook.send (maxAttempts→1 + ctx._retry chain state) + shouldRetry/ctx result logic — the package-model replacement for the retired ambient-retry dispatcher tests
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

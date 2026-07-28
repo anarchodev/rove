@@ -16,12 +16,13 @@
 //!   move <tenant> <cluster> --yes                 relocate a tenant (zero-downtime) (CP).
 //!   host add <host> <tenant>        map a domain → tenant (CP index; CP pushes the worker alias).
 //!   plan set <tenant> <plan>        set a tenant's plan/limits blob (CP).
+//!   seed-packages                   publish the first-party @rewind/* set into the registry (genesis).
 //!   status <host>                   resolve a host → tenant/cluster/nodes + plan.
 //!
 //! Config: operator env file (default ~/.config/rove/prod.env, then ./.env.prod,
 //! --env override; OS env overlays). Vars: REWIND_ROOT_TOKEN, REWIND_ADMIN_DOMAIN,
-//! ROVE_WORKER_URLS, ROVE_CLUSTER, ROVE_PUBLISH_SSH?, ROVE_CP_URL_INTERNAL,
-//! REWIND_MOVE_SECRET.
+//! REWIND_REGISTRY_DOMAIN (seed-packages), ROVE_WORKER_URLS, ROVE_CLUSTER,
+//! ROVE_PUBLISH_SSH?, ROVE_CP_URL_INTERNAL, REWIND_MOVE_SECRET.
 
 const std = @import("std");
 const c = @import("common.zig");
@@ -206,6 +207,110 @@ fn cmdBootstrap(a: std.mem.Allocator, env: *const c.Env) void {
     cmdProvision(a, env, "__admin__", cluster, env.require("REWIND_ADMIN_DOMAIN"));
     _ = cmdReset(a, env);
     std.debug.print("bootstrap complete — deploy capability live; publish with `rewind-ops deploy`\n", .{});
+}
+
+// ── genesis package seed ────────────────────────────────────────────────────
+// The first-party @rewind/* set must exist in the `registry` tenant before any
+// consumer deploys — otherwise the auth→oidc→registry-package→registry-needs-
+// publishing bootstrap cycle can never start. Run once, after the registry
+// tenant is provisioned + its app deployed.
+//
+// The registry is a normal tenant with no platform.auth.checkRootToken, and at
+// genesis there is no OIDC IdP to log into. So this authenticates publish via a
+// seeded operator-token hash: kv-put sha256(root_token) into the registry's own
+// kv (its middleware grants is_root to a Bearer that hashes to it), then POST
+// each package SOURCE to /v1/packages with the root token as Bearer. The
+// registry hashes + writes each package with its OWN code — one canonical
+// pkg_hash implementation, zero cross-publisher divergence. Source-only: each
+// consumer compiles the package at its own deploy (the B path).
+
+const SeedPkg = struct {
+    spec: []const u8,
+    source: []const u8,
+    dep_jwt: bool = false, // imports @rewind/jwt (frozen to jwt's pkg_hash at publish)
+};
+
+const SEED_VERSION = "1.0.0"; // genesis versions are immutable once seeded
+const REGISTRY_TENANT = "registry";
+
+// LEAVES-FIRST: @rewind/jwt has no intra-set dependency and MUST publish before
+// oauth/oidc (the only two that import it), so the registry can freeze their dep
+// to jwt's concrete pkg_hash. The other nine are independent leaves (any order).
+const SEED_PACKAGES = [_]SeedPkg{
+    .{ .spec = "@rewind/jwt", .source = @embedFile("pkg_jwt") },
+    .{ .spec = "@rewind/cron", .source = @embedFile("pkg_cron") },
+    .{ .spec = "@rewind/email", .source = @embedFile("pkg_email") },
+    .{ .spec = "@rewind/sessions", .source = @embedFile("pkg_sessions") },
+    .{ .spec = "@rewind/retry", .source = @embedFile("pkg_retry") },
+    .{ .spec = "@rewind/activitypub", .source = @embedFile("pkg_activitypub") },
+    .{ .spec = "@rewind/users", .source = @embedFile("pkg_users") },
+    .{ .spec = "@rewind/segments", .source = @embedFile("pkg_segments") },
+    .{ .spec = "@rewind/schedule", .source = @embedFile("pkg_schedule") },
+    .{ .spec = "@rewind/browser", .source = @embedFile("pkg_browser") },
+    .{ .spec = "@rewind/oauth", .source = @embedFile("pkg_oauth"), .dep_jwt = true },
+    .{ .spec = "@rewind/oidc", .source = @embedFile("pkg_oidc"), .dep_jwt = true },
+};
+
+fn sha256Hex(a: std.mem.Allocator, s: []const u8) []const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(s, &digest, .{});
+    const hex = a.alloc(u8, 64) catch oom();
+    const lut = "0123456789abcdef";
+    for (digest, 0..) |byte, i| {
+        hex[i * 2] = lut[byte >> 4];
+        hex[i * 2 + 1] = lut[byte & 0xf];
+    }
+    return hex;
+}
+
+fn cmdSeedPackages(a: std.mem.Allocator, env: *const c.Env) void {
+    const rt = env.require("REWIND_ROOT_TOKEN");
+    const reg_host = env.require("REWIND_REGISTRY_DOMAIN");
+
+    // 1. Seed the operator-token hash so the registry accepts our Bearer.
+    std.debug.print("[1/2] seed operator-token hash → {s}\n", .{REGISTRY_TENANT});
+    cmdKvPut(a, env, REGISTRY_TENANT, "_optoken/publish_sha256", sha256Hex(a, rt));
+
+    // 2. Publish the first-party set, leaves-first, routed by the registry Host.
+    const headers = a.alloc(Header, 3) catch oom();
+    headers[0] = .{ .name = "Host", .value = reg_host };
+    headers[1] = .{ .name = "Authorization", .value = std.fmt.allocPrint(a, "Bearer {s}", .{rt}) catch oom() };
+    headers[2] = .{ .name = "Content-Type", .value = "application/json" };
+
+    std.debug.print("[2/2] publish {d} first-party packages (leaves-first)\n", .{SEED_PACKAGES.len});
+    for (SEED_PACKAGES) |pkg| publishPackage(a, env, headers, pkg);
+    std.debug.print("genesis package seed complete — {d} packages live in {s}\n", .{ SEED_PACKAGES.len, REGISTRY_TENANT });
+}
+
+fn publishPackage(a: std.mem.Allocator, env: *const c.Env, headers: []const Header, pkg: SeedPkg) void {
+    var body = std.ArrayList(u8){};
+    body.appendSlice(a, "{\"spec\":") catch oom();
+    c.writeJsonString(&body, a, pkg.spec);
+    body.appendSlice(a, ",\"version\":\"" ++ SEED_VERSION ++ "\",\"files\":[{\"path\":\"index.mjs\",\"source\":") catch oom();
+    c.writeJsonString(&body, a, pkg.source);
+    body.appendSlice(a, "}]") catch oom();
+    if (pkg.dep_jwt) body.appendSlice(a, ",\"dependencies\":{\"@rewind/jwt\":\"" ++ SEED_VERSION ++ "\"}") catch oom();
+    body.append(a, '}') catch oom();
+
+    const workers = c.workerUrls(env, a);
+    var attempt: usize = 0;
+    while (attempt < 6) : (attempt += 1) {
+        for (workers) |w| {
+            const r = c.workerPost(a, env, w, "/v1/packages", headers, body.items, 60);
+            // 201 = created, 200 = idempotent re-publish (identical content). Both OK.
+            if (r.code == 200 or r.code == 201) {
+                std.debug.print("  published {s}@{s} → {d}\n", .{ pkg.spec, SEED_VERSION, r.code });
+                return;
+            }
+            // 409 = this version already holds DIFFERENT bytes — a frozen-identity
+            // violation (someone changed a lib's source). Never retry; the operator
+            // must reconcile (bump the version or restore the bytes).
+            if (r.code == 409) fatal("publish {s}@{s}: 409 conflict — version already holds different content: {s}", .{ pkg.spec, SEED_VERSION, c.trunc(r.body) });
+            std.debug.print("  publish {s} via {s}: {d} {s} (trying next)\n", .{ pkg.spec, w, r.code, c.trunc(r.body) });
+        }
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    fatal("publish '{s}' failed on every worker after retries", .{pkg.spec});
 }
 
 // ── genesis: cold bring-up of a virgin cluster (cold-multi) ──
@@ -492,6 +597,7 @@ const usage =
     \\  rewind-ops host add <host> <tenant>           map a domain → tenant
     \\  rewind-ops plan set <tenant> <plan>           set a tenant's plan/limits blob
     \\  rewind-ops kv-put <tenant> <key> [value]     seed a system kv key (move-secret; operator/OIDC bootstrap)
+    \\  rewind-ops seed-packages                     publish the first-party @rewind/* set into the registry (genesis)
     \\  rewind-ops status <host>                      resolve a host → tenant/cluster/plan
     \\
     \\options:
@@ -602,6 +708,8 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "kv-put")) {
         if (p.len < 2) fatal("kv-put needs <tenant> <key> [value] (value defaults to empty)", .{});
         cmdKvPut(a, &env, p[0], p[1], if (p.len >= 3) p[2] else "");
+    } else if (std.mem.eql(u8, cmd, "seed-packages")) {
+        cmdSeedPackages(a, &env);
     } else if (std.mem.eql(u8, cmd, "status")) {
         if (p.len < 1) fatal("status needs <host>", .{});
         cmdStatus(a, &env, p[0]);

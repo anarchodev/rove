@@ -1,3 +1,4 @@
+import jwt from "@rewind/jwt";
 // OIDC PROVIDER mode offline (#46): mint an id_token with a generated key and
 // verify it against the published JWK — the keyset → mint → verify round-trip an
 // OIDC provider (or ActivityPub actor signer) runs, now testable without a live

@@ -1,3 +1,4 @@
+import email from "@rewind/email";
 // A send loop with a rate-limit catch branch — the shape prod's per-tenant
 // outbound token bucket (bindings/http.zig `outboundRateOk`) eventually trips
 // (email.send composes over the metered webhook.send). Offline the bucket is

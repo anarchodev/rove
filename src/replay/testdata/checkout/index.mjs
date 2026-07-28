@@ -1,3 +1,4 @@
+import email from "@rewind/email";
 // A two-activation checkout handler — the fixture the `rewind test` smoke
 // (build.zig `rewind-test-smoke`) exercises through the saga test library.
 // Inbound reads a cart, opens a pending order, and fires an upstream charge;
