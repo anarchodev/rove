@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
+const world = @import("world.zig"); // test-only: round-trip the emitted world
 
 pub const Error = error{
     BadFixture,
@@ -152,9 +153,11 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         .header_names, .ip_raw => {},
     };
 
-    // ── fetch result (fetch_chunk): status/ok/done/fetchId + the body ──
+    // ── fetch result (fetch_chunk): status/done/fetchId + the body. No `ok`
+    // — status is the single success signal (#7); the request surface has no
+    // `ok` field (world.zig REQ_KEYS), so emitting one makes the world
+    // malformed and replay produces nothing. ──
     var fetch_status: ?u16 = null;
-    var fetch_ok: ?bool = null;
     var fetch_done: ?bool = null;
     var fetch_id: ?[]const u8 = null;
     var fetch_body: ?[]const u8 = null;
@@ -165,10 +168,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         const last = fetch_resp[fetch_resp.len - 1];
         fetch_id = last.fetch_id;
         fetch_done = last.final;
-        if (last.final) {
-            fetch_status = last.terminal_status;
-            fetch_ok = last.terminal_ok;
-        }
+        if (last.final) fetch_status = last.terminal_status;
     }
     // request.body: the fetch result body (fetch_chunk) else the inbound body.
     const eff_body: ?[]const u8 = fetch_body orelse body_bytes;
@@ -270,9 +270,8 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll(",\n    \"ip\": ");
         try jsonStr(w, v);
     }
-    // flattened fetch-result surface (fetch_chunk)
+    // flattened fetch-result surface (fetch_chunk) — no `ok` (see above)
     if (fetch_status) |s| try w.print(",\n    \"status\": {d}", .{s});
-    if (fetch_ok) |b| try w.writeAll(if (b) ",\n    \"ok\": true" else ",\n    \"ok\": false");
     if (fetch_done) |b| try w.writeAll(if (b) ",\n    \"done\": true" else ",\n    \"done\": false");
     if (fetch_id) |id| {
         try w.writeAll(",\n    \"fetchId\": ");
@@ -657,6 +656,84 @@ test "transcode: send_callback bare-ctx envelope (no result) lifts ctx whole (is
     try testing.expect(req.get("status") == null);
     try testing.expect(req.get("activation") == null);
     try testing.expectEqual(@as(i64, 1), wo.get("ctx").?.object.get("step").?.integer);
+}
+
+/// Build a base64 fetch_responses tape with one terminal, inline-body entry
+/// (mirrors the encodeEntry format `decodeFetchResponses` reads).
+fn b64FetchTape(a: std.mem.Allocator, fid: []const u8, status: u16, body: []const u8) ![]const u8 {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(a);
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
+    std.mem.writeInt(u16, hdr[4..6], decode.VERSION, .big);
+    std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.fetch_responses), .big);
+    std.mem.writeInt(u32, hdr[8..12], 1, .big);
+    try buf.appendSlice(a, &hdr);
+    var ent = std.ArrayList(u8){};
+    defer ent.deinit(a);
+    var b8: [8]u8 = undefined;
+    var b4: [4]u8 = undefined;
+    var b2: [2]u8 = undefined;
+    try putLen(&ent, a, fid); // fetch_id
+    std.mem.writeInt(u32, &b4, 0, .big); // seq
+    try ent.appendSlice(a, &b4);
+    std.mem.writeInt(u64, &b8, 0, .big); // byte_offset
+    try ent.appendSlice(a, &b8);
+    std.mem.writeInt(u64, &b8, decode.NO_BATCH, .big); // batch_id (inline)
+    try ent.appendSlice(a, &b8);
+    std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
+    try ent.appendSlice(a, &b8);
+    std.mem.writeInt(u32, &b4, @intCast(body.len), .big); // body_ref.len
+    try ent.appendSlice(a, &b4);
+    try ent.append(a, 1); // final
+    std.mem.writeInt(u16, &b2, status, .big); // status
+    try ent.appendSlice(a, &b2);
+    try ent.append(a, 1); // ok (recorded on the tape, but NOT surfaced — status is the single signal, #7)
+    try ent.append(a, 0); // trunc
+    try putLen(&ent, a, "{}"); // headers
+    try putLen(&ent, a, body); // inline_bytes
+    std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
+    try buf.appendSlice(a, &b4);
+    try buf.appendSlice(a, ent.items);
+    const enc = std.base64.standard.Encoder;
+    const out = try a.alloc(u8, enc.calcSize(buf.items.len));
+    _ = enc.encode(out, buf.items);
+    return out;
+}
+
+test "transcode: fetch_chunk emits a world world.zig accepts — no stray `ok` key (issue #214)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fr_b64 = try b64FetchTape(a, "ftch_1", 200, "upstream-body");
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk", "export":"onUpstream",
+        \\   "request": {{ "method":"POST", "path":"/x", "host":"h" }},
+        \\   "recorded": {{ "status": 200 }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "fetch_responses_b64":"{s}" }}, "sources":[] }}
+    , .{fr_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    // The regression: the emitted world MUST parse under world.zig's strict
+    // key rejection. An `ok` field on the flattened fetch surface (retired
+    // per #7 — status is the single success signal) makes `request` carry an
+    // unknown key, so `fromValue` rejects the world and replay produces an
+    // empty body. Round-tripping here is the guard the smokes (not in CI)
+    // couldn't be.
+    const w = try world.fromValue(a, wp.value);
+    try testing.expectEqualStrings("fetch_chunk", w.activation);
+    try testing.expectEqualStrings("onUpstream", w.export_name.?); // {on} export survives (G3)
+    try testing.expectEqual(@as(?i64, 200), w.status);
+    try testing.expect(w.done.?);
+    try testing.expectEqualStrings("upstream-body", w.body.?); // → request.bytes on replay
+    // And explicitly: no `ok` on the request surface.
+    try testing.expect(wp.value.object.get("request").?.object.get("ok") == null);
 }
 
 test "isFaithfulTranscode" {
