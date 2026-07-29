@@ -221,6 +221,14 @@ assumption the fixture baked in:
   just in this port.
 - Secondary: the bare replay arena lacks `TextDecoder` (a handler using it
   ReferenceErrors on replay) — an engine-global gap independent of this work.
+  *(Closed for the CLI by the epilogue codec below, and for the browser WASM
+  arena by the engine-shim prelude — issue #227: the shell evals a generated
+  `arena-prelude.js` (`scripts/ops/gen_replay_prelude.py`, composed from the
+  engine's own shim sources: the shared pure codec `src/replay/js/
+  textcodec_pure.js` + `globals/{base64,urlsearchparams,time}.js`) into the
+  open arena base pre-freeze via arenajs `arena_init_open`/`arena_eval_base`/
+  `arena_freeze`, outside every drill trace. One codec source serves the sim
+  epilogue and the browser prelude, so the two runtimes can't drift.)*
 
 **Update 2026-06-30 (b) — FIXED (recording side) + validated.** The root cause
 was a capture bug: the bound-fetch resume paths logged the `fetch_chunk`

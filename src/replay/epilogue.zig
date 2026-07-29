@@ -272,6 +272,10 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
+    // The shared pure-JS UTF-8 codec first (installs TextEncoder/TextDecoder;
+    // idempotent) — the same file the browser replay prelude evals, so the
+    // sim and the browser arena can't drift codec-wise.
+    try w.writeAll(TEXTCODEC_PURE);
     try w.writeAll(EPILOGUE_BODY);
     try w.print("  kv.set({s}, __out);\n}})();\n", .{quotedOutputKey});
 
@@ -300,6 +304,11 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
 
 /// `"__replay_output__"` as a JS string literal for the `kv.set` call.
 const quotedOutputKey = "\"" ++ host.OUTPUT_KEY ++ "\"";
+
+/// The pure-JS UTF-8 TextEncoder/TextDecoder (prod-byte-exact, WTF-8 lone
+/// surrogates included). One file shared with the browser replay prelude
+/// (scripts/ops/gen_replay_prelude.py reads the same source).
+const TEXTCODEC_PURE = @embedFile("js/textcodec_pure.js");
 
 const EPILOGUE_BODY =
     \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
@@ -337,15 +346,12 @@ const EPILOGUE_BODY =
     \\  // log so the author sees them before the handler's own output.
     \\  for (const m of D.warnings) __effects.push({ kind: "log", level: "warn", message: m });
     \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
-    \\  // Real UTF-8 codec. The sim base ships no native
-    \\  // TextEncoder/Decoder; the old latin1 (`charCodeAt & 0xff` / escape) hack
-    \\  // diverged from prod (bindings/textcodec.zig) on EVERY non-ASCII byte —
-    \\  // so every hash/HMAC/JWT/base64url/signature over non-ASCII was wrong.
-    \\  // This matches prod byte-for-byte, INCLUDING that prod (QuickJS) encodes
-    \\  // a LONE surrogate as its 3-byte WTF-8 form (ED A0 80), NOT the WHATWG
-    \\  // U+FFFD replacement — same as sim_globals' shaStrU8 (crypto.sha256).
-    \\  const __utf8Encode = (s) => { s = String(s == null ? "" : s); const out = []; for (let i = 0; i < s.length; i++) { let cp = s.charCodeAt(i); if (cp >= 0xD800 && cp <= 0xDBFF) { const lo = i + 1 < s.length ? s.charCodeAt(i + 1) : 0; if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); i++; } } if (cp < 0x80) out.push(cp); else if (cp < 0x800) out.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F)); else if (cp < 0x10000) out.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)); else out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)); } const u = new Uint8Array(out.length); for (let i = 0; i < out.length; i++) u[i] = out[i]; return u; };
-    \\  const __utf8Decode = (bytes, fatal) => { let b = bytes; if (typeof b === "string") { const t = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) t[i] = b.charCodeAt(i) & 0xff; b = t; } let s = ""; let i = 0; const n = b.length; const bad = () => { if (fatal) throw new TypeError("TextDecoder: malformed UTF-8"); s += "\uFFFD"; }; while (i < n) { const c0 = b[i]; if (c0 < 0x80) { s += String.fromCharCode(c0); i++; continue; } let need, cp, min; if (c0 >= 0xC2 && c0 <= 0xDF) { need = 1; cp = c0 & 0x1F; min = 0x80; } else if (c0 >= 0xE0 && c0 <= 0xEF) { need = 2; cp = c0 & 0x0F; min = 0x800; } else if (c0 >= 0xF0 && c0 <= 0xF4) { need = 3; cp = c0 & 0x07; min = 0x10000; } else { bad(); i++; continue; } let ok = i + need < n; for (let k = 1; ok && k <= need; k++) { const cc = b[i + k]; if (cc < 0x80 || cc > 0xBF) { ok = false; break; } cp = (cp << 6) | (cc & 0x3F); } if (!ok || cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { bad(); i++; continue; } if (cp < 0x10000) s += String.fromCharCode(cp); else { cp -= 0x10000; s += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)); } i += need + 1; } return s; };
+    \\  // Real UTF-8 codec — the shared js/textcodec_pure.js spliced just above
+    \\  // this body (prod-byte-exact incl. WTF-8 lone surrogates; a latin1 hack
+    \\  // here silently corrupts every hash/JWT/base64url over non-ASCII). These
+    \\  // aliases keep the epilogue's internal byte math on the one codec.
+    \\  const __utf8Encode = (s) => new TextEncoder().encode(s);
+    \\  const __utf8Decode = (bytes, fatal) => new TextDecoder("utf-8", { fatal: !!fatal }).decode(bytes);
     \\  const headers = {};
     \\  for (const n of D.names) Object.defineProperty(headers, n, {
     \\    enumerable: true, configurable: true,
@@ -504,14 +510,9 @@ const EPILOGUE_BODY =
     \\  // `email` are the REAL shims, so those verbs decompose to primitives
     \\  // (`_send/owed` + `_sched/*` kv writes + `http.fetch`) in the effect log.
     \\  // Outputs are CAPTURED (not fired) so re-execution stays deterministic. Still
-    \\  // epilogue-local: TextDecoder/TextEncoder (no base textcodec), the `on.*`
-    \\  // pre-rename alias, and the kv recorder wrapper below.
-    \\  if (typeof globalThis.TextDecoder === "undefined") {
-    \\    globalThis.TextDecoder = function (label, options) { const enc = String(label == null ? "utf-8" : label).toLowerCase(); if (enc !== "utf-8" && enc !== "utf8") throw new RangeError("TextDecoder: only utf-8 is supported"); this._fatal = !!(options && options.fatal); };
-    \\    globalThis.TextDecoder.prototype.decode = function (u) { if (u == null) return ""; return __utf8Decode(u, this._fatal); };
-    \\    globalThis.TextEncoder = function () {};
-    \\    globalThis.TextEncoder.prototype.encode = function (s) { return __utf8Encode(s); };
-    \\  }
+    \\  // epilogue-local: TextDecoder/TextEncoder (js/textcodec_pure.js, spliced
+    \\  // above this body), the `on.*` pre-rename alias, and the kv recorder
+    \\  // wrapper below.
     \\  // Pre-rename `on.*` — the captured driver only, so records from
     \\  // pre-rename deployments still replay their pinned code. Aliases the
     \\  // base `after`. Authored worlds never see it (retired live).
