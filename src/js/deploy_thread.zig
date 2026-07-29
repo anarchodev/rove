@@ -254,7 +254,17 @@ pub const DeployThread = struct {
         if (blob_mod.BlobBackend.openPerTenant(a, self.blob_cfg, job.tenant_id, "deployments")) |be_const| {
             var be = be_const;
             defer be.deinit();
-            files_mod.putBlobIfMissingTo(be.blobStore(), job.key, job.payload) catch |err| {
+            // Unconditional overwrite — NOT `putBlobIfMissingTo`. The skip-if-
+            // exists helper is only safe where key = hash(bytes) (source /
+            // bytecode / static blobs). A manifest's key derives from the
+            // dep_id, which hashes the CONTENT LIST, not the serialized JSON —
+            // so a manifest schema bump changes the bytes under an unchanged
+            // key, and an if-missing PUT would pin the stale-format object
+            // there forever (the loader then fails every release of that
+            // content with InvalidManifest until the object is deleted by
+            // hand). Overwriting is idempotent: same dep_id ⇒ same content
+            // list ⇒ the freshly-serialized manifest is the right bytes.
+            files_mod.putBlobTo(be.blobStore(), job.key, job.payload) catch |err| {
                 std.log.warn("deploy thread: manifest_put PUT {s}/deployments/{s} failed: {s}", .{ job.tenant_id, job.key, @errorName(err) });
                 put_ok = false;
             };

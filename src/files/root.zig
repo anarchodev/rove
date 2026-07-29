@@ -254,6 +254,26 @@ pub fn putBlobIfMissingTo(blob: BlobStore, key: []const u8, bytes: []const u8) E
     return Error.Blob;
 }
 
+/// Unconditional PUT with the same bounded backoff as
+/// `putBlobIfMissingTo`, minus the exists() short-circuit. For keys that
+/// are NOT a pure content address of the stored bytes — a deployment
+/// manifest's key derives from the dep_id (a hash of the content list,
+/// not the serialized JSON), so the bytes at the key can legitimately
+/// change (schema version bump) while the key stays the same. Skipping
+/// on exists would pin the old bytes there forever.
+pub fn putBlobTo(blob: BlobStore, key: []const u8, bytes: []const u8) Error!void {
+    var attempt: u8 = 0;
+    while (attempt < 6) : (attempt += 1) {
+        blob.put(key, bytes) catch {
+            const delay_ms: u64 = @as(u64, 50) << @as(u6, @intCast(attempt));
+            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            continue;
+        };
+        return;
+    }
+    return Error.Blob;
+}
+
 /// Hex sha-256 of `bytes` — the content address every blob key uses.
 pub fn hashHex(bytes: []const u8, out: *[HASH_HEX_LEN]u8) void {
     var digest: [32]u8 = undefined;
