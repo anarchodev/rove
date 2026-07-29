@@ -1503,6 +1503,12 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(cli_exe);
         run.addArg("test");
         run.addDirectoryArg(b.path(dir));
+        // The timezone fixture asserts handler time is UTC wherever the HOST
+        // sits, so run it somewhere that isn't UTC — on a UTC machine (every
+        // CI box) its assertions hold whether or not the pin exists, and a
+        // regression ships green.
+        if (std.mem.endsWith(u8, dir, "/timezone"))
+            run.setEnvironmentVariable("TZ", "Asia/Tokyo");
         run.expectExitCode(0);
         smoke_step.dependOn(&run.step);
         test_step.dependOn(&run.step);

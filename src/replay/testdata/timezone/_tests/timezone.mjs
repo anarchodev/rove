@@ -1,7 +1,12 @@
-// Local-time Date methods run in UTC, matching production (#53). The assertions
-// hold regardless of the host machine's TZ — verify by running the suite under
-// `TZ=Asia/Tokyo zig build rewind-test-smoke` (getHours would be 12, not 3,
-// without the pin).
+// Local-time Date methods run in UTC, matching production (#53). The build
+// runs this fixture under `TZ=Asia/Tokyo` (build.zig, the test_dirs loop) —
+// on a UTC host these assertions pass with or without the pin, so the
+// non-UTC host IS the test. Without the pin getHours reads 12, not 3.
+//
+// Two mechanisms hold the invariant and either alone suffices: the CLI pins
+// the process (`setenv TZ=UTC` + tzset, src/cli/rewind.zig) and arenajs pins
+// the engine (JS_SetTimezoneUTC at reactor construction, which also covers
+// the browser replay arena where the env route is a no-op).
 import { scenario, expect } from "rewind:test";
 
 const s = scenario({ now: "2026-07-01T00:00:00Z" });
