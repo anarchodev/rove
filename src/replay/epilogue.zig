@@ -613,11 +613,12 @@ const EPILOGUE_BODY =
     \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
     \\    set(k, val) { const ks = __kvGuardWrite(k, true, val); if (ks.startsWith(__NS)) return __kvNative.set(k, val); const mutated = __runTriggers("put", "before", ks, val); const r = __kvNative.set(k, mutated); __effects.push({ kind: "write", key: ks, value: mutated }); __markDirty(ks); __runTriggers("put", "after", ks, mutated); return r; },
     \\    delete(k) { const ks = __kvGuardWrite(k, false); if (ks.startsWith(__NS)) return __kvNative.delete(k); __runTriggers("delete", "before", ks, null); const r = __kvNative.delete(k); __effects.push({ kind: "delete", key: ks }); __markDirty(ks); __runTriggers("delete", "after", ks, null); return r; },
-    \\    // Adapter: the worker's kv.prefix is positional; the replay
-    \\    // NATIVE takes (prefix, {cursor, limit}) — convert here. A scan under the
-    \\    // store namespace (a facade call) returns raw for the facade to strip;
-    \\    // any other scan filters the namespaced keys out.
-    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, { cursor, limit }); if (p.startsWith(__NS)) return r; __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return (r || []).filter((e) => !e.key.startsWith(__NS)); },
+    \\    // Straight through: the native takes the worker's positional
+    \\    // (prefix, cursor, limit), so offline paging matches live paging with
+    \\    // no adapter. A scan under the store namespace (a facade call) returns
+    \\    // raw for the facade to strip; any other scan filters the namespaced
+    \\    // keys out.
+    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, cursor, limit); if (p.startsWith(__NS)) return r; __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return (r || []).filter((e) => !e.key.startsWith(__NS)); },
     \\  };
     \\  // request.tag(key, value) — prod's validation verbatim (globals.zig
     \\  // jsRequestTag): two strings; key 1..32 BYTES of [a-z0-9_], non-'_'
