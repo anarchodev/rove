@@ -61,7 +61,32 @@ pub const DeploymentLoader = struct {
     /// highest dep_id observed for that tenant so far. Keys are
     /// allocator-owned copies of the tenant id.
     pending: std.StringHashMapUnmanaged(u64),
+    /// Failed loads awaiting retry, deduped by tenant id. A load does
+    /// remote S3 I/O, so transient failures are expected — a dropped
+    /// failure would leave the tenant serving 503 (no prior snapshot)
+    /// or silently pinned to the previous deployment until something
+    /// else re-enqueues. Retries back off (1s, 5s, then every 30s) and
+    /// never give up: a deterministic failure (e.g. a corrupt manifest
+    /// object) stays loudly visible in the log + metrics and self-heals
+    /// the moment the input is fixed. A fresh `enqueue` for the tenant
+    /// supersedes its retry entry (highest dep_id wins). Guarded by
+    /// `pending_mutex`.
+    retrying: std.StringHashMapUnmanaged(Retry),
     pending_mutex: std.Thread.Mutex,
+
+    /// Total failed load attempts since process start (monotonic; the
+    /// `deployment_load_failures_total` metric). Atomic — read by the
+    /// worker thread's metrics render while this thread writes.
+    failures_total: std.atomic.Value(u64),
+    /// Tenants currently in the retry set (the
+    /// `deployment_loads_retrying` gauge): >0 means some tenant's
+    /// released deployment is NOT what's serving. Mirrors
+    /// `retrying.count()` so the metrics render needs no lock.
+    retrying_gauge: std.atomic.Value(u64),
+
+    /// Backoff unit in ms — the retry ladder is unit×1, ×5, then ×30
+    /// forever. Tests shrink it so a retry becomes due immediately.
+    retry_unit_ms: u64,
 
     /// Set by `enqueue` to wake the loader thread; cleared by
     /// the loader at the top of its work loop.
@@ -87,7 +112,11 @@ pub const DeploymentLoader = struct {
             .worker_ctx = worker_ctx,
             .load_fn = load_fn,
             .pending = .empty,
+            .retrying = .empty,
             .pending_mutex = .{},
+            .failures_total = std.atomic.Value(u64).init(0),
+            .retrying_gauge = std.atomic.Value(u64).init(0),
+            .retry_unit_ms = 1000,
             .wake = .{},
             .stop = std.atomic.Value(bool).init(false),
             .thread = null,
@@ -115,6 +144,9 @@ pub const DeploymentLoader = struct {
         var it = self.pending.iterator();
         while (it.next()) |e| self.allocator.free(e.key_ptr.*);
         self.pending.deinit(self.allocator);
+        var rit = self.retrying.iterator();
+        while (rit.next()) |e| self.allocator.free(e.key_ptr.*);
+        self.retrying.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -126,8 +158,18 @@ pub const DeploymentLoader = struct {
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
 
+        // A fresh enqueue supersedes any parked retry for the tenant:
+        // fold its dep_id in (highest wins) and load NOW — the retry
+        // backoff was for the failed attempt, not the new release.
+        var effective = dep_id;
+        if (self.retrying.fetchRemove(tenant_id)) |old| {
+            self.allocator.free(@constCast(old.key));
+            if (old.value.dep_id > effective) effective = old.value.dep_id;
+            self.retrying_gauge.store(self.retrying.count(), .monotonic);
+        }
+
         if (self.pending.getPtr(tenant_id)) |slot| {
-            if (dep_id > slot.*) slot.* = dep_id;
+            if (effective > slot.*) slot.* = effective;
             // Don't wake — the loader will pick it up; updating
             // the slot in-place doesn't need a fresh wake signal
             // because the existing wake is enough.
@@ -137,7 +179,7 @@ pub const DeploymentLoader = struct {
 
         const key_copy = try self.allocator.dupe(u8, tenant_id);
         errdefer self.allocator.free(key_copy);
-        try self.pending.put(self.allocator, key_copy, dep_id);
+        try self.pending.put(self.allocator, key_copy, effective);
         self.wake.set();
     }
 
@@ -152,24 +194,65 @@ pub const DeploymentLoader = struct {
 
     fn threadMain(self: *DeploymentLoader) void {
         while (!self.stop.load(.acquire)) {
-            self.wake.wait();
+            // With retries parked, sleep only until the earliest one is
+            // due (an enqueue's wake still interrupts early); otherwise
+            // block until woken.
+            if (self.earliestRetryDelayNs()) |delay_ns| {
+                self.wake.timedWait(delay_ns) catch {};
+            } else {
+                self.wake.wait();
+            }
             self.wake.reset();
             if (self.stop.load(.acquire)) break;
             self.drainAll();
         }
         // Final drain on shutdown — anything queued between the
         // last wake and `stop = true` still runs so we don't
-        // lose a pending load.
+        // lose a pending load. (Parked retries are deliberately NOT
+        // drained: they already failed once and restart re-enqueues
+        // every tenant's current deployment anyway.)
         self.drainAll();
+    }
+
+    /// Nanoseconds until the earliest parked retry is due (0 if one is
+    /// already due), or null when nothing is parked.
+    fn earliestRetryDelayNs(self: *DeploymentLoader) ?u64 {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        var min_due: ?i64 = null;
+        var it = self.retrying.iterator();
+        while (it.next()) |e| {
+            if (min_due == null or e.value_ptr.due_ms < min_due.?) min_due = e.value_ptr.due_ms;
+        }
+        const due = min_due orelse return null;
+        const now = std.time.milliTimestamp();
+        if (due <= now) return 0;
+        return @as(u64, @intCast(due - now)) * std.time.ns_per_ms;
+    }
+
+    fn retryDelayMs(self: *const DeploymentLoader, attempt: u32) u64 {
+        // 1×, 5×, then 30× the unit forever — bounded backoff,
+        // unbounded attempts (see the `retrying` field doc).
+        return self.retry_unit_ms * @as(u64, switch (attempt) {
+            0 => 1,
+            1 => 5,
+            else => 30,
+        });
     }
 
     fn drainAll(self: *DeploymentLoader) void {
         while (self.popOne()) |entry| {
             self.load_fn(self.worker_ctx, entry.tenant_id, entry.dep_id) catch |err| {
                 std.log.warn(
-                    "deployment loader: tenant {s} dep {d} failed: {s}",
-                    .{ entry.tenant_id, entry.dep_id, @errorName(err) },
+                    "deployment loader: tenant {s} dep {d} failed (attempt {d}): {s}",
+                    .{ entry.tenant_id, entry.dep_id, entry.attempt + 1, @errorName(err) },
                 );
+                _ = self.failures_total.fetchAdd(1, .monotonic);
+                self.parkRetry(entry) catch |park_err| std.log.warn(
+                    "deployment loader: tenant {s} retry park failed: {s} — load dropped until the next release/restart",
+                    .{ entry.tenant_id, @errorName(park_err) },
+                );
+                continue;
             };
             // `tenant_id` slice was duped from `enqueue`'s input at
             // insertion time — `popOne` transfers ownership to us.
@@ -177,12 +260,53 @@ pub const DeploymentLoader = struct {
         }
     }
 
+    /// Park a failed load for a later attempt. Takes ownership of
+    /// `entry.tenant_id` (freed here on every path). If a NEWER load
+    /// for the tenant was enqueued while this one ran, drop instead —
+    /// the pending entry supersedes.
+    fn parkRetry(self: *DeploymentLoader, entry: PoppedEntry) !void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        errdefer self.allocator.free(@constCast(entry.tenant_id));
+
+        if (self.pending.contains(entry.tenant_id)) {
+            self.allocator.free(@constCast(entry.tenant_id));
+            return;
+        }
+        const retry: Retry = .{
+            .dep_id = entry.dep_id,
+            .attempt = entry.attempt + 1,
+            .due_ms = std.time.milliTimestamp() + @as(i64, @intCast(self.retryDelayMs(entry.attempt))),
+        };
+        if (self.retrying.getPtr(entry.tenant_id)) |slot| {
+            // Already parked (shouldn't happen — popOne removed it) —
+            // keep the higher dep, refresh the clock.
+            if (retry.dep_id > slot.dep_id) slot.dep_id = retry.dep_id;
+            slot.attempt = retry.attempt;
+            slot.due_ms = retry.due_ms;
+            self.allocator.free(@constCast(entry.tenant_id));
+        } else {
+            try self.retrying.put(self.allocator, entry.tenant_id, retry);
+        }
+        self.retrying_gauge.store(self.retrying.count(), .monotonic);
+    }
+
+    const Retry = struct {
+        dep_id: u64,
+        /// Failed attempts so far (drives the backoff rung).
+        attempt: u32,
+        /// Wall-clock ms when this entry becomes due.
+        due_ms: i64,
+    };
+
     const PoppedEntry = struct {
         /// Owned by the caller — was duped from `enqueue`'s input
         /// at the time of insertion. Free with the loader's
         /// allocator after the load runs.
         tenant_id: []const u8,
         dep_id: u64,
+        /// Failed attempts BEFORE this one (0 for a fresh enqueue).
+        attempt: u32 = 0,
     };
 
     fn popOne(self: *DeploymentLoader) ?PoppedEntry {
@@ -190,12 +314,25 @@ pub const DeploymentLoader = struct {
         defer self.pending_mutex.unlock();
 
         var it = self.pending.iterator();
-        const entry = it.next() orelse return null;
-        const dep_id = entry.value_ptr.*;
-        // fetchRemove returns the (still-owned) key we duped at
-        // enqueue time. Transfer to caller.
-        const kv = self.pending.fetchRemove(entry.key_ptr.*) orelse unreachable;
-        return .{ .tenant_id = kv.key, .dep_id = dep_id };
+        if (it.next()) |entry| {
+            const dep_id = entry.value_ptr.*;
+            // fetchRemove returns the (still-owned) key we duped at
+            // enqueue time. Transfer to caller.
+            const kv = self.pending.fetchRemove(entry.key_ptr.*) orelse unreachable;
+            return .{ .tenant_id = kv.key, .dep_id = dep_id };
+        }
+
+        // No fresh work — pick up a due retry.
+        const now = std.time.milliTimestamp();
+        var rit = self.retrying.iterator();
+        while (rit.next()) |e| {
+            if (e.value_ptr.due_ms > now) continue;
+            const r = e.value_ptr.*;
+            const kv = self.retrying.fetchRemove(e.key_ptr.*) orelse unreachable;
+            self.retrying_gauge.store(self.retrying.count(), .monotonic);
+            return .{ .tenant_id = kv.key, .dep_id = r.dep_id, .attempt = r.attempt };
+        }
+        return null;
     }
 };
 
@@ -240,6 +377,61 @@ test "enqueue dedups by tenant + keeps higher dep_id" {
 
     try testing.expectEqual(@as(u32, 1), counter.calls.load(.acquire));
     try testing.expectEqual(@as(u64, 9), counter.last_dep_id.load(.acquire));
+}
+
+const FlakyCounter = struct {
+    calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Attempts that fail before one succeeds.
+    fail_first: u32,
+};
+
+fn flakyLoadFn(ctx_opaque: ?*anyopaque, _: []const u8, _: u64) anyerror!void {
+    const ctx: *FlakyCounter = @ptrCast(@alignCast(ctx_opaque.?));
+    const n = ctx.calls.fetchAdd(1, .acq_rel);
+    if (n < ctx.fail_first) return error.TransientFetchFailure;
+}
+
+test "failed load parks on retry + eventually succeeds" {
+    var counter: FlakyCounter = .{ .fail_first = 2 };
+    const loader = try DeploymentLoader.init(testing.allocator, &counter, flakyLoadFn);
+    defer loader.deinit();
+    loader.retry_unit_ms = 0; // retries due immediately
+
+    try loader.enqueue("acme", 5);
+
+    // Attempt 1 fails → parked (drainAll stops when nothing is due,
+    // but unit=0 makes the retry due at once, so one drain runs the
+    // whole ladder: fail, fail, succeed).
+    loader.drainSyncForTesting();
+    try testing.expectEqual(@as(u32, 3), counter.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), loader.failures_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), loader.retrying_gauge.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), loader.retrying.count());
+}
+
+test "retry with future due time stays parked; fresh enqueue supersedes it" {
+    var counter: FlakyCounter = .{ .fail_first = 1 };
+    const loader = try DeploymentLoader.init(testing.allocator, &counter, flakyLoadFn);
+    defer loader.deinit();
+    // Default unit: first retry due in 1s — far enough to observe the
+    // parked state without racing the clock.
+
+    try loader.enqueue("acme", 5);
+    loader.drainSyncForTesting();
+    try testing.expectEqual(@as(u32, 1), counter.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), loader.retrying_gauge.load(.monotonic));
+
+    // Not due → another drain is a no-op.
+    loader.drainSyncForTesting();
+    try testing.expectEqual(@as(u32, 1), counter.calls.load(.acquire));
+
+    // A fresh release supersedes the parked retry (higher dep wins,
+    // loads immediately — no backoff for new work).
+    try loader.enqueue("acme", 9);
+    try testing.expectEqual(@as(u64, 0), loader.retrying_gauge.load(.monotonic));
+    loader.drainSyncForTesting();
+    try testing.expectEqual(@as(u32, 2), counter.calls.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), loader.retrying.count());
 }
 
 test "background thread drains queue + responds to shutdown" {

@@ -414,6 +414,31 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         \\
     , .{ mesh_configured, mesh_connected, mesh_configured - mesh_connected });
 
+    // ── deployment loader health ──────────────────────────────────────
+    //
+    // deployment_loads_retrying is the released≠serving signal: tenants
+    // whose committed `_deploy/current` could not be loaded into a live
+    // snapshot (S3 fetch failure, corrupt manifest object, …) and are
+    // parked on the loader's backoff. 0 on a healthy node; SUSTAINED > 0
+    // means some tenant serves a stale deployment or 503s while its
+    // release sits committed — alert on duration, like the raft wedge
+    // gauges. failures_total distinguishes a persistent failure (climbing
+    // ~2/min per stuck tenant, the 30s backoff rung) from a one-off blip.
+    if (worker.node.deploy.deployment_loader) |dl| {
+        try w.print(
+            \\# HELP deployment_load_failures_total failed deployment-load attempts (manifest/bytecode fetch or decode) since start; retries re-count.
+            \\# TYPE deployment_load_failures_total counter
+            \\deployment_load_failures_total {d}
+            \\# HELP deployment_loads_retrying tenants whose released deployment failed to load and is parked on retry backoff — the released!=serving signal; sustained > 0 = a tenant serving stale/503 against a committed release.
+            \\# TYPE deployment_loads_retrying gauge
+            \\deployment_loads_retrying {d}
+            \\
+        , .{
+            dl.failures_total.load(.monotonic),
+            dl.retrying_gauge.load(.monotonic),
+        });
+    }
+
     // ── raft failover / broadcast-time observability ──────────────────
     //
     // The inputs for sizing election/heartbeat timeouts in THIS environment
