@@ -545,13 +545,47 @@ fn writeLockfile(bundle: []const u8, body: []const u8) void {
     f.writeAll(body) catch {};
 }
 
-/// `rewind release <tenant> <dep_id_hex>` — flip the live pointer via the admin
-/// app's ownership-gated release route.
+/// `rewind release <tenant> <dep_id_hex>` — flip the live pointer.
+///
+/// Two auth-shaped paths:
+///   - Root token (operator/headless): worker-native `POST /_system/release`
+///     (root-bearer-gated, `src/js/worker_system.zig`; the front forwards
+///     `/_system/*` transparently). The admin app's release route can't serve
+///     an operator: its M2M path list is exact-match (this path is dynamic)
+///     and `publishRelease` requires `auth.sub`, so a root bearer 401s there.
+///   - Session (customer): the admin app's ownership-gated
+///     `POST /v1/instances/{id}/release`.
 fn cmdRelease(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, dep_id: []const u8) void {
     // dep_id rides the wire as a HEX STRING, not a JSON number: dep_ids are
     // sha256-derived u64 (> 2^53), so a JSON number would lose precision at
     // JSON.parse / JS_ToFloat64 and release the wrong (rounded) manifest.
-    _ = std.fmt.parseInt(u64, dep_id, 16) catch c.fatal("bad dep_id {s} (want hex)", .{dep_id});
+    const dep_num = std.fmt.parseInt(u64, dep_id, 16) catch c.fatal("bad dep_id {s} (want hex)", .{dep_id});
+
+    if (cfg.root_token != null) {
+        // `/_system/release` parses `dep_id` natively as a u64 (no JS f64
+        // round-trip), so the JSON NUMBER is the correct wire form here.
+        // A follower 421s (the release proposes through the tenant's raft
+        // group) and a settling group 503s — retry like deployStep.
+        const body = std.fmt.allocPrint(
+            a,
+            "{{\"tenant_id\":\"{s}\",\"dep_id\":{d}}}",
+            .{ tenant, dep_num },
+        ) catch c.oom();
+        const url = std.fmt.allocPrint(a, "{s}/_system/release", .{cfg.admin_url}) catch c.oom();
+        var attempt: usize = 0;
+        while (attempt < 6) : (attempt += 1) {
+            const r = httpCall(a, cfg, "POST", url, &.{JSON_CT}, body, true, 30);
+            if (r.code == 204) {
+                std.debug.print("released {s} @ {s}\n", .{ tenant, dep_id });
+                return;
+            }
+            if (r.code == 401) c.fatal("root token rejected by /_system/release (token drift?)", .{});
+            if (r.code == 404) c.fatal("release failed: unknown tenant {s}", .{tenant});
+            if (r.code != 421 and r.code != 503) c.fatal("release failed: {d} {s}", .{ r.code, c.trunc(r.body) });
+            std.Thread.sleep(2 * std.time.ns_per_s);
+        }
+        c.fatal("release {s}: no leader after retries", .{tenant});
+    }
     // REST route: POST /v1/instances/{id}/release {"dep_id":"<hex>"} (admin app's
     // ROUTES table). Keep dep_id a hex string so it never round-trips through an
     // f64 — a JSON number lands in publishRelease's lossy number branch → 400
