@@ -530,7 +530,14 @@ fn classifyIgnored(
     const held_offset: u64 = @intCast(c.sqlite3_column_int64(q, 1));
     const held_received_ns: i64 = c.sqlite3_column_int64(q, 2);
 
-    if (held_received_ns == r.received_ns) {
+    // `received_ns == 0` means UNKNOWN, not "epoch": the promotion-time walker
+    // reconstructs records from the raft log, whose replicated header carries
+    // no arrival time (`worker_upload_walker.zig`). Those re-emissions are the
+    // same requests, so an incoming zero cannot be compared and must not be
+    // read as "a different request" — doing so reported 78 phantom conflicts
+    // on one node, every one of them a re-emit of a record the index already
+    // held with its real timestamp.
+    if (r.received_ns == 0 or held_received_ns == r.received_ns) {
         // Same request, arriving again — from the poll path's clock-skew
         // window, a resume after a crash, or the promotion walker re-emitting
         // it into a later batch. Already indexed; nothing is lost.
@@ -863,6 +870,47 @@ test "a re-index counts as re-index, a collision counts as a CONFLICT" {
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
     try testing.expectEqualStrings("/first", list.rows[0].path);
+}
+
+test "an undatable re-emit is a re-index, not a conflict" {
+    // The promotion walker rebuilds records from the raft log, which carries no
+    // arrival time, so it emits received_ns = 0. Treating that zero as a real
+    // timestamp says "different request" for what is the same request — 78
+    // phantom conflicts in production before this was understood.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "undatable");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+    const before_conflicts = metrics.global.index_conflicts.load(.monotonic);
+    const before_reindex = metrics.global.index_reindexed.load(.monotonic);
+
+    var real = [_]sidecar.Record{.{
+        .tenant_id = "registry", .request_id = 9, .received_ns = 1_785_438_625_761_330_313,
+        .duration_ns = 10, .method = "POST", .path = "/v1/publish", .host = "r.test",
+        .status = 201, .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 40,
+    }};
+    try idx.insertBatch(&.{
+        .node_id = "00000001", .batch_id = "real", .ndjson_size = 40, .ndjson_sha256 = "a",
+        .first_received_ns = 1, .last_received_ns = 1, .records = &real,
+    }, "_logs/00000001/real.ndjson", 0);
+
+    // The walker re-emits the same request with no timestamp.
+    var walked = [_]sidecar.Record{.{
+        .tenant_id = "registry", .request_id = 9, .received_ns = 0,
+        .duration_ns = 10, .method = "POST", .path = "/v1/publish", .host = "r.test",
+        .status = 201, .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 40,
+    }};
+    try idx.insertBatch(&.{
+        .node_id = "00000001", .batch_id = "walked", .ndjson_size = 40, .ndjson_sha256 = "b",
+        .first_received_ns = 0, .last_received_ns = 0, .records = &walked,
+    }, "_logs/00000001/walked.ndjson", 0);
+
+    try testing.expectEqual(before_conflicts, metrics.global.index_conflicts.load(.monotonic));
+    try testing.expectEqual(before_reindex + 1, metrics.global.index_reindexed.load(.monotonic));
 }
 
 test "the same id in a DIFFERENT tenant is not a conflict" {
