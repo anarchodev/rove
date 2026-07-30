@@ -42,6 +42,7 @@ const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 const proxy_mod = @import("proxy.zig");
 const route_resolver_mod = @import("route_resolver.zig");
+const cert_expiry_mod = @import("cert_expiry.zig");
 const MetricsServer = @import("metrics-server").MetricsServer;
 
 const curl = blob.curl;
@@ -52,6 +53,7 @@ const curl = blob.curl;
 test {
     _ = proxy_mod;
     _ = route_resolver_mod;
+    _ = cert_expiry_mod;
 }
 
 const FrontH2 = h2.H2(.{
@@ -80,6 +82,10 @@ const CertSync = struct {
     allocator: std.mem.Allocator,
     cp_urls: []const []const u8,
     tls: *h2.TlsConfig,
+    /// Expiry of every cert this sync installs. Recorded here rather than
+    /// inside `TlsConfig` so rove-h2 keeps no dependency on the certificate
+    /// parser, and because this is the one place the PEM is in hand.
+    expiry: *cert_expiry_mod.CertExpiry,
 
     /// GET `suffix` from the first reachable CP node; owned 200 body or null.
     fn cpGet(self: *CertSync, suffix: []const u8) ?[]u8 {
@@ -112,8 +118,13 @@ const CertSync = struct {
             defer a.free(frame);
             const u = unpackCert(frame) orelse continue;
             const ver = std.hash.Wyhash.hash(0, frame);
-            self.tls.putHostCertInMemory(host, u.cert, u.key, ver) catch |e|
+            self.tls.putHostCertInMemory(host, u.cert, u.key, ver) catch |e| {
                 std.log.warn("front: install cert for {s} failed: {s}", .{ host, @errorName(e) });
+                continue;
+            };
+            // After the install, so the gauge only ever describes a cert the
+            // front is actually serving.
+            self.expiry.observe(host, u.cert);
         }
     }
 };
@@ -138,11 +149,12 @@ const CertSyncThread = struct {
         allocator: std.mem.Allocator,
         cp_urls: []const []const u8,
         tls: *h2.TlsConfig,
+        expiry: *cert_expiry_mod.CertExpiry,
         period_ns: u64,
     ) !*CertSyncThread {
         const self = try allocator.create(CertSyncThread);
         self.* = .{
-            .cs = .{ .allocator = allocator, .cp_urls = cp_urls, .tls = tls },
+            .cs = .{ .allocator = allocator, .cp_urls = cp_urls, .tls = tls, .expiry = expiry },
             .period_ns = period_ns,
             .stop = std.atomic.Value(bool).init(false),
             .wake = .{},
@@ -331,12 +343,20 @@ const freeUrlList = boot.freeUrlList;
 /// on) are scrapable instead of grep-only — plus the proxy's live-flow /
 /// tunnel leak canaries. Rendered + published on the :443 poll loop (the only
 /// thread that touches `server`/`proxy`); the MetricsServer thread serves bytes.
-fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: *const Proxy) ![]u8 {
+fn buildFrontMetricsText(
+    allocator: std.mem.Allocator,
+    server: *FrontH2,
+    proxy: *const Proxy,
+    certs: *cert_expiry_mod.CertExpiry,
+) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
     const w = &aw.writer;
     try server.writeConnMetrics(w);
+    // Certificate expiry: known months ahead, invisible to every health check,
+    // and a total outage when it lands. See `cert_expiry.zig`.
+    try certs.writeMetrics(w, std.time.timestamp());
     try w.print(
         \\# HELP front_proxy_flows_active in-flight proxied request flows (leak canary — tracks load, returns to ~0 at idle; a monotonic climb is a flow leak).
         \\# TYPE front_proxy_flows_active gauge
@@ -517,11 +537,19 @@ pub fn main() !void {
     // wildcard from `REWIND_TLS_CERT`/`REWIND_TLS_KEY`; per-host custom-domain
     // certs are synced from the CP (`CertSync`). Both env unset ⇒ the front
     // door stays h2c (TLS terminated upstream).
+    var cert_expiry = cert_expiry_mod.CertExpiry.init(allocator);
+    defer cert_expiry.deinit();
+
     const tls_config: ?*h2.TlsConfig = blk: {
         const cert = std.posix.getenv("REWIND_TLS_CERT");
         const key = std.posix.getenv("REWIND_TLS_KEY");
         if (cert == null or key == null) break :blk null;
-        break :blk try h2.TlsConfig.createFromFiles(allocator, cert.?, key.?, null);
+        const t = try h2.TlsConfig.createFromFiles(allocator, cert.?, key.?, null);
+        // The default context is built by OpenSSL from files, so its expiry is
+        // learned by reading the same PEM. This is the platform wildcard —
+        // renewed by hand, and therefore the one most worth watching.
+        cert_expiry.observeFile(cert_expiry_mod.DEFAULT_LABEL, cert.?);
+        break :blk t;
     };
     defer if (tls_config) |t| t.destroy();
 
@@ -621,7 +649,7 @@ pub fn main() !void {
     // periodic CP pull never blocks the poll loop.
     const cert_sync_ms = envMs("REWIND_CERT_SYNC_MS", 2000);
     const cert_sync_thread: ?*CertSyncThread = if (tls_config) |t|
-        try CertSyncThread.start(allocator, cp_urls, t, @intCast(cert_sync_ms * std.time.ns_per_ms))
+        try CertSyncThread.start(allocator, cp_urls, t, &cert_expiry, @intCast(cert_sync_ms * std.time.ns_per_ms))
     else
         null;
     // Join (and free) the cert-sync thread before tls_config.destroy() and
@@ -686,7 +714,7 @@ pub fn main() !void {
         // serves the published bytes).
         if (front_metrics_srv) |ms| {
             if (metrics_cadence.due(now)) {
-                if (buildFrontMetricsText(allocator, server, &proxy)) |txt| {
+                if (buildFrontMetricsText(allocator, server, &proxy, &cert_expiry)) |txt| {
                     defer allocator.free(txt);
                     ms.publish(txt);
                 } else |_| {}

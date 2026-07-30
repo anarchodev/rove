@@ -139,6 +139,38 @@ cutover.
 - No blob backend, schedule server, snapshot, or JS-runtime metrics.
 - Root-token auth — handing that to a scraper is unacceptable.
 
+### 1.1 TLS certificate expiry (front)
+
+The front exports, per certificate it serves — the default/wildcard context as
+`host="<default>"`, plus each per-host cert `CertSync` installs:
+
+| metric | type | what it tells you |
+|---|---|---|
+| `front_tls_cert_expiry_seconds{host}` | gauge | unix time the certificate stops being valid |
+| `front_tls_cert_remaining_seconds{host}` | gauge | seconds left, clamped to 0 once expired |
+
+Expiry is the one outage that is knowable months ahead and invisible to every
+health check: everything reports healthy until nothing can connect. It matters
+more here than in most systems because the platform wildcard is renewed **by
+hand** — Let's Encrypt issues wildcards over DNS-01 only, so the in-tree
+HTTP-01 issuer cannot produce one (auth-and-domains.md) — which makes a person
+the renewal mechanism.
+
+Two deliberate choices, both so an alert cannot silently stop covering
+something:
+
+- A certificate that cannot be parsed is recorded as **already expired**, not
+  skipped. A missing series is indistinguishable from "no TLS configured here".
+- The remaining-seconds series is clamped at 0 rather than going negative, so
+  one rule (`< threshold`) treats expired and nearly-expired alike and no
+  dashboard sorts an expired cert as healthiest.
+
+Alerting lives in rewind-infra (`grafana/alerts/rewind-rules.yaml`, group
+`rewind-tls-expiry`): a ticket at 21 days remaining — three weekly chances to
+act — and a page at 0. Aggregated `by (host)` and not `by (instance)`, since
+every front serves the same certificate and one expiry should raise one ticket,
+not one per node.
+
 ## 2. Cross-cutting prerequisites (P0)
 
 These aren't "the metrics" — they're the substrate. Without them, every

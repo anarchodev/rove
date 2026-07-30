@@ -1205,6 +1205,10 @@ pub fn build(b: *std.Build) void {
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
     front_mod.addImport("metrics-server", metrics_server_mod);
+    // Certificate expiry parsing, for the gauge the front exports about the
+    // certs it serves (`src/front/cert_expiry.zig`). rove-acme owns reading a
+    // notAfter; rove-h2 stays free of it.
+    front_mod.addImport("rove-acme", acme_mod);
     front_mod.link_libc = true;
     front_mod.linkSystemLibrary("nghttp2", .{});
     front_mod.linkSystemLibrary("ssl", .{});
