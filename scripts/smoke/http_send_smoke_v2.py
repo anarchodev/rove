@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end smoke for the `http.send` / `webhook.send` JS-shim path —
-V2 port on the `V2Cluster` harness (branch `v2`).
+V2 port on the `V2Cluster` harness.
 
 `acme/httpfire?fn=fire` calls `webhook.send(...)`: the JS-shim writes a
 durable `_send/owed/{id}` marker (envelope-0 kv put), issues the inline

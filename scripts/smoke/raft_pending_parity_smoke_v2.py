@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V2 port of `raft_pending_parity_smoke.py` — concurrent-write commit
-consistency on the `V2Cluster` harness (branch `v2`).
+consistency on the `V2Cluster` harness.
 
 The V1 smoke was a *pre-migration parity gate* for collapsing the H2
 reference path off the willemt `raft_pending_response` arm onto

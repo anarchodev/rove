@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end smoke for the `webhook.send` JS-shim — V2 port on the
-`V2Cluster` harness (branch `v2`).
+`V2Cluster` harness.
 
 `webhook.send` (globals/webhook.js) composes durable at-least-once outbound
 HTTP on top of the four reified primitives: a durable `_send/owed/{id}` kv

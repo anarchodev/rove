@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V2 port of `heldsync_smoke.py` — the §6.4 held-synchronous third-party
-call on the `V2Cluster` harness (branch `v2`).
+call on the `V2Cluster` harness.
 
 ONE synchronous client request to acme's `/heldsync`:
 

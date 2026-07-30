@@ -1,6 +1,6 @@
 # rewind.js product plan
 
-> **Status**: the product **roadmap** layer (V2 line, branch `v2`). This is one of
+> **Status**: the product **roadmap** layer (the V2 line, on `main`). This is one of
 > three durable layers — the *why* + considered-and-rejected lives in
 > [decisions.md](decisions.md), the as-built *mechanics* live in `architecture/`,
 > and this captures the product vision, the locked product-shaping decisions (as

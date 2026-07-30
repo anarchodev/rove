@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V2 smoke harness — the `smoke_lib` equivalent for the V2 stack (branch `v2`).
+"""V2 smoke harness — the `smoke_lib` equivalent for the V2 stack.
 
 The V1 `smoke_lib.Cluster` spawned a 3-node `loop46` cluster over TLS with
 leader-direct addressing + follower-503 semantics. V2 is a different shape:
