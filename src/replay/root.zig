@@ -31,6 +31,12 @@ const epilogue = @import("epilogue.zig");
 const world = @import("world.zig");
 const export_fixture = @import("export_fixture.zig");
 
+/// The interaction digest — the rolling hash over what a handler observably
+/// DID, which is how a replay establishes it did the same thing rather than
+/// merely finishing (see the module header for what is excluded and why).
+pub const interaction_digest = @import("interaction_digest.zig");
+pub const InteractionDigest = interaction_digest.Digest;
+
 /// Transcode a captured record (base64 tapes) into the declarative `world.json`
 /// — the ONE format `replay`/`sim` consume. Used by `pull` (online) and the
 /// `export-fixture` verb (offline).
@@ -1000,5 +1006,6 @@ test {
     _ = epilogue;
     _ = world;
     _ = export_fixture;
+    _ = interaction_digest;
     _ = harness;
 }

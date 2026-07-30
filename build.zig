@@ -1435,6 +1435,27 @@ pub fn build(b: *std.Build) void {
     // through the real stack. Agreement proves each fold faithful against a real
     // handler (writing on_fetch's surfaced the streaming-fetch gap). A failing
     // assertion exits non-zero and fails the build.
+    // ── the interaction digest's cross-language gate ──
+    //
+    // The digest has two implementations (interaction_digest.zig and its JS
+    // mirror), and a silent disagreement between them would surface as an
+    // unexplained "replay diverged" on a real record — the hardest kind of
+    // bug to attribute. Neither side is the reference: both assert against
+    // `src/replay/testdata/digest_vectors.json`, the Zig half in its own unit
+    // tests and the JS half here. A change to one that the other does not
+    // mirror fails the build.
+    const digest_vectors = b.addSystemCommand(&.{"node"});
+    digest_vectors.addFileArg(b.path("src/replay/js/digest_vectors_test.mjs"));
+    // Declared inputs, so editing either the mirror or the vectors re-runs the
+    // check. Without them the step is cached on its argv alone and a broken
+    // mirror silently "passes" — which is how a gate rots into decoration.
+    digest_vectors.addFileInput(b.path("src/replay/js/interaction_digest.js"));
+    digest_vectors.addFileInput(b.path("src/replay/testdata/digest_vectors.json"));
+    digest_vectors.expectExitCode(0);
+    const digest_step = b.step("replay-digest-vectors", "Check the JS interaction-digest mirror against the shared vectors");
+    digest_step.dependOn(&digest_vectors.step);
+    test_step.dependOn(&digest_vectors.step);
+
     const smoke_step = b.step("rewind-test-smoke", "Run `rewind test` over the fixtures + smoke cross-checks (saga runner e2e)");
     const test_dirs = [_][]const u8{
         "src/replay/testdata/checkout", // the saga-runner fixture
