@@ -155,21 +155,48 @@ payload-less kinds, identity is always pinned (`session` `null` / `tenant` /
 retired driver-only surfaces (`request.body`, the pre-rename `on.*` alias)
 exist only under `captured` so pinned old deployments still replay.
 
-## 4. The five tape channels (capture) vs what the driver decodes (replay)
+## 4. The recorded input set — five channels (capture) vs what the driver decodes (replay)
+
+> **On the word "tape."** The storage format is called RTAP and the code
+> says `tape` in many places; both are fine as *format* names and the
+> on-disk magic is frozen (`format-versioning.md`). But the **model** is a
+> recorded **input set**, not a tape, and reading it as a tape has cost
+> real time. A tape implies a cursor: positions, ordering, running off the
+> end. What is actually recorded is *the value this key had* and *the
+> source this specifier resolved to* — order is not part of the meaning,
+> because the order a handler reaches its inputs is not something the
+> handler computes.
+>
+> That distinction is load-bearing. Replay resolves every channel **by
+> key** (§1); enforcing order instead rejected runs that were correct —
+> a refactor moving two independent reads, an engine dispatching a module
+> the loader never saw, a caller paging a scan differently. Each was a
+> false negative dressed as rigour, and each cost a debugging cycle.
+>
+> Two different things want the two names. The **input set** is complete,
+> keyed, order-insensitive, and consulted to produce behaviour. A
+> **verification digest** is ordered, lossy, and never consulted to
+> produce behaviour — it only answers "did this run do what the recorded
+> one did". Do not give the first the properties of the second.
 
 Capture writes five channels (`src/tape/root.zig:127`):
 
 | channel | carries |
 |---|---|
-| `kv` (0) | ordered kv **reads** (`get`/`prefix` + outcome); `set`/`delete` are outputs, never taped |
+| `kv` (0) | kv **reads** (`get`/`prefix` + outcome), resolved by key on replay; `set`/`delete` are outputs, never recorded |
 | `module` (1) | resolved module specifier → source hash (bytecode pin) |
 | `fetch_responses` (2) | a fetch result's bytes + terminal `status`/`ok`/`body_truncated` (`worker_streaming.zig:3236`) |
 | `trigger_payload` (3) | the request **body** (inbound) **or** a synthesized `{"ctx": …}` envelope (continuation resume) — `worker_drain.zig:1448`, `liftThreadedCtx` `globals.zig:2253` |
 | `request_reads` (4) | the read-recorded `request` surface (header names/values, body-read flag, ip) |
 
-So the inputs for *every* activation kind are taped — `ctx` rides
+So the inputs for *every* activation kind are recorded — `ctx` rides
 `trigger_payload`, a fetch result rides `fetch_responses`. The capture side is
-(largely) complete.
+(largely) complete for what the loader and the read-recorder see; what it
+does NOT capture is anything the worker resolves *around* the handler
+rather than from a handler read — the resolved module, the middleware
+decision, `session`, `fetchesPending`. Read-taping only sees what the
+handler itself reads, so those are invisible by default; that is the
+`request.ok`/G3 shape and it recurs.
 
 ## 5. As-built driver gaps (snapshot 2026-06-30)
 
