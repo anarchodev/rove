@@ -18,7 +18,7 @@ const sigv4 = @import("sigv4");
 const fatal = c.fatal;
 const oom = c.oom;
 
-pub const Mode = enum { show, adopt, bump };
+pub const Mode = enum { show, adopt, bump, print_prefix };
 
 const S3Env = struct {
     host: []const u8,
@@ -123,6 +123,18 @@ pub fn cmd(a: std.mem.Allocator, env: *const c.Env, mode: Mode) void {
     const current = readMarker(a, s3);
 
     switch (mode) {
+        // Just the effective prefix, nothing else — deploy scripts assert on
+        // this, and parsing prose is how a check quietly stops checking.
+        .print_prefix => {
+            const seg = current orelse {
+                std.debug.print("{s}\n", .{ns.MISSING_MARKER_HINT});
+                std.process.exit(1);
+            };
+            const prefix = ns.apply(a, s3.key_prefix_base, seg) catch oom();
+            const out = std.fs.File.stdout();
+            out.writeAll(prefix) catch {};
+            out.writeAll("\n") catch {};
+        },
         .show => {
             if (current) |seg| {
                 std.debug.print("storage namespace: '{s}' {s}\n", .{ seg, describe(seg) });

@@ -47,6 +47,26 @@ export default function () {
 }
 
 TENANT = "acme"
+# Off the default 9110 so a stray local worker can't answer for ours.
+METRICS_PORT = 19839
+
+
+def worker_storage_prefix() -> str | None:
+    """The prefix the running worker reports on its operator metrics port —
+    the same signal `deploy.sh` asserts on across all three prod nodes."""
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        try:
+            import urllib.request
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{METRICS_PORT}/metrics", timeout=5) as r:
+                for line in r.read().decode().splitlines():
+                    if line.startswith("storage_namespace_info{"):
+                        return line.split('prefix="', 1)[1].split('"', 1)[0]
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return None
 
 
 def ops_namespace(prefix: str, *args) -> subprocess.CompletedProcess:
@@ -137,8 +157,18 @@ def main() -> int:
     check("the namespace bumps", bump.returncode == 0, bump.stdout + bump.stderr)
     print(f"    {bump.stdout.strip().splitlines()[0] if bump.stdout.strip() else ''}")
 
+    os.environ["REWIND_METRICS_PORT"] = str(METRICS_PORT)
     with V2Cluster.spawn("nsA", nodes=1, http_base=19830, raft_base=19930) as c:
         c.spawn_log_server(poll_interval_ms=200)
+
+        # The generation a process is USING is only observable if it says so.
+        # An operator (and the deploy script) has to be able to assert that
+        # every node came up on the new generation — "we bumped before starting
+        # anything" is an ordering argument, not evidence.
+        reported = worker_storage_prefix()
+        check("the worker reports the bumped prefix on its metrics port",
+              reported == f"{prefix}1/", f"reported {reported!r}, expected {prefix + '1/'!r}")
+
         c.provision(TENANT)
         c_paths = serve_and_collect(c, "C", deploy=True)
         check("WITH a namespace bump, lifetime C keeps all its records", len(c_paths) >= 3,

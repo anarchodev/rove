@@ -215,6 +215,7 @@ pub fn main() !void {
     // an optional LOG_S3_KEY_PREFIX prefix, matching what the
     // worker's flushLogs path uses.
     const s3cfg = blob_owned.cfg;
+    log_server.metrics.storage_prefix = s3cfg.key_prefix_base;
     var s3_handle = try log_server.batch_store_s3.S3BatchStore.fromBlobCfg(allocator, s3cfg, ns_segment);
     defer s3_handle.deinit();
     const batch_store: log_server.batch_store.BatchStore = s3_handle.batchStore();

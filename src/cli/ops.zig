@@ -600,7 +600,7 @@ const usage =
     \\  rewind-ops kv-put <tenant> <key> [value]     seed a system kv key (move-secret; operator/OIDC bootstrap)
     \\  rewind-ops seed-packages                     publish the first-party @rewind/* set into the registry (genesis)
     \\  rewind-ops status <host>                      resolve a host → tenant/cluster/plan
-    \\  rewind-ops storage-namespace [--adopt|--bump]   show/set the object store's generation
+    \\  rewind-ops storage-namespace [--adopt|--bump|--print-prefix]  show/set the object store's generation
     \\
     \\options:
     \\  --env <path>   operator env file (default ~/.config/rove/prod.env, then ./.env.prod)
@@ -717,6 +717,7 @@ pub fn main() void {
         for (p) |arg| {
             if (std.mem.eql(u8, arg, "--adopt")) mode = .adopt;
             if (std.mem.eql(u8, arg, "--bump")) mode = .bump;
+            if (std.mem.eql(u8, arg, "--print-prefix")) mode = .print_prefix;
         }
         storage_namespace.cmd(a, &env, mode);
     } else if (std.mem.eql(u8, cmd, "status")) {

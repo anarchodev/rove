@@ -344,6 +344,19 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
     // identical on the worker and the front so the two can't drift.
     try worker.h2.writeConnMetrics(w);
 
+    // Which storage generation this process resolved at startup (the
+    // storage-namespace section of `docs/architecture/deployment-and-logs.md`).
+    // Scraped so a cluster whose nodes disagree — one restarted across a
+    // namespace bump, say — is visible instead of silently writing two
+    // histories. The marker is read once at startup, so this is exactly what
+    // the process is using until it restarts.
+    try w.print(
+        \\# HELP storage_namespace_info the object-store key prefix this process resolved at startup. Nodes must agree.
+        \\# TYPE storage_namespace_info gauge
+        \\storage_namespace_info{{prefix="{s}"}} 1
+        \\
+    , .{worker.node.blob_backend_cfg.key_prefix_base});
+
     // raft-pending is worker-only (the front has no raft path) — emit it
     // separately. Sum the three siblings: "how many entities are parked
     // on raft commit," not which destination.
