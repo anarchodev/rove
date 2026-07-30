@@ -26,6 +26,7 @@ const blob_mod = @import("rove-blob");
 const tenant_mod = @import("rove-tenant");
 const qjs = @import("rove-qjs");
 const log_server = @import("rove-log-server");
+const log_mod = @import("rove-log");
 const files_mod = @import("rove-files");
 const version_registry = @import("version.zig");
 
@@ -253,7 +254,29 @@ fn workerMain(args: *WorkerCtx) !void {
             .accept_http1 = false,
             .websocket_upgrades = false,
         },
-        .log_worker_id = args.worker_idx,
+        // Request-id minter identity. Passing the worker index ALONE left every
+        // node minting as worker 0 while each kept its own node-local counter,
+        // so a tenant's leadership moving between nodes re-issued ids the
+        // previous leader had already handed out (rove#281). Pack the node id
+        // in too. Refusing to start beats minting colliding ids: a collision is
+        // a record that is indexed nowhere and can never be replayed.
+        .log_worker_id = blk: {
+            const node_id: u64 = if (std.posix.getenv("REWIND_NODE_ID")) |v|
+                std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t"), 10) catch {
+                    std.debug.print("error: REWIND_NODE_ID is not a number\n", .{});
+                    std.process.exit(2);
+                }
+            else
+                1; // single-node: the only minter, so any stable identity works.
+            break :blk log_mod.RequestIdMinter.mintIdentity(node_id, args.worker_idx) catch {
+                std.debug.print(
+                    "error: REWIND_NODE_ID={d} / worker index {d} do not fit a minter identity " ++
+                        "(node 1-255, worker 0-255). Request ids would collide across minters.\n",
+                    .{ node_id, args.worker_idx },
+                );
+                std.process.exit(2);
+            };
+        },
         // Operational log-flush cadence overrides (null → module defaults).
         .log_flush_interval_ns = blk: {
             const s = std.posix.getenv("REWIND_LOG_FLUSH_INTERVAL_MS") orelse break :blk null;

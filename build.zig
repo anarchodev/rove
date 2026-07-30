@@ -1186,6 +1186,9 @@ pub fn build(b: *std.Build) void {
     rewind_mod.addImport("raft-kv", kv_mod);
     rewind_mod.addImport("rove-h2", h2_mod);
     rewind_mod.addImport("rove-blob", blob_mod);
+    // The request-id minter identity (RequestIdMinter.mintIdentity) is composed
+    // at boot from REWIND_NODE_ID + the worker index.
+    rewind_mod.addImport("rove-log", log_mod);
     rewind_mod.addImport("rove-tenant", tenant_mod);
     rewind_mod.addImport("rove-qjs", qjs_mod);
     rewind_mod.addImport("rove-log-server", log_server_mod);

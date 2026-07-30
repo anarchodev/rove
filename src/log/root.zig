@@ -596,6 +596,27 @@ pub const RequestIdMinter = struct {
     /// invariant we need is "ids never collide," not "ids are dense."
     reserved_until: u48,
 
+    /// Pack a minter identity into the top 16 bits of every `request_id`.
+    ///
+    /// Those bits exist to partition the id space between minters that each
+    /// keep their OWN counter, and the partition has to cover every such
+    /// minter. The counter lives in the tenant's local kv (a direct put, no
+    /// writeset, so it does not replicate), which means every NODE has its own
+    /// — and a tenant's leadership moves between nodes. Partitioning by worker
+    /// index alone left all three production nodes minting `worker 0`, so a
+    /// leadership change re-issued ids the previous leader had already used
+    /// (rove#281: `marketing/1024` went to three different requests).
+    ///
+    /// 8 bits of node + 8 bits of worker. Both are small by construction —
+    /// clusters are fixed and small (cold-multi), and a node runs a handful of
+    /// workers — and exceeding either is a hard error rather than a silent
+    /// wrap, because a wrapped identity is a collision by another name.
+    pub fn mintIdentity(node_id: u64, worker_idx: u16) error{MinterIdentityRange}!u16 {
+        if (node_id == 0 or node_id > 255) return error.MinterIdentityRange;
+        if (worker_idx > 255) return error.MinterIdentityRange;
+        return (@as(u16, @intCast(node_id)) << 8) | @as(u16, @intCast(worker_idx));
+    }
+
     /// Open a minter. Reads its chunked-reservation counter from
     /// `opts.seq_kv` at `opts.seq_key`; if absent, starts at 0. Any
     /// gap between the loaded value and what was actually handed out
@@ -632,9 +653,11 @@ pub const RequestIdMinter = struct {
     /// sees a write once per `REQUEST_ID_CHUNK` ids, not once per
     /// request. This is load-bearing for dispatch throughput: the
     /// per-request autocommit was ~29% of CPU in a 2026-04-14 profile.
-    /// On restart, any unused tail of the last reservation is
-    /// abandoned — ids become sparse across restarts, but never
-    /// collide.
+    /// On restart, any unused tail of the last reservation is abandoned — ids
+    /// become sparse across restarts, but never collide. That holds only
+    /// because the top 16 bits partition the space per minter (`mintIdentity`):
+    /// the counter itself is node-local, so two nodes sharing an identity would
+    /// hand out the same seq. See rove#281.
     pub fn nextRequestId(self: *RequestIdMinter) Error!u64 {
         if (self.next_request_seq >= self.reserved_until) {
             self.reserved_until = self.next_request_seq + REQUEST_ID_CHUNK;
@@ -932,6 +955,52 @@ test "RequestIdMinter worker_id occupies the upper 16 bits of request_id" {
     const id = try fx.minter.nextRequestId();
     try testing.expectEqual(@as(u64, 0xCAFE), id >> 48);
     try testing.expectEqual(@as(u64, 0), id & 0xFFFFFFFFFFFF);
+}
+
+test "two nodes minting the same tenant never collide" {
+    // The production failure (rove#281): every node passed worker index 0 as
+    // its minter identity while each kept its OWN node-local counter, so a
+    // tenant's leadership moving between nodes re-issued ids the previous
+    // leader had used — `marketing/1024` went to three different requests.
+    //
+    // Identical counters are the point of the fixture: this asserts the ids
+    // differ because of WHO minted them, not because the counters happened to
+    // have advanced differently.
+    const a = testing.allocator;
+    var n1 = try TestMinter.init(a);
+    defer n1.deinit();
+    var n2 = try TestMinter.init(a);
+    defer n2.deinit();
+
+    n1.minter.deinit();
+    n2.minter.deinit();
+    n1.minter = try RequestIdMinter.init(a, try RequestIdMinter.mintIdentity(1, 0), .{
+        .seq_kv = n1.seq_kv, .seq_key = "_log/next_request_seq",
+    });
+    n2.minter = try RequestIdMinter.init(a, try RequestIdMinter.mintIdentity(2, 0), .{
+        .seq_kv = n2.seq_kv, .seq_key = "_log/next_request_seq",
+    });
+
+    var seen: [8]u64 = undefined;
+    for (0..4) |i| {
+        seen[i * 2] = try n1.minter.nextRequestId();
+        seen[i * 2 + 1] = try n2.minter.nextRequestId();
+    }
+    for (seen, 0..) |x, i| {
+        for (seen[i + 1 ..]) |y| try testing.expect(x != y);
+    }
+    // …and the same worker index on one node is still distinct from another.
+    try testing.expect((try RequestIdMinter.mintIdentity(1, 0)) != (try RequestIdMinter.mintIdentity(1, 1)));
+}
+
+test "a minter identity that cannot fit is refused, not wrapped" {
+    // A wrapped identity is a collision wearing a different hat, so the range
+    // is a hard error at boot rather than a silent truncation.
+    try testing.expectError(error.MinterIdentityRange, RequestIdMinter.mintIdentity(0, 0));
+    try testing.expectError(error.MinterIdentityRange, RequestIdMinter.mintIdentity(256, 0));
+    try testing.expectError(error.MinterIdentityRange, RequestIdMinter.mintIdentity(1, 256));
+    try testing.expectEqual(@as(u16, 0x0100), try RequestIdMinter.mintIdentity(1, 0));
+    try testing.expectEqual(@as(u16, 0xFF01), try RequestIdMinter.mintIdentity(255, 1));
 }
 
 test "LogHeader: serialize + parseLogHeader roundtrip" {
