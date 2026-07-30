@@ -43,4 +43,5 @@ test {
     _ = indexer;
     _ = standalone;
     _ = flush_writer;
+    _ = @import("metrics.zig");
 }

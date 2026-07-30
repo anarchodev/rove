@@ -16,4 +16,7 @@ pub const Client = @import("client.zig").Client;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("crypto.zig");
+    _ = @import("expiry.zig");
+    _ = @import("responder.zig");
 }

@@ -2171,3 +2171,10 @@ test "cross-decoder: trigger_payload channel reads back via tape_decode" {
     try testing.expectEqual(@as(u64, 42), out[1].batch_id);
     try testing.expectEqualStrings("", out[1].inline_bytes);
 }
+
+test {
+    // Test discovery: Zig compiles tests only from files a test build
+    // reaches, and importing a file for its declarations does not reach it.
+    // `scripts/ops/test_reachability_lint.py` fails when one is missing here.
+    _ = @import("interaction_digest.zig");
+}

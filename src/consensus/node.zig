@@ -56,4 +56,5 @@ pub const DEFAULT_TICK_NS = core.DEFAULT_TICK_NS;
 // roots `v2_node_test` here).
 test {
     _ = core;
+    _ = @import("envelope.zig");
 }

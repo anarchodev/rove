@@ -905,3 +905,10 @@ pub fn main() !void {
     bridge.stopPump();
     std.log.info("rewind: shut down", .{});
 }
+
+test {
+    // Test discovery: Zig compiles tests only from files a test build
+    // reaches, and importing a file for its declarations does not reach it.
+    // `scripts/ops/test_reachability_lint.py` fails when one is missing here.
+    _ = @import("version.zig");
+}
