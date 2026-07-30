@@ -154,7 +154,10 @@ is keyed `(tenant_id, request_id)` and written `INSERT OR IGNORE`.
 So each lifetime gets a generation:
 
 - The marker is one object at `{key_prefix_base}_namespace`, deliberately
-  OUTSIDE the segment it names so it survives every bump. Its body is the
+  OUTSIDE the segment it names so it survives every bump. `_certs/{host}` (the
+  certificate mirror, [auth-and-domains.md](auth-and-domains.md)) sits beside it
+  and outside generations for the same reason: a certificate outlives the
+  cluster lifetime that requested it. Its body is the
   generation: a decimal count, or empty for the original un-segmented layout.
 - Every store hangs off `{key_prefix_base}{generation}/`, applied once at
   startup — file-blobs, log-blobs, deployments and the body pool move

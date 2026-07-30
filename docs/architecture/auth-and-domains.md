@@ -71,14 +71,36 @@ last-write-wins + sign-only-`current`, not a `_processed` marker.
 - **HTTP-01 issuance**: a **leader-elected issuer thread** on `rewind-cp`
   (`src/cp/acme.zig`; `client.zig` drives the RFC 8555 order with one
   long-lived EC account key under `{data_dir}/acme/`). Each tick the directory
-  leader computes the work-list (`collectUncertedHosts` — mapped hosts lacking
-  `cert/{host}`, filtered by the public/system suffixes), runs the client, and
-  writes `directory.setCert`. The challenge is served by `rewind-front`'s `:80`
+  leader computes the work-list (`collectHostsNeedingCert` — mapped hosts
+  lacking `cert/{host}` OR holding one that expires within 30 days, filtered by
+  the public/system suffixes), runs the client, and writes `directory.setCert`.
+  "Needs a cert" deliberately includes "expiring soon": certificates are
+  short-lived, so a work-list built from mere presence issues each one once and
+  then serves it until it dies. The challenge is served by `rewind-front`'s `:80`
   listener forwarding to the CP's `GET /_cp/acme-challenge?token=` (the
   issuer's in-memory challenge store). Inert unless `REWIND_ACME_DIRECTORY` is
   set. Two deadlock guards: the blocking `issue()` runs off the request loop
   (else it self-deadlocks the validation it depends on), and `setCert` proposes
   through the mutex-guarded bridge whose pump advances on its own thread.
+- **Surviving a cold bring-up**: `cert/{host}` lives in the directory raft
+  group, i.e. under `~/.rove/data/cp`, which `--genesis` wipes — and re-issuing
+  is rate-limited (Let's Encrypt allows five duplicate certificates per week for
+  an identical name set), so a deployment brought up repeatedly can exhaust
+  issuance and fail on some later renewal. Every certificate is therefore
+  mirrored to object storage at `{key_prefix_base}_certs/{host}`
+  (`src/cp/cert_mirror.zig`) as it is written, and the CP restores from there —
+  on its own reconcile tick, and again in the issuer immediately before any CA
+  call. The mirror sits OUTSIDE the storage-namespace generation (the
+  storage-namespace section of [deployment-and-logs.md](deployment-and-logs.md))
+  because a certificate is not lifetime-scoped: one for `example.com` is valid
+  no matter which cluster lifetime asked for it. An **expired** mirrored
+  certificate is never restored — it would satisfy "this host has a cert" and
+  suppress the issuance it needs. Mirroring never fails a cert write (the raft
+  copy is already durable) but logs loudly, because an un-mirrored certificate
+  is one the next genesis destroys. Gated by
+  `scripts/smoke/cert_survives_genesis_smoke.py`, which wipes the CP's state and
+  asserts the certificate returns byte-identical — and, as a control, that it is
+  gone when no mirror is configured.
 - **Cert state & replication**: `cert/{host}` is an axis in the CP
   `__directory__` group (placement-independent), written via
   `directory.setCert` / `POST /_control/cert`, read via `GET /_cp/cert(s)` —

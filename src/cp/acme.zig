@@ -26,6 +26,8 @@
 const std = @import("std");
 const acme = @import("rove-acme");
 const blob = @import("rove-blob");
+const cert_mirror = @import("cert_mirror.zig");
+const acme_expiry = @import("rove-acme").expiry;
 const directory_mod = @import("cp-directory");
 const Directory = directory_mod.Directory;
 
@@ -45,6 +47,10 @@ pub const Config = struct {
     /// is eligible.
     public_suffix: []const u8 = "",
     system_suffix: []const u8 = "",
+    /// The durable certificate copy (`cert_mirror.zig`), consulted BEFORE any
+    /// CA call. Null disables restore — every post-genesis host then goes to
+    /// the CA, which is what spends the rate-limit quota this exists to save.
+    mirror: ?*cert_mirror.CertMirror = null,
 };
 
 pub const Handle = struct {
@@ -95,6 +101,14 @@ pub fn spawn(config: Config) !*Handle {
     return h;
 }
 
+/// Re-issue once a certificate has less than this left. Let's Encrypt issues
+/// 90-day certificates and recommends renewing with 30 days remaining, which
+/// leaves ~30 days of daily retries before anything breaks — issuance can fail
+/// (rate limits, a DNS change, an ACME outage), so the window has to be wide
+/// enough to absorb a long run of failures rather than just wide enough to
+/// succeed once.
+pub const RENEW_WINDOW_S: i64 = 30 * std.time.s_per_day;
+
 fn threadMain(h: *Handle) void {
     runLoop(h) catch |err|
         std.log.err("cp-acme: issuer thread exited: {s}", .{@errorName(err)});
@@ -123,7 +137,8 @@ fn tick(h: *Handle) !void {
     // commits through the leader's proposer). Followers no-op until they win.
     if (!cfg.directory.isLeader()) return;
 
-    const hosts = cfg.directory.collectUncertedHosts(a) catch return;
+    const now_s = std.time.timestamp();
+    const hosts = cfg.directory.collectHostsNeedingCert(a, now_s, RENEW_WINDOW_S) catch return;
     defer {
         for (hosts) |host| a.free(host);
         a.free(hosts);
@@ -140,9 +155,26 @@ fn tick(h: *Handle) !void {
 
     for (hosts) |host| {
         if (!isEligible(host, cfg.public_suffix, cfg.system_suffix)) continue;
+
+        // Restore before issuing. After a cold bring-up every mapped host looks
+        // uncerted, but its certificate usually still exists in the mirror and
+        // is still good — asking the CA for a duplicate would spend quota that
+        // is capped at five per week per name set, and the cost of running out
+        // lands later, on some unrelated renewal.
+        // Restore beats issue: after a cold bring-up every mapped host looks
+        // uncerted, but its certificate usually still exists in the mirror and
+        // is still good. Asking the CA for a duplicate spends quota capped at
+        // five per week per name set, and running out surfaces later, on some
+        // unrelated renewal. The CP's own loop also restores; this is the same
+        // primitive called at the exact point where quota would be spent.
+        if (cfg.mirror) |m| {
+            if (m.restoreHost(a, cfg.directory, host, now_s, RENEW_WINDOW_S)) continue;
+        }
         // A concurrent issuance or a `/_control/cert` operator upload may have
-        // landed since `collectUncertedHosts`; don't double-issue.
-        if (cfg.directory.hasCert(host)) continue;
+        // landed since the work-list was built; don't double-issue. Asks for a
+        // USABLE cert, not merely a stored one — `hasCert` here would skip
+        // every host whose cert is expiring, which is the renewal case.
+        if (cfg.directory.hasUsableCert(a, host, now_s, RENEW_WINDOW_S)) continue;
 
         if (client == null) {
             account_key = ensureAccountKey(a, cfg.data_dir) catch |err| {

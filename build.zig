@@ -1139,6 +1139,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     v2_cp_dir_mod.addImport("bridge", v2_bridge_mod);
+    // Certificate expiry: the directory decides which hosts need issuance, and
+    // "needs issuance" includes "expiring soon", so it has to be able to read a
+    // certificate's notAfter.
+    v2_cp_dir_mod.addImport("rove-acme", acme_mod);
     const v2_cp_dir_test = b.addTest(.{ .root_module = v2_cp_dir_mod });
     const run_v2_cp_dir_test = b.addRunArtifact(v2_cp_dir_test);
     v2_test_step.dependOn(&run_v2_cp_dir_test.step);
