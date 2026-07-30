@@ -69,8 +69,22 @@ pub fn jsOnTimer(
         _ = c.JS_ThrowTypeError(ctx, "after.ms(ms): ms must be > 0");
         return js_exception;
     }
-    const list = state.pending_wakes orelse return js_undefined; // connectionless ⇒ inert
     const on: ?[]u8 = if (argc >= 2) readOn(state, ctx, argv[1]) else null;
+    // Fold the CALL, not the enactment: a connectionless activation treats
+    // this as inert, but the handler cannot tell (undefined either way) and a
+    // replay's recorder sees the call. Folding only enacted arms would have
+    // prod and replay disagree about identical handler behaviour.
+    if (globals.digestBegin(state)) |start| {
+        var dg = start;
+        var ms_buf: [24]u8 = undefined;
+        const ms_str = std.fmt.bufPrint(&ms_buf, "{d}", .{ms}) catch "?";
+        dg.wakeArm('t', ms_str, on orelse "");
+        globals.digestCommit(state, dg);
+    }
+    const list = state.pending_wakes orelse {
+        if (on) |t| state.allocator.free(t);
+        return js_undefined; // connectionless ⇒ inert
+    };
     list.append(state.allocator, .{ .kind = .timer, .interval_ms = ms, .on = on }) catch {
         if (on) |t| state.allocator.free(t);
         _ = c.JS_ThrowInternalError(ctx, "after.ms: out of memory");
@@ -98,12 +112,22 @@ pub fn jsOnKv(
     if (s == null) return js_exception;
     defer c.JS_FreeCString(ctx, s);
 
-    const list = state.pending_wakes orelse return js_undefined; // connectionless ⇒ inert
     const prefix = state.allocator.dupe(u8, s[0..len]) catch {
         _ = c.JS_ThrowInternalError(ctx, "after.kv: out of memory");
         return js_exception;
     };
     const on: ?[]u8 = if (argc >= 2) readOn(state, ctx, argv[1]) else null;
+    // Fold the call, inert or not — see the note in jsOnTimer.
+    if (globals.digestBegin(state)) |start| {
+        var dg = start;
+        dg.wakeArm('k', prefix, on orelse "");
+        globals.digestCommit(state, dg);
+    }
+    const list = state.pending_wakes orelse {
+        state.allocator.free(prefix);
+        if (on) |t| state.allocator.free(t);
+        return js_undefined; // connectionless ⇒ inert
+    };
     list.append(state.allocator, .{ .kind = .kv, .prefix = prefix, .on = on }) catch {
         state.allocator.free(prefix);
         if (on) |t| state.allocator.free(t);

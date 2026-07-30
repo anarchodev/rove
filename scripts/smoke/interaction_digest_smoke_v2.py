@@ -16,9 +16,12 @@ Three properties, each chosen to fail for a different reason:
   2. two requests that do the SAME thing digest identically — the property a
      replay comparison depends on, and the one that breaks if anything
      per-request (a timestamp, a request id, a seed) leaks into the hash;
-  3. a request that writes a DIFFERENT value digests differently even though
-     its response is byte-identical — the case a status-only or response-only
-     check misses entirely, which is the whole reason the digest exists.
+  3. a request that writes a DIFFERENT value AND arms a different wake digests
+     differently even though its response is byte-identical — the case a
+     status-only or response-only check misses entirely, which is the whole
+     reason the digest exists. The handler arms a wake in both modes, so this
+     also covers the effect hooks (before them, an effect-only difference
+     digested as identical).
 
 Ports: 19820/19920 (see the per-smoke port table; do not run two smokes at
 once). Needs S3 credentials: `set -a; . ./.env; set +a`.
@@ -40,6 +43,9 @@ export default function () {
   const seen = kv.get("counter") ?? "0";
   const mode = request.query && request.query.includes("mode=b") ? "b" : "a";
   kv.set("mark", mode === "b" ? "value-b" : "value-a");
+  // An EFFECT whose arguments differ by mode, with the response held
+  // identical: before the effect hooks, both modes digested the same.
+  after.ms(mode === "b" ? 9000 : 5000, { on: "onWake" });
   response.status = 200;
   return "same-body";
 }
