@@ -1449,8 +1449,8 @@ pub fn build(b: *std.Build) void {
     // Declared inputs, so editing either the mirror or the vectors re-runs the
     // check. Without them the step is cached on its argv alone and a broken
     // mirror silently "passes" — which is how a gate rots into decoration.
-    digest_vectors.addFileInput(b.path("src/replay/js/interaction_digest.js"));
-    digest_vectors.addFileInput(b.path("src/replay/testdata/digest_vectors.json"));
+    digest_vectors.addFileInput(b.path("src/tape/js_interaction_digest.js"));
+    digest_vectors.addFileInput(b.path("src/tape/testdata/digest_vectors.json"));
     digest_vectors.expectExitCode(0);
     const digest_step = b.step("replay-digest-vectors", "Check the JS interaction-digest mirror against the shared vectors");
     digest_step.dependOn(&digest_vectors.step);

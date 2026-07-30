@@ -15,6 +15,7 @@ const rove = @import("rove");
 const reserved = @import("reserved.zig");
 const td = @import("trigger_dispatch.zig");
 const tape_mod = @import("rove-tape");
+const digest_mod = tape_mod.interaction_digest;
 
 const c = qjs.c;
 
@@ -32,6 +33,54 @@ const kvSizeViolation = globals_mod.kvSizeViolation;
 const throwKvTooLarge = globals_mod.throwKvTooLarge;
 const throwReservedKey = globals_mod.throwReservedKey;
 const KvSizeViolation = globals_mod.KvSizeViolation;
+
+
+// ── interaction digest folding ───────────────────────────────────────────
+//
+// One rolling hash over what the handler observably did, updated AS the
+// interactions happen. It cannot be reconstructed afterwards from the readset
+// and writeset, because those are two structures and the relative order of a
+// read and a write between them is not preserved — and that order is part of
+// what the handler did.
+//
+// Reads of the activation's own writes are folded too, even though they are
+// elided from the readset (a self-read carries no replay input). The digest is
+// a behaviour log, not an input set: the handler performed the read, and a
+// replay serving it from the overlay performs it as well.
+
+/// The digest so far, seeded on first use. A run with no interactions still
+/// has a digest (the empty one); `0` on the readset means "never computed",
+/// which a reader must treat as unverifiable rather than as a match.
+fn digestOf(rs: anytype) digest_mod.Digest {
+    return .{ .h = if (rs.interaction_digest == 0)
+        digest_mod.Digest.init().h
+    else
+        rs.interaction_digest };
+}
+
+fn foldRead(state: *DispatchState, key: []const u8, found: bool, value: []const u8) void {
+    if (state.readset) |rs| {
+        var d = digestOf(rs);
+        d.kvRead(key, found, value);
+        rs.interaction_digest = d.h;
+    }
+}
+
+fn foldWrite(state: *DispatchState, key: []const u8, value: []const u8) void {
+    if (state.readset) |rs| {
+        var d = digestOf(rs);
+        d.kvWrite(key, value);
+        rs.interaction_digest = d.h;
+    }
+}
+
+fn foldDelete(state: *DispatchState, key: []const u8) void {
+    if (state.readset) |rs| {
+        var d = digestOf(rs);
+        d.kvDelete(key);
+        rs.interaction_digest = d.h;
+    }
+}
 
 pub fn jsKvGet(
     ctx: ?*c.JSContext,
@@ -58,6 +107,7 @@ pub fn jsKvGet(
     const value = state.kv.get(key_str) catch |err| switch (err) {
         error.NotFound => {
             if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .not_found) catch {};
+            foldRead(state, key_str, false, "");
             return js_null;
         },
         else => {
@@ -69,6 +119,7 @@ pub fn jsKvGet(
     defer state.allocator.free(value);
 
     if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, value, .ok) catch {};
+    foldRead(state, key_str, true, value);
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
@@ -105,6 +156,11 @@ fn markSubscriptionsDirty(state: *DispatchState, key: []const u8) void {
             state.pending_kv_error = err;
             return;
         };
+        // The dirty marker is injected by the platform, not written by the
+        // handler — but it lands in the same writeset the replay must
+        // reproduce, so it belongs in the digest. A replay that fails to
+        // inject it (rove#252) diverges here, which is the point.
+        foldWrite(state, mkey, prefix);
         state.writeset.addPut(mkey, prefix) catch |err| {
             state.pending_kv_error = err;
             return;
@@ -163,6 +219,7 @@ pub fn jsKvSet(
         state.writeset.addPut(key_str, val_str) catch |err| {
             state.pending_kv_error = err;
         };
+        foldWrite(state, key_str, val_str);
         markSubscriptionsDirty(state, key_str);
         return js_undefined;
     }
@@ -211,6 +268,7 @@ pub fn jsKvSet(
     state.writeset.addPut(key_str, write_value) catch |err| {
         state.pending_kv_error = err;
     };
+    foldWrite(state, key_str, write_value);
     markSubscriptionsDirty(state, key_str);
 
     if (td.runAfterChain(state, ctx, key_str, .put, write_value, prev_owned)) |trigger_path| {
@@ -260,6 +318,7 @@ pub fn jsKvDelete(
         state.writeset.addDelete(key_str) catch |err| {
             state.pending_kv_error = err;
         };
+        foldDelete(state, key_str);
         markSubscriptionsDirty(state, key_str);
         return js_undefined;
     }
@@ -300,6 +359,7 @@ pub fn jsKvDelete(
     state.writeset.addDelete(key_str) catch |err| {
         state.pending_kv_error = err;
     };
+    foldDelete(state, key_str);
     markSubscriptionsDirty(state, key_str);
 
     if (td.runAfterChain(state, ctx, key_str, .delete, null, prev_owned)) |trigger_path| {

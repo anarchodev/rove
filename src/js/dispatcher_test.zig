@@ -5429,3 +5429,72 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     defer testing.allocator.free(c_value);
     try testing.expectEqualStrings("c-from-b", c_value);
 }
+
+test "interaction digest: folds reads, writes and the response as they happen" {
+    // The digest is what makes "the handler executed the same" checkable
+    // rather than assumed. These assertions are about the PROPERTIES a
+    // fidelity check needs — that behaviour changes move it and incidental
+    // things do not — rather than about any particular hash value, which
+    // lives in the shared vectors (src/tape/testdata/digest_vectors.json).
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    {
+        var txn = try kv.beginTrackedImmediate();
+        try txn.put("n", "5");
+        try txn.commit();
+    }
+
+    const src =
+        \\const n = parseInt(kv.get("n") ?? "0", 10) + 1;
+        \\kv.set("seen", String(n));
+        \\return "n=" + n;
+    ;
+
+    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs.deinit();
+    var resp = try runOne(&d, kv, src, .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1, .readset = &rs } });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+
+    // A run that touched kv and produced a response has a digest.
+    try testing.expect(rs.interaction_digest != 0);
+
+    // The same handler over the same state digests identically — the property
+    // a replay depends on. (Fresh kv value so the read sees "5" again.)
+    {
+        var txn = try kv.beginTrackedImmediate();
+        try txn.put("n", "5");
+        try txn.commit();
+    }
+    var rs2 = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs2.deinit();
+    var resp2 = try runOne(&d, kv, src, .{ .method = "POST", .path = "/", .trace = .{ .request_id = 2, .readset = &rs2 } });
+    defer resp2.deinit(testing.allocator);
+    try testing.expectEqual(rs.interaction_digest, rs2.interaction_digest);
+
+    // A handler that writes a DIFFERENT value digests differently, even though
+    // it reads the same key and returns the same body — the case an
+    // output-only or status-only check misses.
+    {
+        var txn = try kv.beginTrackedImmediate();
+        try txn.put("n", "5");
+        try txn.commit();
+    }
+    var rs3 = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs3.deinit();
+    var resp3 = try runOne(&d, kv,
+        \\const n = parseInt(kv.get("n") ?? "0", 10) + 1;
+        \\kv.set("seen", "different");
+        \\return "n=" + n;
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 3, .readset = &rs3 } });
+    defer resp3.deinit(testing.allocator);
+    try testing.expectEqualStrings(resp.body, resp3.body);          // same response
+    try testing.expect(rs.interaction_digest != rs3.interaction_digest); // different behaviour
+}

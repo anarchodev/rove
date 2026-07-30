@@ -11,10 +11,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-new Function(readFileSync(join(here, "interaction_digest.js"), "utf-8"))();
+new Function(readFileSync(join(here, "..", "..", "tape", "js_interaction_digest.js"), "utf-8"))();
 const { Digest, foldValue, VERSION } = globalThis.__interactionDigest;
 
-const vec = JSON.parse(readFileSync(join(here, "..", "testdata", "digest_vectors.json"), "utf-8"));
+const vec = JSON.parse(readFileSync(join(here, "..", "..", "tape", "testdata", "digest_vectors.json"), "utf-8"));
 if (vec.version !== VERSION) {
   console.error(`grammar version mismatch: vectors say ${vec.version}, JS says ${VERSION}`);
   process.exit(1);

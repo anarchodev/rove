@@ -792,6 +792,20 @@ fn finishResponse(
     const tags_slice = tags_buf.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
 
+    // Close the interaction digest with the run's own result — the last
+    // element, and the one that makes the digest a superset of the status
+    // comparison the fidelity gate does today. Folded HERE because this is the
+    // one point where both the status and the body are known; the log record is
+    // built later and never sees the body.
+    if (state.readset) |rs| {
+        var dg = tape_mod.interaction_digest.Digest{ .h = if (rs.interaction_digest == 0)
+            tape_mod.interaction_digest.Digest.init().h
+        else
+            rs.interaction_digest };
+        dg.response(@intCast(@max(@min(pending.status, 599), 100)), pending.body);
+        rs.interaction_digest = dg.h;
+    }
+
     return .{ .terminal = .{
         .status = pending.status,
         .body = pending.body,
