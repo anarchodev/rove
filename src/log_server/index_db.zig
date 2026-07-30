@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const sidecar = @import("sidecar.zig");
+const metrics = @import("metrics.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -482,7 +483,63 @@ fn execLogIndexInserts(
         _ = c.sqlite3_bind_int64(st, 12, @intCast(r.offset + header_size));
         _ = c.sqlite3_bind_int(st, 13, @intCast(r.length));
         if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
+
+        // `INSERT OR IGNORE` swallows a primary-key clash, and the two things
+        // it can be swallowing are opposites. Ask which one happened.
+        if (c.sqlite3_changes(db) == 0) classifyIgnored(db, r, ndjson_key, header_size);
     }
+}
+
+/// A record the index refused. Idempotent re-index, or a genuine identity
+/// collision?
+///
+/// `(tenant_id, request_id)` is the primary key, and it is only unique within
+/// one run of a tenant's counter — a fresh cluster lifetime re-issues the same
+/// numbers (rove#266). So an ignored insert means EITHER "this exact row is
+/// already here" (the poll path re-listing its clock-skew window; routine) OR
+/// "a different record already owns this identity" (the new record is dropped
+/// and can never be queried or replayed; data loss).
+///
+/// Those need opposite reactions, so distinguish them by what the stored row
+/// actually points at. Counting both together would bury the second under the
+/// first — which is precisely how an hour of production data loss looked
+/// exactly like healthy idempotency.
+fn classifyIgnored(
+    db: *c.sqlite3,
+    r: sidecar.Record,
+    ndjson_key: []const u8,
+    header_size: u64,
+) void {
+    var q: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT ndjson_key, offset FROM log_index WHERE tenant_id = ? AND request_id = ?";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &q, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(q);
+    bindText(q.?, 1, r.tenant_id);
+    _ = c.sqlite3_bind_int64(q, 2, @intCast(r.request_id));
+    if (c.sqlite3_step(q) != c.SQLITE_ROW) return;
+
+    const held_key_ptr = c.sqlite3_column_text(q, 0);
+    const held_key: []const u8 = if (held_key_ptr) |p|
+        std.mem.span(@as([*:0]const u8, @ptrCast(p)))
+    else
+        "";
+    const held_offset: u64 = @intCast(c.sqlite3_column_int64(q, 1));
+
+    if (std.mem.eql(u8, held_key, ndjson_key) and held_offset == r.offset + header_size) {
+        // Same record, same bytes, same place. Idempotency doing its job.
+        metrics.Metrics.inc(&metrics.global.index_reindexed);
+        return;
+    }
+
+    metrics.Metrics.inc(&metrics.global.index_conflicts);
+    // Warn, not err: an error-level log fails any test that drives this path
+    // (rove#274), and this one is worth testing. The counter is the alertable
+    // signal; the log names the two objects so the loss is diagnosable.
+    std.log.warn(
+        "log-index CONFLICT: {s}/{d} already held by {s}@{d}; DROPPING the record at {s}@{d} — " ++
+            "it is unqueryable and unreplayable. Two records claim one identity (rove#266).",
+        .{ r.tenant_id, r.request_id, held_key, held_offset, ndjson_key, r.offset + header_size },
+    );
 }
 
 /// Reserved tag key: the engine-populated per-chain correlation id.
@@ -721,6 +778,94 @@ test "queryList filters by tag (user session + reserved _corr)" {
     var none = try idx.queryList("acme", 0, 0, 0, 10, "session", "nope");
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.rows.len);
+}
+
+test "a re-index counts as re-index, a collision counts as a CONFLICT" {
+    // The two things `INSERT OR IGNORE` swallows, told apart. Both drop a row;
+    // only one is data loss, and before rove#266 they were indistinguishable —
+    // which is why an hour of production records vanished while every counter
+    // stayed green.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "conflict");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    const before_conflicts = metrics.global.index_conflicts.load(.monotonic);
+    const before_reindex = metrics.global.index_reindexed.load(.monotonic);
+
+    var rec = [_]sidecar.Record{.{
+        .tenant_id = "acme", .request_id = 7, .received_ns = 1_000, .duration_ns = 10,
+        .method = "GET", .path = "/first", .host = "h.test", .status = 200,
+        .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 40,
+    }};
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001", .batch_id = "b1", .ndjson_size = 40,
+        .ndjson_sha256 = "aaa", .first_received_ns = 1_000, .last_received_ns = 1_000,
+        .records = &rec,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/b1.ndjson", 0);
+    try testing.expectEqual(before_conflicts, metrics.global.index_conflicts.load(.monotonic));
+
+    // Same object again — the poll path re-listing its clock-skew window.
+    try idx.insertBatch(&batch, "_logs/00000001/b1.ndjson", 0);
+    try testing.expectEqual(before_reindex + 1, metrics.global.index_reindexed.load(.monotonic));
+    try testing.expectEqual(before_conflicts, metrics.global.index_conflicts.load(.monotonic));
+
+    // A DIFFERENT record claiming the same (tenant, request_id) — a fresh
+    // cluster lifetime re-issuing id 7 at a new object. This is the loss.
+    var clash = [_]sidecar.Record{.{
+        .tenant_id = "acme", .request_id = 7, .received_ns = 9_000, .duration_ns = 20,
+        .method = "POST", .path = "/second-lifetime", .host = "h.test", .status = 201,
+        .outcome = "ok", .deployment_id = 2, .offset = 0, .length = 55,
+    }};
+    const batch2 = sidecar.IdxFile{
+        .node_id = "00000001", .batch_id = "b2", .ndjson_size = 55,
+        .ndjson_sha256 = "bbb", .first_received_ns = 9_000, .last_received_ns = 9_000,
+        .records = &clash,
+    };
+    try idx.insertBatch(&batch2, "_logs/00000001/b2.ndjson", 0);
+    try testing.expectEqual(before_conflicts + 1, metrics.global.index_conflicts.load(.monotonic));
+    try testing.expectEqual(before_reindex + 1, metrics.global.index_reindexed.load(.monotonic));
+
+    // And the loss is real: the FIRST record still owns the identity.
+    var list = try idx.queryList("acme", 0, 0, 0, 10, null, null);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 1), list.rows.len);
+    try testing.expectEqualStrings("/first", list.rows[0].path);
+}
+
+test "the same id in a DIFFERENT tenant is not a conflict" {
+    // The key is (tenant_id, request_id). Tenants mint independently, so id 7
+    // existing for one tenant says nothing about another — counting that as a
+    // conflict would make the metric fire constantly and get ignored.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "crosstenant");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+    const before = metrics.global.index_conflicts.load(.monotonic);
+
+    inline for (.{ "acme", "globex" }) |tenant| {
+        var rec = [_]sidecar.Record{.{
+            .tenant_id = tenant, .request_id = 7, .received_ns = 1_000, .duration_ns = 10,
+            .method = "GET", .path = "/p", .host = "h.test", .status = 200,
+            .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 40,
+        }};
+        const b = sidecar.IdxFile{
+            .node_id = "00000001", .batch_id = tenant, .ndjson_size = 40,
+            .ndjson_sha256 = "x", .first_received_ns = 1_000, .last_received_ns = 1_000,
+            .records = &rec,
+        };
+        try idx.insertBatch(&b, "_logs/00000001/" ++ tenant ++ ".ndjson", 0);
+    }
+    try testing.expectEqual(before, metrics.global.index_conflicts.load(.monotonic));
 }
 
 test "insertBatch is idempotent on the same sidecar key" {

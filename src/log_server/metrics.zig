@@ -40,6 +40,18 @@ pub const Metrics = struct {
     /// Push requests whose index attempt errored.
     push_errors: Counter = .init(0),
 
+    // ── index identity ──
+    /// Records the index REFUSED because `(tenant_id, request_id)` was already
+    /// held by a DIFFERENT record — the record is dropped and is
+    /// unqueryable/unreplayable. Never expected: it means two records are
+    /// claiming one identity, which is what silently cost production an hour
+    /// of request logs (rove#266). Any nonzero value warrants a look.
+    index_conflicts: Counter = .init(0),
+    /// Records skipped because that exact row was already present — the poll
+    /// path re-listing its clock-skew window, or a resume after a crash.
+    /// Routine, and counted separately so it cannot drown the signal above.
+    index_reindexed: Counter = .init(0),
+
     // ── query surface ──
     query_list: Counter = .init(0),
     query_show: Counter = .init(0),
@@ -84,6 +96,8 @@ pub fn render(allocator: std.mem.Allocator) ![]u8 {
     try counter(w, "log_push_received_total", "Batch-push requests received.", m.push_received.load(.monotonic));
     try counter(w, "log_push_indexed_total", "Batches indexed by the push fast-path (bypassing the poll).", m.push_indexed.load(.monotonic));
     try counter(w, "log_push_errors_total", "Batch-push requests whose index attempt errored.", m.push_errors.load(.monotonic));
+    try counter(w, "log_index_conflicts_total", "Records DROPPED because (tenant_id, request_id) was already held by a different record. Nonzero = data loss.", m.index_conflicts.load(.monotonic));
+    try counter(w, "log_index_reindexed_total", "Records skipped because that exact row was already indexed (routine idempotent re-index).", m.index_reindexed.load(.monotonic));
     try counter(w, "log_query_list_total", "list queries served.", m.query_list.load(.monotonic));
     try counter(w, "log_query_show_total", "show queries served.", m.query_show.load(.monotonic));
     try counter(w, "log_query_count_total", "count queries served.", m.query_count.load(.monotonic));
