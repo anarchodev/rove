@@ -740,7 +740,11 @@ pub fn main() !void {
 /// CP lookup) cannot stall the :443 poll loop.
 fn port80Loop(s80: *FrontH2, reg80: *rove.Registry, allocator: std.mem.Allocator, cp_urls: []const []const u8) void {
     while (!stop_flag.load(.acquire)) {
-        s80.poll(10 * std.time.ns_per_ms) catch |err| switch (err) {
+        // `pollWithTimeout` — nanoseconds. `poll` takes a COUNT of completions
+        // to wait for, so `poll(10 * ns_per_ms)` asks for ten million of them
+        // and never returns: the kernel still completes the TCP handshake, so
+        // the listener looks alive while answering nothing.
+        s80.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
             else => {
                 std.log.err("rewind-front :80: poll failed: {s}", .{@errorName(err)});

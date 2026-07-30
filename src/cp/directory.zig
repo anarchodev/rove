@@ -59,6 +59,7 @@
 
 const std = @import("std");
 const bridge_mod = @import("bridge");
+const acme_expiry = @import("rove-acme").expiry;
 
 const Bridge = bridge_mod.Bridge;
 
@@ -120,15 +121,32 @@ pub const Resolution = struct {
     cluster: ClusterRef,
 };
 
+/// Where a written certificate is copied so it survives a cold bring-up. A hook
+/// rather than a direct dependency: the directory replicates and projects
+/// state, and knows nothing about object storage. Deliberately infallible — the
+/// certificate is already durable in raft by the time this runs, so a mirror
+/// failure is a warning to log, not a write to fail.
+pub const CertMirrorHook = struct {
+    ctx: *anyopaque,
+    put: *const fn (ctx: *anyopaque, host: []const u8, frame: []const u8) void,
+};
+
 pub const Directory = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
+
 
     /// The replication substrate. Null in ephemeral (test) mode — the
     /// mutating ops then skip the durable log and only update the
     /// projection. Borrowed; the constructing process owns the bridge's
     /// lifetime (the directory never deinits it).
     bridge: ?*Bridge = null,
+
+    /// Optional durable copy of every certificate written here, kept outside
+    /// the state a cold bring-up destroys (`cert_mirror.zig`). Null leaves
+    /// certificates raft-only, which means a genesis destroys them and the
+    /// re-issue spends CA rate-limit quota. Borrowed; the CP owns it.
+    cert_mirror: ?CertMirrorHook = null,
     /// The directory raft group id (set by `initReplicated`).
     dir_gid: u64 = 0,
 
@@ -865,7 +883,13 @@ pub const Directory = struct {
         defer a.free(key);
         const value = try packCert(a, cert_pem, key_pem);
         defer a.free(value);
-        return self.applyDirWrite(key, value);
+        try self.applyDirWrite(key, value);
+        // Mirror AFTER the write commits: the raft copy is the live one, and a
+        // mirror of something that failed to replicate would be a certificate
+        // no node is serving. Both cert writers (the ACME issuer and the
+        // `/_control/cert` upload) funnel through here, so the mirror cannot be
+        // missed by adding a third.
+        if (self.cert_mirror) |m| m.put(m.ctx, host, value);
     }
 
     /// A host's packed cert frame as an OWNED copy (caller frees + `unpackCert`s),
@@ -884,6 +908,24 @@ pub const Directory = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.certs.contains(host);
+    }
+
+    /// True when `host` has a stored certificate that is still good for at
+    /// least `renew_window_s`. This — not `hasCert` — is the question the
+    /// issuer's skip-if-already-done guard must ask: an expiring certificate
+    /// IS a stored certificate, so a `hasCert` guard would skip exactly the
+    /// hosts that need renewing.
+    pub fn hasUsableCert(
+        self: *Directory,
+        a: std.mem.Allocator,
+        host: []const u8,
+        now_s: i64,
+        renew_window_s: i64,
+    ) bool {
+        const frame = (self.certForOwned(a, host) catch return false) orelse return false;
+        defer a.free(frame);
+        const parsedc = unpackCert(frame) orelse return false;
+        return !acme_expiry.needsRenewal(a, parsedc.cert_pem, now_s, renew_window_s);
     }
 
     /// The hosts that currently have a stored cert (owned dups; caller frees
@@ -1068,22 +1110,63 @@ pub const Directory = struct {
         gop.value_ptr.* = val_dup;
     }
 
-    /// Collect the hosts in the domain index that have NO cert yet (owned dups;
-    /// caller frees each + the slice). The ACME issuer's work-list: every
-    /// mapped host without a `cert/{host}` is a pending issuance.
-    pub fn collectUncertedHosts(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    /// Collect the mapped hosts that need a certificate issued (owned dups;
+    /// caller frees each + the slice) — the ACME issuer's work-list.
+    ///
+    /// A host needs one when it has none, OR when the one it has expires within
+    /// `renew_window_s`. Both are the same job: certificates are short-lived by
+    /// design, so "has a cert" is not the same question as "has a usable cert",
+    /// and treating only the first as work means every certificate is issued
+    /// once and then serves until it dies.
+    ///
+    /// Expiry is evaluated OUTSIDE the lock — parsing is pure and the frames
+    /// are copied, so the mutex covers the index walk only.
+    pub fn collectHostsNeedingCert(
+        self: *Directory,
+        a: std.mem.Allocator,
+        now_s: i64,
+        renew_window_s: i64,
+    ) Error![][]u8 {
+        const Candidate = struct { host: []u8, frame: ?[]u8 };
+        var candidates: std.ArrayListUnmanaged(Candidate) = .empty;
+        defer {
+            for (candidates.items) |c| {
+                a.free(c.host);
+                if (c.frame) |f| a.free(f);
+            }
+            candidates.deinit(a);
+        }
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var it = self.hosts.keyIterator();
+            while (it.next()) |k| {
+                const host = a.dupe(u8, k.*) catch return Error.OutOfMemory;
+                errdefer a.free(host);
+                const frame: ?[]u8 = if (self.certs.get(k.*)) |v|
+                    (a.dupe(u8, v) catch return Error.OutOfMemory)
+                else
+                    null;
+                candidates.append(a, .{ .host = host, .frame = frame }) catch return Error.OutOfMemory;
+            }
+        }
+
         var out: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (out.items) |h| a.free(h);
             out.deinit(a);
         }
-        var it = self.hosts.keyIterator();
-        while (it.next()) |k| {
-            if (!self.certs.contains(k.*)) {
-                out.append(a, a.dupe(u8, k.*) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
-            }
+        for (candidates.items) |cand| {
+            const needs = if (cand.frame) |frame| blk: {
+                // An unreadable frame counts as needing issuance for the same
+                // reason an unreadable certificate does — it cannot be vouched
+                // for, and re-issuing is cheap next to serving something broken.
+                const parsedc = unpackCert(frame) orelse break :blk true;
+                break :blk acme_expiry.needsRenewal(a, parsedc.cert_pem, now_s, renew_window_s);
+            } else true;
+            if (needs) out.append(a, a.dupe(u8, cand.host) catch return Error.OutOfMemory) catch
+                return Error.OutOfMemory;
         }
         return out.toOwnedSlice(a) catch return Error.OutOfMemory;
     }
@@ -1372,19 +1455,69 @@ test "directory: setCert + certForOwned round-trip, pack/unpack, uncerted list" 
     try testing.expectError(error.BadConfig, dir.setCert("", "c", "k"));
     try testing.expectError(error.BadConfig, dir.setCert("h", "", "k"));
 
-    // uncerted-hosts work-list: a mapped host with no cert shows up; once it
-    // has a cert it drops off.
-    try dir.setHost("acme.com", "acme");
-    try dir.setHost("beta.com", "beta");
+    // Issuance work-list. "Needs a cert" is three cases, and the middle one is
+    // the whole reason this is not just `!certs.contains(host)`.
+    const real_pem = acme_expiry.testdata.cert_pem;
+    const expires_at = acme_expiry.testdata.not_after;
+    const day = std.time.s_per_day;
+
+    try dir.setHost("valid.com", "t1"); // a real, unexpired certificate
+    try dir.setCert("valid.com", real_pem, "KEYPEM");
+    try dir.setHost("none.com", "t2"); // no certificate at all
+    try dir.setHost("broken.com", "t3"); // a certificate that will not parse
+    try dir.setCert("broken.com", "NOT-A-PEM", "KEYPEM");
+
+    const listPending = struct {
+        fn call(d: *Directory, alloc: std.mem.Allocator, now: i64, window: i64) ![][]u8 {
+            return d.collectHostsNeedingCert(alloc, now, window);
+        }
+    }.call;
+
     {
-        const pending = try dir.collectUncertedHosts(a);
+        // Well before expiry: only the missing and the unreadable are work.
+        const pending = try listPending(&dir, a, expires_at - 60 * day, 30 * day);
         defer {
             for (pending) |h| a.free(h);
             a.free(pending);
         }
-        try testing.expectEqual(@as(usize, 1), pending.len); // acme.com is certed
-        try testing.expectEqualStrings("beta.com", pending[0]);
+        try testing.expectEqual(@as(usize, 2), pending.len);
+        var saw_none = false;
+        var saw_broken = false;
+        for (pending) |h| {
+            if (std.mem.eql(u8, h, "none.com")) saw_none = true;
+            if (std.mem.eql(u8, h, "broken.com")) saw_broken = true;
+            // The valid cert must NOT be work yet — that is the case a
+            // renew-everything loop would get wrong, burning issuance quota.
+            try testing.expect(!std.mem.eql(u8, h, "valid.com"));
+        }
+        try testing.expect(saw_none and saw_broken);
     }
+
+    {
+        // Inside the renewal window the still-valid certificate becomes work.
+        // `hasCert` is true for it throughout, so a containment check would
+        // never surface it and the certificate would expire in place.
+        const pending = try listPending(&dir, a, expires_at - 10 * day, 30 * day);
+        defer {
+            for (pending) |h| a.free(h);
+            a.free(pending);
+        }
+        try testing.expectEqual(@as(usize, 3), pending.len);
+        var saw_valid = false;
+        for (pending) |h| {
+            if (std.mem.eql(u8, h, "valid.com")) saw_valid = true;
+        }
+        try testing.expect(saw_valid);
+    }
+
+    // The issuer's skip-guard has to agree with the work-list, or it would
+    // filter back out exactly what the list surfaced.
+    try testing.expect(dir.hasUsableCert(a, "valid.com", expires_at - 60 * day, 30 * day));
+    try testing.expect(!dir.hasUsableCert(a, "valid.com", expires_at - 10 * day, 30 * day));
+    try testing.expect(!dir.hasUsableCert(a, "broken.com", 0, 0));
+    try testing.expect(!dir.hasUsableCert(a, "none.com", 0, 0));
+    // …while `hasCert` cannot tell the last two apart from a healthy one.
+    try testing.expect(dir.hasCert("broken.com"));
 }
 
 test "directory: multi-node cluster carries every node origin" {

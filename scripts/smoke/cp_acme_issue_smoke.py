@@ -93,11 +93,20 @@ def _self_signed(tmp: str, name: str, cn: str, san: str) -> tuple[str, str]:
 
 
 def _served_cert_san(port: int, servername: str) -> str:
-    """openssl s_client → the leaf cert's SAN extension (or '')."""
-    s = subprocess.run(
-        ["openssl", "s_client", "-connect", f"127.0.0.1:{port}",
-         "-servername", servername, "-alpn", "h2"],
-        input=b"", capture_output=True, timeout=15).stdout.decode("utf-8", "replace")
+    """openssl s_client → the leaf cert's SAN extension (or '').
+
+    A handshake that hangs returns '' rather than raising: this runs in a poll
+    loop, so a stall is "not serving it yet", and letting `TimeoutExpired`
+    escape would abort the run before any assertion — turning a diagnosable
+    red into a stack trace, and skipping the teardown that stops the front.
+    """
+    try:
+        s = subprocess.run(
+            ["openssl", "s_client", "-connect", f"127.0.0.1:{port}",
+             "-servername", servername, "-alpn", "h2"],
+            input=b"", capture_output=True, timeout=15).stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return ""
     b = s.find("-----BEGIN CERTIFICATE-----")
     e = s.find("-----END CERTIFICATE-----")
     if b == -1 or e == -1:
@@ -191,21 +200,45 @@ def main() -> int:
             if CUSTOM_HOST in san:
                 break
             time.sleep(1)
-        assert CUSTOM_HOST in san, (
-            f"front never served the Pebble cert for {CUSTOM_HOST}; "
-            f"last SAN={san!r}\n--- cp log ---\n"
-            + (log_dir / f"cp-{os.getpid()}.log").read_text()[-1500:])
+        if CUSTOM_HOST not in san:
+            # Show BOTH sides. Our issuer only ever learns "authz invalid"; the
+            # CA is the one that decided why, and without its log a validation
+            # failure is indistinguishable from us never having tried.
+            cp_tail = ""
+            with contextlib.suppress(OSError):
+                cp_tail = (log_dir / f"cp-{os.getpid()}.log").read_text()[-1500:]
+            ca_tail = ""
+            with contextlib.suppress(OSError):
+                ca_tail = (log_dir / "pebble.log").read_text()[-8000:]
+            raise AssertionError(
+                f"front never served the Pebble cert for {CUSTOM_HOST}; "
+                f"last SAN={san!r}\n--- cp log ---\n{cp_tail}"
+                f"\n--- CA (pebble) log ---\n{ca_tail}")
         print(f"ok  front serves Pebble-issued {CUSTOM_HOST} by SNI (SAN={san.strip()})")
 
         print("\nall CP ACME issuance smoke checks passed")
         return 0
     finally:
+        # Signal, then WAIT. `pkill` and `send_signal` both return immediately,
+        # so without the wait the interpreter exits while a child is still
+        # shutting down — and a front that outlives the run holds :443/:80 for
+        # the NEXT one, whose own front binds alongside it (SO_REUSEPORT).
+        # Handshakes then land on the stale process and hang, so the next run
+        # fails for a reason that has nothing to do with what it tests, and
+        # leaks another. That compounds silently across runs.
         for p in procs:
             with contextlib.suppress(ProcessLookupError):
                 p.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + 15
+        for p in procs:
+            with contextlib.suppress(Exception):
+                p.wait(timeout=max(0.1, deadline - time.monotonic()))
+        for p in procs:
+            if p.poll() is None:
+                with contextlib.suppress(Exception):
+                    p.kill()
+                    p.wait(timeout=5)
         _kill_stragglers()
-        subprocess.run(["pkill", "-x", "rewind-cp"], capture_output=True)
-        subprocess.run(["pkill", "-x", "rewind-front"], capture_output=True)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

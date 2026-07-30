@@ -27,6 +27,7 @@ const rove = @import("rove");
 const boot = @import("rove-boot");
 const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
+const cert_mirror = @import("cert_mirror.zig");
 
 const curl = blob.curl;
 const bc = @import("backend_client.zig");
@@ -1162,6 +1163,35 @@ pub fn main() !void {
         } else |_| {}
     }
     const directory = try Directory.initReplicated(allocator, cp_bridge);
+
+    // The durable certificate copy. Certificates live in the directory raft
+    // group, which a cold bring-up wipes, and re-issuing spends CA rate-limit
+    // quota — so every cert written here is mirrored to object storage outside
+    // the storage-namespace generation, and the issuer restores from there
+    // before calling a CA. Optional: a CP without S3 configured still serves,
+    // it just leaves certificates raft-only (loudly).
+    var blob_owned: ?blob.BlobBackendOwned = blob.env.loadFromEnv(allocator) catch |err| blk: {
+        std.log.warn(
+            "rewind-cp: no S3 config ({s}) — certificates will NOT be mirrored, so a cold " ++
+                "bring-up destroys them and the re-issue spends CA quota (rove#269)",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+    defer if (blob_owned) |*b| b.deinit(allocator);
+
+    var cert_mirror_store: ?cert_mirror.CertMirror = if (blob_owned) |b|
+        cert_mirror.CertMirror.init(allocator, b.cfg) catch |err| blk: {
+            std.log.warn("rewind-cp: certificate mirror unavailable: {s}", .{@errorName(err)});
+            break :blk null;
+        }
+    else
+        null;
+    defer if (cert_mirror_store) |*m| m.deinit();
+    if (cert_mirror_store) |*m| {
+        directory.cert_mirror = m.hook();
+        std.log.info("rewind-cp: certificate mirror at {s}{s}", .{ blob_owned.?.cfg.key_prefix_base, cert_mirror.SUBDIR });
+    }
     // Teardown order matters: the pump fires the directory's apply observer,
     // so the pump must STOP (`cp_bridge.deinit` → `stopPump`) before the
     // directory is freed. Defers run LIFO, so declare `directory.destroy`
@@ -1285,6 +1315,7 @@ pub fn main() !void {
             .insecure_tls = std.posix.getenv("REWIND_ACME_INSECURE_TLS") != null,
             .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX"),
             .system_suffix = getEnvCfg("REWIND_SYSTEM_SUFFIX"),
+            .mirror = if (cert_mirror_store) |*m| m else null,
         }) catch |err| {
             std.log.warn("rewind-cp: ACME issuer spawn failed: {s}", .{@errorName(err)});
             break :blk null;
@@ -1358,6 +1389,17 @@ pub fn main() !void {
             if (now_ns - last_reconcile_ns > reconcile_period_ns) {
                 last_reconcile_ns = now_ns;
                 reconciler.reconcileMembership(&router);
+                // Re-install certificates this cluster already owns but whose
+                // raft copy is gone — the state after a cold bring-up. Leader
+                // only (the write goes through the leader's proposer), and
+                // independent of ACME: a deployment serving operator-uploaded
+                // certificates has to get them back too.
+                if (cert_mirror_store) |*m| {
+                    if (directory.isLeader()) {
+                        const n = m.restorePass(allocator, directory, std.time.timestamp(), acme_issuer.RENEW_WINDOW_S);
+                        if (n > 0) std.log.info("rewind-cp: restored {d} certificate(s) from the mirror", .{n});
+                    }
+                }
             }
         }
 

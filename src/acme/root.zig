@@ -10,6 +10,7 @@
 //! module is the reusable, network/crypto core.
 
 pub const crypto = @import("crypto.zig");
+pub const expiry = @import("expiry.zig");
 pub const Responder = @import("responder.zig").Responder;
 pub const Client = @import("client.zig").Client;
 
