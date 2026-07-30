@@ -490,20 +490,24 @@ fn execLogIndexInserts(
     }
 }
 
-/// A record the index refused. Idempotent re-index, or a genuine identity
-/// collision?
+/// A record the index refused. Same record arriving again, or a genuine
+/// identity collision?
 ///
 /// `(tenant_id, request_id)` is the primary key, and it is only unique within
 /// one run of a tenant's counter — a fresh cluster lifetime re-issues the same
-/// numbers (rove#266). So an ignored insert means EITHER "this exact row is
-/// already here" (the poll path re-listing its clock-skew window; routine) OR
-/// "a different record already owns this identity" (the new record is dropped
-/// and can never be queried or replayed; data loss).
+/// numbers (rove#266). So an ignored insert means EITHER "this record is
+/// already indexed" (routine) OR "a different request already owns this
+/// identity" (the new record is dropped and can never be queried or replayed;
+/// data loss). Those need opposite reactions.
 ///
-/// Those need opposite reactions, so distinguish them by what the stored row
-/// actually points at. Counting both together would bury the second under the
-/// first — which is precisely how an hour of production data loss looked
-/// exactly like healthy idempotency.
+/// The discriminator is `received_ns` — the request's own arrival time — NOT
+/// where the record is stored. A record legitimately arrives in more than one
+/// object: the promotion-time LogRecord walker re-emits already-flushed
+/// records so they survive a leader dying mid-flush, so the same request shows
+/// up under a later batch key at a different offset. Keying on storage
+/// location classified every one of those as loss — 111 phantom conflicts on
+/// one node within minutes of deploying, which would have fired an alert that
+/// then got ignored, which is the failure this metric exists to avoid.
 fn classifyIgnored(
     db: *c.sqlite3,
     r: sidecar.Record,
@@ -511,7 +515,7 @@ fn classifyIgnored(
     header_size: u64,
 ) void {
     var q: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT ndjson_key, offset FROM log_index WHERE tenant_id = ? AND request_id = ?";
+    const sql = "SELECT ndjson_key, offset, received_ns FROM log_index WHERE tenant_id = ? AND request_id = ?";
     if (c.sqlite3_prepare_v2(db, sql, -1, &q, null) != c.SQLITE_OK) return;
     defer _ = c.sqlite3_finalize(q);
     bindText(q.?, 1, r.tenant_id);
@@ -524,9 +528,12 @@ fn classifyIgnored(
     else
         "";
     const held_offset: u64 = @intCast(c.sqlite3_column_int64(q, 1));
+    const held_received_ns: i64 = c.sqlite3_column_int64(q, 2);
 
-    if (std.mem.eql(u8, held_key, ndjson_key) and held_offset == r.offset + header_size) {
-        // Same record, same bytes, same place. Idempotency doing its job.
+    if (held_received_ns == r.received_ns) {
+        // Same request, arriving again — from the poll path's clock-skew
+        // window, a resume after a crash, or the promotion walker re-emitting
+        // it into a later batch. Already indexed; nothing is lost.
         metrics.Metrics.inc(&metrics.global.index_reindexed);
         return;
     }
@@ -536,9 +543,12 @@ fn classifyIgnored(
     // (rove#274), and this one is worth testing. The counter is the alertable
     // signal; the log names the two objects so the loss is diagnosable.
     std.log.warn(
-        "log-index CONFLICT: {s}/{d} already held by {s}@{d}; DROPPING the record at {s}@{d} — " ++
-            "it is unqueryable and unreplayable. Two records claim one identity (rove#266).",
-        .{ r.tenant_id, r.request_id, held_key, held_offset, ndjson_key, r.offset + header_size },
+        "log-index CONFLICT: {s}/{d} already held by a DIFFERENT request (received_ns {d}, at {s}@{d}); " ++
+            "DROPPING the record received_ns {d} at {s}@{d} — it is unqueryable and unreplayable (rove#266).",
+        .{
+            r.tenant_id,   r.request_id, held_received_ns, held_key, held_offset,
+            r.received_ns, ndjson_key,   r.offset + header_size,
+        },
     );
 }
 
@@ -815,6 +825,21 @@ test "a re-index counts as re-index, a collision counts as a CONFLICT" {
     try testing.expectEqual(before_reindex + 1, metrics.global.index_reindexed.load(.monotonic));
     try testing.expectEqual(before_conflicts, metrics.global.index_conflicts.load(.monotonic));
 
+    // The SAME request re-emitted into a DIFFERENT object at a different
+    // offset — what the promotion-time LogRecord walker does so records
+    // survive a leader dying mid-flush. Still the same request (`received_ns`
+    // matches), so still not loss. Keying on storage location instead called
+    // this a conflict and produced 111 phantom alerts in production within
+    // minutes.
+    const walker = sidecar.IdxFile{
+        .node_id = "00000001", .batch_id = "b1-again", .ndjson_size = 40,
+        .ndjson_sha256 = "aaa", .first_received_ns = 1_000, .last_received_ns = 1_000,
+        .records = &rec,
+    };
+    try idx.insertBatch(&walker, "_logs/00000001/b1-RE-EMITTED.ndjson", 512);
+    try testing.expectEqual(before_reindex + 2, metrics.global.index_reindexed.load(.monotonic));
+    try testing.expectEqual(before_conflicts, metrics.global.index_conflicts.load(.monotonic));
+
     // A DIFFERENT record claiming the same (tenant, request_id) — a fresh
     // cluster lifetime re-issuing id 7 at a new object. This is the loss.
     var clash = [_]sidecar.Record{.{
@@ -829,7 +854,9 @@ test "a re-index counts as re-index, a collision counts as a CONFLICT" {
     };
     try idx.insertBatch(&batch2, "_logs/00000001/b2.ndjson", 0);
     try testing.expectEqual(before_conflicts + 1, metrics.global.index_conflicts.load(.monotonic));
-    try testing.expectEqual(before_reindex + 1, metrics.global.index_reindexed.load(.monotonic));
+    // …and the two benign re-arrivals above are still counted as re-index, not
+    // swept into the conflict total.
+    try testing.expectEqual(before_reindex + 2, metrics.global.index_reindexed.load(.monotonic));
 
     // And the loss is real: the FIRST record still owns the identity.
     var list = try idx.queryList("acme", 0, 0, 0, 10, null, null);
