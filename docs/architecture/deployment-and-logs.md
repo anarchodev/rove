@@ -134,6 +134,49 @@ Raft replicates only the manifest *pointer* (`_deploy/current`, and the per-file
 `file/{path}` → `{hash, kind, content_type}`), never the bytes (consensus-and-
 storage's blob-replication rule).
 
+### Storage namespace
+
+`key_prefix_base` scopes a bucket to a *deployment* (staging vs prod). The
+**storage namespace** scopes it to one *lifetime* of that deployment, and those
+are different things.
+
+Most keys above are named by an id that counts up from state inside a tenant's
+`app.db` — `_log/next_request_seq` for request ids, the deployment sequence for
+`deployments/{dep_id}.json`. A cold bring-up wipes `~/.rove/data`, so those
+counters restart at zero. The object store is deliberately **not** wiped
+alongside it: S3 has no delete-by-prefix (deleting means LIST + DeleteObjects
+over every key), and the blobs are the deployed code. A cluster that came up
+into the un-namespaced store would therefore re-issue ids over keys a previous
+lifetime already wrote, and its records would be adopted into that older
+history — the log index would drop each colliding record silently, because it
+is keyed `(tenant_id, request_id)` and written `INSERT OR IGNORE`.
+
+So each lifetime gets a generation:
+
+- The marker is one object at `{key_prefix_base}_namespace`, deliberately
+  OUTSIDE the segment it names so it survives every bump. Its body is the
+  generation: a decimal count, or empty for the original un-segmented layout.
+- Every store hangs off `{key_prefix_base}{generation}/`, applied once at
+  startup — file-blobs, log-blobs, deployments and the body pool move
+  together, because they are one key space and splitting them would strand a
+  tenant's blobs from its manifests.
+- Content-addressed keys (`file-blobs/{sha256}`) don't need this and don't
+  suffer from it; a repeat there is a match, not a collision. It is the
+  id-keyed prefixes that require the generation.
+
+`rewind-ops storage-namespace` reads it (`--show`, the default), claims an
+existing un-namespaced store as generation 0 (`--adopt`), or moves to the next
+generation (`--bump`). A cold bring-up bumps; nothing is deleted, and the
+previous generation stays readable for forensics while the new cluster simply
+cannot see it.
+
+**Every service refuses to start against a store with no marker.** A missing
+marker means the store's generation is unknown, and the failure mode of
+guessing is invisible: two lifetimes merged into one key space, with every
+health counter green. `scripts/smoke/storage_namespace_smoke_v2.py` runs two
+lifetimes over one store and asserts both halves — that the second lifetime's
+records are lost without a bump, and kept with one.
+
 ## Logs
 
 - **Worker-side buffer** (`src/log/root.zig`): one in-memory buffer per node

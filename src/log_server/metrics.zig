@@ -57,12 +57,24 @@ pub const Metrics = struct {
 pub var global: Metrics = .{};
 
 /// Render the current counters as Prometheus text. Caller owns the slice.
+/// The object-store key prefix this process resolved at startup (the
+/// storage-namespace section of `docs/architecture/deployment-and-logs.md`).
+/// Set once before serving; rendered so a cluster whose nodes disagree on the
+/// generation is visible rather than silently indexing two histories.
+pub var storage_prefix: []const u8 = "";
+
 pub fn render(allocator: std.mem.Allocator) ![]u8 {
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
     const w = &aw.writer;
     const m = &global;
+    try w.print(
+        \\# HELP storage_namespace_info the object-store key prefix this process resolved at startup. Nodes must agree.
+        \\# TYPE storage_namespace_info gauge
+        \\storage_namespace_info{{prefix="{s}"}} 1
+        \\
+    , .{storage_prefix});
     try counter(w, "log_indexer_poll_cycles_total", "Indexer poll passes completed.", m.poll_cycles.load(.monotonic));
     try counter(w, "log_indexer_poll_errors_total", "Indexer poll passes that errored.", m.poll_errors.load(.monotonic));
     try counter(w, "log_indexer_batches_indexed_total", "Batches indexed by the S3 LIST poll path.", m.batches_indexed.load(.monotonic));

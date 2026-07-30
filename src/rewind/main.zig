@@ -663,6 +663,20 @@ pub fn main() !void {
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
     defer blob_owned.deinit(allocator);
 
+    // Scope every store to the object store's current generation before any
+    // of them is opened. A wipe of `data_dir` resets the id counters that
+    // name keys under this prefix, so a cluster that guessed its generation
+    // would re-issue ids over a previous lifetime's keys — refuse instead.
+    const ns_segment = blob_mod.namespace_store.resolve(allocator, blob_owned.cfg) catch |err| {
+        if (err == blob_mod.namespace.Error.MarkerMissing) {
+            std.debug.print("error: {s}\n", .{blob_mod.namespace.MISSING_MARKER_HINT});
+            std.process.exit(2);
+        }
+        return err;
+    };
+    defer allocator.free(ns_segment);
+    _ = try blob_owned.applyNamespace(allocator, ns_segment);
+
     // Node-wide root store + seq counters + tenant registry. The
     // worker opens the root store directly.
     const root_kv = try kv.KvStore.openClusterOwned(allocator, data_dir, "cluster.kv", "__root__");
@@ -778,7 +792,7 @@ pub fn main() !void {
     // worker's single background flusher thread serializes all PUTs through
     // this store's one libcurl handle (rewind runs a single worker — see
     // below; a multi-worker node would need a per-flusher handle).
-    const log_s3 = try log_server.batch_store_s3.S3BatchStore.fromBlobCfg(allocator, blob_owned.cfg);
+    const log_s3 = try log_server.batch_store_s3.S3BatchStore.fromBlobCfg(allocator, blob_owned.cfg, ns_segment);
     defer log_s3.deinit();
     const log_batch_store = log_s3.batchStore();
 
