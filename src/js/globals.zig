@@ -40,6 +40,28 @@ const textcodec_b = @import("bindings/textcodec.zig");
 const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 const request_bindings = @import("globals_request.zig");
+/// Interaction-digest folding, shared by every effect binding
+/// (`src/tape/interaction_digest.zig`). Begin returns the digest so far —
+/// seeded on first use, so a run with no interactions still has one — and
+/// commit writes it back. Null when this activation has no readset (a
+/// non-handler path), in which case the record carries no digest and its
+/// replay is unverifiable rather than wrongly verified.
+///
+/// Folded AS the interaction happens: the order of a read against a write
+/// cannot be recovered afterwards, because the two live in different
+/// structures, and that order is part of what the handler did.
+pub fn digestBegin(state: *DispatchState) ?tape_mod.interaction_digest.Digest {
+    const rs = state.readset orelse return null;
+    return .{ .h = if (rs.interaction_digest == 0)
+        tape_mod.interaction_digest.Digest.init().h
+    else
+        rs.interaction_digest };
+}
+
+pub fn digestCommit(state: *DispatchState, d: tape_mod.interaction_digest.Digest) void {
+    if (state.readset) |rs| rs.interaction_digest = d.h;
+}
+
 pub const installRequest = request_bindings.installRequest;
 const platform_bindings = @import("globals_platform.zig");
 const kv_bindings = @import("globals_kv.zig");

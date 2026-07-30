@@ -5498,3 +5498,56 @@ test "interaction digest: folds reads, writes and the response as they happen" {
     try testing.expectEqualStrings(resp.body, resp3.body);          // same response
     try testing.expect(rs.interaction_digest != rs3.interaction_digest); // different behaviour
 }
+
+test "interaction digest: effects move it, and a same-response handler is not mistaken for identical" {
+    // Before the effect hooks existed, a handler whose only effect was an
+    // outbound send digested as if it had merely responded — the digest would
+    // have reported "identical" for two handlers that behaved differently,
+    // which is worse than reporting nothing.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const base =
+        \\response.status = 200;
+        \\return "same";
+    ;
+    const with_timer =
+        \\after.ms(5000, { on: "onWake" });
+        \\response.status = 200;
+        \\return "same";
+    ;
+    const with_other_timer =
+        \\after.ms(9000, { on: "onWake" });
+        \\response.status = 200;
+        \\return "same";
+    ;
+
+    var d1 = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer d1.deinit();
+    var r1 = try runOne(&d, kv, base, .{ .method = "GET", .path = "/", .trace = .{ .request_id = 1, .readset = &d1 } });
+    defer r1.deinit(testing.allocator);
+
+    var d2 = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer d2.deinit();
+    var r2 = try runOne(&d, kv, with_timer, .{ .method = "GET", .path = "/", .trace = .{ .request_id = 2, .readset = &d2 } });
+    defer r2.deinit(testing.allocator);
+
+    var d3 = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer d3.deinit();
+    var r3 = try runOne(&d, kv, with_other_timer, .{ .method = "GET", .path = "/", .trace = .{ .request_id = 3, .readset = &d3 } });
+    defer r3.deinit(testing.allocator);
+
+    // All three respond identically; only the effects differ.
+    try testing.expectEqualStrings("same", r1.body);
+    try testing.expectEqualStrings("same", r2.body);
+    try testing.expectEqualStrings("same", r3.body);
+
+    try testing.expect(d1.interaction_digest != d2.interaction_digest); // arming an effect shows
+    try testing.expect(d2.interaction_digest != d3.interaction_digest); // its ARGUMENTS show too
+}

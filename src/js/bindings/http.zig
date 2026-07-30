@@ -220,6 +220,18 @@ pub fn jsSystemFetch(
 /// by the partial-rollback below).
 fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     const a = state.allocator;
+    // Fold BEFORE the accumulator check below: issuing the fetch is what the
+    // handler did, and it got an id back either way. Whether a transport
+    // ultimately fires it — a connection-scoped `after.fetch` is dropped at
+    // the success seam — is a platform decision downstream of the handler, and
+    // a replay's recorder sees the issue, not the drop. Folding only the
+    // queued ones would make prod and replay disagree about identical
+    // handler behaviour.
+    if (globals.digestBegin(state)) |start| {
+        var dg = start;
+        dg.fetch(row.method, row.url, row.body);
+        globals.digestCommit(state, dg);
+    }
     // If the caller didn't provide a fetch accumulator (test
     // paths, anonymous dispatch), the fetch is dropped — the
     // binding still returns an id so the customer's code sees

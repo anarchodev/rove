@@ -142,7 +142,6 @@ pub fn jsStreamWrite(
     argv: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
-    const list = state.pending_stream_chunks orelse return js_undefined; // connectionless ⇒ inert
     if (argc < 1) {
         _ = c.JS_ThrowTypeError(ctx, "stream.write(chunk) requires a chunk argument");
         return js_exception;
@@ -165,6 +164,19 @@ pub fn jsStreamWrite(
         _ = c.JS_ThrowRangeError(ctx, "stream.write: too many bytes buffered in one activation; emit fewer per activation and continue with next()");
         return js_exception;
     }
+    // Fold the call before the inert check, so a connectionless activation
+    // digests the same frames a connected one does — the handler cannot tell
+    // the difference (undefined either way) and a replay's recorder sees the
+    // call, not the platform's decision about it.
+    if (globals.digestBegin(state)) |start| {
+        var dg = start;
+        dg.streamWrite(bytes);
+        globals.digestCommit(state, dg);
+    }
+    const list = state.pending_stream_chunks orelse {
+        state.allocator.free(bytes);
+        return js_undefined; // connectionless ⇒ inert
+    };
     // Writing implies the stream is open — `start()` is optional.
     state.stream_started = true;
     list.append(state.allocator, bytes) catch {
