@@ -29,7 +29,10 @@ once). Needs S3 credentials: `set -a; . ./.env; set +a`.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
@@ -129,6 +132,46 @@ def main() -> int:
         check("a different write digests differently despite an identical response",
               d1 is not None and d3 is not None and d1 != d3,
               f"{d1} vs {d3} — the digest is blind to a behaviour change")
+
+        # ── the cross-engine half ──
+        #
+        # Everything above proves the worker computes and carries a digest. It
+        # says nothing about whether a REPLAY of the same record computes the
+        # same one — which is the property the digest exists for. Re-execute
+        # the record in the replay engine and compare.
+        #
+        # Needs a rewind-apps checkout for the shell modules; skipped with a
+        # message rather than silently passing when absent, because a check
+        # that quietly does not run is worse than one that is missing.
+        apps = os.environ.get("REWIND_APPS_DIR", os.path.expanduser("~/src/rewind-apps"))
+        checker = os.path.join(apps, "e2e", "replay-digest-check.mjs")
+        if not os.path.exists(checker):
+            print(f"  SKIP cross-engine replay check — no rewind-apps checkout at {apps}")
+        else:
+            rid = next((r.get("request_id") for r in records if "run=1" in (r.get("path") or "")), None)
+            full = json.loads(c.log_get(f"acme/show/{rid}", timeout=15.0).body)
+            full = full.get("record", full)
+            with tempfile.TemporaryDirectory() as td:
+                rec_path = os.path.join(td, "record.json")
+                src_path = os.path.join(td, "index.mjs")
+                with open(rec_path, "w") as f:
+                    json.dump(full, f)
+                with open(src_path, "w") as f:
+                    f.write(FIXTURE["index.mjs"])
+                proc = subprocess.run(["node", checker, rec_path, src_path],
+                                      capture_output=True, text=True, timeout=120)
+            line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout.strip() else "{}"
+            try:
+                res = json.loads(line)
+            except json.JSONDecodeError:
+                res = {"replayed": None, "error": f"unparseable: {proc.stdout[:200]} {proc.stderr[:200]}"}
+            print(f"    replay recomputed: {res.get('replayed')} (captured {d1})")
+            for el in (res.get("effects") or []):
+                print(f"      folded: {el}")
+            print(f"      status={res.get('status')} result={res.get('result')!r}")
+            check("a replay of the record recomputes the SAME digest",
+                  res.get("replayed") is not None and res.get("replayed") == d1,
+                  res.get("error") or f"replay={res.get('replayed')} vs captured={d1}")
 
     print()
     if failures:

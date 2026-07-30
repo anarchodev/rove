@@ -57,6 +57,11 @@ PIECES = [
     # its dependents). Browser-only: the worker has a native textcodec
     # binding, this arena does not.
     (ROVE / "src" / "replay" / "js" / "textcodec_pure.js", False),
+    # The interaction digest's JS mirror — the replay recomputes the digest the
+    # worker recorded and compares it, which is what turns "it replayed" into
+    # "it replayed the same thing". Shared verbatim with the Zig implementation
+    # and pinned by `zig build replay-digest-vectors`, so the two cannot drift.
+    (ROVE / "src" / "tape" / "js_interaction_digest.js", False),
     # The `_system.*` primitive layer the public shims compose over —
     # recorders for the effect verbs, real crypto over the native
     # bindings. Shared verbatim with the CLI sim (sim_globals.zig embeds
