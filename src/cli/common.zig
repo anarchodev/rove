@@ -46,9 +46,16 @@ pub const Env = struct {
 /// The operator env vars the CLIs overlay from the OS environment (so they
 /// override the file, and smokes can run without a file).
 const OVERLAY_VARS = [_][]const u8{
-    "REWIND_ROOT_TOKEN", "REWIND_ADMIN_DOMAIN", "ROVE_WORKER_URLS",
-    "ROVE_PUBLISH_SSH",  "ROVE_CP_URL_INTERNAL", "REWIND_MOVE_SECRET",
+    "REWIND_ROOT_TOKEN",     "REWIND_ADMIN_DOMAIN",     "ROVE_WORKER_URLS",
+    "ROVE_PUBLISH_SSH",      "ROVE_CP_URL_INTERNAL",    "REWIND_MOVE_SECRET",
     "ROVE_CLUSTER",
+    // S3 connection params, so `storage-namespace` reaches the object store
+    // the same way every platform binary does — those read S3_* straight from
+    // the process env, and a CLI that could only read them from a file would
+    // be addressing a different store than the services it configures.
+    "S3_ENDPOINT",           "S3_REGION",               "S3_BUCKET",
+    "S3_KEY_PREFIX_BASE",    "S3_USE_TLS",              "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
 };
 
 /// Default operator env path: $XDG_CONFIG_HOME/rove/prod.env (or

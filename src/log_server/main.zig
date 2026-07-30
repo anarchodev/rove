@@ -196,12 +196,26 @@ pub fn main() !void {
     var blob_owned = try loadBlobBackend(allocator);
     defer blob_owned.deinit(allocator);
 
+    // The store's generation, resolved before anything is opened — the index
+    // this server builds is keyed by per-tenant request ids, so indexing a
+    // previous lifetime's batches alongside this one's silently drops records
+    // whose ids collide (#266). Refuse rather than guess.
+    const ns_segment = blob_mod.namespace_store.resolve(allocator, blob_owned.cfg) catch |err| {
+        if (err == blob_mod.namespace.Error.MarkerMissing) {
+            std.debug.print("error: {s}\n", .{blob_mod.namespace.MISSING_MARKER_HINT});
+            std.process.exit(2);
+        }
+        return err;
+    };
+    defer allocator.free(ns_segment);
+    _ = try blob_owned.applyNamespace(allocator, ns_segment);
+
     // Pick the batch store backend off the same env signal. `fs` mode
     // S3-only batch store. Same connection params as the worker plus
-    // an optional LOG_S3_KEY_PREFIX namespace, matching what the
+    // an optional LOG_S3_KEY_PREFIX prefix, matching what the
     // worker's flushLogs path uses.
     const s3cfg = blob_owned.cfg;
-    var s3_handle = try log_server.batch_store_s3.S3BatchStore.fromBlobCfg(allocator, s3cfg);
+    var s3_handle = try log_server.batch_store_s3.S3BatchStore.fromBlobCfg(allocator, s3cfg, ns_segment);
     defer s3_handle.deinit();
     const batch_store: log_server.batch_store.BatchStore = s3_handle.batchStore();
     std.log.info(

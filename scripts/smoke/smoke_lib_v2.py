@@ -305,11 +305,42 @@ class V2Cluster:
         )
         for d in (*c.data_dirs, c.cp_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
+        c._claim_storage_namespace()
         if genesis:
             c._boot_genesis(nodes)
         else:
             c._boot(nodes)
         return c
+
+    def _claim_storage_namespace(self) -> None:
+        """Stamp this run's S3 prefix with a storage-namespace marker.
+
+        Every service refuses to start against an unmarked object store —
+        without a generation it cannot tell its own keys from a previous
+        cluster lifetime's, and guessing silently merges the two (rove#266).
+        Each run gets a virgin prefix, so `--adopt` (generation 0) is the right
+        claim. This runs the same `rewind-ops` verb production's genesis does;
+        the harness has no shortcut the operator lacks.
+        """
+        env = dict(os.environ)
+        env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
+
+        def ops(*args):
+            return subprocess.run(
+                [str(BIN_DIR / "rewind-ops"), "storage-namespace", *args,
+                 "--env", "/nonexistent-so-only-the-process-env-is-read"],
+                env=env, capture_output=True, text=True, timeout=60)
+
+        # Already marked (a second cluster lifetime over the same store) —
+        # leave it alone. `--adopt` deliberately refuses to overwrite a
+        # generation, so the "is it claimed yet" branch belongs here.
+        if ops().returncode == 0:
+            return
+        r = ops("--adopt")
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"could not claim the storage namespace for {self.s3_prefix}: "
+                f"{r.stdout}{r.stderr}")
 
     def _boot(self, nodes: int) -> None:
         voters = ",".join(str(i + 1) for i in range(nodes))

@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const backend = @import("backend.zig");
+const namespace = @import("namespace.zig");
 
 pub const ENV_S3_ENDPOINT = "S3_ENDPOINT";
 pub const ENV_S3_REGION = "S3_REGION";
@@ -57,6 +58,23 @@ pub const BlobBackendOwned = struct {
         allocator.free(self.key_prefix_base);
         allocator.free(self.access_key);
         allocator.free(self.secret_key);
+    }
+
+    /// Re-point every store this config will open at the resolved storage
+    /// generation (`namespace.zig`). Applied once at startup, before any
+    /// store is opened, so file-blobs / log-blobs / deployments / the body
+    /// pool all land in the same generation — they are one key space and
+    /// splitting them would strand a tenant's blobs from its manifests.
+    pub fn applyNamespace(
+        self: *BlobBackendOwned,
+        allocator: std.mem.Allocator,
+        segment: []const u8,
+    ) ![]u8 {
+        const scoped = try namespace.apply(allocator, self.key_prefix_base, segment);
+        allocator.free(self.key_prefix_base);
+        self.key_prefix_base = scoped;
+        self.cfg.key_prefix_base = scoped;
+        return scoped;
     }
 };
 

@@ -33,6 +33,8 @@ pub const BlobBackend = backend.BlobBackend;
 pub const BackendConfig = backend.BackendConfig;
 pub const env = @import("env.zig");
 pub const BlobBackendOwned = env.BlobBackendOwned;
+pub const namespace = @import("namespace.zig");
+pub const namespace_store = @import("namespace_store.zig");
 pub const http_blob = @import("http_blob.zig");
 pub const HttpBlobStore = http_blob.HttpBlobStore;
 pub const coordinator = @import("coordinator.zig");
@@ -179,4 +181,6 @@ test {
     _ = @import("http_blob.zig");
     _ = @import("curl_multi.zig");
     _ = @import("coordinator.zig");
+    _ = @import("namespace.zig");
+    _ = @import("namespace_store.zig");
 }

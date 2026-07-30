@@ -1280,6 +1280,12 @@ pub fn build(b: *std.Build) void {
         .{ "pkg_segments", "src/js/packages/@rewind/segments/index.mjs" },
         .{ "pkg_browser", "src/js/packages/@rewind/browser/index.mjs" },
     }) |e| ops_mod.addAnonymousImport(e[0], .{ .root_source_file = b.path(e[1]) });
+    // `storage-namespace` signs S3 requests itself (the CLI links no libcurl).
+    // Both files are pure-std halves of rove-blob, imported rather than
+    // restated so the CLI and the platform cannot drift on the marker key,
+    // the segment rules, or the signature.
+    ops_mod.addAnonymousImport("sigv4", .{ .root_source_file = b.path("src/blob/sigv4.zig") });
+    ops_mod.addAnonymousImport("blob-namespace", .{ .root_source_file = b.path("src/blob/namespace.zig") });
     const ops_exe = b.addExecutable(.{ .name = "rewind-ops", .root_module = ops_mod });
     const ops_step = b.step("rewind-ops", "Build the rewind-ops operator CLI");
     ops_step.dependOn(&b.addInstallArtifact(ops_exe, .{}).step);

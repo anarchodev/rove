@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const c = @import("common.zig");
+const storage_namespace = @import("storage_namespace.zig");
 
 const Header = c.Header;
 const fatal = c.fatal;
@@ -599,6 +600,7 @@ const usage =
     \\  rewind-ops kv-put <tenant> <key> [value]     seed a system kv key (move-secret; operator/OIDC bootstrap)
     \\  rewind-ops seed-packages                     publish the first-party @rewind/* set into the registry (genesis)
     \\  rewind-ops status <host>                      resolve a host → tenant/cluster/plan
+    \\  rewind-ops storage-namespace [--adopt|--bump]   show/set the object store's generation
     \\
     \\options:
     \\  --env <path>   operator env file (default ~/.config/rove/prod.env, then ./.env.prod)
@@ -710,6 +712,13 @@ pub fn main() void {
         cmdKvPut(a, &env, p[0], p[1], if (p.len >= 3) p[2] else "");
     } else if (std.mem.eql(u8, cmd, "seed-packages")) {
         cmdSeedPackages(a, &env);
+    } else if (std.mem.eql(u8, cmd, "storage-namespace")) {
+        var mode: storage_namespace.Mode = .show;
+        for (p) |arg| {
+            if (std.mem.eql(u8, arg, "--adopt")) mode = .adopt;
+            if (std.mem.eql(u8, arg, "--bump")) mode = .bump;
+        }
+        storage_namespace.cmd(a, &env, mode);
     } else if (std.mem.eql(u8, cmd, "status")) {
         if (p.len < 1) fatal("status needs <host>", .{});
         cmdStatus(a, &env, p[0]);

@@ -66,13 +66,26 @@ pub const S3BatchStore = struct {
 
     /// Build the store from the SAME S3 connection params as the blob
     /// backend (rove blob is S3-only), plus the optional `LOG_S3_KEY_PREFIX`
-    /// namespace read HERE — once — so the worker (writer) and the
+    /// prefix read HERE — once — so the worker (writer) and the
     /// log-server (reader) construct byte-identical stores from the same
     /// env and can't disagree on endpoint/prefix (disagreement = captured
     /// tapes that can never be queried back out).
-    pub fn fromBlobCfg(allocator: std.mem.Allocator, cfg: @import("rove-blob").BackendConfig) !*S3BatchStore {
-        const key_prefix = (try @import("rove-blob").env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+    ///
+    /// `ns_segment` is the resolved storage generation (`rove-blob`'s
+    /// `namespace.zig`), applied here as well as to the blob prefix: log
+    /// batches are named by the same per-tenant request ids that a wipe
+    /// resets, so they need the same isolation the blobs get. Leaving them
+    /// un-namespaced is what let a fresh cluster re-index a previous
+    /// lifetime's records (#266).
+    pub fn fromBlobCfg(
+        allocator: std.mem.Allocator,
+        cfg: @import("rove-blob").BackendConfig,
+        ns_segment: []const u8,
+    ) !*S3BatchStore {
+        const base = (try @import("rove-blob").env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
             try allocator.dupe(u8, "");
+        defer allocator.free(base);
+        const key_prefix = try @import("rove-blob").namespace.apply(allocator, base, ns_segment);
         defer allocator.free(key_prefix);
         return init(allocator, .{
             .endpoint = cfg.endpoint,
