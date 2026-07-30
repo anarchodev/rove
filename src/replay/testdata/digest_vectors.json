@@ -1,0 +1,115 @@
+{
+  "_comment": "Shared vectors pinning the interaction digest across its two implementations (src/replay/interaction_digest.zig and src/replay/js/interaction_digest.js). NEITHER implementation is the reference — this file is. Both assert against it, so a change to one side that the other does not mirror fails loudly instead of surfacing later as an unexplained fidelity mismatch. Regenerating these values is a grammar change: bump VERSION on both sides and treat it as a format change (docs/architecture/format-versioning.md).",
+  "version": 1,
+  "maxInlineKey": 320,
+  "cases": {
+    "basic": {
+      "why": "a read, a write, a response — the common shape",
+      "elements": [
+        [
+          "kvRead",
+          "users/jess",
+          true,
+          "{\"n\":1}"
+        ],
+        [
+          "kvWrite",
+          "seen/jess",
+          "yes"
+        ],
+        [
+          "response",
+          200,
+          "ok"
+        ]
+      ],
+      "digest": "b7da1abbd05105a3"
+    },
+    "mixed": {
+      "why": "every element kind, including a not-found read and a scan",
+      "elements": [
+        [
+          "kvRead",
+          "missing",
+          false,
+          ""
+        ],
+        [
+          "kvPrefixFold",
+          "orders/",
+          true,
+          2,
+          "a=1;b=2"
+        ],
+        [
+          "fetch",
+          "POST",
+          "https://example.test/hook?sig=abc",
+          "{}"
+        ],
+        [
+          "wakeArm",
+          "t",
+          "5000",
+          "onWake"
+        ],
+        [
+          "streamWrite",
+          "partial "
+        ],
+        [
+          "kvDelete",
+          "tmp/x"
+        ],
+        [
+          "response",
+          302,
+          ""
+        ]
+      ],
+      "digest": "0f6a96aca186e0d2"
+    },
+    "overlong": {
+      "why": "a key past maxInlineKey must take the folded fallback on BOTH sides at the same byte",
+      "elements": [
+        [
+          "kvReadRepeat",
+          "k",
+          400,
+          true,
+          "v"
+        ]
+      ],
+      "digest": "7ce3952ce64b3236"
+    },
+    "nonascii": {
+      "why": "folds UTF-8 BYTES, not chars — a char-length or latin1 path diverges here",
+      "elements": [
+        [
+          "kvRead",
+          "héllo/kéy",
+          true,
+          "vàlue"
+        ],
+        [
+          "response",
+          204,
+          ""
+        ]
+      ],
+      "digest": "bfe6b84121dd6677"
+    },
+    "byteThreshold": {
+      "why": "200 two-byte chars = 400 BYTES but 200 chars: the overlong fallback must trigger on the BYTE length. A char-length threshold passes every other vector and fails only this one.",
+      "elements": [
+        [
+          "kvWriteRepeat",
+          "é",
+          200,
+          "v"
+        ]
+      ],
+      "digest": "4f450aa96dc07994"
+    }
+  }
+}
