@@ -2267,7 +2267,23 @@ pub fn H2(comptime opts: Options) type {
             allocator.destroy(self);
         }
 
+        /// Wait for `min_complete` io_uring completions — a COUNT, not a
+        /// duration. `pollWithTimeout` is the one that takes nanoseconds.
+        ///
+        /// The assert exists because the two are trivially confusable: both
+        /// take an integer, so `poll(10 * std.time.ns_per_ms)` compiles and
+        /// then blocks forever waiting for ten million completions. The front
+        /// door's `:80` listener did exactly that, and the symptom was silent —
+        /// the kernel still completes the TCP handshake, so the port looks
+        /// alive while nothing is ever answered. Real callers wait on 0 or 1.
+        /// Upper bound on a sane `poll` wait. A caller that wants "drain
+        /// whatever is ready" passes 0 and one that wants "make progress"
+        /// passes 1; nothing legitimately waits on more. Anything larger is a
+        /// duration that took a wrong turn.
+        const MAX_MIN_COMPLETE: u32 = 1024;
+
         pub fn poll(self: *Self, min_complete: u32) !void {
+            std.debug.assert(min_complete <= MAX_MIN_COMPLETE);
             try self.pollPrelude();
             // Phase 3: io.poll submits pending writes and (optionally) waits for CQEs.
             _ = try self.io.poll(min_complete);
