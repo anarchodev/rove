@@ -413,6 +413,15 @@ fn writeTapePayloads(
     // it to fetch the matching engine WASM (a no-op today: one engine, so the
     // bundled engine always matches; the stamp keeps old requests attributable).
     try w.print(",\"js_engine_version\":{d}", .{t.js_engine_version});
+    // The interaction digest, lowercase hex — what a replay recomputes and
+    // compares to establish that the handler did the same thing. Emitted as a
+    // STRING because it is an opaque 64-bit identity, and a JSON number would
+    // lose the top bits in every JS consumer. Absent (0) is emitted as null so
+    // a reader cannot mistake "not computed" for a digest.
+    if (t.interaction_digest == 0)
+        try w.writeAll(",\"interaction_digest\":null")
+    else
+        try w.print(",\"interaction_digest\":\"{x:0>16}\"", .{t.interaction_digest});
     try writeBytesField(allocator, w, "kv_tape_b64", t.kv_tape_bytes, false);
     try writeBytesField(allocator, w, "module_tree_b64", t.module_tree_bytes, false);
     try writeBytesField(allocator, w, "fetch_responses_tape_b64", t.fetch_responses_tape_bytes, false);
@@ -567,6 +576,13 @@ test "writeBatch emits one object with embedded sidecar + frames" {
         try testing.expect(std.mem.indexOf(u8, json, "\"request_id\":\"req_0000000000000001\"") != null);
         try testing.expect(std.mem.indexOf(u8, json, "\"deployment_id\":\"dep_0000000000000001\"") != null);
         try testing.expect(std.mem.indexOf(u8, json, "\"js_engine_version\":1") != null);
+        // The interaction digest reaches the API as a lowercase-hex STRING —
+        // a JSON number would lose the top bits in every JS consumer, and a
+        // digest that silently truncates compares equal to things it should
+        // not. This record has none, so it must read null: a reader has to be
+        // able to tell "not computed" from a real digest, or an unverified
+        // replay looks verified.
+        try testing.expect(std.mem.indexOf(u8, json, "\"interaction_digest\":null") != null);
     }
 
     // Sha256 in sidecar matches the frames-region bytes.
@@ -647,4 +663,19 @@ test "writeBatch sorts records by received_ns before encoding" {
     try testing.expectEqual(@as(i64, 9000), idx.last_received_ns);
     try testing.expectEqual(@as(u64, 6), idx.records[0].request_id);
     try testing.expectEqual(@as(u64, 5), idx.records[1].request_id);
+}
+
+test "flush writer: a present interaction digest is emitted as padded lowercase hex" {
+    // Padding matters: an unpadded hex string would compare unequal to the
+    // replay's padded one for any digest whose top nibble is zero — a
+    // one-in-sixteen false divergence, which is the worst possible rate for a
+    // fidelity check (frequent enough to erode trust, rare enough to look like
+    // a real bug each time).
+    const t = log_mod.TapePayloads{ .interaction_digest = 0x00ff00ff00ff00ff };
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(testing.allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(testing.allocator, &buf);
+    try writeTapePayloads(testing.allocator, &aw.writer, &t);
+    buf = aw.toArrayList();
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\"interaction_digest\":\"00ff00ff00ff00ff\"") != null);
 }

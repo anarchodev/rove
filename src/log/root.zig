@@ -215,6 +215,12 @@ pub const TapePayloads = struct {
     /// the record co-located with the other per-request execution
     /// scalars (`seed`/`timestamp_ns`).
     js_engine_version: u16 = 0,
+    /// The interaction digest of the run this record describes
+    /// (`src/replay/interaction_digest.zig`). Copied from the readset at
+    /// capture; emitted to the log API so a replay can recompute and compare.
+    /// Zero = not computed (an early-error record, or a follower-rebuilt one),
+    /// which a reader must treat as "cannot verify", never as a match.
+    interaction_digest: u64 = 0,
     kv_tape_bytes: []const u8 = &.{},
     module_tree_bytes: []const u8 = &.{},
     /// Readset replication (`docs/architecture/effects-and-handlers.md`):

@@ -131,6 +131,7 @@ pub fn captureTapes(
         .seed = readset.seed,
         .timestamp_ns = readset.timestamp_ns,
         .js_engine_version = readset.js_engine_version,
+        .interaction_digest = readset.interaction_digest,
     };
 
     const channels = [_]struct {

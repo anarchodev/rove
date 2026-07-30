@@ -1,5 +1,5 @@
 // The interaction digest, JS side — the mirror of
-// src/replay/interaction_digest.zig. Read that file for what the digest is
+// src/tape/interaction_digest.zig. Read that file for what the digest is
 // for and, more importantly, for what is deliberately excluded from it.
 //
 // Two implementations of one hash is exactly the shape that has bitten this

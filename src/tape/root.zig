@@ -68,6 +68,13 @@
 //! Per-entry bytes depend on `channel`. See `Entry` for the union.
 
 const std = @import("std");
+
+/// The interaction digest — the rolling hash over what a handler observably
+/// DID (see its module header). It lives beside the recording because it is
+/// produced at capture: the worker folds into it as interactions happen, which
+/// cannot be reconstructed afterwards from the readset and writeset, since the
+/// relative order of a read and a write across those two structures is lost.
+pub const interaction_digest = @import("interaction_digest.zig");
 const bodies_mod = @import("rove-bodies");
 const log_mod = @import("rove-log");
 // The lean CLI's std-only decoder for this same per-Tape wire format
@@ -685,6 +692,23 @@ pub const Readset = struct {
     /// paths. One engine per binary today, so selection is a no-op
     /// until the first semantics-affecting engine bump.
     js_engine_version: u16 = 0,
+    /// The interaction digest (`src/replay/interaction_digest.zig`) — a rolling
+    /// hash over what the handler observably DID: the reads it was served, the
+    /// writes and effects it emitted, and the response it produced. A replay
+    /// recomputes it and compares, which is how "the handler executed the
+    /// same" becomes checkable rather than assumed: without it, fidelity can
+    /// only mean "ended on the same status", and a handler can satisfy that
+    /// down a different path.
+    ///
+    /// Deliberately IN-MEMORY only — it rides `TapePayloads` onto the
+    /// `LogRecord` (which is what replay consumes) and is NOT part of the
+    /// readset's encoded header. Adding a scalar there is a replicated-format
+    /// change wanting a version bump (`docs/architecture/format-versioning.md`,
+    /// and #244), and the cost is not yet warranted: a follower-rebuilt record
+    /// simply carries no digest and its replay is unverified rather than
+    /// wrongly verified. Zero means "not computed", which readers must treat
+    /// as absent rather than as a digest of an empty run.
+    interaction_digest: u64 = 0,
     kv: Tape,
     module: Tape,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`): one entry per
