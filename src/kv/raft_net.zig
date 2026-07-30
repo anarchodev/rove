@@ -1141,3 +1141,12 @@ test "meshCounts: self excluded; configured counts non-self, connected tracks th
     try testing.expectEqual(@as(u32, 1), post.configured);
     try testing.expectEqual(@as(u32, 1), post.connected);
 }
+
+test {
+    // Test discovery: Zig compiles tests only from files a test build reaches,
+    // and importing a file for its declarations does not reach it. `raft_rpc`
+    // belongs to THIS module (raft-net is rooted here), so it is discovered
+    // here — pulling it in from `kvlimbs` instead puts one file in two modules.
+    // `scripts/ops/test_reachability_lint.py` fails when a test file is orphaned.
+    _ = @import("raft_rpc.zig");
+}

@@ -401,6 +401,14 @@ pub fn build(b: *std.Build) void {
     const blob_tests = b.addTest(.{ .root_module = blob_mod });
     test_step.dependOn(&b.addRunArtifact(blob_tests).step);
 
+    // rove-acme tests. The module had no test target at all — it built and
+    // linked fine, so nothing indicated that its tests (certificate expiry, the
+    // CSR/JWS crypto, the challenge responder) were never compiled.
+    const acme_tests = b.addTest(.{ .root_module = acme_mod });
+    const acme_test_step = b.step("acme-test", "Run the rove-acme unit tests");
+    acme_test_step.dependOn(&b.addRunArtifact(acme_tests).step);
+    test_step.dependOn(&b.addRunArtifact(acme_tests).step);
+
     // rove-qjs tests
     const qjs_tests = b.addTest(.{ .root_module = qjs_mod });
     test_step.dependOn(&b.addRunArtifact(qjs_tests).step);
@@ -1187,6 +1195,13 @@ pub fn build(b: *std.Build) void {
     rewind_mod.linkSystemLibrary("ssl", .{});
     rewind_mod.linkSystemLibrary("crypto", .{});
     const rewind_exe = b.addExecutable(.{ .name = "rewind-worker", .root_module = rewind_mod });
+
+    // rewind-worker tests. Like rove-acme, this module had no test target: the
+    // binary built, so nothing showed that `version.zig`'s tests never ran.
+    const rewind_tests = b.addTest(.{ .root_module = rewind_mod });
+    const rewind_test_step = b.step("rewind-worker-test", "Run the rewind-worker unit tests");
+    rewind_test_step.dependOn(&b.addRunArtifact(rewind_tests).step);
+    test_step.dependOn(&b.addRunArtifact(rewind_tests).step);
     const rewind_step = b.step("rewind-worker", "Build the V2 rewind worker binary (Phase 2d)");
     rewind_step.dependOn(&b.addInstallArtifact(rewind_exe, .{}).step);
 

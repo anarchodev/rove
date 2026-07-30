@@ -40,6 +40,8 @@
 
 const std = @import("std");
 
+
+
 /// Re-exported so the format-version registry (`src/version.zig`) can
 /// reach the readset wire version + the customer-id prefixes through the
 /// worker's existing `rove-js` import (no extra build-graph edges).
@@ -118,6 +120,13 @@ pub const buildMetricsText = @import("worker_system.zig").buildMetricsText;
 pub const MetricsServer = @import("metrics-server").MetricsServer;
 
 test {
+    // Expected-failure tests in this module drive paths that warn by design —
+    // arena exhaustion into the GC retry, an oversize config blob, simulated
+    // fetch failures. The runner captures warnings and reports them as test
+    // failures, so those tests would fail for doing exactly what they exist to
+    // do. Raised here, once, because the root's tests run first; errors still
+    // fail the suite.
+    std.testing.log_level = .err;
     _ = dispatcher;
     _ = @import("dispatcher_test.zig");
     _ = effect;
@@ -140,4 +149,29 @@ test {
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");
     _ = @import("surface_tests.zig");
+    _ = @import("bindings/continuation.zig");
+    _ = @import("bindings/crypto.zig");
+    _ = @import("bindings/crypto_ecdsa.zig");
+    _ = @import("bindings/crypto_jose.zig");
+    _ = @import("bindings/http.zig");
+    _ = @import("bindings/stream.zig");
+    _ = @import("bindings/textcodec.zig");
+    _ = @import("blob_sessions.zig");
+    _ = @import("builtin_modules.zig");
+    _ = @import("bytecode_cache.zig");
+    _ = @import("deployment_cache.zig");
+    _ = @import("durable_wake.zig");
+    _ = @import("fetch_engine.zig");
+    _ = @import("gzip.zig");
+    _ = @import("ip_mask.zig");
+    _ = @import("module_execution.zig");
+    _ = @import("owed_retry.zig");
+    _ = @import("package_resolver.zig");
+    _ = @import("reserved_headers.zig");
+    _ = @import("response_builder.zig");
+    _ = @import("response_building.zig");
+    _ = @import("rpc_dispatch.zig");
+    _ = @import("worker_fire.zig");
+    _ = @import("worker_log.zig");
+    _ = @import("worker_system.zig");
 }

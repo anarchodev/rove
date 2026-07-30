@@ -1005,6 +1005,14 @@ test "kv subscriptions: watched-prefix writes inject ONE durable dirty marker (c
 }
 
 test "arena-oom retry: churny handler succeeds under GC re-execution" {
+    // This test provokes arena exhaustion on purpose; the retry path warns by
+    // design. The test runner captures warnings and reports them as failures,
+    // so an expected-failure test would fail for doing its job. Errors still
+    // surface.
+    const prev_log = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log;
+
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1057,6 +1065,12 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
 }
 
 test "arena-oom: loud 500 when even GC can't fit the request (no silent empty body)" {
+    // Provokes arena exhaustion on purpose; that path warns by design and the
+    // runner reports captured warnings as failures. Errors still surface.
+    const prev_log = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log;
+
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1141,6 +1155,14 @@ test "static onChunk: a failed upstream read fails loud (502), never a silent 20
 }
 
 test "arena-oom retry: the worker's churny hint skips the doomed bump attempt" {
+    // This test provokes arena exhaustion on purpose; the retry path warns by
+    // design. The test runner captures warnings and reports them as failures,
+    // so an expected-failure test would fail for doing its job. Errors still
+    // surface.
+    const prev_log = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log;
+
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1162,6 +1184,12 @@ test "arena-oom retry: the worker's churny hint skips the doomed bump attempt" {
 }
 
 test "arena-oom retry: an immediate side effect vetoes re-execution" {
+    // Provokes arena exhaustion on purpose; that path warns by design and the
+    // runner reports captured warnings as failures. Errors still surface.
+    const prev_log = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log;
+
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {

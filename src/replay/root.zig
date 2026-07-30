@@ -1002,4 +1002,5 @@ test {
     _ = world;
     _ = export_fixture;
     _ = harness;
+    _ = @import("path_confine.zig");
 }

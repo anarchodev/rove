@@ -1417,3 +1417,10 @@ pub fn main() !void {
     std.log.info("rewind-cp: shut down", .{});
 }
 
+test {
+    // Test discovery: Zig compiles tests only from files a test build
+    // reaches, and importing a file for its declarations does not reach it.
+    // `scripts/ops/test_reachability_lint.py` fails when one is missing here.
+    _ = @import("acme.zig");
+    _ = @import("reconciler.zig");
+}
