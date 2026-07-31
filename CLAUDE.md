@@ -14,12 +14,13 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 
 ```bash
 zig build              # Build all modules and examples
-zig build test         # Run all unit tests (inline Zig tests across all modules)
-                       # — fixed at the V1 cutover (was broken by frozen V1 modules)
+zig build test         # THE gate: every unit test (inline Zig tests across all
+                       # modules, incl. the raft substrate + directory) AND a
+                       # compile of every shipped binary
 zig build rewind-worker # Build the V2 worker binary (src/rewind/main.zig)
 zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
 zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
-zig build v2-test      # V2 raft substrate tests
+zig build v2-test      # Focused SUBSET of `test`: the raft substrate alone
 zig build echo-server  # Run the TCP echo server example
 zig build h2-echo-server  # Run the HTTP/2 echo server example
 ```
@@ -157,6 +158,7 @@ Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`
 ## Conventions
 
 - Tests are inline Zig tests (`test "description" { ... }`) co-located with the code they cover.
+- **`zig build test` is the whole gate** — every test artifact hangs off it, and every shipped binary compiles under it. The narrower steps (`v2-test`, `rewind-cp-test`, `h1-test`, …) are focused subsets for iterating, never an additional gate to remember. A test artifact that only a narrow step runs is a regression nobody sees. Binaries compile there because a test build never analyses `main` (Zig analyses function bodies lazily), so a type error in a `main.zig` passes both `test` and that binary's own `*-test` step.
 - Module public API is exported through each module's `root.zig`.
 - No async/await — concurrency uses collection-based polling + phase-based dispatch.
 - Write comments in the timeless present: explain the current code — keep rationale, invariants, and cross-references (including `docs/` pointers). Don't narrate the change that produced it (no "was X / now Y", issue-# tags, or bare Phase-N history — that belongs in git + the PR, where it stays accurate as the code moves on). When a past pitfall matters, encode it as a present-tense constraint, not a changelog line. The phased delivery plan itself lives in `docs/PLAN.md` (§3 for phase content, §10.16 for launch sequencing) — reference it by doc-pointer rather than tagging a comment with a phase number.
