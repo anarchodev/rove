@@ -317,6 +317,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── rove-origin: node origin parsing ────────────────────────────
+    //
+    // The one definition of what the fleet can dial. Shared so the CP
+    // (which accepts origins into the directory from REWIND_CLUSTERS)
+    // and the front door (which dials them) cannot disagree — a CP that
+    // accepts what a front rejects only fails at dial time, a hop away
+    // from the operator who typed it. std-only leaf.
+    const origin_mod = b.addModule("rove-origin", .{
+        .root_source_file = b.path("src/origin/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── rove-acme: in-tree ACME (RFC 8555) HTTP-01 client + :80
     //    challenge responder (docs/architecture/auth-and-domains.md). Issues
     //    per-host certs into the Phase-2c custom-cert dir. OpenSSL
@@ -464,6 +477,10 @@ pub fn build(b: *std.Build) void {
     // rove-ssrf tests
     const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
     test_step.dependOn(&b.addRunArtifact(ssrf_tests).step);
+
+    // rove-origin tests
+    const origin_tests = b.addTest(.{ .root_module = origin_mod });
+    test_step.dependOn(&b.addRunArtifact(origin_tests).step);
 
     // rove-plan tests — also exposed as a dedicated `plan-test` step for
     // running the tier table in isolation.
@@ -1147,6 +1164,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     v2_cp_dir_mod.addImport("bridge", v2_bridge_mod);
+    // Origin parsing: the directory must not accept a node origin the front
+    // door cannot dial, so both validate through the same parser.
+    v2_cp_dir_mod.addImport("rove-origin", origin_mod);
     // Certificate expiry: the directory decides which hosts need issuance, and
     // "needs issuance" includes "expiring soon", so it has to be able to read a
     // certificate's notAfter.
@@ -1223,6 +1243,8 @@ pub fn build(b: *std.Build) void {
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
     front_mod.addImport("metrics-server", metrics_server_mod);
+    // Origin parsing, shared with the CP that hands these origins over.
+    front_mod.addImport("rove-origin", origin_mod);
     // Certificate expiry parsing, for the gauge the front exports about the
     // certs it serves (`src/front/cert_expiry.zig`). rove-acme owns reading a
     // notAfter; rove-h2 stays free of it.
@@ -1259,6 +1281,9 @@ pub fn build(b: *std.Build) void {
     cp_mod.addImport("rove-blob", blob_mod);
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
     cp_mod.addImport("bridge", v2_bridge_mod);
+    // Origin validation on the runtime `/_control/cluster` door, matching
+    // the static seed's gate.
+    cp_mod.addImport("rove-origin", origin_mod);
     cp_mod.addImport("rove-acme", acme_mod);
     cp_mod.addImport("metrics-server", metrics_server_mod);
     cp_mod.link_libc = true;

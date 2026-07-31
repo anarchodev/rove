@@ -59,6 +59,7 @@
 
 const std = @import("std");
 const bridge_mod = @import("bridge");
+const origin_mod = @import("rove-origin");
 const acme_expiry = @import("rove-acme").expiry;
 
 const Bridge = bridge_mod.Bridge;
@@ -74,7 +75,42 @@ const DIR_STORE_ID = "__directory__";
 const COMMIT_TIMEOUT_NS: u64 = 10 * std.time.ns_per_s;
 
 /// Max member nodes per cluster (matches `seedClusters`' parse buffer).
-const MAX_CLUSTER_NODES = 16;
+/// Public so the seed caller's error message can state the limit rather
+/// than repeat the number.
+pub const MAX_CLUSTER_NODES = 16;
+
+/// Why a static config string (`REWIND_CLUSTERS` / `REWIND_PLACEMENT` /
+/// `REWIND_HOSTS`) could not be parsed. One value per condition: these are
+/// hand-edited env vars, so "which entry, and what about it" is the whole
+/// diagnostic. `seedBadEntry` carries the offending text alongside.
+///
+/// The seed callers switch over this set with NO `else`, so a new
+/// condition is a compile error until it gets an operator message.
+pub const ConfigError = error{
+    /// An entry had no `=` separating key from value.
+    SeedEntryMissingEquals,
+    /// `id=` with an empty cluster id.
+    SeedClusterIdEmpty,
+    /// An entry named a cluster but listed no node origins.
+    SeedClusterNodesEmpty,
+    /// More than `MAX_CLUSTER_NODES` origins for one cluster.
+    SeedClusterTooManyNodes,
+    /// A node origin is not an IP literal (a hostname, most likely). The
+    /// front door cannot dial it — see `rove-origin`.
+    SeedOriginNotIpLiteral,
+    /// A node origin's `:port` suffix is not a u16.
+    SeedOriginBadPort,
+    /// A node origin had no host at all.
+    SeedOriginEmpty,
+    /// `=cluster` with an empty tenant id.
+    SeedPlacementTenantEmpty,
+    /// `tenant=` with an empty cluster id.
+    SeedPlacementClusterEmpty,
+    /// `=tenant` with an empty host.
+    SeedHostEmpty,
+    /// `host=` with an empty tenant id.
+    SeedHostTenantEmpty,
+};
 
 pub const Error = error{
     /// `assign`/`move` named a cluster id that was never `addCluster`'d.
@@ -82,7 +118,10 @@ pub const Error = error{
     /// `move` named a tenant with no current placement (use `assign` for
     /// initial placement; `move` is strictly a re-placement).
     UnknownTenant,
-    /// A config string handed to `seedFromConfig` was malformed.
+    /// A runtime control write (`setHost`/`setCert`/`setNodeAddr`) carried
+    /// an empty or malformed field. Distinct from `ConfigError`, which is
+    /// for boot-time env parsing: this one maps to a 400 on the control
+    /// API, so it stays a single value the HTTP layer can test for.
     BadConfig,
     /// A directory write could not be replicated through the directory raft
     /// group (propose rejected, commit faulted, or timed out). The caller
@@ -149,6 +188,11 @@ pub const Directory = struct {
     cert_mirror: ?CertMirrorHook = null,
     /// The directory raft group id (set by `initReplicated`).
     dir_gid: u64 = 0,
+
+    /// The config entry that produced the last `ConfigError`, so the seed
+    /// caller can name it. Borrowed from the caller's config string, which
+    /// is an env var and outlives the process. Empty until a seed fails.
+    seed_bad_entry: []const u8 = "",
 
     /// Pointer-stable cluster storage. Appended to by `addCluster`, never
     /// reordered or removed (a cluster outlives the process), so an index
@@ -1180,46 +1224,70 @@ pub const Directory = struct {
     /// is allowed. The static-config path — the front door calls this once
     /// at startup (into an empty directory) from an env var. Each entry is
     /// `addCluster`'d (so it replicates + a repeat id re-addresses).
-    pub fn seedClusters(self: *Directory, config: []const u8) Error!void {
+    ///
+    /// Every origin is validated against `rove-origin` BEFORE anything
+    /// replicates: an origin the front door cannot dial must not reach the
+    /// directory, because from there it fans out to every front and only
+    /// fails at dial time, far from the operator who typed it. Validation
+    /// is per entry and precedes that entry's `addCluster`, so a bad entry
+    /// cannot be replicated — though entries before it already have (the
+    /// caller treats a seed failure as fatal, and seeds are idempotent).
+    pub fn seedClusters(self: *Directory, config: []const u8) (ConfigError || Error)!void {
         var node_buf: [MAX_CLUSTER_NODES][]const u8 = undefined;
         var it = std.mem.tokenizeScalar(u8, config, ';');
         while (it.next()) |raw| {
             const entry = std.mem.trim(u8, raw, " \t\r\n");
             if (entry.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return Error.BadConfig;
+            self.seed_bad_entry = entry;
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse
+                return ConfigError.SeedEntryMissingEquals;
             const id = std.mem.trim(u8, entry[0..eq], " \t");
             const urls = std.mem.trim(u8, entry[eq + 1 ..], " \t");
-            if (id.len == 0 or urls.len == 0) return Error.BadConfig;
+            if (id.len == 0) return ConfigError.SeedClusterIdEmpty;
+            if (urls.len == 0) return ConfigError.SeedClusterNodesEmpty;
 
             var n: usize = 0;
             var nit = std.mem.tokenizeScalar(u8, urls, ',');
             while (nit.next()) |rawn| {
                 const url = std.mem.trim(u8, rawn, " \t");
                 if (url.len == 0) continue;
-                if (n >= node_buf.len) return Error.BadConfig; // > 16 nodes/cluster
+                if (n >= node_buf.len) return ConfigError.SeedClusterTooManyNodes;
+                _ = origin_mod.parse(url) catch |e| {
+                    self.seed_bad_entry = url;
+                    return switch (e) {
+                        error.HostnameOriginUnsupported => ConfigError.SeedOriginNotIpLiteral,
+                        error.OriginBadPort => ConfigError.SeedOriginBadPort,
+                        error.OriginEmpty => ConfigError.SeedOriginEmpty,
+                    };
+                };
                 node_buf[n] = url;
                 n += 1;
             }
-            if (n == 0) return Error.BadConfig;
+            if (n == 0) return ConfigError.SeedClusterNodesEmpty;
             try self.addCluster(id, node_buf[0..n]);
         }
+        self.seed_bad_entry = "";
     }
 
     /// Seed initial placements from a config string of the form
     /// `tenant=cluster_id;tenant=cluster_id;…`. Each entry is `assign`'d,
     /// so every named cluster must already be seeded (`seedClusters`
     /// first). The static-placement path (into a fresh directory).
-    pub fn seedPlacements(self: *Directory, config: []const u8) Error!void {
+    pub fn seedPlacements(self: *Directory, config: []const u8) (ConfigError || Error)!void {
         var it = std.mem.tokenizeScalar(u8, config, ';');
         while (it.next()) |raw| {
             const entry = std.mem.trim(u8, raw, " \t\r\n");
             if (entry.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return Error.BadConfig;
+            self.seed_bad_entry = entry;
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse
+                return ConfigError.SeedEntryMissingEquals;
             const tenant = std.mem.trim(u8, entry[0..eq], " \t");
             const cluster = std.mem.trim(u8, entry[eq + 1 ..], " \t");
-            if (tenant.len == 0 or cluster.len == 0) return Error.BadConfig;
+            if (tenant.len == 0) return ConfigError.SeedPlacementTenantEmpty;
+            if (cluster.len == 0) return ConfigError.SeedPlacementClusterEmpty;
             try self.assign(tenant, cluster);
         }
+        self.seed_bad_entry = "";
     }
 
     /// Seed the domain index from a config string of the form
@@ -1227,17 +1295,21 @@ pub const Directory = struct {
     /// INTO the replicated directory so it survives a restart + spans
     /// the HA nodes). Each entry is `setHost`'d (replicated). Runtime custom
     /// domains are added later via the `/_control/host` control write.
-    pub fn seedHosts(self: *Directory, config: []const u8) Error!void {
+    pub fn seedHosts(self: *Directory, config: []const u8) (ConfigError || Error)!void {
         var it = std.mem.tokenizeScalar(u8, config, ';');
         while (it.next()) |raw| {
             const entry = std.mem.trim(u8, raw, " \t\r\n");
             if (entry.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return Error.BadConfig;
+            self.seed_bad_entry = entry;
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse
+                return ConfigError.SeedEntryMissingEquals;
             const host = std.mem.trim(u8, entry[0..eq], " \t");
             const tenant = std.mem.trim(u8, entry[eq + 1 ..], " \t");
-            if (host.len == 0 or tenant.len == 0) return Error.BadConfig;
+            if (host.len == 0) return ConfigError.SeedHostEmpty;
+            if (tenant.len == 0) return ConfigError.SeedHostTenantEmpty;
             try self.setHost(host, tenant);
         }
+        self.seed_bad_entry = "";
     }
 };
 
@@ -1346,7 +1418,7 @@ test "directory: setHost + hostTenantForOwned round-trip, update, unset→null" 
         defer a.free(t);
         try testing.expectEqualStrings("bob", t);
     }
-    try testing.expectError(error.BadConfig, dir.seedHosts("missing-equals"));
+    try testing.expectError(error.SeedEntryMissingEquals, dir.seedHosts("missing-equals"));
 }
 
 test "directory: setNodeAddr registry round-trips, re-registers, lists per cluster" {
@@ -1602,9 +1674,70 @@ test "directory: seedClusters + seedPlacements parse static config" {
     try testing.expectEqual(@as(usize, 3), c3.nodes.len);
     try testing.expectEqualStrings("http://127.0.0.1:18095", c3.nodes[2]);
 
-    try testing.expectError(error.BadConfig, dir.seedClusters("missing-equals"));
-    try testing.expectError(error.BadConfig, dir.seedClusters("=http://nohost"));
+    try testing.expectError(error.SeedEntryMissingEquals, dir.seedClusters("missing-equals"));
+    try testing.expectError(error.SeedClusterIdEmpty, dir.seedClusters("=http://nohost"));
     try testing.expectError(error.UnknownCluster, dir.seedPlacements("x=ghost-cluster"));
+}
+
+test "directory: every seed parse failure is a distinct error naming its entry" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+
+    // One error per condition — a single BadConfig for all of these told the
+    // operator only that the variable was wrong somewhere.
+    try testing.expectError(error.SeedEntryMissingEquals, dir.seedClusters("no-equals-here"));
+    try testing.expectError(error.SeedClusterIdEmpty, dir.seedClusters("  =http://10.0.0.1:1"));
+    try testing.expectError(error.SeedClusterNodesEmpty, dir.seedClusters("c1="));
+    try testing.expectError(error.SeedClusterNodesEmpty, dir.seedClusters("c1= , ,"));
+
+    try testing.expectError(error.SeedPlacementTenantEmpty, dir.seedPlacements("=c1"));
+    try testing.expectError(error.SeedPlacementClusterEmpty, dir.seedPlacements("alice="));
+    try testing.expectError(error.SeedEntryMissingEquals, dir.seedPlacements("alice"));
+
+    try testing.expectError(error.SeedHostEmpty, dir.seedHosts("=alice"));
+    try testing.expectError(error.SeedHostTenantEmpty, dir.seedHosts("a.com="));
+
+    // The offending entry is recorded so the caller's message can name it
+    // without re-parsing the config string.
+    try testing.expectError(error.SeedClusterIdEmpty, dir.seedClusters("ok=http://10.0.0.1:1; =http://10.0.0.2:2"));
+    try testing.expectEqualStrings("=http://10.0.0.2:2", dir.seed_bad_entry);
+
+    // Cleared on success, so a stale entry cannot be reported against a
+    // later failure.
+    try dir.seedClusters("c9=http://10.0.0.9:9");
+    try testing.expectEqualStrings("", dir.seed_bad_entry);
+}
+
+test "directory: seedClusters rejects origins the front door cannot dial" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+
+    // The whole point: a hostname here would replicate to every front and
+    // only fail at dial time, one hop from the operator who typed it.
+    try testing.expectError(
+        error.SeedOriginNotIpLiteral,
+        dir.seedClusters("c1=http://worker-1.internal:8443"),
+    );
+    try testing.expectError(
+        error.SeedOriginNotIpLiteral,
+        dir.seedClusters("c1=http://localhost:8443"),
+    );
+    try testing.expectError(error.SeedOriginBadPort, dir.seedClusters("c1=http://10.0.0.1:https"));
+
+    // Rejected BEFORE the cluster is added — nothing replicates.
+    try testing.expect(dir.clusterById("c1") == null);
+
+    // The bad origin is what gets recorded, not the whole entry: with 16
+    // origins allowed per cluster, naming the entry would not locate it.
+    try testing.expectError(
+        error.SeedOriginNotIpLiteral,
+        dir.seedClusters("c2=http://10.0.0.1:1,http://bad-host:2"),
+    );
+    try testing.expectEqualStrings("http://bad-host:2", dir.seed_bad_entry);
+
+    // And the valid forms still pass.
+    try dir.seedClusters("c3=http://10.0.0.1:8443,10.0.0.2:8443,https://10.0.0.3:8443");
+    try testing.expectEqual(@as(usize, 3), dir.clusterById("c3").?.nodes.len);
 }
 
 // ── Replicated (durable) directory ──────────────────────────────────────

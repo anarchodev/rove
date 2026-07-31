@@ -36,6 +36,7 @@ const reconciler = @import("reconciler.zig");
 const BackendResp = bc.BackendResp;
 const MOVE_SECRET_HEADER = bc.MOVE_SECRET_HEADER;
 const directory_mod = @import("cp-directory");
+const origin_mod = @import("rove-origin");
 const Directory = directory_mod.Directory;
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
@@ -480,6 +481,21 @@ const Router = struct {
         if (parsed.value.id.len == 0 or parsed.value.nodes.len == 0) {
             try replyStatus(server, ent, sid, sess, 400);
             return;
+        }
+        // Same gate the static seed applies: an origin the front door cannot
+        // dial must not enter the directory, whichever door it arrives
+        // through. Rejecting here costs a 400; accepting it costs a cluster
+        // that resolves but never serves.
+        for (parsed.value.nodes) |node| {
+            _ = origin_mod.parse(node) catch |e| {
+                std.log.err(
+                    "rewind-cp: /_control/cluster {s}: origin `{s}` is not dialable ({s}) — " ++
+                        "node origins must be `ip:port` IP literals",
+                    .{ parsed.value.id, node, @errorName(e) },
+                );
+                try replyStatus(server, ent, sid, sess, 400);
+                return;
+            };
         }
         self.directory.addCluster(parsed.value.id, parsed.value.nodes) catch {
             try replyStatus(server, ent, sid, sess, 500);
@@ -1032,6 +1048,110 @@ fn getEnvCfg(name: []const u8) []const u8 {
     return std.posix.getenv(name) orelse "";
 }
 
+/// Which static-config env var to seed from. Pairing the var name with its
+/// seed function here keeps the two from drifting at the six call sites.
+const SeedKind = enum {
+    clusters,
+    placements,
+    hosts,
+
+    fn envVar(self: SeedKind) []const u8 {
+        return switch (self) {
+            .clusters => "REWIND_CLUSTERS",
+            .placements => "REWIND_PLACEMENT",
+            .hosts => "REWIND_HOSTS",
+        };
+    }
+};
+
+/// Seed one static-config var, reporting a parse failure in the operator's
+/// vocabulary before propagating it.
+///
+/// The parser stays silent and returns a distinct error per condition
+/// (`Directory.ConfigError`); this is the boundary that owns the env-var
+/// names, so the message belongs here. Replication faults pass through
+/// untouched — the caller retries those.
+fn seedOrReport(directory: *Directory, kind: SeedKind) !void {
+    const cfg = getEnvCfg(kind.envVar());
+    const result = switch (kind) {
+        .clusters => directory.seedClusters(cfg),
+        .placements => directory.seedPlacements(cfg),
+        .hosts => directory.seedHosts(cfg),
+    };
+    result catch |e| {
+        if (asConfigError(e)) |ce| reportSeedError(kind.envVar(), directory.seed_bad_entry, ce);
+        return e;
+    };
+}
+
+/// Narrow `anyerror` to a `ConfigError` member, or null. Reflection over the
+/// error set rather than a hand-written list, so it cannot fall behind.
+fn asConfigError(e: anyerror) ?directory_mod.ConfigError {
+    inline for (@typeInfo(directory_mod.ConfigError).error_set.?) |f| {
+        if (e == @field(directory_mod.ConfigError, f.name)) {
+            return @field(directory_mod.ConfigError, f.name);
+        }
+    }
+    return null;
+}
+
+/// The operator message for each parse failure, naming the env var and the
+/// entry that broke.
+///
+/// Exhaustive with NO `else`: adding a condition to `ConfigError` is a
+/// compile error until it gets a message, so a new way to misconfigure the
+/// CP cannot ship reporting nothing.
+fn reportSeedError(var_name: []const u8, entry: []const u8, e: directory_mod.ConfigError) void {
+    switch (e) {
+        error.SeedEntryMissingEquals => std.log.err(
+            "rewind-cp: {s} entry `{s}` has no `=` — entries are `key=value`, separated by `;`",
+            .{ var_name, entry },
+        ),
+        error.SeedClusterIdEmpty => std.log.err(
+            "rewind-cp: {s} entry `{s}` has an empty cluster id — `id=origin,origin`",
+            .{ var_name, entry },
+        ),
+        error.SeedClusterNodesEmpty => std.log.err(
+            "rewind-cp: {s} entry `{s}` lists no node origins — `id=origin,origin`",
+            .{ var_name, entry },
+        ),
+        error.SeedClusterTooManyNodes => std.log.err(
+            "rewind-cp: {s} entry `{s}` lists more than {d} node origins",
+            .{ var_name, entry, directory_mod.MAX_CLUSTER_NODES },
+        ),
+        error.SeedOriginNotIpLiteral => std.log.err(
+            "rewind-cp: {s} origin `{s}` is not an IP literal — hostnames are unsupported " ++
+                "(the front door would have to resolve them on its :443 poll loop, which must " ++
+                "never block); use the node's vRack IP",
+            .{ var_name, entry },
+        ),
+        error.SeedOriginBadPort => std.log.err(
+            "rewind-cp: {s} origin `{s}` has a malformed port — expected `ip:port`",
+            .{ var_name, entry },
+        ),
+        error.SeedOriginEmpty => std.log.err(
+            "rewind-cp: {s} origin `{s}` has no host",
+            .{ var_name, entry },
+        ),
+        error.SeedPlacementTenantEmpty => std.log.err(
+            "rewind-cp: {s} entry `{s}` has an empty tenant id — `tenant=cluster`",
+            .{ var_name, entry },
+        ),
+        error.SeedPlacementClusterEmpty => std.log.err(
+            "rewind-cp: {s} entry `{s}` names no cluster — `tenant=cluster`",
+            .{ var_name, entry },
+        ),
+        error.SeedHostEmpty => std.log.err(
+            "rewind-cp: {s} entry `{s}` has an empty host — `host=tenant`",
+            .{ var_name, entry },
+        ),
+        error.SeedHostTenantEmpty => std.log.err(
+            "rewind-cp: {s} entry `{s}` names no tenant — `host=tenant`",
+            .{ var_name, entry },
+        ),
+    }
+}
+
 /// Parse a `;`/`,`-separated list of origins into an owned, owned-element
 /// slice. Empty input → empty slice. Whitespace trimmed; blanks skipped.
 const parseUrlList = boot.parseUrlList;
@@ -1211,9 +1331,9 @@ pub fn main() !void {
     // election / replication to settle before deciding.
     if (cp_bridge.node.isSingleNode()) {
         if (directory.isEmpty()) {
-            try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
-            try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
-            try directory.seedHosts(getEnvCfg("REWIND_HOSTS"));
+            try seedOrReport(directory, .clusters);
+            try seedOrReport(directory, .placements);
+            try seedOrReport(directory, .hosts);
             std.log.info("rewind-cp: seeded directory from static config", .{});
         } else {
             std.log.info("rewind-cp: directory replayed from {s} (skipping static seed)", .{cp_data_dir});
@@ -1234,21 +1354,21 @@ pub fn main() !void {
             var attempt: u32 = 0;
             while (attempt < 100) : (attempt += 1) {
                 if (!directory.isLeader() or !directory.isEmpty()) break;
-                directory.seedClusters(getEnvCfg("REWIND_CLUSTERS")) catch |e| switch (e) {
+                seedOrReport(directory, .clusters) catch |e| switch (e) {
                     error.Replication => {
                         std.Thread.sleep(100 * std.time.ns_per_ms);
                         continue;
                     },
                     else => return e, // malformed config / OOM → fail loud
                 };
-                directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT")) catch |e| switch (e) {
+                seedOrReport(directory, .placements) catch |e| switch (e) {
                     error.Replication => {
                         std.Thread.sleep(100 * std.time.ns_per_ms);
                         continue;
                     },
                     else => return e,
                 };
-                directory.seedHosts(getEnvCfg("REWIND_HOSTS")) catch |e| switch (e) {
+                seedOrReport(directory, .hosts) catch |e| switch (e) {
                     error.Replication => {
                         std.Thread.sleep(100 * std.time.ns_per_ms);
                         continue;
