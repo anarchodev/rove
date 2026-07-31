@@ -2223,15 +2223,17 @@ pub fn Proxy(comptime FrontH2: type) type {
 }
 
 /// Parse a node origin (`http://host:port`) into a socket address.
-/// IP literals resolve directly; hostnames go through the blocking
-/// resolver (private-network names; resolved once per pool entry).
-/// Parse a node origin (`http://host:port`) into a socket address.
 /// Origins MUST be IP literals — production uses vRack private IPs
 /// (REWIND_CLUSTERS). A hostname is REJECTED, not resolved:
 /// `std.net.getAddressList` is a blocking DNS call and this runs on the
 /// :443 poll loop, which must never block (a slow resolver would stall
 /// accept/TLS for every tenant). A hostname origin is a config error —
 /// fail loud + fast (the caller fails the connect over) instead.
+///
+/// Silent by design: every failure returns a distinct error and the
+/// caller owns the operator message. Logging here would both duplicate
+/// what the caller reports and, at `.err`, make these paths untestable —
+/// Zig's test runner counts an error-level log as a failure.
 pub fn resolveOrigin(origin: []const u8) !std.net.Address {
     var rest = origin;
     if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
@@ -2242,13 +2244,8 @@ pub fn resolveOrigin(origin: []const u8) !std.net.Address {
         host = rest[0..i];
         port = try std.fmt.parseInt(u16, rest[i + 1 ..], 10);
     }
-    return std.net.Address.parseIp(host, port) catch {
-        std.log.err(
-            "front: origin {s} is not an IP literal — hostname origins are unsupported (would block the poll loop on DNS); set IP-literal origins in REWIND_CLUSTERS",
-            .{origin},
-        );
+    return std.net.Address.parseIp(host, port) catch
         return error.HostnameOriginUnsupported;
-    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -2269,6 +2266,37 @@ test "normalizeHost: lowercases, strips port bracket-aware, rejects junk" {
     try testing.expect(normalizeHost(&buf, "acme.example/evil?x=") == null);
     try testing.expect(normalizeHost(&buf, "") == null);
     try testing.expect(normalizeHost(&buf, "acme\r\nx-inject: 1") == null);
+}
+
+test "resolveOrigin: IP literals parse, hostnames are rejected" {
+    // Scheme and any trailing path are stripped before the host:port split.
+    const with_scheme = try resolveOrigin("http://10.99.0.1:8443");
+    try testing.expectEqual(@as(u16, 8443), with_scheme.getPort());
+    const with_path = try resolveOrigin("http://10.99.0.1:8443/_system/health");
+    try testing.expectEqual(@as(u16, 8443), with_path.getPort());
+
+    // No port → the h2c default.
+    const bare = try resolveOrigin("10.99.0.1");
+    try testing.expectEqual(@as(u16, 80), bare.getPort());
+
+    // A hostname is a config error, not a DNS lookup: resolving it would
+    // block the :443 poll loop. Distinct error so the caller can name the
+    // fix (REWIND_CLUSTERS) without re-deriving what went wrong.
+    try testing.expectError(
+        error.HostnameOriginUnsupported,
+        resolveOrigin("http://worker-1.internal:8443"),
+    );
+    try testing.expectError(
+        error.HostnameOriginUnsupported,
+        resolveOrigin("http://localhost:8443"),
+    );
+
+    // A malformed port is its own failure — distinct from the hostname
+    // case, and previously silent (no log, no distinct error).
+    try testing.expectError(
+        error.InvalidCharacter,
+        resolveOrigin("http://10.99.0.1:https"),
+    );
 }
 
 test "nominatedByConnection: Connection-listed headers are hop-by-hop (RFC 7230 §6.1)" {

@@ -86,6 +86,11 @@ pub const Upstream = struct {
     /// tunnels wait in `waiters`. 0 = unset (no tunnel awaiting
     /// SETTINGS). Stamped/cleared by `drainSettledTunnels`.
     settle_deadline_ns: i128 = 0,
+    /// True once `dialLeg` has reported this origin as unresolvable.
+    /// The origin is constant for the pool entry's life, so the failure
+    /// repeats on every backoff retry — report it once instead of
+    /// once per dial.
+    origin_reported: bool = false,
 
     fn anyConnecting(up: *const Upstream) bool {
         for (up.legs[0..up.n_legs]) |*leg| {
@@ -220,7 +225,20 @@ pub fn Fns(comptime FrontH2: type) type {
             const up = leg.up;
             const now = std.time.nanoTimestamp();
             const addr = up.addr orelse blk: {
-                const a = resolveOrigin(up.origin) catch {
+                const a = resolveOrigin(up.origin) catch |err| {
+                    if (!up.origin_reported) {
+                        up.origin_reported = true;
+                        switch (err) {
+                            error.HostnameOriginUnsupported => std.log.err(
+                                "front: origin {s} is not an IP literal — hostname origins are unsupported (would block the poll loop on DNS); set IP-literal origins in REWIND_CLUSTERS",
+                                .{up.origin},
+                            ),
+                            else => std.log.err(
+                                "front: origin {s} is unusable: {s} — set `host:port` IP-literal origins in REWIND_CLUSTERS",
+                                .{ up.origin, @errorName(err) },
+                            ),
+                        }
+                    }
                     leg.last_fail_ns = now;
                     return false;
                 };
