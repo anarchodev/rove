@@ -2845,6 +2845,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .request_id = request_id,
             .deployment_id = dep_id,
             .duration_ns = now_ns - received_ns,
+            // Carried so a walker-rebuilt record keeps its place in time
+            // rather than landing at 1970 and being hidden by retention.
+            .received_ns = received_ns,
             .status = status_code,
             .outcome = .ok,
             .activation = .inbound,
