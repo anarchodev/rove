@@ -198,6 +198,11 @@ pub const FetchEngine = struct {
     door_addr_count: u8 = 0,
     door_suffixes: [2][]const u8 = .{ "", "" },
     door_suffix_count: u8 = 0,
+    /// The offending entry when `parseDoorConfig` returns
+    /// `TenantDoorBadAddress` — borrowed from the caller's csv, which outlives
+    /// the call. Exists so the parser can stay silent and still let `init`
+    /// name the exact value an operator has to fix.
+    door_bad_entry: []const u8 = "",
     /// The URL port the door fires for — the front's TLS port. Defaults
     /// to `FRONT_TLS_PORT` (443); `REWIND_INTERNAL_FRONT_PORT` overrides
     /// it for test topologies whose front binds a high port. A door host
@@ -247,11 +252,45 @@ pub const FetchEngine = struct {
         self.* = .{ .allocator = allocator, .node = node };
         if (std.posix.getenv("REWIND_INTERNAL_FRONT")) |csv| {
             if (csv.len > 0) {
-                try self.parseDoorConfig(
+                // The parser returns a distinct error per misconfiguration and
+                // logs nothing; the message belongs here, where the boot
+                // context and the operator's vocabulary (env var names) live.
+                // Keeping both in the parser made every one of these paths
+                // untestable — the test runner counts an error-level log as a
+                // failure, so a test asserting the error could never pass
+                // (rove#274).
+                self.parseDoorConfig(
                     csv,
                     std.posix.getenv("REWIND_PUBLIC_SUFFIX"),
                     std.posix.getenv("REWIND_SYSTEM_SUFFIX"),
-                );
+                ) catch |err| {
+                    switch (err) {
+                        error.TenantDoorNoSuffixes => std.log.err(
+                            "rove-js fetch_engine: REWIND_INTERNAL_FRONT is set but neither " ++
+                                "REWIND_PUBLIC_SUFFIX nor REWIND_SYSTEM_SUFFIX is — the tenant " ++
+                                "door has no hostnames to match",
+                            .{},
+                        ),
+                        error.TenantDoorTooManyAddrs => std.log.err(
+                            "rove-js fetch_engine: REWIND_INTERNAL_FRONT has more than {d} entries",
+                            .{MAX_DOOR_ADDRS},
+                        ),
+                        error.TenantDoorBadAddress => std.log.err(
+                            "rove-js fetch_engine: bad REWIND_INTERNAL_FRONT entry '{s}' — " ++
+                                "entries are bare IPs (the URL's port is preserved)",
+                            .{self.door_bad_entry},
+                        ),
+                        error.TenantDoorNoAddrs => std.log.err(
+                            "rove-js fetch_engine: REWIND_INTERNAL_FRONT is set but empty",
+                            .{},
+                        ),
+                    }
+                    // No `else`: the switch is exhaustive over the parser's
+                    // error set, so adding a failure mode there is a compile
+                    // error here until it gets a message. That is the point —
+                    // a new misconfiguration cannot ship silently.
+                    return err;
+                };
                 // The door fires only for the front's TLS port (443 in
                 // prod). Test topologies whose front binds a high port
                 // set REWIND_INTERNAL_FRONT_PORT so the door still applies.
@@ -288,42 +327,21 @@ pub const FetchEngine = struct {
             self.door_suffixes[self.door_suffix_count] = s;
             self.door_suffix_count += 1;
         };
-        if (self.door_suffix_count == 0) {
-            std.log.err(
-                "rove-js fetch_engine: REWIND_INTERNAL_FRONT is set but neither " ++
-                    "REWIND_PUBLIC_SUFFIX nor REWIND_SYSTEM_SUFFIX is — the tenant " ++
-                    "door has no hostnames to match",
-                .{},
-            );
-            return error.TenantDoorMisconfig;
-        }
+        if (self.door_suffix_count == 0) return error.TenantDoorNoSuffixes;
         var it = std.mem.splitScalar(u8, addrs_csv, ',');
         while (it.next()) |raw| {
             const entry = std.mem.trim(u8, raw, " ");
             if (entry.len == 0) continue;
-            if (self.door_addr_count == MAX_DOOR_ADDRS) {
-                std.log.err(
-                    "rove-js fetch_engine: REWIND_INTERNAL_FRONT has more than {d} entries",
-                    .{MAX_DOOR_ADDRS},
-                );
-                return error.TenantDoorMisconfig;
-            }
+            if (self.door_addr_count == MAX_DOOR_ADDRS) return error.TenantDoorTooManyAddrs;
             // Bare IPs only: CURLOPT_RESOLVE keeps the URL's port, so a
             // `:port` here would be dead config masquerading as live.
             self.door_addrs[self.door_addr_count] = std.net.Address.parseIp(entry, 0) catch {
-                std.log.err(
-                    "rove-js fetch_engine: bad REWIND_INTERNAL_FRONT entry '{s}' — " ++
-                        "entries are bare IPs (the URL's port is preserved)",
-                    .{entry},
-                );
-                return error.TenantDoorMisconfig;
+                self.door_bad_entry = entry;
+                return error.TenantDoorBadAddress;
             };
             self.door_addr_count += 1;
         }
-        if (self.door_addr_count == 0) {
-            std.log.err("rove-js fetch_engine: REWIND_INTERNAL_FRONT is set but empty", .{});
-            return error.TenantDoorMisconfig;
-        }
+        if (self.door_addr_count == 0) return error.TenantDoorNoAddrs;
         std.log.info(
             "rove-js fetch_engine: tenant door enabled — {d} internal front addr(s), {d} suffix(es)",
             .{ self.door_addr_count, self.door_suffix_count },
@@ -1506,24 +1524,40 @@ test "tenant door: parseDoorConfig + label-boundary host match" {
 
 }
 
-test "tenant door: misconfiguration is rejected (door with no suffixes; `ip:port` entry)" {
-    // SKIPPED, and the reason is worth stating: `parseDoorConfig` both LOGS at
-    // error level and RETURNS an error. Zig's test runner counts any
-    // error-level log as a test failure and offers no opt-out (`log_err_count`
-    // in test_runner.zig increments before any level filtering), so a test that
-    // drives this path cannot pass no matter what it asserts.
-    //
-    // The fix is to stop logging and returning the same failure — give the
-    // parser distinct error values and let `init`, which owns the boot context
-    // and the operator vocabulary, log the specific message. That keeps the
-    // four diagnostics an operator needs AND makes the parser assertable.
-    // Deliberately not done here: it is production behaviour, not test
-    // plumbing. rove#274.
-    if (true) return error.SkipZigTest;
-    var fe2: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
-    try std.testing.expectError(error.TenantDoorMisconfig, fe2.parseDoorConfig("10.99.0.1", null, null));
-    var fe3: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
-    try std.testing.expectError(error.TenantDoorMisconfig, fe3.parseDoorConfig("10.99.0.1:443", "rewindjs.app", null));
+test "tenant door: each misconfiguration returns its own error" {
+    // Previously unrunnable: the parser logged at error level as well as
+    // returning, and the test runner counts any error-level log as a failure,
+    // so a test asserting the error could never pass (rove#274). The parser is
+    // silent now and `init` owns the message, which is also why each failure
+    // gets a DISTINCT error — a single `TenantDoorMisconfig` carried none of
+    // the diagnostic, leaving the log as the only thing that knew what broke.
+    const a = std.testing.allocator;
+
+    var no_suffix: FetchEngine = .{ .allocator = a, .node = undefined };
+    try std.testing.expectError(
+        error.TenantDoorNoSuffixes,
+        no_suffix.parseDoorConfig("10.99.0.1", null, null),
+    );
+
+    var ip_port: FetchEngine = .{ .allocator = a, .node = undefined };
+    try std.testing.expectError(
+        error.TenantDoorBadAddress,
+        ip_port.parseDoorConfig("10.99.0.1:443", "rewindjs.app", null),
+    );
+    // …and it names the entry, so the caller can report it without re-parsing.
+    try std.testing.expectEqualStrings("10.99.0.1:443", ip_port.door_bad_entry);
+
+    var empty: FetchEngine = .{ .allocator = a, .node = undefined };
+    try std.testing.expectError(
+        error.TenantDoorNoAddrs,
+        empty.parseDoorConfig("  ,  ", "rewindjs.app", null),
+    );
+
+    var too_many: FetchEngine = .{ .allocator = a, .node = undefined };
+    try std.testing.expectError(
+        error.TenantDoorTooManyAddrs,
+        too_many.parseDoorConfig("10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4,10.0.0.5", "rewindjs.app", null),
+    );
 }
 
 test "tenant door: pin redirects host to internal fronts, only port 443" {
