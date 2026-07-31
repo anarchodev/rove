@@ -446,6 +446,18 @@ pub const LogHeader = struct {
     /// inherit the leader's clock-skewed value, which is fine for a
     /// human-readable log surface.
     duration_ns: i64,
+    /// When the request arrived, unix nanoseconds — the same value the live
+    /// LogRecord carries. Present so a record rebuilt from a raft entry keeps
+    /// its place in time: the promotion walker had no arrival time and emitted
+    /// zero, which sorts at 1970 and is filtered out by the retention
+    /// read-clamp, hiding exactly the records the walker exists to recover
+    /// (rove#280).
+    ///
+    /// Required. The readset bundle that carries this header is versioned and
+    /// its parser rejects any mismatch outright, so there is exactly one shape
+    /// per version — an entry either predates the field and is v7 (rejected
+    /// whole), or is v8 and carries it.
+    received_ns: i64,
     status: u16,
     outcome: Outcome,
     activation: ActivationSource,
@@ -467,6 +479,7 @@ pub const LogHeader = struct {
     /// [u32 path_len BE  ][path_bytes  ]
     /// [u32 host_len BE  ][host_bytes  ]
     /// [u32 corr_len BE  ][corr_bytes  ]
+    /// [i64 received_ns BE]
     /// ```
     /// Encoded size is `28 + 16 + sum(len_fields)` (28 scalar bytes +
     /// 4×u32 length prefixes + the variable string payloads).
@@ -474,7 +487,7 @@ pub const LogHeader = struct {
         const fixed: usize = 8 + 8 + 8 + 2 + 1 + 1;
         const var_bytes = self.method.len + self.path.len + self.host.len + self.correlation_id.len;
         const len_prefixes: usize = 4 * 4;
-        const total = fixed + len_prefixes + var_bytes;
+        const total = fixed + len_prefixes + var_bytes + 8;
         const out = try allocator.alloc(u8, total);
         var cur: usize = 0;
         std.mem.writeInt(u64, out[cur..][0..8], self.request_id, .big);
@@ -496,6 +509,8 @@ pub const LogHeader = struct {
             @memcpy(out[cur..][0..s.len], s);
             cur += s.len;
         }
+        std.mem.writeInt(i64, out[cur..][0..8], self.received_ns, .big);
+        cur += 8;
         std.debug.assert(cur == total);
         return out;
     }
@@ -534,11 +549,14 @@ pub fn parseLogHeader(bytes: []const u8) LogHeaderParseError!LogHeader {
         strings[i] = bytes[cur .. cur + slen];
         cur += slen;
     }
-    if (cur != bytes.len) return LogHeaderParseError.Truncated;
+    if (bytes.len - cur != 8) return LogHeaderParseError.Truncated;
+    const received_ns = std.mem.readInt(i64, bytes[cur..][0..8], .big);
+    cur += 8;
     return .{
         .request_id = request_id,
         .deployment_id = deployment_id,
         .duration_ns = duration_ns,
+        .received_ns = received_ns,
         .status = status,
         .outcome = outcome,
         .activation = activation,
@@ -1008,6 +1026,7 @@ test "LogHeader: serialize + parseLogHeader roundtrip" {
         .request_id = 0xCAFEBABEDEADBEEF,
         .deployment_id = 1_700_000_000_000_000_000,
         .duration_ns = 123_456_789,
+        .received_ns = 1_700_000_000_000_000_000,
         .status = 201,
         .outcome = .ok,
         .activation = .inbound,
@@ -1036,6 +1055,7 @@ test "LogHeader: empty strings roundtrip" {
         .request_id = 0,
         .deployment_id = 0,
         .duration_ns = 0,
+        .received_ns = 1_700_000_000_000_000_000,
         .status = 0,
         .outcome = .ok,
         .activation = .inbound,
@@ -1058,6 +1078,7 @@ test "LogHeader: non-default outcome + activation" {
         .request_id = 1,
         .deployment_id = 2,
         .duration_ns = 3,
+        .received_ns = 1_700_000_000_000_000_000,
         .status = 500,
         .outcome = .handler_error,
         .activation = .fetch_chunk,
@@ -1073,6 +1094,58 @@ test "LogHeader: non-default outcome + activation" {
     try testing.expectEqual(ActivationSource.fetch_chunk, parsed.activation);
 }
 
+test "LogHeader: received_ns round-trips" {
+    const header: LogHeader = .{
+        .request_id = 7, .deployment_id = 9, .duration_ns = 123,
+        .received_ns = 1_785_453_109_497_854_452,
+        .status = 200, .outcome = .ok, .activation = .inbound,
+        .method = "GET", .path = "/p", .host = "h", .correlation_id = "c",
+    };
+    const bytes = try header.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const parsed = try parseLogHeader(bytes);
+    try testing.expectEqual(header.received_ns, parsed.received_ns);
+    // the pre-existing fields are undisturbed by the tail
+    try testing.expectEqual(@as(u64, 7), parsed.request_id);
+    try testing.expectEqualStrings("/p", parsed.path);
+}
+
+test "LogHeader: a header without received_ns is rejected, not tolerated" {
+    // v8 makes the field required, and the readset bundle carrying this header
+    // is version-guarded (`READSET_VERSION`), so there is exactly one shape per
+    // version. A v7-shaped header reaching this parser means something is wrong
+    // upstream — saying so beats inventing a timestamp, which would place the
+    // record at a plausible-looking lie.
+    const a = testing.allocator;
+    const header: LogHeader = .{
+        .request_id = 42, .deployment_id = 1, .duration_ns = 5, .received_ns = 999,
+        .status = 404, .outcome = .handler_error, .activation = .inbound,
+        .method = "POST", .path = "/old", .host = "h.test", .correlation_id = "",
+    };
+    const full = try header.serialize(a);
+    defer a.free(full);
+    const v7_shaped = full[0 .. full.len - 8];
+    try testing.expectError(LogHeaderParseError.Truncated, parseLogHeader(v7_shaped));
+}
+
+test "LogHeader: extra trailing bytes are rejected" {
+    // The parser stays exact about length in both directions: too short and
+    // too long are both malformed.
+    const a = testing.allocator;
+    const header: LogHeader = .{
+        .request_id = 1, .deployment_id = 1, .duration_ns = 1, .received_ns = 1,
+        .status = 200, .outcome = .ok, .activation = .inbound,
+        .method = "GET", .path = "/", .host = "h", .correlation_id = "",
+    };
+    const full = try header.serialize(a);
+    defer a.free(full);
+    const junk = try a.alloc(u8, full.len + 3);
+    defer a.free(junk);
+    @memcpy(junk[0..full.len], full);
+    @memset(junk[full.len..], 0xAA);
+    try testing.expectError(LogHeaderParseError.Truncated, parseLogHeader(junk));
+}
+
 test "LogHeader: parseLogHeader rejects truncated scalar section" {
     try testing.expectError(LogHeaderParseError.Truncated, parseLogHeader(""));
     var bytes: [10]u8 = undefined;
@@ -1085,6 +1158,7 @@ test "LogHeader: parseLogHeader rejects bad outcome enum" {
         .request_id = 0,
         .deployment_id = 0,
         .duration_ns = 0,
+        .received_ns = 1_700_000_000_000_000_000,
         .status = 0,
         .outcome = .ok,
         .activation = .inbound,
@@ -1107,6 +1181,7 @@ test "LogHeader: parseLogHeader rejects truncated trailing string" {
         .request_id = 0,
         .deployment_id = 0,
         .duration_ns = 0,
+        .received_ns = 1_700_000_000_000_000_000,
         .status = 0,
         .outcome = .ok,
         .activation = .inbound,

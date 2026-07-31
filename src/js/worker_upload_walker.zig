@@ -111,7 +111,22 @@ fn hydrateWriteSetEnvelope(
     defer parsed_list.deinit(allocator);
 
     for (parsed_list.blobs) |rs_blob| {
-        const parsed = tape_mod.parseReadset(rs_blob) catch continue;
+        // A readset this node cannot parse is a record it cannot recover, and
+        // the walker's whole job is recovery — so say so rather than skipping
+        // in silence. The expected case is an entry written before a readset
+        // version bump (`READSET_VERSION`): after one, entries from the
+        // previous binary are unreadable and those requests are unrecoverable
+        // on a pre-flush failover. Bounded and shrinking as the log compacts,
+        // but not something to discover from an absence.
+        const parsed = tape_mod.parseReadset(rs_blob) catch |err| {
+            std.log.warn(
+                "walker: unreadable readset for {s} at raft seq {d}: {s} — that request " ++
+                    "cannot be recovered (readset version is a strict guard; entries written " ++
+                    "before a bump are unreadable)",
+                .{ instance_id, raft_seq, @errorName(err) },
+            );
+            continue;
+        };
         const lh = parsed.log_header orelse continue;
         const record = try buildLogRecord(
             allocator,
@@ -184,7 +199,10 @@ fn buildLogRecord(
         .tenant_id = tenant_id,
         .request_id = lh.request_id,
         .deployment_id = lh.deployment_id,
-        .received_ns = 0,
+        // From the header the dispatch stamped into the raft entry. Zero only
+        // for entries written before the field existed, which the retention
+        // read-clamp still hides — see rove#280.
+        .received_ns = lh.received_ns,
         .duration_ns = lh.duration_ns,
         .method = method,
         .path = path,
@@ -216,6 +234,7 @@ const sample_lh: log_mod.LogHeader = .{
     .request_id = 0xCAFE,
     .deployment_id = 42,
     .duration_ns = 1234,
+    .received_ns = 1_700_000_000_000_000_000,
     .status = 200,
     .outcome = .ok,
     .activation = .inbound,

@@ -120,7 +120,10 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// + `seed` + `js_engine_version` scalars, then the 5 channel blobs in
 /// fixed order, then a trailing `[u32 log_header_len][log_header_bytes]`
 /// section so any node can rebuild the customer LogRecord from the raft
-/// entry alone (`log_header_len == 0` is the "no header" sentinel for
+/// entry alone — including the request's `received_ns`, so a rebuilt record
+/// keeps its place in time instead of landing at the epoch and being hidden by
+/// the retention read-clamp (v8, rove#280). (`log_header_len == 0` is the
+/// "no header" sentinel for
 /// non-handler producers and paths that don't stamp a header). The
 /// `js_engine_version: u16` scalar (`docs/architecture/format-versioning.md`
 /// §4) records which JS engine executed each replicated request, so a
@@ -132,7 +135,7 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// raft log (type-0 envelopes carry the readset): when the format
 /// changes, bump this and delete the old shape in the same change (and
 /// wipe the data dir) — do not add a min-supported fallback.
-pub const READSET_VERSION: u16 = 7;
+pub const READSET_VERSION: u16 = 8;
 pub const READSET_CHANNEL_COUNT: usize = 5;
 
 /// Wire ids are contiguous and stable — the per-tape decoder rejects
@@ -798,7 +801,7 @@ pub const Readset = struct {
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
     /// (readset replication, `docs/architecture/effects-and-handlers.md`). Wire format
-    /// (READSET_VERSION = 7):
+    /// (READSET_VERSION = 8):
     ///
     /// ```
     /// [u32  magic = READSET_MAGIC ('RREA')]
@@ -1580,6 +1583,7 @@ test "readset: serialize + parseReadset roundtrip with LogHeader" {
         .request_id = 0xCAFE_BABE_DEAD_BEEF,
         .deployment_id = 1_700_000_000,
         .duration_ns = 12345,
+        .received_ns = 1_700_000_000_000_000_000,
         .status = 200,
         .outcome = .ok,
         .activation = .inbound,

@@ -683,7 +683,7 @@ fn finishStreamResume(
                         return;
                     }
                 }
-                const lh_term = fireLogHeader(ctx.request_id, dep_id, @intCast(@max(@min(r.status, 599), 100)), ctx.act, mpath, corr);
+                const lh_term = fireLogHeader(ctx.request_id, dep_id, @intCast(@max(@min(r.status, 599), 100)), ctx.act, mpath, corr, ctx.now_ns);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (`docs/architecture/deployment-and-logs.md`).
                 const tapes = streamTapes(worker, spec.tape, &ctx);
@@ -810,7 +810,7 @@ fn finishStreamResume(
                 // no chunks to stage.
                 var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = false };
                 defer stage.chunks.deinit(allocator);
-                const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr);
+                const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr, ctx.now_ns);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (held + writes): propose failed: {s}", .{@errorName(perr)});
                     cval.deinit(allocator);
@@ -902,7 +902,7 @@ fn finishStreamResume(
                     allocator.free(s2.chunks);
                     s2.chunks = &.{};
                 }
-                const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr);
+                const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr, ctx.now_ns);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the outer defer
@@ -1582,11 +1582,15 @@ pub fn fireLogHeader(
     act: log_mod.ActivationSource,
     path: []const u8,
     corr: ?[]const u8,
+    received_ns: i64,
 ) log_mod.LogHeader {
     return .{
         .request_id = request_id,
         .deployment_id = deployment_id,
         .duration_ns = 0,
+        // The activation's own arrival time, so a record the promotion walker
+        // rebuilds from the raft entry keeps its place in time (rove#280).
+        .received_ns = received_ns,
         .status = status,
         .outcome = .ok,
         .activation = act,
@@ -1726,7 +1730,7 @@ pub fn runFire(
                 );
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, log_path, corr);
+                const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, log_path, corr, p.now_ns);
                 // Capture tapes BEFORE the propose so the input channels
                 // (ctx/Msg on `trigger_payload`, the fetch event on
                 // `fetch_responses`) ride the raft entry's readset — the
@@ -1783,7 +1787,7 @@ pub fn runFire(
                 },
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr);
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr, p.now_ns);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
@@ -1823,7 +1827,7 @@ pub fn runFire(
                 },
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr);
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr, p.now_ns);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");

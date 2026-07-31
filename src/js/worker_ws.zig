@@ -487,7 +487,7 @@ fn finishWsResume(
                 tearDownWsChain(worker, conn_ent);
                 return;
             }
-            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), act, path, chain_ctx.correlation_id);
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), act, path, chain_ctx.correlation_id, p.now_ns);
             // Tapes before shipWsFrames' propose so the input channels (ctx on
             // trigger_payload, fetch event on fetch_responses) ride the raft
             // readset for the promotion walker
@@ -527,7 +527,7 @@ fn finishWsResume(
                 tearDownWsChain(worker, conn_ent);
                 return;
             }
-            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, path, chain_ctx.correlation_id);
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, path, chain_ctx.correlation_id, p.now_ns);
             const wrote = p.ws.ops.items.len > 0;
             // Snap the §8.4 read baseline before shipWsFrames may transfer txn.
             const read_version = p.txn.readVersion();
@@ -1145,7 +1145,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .no_onheaders, .no_onchunk => {},
     }
     if (wrote) {
-        const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, path, chain_ctx.correlation_id);
+        const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, path, chain_ctx.correlation_id, p.now_ns);
         _ = proposeForgetfulWrites(worker, &p.ws, p.txn, chain_ctx.tenant_id, null, null, &p.readset, lh) catch |perr| {
             std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
             p.txn_owned = false;
