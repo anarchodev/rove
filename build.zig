@@ -379,7 +379,7 @@ pub fn build(b: *std.Build) void {
     // DeployThread). The separate binary + its trust domain are gone.
 
     // ── Tests ──
-    const test_step = b.step("test", "Run all unit tests");
+    const test_step = b.step("test", "THE gate: every unit test + a compile of every shipped binary");
 
     // metrics-server (shared by rewind-worker + rewind-cp)
     test_step.dependOn(&run_metrics_server_tests.step);
@@ -442,10 +442,10 @@ pub fn build(b: *std.Build) void {
     const bodies_tests = b.addTest(.{ .root_module = bodies_mod });
     test_step.dependOn(&b.addRunArtifact(bodies_tests).step);
 
-    // rove-log-server tests — a dedicated `log-server-test` step, kept OUT of
-    // the aggregate `test`: the shared module stays sqlite-free (sqlite is
+    // rove-log-server tests. The shared module stays sqlite-free (sqlite is
     // linked at the binary level), so the test gets its OWN module that links
-    // sqlite3 (index_db.zig needs it).
+    // sqlite3 (index_db.zig needs it) — which is why `zig build test` needs
+    // libsqlite3 present, same as the `rewind-logs` binary it also compiles.
     const log_server_test_mod = b.createModule(.{
         .root_source_file = b.path("src/log_server/root.zig"),
         .target = target,
@@ -469,6 +469,7 @@ pub fn build(b: *std.Build) void {
     const run_log_server_tests = b.addRunArtifact(log_server_tests);
     const log_server_test_step = b.step("log-server-test", "Run rove-log-server unit tests");
     log_server_test_step.dependOn(&run_log_server_tests.step);
+    test_step.dependOn(&run_log_server_tests.step);
 
     // rove-jwt tests
     const jwt_tests = b.addTest(.{ .root_module = jwt_mod });
@@ -490,25 +491,11 @@ pub fn build(b: *std.Build) void {
     const plan_test_step = b.step("plan-test", "Run rove-plan (tier table) unit tests");
     plan_test_step.dependOn(&run_plan_tests.step);
 
-    // rove-h2 HTTP/1.1 codec (gap #6) — pure std, so a standalone test module.
-    const h1_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/h2/http1.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const h1_tests = b.addTest(.{ .root_module = h1_test_mod });
-    const h1_test_step = b.step("h1-test", "Run the HTTP/1.1 codec unit tests");
-    h1_test_step.dependOn(&b.addRunArtifact(h1_tests).step);
-
-    // rove-h2 RFC 6455 WebSocket codec (inbound WS — docs/architecture/websockets.md) — pure std.
-    const ws_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/h2/ws.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const ws_tests = b.addTest(.{ .root_module = ws_test_mod });
-    const ws_test_step = b.step("ws-test", "Run the WebSocket frame codec unit tests");
-    ws_test_step.dependOn(&b.addRunArtifact(ws_tests).step);
+    // The HTTP/1.1 codec (`src/h2/http1.zig`) and the RFC 6455 WebSocket codec
+    // (`src/h2/ws.zig`, docs/architecture/websockets.md) had standalone test
+    // modules + `h1-test`/`ws-test` steps. Both files are re-exported by
+    // `src/h2/root.zig`, so `h2_tests` already runs their tests — the extra
+    // artifacts only ran the same tests a second time.
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
@@ -1190,16 +1177,15 @@ pub fn build(b: *std.Build) void {
     v2_test_step.dependOn(&run_v2_cp_dir_test.step);
     test_step.dependOn(&run_v2_cp_dir_test.step);
 
-    // ── V2 Phase 2c — attach the rove-js worker to the bridge ──────────
     // rove-js imports the bridge as `@import("bridge")`. js_mod already
     // imports `kv_mod` as "raft-kv" (the facade), so the worker's
-    // KvStore/TrackedTxn and the bridge's are the SAME type. A dedicated
-    // `js-v2` step compiles rove-js against the facade + bridge (V1's
-    // loop46 is dead on this branch) to drive the seam cut.
+    // KvStore/TrackedTxn and the bridge's are the SAME type.
+    //
+    // A `js-v2` step used to compile rove-js against the facade + bridge to
+    // drive the V1→V2 seam cut. It rooted a test at js_mod — the same module
+    // `js_tests` roots at — so once this import landed it was `js_tests`
+    // twice over. The aggregate covers it.
     js_mod.addImport("bridge", v2_bridge_mod);
-    const js_v2_test = b.addTest(.{ .root_module = js_mod });
-    const js_v2_step = b.step("js-v2", "Compile rove-js against the V2 facade + bridge (Phase 2c)");
-    js_v2_step.dependOn(&b.addRunArtifact(js_v2_test).step);
 
     // ── rewind-worker: the V2 single-node worker binary (v2-build-order
     // §Phase 2d). The V2 counterpart of `loop46` — the reused rove-js
@@ -1505,6 +1491,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&rewind_exe.step);
     test_step.dependOn(&front_exe.step);
     test_step.dependOn(&cp_exe.step);
+    test_step.dependOn(&ls_standalone.step);
     test_step.dependOn(&ops_exe.step);
     test_step.dependOn(&cli_exe.step);
     const cli_step = b.step("rewind", "Build the rewind customer CLI");

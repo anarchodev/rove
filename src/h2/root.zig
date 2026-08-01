@@ -5414,9 +5414,14 @@ test "nghttp2 linked and callable" {
 }
 
 test {
-    // Pull conn_state.zig's inline tests (if any get added) into this
-    // module's test build — a bare `const = @import(...)` alone does not.
+    // Pull these files' inline tests into this module's test build — a bare
+    // `const = @import(...)`, even a `pub` one, does NOT: re-exporting a file
+    // makes its declarations available, not its tests. `http1` and `ws` had
+    // standalone test modules for exactly this reason; referencing them here
+    // runs their tests against the real rove-h2 module instead.
     _ = conn_state;
+    _ = http1;
+    _ = ws;
 }
 
 test "stream accumulator — headers and body" {

@@ -27,11 +27,11 @@ zig build h2-echo-server  # Run the HTTP/2 echo server example
 
 Requires Zig 0.15.0+ and a Rust toolchain (pinned by `rust-toolchain.toml`) for
 the consensus-linked steps — anything that pulls in the bridge (`rewind-worker`,
-`rewind-cp`, `v2-test`, `js-v2`, the aggregate `test` via rove-js) builds
-raft-rs-zig's Rust FFI via cargo; the bare `zig build` install step does not.
-System libraries: nghttp2, OpenSSL (ssl + crypto), libcurl, liblmdb (via
-kvexp), zlib; SQLite3 only for the `rewind-logs` binary and its
-`log-server-test` step.
+`rewind-cp`, `v2-test`, and `test`, which links it via rove-js and compiles
+every binary) builds raft-rs-zig's Rust FFI via cargo; the bare `zig build`
+install step does not. System libraries: nghttp2, OpenSSL (ssl + crypto),
+libcurl, liblmdb (via kvexp), zlib, SQLite3 (`rewind-logs` + the log-server
+tests, both of which `test` covers).
 
 ## Smoke tests
 
