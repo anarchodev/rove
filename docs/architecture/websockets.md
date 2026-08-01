@@ -153,7 +153,7 @@ seam (`ws_message_out` inbound / `ws_send_in` outbound collections). Pieces:
 | # | Piece | Status |
 |---|---|---|
 | A | `101` Upgrade handshake (`wsIsUpgrade` / `wsHandshake`) | ✅ done |
-| B | RFC 6455 frame codec (`src/h2/ws.zig`, table-tested, `zig build ws-test`) | ✅ done |
+| B | RFC 6455 frame codec (`src/h2/ws.zig`, table-tested, `zig build test`) | ✅ done |
 | C | connection mode switch (`Http1Conn.ws_mode` → `wsDrive`) | ✅ done |
 | D | frame → `onMessage`/`onDisconnect` activation (`serviceWsMessages`, `src/js/worker_ws.zig`) | ✅ done (2026-06-09) |
 | E | outbound framing (`consumeWsSends` / `wsFlush`, one write in flight) | ✅ done |

@@ -317,6 +317,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── rove-origin: node origin parsing ────────────────────────────
+    //
+    // The one definition of what the fleet can dial. Shared so the CP
+    // (which accepts origins into the directory from REWIND_CLUSTERS)
+    // and the front door (which dials them) cannot disagree — a CP that
+    // accepts what a front rejects only fails at dial time, a hop away
+    // from the operator who typed it. std-only leaf.
+    const origin_mod = b.addModule("rove-origin", .{
+        .root_source_file = b.path("src/origin/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── rove-acme: in-tree ACME (RFC 8555) HTTP-01 client + :80
     //    challenge responder (docs/architecture/auth-and-domains.md). Issues
     //    per-host certs into the Phase-2c custom-cert dir. OpenSSL
@@ -366,7 +379,7 @@ pub fn build(b: *std.Build) void {
     // DeployThread). The separate binary + its trust domain are gone.
 
     // ── Tests ──
-    const test_step = b.step("test", "Run all unit tests");
+    const test_step = b.step("test", "THE gate: every unit test + a compile of every shipped binary");
 
     // metrics-server (shared by rewind-worker + rewind-cp)
     test_step.dependOn(&run_metrics_server_tests.step);
@@ -429,10 +442,10 @@ pub fn build(b: *std.Build) void {
     const bodies_tests = b.addTest(.{ .root_module = bodies_mod });
     test_step.dependOn(&b.addRunArtifact(bodies_tests).step);
 
-    // rove-log-server tests — a dedicated `log-server-test` step, kept OUT of
-    // the aggregate `test`: the shared module stays sqlite-free (sqlite is
+    // rove-log-server tests. The shared module stays sqlite-free (sqlite is
     // linked at the binary level), so the test gets its OWN module that links
-    // sqlite3 (index_db.zig needs it).
+    // sqlite3 (index_db.zig needs it) — which is why `zig build test` needs
+    // libsqlite3 present, same as the `rewind-logs` binary it also compiles.
     const log_server_test_mod = b.createModule(.{
         .root_source_file = b.path("src/log_server/root.zig"),
         .target = target,
@@ -456,6 +469,7 @@ pub fn build(b: *std.Build) void {
     const run_log_server_tests = b.addRunArtifact(log_server_tests);
     const log_server_test_step = b.step("log-server-test", "Run rove-log-server unit tests");
     log_server_test_step.dependOn(&run_log_server_tests.step);
+    test_step.dependOn(&run_log_server_tests.step);
 
     // rove-jwt tests
     const jwt_tests = b.addTest(.{ .root_module = jwt_mod });
@@ -465,6 +479,10 @@ pub fn build(b: *std.Build) void {
     const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
     test_step.dependOn(&b.addRunArtifact(ssrf_tests).step);
 
+    // rove-origin tests
+    const origin_tests = b.addTest(.{ .root_module = origin_mod });
+    test_step.dependOn(&b.addRunArtifact(origin_tests).step);
+
     // rove-plan tests — also exposed as a dedicated `plan-test` step for
     // running the tier table in isolation.
     const plan_tests = b.addTest(.{ .root_module = plan_mod });
@@ -473,25 +491,11 @@ pub fn build(b: *std.Build) void {
     const plan_test_step = b.step("plan-test", "Run rove-plan (tier table) unit tests");
     plan_test_step.dependOn(&run_plan_tests.step);
 
-    // rove-h2 HTTP/1.1 codec (gap #6) — pure std, so a standalone test module.
-    const h1_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/h2/http1.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const h1_tests = b.addTest(.{ .root_module = h1_test_mod });
-    const h1_test_step = b.step("h1-test", "Run the HTTP/1.1 codec unit tests");
-    h1_test_step.dependOn(&b.addRunArtifact(h1_tests).step);
-
-    // rove-h2 RFC 6455 WebSocket codec (inbound WS — docs/architecture/websockets.md) — pure std.
-    const ws_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/h2/ws.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const ws_tests = b.addTest(.{ .root_module = ws_test_mod });
-    const ws_test_step = b.step("ws-test", "Run the WebSocket frame codec unit tests");
-    ws_test_step.dependOn(&b.addRunArtifact(ws_tests).step);
+    // The HTTP/1.1 codec (`src/h2/http1.zig`) and the RFC 6455 WebSocket codec
+    // (`src/h2/ws.zig`, docs/architecture/websockets.md) had standalone test
+    // modules + `h1-test`/`ws-test` steps. Both files are re-exported by
+    // `src/h2/root.zig`, so `h2_tests` already runs their tests — the extra
+    // artifacts only ran the same tests a second time.
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
@@ -1030,8 +1034,17 @@ pub fn build(b: *std.Build) void {
     v2_smoke_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     const v2_smoke_test = b.addTest(.{ .root_module = v2_smoke_mod });
     const run_v2_smoke_test = b.addRunArtifact(v2_smoke_test);
-    const v2_test_step = b.step("v2-test", "V2 raft substrate tests (Phase-0 smoke + Phase-1 per-tenant pump)");
+    // `v2-test` is a FOCUSED SUBSET, not a separate gate: every artifact below
+    // is also on the aggregate `test`. The split dated from V2 being a branch
+    // beside a live V1; V2 is main now, and the "keep cargo out of a
+    // lightweight `test`" rationale expired when rove-js took a `bridge`
+    // import — the aggregate already links raft-rs. Keeping the step is worth
+    // it for iterating on the raft substrate alone (~4s vs the full suite);
+    // keeping it EXCLUSIVE meant consensus and directory regressions did not
+    // fail `zig build test`.
+    const v2_test_step = b.step("v2-test", "V2 raft substrate tests, a subset of `test` (Phase-0 smoke + Phase-1 per-tenant pump)");
     v2_test_step.dependOn(&run_v2_smoke_test.step);
+    test_step.dependOn(&run_v2_smoke_test.step);
 
     // The cross-node wire layer's own inline tests (loopback frame exchange,
     // mesh-count accounting). raft_net is a named module everywhere else, so
@@ -1040,6 +1053,7 @@ pub fn build(b: *std.Build) void {
     const raftnet_test = b.addTest(.{ .root_module = raftnet_mod });
     const run_raftnet_test = b.addRunArtifact(raftnet_test);
     v2_test_step.dependOn(&run_raftnet_test.step);
+    test_step.dependOn(&run_raftnet_test.step);
 
     // ── V2 Phase 1 — data-plane core: the per-tenant pump (single node)
     // (v2-build-order Phase 1). `src/consensus/node.zig` owns a
@@ -1111,9 +1125,12 @@ pub fn build(b: *std.Build) void {
     // a test instantiates the Transport struct (not just the wire codec).
     v2_transport_mod.addImport("kvlimbs", kv_mod);
     const v2_transport_test = b.addTest(.{ .root_module = v2_transport_mod });
-    v2_test_step.dependOn(&b.addRunArtifact(v2_transport_test).step);
+    const run_v2_transport_test = b.addRunArtifact(v2_transport_test);
+    v2_test_step.dependOn(&run_v2_transport_test.step);
+    test_step.dependOn(&run_v2_transport_test.step);
     const run_v2_node_test = b.addRunArtifact(v2_node_test);
     v2_test_step.dependOn(&run_v2_node_test.step);
+    test_step.dependOn(&run_v2_node_test.step);
 
     // ── V2 Phase 2 — the worker-facing bridge over the per-tenant pump
     // (v2-build-order Phase 2). `src/consensus/bridge.zig` owns the
@@ -1133,6 +1150,7 @@ pub fn build(b: *std.Build) void {
     const v2_bridge_test = b.addTest(.{ .root_module = v2_bridge_mod });
     const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
     v2_test_step.dependOn(&run_v2_bridge_test.step);
+    test_step.dependOn(&run_v2_bridge_test.step);
 
     // ── V2 Phase 3/7 — control plane: the tenant→cluster directory ─────
     // (directory replication; docs/architecture/control-plane.md).
@@ -1147,6 +1165,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     v2_cp_dir_mod.addImport("bridge", v2_bridge_mod);
+    // Origin parsing: the directory must not accept a node origin the front
+    // door cannot dial, so both validate through the same parser.
+    v2_cp_dir_mod.addImport("rove-origin", origin_mod);
     // Certificate expiry: the directory decides which hosts need issuance, and
     // "needs issuance" includes "expiring soon", so it has to be able to read a
     // certificate's notAfter.
@@ -1154,17 +1175,17 @@ pub fn build(b: *std.Build) void {
     const v2_cp_dir_test = b.addTest(.{ .root_module = v2_cp_dir_mod });
     const run_v2_cp_dir_test = b.addRunArtifact(v2_cp_dir_test);
     v2_test_step.dependOn(&run_v2_cp_dir_test.step);
+    test_step.dependOn(&run_v2_cp_dir_test.step);
 
-    // ── V2 Phase 2c — attach the rove-js worker to the bridge ──────────
     // rove-js imports the bridge as `@import("bridge")`. js_mod already
     // imports `kv_mod` as "raft-kv" (the facade), so the worker's
-    // KvStore/TrackedTxn and the bridge's are the SAME type. A dedicated
-    // `js-v2` step compiles rove-js against the facade + bridge (V1's
-    // loop46 is dead on this branch) to drive the seam cut.
+    // KvStore/TrackedTxn and the bridge's are the SAME type.
+    //
+    // A `js-v2` step used to compile rove-js against the facade + bridge to
+    // drive the V1→V2 seam cut. It rooted a test at js_mod — the same module
+    // `js_tests` roots at — so once this import landed it was `js_tests`
+    // twice over. The aggregate covers it.
     js_mod.addImport("bridge", v2_bridge_mod);
-    const js_v2_test = b.addTest(.{ .root_module = js_mod });
-    const js_v2_step = b.step("js-v2", "Compile rove-js against the V2 facade + bridge (Phase 2c)");
-    js_v2_step.dependOn(&b.addRunArtifact(js_v2_test).step);
 
     // ── rewind-worker: the V2 single-node worker binary (v2-build-order
     // §Phase 2d). The V2 counterpart of `loop46` — the reused rove-js
@@ -1223,6 +1244,8 @@ pub fn build(b: *std.Build) void {
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
     front_mod.addImport("metrics-server", metrics_server_mod);
+    // Origin parsing, shared with the CP that hands these origins over.
+    front_mod.addImport("rove-origin", origin_mod);
     // Certificate expiry parsing, for the gauge the front exports about the
     // certs it serves (`src/front/cert_expiry.zig`). rove-acme owns reading a
     // notAfter; rove-h2 stays free of it.
@@ -1259,6 +1282,9 @@ pub fn build(b: *std.Build) void {
     cp_mod.addImport("rove-blob", blob_mod);
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
     cp_mod.addImport("bridge", v2_bridge_mod);
+    // Origin validation on the runtime `/_control/cluster` door, matching
+    // the static seed's gate.
+    cp_mod.addImport("rove-origin", origin_mod);
     cp_mod.addImport("rove-acme", acme_mod);
     cp_mod.addImport("metrics-server", metrics_server_mod);
     cp_mod.link_libc = true;
@@ -1270,13 +1296,16 @@ pub fn build(b: *std.Build) void {
     const cp_step = b.step("rewind-cp", "Build the V2 control-plane binary");
     cp_step.dependOn(&b.addInstallArtifact(cp_exe, .{}).step);
 
-    // cp unit tests as a SEPARATE step — deliberately NOT added to the aggregate
-    // `test`: cp_mod imports the raft-rs `bridge` (cargo linkage), kept out of the
-    // lightweight `zig build test` (same reason rewind/main.zig is). Run with
-    // `zig build rewind-cp-test`.
+    // cp unit tests, on the aggregate `test` AND on their own step. Being on
+    // the aggregate is what makes `cp/main.zig` compile there at all — the
+    // module is otherwise reachable from no test root, so a type error in the
+    // CP's main is invisible to `zig build test` and only the `rewind-cp`
+    // binary build catches it.
     const cp_tests = b.addTest(.{ .root_module = cp_mod });
+    const run_cp_tests = b.addRunArtifact(cp_tests);
     const cp_test_step = b.step("rewind-cp-test", "Run the rewind-cp unit tests");
-    cp_test_step.dependOn(&b.addRunArtifact(cp_tests).step);
+    cp_test_step.dependOn(&run_cp_tests.step);
+    test_step.dependOn(&run_cp_tests.step);
 
     // ── rewind-ops: the platform/operator CLI (docs/architecture/cli-and-deploy.md §2–§3,
     // §6). The privileged half of the split (root + move-secret + ops-secret);
@@ -1448,6 +1477,23 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("build_options", cli_opts.createModule());
     linkReplayEngine(cli_mod, arenajs_dep);
     const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
+
+    // ── The shipped binaries COMPILE as part of `test` ──────────────────
+    //
+    // A test build never analyses `main`: Zig analyses function bodies
+    // lazily, and nothing in a test references it. So a type error in any
+    // `main.zig` passes both `zig build test` and that binary's own
+    // `*-test` step, and only the binary build catches it — which is how a
+    // broken `rewind-cp` reached a green test run.
+    //
+    // Depend on the COMPILE step, not the install artifact: this gates the
+    // build without writing into zig-out.
+    test_step.dependOn(&rewind_exe.step);
+    test_step.dependOn(&front_exe.step);
+    test_step.dependOn(&cp_exe.step);
+    test_step.dependOn(&ls_standalone.step);
+    test_step.dependOn(&ops_exe.step);
+    test_step.dependOn(&cli_exe.step);
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 
