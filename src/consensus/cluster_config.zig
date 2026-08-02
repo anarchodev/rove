@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Static multi-node raft bootstrap config, parsed from the environment.
 //!
 //! The worker (`rewind-worker`, env prefix `REWIND_`) and the control

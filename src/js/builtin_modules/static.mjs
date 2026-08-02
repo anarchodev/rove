@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // __system/static — engine-fired deploy-static streamer ("onStatic").
 //
 // On an LRU MISS for a stable static path (/app.js, /index.html, an image…),

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `rove-js` worker — HTTP/2 server that runs a JS handler per request.
 //!
 //! `Worker(Options)` is a comptime-parameterized type that composes

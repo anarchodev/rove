@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // blob.* — tenant object storage (blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`).
 //
 // The storage doctrine in one line: kv is for state you mutate; the

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! ACME RFC 8555 client — the HTTP-01 order→finalize state machine.
 //!
 //! One issuance = `Client.issue(host)`: directory → nonce → account

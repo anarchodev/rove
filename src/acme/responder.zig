@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Dedicated HTTP/1.1 :80 responder for ACME HTTP-01 challenges.
 //!
 //! Deliberately tiny and isolated from the h2 stack (auth-domain-plan

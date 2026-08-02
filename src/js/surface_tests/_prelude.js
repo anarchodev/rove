@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Injected before every surface-test module (surface_tests.zig
 // prepends this file verbatim). Module-scoped — nothing leaks onto
 // globalThis. A test module exercises its namespace through

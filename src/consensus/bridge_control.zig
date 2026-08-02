@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The `ControlCmd` relay — the worker→pump control-command path split out of
 //! `bridge.zig`. The raft Manager is pump-thread-only, so every group
 //! lifecycle / introspection op the worker needs (create/destroy group,

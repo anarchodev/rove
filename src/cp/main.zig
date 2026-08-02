@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rewind-cp — the V2 control plane (docs/architecture/control-plane.md).
 //!
 //! The CP is the authoritative, replicated directory: it owns placement

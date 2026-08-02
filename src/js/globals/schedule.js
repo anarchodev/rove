@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The durable one-shot scheduler core — installed as the PRIVATE
 // `_system.sched` (deleted from customer scope by `_harden.js`, like
 // every other `_system.*` capability). The customer-facing verb is the

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Public `next` disposition verb (docs/handler-shape.md §2.1). Thin shim
 // over the `_system.continuation.next` native, captured once at
 // base-eval (before `delete globalThis._system`) — the same closure-

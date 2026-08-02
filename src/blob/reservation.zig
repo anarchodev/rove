@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `ReservationAllocator` — the globally-unique `batch_id` source for the blob
 //! coordinator, extracted from `coordinator.zig` (it never touches bytes).
 //!

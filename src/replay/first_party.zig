@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Offline resolution of the first-party `@rewind/*` package set for
 //! `rewind test`. The 12 lifted libraries are embedded here (the same sources
 //! the registry seed publishes); when an app's bundle `manifest.json` declares

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `durable_wake.zig` — §2.6 leader-side durable-scheduled-wake sweep
 //! (durable-wake P0; `docs/architecture/effects-and-handlers.md`). The engine half of the durable
 //! scheduler: it owns ONE next-fire watermark per tenant

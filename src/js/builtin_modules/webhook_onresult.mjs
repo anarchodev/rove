@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // `webhook.send`'s result classifier — the baked on_chunk handler
 // every webhook fetch (inline first fire from the shim, or a deferred
 // fire from `__system/webhook_fire`) reports into.

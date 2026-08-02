@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pure HTTP header wire helpers for rewind-front — header read
 //! (`headerValue`/`respHeaderValue`) and pack (`packFields`). No
 //! Proxy/Flow/WsTunnel dependency: a leaf that both proxy.zig (flow +

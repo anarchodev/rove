@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // @rewind/oauth — OAuth 2.0 + OIDC authorization-code flow helper
 // (P-Lift, rove#123). The lifted form of the former ambient
 // `globalThis.oauth` (was `src/js/globals/oauth.js`).

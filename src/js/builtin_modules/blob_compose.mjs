@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // blob-write-recipes.md §4: the seal-time prompt compose. The
 // rove-compose.internal door fires this with ctx {sid, hash, on, ctx}
 // after the seal's writeset committed. It assembles the recipe's

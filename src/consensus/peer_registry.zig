@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! An in-memory raft node id → transport address map, fed by the control
 //! plane (attach / conf-change carry the joining node's address; the
 //! directory node-address registry is the durable source) and consulted

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // surface test: platform — the customer-facing contract of the admin
 // surface is the natively-enforced gate: every method reached from a
 // normal tenant activation (request.admin all-null) throws. The admin

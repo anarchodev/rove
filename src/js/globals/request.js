@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The uniform payload surface — `request.text` / `request.json` derived
 // from `request.bytes` (decisions.md §4.11).
 //

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `blob.receive` upload driver — the transport half of
 //! blob-storage-plan §3.5 (P3 slice B; `docs/architecture/routing-and-ingress.md`).
 //!

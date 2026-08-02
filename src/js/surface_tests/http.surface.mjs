@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // http — held outbound subscriptions. In this harness there is no
 // fetch accumulator, so the transport never fires; the pinnable
 // contract is the id shape, option validation, and cancel's no-op.

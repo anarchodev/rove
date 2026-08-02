@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Time coercion helpers — the single home for turning human time inputs
 // (durations, ms-since-epoch, Date, ISO-8601) into the BigInt
 // nanoseconds-since-epoch the scheduler verbs work in. `cron`,

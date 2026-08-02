@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The interaction digest — a rolling hash over what a handler observably
 //! DID, so a replay can prove it did the same thing.
 //!

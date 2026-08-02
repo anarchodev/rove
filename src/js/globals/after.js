@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Public `after` surface — connection wake triggers (docs/handler-shape.md
 // §2.3; decisions.md §4.11). Thin shim over the native
 // `_system.after` binding.

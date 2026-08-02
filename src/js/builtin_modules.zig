@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Built-in handler modules — the `__system/` namespace.
 //!
 //! Module paths in this namespace resolve without those modules being

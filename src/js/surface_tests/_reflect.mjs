@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The surface reflector — enumerates the LIVE public API from inside
 // an activation and returns its canonical names. surface_tests.zig
 // diffs this against the union of every test module's `covers` claims,

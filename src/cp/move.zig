@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Tenant-move orchestration helpers — the reply-free workers behind the
 //! CP's `/_control/move-live` + provisioning paths, split out of
 //! `cp/main.zig`'s Router. Each takes explicit node/tenant args and returns a

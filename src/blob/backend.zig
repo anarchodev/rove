@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-tenant blob backend wrapper. S3-only: rove uses S3-shaped
 //! object storage (AWS / OVH / R2 / B2 / MinIO) for content-addressed
 //! blobs (source, bytecode, static assets, log batches, snapshots).

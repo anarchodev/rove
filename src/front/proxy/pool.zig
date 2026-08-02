@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Upstream connection pool for rewind-front's streaming proxy.
 //!
 //! One pooled h2c connection ("leg") per backend node, up to `MAX_LEGS`

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-importer `@scope/pkg` resolution — the pure resolution logic shared
 //! by the production worker (`module_execution.zig`) and the offline
 //! simulator (`src/replay/`), so the two can't drift on how a package

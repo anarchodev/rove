@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Request-object construction — the `request.*` surface split out of
 //! globals.zig so that file can stay the binding-assembly root.
 //!

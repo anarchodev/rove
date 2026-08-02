@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Public `platform` surface — the documentation source of truth for
 // the admin control plane (docs/architecture/builtin-libs.md Phase A;
 // auth-domain-plan.md for the admin handler context).

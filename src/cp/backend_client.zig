@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! CP → backend HTTP client — the move-secret-authenticated call the
 //! control plane makes to a rewind worker's `/_system/*` surface, split out
 //! of `cp/main.zig`'s Router. Every move-orchestration and membership-

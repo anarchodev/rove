@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `__rove.wake.set` / `__rove.wake.fire` — the durable-wake
 //! engine primitive, gated to baked `__system/` modules (durable-wake
 //! P0; `docs/architecture/effects-and-handlers.md`). Registered under the

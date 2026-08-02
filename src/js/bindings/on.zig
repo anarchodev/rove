@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `_system.after` — connection wake triggers (`docs/handler-shape.md`
 //! §2.3). `after.ms(ms)` /
 //! `after.kv(prefix, {on?})` register a wake **for the current

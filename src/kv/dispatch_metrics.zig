@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Histograms for the dispatch / raft-propose hot path.
 //!
 //! Three observation points answer "how big are our raft batches?":

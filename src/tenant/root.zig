@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-tenant — account/user/instance/domain bookkeeping.
 //!
 //! ## Store-per-instance model

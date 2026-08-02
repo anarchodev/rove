@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! JSON encoder / decoder for the per-deployment manifest stored in
 //! S3 at `tenants/{id}/deployments/{dep_id:020d}.json` — one object per
 //! deployment in a per-tenant `deployments/` BlobBackend.

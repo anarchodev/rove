@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Group lifecycle for the data-plane `Node` — standing up and tearing down
 //! per-tenant raft groups (ensure/create/recover, the node-local group manifest,
 //! and `GroupedFileStorage` handoff to the Manager). Method bodies for

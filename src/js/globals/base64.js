@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Base64 + base64url encoding/decoding + hex byte helpers.
 //
 // `atob` / `btoa` are the standard browser-shaped APIs (binary

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Public `http` surface — the documentation source of truth for the
 // outbound HTTP primitive (docs/architecture/builtin-libs.md Phase A,
 // the reified primitives in docs/architecture/effects-and-handlers.md).

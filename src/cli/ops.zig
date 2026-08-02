@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `rewind-ops` — the platform/operator CLI (docs/architecture/cli-and-deploy.md §2–§3,
 //! §6). The privileged half of the split: every verb here carries an operator
 //! secret (root token → workers + deploy app; REWIND_MOVE_SECRET → CP control,

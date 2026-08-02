@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // next — the park verb. The descriptor is checked in the body; the
 // module then ACTUALLY ends held, so the harness reading this report
 // from the continuation's ctx_json is itself the ctx-threading proof.

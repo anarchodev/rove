@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! effect.Cmd — Cmd-runtime vocabulary (`docs/effect-algebra.md` §2.4).
 //!
 //! A `Cmd` is an output the handler emits via its return — a

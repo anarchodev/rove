@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Data-plane core — the per-tenant pump.
 //!
 //! A `Node` owns one `SharedWal` + one raft-rs `Manager`, and a pump that

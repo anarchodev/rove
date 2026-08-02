@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Focused decoder for the RTAP per-`Tape` wire format.
 //!
 //! `rewind pull` writes the recorded request's tape channels as base64 blobs

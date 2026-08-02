@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! URL path → deployment module path resolver.
 //!
 //! Direct port of shift-js's `src/router.c`. The rule is simple:

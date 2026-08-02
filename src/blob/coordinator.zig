@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Process-global write coordinator for object-storage PUTs.
 //!
 //! See the blob coordinator / chunk spool in

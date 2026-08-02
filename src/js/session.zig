@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Platform-managed session cookie. Eagerly minted on every JS-handler
 //! request that doesn't already carry one. Exposed to handlers as
 //! `request.session.id` — a guaranteed-present, host-isolated browser

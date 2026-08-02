@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Front-door route caches — the stateless proxy's host→placement lookups,
 //! independent of request/tunnel proxying and each other. `RouteCache`
 //! (host→cluster nodes, single TTL, negative-cached + capped) and `LeaderCache`

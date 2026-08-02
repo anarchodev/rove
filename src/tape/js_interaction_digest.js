@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The interaction digest, JS side — the mirror of
 // src/tape/interaction_digest.zig. Read that file for what the digest is
 // for and, more importantly, for what is deliberately excluded from it.
