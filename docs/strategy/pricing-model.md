@@ -457,12 +457,27 @@ flush seams, so neither adds hot-path work.
   the likely transparent baseline (encrypted volume + S3 SSE) sits below
   compression so margin is preserved, but a future mis-ordered app-level
   page encryption would zero the margin (§6.1).
-- **Egress is unpriced on axis 3.** `blob.url` mints presigned URLs, so
-  customer objects can be served directly from the object store to the
-  public at whatever volume the customer drives. That bandwidth is billed
-  by the provider and metered by nothing here. A quota bounds bytes
-  *stored*, not bytes *served* — decide whether egress needs its own
-  ceiling before a customer discovers we are a free CDN.
+- **Egress on axis 3 — free today, but that is a provider fact, not a
+  property of the model.** `blob.url` mints presigned URLs, so customer
+  objects serve directly from the object store to the public at whatever
+  volume the customer drives, metered by nothing here. On the current
+  backend that costs nothing: OVHcloud removed Object Storage egress fees
+  effective December 2025 consumption, across all storage classes and
+  regions (US included), and lists incoming, outgoing, and internal
+  traffic as included. Presigned traffic also bypasses our compute nodes
+  entirely, so it does not consume the ~117 MB/s NIC ceiling either.
+
+  Two residual concerns survive, and neither is COGS:
+
+  - **Portability.** Free egress is an OVH (and R2) property, not an
+    industry one — AWS S3 charges roughly $0.09/GB out. A backend move
+    would turn a free feature into the single largest line on the bill,
+    so treat zero-egress as a constraint on where we can host, not as a
+    permanent given.
+  - **Promise creep.** Free egress makes the free-CDN outcome *more*
+    likely, not less, because the cost signal that would otherwise bound
+    it is absent. Decide deliberately whether unbounded public serving is
+    part of the offer, since withdrawing it later is a takeaway.
 - **`k` (per-request byte floor).** Set against measured fixed overhead
   (header + sidecar + raft entry); needs a real measurement.
 - **Concrete tier rows.** `kv_max_bytes` / `stored_max_bytes` /
@@ -470,9 +485,15 @@ flush seams, so neither adds hot-path work.
   call, gated on the axis-1 and axis-3 measurements landing first so the
   numbers are chosen against a real distribution. Note the 1 GiB LMDB
   ceiling of §2 constrains what the top tier can offer on axis 1.
-- **Backend pricing.** COGS math here uses S3-standard rates; the live
-  backend is OVH (`reference_s3_smoke_env`). Plug in OVH GB-month + PUT
-  pricing for the real bill; order of magnitude is similar.
+- **Backend pricing.** COGS math elsewhere in this doc uses S3-standard
+  rates; the live backend is OVHcloud US. Published list price as of
+  2026-08-01 is **$0.0081/GB/month** standard and **$0.0203/GB/month**
+  high-performance, with no charge for API calls, ingress, or egress —
+  materially cheaper than the S3-standard figures the storage-cost
+  estimate was built on, so that estimate is conservative. Confirm
+  against an actual invoice before it reaches a pricing page; the OVH API
+  credential in `~/.config/rove/ovh.env` is currently expired (403
+  "This credential is not valid"), so this is list price, not our bill.
 - **The bodies compactor.** Per-tenant eviction over the cross-tenant
   `_pool/` batch objects (§3.2) is the one substantial new build this
   model requires — and it is scoped to bodies alone, not to the whole
