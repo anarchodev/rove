@@ -67,7 +67,7 @@ def main() -> int:
     with V2Cluster.spawn("graceful-xfer", nodes=3) as c:
         print("step 1: provision 'acme' across the 3-node cluster")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy the kv handler on the current leader")
         lead0 = c.leader_node("acme")

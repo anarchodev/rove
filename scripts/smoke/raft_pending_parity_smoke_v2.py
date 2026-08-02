@@ -93,7 +93,7 @@ def main() -> int:
     with V2Cluster.spawn("rpparity", nodes=1) as c:
         print("step 1: provision tenant via the CP")
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy index.mjs")
         try:

@@ -75,9 +75,9 @@ def main() -> int:
 
         print("step 1: provision + deploy acme (httpfire) and wb (echo)")
         r = c.provision("acme")
-        check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         r = c.provision("wb")
-        check("provision wb → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision wb → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("wb", {"index.mjs": WB_SRC})
             dep_id = c.deploy_handlers("acme", {

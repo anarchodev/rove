@@ -105,7 +105,7 @@ def main() -> int:
     with V2Cluster.spawn("blob-receive", nodes=1) as c:
         print("step 1: provision + pro plan (32 MiB body cap) + deploy")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status}")
+        check("provision → 200", r.status == 200, f"got {r.status}")
         rp = c.set_plan("acme", '{"tier":"pro"}')
         check("set_plan pro → 2xx", rp.status in (200, 204), f"got {rp.status} {rp.body!r}")
         dep_id = c.deploy_handlers("acme", {

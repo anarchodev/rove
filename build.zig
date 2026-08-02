@@ -497,6 +497,22 @@ pub fn build(b: *std.Build) void {
     // `src/h2/root.zig`, so `h2_tests` already runs their tests — the extra
     // artifacts only ran the same tests a second time.
 
+    // ── rove-instance-id: the tenant-id spec ──
+    //
+    // A dependency-free leaf so the worker (which resolves `{id}.{suffix}`
+    // locally) and the control plane (which validates at provisioning and
+    // resolves the same wildcard for the front door) read ONE rule. A CP that
+    // accepted an id the worker's wildcard cannot resolve would provision a
+    // tenant that is placed but unreachable.
+    const instance_id_mod = b.addModule("rove-instance-id", .{
+        .root_source_file = b.path("src/instance_id/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const instance_id_tests = b.addTest(.{ .root_module = instance_id_mod });
+    test_step.dependOn(&b.addRunArtifact(instance_id_tests).step);
+
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
     // M1 slice: just `Instance` + `Domain` with an in-memory cache and
@@ -508,6 +524,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     tenant_mod.addImport("raft-kv", kv_mod);
+    tenant_mod.addImport("rove-instance-id", instance_id_mod);
 
     const tenant_tests = b.addTest(.{ .root_module = tenant_mod });
     test_step.dependOn(&b.addRunArtifact(tenant_tests).step);
@@ -1281,6 +1298,7 @@ pub fn build(b: *std.Build) void {
     cp_mod.addImport("rove-h2", h2_mod);
     cp_mod.addImport("rove-blob", blob_mod);
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
+    cp_mod.addImport("rove-instance-id", instance_id_mod);
     cp_mod.addImport("bridge", v2_bridge_mod);
     // Origin validation on the runtime `/_control/cluster` door, matching
     // the static seed's gate.

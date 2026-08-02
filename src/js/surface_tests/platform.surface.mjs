@@ -40,6 +40,14 @@ export default function () {
     throws(() => platform.auth.checkRootToken("tok"), NOT_ADMIN);
   });
 
+  check("platform.stage", () => {
+    // Like compile, staging lowers to a bound fetch at a trusted door and is
+    // admin-checked door-side, so the emission itself succeeds here.
+    const id = platform.stage([{ path: "index.mjs", source: "export default ()=>1" }],
+                              { scope: "acme" });
+    ok(typeof id === "string" && id.startsWith("ftch_"), "bound fetch id: " + id);
+  });
+
   check("platform.compile", () => {
     // Unlike the sys.platform natives, compile lowers to a bound
     // after.fetch at the trusted compile door — the call itself is

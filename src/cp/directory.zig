@@ -793,6 +793,19 @@ pub const Directory = struct {
         return .{ .id = c.id, .nodes = c.nodes };
     }
 
+    /// The one configured cluster, or null when there are zero or several.
+    /// Lets a caller that has no basis to choose — self-serve provisioning —
+    /// omit the cluster in the single-cluster deployment that is the norm,
+    /// while a multi-cluster deployment still has to say which, because
+    /// picking one IS a placement policy.
+    pub fn soleCluster(self: *Directory) ?ClusterRef {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.clusters.items.len != 1) return null;
+        const c = self.clusters.items[0];
+        return .{ .id = c.id, .nodes = c.nodes };
+    }
+
     // ── Plan / limits (admin-plane writes, DP reads) ─────────────────
 
     /// Set a tenant's opaque plan/limits blob (`plan/{tenant} = value`). The
@@ -1679,6 +1692,22 @@ test "directory: seedClusters + seedPlacements parse static config" {
     try testing.expectError(error.SeedEntryMissingEquals, dir.seedClusters("missing-equals"));
     try testing.expectError(error.SeedClusterIdEmpty, dir.seedClusters("=http://nohost"));
     try testing.expectError(error.UnknownCluster, dir.seedPlacements("x=ghost-cluster"));
+}
+
+test "directory: soleCluster answers only when there is no choice to make" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+
+    // Nothing configured — a provisioner has nowhere to place a tenant.
+    try testing.expect(dir.soleCluster() == null);
+
+    try dir.seedClusters("only=http://127.0.0.1:18091");
+    try testing.expectEqualStrings("only", dir.soleCluster().?.id);
+
+    // A second cluster makes placement a policy decision, so the default
+    // disappears rather than silently favouring the first-seeded one.
+    try dir.seedClusters("only=http://127.0.0.1:18091; other=http://127.0.0.1:18092");
+    try testing.expect(dir.soleCluster() == null);
 }
 
 test "directory: every seed parse failure is a distinct error naming its entry" {

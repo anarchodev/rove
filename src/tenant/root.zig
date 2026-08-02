@@ -51,6 +51,10 @@
 
 const std = @import("std");
 const kv_mod = @import("raft-kv");
+/// The id spec itself lives in a leaf module because the control plane
+/// enforces the same rule when it provisions a tenant, and resolves the same
+/// `{id}.{suffix}` wildcard when the front door asks who owns a host.
+const id_spec = @import("rove-instance-id");
 
 pub const Error = error{
     InvalidInstanceId,
@@ -82,7 +86,7 @@ pub const AuthContext = struct {
 pub const TOKEN_MIN_LEN: usize = 32;
 pub const TOKEN_MAX_LEN: usize = 128;
 
-pub const MAX_INSTANCE_ID_LEN: usize = 64;
+pub const MAX_INSTANCE_ID_LEN = id_spec.MAX_INSTANCE_ID_LEN;
 pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 
 /// Reserved instance id for the built-in admin handler. The admin
@@ -92,7 +96,7 @@ pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 /// the admin JS handler can issue platform operations (instance
 /// CRUD, domain CRUD, root kv reads) via the `platform.*` globals.
 /// Every other instance has `platform = null`.
-pub const ADMIN_INSTANCE_ID = "__admin__";
+pub const ADMIN_INSTANCE_ID = id_spec.ADMIN_INSTANCE_ID;
 
 /// Reserved tenant id for the tape-replay browser page (PLAN §10.12).
 /// Bootstrapped as a regular instance — no `platform` capability, no
@@ -100,14 +104,14 @@ pub const ADMIN_INSTANCE_ID = "__admin__";
 /// `replay.{public_suffix}` host alias added in `bootstrapTenants`,
 /// which routes the well-known host straight at this tenant via the
 /// existing `assignDomain` machinery.
-pub const REPLAY_INSTANCE_ID = "__replay__";
+pub const REPLAY_INSTANCE_ID = id_spec.REPLAY_INSTANCE_ID;
 
 /// Reserved tenant id for the OIDC identity provider
 /// (auth-domain-plan.md §4). Same shape as `__replay__`: a regular
 /// instance, no `platform` capability, reached via the
 /// `auth.{system_suffix}` host alias added in bootstrap. Runs the
 /// `oidc.provider()` library + a magic-link login.
-pub const AUTH_INSTANCE_ID = "__auth__";
+pub const AUTH_INSTANCE_ID = id_spec.AUTH_INSTANCE_ID;
 
 pub const InstanceList = struct {
     ids: [][]u8,
@@ -445,16 +449,7 @@ pub const Tenant = struct {
     /// corresponds to a real instance — caller's job.
     fn wildcardInstanceId(self: *const Tenant, host: []const u8) ?[]const u8 {
         const suffix = self.public_suffix orelse return null;
-        if (host.len <= suffix.len + 1) return null;
-        const dot_before = host.len - suffix.len - 1;
-        if (host[dot_before] != '.') return null;
-        if (!std.mem.eql(u8, host[dot_before + 1 ..], suffix)) return null;
-        const sub = host[0..dot_before];
-        // Reject multi-label subdomains — wildcard is single-label
-        // only, matching how `{id}.loop46.me` is documented. Callers
-        // who want deeper nesting must still `assignDomain` explicitly.
-        if (std.mem.indexOfScalar(u8, sub, '.') != null) return null;
-        return sub;
+        return id_spec.wildcardLabel(host, suffix);
     }
 
     /// True if `id` has a registered existence marker in the root store.
@@ -809,80 +804,12 @@ fn bytesToHex(src: []const u8, dst: []u8) void {
 
 // ── Validation ─────────────────────────────────────────────────────────
 
-/// Platform-reserved tenant ids (the `__name__` form). Exempt from the
-/// DNS-label spec below — they are internal singletons that never resolve as
-/// a public subdomain. Customers cannot create them: the `__…__` form fails
-/// DNS validation (underscores), and only these exact ids are exempted.
-const RESERVED_INSTANCE_IDS = [_][]const u8{
-    ADMIN_INSTANCE_ID,
-    REPLAY_INSTANCE_ID,
-    AUTH_INSTANCE_ID,
-};
-
-/// A DNS host label is capped at 63 octets, and an instance id may serve as
-/// a `{id}.<zone>` subdomain.
-const MAX_DNS_LABEL_LEN: usize = 63;
-
-/// Subdomain labels reserved away from customer instance ids. Because an id
-/// auto-routes as `{id}.<platform-zone>` (the wildcard public suffix,
-/// `REWIND_PUBLIC_SUFFIX`), a customer who provisioned `auth`/`api`/… would
-/// claim a platform-looking subdomain on our own zone — so we deny these at
-/// provisioning, pre-customer, while it's free to do so
-/// (docs/architecture/format-versioning.md §7.7). Curated platform-product + infra
-/// labels; extend as new platform surfaces appear. NOT generic business words
-/// (blog/shop/docs/…) — those stay available to customers. All lowercase
-/// (ids are already lowercased by the DNS check), so an exact match suffices.
-const RESERVED_SUBDOMAIN_LABELS = [_][]const u8{
-    // platform product surfaces
-    "admin",  "api",      "app",      "account", "accounts", "auth",
-    "billing","console",  "dashboard","login",   "logout",   "signup",
-    "register",
-    // brand / ops
-    "rewind", "ops",      "internal", "system",  "status",
-    // well-known infra / RFC-ish
-    "www",    "mail",     "smtp",     "imap",    "pop",      "ftp",
-    "sftp",   "ssh",      "ns",       "ns1",     "ns2",      "mx",
-    "dns",    "cdn",      "static",   "assets",  "media",    "blob",
-    "proxy",  "gateway",  "vpn",      "ssl",     "tls",
-    "webhook","webhooks", "email",    "ws",      "wss",      "autoconfig",
-    "autodiscover",
-    // NOTE: the ACME http-01 / dns-01 challenge label is `_acme-challenge`
-    // (leading `_` → already an invalid instance id); bare `acme` is left
-    // available so it doesn't collide with the `acme` example-tenant used
-    // throughout the test + smoke suite.
-};
-
-fn isReservedSubdomainLabel(id: []const u8) bool {
-    for (RESERVED_SUBDOMAIN_LABELS) |r| {
-        if (std.mem.eql(u8, id, r)) return true;
-    }
-    return false;
-}
-
-/// Validate a tenant/instance id. Customer ids are locked to a DNS-label-safe
-/// spec — `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$` — so an id can safely become
-/// a public subdomain: lowercase only (DNS is case-insensitive), no `_`
-/// (invalid in DNS host labels), no leading/trailing hyphen, ≤63 octets. This
-/// is the strictest plausible spec, locked pre-customer; loosening later is
-/// always safe, tightening is not (docs/architecture/format-versioning.md §7.4).
-/// Platform-reserved `__…__` ids are exempted.
+/// Validate a tenant/instance id against the shared spec
+/// (`rove-instance-id`). The rule is one definition because the control plane
+/// enforces it at provisioning time and the reject reason has to reach the
+/// customer; here we only need the yes/no.
 fn validateInstanceId(id: []const u8) Error!void {
-    if (id.len == 0 or id.len > MAX_INSTANCE_ID_LEN) return Error.InvalidInstanceId;
-    for (RESERVED_INSTANCE_IDS) |r| {
-        if (std.mem.eql(u8, id, r)) return;
-    }
-    if (id.len > MAX_DNS_LABEL_LEN) return Error.InvalidInstanceId;
-    for (id, 0..) |b, i| {
-        const ok = (b >= 'a' and b <= 'z') or
-            (b >= '0' and b <= '9') or
-            b == '-';
-        if (!ok) return Error.InvalidInstanceId;
-        // No leading or trailing hyphen.
-        if (b == '-' and (i == 0 or i == id.len - 1)) return Error.InvalidInstanceId;
-    }
-    // Reserve platform/infra subdomain labels — a customer must not be able to
-    // become `auth.<zone>` / `api.<zone>` / … via the wildcard route (§7.7).
-    if (isReservedSubdomainLabel(id)) return Error.InvalidInstanceId;
+    if (id_spec.check(id) != null) return Error.InvalidInstanceId;
 }
 
 fn validateHost(host: []const u8) Error!void {

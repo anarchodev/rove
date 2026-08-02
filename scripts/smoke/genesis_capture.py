@@ -136,7 +136,7 @@ def run_once(run_idx) -> str:
     nodes = 3
     with V2Cluster.spawn("genesis", nodes=nodes, genesis=True) as c:
         # A. provision
-        if c.provision(TENANT).status != 204:
+        if c.provision(TENANT).status != 200:
             return "fail-other"
         # B. grow to 3 voters
         try:

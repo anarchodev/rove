@@ -80,7 +80,7 @@ def main() -> int:
     with V2Cluster.spawn("failover", nodes=3) as c:
         print("step 1: provision 'acme' across the 3-node cluster")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy the kv handler (release on the current leader)")
         # release() writes _deploy/current through raft — it must hit the

@@ -112,7 +112,7 @@ def main() -> int:
     with V2Cluster.spawn("replay-wasm", nodes=1) as c:
         print(f"step 1: provision '{TENANT}' via the CP")
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy the replay-demo handler (kv + random + date tape channels)")
         try:

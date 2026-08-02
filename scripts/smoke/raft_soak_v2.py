@@ -130,7 +130,7 @@ def main() -> int:
 
     with V2Cluster.spawn("raftsoak", nodes=3) as c:
         print("setup: provision + deploy the write handler")
-        if c.provision("acme").status != 204:
+        if c.provision("acme").status != 200:
             print("FAIL provision")
             return 1
         lead0 = c.leader_node("acme")

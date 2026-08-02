@@ -99,7 +99,7 @@ def main() -> int:
     with V2Cluster.spawn("sched-hb", nodes=1) as c:
         print("step 1: provision + deploy acme (handler-seeded scheduler heartbeat)")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             dep_id = c.deploy_manifest("acme", HANDLERS)
             check("deploy_manifest → dep_id", bool(dep_id), f"dep_id={dep_id}")
@@ -159,7 +159,7 @@ def main() -> int:
         # ── 4. kind=cron spec.json fails the deploy loudly. ───────────
         print("step 2: kind=cron spec.json is rejected at deploy")
         r = c.provision("legacy")
-        check("provision legacy → 204", r.status == 204, f"got {r.status}")
+        check("provision legacy → 200", r.status == 200, f"got {r.status}")
         try:
             c.deploy_manifest("legacy", CRON_SPEC_HANDLERS)
         except RuntimeError as e:
@@ -182,7 +182,7 @@ def main() -> int:
         # ── 5. kind=boot spec.json fails the deploy loudly (retired 2026-07-05). ──
         print("step 3: kind=boot spec.json is rejected at deploy")
         r = c.provision("legacyboot")
-        check("provision legacyboot → 204", r.status == 204, f"got {r.status}")
+        check("provision legacyboot → 200", r.status == 200, f"got {r.status}")
         try:
             c.deploy_manifest("legacyboot", BOOT_SPEC_HANDLERS)
         except RuntimeError as e:

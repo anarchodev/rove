@@ -119,7 +119,7 @@ def main() -> int:
 
     with V2Cluster.spawn("nexttarget", nodes=1) as c:
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status}")
+        check("provision → 200", r.status == 200, f"got {r.status}")
         try:
             c.deploy_handlers(TENANT, {
                 "index.mjs": INDEX_SRC,

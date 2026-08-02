@@ -104,9 +104,9 @@ def main() -> int:
     with V2Cluster.spawn("wbrecov", nodes=1) as c:
         print("step 1: provision tenants 'acme' + 'wb' via the CP")
         r = c.provision("acme")
-        check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         r = c.provision("wb")
-        check("provision wb → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision wb → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy wb (echo+record) + acme (cbfire + cbresult)")
         try:

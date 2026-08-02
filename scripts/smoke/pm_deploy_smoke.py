@@ -80,7 +80,7 @@ def main() -> int:
     with V2Cluster.spawn("pm", nodes=1) as c:
         print("step 1: provision tenant 'pkgacme'")
         r = c.provision("pkgacme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy handler + packages (app pins jwt@1.9, oidc pins jwt@1.4)")
         dep1 = None
@@ -111,9 +111,12 @@ def main() -> int:
         except RuntimeError as e:
             # P2 author feedback: the error must NAME the unresolvable
             # module, not just say "compile failed".
-            check("undeclared import rejected, module named",
-                  "file index.mjs" in str(e) and "@rewind/undeclared" in str(e),
-                  str(e)[:160])
+            # The bundle compiles at cut (rove#344), so the refusal arrives
+            # there — and must still name BOTH the unresolvable module and the
+            # file that imports it, which is what the author has to fix.
+            check("undeclared import rejected, module + file named",
+                  "@rewind/undeclared" in str(e) and "index.mjs" in str(e),
+                  str(e)[:200])
 
         print("step 5: package naming the privileged surface is rejected (P2 static gate)")
         try:

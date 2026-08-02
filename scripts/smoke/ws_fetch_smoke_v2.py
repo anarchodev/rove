@@ -142,7 +142,7 @@ def main():
 
     with V2Cluster.spawn("wsfetch", nodes=1) as c:
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status}")
+        check("provision → 200", r.status == 200, f"got {r.status}")
         try:
             c.deploy_handlers(TENANT, {"index.mjs": HANDLER_SRC})
         except RuntimeError as e:

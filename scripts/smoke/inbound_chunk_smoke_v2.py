@@ -112,7 +112,7 @@ def main() -> int:
     with V2Cluster.spawn("ichunk", nodes=1, http_base=19500, raft_base=19560) as c:
         print("step 1: provision + deploy (onChunk, reject, default-only)")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status}")
+        check("provision → 200", r.status == 200, f"got {r.status}")
         dep_id = c.deploy_handlers("acme", {
             "index.mjs": DEFAULT_SRC,
             "up/index.mjs": ONCHUNK_SRC,

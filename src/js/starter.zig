@@ -133,6 +133,7 @@ pub fn deployBakedBundle(
         compile_ctx,
         inputs,
         "",
+        null, // baked bundles: a compile failure here is OUR bug, not an author's
     );
     defer allocator.free(compiled);
 

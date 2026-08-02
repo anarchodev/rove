@@ -105,7 +105,7 @@ def main() -> int:
 
         print("step 1: provision + deploy")
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         c.deploy_handlers(TENANT, {"index.mjs": HANDLER_SRC})
         ready = c.wait_for_handler(TENANT, "/", want_body="ready")
         check("deployment loaded", ready.status == 200, f"got {ready.status} {ready.body!r}")

@@ -158,6 +158,17 @@ pub const DeployThread = struct {
         /// module's baked identity + runtime resolution base). 64-hex,
         /// validated at the submit door. Owned.
         pkg_hash: []u8 = &.{},
+        /// STAGE, don't link: content-address each input's source and return
+        /// its hash without compiling. The first half of a deploy — a file
+        /// uploaded on its own cannot be compiled, because compilation
+        /// resolves imports eagerly and its siblings may not have arrived yet
+        /// (#344). The bundle compiles later, in one batch, at cut.
+        stage_only: bool = false,
+        /// Parallel to `inputs`: the source's content hash when the caller
+        /// sent a hash instead of bytes (the cut-time compile of an
+        /// already-staged bundle). Empty string ⇒ that input carries its
+        /// bytes inline. Each entry owned; the slice too.
+        source_hashes: [][]u8 = &.{},
     };
 
     pub fn init(
@@ -312,6 +323,53 @@ pub const DeployThread = struct {
             }
         }
 
+        var file_be = blob_mod.BlobBackend.openPerTenant(a, self.blob_cfg, job.tenant_id, "file-blobs") catch |err| {
+            std.log.warn("deploy thread: open file-blobs for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
+            return fail(self, router, job, 502, "blob backend open failed");
+        };
+        defer file_be.deinit();
+
+        // Stage-only: content-address and stop. No compiler is involved,
+        // deliberately — a file uploaded on its own may import a sibling that
+        // has not arrived yet, and compiling it here would fail on a bundle
+        // that is merely incomplete rather than wrong (#344).
+        if (job.stage_only) {
+            const staged = files_mod.stageSources(a, file_be.blobStore(), job.inputs) catch |err| {
+                std.log.warn("deploy thread: stage scope={s} failed: {s}", .{ job.tenant_id, @errorName(err) });
+                const status: u16, const msg: []const u8 = switch (err) {
+                    error.InvalidManifest => .{ 400, "invalid input (duplicate paths or too many entries)" },
+                    error.InvalidPath => .{ 400, "invalid path" },
+                    error.Blob => .{ 502, "blob storage error" },
+                    else => .{ 500, "stage failed" },
+                };
+                return fail(self, router, job, status, msg);
+            };
+            defer a.free(staged);
+            const ctx_json = buildStagedJson(a, staged, job.app_ctx) catch
+                return fail(self, router, job, 500, "out of memory");
+            routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, 200, true, ctx_json);
+            return;
+        }
+
+        // Sources sent by HASH (the cut-time compile of an already-staged
+        // bundle) are read back here rather than re-uploaded by the deploy
+        // app: the bytes are already in this tenant's blobs, and routing them
+        // back through JS is what the per-file split existed to avoid.
+        // Ownership stays with the job: the fetched buffer REPLACES the
+        // input's (empty) bytes, so `freeJob` releases it exactly once.
+        if (job.source_hashes.len != 0) {
+            const bs = file_be.blobStore();
+            for (job.source_hashes, 0..) |h, i| {
+                if (h.len == 0) continue; // bytes came inline
+                const bytes = bs.get(h, a) catch {
+                    std.log.warn("deploy thread: staged source {s} for {s} missing", .{ h, job.inputs[i].path });
+                    return fail(self, router, job, 400, "staged source not found — re-upload the file");
+                };
+                a.free(job.inputs[i].bytes);
+                job.inputs[i].bytes = bytes;
+            }
+        }
+
         const rt = rt_ptr orelse return fail(self, router, job, 500, "compiler unavailable");
         // Fresh context per job — hermetic module table (see threadMain).
         var jctx = rt.newContext() catch |err| {
@@ -319,12 +377,6 @@ pub const DeployThread = struct {
             return fail(self, router, job, 500, "compiler unavailable");
         };
         defer jctx.deinit();
-
-        var file_be = blob_mod.BlobBackend.openPerTenant(a, self.blob_cfg, job.tenant_id, "file-blobs") catch |err| {
-            std.log.warn("deploy thread: open file-blobs for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
-            return fail(self, router, job, 502, "blob backend open failed");
-        };
-        defer file_be.deinit();
 
         // PM P1: stage the job's resolution context BEFORE compiling.
         // quickjs resolves + loads every import at compile (the deploy's
@@ -387,16 +439,6 @@ pub const DeployThread = struct {
             }
         }
 
-        // Install the module loader for this job's compile calls, and
-        // clear it before `lctx` (stack) goes out of scope.
-        var lctx = module_execution.module_loader.Ctx{
-            .allocator = a,
-            .bytecodes = &pkg_bc,
-            .resolver = if (resolver) |*r| r else null,
-        };
-        qjs.c.JS_SetModuleLoaderFunc(rt.raw, module_execution.module_loader.normalize, module_execution.module_loader.load, &lctx);
-        defer qjs.c.JS_SetModuleLoaderFunc(rt.raw, null, null, null);
-
         // A package batch compiles each file under its package-virtual
         // name — the module's baked identity + the base its own imports
         // (re-)resolve against, at compile and at every runtime load.
@@ -407,7 +449,45 @@ pub const DeployThread = struct {
         else
             "";
 
-        const compiled = files_mod.compileAndStage(a, file_be.blobStore(), compileThunk, &jctx, job.inputs, virtual_dir) catch |err| {
+        // The batch's own files, by the name an import of them resolves to.
+        // A handler importing a sibling handler (`./lib.mjs` → `lib.mjs`) has
+        // no bytecode yet — nothing in this bundle does — so the loader
+        // compiles it from source. Without this the import is unresolvable and
+        // the deploy fails for code the runtime would load fine (#344). App
+        // files keep their bundle paths; a package batch keys them under its
+        // `/pkg/<hash>/` virtual dir, the same names its own imports resolve
+        // to. Borrows `job.inputs`; nothing is copied.
+        var app_srcs: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer {
+            var it = app_srcs.iterator();
+            while (it.next()) |e| a.free(e.key_ptr.*);
+            app_srcs.deinit(a);
+        }
+        for (job.inputs) |in| {
+            const key = if (virtual_dir.len != 0)
+                std.fmt.allocPrint(a, "{s}{s}", .{ virtual_dir, in.path }) catch
+                    return fail(self, router, job, 500, "out of memory")
+            else
+                a.dupe(u8, in.path) catch return fail(self, router, job, 500, "out of memory");
+            app_srcs.put(a, key, in.bytes) catch {
+                a.free(key);
+                return fail(self, router, job, 500, "out of memory");
+            };
+        }
+
+        // Install the module loader for this job's compile calls, and
+        // clear it before `lctx` (stack) goes out of scope.
+        var lctx = module_execution.module_loader.Ctx{
+            .allocator = a,
+            .bytecodes = &pkg_bc,
+            .resolver = if (resolver) |*r| r else null,
+            .sources = &app_srcs,
+        };
+        qjs.c.JS_SetModuleLoaderFunc(rt.raw, module_execution.module_loader.normalize, module_execution.module_loader.load, &lctx);
+        defer qjs.c.JS_SetModuleLoaderFunc(rt.raw, null, null, null);
+
+        var failed_path: []const u8 = "";
+        const compiled = files_mod.compileAndStage(a, file_be.blobStore(), compileThunk, &jctx, job.inputs, virtual_dir, &failed_path) catch |err| {
             std.log.warn("deploy thread: compile-batch scope={s} (compile {d}) failed: {s}", .{ job.tenant_id, job.compile_id, @errorName(err) });
             // Author feedback (PM P2): a CompileFailed leaves the quickjs
             // exception pending on the job context — its message names the
@@ -418,7 +498,14 @@ pub const DeployThread = struct {
                 if (jctx.takeExceptionMessage(a)) |m| {
                     defer a.free(m);
                     if (m.len != 0) {
-                        const detail = std.fmt.allocPrint(a, "compile failed: {s}", .{m}) catch
+                        // Name the FILE as well as the problem: the compiler
+                        // reports the missing module or the syntax error, but
+                        // a bundle compiles as a batch, so without the
+                        // importer's path the author is left searching.
+                        const detail = (if (failed_path.len != 0)
+                            std.fmt.allocPrint(a, "compile failed in {s}: {s}", .{ failed_path, m })
+                        else
+                            std.fmt.allocPrint(a, "compile failed: {s}", .{m})) catch
                             return fail(self, router, job, 400, "compile failed");
                         defer a.free(detail);
                         return fail(self, router, job, 400, detail);
@@ -460,6 +547,25 @@ fn buildResultsJson(allocator: std.mem.Allocator, compiled: []const files_mod.Co
         try w.print("{{\"path\":\"{s}\",\"source_hex\":\"{s}\",\"bytecode_hex\":\"{s}\"}}", .{ cf.path, &cf.source_hex, &cf.bytecode_hex });
     }
     // Echo the threaded app ctx raw (it's already a JSON value; "null" when absent).
+    try w.writeAll("],\"app\":");
+    try w.writeAll(if (app_ctx.len == 0) "null" else app_ctx);
+    try w.writeAll("}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `{"ok":true,"results":[{"path","source_hex"},...],"app":<ctx>}` — the
+/// stage-only twin of `buildResultsJson`. No `bytecode_hex`: nothing was
+/// compiled, and emitting an empty or placeholder hash would look like a
+/// bytecode blob the manifest could point at.
+fn buildStagedJson(allocator: std.mem.Allocator, staged: []const files_mod.StagedFile, app_ctx: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"ok\":true,\"results\":[");
+    for (staged, 0..) |sf, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("{{\"path\":\"{s}\",\"source_hex\":\"{s}\"}}", .{ sf.path, &sf.source_hex });
+    }
     try w.writeAll("],\"app\":");
     try w.writeAll(if (app_ctx.len == 0) "null" else app_ctx);
     try w.writeAll("}");
@@ -593,6 +699,8 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     // compile_batch package context (PM P1).
     if (job.resolution_json.len != 0) allocator.free(job.resolution_json);
     if (job.pkg_hash.len != 0) allocator.free(job.pkg_hash);
+    for (job.source_hashes) |h| allocator.free(h);
+    if (job.source_hashes.len != 0) allocator.free(job.source_hashes);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

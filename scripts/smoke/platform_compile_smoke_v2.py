@@ -63,10 +63,10 @@ def main() -> int:
     with V2Cluster.spawn("platcompile", nodes=1) as c:
         print("step 1: provision scope tenant 'acme' + the admin tenant '__admin__'")
         r = c.provision("acme")
-        check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         r = c.provision("__admin__")
         # __admin__ may be auto-bootstrapped → 204 (created) or 409 (exists).
-        check("provision __admin__ → 204/409", r.status in (204, 409), f"got {r.status} {r.body!r}")
+        check("provision __admin__ → 200/409", r.status in (200, 409), f"got {r.status} {r.body!r}")
 
         print("step 2: deploy the compile-test handler to __admin__")
         try:

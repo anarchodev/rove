@@ -76,7 +76,7 @@ def main() -> int:
         c.spawn_log_server(poll_interval_ms=200)
 
         r = c.provision("acme")
-        check("provision acme → 204/409", r.status in (204, 409), f"got {r.status}")
+        check("provision acme → 200/409", r.status in (200, 409), f"got {r.status}")
         c.deploy_handlers("acme", FIXTURE)
         c.wait_for_handler("acme", "/?mode=a", want_body="same-body", timeout_s=30.0)
 

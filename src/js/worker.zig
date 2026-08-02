@@ -2756,7 +2756,15 @@ pub fn Worker(comptime opts: Options) type {
 
             var parsed = std.json.parseFromSlice(struct {
                 scope: []const u8,
-                files: []const struct { path: []const u8, source: []const u8 },
+                /// A file carries EITHER its `source` inline (staging, and the
+                /// package path) OR the `source_hash` of a source already
+                /// staged in the scope's blobs (the cut-time compile of a
+                /// finished bundle — the deploy app holds hashes, not bytes).
+                files: []const struct {
+                    path: []const u8,
+                    source: []const u8 = "",
+                    source_hash: []const u8 = "",
+                },
                 /// PM P1: pre-stringified `{packages, app_imports}` JSON
                 /// (the shim JSON.stringify's it — manifest v2 section
                 /// shapes). Empty → package-less compile.
@@ -2764,8 +2772,14 @@ pub fn Worker(comptime opts: Options) type {
                 /// PM P1: non-empty → compile the batch as PACKAGE files
                 /// under `/pkg/<pkg_hash>/…` virtual names.
                 pkg_hash: []const u8 = "",
+                /// Content-address the sources and return their hashes
+                /// WITHOUT compiling (`platform.stage`). Compilation resolves
+                /// imports eagerly, so a lone file whose siblings have not
+                /// been uploaded yet cannot be compiled — it is staged now and
+                /// the bundle is compiled at cut (#344).
+                stage: bool = false,
             }, a, pf.body, .{ .ignore_unknown_fields = true }) catch
-                return fail(router, a, &pf, 400, "expected {scope, files:[{path,source}]}");
+                return fail(router, a, &pf, 400, "expected {scope, files:[{path, source|source_hash}]}");
             defer parsed.deinit();
             const p = parsed.value;
             if (p.scope.len == 0) return fail(router, a, &pf, 400, "scope required");
@@ -2780,9 +2794,29 @@ pub fn Worker(comptime opts: Options) type {
                 }
             }
 
-            // Build owned DeployInput[] (all handlers).
+            // A hash instead of a source is only meaningful for a compile:
+            // staging is what PRODUCES the hash, so a stage call carrying one
+            // has nothing to store.
+            for (p.files) |f| {
+                if (f.source_hash.len == 0) continue;
+                if (p.stage) return fail(router, a, &pf, 400, "stage takes source, not source_hash");
+                if (f.source_hash.len != files_mod.HASH_HEX_LEN)
+                    return fail(router, a, &pf, 400, "source_hash must be 64 hex chars");
+                for (f.source_hash) |ch| {
+                    const hex_ok = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+                    if (!hex_ok) return fail(router, a, &pf, 400, "source_hash must be 64 hex chars");
+                }
+            }
+
+            // Build owned DeployInput[] (all handlers) + the parallel hashes.
+            // An input sent by hash gets empty bytes here; the deploy thread
+            // fills them from the scope's blobs, where it can block on S3.
             const inputs = a.alloc(files_mod.DeployInput, p.files.len) catch
                 return fail(router, a, &pf, 500, "out of memory");
+            const hashes = a.alloc([]u8, p.files.len) catch {
+                a.free(inputs);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
             var built: usize = 0;
             const inputs_ok = blk: {
                 for (p.files) |f| {
@@ -2791,22 +2825,30 @@ pub fn Worker(comptime opts: Options) type {
                         a.free(path_owned);
                         break :blk false;
                     };
+                    const hash_owned = a.dupe(u8, f.source_hash) catch {
+                        a.free(path_owned);
+                        a.free(src_owned);
+                        break :blk false;
+                    };
                     inputs[built] = .{ .path = path_owned, .kind = .handler, .content_type = "", .bytes = src_owned };
+                    hashes[built] = hash_owned;
                     built += 1;
                 }
                 break :blk true;
             };
             const freeInputs = struct {
-                fn f(alloc: std.mem.Allocator, ins: []files_mod.DeployInput, n: usize) void {
+                fn f(alloc: std.mem.Allocator, ins: []files_mod.DeployInput, hs: [][]u8, n: usize) void {
                     for (ins[0..n]) |*in| {
                         alloc.free(in.path);
                         alloc.free(in.bytes);
                     }
+                    for (hs[0..n]) |h| alloc.free(h);
                     alloc.free(ins);
+                    alloc.free(hs);
                 }
             }.f;
             if (!inputs_ok) {
-                freeInputs(a, inputs, built);
+                freeInputs(a, inputs, hashes, built);
                 return fail(router, a, &pf, 500, "out of memory");
             }
 
@@ -2814,25 +2856,25 @@ pub fn Worker(comptime opts: Options) type {
             // id + resume export to route the completion back to the held
             // admin chain). On any dupe failure, free everything.
             const scope_owned = a.dupe(u8, p.scope) catch {
-                freeInputs(a, inputs, built);
+                freeInputs(a, inputs, hashes, built);
                 return fail(router, a, &pf, 500, "out of memory");
             };
             const chain_owned = a.dupe(u8, pf.tenant_id) catch {
                 a.free(scope_owned);
-                freeInputs(a, inputs, built);
+                freeInputs(a, inputs, hashes, built);
                 return fail(router, a, &pf, 500, "out of memory");
             };
             const fid_owned = a.dupe(u8, pf.id) catch {
                 a.free(scope_owned);
                 a.free(chain_owned);
-                freeInputs(a, inputs, built);
+                freeInputs(a, inputs, hashes, built);
                 return fail(router, a, &pf, 500, "out of memory");
             };
             const name_owned: []u8 = if (pf.name.len != 0) (a.dupe(u8, pf.name) catch {
                 a.free(scope_owned);
                 a.free(chain_owned);
                 a.free(fid_owned);
-                freeInputs(a, inputs, built);
+                freeInputs(a, inputs, hashes, built);
                 return fail(router, a, &pf, 500, "out of memory");
             }) else &.{};
             // Echo the on.fetch issue-time ctx back in the completion (under
@@ -2844,7 +2886,7 @@ pub fn Worker(comptime opts: Options) type {
                     a.free(chain_owned);
                     a.free(fid_owned);
                     if (name_owned.len != 0) a.free(name_owned);
-                    freeInputs(a, inputs, built);
+                    freeInputs(a, inputs, hashes, built);
                     return fail(router, a, &pf, 500, "out of memory");
                 })
             else
@@ -2856,7 +2898,7 @@ pub fn Worker(comptime opts: Options) type {
                     a.free(fid_owned);
                     if (name_owned.len != 0) a.free(name_owned);
                     if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
-                    freeInputs(a, inputs, built);
+                    freeInputs(a, inputs, hashes, built);
                     return fail(router, a, &pf, 500, "out of memory");
                 })
             else
@@ -2869,7 +2911,7 @@ pub fn Worker(comptime opts: Options) type {
                     if (name_owned.len != 0) a.free(name_owned);
                     if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
                     if (resolution_owned.len != 0) a.free(resolution_owned);
-                    freeInputs(a, inputs, built);
+                    freeInputs(a, inputs, hashes, built);
                     return fail(router, a, &pf, 500, "out of memory");
                 })
             else
@@ -2887,6 +2929,8 @@ pub fn Worker(comptime opts: Options) type {
                 .app_ctx = app_ctx_owned,
                 .resolution_json = resolution_owned,
                 .pkg_hash = pkg_hash_owned,
+                .stage_only = p.stage,
+                .source_hashes = hashes,
             }) catch {
                 a.free(scope_owned);
                 a.free(chain_owned);
@@ -2895,7 +2939,7 @@ pub fn Worker(comptime opts: Options) type {
                 if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
                 if (resolution_owned.len != 0) a.free(resolution_owned);
                 if (pkg_hash_owned.len != 0) a.free(pkg_hash_owned);
-                freeInputs(a, inputs, built);
+                freeInputs(a, inputs, hashes, built);
                 return fail(router, a, &pf, 503, "deploy queue unavailable");
             };
         }

@@ -76,7 +76,7 @@ def main() -> int:
 
     with V2Cluster.spawn("heldwakes", nodes=1) as c:
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             dep_id = c.deploy_handlers("acme", {
                 "index.mjs": rpc_wrap(READY_SRC),

@@ -291,7 +291,7 @@ def main() -> int:
     with V2Cluster.spawn("agent", nodes=1) as c:
         print("step 1: provision + deploy reference handler")
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers(TENANT, {"index.mjs": READY_SRC,
                                        "agent/index.mjs": AGENT_SRC})

@@ -114,7 +114,7 @@ def main() -> int:
             return st
 
         print("step 1: provision acme [1,2,3] + deploy + seed")
-        check("provision → 204", c.provision("acme").status == 204)
+        check("provision → 200", c.provision("acme").status == 200)
         lead0 = c.leader_node("acme")
         if lead0 is None:
             check("leader present", False); return 1
