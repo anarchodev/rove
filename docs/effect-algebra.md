@@ -91,9 +91,14 @@ is *allowed* to grow.
 > enter a handler except through a recorded Msg or a Model snapshot read.
 
 This is the engine-side half of determinism. arenajs handles
-within-activation; L3 handles between. Tape volume is bounded by per-tenant
-retention, not a per-chain cap (`decisions.md` §3.6; the reclamation engine is
-the retention/GC design, issue #91) — recorded, not recorded *forever*.
+within-activation; L3 handles between. Tape volume is bounded on the
+per-tenant retention axis, not by a per-chain cap (`decisions.md` §3.6) —
+the intent is recorded, not recorded *forever*. Note the bound is not yet
+enforced: `retention_days` clamps the read window, and nothing reclaims the
+bytes. The reclamation engine is the retention/GC design (issue #91), and
+until it ships this axis is a statement about where the bound belongs, not
+one the engine applies. Customer-facing docs must not describe retention as
+deletion.
 
 The inbound request surface satisfies L3 by **read-recording** (the
 `request_reads` tape channel; `decisions.md` §4): header names are
