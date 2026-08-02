@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -73,7 +74,19 @@ def main() -> int:
 
         # Write a secret as the FIRST tenant. If a later tenant with the same
         # name can read this, deprovision leaked one customer's data to another.
-        c.admin_kv_put(TENANT, "secret", "alice-private-data")
+        # The write is leader-gated (a follower 503s) and the leader for a
+        # freshly-born group is whichever node won its election, so try each
+        # node until one accepts rather than assuming node 0.
+        put_ok = False
+        for _ in range(20):
+            for n in range(len(c.node_ports)):
+                if c.admin_kv_put(TENANT, "secret", "alice-private-data", node=n).status == 204:
+                    put_ok = True
+                    break
+            if put_ok:
+                break
+            time.sleep(0.3)
+        check("the first tenant's secret was written", put_ok, "no node accepted the write")
         rr = _curl(f"{cp_url.replace(str(c.cp_port), str(c.node_ports[0]))}"
                    f"/_system/v2-kv?tenant={TENANT}&key=secret", method="GET",
                    headers={"X-Rewind-Move-Secret": MOVE_SECRET})
