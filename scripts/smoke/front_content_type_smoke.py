@@ -2,9 +2,9 @@
 """V2 cutover gate: the front door relays the backend's response headers
 (content-type et al.) — not just status + body.
 
-  rewind-cp :18305   (directory)
-    └─ cluster-1 → rewind :18301   (single node)
-  rewind-front :18300
+  rewind-cp    (directory)
+    └─ cluster-1 → rewind    (single node)
+  rewind-front
 
 The DP's `/_system/v2-kv` GET responds `content-type: text/plain`
 (`v2_move.zig`). Before the passthrough fix the front dropped all response

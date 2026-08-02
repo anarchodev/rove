@@ -7,9 +7,9 @@ that receives a request for a tenant it does NOT own forwards it to the owner
 (discovered via the control plane's `/_cp/route`), instead of 404ing — so a
 stale public route (Cloudflare) costs an extra hop, never a failure.
 
-    CP (rewind-cp)    :19010   — owns host→tenant→cluster (the /_cp/route lookup)
-    cluster-A rewind  :19011   — OWNS custtenant   (admin domain a.localhost)
-    cluster-B rewind  :19012   — does NOT have it  (admin domain b.localhost)
+    CP (rewind-cp)       — owns host→tenant→cluster (the /_cp/route lookup)
+    cluster-A rewind     — OWNS custtenant   (admin domain a.localhost)
+    cluster-B rewind     — does NOT have it  (admin domain b.localhost)
 
 No customer deploy needed: each cluster's "no tenant for host" 404 body names
 its OWN admin_api_domain, so a request that reaches cluster-A comes back

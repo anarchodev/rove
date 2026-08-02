@@ -6,9 +6,9 @@ Stands up TWO single-node `rewind` clusters + one `rewind-front` front
 door and proves the front door routes each tenant's request to the cluster
 that owns it:
 
-    front door :18090
-      ├─ Host c1.localhost → tenant c1tenant → cluster-1 → rewind :18091
-      └─ Host c2.localhost → tenant c2tenant → cluster-2 → rewind :18092
+    front door
+      ├─ Host c1.localhost → tenant c1tenant → cluster-1 → rewind
+      └─ Host c2.localhost → tenant c2tenant → cluster-2 → rewind
 
 Routing proof without provisioning customer tenants: each backend runs
 with a DISTINCT admin domain (`REWIND_ADMIN_DOMAIN`) + root token. The

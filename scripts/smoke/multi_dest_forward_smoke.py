@@ -15,10 +15,10 @@ dual-write walks it, re-aiming past 421s (non-leader dest nodes). This proves:
      still acks 204 (the re-targeting this slice exists for).
 
   topology:
-    rewind-cp :19515
-      ├─ cluster-1 → rewind :19510                 (single-node source)
-      └─ cluster-2 → rewind :19511/12/13           (3-node dest)
-                       raft peers :19521/22/23
+    rewind-cp
+      ├─ cluster-1 → rewind                  (single-node source)
+      └─ cluster-2 → rewind /12/13           (3-node dest)
+                       raft peers /22/23
 
 Run S3-first:  `set -a; . ./.env; set +a; python3 scripts/smoke/multi_dest_forward_smoke.py`
 Build first:   `zig build rewind-worker && zig build rewind-cp`

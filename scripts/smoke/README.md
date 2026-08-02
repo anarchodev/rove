@@ -13,11 +13,18 @@ zig build rewind-worker rewind-cp rewind-front rewind-logs rewind-ops
 set -a; . ./.env; set +a          # S3 credentials — V2 has no fs blob backend
 export REWIND_APPS_DIR=~/src/rewind-apps    # only for smokes that deploy first-party apps
 
+scripts/smoke/run_all.py --jobs 8              # the whole suite, parallel
 scripts/smoke/run_all.py                       # the whole suite, serially
 scripts/smoke/run_all.py --filter deploy       # substring match on the name
-scripts/smoke/run_all.py --list                # what would run
+scripts/smoke/run_all.py --list                # what would run ([serial] = tail)
 python3 scripts/smoke/ctl_smoke_v2.py          # one smoke directly
 ```
+
+`--jobs N` runs a longest-first pool of N concurrent smokes, then a small
+SERIAL tail (election soaks and other members whose timing assertions
+co-tenant CPU load can skew) one at a time on a quiet box. The runner leases
+port slots through the same locks a standalone smoke takes, so a hand-run
+smoke beside a running suite still gets its own range.
 
 Ports come from `smoke_ports.py`, the suite's one port authority: every smoke
 process owns a disjoint slot (`flock`ed standalone; assigned via

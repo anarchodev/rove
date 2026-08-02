@@ -14,9 +14,9 @@ flip→evict window). The exit criteria:
     eventual owner via one of: the snapshot (pre-forward-begin), a synchronous
     forward (during the overlap), or a direct write (post-flip).
 
-    rewind-cp  :19030   (move-live orchestrator + CP directory)
-    cluster-A  :19031   (source)
-    cluster-B  :19032   (destination)
+    rewind-cp     (move-live orchestrator + CP directory)
+    cluster-A     (source)
+    cluster-B     (destination)
 
 Requires S3 env — `set -a; . ./.env; set +a` first.
 Build:  `zig build rewind-worker && zig build rewind-cp`

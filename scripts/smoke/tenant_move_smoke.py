@@ -7,10 +7,10 @@ Moves a live tenant from one single-node cluster to another (zero-downtime —
 the source serves throughout) and proves the data survives + the new cluster
 serves it:
 
-    rewind-cp :18093    (move orchestrator + routing directory)
-    front door :18090   (stateless proxy; resolves placement from the CP)
-      ├─ cluster-1 → rewind :18091   (movetenant starts here)
-      └─ cluster-2 → rewind :18092   (movetenant ends here)
+    rewind-cp     (move orchestrator + routing directory)
+    front door    (stateless proxy; resolves placement from the CP)
+      ├─ cluster-1 → rewind    (movetenant starts here)
+      └─ cluster-2 → rewind    (movetenant ends here)
 
     write → move → read-back
 

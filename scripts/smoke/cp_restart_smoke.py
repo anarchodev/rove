@@ -9,10 +9,10 @@ the recovered front door replays the store and keeps routing to the new
 owner, rather than re-seeding back to the static REWIND_PLACEMENT.
 
   topology:
-    rewind-cp  :18093   (move orchestrator + DURABLE routing directory; restarted)
-    front door :18090   (stateless proxy; resolves placement from the CP)
-      ├─ cluster-1 → rewind :18091   (movetenant starts here)
-      └─ cluster-2 → rewind :18092   (movetenant ends here)
+    rewind-cp     (move orchestrator + DURABLE routing directory; restarted)
+    front door    (stateless proxy; resolves placement from the CP)
+      ├─ cluster-1 → rewind    (movetenant starts here)
+      └─ cluster-2 → rewind    (movetenant ends here)
 
   A. seed movetenant on cluster-1; front routes Host=mover → c1.
   B. POST CP /_control/move {tenant, dest:cluster-2} → 200 (directory

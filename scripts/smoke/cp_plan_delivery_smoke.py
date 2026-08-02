@@ -19,9 +19,9 @@ makes delivery observable end to end.
 Topology (single-node clusters; no front door needed — we talk to the workers'
 move surface directly):
 
-    rewind-cp :18213    (plan control + move orchestrator + directory)
-      ├─ cluster-1 → rewind :18211   (planco starts here)
-      └─ cluster-2 → rewind :18212   (planco moves here)
+    rewind-cp     (plan control + move orchestrator + directory)
+      ├─ cluster-1 → rewind    (planco starts here)
+      └─ cluster-2 → rewind    (planco moves here)
 
 Proof legs:
   A. seed planco on c1 (creates the instance/slot); GET v2-plan → FREE table

@@ -4,11 +4,11 @@
 
 Proves multi-node HA + the move fan-out end to end:
 
-    rewind-cp  :18105   (move orchestrator + routing directory)
-    front door :18100   (stateless proxy; leader-aware forward to a cluster)
-      ├─ cluster-1 → rewind :18101            (single-node source)
-      └─ cluster-2 → rewind :18102/03/04      (3-node HA destination)
-                       raft peers :18112/13/14
+    rewind-cp     (move orchestrator + routing directory)
+    front door    (stateless proxy; leader-aware forward to a cluster)
+      ├─ cluster-1 → rewind             (single-node source)
+      └─ cluster-2 → rewind ×3          (3-node HA destination)
+                       raft peers /13/14
 
 Legs:
   A.  seed movetenant on the single-node cluster-1, read it back.

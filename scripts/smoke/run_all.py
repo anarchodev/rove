@@ -6,11 +6,13 @@ accident in a single session (rove#355), each broken for weeks by a change
 elsewhere that nobody connected to them. A suite nobody runs is not coverage,
 it is the appearance of coverage — which is worse, because it is counted.
 
-Smokes bind fixed ports and spawn real clusters, so they run SERIALLY. The
-whole suite takes a while; that is the price of end-to-end tests against real
-binaries, and it is why this prints progress per smoke rather than going quiet.
+Smokes spawn real clusters but own disjoint port slots (smoke_ports.py), so
+they can run CONCURRENTLY: `--jobs N` runs a longest-first pool, with a small
+SERIAL set of timing-sensitive members (election soaks) run alone afterwards.
+Progress prints per smoke either way.
 
     scripts/smoke/run_all.py                  # everything
+    scripts/smoke/run_all.py --jobs 8         # parallel pool + serial tail
     scripts/smoke/run_all.py --filter deploy  # substring match
     scripts/smoke/run_all.py --list           # just names
     scripts/smoke/run_all.py --baseline b.json  # compare against a prior run
@@ -28,16 +30,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
+sys.path.insert(0, str(HERE))
+from smoke_ports import acquire_slots  # noqa: E402
+
 # Not smokes: shared harness modules, and helpers imported by them.
-NOT_SMOKES = {"smoke_lib.py", "smoke_lib_v2.py", "v2_topology.py", "run_all.py"}
+NOT_SMOKES = {"smoke_lib.py", "smoke_lib_v2.py", "v2_topology.py", "run_all.py",
+              "smoke_ports.py"}
 
 # Scripts that are deliberately not part of the suite. Each needs a REASON —
 # "it fails" is not one; that is what the report is for.
@@ -59,12 +67,29 @@ EXCLUDED = {
 #                                call it a regression on a run where it flips.
 #                                Check it against rove#362 before believing it.
 
+# Members that run ALONE, after the parallel pool drains. These assert timing
+# that co-tenant CPU load can skew — an election-timeout soak or a
+# hibernation-window race read under load produces flakes that look exactly
+# like product bugs, and a flaky red trains people to ignore the report.
+# Membership is empirical: a member that proves load-tolerant should move to
+# the pool (the tail bounds the parallel suite's floor).
+SERIAL = {
+    "raft_soak_prod.py",        # 6 kill/wipe/heal rounds on election timing
+    "raft_soak_v2.py",          # same shape, shorter
+    "dispatch_gate_smoke_v2.py",  # rove#362: already intermittent serially —
+                                  # co-load noise would make the flip unreadable
+    "tls_large_body_smoke.py",  # rove#361: red via ITS OWN download
+                                # concurrency — keep the repro conditions fixed
+}
+
 # Smokes that legitimately run longer than the default budget. Without an
 # entry here a slow-but-healthy smoke is reported HUNG, which reads as a
 # product hang and is the fastest way to teach people to distrust the report.
 TIMEOUTS = {
     "raft_soak_prod.py": 1800,      # 6 rounds of kill/wipe/heal by design
 }
+
+BASELINE_PATH = HERE / "smoke-baseline.json"
 
 
 def discover(filter_str: str | None) -> list[Path]:
@@ -78,10 +103,49 @@ def discover(filter_str: str | None) -> list[Path]:
     return out
 
 
+def baseline_seconds() -> dict[str, float]:
+    """Per-smoke durations from the checked-in baseline, for longest-first
+    scheduling. Unknown smokes get a middling default so they start early
+    enough not to straggle."""
+    try:
+        base = json.loads(BASELINE_PATH.read_text())
+        return {n: r.get("seconds", 60.0) for n, r in base.items()}
+    except Exception:
+        return {}
+
+
+def run_one(p: Path, budget: int, log_dir: Path, slot: int | None) -> dict:
+    log_path = log_dir / f"{p.stem}.log"
+    env = dict(os.environ)
+    if slot is not None:
+        env["SMOKE_PORT_SLOT"] = str(slot)
+    t0 = time.time()
+    with open(log_path, "w") as lf:
+        # Own process group, so a timeout can kill the smoke AND the
+        # cluster it spawned. Killing only the script leaves its nodes
+        # holding their ports for every later smoke in the same slot.
+        proc = subprocess.Popen([sys.executable, str(p)], stdout=lf,
+                                stderr=subprocess.STDOUT, env=env,
+                                start_new_session=True)
+        try:
+            rc = proc.wait(timeout=budget)
+            status = "pass" if rc == 0 else "fail"
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            rc, status = -1, "timeout"
+    return {"status": status, "rc": rc, "seconds": round(time.time() - t0, 1)}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--filter", default=None, help="substring match on the script name")
     ap.add_argument("--list", action="store_true", help="list what would run, then exit")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="concurrent smokes (SERIAL members always run alone)")
     ap.add_argument("--timeout", type=int, default=420,
                     help="per-smoke seconds (TIMEOUTS overrides it per smoke)")
     ap.add_argument("--logs", default=None, help="directory for per-smoke logs")
@@ -92,7 +156,7 @@ def main() -> int:
     smokes = discover(args.filter)
     if args.list:
         for p in smokes:
-            print(p.name)
+            print(p.name + ("  [serial]" if p.name in SERIAL else ""))
         print(f"\n{len(smokes)} smoke(s); {len(EXCLUDED)} excluded")
         for name, why in EXCLUDED.items():
             print(f"  excluded: {name} — {why}")
@@ -102,11 +166,11 @@ def main() -> int:
         print("S3 env not set — `set -a; . ./.env; set +a` first", file=sys.stderr)
         return 2
 
-    # Preflight the binaries. Several smokes drive the h2 example servers, which
-    # the DEFAULT `zig build` install step produces — not the `rewind-*` steps.
-    # Without this the suite reports a pile of unrelated-looking failures whose
-    # real cause is one missing build, which is exactly the kind of noise that
-    # teaches people to stop reading the report.
+    # Preflight the binaries. Several smokes drive the h2/ws example servers,
+    # which the DEFAULT `zig build` install step produces — not the `rewind-*`
+    # steps. Without this the suite reports a pile of unrelated-looking
+    # failures whose real cause is one missing build, which is exactly the
+    # kind of noise that teaches people to stop reading the report.
     bin_dir = HERE.parent.parent / "zig-out" / "bin"
     needed = ["rewind-worker", "rewind-cp", "rewind-front", "rewind-logs",
               "rewind-ops", "h2-echo-server", "echo-server", "ws-echo"]
@@ -117,45 +181,83 @@ def main() -> int:
               "rewind-front rewind-logs rewind-ops` first", file=sys.stderr)
         return 2
 
+    jobs = max(1, args.jobs)
     log_dir = Path(args.logs) if args.logs else Path(f"/tmp/smoke-run-{os.getpid()}")
     log_dir.mkdir(parents=True, exist_ok=True)
-    print(f"running {len(smokes)} smoke(s) serially — logs in {log_dir}\n", flush=True)
+
+    pool_members = [p for p in smokes if p.name not in SERIAL]
+    serial_members = [p for p in smokes if p.name in SERIAL]
+    if jobs > 1:
+        # Longest-first: the pool's makespan is bounded by its longest member,
+        # so start the long ones before the sub-20s crowd fills the slots.
+        secs = baseline_seconds()
+        pool_members.sort(key=lambda p: -secs.get(p.name, 60.0))
+
+    print(f"running {len(smokes)} smoke(s) with --jobs {jobs}"
+          f"{f' (+{len(serial_members)} serial tail)' if jobs > 1 and serial_members else ''}"
+          f" — logs in {log_dir}\n", flush=True)
 
     results: dict[str, dict] = {}
     started = time.time()
-    for i, p in enumerate(smokes, 1):
-        log_path = log_dir / f"{p.stem}.log"
-        budget = TIMEOUTS.get(p.name, args.timeout)
-        t0 = time.time()
-        with open(log_path, "w") as lf:
-            # Own process group, so a timeout can kill the smoke AND the
-            # cluster it spawned. Killing only the script leaves its nodes
-            # holding the fixed ports, and every later smoke fails on
-            # EADDRINUSE — one hang reported as a dozen.
-            proc = subprocess.Popen([sys.executable, str(p)], stdout=lf,
-                                    stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-            try:
-                rc = proc.wait(timeout=budget)
-                status = "pass" if rc == 0 else "fail"
-            except subprocess.TimeoutExpired:
+    done_count = 0
+    print_lock = threading.Lock()
+
+    def report(p: Path, res: dict) -> None:
+        nonlocal done_count
+        with print_lock:
+            done_count += 1
+            results[p.name] = res
+            mark = {"pass": "ok  ", "fail": "FAIL", "timeout": "HUNG"}[res["status"]]
+            print(f"  [{done_count:3d}/{len(smokes)}] {mark} {p.name}  "
+                  f"({res['seconds']:.0f}s)", flush=True)
+            if res["status"] != "pass":
+                # The first failing assertion is usually the whole story; show
+                # a little of it inline so the report is readable without
+                # opening logs.
+                log_path = log_dir / f"{p.stem}.log"
+                tail = [ln for ln in log_path.read_text(errors="replace").splitlines()
+                        if "FAIL" in ln or "Error" in ln or "error:" in ln]
+                for ln in tail[:3]:
+                    print(f"         | {ln.strip()[:150]}", flush=True)
+
+    if jobs == 1:
+        for p in pool_members + serial_members:
+            report(p, run_one(p, TIMEOUTS.get(p.name, args.timeout), log_dir, None))
+    else:
+        # The runner leases the slots through the same flocks the standalone
+        # path uses, so a hand-run smoke beside the suite still partitions.
+        slots: "queue.Queue[int]" = queue.Queue()
+        for s in acquire_slots(jobs):
+            slots.put(s)
+
+        work: "queue.Queue[Path]" = queue.Queue()
+        for p in pool_members:
+            work.put(p)
+
+        def worker() -> None:
+            while True:
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
-                rc, status = -1, "timeout"
-        dur = time.time() - t0
-        results[p.name] = {"status": status, "rc": rc, "seconds": round(dur, 1)}
-        mark = {"pass": "ok  ", "fail": "FAIL", "timeout": "HUNG"}[status]
-        print(f"  [{i:3d}/{len(smokes)}] {mark} {p.name}  ({dur:.0f}s)", flush=True)
-        if status != "pass":
-            # The first failing assertion is usually the whole story; show a
-            # little of it inline so the report is readable without opening logs.
-            tail = [ln for ln in log_path.read_text(errors="replace").splitlines()
-                    if "FAIL" in ln or "Error" in ln or "error:" in ln]
-            for ln in tail[:3]:
-                print(f"         | {ln.strip()[:150]}", flush=True)
+                    p = work.get_nowait()
+                except queue.Empty:
+                    return
+                slot = slots.get()
+                try:
+                    report(p, run_one(p, TIMEOUTS.get(p.name, args.timeout),
+                                      log_dir, slot))
+                finally:
+                    slots.put(slot)
+
+        threads = [threading.Thread(target=worker, daemon=True)
+                   for _ in range(jobs)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Serial tail: timing-sensitive members, alone on a quiet box.
+        for p in serial_members:
+            report(p, run_one(p, TIMEOUTS.get(p.name, args.timeout), log_dir,
+                              slots.get()))
 
     elapsed = time.time() - started
     passed = [n for n, r in results.items() if r["status"] == "pass"]

@@ -41,7 +41,7 @@ handlers (no `pkill -f` fragility). V2 smokes need S3 credentials in the
 environment first (`set -a; . ./.env; set +a`) — V2 has no fs blob backend.
 
 ```bash
-scripts/smoke/run_all.py                     # THE suite — serial, ~1h; --filter to narrow
+scripts/smoke/run_all.py --jobs 8            # THE suite — parallel pool + serial tail; --filter to narrow
 python3 scripts/smoke/rewind_smoke.py        # single-node rewind write path (propose → commit → 204)
 python3 scripts/smoke/ctl_smoke_v2.py        # provision → deploy → serve through the front door
 python3 scripts/smoke/three_node_smoke.py    # ⭐ multi-node HA: move onto a 3-node cluster, kill the leader
