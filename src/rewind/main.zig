@@ -266,7 +266,7 @@ fn workerMain(args: *WorkerCtx) !void {
         // previous leader had already handed out (rove#281). Pack the node id
         // in too. Refusing to start beats minting colliding ids: a collision is
         // a record that is indexed nowhere and can never be replayed.
-        .log_worker_id = blk: {
+        .minter_id = blk: {
             const node_id: u64 = if (std.posix.getenv("REWIND_NODE_ID")) |v|
                 std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t"), 10) catch {
                     std.debug.print("error: REWIND_NODE_ID is not a number\n", .{});
@@ -274,7 +274,7 @@ fn workerMain(args: *WorkerCtx) !void {
                 }
             else
                 1; // single-node: the only minter, so any stable identity works.
-            break :blk log_mod.RequestIdMinter.mintIdentity(node_id, args.worker_idx) catch {
+            break :blk log_mod.MinterId.init(node_id, args.worker_idx) catch {
                 std.debug.print(
                     "error: REWIND_NODE_ID={d} / worker index {d} do not fit a minter identity " ++
                         "(node 1-255, worker 0-255). Request ids would collide across minters.\n",

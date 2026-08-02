@@ -706,7 +706,7 @@ pub fn fireFetchEventActivation(
         // strictly async, durable_seq can't have advanced past
         // this seq before the executor lands the PUT).
         if (worker.node.blob_coord.coordinator) |coord| {
-            const wid = worker.coord_worker_id;
+            const wid = worker.coord_queue_id;
             const seq = coord.submit(wid, event.bytes) catch |err| blk: {
                 std.log.warn(
                     "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
@@ -718,7 +718,7 @@ pub fn fireFetchEventActivation(
                 worker.fetch_pending_durability.append(worker.allocator, .{
                     .event = event.*,
                     .worker_seq = s,
-                    .worker_id = wid,
+                    .queue_id = wid,
                     .tenant_id_view = p.dep.inst.id,
                 }) catch |err| {
                     std.log.warn(

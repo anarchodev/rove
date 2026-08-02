@@ -55,6 +55,7 @@
 //! customer's chain just stops.
 
 const std = @import("std");
+const blob_mod = @import("rove-blob");
 const blob_curl_multi = @import("rove-blob").curl_multi;
 const blob_sigv4 = @import("rove-blob").sigv4;
 const components_mod = @import("components.zig");
@@ -1193,7 +1194,7 @@ pub const FetchEngine = struct {
         // (`docs/architecture/routing-and-ingress.md`): bound-fetch chunk bytes
         // become durable via the process-global blob coordinator at
         // upstream rate, decoupled from the held chain's raft commit
-        // cadence. This stamps `coord_seq`/`coord_worker_id` on the
+        // cadence. This stamps `coord_seq`/`coord_queue_id` on the
         // event; the consumer reads inline `bytes`.
         self.submitBoundChunkToCoord(&event);
         self.node.router.enqueueFetchEventForTenant(tenant_id, event) catch |err| {
@@ -1220,16 +1221,16 @@ pub const FetchEngine = struct {
     /// not a bound chunk, the coordinator isn't up, the owner isn't
     /// registered yet, or the submit fails, the fields stay 0 and the
     /// consumer simply uses `bytes`. We submit under the owning
-    /// worker's id (== its coord queue id, == its `log_worker_id`) so
-    /// the consumer can later gate on `durableSeq(coord_worker_id)`;
-    /// that's the same owner the slim Msg routes to via
-    /// `bound_fetch_owners`.
+    /// worker's registered msg-inbox slot — the identity
+    /// `QueueId.fromInboxIdx` exists for, and the same owner the slim
+    /// Msg routes to via `bound_fetch_owners` — so the consumer can
+    /// later gate on `durableSeq(coord_queue_id)`.
     fn submitBoundChunkToCoord(self: *FetchEngine, ev: *UpstreamFetchEvent) void {
         if (!ev.bind) return;
         if (ev.bytes.len == 0) return;
         const coord = self.node.blob_coord.coordinator orelse return;
         const owner_idx = self.node.router.lookupBoundFetchOwner(ev.fetch_id) orelse return;
-        const wid = std.math.cast(u8, owner_idx) orelse return;
+        const wid = blob_mod.coordinator.QueueId.fromInboxIdx(owner_idx) orelse return;
         const seq = coord.submit(wid, ev.bytes) catch |err| {
             std.log.warn(
                 "rove-js chunk-spool: coord.submit fetch_id={s} seq={d} bytes={d}: {s}",
@@ -1238,7 +1239,7 @@ pub const FetchEngine = struct {
             return;
         };
         ev.coord_seq = seq;
-        ev.coord_worker_id = wid;
+        ev.coord_queue_id = wid;
         ev.coord_submitted = true;
     }
 };

@@ -17,7 +17,7 @@
 //! A FIFO with a K-deep RAM window. Entries within K of the
 //! head keep their inline `bytes`; entries pushed beyond K have their
 //! inline bytes evicted (freed) — the coordinator copy
-//! (`coord_worker_id`/`coord_seq`, submitted by the producer) is the
+//! (`coord_queue_id`/`coord_seq`, submitted by the producer) is the
 //! durable ground truth, and the consumer reads evicted
 //! bytes back via `coord.readBody` when the entry finally reaches the
 //! head. This bounds the spool's inline RAM at ~K chunks regardless
@@ -37,7 +37,7 @@ pub const SpoolEntry = struct {
     /// True once the inline `event.bytes` have been freed to honour
     /// the K-window (`event.bytes` is then `&.{}`). The bytes are
     /// re-read from the coordinator at dispatch via
-    /// `event.coord_worker_id` / `event.coord_seq`. Distinct from an
+    /// `event.coord_queue_id` / `event.coord_seq`. Distinct from an
     /// empty `bytes` slice, which is a legitimate value (e.g. the
     /// final-empty terminal event of a stream) and is never evicted.
     evicted: bool = false,

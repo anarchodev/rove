@@ -41,22 +41,26 @@ inherits the new value.
   protect a consumer that re-derives — the narrowing cast was three modules
   away.
 
-**Why the code permits it.** Every identity in the worker is a bare integer
+**Why the code permitted it.** Every identity in the worker was a bare integer
 (`u16`, `u8`, `usize`). `log_worker_id`, `msg_inbox_idx` and `coord_worker_id`
-are mutually assignable, so nothing distinguishes "this is a raft-partitioned
+were mutually assignable, so nothing distinguished "this is a raft-partitioned
 minter identity" from "this is an index into a queue array".
 
-**What would make it unlikely.**
+**The structural fix (landed, rove#363).**
 
-- Distinct wrapper types for identities that must never be interchanged — in
-  Zig, `const CoordQueueId = enum(u8) { _ };` and a `MinterIdentity` struct. A
-  cast between them then has to be written on purpose and is greppable.
-- One named source per identity, with an accessor rather than a field read, so
-  "where does this come from" has one answer. (The fix used this: the coord
-  queue id derives from `msg_inbox_idx` at registration — the same slot the
-  fetch engine already uses — so the two submit paths cannot drift.)
-- Treat "A == B today" comments as a smell, not documentation. If two values
-  must be equal, derive one from the other.
+- Distinct types for the two identities that collided:
+  `log.MinterId` (`enum(u16)`, constructed only by `MinterId.init`'s packed
+  node/worker rule) and `coordinator.QueueId` (`enum(u8)`, constructed only
+  from a registered msg-inbox slot via `QueueId.fromInboxIdx`). Every carrier
+  — the coordinator API, the fetch events, the durability parks — holds the
+  type, so a cast between identities has to be written as a greppable
+  `@enumFromInt` on purpose.
+- One named source per identity: the queue id derives from `msg_inbox_idx` at
+  registration — the same slot the fetch engine's owner lookup uses — so the
+  two submit paths cannot drift.
+- Still true, and worth keeping in review: treat "A == B today" comments as a
+  smell, not documentation. If two values must be equal, derive one from the
+  other.
 
 ---
 
@@ -324,7 +328,7 @@ Worth preserving through any refactor:
 - **Lints for invisible rules.** `test_reachability_lint.py`,
   `doc_pointer_lint.py`, `globals_lint.py`, `spdx_lint.py`. A rule that lives
   only in a reviewer's head is a rule that breaks.
-- **Refusing to start.** `mintIdentity` refuses an out-of-range identity;
+- **Refusing to start.** `MinterId.init` refuses an out-of-range identity;
   services refuse to start against an unmarked object store (rove#266). Both
   turn a silent wrong answer into an immediate stop. Their limit is class 1:
   they protect the producer, not a consumer that re-derives.

@@ -43,6 +43,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("raft-kv");
 const log_mod = @import("rove-log");
+const blob_mod = @import("rove-blob");
 const tape_mod = @import("rove-tape");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -2518,7 +2519,7 @@ pub fn dropSpool(worker: anytype, fetch_id: []const u8) void {
     // cancel/disconnect of a backed-up fetch doesn't leak its backlog
     // in coordinator RAM.
     for (entry.value.entries.items) |*e| {
-        if (e.event.coord_submitted) queueCoordRelease(worker, e.event.coord_worker_id, e.event.coord_seq);
+        if (e.event.coord_submitted) queueCoordRelease(worker, e.event.coord_queue_id, e.event.coord_seq);
     }
     entry.value.deinit(worker.allocator);
     worker.allocator.destroy(entry.value);
@@ -2651,7 +2652,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
                     dropSpool(worker, key);
                     return;
                 };
-                const wid = h.event.coord_worker_id;
+                const wid = h.event.coord_queue_id;
                 if (coord.durableSeq(wid) <= h.event.coord_seq) {
                     // Bytes not durable yet — defer this head.
                     return;
@@ -2665,7 +2666,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
                     // rest of the spool. P6: queue its coord copy for
                     // release (deferred — see queueCoordRelease).
                     var bad = sp.popHead();
-                    if (bad.coord_submitted) queueCoordRelease(worker, bad.coord_worker_id, bad.coord_seq);
+                    if (bad.coord_submitted) queueCoordRelease(worker, bad.coord_queue_id, bad.coord_seq);
                     components_mod.UpstreamFetchEvent.deinitItem(&bad, worker.allocator);
                     continue;
                 };
@@ -2691,7 +2692,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         // consumed (every bound chunk was submitted, inline
         // or evicted — releasing bounds coord RAM to the live backlog).
         const rel_submitted = ev.coord_submitted;
-        const rel_wid = ev.coord_worker_id;
+        const rel_wid = ev.coord_queue_id;
         const rel_seq = ev.coord_seq;
         if (ready_cont) {
             // A held WS chain reparks in place (no h2 response) — route its
@@ -2729,10 +2730,10 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
 /// chunk's coordinator release for retry. Deferred (not direct)
 /// because in-window chunks are consumed before their submit is
 /// durable; `drainSpools` retries `coord.release` until it succeeds.
-fn queueCoordRelease(worker: anytype, worker_id: u8, seq: u64) void {
+fn queueCoordRelease(worker: anytype, queue_id: blob_mod.coordinator.QueueId, seq: u64) void {
     // Once-to-queue guard (runtime-safety builds only): each consumed/
     // dropped chunk is released exactly once. Queueing the same
-    // (worker_id, seq) twice would make `drainCoordReleases` retry the
+    // (queue_id, seq) twice would make `drainCoordReleases` retry the
     // second copy forever — `coord.release` returns `false` for an
     // already-released seq by contract (indistinguishable from
     // not-yet-durable), so the duplicate never drains, growing
@@ -2740,13 +2741,13 @@ fn queueCoordRelease(worker: anytype, worker_id: u8, seq: u64) void {
     // the source rather than chasing the symptom downstream.
     if (std.debug.runtime_safety) {
         for (worker.spools.coord_pending_releases.items) |p| {
-            if (p.worker_id == worker_id and p.seq == seq) std.debug.panic(
-                "queueCoordRelease: double queue of worker={d} seq={d} (would retry forever)",
-                .{ worker_id, seq },
+            if (p.queue_id == queue_id and p.seq == seq) std.debug.panic(
+                "queueCoordRelease: double queue of queue={d} seq={d} (would retry forever)",
+                .{ queue_id.index(), seq },
             );
         }
     }
-    worker.spools.coord_pending_releases.append(worker.allocator, .{ .worker_id = worker_id, .seq = seq }) catch {
+    worker.spools.coord_pending_releases.append(worker.allocator, .{ .queue_id = queue_id, .seq = seq }) catch {
         // OOM: drop the deferred release. The coordinator batch leaks
         // until coord deinit — rare, bounded by this one chunk.
         std.log.warn("rove-js chunk-spool: coord_pending_releases append OOM; release dropped", .{});
@@ -2761,7 +2762,7 @@ fn drainCoordReleases(worker: anytype) void {
     var i: usize = 0;
     while (i < worker.spools.coord_pending_releases.items.len) {
         const p = worker.spools.coord_pending_releases.items[i];
-        if (coord.release(p.worker_id, p.seq)) {
+        if (coord.release(p.queue_id, p.seq)) {
             _ = worker.spools.coord_pending_releases.swapRemove(i); // freed — drop
         } else {
             i += 1; // not durable yet — retry next tick

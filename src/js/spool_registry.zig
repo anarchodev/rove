@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const rove = @import("rove");
+const blob_mod = @import("rove-blob");
 const chunk_spool_mod = @import("chunk_spool.zig");
 
 /// Default K, the per-fetch RAM window depth (chunks within K of a spool's
@@ -22,7 +23,7 @@ pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH: usize = 4;
 
 /// A deferred `coord.release(worker_id, seq)` retried by `drainSpools` until
 /// the coordinator's durableSeq advances past it.
-pub const CoordPendingRelease = struct { worker_id: u8, seq: u64 };
+pub const CoordPendingRelease = struct { queue_id: blob_mod.coordinator.QueueId, seq: u64 };
 
 pub const SpoolRegistry = struct {
     /// Bound-fetch registry: `fetch_id` → the held chain entity. Keys are

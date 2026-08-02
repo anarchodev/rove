@@ -2137,11 +2137,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // we park on the resulting seq, drain materializes
                     // the BodyRef once the seq is durable.
                     if (worker.node.blob_coord.coordinator) |coord| {
-                        const wid = worker.coord_worker_id;
+                        const wid = worker.coord_queue_id;
                         if (coord.submit(wid, body)) |seq| {
                             try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
                                 .worker_seq = seq,
-                                .worker_id = wid,
+                                .queue_id = wid,
                                 .status = .fresh,
                                 .tenant_id = scope_inst.id,
                             });
