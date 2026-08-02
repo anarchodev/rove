@@ -565,6 +565,13 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// node. A later 2xx then provably came from the leader (see
             /// `leaders`), so we record `nodes[node_idx]` as the leader.
             saw_421: bool = false,
+            /// Nodes already attempted for this flow, one bit per index.
+            /// Failover asks "which node have I NOT tried?" rather than
+            /// walking `node_idx + 1`: the re-aim can jump straight to the
+            /// leader the worker named, and a linear scan from there would
+            /// skip every node before it (and stop dead if the hint was the
+            /// last one). `MAX_CLUSTER_NODES` is 16, so a u32 covers it.
+            tried_mask: u32 = 0,
             attempt: u32 = 0,
             /// Pump entities issued but not yet seen terminal in
             /// `client_response_out` — the flow may not be freed while
@@ -1082,6 +1089,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             // fan-out, incl. attempts whose connect fails before a head is
             // submitted (those never bump `attempt`). See `Flow.nodes_tried`.
             flow.nodes_tried += 1;
+            if (flow.node_idx < 32) flow.tried_mask |= (@as(u32, 1) << @intCast(flow.node_idx));
             flow.sent = flow.body_base; // replay from the buffer start
             flow.up_closed = false;
             flow.up_sid = 0;
@@ -1165,19 +1173,36 @@ pub fn Proxy(comptime FrontH2: type) type {
             flow.pending_terminals += 1;
         }
 
+        /// The lowest-indexed node this flow has not attempted yet, or null
+        /// when every node has been tried. Failover and 421 re-aim both use
+        /// this so that jumping to a leader hint never strands the nodes
+        /// before it — the bug a `node_idx + 1` scan has once the hint moves
+        /// the cursor (rove#353).
+        fn nextUntried(flow: *const Flow) ?usize {
+            for (flow.nodes, 0..) |_, i| {
+                if (i >= 32) break;
+                if (flow.tried_mask & (@as(u32, 1) << @intCast(i)) == 0) return i;
+            }
+            return null;
+        }
+
         /// The current attempt failed before any response. Re-aim or
         /// give up.
         ///
-        /// `head_sent` says the request head was already handed to the
-        /// failed upstream. That makes the failure AMBIGUOUS for a
-        /// non-idempotent request: the worker may have dispatched the
-        /// handler (an `onHeaders` export activates on the head alone)
-        /// and committed before the connection died — a replay would
-        /// double-execute. Same discipline as the never-retried
-        /// post-propose 503 (decisions.md §10.5): the client's retry
-        /// policy owns the ambiguous case, so it gets a 502, not a
-        /// silent re-send. A 421 is NOT ambiguous (nothing entered the
-        /// log) and takes `handle421`, never this gate.
+        /// `head_sent` says the request head actually reached the wire —
+        /// i.e. the attempt got an upstream stream id. That makes the failure
+        /// AMBIGUOUS for a non-idempotent request: the worker may have
+        /// dispatched the handler (an `onHeaders` export activates on the head
+        /// alone) and committed before the connection died — a replay would
+        /// double-execute. Same discipline as the never-retried post-propose
+        /// 503 (decisions.md §10.5): the client's retry policy owns the
+        /// ambiguous case, so it gets a 502, not a silent re-send.
+        ///
+        /// It must be the SENT question, not "did we try": a leg that could
+        /// not be acquired, or a submission that never got a stream id,
+        /// delivered nothing, so replaying is as safe as a first attempt.
+        /// Callers pass `false` for those. A 421 is NOT ambiguous (nothing
+        /// entered the log) and takes `handle421`, never this gate.
         fn attemptFailed(self: *Self, flow: *Flow, conn_died: bool, head_sent: bool) void {
             self.unmapAttempt(flow);
             flow.attempt_live = false;
@@ -1199,14 +1224,16 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.startAttempt(flow); // same node, fresh conn
                 return;
             }
-            if (flow.canRetry() and flow.node_idx + 1 < flow.nodes.len) {
-                // A node we routed to is down. If it was the cached leader
-                // (we start there), drop the hint so we re-learn instead of
-                // dialing the dead node on every future request.
-                if (conn_died) self.leaders.drop(self.allocator, flow.host);
-                flow.node_idx += 1;
-                self.startAttempt(flow);
-                return;
+            if (flow.canRetry()) {
+                if (nextUntried(flow)) |idx| {
+                    // A node we routed to is down. If it was the cached leader
+                    // (we start there), drop the hint so we re-learn instead of
+                    // dialing the dead node on every future request.
+                    if (conn_died) self.leaders.drop(self.allocator, flow.host);
+                    flow.node_idx = idx;
+                    self.startAttempt(flow);
+                    return;
+                }
             }
             // All nodes unreachable → 502; the cached cluster is likely
             // stale (moved/evicted) — drop it so the next request
@@ -1264,16 +1291,19 @@ pub fn Proxy(comptime FrontH2: type) type {
             });
             self.abandonAttempt(flow);
             if (flow.canRetry()) {
-                if (hinted_idx) |idx| {
+                // Prefer the node the worker named — but only if we have not
+                // already tried it (a stale hint can point at a node that just
+                // refused or died). Otherwise fall back to the scan, which is
+                // what finds a leader that has not announced itself yet.
+                const target: ?usize = blk: {
+                    if (hinted_idx) |idx| {
+                        if (idx < 32 and flow.tried_mask & (@as(u32, 1) << @intCast(idx)) == 0)
+                            break :blk idx;
+                    }
+                    break :blk nextUntried(flow);
+                };
+                if (target) |idx| {
                     flow.node_idx = idx;
-                    self.startAttempt(flow);
-                    return;
-                }
-                // No hint (unknown leader: mid-election) — fall back to
-                // scanning, which is what discovers a leader that has not
-                // announced itself yet.
-                if (flow.node_idx + 1 < flow.nodes.len) {
-                    flow.node_idx += 1;
                     self.startAttempt(flow);
                     return;
                 }
@@ -1675,9 +1705,19 @@ pub fn Proxy(comptime FrontH2: type) type {
                         flow.idempotent,
                     },
                 );
-                // A terminal for a submitted request: the head reached
-                // the upstream leg — ambiguous for non-idempotent flows.
-                self.attemptFailed(flow, conn_died, true);
+                // Was anything actually PUT ON THE WIRE? The front learns
+                // `up_sid` when the HEADERS frame is serialized for this
+                // attempt, so a zero id means the request never left — no
+                // worker can have seen it, and replaying it cannot
+                // double-execute. A non-zero id means a stream existed
+                // upstream and the failure stays ambiguous.
+                //
+                // This is the line nginx draws: a connect-time failure is
+                // retried even for a POST; only a failure AFTER the request
+                // went out is treated as unsafe. Hardcoding "sent" here made
+                // a stale pooled leg — which delivered nothing — look
+                // identical to a worker that may have committed (rove#353).
+                self.attemptFailed(flow, conn_died, flow.up_sid != 0);
             }
         }
 
