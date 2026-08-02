@@ -35,15 +35,15 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 TENANT = "shopdemo"
 
-# Prices are duplicated across the two route modules rather than shared: with
-# rove#344 open there is no way to factor them into a sibling module, and a
-# package would put the interesting code outside the tenant.
-PRICES = """
-const PRICES = { mug: 900, shirt: 2400, sticker: 300 };
-const fmt = (c) => "$" + (c / 100).toFixed(2);
+# The shared helper both route modules import — the shape rove#344 was about.
+LIB_SRC = """
+export const PRICES = { mug: 900, shirt: 2400, sticker: 300 };
+export const fmt = (c) => "$" + (c / 100).toFixed(2);
 """
 
-INDEX_SRC = PRICES + """
+# Relative to each module's OWN directory, as ES resolution requires: the
+# entry sits beside lib.mjs, the /order route module a directory below it.
+INDEX_SRC = 'import { PRICES, fmt } from "./lib.mjs";\n' + """
 export function catalogue() {
   const items = ["mug", "shirt", "sticker"];
   return { items: items.map((i) => ({ item: i, price: fmt(PRICES[i]) })) };
@@ -52,7 +52,7 @@ export function catalogue() {
 
 # A second dispatchable module, reached at /order. The engine dispatches it by
 # path — it is never imported, so it never passes through the module loader.
-ORDER_SRC = PRICES + """
+ORDER_SRC = 'import { PRICES, fmt } from "../lib.mjs";\n' + """
 // Reads, then writes, then answers. The digest folds the read (including
 // whether the key was PRESENT), the write, and the response, so a replay that
 // took a different branch cannot match by accident.
@@ -92,6 +92,7 @@ def main() -> int:
         dep = c.deploy_handlers(TENANT, {
             "index.mjs": rpc_wrap(INDEX_SRC),
             "order/index.mjs": rpc_wrap(ORDER_SRC),
+            "lib.mjs": LIB_SRC,
         })
         check("deploy → dep_id", bool(dep), f"dep_id={dep}")
 
@@ -127,10 +128,13 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as td:
             idx_path = os.path.join(td, "index.mjs")
             order_path = os.path.join(td, "order.mjs")
+            lib_path = os.path.join(td, "lib.mjs")
             with open(idx_path, "w") as f:
                 f.write(rpc_wrap(INDEX_SRC))
             with open(order_path, "w") as f:
                 f.write(rpc_wrap(ORDER_SRC))
+            with open(lib_path, "w") as f:
+                f.write(LIB_SRC)
 
             for rec in records:
                 rid = rec.get("request_id")
@@ -150,9 +154,12 @@ def main() -> int:
                 # in the record (rove#254), so the driver re-derives it from the
                 # path the same way the worker does — the duplication that issue
                 # is about.
-                entry = order_path if (full.get("path") or "").startswith("/order") else idx_path
+                is_order = (full.get("path") or "").startswith("/order")
+                entry = order_path if is_order else idx_path
+                entry_path = "order/index.mjs" if is_order else "index.mjs"
                 proc = subprocess.run(
-                    ["node", checker, rec_path, entry],
+                    ["node", checker, rec_path, entry,
+                     f"--entry-path={entry_path}", f"lib.mjs={lib_path}"],
                     capture_output=True, text=True, timeout=180)
                 line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout.strip() else "{}"
                 try:

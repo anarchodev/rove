@@ -111,7 +111,51 @@ def main() -> int:
         check("target serves the app-staged static", served,
               f"got {r.status} loc={r.headers.get('location')!r}")
 
-        print("step 4: a wrong-token deploy → 401")
+        print("step 5: a bundle whose modules import each other (rove#344)")
+        # Compilation resolves imports eagerly, so this only works because the
+        # bundle compiles at CUT, where every sibling is present. Upload the
+        # importer FIRST to prove order doesn't matter.
+        r = deploy_post(c, "reset", {"tenant": TARGET}, token=c.root_token)
+        check("reset for the multi-file bundle → 200", r.status == 200, f"got {r.status}")
+        r = deploy_post(c, "file", {"tenant": TARGET, "path": "index.mjs", "kind": "handler",
+                                    "source": 'import { hi } from "./lib.mjs";\n'
+                                              "export default function(){ return hi(); }\n"},
+                        token=c.root_token)
+        check("stage the importer first → 200", r.status == 200, f"got {r.status} {r.body[:160]!r}")
+        r = deploy_post(c, "file", {"tenant": TARGET, "path": "lib.mjs", "kind": "handler",
+                                    "source": 'export function hi(){ return "multi-file ok\\n"; }\n'},
+                        token=c.root_token)
+        check("stage the sibling → 200", r.status == 200, f"got {r.status} {r.body[:160]!r}")
+        r = deploy_post(c, "cut", {"tenant": TARGET}, token=c.root_token)
+        multi_dep = None
+        if r.status == 200:
+            try:
+                multi_dep = json.loads(r.body).get("dep_id")
+            except Exception:
+                pass
+        check("cut compiles the bundle → dep_id", bool(multi_dep), f"got {r.status} {r.body[:200]!r}")
+        if multi_dep:
+            rel = c.release(TARGET, int(multi_dep, 16))
+            check("release the multi-file bundle → 204", rel.status == 204, f"got {rel.status}")
+            r = c.wait_for_handler(TARGET, "/", want_body="multi-file ok", timeout_s=30.0)
+            check("the imported module actually ran", r.status == 200 and "multi-file ok" in r.body,
+                  f"got {r.status} {r.body!r}")
+
+        print("step 6: an import that resolves to nothing still fails the DEPLOY")
+        # The reason cut compiles rather than skipping resolution: a typo must
+        # not deploy clean and 500 on the first request.
+        r = deploy_post(c, "reset", {"tenant": TARGET}, token=c.root_token)
+        r = deploy_post(c, "file", {"tenant": TARGET, "path": "index.mjs", "kind": "handler",
+                                    "source": 'import { hi } from "./nope.mjs";\n'
+                                              "export default function(){ return hi(); }\n"},
+                        token=c.root_token)
+        check("staging a bad import is fine (staging does not link) → 200",
+              r.status == 200, f"got {r.status} {r.body[:160]!r}")
+        r = deploy_post(c, "cut", {"tenant": TARGET}, token=c.root_token)
+        check("cut refuses the unresolvable import", r.status >= 400, f"got {r.status}")
+        check("and names the module", "nope.mjs" in r.body, f"got {r.body[:200]!r}")
+
+        print("step 7: a wrong-token deploy → 401")
         r = deploy_post(c, "reset", {"tenant": TARGET}, token="not-the-root-token")
         check("wrong token → 401", r.status == 401, f"got {r.status} {r.body[:120]!r}")
 
