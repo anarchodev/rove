@@ -62,7 +62,7 @@ def main() -> int:
         print("step 1: bootstrap the baked deploy app via POST /_system/reset")
         c._ensure_admin_app()  # provision __admin__ + POST /_system/reset + wait 405
         r = c.provision(TARGET)
-        check("provision target → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision target → 200", r.status == 200, f"got {r.status} {r.body!r}")
         # /_system/reset (root, no body) deployed the BAKED deploy app
         # (docs/architecture/cli-and-deploy.md §4). The app answers on "/" — a GET → 405 POST-only
         # confirms it's live.

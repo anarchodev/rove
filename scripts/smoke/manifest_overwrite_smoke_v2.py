@@ -36,7 +36,7 @@ def s3_curl(method: str, key: str, data: bytes | None = None) -> tuple[int, byte
 
 def main() -> int:
     with V2Cluster.spawn("manifow", nodes=1) as c:
-        assert c.provision("manifow").status == 204
+        assert c.provision("manifow").status == 200
         statics = {"_static/index.html": (HTML, "text/html; charset=utf-8")}
 
         print("deploy #1…")

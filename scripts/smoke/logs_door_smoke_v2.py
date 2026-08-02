@@ -74,7 +74,7 @@ def main() -> int:
 
         # ── Negative: a NON-admin tenant cannot use the door. ──────────────
         r = c.provision("globex")
-        check("provision globex → 204/409", r.status in (204, 409),
+        check("provision globex → 200/409", r.status in (200, 409),
               f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("globex", FIXTURE)

@@ -111,9 +111,9 @@ def main() -> int:
     with V2Cluster.spawn("rearmwake", nodes=1) as c:
         print("step 1: provision + deploy acme (holdfetch/poke) and wb (bulk upstream)")
         r = c.provision("acme")
-        check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         r = c.provision("wb")
-        check("provision wb → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision wb → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("acme", {
                 "index.mjs": rpc_wrap(READY_SRC),

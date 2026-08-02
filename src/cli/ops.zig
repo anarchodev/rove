@@ -183,7 +183,10 @@ fn cmdKvPut(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, key: []
 
 // ── placement / routing verbs (CP, move-secret) ─────────────────────────────
 
-/// POST /_control/provision {tenant, cluster, host?}. 204 = placed, 409 = already.
+/// POST /_control/provision {tenant, cluster, host?}. 200 = placed (the body
+/// reports the host it answers on; 204 is the same outcome from a CP that
+/// couldn't build the report), 409 = already placed. A 4xx carries
+/// `{"error": reason}` naming the rule the id broke.
 fn cmdProvision(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, host: ?[]const u8) void {
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
@@ -197,6 +200,7 @@ fn cmdProvision(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, clu
     body.append(a, '}') catch oom();
     const r = c.cpPost(a, env, "/_control/provision", body.items, 60);
     switch (r.code) {
+        200 => std.debug.print("provisioned {s} on {s} — {s}\n", .{ tenant, cluster, c.trunc(r.body) }),
         204 => std.debug.print("provisioned {s} on {s}{s}\n", .{ tenant, cluster, if (host) |h| std.fmt.allocPrint(a, " (host {s})", .{h}) catch "" else "" }),
         409 => std.debug.print("{s} already placed (409) — use `move` to relocate\n", .{tenant}),
         else => fatal("provision {s}: {d} {s}", .{ tenant, r.code, c.trunc(r.body) }),
@@ -391,7 +395,8 @@ fn registerNodeAddr(a: std.mem.Allocator, env: *const c.Env, cluster: []const u8
 }
 
 /// POST /_control/provision, retrying (a fresh cold-multi attach can transiently
-/// 5xx while the group forms + elects). 204 = placed, 409 = already placed (idempotent).
+/// 5xx while the group forms + elects). 200/204 = placed, 409 = already placed
+/// (idempotent).
 fn provisionRetry(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, host: ?[]const u8) void {
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
@@ -407,7 +412,7 @@ fn provisionRetry(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, c
     while (attempt < 30) : (attempt += 1) {
         const r = c.cpPost(a, env, "/_control/provision", body.items, 60);
         switch (r.code) {
-            204 => {
+            200, 204 => {
                 std.debug.print("  provisioned {s} on {s}\n", .{ tenant, cluster });
                 return;
             },

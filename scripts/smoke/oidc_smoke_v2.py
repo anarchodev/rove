@@ -107,7 +107,7 @@ def main() -> int:
 
         # 1. Provision + deploy the real web/auth app (handler + config static).
         r = c.provision("__auth__")
-        check("provision __auth__ → 204/409", r.status in (204, 409),
+        check("provision __auth__ → 200/409", r.status in (200, 409),
               f"got {r.status} {r.body!r}")
         try:
             c.deploy_with_static(

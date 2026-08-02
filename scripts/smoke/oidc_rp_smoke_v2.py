@@ -149,7 +149,7 @@ def main() -> int:
         # deploy is LAST (it replaces the baked deploy app).
         c._ensure_admin_app()
         r = c.provision("__auth__")
-        check("provision __auth__ → 204/409", r.status in (204, 409), f"got {r.status}")
+        check("provision __auth__ → 200/409", r.status in (200, 409), f"got {r.status}")
         try:
             c.deploy_with_static(
                 "__auth__", {"index.mjs": auth_src},
@@ -264,7 +264,7 @@ def main() -> int:
         r = c.tls_curl(app_origin + "/v1/cp/provision", method="POST",
                        headers={"Cookie": op_cookie, "content-type": "application/json"},
                        data=prov_body, timeout=30.0)
-        check("operator CP provision via chokepoint → 204", r.status == 204,
+        check("operator CP provision via chokepoint → 200", r.status == 200,
               f"got {r.status} {r.body[:160]!r}")
         if r.status != 204:
             c.dump_node_log(grep=["cp door", "cpdoor", "provision", "fetch",

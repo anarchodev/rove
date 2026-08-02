@@ -91,7 +91,7 @@ def probe(c: V2Cluster, tag: str, target: str):
 
 def deploy_and_wait(c: V2Cluster, check) -> bool:
     r = c.provision("acme")
-    check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+    check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
     try:
         dep_id = c.deploy_handlers("acme", FIXTURE)
     except RuntimeError as e:
@@ -154,7 +154,7 @@ def main() -> int:
     with V2Cluster.spawn("ssrfB", nodes=1, http_base=19600,
                          raft_base=19700) as c:
         r = c.provision("wb")
-        check("provision wb → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision wb → 200", r.status == 200, f"got {r.status} {r.body!r}")
         if not deploy_and_wait(c, check):
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1

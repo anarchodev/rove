@@ -129,7 +129,7 @@ def main() -> int:
 
     with V2Cluster.spawn("soak", nodes=3) as c:
         print(f"setup: provision + deploy + seed (rounds={ROUNDS})")
-        check("provision", c.provision(TENANT).status == 204)
+        check("provision", c.provision(TENANT).status == 200)
         lead0 = c.leader_node(TENANT)
         if lead0 is None:
             check("leader present", False); return 1

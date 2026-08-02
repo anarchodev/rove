@@ -352,7 +352,7 @@ class V2Cluster:
         spawn_cp(self.procs, self.cp_port,
                  clusters=f"{self.cluster_id}={nodes_csv}",
                  hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
-                 move_secret=MOVE_SECRET)
+                 public_suffix=PUBLIC_SUFFIX, move_secret=MOVE_SECRET)
         spawn_front(self.procs, self.front_port,
                     f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0)
         if self.tls_front_port:
@@ -399,7 +399,8 @@ class V2Cluster:
         spawn_cp(self.procs, self.cp_port,
                  clusters=f"{self.cluster_id}={nodes_csv}",
                  hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
-                 move_secret=MOVE_SECRET, log_dir=log_dir)
+                 public_suffix=PUBLIC_SUFFIX, move_secret=MOVE_SECRET,
+                 log_dir=log_dir)
         # Register each node's raft transport address with the CP registry
         # (node/{cluster}/{id} → raft_addr). Not needed to FORM a cold-multi group,
         # but it is the real genesis flow's step 1 and seeds the registry for later
@@ -630,15 +631,21 @@ class V2Cluster:
 
     # ── provisioning + deploy ──────────────────────────────────────────
     def provision(self, tenant: str, *, host: Optional[str] = None) -> HttpResponse:
-        host = host or self.host_for(tenant)
+        """Provision a tenant on the CP. No `host` = the production shape: the
+        tenant answers on `{tenant}.{PUBLIC_SUFFIX}` through the wildcard both
+        the CP and the worker derive, with no host row written. Pass `host`
+        only for a CUSTOM domain, which is the one case that needs a mapping."""
         import json
+        body = {"tenant": tenant, "cluster": self.cluster_id}
+        if host:
+            body["host"] = host
         return _curl(
             f"{self.front_url().replace(str(self.front_port), str(self.cp_port))}"
             f"/_control/provision",
             method="POST",
             headers={"X-Rewind-Move-Secret": MOVE_SECRET,
                      "Content-Type": "application/json"},
-            data=json.dumps({"tenant": tenant, "cluster": self.cluster_id, "host": host}),
+            data=json.dumps(body),
         )
 
     @staticmethod
@@ -657,7 +664,7 @@ class V2Cluster:
         confirms it's live. Runs once per cluster."""
         if getattr(self, "_admin_app_ready", False):
             return
-        self.provision("__admin__")  # 204 or 409 (already) — both fine
+        self.provision("__admin__")  # 200 or 409 (already) — both fine
         deadline = time.time() + 30.0
         last = None
         while time.time() < deadline:

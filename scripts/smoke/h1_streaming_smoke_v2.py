@@ -129,7 +129,7 @@ def main() -> int:
     with V2Cluster.spawn("h1strm", nodes=1, http_base=24100, raft_base=24160) as c:
         print("step 1: provision + deploy (onChunk, hash, onHeaders)")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status}")
+        check("provision → 200", r.status == 200, f"got {r.status}")
         dep_id = c.deploy_handlers("acme", {
             "index.mjs": rpc_wrap(READY_SRC),
             "up/index.mjs": ONCHUNK_SRC,

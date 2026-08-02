@@ -15,7 +15,7 @@ cluster (gap #4) — awaits the group's election, then writes the placement
 
 Checks:
   A. route for an unprovisioned host → 404 (nothing there yet).
-  B. provision {freshtenant, cluster-1, fresh.localhost} → 204.
+  B. provision {freshtenant, cluster-1, fresh.localhost} → 200.
   C. /_cp/route resolves the host → cluster-1 with all 3 nodes.
   D. the formed group SERVES: a v2-kv PUT commits + reads back on every node
      (proves the group formed across the cluster and replicates).
@@ -191,7 +191,7 @@ def main():
         # ── B. provision the brand-new tenant onto the 3-node cluster ─
         print("leg B: POST /_control/provision (form group on 3 nodes + place)")
         st, body = provision(PCP, TENANT, "cluster-1", host=HOST)
-        check("provision status", st, 204)
+        check("provision status", st, 200)
 
         # ── C. now routable to all 3 nodes ────────────────────────────
         print("leg C: /_cp/route resolves the host → cluster-1 (3 nodes)")

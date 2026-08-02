@@ -36,6 +36,10 @@ const reconciler = @import("reconciler.zig");
 const BackendResp = bc.BackendResp;
 const MOVE_SECRET_HEADER = bc.MOVE_SECRET_HEADER;
 const directory_mod = @import("cp-directory");
+/// The tenant-id spec — shared with the worker so provisioning refuses any id
+/// the worker's wildcard could not resolve, and `/_cp/route` splits a
+/// `{id}.{suffix}` host exactly the way the worker does.
+const id_spec = @import("rove-instance-id");
 const origin_mod = @import("rove-origin");
 const Directory = directory_mod.Directory;
 const bridge_mod = @import("bridge");
@@ -135,6 +139,16 @@ const Router = struct {
     /// (`REWIND_CP_RECONCILE_MEMBERSHIP=1`). OFF by default — a continuous
     /// unattended actor on prod must be deliberately enabled.
     reconcile_membership: bool = false,
+
+    /// The platform zone customer tenants auto-route under
+    /// (`REWIND_PUBLIC_SUFFIX`, e.g. `rewindjs.app`): `/_cp/route` resolves
+    /// `{tenant}.{public_suffix}` to that tenant with no stored alias, and
+    /// provisioning reports the resulting URL. Empty disables the wildcard —
+    /// every host then needs an explicit `/_control/host` mapping. MUST match
+    /// the workers' `REWIND_PUBLIC_SUFFIX`: the front door resolves the host
+    /// here and the worker resolves it again locally, so a mismatch routes a
+    /// request to a cluster whose worker then 404s it.
+    public_suffix: []const u8 = "",
 
     /// RC-6 demote hysteresis. A reconciler demote-to-learner of a voter judged
     /// `!recent_active` must require SUSTAINED inactivity, never a single reading:
@@ -267,12 +281,33 @@ const Router = struct {
         // Domain index: host → tenant from the replicated directory.
         // Owned copy (a host's tenant can be replaced by a concurrent apply,
         // and `resolve` re-takes the directory mutex), freed after we resolve.
-        const tenant = (self.directory.hostTenantForOwned(a, host) catch {
+        const mapped = self.directory.hostTenantForOwned(a, host) catch {
             try replyStatus(server, ent, sid, sess, 500);
             return;
-        }) orelse {
-            try replyStatus(server, ent, sid, sess, 404);
-            return;
+        };
+        // No stored alias → the wildcard: `{tenant}.{public_suffix}` belongs to
+        // the tenant of that name. The worker applies the same rule to the
+        // proxied Host (`rove-instance-id`'s `wildcardLabel`), so the two hops
+        // agree by construction; deriving it here means a self-serve tenant is
+        // routable the moment it is placed, with no per-tenant host row to
+        // write, retry, or leave dangling. An explicit alias still wins — it is
+        // consulted first.
+        const tenant = mapped orelse blk: {
+            const label = id_spec.wildcardLabel(host, self.public_suffix) orelse {
+                try replyStatus(server, ent, sid, sess, 404);
+                return;
+            };
+            // A label that could never BE a tenant (uppercase, too long, a
+            // reserved platform label) is a 404 here rather than a directory
+            // lookup for a name provisioning would have refused.
+            if (!id_spec.isValid(label)) {
+                try replyStatus(server, ent, sid, sess, 404);
+                return;
+            }
+            break :blk a.dupe(u8, label) catch {
+                try replyStatus(server, ent, sid, sess, 500);
+                return;
+            };
         };
         defer a.free(tenant);
         const resolution = self.directory.resolve(tenant) orelse {
@@ -539,43 +574,71 @@ const Router = struct {
         try replyStatus(server, ent, sid, sess, 204);
     }
 
-    /// `POST /_control/provision {tenant, cluster, host?}` — stand up a
+    /// `POST /_control/provision {tenant, cluster?, host?}` — stand up a
     /// brand-new tenant: form its raft group on EVERY node of
     /// `cluster` via an empty-attach (no bundle — the multi-node formation path
     /// that needs no move), await the group's election, then write the
     /// placement (the commit point that makes it routable), and optionally map
     /// `host`→tenant. Create-only: 409 if the tenant is already placed (use
-    /// `/_control/move` to relocate); 400 for an unknown cluster. On a
-    /// formation failure the freshly-formed groups are evicted, so a failed
-    /// provision is a no-op.
+    /// `/_control/move` to relocate); 400 for an unknown cluster or an id the
+    /// spec refuses. On a formation failure the freshly-formed groups are
+    /// evicted, so a failed provision is a no-op.
+    ///
+    /// This is the chokepoint EVERY provisioner goes through — the operator
+    /// CLI, the dashboard's self-serve signup, and any future API — so the id
+    /// spec is enforced here rather than in each caller. It is the only place
+    /// that can see the whole rule: an id must be a legal DNS label because it
+    /// becomes `{id}.{public_suffix}`, and must not claim a platform label.
+    ///
+    /// `cluster` is optional when exactly one is configured — a customer has no
+    /// basis to choose one, and inventing a default when there IS a choice
+    /// would be a placement policy decided by omission.
+    ///
+    /// 200 with `{tenant, cluster, host}` on success — `host` is where the
+    /// tenant now answers, so a caller that does not carry the platform's zone
+    /// in its own config (the dashboard) learns the URL from the party that
+    /// decided it, rather than re-deriving it from state it would have to be
+    /// told separately and could get wrong.
+    ///
+    /// A refusal carries `{"error": reason}`: this endpoint is the only place
+    /// that knows WHICH rule an id broke, and the dashboard puts that sentence
+    /// in front of the customer.
     fn handleProvision(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
         const a = self.allocator;
         var parsed = std.json.parseFromSlice(struct {
             tenant: []const u8,
-            cluster: []const u8,
+            cluster: []const u8 = "",
             host: ?[]const u8 = null,
         }, a, body, .{ .ignore_unknown_fields = true }) catch {
-            try replyStatus(server, ent, sid, sess, 400);
+            try self.replyProvisionError(server, ent, sid, sess, 400, "malformed request body");
             return;
         };
         defer parsed.deinit();
         const tenant = parsed.value.tenant;
-        const cluster = parsed.value.cluster;
-        if (tenant.len == 0 or cluster.len == 0) {
-            try replyStatus(server, ent, sid, sess, 400);
+        // The id spec, in the customer's words — a bare 400 leaves the
+        // dashboard guessing which of five rules the name broke.
+        if (id_spec.check(tenant)) |reject| {
+            try self.replyProvisionError(server, ent, sid, sess, 400, reject.message());
             return;
         }
 
         // Create-only — provisioning an already-placed tenant is a 409 (its
         // group already exists; relocate via `/_control/move`).
         if (self.directory.resolve(tenant) != null) {
-            try replyStatus(server, ent, sid, sess, 409);
+            try self.replyProvisionError(server, ent, sid, sess, 409, "that name is taken");
             return;
         }
-        const cluster_ref = self.directory.clusterById(cluster) orelse {
-            try replyStatus(server, ent, sid, sess, 400); // unknown cluster
-            return;
-        };
+        const cluster_ref = if (parsed.value.cluster.len > 0)
+            self.directory.clusterById(parsed.value.cluster) orelse {
+                try self.replyProvisionError(server, ent, sid, sess, 400, "unknown cluster");
+                return;
+            }
+        else
+            self.directory.soleCluster() orelse {
+                try self.replyProvisionError(server, ent, sid, sess, 400, "cluster is required (more than one is configured)");
+                return;
+            };
+        const cluster = cluster_ref.id;
         const nodes = cluster_ref.nodes; // pointer-stable across the calls below
 
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
@@ -626,9 +689,11 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
-        // 4. Optional host→tenant mapping so the tenant is reachable now. It is
-        //    already provisioned (placed) — a host write failure is non-fatal;
-        //    retry via `/_control/host`.
+        // 4. Optional EXTRA host→tenant mapping. The tenant is already
+        //    reachable at `{tenant}.{public_suffix}` via the wildcard the
+        //    moment step 3 committed — this is for a custom domain, and only
+        //    an operator passes one. It is already provisioned (placed), so a
+        //    host write failure is non-fatal; retry via `/_control/host`.
         if (parsed.value.host) |host| {
             if (host.len > 0) {
                 self.directory.setHost(host, tenant) catch |err|
@@ -664,7 +729,50 @@ const Router = struct {
             }
         }
         std.log.info("rewind-cp: provisioned {s} on {s} ({d} node(s))", .{ tenant, cluster, nodes.len });
-        try replyStatus(server, ent, sid, sess, 204);
+
+        // Where the tenant answers: the explicitly-mapped custom domain if one
+        // was requested, else the wildcard host placement just made live.
+        // Empty when neither exists (no `host`, no configured suffix) — the
+        // tenant is placed but nothing routes to it, and saying so beats
+        // reporting a URL that 404s.
+        const primary_host: []const u8 = blk: {
+            if (parsed.value.host) |h| {
+                if (h.len > 0) break :blk h;
+            }
+            if (self.public_suffix.len == 0) break :blk "";
+            break :blk std.fmt.allocPrint(a, "{s}.{s}", .{ tenant, self.public_suffix }) catch "";
+        };
+        const msg = std.fmt.allocPrint(
+            a,
+            "{{\"tenant\":\"{s}\",\"cluster\":\"{s}\",\"host\":\"{s}\"}}",
+            .{ tenant, cluster, primary_host },
+        ) catch {
+            // The provision COMMITTED and only the report failed. 204 also
+            // means placed, so the caller must not read this as a failure and
+            // retry — it just doesn't learn the URL.
+            try replyStatus(server, ent, sid, sess, 204);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// A `/_control/provision` failure, as `{"error": reason}` — the dashboard
+    /// puts the reason straight in front of the customer, so the status alone
+    /// is not enough. Falls back to a bare status if the body can't be built.
+    fn replyProvisionError(
+        self: *Router,
+        server: *CpH2,
+        ent: rove.Entity,
+        sid: h2.StreamId,
+        sess: h2.Session,
+        code: u16,
+        reason: []const u8,
+    ) !void {
+        const msg = std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{reason}) catch {
+            try replyStatus(server, ent, sid, sess, code);
+            return;
+        };
+        try replyText(server, ent, sid, sess, code, msg);
     }
 
     /// Set a tenant's plan/limits blob: `POST /_control/plan {tenant, plan}`.
@@ -1465,7 +1573,7 @@ pub fn main() !void {
         const ms = std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t"), 10) catch break :blk 60 * std.time.ns_per_s;
         break :blk @as(i128, ms) * std.time.ns_per_ms;
     };
-    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns };
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns, .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX") };
 
     // Periodic membership reconciliation on the directory leader (between
     // request batches). last=0 → the first iteration reconciles, so a CP
@@ -1489,6 +1597,15 @@ pub fn main() !void {
     defer if (cp_metrics_srv) |ms| ms.deinit();
     var metrics_cadence: boot.Cadence = .{};
 
+    // Say whether wildcard tenant routing is live. Unset, every self-serve
+    // tenant provisions successfully and is then unroutable — a silent config
+    // gap whose only symptom is a 404 at the front door, one hop away from
+    // here. Worth a boot line rather than a discovery.
+    if (router.public_suffix.len > 0) {
+        std.log.info("rewind-cp: wildcard tenant routing on *.{s} (must match the workers' REWIND_PUBLIC_SUFFIX)", .{router.public_suffix});
+    } else {
+        std.log.warn("rewind-cp: REWIND_PUBLIC_SUFFIX unset — no wildcard routing; every tenant needs an explicit host mapping", .{});
+    }
     std.log.info("rewind-cp: listening on 0.0.0.0:{d} (move control {s}, reconcile {s})", .{
         port,
         if (move_secret != null) "enabled" else "disabled",

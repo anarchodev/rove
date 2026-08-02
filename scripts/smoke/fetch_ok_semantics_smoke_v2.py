@@ -80,7 +80,7 @@ def main() -> int:
         print("step 1: provision + deploy up (upstream) and cli (probe)")
         for t in ("up", "cli"):
             r = c.provision(t)
-            check(f"provision {t} → 204", r.status == 204, f"got {r.status} {r.body!r}")
+            check(f"provision {t} → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("up", UP_HANDLERS)
             c.deploy_handlers("cli", CLI_HANDLERS)

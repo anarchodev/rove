@@ -89,9 +89,9 @@ def main() -> int:
     with V2Cluster.spawn("platdeploy", nodes=1) as c:
         print("step 1: provision __admin__ + the target tenant")
         r = c.provision("__admin__")
-        check("provision __admin__ → 204/409", r.status in (204, 409), f"got {r.status} {r.body!r}")
+        check("provision __admin__ → 200/409", r.status in (200, 409), f"got {r.status} {r.body!r}")
         r = c.provision(TARGET)
-        check("provision target → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision target → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy the composed-deploy admin app to __admin__")
         try:

@@ -98,9 +98,9 @@ def main() -> int:
     with V2Cluster.spawn("bflarge", nodes=1) as c:
         print("step 1: provision + deploy acme (spoolsink) and wb (bigbody upstream)")
         r = c.provision("acme")
-        check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         r = c.provision("wb")
-        check("provision wb → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision wb → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("acme", ACME_HANDLERS)
             c.deploy_handlers("wb", WB_HANDLERS)

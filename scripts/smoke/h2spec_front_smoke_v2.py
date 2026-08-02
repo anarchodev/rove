@@ -125,7 +125,7 @@ def main() -> int:
         host = c.host_for("h2spec")  # h2spec.localhost — resolved by suffix-strip
         print(f"step 1: provision tenant 'h2spec' (host {host})")
         r = c.provision("h2spec")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy a trivial always-200 handler")
         dep = None

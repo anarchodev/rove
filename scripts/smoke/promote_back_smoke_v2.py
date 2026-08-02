@@ -121,7 +121,7 @@ def main() -> int:
 
         print("step 1: provision 'acme' + deploy the kv handler")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status}")
+        check("provision → 200", r.status == 200, f"got {r.status}")
         lead0 = c.leader_node("acme")
         if lead0 is None:
             check("leader present", False)

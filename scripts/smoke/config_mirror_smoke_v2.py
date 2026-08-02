@@ -82,7 +82,7 @@ def main() -> int:
     with V2Cluster.spawn("config-mirror", nodes=1) as c:
         print("step 1: provision tenant 'acme' via the CP")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy the /cfg probe handler (+ a root readiness probe)")
         try:

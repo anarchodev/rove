@@ -80,7 +80,7 @@ def main() -> int:
     with V2Cluster.spawn("pm", nodes=1) as c:
         print("step 1: provision tenant 'pkgacme'")
         r = c.provision("pkgacme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy handler + packages (app pins jwt@1.9, oidc pins jwt@1.4)")
         dep1 = None

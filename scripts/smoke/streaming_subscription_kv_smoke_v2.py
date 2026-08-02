@@ -73,7 +73,7 @@ def main() -> int:
     with V2Cluster.spawn("sub-kv", nodes=1) as c:
         print("step 1: provision + deploy acme (sub-react kv subscription)")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             dep_id = c.deploy_manifest("acme", HANDLERS)
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
