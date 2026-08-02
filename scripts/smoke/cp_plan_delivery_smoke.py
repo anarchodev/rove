@@ -63,17 +63,20 @@ HOST = "planco.localhost"
 KEY = "k"
 VALUE = "v"
 
-# Mirror src/js/plan.zig's baked tier table so the smoke fails loudly if the
-# numbers drift apart (the table is the contract the DP enforces).
+# Mirror rove-plan's baked tier table (src/plan/root.zig) so the smoke fails
+# loudly if the numbers drift apart (the table is the contract the DP
+# enforces). `outbound_*` is the ONE outbound-HTTP primitive's budget —
+# email/webhook are JS shims over it and have no separate limit
+# (docs/effect-algebra.md, the durability rule).
 FREE = dict(request_capacity=1000, request_refill_per_sec=500,
-            email_capacity=100, email_refill_per_sec=10,
+            outbound_capacity=100, outbound_refill_per_sec=10,
             max_body_bytes=4 * 1024 * 1024, retention_days=7)
 PRO = dict(request_capacity=10000, request_refill_per_sec=5000,
-           email_capacity=1000, email_refill_per_sec=100,
+           outbound_capacity=1000, outbound_refill_per_sec=100,
            max_body_bytes=32 * 1024 * 1024, retention_days=30)
 ENT_OVERRIDE_BODY = 1048576
 ENT = dict(request_capacity=100000, request_refill_per_sec=50000,
-           email_capacity=10000, email_refill_per_sec=1000,
+           outbound_capacity=10000, outbound_refill_per_sec=1000,
            max_body_bytes=ENT_OVERRIDE_BODY, retention_days=365)
 
 PLAN_PRO = '{"tier":"pro"}'
