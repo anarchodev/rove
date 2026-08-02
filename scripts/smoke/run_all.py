@@ -48,9 +48,16 @@ EXCLUDED = {
 }
 
 # Known-red members that ARE in the suite, so the report keeps counting them.
-# Listed here only as a pointer for whoever reads a red run:
-#   tls_large_body_smoke.py — rove#361, concurrent large static downloads
-#   abort mid-stream. A real product defect, not a stale fixture.
+# Both are genuine product defects, not stale fixtures — which is why they stay
+# in and stay red rather than being excluded:
+#   tls_large_body_smoke.py    — rove#361, concurrent large static downloads
+#                                abort mid-stream (sequential ones are fine).
+#   dispatch_gate_smoke_v2.py  — rove#362, a leader that idles past the
+#                                hibernation window spuriously steps down.
+#                                INTERMITTENT (~2 of 3), so it moves between
+#                                pass and fail across runs; `--baseline` will
+#                                call it a regression on a run where it flips.
+#                                Check it against rove#362 before believing it.
 
 # Smokes that legitimately run longer than the default budget. Without an
 # entry here a slow-but-healthy smoke is reported HUNG, which reads as a

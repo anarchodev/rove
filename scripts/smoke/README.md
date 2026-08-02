@@ -73,8 +73,16 @@ size there will usually be something red, and the question worth answering is
 "did I break something?", not "is everything green?". A long-standing failure is
 a backlog item; a new one is a regression, and only the second should block you.
 
-`smoke-baseline.json` in this directory is the last recorded full run. Refresh
-it when you fix something, so the next person's diff is meaningful.
+`smoke-baseline.json` in this directory is the last recorded full run:
+**140/142 in 33m**, the two reds being rove#361 (concurrent large static
+downloads abort mid-stream) and rove#362 (a leader that idles past the
+hibernation window spuriously steps down). Both are product defects, not
+stale fixtures. Refresh the baseline when you fix something, so the next
+person's diff is meaningful.
+
+rove#362 is INTERMITTENT (~2 runs in 3), so a run where it flips will read as
+a regression or a fix when it is neither — check it against the issue before
+believing either.
 
 ## Writing one
 

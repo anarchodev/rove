@@ -1,0 +1,712 @@
+{
+  "admin_deploy_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.2,
+    "status": "pass"
+  },
+  "agent_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.5,
+    "status": "pass"
+  },
+  "auto_demote_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.7,
+    "status": "pass"
+  },
+  "blob_receive_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 15.8,
+    "status": "pass"
+  },
+  "blob_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.7,
+    "status": "pass"
+  },
+  "bound_fetch_large_body_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 29.4,
+    "status": "pass"
+  },
+  "bound_fetch_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 28.0,
+    "status": "pass"
+  },
+  "bound_fetch_spool_cleanup_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 30.4,
+    "status": "pass"
+  },
+  "bound_fetch_spool_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 27.8,
+    "status": "pass"
+  },
+  "cert_survives_genesis_smoke.py": {
+    "rc": 0,
+    "seconds": 10.8,
+    "status": "pass"
+  },
+  "churn_kv_convergence_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 162.9,
+    "status": "pass"
+  },
+  "confchange_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.8,
+    "status": "pass"
+  },
+  "config_mirror_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.2,
+    "status": "pass"
+  },
+  "cp_acme_issue_smoke.py": {
+    "rc": 0,
+    "seconds": 3.8,
+    "status": "pass"
+  },
+  "cp_cert_smoke.py": {
+    "rc": 0,
+    "seconds": 0.3,
+    "status": "pass"
+  },
+  "cp_genesis_3node.py": {
+    "rc": 0,
+    "seconds": 0.5,
+    "status": "pass"
+  },
+  "cp_ha_smoke.py": {
+    "rc": 0,
+    "seconds": 0.7,
+    "status": "pass"
+  },
+  "cp_host_smoke.py": {
+    "rc": 0,
+    "seconds": 0.3,
+    "status": "pass"
+  },
+  "cp_plan_delivery_smoke.py": {
+    "rc": 0,
+    "seconds": 0.5,
+    "status": "pass"
+  },
+  "cp_plan_smoke.py": {
+    "rc": 0,
+    "seconds": 0.3,
+    "status": "pass"
+  },
+  "cp_provision_smoke.py": {
+    "rc": 0,
+    "seconds": 3.7,
+    "status": "pass"
+  },
+  "cp_restart_smoke.py": {
+    "rc": 0,
+    "seconds": 0.6,
+    "status": "pass"
+  },
+  "cp_tls_edge_smoke.py": {
+    "rc": 0,
+    "seconds": 1.8,
+    "status": "pass"
+  },
+  "ctl_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.3,
+    "status": "pass"
+  },
+  "demo_replay_fidelity_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 8.0,
+    "status": "pass"
+  },
+  "deprovision_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 7.6,
+    "status": "pass"
+  },
+  "dispatch_gate_smoke_v2.py": {
+    "rc": 1,
+    "seconds": 8.5,
+    "status": "fail"
+  },
+  "durable_wake_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 14.0,
+    "status": "pass"
+  },
+  "epoch_join_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 20.7,
+    "status": "pass"
+  },
+  "fetch_ok_semantics_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 27.5,
+    "status": "pass"
+  },
+  "fresh_voter_join_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 14.3,
+    "status": "pass"
+  },
+  "front_body_stall_smoke.py": {
+    "rc": 0,
+    "seconds": 17.2,
+    "status": "pass"
+  },
+  "front_connect_timeout_smoke.py": {
+    "rc": 0,
+    "seconds": 2.3,
+    "status": "pass"
+  },
+  "front_content_type_smoke.py": {
+    "rc": 0,
+    "seconds": 0.3,
+    "status": "pass"
+  },
+  "front_drain_smoke.py": {
+    "rc": 0,
+    "seconds": 2.3,
+    "status": "pass"
+  },
+  "front_handshake_reap_smoke.py": {
+    "rc": 0,
+    "seconds": 2.2,
+    "status": "pass"
+  },
+  "front_headers_smoke.py": {
+    "rc": 0,
+    "seconds": 10.2,
+    "status": "pass"
+  },
+  "front_pool_smoke.py": {
+    "rc": 0,
+    "seconds": 6.5,
+    "status": "pass"
+  },
+  "front_streaming_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.0,
+    "status": "pass"
+  },
+  "genesis_capture.py": {
+    "rc": 0,
+    "seconds": 34.7,
+    "status": "pass"
+  },
+  "genesis_ops_smoke.py": {
+    "rc": 0,
+    "seconds": 1.2,
+    "status": "pass"
+  },
+  "genesis_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.9,
+    "status": "pass"
+  },
+  "graceful_transfer_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.6,
+    "status": "pass"
+  },
+  "group_recovery_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.2,
+    "status": "pass"
+  },
+  "h1_streaming_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 15.4,
+    "status": "pass"
+  },
+  "h2spec_front_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 17.8,
+    "status": "pass"
+  },
+  "held_wakes_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.7,
+    "status": "pass"
+  },
+  "heldsync_concurrent_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.2,
+    "status": "pass"
+  },
+  "heldsync_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.7,
+    "status": "pass"
+  },
+  "http_send_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.4,
+    "status": "pass"
+  },
+  "inbound_body_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 12.7,
+    "status": "pass"
+  },
+  "inbound_chunk_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 16.3,
+    "status": "pass"
+  },
+  "interaction_digest_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.6,
+    "status": "pass"
+  },
+  "leader_failover_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.4,
+    "status": "pass"
+  },
+  "learner_add_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 12.1,
+    "status": "pass"
+  },
+  "log_failover_walker_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.7,
+    "status": "pass"
+  },
+  "log_tenant_scope_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.3,
+    "status": "pass"
+  },
+  "logs_door_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.0,
+    "status": "pass"
+  },
+  "logs_roundtrip_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.4,
+    "status": "pass"
+  },
+  "manifest_overwrite_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.1,
+    "status": "pass"
+  },
+  "membership_from_snapshot_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.7,
+    "status": "pass"
+  },
+  "membership_reconciler_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 16.0,
+    "status": "pass"
+  },
+  "multi_dest_forward_smoke.py": {
+    "rc": 0,
+    "seconds": 1.2,
+    "status": "pass"
+  },
+  "next_target_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 7.0,
+    "status": "pass"
+  },
+  "oidc_rp_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 7.4,
+    "status": "pass"
+  },
+  "oidc_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.7,
+    "status": "pass"
+  },
+  "on_fetch_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 28.6,
+    "status": "pass"
+  },
+  "on_kv_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.6,
+    "status": "pass"
+  },
+  "on_timer_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.5,
+    "status": "pass"
+  },
+  "penalty_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.9,
+    "status": "pass"
+  },
+  "per_arm_wake_export_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.5,
+    "status": "pass"
+  },
+  "platform_compile_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.6,
+    "status": "pass"
+  },
+  "platform_deploy_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.4,
+    "status": "pass"
+  },
+  "platform_scope_kv_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.2,
+    "status": "pass"
+  },
+  "pm_cli_smoke.py": {
+    "rc": 0,
+    "seconds": 2.8,
+    "status": "pass"
+  },
+  "pm_deploy_smoke.py": {
+    "rc": 0,
+    "seconds": 3.6,
+    "status": "pass"
+  },
+  "pm_genesis_seed_smoke.py": {
+    "rc": 0,
+    "seconds": 6.0,
+    "status": "pass"
+  },
+  "promote_back_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 20.7,
+    "status": "pass"
+  },
+  "provision_host_alias_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 1.8,
+    "status": "pass"
+  },
+  "raft_pending_parity_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.3,
+    "status": "pass"
+  },
+  "raft_soak_prod.py": {
+    "rc": 0,
+    "seconds": 201.1,
+    "status": "pass"
+  },
+  "raft_soak_v2.py": {
+    "rc": 0,
+    "seconds": 101.2,
+    "status": "pass"
+  },
+  "rate_limit_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.3,
+    "status": "pass"
+  },
+  "replay_matrix_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 35.8,
+    "status": "pass"
+  },
+  "replay_prefix_writeset_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.0,
+    "status": "pass"
+  },
+  "replay_reorder_smoke.py": {
+    "rc": 0,
+    "seconds": 0.2,
+    "status": "pass"
+  },
+  "replay_tags_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.7,
+    "status": "pass"
+  },
+  "replay_wasm_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.9,
+    "status": "pass"
+  },
+  "repro_admin_deploy.py": {
+    "rc": 0,
+    "seconds": 1.4,
+    "status": "pass"
+  },
+  "reset_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 1.3,
+    "status": "pass"
+  },
+  "resume_rearm_wake_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.3,
+    "status": "pass"
+  },
+  "rewind_cli_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.3,
+    "status": "pass"
+  },
+  "rewind_customer_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.0,
+    "status": "pass"
+  },
+  "rewind_publish_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 13.9,
+    "status": "pass"
+  },
+  "rewind_smoke.py": {
+    "rc": 0,
+    "seconds": 0.5,
+    "status": "pass"
+  },
+  "s3_blob_smoke.py": {
+    "rc": 0,
+    "seconds": 1.6,
+    "status": "pass"
+  },
+  "s3_blob_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 1.4,
+    "status": "pass"
+  },
+  "schedule_cron_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 20.8,
+    "status": "pass"
+  },
+  "schedule_method_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.7,
+    "status": "pass"
+  },
+  "scheduler_heartbeat_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 27.1,
+    "status": "pass"
+  },
+  "self_serve_provision_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.5,
+    "status": "pass"
+  },
+  "serve_or_forward_smoke.py": {
+    "rc": 0,
+    "seconds": 5.1,
+    "status": "pass"
+  },
+  "snap_catchup_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.5,
+    "status": "pass"
+  },
+  "snapshot_catchup_no_fork_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 12.5,
+    "status": "pass"
+  },
+  "snapshot_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 0.0,
+    "status": "pass"
+  },
+  "snapshot_stream_large_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 38.1,
+    "status": "pass"
+  },
+  "snapshot_trigger_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 9.3,
+    "status": "pass"
+  },
+  "ssrf_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.7,
+    "status": "pass"
+  },
+  "static_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.0,
+    "status": "pass"
+  },
+  "storage_namespace_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 55.4,
+    "status": "pass"
+  },
+  "stream_effect_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 8.1,
+    "status": "pass"
+  },
+  "streaming_disconnect_writes_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.2,
+    "status": "pass"
+  },
+  "streaming_first_hop_writes_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.7,
+    "status": "pass"
+  },
+  "streaming_heartbeat_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.0,
+    "status": "pass"
+  },
+  "streaming_kv_wake_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.0,
+    "status": "pass"
+  },
+  "streaming_kv_wake_writes_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.3,
+    "status": "pass"
+  },
+  "streaming_resume_fault_inj_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.4,
+    "status": "pass"
+  },
+  "streaming_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.5,
+    "status": "pass"
+  },
+  "streaming_subscription_kv_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.5,
+    "status": "pass"
+  },
+  "streaming_wake_coalesce_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.2,
+    "status": "pass"
+  },
+  "streaming_write_pressure_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.2,
+    "status": "pass"
+  },
+  "subscription_cap_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.7,
+    "status": "pass"
+  },
+  "subscription_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.8,
+    "status": "pass"
+  },
+  "teams_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 7.4,
+    "status": "pass"
+  },
+  "tenant_door_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.4,
+    "status": "pass"
+  },
+  "tenant_move_smoke.py": {
+    "rc": 0,
+    "seconds": 0.6,
+    "status": "pass"
+  },
+  "three_node_smoke.py": {
+    "rc": 0,
+    "seconds": 1.0,
+    "status": "pass"
+  },
+  "tls_large_body_smoke.py": {
+    "rc": 1,
+    "seconds": 90.4,
+    "status": "fail"
+  },
+  "triggers_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.1,
+    "status": "pass"
+  },
+  "ttfb_idle_reuse_smoke.py": {
+    "rc": 0,
+    "seconds": 405.2,
+    "status": "pass"
+  },
+  "two_cluster_smoke.py": {
+    "rc": 0,
+    "seconds": 0.5,
+    "status": "pass"
+  },
+  "utf8_encode_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.0,
+    "status": "pass"
+  },
+  "webhook_recovery_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 9.2,
+    "status": "pass"
+  },
+  "webhook_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.7,
+    "status": "pass"
+  },
+  "ws_echo_smoke.py": {
+    "rc": 0,
+    "seconds": 0.4,
+    "status": "pass"
+  },
+  "ws_fetch_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.0,
+    "status": "pass"
+  },
+  "ws_ordering_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.0,
+    "status": "pass"
+  },
+  "ws_wake_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.5,
+    "status": "pass"
+  },
+  "ws_worker_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 1.9,
+    "status": "pass"
+  },
+  "zero_downtime_forward_smoke.py": {
+    "rc": 0,
+    "seconds": 0.5,
+    "status": "pass"
+  },
+  "zero_downtime_load_smoke.py": {
+    "rc": 0,
+    "seconds": 2.9,
+    "status": "pass"
+  },
+  "zero_downtime_move_smoke.py": {
+    "rc": 0,
+    "seconds": 0.4,
+    "status": "pass"
+  }
+}
