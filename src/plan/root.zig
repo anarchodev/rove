@@ -82,7 +82,31 @@ pub const PlanLimits = struct {
     /// Tape/log read-window in days — list/query clamp to the last N days
     /// (Lever 3; a read-path clamp, not GC).
     retention_days: u32,
+    /// Ceiling on a tenant's durable KV bytes — the plan-derived form of the
+    /// LMDB map size each tenant's `app.db` is opened at. KV is deliberate
+    /// customer data, so the ceiling REFUSES the write; it never evicts, and
+    /// it never bills elastically past the tier.
+    max_kv_bytes: u64,
+    /// Ceiling on a tenant's stored object bytes — the customer-written
+    /// `app-blobs/` plus the deploy-written `file-blobs/`. Deliberate customer
+    /// data, so the same rule as `max_kv_bytes`: refuse, never evict. Distinct
+    /// from the `log-blobs/` pool, which is platform exhaust the customer never
+    /// chose to write and where FIFO eviction at the ceiling is the fair
+    /// answer.
+    max_stored_bytes: u64,
 };
+
+/// `max_stored_bytes` for a tier whose storage figure is not yet a product
+/// decision — arithmetically "no ceiling", so an ordinary `>` comparison at a
+/// write path needs no sentinel special-case.
+pub const UNMETERED_BYTES: u64 = std.math.maxInt(u64);
+
+/// Every tier's `max_kv_bytes`. Uniform across tiers because a tenant's
+/// `app.db` is a single LMDB env opened at one baked map size
+/// (`src/kv/kvstore.zig`), so no tier can be sold more than this until that
+/// size is itself plan-derived. The tier table may not name a larger figure
+/// than the map it would have to fit in.
+pub const KV_BYTES_CEILING: u64 = 1 * 1024 * 1024 * 1024;
 
 /// The baked tier table. The single source of what each named tier means.
 pub fn table(t: Tier) PlanLimits {
@@ -99,6 +123,8 @@ pub fn table(t: Tier) PlanLimits {
             .max_body_bytes = 4 * 1024 * 1024,
             .max_resident_html_bytes = 4 * 1024 * 1024,
             .retention_days = 7,
+            .max_kv_bytes = KV_BYTES_CEILING,
+            .max_stored_bytes = UNMETERED_BYTES,
         },
         .pro => .{
             .rate = .{
@@ -110,6 +136,8 @@ pub fn table(t: Tier) PlanLimits {
             .max_body_bytes = 32 * 1024 * 1024,
             .max_resident_html_bytes = 32 * 1024 * 1024,
             .retention_days = 30,
+            .max_kv_bytes = KV_BYTES_CEILING,
+            .max_stored_bytes = UNMETERED_BYTES,
         },
         .enterprise => .{
             .rate = .{
@@ -121,6 +149,8 @@ pub fn table(t: Tier) PlanLimits {
             .max_body_bytes = 256 * 1024 * 1024,
             .max_resident_html_bytes = 256 * 1024 * 1024,
             .retention_days = 365,
+            .max_kv_bytes = KV_BYTES_CEILING,
+            .max_stored_bytes = UNMETERED_BYTES,
         },
     };
 }
@@ -136,6 +166,8 @@ pub const Overrides = struct {
     max_body_bytes: ?u32 = null,
     max_resident_html_bytes: ?u32 = null,
     retention_days: ?u32 = null,
+    max_kv_bytes: ?u64 = null,
+    max_stored_bytes: ?u64 = null,
 };
 
 /// Fold overrides over the tier table: `override ?? table(tier).field`.
@@ -148,6 +180,8 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     if (ov.max_body_bytes) |v| p.max_body_bytes = v;
     if (ov.max_resident_html_bytes) |v| p.max_resident_html_bytes = v;
     if (ov.retention_days) |v| p.retention_days = v;
+    if (ov.max_kv_bytes) |v| p.max_kv_bytes = v;
+    if (ov.max_stored_bytes) |v| p.max_stored_bytes = v;
     return p;
 }
 
@@ -221,6 +255,37 @@ test "plan: parseBlob round-trips tier + overrides" {
         try testing.expectEqual(@as(u32, 90), p.retention_days);
         try testing.expectEqual(table(.pro).max_body_bytes, p.max_body_bytes);
     }
+}
+
+test "plan: every tier carries both byte ceilings" {
+    for ([_]Tier{ .free, .pro, .enterprise }) |t| {
+        const p = table(t);
+        // No tier may promise more KV than the map its `app.db` opens at.
+        try testing.expect(p.max_kv_bytes <= KV_BYTES_CEILING);
+        try testing.expect(p.max_kv_bytes > 0);
+        try testing.expect(p.max_stored_bytes > 0);
+    }
+}
+
+test "plan: effective folds the byte-ceiling overrides" {
+    const p = effective(.enterprise, .{
+        .max_kv_bytes = 512 * 1024 * 1024,
+        .max_stored_bytes = 100 * 1024 * 1024 * 1024,
+    });
+    try testing.expectEqual(@as(u64, 512 * 1024 * 1024), p.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 100 * 1024 * 1024 * 1024), p.max_stored_bytes);
+    // Unset fields still fall through to the enterprise table.
+    try testing.expectEqual(table(.enterprise).retention_days, p.retention_days);
+}
+
+test "plan: parseBlob carries the byte ceilings" {
+    const a = testing.allocator;
+    const p = parseBlob(a, "{\"tier\":\"pro\",\"overrides\":{\"max_stored_bytes\":42}}");
+    try testing.expectEqual(@as(u64, 42), p.max_stored_bytes);
+    // A blob that names neither ceiling resolves to the tier's own figures.
+    try testing.expectEqual(table(.pro).max_kv_bytes, p.max_kv_bytes);
+    const bare = parseBlob(a, "{\"tier\":\"free\"}");
+    try testing.expectEqual(table(.free).max_stored_bytes, bare.max_stored_bytes);
 }
 
 test "plan: parseBlob fails toward the free tier" {
