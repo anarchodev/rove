@@ -1516,6 +1516,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ls_standalone.step);
     test_step.dependOn(&ops_exe.step);
     test_step.dependOn(&cli_exe.step);
+
+    // Bare `zig build` gets the same gate. The default install step builds
+    // examples and benches (their unconditional `installArtifact`s) while —
+    // without these lines — skipping every shipped binary, so it read as "the
+    // build passes" while proving nothing about the product. The rule "only
+    // `zig build test` is the gate" lived in heads, not the build graph
+    // (docs/defect-patterns.md class 10). Compile steps only, same as above:
+    // installing stays behind the named steps `scripts/ops/build.sh` drives.
+    b.getInstallStep().dependOn(&rewind_exe.step);
+    b.getInstallStep().dependOn(&front_exe.step);
+    b.getInstallStep().dependOn(&cp_exe.step);
+    b.getInstallStep().dependOn(&ls_standalone.step);
+    b.getInstallStep().dependOn(&ops_exe.step);
+    b.getInstallStep().dependOn(&cli_exe.step);
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 
