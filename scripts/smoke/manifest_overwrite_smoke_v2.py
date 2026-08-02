@@ -41,7 +41,11 @@ def main() -> int:
 
         print("deploy #1…")
         dep = c.deploy_with_static("manifow", {}, statics)
-        key = f"{c.s3_prefix}manifow/deployments/{int(dep):020d}.json"
+        # The deployments prefix is incarnation-scoped (rove#357) — ask the
+        # product for the segment rather than assuming the layout.
+        inc = c.incarnation("manifow")
+        scope = f"manifow/{inc}" if inc else "manifow"
+        key = f"{c.s3_prefix}{scope}/deployments/{int(dep):020d}.json"
         code, body = s3_curl("GET", key)
         assert code == 200 and b'"v":2' in body, (code, body[:100])
         print(f"  manifest at {key}: v2, {len(body)}B")

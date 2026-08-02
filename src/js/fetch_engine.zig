@@ -882,11 +882,25 @@ pub const FetchEngine = struct {
 
         if (method != .GET) return error.BlobMethodDenied;
 
-        const path = try std.fmt.allocPrint(
-            self.allocator,
-            "/{s}/{s}{s}/file-blobs/{s}",
-            .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
-        );
+        // Incarnation-scoped, like the app-blobs door above (#357) — the
+        // deploy writes file-blobs under `{tenant}/{incarnation}/`, so a
+        // legacy-prefixed read gets S3's NoSuchKey error document and the
+        // stream relay serves THAT as the asset body.
+        const inc = self.node.tenant.incarnationOf(self.allocator, pf.tenant_id) catch
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(inc);
+        const path = if (inc.len == 0)
+            try std.fmt.allocPrint(
+                self.allocator,
+                "/{s}/{s}{s}/file-blobs/{s}",
+                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "/{s}/{s}{s}/{s}/file-blobs/{s}",
+                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, inc, hash },
+            );
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";

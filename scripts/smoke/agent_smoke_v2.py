@@ -300,8 +300,12 @@ def main() -> int:
         r = c.provision(TENANT)
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
-            c.deploy_handlers(TENANT, {"index.mjs": READY_SRC,
-                                       "agent/index.mjs": AGENT_SRC})
+            # The agent handler imports `@rewind/browser`, so the package
+            # stages with the deploy — it stopped being an ambient global.
+            pkgs, imports = c.firstparty_packages(["@rewind/browser"])
+            c.deploy_with_packages(TENANT, {"index.mjs": READY_SRC,
+                                            "agent/index.mjs": AGENT_SRC},
+                                   pkgs, imports)
         except RuntimeError as e:
             check("deploy_handlers", False, str(e))
             print(f"\nFAILURES: {failures}")

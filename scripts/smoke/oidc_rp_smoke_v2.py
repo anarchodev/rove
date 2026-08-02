@@ -151,9 +151,13 @@ def main() -> int:
         r = c.provision("__auth__")
         check("provision __auth__ → 200/409", r.status in (200, 409), f"got {r.status}")
         try:
-            c.deploy_with_static(
-                "__auth__", {"index.mjs": auth_src},
-                {"_config/oidc/default.json": (auth_cfg, "application/json")})
+            # web/auth imports `@rewind/oidc` (which pulls `@rewind/jwt`) and
+            # `@rewind/email`, so
+            # the packages stage with the deploy.
+            auth_pkgs, auth_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            c.deploy_with_packages(
+                "__auth__", {"index.mjs": auth_src}, auth_pkgs, auth_imports,
+                statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
         except RuntimeError as e:
             check("deploy web/auth → __auth__", False, str(e))
             return 1
@@ -165,7 +169,10 @@ def main() -> int:
             "login_path": "/login",
         }, separators=(",", ":")))
         try:
-            c.deploy_handlers("__admin__", admin_files)
+            # web/admin's middleware imports `@rewind/oidc` + `@rewind/email`,
+            # so the packages stage with the deploy.
+            adm_pkgs, adm_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e))
             return 1
@@ -306,7 +313,11 @@ def main() -> int:
                 h["content-type"] = "application/json"
                 data = json.dumps(payload)
             return c.tls_curl(app_origin + path, method=method, headers=h, data=data)
-        r = rest(op_cookie, "POST", "/v1/instances/not-mine/release", {"dep_id": 1})
+        # `dep_id` is a HEX STRING: a JSON number loses precision above 2^53,
+        # so the API rejects one outright — a numeric literal here never
+        # reaches the ownership check this asserts on.
+        r = rest(op_cookie, "POST", "/v1/instances/not-mine/release",
+                 {"dep_id": "0000000000000001"})
         check("operator (is_root) bypasses ownership → 404 not-found",
               r.status == 404, f"got {r.status} {r.body[:120]!r}")
         if cust_cookie:

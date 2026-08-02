@@ -1068,6 +1068,21 @@ class V2Cluster:
         return _curl(f"{self.node_url(node)}{path}", method=method, data=data,
                      host=host, headers=headers)
 
+    def incarnation(self, tenant: str, *, node: int = 0) -> str:
+        """The tenant's storage incarnation (rove#357), read from the product.
+
+        Any smoke that addresses a tenant's S3 objects DIRECTLY has to build
+        `{prefix}{tenant}/{incarnation}/{subdir}/…`; the incarnation segment is
+        what makes a reused tenant name unable to reach its predecessor's
+        objects. Guessing the layout instead of asking is how these smokes
+        started 404ing (rove#355). Empty for a tenant on the legacy layout.
+        """
+        r = _curl(f"{self.node_url(node)}/_system/v2-applied-baseline?tenant={tenant}",
+                  headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        if r.status != 200:
+            raise RuntimeError(f"incarnation {tenant}: {r.status} {r.body}")
+        return json.loads(r.body).get("incarnation", "")
+
     def admin_kv_get(self, tenant: str, key: str, *, node: int = 0) -> HttpResponse:
         """Read a tenant KV key via the worker's `/_system/v2-kv` (move-secret
         gated) — handy for asserting a handler's durable writes landed."""
