@@ -1,13 +1,15 @@
 # Pricing model — what to sell and why
 
-> **Status**: Design proposal, 2026-06-02. Captures the economic model
-> behind the tiers; the *enforcement* mechanism is the plan-tiers enforcement (`architecture/control-plane.md` "Operational state")
+> **Status**: Design proposal, 2026-06-02; revised 2026-08-01 to add the
+> third axis (§4) and correct three claims about the shipped storage
+> layout (§2, §3.2). Captures the economic model behind the tiers; the
+> *enforcement* mechanism is the plan-tiers enforcement (`architecture/control-plane.md` "Operational state")
 > (tier plumbing + per-lever wire-up). This doc is the "what to charge
 > for and why" that sits upstream of that one. It **revises** the
 > retention lever of the plan-tiers enforcement (`architecture/control-plane.md`) (§Lever 3) from a time-window clamp
-> to a capacity ring with a derived time floor — see §6 for the
+> to a capacity ring with a derived time floor — see §7 for the
 > reconciliation. Nothing here is built; the load-bearing unmeasured
-> assumption is the per-record deflate ratio (§7).
+> assumption is the per-record deflate ratio (§8).
 
 ## 1. The principle — price the scarce resources, guard the rest
 
@@ -22,17 +24,22 @@ usually goes wrong:
   invoice short while plugging the arbitrage a pure billing model leaves
   open.
 
-We sell **two billing axes** and back them with **one new guardrail**
+We sell **three billing axes** and back them with **one new guardrail**
 (plus the rate/body levers already specced in the plan-tiers enforcement (`architecture/control-plane.md`)):
 
-| | What | Role | Scarcity |
-|---|---|---|---|
-| Billing axis 1 | **Max KV size** | buy more | HIGH — raft-replicated, RAM/fsync-bound, on the hot path |
-| Billing axis 2 | **Object-storage capacity** (replay-log ring) | buy more | LOW per byte, but the product's core durable artifact |
-| Guardrail | **Log-byte ingest rate** | bound, not billed | the universal cost currency (see §5) |
+| | What | Role | Ceiling behavior | Scarcity |
+|---|---|---|---|---|
+| Billing axis 1 | **Max KV size** | buy more | refuse the write | HIGH — raft-replicated, RAM/fsync-bound, on the hot path |
+| Billing axis 2 | **Replay-log capacity** (the ring) | buy more | evict oldest (FIFO) | LOW per byte, but the product's core durable artifact |
+| Billing axis 3 | **Customer object storage** | buy more | refuse the write | LOW per byte, but customer-controlled and unbounded |
+| Guardrail | **Log-byte ingest rate** | bound, not billed | admission 429 | the universal cost currency (see §6) |
 
-Why these are the right two axes — and not "requests" — is the rest of
-this doc.
+The **ceiling behavior** column is the load-bearing one, and it is why
+axes 2 and 3 stay separate despite both being S3 bytes in one bucket —
+see §4.1.
+
+Why these are the right axes — and not "requests" — is the rest of this
+doc.
 
 ## 2. Axis 1 — Max KV size
 
@@ -43,30 +50,47 @@ pricing on it is pricing on real marginal cost. This is the strong
 axis.
 
 - **Define it as logical committed bytes**, not raw `app.db` file size.
-  SQLite free pages, pre-VACUUM bloat, and WAL make file size jump
-  around and produce billing disputes we'd lose.
+  LMDB reuses freed pages and the file never shrinks, so file size
+  ratchets upward and drifts away from live data — a denomination that
+  produces billing disputes we would lose.
 
 - **Overage semantics = throttle → upgrade, never elastic billing.**
   KV is RAM/raft-bound; at some point we physically cannot honor more
   without OOM-ing a node and hurting every co-tenant. So at the cap, go
   read-only / reject writes and prompt an upgrade. Selling "unlimited KV
   at $X/GB" writes a check the cluster can't cash. This is the key
-  asymmetry vs. axis 2: meter both, bill elastically only on the elastic
-  one.
+  asymmetry vs. axis 2: meter all three, bill elastically only on the
+  elastic one.
 
-- **Already cheap to measure off the hot path.** The snapshot manifest
-  already computes per-tenant `db_size` (`docs/architecture/consensus-and-storage.md`), so
-  billing rides an existing seam without violating the
-  no-`O(N_tenants)`-on-dispatch rule.
+- **Nothing measures this today.** An earlier draft claimed the snapshot
+  manifest already computes a per-tenant `db_size`; it does not, and no
+  per-tenant KV size figure exists anywhere in the tree. The measurement
+  is a real (small) build: kvexp gives each store its own LMDB DBI, so
+  the durable size is a stat on that DBI —
+  `(branch + leaf + overflow pages) × page_size` — which is O(1)-ish and
+  respects the no-`O(N_tenants)`-on-dispatch rule.
 
-## 3. Axis 2 — Object storage as a capacity ring (not a time window)
+- **A hard ceiling already exists, as a cliff.** Every tenant's `app.db`
+  is its own LMDB environment opened at `STANDALONE_MAP_SIZE` = 1 GiB, so
+  tenants already hit `MDB_MAP_FULL` today: an unattributed write
+  failure, at a number no tier mentions, with no warning. Axis 1 is
+  therefore not "add a cap" but "make the existing cliff explicit,
+  plan-derived, and graceful" — and **no tier can sell more than 1 GiB of
+  KV until that constant becomes plan-derived or is raised above the
+  highest sellable tier.**
+
+## 3. Axis 2 — Replay-log storage as a capacity ring (not a time window)
 
 Every transaction deposits ~1 KB of replay log into object storage
-(`_logs/...`, `docs/architecture/deployment-and-logs.md`). So for any tenant that retains
-logs, object-storage growth *tracks transaction volume* — something
-Lambda/Cloudflare can't price because they can't see invocations as
-storage. Here the product literally stores every transaction, so
-storage is a legitimate proxy for usage.
+(`{instance}/log-blobs/`, `docs/architecture/deployment-and-logs.md`). So
+for any tenant that retains logs, object-storage growth *tracks
+transaction volume* — something Lambda/Cloudflare can't price because
+they can't see invocations as storage. Here the product literally stores
+every transaction, so storage is a legitimate proxy for usage.
+
+This axis covers **platform-generated bytes only**: the replay log and
+the recorded request/response bodies it references. Bytes the customer
+deliberately stored are axis 3.
 
 The model is **capacity-based retention, not time-based**: you buy N GB
 of replay-log space; logs accumulate; when the ring is full the oldest
@@ -109,7 +133,7 @@ play two opposite roles:
   delete our own pitch.
 - **Time as a floor** (guarantee ≥90 days even if bytes overflow) — a
   *gift*. Strictly better than pure capacity, but we'd eat the overflow
-  (variable COGS) unless that overflow is bounded. §5 is what bounds it.
+  (variable COGS) unless that overflow is bounded. §6 is what bounds it.
 
 What a time number actually sells is *removal of uncertainty*, not
 bytes. "Unlimited, probably, depends on your traffic" reads as flaky;
@@ -130,28 +154,128 @@ without degrading the deal:
 
 ### 3.2 Implementation cost to go in eyes-open
 
-Capacity-based per-tenant eviction is meaningfully harder than
-time-based, because log batch objects are **cross-tenant fan-in**
-(`flush_writer` bundles many tenants' records into one
-`_logs/.../{batch}.ndjson` PUT). You can't reclaim a tenant's oldest
-bytes by deleting a batch object — it holds other tenants' records too.
-So precise per-tenant eviction *requires* the compacting GC rewrite that
-`architecture/deployment-and-logs.md` §6.8 currently lists as deferred — and makes it
-**mandatory and continuous**, not a someday-nicety. Time-based, by
-contrast, can drop whole objects past their newest record's TTL, or even
-be a plain S3 lifecycle rule. That compactor is the real price of this
-model; scope it before committing the pricing page to capacity.
+An earlier draft of this section claimed all log batch objects are
+cross-tenant fan-in, and concluded that the deferred compacting GC
+(`architecture/deployment-and-logs.md` §6.8) becomes mandatory and
+continuous for this model. That is **half wrong**, and the correction
+materially lowers the price of the ring:
 
-## 4. Why not price "requests" / transactions directly
+- **Log records are already per-tenant prefixed** —
+  `{key_prefix_base}{instance}/log-blobs/`. Reclaiming a tenant's oldest
+  log bytes is an ordinary per-tenant FIFO sweep over its own prefix. No
+  compaction, no cross-tenant coordination.
+- **Request/response bodies are the cross-tenant part** — they batch into
+  a shared pool at `{key_prefix_base}_pool/{batch_id}`, so one object
+  holds slices belonging to many tenants and cannot be dropped until
+  every tenant's slice in it is evictable. This is where the compacting
+  GC is genuinely required.
+
+So the compactor is scoped to the **bodies** half, not the whole ring,
+and the two halves can ship independently. The open choice for bodies is
+compaction (rewrite live slices, keep the S3-request amortisation the
+pool exists for) versus per-tenant pools (trivial eviction, lose the
+batching win for low-traffic tenants) — decide it on measured pool
+occupancy, not taste.
+
+Two further realities to go in eyes-open:
+
+- **Nothing evicts anything today.** No blob GC of any kind exists; the
+  only blob delete in the tree is a temp-key cleanup on a failed upload.
+  The shipped `retention_days` lever is a *read* clamp — it hides records
+  older than the window, it never removes them. So S3 grows without bound
+  right now, including data no customer can read.
+- **Eviction must be honest at the read surface.** A query for an evicted
+  window has to report "beyond your horizon" rather than silently return
+  a short result set.
+
+## 4. Axis 3 — Customer object storage
+
+`blob.*` ([`handler-shape.md`](../handler-shape.md)) is a full
+customer-facing content-addressed
+object store: `put` / `get`, presigned `url` for zero-copy downloads,
+`write` + `seal` for streaming recipes, and `receive` to pipe an inbound
+request body straight to storage. Customer runtime objects land in
+`{instance}/app-blobs/`; deploy-time statics and bytecode land in
+`{instance}/file-blobs/`. Both are **customer-controlled** — bytes exist
+because the customer chose to store them.
+
+**It is entirely unmetered today.** The only limit in the tree is a
+per-session 64 MiB cap on a single `blob.write` chain; `put` may be
+called without bound, and the tier table has no storage field at all.
+This axis is the newest of the three and the reason this doc needed
+revising: the original two-axis model predates the `blob.*` API.
+
+- **Overage semantics = refuse the write, like axis 1.** See §4.1.
+- **Measurement is the same machinery as axis 2**, pointed at the
+  customer-controlled prefixes instead of `log-blobs/` — a running
+  per-tenant byte counter, never an S3 LIST per query.
+- **This axis cannot be added later.** Customers accumulate objects
+  freely, and a cap imposed after the fact either breaks existing
+  customers or gets grandfathered away for exactly the customers who
+  matter. That is the same "impossible later" property as axis 1, and the
+  opposite of axis 2 — a ring can arrive at any time because eviction is
+  prospective. **Axes 1 and 3 gate launch; axis 2 does not.**
+
+### 4.1 Why this is not just more of axis 2
+
+Both axes are S3 bytes, in one bucket, differing only by key prefix.
+There is nothing to physically separate — and they still must not share
+a metered pool, because they differ in the single property enforcement
+turns on: **what happens at the ceiling.**
+
+- **Axis 2 is platform exhaust.** The customer never chose to write a
+  replay log; it is a byproduct of being served. FIFO eviction is fair
+  *because* of that, and §6's ingest throttle is the matching guardrail —
+  we bound what we generate on their behalf.
+- **Axis 3 is deliberate customer data.** They called `put` because they
+  wanted the object kept, and the documented pattern is to store the hash
+  in KV and dereference it later. Evicting it is destroying data they
+  asked us to hold.
+
+Merge the pools and you are forced into one of two bad outcomes: evict
+customer uploads (silent data loss), or refuse writes when the shared
+pool fills — which means a traffic spike, by generating logs, breaks the
+customer's `blob.put`. Coupling a deliberate write path to an exhaust
+stream's fullness is a worse failure than either axis has alone.
+
+So: one bucket, one accounting mechanism, **two axes with opposite
+ceiling rules.**
+
+### 4.2 The durability nuance — and why it does not change the answer
+
+[`effect-algebra.md`](../effect-algebra.md) classifies blob bytes by
+recoverability, and under
+that lens axis 3 looks softer than stated above: **input bytes** (request
+and fetch bodies) are unrecoverable because they came from outside, while
+**output bytes** — a `blob.put` payload — are a pure function of the
+source activation and its readset, so in principle they are a *cache*
+that could be re-derived rather than storage that must be kept.
+
+Two reasons that does not license eviction:
+
+1. **Re-derivation depends on the readset, which axis 2 evicts.** Once
+   the source activation's readset ages out of the ring, the output is no
+   longer re-derivable either. A cache whose backing is on a FIFO is not
+   a durable store.
+2. **Nothing re-materializes on read.** There is no on-demand
+   re-derivation path behind `blob.get`; an absent object is an absent
+   object from the handler's seat.
+
+The recoverability classification is the right model for *durability
+engineering* — what a fault can lose and what it must not. It is the
+wrong model for *billing*, where the question is what the customer
+believes they bought. Record the distinction; price on the belief.
+
+## 5. Why not price "requests" / transactions directly
 
 Per-request billing is the surprise-invoice customers hate, and it
 fights our no-`O(N_tenants)`-on-the-hot-path rule (a per-request meter
 keyed by tenant is exactly the per-tenant hot-path accounting we keep
 out). The storage axes are measurable at existing batch/snapshot seams;
 a transaction counter is not. So we never put transactions on the
-invoice — we bound them with a guardrail instead (§5).
+invoice — we bound them with a guardrail instead (§6).
 
-## 5. Guardrail — throttle log-byte *ingest rate* (the keystone)
+## 6. Guardrail — throttle log-byte *ingest rate* (the keystone)
 
 Rate-limiting by request *count* is dimensionally wrong: a 1 MB-body
 request costs ~1000× a tiny one but counts the same. Throttle the actual
@@ -176,7 +300,12 @@ tenants still get "basically forever," at zero extra COGS. This is the
 synthesis that reconciles §3's pure-capacity model with a legible floor
 promise.
 
-### 5.1 Denominate everything in RAW bytes — the floor must not depend on deflate
+Note this guardrail bounds **axis 2 only.** It throttles what the
+platform writes on the customer's behalf. Axis 3 needs no rate
+guardrail — a customer storing their own objects is bounded by the axis-3
+quota directly, and refusing at the ceiling is the whole mechanism.
+
+### 6.1 Denominate everything in RAW bytes — the floor must not depend on deflate
 
 The identity only holds if both sides are the same unit, and the
 dangerous trap is metering the throttle in *ingested* (raw) bytes while
@@ -201,7 +330,10 @@ incompressible. Consequences:
   intuitive denomination anyway, since a customer can't predict our
   deflate but knows what they pushed.
 - **Do NOT model compression in any guarantee or any customer promise.**
-  It is a margin / capacity-planning input only (§7).
+  It is a margin / capacity-planning input only (§8).
+
+The same rule applies to axis 3: quote and enforce the storage quota in
+the bytes the customer handed us, not in what they occupy after deflate.
 
 Two constraints this exposes:
 
@@ -219,7 +351,7 @@ Two constraints this exposes:
   does NOT give provider-blind logs / per-tenant crypto isolation /
   crypto-shred, which is what `project_observability_split`'s
   "page-encrypted" property requires; that remains demand-gated.
-- **Size `k` (the per-request floor, §5 below) on uncompressed
+- **Size `k` (the per-request floor, below) on uncompressed
   overhead** — header + sidecar + raft entry — same worst-case logic.
 
 Byte-rate is also close to a *universal* cost currency here: those bytes
@@ -255,7 +387,7 @@ Three implementation realities:
   no-per-tenant-work rule is about sweeping all tenants, not touching the
   one in front of you. This composes directly with the existing
   `src/js/limiter.zig` token-bucket machinery — add a `log_bytes` action
-  alongside `request` / `email`.
+  alongside the existing `request` / `outbound` pair.
 
 **Residual gap:** a genuinely CPU-heavy, byte-light handler (lots of
 compute, tiny readset) stays under-priced even with the `k·count` term.
@@ -263,14 +395,16 @@ Acceptable to ignore pre-launch — but it's the one workload this
 guardrail doesn't catch, so note it rather than assume bytes covers
 everything.
 
-## 6. The tier as a (capacity, rate, floor) triple
+## 7. The tier as a (kv, storage, capacity, rate) quadruple
 
-A tier is therefore an honest triple where any two fix the third:
+A tier is therefore an honest quadruple, where the last two fix the
+derived floor:
 
 ```
 tier = {
-  kv_max_bytes:        <hard cap, throttle→upgrade at limit>
-  log_capacity_bytes:  <the replay-log ring size>
+  kv_max_bytes:        <axis 1 — hard cap, throttle→upgrade at limit>
+  stored_max_bytes:    <axis 3 — hard cap on customer objects>
+  log_capacity_bytes:  <axis 2 — the replay-log ring size>
   log_max_ingest_rate: <bytes/sec, incl. k·count overhead>
   ⇒ retention_floor  = log_capacity_bytes / log_max_ingest_rate   (derived, displayed)
 }
@@ -287,28 +421,31 @@ The plan-tiers enforcement (folded into `architecture/control-plane.md`; decisio
 enforces. Mapping:
 
 - **Lever 1 (request rate)** → augmented. Keep the limiter, but the
-  sharper axis is the `log_bytes` ingest bucket of §5 (with `k·count`
+  sharper axis is the `log_bytes` ingest bucket of §6 (with `k·count`
   folding request-rate into it). Request-count rate stays as the cheap
-  CPU/ops-axis backstop for the §5 residual gap.
+  CPU/ops-axis backstop for the §6 residual gap.
 - **Lever 2 (max body size)** → unchanged and complementary. Per-request
-  413 gate bounds single-shot overshoot; the §5 bucket bounds sustained
+  413 gate bounds single-shot overshoot; the §6 bucket bounds sustained
   rate.
 - **Lever 3 (tape retention)** → **revised.** the shipped Lever 3 fakes
   retention as a read-path *time clamp* (return only the last N days,
   no GC). This doc replaces that with a **capacity ring + derived time
   floor**. The read-path clamp is fine as a launch stopgap (instant,
   reversible, no GC), but the billed axis is *bytes of capacity*, not
-  *days*, and the real eviction is the per-tenant compactor of §3.2.
-  When that compactor ships, the time-clamp retires.
+  *days*, and the real eviction is the per-tenant sweep of §3.2. When
+  that ships, the time-clamp retires. **Until it does, `retention_days`
+  is both the enforced and the advertised retention mechanism** — the
+  pricing page sells days, not a byte floor, and switching the two is a
+  later revision of the page.
 
-New control-plane state (beyond the plan axis `plan/{tenant}`): the ring
-needs per-tenant resident-log-bytes accounting and the eviction
+New control-plane state (beyond the plan axis `plan/{tenant}`): per-tenant
+resident-byte accounting for both storage axes, plus the ring's eviction
 watermark. KV-size and log-bytes are both readable at the snapshot /
 flush seams, so neither adds hot-path work.
 
-## 7. Open decisions / unmeasured assumptions
+## 8. Open decisions / unmeasured assumptions
 
-- **Deflate ratio — margin input, NOT a guarantee input (§5.1).** By
+- **Deflate ratio — margin input, NOT a guarantee input (§6.1).** By
   denominating quota/throttle/eviction in raw bytes, no floor or
   customer promise depends on the ratio; worst-case (incompressible:
   encrypted, already-compressed, or random payloads, ratio ≈ 1.0) is
@@ -319,14 +456,24 @@ flush seams, so neither adds hot-path work.
   longer gates correctness. **Caveat:** encryption at rest is deferred;
   the likely transparent baseline (encrypted volume + S3 SSE) sits below
   compression so margin is preserved, but a future mis-ordered app-level
-  page encryption would zero the margin (§5.1).
+  page encryption would zero the margin (§6.1).
+- **Egress is unpriced on axis 3.** `blob.url` mints presigned URLs, so
+  customer objects can be served directly from the object store to the
+  public at whatever volume the customer drives. That bandwidth is billed
+  by the provider and metered by nothing here. A quota bounds bytes
+  *stored*, not bytes *served* — decide whether egress needs its own
+  ceiling before a customer discovers we are a free CDN.
 - **`k` (per-request byte floor).** Set against measured fixed overhead
   (header + sidecar + raft entry); needs a real measurement.
-- **Concrete tier rows.** `kv_max_bytes` / `log_capacity_bytes` /
-  `log_max_ingest_rate` per named tier — a product call, gated on the
-  deflate measurement.
+- **Concrete tier rows.** `kv_max_bytes` / `stored_max_bytes` /
+  `log_capacity_bytes` / `log_max_ingest_rate` per named tier — a product
+  call, gated on the axis-1 and axis-3 measurements landing first so the
+  numbers are chosen against a real distribution. Note the 1 GiB LMDB
+  ceiling of §2 constrains what the top tier can offer on axis 1.
 - **Backend pricing.** COGS math here uses S3-standard rates; the live
   backend is OVH (`reference_s3_smoke_env`). Plug in OVH GB-month + PUT
   pricing for the real bill; order of magnitude is similar.
-- **The compactor.** Per-tenant log GC over cross-tenant batch objects
-  (§3.2) is the one substantial new build this model requires.
+- **The bodies compactor.** Per-tenant eviction over the cross-tenant
+  `_pool/` batch objects (§3.2) is the one substantial new build this
+  model requires — and it is scoped to bodies alone, not to the whole
+  ring.
