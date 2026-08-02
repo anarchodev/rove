@@ -12,6 +12,9 @@ ground truth for *mechanics*; these docs explain *why* and *how the pieces fit*.
   (the *why*). Check here before re-litigating a settled call.
 - **[architecture/overview.md](architecture/overview.md)** — the orientation map:
   processes, request flow, module graph, and where to go next.
+- **[defect-patterns.md](defect-patterns.md)** — the recurring shapes of bugs in
+  this codebase, with the instances that name each one. Read before a refactor,
+  and before assuming a class of bug is a one-off.
 - **[../CLAUDE.md](../CLAUDE.md)** — repo orientation, build/test commands.
 
 ## How this folder is organized
@@ -24,6 +27,7 @@ Three durable layers, plus working docs:
 | **What / roadmap** | `PLAN.md` | Product direction, phases. |
 | **How it works (as-built)** | `architecture/` | One doc per subsystem, kept current. |
 | Customer contracts | `effect-algebra.md`, `handler-shape.md` | The effect model + handler API surface. |
+| Engineering | `defect-patterns.md` | The recurring *shapes* of bugs here, and what would prevent them structurally. |
 | In-flight | **GitHub issues** | Active work. `gh issue list` / the tracker issues below. |
 | Product / strategy | `strategy/` | Not engine mechanics. |
 | Guides | `guides/` | Tutorials. |

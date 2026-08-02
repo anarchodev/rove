@@ -38,11 +38,23 @@ nobody re-ran:
 | 2026-06-17 | per-file workspace deploy protocol | smokes POSTing the old mega-bundle |
 | 2026-06-28 | `web/` extracted to the rewind-apps repo | smokes reading `web/…` in-repo |
 | 2026-07-05 | `name:` → `on:` resume-export key | smokes passing the retired spelling |
-| 2026-07-28 | 12 ambient libs became `@rewind/*` packages | fixtures using `oidc.` / `segments.` / … as globals |
+| 2026-07-28 | 12 ambient libs became `@rewind/*` packages | fixtures using `oidc.` / `schedule.` / … as globals |
+| — | `v2-bundle` → `v2-snapshot`; pause/resume dropped when the dump went non-quiescing | a door that 404s |
+| — | plan tiers `email_*` → `outbound_*`; `email.send`'s `key` → `apiKey` | `None` where a number was expected |
+| — | the cert frame gained a leading version byte | an unpacker returning None, read as "certs are broken" |
+| — | `stream.write` became lossless (soft cap = back-pressure, hard cap throws) | a smoke that required drops, i.e. required data loss |
+| — | provision answers 200 + a body, not 204 | a guard that bailed out after a SUCCESSFUL provision |
+| — | the storage incarnation (#357) | joiners opening a legacy-keyed store and reading empty |
 
 None of these were bad changes. The lesson is narrower and duller: **a test
 suite nobody runs is not coverage, it is the appearance of coverage** — and it
 is worse than no suite, because it is counted.
+
+Running it once found three live production bugs, none of which any unit test
+could reach: an unconditional worker panic on every over-threshold inbound
+body, a `blob.url` that signed keys nothing had written, and a CP that
+delivered the storage incarnation only at provision (so a move, a reconciler
+grow, or a node rejoin silently opened the wrong store).
 
 So: run `run_all.py` before you claim a change is safe, and after anything that
 touches the deploy protocol, a global/shim surface, the front door, or the
@@ -79,3 +91,14 @@ it when you fix something, so the next person's diff is meaningful.
 - If a script is a reproduction for an open bug and is *meant* to be red, add it
   to `EXCLUDED` in `run_all.py` with the issue number. A permanently-red member
   teaches people to ignore the report.
+- A smoke that legitimately runs long (the raft soak: 6 kill/wipe/heal rounds)
+  needs an entry in `TIMEOUTS`, or it is reported HUNG and reads as a product
+  hang rather than a slow test.
+- Don't build while the suite runs. A saturated CPU trips raft election
+  timeouts, and a spurious leader step-down looks exactly like a real one.
+- Never hand-build a tenant's S3 key. `V2Cluster.incarnation()` reads the real
+  segment from the product; guessing the layout is how several of these smokes
+  started 404ing.
+- Simulating the CP means sending what the CP sends. Use
+  `smoke_lib_v2.attach_bundle` rather than a private copy of the attach
+  contract — four smokes each had their own, so a new header landed in none.

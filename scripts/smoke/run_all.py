@@ -47,6 +47,11 @@ EXCLUDED = {
     "front_write_reaim_repro.py": "rove#353 repro — red by design until fixed",
 }
 
+# Known-red members that ARE in the suite, so the report keeps counting them.
+# Listed here only as a pointer for whoever reads a red run:
+#   tls_large_body_smoke.py — rove#361, concurrent large static downloads
+#   abort mid-stream. A real product defect, not a stale fixture.
+
 # Smokes that legitimately run longer than the default budget. Without an
 # entry here a slow-but-healthy smoke is reported HUNG, which reads as a
 # product hang and is the fastest way to teach people to distrust the report.
