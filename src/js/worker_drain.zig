@@ -2126,7 +2126,7 @@ fn resumeContinuation(
         // .wake_batch (with the drained fired prefixes) for an on.* wake.
         .activation = if (wake) .{ .wake_batch = .{ .wakes = batch_owned } } else .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .effects = .{
             .pending_wakes = &pending_wakes,
@@ -2366,7 +2366,7 @@ pub fn resumeBoundFetchChain(
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
@@ -3289,7 +3289,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,

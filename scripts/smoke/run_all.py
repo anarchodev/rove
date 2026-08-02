@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -46,6 +47,13 @@ EXCLUDED = {
     "front_write_reaim_repro.py": "rove#353 repro — red by design until fixed",
 }
 
+# Smokes that legitimately run longer than the default budget. Without an
+# entry here a slow-but-healthy smoke is reported HUNG, which reads as a
+# product hang and is the fastest way to teach people to distrust the report.
+TIMEOUTS = {
+    "raft_soak_prod.py": 1800,      # 6 rounds of kill/wipe/heal by design
+}
+
 
 def discover(filter_str: str | None) -> list[Path]:
     out = []
@@ -62,7 +70,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--filter", default=None, help="substring match on the script name")
     ap.add_argument("--list", action="store_true", help="list what would run, then exit")
-    ap.add_argument("--timeout", type=int, default=420, help="per-smoke seconds")
+    ap.add_argument("--timeout", type=int, default=420,
+                    help="per-smoke seconds (TIMEOUTS overrides it per smoke)")
     ap.add_argument("--logs", default=None, help="directory for per-smoke logs")
     ap.add_argument("--json", default=None, help="write a machine-readable summary here")
     ap.add_argument("--baseline", default=None, help="compare against a prior --json summary")
@@ -104,14 +113,25 @@ def main() -> int:
     started = time.time()
     for i, p in enumerate(smokes, 1):
         log_path = log_dir / f"{p.stem}.log"
+        budget = TIMEOUTS.get(p.name, args.timeout)
         t0 = time.time()
         with open(log_path, "w") as lf:
-            try:
-                rc = subprocess.run([sys.executable, str(p)], stdout=lf,
+            # Own process group, so a timeout can kill the smoke AND the
+            # cluster it spawned. Killing only the script leaves its nodes
+            # holding the fixed ports, and every later smoke fails on
+            # EADDRINUSE — one hang reported as a dozen.
+            proc = subprocess.Popen([sys.executable, str(p)], stdout=lf,
                                     stderr=subprocess.STDOUT,
-                                    timeout=args.timeout).returncode
+                                    start_new_session=True)
+            try:
+                rc = proc.wait(timeout=budget)
                 status = "pass" if rc == 0 else "fail"
             except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
                 rc, status = -1, "timeout"
         dur = time.time() - t0
         results[p.name] = {"status": status, "rc": rc, "seconds": round(dur, 1)}

@@ -1130,7 +1130,7 @@ fn resumeStream(
             .request_id = request_id,
             .correlation_id = chain_ctx.correlation_id,
         },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .effects = .{
             .pending_wakes = &pending_wakes,
@@ -1357,7 +1357,7 @@ pub fn resumeBoundFetchStream(
             .request_id = request_id,
             .correlation_id = chain_ctx.correlation_id,
         },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,

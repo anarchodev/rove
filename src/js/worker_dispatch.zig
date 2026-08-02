@@ -2311,7 +2311,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // running as `__admin__` scoped to `acme` should pull
                 // from acme's email bucket, not __admin__'s.
                 .limiter = &worker.limiter,
-                .instance_id = scope_inst.id,
+                .instance_id = scope_inst.id, .instance_incarnation = scope_inst.incarnation,
                 // Same plan the request-rate check used — so `email.send`'s rate
                 // check sizes its bucket from this tenant's tier too (Lever 1's
                 // free second lever).
