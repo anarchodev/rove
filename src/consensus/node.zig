@@ -42,6 +42,7 @@ pub const CommitHook = core.CommitHook;
 pub const SkipQuery = core.SkipQuery;
 pub const DurabilizeFloor = core.DurabilizeFloor;
 pub const ApplyObserver = core.ApplyObserver;
+pub const ApplyOp = core.ApplyOp;
 pub const ApplyMode = core.ApplyMode;
 pub const ApplyPolicy = core.ApplyPolicy;
 

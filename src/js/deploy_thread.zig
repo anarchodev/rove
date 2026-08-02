@@ -158,6 +158,10 @@ pub const DeployThread = struct {
         /// module's baked identity + runtime resolution base). 64-hex,
         /// validated at the submit door. Owned.
         pkg_hash: []u8 = &.{},
+        /// The SCOPE tenant's storage incarnation, resolved by the worker at
+        /// submit time. Blobs must stage under the same lifetime-scoped prefix
+        /// the serving path reads from (#357); empty = legacy layout. Owned.
+        incarnation: []u8 = &.{},
         /// STAGE, don't link: content-address each input's source and return
         /// its hash without compiling. The first half of a deploy — a file
         /// uploaded on its own cannot be compiled, because compilation
@@ -264,7 +268,7 @@ pub const DeployThread = struct {
         };
         const a = self.allocator;
         var put_ok = true;
-        if (blob_mod.BlobBackend.openPerTenant(a, self.blob_cfg, job.tenant_id, "deployments")) |be_const| {
+        if (blob_mod.BlobBackend.openPerTenantIncarnation(a, self.blob_cfg, job.tenant_id, job.incarnation, "deployments")) |be_const| {
             var be = be_const;
             defer be.deinit();
             // Unconditional overwrite — NOT `putBlobIfMissingTo`. The skip-if-
@@ -323,7 +327,7 @@ pub const DeployThread = struct {
             }
         }
 
-        var file_be = blob_mod.BlobBackend.openPerTenant(a, self.blob_cfg, job.tenant_id, "file-blobs") catch |err| {
+        var file_be = blob_mod.BlobBackend.openPerTenantIncarnation(a, self.blob_cfg, job.tenant_id, job.incarnation, "file-blobs") catch |err| {
             std.log.warn("deploy thread: open file-blobs for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
             return fail(self, router, job, 502, "blob backend open failed");
         };
@@ -699,6 +703,7 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     // compile_batch package context (PM P1).
     if (job.resolution_json.len != 0) allocator.free(job.resolution_json);
     if (job.pkg_hash.len != 0) allocator.free(job.pkg_hash);
+    if (job.incarnation.len != 0) allocator.free(job.incarnation);
     for (job.source_hashes) |h| allocator.free(h);
     if (job.source_hashes.len != 0) allocator.free(job.source_hashes);
 }

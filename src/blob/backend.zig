@@ -84,11 +84,41 @@ pub const BlobBackend = struct {
         instance_id: []const u8,
         subdir: []const u8,
     ) !BlobBackend {
-        const prefix = try std.fmt.allocPrint(
-            allocator,
-            "{s}{s}/{s}/",
-            .{ cfg.key_prefix_base, instance_id, subdir },
-        );
+        return openPerTenantIncarnation(allocator, cfg, instance_id, "", subdir);
+    }
+
+    /// `openPerTenant`, scoped to the tenant's storage INCARNATION — the token
+    /// minted per tenant lifetime (`rove-tenant`'s `MAX_INCARNATION_LEN`).
+    ///
+    /// Deprovision frees a name for reuse, so a prefix keyed on the name alone
+    /// would hand the next holder of that name the previous holder's deployed
+    /// bytes and captured request logs. Keying on the incarnation makes those
+    /// objects unaddressable by construction, whether or not teardown ever
+    /// managed to delete them.
+    ///
+    /// An empty incarnation keeps the legacy `{base}{id}/{subdir}/` layout, so
+    /// instances created before incarnations existed stay where their objects
+    /// already are — no migration, and no risk, since a name could not be
+    /// freed and reused before deprovision.
+    pub fn openPerTenantIncarnation(
+        allocator: std.mem.Allocator,
+        cfg: BackendConfig,
+        instance_id: []const u8,
+        incarnation: []const u8,
+        subdir: []const u8,
+    ) !BlobBackend {
+        const prefix = if (incarnation.len == 0)
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}/{s}/",
+                .{ cfg.key_prefix_base, instance_id, subdir },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}/{s}/{s}/",
+                .{ cfg.key_prefix_base, instance_id, incarnation, subdir },
+            );
         defer allocator.free(prefix);
         return openS3(allocator, .{
             .endpoint = cfg.endpoint,

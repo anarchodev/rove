@@ -38,10 +38,21 @@ pub fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
 /// (idempotent re-attach included). On the first failure returns false; the
 /// caller evicts the partially-attached set.
 pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8) bool {
+    return attachToAllIncarnation(router, dest_nodes, bundle, tenant, plan, birth_voters, "");
+}
+
+/// `attachToAll`, also delivering the tenant's storage INCARNATION (#357).
+/// Minted once by the caller so every node keys the tenant's storage
+/// identically; empty leaves a node on the legacy name-keyed layout.
+pub fn attachToAllIncarnation(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8, incarnation: []const u8) bool {
     const a = router.allocator;
-    var hdrs: [3]curl.Header = undefined;
+    var hdrs: [4]curl.Header = undefined;
     hdrs[0] = .{ .name = TENANT_HEADER, .value = tenant };
     var nh: usize = 1;
+    if (incarnation.len != 0) {
+        hdrs[nh] = .{ .name = "X-Rewind-Incarnation", .value = incarnation };
+        nh += 1;
+    }
     if (plan) |p| {
         hdrs[nh] = .{ .name = PLAN_HEADER, .value = p };
         nh += 1;
@@ -101,6 +112,32 @@ pub fn evictAll(router: anytype, tenant: []const u8, nodes: []const []const u8, 
             std.log.warn("rewind-cp: evict {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
         }
     }
+}
+
+/// `evictAll`, but reporting whether EVERY node accepted. A deprovision needs
+/// the answer: a move can treat a failed evict as cosmetic (the tenant lives on
+/// elsewhere), while a delete that silently skipped a node would leave an
+/// orphaned group holding the tenant's name on that node forever.
+///
+/// A node that no longer has the group answers 204 as well — `v2-evict` is
+/// idempotent — so a retry after a partial failure converges to true.
+pub fn evictAllChecked(router: anytype, tenant: []const u8, nodes: []const []const u8, tbody: []const u8) bool {
+    const a = router.allocator;
+    var all = true;
+    for (nodes) |base| {
+        if (bc.call(router, base, "/_system/v2-evict", .POST, tbody, &.{})) |ev| {
+            var e2 = ev;
+            defer e2.deinit(a);
+            if (e2.status != 204 and e2.status != 200) {
+                std.log.warn("rewind-cp: evict {s} on {s}: status {d}", .{ tenant, base, e2.status });
+                all = false;
+            }
+        } else |err| {
+            std.log.warn("rewind-cp: evict {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
+            all = false;
+        }
+    }
+    return all;
 }
 
 /// Pick a serving leader URL for `tenant` from `dest_nodes` — the forward

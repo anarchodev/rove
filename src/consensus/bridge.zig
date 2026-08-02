@@ -99,6 +99,7 @@ pub const PeerResolver = node_mod.PeerResolver;
 pub const PeerRegistry = node_mod.PeerRegistry;
 pub const StoreResolver = node_mod.StoreResolver;
 pub const ApplyObserver = node_mod.ApplyObserver;
+pub const ApplyOp = node_mod.ApplyOp;
 
 pub const Error = @import("bridge_error.zig").Error;
 
@@ -715,6 +716,30 @@ pub const Bridge = struct {
         var ws = WriteSet.init(self.allocator);
         defer ws.deinit();
         ws.addPut(key, value) catch return Error.OutOfMemory;
+        const ws_bytes = ws.encode(self.allocator) catch return Error.OutOfMemory;
+        defer self.allocator.free(ws_bytes);
+        const env = envelope.encodeWriteSet(self.allocator, id_str, ws_bytes) catch return Error.OutOfMemory;
+        defer self.allocator.free(env);
+        return self.propose(gid, env);
+    }
+
+    /// The removal twin of `proposePut`: replicate a single-key DELETE for the
+    /// gid's registered tenant id, returning the assigned seq.
+    ///
+    /// A real delete rather than an empty-value tombstone, so the key is gone
+    /// from the store: a replay that rebuilds a projection by prefix-scanning
+    /// simply doesn't see it, with no tombstone to interpret and none to
+    /// accumulate. Followers converge through the apply observer's `.delete`
+    /// arm. Used by the control-plane directory to withdraw a placement / host
+    /// / plan / cert when a tenant is deprovisioned.
+    pub fn proposeDelete(self: *Bridge, gid: u64, key: []const u8) Error!u64 {
+        const id_str = blk: {
+            const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
+            break :blk sig.id_str; // pointer-stable for the bridge's lifetime
+        };
+        var ws = WriteSet.init(self.allocator);
+        defer ws.deinit();
+        ws.addDelete(key) catch return Error.OutOfMemory;
         const ws_bytes = ws.encode(self.allocator) catch return Error.OutOfMemory;
         defer self.allocator.free(ws_bytes);
         const env = envelope.encodeWriteSet(self.allocator, id_str, ws_bytes) catch return Error.OutOfMemory;

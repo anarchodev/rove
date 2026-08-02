@@ -53,6 +53,8 @@ pub const BakedStatic = struct { path: []const u8, content: []const u8, content_
 pub fn deployStarterContent(
     allocator: std.mem.Allocator,
     inst_id: []const u8,
+    /// The target instance's storage incarnation (`Instance.incarnation`).
+    incarnation: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
@@ -61,6 +63,7 @@ pub fn deployStarterContent(
     return deployBakedBundle(
         allocator,
         inst_id,
+        incarnation,
         blob_cfg,
         compile_fn,
         compile_ctx,
@@ -77,6 +80,8 @@ pub fn deployStarterContent(
 pub fn deployGenesisAdminContent(
     allocator: std.mem.Allocator,
     inst_id: []const u8,
+    /// The target instance's storage incarnation (`Instance.incarnation`).
+    incarnation: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
@@ -85,6 +90,7 @@ pub fn deployGenesisAdminContent(
     return deployBakedBundle(
         allocator,
         inst_id,
+        incarnation,
         blob_cfg,
         compile_fn,
         compile_ctx,
@@ -106,6 +112,10 @@ pub fn deployGenesisAdminContent(
 pub fn deployBakedBundle(
     allocator: std.mem.Allocator,
     inst_id: []const u8,
+    /// The target instance's storage incarnation (`Instance.incarnation`);
+    /// empty for a legacy instance. Staged blobs must land under the same
+    /// lifetime-scoped prefix the serving path reads from.
+    incarnation: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
@@ -113,10 +123,11 @@ pub fn deployBakedBundle(
     handlers: []const BakedHandler,
     statics: []const BakedStatic,
 ) !u64 {
-    var blob_backend = try blob_mod.BlobBackend.openPerTenant(
+    var blob_backend = try blob_mod.BlobBackend.openPerTenantIncarnation(
         allocator,
         blob_cfg,
         inst_id,
+        incarnation,
         "file-blobs",
     );
     defer blob_backend.deinit();
@@ -170,10 +181,11 @@ pub fn deployBakedBundle(
     const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries, &.{}, &.{});
     defer allocator.free(json_bytes);
 
-    var manifest_be = try blob_mod.BlobBackend.openPerTenant(
+    var manifest_be = try blob_mod.BlobBackend.openPerTenantIncarnation(
         allocator,
         blob_cfg,
         inst_id,
+        incarnation,
         "deployments",
     );
     defer manifest_be.deinit();

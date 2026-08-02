@@ -721,7 +721,7 @@ pub fn storeFor(self: *Node, slot: *TenantSlot, id_str: []const u8) ?*KvStore {
     return null;
 }
 
-/// Fire the `apply_observer` (if set) once per PUT in a just-applied
+/// Fire the `apply_observer` (if set) once per op in a just-applied
 /// writeset. `id_str` is the tenant id the writeset targeted (the
 /// inner's id for a multi inner, `""` for a root writeset). Re-decodes
 /// the writeset bytes — cheap for the single-op writes the observers
@@ -735,10 +735,11 @@ pub fn notifyApply(self: *Node, group_id: u64, id_str: []const u8, ws_bytes: []c
     defer ops.deinit(self.allocator);
     writeset.decodeOps(ws_bytes, self.allocator, &ops) catch return;
     for (ops.items) |op| switch (op) {
-        .put => |p| obs.func(obs.ctx, group_id, id_str, p.key, p.value),
-        // The directory never deletes; ignore (a future deleting producer
-        // would extend the observer with a delete arm).
-        .delete => {},
+        .put => |p| obs.func(obs.ctx, group_id, id_str, .put, p.key, p.value),
+        // A delete carries no value; the observer decides what removal means
+        // for its projection (the CP directory drops the row, so a follower
+        // converges with the leader on a deprovision).
+        .delete => |d| obs.func(obs.ctx, group_id, id_str, .delete, d.key, ""),
     };
 }
 
