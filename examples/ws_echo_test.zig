@@ -9,8 +9,8 @@
 //! an `ws_send_in` frame with the same opcode — the stand-in for what the
 //! `onMessage` handler will do once piece D lands.
 //!
-//! Run: `zig build ws-echo` (listens on 127.0.0.1:8085). Drive it with any WS
-//! client, e.g. `scripts/smoke/ws_echo_smoke.py`.
+//! Run: `zig build ws-echo` (listens on 127.0.0.1:8085, or `argv[1]`). Drive
+//! it with any WS client, e.g. `scripts/smoke/ws_echo_smoke.py`.
 
 const std = @import("std");
 const rove = @import("rove");
@@ -61,7 +61,16 @@ pub fn main() !void {
     });
     defer reg.deinit();
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8085);
+    // Port from argv[1] (default 8085) so concurrent smoke runs can each
+    // spawn their own instance — the smoke suite's port authority
+    // (scripts/smoke/smoke_ports.py) hands every run a disjoint range.
+    var args = std.process.args();
+    _ = args.next();
+    const port: u16 = if (args.next()) |a|
+        try std.fmt.parseInt(u16, a, 10)
+    else
+        8085;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
     const server = try MyH2.create(&reg, alloc, addr, .{
         .max_connections = 256,
         .buf_count = 256,
@@ -69,7 +78,7 @@ pub fn main() !void {
     }, .{});
     defer server.destroy();
 
-    std.debug.print("WebSocket echo server on ws://127.0.0.1:8085\n", .{});
+    std.debug.print("WebSocket echo server on ws://127.0.0.1:{d}\n", .{port});
 
     while (true) {
         try server.poll(1);

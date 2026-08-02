@@ -13,7 +13,7 @@ connection or fast-reconnects on a GOAWAY — never a silent multi-second stall.
 
 Topology (no S3 / worker / DP needed — the race is purely in the front's
 rove-h2 server leg):
-  h2-echo-server  :8081   real h2c upstream (200 + echo), same fixed rove-h2
+  h2-echo-server          real h2c upstream (200 + echo), same fixed rove-h2
   rewind-cp       :PCP    routing only (host 127.0.0.1 → tenant → cluster-1)
   rewind-front    :PF     TLS termination — the component that stalled in prod
                           REWIND_FRONT_IDLE_TIMEOUT_MS small so the boundary is
@@ -33,15 +33,16 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, CP_BIN, FRONT_BIN  # noqa: E402
 
 import httpx  # noqa: E402
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 
-PCP = int(os.environ.get("CP_PORT", "18240"))
-PF = int(os.environ.get("FRONT_PORT", "18241"))
-PUP = int(os.environ.get("UPSTREAM_PORT", "8081"))   # h2-echo-server hardcodes 8081
+PCP = alloc_port()
+PF = alloc_port()
+PUP = alloc_port()   # h2-echo-server upstream (port via argv)
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 
 # Small browser-facing idle so the reuse boundary is the reap boundary.
@@ -128,11 +129,12 @@ def main():
               f"gaps={GAPS} trials={TRIALS}")
         cert, key = gen_cert(tmp)
 
-        # 1) h2c upstream (real 200s). h2-echo-server hardcodes :8081.
+        # 1) h2c upstream (real 200s) — the installed example binary, NOT
+        # `zig build` (a build racing the smoke saturates CPU and skews the
+        # timing sweep this smoke exists to measure).
         print("boot: h2-echo-server (h2c upstream :%d)" % PUP)
         echo = subprocess.Popen(
-            ["zig", "build", "h2-echo-server"],
-            cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
+            [os.path.join(BINDIR, "h2-echo-server"), str(PUP)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         procs.append(echo)

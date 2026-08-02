@@ -6,8 +6,9 @@ RFC 6455 client — no third-party WS library — and asserts the rove-h2 transp
 the 101 handshake (Sec-WebSocket-Accept), text/binary echo, fragmented-message
 reassembly, runtime auto-pong, and the close handshake.
 
-Run standalone against an already-running server on :8085, or let it spawn one:
-    python3 scripts/smoke/ws_echo_smoke.py            # spawns `zig build ws-echo`
+Run standalone against an already-running server, or let it spawn one
+(`zig build` installs the binary first):
+    python3 scripts/smoke/ws_echo_smoke.py            # spawns zig-out/bin/ws-echo
     python3 scripts/smoke/ws_echo_smoke.py --port 8085 --no-spawn
 """
 
@@ -183,18 +184,25 @@ def wait_ready(proc, log_path, timeout=180):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8085)
+    ap.add_argument("--port", type=int, default=0,
+                    help="0 = allocate one (or the server's port with --no-spawn)")
     ap.add_argument("--no-spawn", action="store_true", help="connect to an already-running server")
     args = ap.parse_args()
+    if args.port == 0:
+        if args.no_spawn:
+            args.port = 8085
+        else:
+            from smoke_ports import alloc_port
+            args.port = alloc_port()
 
     proc = None
-    log_path = "/tmp/ws_echo_smoke_server.log"
+    log_path = f"/tmp/ws_echo_smoke_server-{os.getpid()}.log"
     if not args.no_spawn:
         repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         logf = open(log_path, "w")
-        print("Building + starting ws-echo server (zig build ws-echo)…")
+        print("Starting ws-echo server (zig-out/bin/ws-echo)…")
         proc = subprocess.Popen(
-            ["zig", "build", "ws-echo"], cwd=repo,
+            [os.path.join(repo, "zig-out", "bin", "ws-echo"), str(args.port)],
             stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             start_new_session=True,
         )

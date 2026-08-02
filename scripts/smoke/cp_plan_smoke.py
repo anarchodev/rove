@@ -29,14 +29,16 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, CP_BIN
 
-PCP = int(os.environ.get("CP_PORT", "18200"))
+PCP = alloc_port()
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 TENANT = "acme"
 HOST = "acme.localhost"
 
-CLUSTERS = "cluster-1=http://127.0.0.1:18201"
+P1 = alloc_port()
+CLUSTERS = f"cluster-1=http://127.0.0.1:{P1}"
 HOSTS = f"{HOST}={TENANT}"
 PLACEMENT = f"{TENANT}=cluster-1"
 

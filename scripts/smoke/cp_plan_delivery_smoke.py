@@ -48,14 +48,15 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, await_line, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
-PCP = int(os.environ.get("CP_PORT", "18213"))
-P1 = int(os.environ.get("C1_PORT", "18211"))
-P2 = int(os.environ.get("C2_PORT", "18212"))
+PCP = alloc_port()
+P1 = alloc_port()
+P2 = alloc_port()
 
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 TENANT = "planco"

@@ -35,14 +35,16 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, CP_BIN
 
-PCP = int(os.environ.get("CP_PORT", "18220"))
+PCP = alloc_port()
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 
 # Two clusters + two placed tenants; the workers don't have to exist — the route
 # lookup returns the projection's node list without contacting them.
-CLUSTERS = "cluster-1=http://127.0.0.1:18221;cluster-2=http://127.0.0.1:18222"
+P1, P2 = alloc_port(), alloc_port()
+CLUSTERS = f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}"
 PLACEMENT = "acme=cluster-1;globex=cluster-2"
 # Static seed → written INTO the directory (leg A2 + survives restart).
 HOSTS = "seeded.example=acme"

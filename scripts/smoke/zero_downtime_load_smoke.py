@@ -32,11 +32,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2_topology import spawn_cp, CP_BIN
+from smoke_ports import alloc_port  # noqa: E402
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
-PCP, PA, PB = 19030, 19031, 19032
+PCP, PA, PB = alloc_port(), alloc_port(), alloc_port()
 SECRET = "rewindmovesecretpadding0123456789abcdef0"
 A_URL, B_URL = f"http://127.0.0.1:{PA}", f"http://127.0.0.1:{PB}"
 HOST = "load.localhost"

@@ -36,15 +36,16 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, CP_BIN, FRONT_BIN
 
 import h2.config
 import h2.connection
 import h2.events
 
-PCP = int(os.environ.get("CP_PORT", "18300"))
-PF = int(os.environ.get("FRONT_PORT", "18301"))
-PUP = int(os.environ.get("UPSTREAM_PORT", "18302"))
+PCP = alloc_port()
+PF = alloc_port()
+PUP = alloc_port()
 
 CLUSTERS = f"cluster-1=http://127.0.0.1:{PUP}"
 PLACEMENT = "acme=cluster-1"
@@ -195,7 +196,7 @@ def main():
         check("fresh request → 200", r[0] == 200, f"got {r[0]}")
 
         print("leg D: per-client-IP cap (plan C13) — cap 3, burst 6")
-        pf2 = int(os.environ.get("FRONT2_PORT", "18303"))
+        pf2 = alloc_port()
         spawn_front(procs, pf2, f"http://127.0.0.1:{PCP}", extra_env={
             "REWIND_FRONT_MAX_FLOWS_PER_IP": "3",
             "REWIND_FRONT_METRICS_PORT": "0",  # first front holds 9112

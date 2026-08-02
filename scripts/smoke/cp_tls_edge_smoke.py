@@ -30,12 +30,13 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, FRONT_BIN, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 
-PCP = int(os.environ.get("CP_PORT", "18240"))
-PF = int(os.environ.get("FRONT_PORT", "18241"))
+PCP = alloc_port()
+PF = alloc_port()
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 
 HOST = "acme.localhost"
@@ -43,7 +44,8 @@ LATE_HOST = "beta.localhost"
 TENANT = "acme"
 
 # No real DP needed; routing just has to resolve so the front accepts the host.
-CLUSTERS = "cluster-1=http://127.0.0.1:18242"
+P1 = alloc_port()
+CLUSTERS = f"cluster-1=http://127.0.0.1:{P1}"
 HOSTS = f"{HOST}={TENANT};{LATE_HOST}={TENANT}"
 PLACEMENT = f"{TENANT}=cluster-1"
 

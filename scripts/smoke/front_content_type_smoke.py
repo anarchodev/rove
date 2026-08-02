@@ -26,14 +26,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN  # noqa: E402
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
-PF = int(os.environ.get("FRONT_PORT", "18300"))
-PCP = int(os.environ.get("CP_PORT", "18305"))
-P1 = int(os.environ.get("C1_PORT", "18301"))
+PF = alloc_port()
+PCP = alloc_port()
+P1 = alloc_port()
 
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 TENANT = "cttenant"

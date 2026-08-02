@@ -186,4 +186,4 @@ Rules for the shared repo:
 - The main checkout (`/home/user/src/rove`) is load-bearing — it holds the real `.git`; don't delete or move it.
 - A branch can be checked out in only one worktree (git enforces this) — one branch per session by construction.
 - Never switch the branch of, or run `git add -u` / `git commit` in, a checkout another session is using. Unexplained working-tree WIP is probably a sibling session's — examine it, stage only your own files, and never commit another window's work without confirmation.
-- Smoke tests bind fixed ports (see the per-smoke port table in the scripts); don't run two smoke suites across worktrees simultaneously or they collide (`EADDRINUSE`).
+- Smoke ports come from `scripts/smoke/smoke_ports.py` (each smoke process owns a disjoint slot), so concurrent smokes/suites don't collide on ports. The remaining reason not to run two full suites at once is CPU: a saturated box trips raft election timeouts, which reads as spurious failovers.

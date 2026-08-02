@@ -26,7 +26,7 @@ mechanism rather than the issuance path around it:
      certificate is gone. Without this the test would pass just as happily if
      the wipe were not really destroying anything.
 
-Ports: 19860 (see the per-smoke port table). Needs S3 credentials:
+Needs S3 credentials:
 `set -a; . ./.env; set +a`.
 """
 from __future__ import annotations
@@ -42,8 +42,9 @@ import urllib.request
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from smoke_lib import BIN_DIR  # noqa: E402
+from smoke_ports import alloc_port  # noqa: E402
 
-CP_PORT = 19860
+CP_PORT = alloc_port()
 DATA_DIR = "/tmp/rove-cert-survives-cp"
 MOVE_SECRET = "certsurvivesecret0123456789abcdef"
 HOST = "cert-survives.test"

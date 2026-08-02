@@ -38,15 +38,16 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
-PF = int(os.environ.get("FRONT_PORT", "18090"))
-PCP = int(os.environ.get("CP_PORT", "18093"))
-P1 = int(os.environ.get("C1_PORT", "18091"))
-P2 = int(os.environ.get("C2_PORT", "18092"))
+PF = alloc_port()
+PCP = alloc_port()
+P1 = alloc_port()
+P2 = alloc_port()
 
 C1_HOST, C1_TOKEN = "c1.localhost", "c1roottokenpadding0123456789abcdefghij01"
 C2_HOST, C2_TOKEN = "c2.localhost", "c2roottokenpadding0123456789abcdefghij02"
