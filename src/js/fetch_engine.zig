@@ -827,11 +827,25 @@ pub const FetchEngine = struct {
         };
 
         // Path used both for signing and the wire URL (path-style S3).
-        const path = try std.fmt.allocPrint(
-            self.allocator,
-            "/{s}/{s}{s}/app-blobs/{s}",
-            .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
-        );
+        // Incarnation-scoped like every other per-tenant path (#357): a door
+        // that addressed `{tenant}/…` while writes went to
+        // `{tenant}/{incarnation}/…` would read a previous tenant lifetime's
+        // objects — or, for a live tenant, nothing at all.
+        const inc = self.node.tenant.incarnationOf(self.allocator, pf.tenant_id) catch
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(inc);
+        const path = if (inc.len == 0)
+            try std.fmt.allocPrint(
+                self.allocator,
+                "/{s}/{s}{s}/app-blobs/{s}",
+                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "/{s}/{s}{s}/{s}/app-blobs/{s}",
+                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, inc, hash },
+            );
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";
@@ -991,11 +1005,23 @@ pub const FetchEngine = struct {
             blob_key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
         } else return error.BlobReadBadPath;
 
-        const path = try std.fmt.allocPrint(
-            self.allocator,
-            "/{s}/{s}{s}/{s}/{s}",
-            .{ cfg.bucket, cfg.key_prefix_base, tenant, subdir, blob_key },
-        );
+        // The TARGET tenant's incarnation (#357) — the door reads whatever the
+        // deploy path wrote, and that is incarnation-scoped.
+        const inc = self.node.tenant.incarnationOf(self.allocator, tenant) catch
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(inc);
+        const path = if (inc.len == 0)
+            try std.fmt.allocPrint(
+                self.allocator,
+                "/{s}/{s}{s}/{s}/{s}",
+                .{ cfg.bucket, cfg.key_prefix_base, tenant, subdir, blob_key },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "/{s}/{s}{s}/{s}/{s}/{s}",
+                .{ cfg.bucket, cfg.key_prefix_base, tenant, inc, subdir, blob_key },
+            );
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";

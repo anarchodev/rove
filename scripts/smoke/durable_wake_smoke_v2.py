@@ -80,11 +80,15 @@ def main() -> int:
         lead0 = c.leader_node("acme")
         check("leader present pre-deploy", lead0 is not None, f"lead={lead0}")
         try:
-            dep_id = c.deploy_handlers("acme", HANDLERS,
-                                       node=lead0 if lead0 is not None else 0)
-            check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
+            # `schedule` became the `@rewind/schedule` package on 2026-07-28,
+            # so the handler imports it and the package must be staged with the
+            # deploy — the real shipped source, not a copy.
+            pkgs, imports = c.firstparty_packages(["@rewind/schedule"])
+            dep_id = c.deploy_with_packages("acme", HANDLERS, pkgs, imports,
+                                            node=lead0 if lead0 is not None else 0)
+            check("deploy_with_packages → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
-            check("deploy_handlers", False, str(e))
+            check("deploy_with_packages", False, str(e))
             print("\nFAILURES:", failures)
             return 1
 

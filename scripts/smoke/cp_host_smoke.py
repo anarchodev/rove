@@ -50,6 +50,14 @@ HOSTS = "seeded.example=acme"
 procs = []
 
 
+# `/_control/host` also pushes the worker-side `__root__/domain/{host}` alias to
+# the tenant's serving cluster, and reports 503 when that push cannot land. This
+# topology deliberately runs the CP with NO workers (see the header), so the push
+# can never succeed here — 503 means "directory write committed, alias not
+# pushed", which is exactly the state this smoke is about. Accept either and let
+# the routing assertions below carry the proof.
+HOST_WRITE_OK = (200, 503)
+
 def _curl(args):
     out = subprocess.run(
         ["curl", "-s", "-w", "\n%{http_code}", "-m", "10", "--http2-prior-knowledge"] + args,
@@ -138,7 +146,7 @@ def main():
         # ── B. runtime custom-domain provisioning ────────────────────
         print("leg B: map acme.com → acme via /_control/host")
         st, _ = set_host("acme.com", "acme")
-        check("POST /_control/host → 200", st, 200)
+        check("POST /_control/host accepted", st in HOST_WRITE_OK, True)
         st, r = route("acme.com")
         check("GET /_cp/route acme.com → 200", st, 200)
         check("acme.com → cluster-1", (r or {}).get("cluster"), "cluster-1")
@@ -146,7 +154,7 @@ def main():
         # ── C. re-point to a tenant on another cluster ───────────────
         print("leg C: re-point acme.com → globex (on cluster-2)")
         st, _ = set_host("acme.com", "globex")
-        check("POST /_control/host re-point → 200", st, 200)
+        check("POST /_control/host re-point accepted", st in HOST_WRITE_OK, True)
         st, r = route("acme.com")
         check("acme.com now → cluster-2", (r or {}).get("cluster"), "cluster-2")
         check("acme.com now → tenant globex", (r or {}).get("tenant"), "globex")

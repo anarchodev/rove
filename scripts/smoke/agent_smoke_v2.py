@@ -45,10 +45,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import APPS_DIR, V2Cluster  # noqa: E402
 
-REPO = Path(__file__).resolve().parent.parent.parent
-AGENT_SRC = (REPO / "web" / "agent-sample" / "agent" / "index.mjs").read_text()
+# The first-party apps live in the rewind-apps repo (extracted 2026-06-28), so
+# resolve through APPS_DIR rather than an in-repo `web/` path that no longer
+# exists. Skip cleanly when that checkout is absent: a smoke that cannot find
+# its fixture should say so, not fail as though the engine were broken.
+AGENT_MJS = APPS_DIR / "agent-sample" / "agent" / "index.mjs"
+if not AGENT_MJS.exists():
+    print(f"SKIP — no rewind-apps checkout at {APPS_DIR} (set REWIND_APPS_DIR)")
+    raise SystemExit(0)
+AGENT_SRC = AGENT_MJS.read_text()
 READY_SRC = 'export default function () { return "ready"; }\n'
 
 TENANT = "agentsmoke"

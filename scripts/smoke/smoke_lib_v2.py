@@ -825,9 +825,52 @@ class V2Cluster:
             raise RuntimeError(f"release {tenant}/{dep_hex}: {r.status} {r.body}")
         return str(int(dep_hex, 16))
 
+    # `@rewind/oidc` and `@rewind/oauth` import `@rewind/jwt`; the rest are
+    # leaves. A table rather than a scan so the dependency ORDER — leaves first,
+    # because a package's files compile with the loader live — is explicit.
+    FIRSTPARTY_PKG_DEPS = {"@rewind/oidc": ["@rewind/jwt"], "@rewind/oauth": ["@rewind/jwt"]}
+
+    def firstparty_packages(self, specs: list[str]) -> tuple[list[dict], dict]:
+        """Build the `(packages, app_imports)` pair `deploy_with_packages` takes,
+        from the real first-party sources in `src/js/packages/@rewind/`.
+
+        These were ambient globals until 2026-07-28 (`a6b0674`), when they became
+        `@rewind/*` packages. Every smoke whose fixture said `oidc.` / `schedule.`
+        / `segments.` broke that day and stayed broken, because nothing ran them
+        (rove#355). Staging the SHIPPED sources — the same tree
+        `rewind-ops seed-packages` publishes — keeps those smokes testing the
+        real library rather than a copy that can drift.
+        """
+        import hashlib
+        root = Path(__file__).resolve().parent.parent.parent / "src/js/packages/@rewind"
+
+        ordered: list[str] = []
+        for spec in specs:
+            for dep in self.FIRSTPARTY_PKG_DEPS.get(spec, []):
+                if dep not in ordered:
+                    ordered.append(dep)
+            if spec not in ordered:
+                ordered.append(spec)
+
+        hashes: dict[str, str] = {}
+        packages: list[dict] = []
+        for spec in ordered:
+            src = (root / spec.split("/", 1)[1] / "index.mjs").read_text()
+            pkg_hash = hashlib.sha256((spec + "@1.0.0\n" + src).encode()).hexdigest()
+            hashes[spec] = pkg_hash
+            packages.append({
+                "spec": spec, "version": "1.0.0", "pkg_hash": pkg_hash,
+                "files": {"index.mjs": src},
+                "imports": {d: hashes[d] for d in self.FIRSTPARTY_PKG_DEPS.get(spec, [])},
+            })
+        # Only the requested specs go on the APP surface; a transitively pulled
+        # dep stays internal to the package importing it.
+        return packages, {spec: hashes[spec] for spec in specs}
+
     def deploy_with_packages(self, tenant: str, handler_files: dict[str, str],
                              packages: list[dict], app_imports: dict[str, str],
-                             *, node: int = 0) -> str:
+                             *, statics: Optional[dict[str, tuple]] = None,
+                             node: int = 0) -> str:
         """PM P1: deploy handlers that import `@scope/pkg` packages.
 
         `packages` entries (IN DEPENDENCY ORDER, leaves first — a package's
@@ -892,6 +935,20 @@ class V2Cluster:
                               "source": source, "resolution": resolution()})
             if r.status != 200:
                 raise RuntimeError(f"deploy {tenant} file {path}: {r.status} {r.body}")
+
+        # Statics stream as raw bytes to PUT /v1/upload, same door
+        # `deploy_with_static` uses — a package-bearing bundle still needs its
+        # `_config/*` rows for the deploy-time config→kv mirror.
+        import urllib.parse
+        for spath, (content, ct) in (statics or {}).items():
+            qs = urllib.parse.urlencode({"tenant": tenant, "path": spath, "content_type": ct})
+            ur = _curl(f"{self.front_url()}/v1/upload?{qs}", method="PUT",
+                       host=self.host_for("__admin__"),
+                       headers={"Authorization": f"Bearer {self.root_token}"},
+                       data=content.encode() if isinstance(content, str) else content,
+                       timeout=60.0)
+            if ur.status != 200:
+                raise RuntimeError(f"deploy {tenant} static {spath}: {ur.status} {ur.body}")
 
         r = post("cut", {"tenant": tenant, "resolution": lock})
         if r.status != 200:

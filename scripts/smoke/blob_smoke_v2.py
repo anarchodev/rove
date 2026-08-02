@@ -156,6 +156,7 @@ export default function () {{
 # sync return; sealed → blob.get of the segment resumes onSeg, which
 # slices via the recipe helper.
 SEGGET_SRC = """
+import segments from "@rewind/segments";
 export default function () {
   const qp = new URLSearchParams(request.query || "");
   const v = segments.get(qp.get("stream"), Number(qp.get("seq")), { on: "onSeg" });
@@ -172,6 +173,7 @@ export function onSeg() {
 """
 
 HANDLER_SRC = """
+import segments from "@rewind/segments";
 export default function () {
   const path = request.path;
   const qp = new URLSearchParams(request.query || "");
@@ -242,7 +244,10 @@ def main() -> int:
         r = c.provision(TENANT)
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
-            c.deploy_handlers(TENANT, {
+            # `segments` became the `@rewind/segments` package on 2026-07-28;
+            # stage the shipped source alongside the handlers.
+            seg_pkgs, seg_imports = c.firstparty_packages(["@rewind/segments"])
+            c.deploy_with_packages(TENANT, {
                 "index.mjs": HANDLER_SRC,
                 "get/index.mjs": GET_SRC,
                 "putresult.mjs": PUTRESULT_SRC,
@@ -251,9 +256,9 @@ def main() -> int:
                 "sealednote.mjs": SEALEDNOTE_SRC,
                 "sealcheck/index.mjs": SEALCHECK_SRC,
                 "segget/index.mjs": SEGGET_SRC,
-            })
+            }, seg_pkgs, seg_imports)
         except Exception as e:  # noqa: BLE001
-            check("deploy_handlers", False, str(e))
+            check("deploy_with_packages", False, str(e))
             return 1
         ready = c.wait_for_handler(TENANT, "/", want_body="ready")
         check("handler ready", ready, "never served 'ready'")
