@@ -240,6 +240,36 @@ def attach_bundle(url: str, bundle_path: str, *, tenant: str,
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
+def claim_storage_namespace(prefix: str) -> None:
+    """Stamp `prefix` with a storage-namespace marker (rove#266).
+
+    Every service refuses to start against an unmarked object store — without
+    a generation it cannot tell its own keys from a previous cluster
+    lifetime's, and guessing silently merges the two. A smoke that spawns a
+    service against its OWN prefix (rather than a V2Cluster's) has to claim it
+    too, or the service exits rc=2 and reads like a broken binary.
+
+    Runs the same `rewind-ops` verb production's genesis does; the harness has
+    no shortcut the operator lacks. A virgin prefix takes `--adopt`
+    (generation 0); an already-claimed one is left alone.
+    """
+    env = dict(os.environ)
+    env["S3_KEY_PREFIX_BASE"] = prefix
+
+    def ops(*args):
+        return subprocess.run(
+            [str(BIN_DIR / "rewind-ops"), "storage-namespace", *args,
+             "--env", "/nonexistent-so-only-the-process-env-is-read"],
+            env=env, capture_output=True, text=True, timeout=60)
+
+    if ops().returncode == 0:
+        return
+    r = ops("--adopt")
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"could not claim the storage namespace for {prefix}: {r.stdout}{r.stderr}")
+
+
 def _gen_self_signed(prefix: str) -> tuple[str, str]:
     """Self-signed `*.localhost` cert+key (SAN also covers `localhost`) for the
     TLS front. Verification is OFF everywhere it's used — curl `-k`, and the
@@ -354,34 +384,8 @@ class V2Cluster:
         return c
 
     def _claim_storage_namespace(self) -> None:
-        """Stamp this run's S3 prefix with a storage-namespace marker.
-
-        Every service refuses to start against an unmarked object store —
-        without a generation it cannot tell its own keys from a previous
-        cluster lifetime's, and guessing silently merges the two (rove#266).
-        Each run gets a virgin prefix, so `--adopt` (generation 0) is the right
-        claim. This runs the same `rewind-ops` verb production's genesis does;
-        the harness has no shortcut the operator lacks.
-        """
-        env = dict(os.environ)
-        env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
-
-        def ops(*args):
-            return subprocess.run(
-                [str(BIN_DIR / "rewind-ops"), "storage-namespace", *args,
-                 "--env", "/nonexistent-so-only-the-process-env-is-read"],
-                env=env, capture_output=True, text=True, timeout=60)
-
-        # Already marked (a second cluster lifetime over the same store) —
-        # leave it alone. `--adopt` deliberately refuses to overwrite a
-        # generation, so the "is it claimed yet" branch belongs here.
-        if ops().returncode == 0:
-            return
-        r = ops("--adopt")
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"could not claim the storage namespace for {self.s3_prefix}: "
-                f"{r.stdout}{r.stderr}")
+        """Claim this run's prefix — see `claim_storage_namespace`."""
+        claim_storage_namespace(self.s3_prefix)
 
     def _boot(self, nodes: int) -> None:
         voters = ",".join(str(i + 1) for i in range(nodes))

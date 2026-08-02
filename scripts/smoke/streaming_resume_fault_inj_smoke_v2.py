@@ -103,7 +103,10 @@ def main() -> int:
         print("step 1: provision tenant 'streamfi' (group forms across all 3 nodes)")
         r = c.provision("streamfi")
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
-        if r.status != 204:
+        # Provision answers 200 with `{tenant,cluster,host}` — the guard used to
+        # test for the 204 it returned before that body existed, so the smoke
+        # bailed out immediately after a SUCCESSFUL provision.
+        if r.status != 200:
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1
 
