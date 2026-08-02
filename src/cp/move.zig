@@ -37,14 +37,13 @@ pub fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
 /// docs/architecture/control-plane.md). True only if all returned 204
 /// (idempotent re-attach included). On the first failure returns false; the
 /// caller evicts the partially-attached set.
-pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8) bool {
-    return attachToAllIncarnation(router, dest_nodes, bundle, tenant, plan, birth_voters, "");
-}
-
-/// `attachToAll`, also delivering the tenant's storage INCARNATION (#357).
-/// Minted once by the caller so every node keys the tenant's storage
-/// identically; empty leaves a node on the legacy name-keyed layout.
-pub fn attachToAllIncarnation(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8, incarnation: []const u8) bool {
+///
+/// `incarnation` is the tenant's storage incarnation (#357): every node must
+/// key the tenant's storage identically, so EVERY attach — provision, move,
+/// membership backfill — carries the one the CP recorded at provision. Empty
+/// leaves a node on the legacy name-keyed layout, which is correct only for
+/// tenants provisioned before incarnations existed.
+pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8, incarnation: []const u8) bool {
     const a = router.allocator;
     var hdrs: [4]curl.Header = undefined;
     hdrs[0] = .{ .name = TENANT_HEADER, .value = tenant };

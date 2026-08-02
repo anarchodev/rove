@@ -687,7 +687,7 @@ const Router = struct {
         const incarnation = std.fmt.bufPrint(&inc_buf, "{x:0>16}", .{std.mem.readInt(u64, &rnd, .big)}) catch
             return replyStatus(server, ent, sid, sess, 500);
 
-        if (!move.attachToAllIncarnation(self, birth_nodes, "", tenant, null, birth_voters, incarnation)) {
+        if (!move.attachToAll(self, birth_nodes, "", tenant, null, birth_voters, incarnation)) {
             move.evictAll(self, tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -700,6 +700,19 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 504);
             return;
         }
+        // 2b. RECORD the incarnation before the placement commits. Every later
+        //     attach — a move, a membership backfill, a node rejoining — must
+        //     carry it, and the CP is the only party positioned to know it. A
+        //     node that attaches without it opens a legacy-keyed store while
+        //     the rest of the cluster uses the incarnation-keyed one, and the
+        //     tenant's data silently diverges (#357).
+        self.directory.setIncarnation(tenant, incarnation) catch |err| {
+            std.log.warn("rewind-cp: provision {s}: setIncarnation failed: {s}", .{ tenant, @errorName(err) });
+            move.evictAll(self, tenant, birth_nodes, tbody);
+            try self.replyProvisionError(server, ent, sid, sess, 500, "could not record the storage incarnation");
+            return;
+        };
+
         // 3. Write the placement — the commit point that makes it routable.
         self.directory.assign(tenant, cluster) catch {
             move.evictAll(self, tenant, nodes, tbody);
@@ -857,6 +870,10 @@ const Router = struct {
         }
         self.directory.removePlan(tenant) catch |err|
             std.log.warn("rewind-cp: delete {s}: removePlan failed: {s}", .{ tenant, @errorName(err) });
+        // The incarnation is per-LIFETIME: the next tenant to take this name
+        // must mint a fresh one, never inherit this one.
+        self.directory.removeIncarnation(tenant) catch |err|
+            std.log.warn("rewind-cp: delete {s}: removeIncarnation failed: {s}", .{ tenant, @errorName(err) });
 
         // 3. Tear the group down on every node that could hold it. `v2-evict`
         //    destroys the raft group AND the instance (its store, its
@@ -1198,7 +1215,12 @@ const Router = struct {
         //    from the first forwarded write onward.
         const plan_blob = self.directory.planForOwned(a, tenant) catch null;
         defer if (plan_blob) |p| a.free(p);
-        if (!move.attachToAll(self, dest_nodes, "", tenant, plan_blob, null)) {
+        // The tenant's recorded incarnation rides the move, so the destination
+        // opens the SAME store the source used (#357).
+        const move_inc = self.directory.incarnationForOwned(a, tenant) catch
+            a.dupe(u8, "") catch "";
+        defer if (move_inc.len != 0) a.free(move_inc);
+        if (!move.attachToAll(self, dest_nodes, "", tenant, plan_blob, null, move_inc)) {
             move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;

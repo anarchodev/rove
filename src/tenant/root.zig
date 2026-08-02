@@ -747,6 +747,11 @@ pub const Tenant = struct {
         };
 
         self.instances.put(self.allocator, id_copy, inst) catch return Error.OutOfMemory;
+        // Which store a node opened for a tenant is the first thing you need
+        // when a write "replicates" but reads come back empty: two nodes on
+        // different incarnations of the same name each look internally
+        // consistent, and only this line shows they disagree (#357).
+        std.log.info("tenant: opened {s} incarnation='{s}' store_id={x} dir={s}", .{ id, incarnation, u64_id, inst_dir });
         return inst;
     }
 

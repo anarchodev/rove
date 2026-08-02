@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -68,13 +68,6 @@ def _curl_to_file(url, path, *, data=None):
     if data is not None:
         args += ["-H", "Content-Type: application/json", "--data", data]
     args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
-
-
-def _curl_post_file(url, path, *, tenant):
-    args = ["curl", "-s", "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET,
-            "-H", f"X-Rewind-Tenant: {tenant}", "--data-binary", f"@{path}", url]
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
@@ -154,7 +147,8 @@ def main() -> int:
               _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
 
         print(f"step 4: v2-attach the bundle on node {vnid} (CREATE group@epoch1 + load) + apply-snapshot")
-        check("attach → 204", _curl_post_file(url(victim, "v2-attach"), bpath, tenant="acme") == "204")
+        check("attach → 204", attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
+                                            incarnation=base.get("incarnation", "")) == "204")
         st, body = _curl_json(url(victim, "v2-apply-snapshot"), method="POST",
                               data=json.dumps({"tenant": "acme", "index": base["index"], "term": base["term"]}))
         check("apply-snapshot → 204", st == 204, f"got {st} {body!r}")

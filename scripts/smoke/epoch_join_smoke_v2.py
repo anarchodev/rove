@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -69,18 +69,6 @@ def _curl_to_file(url, path, *, data=None):
     if data is not None:
         args += ["-H", "Content-Type: application/json", "--data", data]
     args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
-
-
-def _attach_file(url, path, *, tenant, index, term, epoch, as_learner=True):
-    args = ["curl", "-s", "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET,
-            "-H", f"X-Rewind-Tenant: {tenant}",
-            "-H", f"X-Rewind-Baseline-Index: {index}",
-            "-H", f"X-Rewind-Baseline-Term: {term}",
-            "-H", f"X-Rewind-Epoch: {epoch}",
-            "-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}",
-            "--data-binary", f"@{path}", url]
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
@@ -170,8 +158,9 @@ def main() -> int:
             b = json.loads(body2)
             if _curl_to_file(url(lead_now, "v2-snapshot"), bpath, data='{"tenant":"acme"}') != "200":
                 return None, False, 0, 0
-            ac = _attach_file(url(victim, "v2-attach"), bpath, tenant="acme",
-                              index=b["index"], term=b["term"], epoch=epoch_to_use)
+            ac = attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
+                               index=b["index"], term=b["term"], epoch=epoch_to_use,
+                               incarnation=b.get("incarnation", ""), as_learner=True)
             # create a live gap AFTER the attach
             for i in range(12):
                 c.request_retry("acme", "/?fn=handler", method="POST", data=f'{{"value":"e{epoch_to_use}-{i}"}}', want_status=204, deadline_s=10)

@@ -199,6 +199,47 @@ def _curl_run(args: list, data: bytes, timeout: float) -> HttpResponse:
     return HttpResponse(status=status, body=body, headers=headers_out)
 
 
+def attach_bundle(url: str, bundle_path: str, *, tenant: str,
+                  index=None, term=None, epoch=None, incarnation: str = "",
+                  as_learner=None, voters=None, learners=None,
+                  discard_body: bool = False) -> str:
+    """POST a snapshot bundle to a node's `/_system/v2-attach` and return the
+    HTTP status as a string.
+
+    ONE implementation of the CP's attach contract, because the smokes that
+    hand-roll a join are simulating the CP and must send what it sends. Four
+    of them had their own copy, so `X-Rewind-Incarnation` (rove#357) was added
+    to the CP and to none of them: the joining node opened a legacy name-keyed
+    store, caught up on the raft log, and still read empty (rove#355).
+
+    Omitted arguments send no header, which is what an attach that means to
+    exercise the server's default needs. `discard_body` drops the response
+    body so an error message can't be concatenated ahead of the status code.
+    """
+    args = ["curl", "-s"]
+    if discard_body:
+        args += ["-o", "/dev/null"]
+    args += ["-w", "%{http_code}", "-m", "20", "--http2-prior-knowledge",
+             "-X", "POST", "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
+             "-H", f"X-Rewind-Tenant: {tenant}"]
+    if index is not None:
+        args += ["-H", f"X-Rewind-Baseline-Index: {index}"]
+    if term is not None:
+        args += ["-H", f"X-Rewind-Baseline-Term: {term}"]
+    if epoch is not None:
+        args += ["-H", f"X-Rewind-Epoch: {epoch}"]
+    if incarnation:
+        args += ["-H", f"X-Rewind-Incarnation: {incarnation}"]
+    if as_learner is not None:
+        args += ["-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}"]
+    if voters is not None:
+        args += ["-H", "X-Rewind-Voters: " + ",".join(str(v) for v in voters)]
+    if learners is not None:
+        args += ["-H", "X-Rewind-Learners: " + ",".join(str(l) for l in learners)]
+    args += ["--data-binary", f"@{bundle_path}", url]
+    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
+
+
 def _gen_self_signed(prefix: str) -> tuple[str, str]:
     """Self-signed `*.localhost` cert+key (SAN also covers `localhost`) for the
     TLS front. Verification is OFF everywhere it's used — curl `-k`, and the
