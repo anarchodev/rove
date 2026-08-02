@@ -200,21 +200,28 @@ def _curl_run(args: list, data: bytes, timeout: float) -> HttpResponse:
 
 
 def attach_bundle(url: str, bundle_path: str, *, tenant: str,
-                  index=None, term=None, epoch=None, incarnation: str = "",
+                  index=None, term=None, epoch=None,
+                  incarnation: str | None = "",
                   as_learner=None, voters=None, learners=None,
                   discard_body: bool = False) -> str:
     """POST a snapshot bundle to a node's `/_system/v2-attach` and return the
     HTTP status as a string.
 
-    ONE implementation of the CP's attach contract, because the smokes that
-    hand-roll a join are simulating the CP and must send what it sends. Four
-    of them had their own copy, so `X-Rewind-Incarnation` (rove#357) was added
-    to the CP and to none of them: the joining node opened a legacy name-keyed
+    ONE implementation of the CP's attach contract (the Python mirror of
+    `src/wire/root.zig`'s `encodeAttach`), because the smokes that hand-roll
+    a join are simulating the CP and must send what it sends. Four of them
+    had their own copy, so `X-Rewind-Incarnation` (rove#357) was added to
+    the CP and to none of them: the joining node opened a legacy name-keyed
     store, caught up on the raft log, and still read empty (rove#355).
 
-    Omitted arguments send no header, which is what an attach that means to
-    exercise the server's default needs. `discard_body` drops the response
-    body so an error message can't be concatenated ahead of the status code.
+    The incarnation header is REQUIRED by the receiver (rove#363 class 3):
+    `""` (the default) sends the explicit wire token `legacy` — a
+    name-keyed tenant — and a token string sends that token. Pass `None` to
+    OMIT the header, which the server rejects with 400; that exists for
+    negative tests only. Other omitted arguments send no header, which is
+    what an attach that means to exercise the server's default needs.
+    `discard_body` drops the response body so an error message can't be
+    concatenated ahead of the status code.
     """
     args = ["curl", "-s"]
     if discard_body:
@@ -228,8 +235,8 @@ def attach_bundle(url: str, bundle_path: str, *, tenant: str,
         args += ["-H", f"X-Rewind-Baseline-Term: {term}"]
     if epoch is not None:
         args += ["-H", f"X-Rewind-Epoch: {epoch}"]
-    if incarnation:
-        args += ["-H", f"X-Rewind-Incarnation: {incarnation}"]
+    if incarnation is not None:
+        args += ["-H", f"X-Rewind-Incarnation: {incarnation or 'legacy'}"]
     if as_learner is not None:
         args += ["-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}"]
     if voters is not None:

@@ -670,7 +670,7 @@ const Router = struct {
         //    `/_control/plan`. Raft ids are positional (node i ↔ id i+1).
         const grow = self.reconcile_membership;
         const birth_nodes: []const []const u8 = if (grow) nodes[0..1] else nodes;
-        const birth_voters = (if (grow) a.dupe(u8, "1") else move.clusterVotersCsv(a, nodes.len)) catch {
+        const birth_voters = (if (grow) a.dupe(u64, &.{1}) else move.clusterVoterIds(a, nodes.len)) catch {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
@@ -1216,10 +1216,13 @@ const Router = struct {
         const plan_blob = self.directory.planForOwned(a, tenant) catch null;
         defer if (plan_blob) |p| a.free(p);
         // The tenant's recorded incarnation rides the move, so the destination
-        // opens the SAME store the source used (#357).
-        const move_inc = self.directory.incarnationForOwned(a, tenant) catch
-            a.dupe(u8, "") catch "";
-        defer if (move_inc.len != 0) a.free(move_inc);
+        // opens the SAME store the source used (#357). An unreadable record
+        // fails the move loudly — guessing "legacy" would re-key the tenant.
+        const move_inc = self.directory.incarnationForOwned(a, tenant) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(move_inc);
         if (!move.attachToAll(self, dest_nodes, "", tenant, plan_blob, null, move_inc)) {
             move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);

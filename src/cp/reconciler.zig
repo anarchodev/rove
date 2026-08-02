@@ -12,11 +12,11 @@
 const std = @import("std");
 const blob = @import("rove-blob");
 const curl = blob.curl;
+const wire = @import("rove-wire");
 const bc = @import("backend_client.zig");
 const move = @import("move.zig");
 const Directory = @import("cp-directory").Directory;
 const BackendResp = bc.BackendResp;
-const TENANT_HEADER = bc.TENANT_HEADER;
 
 /// Additive membership reconciler (opt-in `reconcile_membership`).
 /// On the directory leader, converge each placed tenant's DP group
@@ -310,22 +310,6 @@ fn reconcileConfChange(router: anytype, leader_url: []const u8, tenant: []const 
 /// leader's baseline {index,term} + snapshot bundle, attach (create group +
 /// load) on the node, then install the data-free raft baseline so the leader
 /// replicates the tail.
-/// Format a raft-id list as `a,b,c`, optionally appending one more id. Caller
-/// frees. Builds the augmented-ConfState membership headers.
-fn joinIdsAug(a: std.mem.Allocator, ids: []const u64, extra: ?u64) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(a);
-    for (ids, 0..) |id, i| {
-        if (i != 0) try buf.append(a, ',');
-        try buf.writer(a).print("{d}", .{id});
-    }
-    if (extra) |e| {
-        if (ids.len != 0) try buf.append(a, ',');
-        try buf.writer(a).print("{d}", .{e});
-    }
-    return buf.toOwnedSlice(a);
-}
-
 /// Build the genesis §4d attach-carry header — `id@raft_addr,…` for every
 /// REGISTERED cluster node EXCEPT `skip_id` (the joiner itself) — so a
 /// genesis-booted joiner learns the existing members' transport addresses and
@@ -358,24 +342,17 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
     const bresp = bc.call(router, leader_url, bpath, .GET, "", &.{}) catch return false;
     defer a.free(bresp.body);
     if (bresp.status != 200) return false;
-    var bp = std.json.parseFromSlice(
-        struct {
-            index: u64 = 0,
-            term: u64 = 0,
-            epoch: u64 = 1,
-            voters: []const u64 = &.{},
-            learners: []const u64 = &.{},
-            // The tenant's storage incarnation (#357), read from the leader in
-            // the SAME call as the membership it must agree with. A bootstrap
-            // that omits it opens a legacy name-keyed store on the joining
-            // node: the node catches up on the raft log, is promoted, and
-            // serves an empty tenant.
-            incarnation: []const u8 = "",
-        },
-        a,
-        bresp.body,
-        .{ .ignore_unknown_fields = true },
-    ) catch return false;
+    // One decode pair (`rove-wire`): every field is REQUIRED, so a field
+    // the leader stops sending is a loud parse failure here, not a zero
+    // that silently mis-births the joiner. The incarnation (#357) rides
+    // the SAME reply as the membership it must agree with — a bootstrap
+    // that omitted it once opened a legacy name-keyed store on the joining
+    // node: the node caught up on the raft log, was promoted, and served
+    // an empty tenant.
+    var bp = wire.parseAppliedBaseline(a, bresp.body) catch |err| {
+        std.log.warn("rewind-cp: bootstrap {s} onto {s}: v2-applied-baseline reply did not parse: {s}", .{ tenant, node_url, @errorName(err) });
+        return false;
+    };
     defer bp.deinit();
 
     // The leader's ConfState must be non-empty for a live group. An EMPTY
@@ -394,22 +371,6 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
     defer a.free(snap.body);
     if (snap.status != 200) return false;
 
-    // Attach AND install the baseline atomically (X-Rewind-Baseline-* headers
-    // → createGroupAtBaseline on the worker). A separate v2-apply-snapshot
-    // POST would leave a window where the freshly-attached empty group
-    // (last_index 0) is reachable; a leader heartbeat carrying commit > 0
-    // arriving in that window crashes raft (commit_to out of range). One
-    // atomic op closes it. The store bundle (snap.body) is loaded by attach
-    // before the group is created, so the baseline's data is already present.
-    const bidx = std.fmt.allocPrint(a, "{d}", .{bp.value.index}) catch return false;
-    defer a.free(bidx);
-    const bterm = std.fmt.allocPrint(a, "{d}", .{bp.value.term}) catch return false;
-    defer a.free(bterm);
-    // Birth the joining group at the LEADER's epoch, not a hard-coded 1, or
-    // the leader's epoch-stamped messages are fenced out and the join stalls
-    // (the genesis `__admin__` group is epoch 0; a moved tenant is >1).
-    const bepoch = std.fmt.allocPrint(a, "{d}", .{bp.value.epoch}) catch return false;
-    defer a.free(bepoch);
     // Membership SSOT, the AUGMENTED-ConfState approach: the
     // baseline carries the leader's CURRENT ConfState PLUS this node as a
     // learner, so the joiner learns its membership from the snapshot
@@ -423,45 +384,49 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
     // node (the absent-from-config first touch); when it is already a learner
     // (re-bootstrap) the set is the leader's as-is.
     const add_self = !idIn(bp.value.voters, node_id) and !idIn(bp.value.learners, node_id);
-    const voters_csv = joinIdsAug(a, bp.value.voters, null) catch return false;
-    defer a.free(voters_csv);
-    const learners_csv = joinIdsAug(a, bp.value.learners, if (add_self) node_id else null) catch return false;
-    defer a.free(learners_csv);
+    var learners_buf: [wire.MAX_MEMBER_IDS + 1]u64 = undefined;
+    if (bp.value.learners.len > wire.MAX_MEMBER_IDS) return false;
+    @memcpy(learners_buf[0..bp.value.learners.len], bp.value.learners);
+    var learners_len = bp.value.learners.len;
+    if (add_self) {
+        learners_buf[learners_len] = node_id;
+        learners_len += 1;
+    }
 
-    // Join as a non-voting learner (born-learner) when ADDING this node to
-    // the group — a learner doesn't campaign, so it follows the leader and
-    // catches up instead of deadlocking a high-term group. The baseline's
-    // ConfState (above) is authoritative for the final role; this seeds the
-    // pre-baseline born state.
     // Genesis §4d (attach-carry): the existing members' raft addresses, so a
     // genesis joiner can ACK the leader. Null on a static cluster → header
     // omitted. Lives until the call below.
     const peer_addrs = peerAddrsHeader(router, cluster_id, node_id);
     defer if (peer_addrs) |pa| a.free(pa);
-    var th_buf = [_]curl.Header{
-        .{ .name = TENANT_HEADER, .value = tenant },
-        .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
-        .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
-        .{ .name = "X-Rewind-Epoch", .value = bepoch },
-        .{ .name = "X-Rewind-Join-As-Learner", .value = if (as_learner) "1" else "0" },
-        .{ .name = "X-Rewind-Voters", .value = voters_csv },
-        .{ .name = "X-Rewind-Learners", .value = learners_csv },
-        .{ .name = "X-Rewind-Peer-Addrs", .value = peer_addrs orelse "" },
-        .{ .name = "X-Rewind-Incarnation", .value = bp.value.incarnation },
-    };
-    // Header order is positional here: the incarnation sits LAST so the
-    // optional peer-addrs header keeps its slot. An empty incarnation is the
-    // legacy layout and must not be sent as an empty header.
-    var th_len: usize = if (peer_addrs != null) 8 else 7;
-    if (bp.value.incarnation.len != 0) {
-        if (peer_addrs == null) th_buf[7] = th_buf[8];
-        th_len += 1;
-    }
-    const th: []const curl.Header = th_buf[0..th_len];
-    const ar = bc.call(router, node_url, "/_system/v2-attach", .POST, snap.body, th) catch return false;
+
+    // Attach AND install the baseline atomically (the wire envelope's
+    // baseline fields → createGroupAtBaseline on the worker). A separate
+    // v2-apply-snapshot POST would leave a window where the freshly-attached
+    // empty group (last_index 0) is reachable; a leader heartbeat carrying
+    // commit > 0 arriving in that window crashes raft (commit_to out of
+    // range). One atomic op closes it. The store bundle (snap.body) is
+    // loaded by attach before the group is created, so the baseline's data
+    // is already present. The epoch is the LEADER's, not a hard-coded 1, or
+    // its epoch-stamped messages are fenced out and the join stalls (the
+    // genesis `__admin__` group is epoch 0; a moved tenant is >1).
+    // `join_as_learner` seeds the pre-baseline born state — a learner
+    // doesn't campaign, so it follows the leader instead of deadlocking a
+    // high-term group; the baseline ConfState is authoritative after.
+    var enc = wire.encodeAttach(a, .{
+        .tenant = tenant,
+        .incarnation = bp.value.incarnation,
+        .baseline = .{ .index = bp.value.index, .term = bp.value.term },
+        .epoch = bp.value.epoch,
+        .join_as_learner = as_learner,
+        .voters = bp.value.voters,
+        .learners = learners_buf[0..learners_len],
+        .peer_addrs = peer_addrs,
+    }) catch return false;
+    defer enc.deinit();
+    const ar = bc.call(router, node_url, "/_system/v2-attach", .POST, snap.body, enc.headers) catch return false;
     defer a.free(ar.body);
     if (ar.status != 204) return false;
-    std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={}, conf_state voters=[{s}] learners=[{s}])", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner, voters_csv, learners_csv });
+    std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={}, conf_state voters={any} learners={any})", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner, bp.value.voters, learners_buf[0..learners_len] });
     return true;
 }
 

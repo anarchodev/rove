@@ -533,6 +533,19 @@ pub fn build(b: *std.Build) void {
     const tenant_tests = b.addTest(.{ .root_module = tenant_mod });
     test_step.dependOn(&b.addRunArtifact(tenant_tests).step);
 
+    // ── rove-wire: CP↔worker wire contracts (one encode/decode pair per
+    //    envelope — docs/defect-patterns.md class 3). Shared by rewind-cp
+    //    (senders) and rove-js (receivers).
+    const wire_mod = b.addModule("rove-wire", .{
+        .root_source_file = b.path("src/wire/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wire_mod.addImport("rove-blob", blob_mod);
+
+    const wire_tests = b.addTest(.{ .root_module = wire_mod });
+    test_step.dependOn(&b.addRunArtifact(wire_tests).step);
+
     // ── rove-js: worker-side JS dispatcher ──
     //
     // Phase 2 session 1 scope: library only, in-process dispatcher.
@@ -557,6 +570,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-bodies", bodies_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
+    js_mod.addImport("rove-wire", wire_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
     js_mod.addImport("rove-plan", plan_mod);
     js_mod.addImport("metrics-server", metrics_server_mod);
@@ -1303,6 +1317,7 @@ pub fn build(b: *std.Build) void {
     cp_mod.addImport("rove-blob", blob_mod);
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
     cp_mod.addImport("rove-instance-id", instance_id_mod);
+    cp_mod.addImport("rove-wire", wire_mod);
     cp_mod.addImport("bridge", v2_bridge_mod);
     // Origin validation on the runtime `/_control/cluster` door, matching
     // the static seed's gate.

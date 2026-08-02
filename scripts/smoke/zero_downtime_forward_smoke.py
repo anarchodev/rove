@@ -139,6 +139,8 @@ def attach(port, bundle_path):
          "-X", "POST", f"http://127.0.0.1:{port}/_system/v2-attach",
          "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
          "-H", f"X-Rewind-Tenant: {TENANT}",
+         # Required header (rove#363 class 3); name-keyed harness tenant.
+         "-H", "X-Rewind-Incarnation: legacy",
          "--data-binary", f"@{bundle_path}"],
         capture_output=True, text=True,
     ).stdout.strip()
