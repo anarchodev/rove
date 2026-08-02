@@ -128,14 +128,21 @@ def main() -> int:
 
         c._ensure_admin_app()
         c.provision("__auth__")
-        c.deploy_with_static(
-            "__auth__", {"index.mjs": auth_src},
-            {"_config/oidc/default.json": (auth_cfg, "application/json")})
+        # web/auth imports `@rewind/oidc` (which pulls `@rewind/jwt`) and
+            # `@rewind/email`, so the
+        # packages stage with the deploy.
+        auth_pkgs, auth_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+        c.deploy_with_packages(
+            "__auth__", {"index.mjs": auth_src}, auth_pkgs, auth_imports,
+            statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
         c.admin_kv_put("__auth__", "_oidc/config/default", json.dumps({
             "clients": [{"client_id": "admin-dashboard",
                          "redirect_uris": [app_origin + "/_rp/callback"]}],
             "login_path": "/login"}, separators=(",", ":")))
-        c.deploy_handlers("__admin__", admin_files)
+        # web/admin's middleware imports `@rewind/oidc` + `@rewind/email`,
+        # so the packages stage with the deploy.
+        adm_pkgs, adm_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+        c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         c.admin_kv_put("__admin__", "_oidc/rp/default", json.dumps({
             "issuer": auth_base, "client_id": "admin-dashboard",
             "redirect_uri": app_origin + "/_rp/callback",

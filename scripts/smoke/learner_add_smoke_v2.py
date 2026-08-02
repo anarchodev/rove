@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -75,17 +75,6 @@ def _curl_to_file(url, path, *, data=None):
     if data is not None:
         args += ["-H", "Content-Type: application/json", "--data", data]
     args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
-
-
-def _attach_file(url, path, *, tenant, index, term, as_learner):
-    args = ["curl", "-s", "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET,
-            "-H", f"X-Rewind-Tenant: {tenant}",
-            "-H", f"X-Rewind-Baseline-Index: {index}",
-            "-H", f"X-Rewind-Baseline-Term: {term}",
-            "-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}",
-            "--data-binary", f"@{path}", url]
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
@@ -170,8 +159,10 @@ def main() -> int:
             bpath = tf.name
         check("snapshot bundle → 200", _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
         check("attach (join-as-learner) → 204",
-              _attach_file(url(victim, "v2-attach"), bpath, tenant="acme",
-                           index=base["index"], term=base["term"], as_learner=True) == "204")
+              attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
+                            index=base["index"], term=base["term"],
+                            incarnation=base.get("incarnation", ""),
+                            as_learner=True) == "204")
 
         print(f"step 5: ⭐ node {vnid}'s LOCAL confstate must NOT list it as a voter (BORN LEARNER, not [1,2,3])")
         # The anti-deadlock property is that the joining node is NOT born a VOTER:

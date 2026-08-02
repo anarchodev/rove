@@ -2,12 +2,12 @@
 """e2e smoke for the `platform.compile` primitive (docs/architecture/cli-and-deploy.md §4.1) —
 the bound-respond shape.
 
-`platform.compile(files, {scope, name})` is the admin-only, off-hot-path,
+`platform.compile(files, {scope, on})` is the admin-only, off-hot-path,
 deterministic compile primitive that makes customer deploys composable
 rewind.js. It rides the bound-fetch machinery: the handler issues it + returns
 `next()` (binding to the held chain); the worker's background DeployThread
 compiles + content-addresses the bytecode into the SCOPE tenant's blobs, then
-emits a terminal bound event that RESUMES THE HELD CONNECTION at the `name`
+emits a terminal bound event that RESUMES THE HELD CONNECTION at the `on`
 export with `request.ctx = {ok, results:[{path, source_hex, bytecode_hex}]}`.
 
 This proves the whole arc end to end:
@@ -41,7 +41,7 @@ def handler_src(scope: str) -> str:
         "export default function () {\n"
         "  platform.compile(\n"
         '    [{ path: "hello.mjs", source: "export default () => \'hi\';\\n" }],\n'
-        f'    {{ scope: {json.dumps(scope)}, name: "onCompiled" }}\n'
+        f'    {{ scope: {json.dumps(scope)}, on: "onCompiled" }}\n'
         "  );\n"
         "  return next();\n"
         "}\n"
@@ -67,6 +67,19 @@ def main() -> int:
         r = c.provision("__admin__")
         # __admin__ may be auto-bootstrapped → 204 (created) or 409 (exists).
         check("provision __admin__ → 200/409", r.status in (200, 409), f"got {r.status} {r.body!r}")
+
+        # `cust` (step 4's non-admin caller) is deployed HERE, before step 2
+        # replaces __admin__'s app: every deploy goes through __admin__'s
+        # `/v1/deploy/*` door, so once the test handler is live there is no
+        # deploy door left to deploy anything else with.
+        print("step 1b: provision + deploy 'cust', the non-admin caller")
+        c.provision("cust")
+        try:
+            c.deploy_handlers("cust", {"index.mjs": handler_src("acme")})
+            deploy_ok = True
+        except RuntimeError as e:
+            check("deploy cust handler", False, str(e))
+            deploy_ok = False
 
         print("step 2: deploy the compile-test handler to __admin__")
         try:
@@ -107,13 +120,6 @@ def main() -> int:
                       e0.get("source_hex") != e0.get("bytecode_hex"))
 
         print("step 4: a NON-admin tenant calling platform.compile is rejected (403 via the held chain)")
-        c.provision("cust")
-        try:
-            c.deploy_handlers("cust", {"index.mjs": handler_src("acme")})
-            deploy_ok = True
-        except RuntimeError as e:
-            check("deploy cust handler", False, str(e))
-            deploy_ok = False
         if deploy_ok:
             r = c.wait_for_handler("cust", "/", want_status=200, timeout_s=30.0)
             gate = None

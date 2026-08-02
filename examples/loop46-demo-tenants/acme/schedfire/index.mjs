@@ -9,6 +9,12 @@
 //
 // Returns JSON `{ id }`. The wake fires the `schedtarget` handler with
 // msg `{ tag }`.
+//
+// `schedule` was an ambient global until 2026-07-28; it is now the
+// `@rewind/schedule` package, so it must be imported and the package staged
+// with the deploy (the smoke does that via `firstparty_packages`).
+import schedule from "@rewind/schedule";
+
 export default function () {
     const q = request.query || "";
     const params = {};

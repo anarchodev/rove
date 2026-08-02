@@ -87,14 +87,20 @@ def get_cert(host=HOST):
     return _curl_bytes(f"http://127.0.0.1:{PCP}/_cp/cert?host={host}")
 
 
+# `Directory.CERT_PACK_VERSION` (src/cp/directory.zig), mirrored by the front
+# door's own unpacker. A bump must fail this smoke loudly rather than let it
+# mis-parse a frame it no longer understands.
+CERT_PACK_VERSION = 1
+
+
 def unpack(frame: bytes):
-    """[4B BE cert_len][cert][key] → (cert:bytes, key:bytes) or None."""
-    if len(frame) < 4:
+    """[1B version][4B BE cert_len][cert][key] → (cert, key) or None."""
+    if len(frame) < 5 or frame[0] != CERT_PACK_VERSION:
         return None
-    clen = struct.unpack(">I", frame[:4])[0]
-    if 4 + clen > len(frame):
+    clen = struct.unpack(">I", frame[1:5])[0]
+    if 5 + clen > len(frame):
         return None
-    return (frame[4:4 + clen], frame[4 + clen:])
+    return (frame[5:5 + clen], frame[5 + clen:])
 
 
 def spawn(want_needle, cpd):

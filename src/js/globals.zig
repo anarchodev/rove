@@ -552,6 +552,9 @@ pub const DispatchState = struct {
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
     instance_id: []const u8 = "",
+    /// The instance's storage incarnation, carried so `blob.url` signs the
+    /// same key the write path used (`PlanLimits.instance_incarnation`).
+    instance_incarnation: []const u8 = "",
     /// The node's S3 backend config (`docs/architecture/routing-and-ingress.md`),
     /// borrowed from `NodeState.blob_backend_cfg` for the
     /// `_system.blob.presign` binding (the one blob verb that needs

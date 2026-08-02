@@ -267,6 +267,7 @@ pub const Dispatcher = struct {
             .bytecodes = bytecodes,
             .limiter = request.plan.limiter,
             .instance_id = request.plan.instance_id,
+            .instance_incarnation = request.plan.instance_incarnation,
             .plan_rate = request.plan.plan_rate,
             .plan_gen = request.plan.plan_gen,
             .blob_cfg = request.plan.blob_cfg,

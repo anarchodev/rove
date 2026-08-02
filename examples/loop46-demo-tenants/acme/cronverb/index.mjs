@@ -1,7 +1,12 @@
-// Handler-surface Phase 5 smoke helper — exercise the recurring `cron`
-// verb. Query: ?spec=<crontab>&tag=<str> → cron(spec, "schedtarget",
-// { tag }). Returns JSON `{ key }` (the stable registration id); each
-// occurrence fires schedtarget (records the tag) and re-arms.
+// Smoke helper — exercise the recurring `cron` verb.
+// Query: ?spec=<crontab>&tag=<str> → cron(spec, "schedtarget", { tag }).
+// Returns JSON `{ key }` (the stable registration id); each occurrence
+// fires schedtarget (records the tag) and re-arms.
+//
+// `cron` is not ambient — it is the `@rewind/cron` package, so it must be
+// imported and the package staged with the deploy.
+import cron from "@rewind/cron";
+
 export default function () {
     const q = request.query || "";
     const params = {};

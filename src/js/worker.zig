@@ -1605,6 +1605,13 @@ pub fn Worker(comptime opts: Options) type {
         /// teardown ordering (join flusher → join push → free push_queue)
         /// is local + auditable (`LogSubsystem.deinit`).
         log: log_subsystem_mod.LogSubsystem,
+        /// This worker's queue in the process-global blob coordinator —
+        /// its `msg_inbox_idx`, assigned at registration. DISTINCT from
+        /// `log.log_worker_id`, which packs the node id in so request ids
+        /// stay unique across nodes and is therefore far wider than the
+        /// coordinator's queue space: submitting under it is out of range,
+        /// and casting it to the queue's width panics on any node past 0.
+        coord_worker_id: u8 = 0,
         /// Promotion-time LogRecord catch-up state. On a follower→leader
         /// edge it walks the group's live raft log, re-deriving LogRecords
         /// a crashed prior leader buffered but never flushed, and appends
@@ -1798,6 +1805,12 @@ pub fn Worker(comptime opts: Options) type {
             // partitioned sweeps (`sweepOwedRetries`).
             self.msg_inbox_idx = try config.node.router.registerMsgInbox(&self.msg_inbox);
             errdefer config.node.router.unregisterMsgInbox(&self.msg_inbox);
+            // The blob coordinator's queue for this worker IS that slot — the
+            // same identity `registerBoundFetchOwner` hands the fetch engine,
+            // so the inbound-body and bound-chunk submit paths share one queue
+            // instead of each deriving their own and drifting apart.
+            self.coord_worker_id = std.math.cast(u8, self.msg_inbox_idx) orelse
+                return error.TooManyWorkers;
 
             // Eagerly open per-worker tenant_logs (request_id minters
             // bake the worker_id into the upper 16 bits; can't share).

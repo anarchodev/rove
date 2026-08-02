@@ -72,7 +72,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .query = null,
         .activation = .disconnect,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .instance_incarnation = p.dep.inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
     // The handler's return shape is moot — the socket is closed
@@ -186,7 +186,7 @@ pub fn fireSubscriptionActivation(
         .fn_override = subscriptionExport(source),
         .activation = .{ .subscription_fire = .{ .name = subscription_name, .source = source } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .instance_incarnation = p.dep.inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
     // The marker delete must land even for a read-only handler.
@@ -238,7 +238,7 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .{ .subscription_fire = .{ .name = "__scheduler_tick", .source = null } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .instance_incarnation = p.dep.inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{
             .set_wake = &deployment_cache.TenantSlot.setWakeTrampoline,
@@ -308,7 +308,7 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
             .msg_json = ctx_json,
         } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .instance_incarnation = p.dep.inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
     runFire(worker, &p, req, .{
@@ -447,7 +447,7 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
             .msg_json = dw.msg_json,
         } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .instance_incarnation = p.dep.inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
 
@@ -523,7 +523,7 @@ pub fn fireChainedActivation(
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .send_callback,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .instance_incarnation = p.dep.inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
     // `.enqueue`: chained-from-chained re-enqueues another
@@ -636,7 +636,7 @@ pub fn fireFetchEventActivation(
             .body_truncated = if (event.final) event.body_truncated else false,
         } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .instance_incarnation = p.dep.inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{
             // §6.4 held-sync resume hook. The baked
@@ -706,7 +706,7 @@ pub fn fireFetchEventActivation(
         // strictly async, durable_seq can't have advanced past
         // this seq before the executor lands the PUT).
         if (worker.node.blob_coord.coordinator) |coord| {
-            const wid: u8 = @intCast(worker.log.log_worker_id);
+            const wid = worker.coord_worker_id;
             const seq = coord.submit(wid, event.bytes) catch |err| blk: {
                 std.log.warn(
                     "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",

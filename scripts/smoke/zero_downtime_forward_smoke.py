@@ -119,12 +119,12 @@ def post(port, suffix, payload):
 
 
 def bundle(port):
-    """v2-bundle returns the raw snapshot bytes; capture to a temp file."""
+    """v2-snapshot returns the raw snapshot bytes; capture to a temp file."""
     path = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), f"fwd-bundle-{os.getpid()}.bin")
     rc = subprocess.run(
         ["curl", "-s", "-o", path, "-w", "%{http_code}", "-m", "15",
          "--http2-prior-knowledge", "-X", "POST",
-         f"http://127.0.0.1:{port}/_system/v2-bundle",
+         f"http://127.0.0.1:{port}/_system/v2-snapshot",
          "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
          "-H", "Content-Type: application/json",
          "--data", f'{{"tenant":"{TENANT}"}}'],
@@ -196,9 +196,10 @@ def main():
         # race to an empty snapshot.
         check("source read-back key1", kv_get(PSRC, "key1"), (200, "v1"))
         code, bpath = bundle(PSRC)
-        check("v2-bundle src", code, "200")
+        check("v2-snapshot src", code, "200")
         check("v2-attach dst", attach(PDST, bpath), "204")
-        check("v2-resume src", post(PSRC, "v2-resume", f'{{"tenant":"{TENANT}"}}')[0], 204)
+        # No resume step: `v2-snapshot` is a NON-QUIESCING consistent dump, so
+        # the source never stopped serving and has nothing to resume.
         st, body = kv_get(PDST, "key1")
         check("dest has snapshot key1", (st, body), (200, "v1"))
 

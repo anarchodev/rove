@@ -209,6 +209,12 @@ pub const Directory = struct {
     /// + serves the bytes verbatim; the DP parses them into effective limits
     /// (decisions.md §10.9 + docs/architecture/control-plane.md). Owned key + value.
     plans: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// tenant → storage incarnation (#357). The CP mints one per tenant
+    /// LIFETIME at provision and must be able to hand it to EVERY later attach
+    /// — a move, a membership backfill, a node rejoining. A node that attaches
+    /// without it opens a legacy-keyed store while the rest of the cluster uses
+    /// the incarnation-keyed one, and the tenant's data silently diverges.
+    incarnations: std.StringHashMapUnmanaged([]u8) = .empty,
     /// host (`acme.com`) → tenant store id — the replicated domain index.
     /// The front door resolves `host → tenant → cluster` via
     /// `/_cp/route`; this is the first hop, authored by a control write so
@@ -311,6 +317,14 @@ pub const Directory = struct {
         var it = self.placements.keyIterator();
         while (it.next()) |k| a.free(k.*);
         self.placements.deinit(a);
+        // `incarnations` keys AND values are owned dups, like `plans`.
+        var iit = self.incarnations.iterator();
+        while (iit.next()) |e| {
+            a.free(e.key_ptr.*);
+            a.free(e.value_ptr.*);
+        }
+        self.incarnations.deinit(a);
+
         // `plans` keys AND values are owned dups (see `applyPlanLocal`).
         var pit = self.plans.iterator();
         while (pit.next()) |e| {
@@ -622,6 +636,7 @@ pub const Directory = struct {
         .{ .prefix = "cluster/", .apply = applyClusterFromJoined },
         .{ .prefix = "placement/", .apply = applyPlacementFromValue, .remove = removePlacementLocal },
         .{ .prefix = "plan/", .apply = applyPlanLocal, .remove = removePlanLocal },
+        .{ .prefix = "incarnation/", .apply = applyIncarnationLocal, .remove = removeIncarnationLocal },
         .{ .prefix = "host/", .apply = applyHostLocal, .remove = removeHostLocal },
         .{ .prefix = "cert/", .apply = applyCertLocal, .remove = removeCertLocal },
         .{ .prefix = "node/", .apply = applyNodeAddrLocal },
@@ -835,6 +850,60 @@ pub const Directory = struct {
         }
         const a = self.allocator;
         const key = std.fmt.allocPrint(a, "host/{s}", .{host}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirDelete(key);
+    }
+
+    /// Record a tenant's storage incarnation so later attaches can carry it.
+    /// Replicates like every other directory axis.
+    pub fn setIncarnation(self: *Directory, tenant_id: []const u8, value: []const u8) Error!void {
+        if (tenant_id.len == 0) return Error.BadConfig;
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "incarnation/{s}", .{tenant_id}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirWrite(key, value);
+    }
+
+    /// A tenant's incarnation as an OWNED copy (caller frees), or empty when it
+    /// has none — a tenant provisioned before incarnations existed, which stays
+    /// on the legacy name-keyed layout.
+    pub fn incarnationForOwned(self: *Directory, a: std.mem.Allocator, tenant_id: []const u8) Error![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = self.incarnations.get(tenant_id) orelse return a.dupe(u8, "") catch Error.OutOfMemory;
+        return a.dupe(u8, v) catch Error.OutOfMemory;
+    }
+
+    fn applyIncarnationLocal(self: *Directory, tenant: []const u8, value: []const u8) Error!void {
+        const a = self.allocator;
+        const val_dup = a.dupe(u8, value) catch return Error.OutOfMemory;
+        errdefer a.free(val_dup);
+        const gop = self.incarnations.getOrPut(a, tenant) catch return Error.OutOfMemory;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = a.dupe(u8, tenant) catch {
+                _ = self.incarnations.remove(tenant);
+                return Error.OutOfMemory;
+            };
+        } else a.free(gop.value_ptr.*);
+        gop.value_ptr.* = val_dup;
+    }
+
+    fn removeIncarnationLocal(self: *Directory, tenant: []const u8) void {
+        if (self.incarnations.fetchRemove(tenant)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
+        }
+    }
+
+    /// Withdraw a tenant's incarnation row (deprovision). Idempotent.
+    pub fn removeIncarnation(self: *Directory, tenant_id: []const u8) Error!void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.incarnations.getPtr(tenant_id) == null) return;
+        }
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "incarnation/{s}", .{tenant_id}) catch return Error.OutOfMemory;
         defer a.free(key);
         return self.applyDirDelete(key);
     }

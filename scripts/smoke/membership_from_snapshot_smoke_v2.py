@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -71,24 +71,6 @@ def _curl_to_file(url, path, *, data=None):
     if data is not None:
         args += ["-H", "Content-Type: application/json", "--data", data]
     args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
-
-
-def _attach(url, path, *, tenant, index, term, epoch, voters=None, learners=None):
-    # -o /dev/null so a non-2xx response BODY (the error message) doesn't get
-    # concatenated ahead of %{http_code} in stdout.
-    args = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET,
-            "-H", f"X-Rewind-Tenant: {tenant}",
-            "-H", f"X-Rewind-Baseline-Index: {index}",
-            "-H", f"X-Rewind-Baseline-Term: {term}",
-            "-H", f"X-Rewind-Epoch: {epoch}",
-            "-H", "X-Rewind-Join-As-Learner: 1"]
-    if voters is not None:
-        args += ["-H", "X-Rewind-Voters: " + ",".join(str(v) for v in voters)]
-    if learners is not None:
-        args += ["-H", "X-Rewind-Learners: " + ",".join(str(l) for l in learners)]
-    args += ["--data-binary", f"@{path}", url]
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
@@ -163,16 +145,20 @@ def main() -> int:
               _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
 
         print(f"step 5: ⭐ attach with a ConfState OMITTING node {vnid} → 409 (the -6 guard)")
-        rc = _attach(url(victim, "v2-attach"), bpath, tenant="acme",
-                     index=base["index"], term=base["term"], epoch=base.get("epoch", 1),
-                     voters=base["voters"], learners=[])  # victim deliberately omitted
+        rc = attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
+                           index=base["index"], term=base["term"], epoch=base.get("epoch", 1),
+                           incarnation=base.get("incarnation", ""), as_learner=True,
+                           voters=base["voters"], learners=[],  # victim deliberately omitted
+                           discard_body=True)
         check("⭐ attach with self-omitting ConfState → 409 (membership is read + enforced; "
               "pre-2d this 204s via the static path)", rc == "409", f"got {rc}")
 
         print(f"step 6: attach with the correct ConfState (from the baseline) → 204")
-        rc = _attach(url(victim, "v2-attach"), bpath, tenant="acme",
-                     index=base["index"], term=base["term"], epoch=base.get("epoch", 1),
-                     voters=base["voters"], learners=base["learners"])
+        rc = attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
+                           index=base["index"], term=base["term"], epoch=base.get("epoch", 1),
+                           incarnation=base.get("incarnation", ""), as_learner=True,
+                           voters=base["voters"], learners=base["learners"],
+                           discard_body=True)
         check("attach with baseline ConfState → 204", rc == "204", f"got {rc}")
 
         print(f"step 7: ⭐ node {vnid} adopted the leader's membership from the snapshot")

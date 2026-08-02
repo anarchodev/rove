@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import (  # noqa: E402
     _curl, _free_base, mint_jwt, JWT_SECRET_HEX, LOG_SERVER,
+    claim_storage_namespace,
 )
 from v2_topology import await_ready  # noqa: E402
 
@@ -69,6 +70,9 @@ def spawn_log_server(port: int) -> subprocess.Popen:
     env["S3_KEY_PREFIX_BASE"] = PREFIX
     env["LOG_S3_KEY_PREFIX"] = PREFIX
     subprocess.run(["rm", "-rf", str(DATA_DIR)])
+    # The log-server refuses to start against an unmarked object store
+    # (rove#266); this smoke owns its prefix, so it claims it itself.
+    claim_storage_namespace(PREFIX)
     logf = open(LOG_FILE, "w+")
     p = subprocess.Popen(
         [str(LOG_SERVER),

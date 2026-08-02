@@ -102,14 +102,29 @@ pub fn jsBlobPresign(
     blob_mod.sigv4.formatAmzDate(&ts_buf, epoch_secs);
 
     const a = state.allocator;
-    const path = std.fmt.allocPrint(
-        a,
-        "/{s}/{s}{s}/app-blobs/{s}",
-        .{ cfg.bucket, cfg.key_prefix_base, state.instance_id, hash },
-    ) catch {
-        state.pending_kv_error = error.OutOfMemory;
-        return js_exception;
-    };
+    // Must reproduce `BlobBackend.openPerTenantIncarnation`'s prefix exactly —
+    // this is the ONE place a per-tenant blob key is built without going
+    // through it (presigning needs the signing keys, not a backend handle).
+    // A prefix that omits the incarnation signs a URL for an object the write
+    // path never wrote, and the customer gets a 404 from S3 (#357).
+    const path = if (state.instance_incarnation.len == 0)
+        std.fmt.allocPrint(
+            a,
+            "/{s}/{s}{s}/app-blobs/{s}",
+            .{ cfg.bucket, cfg.key_prefix_base, state.instance_id, hash },
+        ) catch {
+            state.pending_kv_error = error.OutOfMemory;
+            return js_exception;
+        }
+    else
+        std.fmt.allocPrint(
+            a,
+            "/{s}/{s}{s}/{s}/app-blobs/{s}",
+            .{ cfg.bucket, cfg.key_prefix_base, state.instance_id, state.instance_incarnation, hash },
+        ) catch {
+            state.pending_kv_error = error.OutOfMemory;
+            return js_exception;
+        };
     defer a.free(path);
 
     const scheme = if (cfg.use_tls) "https" else "http";

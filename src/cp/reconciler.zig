@@ -359,7 +359,19 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
     defer a.free(bresp.body);
     if (bresp.status != 200) return false;
     var bp = std.json.parseFromSlice(
-        struct { index: u64 = 0, term: u64 = 0, epoch: u64 = 1, voters: []const u64 = &.{}, learners: []const u64 = &.{} },
+        struct {
+            index: u64 = 0,
+            term: u64 = 0,
+            epoch: u64 = 1,
+            voters: []const u64 = &.{},
+            learners: []const u64 = &.{},
+            // The tenant's storage incarnation (#357), read from the leader in
+            // the SAME call as the membership it must agree with. A bootstrap
+            // that omits it opens a legacy name-keyed store on the joining
+            // node: the node catches up on the raft log, is promoted, and
+            // serves an empty tenant.
+            incarnation: []const u8 = "",
+        },
         a,
         bresp.body,
         .{ .ignore_unknown_fields = true },
@@ -435,8 +447,17 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
         .{ .name = "X-Rewind-Voters", .value = voters_csv },
         .{ .name = "X-Rewind-Learners", .value = learners_csv },
         .{ .name = "X-Rewind-Peer-Addrs", .value = peer_addrs orelse "" },
+        .{ .name = "X-Rewind-Incarnation", .value = bp.value.incarnation },
     };
-    const th: []const curl.Header = if (peer_addrs != null) th_buf[0..8] else th_buf[0..7];
+    // Header order is positional here: the incarnation sits LAST so the
+    // optional peer-addrs header keeps its slot. An empty incarnation is the
+    // legacy layout and must not be sent as an empty header.
+    var th_len: usize = if (peer_addrs != null) 8 else 7;
+    if (bp.value.incarnation.len != 0) {
+        if (peer_addrs == null) th_buf[7] = th_buf[8];
+        th_len += 1;
+    }
+    const th: []const curl.Header = th_buf[0..th_len];
     const ar = bc.call(router, node_url, "/_system/v2-attach", .POST, snap.body, th) catch return false;
     defer a.free(ar.body);
     if (ar.status != 204) return false;

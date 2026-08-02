@@ -41,11 +41,19 @@ handlers (no `pkill -f` fragility). V2 smokes need S3 credentials in the
 environment first (`set -a; . ./.env; set +a`) — V2 has no fs blob backend.
 
 ```bash
+scripts/smoke/run_all.py                     # THE suite — serial, ~1h; --filter to narrow
 python3 scripts/smoke/rewind_smoke.py        # single-node rewind write path (propose → commit → 204)
 python3 scripts/smoke/ctl_smoke_v2.py        # provision → deploy → serve through the front door
 python3 scripts/smoke/three_node_smoke.py    # ⭐ multi-node HA: move onto a 3-node cluster, kill the leader
 python3 scripts/smoke/tenant_move_smoke.py   # live tenant move cluster-1 → cluster-2
 ```
+
+**Run the suite after anything touching the deploy protocol, a global/shim
+surface, the front door, or the harness.** Nothing ran it for months and it
+rotted silently — smokes broke one at a time as unrelated changes landed
+(`scripts/smoke/README.md` has the table). Use
+`--json now.json --baseline scripts/smoke/smoke-baseline.json`: it fails only on
+a NEWLY broken smoke, which is the question that matters.
 
 `scripts/smoke/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
 rewind-cp + front door + rewind node(s) and exposes `provision` /

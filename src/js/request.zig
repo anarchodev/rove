@@ -252,6 +252,11 @@ pub const PlanLimits = struct {
     /// Instance id this request scopes to (the limiter's per-instance
     /// bucket key). Empty outside a worker context (test paths).
     instance_id: []const u8 = "",
+    /// The instance's storage incarnation, so a per-tenant blob key built
+    /// here addresses the same objects `BlobBackend.openPerTenantIncarnation`
+    /// writes. Empty = the legacy name-keyed layout, which is what a tenant
+    /// provisioned before incarnations existed is actually on.
+    instance_incarnation: []const u8 = "",
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
     /// `_system.blob.presign` (`docs/architecture/routing-and-ingress.md`): the node's S3 backend config

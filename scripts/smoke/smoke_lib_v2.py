@@ -199,6 +199,77 @@ def _curl_run(args: list, data: bytes, timeout: float) -> HttpResponse:
     return HttpResponse(status=status, body=body, headers=headers_out)
 
 
+def attach_bundle(url: str, bundle_path: str, *, tenant: str,
+                  index=None, term=None, epoch=None, incarnation: str = "",
+                  as_learner=None, voters=None, learners=None,
+                  discard_body: bool = False) -> str:
+    """POST a snapshot bundle to a node's `/_system/v2-attach` and return the
+    HTTP status as a string.
+
+    ONE implementation of the CP's attach contract, because the smokes that
+    hand-roll a join are simulating the CP and must send what it sends. Four
+    of them had their own copy, so `X-Rewind-Incarnation` (rove#357) was added
+    to the CP and to none of them: the joining node opened a legacy name-keyed
+    store, caught up on the raft log, and still read empty (rove#355).
+
+    Omitted arguments send no header, which is what an attach that means to
+    exercise the server's default needs. `discard_body` drops the response
+    body so an error message can't be concatenated ahead of the status code.
+    """
+    args = ["curl", "-s"]
+    if discard_body:
+        args += ["-o", "/dev/null"]
+    args += ["-w", "%{http_code}", "-m", "20", "--http2-prior-knowledge",
+             "-X", "POST", "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
+             "-H", f"X-Rewind-Tenant: {tenant}"]
+    if index is not None:
+        args += ["-H", f"X-Rewind-Baseline-Index: {index}"]
+    if term is not None:
+        args += ["-H", f"X-Rewind-Baseline-Term: {term}"]
+    if epoch is not None:
+        args += ["-H", f"X-Rewind-Epoch: {epoch}"]
+    if incarnation:
+        args += ["-H", f"X-Rewind-Incarnation: {incarnation}"]
+    if as_learner is not None:
+        args += ["-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}"]
+    if voters is not None:
+        args += ["-H", "X-Rewind-Voters: " + ",".join(str(v) for v in voters)]
+    if learners is not None:
+        args += ["-H", "X-Rewind-Learners: " + ",".join(str(l) for l in learners)]
+    args += ["--data-binary", f"@{bundle_path}", url]
+    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
+
+
+def claim_storage_namespace(prefix: str) -> None:
+    """Stamp `prefix` with a storage-namespace marker (rove#266).
+
+    Every service refuses to start against an unmarked object store — without
+    a generation it cannot tell its own keys from a previous cluster
+    lifetime's, and guessing silently merges the two. A smoke that spawns a
+    service against its OWN prefix (rather than a V2Cluster's) has to claim it
+    too, or the service exits rc=2 and reads like a broken binary.
+
+    Runs the same `rewind-ops` verb production's genesis does; the harness has
+    no shortcut the operator lacks. A virgin prefix takes `--adopt`
+    (generation 0); an already-claimed one is left alone.
+    """
+    env = dict(os.environ)
+    env["S3_KEY_PREFIX_BASE"] = prefix
+
+    def ops(*args):
+        return subprocess.run(
+            [str(BIN_DIR / "rewind-ops"), "storage-namespace", *args,
+             "--env", "/nonexistent-so-only-the-process-env-is-read"],
+            env=env, capture_output=True, text=True, timeout=60)
+
+    if ops().returncode == 0:
+        return
+    r = ops("--adopt")
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"could not claim the storage namespace for {prefix}: {r.stdout}{r.stderr}")
+
+
 def _gen_self_signed(prefix: str) -> tuple[str, str]:
     """Self-signed `*.localhost` cert+key (SAN also covers `localhost`) for the
     TLS front. Verification is OFF everywhere it's used — curl `-k`, and the
@@ -313,34 +384,8 @@ class V2Cluster:
         return c
 
     def _claim_storage_namespace(self) -> None:
-        """Stamp this run's S3 prefix with a storage-namespace marker.
-
-        Every service refuses to start against an unmarked object store —
-        without a generation it cannot tell its own keys from a previous
-        cluster lifetime's, and guessing silently merges the two (rove#266).
-        Each run gets a virgin prefix, so `--adopt` (generation 0) is the right
-        claim. This runs the same `rewind-ops` verb production's genesis does;
-        the harness has no shortcut the operator lacks.
-        """
-        env = dict(os.environ)
-        env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
-
-        def ops(*args):
-            return subprocess.run(
-                [str(BIN_DIR / "rewind-ops"), "storage-namespace", *args,
-                 "--env", "/nonexistent-so-only-the-process-env-is-read"],
-                env=env, capture_output=True, text=True, timeout=60)
-
-        # Already marked (a second cluster lifetime over the same store) —
-        # leave it alone. `--adopt` deliberately refuses to overwrite a
-        # generation, so the "is it claimed yet" branch belongs here.
-        if ops().returncode == 0:
-            return
-        r = ops("--adopt")
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"could not claim the storage namespace for {self.s3_prefix}: "
-                f"{r.stdout}{r.stderr}")
+        """Claim this run's prefix — see `claim_storage_namespace`."""
+        claim_storage_namespace(self.s3_prefix)
 
     def _boot(self, nodes: int) -> None:
         voters = ",".join(str(i + 1) for i in range(nodes))
@@ -825,9 +870,61 @@ class V2Cluster:
             raise RuntimeError(f"release {tenant}/{dep_hex}: {r.status} {r.body}")
         return str(int(dep_hex, 16))
 
+    # `@rewind/oidc` and `@rewind/oauth` import `@rewind/jwt`; the rest are
+    # leaves. A table rather than a scan so the dependency ORDER — leaves first,
+    # because a package's files compile with the loader live — is explicit.
+    # First-party packages that import other first-party packages. Derived from
+    # the `from "@rewind/…"` lines in `src/js/packages/@rewind/*/index.mjs`;
+    # `firstparty_packages` stages a dep ahead of its dependent so the import
+    # hash resolves. Add an entry when a package grows a sibling import — a
+    # missing one shows up as a resolve failure at deploy, not at edit time.
+    FIRSTPARTY_PKG_DEPS = {
+        "@rewind/cron": ["@rewind/schedule"],
+        "@rewind/oauth": ["@rewind/jwt"],
+        "@rewind/oidc": ["@rewind/jwt"],
+    }
+
+    def firstparty_packages(self, specs: list[str]) -> tuple[list[dict], dict]:
+        """Build the `(packages, app_imports)` pair `deploy_with_packages` takes,
+        from the real first-party sources in `src/js/packages/@rewind/`.
+
+        These were ambient globals until 2026-07-28 (`a6b0674`), when they became
+        `@rewind/*` packages. Every smoke whose fixture said `oidc.` / `schedule.`
+        / `segments.` broke that day and stayed broken, because nothing ran them
+        (rove#355). Staging the SHIPPED sources — the same tree
+        `rewind-ops seed-packages` publishes — keeps those smokes testing the
+        real library rather than a copy that can drift.
+        """
+        import hashlib
+        root = Path(__file__).resolve().parent.parent.parent / "src/js/packages/@rewind"
+
+        ordered: list[str] = []
+        for spec in specs:
+            for dep in self.FIRSTPARTY_PKG_DEPS.get(spec, []):
+                if dep not in ordered:
+                    ordered.append(dep)
+            if spec not in ordered:
+                ordered.append(spec)
+
+        hashes: dict[str, str] = {}
+        packages: list[dict] = []
+        for spec in ordered:
+            src = (root / spec.split("/", 1)[1] / "index.mjs").read_text()
+            pkg_hash = hashlib.sha256((spec + "@1.0.0\n" + src).encode()).hexdigest()
+            hashes[spec] = pkg_hash
+            packages.append({
+                "spec": spec, "version": "1.0.0", "pkg_hash": pkg_hash,
+                "files": {"index.mjs": src},
+                "imports": {d: hashes[d] for d in self.FIRSTPARTY_PKG_DEPS.get(spec, [])},
+            })
+        # Only the requested specs go on the APP surface; a transitively pulled
+        # dep stays internal to the package importing it.
+        return packages, {spec: hashes[spec] for spec in specs}
+
     def deploy_with_packages(self, tenant: str, handler_files: dict[str, str],
                              packages: list[dict], app_imports: dict[str, str],
-                             *, node: int = 0) -> str:
+                             *, statics: Optional[dict[str, tuple]] = None,
+                             node: int = 0) -> str:
         """PM P1: deploy handlers that import `@scope/pkg` packages.
 
         `packages` entries (IN DEPENDENCY ORDER, leaves first — a package's
@@ -892,6 +989,20 @@ class V2Cluster:
                               "source": source, "resolution": resolution()})
             if r.status != 200:
                 raise RuntimeError(f"deploy {tenant} file {path}: {r.status} {r.body}")
+
+        # Statics stream as raw bytes to PUT /v1/upload, same door
+        # `deploy_with_static` uses — a package-bearing bundle still needs its
+        # `_config/*` rows for the deploy-time config→kv mirror.
+        import urllib.parse
+        for spath, (content, ct) in (statics or {}).items():
+            qs = urllib.parse.urlencode({"tenant": tenant, "path": spath, "content_type": ct})
+            ur = _curl(f"{self.front_url()}/v1/upload?{qs}", method="PUT",
+                       host=self.host_for("__admin__"),
+                       headers={"Authorization": f"Bearer {self.root_token}"},
+                       data=content.encode() if isinstance(content, str) else content,
+                       timeout=60.0)
+            if ur.status != 200:
+                raise RuntimeError(f"deploy {tenant} static {spath}: {ur.status} {ur.body}")
 
         r = post("cut", {"tenant": tenant, "resolution": lock})
         if r.status != 200:
@@ -960,6 +1071,21 @@ class V2Cluster:
         surfaces — pass `host=self.admin_host(node)`."""
         return _curl(f"{self.node_url(node)}{path}", method=method, data=data,
                      host=host, headers=headers)
+
+    def incarnation(self, tenant: str, *, node: int = 0) -> str:
+        """The tenant's storage incarnation (rove#357), read from the product.
+
+        Any smoke that addresses a tenant's S3 objects DIRECTLY has to build
+        `{prefix}{tenant}/{incarnation}/{subdir}/…`; the incarnation segment is
+        what makes a reused tenant name unable to reach its predecessor's
+        objects. Guessing the layout instead of asking is how these smokes
+        started 404ing (rove#355). Empty for a tenant on the legacy layout.
+        """
+        r = _curl(f"{self.node_url(node)}/_system/v2-applied-baseline?tenant={tenant}",
+                  headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        if r.status != 200:
+            raise RuntimeError(f"incarnation {tenant}: {r.status} {r.body}")
+        return json.loads(r.body).get("incarnation", "")
 
     def admin_kv_get(self, tenant: str, key: str, *, node: int = 0) -> HttpResponse:
         """Read a tenant KV key via the worker's `/_system/v2-kv` (move-secret

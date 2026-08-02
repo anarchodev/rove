@@ -99,8 +99,21 @@ def main() -> int:
         for i in range(30):
             c.request_retry("acme", "/?fn=handler", method="POST", data=f'{{"value":"v-{i}"}}', want_status=204, deadline_s=10)
         latest = "v-29"
-        cs = confstate(c, lead0)
-        check("3 voters at start", cs is not None and len(cs["voters"]) == 3, f"cs={cs}")
+
+        # With a reconciler present the CP births a tenant as the SOLE voter {1}
+        # and the reconciler GROWS it to the full node set learner-first (the
+        # CP's two-births rule) — so "3 voters" is something to WAIT for, not
+        # something true at provision. Waiting is also the cheapest assertion
+        # that the grow half of the reconciler works before the heal half is
+        # exercised below.
+        cs = None
+        deadline = time.time() + 90.0
+        while time.time() < deadline:
+            cs = confstate(c, c.leader_node("acme") if c.leader_node("acme") is not None else lead0)
+            if cs is not None and len(cs.get("voters", [])) == 3:
+                break
+            time.sleep(1.0)
+        check("⭐ reconciler GREW the group to 3 voters", cs is not None and len(cs["voters"]) == 3, f"cs={cs}")
 
         lead = c.leader_node("acme")
         victim = next(i for i in range(3) if i != lead)
@@ -108,7 +121,16 @@ def main() -> int:
         print(f"       leader=node {lead + 1}; will WIPE node {vnid}")
 
         print(f"step 2: STOP node {vnid}, WIPE its data → fresh voter with no group (phantom)")
-        check("victim holds data pre-wipe", latest in c.admin_kv_get("acme", KEY, node=victim).body)
+        # The grown voter has to be CAUGHT UP before the wipe means anything —
+        # otherwise step 3 could "heal" a node that never held the data.
+        held = False
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            if latest in c.admin_kv_get("acme", KEY, node=victim).body:
+                held = True
+                break
+            time.sleep(1.0)
+        check("victim holds data pre-wipe", held)
         c.stop_node(victim)
         subprocess.run(["rm", "-rf", str(c.data_dirs[victim])])
         c.start_node(victim)

@@ -139,9 +139,14 @@ def main() -> int:
         c._ensure_admin_app()
         c.provision("__auth__")
         try:
-            c.deploy_with_static(
-                "__auth__", {"index.mjs": auth_src},
-                {"_config/oidc/default.json": (auth_cfg, "application/json")})
+            # web/auth imports `@rewind/oidc` (which pulls `@rewind/jwt`) and
+            # `@rewind/email`, so
+            # the packages stage with the deploy — they stopped being ambient
+            # globals on 2026-07-28.
+            pkgs, imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            c.deploy_with_packages(
+                "__auth__", {"index.mjs": auth_src}, pkgs, imports,
+                statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
         except RuntimeError as e:
             check("deploy web/auth → __auth__", False, str(e)); return 1
         c.admin_kv_put("__auth__", "_oidc/config/default", json.dumps({
@@ -150,7 +155,10 @@ def main() -> int:
             "login_path": "/login",
         }, separators=(",", ":")))
         try:
-            c.deploy_handlers("__admin__", admin_files)
+            # web/admin's middleware imports `@rewind/oidc` + `@rewind/email`,
+            # so the packages stage with the deploy.
+            adm_pkgs, adm_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e)); return 1
         c.admin_kv_put("__admin__", "_oidc/rp/default", json.dumps({

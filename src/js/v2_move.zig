@@ -1125,7 +1125,9 @@ fn handleMemberStatus(
 // The orchestrator (CP / smoke) sequences these; each endpoint is a passive
 // primitive, like the tenant-move surface.
 
-/// `GET /_system/v2-applied-baseline?tenant=` → `{"index":X,"term":T}` where X
+/// `GET /_system/v2-applied-baseline?tenant=` →
+/// `{"index":X,"term":T,"epoch":E,"voters":[..],"learners":[..],"incarnation":"…"}`
+/// — everything a joining node must be born with, in one read. X
 /// is the leader's LIVE applied index (`slot.applied_idx`) and T is the term of
 /// the log entry at X (so the learner's baseline matches the leader's log).
 /// Leader-gated (only the leader tracks term-by-index meaningfully).
@@ -1193,6 +1195,15 @@ fn handleAppliedBaseline(
     var learners_buf: [16]u64 = undefined;
     const cs = worker.raft.confState(gid, &voters_buf, &learners_buf) orelse
         return reply(server, allocator, ent, sid, sess, 500, "conf_state unavailable\n");
+    // The tenant's storage incarnation, for the same reason the epoch is here:
+    // a joiner must be born with it (passed back via `X-Rewind-Incarnation` on
+    // the attach) or it opens a DIFFERENT store from the rest of the group and
+    // applies replicated writes somewhere nothing reads (#357). Empty for a
+    // tenant provisioned before incarnations existed — legacy name-keyed, and
+    // the joiner must stay there too.
+    const inc = worker.node.tenant.incarnationOf(allocator, tenant) catch
+        return reply(server, allocator, ent, sid, sess, 500, "incarnation unavailable\n");
+    defer allocator.free(inc);
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     var w = buf.writer(allocator);
@@ -1203,7 +1214,8 @@ fn handleAppliedBaseline(
     w.writeAll("],\"learners\":[") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     for (cs.learners, 0..) |l, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", l }) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
-    w.writeAll("]}\n") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    w.print("],\"incarnation\":\"{s}\"}}\n", .{inc}) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }

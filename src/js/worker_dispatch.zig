@@ -2137,7 +2137,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // we park on the resulting seq, drain materializes
                     // the BodyRef once the seq is durable.
                     if (worker.node.blob_coord.coordinator) |coord| {
-                        const wid: u8 = @intCast(worker.log.log_worker_id);
+                        const wid = worker.coord_worker_id;
                         if (coord.submit(wid, body)) |seq| {
                             try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
                                 .worker_seq = seq,
@@ -2311,7 +2311,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // running as `__admin__` scoped to `acme` should pull
                 // from acme's email bucket, not __admin__'s.
                 .limiter = &worker.limiter,
-                .instance_id = scope_inst.id,
+                .instance_id = scope_inst.id, .instance_incarnation = scope_inst.incarnation,
                 // Same plan the request-rate check used — so `email.send`'s rate
                 // check sizes its bucket from this tenant's tier too (Lever 1's
                 // free second lever).
