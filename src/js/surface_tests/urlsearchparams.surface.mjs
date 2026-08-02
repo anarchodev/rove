@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // URLSearchParams — WHATWG subset; toString() round-trips through
 // request.query (the standard request carries "alpha=1&beta=two").
 export default function () {

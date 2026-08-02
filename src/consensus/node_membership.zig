@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Raft membership + log-inspection surface for the data-plane `Node` — the
 //! pump-side twins of the bridge's ControlCmd relay (campaign / transfer /
 //! conf-change / conf-state / voter-progress / log reads / local-snapshot

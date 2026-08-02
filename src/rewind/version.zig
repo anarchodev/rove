@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Format-version registry (`docs/architecture/format-versioning.md` §3.8) —
 //! the single in-binary place that names every wire / on-disk / persisted
 //! format version, so the whole surface is auditable at a glance and the

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Background deployment loader. The worker's request-handling
 //! threads never do network I/O on the request hot path — every
 //! manifest fetch, bytecode fetch, and config-mirror write that

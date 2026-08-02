@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Dedicated operator-metrics HTTP/1.1 listener.
 //!
 //! A minimal HTTP/1.1 server that serves the latest Prometheus-text snapshot on

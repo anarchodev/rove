@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Customer-facing kv surface — the `kv.get/set/delete/prefix` bindings
 //! split out of globals.zig, plus the `markSubscriptionsDirty` hook that
 //! arms kv-react subscriptions on every write.

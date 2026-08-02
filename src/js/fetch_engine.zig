@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `http.fetch` engine — outbound fetch driven by a libcurl multi
 //! handle (`docs/architecture/configuration-and-network.md`).
 //!

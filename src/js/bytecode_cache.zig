@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Process-wide content-addressed cache for compiled module bytecode.
 //!
 //! The runtime `BytecodeCache` (`docs/architecture/package-compile-caching.md`). A standalone module so

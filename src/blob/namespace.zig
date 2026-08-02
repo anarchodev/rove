@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Storage namespace — which generation of the object store a cluster may see.
 //!
 //! `key_prefix_base` scopes a bucket to a deployment (staging vs prod). The

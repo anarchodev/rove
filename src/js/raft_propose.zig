@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Worker-side propose helpers for the three writeset envelope flavors.
 //!
 //! Each helper:

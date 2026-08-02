@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! V2 — the cluster-internal tenant-MOVE surface.
 //!
 //! The data-plane half of moving a tenant from one cluster to another; the CP

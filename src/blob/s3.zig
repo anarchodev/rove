@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! S3-compatible object-store backend for `rove-blob`.
 //!
 //! Implements the `BlobStore` vtable against any S3-compatible

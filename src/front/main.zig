@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rewind-front — the V2 front door (docs/architecture/routing-and-ingress.md).
 //!
 //! A STATELESS HTTP/2 reverse proxy. Per customer request:

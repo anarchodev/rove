@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Promotion-time LogRecord rebuild — recover request logs that die
 //! in a leader's RAM when it crashes between propose and flush.
 //!

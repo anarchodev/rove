@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The one `@cImport` of arenajs's quickjs C surface for the replay/sim
 //! engine — kept in a single file so every replay module that needs a qjs
 //! type shares the SAME import instance (a second `@cImport` of the same

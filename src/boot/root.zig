@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-boot — the shared process-boot scaffolding for the four serving
 //! binaries (rewind-worker / rewind-cp / rewind-front / rewind-logs).
 //! It holds the blocks the four binaries share: SIGINT/TERM → stop-flag

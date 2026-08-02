@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Customer-side retry helper layered on top of `webhook.send`.
 //
 // All retry state lives in the customer tenant — this module's

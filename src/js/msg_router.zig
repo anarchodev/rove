@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `MsgRouter` — async-activation routing for the rove-js worker node.
 //!
 //! Owns the per-worker inbox registries (the unified `effect.MsgInbox`

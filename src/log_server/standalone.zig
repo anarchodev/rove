@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Standalone log-server — combines the background indexer thread +
 //! an h2 query API in one process.
 //!

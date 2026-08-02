@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Build-integration smoke: prove the fetched raft-rs-zig substrate is
 //! callable from inside rove — create a Manager, stand up a single-voter
 //! group, and drive it to leader. Checks that cargo → link → FFI works end

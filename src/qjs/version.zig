@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! JS engine version — the replay-critical identity of the interpreter
 //! that ran a request (`docs/architecture/format-versioning.md` §4).
 //!

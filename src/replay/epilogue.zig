@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Replay-side `request` reconstruction — the Zig port of
 //! `rewind-apps/replay/_static/request-replay.mjs` `buildRequestEpilogue`.
 //! Returns a JS source string the driver APPENDS to the entry

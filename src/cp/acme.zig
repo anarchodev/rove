@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Leader-elected ACME HTTP-01 issuer for the V2 control plane (gap #3 slice 3).
 //!
 //! A background thread on the CP. On the directory-group leader, every tick it

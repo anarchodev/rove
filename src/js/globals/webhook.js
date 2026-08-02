@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // `webhook.send` — durable outbound HTTP, composed in JS on top of
 // the reified primitives: `kv.set` (durable marker), `http.fetch`
 // (transient transport), `__system/webhook_onresult` (the baked

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! arenajs wrapper for rove-qjs.
 //!
 //! Wraps the arenajs dual-arena model: the runtime+context are created

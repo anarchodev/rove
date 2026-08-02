@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import jwt from "@rewind/jwt";
 // @rewind/oidc — OIDC authorization-code + PKCE *provider* (the
 // issuance analog of oauth.js's client helper). Dogfooded: the

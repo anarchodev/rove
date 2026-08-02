@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! V2 control plane — the tenant→cluster directory; directory replication
 //! (`docs/architecture/control-plane.md`).
 //!

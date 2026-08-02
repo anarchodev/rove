@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `_system.stream.start()` / `_system.stream.write(chunk)` — the
 //! connection-output EFFECT surface (`docs/handler-shape.md` §2.2).
 //! `stream` is an ambient namespace (like

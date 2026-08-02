@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Raw-key ECDSA bindings for atproto / did:key (`project_fediverse_libs`).
 //!
 //! Policy distinct from the JOSE surface (`crypto_jose.zig`): raw 32-byte

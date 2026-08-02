@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `HttpBlobStore` — read-only `BlobStore` that fetches manifests
 //! from a files-server cluster over HTTP/2 (Production.md #1.4
 //! step 4). The worker reads manifests via queries against

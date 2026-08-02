@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Client-IP masking for the `request.ip` surface — the ONE mask rule,
 //! shared by the worker's request installer (`globals.zig`) and the sim's
 //! world build (`src/replay/root.zig`, which derives the masked channel

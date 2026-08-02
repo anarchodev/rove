@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // webhook.send — durable outbound HTTP, composed from kv markers +
 // the internal fetch + durable scheduled wakes. In-process the fetch
 // is a buffered Cmd; what's observable is the marker row, the

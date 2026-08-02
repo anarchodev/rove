@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The `Bridge`'s pump thread — the loop that drives the per-tenant `Node`
 //! forward: `pumpLoop` (thread entry) → `pumpOnce` (drain the propose inbox,
 //! tick the node, refresh leadership, sweep lost leadership, service snapshot

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-bodies — wire-format types for readset BodyRefs.
 //!
 //! This module holds the on-wire shape (`BodyRef`, `NO_BATCH`) and the

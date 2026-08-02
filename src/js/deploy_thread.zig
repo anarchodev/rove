@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Background deploy/compile thread. Backs the `platform.*` deploy
 //! primitives the standing `__admin__` deploy app composes (`platform.compile`
 //! / `platform.scope(t).blob.put` / `platform.scope(t).deploy.stampManifest`

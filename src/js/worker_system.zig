@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `/_system/*` operator surface — the admin/control route family split
 //! out of `worker_dispatch.zig` so that file can stay focused on the
 //! request hot path (`dispatchOnce` / `finalizeBatch` / `resolveRequest`).

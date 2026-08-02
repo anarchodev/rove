@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Streaming inbound body → per-chunk `onChunk` activations
 //! (`docs/architecture/effects-and-handlers.md`, Streaming inbound body).
 //!

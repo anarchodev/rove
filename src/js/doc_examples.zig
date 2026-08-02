@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Executable-examples lint — the docs' teeth.
 //!
 //! Every code example a customer can copy — the ```js fences in

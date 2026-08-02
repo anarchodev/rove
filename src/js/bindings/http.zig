@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `http.fetch` / `http.cancelFetch` (transient streaming HTTP —
 //! upstream streaming, `docs/architecture/routing-and-ingress.md`) JS
 //! bindings.

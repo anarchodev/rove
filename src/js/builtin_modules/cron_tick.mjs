@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Handler-surface Phase 5 — the recurrence engine behind the public
 // `cron(spec, target, ctx?)` verb (docs/handler-shape.md §2.4). A
 // `cron(...)` registration schedules a durable wake aimed at THIS

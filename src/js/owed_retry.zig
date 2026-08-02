@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `owed_retry.zig` — the `_send/owed/` marker's Zig-visible surface.
 //!
 //! This is ONLY the held-sync §6.4 binding scan — there is no

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `LogSubsystem` — the per-request log buffer + S3-batch flusher + log-server
 //! push machinery grouped out of the `Worker` god-struct. Its behavior lives
 //! in `worker_log.zig`; grouping the state makes the shutdown teardown

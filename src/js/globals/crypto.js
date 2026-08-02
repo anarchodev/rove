@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Public `crypto` surface — the documentation source of truth for
 // handler cryptography (docs/architecture/builtin-libs.md Phase A).
 //

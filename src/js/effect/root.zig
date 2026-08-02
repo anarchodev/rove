@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-js `effect/` — the four primitives of `docs/effect-algebra.md`
 //! as concrete code artifacts, per `docs/architecture/effects-and-handlers.md`.
 //!

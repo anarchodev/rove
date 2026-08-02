@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Shared infrastructure for the rewind operator CLIs (`rewind-ops` and the
 //! OIDC-scoped customer `rewind`). The split is by credential/audience
 //! (docs/architecture/cli-and-deploy.md §6): platform verbs that carry root +

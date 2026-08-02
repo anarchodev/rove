@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // durable-wake-plan P5(a) — the wake-fired half of `webhook.send`.
 // Replaces the deleted Zig owed sweep (`owed_retry.zig`'s
 // `sweepOwedRetries*` + `buildRetryFetch`): every deferred fire of a

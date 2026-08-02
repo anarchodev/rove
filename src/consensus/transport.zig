@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Cross-node raft transport (coalesced, per-recipient).
 //!
 //! The wire layer is rove's `raft_net.zig` io_uring transport, adapted to

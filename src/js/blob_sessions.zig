@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Blob upload sessions — blob-storage-plan P2.
 //!
 //! A session accumulates bytes across the activations of ONE held

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The pump's hibernating active set — the per-node group-id worklists plus
 //! the dedup-append invariant that keeps each gid on each list at most once.
 //!

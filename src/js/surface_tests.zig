@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Surface tests — behavioral coverage of the whole global public API.
 //!
 //! Where the doc-examples lint (`doc_examples.zig`) proves the DOCS

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The rewind **test harness** — the second-runtime runner that turns the
 //! `simulate(world) → bundle` atom into a JS-authored test surface
 //! (`docs/architecture/replay-and-sim.md` "The saga test model").

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Panic helper for infallibility violations.
 //!
 //! Use at sites where an operation can only fail under disk failure, OOM,

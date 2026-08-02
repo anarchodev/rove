@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The `_system.*` primitive layer the offline runtimes compose over — ONE
 // source shared by the CLI sim (src/replay/sim_globals.zig embeds it into
 // the reactor base) and the browser replay arena
