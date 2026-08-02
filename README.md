@@ -95,7 +95,7 @@ examples/       echo / h2 / ws standalones + bench drivers
 
 There is no `vendor/` directory — all dependencies are fetched (see
 **Build** above). The first-party web apps (admin dashboard, replay
-shell, marketing) live in the private `rewind-apps` repo and are
+shell, marketing) live in the public `rewind-apps` repo and are
 published as ordinary tenant bundles.
 
 ## Documentation pointers
@@ -117,3 +117,24 @@ published as ordinary tenant bundles.
   effect model + handler API surface.
 - [`CLAUDE.md`](CLAUDE.md) — repo orientation, build/test commands, and
   conventions for working across git worktrees.
+
+## License
+
+Copyright (C) 2026 Loop46, Inc.
+
+`rove` is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your
+option) any later version — `SPDX-License-Identifier: AGPL-3.0-or-later`.
+
+It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+details.
+
+The complete license text is in [`LICENSE`](LICENSE), reproduced verbatim
+— it is the license itself, not a pointer to one, because the AGPL
+requires conveying a copy along with the program. The copyright line
+above is the one that names the licensor; `LICENSE` carries the Free
+Software Foundation's own notice on the license document and must not be
+edited.
