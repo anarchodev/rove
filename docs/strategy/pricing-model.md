@@ -266,6 +266,52 @@ engineering* — what a fault can lose and what it must not. It is the
 wrong model for *billing*, where the question is what the customer
 believes they bought. Record the distinction; price on the belief.
 
+### 4.3 Egress — state the allowance now, enforce later
+
+Serving is free on the current backend (§8), so nothing about egress is
+urgent as *cost*. It is urgent as a *promise*: an allowance published at
+launch is part of the deal a customer accepted, while one introduced
+after they have built on unlimited serving is a takeaway. This is §3.1's
+cap-versus-floor asymmetry pointed at bandwidth — so publish the number
+from day one and leave enforcement for when it is needed.
+
+**The allowance is derived, not a new knob:**
+
+```
+egress_allowance_per_month = 10 × stored_max_bytes
+```
+
+Computed off the tier's *quota*, not off actual stored bytes, so a
+customer is never penalised for storing less than they bought. A 100 GB
+tier serves 1 TB/month; the free tier scales down with it. No new tier
+field, no new product decision per tier — it moves when axis 3 moves.
+
+Why 10× is the right shape: it comfortably covers an application serving
+its own assets — the hot subset of a customer's objects re-served many
+times over a month — while a content-distribution workload sits orders of
+magnitude above it. The ratio is what separates "storage with normal
+serving" from "using us as a free CDN", and it separates them without
+anyone having to define a CDN.
+
+**Fair use, not a hard cutoff.** Cutting off a customer's public assets
+mid-month is a severe, visible failure, and the cost of overshoot to us
+is currently zero. So the stated posture is: an allowance, a conversation
+and an upgrade path on sustained breach, and hard enforcement only if
+abuse actually materialises. Publish it as a fair-use ceiling, not a
+guillotine.
+
+**Enforcement is architecturally non-trivial, which is the real reason it
+waits.** `blob.url` hands the client a presigned URL and the bytes flow
+client→object-store directly, never touching our compute. **We cannot
+currently measure presigned egress at all** — not "we haven't built the
+counter", but "the traffic does not pass through us." Enforcing would
+mean either ingesting the object store's access logs (asynchronous,
+provider-specific, and the only option that preserves zero-copy) or
+proxying downloads through the worker, which discards the entire point of
+presigned URLs and puts customer asset bandwidth back on our NIC. Prefer
+the former when the time comes; note that a stated-but-unmeasured
+allowance is honest only while the posture is fair-use.
+
 ## 5. Why not price "requests" / transactions directly
 
 Per-request billing is the surprise-invoice customers hate, and it
@@ -406,9 +452,15 @@ tier = {
   stored_max_bytes:    <axis 3 — hard cap on customer objects>
   log_capacity_bytes:  <axis 2 — the replay-log ring size>
   log_max_ingest_rate: <bytes/sec, incl. k·count overhead>
-  ⇒ retention_floor  = log_capacity_bytes / log_max_ingest_rate   (derived, displayed)
+  ⇒ retention_floor   = log_capacity_bytes / log_max_ingest_rate  (derived, displayed)
+  ⇒ egress_allowance  = 10 × stored_max_bytes / month             (derived, published, unenforced — §4.3)
 }
 ```
+
+Both derived rows are published, and neither is separately configurable:
+the retention floor is a *guarantee* we owe the customer, the egress
+allowance is a *ceiling* they owe us. Each falls out of a field already
+in the tier, so a tier stays four numbers.
 
 Surface the *derived* floor in the live-horizon UI: "500 GB at 64 KB/s
 ⇒ ≥90 days guaranteed, ~14 months at your current traffic." Legible, a
@@ -467,7 +519,10 @@ flush seams, so neither adds hot-path work.
   traffic as included. Presigned traffic also bypasses our compute nodes
   entirely, so it does not consume the ~117 MB/s NIC ceiling either.
 
-  Two residual concerns survive, and neither is COGS:
+  A stated allowance rides on top of this regardless — `10 ×
+  stored_max_bytes` per month, published from launch and unenforced
+  (§4.3) — because the reason to name a number is the promise, not the
+  bill. Two residual concerns survive, and neither is COGS:
 
   - **Portability.** Free egress is an OVH (and R2) property, not an
     industry one — AWS S3 charges roughly $0.09/GB out. A backend move
