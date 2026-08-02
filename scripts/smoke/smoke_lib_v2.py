@@ -353,8 +353,16 @@ class V2Cluster:
                  clusters=f"{self.cluster_id}={nodes_csv}",
                  hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
                  public_suffix=PUBLIC_SUFFIX, move_secret=MOVE_SECRET)
+        # File-log the front. Its stdout pipe is only drained until the
+        # readiness needle, so anything it says afterwards — re-aims, forward
+        # failures, the reason behind a 5xx — was previously unreadable from a
+        # smoke. `dump_log("front")` reads this.
+        front_log_dir = f"/tmp/v2smoke-{self.tag}-{os.getpid()}-frontlog"
+        subprocess.run(["mkdir", "-p", front_log_dir])
+        self.log_paths["front"] = os.path.join(front_log_dir, f"front-{os.getpid()}.log")
         spawn_front(self.procs, self.front_port,
-                    f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0)
+                    f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0,
+                    log_dir=front_log_dir)
         if self.tls_front_port:
             # Second front, TLS-terminating, same CP. The workers' tenant door
             # pins outbound to THIS port (see _spawn_node), so RP→IdP rides real
@@ -1010,6 +1018,21 @@ class V2Cluster:
                 return last
             time.sleep(0.4)
         return last
+
+    def dump_log(self, which: str, *, grep: Optional[list[str]] = None, tail: int = 30) -> None:
+        """Print lines from a component's log file (`front` / `cp` / `logsrv`).
+        Node logs have their own helper below."""
+        log = self.log_paths.get(which)
+        if not log or not os.path.exists(log):
+            print(f"  --- {which} log unavailable ---")
+            return
+        with open(log) as f:
+            lines = f.read().splitlines()
+        if grep:
+            lines = [ln for ln in lines if any(k in ln.lower() for k in grep)]
+        print(f"  --- {which} log (last {tail}) ---")
+        for ln in lines[-tail:]:
+            print(f"    | {ln}")
 
     def dump_node_log(self, node: int = 0, *, grep: Optional[list[str]] = None) -> None:
         log = self.log_paths.get(f"n{node + 1}")
