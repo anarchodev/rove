@@ -20,7 +20,7 @@ Needs the full topology + S3 (worker mints, log-server verifies). Run:
     set -a; . ./.env; set +a
     python3 scripts/smoke/replay_tags_smoke_v2.py
 
-Ports: http_base 19700 (PID-nudged). Companion to logs_door_smoke_v2.py
+Companion to logs_door_smoke_v2.py
 (admin cross-tenant door) and log_tenant_scope_smoke_v2.py (log-server gate).
 """
 from __future__ import annotations
@@ -91,8 +91,7 @@ def main() -> int:
             failures.append(label)
 
     print("=== replay-context + user tags (self-tenant door) ===")
-    with V2Cluster.spawn("replaytags", nodes=1, http_base=19700,
-                         raft_base=19800) as c:
+    with V2Cluster.spawn("replaytags", nodes=1) as c:
         c.spawn_log_server()
         c._ensure_admin_app()
 

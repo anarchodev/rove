@@ -86,7 +86,7 @@ def _load_registry_app() -> tuple[dict, dict]:
 def main() -> int:
     handlers, statics = _load_registry_app()
 
-    with V2Cluster.spawn("pmseed", nodes=1, http_base=18700, raft_base=18800) as c:
+    with V2Cluster.spawn("pmseed", nodes=1) as c:
         reg_host = c.host_for("registry")  # registry.localhost
 
         # ── stand up the real registry app ──

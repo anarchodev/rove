@@ -24,7 +24,6 @@ the edge; a worker-direct h1 read closes, asserted in the final step):
      cleanly (the never-told-to-proceed close rule).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Ports: http_base=24100 (see the per-smoke port table convention).
 """
 
 from __future__ import annotations
@@ -87,7 +86,6 @@ export default function () {
 
 READY_SRC = 'export function handler() { return "ready"; }\n'
 
-
 def h1_curl(url: str, host: str, *, data: bytes | None = None,
             headers: dict | None = None, timeout: int = 90):
     """HTTP/1.1 request → (exit, status, body). Tolerates exit 55 with a
@@ -117,7 +115,6 @@ def h1_curl(url: str, host: str, *, data: bytes | None = None,
                 status = int(parts[1])
     return proc.returncode, status, body.decode(errors="replace")
 
-
 def main() -> int:
     failures = []
 
@@ -126,7 +123,7 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    with V2Cluster.spawn("h1strm", nodes=1, http_base=24100, raft_base=24160) as c:
+    with V2Cluster.spawn("h1strm", nodes=1) as c:
         print("step 1: provision + deploy (onChunk, hash, onHeaders)")
         r = c.provision("acme")
         check("provision → 200", r.status == 200, f"got {r.status}")
@@ -226,7 +223,6 @@ def main() -> int:
           "and the Expect early-reply close-out THROUGH THE FRONT; the worker "
           "itself is h2c-only and refuses h1")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

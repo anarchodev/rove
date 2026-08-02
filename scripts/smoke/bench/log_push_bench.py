@@ -135,7 +135,7 @@ def bench_arm(name: str, *, push: bool, reqs: int, clients: int,
         if push:
             # Verify push ACTUALLY fired — else "ON" is a no-op and the A/B lies.
             m = subprocess.run(["curl", "-sS", "-m", "5",
-                                "http://127.0.0.1:9113/metrics"],
+                                f"http://127.0.0.1:{c.logs_metrics_port}/metrics"],
                                capture_output=True, text=True).stdout
             def _mv(name):
                 mm = re.search(rf"^{name}\s+(\d+)", m, re.M)

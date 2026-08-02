@@ -113,8 +113,7 @@ def main() -> int:
             failures.append(label)
 
     print("=== cluster A: production posture (no REWIND_UNSAFE_OUTBOUND) ===")
-    with V2Cluster.spawn("ssrfA", nodes=1, http_base=19300,
-                         raft_base=19400, unsafe_outbound=False) as c:
+    with V2Cluster.spawn("ssrfA", nodes=1, unsafe_outbound=False) as c:
         if not deploy_and_wait(c, check):
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1
@@ -151,8 +150,7 @@ def main() -> int:
               f"{n_blocked} 'outbound blocked' line(s) in n1 log")
 
     print("=== cluster B: smoke default (REWIND_UNSAFE_OUTBOUND=1) ===")
-    with V2Cluster.spawn("ssrfB", nodes=1, http_base=19600,
-                         raft_base=19700) as c:
+    with V2Cluster.spawn("ssrfB", nodes=1) as c:
         r = c.provision("wb")
         check("provision wb → 200", r.status == 200, f"got {r.status} {r.body!r}")
         if not deploy_and_wait(c, check):

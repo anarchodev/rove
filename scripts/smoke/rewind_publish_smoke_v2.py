@@ -118,7 +118,7 @@ def main() -> int:
 
     print("=== rewind CLI as the single deploy/ops tool (Phase 1) ===")
     cert, key = gen_cert(CLI_HOSTS)
-    with V2Cluster.spawn("rwpub", nodes=1, http_base=19980, raft_base=20080,
+    with V2Cluster.spawn("rwpub", nodes=1,
                          tls_idp=True, tls_cert=cert, tls_key=key) as c:
         tls_port = c.tls_front_port
         # Phase 2 needs the request-log query surface: the `__admin__`
@@ -475,7 +475,9 @@ def main() -> int:
         # server batch PUSH fast-path is live (push_indexed > 0) — distinct
         # from the S3 LIST poll doing the indexing.
         try:
-            mtext = urllib.request.urlopen("http://127.0.0.1:9113/metrics", timeout=5).read().decode()
+            mtext = urllib.request.urlopen(
+                f"http://127.0.0.1:{c.logs_metrics_port}/metrics",
+                timeout=5).read().decode()
         except Exception as e:  # noqa: BLE001
             mtext = f"(scrape failed: {e})"
 

@@ -38,7 +38,7 @@ def main() -> int:
     nocm = [f for f in full if f["path"] != "_static/codemirror.mjs"]
     handlers = nostatic
     one_css = nostatic + [f for f in full if f["path"] == "_static/app.css"]
-    with V2Cluster.spawn("reproadmin", nodes=1, http_base=19980, raft_base=20080) as c:
+    with V2Cluster.spawn("reproadmin", nodes=1) as c:
         c._ensure_admin_app()
         # Each case is the FIRST deploy to a FRESH tenant — isolates the bundle
         # from cross-deploy accumulation. Ordered small→large.

@@ -16,7 +16,6 @@ Two tenants on a single node:
     (`hasOk` proves `request.ok` is absent).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Ports: inherited from V2Cluster.spawn (PID-nudged).
 """
 
 from __future__ import annotations
