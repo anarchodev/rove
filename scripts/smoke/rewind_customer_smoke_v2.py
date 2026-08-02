@@ -104,9 +104,12 @@ def main() -> int:
         c._ensure_admin_app()
         c.provision("__auth__")
         try:
-            c.deploy_with_static(
-                "__auth__", {"index.mjs": auth_src},
-                {"_config/oidc/default.json": (auth_cfg, "application/json")})
+            # web/auth imports `@rewind/oidc` (which pulls `@rewind/jwt`), so
+            # the packages stage with the deploy.
+            pkgs, imports = c.firstparty_packages(["@rewind/oidc"])
+            c.deploy_with_packages(
+                "__auth__", {"index.mjs": auth_src}, pkgs, imports,
+                statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
         except RuntimeError as e:
             check("deploy web/auth → __auth__", False, str(e)); return 1
         c.admin_kv_put("__auth__", "_oidc/config/default", json.dumps({
