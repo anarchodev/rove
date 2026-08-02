@@ -20,6 +20,15 @@ if the placement went first.
 And the guards: a retried delete converges instead of erroring, and a platform
 singleton refuses to be deleted at all.
 
+STEP 6 CURRENTLY FAILS, ON PURPOSE (rove#357). Storage identity is the tenant
+NAME — `{data_dir}/{id}/app.db` and `{prefix}{id}/{file-blobs,log-blobs}/` —
+and nothing distinguishes one tenant's lifetime from the next, so the second
+holder of a reused name reads the first holder's data. That was unreachable
+until deprovision made names reusable, which is precisely why the assertion
+lives here: this smoke is the gate that stops deprovision shipping a
+cross-customer leak. It goes green when tenant storage is scoped to an
+incarnation.
+
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
 
@@ -62,6 +71,14 @@ def main() -> int:
         check("serves before delete", r.status == 200 and "alive" in r.body,
               f"got {r.status} {r.body!r}")
 
+        # Write a secret as the FIRST tenant. If a later tenant with the same
+        # name can read this, deprovision leaked one customer's data to another.
+        c.admin_kv_put(TENANT, "secret", "alice-private-data")
+        rr = _curl(f"{cp_url.replace(str(c.cp_port), str(c.node_ports[0]))}"
+                   f"/_system/v2-kv?tenant={TENANT}&key=secret", method="GET",
+                   headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        check("first tenant's secret is stored", "alice-private" in rr.body, f"got {rr.status} {rr.body!r}")
+
         print("step 2: delete")
         r = cp("delete", {"tenant": TENANT})
         check("delete → 204", r.status == 204, f"got {r.status} {r.body!r}")
@@ -89,7 +106,15 @@ def main() -> int:
         check("serves the NEW content (fresh state, not the old store)",
               r.status == 200 and "reborn" in r.body, f"got {r.status} {r.body!r}")
 
-        print("step 6: the platform's own singletons refuse deletion")
+        print("step 6: ⭐ the reborn tenant must NOT inherit the deleted one's data")
+        leaked = _curl(f"{cp_url.replace(str(c.cp_port), str(c.node_ports[0]))}"
+                       f"/_system/v2-kv?tenant={TENANT}&key=secret", method="GET",
+                       headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        check("previous tenant's KV is NOT readable by the new one",
+              "alice-private" not in leaked.body,
+              f"LEAK: got {leaked.status} {leaked.body!r}")
+
+        print("step 7: the platform's own singletons refuse deletion")
         r = cp("delete", {"tenant": "__admin__"})
         check("delete __admin__ → 403", r.status == 403, f"got {r.status} {r.body!r}")
         r = c.get("__admin__", "/", host=c.host_for("__admin__"))
