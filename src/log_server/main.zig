@@ -153,7 +153,22 @@ fn parseHostPort(allocator: std.mem.Allocator, hp: []const u8) !std.net.Address 
 /// decode (`jwt.loadSecretFromEnvOpt`); unset is fatal HERE because a
 /// log-server without the secret can never authenticate any reader.
 fn loadJwtSecret(allocator: std.mem.Allocator) ![]u8 {
-    return (try jwt.loadSecretFromEnvOpt(allocator, ENV_JWT_SECRET)) orelse {
+    const loaded = jwt.loadSecretFromEnvOpt(allocator, ENV_JWT_SECRET) catch |e| switch (e) {
+        // Fatal here, and decided here: a log-server holding a key that can
+        // never match the worker's would authenticate nobody, so failing to
+        // start is the honest outcome. The jwt module returns the reason; the
+        // binary owns the exit.
+        error.SecretHexOddLength => {
+            std.debug.print("error: {s} must be even-length hex\n", .{ENV_JWT_SECRET});
+            std.process.exit(2);
+        },
+        error.SecretHexInvalid => {
+            std.debug.print("error: {s} is not valid hex\n", .{ENV_JWT_SECRET});
+            std.process.exit(2);
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return loaded orelse {
         std.debug.print("error: {s} not set\n", .{ENV_JWT_SECRET});
         std.process.exit(2);
     };

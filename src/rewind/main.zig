@@ -644,8 +644,22 @@ pub fn main() !void {
     // hex `LOOP46_SERVICES_JWT_SECRET` the log-server verifies with (hex-decoded
     // to raw HMAC bytes here, matching the log-server). Both optional: unset →
     // the door is disabled (`error.LogsDoorUnconfigured`).
+    // Unset disables the door; MALFORMED is fatal — a worker minting tokens
+    // with a key the log-server cannot verify would fail every logs read at
+    // request time instead of at boot. The jwt module reports which way the
+    // hex is wrong; naming the env var is this binary's job.
     const services_jwt_secret: ?[]const u8 =
-        try jwt.loadSecretFromEnvOpt(allocator, "LOOP46_SERVICES_JWT_SECRET");
+        jwt.loadSecretFromEnvOpt(allocator, "LOOP46_SERVICES_JWT_SECRET") catch |e| switch (e) {
+            error.SecretHexOddLength => {
+                std.log.err("LOOP46_SERVICES_JWT_SECRET must be even-length hex", .{});
+                std.process.exit(2);
+            },
+            error.SecretHexInvalid => {
+                std.log.err("LOOP46_SERVICES_JWT_SECRET is not valid hex", .{});
+                std.process.exit(2);
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     defer if (services_jwt_secret) |s| allocator.free(s);
     // Worker's internal-plane view of the standalone log-server (no trailing
     // slash, e.g. `http://127.0.0.1:9000`). Env memory lives for the process,

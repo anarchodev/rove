@@ -665,23 +665,64 @@ test "tenant scope is back-compatible: plain verify + verifyWithCap ignore it" {
     _ = try verifyWithCap("k", tok, 0, "logs-read");
 }
 
-/// Load a hex-encoded HMAC secret from the environment, decoded to raw
-/// key bytes (the form `mint`/`verify` take). Returns null when
-/// `var_name` is unset (callers decide whether that disables a feature
-/// or is fatal); exits(2) loudly on malformed hex — that's a boot config
-/// error, and both the worker (writer) and log-server (verifier) must
-/// die on it rather than run with a key that can never match the other
-/// side's. Caller frees the returned bytes.
-pub fn loadSecretFromEnvOpt(allocator: std.mem.Allocator, var_name: []const u8) error{OutOfMemory}!?[]u8 {
-    const hex = std.posix.getenv(var_name) orelse return null;
-    if (hex.len == 0 or hex.len % 2 != 0) {
-        std.log.err("{s} must be even-length hex", .{var_name});
-        std.process.exit(2);
-    }
+pub const SecretLoadError = error{
+    /// Empty, or an odd number of hex digits — it cannot decode to bytes.
+    SecretHexOddLength,
+    /// Contains a character that is not a hex digit.
+    SecretHexInvalid,
+    OutOfMemory,
+};
+
+/// Decode a hex-encoded HMAC secret to the raw key bytes `mint`/`verify`
+/// take. Caller frees.
+///
+/// Pure: no environment, no logging, no exit — so both failure branches are
+/// directly assertable. `loadSecretFromEnvOpt` is this plus a `getenv`.
+pub fn decodeSecretHex(allocator: std.mem.Allocator, hex: []const u8) SecretLoadError![]u8 {
+    if (hex.len == 0 or hex.len % 2 != 0) return error.SecretHexOddLength;
     const bytes = allocator.alloc(u8, hex.len / 2) catch return error.OutOfMemory;
-    _ = std.fmt.hexToBytes(bytes, hex) catch {
-        std.log.err("{s} is not valid hex", .{var_name});
-        std.process.exit(2);
-    };
+    errdefer allocator.free(bytes);
+    _ = std.fmt.hexToBytes(bytes, hex) catch return error.SecretHexInvalid;
     return bytes;
+}
+
+test "decodeSecretHex: round-trips, and each malformed form is its own error" {
+    const a = testing.allocator;
+
+    const ok = try decodeSecretHex(a, "00ff10");
+    defer a.free(ok);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0xff, 0x10 }, ok);
+
+    // Odd length and empty cannot decode to bytes at all.
+    try testing.expectError(error.SecretHexOddLength, decodeSecretHex(a, "abc"));
+    try testing.expectError(error.SecretHexOddLength, decodeSecretHex(a, ""));
+
+    // Right length, wrong alphabet — a DIFFERENT mistake, so a different
+    // error: "even-length hex" would be misleading advice here.
+    try testing.expectError(error.SecretHexInvalid, decodeSecretHex(a, "zz"));
+    try testing.expectError(error.SecretHexInvalid, decodeSecretHex(a, "00gg"));
+
+    // The failing path frees its buffer — testing.allocator fails the test
+    // on a leak, which is the assertion. Nothing freed the allocation when
+    // this branch called process.exit instead of returning.
+    try testing.expectError(error.SecretHexInvalid, decodeSecretHex(a, "00zz00zz"));
+
+    // A decoded secret is usable as a key: the point of the function.
+    const key = try decodeSecretHex(a, "6b6579");
+    defer a.free(key);
+    try testing.expectEqualStrings("key", key);
+}
+
+/// Load a hex-encoded HMAC secret from the environment, decoded to raw key
+/// bytes. Returns null when `var_name` is unset — callers decide whether
+/// that disables a feature or is fatal. Caller frees the returned bytes.
+///
+/// Malformed hex returns a distinct error rather than killing the process.
+/// Both binaries do treat it as fatal — running with a key that can never
+/// match the other side's is worse than not starting — but that is the
+/// binary's call to make and its vocabulary to say it in, not a leaf's.
+/// `rove-blob`'s `env.loadFromEnv` is the same shape.
+pub fn loadSecretFromEnvOpt(allocator: std.mem.Allocator, var_name: []const u8) SecretLoadError!?[]u8 {
+    const hex = std.posix.getenv(var_name) orelse return null;
+    return try decodeSecretHex(allocator, hex);
 }
