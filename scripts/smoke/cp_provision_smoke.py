@@ -2,9 +2,9 @@
 """V2 cutover gates #4 + #5: provision a BRAND-NEW tenant onto a multi-node
 cluster with no move.
 
-  rewind-cp :18205   (directory + provisioning orchestrator)
-    └─ cluster-1 → rewind :18201,:18202,:18203  (3-node, no tenant placed)
-  rewind-front :18200
+  rewind-cp    (directory + provisioning orchestrator)
+    └─ cluster-1 → rewind ×3  (3-node, no tenant placed)
+  rewind-front
 
 Until now a tenant's raft group only formed via the attach fan-out of a
 MOVE-in; a brand-new tenant had no create+place+form path. `POST
@@ -198,7 +198,8 @@ def main():
         print("leg C: /_cp/route resolves the host → cluster-1 (3 nodes)")
         st, body = cp_route(PCP, HOST)
         check("route after provision", st, 200)
-        check("route names all 3 nodes", body.count("http://127.0.0.1:1820"), 3)
+        check("route names all 3 nodes",
+              sum(f"http://127.0.0.1:{p}" in body for p in P), 3)
 
         # ── D. the formed group SERVES + replicates ───────────────────
         print("leg D: the freshly-formed group serves a v2-kv write")

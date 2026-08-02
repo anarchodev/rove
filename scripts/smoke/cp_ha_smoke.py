@@ -13,11 +13,11 @@ group spanning three `rewind-cp` nodes. This proves the Slice-2 exit:
     promoted, and the directory still reads (and a fresh move still commits).
 
   topology:
-    CP node 1 :19090  ┐
-    CP node 2 :19093  ├─ directory raft group (consensus :19190/:19191/:19192)
-    CP node 3 :19094  ┘
-      ├─ cluster-1 → rewind :19091   (movetenant starts here)
-      └─ cluster-2 → rewind :19092   (movetenant ends here)
+    CP node 1   ┐
+    CP node 2   ├─ directory raft group (own consensus ports)
+    CP node 3   ┘
+      ├─ cluster-1 → rewind    (movetenant starts here)
+      └─ cluster-2 → rewind    (movetenant ends here)
 
 Run S3-first:  `set -a; . ./.env; set +a; python3 scripts/smoke/cp_ha_smoke.py`
 Build first:   `zig build rewind-worker && zig build rewind-cp`

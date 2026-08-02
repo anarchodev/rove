@@ -8,14 +8,14 @@ destination, so the destination stays caught up — all WITHOUT a quiesce or a
 directory flip (those are the cutover, slice c). No Cloudflare / front door
 here; this is the cluster-to-cluster forwarding mechanism in isolation.
 
-    source  → rewind :18121   (keeps serving throughout)
-    dest    → rewind :18122   (acquiring: holds the group + applies forwards)
+    source  → rewind    (keeps serving throughout)
+    dest    → rewind    (acquiring: holds the group + applies forwards)
 
 Legs:
   A.  seed key1 on the source; snapshot it onto the dest (bundle→attach→
       resume — the dest now holds the group + the snapshot; the source's
       brief quiesce is lifted immediately and it serves again).
-  B.  open the overlap: `v2-forward-begin` on the source (dest = :18122).
+  B.  open the overlap: `v2-forward-begin` on the source (dest = ).
   C.  write key2 + key3 on the SOURCE → each is committed locally AND
       forwarded → both appear on the DEST, while the source still serves
       every key (no flip — the source is still the owner).

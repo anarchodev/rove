@@ -105,3 +105,25 @@ def alloc_port() -> int:
     """A single free port from this process's slot. For helper servers (an
     upstream echo, a metrics listener) that sit beside a cluster block."""
     return alloc(1)
+
+
+def acquire_slots(n: int) -> list[int]:
+    """For a RUNNER: flock `n` slots (held for the runner's lifetime) to hand
+    to children via SMOKE_PORT_SLOT. Going through the same lockfiles the
+    standalone path uses means a hand-run smoke beside a running suite still
+    self-partitions — the runner's slots are visibly taken."""
+    got: list[int] = []
+    for i in range(SLOT_COUNT):
+        if len(got) == n:
+            break
+        fd = os.open(f"/tmp/rove-smoke-slot-{i}.lock", os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        got.append(i)  # fd deliberately left open — the lock IS the lease
+    if len(got) < n:
+        raise SystemExit(f"only {len(got)} of {n} port slots free — "
+                         "another suite running?")
+    return got

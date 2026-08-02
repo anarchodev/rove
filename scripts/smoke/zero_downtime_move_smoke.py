@@ -5,9 +5,9 @@ memory; v2-build-order §Phase 7).
 Proves the move-live orchestration end to end, keeping the source serving (no
 quiesce) and losing no write:
 
-    rewind-cp  :19020   (move-live orchestrator + directory)
-    cluster-A  :19021   (source)
-    cluster-B  :19022   (destination)
+    rewind-cp     (move-live orchestrator + directory)
+    cluster-A     (source)
+    cluster-B     (destination)
 
   one `POST /_control/move-live` moves a tenant A→B with the source serving
   the whole time; afterward B serves the data and A is evicted.
