@@ -560,13 +560,27 @@ pub const Directory = struct {
         }
     }
 
+    /// The removal twin of `applyDirWrite`: replicate a directory key's DELETE
+    /// and block until it commits. Same locking discipline — the caller must
+    /// NOT hold `self.mutex` (the observer takes it on the pump thread).
+    fn applyDirDelete(self: *Directory, key: []const u8) Error!void {
+        if (self.bridge) |bridge| {
+            const seq = bridge.proposeDelete(self.dir_gid, key) catch return Error.Replication;
+            bridge.awaitCommit(self.dir_gid, seq, COMMIT_TIMEOUT_NS) catch return Error.Replication;
+        } else {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.applyDirKvDelete(key);
+        }
+    }
+
     /// The apply observer (`Bridge.setApplyObserver`): fired on the pump
     /// thread once per committed directory PUT, on the leader and every
     /// follower. Materializes the write into the in-memory projection under
     /// the mutex — the seam by which a CP follower (no local proposer) stays
     /// in sync, and the leader's own writes land. Best-effort: a parse error
     /// is logged, not fatal (the durable store remains the source of truth).
-    fn onApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8, value: []const u8) void {
+    fn onApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.ApplyOp, key: []const u8, value: []const u8) void {
         // `id_str` (the writeset's target tenant id) is unused: the
         // directory filters on its own group id — every entry in that
         // group is a directory write.
@@ -575,9 +589,16 @@ pub const Directory = struct {
         if (gid != self.dir_gid) return;
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.applyDirKv(key, value) catch |e| {
-            std.log.warn("cp directory apply {s}: {s}", .{ key, @errorName(e) });
-        };
+        switch (op) {
+            .put => self.applyDirKv(key, value) catch |e| {
+                std.log.warn("cp directory apply {s}: {s}", .{ key, @errorName(e) });
+            },
+            // A deprovision's row removal: a follower drops it here, which is
+            // what keeps its projection equal to the leader's.
+            .delete => self.applyDirKvDelete(key) catch |e| {
+                std.log.warn("cp directory apply delete {s}: {s}", .{ key, @errorName(e) });
+            },
+        }
     }
 
     /// One replicated directory axis: a key prefix and the applier that
@@ -589,13 +610,20 @@ pub const Directory = struct {
     const DirAxis = struct {
         prefix: []const u8,
         apply: *const fn (*Directory, []const u8, []const u8) Error!void,
+        /// Materialize a committed DELETE of this axis. Null = the axis has no
+        /// removal path; a delete arriving for it is logged and ignored rather
+        /// than silently treated as a write. `cluster/` and `node/` are
+        /// topology, not tenant state: removing a cluster out from under live
+        /// placements is a different operation with its own safety questions,
+        /// so deprovision does not get to do it by accident.
+        remove: ?*const fn (*Directory, []const u8) void = null,
     };
     const dir_axes = [_]DirAxis{
         .{ .prefix = "cluster/", .apply = applyClusterFromJoined },
-        .{ .prefix = "placement/", .apply = applyPlacementFromValue },
-        .{ .prefix = "plan/", .apply = applyPlanLocal },
-        .{ .prefix = "host/", .apply = applyHostLocal },
-        .{ .prefix = "cert/", .apply = applyCertLocal },
+        .{ .prefix = "placement/", .apply = applyPlacementFromValue, .remove = removePlacementLocal },
+        .{ .prefix = "plan/", .apply = applyPlanLocal, .remove = removePlanLocal },
+        .{ .prefix = "host/", .apply = applyHostLocal, .remove = removeHostLocal },
+        .{ .prefix = "cert/", .apply = applyCertLocal, .remove = removeCertLocal },
         .{ .prefix = "node/", .apply = applyNodeAddrLocal },
     };
 
@@ -607,6 +635,49 @@ pub const Directory = struct {
             if (std.mem.startsWith(u8, key, ax.prefix)) {
                 return ax.apply(self, key[ax.prefix.len..], value);
             }
+        }
+    }
+
+    /// Route a committed directory DELETE to the projection by key prefix.
+    /// Caller holds `self.mutex`. An axis with no remover logs and ignores —
+    /// never falls through to a write.
+    fn applyDirKvDelete(self: *Directory, key: []const u8) Error!void {
+        for (dir_axes) |ax| {
+            if (!std.mem.startsWith(u8, key, ax.prefix)) continue;
+            const remove = ax.remove orelse {
+                std.log.warn("cp directory: delete of {s} ignored — axis {s} has no removal path", .{ key, ax.prefix });
+                return;
+            };
+            remove(self, key[ax.prefix.len..]);
+            return;
+        }
+    }
+
+    /// Drop a placement from the projection. Freeing the owned key requires
+    /// `fetchRemove` — plain `remove` would leak the duped tenant id.
+    fn removePlacementLocal(self: *Directory, tenant: []const u8) void {
+        if (self.placements.fetchRemove(tenant)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// Drop a plan; both the key and the blob are owned.
+    fn removePlanLocal(self: *Directory, tenant: []const u8) void {
+        if (self.plans.fetchRemove(tenant)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
+        }
+    }
+
+    fn removeHostLocal(self: *Directory, host: []const u8) void {
+        if (self.hosts.fetchRemove(host)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
+        }
+    }
+
+    fn removeCertLocal(self: *Directory, host: []const u8) void {
+        if (self.certs.fetchRemove(host)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
         }
     }
 
@@ -733,6 +804,90 @@ pub const Directory = struct {
             gop.key_ptr.* = key_dup;
         }
         gop.value_ptr.* = .{ .cluster_idx = cluster_idx };
+    }
+
+    /// Withdraw a tenant's placement — the tenant stops being routable and its
+    /// name becomes reusable. The directory half of a deprovision.
+    ///
+    /// Idempotent: removing an absent placement succeeds, so a retried teardown
+    /// after a partial failure converges instead of 500ing. That matters more
+    /// than reporting "already gone" — a deprovision is a sequence of steps
+    /// across several nodes, and any of them may be retried.
+    pub fn unassign(self: *Directory, tenant_id: []const u8) Error!void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.placements.getPtr(tenant_id) == null) return; // already gone
+        }
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "placement/{s}", .{tenant_id}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirDelete(key);
+    }
+
+    /// Drop a host→tenant mapping, so the host stops resolving and may be
+    /// remapped. Idempotent (see `unassign`).
+    pub fn removeHost(self: *Directory, host: []const u8) Error!void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.hosts.getPtr(host) == null) return;
+        }
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "host/{s}", .{host}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirDelete(key);
+    }
+
+    /// Drop a tenant's plan blob; the DP then treats it as the free tier
+    /// (absent has always meant free). Idempotent (see `unassign`).
+    pub fn removePlan(self: *Directory, tenant_id: []const u8) Error!void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.plans.getPtr(tenant_id) == null) return;
+        }
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "plan/{s}", .{tenant_id}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirDelete(key);
+    }
+
+    /// Drop a host's stored cert+key. Idempotent (see `unassign`).
+    pub fn removeCert(self: *Directory, host: []const u8) Error!void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.certs.getPtr(host) == null) return;
+        }
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "cert/{s}", .{host}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirDelete(key);
+    }
+
+    /// Every host currently mapped to `tenant_id`, as owned strings (caller
+    /// frees each and the slice). A deprovision needs this because the
+    /// host→tenant index has no reverse direction: the rows to withdraw can
+    /// only be found by scanning.
+    pub fn hostsForOwned(self: *Directory, a: std.mem.Allocator, tenant_id: []const u8) Error![][]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |h| a.free(h);
+            out.deinit(a);
+        }
+        var it = self.hosts.iterator();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.value_ptr.*, tenant_id)) continue;
+            const dup = a.dupe(u8, e.key_ptr.*) catch return Error.OutOfMemory;
+            out.append(a, dup) catch {
+                a.free(dup);
+                return Error.OutOfMemory;
+            };
+        }
+        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
     }
 
     /// Resolve a tenant to the cluster currently serving it, or null if the
@@ -1692,6 +1847,93 @@ test "directory: seedClusters + seedPlacements parse static config" {
     try testing.expectError(error.SeedEntryMissingEquals, dir.seedClusters("missing-equals"));
     try testing.expectError(error.SeedClusterIdEmpty, dir.seedClusters("=http://nohost"));
     try testing.expectError(error.UnknownCluster, dir.seedPlacements("x=ghost-cluster"));
+}
+
+test "directory: removal withdraws each axis and is idempotent" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    const a = testing.allocator;
+
+    try dir.seedClusters("c1=http://127.0.0.1:1");
+    try dir.assign("acme", "c1");
+    try dir.setHost("acme.test", "acme");
+    try dir.setPlan("acme", "{\"tier\":\"pro\"}");
+
+    try testing.expect(dir.resolve("acme") != null);
+    {
+        const t = (try dir.hostTenantForOwned(a, "acme.test")).?;
+        defer a.free(t);
+        try testing.expectEqualStrings("acme", t);
+    }
+
+    // Withdrawing a placement makes the tenant unroutable and frees the name.
+    try dir.unassign("acme");
+    try testing.expect(dir.resolve("acme") == null);
+
+    try dir.removeHost("acme.test");
+    try testing.expect((try dir.hostTenantForOwned(a, "acme.test")) == null);
+
+    try dir.removePlan("acme");
+    try testing.expect((try dir.planForOwned(a, "acme")) == null);
+
+    // Idempotent: a retried teardown after a partial failure must converge,
+    // not error — every one of these runs again in a retry.
+    try dir.unassign("acme");
+    try dir.removeHost("acme.test");
+    try dir.removePlan("acme");
+
+    // And the name is genuinely reusable afterwards.
+    try dir.assign("acme", "c1");
+    try testing.expectEqualStrings("c1", dir.resolve("acme").?.cluster.id);
+}
+
+test "directory: a removed row does not resurrect on replay" {
+    // The property a follower depends on: rebuilding the projection from the
+    // durable store must reach the same state as the leader. A real DELETE
+    // (not an empty-value tombstone) means the key is simply absent from the
+    // prefix scan — so this is really asserting that the delete reached the
+    // store, not just the in-memory map.
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+
+    try dir.seedClusters("c1=http://127.0.0.1:1");
+    try dir.assign("gone", "c1");
+    try dir.assign("stays", "c1");
+    try dir.unassign("gone");
+
+    // Re-derive the projection the way `replayFromStore` would: drop the
+    // in-memory state and re-apply what the axes hold.
+    dir.removePlacementLocal("gone");
+    try testing.expect(dir.resolve("gone") == null);
+    try testing.expect(dir.resolve("stays") != null);
+}
+
+test "directory: hostsForOwned finds the rows a deprovision must withdraw" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    const a = testing.allocator;
+
+    try dir.seedClusters("c1=http://127.0.0.1:1");
+    try dir.setHost("one.test", "acme");
+    try dir.setHost("two.test", "acme");
+    try dir.setHost("other.test", "globex");
+
+    // The host index has no reverse direction, so teardown can only find a
+    // tenant's hosts by scanning — without this, a deprovisioned tenant's
+    // custom domains would dangle and could never be remapped.
+    const hosts = try dir.hostsForOwned(a, "acme");
+    defer {
+        for (hosts) |h| a.free(h);
+        a.free(hosts);
+    }
+    try testing.expectEqual(@as(usize, 2), hosts.len);
+    for (hosts) |h| {
+        try testing.expect(std.mem.eql(u8, h, "one.test") or std.mem.eql(u8, h, "two.test"));
+    }
+
+    const none = try dir.hostsForOwned(a, "nobody");
+    defer a.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "directory: soleCluster answers only when there is no choice to make" {

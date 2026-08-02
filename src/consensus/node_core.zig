@@ -269,9 +269,17 @@ pub const DurabilizeFloor = struct {
 /// using it to filter for the directory group). `key`/`value`/`id_str`
 /// borrow the decoded entry bytes (valid only for the call). `null` for
 /// every non-CP, non-worker node.
+/// Which kind of writeset op an `ApplyObserver` is being told about. Explicit
+/// rather than signalled by an empty value: a legitimately-empty value is
+/// indistinguishable from a removal, and an observer that guessed wrong would
+/// silently keep or drop projection state. Adding a variant here forces every
+/// observer to decide what it means.
+pub const ApplyOp = enum { put, delete };
+
 pub const ApplyObserver = struct {
     ctx: *anyopaque,
-    func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8, key: []const u8, value: []const u8) void,
+    /// `value` is the written bytes for `.put`, and empty for `.delete`.
+    func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8, op: ApplyOp, key: []const u8, value: []const u8) void,
 };
 
 /// How committed entries apply to the tenant store (v2-build-order

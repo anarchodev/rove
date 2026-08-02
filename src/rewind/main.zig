@@ -153,8 +153,12 @@ const WorkerCtx = struct {
 /// (which resolves the anchor, not the target tenant).
 /// Borrowed for the call; the loader dups it. Empty for root writesets
 /// (no `_deploy/current` key there — the key check filters them).
-fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8, value: []const u8) void {
+fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.ApplyOp, key: []const u8, value: []const u8) void {
     _ = gid;
+    // Only a written marker names a deployment to load. A DELETE of
+    // `_deploy/current` (a tenant being torn down) has no dep to enqueue —
+    // dropping the release pointer is the point.
+    if (op != .put) return;
     if (!std.mem.eql(u8, key, "_deploy/current")) return;
     if (id_str.len == 0) return;
     const node: *rjs.NodeState = @ptrCast(@alignCast(ctx));
