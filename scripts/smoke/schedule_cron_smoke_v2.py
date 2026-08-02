@@ -66,10 +66,13 @@ def main() -> int:
         r = c.provision("acme")
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
-            dep_id = c.deploy_handlers("acme", HANDLERS)
-            check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
+            # `schedule` / `cron` are `@rewind/*` packages, not ambient — the
+            # handlers import them, so the deploy stages the shipped sources.
+            pkgs, imports = c.firstparty_packages(["@rewind/schedule", "@rewind/cron"])
+            dep_id = c.deploy_with_packages("acme", HANDLERS, pkgs, imports)
+            check("deploy_with_packages → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
-            check("deploy_handlers", False, str(e))
+            check("deploy_with_packages", False, str(e))
             print("\nFAILURES:", failures)
             return 1
 

@@ -869,7 +869,16 @@ class V2Cluster:
     # `@rewind/oidc` and `@rewind/oauth` import `@rewind/jwt`; the rest are
     # leaves. A table rather than a scan so the dependency ORDER — leaves first,
     # because a package's files compile with the loader live — is explicit.
-    FIRSTPARTY_PKG_DEPS = {"@rewind/oidc": ["@rewind/jwt"], "@rewind/oauth": ["@rewind/jwt"]}
+    # First-party packages that import other first-party packages. Derived from
+    # the `from "@rewind/…"` lines in `src/js/packages/@rewind/*/index.mjs`;
+    # `firstparty_packages` stages a dep ahead of its dependent so the import
+    # hash resolves. Add an entry when a package grows a sibling import — a
+    # missing one shows up as a resolve failure at deploy, not at edit time.
+    FIRSTPARTY_PKG_DEPS = {
+        "@rewind/cron": ["@rewind/schedule"],
+        "@rewind/oauth": ["@rewind/jwt"],
+        "@rewind/oidc": ["@rewind/jwt"],
+    }
 
     def firstparty_packages(self, specs: list[str]) -> tuple[list[dict], dict]:
         """Build the `(packages, app_imports)` pair `deploy_with_packages` takes,

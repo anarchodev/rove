@@ -46,12 +46,15 @@ REQ_CAP = 8
 # Trivial 200 handler (verbatim from the V1 smoke).
 INDEX_SRC = 'export default function () { return { ok: true }; }'
 
-# Email handler (verbatim from the V1 smoke) — catches the rate_limited
-# Error the email bucket throws and returns its code/message.
-EMAIL_SRC = '''export default function () {
+# Email handler — catches the rate_limited Error the outbound bucket throws
+# and returns its code/message. `email` is the `@rewind/email` package, not
+# an ambient global.
+EMAIL_SRC = '''import email from "@rewind/email";
+
+export default function () {
   try {
     email.send({
-      key: "re_test",
+      apiKey: "re_test",
       from: "test@example.com",
       to: "user@example.com",
       subject: "hi",
@@ -64,15 +67,18 @@ EMAIL_SRC = '''export default function () {
 }'''
 
 
-def _plan_blob(*, request_capacity: int, email_capacity: int) -> str:
-    """A free-tier plan with overrides dialing tiny, refill-0 caps."""
+def _plan_blob(*, request_capacity: int, outbound_capacity: int) -> str:
+    """A free-tier plan with overrides dialing tiny, refill-0 caps.
+
+    `outbound_*` is the ONE outbound-HTTP primitive's budget — `email.send`
+    is a JS shim over it and has no separate limit (docs/effect-algebra.md)."""
     return json.dumps({
         "tier": "free",
         "overrides": {
             "request_capacity": request_capacity,
             "request_refill_per_sec": 0,
-            "email_capacity": email_capacity,
-            "email_refill_per_sec": 0,
+            "outbound_capacity": outbound_capacity,
+            "outbound_refill_per_sec": 0,
         },
     })
 
@@ -92,7 +98,10 @@ def main() -> int:
             check(f"provision {t} → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("rl1", {"index.mjs": INDEX_SRC})
-            c.deploy_handlers("rl2", {"index.mjs": INDEX_SRC, "email/index.mjs": EMAIL_SRC})
+            pkgs, imports = c.firstparty_packages(["@rewind/email"])
+            c.deploy_with_packages("rl2", {"index.mjs": INDEX_SRC,
+                                           "email/index.mjs": EMAIL_SRC},
+                                   pkgs, imports)
             check("deploy rl1 + rl2", True)
         except RuntimeError as e:
             check("deploy rl1 + rl2", False, str(e))
@@ -117,13 +126,13 @@ def main() -> int:
             return 1
 
         print(f"step 3: dial tiny caps via /_system/v2-plan "
-              f"(request_capacity={REQ_CAP}, email_capacity=2)")
+              f"(request_capacity={REQ_CAP}, outbound_capacity=2)")
         # Installing the plan bumps plan_gen → the limiter re-snapshots the
         # bucket to the new cap, full, on the next request. So the warm-up
         # 200s above don't count against the exhaustion budget.
-        rp1 = c.set_plan("rl1", _plan_blob(request_capacity=REQ_CAP, email_capacity=2))
+        rp1 = c.set_plan("rl1", _plan_blob(request_capacity=REQ_CAP, outbound_capacity=2))
         check("set rl1 plan → 204", rp1.status == 204, f"got {rp1.status} {rp1.body!r}")
-        rp2 = c.set_plan("rl2", _plan_blob(request_capacity=10_000, email_capacity=2))
+        rp2 = c.set_plan("rl2", _plan_blob(request_capacity=10_000, outbound_capacity=2))
         check("set rl2 plan → 204", rp2.status == 204, f"got {rp2.status} {rp2.body!r}")
         # Read-back proves delivery landed.
         gp = c.get_plan("rl1")
@@ -157,7 +166,7 @@ def main() -> int:
               f"got {r.status} {r.body!r}")
 
         print("step 6: email bucket → catchable rate_limited after 2")
-        # email_capacity=2 → first 2 succeed, 3rd throws catchable rate_limited.
+        # outbound_capacity=2 → first 2 succeed, 3rd throws catchable rate_limited.
         for i in (1, 2):
             r = c.get("rl2", "/email")
             check(f"email.send {i} within capacity → ok:true",
@@ -165,8 +174,11 @@ def main() -> int:
         r = c.get("rl2", "/email")
         check("email.send 3 → Error{code:'rate_limited'}",
               '"code":"rate_limited"' in r.body, f"got {r.status} {r.body!r}")
-        check("email 429 message explains the limit",
-              "email rate limit exceeded" in r.body, f"got {r.body!r}")
+        # The message names the OUTBOUND budget, not "email" — email.send is a
+        # shim over the one outbound primitive and shares its bucket, so a
+        # customer chasing this limit needs the real name.
+        check("rate-limit message names the outbound budget",
+              "outbound rate limit exceeded" in r.body, f"got {r.body!r}")
 
         if failures:
             c.dump_node_log(grep=["rate", "limit", "429", "plan", "email",

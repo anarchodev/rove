@@ -32,7 +32,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster  # noqa: E402
 
-INDEX_SRC = r"""export default function () {
+INDEX_SRC = r"""
+// `schedule` is the `@rewind/schedule` package, not an ambient global.
+import schedule from "@rewind/schedule";
+export default function () {
     const q = new URLSearchParams(request.query || "");
     const target = q.get("target") || "jobs.mjs.weekly";
     const id = schedule({ in: 1000 }, target, { tag: q.get("tag") || "m" });
@@ -100,7 +103,8 @@ def main() -> int:
         r = c.provision("acme")
         check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
-            c.deploy_handlers("acme", HANDLERS)
+            pkgs, imports = c.firstparty_packages(["@rewind/schedule"])
+            c.deploy_with_packages("acme", HANDLERS, pkgs, imports)
             check("deploy handlers", True)
         except RuntimeError as e:
             check("deploy handlers", False, str(e))

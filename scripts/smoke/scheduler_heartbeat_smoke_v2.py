@@ -39,7 +39,10 @@ from smoke_lib_v2 import V2Cluster  # noqa: E402
 
 # Seed handler: registers the first heartbeat wake. The idempotency key
 # makes re-seeding harmless (same key ⇒ same id ⇒ last-write-wins).
-SEED_SRC = r'''export default function () {
+SEED_SRC = r'''// `schedule` is the `@rewind/schedule` package, not an ambient global.
+import schedule from "@rewind/schedule";
+
+export default function () {
     schedule({ in: 1000 }, "heartbeat", { n: 0 }, { key: "heartbeat" });
     kv.set("hb-seeded", "1");
     return "seeded";
@@ -47,7 +50,9 @@ SEED_SRC = r'''export default function () {
 
 # The recurring target: count + stamp + re-arm. `request.activation`
 # carries {kind:"durable_wake", id, key, scheduled_at_ns, msg}.
-HEARTBEAT_SRC = r'''export default function () {
+HEARTBEAT_SRC = r'''import schedule from "@rewind/schedule";
+
+export default function () {
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
     const count = parseInt(kv.get("hb-fire-count") ?? "0", 10) + 1;
@@ -60,10 +65,13 @@ HEARTBEAT_SRC = r'''export default function () {
 
 INDEX_SRC = r'''export default function () { return { status: 200, body: "ok" }; }'''
 
+# All handlers, so this one deploys through `deploy_with_packages` (it needs
+# `@rewind/schedule` staged). The legacy-spec bundles below stay on
+# `deploy_manifest` — they carry `static` files and are meant to be REJECTED.
 HANDLERS = {
-    "index.mjs": ("handler", INDEX_SRC),
-    "heartbeat.mjs": ("handler", HEARTBEAT_SRC),
-    "seed/index.mjs": ("handler", SEED_SRC),
+    "index.mjs": INDEX_SRC,
+    "heartbeat.mjs": HEARTBEAT_SRC,
+    "seed/index.mjs": SEED_SRC,
 }
 
 # The retired boot-subscription surface — must fail the deploy loudly.
@@ -101,10 +109,11 @@ def main() -> int:
         r = c.provision("acme")
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
-            dep_id = c.deploy_manifest("acme", HANDLERS)
-            check("deploy_manifest → dep_id", bool(dep_id), f"dep_id={dep_id}")
+            pkgs, imports = c.firstparty_packages(["@rewind/schedule"])
+            dep_id = c.deploy_with_packages("acme", HANDLERS, pkgs, imports)
+            check("deploy_with_packages → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
-            check("deploy_manifest", False, str(e))
+            check("deploy_with_packages", False, str(e))
             print("\nFAILURES:", failures)
             return 1
 
