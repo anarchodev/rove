@@ -22,6 +22,7 @@
 
 pub const kvstore = @import("kvstore.zig");
 pub const writeset = @import("writeset.zig");
+pub const usage = @import("usage.zig");
 pub const snapshot_stream = @import("snapshot_stream.zig");
 
 // ── Flat facade ──────────────────────────────────────────────────────
@@ -38,6 +39,11 @@ pub const WriteSetOp = writeset.Op;
 pub const applyEncodedWriteSet = writeset.applyEncoded;
 pub const scanWriteSetPutValue = writeset.scanPutValue;
 pub const decodeWriteSetOps = writeset.decodeOps;
+
+// usage.zig (per-tenant stored-byte accounting, folded at apply time)
+pub const UsagePool = usage.Pool;
+pub const usageRowKey = usage.rowKey;
+pub const storedBytes = usage.storedBytes;
 
 // snapshot_stream.zig (raft streaming transfer codec)
 pub const StreamDumper = snapshot_stream.StreamDumper;
@@ -90,6 +96,7 @@ pub const encodeWriteSetPayload = envelope_codec.encodeWriteSetPayload;
 test {
     _ = kvstore;
     _ = writeset;
+    _ = usage;
     _ = snapshot_stream;
     _ = envelope_codec;
     _ = dispatch_metrics;

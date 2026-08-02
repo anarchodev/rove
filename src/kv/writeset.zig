@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const kvstore = @import("kvstore.zig");
+const usage = @import("usage.zig");
 
 pub const OpType = enum(u8) {
     put = 1,
@@ -202,8 +203,19 @@ pub fn applyEncoded(
 
         const op_type = std.meta.intToEnum(OpType, type_byte) catch return DecodeError.UnknownOpType;
         switch (op_type) {
-            .put => try kv.putSeq(key, value, seq),
-            .delete => try kv.delete(key),
+            .put => {
+                // Fold BEFORE the write: the stored-byte total moves only when
+                // an object row appears, and that test reads the pre-write
+                // state (`usage.zig` — the fold is idempotent precisely
+                // because it keys on existence, which a re-applied entry
+                // already satisfies).
+                try usage.observePut(kv, .txn, key, value);
+                try kv.putSeq(key, value, seq);
+            },
+            .delete => {
+                try usage.observeDelete(kv, .txn, key);
+                try kv.delete(key);
+            },
         }
     }
 
@@ -236,8 +248,14 @@ pub fn applyEncodedDirect(
 
         const op_type = std.meta.intToEnum(OpType, type_byte) catch return DecodeError.UnknownOpType;
         switch (op_type) {
-            .put => try kv.applyPut(key, value),
-            .delete => try kv.applyDelete(key),
+            .put => {
+                try usage.observePut(kv, .direct, key, value);
+                try kv.applyPut(key, value);
+            },
+            .delete => {
+                try usage.observeDelete(kv, .direct, key);
+                try kv.applyDelete(key);
+            },
         }
     }
 }
@@ -333,6 +351,126 @@ const Reader = struct {
 // ── tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Read the folded stored-byte total, or 0 when no object row has landed.
+fn readStoredTotal(kv: *kvstore.KvStore) u64 {
+    return usage.storedBytes(kv);
+}
+
+/// Apply a one-op writeset carrying an object row, through whichever apply
+/// path the test is exercising.
+fn applyRow(
+    kv: *kvstore.KvStore,
+    mode: usage.Mode,
+    pool: usage.Pool,
+    hash: []const u8,
+    len: []const u8,
+) !void {
+    var key_buf: [128]u8 = undefined;
+    const key = usage.rowKey(&key_buf, pool, hash);
+    var ws = WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    try ws.addPut(key, len);
+    const encoded = try ws.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    switch (mode) {
+        .txn => try applyEncoded(kv, 1, encoded),
+        .direct => try applyEncodedDirect(kv, 1, encoded),
+    }
+}
+
+test "usage fold: a new object row adds its bytes, a rewrite adds nothing" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-idem");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    const hash = "a" ** 64;
+    try testing.expectEqual(@as(u64, 0), readStoredTotal(kv));
+
+    try applyRow(kv, .txn, .app, hash, "1000");
+    try testing.expectEqual(@as(u64, 1000), readStoredTotal(kv));
+
+    // The leader applies speculatively and then applies the committed entry
+    // for the same ops; a re-delivered entry can arrive again after that.
+    // Both must move the total exactly once, which is what keying the fold
+    // on row existence buys.
+    try applyRow(kv, .txn, .app, hash, "1000");
+    try applyRow(kv, .direct, .app, hash, "1000");
+    try testing.expectEqual(@as(u64, 1000), readStoredTotal(kv));
+}
+
+test "usage fold: the two pools are counted separately" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-pools");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    // The same bytes deployed as a static AND stored via blob.put are two
+    // objects in the bucket, so they cost twice.
+    const hash = "b" ** 64;
+    try applyRow(kv, .txn, .app, hash, "512");
+    try applyRow(kv, .txn, .file, hash, "512");
+    try testing.expectEqual(@as(u64, 1024), readStoredTotal(kv));
+}
+
+test "usage fold: deleting a row gives its bytes back" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-del");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    const hash = "c" ** 64;
+    try applyRow(kv, .txn, .app, hash, "4096");
+    try applyRow(kv, .txn, .app, "d" ** 64, "1");
+    try testing.expectEqual(@as(u64, 4097), readStoredTotal(kv));
+
+    var key_buf: [128]u8 = undefined;
+    const key = usage.rowKey(&key_buf, .app, hash);
+    var ws = WriteSet.init(allocator);
+    defer ws.deinit();
+    try ws.addDelete(key);
+    const encoded = try ws.encode(allocator);
+    defer allocator.free(encoded);
+    try applyEncoded(kv, 1, encoded);
+    try testing.expectEqual(@as(u64, 1), readStoredTotal(kv));
+
+    // Deleting an absent row is a no-op, not an underflow.
+    try applyEncoded(kv, 1, encoded);
+    try testing.expectEqual(@as(u64, 1), readStoredTotal(kv));
+}
+
+test "usage fold: ordinary customer writes never move the total" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-inert");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    var ws = WriteSet.init(allocator);
+    defer ws.deinit();
+    try ws.addPut("media/1", "9999");
+    // A shim-writable marker beside the meter, and the total key itself
+    // arriving as an ordinary op — neither is an object row.
+    try ws.addPut("_blob/owed/" ++ "e" ** 64, "9999");
+    try ws.addPut(usage.TOTAL_KEY, "9999");
+    const encoded = try ws.encode(allocator);
+    defer allocator.free(encoded);
+    try applyEncoded(kv, 1, encoded);
+
+    // The total key was written verbatim by the op — the fold neither
+    // recursed on it nor added anything of its own.
+    try testing.expectEqual(@as(u64, 9999), readStoredTotal(kv));
+    try applyRow(kv, .txn, .app, "f" ** 64, "1");
+    try testing.expectEqual(@as(u64, 10000), readStoredTotal(kv));
+}
 
 test "encode/decode round trip via KvStore" {
     const allocator = testing.allocator;

@@ -65,6 +65,14 @@ const std = @import("std");
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
 ///   `_sessions/`        → reserved for future platform session storage
+///   `_usage/`           → per-tenant stored-byte accounting: one row per
+///                         stored object plus the folded total
+///                         (`src/kv/usage.zig`). Written ONLY by platform
+///                         Zig at apply time. It must stay outside
+///                         `SHIM_WRITABLE_PREFIXES` below — this is the
+///                         number the storage quota is enforced against, so
+///                         a tenant that could write it could zero its own
+///                         meter.
 ///
 /// Used only by `isReservedTriggerPrefix` (the deploy-load trigger guard).
 /// The customer-WRITE guard does not pivot on this enumerated list — it
@@ -81,6 +89,7 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_magic/",
     "_triggers/",
     "_sessions/",
+    "_usage/",
 };
 
 /// Leading-`_` prefixes that platform JS *shims* write into a tenant's own
@@ -200,6 +209,19 @@ test "isCustomerWriteReserved: known platform prefixes blocked" {
     try std.testing.expect(isCustomerWriteReserved("_deploy/current"));
     // `_admin/` is read-only from shims (is_root allowlist) → reserved.
     try std.testing.expect(isCustomerWriteReserved("_admin/operator/abc"));
+}
+
+test "isCustomerWriteReserved: the storage meter is not writable by what it meters" {
+    // `_usage/` holds the stored-byte rows + the folded total the storage
+    // quota is checked against (`src/kv/usage.zig`). A tenant able to write
+    // it could zero its own meter, so — unlike the `_blob/` durability
+    // markers beside it — this one must never join SHIM_WRITABLE_PREFIXES.
+    try std.testing.expect(isCustomerWriteReserved("_usage/blob_bytes"));
+    try std.testing.expect(isCustomerWriteReserved("_usage/blob/app/" ++ "a" ** 64));
+    try std.testing.expect(isCustomerWriteReserved("_usage/blob/file/" ++ "b" ** 64));
+    for (SHIM_WRITABLE_PREFIXES) |p| {
+        try std.testing.expect(!std.mem.startsWith(u8, "_usage/", p));
+    }
 }
 
 test "isCustomerWriteReserved: whole leading-_ keyspace reserved" {
