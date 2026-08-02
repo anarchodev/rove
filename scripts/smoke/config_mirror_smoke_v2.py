@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V2 port of `config_mirror_smoke.py` — the `_config/` → kv config surface
-on the `V2Cluster` harness (branch `v2`).
+on the `V2Cluster` harness.
 
 WHAT THIS COVERS vs THE V1 SMOKE — read this before extending.
 

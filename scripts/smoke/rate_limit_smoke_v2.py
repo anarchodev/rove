@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Smoke for the per-tenant rate limiter — V2 port on the `V2Cluster`
-harness (branch `v2`).
+harness.
 
 The per-tenant request bucket + email bucket (`src/js/limiter.zig`,
 PLAN §2.10) are enforced in the V2 worker's dispatch path off each

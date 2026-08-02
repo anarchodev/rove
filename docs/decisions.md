@@ -1016,7 +1016,7 @@ under load is a footgun — the audit found exactly that).
 Mechanics live in the as-built references
 (`architecture/consensus-and-storage.md`, `architecture/control-plane.md`,
 `architecture/routing-and-ingress.md`). This section records the locked V2
-decisions and rejected paths only. V2 is on branch `v2`; Phases 0–7 shipped
+decisions and rejected paths only. V2 is on `main`; Phases 0–7 shipped
 through 2026-06; the substrate was de-risked by the `rewind2` / `raft-rs-zig`
 prototype before V2 wrote code.
 

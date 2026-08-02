@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Concurrent same-tenant heldsync smoke (V2 port) — regression guard for
-the `cont_bound_sched_id` scan fix, on the `V2Cluster` harness (branch `v2`).
+the `cont_bound_sched_id` scan fix, on the `V2Cluster` harness.
 
 Pre-fix, the worker's scan over `writeset.ops.items` looked at the WHOLE
 batch's writeset. When N concurrent same-tenant heldsync requests landed in

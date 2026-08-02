@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Smoke for the trigger system (beforePut, afterPut, afterDelete) — V2 port
-on the `V2Cluster` harness (branch `v2`).
+on the `V2Cluster` harness.
 
 Provisions a `trig` tenant, deploys a trigger module + handler, then verifies:
   - afterPut maintains a reverse index
