@@ -1,21 +1,35 @@
-// Gap 2.2 §9.4 write-pressure exerciser (handler-surface Phase 2
-// `stream.*` surface). Heartbeat stream that writes more chunk bytes
-// per activation than `StreamChunks.QUEUE_BYTES_CAP` so the cap-overflow
-// path fires, then echoes `request.activation.write_pressure
-// .dropped_chunks` from the PRIOR activation on the next one. Pairs with
-// `scripts/streaming_write_pressure_smoke.py`.
+// `stream.write` back-pressure + overrun exerciser (the handler `stream.*`
+// surface). Drives BOTH sides of the lossless-write contract from one held
+// SSE stream; pairs with `scripts/smoke/streaming_write_pressure_smoke_v2.py`.
 //
-// Each activation writes:
-//   1. A `pressure` status frame (small — always survives the cap)
-//      reporting the dropped-chunk count from the previous run.
-//   2. ~80 fat chunks (~4 KB each = ~320 KB) — exceeds the 256 KB cap so
-//      ~16-20 chunks drop per activation. The status frame always
-//      survives because it goes FIRST.
+// The contract (`StreamChunks` in src/js/components.zig):
+//   - SOFT cap (256 KB) is BACK-PRESSURE, not truncation. A burst past it is
+//     absorbed and delivered in full; the producer is throttled, not clipped.
+//   - HARD cap (4 MB in ONE activation) THROWS. `stream.write` is lossless —
+//     the runtime never silently drops, so an activation that cannot buffer
+//     what it was handed says so instead of shipping a short stream.
+//
+// `?overrun=1` picks the second case; the default drives the first.
+//
+// Each activation writes a small `burst` marker FIRST — always the head of
+// that activation's output, so the smoke can count activations by counting
+// markers — then the burst itself.
 const FAT_CHUNK = "data: " + "X".repeat(3950) + "\n\n"; // ~3.96 KB
 
-function emit(prior_dropped) {
-    stream.write(`event: pressure\ndata: dropped=${prior_dropped}\n\n`);
-    for (let i = 0; i < 80; i++) stream.write(FAT_CHUNK);
+// 80 × ~3.96 KB ≈ 317 KB — past the 256 KB soft cap, nowhere near the hard
+// one, so every byte must arrive.
+const ABSORB_CHUNKS = 80;
+// 1200 × ~3.96 KB ≈ 4.75 MB — past the 4 MB hard cap, so the write throws.
+const OVERRUN_CHUNKS = 1200;
+
+function overrunRequested() {
+    return (request.query || "").indexOf("overrun=1") !== -1;
+}
+
+function emit() {
+    stream.write("event: burst\ndata: start\n\n");
+    const n = overrunRequested() ? OVERRUN_CHUNKS : ABSORB_CHUNKS;
+    for (let i = 0; i < n; i++) stream.write(FAT_CHUNK);
 }
 
 export default function () {
@@ -25,16 +39,16 @@ export default function () {
         "Cache-Control": "no-cache",
     };
     stream.start();
-    emit(0);
+    emit();
     after.ms(100);
     return next();
 }
 
-// Timer wake — echo the prior activation's dropped-chunk count, then
-// flood again.
+// Timer wake — same burst again, so the smoke can watch several activations
+// stream losslessly rather than judging from one.
 export function onWake() {
     stream.start();
-    emit(request.activation.write_pressure.dropped_chunks);
+    emit();
     after.ms(100);
     return next();
 }
