@@ -550,11 +550,14 @@ pub const DispatchState = struct {
     /// paths that don't care.
     limiter: ?*limiter_mod.RateLimiter = null,
     /// Instance id for limiter lookup. Empty when the dispatcher
-    /// runs without a worker (test paths).
+    /// runs without a worker (test paths). Derived from
+    /// `PlanLimits.storage` at the single dispatcher hand-off.
     instance_id: []const u8 = "",
-    /// The instance's storage incarnation, carried so `blob.url` signs the
-    /// same key the write path used (`PlanLimits.instance_incarnation`).
-    instance_incarnation: []const u8 = "",
+    /// The instance's storage handle (`PlanLimits.storage`), carried so
+    /// `blob.url` signs the same key the write path used. Null on paths
+    /// with no storage context — presign then throws rather than signing
+    /// a legacy-shaped key for a tenant that isn't on that layout (#357).
+    storage: ?tenant_mod.TenantStorage = null,
     /// The node's S3 backend config (`docs/architecture/routing-and-ingress.md`),
     /// borrowed from `NodeState.blob_backend_cfg` for the
     /// `_system.blob.presign` binding (the one blob verb that needs

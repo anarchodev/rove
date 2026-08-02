@@ -249,14 +249,14 @@ pub const Activation = union(enum) {
 pub const PlanLimits = struct {
     /// Per-worker rate limiter. Null in test paths that don't exercise it.
     limiter: ?*limiter_mod.RateLimiter = null,
-    /// Instance id this request scopes to (the limiter's per-instance
-    /// bucket key). Empty outside a worker context (test paths).
-    instance_id: []const u8 = "",
-    /// The instance's storage incarnation, so a per-tenant blob key built
-    /// here addresses the same objects `BlobBackend.openPerTenantIncarnation`
-    /// writes. Empty = the legacy name-keyed layout, which is what a tenant
-    /// provisioned before incarnations existed is actually on.
-    instance_incarnation: []const u8 = "",
+    /// The instance's storage handle — id (the limiter's per-instance bucket
+    /// key) plus incarnation, so a per-tenant blob key built here addresses
+    /// the same objects the write path's `TenantStorage.openBackend` wrote.
+    /// One field rather than an id/incarnation pair: a site that threads the
+    /// id but forgets the incarnation is how every presigned URL once 404'd
+    /// (#357). Null outside a worker context (test paths, internal callback
+    /// dispatch) — storage-touching builtins throw rather than guess.
+    storage: ?tenant_mod.TenantStorage = null,
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
     /// `_system.blob.presign` (`docs/architecture/routing-and-ingress.md`): the node's S3 backend config

@@ -826,26 +826,15 @@ pub const FetchEngine = struct {
             else => return error.BlobMethodDenied,
         };
 
-        // Path used both for signing and the wire URL (path-style S3).
-        // Incarnation-scoped like every other per-tenant path (#357): a door
-        // that addressed `{tenant}/…` while writes went to
-        // `{tenant}/{incarnation}/…` would read a previous tenant lifetime's
-        // objects — or, for a live tenant, nothing at all.
-        const inc = self.node.tenant.incarnationOf(self.allocator, pf.tenant_id) catch
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(inc);
-        const path = if (inc.len == 0)
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/app-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/app-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, inc, hash },
-            );
+        // Path used both for signing and the wire URL (path-style S3),
+        // derived through the tenant-storage handle so this door and the
+        // write path share one prefix rule (#357). An unresolvable handle
+        // (unknown tenant, root-store error) fails the fetch loudly — a door
+        // that guessed "legacy" here would read a previous tenant lifetime's
+        // objects, or nothing at all.
+        const storage = try self.node.tenant.storageOf(self.allocator, pf.tenant_id);
+        defer storage.incarnation.free(self.allocator);
+        const path = try storage.s3ObjectPath(self.allocator, cfg.*, "app-blobs", hash);
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";
@@ -882,25 +871,14 @@ pub const FetchEngine = struct {
 
         if (method != .GET) return error.BlobMethodDenied;
 
-        // Incarnation-scoped, like the app-blobs door above (#357) — the
-        // deploy writes file-blobs under `{tenant}/{incarnation}/`, so a
-        // legacy-prefixed read gets S3's NoSuchKey error document and the
-        // stream relay serves THAT as the asset body.
-        const inc = self.node.tenant.incarnationOf(self.allocator, pf.tenant_id) catch
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(inc);
-        const path = if (inc.len == 0)
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/file-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/file-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, inc, hash },
-            );
+        // Derived through the tenant-storage handle, like the app-blobs door
+        // above (#357) — the deploy writes file-blobs under the
+        // incarnation-scoped prefix, so a legacy-prefixed read gets S3's
+        // NoSuchKey error document and the stream relay serves THAT as the
+        // asset body. An unresolvable handle fails the fetch loudly.
+        const storage = try self.node.tenant.storageOf(self.allocator, pf.tenant_id);
+        defer storage.incarnation.free(self.allocator);
+        const path = try storage.s3ObjectPath(self.allocator, cfg.*, "file-blobs", hash);
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";
@@ -1019,23 +997,12 @@ pub const FetchEngine = struct {
             blob_key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
         } else return error.BlobReadBadPath;
 
-        // The TARGET tenant's incarnation (#357) — the door reads whatever the
-        // deploy path wrote, and that is incarnation-scoped.
-        const inc = self.node.tenant.incarnationOf(self.allocator, tenant) catch
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(inc);
-        const path = if (inc.len == 0)
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, tenant, subdir, blob_key },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/{s}/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, tenant, inc, subdir, blob_key },
-            );
+        // The TARGET tenant's storage handle (#357) — the door reads whatever
+        // the deploy path wrote, and that is incarnation-scoped. An unknown
+        // target tenant is a loud error, not a legacy-prefixed guess.
+        const storage = try self.node.tenant.storageOf(self.allocator, tenant);
+        defer storage.incarnation.free(self.allocator);
+        const path = try storage.s3ObjectPath(self.allocator, cfg.*, subdir, blob_key);
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";

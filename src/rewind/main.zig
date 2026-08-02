@@ -473,14 +473,14 @@ const PumpStores = struct {
         // stays globally monotonic across both handles.
         self.tenant.createInstance(id_str) catch return null;
         const inst = (self.tenant.getInstance(id_str) catch null) orelse return null;
-        // `inst.store_id`, never a fresh hash of the name: the instance's store
-        // is keyed by (id, incarnation), so re-hashing the id here would open
-        // the PREVIOUS tenant-lifetime's store and apply writesets into it
-        // while the dispatcher reads the current one (#357).
+        // `inst.storage.storeId()`, never a fresh hash of the name: the
+        // instance's store is keyed by (id, incarnation), so re-hashing the
+        // id here would open the PREVIOUS tenant-lifetime's store and apply
+        // writesets into it while the dispatcher reads the current one (#357).
         const h = kv.KvStore.attachSibling(
             self.allocator,
             self.tenant.root,
-            inst.store_id,
+            inst.storage.storeId(),
             inst.kv.counter,
         ) catch return null;
         const key = self.allocator.dupe(u8, id_str) catch {

@@ -187,7 +187,7 @@ fn runSurfaceModule(
         .body = STD_BODY,
         .headers = hdrs,
         .trace = .{ .request_id = 1 },
-        .plan = .{ .instance_id = "surface", .blob_cfg = &TEST_BLOB_CFG },
+        .plan = .{ .storage = .{ .id = "surface", .incarnation = .legacy }, .blob_cfg = &TEST_BLOB_CFG },
     };
 
     var outcome = d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, null, request, &budget) catch |err| {
@@ -353,7 +353,7 @@ test "surface tests: behavior + two-way inventory gate" {
             .body = STD_BODY,
             .headers = hdrs,
             .trace = .{ .request_id = 2 },
-            .plan = .{ .instance_id = "surface", .blob_cfg = &TEST_BLOB_CFG },
+            .plan = .{ .storage = .{ .id = "surface", .incarnation = .legacy }, .blob_cfg = &TEST_BLOB_CFG },
         }, &budget);
         defer resp.deinit(testing.allocator);
         if (resp.exception.len > 0) {

@@ -525,6 +525,10 @@ pub fn build(b: *std.Build) void {
     });
     tenant_mod.addImport("raft-kv", kv_mod);
     tenant_mod.addImport("rove-instance-id", instance_id_mod);
+    // storage.zig: the per-tenant blob-backend constructor lives on the
+    // TenantStorage handle, so the (id, incarnation) → prefix rule has
+    // exactly one home.
+    tenant_mod.addImport("rove-blob", blob_mod);
 
     const tenant_tests = b.addTest(.{ .root_module = tenant_mod });
     test_step.dependOn(&b.addRunArtifact(tenant_tests).step);

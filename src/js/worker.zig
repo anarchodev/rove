@@ -2097,8 +2097,7 @@ pub fn Worker(comptime opts: Options) type {
             defer release_ws.deinit();
             const starter_dep_id = try starter.deployStarterContent(
                 allocator,
-                inst.id,
-                inst.incarnation,
+                inst.storage,
                 self.node.blob_backend_cfg,
                 compile_fn,
                 self.compile_ctx,
@@ -2153,8 +2152,7 @@ pub fn Worker(comptime opts: Options) type {
             defer release_ws.deinit();
             const dep_id = starter.deployGenesisAdminContent(
                 a,
-                inst.id,
-                inst.incarnation,
+                inst.storage,
                 self.node.blob_backend_cfg,
                 compile_fn,
                 self.compile_ctx,
@@ -2460,22 +2458,26 @@ pub fn Worker(comptime opts: Options) type {
             }) else &.{};
 
             // The manifest lands in the tenant's `deployments/`, which is
-            // incarnation-scoped like everything else (#357).
-            const minc = self.node.tenant.incarnationOf(a, t) catch
-                a.dupe(u8, "") catch {
-                    a.free(json);
-                    a.free(t);
-                    a.free(k);
-                    a.free(chain);
-                    a.free(fid);
-                    return fail(router, a, &pf, 500, "out of memory");
-                };
+            // incarnation-scoped like everything else (#357). An
+            // unresolvable scope tenant fails the deploy loudly — writing
+            // the manifest under a guessed prefix is a manifest nothing
+            // will ever read.
+            const mstorage = self.node.tenant.storageOf(a, t) catch |err| {
+                std.log.warn("rove-js deploy: no storage handle for scope {s}: {s}", .{ t, @errorName(err) });
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                a.free(chain);
+                a.free(fid);
+                if (nm.len != 0) a.free(nm);
+                return fail(router, a, &pf, 500, "scope tenant storage unavailable");
+            };
             self.next_compile_id += 1;
             dt.enqueue(.{
                 .compile_id = self.next_compile_id,
                 .kind = .manifest_put,
                 .tenant_id = t,
-                .incarnation = minc,
+                .incarnation = mstorage.incarnation,
                 .key = k,
                 .payload = json,
                 .chain_tenant = chain,
@@ -2489,6 +2491,7 @@ pub fn Worker(comptime opts: Options) type {
                 a.free(chain);
                 a.free(fid);
                 if (nm.len != 0) a.free(nm);
+                mstorage.incarnation.free(a);
                 return fail(router, a, &pf, 503, "deploy queue unavailable");
             };
         }
@@ -2680,22 +2683,24 @@ pub fn Worker(comptime opts: Options) type {
             // issue-time ctx echoed back to the resume export. `pf.tenant_id`
             // stays the chain holder (where the resume lands).
             const target = blob_receive_mod.targetFromReceiveUrl(pf.url);
-            // Resolve the STAGING tenant's incarnation now: the upload runs
-            // long after this returns and must land under the same
-            // lifetime-scoped prefix the serving path reads (#357). Empty for
-            // a legacy instance, or one we cannot resolve — which degrades to
-            // the pre-incarnation layout rather than writing somewhere unread.
+            // Resolve the STAGING tenant's storage handle now: the upload
+            // runs long after this returns and must land under the same
+            // lifetime-scoped prefix the serving path reads (#357). An
+            // unresolvable tenant rejects the receive — guessing "legacy"
+            // here would write bytes somewhere the serving path never reads.
             const stage_tenant = target orelse pf.tenant_id;
-            const stage_inc = self.node.tenant.incarnationOf(self.allocator, stage_tenant) catch
-                self.allocator.dupe(u8, "") catch return;
-            defer self.allocator.free(stage_inc);
+            const stage_storage = self.node.tenant.storageOf(self.allocator, stage_tenant) catch |err| {
+                std.log.warn("rove-js blob.receive: no storage handle for staging tenant {s}: {s}", .{ stage_tenant, @errorName(err) });
+                return;
+            };
+            defer stage_storage.incarnation.free(self.allocator);
             const job = blob_receive_mod.Job.create(
                 self.allocator,
                 &self.node.router,
                 &self.node.blob_backend_cfg,
                 pf.tenant_id,
                 target,
-                stage_inc,
+                stage_storage.incarnation,
                 pf.ctx_json,
                 pf.id,
                 pf.name,
@@ -2954,19 +2959,27 @@ pub fn Worker(comptime opts: Options) type {
             else
                 &.{};
 
-            // The scope tenant's incarnation — staged blobs must land where
-            // the serving path reads (#357). Owned by the job.
-            const inc_owned = self.node.tenant.incarnationOf(a, p.scope) catch
-                a.dupe(u8, "") catch {
-                    freeInputs(a, inputs, hashes, built);
-                    return fail(router, a, &pf, 500, "out of memory");
-                };
+            // The scope tenant's storage handle — staged blobs must land
+            // where the serving path reads (#357). Unresolvable = fail the
+            // deploy loudly; token ownership transfers to the job.
+            const scope_storage = self.node.tenant.storageOf(a, p.scope) catch |err| {
+                std.log.warn("rove-js deploy: no storage handle for scope {s}: {s}", .{ p.scope, @errorName(err) });
+                a.free(scope_owned);
+                a.free(chain_owned);
+                a.free(fid_owned);
+                if (name_owned.len != 0) a.free(name_owned);
+                if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
+                if (resolution_owned.len != 0) a.free(resolution_owned);
+                if (pkg_hash_owned.len != 0) a.free(pkg_hash_owned);
+                freeInputs(a, inputs, hashes, built);
+                return fail(router, a, &pf, 500, "scope tenant storage unavailable");
+            };
             self.next_compile_id += 1;
             dt.enqueue(.{
                 .compile_id = self.next_compile_id,
                 .kind = .compile_batch,
                 .tenant_id = scope_owned,
-                .incarnation = inc_owned,
+                .incarnation = scope_storage.incarnation,
                 .inputs = inputs,
                 .chain_tenant = chain_owned,
                 .fetch_id = fid_owned,
@@ -2984,6 +2997,7 @@ pub fn Worker(comptime opts: Options) type {
                 if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
                 if (resolution_owned.len != 0) a.free(resolution_owned);
                 if (pkg_hash_owned.len != 0) a.free(pkg_hash_owned);
+                scope_storage.incarnation.free(a);
                 freeInputs(a, inputs, hashes, built);
                 return fail(router, a, &pf, 503, "deploy queue unavailable");
             };

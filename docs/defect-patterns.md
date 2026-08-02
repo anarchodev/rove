@@ -82,36 +82,33 @@ consistent, they just disagree.
 | CP `handleMove` / provisioning attach | delivered the incarnation only at provision, so a move or backfill opened a legacy-keyed store |
 | CP membership reconciler bootstrap | same, for a node it grew or healed — the node caught up on the raft log, was promoted to voter, and served an **empty tenant** |
 
-**Why the code permits it.** `BlobBackend.openPerTenantIncarnation` is the
-intended constructor, but it returns a *backend handle*. Any code that needs a
-signed URL, a raw path, or a key string cannot use it and reaches for
-`std.fmt.allocPrint` with `cfg.key_prefix_base` and a bare `instance_id`. The
-tenant id is a `[]const u8` available everywhere; the incarnation is a second
-`[]const u8` that has to be fetched and threaded separately, so forgetting it is
-the path of least resistance and produces no diagnostic.
+**Why the code permitted it.** The intended constructor returned a *backend
+handle*. Any code that needed a signed URL, a raw path, or a key string could
+not use it and reached for `std.fmt.allocPrint` with `cfg.key_prefix_base` and
+a bare `instance_id`. The tenant id was a `[]const u8` available everywhere;
+the incarnation was a second `[]const u8` that had to be fetched and threaded
+separately, so forgetting it was the path of least resistance and produced no
+diagnostic. The asymmetry that made it so costly: an **empty** incarnation is
+legitimate (pre-#357 tenants stay on the legacy layout), so "nobody passed
+one" and "this tenant has none" were the same value — every miss was a quiet
+wrong answer instead of a loud failure.
 
-**What would make it unlikely.**
+**The structural fix (landed, rove#363).**
 
-- **A tenant-storage handle as the only way to name a tenant's bytes.** One
-  value carrying `(id, incarnation)` that exposes `blobPrefix(subdir)`,
-  `storeId()`, `dir()`, `presignPath(subdir, hash)`. Code that needs a path
-  takes the handle, not the id. The current `Instance.store_id` field is this
-  idea applied to exactly one of the derivations — generalize it.
-- Make the raw pair hard to pass around: a bare `instance_id: []const u8` on a
-  struct that also needs storage is the smell.
-- A lint for the residue: a format string building `{prefix}{tenant}/…` outside
-  `src/blob/backend.zig`. There are still **4 such doors** (in
-  `src/js/fetch_engine.zig` and `src/js/bindings/blob.zig`), each written twice
-  — once for the legacy layout and once for the incarnation one — which is
-  itself the tell: the branch is duplicated at every site instead of living in
-  the constructor. Those four legitimately need a *path* rather than a handle,
-  so the lint wants an allow-list, and the handle wants a `pathFor` method that
-  makes the allow-list a single entry.
-- Note the asymmetry that made this so costly: an **empty** incarnation is
-  legitimate (pre-#357 tenants stay on the legacy layout). So "missing" and
-  "legacy" look identical. A sentinel that distinguishes *unset* from
-  *legacy* would have made every one of these seven a loud failure instead of a
-  quiet wrong answer.
+- **`TenantStorage` (`src/tenant/storage.zig`) is the only way to name a
+  tenant's bytes**: one value carrying `(id, incarnation)` exposing
+  `keyPrefix(subdir)` / `s3ObjectPath(subdir, key)` / `openBackend(subdir)` /
+  `storeId()` / `dirPath()`. The legacy-vs-incarnation branch lives only
+  there; the four doors that used to hand-build paths take the handle.
+- **Unset is unrepresentable.** `Incarnation` is `legacy | token`, with no
+  default on any struct that carries one — omitting it is a compile error,
+  not a legacy-shaped guess. `Tenant.storageOf` answers by name and returns
+  `InstanceNotFound` for an absent marker; the `"" = maybe-legacy` collapse
+  (and every `catch dupe("")` quiet default downstream of it) is gone.
+- **A lint for the residue**: `scripts/ops/tenant_prefix_lint.py` flags a
+  format string building a per-tenant object path (or interpolating
+  `key_prefix_base`) outside the handle and the few cluster-scoped key
+  builders.
 
 ---
 
