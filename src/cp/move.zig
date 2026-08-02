@@ -11,23 +11,17 @@
 const std = @import("std");
 const blob = @import("rove-blob");
 const curl = blob.curl;
+const wire = @import("rove-wire");
 const bc = @import("backend_client.zig");
 const BackendResp = bc.BackendResp;
-const TENANT_HEADER = bc.TENANT_HEADER;
-const PLAN_HEADER = bc.PLAN_HEADER;
 
-/// The cluster's voter set as a comma-separated raft-id list `1,2,…,n` (raft
-/// ids are positional — node index i → id i+1, the `REWIND_PEERS` convention).
-/// Caller frees. The cluster node-set SSOT for a fresh tenant group.
-pub fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(a);
-    var i: usize = 1;
-    while (i <= n) : (i += 1) {
-        if (i != 1) try buf.append(a, ',');
-        try buf.writer(a).print("{d}", .{i});
-    }
-    return buf.toOwnedSlice(a);
+/// The cluster's voter set as raft ids `1..n` (raft ids are positional —
+/// node index i → id i+1, the `REWIND_PEERS` convention). Caller frees.
+/// The cluster node-set SSOT for a fresh tenant group.
+pub fn clusterVoterIds(a: std.mem.Allocator, n: usize) ![]u64 {
+    const ids = try a.alloc(u64, n);
+    for (ids, 0..) |*id, i| id.* = i + 1;
+    return ids;
 }
 
 /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`, plus the tenant's
@@ -38,34 +32,28 @@ pub fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
 /// (idempotent re-attach included). On the first failure returns false; the
 /// caller evicts the partially-attached set.
 ///
-/// `incarnation` is the tenant's storage incarnation (#357): every node must
-/// key the tenant's storage identically, so EVERY attach — provision, move,
-/// membership backfill — carries the one the CP recorded at provision. Empty
-/// leaves a node on the legacy name-keyed layout, which is correct only for
-/// tenants provisioned before incarnations existed.
-pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8, incarnation: []const u8) bool {
+/// `incarnation` is the tenant's storage incarnation (#357) in MARKER
+/// spelling: every node must key the tenant's storage identically, so EVERY
+/// attach — provision, move, membership backfill — carries the one the CP
+/// recorded at provision. Empty = the legacy name-keyed layout (correct only
+/// for tenants provisioned before incarnations existed); the shared encoder
+/// puts it on the wire explicitly either way.
+///
+/// `birth_voters` is the cluster node-set SSOT: the CP-owned voter set the
+/// born group forms with — the SAME set for every node, so the group forms
+/// consistently without depending on each node's static `REWIND_VOTERS`.
+/// Null → the node falls back to its env.
+pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u64, incarnation: []const u8) bool {
     const a = router.allocator;
-    var hdrs: [4]curl.Header = undefined;
-    hdrs[0] = .{ .name = TENANT_HEADER, .value = tenant };
-    var nh: usize = 1;
-    if (incarnation.len != 0) {
-        hdrs[nh] = .{ .name = "X-Rewind-Incarnation", .value = incarnation };
-        nh += 1;
-    }
-    if (plan) |p| {
-        hdrs[nh] = .{ .name = PLAN_HEADER, .value = p };
-        nh += 1;
-    }
-    // Cluster node-set SSOT: the cluster's node set as the born
-    // group's voter set, the CP-owned single source of truth — the SAME set
-    // for every node, so the group forms consistently without depending on
-    // each node's static `REWIND_VOTERS`. Null → the node falls back to its env.
-    if (birth_voters) |v| {
-        hdrs[nh] = .{ .name = "X-Rewind-Voters", .value = v };
-        nh += 1;
-    }
+    var enc = wire.encodeAttach(a, .{
+        .tenant = tenant,
+        .incarnation = incarnation,
+        .plan = plan,
+        .voters = birth_voters,
+    }) catch return false;
+    defer enc.deinit();
     for (dest_nodes) |base| {
-        const resp = bc.call(router, base, "/_system/v2-attach", .POST, bundle, hdrs[0..nh]) catch |err| {
+        const resp = bc.call(router, base, "/_system/v2-attach", .POST, bundle, enc.headers) catch |err| {
             std.log.warn("rewind-cp: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
             return false;
         };
@@ -222,7 +210,7 @@ pub fn streamMergeToAll(router: anytype, src_nodes: []const []const u8, dest_nod
 pub fn snapshotPushToLeader(router: anytype, src_nodes: []const []const u8, tenant: []const u8, dest: []const u8) bool {
     const a = router.allocator;
     const hdrs = [_]curl.Header{
-        .{ .name = TENANT_HEADER, .value = tenant },
+        .{ .name = wire.TENANT, .value = tenant },
         .{ .name = "x-rewind-dest", .value = dest },
         .{ .name = "x-rewind-snapshot-mode", .value = "merge" },
     };

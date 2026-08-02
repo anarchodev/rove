@@ -147,6 +147,12 @@ def main() -> int:
               _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
 
         print(f"step 4: v2-attach the bundle on node {vnid} (CREATE group@epoch1 + load) + apply-snapshot")
+        # Envelope decode gate (rove#363 class 3): an attach that OMITS the
+        # incarnation header is rejected loudly — absence means the sender
+        # bypassed the shared encoder; it must never quietly read as legacy.
+        check("attach without incarnation → 400",
+              attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
+                            incarnation=None, discard_body=True) == "400")
         check("attach → 204", attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
                                             incarnation=base.get("incarnation", "")) == "204")
         st, body = _curl_json(url(victim, "v2-apply-snapshot"), method="POST",

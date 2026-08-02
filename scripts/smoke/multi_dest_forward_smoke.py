@@ -101,8 +101,11 @@ def v2_leader(port, tenant):
 
 
 def attach(port, tenant):
+    # `X-Rewind-Incarnation` is required (rove#363 class 3); this harness
+    # tenant is name-keyed, so it sends the explicit `legacy` wire token.
     return _curl(["-X", "POST", f"http://127.0.0.1:{port}/_system/v2-attach", *hdr(),
-                  "-H", f"X-Rewind-Tenant: {tenant}", "--data", ""])[0]
+                  "-H", f"X-Rewind-Tenant: {tenant}",
+                  "-H", "X-Rewind-Incarnation: legacy", "--data", ""])[0]
 
 
 def forward_begin(port, tenant, dest_csv):

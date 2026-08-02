@@ -49,14 +49,13 @@ const raft_propose = @import("raft_propose.zig");
 const plan_mod = @import("rove-plan");
 const blob = @import("rove-blob");
 const curl = blob.curl;
+/// The CP↔worker wire contracts — ONE encode/decode pair per envelope
+/// (docs/defect-patterns.md class 3). The attach envelope's fields, header
+/// names, and absent-vs-malformed semantics all live there.
+const wire = @import("rove-wire");
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
-const TENANT_HEADER = "x-rewind-tenant";
-/// The tenant's storage incarnation, minted ONCE by the CP at provision and
-/// delivered here (#357). It must arrive rather than be generated locally:
-/// attach runs on every node, and a per-node value would give each node a
-/// different store id for the same tenant.
-const INCARNATION_HEADER = "x-rewind-incarnation";
+const TENANT_HEADER = wire.TENANT;
 // Streamed-snapshot baseline, carried in headers so the body is the pure
 // pair stream.
 const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
@@ -79,41 +78,6 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
     return diff == 0;
 }
 
-/// Carries a tenant's opaque CP plan blob (`{tier, overrides}` JSON) on the
-/// `v2-attach` handshake (operational state — docs/architecture/control-plane.md;
-/// the plan rides attach on a move). Absent header ⇒ no plan delivered
-/// (the tenant stays free until a live push / the next attach).
-const PLAN_HEADER = "x-rewind-plan";
-// Optional atomic-baseline headers on v2-attach: when both are present the group
-// is created AND given a data-free raft baseline at {index, term} in one pump op
-// (createGroupAtBaseline) — the reconciler bootstrap path, which must never leave
-// the fresh group observable at last_index 0 (see bridge.createGroupAtBaseline).
-const BASELINE_INDEX_HEADER = "x-rewind-baseline-index";
-const BASELINE_TERM_HEADER = "x-rewind-baseline-term";
-// "1" → birth the local group with this node as a non-voting LEARNER (joining an
-// existing group learner-first) instead of a voter from the static voter set.
-const JOIN_LEARNER_HEADER = "x-rewind-join-as-learner";
-// The leader's migration epoch for the group being joined (from
-// `v2-applied-baseline`). The attached group MUST be born at this epoch or the
-// leader's epoch-stamped messages are fenced out. ABSENT defaults to 1 — the
-// epoch every provisioned tenant has (provision/move attaches omit the header,
-// so their long-standing behavior is unchanged).
-const EPOCH_HEADER = "x-rewind-epoch";
-// Membership SSOT: the leader's ConfState (comma-separated raft ids)
-// the baseline carries, so a joiner learns its membership from the snapshot
-// instead of a static voter set. The reconciler reads these from the leader's
-// `v2-applied-baseline` (one consistent read) and forwards them on the attach.
-// Absent → membership-neutral (the group's born/current prs, unchanged).
-const VOTERS_HEADER = "x-rewind-voters";
-const LEARNERS_HEADER = "x-rewind-learners";
-// Genesis §4d (attach-carry): the existing members' raft transport addresses,
-// `id@host:port,id@host:port,…`, the CP carries on the reconciler's bootstrap
-// attach so a genesis-booted joiner — which booted self-only with an EMPTY peer
-// registry — can dial the leader to ACK its appends (and reach the other members
-// for elections). The leader already learns the JOINER's address from the
-// conf-change `raft_addr`; this is the reverse direction. Absent → nothing
-// learned (a static-`REWIND_PEERS` cluster already knows every peer).
-const PEER_ADDRS_HEADER = "x-rewind-peer-addrs";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -418,23 +382,14 @@ fn handleDomain(
 
 // ── v2-attach: load bundle + stand up the group (destination) ─────────
 
-/// Parse a comma-separated list of raft node ids (e.g. the `X-Rewind-Voters`
-/// header) into `buf`, returning the populated prefix — or null when the header
-/// is absent (membership-neutral). Errors on a non-numeric / overflowing token,
-/// or more than `buf.len` ids (a 3-node cluster never approaches the cap).
-fn parseIdList(header: ?[]const u8, buf: []u64) !?[]const u64 {
-    const s = header orelse return null;
-    var n: usize = 0;
-    var it = std.mem.tokenizeScalar(u8, s, ',');
-    while (it.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " ");
-        if (t.len == 0) continue;
-        if (n >= buf.len) return error.TooManyIds;
-        buf[n] = try std.fmt.parseInt(u64, t, 10);
-        n += 1;
+/// Adapts the h2 request-header lookup to `wire.decodeAttach`'s
+/// `get(name) ?value` shape.
+const HeaderGetter = struct {
+    rh: h2.ReqHeaders,
+    pub fn get(self: HeaderGetter, name: []const u8) ?[]const u8 {
+        return respb.findHeader(self.rh, name);
     }
-    return buf[0..n];
-}
+};
 
 fn handleAttach(
     server: anytype,
@@ -449,8 +404,17 @@ fn handleAttach(
 ) !void {
     if (!std.mem.eql(u8, method, "POST"))
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
-    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    // ONE decoder for the whole envelope (`rove-wire`): required fields are
+    // decode errors, malformed values NEVER collapse to "absent" — a
+    // malformed baseline routed into the no-baseline birth path is the exact
+    // last_index-0 crash window the atomic baseline attach closes. The
+    // incarnation header is REQUIRED (wire spelling `legacy` for a
+    // name-keyed tenant): an absent header means the sender bypassed the
+    // shared encoder, and defaulting it to legacy is what once re-keyed a
+    // backfilled node onto the wrong storage (#357).
+    const dec = wire.decodeAttach(HeaderGetter{ .rh = rh }) catch |err|
+        return reply(server, allocator, ent, sid, sess, 400, wire.attachDecodeMessage(err));
+    const tenant = dec.tenant;
 
     // Create the instance store, load the bundle into it (if any), then
     // attach the raft group at the migration epoch (source birth 0 + 1) so a
@@ -463,11 +427,7 @@ fn handleAttach(
     // receive the source's live forwards BEFORE its snapshot is shipped — the
     // snapshot then loads insert-if-absent so it never clobbers a forwarded
     // (newer) key. A non-empty body ships a bundle to load here.
-    // Wire edge (pre-envelope-rework protocol): the header is OMITTED for a
-    // legacy tenant, so absent and empty both decode to `.legacy` HERE, at
-    // the one named conversion — the attach-envelope consolidation (#363
-    // class 3) is where absence becomes a decode error instead.
-    const incarnation = tenant_mod.Incarnation.fromMarker(respb.findHeader(rh, INCARNATION_HEADER) orelse "");
+    const incarnation = tenant_mod.Incarnation.fromMarker(dec.incarnation);
     const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
     if (body.len > 0) {
@@ -480,7 +440,7 @@ fn handleAttach(
     // from the first post-move request. Non-fatal — a bad/absent plan leaves
     // the tenant on the free tier until a live push corrects it; it must not
     // fail the move.
-    if (respb.findHeader(rh, PLAN_HEADER)) |plan_blob| {
+    if (dec.plan) |plan_blob| {
         applyPlanBlob(worker, allocator, tenant, plan_blob) catch |err|
             std.log.warn("v2-attach: applyPlanBlob({s}) failed: {s}", .{ tenant, @errorName(err) });
     }
@@ -492,7 +452,7 @@ fn handleAttach(
     // header and already knows every peer (no-op). Best-effort per entry — a
     // malformed token is skipped, never fatal (the conf-change still drives the
     // join; a missing address just delays this node's reachability one pass).
-    if (respb.findHeader(rh, PEER_ADDRS_HEADER)) |pa| {
+    if (dec.peer_addrs) |pa| {
         var it = std.mem.tokenizeScalar(u8, pa, ',');
         while (it.next()) |tok| {
             const t = std.mem.trim(u8, tok, " ");
@@ -507,71 +467,30 @@ fn handleAttach(
 
     const gid = worker.raft.registerTenant(tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
-    // A reconciler bootstrap supplies the leader's baseline {index, term} so the
-    // group is created already at that baseline (atomic) rather than at an empty
-    // last_index 0 — eliminating the attach→apply-snapshot window where a leader
-    // heartbeat carrying commit > 0 would crash the fresh group. Plain attach
-    // (moves, empty-attach) omits the headers and creates at epoch with no baseline.
-    // Baseline headers: ABSENT → no baseline (plain attach). PRESENT but
-    // unparseable → hard 400. A malformed header must NEVER silently collapse
-    // to "no baseline" (catch 0) and route the reconciler bootstrap into the
-    // last_index-0 birth path — the exact crash window documented above.
-    const baseline_index: u64 = if (respb.findHeader(rh, BASELINE_INDEX_HEADER)) |s|
-        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
-            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_INDEX_HEADER ++ "\n"))
-    else
-        0;
-    const baseline_term: u64 = if (respb.findHeader(rh, BASELINE_TERM_HEADER)) |s|
-        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
-            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_TERM_HEADER ++ "\n"))
-    else
-        0;
-    // INVARIANT: a baseline at index>0 must carry a real term (a term-0 baseline
-    // crashes raft's restore — Bridge.InvalidBaseline enforces the same at install).
-    if (baseline_index > 0 and baseline_term == 0)
-        return reply(server, allocator, ent, sid, sess, 400, "baseline index>0 requires a nonzero term\n");
-    // Join an EXISTING group as a non-voting learner (the reconciler adds a node
-    // learner-first: a born-voter would campaign past a high-term leader and
-    // deadlock). The leader must already hold the matching AddLearner conf-change.
-    const join_as_learner = if (respb.findHeader(rh, JOIN_LEARNER_HEADER)) |s|
-        std.mem.eql(u8, std.mem.trim(u8, s, " "), "1")
-    else
-        false;
-    // Birth the group at the leader's actual epoch (X-Rewind-Epoch). Default 1
-    // when absent (provision/move attaches don't send it — unchanged). Without
-    // this, joining a non-epoch-1 group (genesis `__admin__` at epoch 0, or a
-    // moved tenant at epoch >1) births the replica at the wrong epoch → the
-    // leader's messages are FENCED → the join silently stalls.
-    const epoch: u64 = if (respb.findHeader(rh, EPOCH_HEADER)) |s|
-        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
-            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ EPOCH_HEADER ++ "\n"))
-    else
-        1;
-    if (baseline_index > 0) {
-        // Optional ConfState (membership SSOT). Parsed onto the handler
-        // stack — `createGroupAtBaseline` BLOCKS on the pump ControlCmd, so these
-        // buffers outlive the install. Absent headers → null → membership-neutral.
-        var voters_buf: [16]u64 = undefined;
-        var learners_buf: [16]u64 = undefined;
-        const voters = parseIdList(respb.findHeader(rh, VOTERS_HEADER), &voters_buf) catch
-            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ VOTERS_HEADER ++ "\n");
-        const learners = parseIdList(respb.findHeader(rh, LEARNERS_HEADER), &learners_buf) catch
-            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ LEARNERS_HEADER ++ "\n");
-        worker.raft.createGroupAtBaseline(gid, epoch, baseline_index, baseline_term, join_as_learner, voters, learners) catch |err| switch (err) {
+    // A reconciler bootstrap supplies the leader's baseline {index, term} so
+    // the group is created already at that baseline (atomic) rather than at
+    // an empty last_index 0 — eliminating the attach→apply-snapshot window
+    // where a leader heartbeat carrying commit > 0 would crash the fresh
+    // group. Plain attach (moves, empty-attach) carries no baseline and
+    // creates at epoch. The epoch is the leader's actual one (default 1):
+    // joining a non-epoch-1 group (genesis `__admin__` at epoch 0, a moved
+    // tenant at >1) at the wrong epoch gets the leader's messages FENCED and
+    // the join silently stalls. `join_as_learner`: the reconciler adds a
+    // node learner-first — a born-voter would campaign past a high-term
+    // leader and deadlock.
+    //
+    // The decoded id lists live in `dec`'s inline buffers on this frame —
+    // `createGroupAtBaseline` BLOCKS on the pump ControlCmd, so they outlive
+    // the install. Absent lists → null → membership-neutral (baseline) /
+    // this node's static `REWIND_VOTERS` (plain birth).
+    if (dec.baseline) |b| {
+        worker.raft.createGroupAtBaseline(gid, dec.epoch, b.index, b.term, dec.join_as_learner, dec.voters(), dec.learners()) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
             error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
         };
     } else {
-        // Cluster node-set SSOT: a plain (no-baseline) formation —
-        // provision's empty-attach — is born with the CP-supplied cluster node set
-        // (`X-Rewind-Voters`) instead of this node's static `REWIND_VOTERS`. Absent
-        // → null → `REWIND_VOTERS` (unchanged). Parsed onto the handler stack; the
-        // blocking control op keeps it alive.
-        var birth_buf: [16]u64 = undefined;
-        const birth_voters = parseIdList(respb.findHeader(rh, VOTERS_HEADER), &birth_buf) catch
-            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ VOTERS_HEADER ++ "\n");
-        worker.raft.createGroupEpoch(gid, epoch, birth_voters) catch |err| switch (err) {
+        worker.raft.createGroupEpoch(gid, dec.epoch, dec.voters()) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
         };
@@ -1208,20 +1127,17 @@ fn handleAppliedBaseline(
     const st = worker.node.tenant.storageOf(allocator, tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "incarnation unavailable\n");
     defer st.incarnation.free(allocator);
-    const inc = st.incarnation.marker();
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    var w = buf.writer(allocator);
-    w.print("{{\"index\":{d},\"term\":{d},\"epoch\":{d},\"voters\":[", .{ index, term, epoch }) catch
-        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
-    for (cs.voters, 0..) |v, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", v }) catch
-        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
-    w.writeAll("],\"learners\":[") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
-    for (cs.learners, 0..) |l, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", l }) catch
-        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
-    w.print("],\"incarnation\":\"{s}\"}}\n", .{inc}) catch
-        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
-    const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    // ONE encoder (`rove-wire.AppliedBaseline`): the reconciler parses the
+    // same struct with every field required, so this reply and its consumer
+    // cannot drift field-by-field.
+    const out = wire.encodeAppliedBaseline(allocator, .{
+        .index = index,
+        .term = term,
+        .epoch = epoch,
+        .voters = cs.voters,
+        .learners = cs.learners,
+        .incarnation = st.incarnation.marker(),
+    }) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
 
@@ -1385,13 +1301,14 @@ fn handleLoadReplace(
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
     const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
         return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
-    // Wire edge (pre-envelope-rework protocol): the header is OMITTED for a
-    // legacy tenant, so absent and empty both decode to `.legacy` HERE, at
-    // the one named conversion — the attach-envelope consolidation (#363
-    // class 3) is where absence becomes a decode error instead.
-    const incarnation = tenant_mod.Incarnation.fromMarker(respb.findHeader(rh, INCARNATION_HEADER) orelse "");
-    const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
-        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    // The instance must already exist: `v2-attach` is the ONLY door that
+    // creates one (and the only carrier of the storage incarnation), and the
+    // move/promote-back protocol always attaches before it streams. A
+    // replace-load reaching a node that was never attached is a protocol
+    // violation — creating the instance here would have to guess its storage
+    // identity, which is #357's wrong-lifetime bug by construction.
+    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not attached on this node\n");
     inst.kv.loadTenantBundleReplace(body) catch
         return reply(server, allocator, ent, sid, sess, 400, "replace load failed\n");
     inst.kv.delete(FORWARD_MARKER) catch |err| switch (err) {
@@ -1491,13 +1408,14 @@ pub fn armSnapshotStream(
             (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "merge")) .merge else .replace)
         else
             .replace;
-    // Wire edge (pre-envelope-rework protocol): the header is OMITTED for a
-    // legacy tenant, so absent and empty both decode to `.legacy` HERE, at
-    // the one named conversion — the attach-envelope consolidation (#363
-    // class 3) is where absence becomes a decode error instead.
-    const incarnation = tenant_mod.Incarnation.fromMarker(respb.findHeader(rh, INCARNATION_HEADER) orelse "");
-    const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
-        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    // The instance must already exist: `v2-attach` is the ONLY door that
+    // creates one (and the only carrier of the storage incarnation). Both
+    // stream modes are attach-first by protocol — merge (zero-downtime move)
+    // attaches the empty destination before the snapshot ships, and replace
+    // (catch-up/promote-back) targets a node already in the group. Creating
+    // an instance here would have to guess its storage identity (#357).
+    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not attached on this node\n");
 
     var gid: u64 = 0;
     var index: u64 = 0;

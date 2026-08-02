@@ -130,23 +130,38 @@ fail — the receiver defaults.
   sender and not the move sender, the reconciler sender, or any of the four
   smokes that simulate a CP join. Each smoke had its own private copy of the
   header list.
-- The same shape, benign so far: `v2-applied-baseline` is parsed by an
-  anonymous struct in `src/cp/reconciler.zig` with defaults for every field, so
-  a field the leader stops sending reads as its default rather than an error.
+- The same shape, benign before it was closed: `v2-applied-baseline` was
+  parsed by an anonymous struct in `src/cp/reconciler.zig` with defaults for
+  every field, so a field the leader stopped sending read as its default
+  rather than an error.
 
-**Why the code permits it.** The attach contract has no single definition. It
-exists as: a `curl.Header` array in `move.zig`, another in `reconciler.zig`,
-header-name constants in `v2_move.zig`, and four Python lists.
+**Why the code permitted it.** The attach contract had no single definition.
+It existed as: a `curl.Header` array in `move.zig`, another in
+`reconciler.zig`, header-name constants in `v2_move.zig`, and four Python
+lists.
 
-**What would make it unlikely.**
+**The structural fix (landed, rove#363).**
 
-- One encode/decode pair for the attach envelope, shared by the CP and the
-  worker, with the smokes driving the same encoder (the Python side now shares
-  `smoke_lib_v2.attach_bundle`, which is the same idea one level up).
-- Decode failures over defaults: a required field that is absent should be an
-  error at the receiver, not a zero value. `std.json` `ignore_unknown_fields`
-  with per-field defaults is the mechanism that turns a protocol mismatch into a
-  silent wrong answer.
+- **`rove-wire` (`src/wire/root.zig`) is the one encode/decode pair.**
+  `encodeAttach` is the only Zig sender path (provision/move fan-out and the
+  reconciler bootstrap both drive it; the positional header juggling in the
+  reconciler is gone) and `decodeAttach` the only receiver path; the Python
+  smokes' mirror stays `smoke_lib_v2.attach_bundle`. `AppliedBaseline` gets
+  the same treatment: one JSON encoder at the worker, one parser at the
+  reconciler with **every field required** — a field the leader stops
+  sending is a parse error, not a zero (`ignore_unknown_fields` stays on, so
+  *adding* a field remains compatible).
+- **Decode failures over defaults.** The incarnation header is required on
+  every attach — a legacy tenant sends the explicit wire token `legacy`
+  (an empty header value would be dropped by libcurl's serialization), and
+  an ABSENT header is a 400 naming the rule, because absence means the
+  sender bypassed the encoder. Malformed values never collapse to
+  "absent-field" behavior.
+- **Attach is the only instance-creating door.** `v2-load-replace` and
+  `v2-snapshot-stream` no longer carry (or guess) a storage identity — the
+  move/promote-back protocol attaches first, so those doors now 404 on a
+  never-attached tenant instead of minting an instance with a guessed
+  incarnation.
 
 ---
 
