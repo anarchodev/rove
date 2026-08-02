@@ -15,7 +15,7 @@ Needs the full topology + S3 (the worker mints; the log-server verifies). Run:
     set -a; . ./.env; set +a
     python3 scripts/smoke/logs_door_smoke_v2.py
 
-Ports: http_base 19500 (PID-nudged). Companion to log_tenant_scope_smoke_v2.py
+Companion to log_tenant_scope_smoke_v2.py
 (which tests the log-server gate in isolation); this tests the worker door.
 """
 from __future__ import annotations
@@ -67,8 +67,7 @@ def main() -> int:
             failures.append(label)
 
     print("=== rewind-logs.internal door ===")
-    with V2Cluster.spawn("logsdoor", nodes=1, http_base=19500,
-                         raft_base=19600) as c:
+    with V2Cluster.spawn("logsdoor", nodes=1) as c:
         c.spawn_log_server()
         c._ensure_admin_app()
 

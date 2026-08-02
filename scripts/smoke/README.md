@@ -19,9 +19,12 @@ scripts/smoke/run_all.py --list                # what would run
 python3 scripts/smoke/ctl_smoke_v2.py          # one smoke directly
 ```
 
-They bind fixed ports, so **they run serially and only one suite at a time** —
-two runs (or a run alongside a hand-started smoke) collide with `EADDRINUSE`.
-The full suite takes about an hour.
+Ports come from `smoke_ports.py`, the suite's one port authority: every smoke
+process owns a disjoint slot (`flock`ed standalone; assigned via
+`SMOKE_PORT_SLOT` by the runner) and draws blocks from it, so concurrent
+smokes — including a hand-run one beside a running suite — cannot collide.
+Never hardcode a port in a smoke; take it from the harness
+(`V2Cluster` allocates its own) or `smoke_ports.alloc()`.
 
 `run_all.py` preflights those binaries and refuses to start without them —
 a missing build otherwise shows up as a scatter of unrelated-looking failures.

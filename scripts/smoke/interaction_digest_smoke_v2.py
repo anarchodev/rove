@@ -22,9 +22,6 @@ Three properties, each chosen to fail for a different reason:
      reason the digest exists. The handler arms a wake in both modes, so this
      also covers the effect hooks (before them, an effect-only difference
      digested as identical).
-
-Ports: 19820/19920 (see the per-smoke port table; do not run two smokes at
-once). Needs S3 credentials: `set -a; . ./.env; set +a`.
 """
 from __future__ import annotations
 
@@ -72,7 +69,7 @@ def main() -> int:
             failures.append(label)
 
     print("=== interaction digest reaches the record (real worker + S3) ===")
-    with V2Cluster.spawn("digest", nodes=1, http_base=19820, raft_base=19920) as c:
+    with V2Cluster.spawn("digest", nodes=1) as c:
         c.spawn_log_server(poll_interval_ms=200)
 
         r = c.provision("acme")

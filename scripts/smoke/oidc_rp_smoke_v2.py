@@ -28,7 +28,6 @@ deploys. verify is off everywhere (self-signed cert; unsafe_outbound).
 Run: zig build rewind-worker rewind-cp rewind-front
      set -a; . ./.env; set +a
      python3 scripts/smoke/oidc_rp_smoke_v2.py
-Ports: http_base 19900 (PID-nudged); TLS front at base+54.
 """
 from __future__ import annotations
 
@@ -47,15 +46,12 @@ from smoke_lib_v2 import V2Cluster, APPS_DIR  # noqa: E402
 OPERATOR = "operator@example.com"
 CUSTOMER = "customer@example.com"
 
-
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
-
 
 def _sid(r) -> str | None:
     m = re.search(r"__Host-rove_sid=[^;]+", r.headers.get("set-cookie", ""))
     return m.group(0) if m else None
-
 
 def idp_login(c: V2Cluster, *, email: str, app_origin: str, auth_base: str) -> str:
     """Drive the OIDC RP handshake as `email` over the TLS front; return the app
@@ -123,7 +119,6 @@ def idp_login(c: V2Cluster, *, email: str, app_origin: str, auth_base: str) -> s
         time.sleep(0.25)
     raise RuntimeError(f"RP login never completed for {email}: {last[:200]}")
 
-
 def main() -> int:
     failures: list[str] = []
 
@@ -139,7 +134,7 @@ def main() -> int:
                     "_rp/complete.mjs", "_rp/jwks.mjs", "v1/upload/index.mjs")}
 
     print("=== dashboard RP login over OIDC (B2) ===")
-    with V2Cluster.spawn("oidcrp", nodes=1, http_base=19900, raft_base=20000,
+    with V2Cluster.spawn("oidcrp", nodes=1,
                          tls_idp=True) as c:
         app_origin = c.tls_origin("__admin__")    # https://__admin__.localhost:{tls}
         auth_base = c.tls_origin("__auth__")       # https://__auth__.localhost:{tls}
@@ -432,7 +427,6 @@ def main() -> int:
           "root-token + ownership-gated) + source read door (cross-tenant "
           "scope(t).blob.get + readManifest, composed in JS) through the dashboard.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

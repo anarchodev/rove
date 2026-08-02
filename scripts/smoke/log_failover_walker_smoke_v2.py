@@ -76,8 +76,7 @@ def main() -> int:
             failures.append(label)
 
     print("=== promotion-time LogRecord walker: pre-flush leader crash (#77) ===")
-    with V2Cluster.spawn("logwalk", nodes=3, http_base=19600,
-                         raft_base=19700) as c:
+    with V2Cluster.spawn("logwalk", nodes=3) as c:
         c.spawn_log_server(poll_interval_ms=200)
 
         r = c.provision(TENANT)

@@ -16,7 +16,6 @@ backend at boot):
     set -a; . ./.env; set +a
     python3 scripts/smoke/log_tenant_scope_smoke_v2.py
 
-Port: 18960 (+PID nudge). No fixed-topology collision with other smokes.
 """
 from __future__ import annotations
 
@@ -31,9 +30,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import (  # noqa: E402
-    _curl, _free_base, mint_jwt, JWT_SECRET_HEX, LOG_SERVER,
+    _curl, mint_jwt, JWT_SECRET_HEX, LOG_SERVER,
     claim_storage_namespace,
 )
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import await_ready  # noqa: E402
 
 TAG = "logscope"
@@ -97,7 +97,7 @@ def tok(tenant=None, caps=("logs-read",), ttl_s=300) -> str:
 
 
 def main() -> int:
-    port = _free_base(18960)
+    port = alloc_port()
     spawn_log_server(port)
     base = f"http://127.0.0.1:{port}"
 

@@ -30,7 +30,6 @@ against real S3 (the V2 blob backend is S3-only):
 Needs S3 env (`set -a; . ./.env; set +a`) and binaries:
 `zig build rewind-worker rewind-cp rewind-front`.
 
-Port base 18700 (see the per-smoke port table convention).
 """
 
 from __future__ import annotations
@@ -239,7 +238,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    with V2Cluster.spawn("blob", http_base=18700) as c:
+    with V2Cluster.spawn("blob") as c:
         print("step 1: provision + deploy the blob handler")
         r = c.provision(TENANT)
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")

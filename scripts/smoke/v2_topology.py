@@ -121,6 +121,10 @@ def spawn_cp(
     `want_needle` asserts a boot-log line (e.g. the seed-vs-replay decision)
     appears before "listening on". Returns the proc (appended to `procs`)."""
     env = dict(os.environ)
+    # No operator-metrics listener by default: concurrent smokes would fight
+    # over (or worse, silently share) the fixed :9111. A smoke that tests the
+    # surface passes its own allocated port via extra_env / its environ.
+    env.setdefault("REWIND_CP_METRICS_PORT", "0")
     env["REWIND_CLUSTERS"] = clusters
     env["REWIND_HOSTS"] = hosts
     env["REWIND_PLACEMENT"] = placement
@@ -168,6 +172,9 @@ def spawn_front(
     `cp_url` (`REWIND_CP_URL`; `;`-join multiple CP origins for HA). Returns
     the proc (appended to `procs`)."""
     env = dict(os.environ)
+    # Same rationale as spawn_cp: the fixed :9112 default cannot be shared
+    # between concurrent smokes.
+    env.setdefault("REWIND_FRONT_METRICS_PORT", "0")
     env["REWIND_CP_URL"] = cp_url
     if route_cache_ms is not None:
         env["REWIND_ROUTE_CACHE_MS"] = str(route_cache_ms)

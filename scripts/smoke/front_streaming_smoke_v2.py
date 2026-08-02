@@ -23,7 +23,6 @@ they arrive over a pooled h2c client leg. This smoke proves the edge path:
      relays intact (chunk-relay reassembly fidelity).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Ports: http_base=19700 (see the per-smoke port table convention).
 """
 
 from __future__ import annotations
@@ -79,7 +78,6 @@ export default function () {
 
 READY_SRC = 'export function handler() { return "ready"; }\n'
 
-
 def main() -> int:
     failures = []
 
@@ -88,7 +86,7 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    with V2Cluster.spawn("fstrm", nodes=1, http_base=19700, raft_base=19760) as c:
+    with V2Cluster.spawn("fstrm", nodes=1) as c:
         print("step 1: provision + deploy (onChunk, heartbeat SSE, big, ready)")
         r = c.provision("acme")
         check("provision → 200", r.status == 200, f"got {r.status}")
@@ -201,7 +199,6 @@ def main() -> int:
     print("\nPASS front streaming smoke (v2): chunked upload, held SSE, and a "
           "1 MiB response all relay through the front door incrementally")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

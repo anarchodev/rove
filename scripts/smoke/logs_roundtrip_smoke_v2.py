@@ -44,8 +44,7 @@ def main() -> int:
             failures.append(label)
 
     print("=== logs round-trip (poll cursor + reader connection, real S3) ===")
-    with V2Cluster.spawn("logsrt", nodes=1, http_base=19800,
-                         raft_base=19900) as c:
+    with V2Cluster.spawn("logsrt", nodes=1) as c:
         # 200ms poll → indexing here is the POLL path (no worker push wiring).
         c.spawn_log_server(poll_interval_ms=200)
 

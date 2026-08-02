@@ -25,7 +25,6 @@ Run (full topology + S3):
     set -a; . ./.env; set +a
     python3 scripts/smoke/oidc_smoke_v2.py
 
-Ports: http_base 19700 (PID-nudged).
 """
 from __future__ import annotations
 
@@ -49,18 +48,14 @@ CLIENT = "smoke-rp"
 REDIRECT = "https://rp.smoke.test/cb"
 LOGIN_EMAIL = "alice@example.com"
 
-
 # ── pure-Python RS256 verify (no `cryptography` dep — the verify IS the gate) ─
 def b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
-
 def b64url_dec(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
-
 _SHA256_DI = bytes.fromhex("3031300d060960864801650304020105000420")
-
 
 def verify_rs256(jwk: dict, signing_input: bytes, sig: bytes) -> bool:
     n = int.from_bytes(b64url_dec(jwk["n"]), "big")
@@ -73,12 +68,10 @@ def verify_rs256(jwk: dict, signing_input: bytes, sig: bytes) -> bool:
         b"\x00" + _SHA256_DI + h
     return em == expected
 
-
 def parse_jwt(tok: str):
     h_b, p_b, s_b = tok.split(".")
     return (json.loads(b64url_dec(h_b)), json.loads(b64url_dec(p_b)),
             b64url_dec(s_b), (h_b + "." + p_b).encode())
-
 
 def path_of(url: str) -> str:
     """The path+query of an absolute IdP URL — to re-issue it through the front
@@ -86,7 +79,6 @@ def path_of(url: str) -> str:
     loopback port, not its advertised https host)."""
     u = urllib.parse.urlparse(url)
     return u.path + (("?" + u.query) if u.query else "")
-
 
 def main() -> int:
     failures: list[str] = []
@@ -100,7 +92,7 @@ def main() -> int:
     auth_cfg = (APPS_DIR / "auth/_config/oidc/default.json").read_text()
 
     print("=== stand up __auth__ + OIDC conformance ===")
-    with V2Cluster.spawn("oidc", nodes=1, http_base=19700, raft_base=19800) as c:
+    with V2Cluster.spawn("oidc", nodes=1) as c:
         # Reach the IdP through the front door with an explicit Host header.
         def idp(path, **kw):
             return c.request("__auth__", path, host=AUTH_HOST, **kw)
@@ -380,7 +372,6 @@ def main() -> int:
     print("\nPASS — __auth__ IdP: discovery + magic-link + PKCE auth-code + "
           "refresh + RFC 8628 device grant + RP-initiated logout, all RS256-verified.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

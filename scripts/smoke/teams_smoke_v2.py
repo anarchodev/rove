@@ -18,7 +18,6 @@ Run:
   set -a; . ./.env; set +a
   REWIND_APPS_DIR=/home/user/src/rewind-apps/.claude/worktrees/teams \
     python3 <this file>
-Ports: http_base 19400 (PID-nudged); TLS front at base+54.
 """
 from __future__ import annotations
 
@@ -38,15 +37,12 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 CAROL = "carol@example.com"
 
-
 def user_hash(email: str) -> str:
     return hashlib.sha256(email.strip().lower().encode()).hexdigest()
-
 
 def _sid(r) -> str | None:
     m = re.search(r"__Host-rove_sid=[^;]+", r.headers.get("set-cookie", ""))
     return m.group(0) if m else None
-
 
 def idp_login(c: V2Cluster, *, email: str, app_origin: str, auth_base: str) -> str:
     """Drive the full OIDC RP handshake as `email` over the TLS front; return the
@@ -105,7 +101,6 @@ def idp_login(c: V2Cluster, *, email: str, app_origin: str, auth_base: str) -> s
         time.sleep(0.25)
     raise RuntimeError(f"RP login never completed for {email}: {last[:200]}")
 
-
 def main() -> int:
     failures: list[str] = []
 
@@ -121,7 +116,7 @@ def main() -> int:
                     "_rp/complete.mjs", "_rp/jwks.mjs", "v1/upload/index.mjs")}
 
     print("=== teams: shared ownership + invites on __admin__ ===")
-    with V2Cluster.spawn("teams", nodes=1, http_base=19400, raft_base=19500,
+    with V2Cluster.spawn("teams", nodes=1,
                          tls_idp=True) as c:
         app_origin = c.tls_origin("__admin__")
         auth_base = c.tls_origin("__auth__")
@@ -297,7 +292,6 @@ def main() -> int:
           "denials, role transfer + last-owner/personal guards — all through the "
           "real OIDC dispatch + raft.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

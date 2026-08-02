@@ -93,7 +93,7 @@ def main() -> int:
                     "_rp/complete.mjs", "_rp/jwks.mjs")}
 
     print("=== rewind customer CLI gateway flow (Track 3) ===")
-    with V2Cluster.spawn("rwcli", nodes=1, http_base=19960, raft_base=20060,
+    with V2Cluster.spawn("rwcli", nodes=1,
                          tls_idp=True) as c:
         app_origin = c.tls_origin("__admin__")
         auth_base = c.tls_origin("__auth__")

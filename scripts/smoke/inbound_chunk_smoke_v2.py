@@ -24,7 +24,6 @@ front-door streaming proxy landed 2026-06-11):
      `docs/architecture/effects-and-handlers.md` (Streaming inbound body).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Ports: http_base=19500 (see the per-smoke port table convention).
 """
 
 from __future__ import annotations
@@ -80,7 +79,6 @@ export default function () {
 }
 """
 
-
 def _upload_proc(c, path, host, upl, body_file, rate="1500k"):
     """POST a rate-limited body DIRECT to the node, streaming to a PIPE.
     We kill this process mid-upload (while the request body is still
@@ -100,7 +98,6 @@ def _upload_proc(c, path, host, upl, body_file, rate="1500k"):
     ]
     return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-
 def main() -> int:
     failures = []
 
@@ -109,7 +106,7 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    with V2Cluster.spawn("ichunk", nodes=1, http_base=19500, raft_base=19560) as c:
+    with V2Cluster.spawn("ichunk", nodes=1) as c:
         print("step 1: provision + deploy (onChunk, reject, default-only)")
         r = c.provision("acme")
         check("provision → 200", r.status == 200, f"got {r.status}")
@@ -323,7 +320,6 @@ def main() -> int:
         return 1
     print("inbound_chunk_smoke_v2: ALL CHECKS PASSED")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

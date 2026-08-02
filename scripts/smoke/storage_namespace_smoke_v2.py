@@ -22,9 +22,6 @@ as genesis does:
      pass just as happily if the namespace did nothing at all, so this asserts
      the failure is real and that this smoke can see it.
   3. WITH a bump, lifetime C's records survive.
-
-Ports: 19830/19930 (see the per-smoke port table; do not run two smokes at
-once). Needs S3 credentials: `set -a; . ./.env; set +a`.
 """
 from __future__ import annotations
 
@@ -114,7 +111,7 @@ def main() -> int:
     print("=== a second cluster lifetime keeps its records (rove#266) ===")
 
     # ── lifetime A ────────────────────────────────────────────────────
-    with V2Cluster.spawn("nsA", nodes=1, http_base=19830, raft_base=19930) as c:
+    with V2Cluster.spawn("nsA", nodes=1) as c:
         prefix = c.s3_prefix
         c.spawn_log_server(poll_interval_ms=200)
         c.provision(TENANT)
@@ -131,7 +128,7 @@ def main() -> int:
     # paths), so the id counter restarts exactly as it does after a genesis.
     # Wait for the indexer to re-import lifetime A's batches first, so the
     # collision is deterministic rather than a race.
-    with V2Cluster.spawn("nsA", nodes=1, http_base=19830, raft_base=19930) as c:
+    with V2Cluster.spawn("nsA", nodes=1) as c:
         c.spawn_log_server(poll_interval_ms=200)
         deadline = time.time() + 45.0
         reimported = 0
@@ -158,7 +155,7 @@ def main() -> int:
     print(f"    {bump.stdout.strip().splitlines()[0] if bump.stdout.strip() else ''}")
 
     os.environ["REWIND_METRICS_PORT"] = str(METRICS_PORT)
-    with V2Cluster.spawn("nsA", nodes=1, http_base=19830, raft_base=19930) as c:
+    with V2Cluster.spawn("nsA", nodes=1) as c:
         c.spawn_log_server(poll_interval_ms=200)
 
         # The generation a process is USING is only observable if it says so.
