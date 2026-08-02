@@ -922,6 +922,22 @@ pub const DeploymentCache = struct {
         return opened;
     }
 
+    /// Drop a tenant's cached slot — its loaded bundle, bytecode map and
+    /// resolved plan. Called when the tenant is torn down (`v2-evict`).
+    ///
+    /// The slot is keyed by tenant NAME, so without this the next tenant to
+    /// hold that name would be served the previous tenant's CODE straight out
+    /// of memory — storage isolation alone does not help, because nothing goes
+    /// back to storage while a snapshot is cached (#357).
+    ///
+    /// Idempotent: evicting an unknown tenant is a no-op.
+    pub fn evictTenant(self: *DeploymentCache, tenant_id: []const u8) void {
+        self.tenant_files_lock.lock();
+        const removed = self.tenant_files_map.fetchRemove(tenant_id);
+        self.tenant_files_lock.unlock();
+        if (removed) |kv| freeTenantSlot(self.allocator, kv.value);
+    }
+
     /// Cold-start eager-open: walk every known tenant, populate the
     /// map, enqueue the loader to fetch every deployment in parallel.
     /// Called once from `main.zig` after the loader is up. Returns the
@@ -1059,10 +1075,11 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     // pre-quorum crash loses the volatile speculative overlay, so
     // there are no orphan rows to recover.)
 
-    var blob_backend = try blob_mod.BlobBackend.openPerTenant(
+    var blob_backend = try blob_mod.BlobBackend.openPerTenantIncarnation(
         allocator,
         dc.blob_backend_cfg,
         inst.id,
+        inst.incarnation,
         "file-blobs",
     );
     errdefer blob_backend.deinit();
@@ -1088,10 +1105,11 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
             .verify_tls = mh.verify_tls,
         })
     else
-        try blob_mod.BlobBackend.openPerTenant(
+        try blob_mod.BlobBackend.openPerTenantIncarnation(
             allocator,
             dc.blob_backend_cfg,
             inst.id,
+            inst.incarnation,
             "deployments",
         );
     errdefer manifest_backend.deinit();

@@ -675,7 +675,19 @@ const Router = struct {
             return;
         };
         defer a.free(birth_voters);
-        if (!move.attachToAll(self, birth_nodes, "", tenant, null, birth_voters)) {
+        // Mint this tenant LIFETIME's storage incarnation (#357). Random, not a
+        // counter: a counter would have to survive the very deletion that
+        // destroys the tenant, and losing it would silently re-issue a live
+        // storage path. Minted HERE, once, and delivered to every node — a
+        // per-node value would key the same tenant's storage differently on
+        // each, which is a correctness fault, not just a leak.
+        var inc_buf: [16]u8 = undefined;
+        var rnd: [8]u8 = undefined;
+        std.crypto.random.bytes(&rnd);
+        const incarnation = std.fmt.bufPrint(&inc_buf, "{x:0>16}", .{std.mem.readInt(u64, &rnd, .big)}) catch
+            return replyStatus(server, ent, sid, sess, 500);
+
+        if (!move.attachToAllIncarnation(self, birth_nodes, "", tenant, null, birth_voters, incarnation)) {
             move.evictAll(self, tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;

@@ -2085,6 +2085,7 @@ pub fn Worker(comptime opts: Options) type {
             const starter_dep_id = try starter.deployStarterContent(
                 allocator,
                 inst.id,
+                inst.incarnation,
                 self.node.blob_backend_cfg,
                 compile_fn,
                 self.compile_ctx,
@@ -2140,6 +2141,7 @@ pub fn Worker(comptime opts: Options) type {
             const dep_id = starter.deployGenesisAdminContent(
                 a,
                 inst.id,
+                inst.incarnation,
                 self.node.blob_backend_cfg,
                 compile_fn,
                 self.compile_ctx,
@@ -2444,11 +2446,23 @@ pub fn Worker(comptime opts: Options) type {
                 return fail(router, a, &pf, 500, "out of memory");
             }) else &.{};
 
+            // The manifest lands in the tenant's `deployments/`, which is
+            // incarnation-scoped like everything else (#357).
+            const minc = self.node.tenant.incarnationOf(a, t) catch
+                a.dupe(u8, "") catch {
+                    a.free(json);
+                    a.free(t);
+                    a.free(k);
+                    a.free(chain);
+                    a.free(fid);
+                    return fail(router, a, &pf, 500, "out of memory");
+                };
             self.next_compile_id += 1;
             dt.enqueue(.{
                 .compile_id = self.next_compile_id,
                 .kind = .manifest_put,
                 .tenant_id = t,
+                .incarnation = minc,
                 .key = k,
                 .payload = json,
                 .chain_tenant = chain,
@@ -2653,12 +2667,22 @@ pub fn Worker(comptime opts: Options) type {
             // issue-time ctx echoed back to the resume export. `pf.tenant_id`
             // stays the chain holder (where the resume lands).
             const target = blob_receive_mod.targetFromReceiveUrl(pf.url);
+            // Resolve the STAGING tenant's incarnation now: the upload runs
+            // long after this returns and must land under the same
+            // lifetime-scoped prefix the serving path reads (#357). Empty for
+            // a legacy instance, or one we cannot resolve — which degrades to
+            // the pre-incarnation layout rather than writing somewhere unread.
+            const stage_tenant = target orelse pf.tenant_id;
+            const stage_inc = self.node.tenant.incarnationOf(self.allocator, stage_tenant) catch
+                self.allocator.dupe(u8, "") catch return;
+            defer self.allocator.free(stage_inc);
             const job = blob_receive_mod.Job.create(
                 self.allocator,
                 &self.node.router,
                 &self.node.blob_backend_cfg,
                 pf.tenant_id,
                 target,
+                stage_inc,
                 pf.ctx_json,
                 pf.id,
                 pf.name,
@@ -2917,11 +2941,19 @@ pub fn Worker(comptime opts: Options) type {
             else
                 &.{};
 
+            // The scope tenant's incarnation — staged blobs must land where
+            // the serving path reads (#357). Owned by the job.
+            const inc_owned = self.node.tenant.incarnationOf(a, p.scope) catch
+                a.dupe(u8, "") catch {
+                    freeInputs(a, inputs, hashes, built);
+                    return fail(router, a, &pf, 500, "out of memory");
+                };
             self.next_compile_id += 1;
             dt.enqueue(.{
                 .compile_id = self.next_compile_id,
                 .kind = .compile_batch,
                 .tenant_id = scope_owned,
+                .incarnation = inc_owned,
                 .inputs = inputs,
                 .chain_tenant = chain_owned,
                 .fetch_id = fid_owned,

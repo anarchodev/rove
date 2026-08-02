@@ -106,6 +106,10 @@ pub const Job = struct {
     /// Cross-tenant staging tenant (`null` → stage into `tenant_id`). When set,
     /// bytes stream into `{target_id}/file-blobs/`; else `{tenant_id}/app-blobs/`.
     target_id: ?[]u8,
+    /// The STAGING tenant's storage incarnation — whichever of the two above
+    /// the bytes land under. Resolved at arm time, because the receive runs
+    /// long after and must write where the serving path will read (#357).
+    stage_incarnation: []u8,
     /// Issue-time `ctx` (JSON) echoed back in the completion under `app` so the
     /// admin deploy app can thread {tenant, path, content_type} across the
     /// receive re-entry. Empty when absent.
@@ -135,6 +139,7 @@ pub const Job = struct {
         cfg: *const blob_mod.backend.BackendConfig,
         tenant_id: []const u8,
         target_id: ?[]const u8,
+        stage_incarnation: []const u8,
         app_ctx: []const u8,
         fetch_id: []const u8,
         name: []const u8,
@@ -145,6 +150,7 @@ pub const Job = struct {
         const tenant_owned = try allocator.dupe(u8, tenant_id);
         errdefer allocator.free(tenant_owned);
         const target_owned: ?[]u8 = if (target_id) |t| try allocator.dupe(u8, t) else null;
+        const inc_owned = try allocator.dupe(u8, stage_incarnation);
         errdefer if (target_owned) |t| allocator.free(t);
         const ctx_owned = try allocator.dupe(u8, app_ctx);
         errdefer allocator.free(ctx_owned);
@@ -157,6 +163,7 @@ pub const Job = struct {
             .allocator = allocator,
             .tenant_id = tenant_owned,
             .target_id = target_owned,
+            .stage_incarnation = inc_owned,
             .app_ctx = ctx_owned,
             .fetch_id = id_owned,
             .name = name_owned,
@@ -173,6 +180,7 @@ pub const Job = struct {
         for (self.chunks.items) |ch| self.allocator.free(ch);
         self.chunks.deinit(self.allocator);
         self.allocator.free(self.tenant_id);
+        self.allocator.free(self.stage_incarnation);
         if (self.target_id) |t| self.allocator.free(t);
         self.allocator.free(self.app_ctx);
         self.allocator.free(self.fetch_id);
@@ -291,10 +299,11 @@ pub const Job = struct {
         // namespace (`file-blobs`); an own-tenant receive uses `app-blobs`.
         const stage_tenant = self.target_id orelse self.tenant_id;
         const subdir: []const u8 = if (self.target_id != null) "file-blobs" else "app-blobs";
-        var backend = try blob_mod.backend.BlobBackend.openPerTenant(
+        var backend = try blob_mod.backend.BlobBackend.openPerTenantIncarnation(
             a,
             self.cfg.*,
             stage_tenant,
+            self.stage_incarnation,
             subdir,
         );
         defer backend.deinit();

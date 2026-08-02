@@ -52,6 +52,11 @@ const curl = blob.curl;
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = "x-rewind-tenant";
+/// The tenant's storage incarnation, minted ONCE by the CP at provision and
+/// delivered here (#357). It must arrive rather than be generated locally:
+/// attach runs on every node, and a per-node value would give each node a
+/// different store id for the same tenant.
+const INCARNATION_HEADER = "x-rewind-incarnation";
 // Streamed-snapshot baseline, carried in headers so the body is the pure
 // pair stream.
 const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
@@ -458,7 +463,8 @@ fn handleAttach(
     // receive the source's live forwards BEFORE its snapshot is shipped — the
     // snapshot then loads insert-if-absent so it never clobbers a forwarded
     // (newer) key. A non-empty body ships a bundle to load here.
-    const inst = ensureInstance(worker, tenant) catch
+    const incarnation = respb.findHeader(rh, INCARNATION_HEADER) orelse "";
+    const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
     if (body.len > 0) {
         inst.kv.loadTenantBundle(body) catch
@@ -591,6 +597,10 @@ fn handleEvict(
         worker.raft.destroyGroup(gid) catch
             return reply(server, allocator, ent, sid, sess, 500, "group destroy failed\n");
     }
+    // Drop the cached bundle BEFORE the instance goes: the slot is keyed by
+    // tenant name, so a name reused later would otherwise be served the
+    // previous tenant's code from memory, never reaching storage (#357).
+    worker.node.deploy.evictTenant(tenant);
     worker.node.tenant.deleteInstance(tenant) catch |err|
         std.log.warn("v2-evict: deleteInstance({s}) failed: {s}", .{ tenant, @errorName(err) });
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
@@ -882,8 +892,16 @@ fn forwardWriteOne(allocator: std.mem.Allocator, secret: []const u8, dest: []con
 /// Resolve a tenant instance, creating it (existence marker + per-tenant
 /// `cluster.kv` store) on first sight. Idempotent.
 fn ensureInstance(worker: anytype, tenant: []const u8) !*const tenant_mod.Instance {
+    return ensureInstanceWithIncarnation(worker, tenant, "");
+}
+
+/// `ensureInstance`, binding a first-sight instance to the storage incarnation
+/// the CP minted for this tenant lifetime (#357). An instance that already
+/// exists keeps the incarnation its data is keyed by — re-attach must not
+/// re-key a live tenant.
+fn ensureInstanceWithIncarnation(worker: anytype, tenant: []const u8, incarnation: []const u8) !*const tenant_mod.Instance {
     if (try worker.node.tenant.getInstance(tenant)) |inst| return inst;
-    try worker.node.tenant.createInstance(tenant);
+    try worker.node.tenant.createInstanceWithIncarnation(tenant, incarnation);
     return (try worker.node.tenant.getInstance(tenant)) orelse error.ProvisionFailed;
 }
 
@@ -1350,7 +1368,8 @@ fn handleLoadReplace(
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
     const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
         return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
-    const inst = ensureInstance(worker, tenant) catch
+    const incarnation = respb.findHeader(rh, INCARNATION_HEADER) orelse "";
+    const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
     inst.kv.loadTenantBundleReplace(body) catch
         return reply(server, allocator, ent, sid, sess, 400, "replace load failed\n");
@@ -1451,7 +1470,8 @@ pub fn armSnapshotStream(
             (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "merge")) .merge else .replace)
         else
             .replace;
-    const inst = ensureInstance(worker, tenant) catch
+    const incarnation = respb.findHeader(rh, INCARNATION_HEADER) orelse "";
+    const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
 
     var gid: u64 = 0;
