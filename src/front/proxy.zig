@@ -1232,6 +1232,13 @@ pub fn Proxy(comptime FrontH2: type) type {
             // absent (unknown leader: mid-election) or maps nowhere, FORGET
             // the stale hint so the next request re-scans instead of starting
             // at a node that's no longer the leader.
+            // Where to re-aim THIS request. The hint names the leader, so use
+            // it here rather than only caching it for the next request: walking
+            // to `node_idx + 1` instead can land on another follower (another
+            // 421, and eventually a 503 once the list is exhausted) or on a node
+            // that is down (a dead leg → an unretryable 502 for a write that
+            // nothing had accepted). Both were observed — rove#353.
+            var hinted_idx: ?usize = null;
             if (leaderOriginHint(rh, flow.nodes)) |origin| {
                 if (std.mem.eql(u8, origin, flow.nodes[flow.node_idx])) {
                     // Hint points back at the node that just refused — stale
@@ -1239,6 +1246,12 @@ pub fn Proxy(comptime FrontH2: type) type {
                     self.leaders.drop(self.allocator, flow.host);
                 } else {
                     self.leaders.note(self.allocator, flow.host, origin);
+                    for (flow.nodes, 0..) |n, i| {
+                        if (std.mem.eql(u8, n, origin)) {
+                            hinted_idx = i;
+                            break;
+                        }
+                    }
                 }
             } else {
                 self.leaders.drop(self.allocator, flow.host);
@@ -1250,10 +1263,20 @@ pub fn Proxy(comptime FrontH2: type) type {
                 flow.host, flow.nodes[flow.node_idx],
             });
             self.abandonAttempt(flow);
-            if (flow.canRetry() and flow.node_idx + 1 < flow.nodes.len) {
-                flow.node_idx += 1;
-                self.startAttempt(flow);
-                return;
+            if (flow.canRetry()) {
+                if (hinted_idx) |idx| {
+                    flow.node_idx = idx;
+                    self.startAttempt(flow);
+                    return;
+                }
+                // No hint (unknown leader: mid-election) — fall back to
+                // scanning, which is what discovers a leader that has not
+                // announced itself yet.
+                if (flow.node_idx + 1 < flow.nodes.len) {
+                    flow.node_idx += 1;
+                    self.startAttempt(flow);
+                    return;
+                }
             }
             self.finishWithStatus(flow, 503, "no-leader");
         }
@@ -1638,7 +1661,20 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // Transport/stream error with no usable response.
                 const conn_died = self.reg.isStale(flow.up_sess);
                 if (conn_died) self.markDown(flow);
-                std.log.warn("front: forward {s} → {s} failed", .{ flow.host, flow.nodes[flow.node_idx] });
+                // Say WHY, and say what it costs: the retry decision below turns
+                // on whether anything reached the worker, and "failed" alone
+                // cannot distinguish a dead connection from a stream the worker
+                // reset after reading the head. Without these fields a 502 here
+                // is unattributable (rove#353).
+                std.log.warn(
+                    "front: forward {s} → {s} failed (conn_died={}, replayable={}, saw_421={}, body={d}B, idempotent={})",
+                    .{
+                        flow.host,    flow.nodes[flow.node_idx],
+                        conn_died,    flow.replayable,
+                        flow.saw_421, flow.body_total,
+                        flow.idempotent,
+                    },
+                );
                 // A terminal for a submitted request: the head reached
                 // the upstream leg — ambiguous for non-idempotent flows.
                 self.attemptFailed(flow, conn_died, true);
