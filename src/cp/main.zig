@@ -455,7 +455,8 @@ const Router = struct {
         const is_cert = std.mem.eql(u8, path, "/_control/cert");
         const is_cluster = std.mem.eql(u8, path, "/_control/cluster");
         const is_node_addr = std.mem.eql(u8, path, "/_control/node-address");
-        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster or is_node_addr) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_delete = std.mem.eql(u8, path, "/_control/delete");
+        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster or is_node_addr or is_delete) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -492,6 +493,8 @@ const Router = struct {
             try self.handleNodeAddress(server, ent, sid, sess, body)
         else if (is_provision)
             try self.handleProvision(server, ent, sid, sess, body)
+        else if (is_delete)
+            try self.handleDelete(server, ent, sid, sess, body)
         else
             // `move` and `move-live` name the SAME (zero-downtime) move; both
             // route names are accepted so callers can use either.
@@ -756,6 +759,112 @@ const Router = struct {
             return;
         };
         try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// `POST /_control/delete {tenant}` — deprovision: make the tenant
+    /// unroutable, withdraw its directory rows, and tear its raft group down on
+    /// every node that held it. The inverse of `/_control/provision`.
+    ///
+    /// ## Order: the directory goes first, and that is load-bearing
+    ///
+    /// Removing `placement/` is the COMMIT POINT — from that moment the front
+    /// door 404s the tenant and its name is free. Eviction follows.
+    ///
+    /// The opposite order is the trap (#293): evicting first leaves a window
+    /// where `placement/` still names a cluster whose nodes no longer hold the
+    /// tenant, so the front door routes live traffic at a group that is gone;
+    /// and if the directory write then fails, the tenant is left permanently
+    /// routable-to-nothing. Placement-first fails the other way — an orphaned
+    /// group that nothing routes to, invisible to users and cleared by running
+    /// the delete again.
+    ///
+    /// So every step is idempotent and the whole thing is safe to retry: the
+    /// directory removals no-op when already gone, and `v2-evict` no-ops on a
+    /// node that no longer has the group.
+    ///
+    /// 204 on success (including a tenant that was already gone — the caller
+    /// asked for it to not exist, and it doesn't). 502 if the directory rows
+    /// came out but some node's eviction did not, so the caller knows to retry;
+    /// the tenant is already unroutable at that point.
+    ///
+    /// NOTE: this does NOT delete the tenant's stored objects (`file-blobs/`,
+    /// `log-blobs/`, …) — that is #350, and it is both a cost leak and the
+    /// deletion path a privacy policy will lean on.
+    fn handleDelete(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            tenant: []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try self.replyProvisionError(server, ent, sid, sess, 400, "malformed request body");
+            return;
+        };
+        defer parsed.deinit();
+        const tenant = parsed.value.tenant;
+        if (tenant.len == 0) {
+            try self.replyProvisionError(server, ent, sid, sess, 400, "tenant is required");
+            return;
+        }
+        // The platform's own singletons are not deprovisionable: deleting
+        // `__admin__` would remove the surface that serves this request.
+        for (id_spec.RESERVED_INSTANCE_IDS) |r| {
+            if (std.mem.eql(u8, tenant, r)) {
+                try self.replyProvisionError(server, ent, sid, sess, 403, "that tenant is part of the platform");
+                return;
+            }
+        }
+
+        // Capture the node set BEFORE withdrawing the placement — it is the
+        // only record of which nodes hold the group, and step 2 destroys it.
+        // An unplaced tenant may still have a group on nodes from a previous
+        // partial delete, so fall back to every configured cluster's nodes
+        // rather than skipping eviction (that is what makes a retry converge).
+        var nodes_owned: ?directory_mod.Directory.OwnedResolution = null;
+        defer if (nodes_owned) |*r| r.deinit(a);
+        nodes_owned = (self.directory.resolveOwned(a, tenant) catch null) orelse null;
+
+        // Host rows must be collected before removal too — the host index has
+        // no reverse direction.
+        const hosts = self.directory.hostsForOwned(a, tenant) catch &[_][]u8{};
+        defer {
+            for (hosts) |h| a.free(h);
+            if (hosts.len != 0) a.free(hosts);
+        }
+
+        // 1. Withdraw the placement — the commit point. Unroutable from here.
+        self.directory.unassign(tenant) catch {
+            try self.replyProvisionError(server, ent, sid, sess, 500, "could not withdraw the placement");
+            return;
+        };
+        // 2. The remaining directory rows. Each is idempotent; a failure here
+        //    leaves the tenant already-unroutable and the delete retryable.
+        for (hosts) |h| {
+            self.directory.removeHost(h) catch |err|
+                std.log.warn("rewind-cp: delete {s}: removeHost({s}) failed: {s}", .{ tenant, h, @errorName(err) });
+            self.directory.removeCert(h) catch |err|
+                std.log.warn("rewind-cp: delete {s}: removeCert({s}) failed: {s}", .{ tenant, h, @errorName(err) });
+        }
+        self.directory.removePlan(tenant) catch |err|
+            std.log.warn("rewind-cp: delete {s}: removePlan failed: {s}", .{ tenant, @errorName(err) });
+
+        // 3. Tear the group down on every node that could hold it. `v2-evict`
+        //    destroys the raft group AND the instance (its store, its
+        //    `instance/{id}` root marker — which is what frees the name — and
+        //    its domain aliases).
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(tbody);
+        const nodes: []const []const u8 = if (nodes_owned) |r| r.nodes else &.{};
+        const all_evicted = move.evictAllChecked(self, tenant, nodes, tbody);
+
+        if (!all_evicted) {
+            std.log.warn("rewind-cp: delete {s}: directory rows withdrawn but eviction incomplete — retry the delete", .{tenant});
+            try self.replyProvisionError(server, ent, sid, sess, 502, "tenant is unroutable, but its group was not fully torn down — retry");
+            return;
+        }
+        std.log.info("rewind-cp: deleted {s} ({d} node(s), {d} host row(s))", .{ tenant, nodes.len, hosts.len });
+        try replyStatus(server, ent, sid, sess, 204);
     }
 
     /// A `/_control/provision` failure, as `{"error": reason}` — the dashboard

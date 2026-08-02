@@ -15,6 +15,7 @@
 //!   deploy <tenant> <bundle> [--release]   classify + POST to the standing app.
 //!   release <tenant> <dep_id_hex>   flip _deploy/current (leader-aware retry).
 //!   provision <tenant> [--cluster C] [--host H]   create+place a tenant (CP).
+//!   delete <tenant> --yes           deprovision: unroute + tear down the group (CP).
 //!   move <tenant> <cluster> --yes                 relocate a tenant (zero-downtime) (CP).
 //!   host add <host> <tenant>        map a domain → tenant (CP index; CP pushes the worker alias).
 //!   plan set <tenant> <plan>        set a tenant's plan/limits blob (CP).
@@ -184,6 +185,24 @@ fn cmdKvPut(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, key: []
 }
 
 // ── placement / routing verbs (CP, move-secret) ─────────────────────────────
+
+/// POST /_control/delete {tenant}. Deprovision: the CP withdraws the tenant's
+/// directory rows (unroutable from that moment, name freed) and tears its raft
+/// group down on every node. 204 = gone; 502 = unrouted but not fully torn
+/// down, so re-run. Destroys the tenant's data — gated behind `--yes`.
+fn cmdDelete(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, yes: bool) void {
+    if (!yes) fatal("delete {s}: refusing without --yes (this destroys the tenant)", .{tenant});
+    var body = std.ArrayList(u8){};
+    body.appendSlice(a, "{\"tenant\":") catch oom();
+    c.writeJsonString(&body, a, tenant);
+    body.append(a, '}') catch oom();
+    const r = c.cpPost(a, env, "/_control/delete", body.items, 120);
+    switch (r.code) {
+        204 => std.debug.print("deleted {s} — unroutable, rows withdrawn, group evicted\n", .{tenant}),
+        502 => fatal("delete {s}: unroutable but NOT fully torn down — re-run `delete` ({s})", .{ tenant, c.trunc(r.body) }),
+        else => fatal("delete {s}: {d} {s}", .{ tenant, r.code, c.trunc(r.body) }),
+    }
+}
 
 /// POST /_control/provision {tenant, cluster, host?}. 200 = placed (the body
 /// reports the host it answers on; 204 is the same outcome from a CP that
@@ -604,6 +623,7 @@ const usage =
     \\  rewind-ops move <tenant> <cluster> --yes                 relocate a tenant (zero-downtime)
     \\  rewind-ops host add <host> <tenant>           map a domain → tenant
     \\  rewind-ops plan set <tenant> <plan>           set a tenant's plan/limits blob
+    \\  rewind-ops delete <tenant> --yes             deprovision a tenant (CP: unroute, drop rows, evict the group)
     \\  rewind-ops kv-put <tenant> <key> [value]     seed a system kv key (move-secret; operator/OIDC bootstrap)
     \\  rewind-ops seed-packages                     publish the first-party @rewind/* set into the registry (genesis)
     \\  rewind-ops status <host>                      resolve a host → tenant/cluster/plan

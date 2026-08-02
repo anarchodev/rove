@@ -103,6 +103,32 @@ pub fn evictAll(router: anytype, tenant: []const u8, nodes: []const []const u8, 
     }
 }
 
+/// `evictAll`, but reporting whether EVERY node accepted. A deprovision needs
+/// the answer: a move can treat a failed evict as cosmetic (the tenant lives on
+/// elsewhere), while a delete that silently skipped a node would leave an
+/// orphaned group holding the tenant's name on that node forever.
+///
+/// A node that no longer has the group answers 204 as well — `v2-evict` is
+/// idempotent — so a retry after a partial failure converges to true.
+pub fn evictAllChecked(router: anytype, tenant: []const u8, nodes: []const []const u8, tbody: []const u8) bool {
+    const a = router.allocator;
+    var all = true;
+    for (nodes) |base| {
+        if (bc.call(router, base, "/_system/v2-evict", .POST, tbody, &.{})) |ev| {
+            var e2 = ev;
+            defer e2.deinit(a);
+            if (e2.status != 204 and e2.status != 200) {
+                std.log.warn("rewind-cp: evict {s} on {s}: status {d}", .{ tenant, base, e2.status });
+                all = false;
+            }
+        } else |err| {
+            std.log.warn("rewind-cp: evict {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
+            all = false;
+        }
+    }
+    return all;
+}
+
 /// Pick a serving leader URL for `tenant` from `dest_nodes` — the forward
 /// target for a live move. Returns the first node that self-reports as the
 /// group leader, or null if none does yet.
