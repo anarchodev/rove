@@ -27,7 +27,9 @@ import subprocess
 import sys
 import time
 
-PORT = int(os.environ.get("REWIND_SMOKE_PORT", "18097"))
+from smoke_ports import alloc_port
+
+PORT = alloc_port()
 DATA_DIR = f"/tmp/rewind-smoke-{os.getpid()}"
 BIN = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin", "rewind-worker")
 ADMIN_HOST = "admin.localhost"

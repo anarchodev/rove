@@ -58,7 +58,16 @@ pub fn main() !void {
     });
     defer reg.deinit();
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8081);
+    // Port from argv[1] (default 8081) so concurrent smoke runs can each
+    // spawn their own upstream — the smoke suite's port authority
+    // (scripts/smoke/smoke_ports.py) hands every run a disjoint range.
+    var args = std.process.args();
+    _ = args.next();
+    const port: u16 = if (args.next()) |a|
+        try std.fmt.parseInt(u16, a, 10)
+    else
+        8081;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
     const server = try MyH2.create(&reg, alloc, addr, .{
         .max_connections = 256,
         .buf_count = 256,
@@ -66,7 +75,7 @@ pub fn main() !void {
     }, .{});
     defer server.destroy();
 
-    std.debug.print("H2 echo server listening on http://127.0.0.1:8081 (h2c)\n", .{});
+    std.debug.print("H2 echo server listening on http://127.0.0.1:{d} (h2c)\n", .{port});
 
     while (true) {
         try server.poll(1);

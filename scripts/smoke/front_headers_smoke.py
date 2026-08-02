@@ -35,15 +35,16 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, CP_BIN, FRONT_BIN
 
 import h2.config
 import h2.connection
 import h2.events
 
-PCP = int(os.environ.get("CP_PORT", "18270"))
-PF = int(os.environ.get("FRONT_PORT", "18271"))
-PREFLECT = int(os.environ.get("REFLECT_PORT", "18272"))
+PCP = alloc_port()
+PF = alloc_port()
+PREFLECT = alloc_port()
 
 CLUSTERS = f"cluster-1=http://127.0.0.1:{PREFLECT}"
 PLACEMENT = "acme=cluster-1"

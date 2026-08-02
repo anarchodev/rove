@@ -38,9 +38,10 @@ import time
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
+from smoke_ports import alloc_port  # noqa: E402
 
-PSRC = int(os.environ.get("SRC_PORT", "18121"))
-PDST = int(os.environ.get("DST_PORT", "18122"))
+PSRC = alloc_port()
+PDST = alloc_port()
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 TENANT = "fwdtenant"
 

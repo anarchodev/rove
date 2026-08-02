@@ -34,9 +34,10 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import FRONT_BIN
 
-PF = int(os.environ.get("FRONT_PORT", "18251"))
+PF = alloc_port()
 HANDSHAKE_TIMEOUT_MS = 2000
 
 procs = []

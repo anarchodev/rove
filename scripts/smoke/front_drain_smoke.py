@@ -9,8 +9,7 @@ serving until in-flight flows finish or `REWIND_FRONT_DRAIN_TIMEOUT_MS`
 (default 10 s) fires.
 
 Topology: CP + front (drain budget 8 s) + the h2-echo-server example
-upstream (:8081, replies at body-complete). Ports: CP 18290, front
-18291.
+upstream (replies at body-complete).
 
 Proof legs:
   A. a request in flight at SIGTERM (mid-upload) COMPLETES with 200 —
@@ -31,13 +30,14 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, CP_BIN, FRONT_BIN, BINDIR
 
 ECHO_BIN = os.path.join(BINDIR, "h2-echo-server")
 
-PCP = int(os.environ.get("CP_PORT", "18290"))
-PF = int(os.environ.get("FRONT_PORT", "18291"))
-PECHO = 8081  # fixed in examples/h2_echo_server.zig
+PCP = alloc_port()
+PF = alloc_port()
+PECHO = alloc_port()
 
 CLUSTERS = f"cluster-1=http://127.0.0.1:{PECHO}"
 PLACEMENT = "acme=cluster-1"
@@ -84,7 +84,7 @@ def main():
 
     try:
         print("boot: h2 echo upstream + CP + front (drain budget 8s)")
-        echo = subprocess.Popen([ECHO_BIN], stdout=subprocess.PIPE,
+        echo = subprocess.Popen([ECHO_BIN, str(PECHO)], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)
         procs.append(echo)
         deadline = time.monotonic() + 10

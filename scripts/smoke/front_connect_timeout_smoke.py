@@ -33,10 +33,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, CP_BIN, FRONT_BIN
 
-PCP = int(os.environ.get("CP_PORT", "18240"))
-PF = int(os.environ.get("FRONT_PORT", "18241"))
+PCP = alloc_port()
+PF = alloc_port()
 
 # The blackhole: SYNs to this RFC 1918 address are dropped, not RST.
 CLUSTERS = "cluster-1=http://10.255.255.1:18999"

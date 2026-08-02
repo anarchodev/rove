@@ -109,7 +109,7 @@ def main() -> int:
     # teaches people to stop reading the report.
     bin_dir = HERE.parent.parent / "zig-out" / "bin"
     needed = ["rewind-worker", "rewind-cp", "rewind-front", "rewind-logs",
-              "rewind-ops", "h2-echo-server", "echo-server"]
+              "rewind-ops", "h2-echo-server", "echo-server", "ws-echo"]
     missing = [b for b in needed if not (bin_dir / b).exists()]
     if missing:
         print(f"missing binaries in {bin_dir}: {', '.join(missing)}", file=sys.stderr)

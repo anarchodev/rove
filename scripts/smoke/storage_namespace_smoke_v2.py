@@ -33,6 +33,7 @@ import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from smoke_lib_v2 import V2Cluster, BIN_DIR  # noqa: E402
+from smoke_ports import alloc_port  # noqa: E402
 
 FIXTURE = {
     "index.mjs": """
@@ -44,8 +45,8 @@ export default function () {
 }
 
 TENANT = "acme"
-# Off the default 9110 so a stray local worker can't answer for ours.
-METRICS_PORT = 19839
+# Allocated (not the default 9110) so a stray local worker can't answer for ours.
+METRICS_PORT = alloc_port()
 
 
 def worker_storage_prefix() -> str | None:

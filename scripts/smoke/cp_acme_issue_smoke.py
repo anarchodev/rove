@@ -13,7 +13,7 @@ The V2 shape (vs the V1 `acme_issue_smoke.py`):
 Flow:
   1. pebble-challtestsrv: mock DNS, every name → 127.0.0.1 (so Pebble's
      validator hits OUR front `:80` listener).
-  2. pebble: ACME dir at https://127.0.0.1:14000/dir.
+  2. pebble: a local ACME directory.
   3. rewind-cp with REWIND_ACME_DIRECTORY=pebble, a host mapped
      (acmecorp.test=acme) but no cert → the issuer's work-list.
   4. rewind-front terminating TLS (default self-signed ctx) with its `:80`
@@ -45,12 +45,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import v2_topology as topo  # noqa: E402
+from smoke_ports import alloc_port  # noqa: E402
 
 CUSTOM_HOST = "acmecorp.test"
-ACME_HTTP_PORT = 5002          # pebble httpPort == front :80 listener port
-CP_PORT = 9390
-FRONT_TLS_PORT = 9443
-PEBBLE_DIR_URL = "https://127.0.0.1:14000/dir"
+ACME_HTTP_PORT = alloc_port()  # pebble httpPort == front :80 listener port
+CP_PORT = alloc_port()
+FRONT_TLS_PORT = alloc_port()
+PEBBLE_DIR_PORT = alloc_port()
+PEBBLE_MGMT_PORT = alloc_port()
+PEBBLE_TLS_PORT = alloc_port()      # pebble tlsPort (unused by http-01 but must not collide)
+CHALLTESTSRV_DNS_PORT = alloc_port()
+CHALLTESTSRV_MGMT_PORT = alloc_port()
+PEBBLE_DIR_URL = f"https://127.0.0.1:{PEBBLE_DIR_PORT}/dir"
 
 
 def _need(bin_name: str) -> str | None:
@@ -141,21 +147,21 @@ def main() -> int:
         fc, fk = _self_signed(tmp, "front", "default.local", "DNS:default.local")
 
         cfg = {"pebble": {
-            "listenAddress": "127.0.0.1:14000",
-            "managementListenAddress": "127.0.0.1:15000",
+            "listenAddress": f"127.0.0.1:{PEBBLE_DIR_PORT}",
+            "managementListenAddress": f"127.0.0.1:{PEBBLE_MGMT_PORT}",
             "certificate": pc, "privateKey": pk,
-            "httpPort": ACME_HTTP_PORT, "tlsPort": 5001, "ocspResponderURL": "",
+            "httpPort": ACME_HTTP_PORT, "tlsPort": PEBBLE_TLS_PORT, "ocspResponderURL": "",
         }}
         cfg_path = Path(tmp) / "pebble.json"
         cfg_path.write_text(json.dumps(cfg))
 
         procs.append(subprocess.Popen(
             [challsrv, "-defaultIPv4", "127.0.0.1", "-defaultIPv6", "",
-             "-dnsserver", ":8053", "-http01", "", "-https01", "",
-             "-tlsalpn01", "", "-doh", "", "-management", ":8055"],
+             "-dnsserver", f":{CHALLTESTSRV_DNS_PORT}", "-http01", "", "-https01", "",
+             "-tlsalpn01", "", "-doh", "", "-management", f":{CHALLTESTSRV_MGMT_PORT}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         procs.append(subprocess.Popen(
-            [pebble, "-config", str(cfg_path), "-dnsserver", "127.0.0.1:8053"],
+            [pebble, "-config", str(cfg_path), "-dnsserver", f"127.0.0.1:{CHALLTESTSRV_DNS_PORT}"],
             env={**os.environ, "PEBBLE_VA_NOSLEEP": "1", "PEBBLE_AUTHZREUSE": "0"},
             stdout=open(str(log_dir / "pebble.log"), "wb"), stderr=subprocess.STDOUT))
         if not _wait_dir():

@@ -31,17 +31,18 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, await_ready, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
 # DP cluster HTTP ports.
-P1 = int(os.environ.get("C1_PORT", "19091"))
-P2 = int(os.environ.get("C2_PORT", "19092"))
+P1 = alloc_port()
+P2 = alloc_port()
 # CP node HTTP ports + consensus ports (distinct from HTTP).
-CP_HTTP = [19090, 19093, 19094]
-CP_RAFT = [19190, 19191, 19192]
+CP_HTTP = [alloc_port() for _ in range(3)]
+CP_RAFT = [alloc_port() for _ in range(3)]
 
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 TENANT = "movetenant"

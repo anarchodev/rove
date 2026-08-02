@@ -42,16 +42,17 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
-PF = int(os.environ.get("FRONT_PORT", "18100"))
-PCP = int(os.environ.get("CP_PORT", "18105"))          # single-node CP
-P1 = int(os.environ.get("C1_PORT", "18101"))           # cluster-1 (source)
-P2 = [18102, 18103, 18104]                             # cluster-2 HTTP ports
-RP2 = [18112, 18113, 18114]                            # cluster-2 raft peer ports
+PF = alloc_port()
+PCP = alloc_port()                                     # single-node CP
+P1 = alloc_port()                                      # cluster-1 (source)
+P2 = [alloc_port() for _ in range(3)]                  # cluster-2 HTTP ports
+RP2 = [alloc_port() for _ in range(3)]                 # cluster-2 raft peer ports
 
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 TENANT = "movetenant"

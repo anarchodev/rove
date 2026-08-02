@@ -31,15 +31,16 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, await_line, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
-PA = 19510                       # cluster-1 (source)
-P2 = [19511, 19512, 19513]       # cluster-2 HTTP ports
-RP2 = [19521, 19522, 19523]      # cluster-2 raft peer ports
-PCP = 19515
+PA = alloc_port()                # cluster-1 (source)
+P2 = [alloc_port() for _ in range(3)]   # cluster-2 HTTP ports
+RP2 = [alloc_port() for _ in range(3)]  # cluster-2 raft peer ports
+PCP = alloc_port()
 
 SECRET = "rewindmovesecretpadding0123456789abcdef0"
 

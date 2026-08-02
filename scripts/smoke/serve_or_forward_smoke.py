@@ -45,15 +45,16 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from smoke_ports import alloc_port  # noqa: E402
 from v2_topology import spawn_cp, await_line, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind-worker")
 
-PCP = 19010
-PA = 19011
-PB = 19012
-PBH = 19013  # black-hole owner: accepts the TCP connection, never replies
+PCP = alloc_port()
+PA = alloc_port()
+PB = alloc_port()
+PBH = alloc_port()  # black-hole owner: accepts the TCP connection, never replies
 HOST = "cust.localhost"
 TENANT = "custtenant"
 SLOW_HOST = "slow.localhost"
