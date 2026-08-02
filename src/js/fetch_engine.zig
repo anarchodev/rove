@@ -55,6 +55,7 @@
 //! customer's chain just stops.
 
 const std = @import("std");
+const blob_mod = @import("rove-blob");
 const blob_curl_multi = @import("rove-blob").curl_multi;
 const blob_sigv4 = @import("rove-blob").sigv4;
 const components_mod = @import("components.zig");
@@ -826,26 +827,15 @@ pub const FetchEngine = struct {
             else => return error.BlobMethodDenied,
         };
 
-        // Path used both for signing and the wire URL (path-style S3).
-        // Incarnation-scoped like every other per-tenant path (#357): a door
-        // that addressed `{tenant}/…` while writes went to
-        // `{tenant}/{incarnation}/…` would read a previous tenant lifetime's
-        // objects — or, for a live tenant, nothing at all.
-        const inc = self.node.tenant.incarnationOf(self.allocator, pf.tenant_id) catch
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(inc);
-        const path = if (inc.len == 0)
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/app-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/app-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, inc, hash },
-            );
+        // Path used both for signing and the wire URL (path-style S3),
+        // derived through the tenant-storage handle so this door and the
+        // write path share one prefix rule (#357). An unresolvable handle
+        // (unknown tenant, root-store error) fails the fetch loudly — a door
+        // that guessed "legacy" here would read a previous tenant lifetime's
+        // objects, or nothing at all.
+        const storage = try self.node.tenant.storageOf(self.allocator, pf.tenant_id);
+        defer storage.incarnation.free(self.allocator);
+        const path = try storage.s3ObjectPath(self.allocator, cfg.*, "app-blobs", hash);
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";
@@ -882,25 +872,14 @@ pub const FetchEngine = struct {
 
         if (method != .GET) return error.BlobMethodDenied;
 
-        // Incarnation-scoped, like the app-blobs door above (#357) — the
-        // deploy writes file-blobs under `{tenant}/{incarnation}/`, so a
-        // legacy-prefixed read gets S3's NoSuchKey error document and the
-        // stream relay serves THAT as the asset body.
-        const inc = self.node.tenant.incarnationOf(self.allocator, pf.tenant_id) catch
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(inc);
-        const path = if (inc.len == 0)
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/file-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/file-blobs/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, inc, hash },
-            );
+        // Derived through the tenant-storage handle, like the app-blobs door
+        // above (#357) — the deploy writes file-blobs under the
+        // incarnation-scoped prefix, so a legacy-prefixed read gets S3's
+        // NoSuchKey error document and the stream relay serves THAT as the
+        // asset body. An unresolvable handle fails the fetch loudly.
+        const storage = try self.node.tenant.storageOf(self.allocator, pf.tenant_id);
+        defer storage.incarnation.free(self.allocator);
+        const path = try storage.s3ObjectPath(self.allocator, cfg.*, "file-blobs", hash);
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";
@@ -1019,23 +998,12 @@ pub const FetchEngine = struct {
             blob_key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
         } else return error.BlobReadBadPath;
 
-        // The TARGET tenant's incarnation (#357) — the door reads whatever the
-        // deploy path wrote, and that is incarnation-scoped.
-        const inc = self.node.tenant.incarnationOf(self.allocator, tenant) catch
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(inc);
-        const path = if (inc.len == 0)
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, tenant, subdir, blob_key },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/{s}/{s}{s}/{s}/{s}/{s}",
-                .{ cfg.bucket, cfg.key_prefix_base, tenant, inc, subdir, blob_key },
-            );
+        // The TARGET tenant's storage handle (#357) — the door reads whatever
+        // the deploy path wrote, and that is incarnation-scoped. An unknown
+        // target tenant is a loud error, not a legacy-prefixed guess.
+        const storage = try self.node.tenant.storageOf(self.allocator, tenant);
+        defer storage.incarnation.free(self.allocator);
+        const path = try storage.s3ObjectPath(self.allocator, cfg.*, subdir, blob_key);
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";
@@ -1226,7 +1194,7 @@ pub const FetchEngine = struct {
         // (`docs/architecture/routing-and-ingress.md`): bound-fetch chunk bytes
         // become durable via the process-global blob coordinator at
         // upstream rate, decoupled from the held chain's raft commit
-        // cadence. This stamps `coord_seq`/`coord_worker_id` on the
+        // cadence. This stamps `coord_seq`/`coord_queue_id` on the
         // event; the consumer reads inline `bytes`.
         self.submitBoundChunkToCoord(&event);
         self.node.router.enqueueFetchEventForTenant(tenant_id, event) catch |err| {
@@ -1253,16 +1221,16 @@ pub const FetchEngine = struct {
     /// not a bound chunk, the coordinator isn't up, the owner isn't
     /// registered yet, or the submit fails, the fields stay 0 and the
     /// consumer simply uses `bytes`. We submit under the owning
-    /// worker's id (== its coord queue id, == its `log_worker_id`) so
-    /// the consumer can later gate on `durableSeq(coord_worker_id)`;
-    /// that's the same owner the slim Msg routes to via
-    /// `bound_fetch_owners`.
+    /// worker's registered msg-inbox slot — the identity
+    /// `QueueId.fromInboxIdx` exists for, and the same owner the slim
+    /// Msg routes to via `bound_fetch_owners` — so the consumer can
+    /// later gate on `durableSeq(coord_queue_id)`.
     fn submitBoundChunkToCoord(self: *FetchEngine, ev: *UpstreamFetchEvent) void {
         if (!ev.bind) return;
         if (ev.bytes.len == 0) return;
         const coord = self.node.blob_coord.coordinator orelse return;
         const owner_idx = self.node.router.lookupBoundFetchOwner(ev.fetch_id) orelse return;
-        const wid = std.math.cast(u8, owner_idx) orelse return;
+        const wid = blob_mod.coordinator.QueueId.fromInboxIdx(owner_idx) orelse return;
         const seq = coord.submit(wid, ev.bytes) catch |err| {
             std.log.warn(
                 "rove-js chunk-spool: coord.submit fetch_id={s} seq={d} bytes={d}: {s}",
@@ -1271,7 +1239,7 @@ pub const FetchEngine = struct {
             return;
         };
         ev.coord_seq = seq;
-        ev.coord_worker_id = wid;
+        ev.coord_queue_id = wid;
         ev.coord_submitted = true;
     }
 };

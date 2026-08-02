@@ -463,7 +463,11 @@ fn handleAttach(
     // receive the source's live forwards BEFORE its snapshot is shipped — the
     // snapshot then loads insert-if-absent so it never clobbers a forwarded
     // (newer) key. A non-empty body ships a bundle to load here.
-    const incarnation = respb.findHeader(rh, INCARNATION_HEADER) orelse "";
+    // Wire edge (pre-envelope-rework protocol): the header is OMITTED for a
+    // legacy tenant, so absent and empty both decode to `.legacy` HERE, at
+    // the one named conversion — the attach-envelope consolidation (#363
+    // class 3) is where absence becomes a decode error instead.
+    const incarnation = tenant_mod.Incarnation.fromMarker(respb.findHeader(rh, INCARNATION_HEADER) orelse "");
     const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
     if (body.len > 0) {
@@ -892,14 +896,14 @@ fn forwardWriteOne(allocator: std.mem.Allocator, secret: []const u8, dest: []con
 /// Resolve a tenant instance, creating it (existence marker + per-tenant
 /// `cluster.kv` store) on first sight. Idempotent.
 fn ensureInstance(worker: anytype, tenant: []const u8) !*const tenant_mod.Instance {
-    return ensureInstanceWithIncarnation(worker, tenant, "");
+    return ensureInstanceWithIncarnation(worker, tenant, .legacy);
 }
 
 /// `ensureInstance`, binding a first-sight instance to the storage incarnation
 /// the CP minted for this tenant lifetime (#357). An instance that already
 /// exists keeps the incarnation its data is keyed by — re-attach must not
 /// re-key a live tenant.
-fn ensureInstanceWithIncarnation(worker: anytype, tenant: []const u8, incarnation: []const u8) !*const tenant_mod.Instance {
+fn ensureInstanceWithIncarnation(worker: anytype, tenant: []const u8, incarnation: tenant_mod.Incarnation) !*const tenant_mod.Instance {
     if (try worker.node.tenant.getInstance(tenant)) |inst| return inst;
     try worker.node.tenant.createInstanceWithIncarnation(tenant, incarnation);
     return (try worker.node.tenant.getInstance(tenant)) orelse error.ProvisionFailed;
@@ -1201,9 +1205,10 @@ fn handleAppliedBaseline(
     // applies replicated writes somewhere nothing reads (#357). Empty for a
     // tenant provisioned before incarnations existed — legacy name-keyed, and
     // the joiner must stay there too.
-    const inc = worker.node.tenant.incarnationOf(allocator, tenant) catch
+    const st = worker.node.tenant.storageOf(allocator, tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "incarnation unavailable\n");
-    defer allocator.free(inc);
+    defer st.incarnation.free(allocator);
+    const inc = st.incarnation.marker();
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     var w = buf.writer(allocator);
@@ -1380,7 +1385,11 @@ fn handleLoadReplace(
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
     const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
         return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
-    const incarnation = respb.findHeader(rh, INCARNATION_HEADER) orelse "";
+    // Wire edge (pre-envelope-rework protocol): the header is OMITTED for a
+    // legacy tenant, so absent and empty both decode to `.legacy` HERE, at
+    // the one named conversion — the attach-envelope consolidation (#363
+    // class 3) is where absence becomes a decode error instead.
+    const incarnation = tenant_mod.Incarnation.fromMarker(respb.findHeader(rh, INCARNATION_HEADER) orelse "");
     const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
     inst.kv.loadTenantBundleReplace(body) catch
@@ -1482,7 +1491,11 @@ pub fn armSnapshotStream(
             (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "merge")) .merge else .replace)
         else
             .replace;
-    const incarnation = respb.findHeader(rh, INCARNATION_HEADER) orelse "";
+    // Wire edge (pre-envelope-rework protocol): the header is OMITTED for a
+    // legacy tenant, so absent and empty both decode to `.legacy` HERE, at
+    // the one named conversion — the attach-envelope consolidation (#363
+    // class 3) is where absence becomes a decode error instead.
+    const incarnation = tenant_mod.Incarnation.fromMarker(respb.findHeader(rh, INCARNATION_HEADER) orelse "");
     const inst = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
 

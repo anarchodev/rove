@@ -18,8 +18,8 @@ const blob_mod = @import("rove-blob");
 pub const LogSubsystem = struct {
     /// Per-request log record buffer; the flusher drains it into S3 batches.
     log_buffer: log_mod.NodeLogBuffer,
-    /// This worker's log-shard id (defaults to its raft node id).
-    log_worker_id: u16,
+    /// This worker's request-id minter identity (`log_mod.MinterId`).
+    minter_id: log_mod.MinterId,
     /// S3-backed batch store the flusher writes log batches to.
     log_batch_store: log_server_mod.batch_store.BatchStore,
     /// Public base URL of the log-server (for the push notification), if any.

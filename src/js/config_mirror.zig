@@ -54,7 +54,7 @@ pub const Stats = struct {
 /// writeset to raft.
 ///
 /// `file_blobs` is the per-tenant file-blobs BlobStore (vtable form;
-/// caller obtains via `BlobBackend.openPerTenant(..., "file-blobs")`
+/// caller obtains via `TenantStorage.openBackend(..., "file-blobs")`
 /// then `blobStore()`).
 pub fn mirrorConfigToKv(
     allocator: std.mem.Allocator,

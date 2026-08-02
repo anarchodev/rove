@@ -55,6 +55,13 @@ const kv_mod = @import("raft-kv");
 /// enforces the same rule when it provisions a tenant, and resolves the same
 /// `{id}.{suffix}` wildcard when the front door asks who owns a host.
 const id_spec = @import("rove-instance-id");
+const storage_mod = @import("storage.zig");
+
+/// The tenant-storage handle: `(id, incarnation)` plus every derivation —
+/// key prefixes, signed paths, blob backends, store ids, directories. See
+/// `storage.zig` for why the bare id must never be the input to any of them.
+pub const TenantStorage = storage_mod.TenantStorage;
+pub const Incarnation = storage_mod.Incarnation;
 
 pub const Error = error{
     InvalidInstanceId,
@@ -92,11 +99,7 @@ pub const MAX_INSTANCE_ID_LEN = id_spec.MAX_INSTANCE_ID_LEN;
 /// tenant LIFETIME, so storage identity is (name, incarnation) rather than name
 /// alone. Deprovision frees a name for reuse, and without this the next holder
 /// of that name would address the previous holder's KV rows and S3 objects.
-///
-/// Random rather than a counter: a counter would have to be remembered across
-/// the very deletion that destroys the tenant's state, and losing it would
-/// silently re-issue a live path. A token needs no history to be safe.
-pub const MAX_INCARNATION_LEN: usize = 32;
+pub const MAX_INCARNATION_LEN = storage_mod.MAX_INCARNATION_LEN;
 pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 
 /// Reserved instance id for the built-in admin handler. The admin
@@ -172,16 +175,12 @@ pub const Instance = struct {
     dir: []u8,
     kv: *kv_mod.KvStore,
     platform: ?*Tenant = null,
-    /// This instance's storage incarnation (`MAX_INCARNATION_LEN`), or empty
-    /// for a legacy instance keyed by name alone. Carried here so every
-    /// consumer that opens per-tenant storage — blob backends especially —
-    /// derives the same lifetime-scoped path without re-reading the root store.
-    incarnation: []u8 = &.{},
-    /// The sibling-store id this instance's KV lives under, derived from
-    /// (id, incarnation). THE single definition: anything opening its own
-    /// handle to this instance's store must use this rather than re-hashing
-    /// the name, or it addresses a different store than the dispatcher does.
-    store_id: u64 = 0,
+    /// This instance's storage identity — THE handle every consumer that
+    /// opens per-tenant storage (blob backends, sibling KV handles, signed
+    /// paths) derives from, so all of them address the same tenant lifetime
+    /// without re-reading the root store. `storage.id` aliases `id`; a
+    /// `.token` incarnation aliases a buffer owned by this instance.
+    storage: TenantStorage,
 };
 
 pub const Tenant = struct {
@@ -282,7 +281,7 @@ pub const Tenant = struct {
             inst.kv.close();
             allocator.free(inst.id);
             allocator.free(inst.dir);
-            allocator.free(inst.incarnation);
+            inst.storage.incarnation.free(allocator);
             allocator.destroy(inst);
         }
         self.instances.deinit(allocator);
@@ -329,7 +328,7 @@ pub const Tenant = struct {
     /// that avoids N-way root.db write contention when every worker
     /// in a multi-worker process bootstraps the same tenant set.
     pub fn createInstance(self: *Tenant, id: []const u8) Error!void {
-        return self.createInstanceWithIncarnation(id, "");
+        return self.createInstanceWithIncarnation(id, .legacy);
     }
 
     /// `createInstance`, binding the instance to a storage INCARNATION.
@@ -347,16 +346,21 @@ pub const Tenant = struct {
     /// a different value would silently orphan it. That also makes re-attach
     /// and lazy re-open idempotent.
     ///
-    /// Empty = a legacy instance, keyed by name alone. Instances created before
-    /// incarnations exist keep their storage exactly where it is, so this needs
-    /// no migration; they are also never at risk, because a name could not be
+    /// `.legacy` = keyed by name alone. Instances created before incarnations
+    /// exist keep their storage exactly where it is, so this needs no
+    /// migration; they are also never at risk, because a name could not be
     /// freed and reused before deprovision.
-    pub fn createInstanceWithIncarnation(self: *Tenant, id: []const u8, incarnation: []const u8) Error!void {
+    pub fn createInstanceWithIncarnation(self: *Tenant, id: []const u8, incarnation: Incarnation) Error!void {
         try validateInstanceId(id);
-        if (incarnation.len > MAX_INCARNATION_LEN) return Error.InvalidInstanceId;
-        for (incarnation) |b| {
-            const ok = (b >= 'a' and b <= 'z') or (b >= '0' and b <= '9');
-            if (!ok) return Error.InvalidInstanceId;
+        switch (incarnation) {
+            .legacy => {},
+            .token => |t| {
+                if (t.len == 0 or t.len > MAX_INCARNATION_LEN) return Error.InvalidInstanceId;
+                for (t) |b| {
+                    const ok = (b >= 'a' and b <= 'z') or (b >= '0' and b <= '9');
+                    if (!ok) return Error.InvalidInstanceId;
+                }
+            },
         }
         const already_exists = try self.instanceExistsInRoot(id);
         {
@@ -371,7 +375,7 @@ pub const Tenant = struct {
             // because that is what its live data is already keyed by.
             _ = try self.ensureOpenLockedWith(id, if (already_exists) null else incarnation);
         }
-        if (!already_exists) try self.writeInstanceMarker(id, incarnation);
+        if (!already_exists) try self.writeInstanceMarker(id, incarnation.marker());
     }
 
     /// Delete an instance. Closes its open `KvStore`, drops it from
@@ -391,7 +395,7 @@ pub const Tenant = struct {
                 inst.kv.close();
                 self.allocator.free(inst.id);
                 self.allocator.free(inst.dir);
-                self.allocator.free(inst.incarnation);
+                inst.storage.incarnation.free(self.allocator);
                 self.allocator.destroy(inst);
             }
         }
@@ -627,22 +631,35 @@ pub const Tenant = struct {
         self.invalidateHostCache();
     }
 
-    /// The instance's storage incarnation — the marker's value — or empty when
-    /// it has none. See `MAX_INCARNATION_LEN` for what it is and why.
+    /// The instance's storage handle, resolved by NAME — for callers that
+    /// don't hold a live `*Instance` (the fetch-engine doors, the deploy
+    /// staging paths). `storage.id` borrows `id`; a `.token` incarnation is
+    /// owned by the caller: free it with `storage.incarnation.free(a)`.
     ///
-    /// Read from the ROOT store rather than cached on `Instance`, because a
-    /// follower learns it by applying the replicated marker, which may land
+    /// Read from the ROOT store rather than the instance map, because a
+    /// follower learns the marker by applying it replicated, which may land
     /// before anything opens the instance locally.
-    pub fn incarnationOf(self: *Tenant, a: std.mem.Allocator, id: []const u8) Error![]u8 {
+    ///
+    /// An ABSENT marker is `Error.InstanceNotFound`, never legacy: "this
+    /// instance has name-keyed storage" is a fact recorded in the marker,
+    /// while "there is no marker" means the instance doesn't exist — and
+    /// conflating the two is what turned every missed incarnation hand-off
+    /// into a quiet read of the wrong tenant lifetime (#357).
+    pub fn storageOf(self: *Tenant, a: std.mem.Allocator, id: []const u8) Error!TenantStorage {
         var key_buf: [16 + MAX_INSTANCE_ID_LEN]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{id}) catch
             return Error.InvalidInstanceId;
         const v = self.root.get(key) catch |err| switch (err) {
-            error.NotFound => return a.dupe(u8, "") catch Error.OutOfMemory,
+            error.NotFound => return Error.InstanceNotFound,
             else => return Error.Kv,
         };
         defer self.allocator.free(v);
-        return a.dupe(u8, v) catch Error.OutOfMemory;
+        const owned = a.dupe(u8, v) catch return Error.OutOfMemory;
+        if (owned.len == 0) {
+            a.free(owned);
+            return .{ .id = id, .incarnation = .legacy };
+        }
+        return .{ .id = id, .incarnation = .{ .token = owned } };
     }
 
     /// Open (or reuse) the store for `id` and return its `*Instance`.
@@ -670,26 +687,30 @@ pub const Tenant = struct {
     /// `ensureOpenLocked`, with the incarnation supplied rather than read back
     /// from the marker. `null` = read the marker (every path except the first
     /// creation, where the marker is written only after a successful open).
-    fn ensureOpenLockedWith(self: *Tenant, id: []const u8, supplied: ?[]const u8) Error!*Instance {
+    fn ensureOpenLockedWith(self: *Tenant, id: []const u8, supplied: ?Incarnation) Error!*Instance {
         if (self.instances.get(id)) |inst| return inst;
 
         // The instance's storage key is (id, incarnation), not id alone — so
         // the next tenant to hold this name addresses a different store and a
         // different directory, and cannot reach the previous one's data even
-        // if its objects were never cleaned up. Empty incarnation = legacy,
-        // keyed by name alone, leaving pre-existing instances where they are.
-        const incarnation = if (supplied) |inc|
-            self.allocator.dupe(u8, inc) catch return Error.OutOfMemory
-        else
-            try self.incarnationOf(self.allocator, id);
-        defer self.allocator.free(incarnation);
+        // if its objects were never cleaned up. Unlike `storageOf` (a query),
+        // an absent marker here means this open IS the instance's creation:
+        // an id nothing has provisioned an incarnation for opens legacy,
+        // which is `createInstance`'s (and the pump's first-sight) contract.
+        const incarnation: Incarnation = if (supplied) |inc|
+            inc.dupe(self.allocator) catch return Error.OutOfMemory
+        else blk: {
+            const st = self.storageOf(self.allocator, id) catch |err| switch (err) {
+                Error.InstanceNotFound => break :blk .legacy,
+                else => return err,
+            };
+            break :blk st.incarnation;
+        };
+        errdefer incarnation.free(self.allocator);
 
-        const inst_dir = if (incarnation.len == 0)
-            std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir, id }) catch
-                return Error.OutOfMemory
-        else
-            std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ self.dir, id, incarnation }) catch
-                return Error.OutOfMemory;
+        const storage = TenantStorage{ .id = id, .incarnation = incarnation };
+        const inst_dir = storage.dirPath(self.allocator, self.dir) catch
+            return Error.OutOfMemory;
         errdefer self.allocator.free(inst_dir);
 
         std.fs.cwd().makePath(inst_dir) catch |err| switch (err) {
@@ -710,14 +731,7 @@ pub const Tenant = struct {
         // Same rule for the sibling store id: the per-instance KV lives inside
         // the shared manifest keyed by this hash, so hashing the name alone is
         // exactly what let a reborn tenant read its predecessor's rows.
-        const u64_id = if (incarnation.len == 0)
-            kv_mod.hashStoreId(id)
-        else blk: {
-            var buf: [MAX_INSTANCE_ID_LEN + 1 + MAX_INCARNATION_LEN]u8 = undefined;
-            const keyed = std.fmt.bufPrint(&buf, "{s}/{s}", .{ id, incarnation }) catch
-                return Error.InvalidInstanceId;
-            break :blk kv_mod.hashStoreId(keyed);
-        };
+        const u64_id = storage.storeId();
         const store = kv_mod.KvStore.attachSibling(
             self.allocator,
             self.root,
@@ -731,15 +745,14 @@ pub const Tenant = struct {
 
         const inst = self.allocator.create(Instance) catch return Error.OutOfMemory;
         errdefer self.allocator.destroy(inst);
-        const inc_copy = self.allocator.dupe(u8, incarnation) catch return Error.OutOfMemory;
-        errdefer self.allocator.free(inc_copy);
 
         inst.* = .{
             .id = id_copy,
             .dir = inst_dir,
             .kv = store,
-            .incarnation = inc_copy,
-            .store_id = u64_id,
+            // `incarnation`'s token bytes were duped above and are owned by
+            // this instance from here (freed in destroy/deleteInstance).
+            .storage = .{ .id = id_copy, .incarnation = incarnation },
             // The singleton admin tenant gets a back-pointer to the
             // Tenant so its JS handler can issue platform ops. Every
             // other instance leaves `platform = null`.
@@ -751,7 +764,7 @@ pub const Tenant = struct {
         // when a write "replicates" but reads come back empty: two nodes on
         // different incarnations of the same name each look internally
         // consistent, and only this line shows they disagree (#357).
-        std.log.info("tenant: opened {s} incarnation='{s}' store_id={x} dir={s}", .{ id, incarnation, u64_id, inst_dir });
+        std.log.info("tenant: opened {s} incarnation='{s}' store_id={x} dir={s}", .{ id, incarnation.marker(), u64_id, inst_dir });
         return inst;
     }
 
@@ -972,6 +985,12 @@ const TestFixture = struct {
         self.allocator.free(self.tmp_dir);
     }
 };
+
+test {
+    // Pull storage.zig's tests into this module's test build — an import
+    // for declarations alone does not (test_reachability_lint.py).
+    _ = storage_mod;
+}
 
 test "createInstance opens a dedicated kv file" {
     var fx = try TestFixture.init(testing.allocator);
@@ -1214,17 +1233,17 @@ test "instance storage is keyed by (id, incarnation), not id alone" {
 
     // Two lifetimes of ONE name. The second must not be able to reach the
     // first's rows — the deprovision leak (#357).
-    try fx.tenant.createInstanceWithIncarnation("acme", "aaaa1111");
+    try fx.tenant.createInstanceWithIncarnation("acme", .{ .token = "aaaa1111" });
     const first = (try fx.tenant.getInstance("acme")).?;
-    const first_store = first.store_id;
+    const first_store = first.storage.storeId();
     try first.kv.put("secret", "first-tenant-data");
 
     try fx.tenant.deleteInstance("acme");
-    try fx.tenant.createInstanceWithIncarnation("acme", "bbbb2222");
+    try fx.tenant.createInstanceWithIncarnation("acme", .{ .token = "bbbb2222" });
     const second = (try fx.tenant.getInstance("acme")).?;
 
-    try testing.expect(first_store != second.store_id);
-    try testing.expectEqualStrings("bbbb2222", second.incarnation);
+    try testing.expect(first_store != second.storage.storeId());
+    try testing.expectEqualStrings("bbbb2222", second.storage.incarnation.marker());
     try testing.expectError(error.NotFound, second.kv.get("secret"));
 }
 
@@ -1233,15 +1252,15 @@ test "an existing instance keeps the incarnation its data is keyed by" {
     var fx = try TestFixture.init(a);
     defer fx.deinit();
 
-    try fx.tenant.createInstanceWithIncarnation("acme", "aaaa1111");
+    try fx.tenant.createInstanceWithIncarnation("acme", .{ .token = "aaaa1111" });
     const inst = (try fx.tenant.getInstance("acme")).?;
     try inst.kv.put("k", "v");
 
     // A re-attach carrying a DIFFERENT incarnation must not re-key a live
     // tenant — that would orphan its data rather than protect it.
-    try fx.tenant.createInstanceWithIncarnation("acme", "cccc3333");
+    try fx.tenant.createInstanceWithIncarnation("acme", .{ .token = "cccc3333" });
     const again = (try fx.tenant.getInstance("acme")).?;
-    try testing.expectEqualStrings("aaaa1111", again.incarnation);
+    try testing.expectEqualStrings("aaaa1111", again.storage.incarnation.marker());
     const v = try again.kv.get("k");
     defer a.free(v);
     try testing.expectEqualStrings("v", v);
@@ -1255,8 +1274,29 @@ test "a legacy instance (no incarnation) keeps its name-keyed storage" {
     // their data is — this is what makes the change need no migration.
     try fx.tenant.createInstance("legacy");
     const inst = (try fx.tenant.getInstance("legacy")).?;
-    try testing.expectEqualStrings("", inst.incarnation);
-    try testing.expectEqual(kv_mod.hashStoreId("legacy"), inst.store_id);
+    try testing.expect(inst.storage.incarnation == .legacy);
+    try testing.expectEqual(kv_mod.hashStoreId("legacy"), inst.storage.storeId());
+}
+
+test "storageOf: absent marker is InstanceNotFound, never legacy" {
+    const a = testing.allocator;
+    var fx = try TestFixture.init(a);
+    defer fx.deinit();
+
+    // "No such instance" and "legacy instance" must be distinguishable —
+    // collapsing them is what made a missed incarnation hand-off a quiet
+    // read of the wrong tenant lifetime instead of a loud failure (#357).
+    try testing.expectError(Error.InstanceNotFound, fx.tenant.storageOf(a, "ghost"));
+
+    try fx.tenant.createInstance("oldster");
+    const legacy_st = try fx.tenant.storageOf(a, "oldster");
+    defer legacy_st.incarnation.free(a);
+    try testing.expect(legacy_st.incarnation == .legacy);
+
+    try fx.tenant.createInstanceWithIncarnation("fresh", .{ .token = "dddd4444" });
+    const st = try fx.tenant.storageOf(a, "fresh");
+    defer st.incarnation.free(a);
+    try testing.expectEqualStrings("dddd4444", st.incarnation.marker());
 }
 
 test "validateInstanceId enforces DNS-label-safe spec" {

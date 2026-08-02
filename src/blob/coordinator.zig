@@ -79,6 +79,34 @@ pub const BodyRef = struct {
 /// naming `coordinator.ReservationProvider`.
 pub const ReservationProvider = reservation.ReservationProvider;
 
+/// A worker's queue id in the coordinator — a DISTINCT TYPE, not a bare
+/// integer, so it cannot be confused with any other worker identity. The
+/// request-id minter identity in particular is a packed
+/// `(node_id << 8) | worker_idx` whose smallest legal value is 256; three
+/// call sites once narrowed it into this queue space with `@intCast` and
+/// panicked the worker thread on every inbound body on every node
+/// (docs/defect-patterns.md class 1). A conversion into this type now has
+/// to be written on purpose and is greppable.
+///
+/// The one legitimate source is the worker's registered msg-inbox slot —
+/// the same identity the router's bound-fetch owner table hands out — via
+/// `fromInboxIdx`.
+pub const QueueId = enum(u8) {
+    _,
+
+    /// The single constructor: a registered msg-inbox slot index. Null when
+    /// the slot exceeds the queue space (the worker registration path turns
+    /// that into `error.TooManyWorkers`).
+    pub fn fromInboxIdx(idx: usize) ?QueueId {
+        return @enumFromInt(std.math.cast(u8, idx) orelse return null);
+    }
+
+    /// The queue's array index.
+    pub fn index(self: QueueId) usize {
+        return @intFromEnum(self);
+    }
+};
+
 pub const Config = struct {
     /// Number of distinct worker threads that will call `submit`.
     /// Each worker's `worker_id` must be in `[0, worker_count)`.
@@ -424,11 +452,11 @@ pub const BlobCoordinator = struct {
     /// remains free to read/mutate the original.
     pub fn submit(
         self: *Self,
-        worker_id: u8,
+        queue: QueueId,
         bytes: []const u8,
     ) Error!u64 {
         if (self.shutdown_flag.load(.acquire)) return Error.Shutdown;
-        if (worker_id >= self.config.worker_count) return Error.InvalidWorkerId;
+        if (queue.index() >= self.config.worker_count) return Error.InvalidWorkerId;
         if (bytes.len > self.config.max_batch_bytes) return Error.SubmissionTooLarge;
 
         const bytes_copy = self.allocator.dupe(u8, bytes) catch return error.PutFailed;
@@ -451,7 +479,7 @@ pub const BlobCoordinator = struct {
         self.pending_count += 1;
         self.drain_mu.unlock();
 
-        const w = &self.workers[worker_id];
+        const w = &self.workers[queue.index()];
         w.mu.lock();
         const seq = w.next_seq;
         w.next_seq += 1;
@@ -508,9 +536,9 @@ pub const BlobCoordinator = struct {
     /// Per-worker high water mark — every submission on this
     /// worker's queue with `seq < return value` is durable (or
     /// terminally failed; check `bodyRef(seq)` to distinguish).
-    pub fn durableSeq(self: *Self, worker_id: u8) u64 {
-        std.debug.assert(worker_id < self.config.worker_count);
-        return self.workers[worker_id].durable_seq.load(.acquire);
+    pub fn durableSeq(self: *Self, queue: QueueId) u64 {
+        std.debug.assert(queue.index() < self.config.worker_count);
+        return self.workers[queue.index()].durable_seq.load(.acquire);
     }
 
     /// Lookup the outcome for a (worker_id, seq). Caller must only
@@ -518,9 +546,9 @@ pub const BlobCoordinator = struct {
     /// Returns the BodyRef on success, error.PutFailed if the seq
     /// terminally failed, error.UnknownSeq if the seq was never
     /// submitted (caller bug — either misuse or seq out of range).
-    pub fn bodyRef(self: *Self, worker_id: u8, seq: u64) Error!BodyRef {
-        std.debug.assert(worker_id < self.config.worker_count);
-        const w = &self.workers[worker_id];
+    pub fn bodyRef(self: *Self, queue: QueueId, seq: u64) Error!BodyRef {
+        std.debug.assert(queue.index() < self.config.worker_count);
+        const w = &self.workers[queue.index()];
         w.mu.lock();
         defer w.mu.unlock();
         const slot = w.refs.get(seq) orelse return Error.UnknownSeq;
@@ -544,12 +572,12 @@ pub const BlobCoordinator = struct {
     /// ready to consume them.
     pub fn readBody(
         self: *Self,
-        worker_id: u8,
+        queue: QueueId,
         seq: u64,
         allocator: std.mem.Allocator,
     ) Error![]u8 {
-        std.debug.assert(worker_id < self.config.worker_count);
-        const w = &self.workers[worker_id];
+        std.debug.assert(queue.index() < self.config.worker_count);
+        const w = &self.workers[queue.index()];
         w.mu.lock();
         defer w.mu.unlock();
         const slot = w.refs.get(seq) orelse return Error.UnknownSeq;
@@ -579,9 +607,9 @@ pub const BlobCoordinator = struct {
     /// MUST be called at most once-to-success per submission, by its
     /// consumer. The durable copy lives in S3, so releasing never
     /// affects replay.
-    pub fn release(self: *Self, worker_id: u8, seq: u64) bool {
-        if (worker_id >= self.config.worker_count) return true;
-        const w = &self.workers[worker_id];
+    pub fn release(self: *Self, queue: QueueId, seq: u64) bool {
+        if (queue.index() >= self.config.worker_count) return true;
+        const w = &self.workers[queue.index()];
 
         // Drop the ref first (no future bodyRef/readBody can read the
         // soon-to-be-freed bytes), capturing the owning batch_id.
@@ -609,7 +637,7 @@ pub const BlobCoordinator = struct {
         // ref is dropped only here) — treat as released.
         const batch = self.retained_by_batch.get(batch_id) orelse return true;
         for (batch.entries.items) |*e| {
-            if (e.worker_id == worker_id and e.seq == seq) {
+            if (e.worker_id == queue.index() and e.seq == seq) {
                 if (e.bytes.len > 0) self.allocator.free(e.bytes);
                 e.bytes = &.{};
                 break;
@@ -639,12 +667,12 @@ pub const BlobCoordinator = struct {
     /// To wait for "seq N is durable", call with `target_exclusive = N + 1`.
     pub fn waitForSeq(
         self: *Self,
-        worker_id: u8,
+        queue: QueueId,
         target_exclusive: u64,
         timeout_ns: u64,
     ) !void {
-        std.debug.assert(worker_id < self.config.worker_count);
-        const w = &self.workers[worker_id];
+        std.debug.assert(queue.index() < self.config.worker_count);
+        const w = &self.workers[queue.index()];
         const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
         w.mu.lock();
         defer w.mu.unlock();
@@ -985,6 +1013,11 @@ fn removeFromSorted(list: *std.ArrayListUnmanaged(u64), seq: u64) void {
 
 const testing = std.testing;
 
+/// Test shorthand for a queue id literal.
+fn qid(n: u8) QueueId {
+    return @enumFromInt(n);
+}
+
 /// In-memory blob store fixture for tests. Mirrors the MemBlobStore
 /// pattern in `src/bodies/root.zig`. Optional per-key-prefix delay
 /// + "always fail" mode lets us drive out-of-order completion and
@@ -1094,13 +1127,13 @@ test "coordinator: submit advances durable_seq when batch commits" {
     });
     defer coord.deinit();
 
-    const seq = try coord.submit(0, "hello world");
+    const seq = try coord.submit(qid(0), "hello world");
     try testing.expectEqual(@as(u64, 0), seq);
 
-    try coord.waitForSeq(0, 1, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(0));
+    try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
 
-    const ref = try coord.bodyRef(0, 0);
+    const ref = try coord.bodyRef(qid(0), 0);
     try testing.expectEqual(@as(u64, 0), ref.offset);
     try testing.expectEqual(@as(u32, 11), ref.len);
     // Local-mode counter starts at 1; first batch_id should be 1.
@@ -1132,19 +1165,19 @@ test "coordinator: HWM is monotonic across in-flight + queued seqs" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "AAAA");
+    _ = try coord.submit(qid(0), "AAAA");
     // Sleep a tick so the first submission is sealed into its own
     // batch before the next two land.
     std.Thread.sleep(5 * std.time.ns_per_ms);
-    _ = try coord.submit(0, "BBBB");
-    _ = try coord.submit(0, "CCCC");
+    _ = try coord.submit(qid(0), "BBBB");
+    _ = try coord.submit(qid(0), "CCCC");
 
     // Mid-flight: HWM is still 0 (seq 0 not committed yet).
-    try testing.expectEqual(@as(u64, 0), coord.durableSeq(0));
+    try testing.expectEqual(@as(u64, 0), coord.durableSeq(qid(0)));
 
     // After all batches commit, HWM jumps to 3.
-    try coord.waitForSeq(0, 3, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 3), coord.durableSeq(0));
+    try coord.waitForSeq(qid(0), 3, 5 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 3), coord.durableSeq(qid(0)));
 }
 
 test "coordinator: rejects oversized submit" {
@@ -1159,7 +1192,7 @@ test "coordinator: rejects oversized submit" {
 
     const big = try testing.allocator.alloc(u8, 2048);
     defer testing.allocator.free(big);
-    try testing.expectError(Error.SubmissionTooLarge, coord.submit(0, big));
+    try testing.expectError(Error.SubmissionTooLarge, coord.submit(qid(0), big));
 }
 
 test "coordinator: rejects invalid worker_id" {
@@ -1171,7 +1204,7 @@ test "coordinator: rejects invalid worker_id" {
     });
     defer coord.deinit();
 
-    try testing.expectError(Error.InvalidWorkerId, coord.submit(7, "x"));
+    try testing.expectError(Error.InvalidWorkerId, coord.submit(qid(7), "x"));
 }
 
 test "coordinator: terminal failure stalls durable_seq + bodyRef returns PutFailed" {
@@ -1185,22 +1218,22 @@ test "coordinator: terminal failure stalls durable_seq + bodyRef returns PutFail
     });
     defer coord.deinit();
 
-    const seq = try coord.submit(0, "doomed");
+    const seq = try coord.submit(qid(0), "doomed");
     try testing.expectEqual(@as(u64, 0), seq);
 
     // Poll until the executor has marked the seq as failed in refs.
     // durable_seq sticks at 0 forever (seq 0 unfinished + failed).
     const deadline = std.time.nanoTimestamp() + std.time.ns_per_s;
     while (std.time.nanoTimestamp() < deadline) {
-        if (coord.bodyRef(0, 0)) |_| unreachable else |err| {
+        if (coord.bodyRef(qid(0), 0)) |_| unreachable else |err| {
             if (err == Error.PutFailed) break;
             if (err != Error.UnknownSeq) return err;
         }
         std.Thread.sleep(1 * std.time.ns_per_ms);
     } else return error.TestTimeout;
 
-    try testing.expectEqual(@as(u64, 0), coord.durableSeq(0));
-    try testing.expectError(Error.PutFailed, coord.bodyRef(0, 0));
+    try testing.expectEqual(@as(u64, 0), coord.durableSeq(qid(0)));
+    try testing.expectError(Error.PutFailed, coord.bodyRef(qid(0), 0));
 }
 
 test "coordinator: readBody returns submitted bytes from RAM" {
@@ -1212,27 +1245,27 @@ test "coordinator: readBody returns submitted bytes from RAM" {
     });
     defer coord.deinit();
 
-    const s0 = try coord.submit(0, "hello chunk zero");
-    const s1 = try coord.submit(0, "second chunk!!");
-    const sw = try coord.submit(1, "other worker");
+    const s0 = try coord.submit(qid(0), "hello chunk zero");
+    const s1 = try coord.submit(qid(0), "second chunk!!");
+    const sw = try coord.submit(qid(1), "other worker");
 
-    try coord.waitForSeq(0, 2, 5 * std.time.ns_per_s);
-    try coord.waitForSeq(1, 1, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(0), 2, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
 
-    const b0 = try coord.readBody(0, s0, testing.allocator);
+    const b0 = try coord.readBody(qid(0), s0, testing.allocator);
     defer testing.allocator.free(b0);
     try testing.expectEqualStrings("hello chunk zero", b0);
 
-    const b1 = try coord.readBody(0, s1, testing.allocator);
+    const b1 = try coord.readBody(qid(0), s1, testing.allocator);
     defer testing.allocator.free(b1);
     try testing.expectEqualStrings("second chunk!!", b1);
 
-    const bw = try coord.readBody(1, sw, testing.allocator);
+    const bw = try coord.readBody(qid(1), sw, testing.allocator);
     defer testing.allocator.free(bw);
     try testing.expectEqualStrings("other worker", bw);
 
     // Never-submitted seq → UnknownSeq.
-    try testing.expectError(Error.UnknownSeq, coord.readBody(0, 999, testing.allocator));
+    try testing.expectError(Error.UnknownSeq, coord.readBody(qid(0), 999, testing.allocator));
 }
 
 test "coordinator: release frees retained batch when fully consumed" {
@@ -1244,16 +1277,16 @@ test "coordinator: release frees retained batch when fully consumed" {
     });
     defer coord.deinit();
 
-    const s0 = try coord.submit(0, "alpha");
-    const s1 = try coord.submit(0, "bravo");
-    const sw = try coord.submit(1, "charlie");
-    try coord.waitForSeq(0, 2, 5 * std.time.ns_per_s);
-    try coord.waitForSeq(1, 1, 5 * std.time.ns_per_s);
+    const s0 = try coord.submit(qid(0), "alpha");
+    const s1 = try coord.submit(qid(0), "bravo");
+    const sw = try coord.submit(qid(1), "charlie");
+    try coord.waitForSeq(qid(0), 2, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
 
     // All readable before release; some batch(es) retained. (Whether
     // the three submits seal into one or several batches is timing-
     // dependent, so don't assert an exact count here.)
-    const b0 = try coord.readBody(0, s0, testing.allocator);
+    const b0 = try coord.readBody(qid(0), s0, testing.allocator);
     testing.allocator.free(b0);
     coord.retained_mu.lock();
     try testing.expect(coord.retained.items.len >= 1);
@@ -1261,35 +1294,35 @@ test "coordinator: release frees retained batch when fully consumed" {
 
     // Releasing a durable seq succeeds + drops its ref (readBody →
     // UnknownSeq) but leaves the others consumable.
-    try testing.expect(coord.release(0, s0));
-    try testing.expectError(Error.UnknownSeq, coord.readBody(0, s0, testing.allocator));
-    const b1 = try coord.readBody(0, s1, testing.allocator);
+    try testing.expect(coord.release(qid(0), s0));
+    try testing.expectError(Error.UnknownSeq, coord.readBody(qid(0), s0, testing.allocator));
+    const b1 = try coord.readBody(qid(0), s1, testing.allocator);
     testing.allocator.free(b1);
 
     // Releasing EVERY submitted seq frees all retained state — the
     // invariant: no batch outlives consumption (regardless of how they
     // were batched).
-    try testing.expect(coord.release(0, s1));
-    try testing.expect(coord.release(1, sw));
+    try testing.expect(coord.release(qid(0), s1));
+    try testing.expect(coord.release(qid(1), sw));
     coord.retained_mu.lock();
     try testing.expectEqual(@as(usize, 0), coord.retained.items.len);
     try testing.expectEqual(@as(usize, 0), coord.retained_by_batch.count());
     coord.retained_mu.unlock();
-    try testing.expectError(Error.UnknownSeq, coord.readBody(0, s1, testing.allocator));
+    try testing.expectError(Error.UnknownSeq, coord.readBody(qid(0), s1, testing.allocator));
 
     // Releasing an already-released / unknown seq returns false (the
     // "retry later" signal — here it's terminal, but the caller treats
     // false as "not yet").
-    try testing.expect(!coord.release(0, s0));
-    try testing.expect(!coord.release(1, 12345));
+    try testing.expect(!coord.release(qid(0), s0));
+    try testing.expect(!coord.release(qid(1), 12345));
 
     // A never-durable seq: release returns false (retry later), and a
     // later retry after it becomes durable succeeds.
-    const s2 = try coord.submit(0, "delta");
+    const s2 = try coord.submit(qid(0), "delta");
     // Before durability the ref isn't set → release defers.
-    if (coord.durableSeq(0) <= s2) try testing.expect(!coord.release(0, s2));
-    try coord.waitForSeq(0, s2 + 1, 5 * std.time.ns_per_s);
-    try testing.expect(coord.release(0, s2));
+    if (coord.durableSeq(qid(0)) <= s2) try testing.expect(!coord.release(qid(0), s2));
+    try coord.waitForSeq(qid(0), s2 + 1, 5 * std.time.ns_per_s);
+    try testing.expect(coord.release(qid(0), s2));
 }
 
 test "coordinator: per-worker HWMs are independent" {
@@ -1301,16 +1334,16 @@ test "coordinator: per-worker HWMs are independent" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "a");
-    _ = try coord.submit(1, "b");
-    _ = try coord.submit(2, "c");
+    _ = try coord.submit(qid(0), "a");
+    _ = try coord.submit(qid(1), "b");
+    _ = try coord.submit(qid(2), "c");
 
-    try coord.waitForSeq(0, 1, 5 * std.time.ns_per_s);
-    try coord.waitForSeq(1, 1, 5 * std.time.ns_per_s);
-    try coord.waitForSeq(2, 1, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(0));
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(1));
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(2));
+    try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(2), 1, 5 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(1)));
+    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(2)));
 }
 
 test "coordinator: retries SlowDown then succeeds" {
@@ -1330,11 +1363,11 @@ test "coordinator: retries SlowDown then succeeds" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "persistent");
+    _ = try coord.submit(qid(0), "persistent");
 
-    try coord.waitForSeq(0, 1, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(0));
-    _ = try coord.bodyRef(0, 0); // .durable, no error
+    try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
+    _ = try coord.bodyRef(qid(0), 0); // .durable, no error
     try testing.expectEqual(@as(u32, 4), store.put_attempts.load(.monotonic));
 }
 
@@ -1354,18 +1387,18 @@ test "coordinator: retry budget exhausted → terminal PutFailed" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "doomed");
+    _ = try coord.submit(qid(0), "doomed");
 
     const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
     while (std.time.nanoTimestamp() < deadline) {
-        if (coord.bodyRef(0, 0)) |_| unreachable else |err| {
+        if (coord.bodyRef(qid(0), 0)) |_| unreachable else |err| {
             if (err == Error.PutFailed) break;
             if (err != Error.UnknownSeq) return err;
         }
         std.Thread.sleep(1 * std.time.ns_per_ms);
     } else return error.TestTimeout;
 
-    try testing.expectEqual(@as(u64, 0), coord.durableSeq(0));
+    try testing.expectEqual(@as(u64, 0), coord.durableSeq(qid(0)));
     try testing.expectEqual(@as(u32, 5), store.put_attempts.load(.monotonic));
 }
 
@@ -1383,11 +1416,11 @@ test "coordinator: non-SlowDown error is terminal on first attempt" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "doomed");
+    _ = try coord.submit(qid(0), "doomed");
 
     const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
     while (std.time.nanoTimestamp() < deadline) {
-        if (coord.bodyRef(0, 0)) |_| unreachable else |err| {
+        if (coord.bodyRef(qid(0), 0)) |_| unreachable else |err| {
             if (err == Error.PutFailed) break;
             if (err != Error.UnknownSeq) return err;
         }
@@ -1413,22 +1446,22 @@ test "coordinator: cross-tenant pool — different workers share one batch" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "AAAA");
-    _ = try coord.submit(1, "BBBB");
+    _ = try coord.submit(qid(0), "AAAA");
+    _ = try coord.submit(qid(1), "BBBB");
 
-    try coord.waitForSeq(0, 1, 5 * std.time.ns_per_s);
-    try coord.waitForSeq(1, 1, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
 
-    const ref0 = try coord.bodyRef(0, 0);
-    const ref1 = try coord.bodyRef(1, 0);
+    const ref0 = try coord.bodyRef(qid(0), 0);
+    const ref1 = try coord.bodyRef(qid(1), 0);
     // If both submissions made it into the same drain pass, they
     // share a batch_id. The drainer's behavior is timing-dependent,
     // so we only assert the weaker contract: distinct workers can
     // resolve durably without collision and reference valid bytes.
     _ = ref0;
     _ = ref1;
-    try testing.expect(coord.durableSeq(0) == 1);
-    try testing.expect(coord.durableSeq(1) == 1);
+    try testing.expect(coord.durableSeq(qid(0)) == 1);
+    try testing.expect(coord.durableSeq(qid(1)) == 1);
 }
 
 test "coordinator: executor_size knob bounds concurrency" {
@@ -1448,11 +1481,11 @@ test "coordinator: executor_size knob bounds concurrency" {
     defer coord.deinit();
 
     const t0 = std.time.nanoTimestamp();
-    _ = try coord.submit(0, "1");
-    _ = try coord.submit(0, "2");
-    _ = try coord.submit(0, "3");
+    _ = try coord.submit(qid(0), "1");
+    _ = try coord.submit(qid(0), "2");
+    _ = try coord.submit(qid(0), "3");
 
-    try coord.waitForSeq(0, 3, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(0), 3, 5 * std.time.ns_per_s);
     const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - t0);
     // 3 serial 100ms PUTs => >= 300ms.
     try testing.expect(elapsed_ns >= 280 * std.time.ns_per_ms);
@@ -1520,12 +1553,12 @@ test "coordinator: reservation mints unique batch_ids from raft block" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "one");
-    _ = try coord.submit(0, "two");
-    try coord.waitForSeq(0, 2, 5 * std.time.ns_per_s);
+    _ = try coord.submit(qid(0), "one");
+    _ = try coord.submit(qid(0), "two");
+    try coord.waitForSeq(qid(0), 2, 5 * std.time.ns_per_s);
 
-    const r0 = try coord.bodyRef(0, 0);
-    const r1 = try coord.bodyRef(0, 1);
+    const r0 = try coord.bodyRef(qid(0), 0);
+    const r1 = try coord.bodyRef(qid(0), 1);
     // batch_ids come from the reservation block [0, 100). Both are
     // strictly less than the new_end (100) and may equal each other
     // when both submissions land in the same drainer pass + same
@@ -1555,9 +1588,9 @@ test "coordinator: reservation retries on provider failure" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(0, "x");
-    try coord.waitForSeq(0, 1, 5 * std.time.ns_per_s);
-    const r = try coord.bodyRef(0, 0);
+    _ = try coord.submit(qid(0), "x");
+    try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+    const r = try coord.bodyRef(qid(0), 0);
     try testing.expect(r.batch_id < 10);
 
     res.mu.lock();

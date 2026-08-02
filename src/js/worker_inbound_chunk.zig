@@ -31,6 +31,7 @@
 //! which a writing chunk reaches only at raft commit.
 
 const std = @import("std");
+const blob_mod = @import("rove-blob");
 
 /// Per-fire payload bound. Queued arrivals concatenate/slice into
 /// fires up to this size.
@@ -61,7 +62,7 @@ pub const Prepared = struct {
     done: bool = false,
     coord: CoordState = .unsubmitted,
     /// Coordinator durability key (valid from `.pending`).
-    wid: u8 = 0,
+    wid: blob_mod.coordinator.QueueId = @enumFromInt(0),
     seq: u64 = 0,
     /// Materialized wire BodyRef (valid when `.resolved`); plain ints
     /// so this file stays import-free.

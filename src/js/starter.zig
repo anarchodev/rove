@@ -13,6 +13,7 @@ const std = @import("std");
 const kv_mod = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
+const tenant_mod = @import("rove-tenant");
 
 // ── Starter content ────────────────────────────────────────────────
 //
@@ -52,9 +53,8 @@ pub const BakedStatic = struct { path: []const u8, content: []const u8, content_
 /// it through raft alongside the rest of the signup writeset.
 pub fn deployStarterContent(
     allocator: std.mem.Allocator,
-    inst_id: []const u8,
-    /// The target instance's storage incarnation (`Instance.incarnation`).
-    incarnation: []const u8,
+    /// The target instance's storage handle (`Instance.storage`).
+    storage: tenant_mod.TenantStorage,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
@@ -62,8 +62,7 @@ pub fn deployStarterContent(
 ) !u64 {
     return deployBakedBundle(
         allocator,
-        inst_id,
-        incarnation,
+        storage,
         blob_cfg,
         compile_fn,
         compile_ctx,
@@ -79,9 +78,8 @@ pub fn deployStarterContent(
 /// `release_ws`'s `_deploy/current` through raft.
 pub fn deployGenesisAdminContent(
     allocator: std.mem.Allocator,
-    inst_id: []const u8,
-    /// The target instance's storage incarnation (`Instance.incarnation`).
-    incarnation: []const u8,
+    /// The target instance's storage handle (`Instance.storage`).
+    storage: tenant_mod.TenantStorage,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
@@ -89,8 +87,7 @@ pub fn deployGenesisAdminContent(
 ) !u64 {
     return deployBakedBundle(
         allocator,
-        inst_id,
-        incarnation,
+        storage,
         blob_cfg,
         compile_fn,
         compile_ctx,
@@ -111,11 +108,10 @@ pub fn deployGenesisAdminContent(
 /// worker's deploy thread (`compileAndStage`), just with baked inputs.
 pub fn deployBakedBundle(
     allocator: std.mem.Allocator,
-    inst_id: []const u8,
-    /// The target instance's storage incarnation (`Instance.incarnation`);
-    /// empty for a legacy instance. Staged blobs must land under the same
-    /// lifetime-scoped prefix the serving path reads from.
-    incarnation: []const u8,
+    /// The target instance's storage handle (`Instance.storage`). Staged
+    /// blobs must land under the same lifetime-scoped prefix the serving
+    /// path reads from.
+    storage: tenant_mod.TenantStorage,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
@@ -123,13 +119,7 @@ pub fn deployBakedBundle(
     handlers: []const BakedHandler,
     statics: []const BakedStatic,
 ) !u64 {
-    var blob_backend = try blob_mod.BlobBackend.openPerTenantIncarnation(
-        allocator,
-        blob_cfg,
-        inst_id,
-        incarnation,
-        "file-blobs",
-    );
+    var blob_backend = try storage.openBackend(allocator, blob_cfg, "file-blobs");
     defer blob_backend.deinit();
 
     const inputs = try allocator.alloc(files_mod.DeployInput, handlers.len);
@@ -181,13 +171,7 @@ pub fn deployBakedBundle(
     const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries, &.{}, &.{});
     defer allocator.free(json_bytes);
 
-    var manifest_be = try blob_mod.BlobBackend.openPerTenantIncarnation(
-        allocator,
-        blob_cfg,
-        inst_id,
-        incarnation,
-        "deployments",
-    );
+    var manifest_be = try storage.openBackend(allocator, blob_cfg, "deployments");
     defer manifest_be.deinit();
 
     var key_buf: [25]u8 = undefined;

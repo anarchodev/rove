@@ -266,7 +266,7 @@ fn workerMain(args: *WorkerCtx) !void {
         // previous leader had already handed out (rove#281). Pack the node id
         // in too. Refusing to start beats minting colliding ids: a collision is
         // a record that is indexed nowhere and can never be replayed.
-        .log_worker_id = blk: {
+        .minter_id = blk: {
             const node_id: u64 = if (std.posix.getenv("REWIND_NODE_ID")) |v|
                 std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t"), 10) catch {
                     std.debug.print("error: REWIND_NODE_ID is not a number\n", .{});
@@ -274,7 +274,7 @@ fn workerMain(args: *WorkerCtx) !void {
                 }
             else
                 1; // single-node: the only minter, so any stable identity works.
-            break :blk log_mod.RequestIdMinter.mintIdentity(node_id, args.worker_idx) catch {
+            break :blk log_mod.MinterId.init(node_id, args.worker_idx) catch {
                 std.debug.print(
                     "error: REWIND_NODE_ID={d} / worker index {d} do not fit a minter identity " ++
                         "(node 1-255, worker 0-255). Request ids would collide across minters.\n",
@@ -473,14 +473,14 @@ const PumpStores = struct {
         // stays globally monotonic across both handles.
         self.tenant.createInstance(id_str) catch return null;
         const inst = (self.tenant.getInstance(id_str) catch null) orelse return null;
-        // `inst.store_id`, never a fresh hash of the name: the instance's store
-        // is keyed by (id, incarnation), so re-hashing the id here would open
-        // the PREVIOUS tenant-lifetime's store and apply writesets into it
-        // while the dispatcher reads the current one (#357).
+        // `inst.storage.storeId()`, never a fresh hash of the name: the
+        // instance's store is keyed by (id, incarnation), so re-hashing the
+        // id here would open the PREVIOUS tenant-lifetime's store and apply
+        // writesets into it while the dispatcher reads the current one (#357).
         const h = kv.KvStore.attachSibling(
             self.allocator,
             self.tenant.root,
-            inst.store_id,
+            inst.storage.storeId(),
             inst.kv.counter,
         ) catch return null;
         const key = self.allocator.dupe(u8, id_str) catch {

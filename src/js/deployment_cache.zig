@@ -1075,11 +1075,9 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     // pre-quorum crash loses the volatile speculative overlay, so
     // there are no orphan rows to recover.)
 
-    var blob_backend = try blob_mod.BlobBackend.openPerTenantIncarnation(
+    var blob_backend = try inst.storage.openBackend(
         allocator,
         dc.blob_backend_cfg,
-        inst.id,
-        inst.incarnation,
         "file-blobs",
     );
     errdefer blob_backend.deinit();
@@ -1105,11 +1103,9 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
             .verify_tls = mh.verify_tls,
         })
     else
-        try blob_mod.BlobBackend.openPerTenantIncarnation(
+        try inst.storage.openBackend(
             allocator,
             dc.blob_backend_cfg,
-            inst.id,
-            inst.incarnation,
             "deployments",
         );
     errdefer manifest_backend.deinit();

@@ -41,7 +41,7 @@ const TenantLog = worker_mod.TenantLog;
 pub fn openTenantLog(
     worker: anytype,
     inst: *const tenant_mod.Instance,
-    worker_id: u16,
+    minter_id: log_mod.MinterId,
 ) !*TenantLog {
     const allocator = worker.allocator;
 
@@ -57,7 +57,7 @@ pub fn openTenantLog(
     };
     tl.id_minter = try log_mod.RequestIdMinter.init(
         allocator,
-        worker_id,
+        minter_id,
         .{
             .seq_kv = inst.kv,
             .seq_key = "_log/next_request_seq",

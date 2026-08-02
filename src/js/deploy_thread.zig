@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const blob_mod = @import("rove-blob");
+const tenant_mod = @import("rove-tenant");
 const files_mod = @import("rove-files");
 const qjs = @import("rove-qjs");
 const components_mod = @import("components.zig");
@@ -160,8 +161,9 @@ pub const DeployThread = struct {
         pkg_hash: []u8 = &.{},
         /// The SCOPE tenant's storage incarnation, resolved by the worker at
         /// submit time. Blobs must stage under the same lifetime-scoped prefix
-        /// the serving path reads from (#357); empty = legacy layout. Owned.
-        incarnation: []u8 = &.{},
+        /// the serving path reads from (#357). No default: a job cannot be
+        /// enqueued without deciding it. `.token` bytes owned (see deinit).
+        incarnation: tenant_mod.Incarnation,
         /// STAGE, don't link: content-address each input's source and return
         /// its hash without compiling. The first half of a deploy — a file
         /// uploaded on its own cannot be compiled, because compilation
@@ -268,7 +270,8 @@ pub const DeployThread = struct {
         };
         const a = self.allocator;
         var put_ok = true;
-        if (blob_mod.BlobBackend.openPerTenantIncarnation(a, self.blob_cfg, job.tenant_id, job.incarnation, "deployments")) |be_const| {
+        const mstorage = tenant_mod.TenantStorage{ .id = job.tenant_id, .incarnation = job.incarnation };
+        if (mstorage.openBackend(a, self.blob_cfg, "deployments")) |be_const| {
             var be = be_const;
             defer be.deinit();
             // Unconditional overwrite — NOT `putBlobIfMissingTo`. The skip-if-
@@ -327,7 +330,8 @@ pub const DeployThread = struct {
             }
         }
 
-        var file_be = blob_mod.BlobBackend.openPerTenantIncarnation(a, self.blob_cfg, job.tenant_id, job.incarnation, "file-blobs") catch |err| {
+        const jstorage = tenant_mod.TenantStorage{ .id = job.tenant_id, .incarnation = job.incarnation };
+        var file_be = jstorage.openBackend(a, self.blob_cfg, "file-blobs") catch |err| {
             std.log.warn("deploy thread: open file-blobs for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
             return fail(self, router, job, 502, "blob backend open failed");
         };
@@ -703,7 +707,7 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     // compile_batch package context (PM P1).
     if (job.resolution_json.len != 0) allocator.free(job.resolution_json);
     if (job.pkg_hash.len != 0) allocator.free(job.pkg_hash);
-    if (job.incarnation.len != 0) allocator.free(job.incarnation);
+    job.incarnation.free(allocator);
     for (job.source_hashes) |h| allocator.free(h);
     if (job.source_hashes.len != 0) allocator.free(job.source_hashes);
 }
@@ -738,6 +742,7 @@ fn makeJob(compile_id: u64, tenant: []const u8) !DeployThread.Job {
         .compile_id = compile_id,
         .kind = .compile_batch,
         .tenant_id = try testing.allocator.dupe(u8, tenant),
+        .incarnation = .legacy,
         .inputs = inputs,
     };
 }
@@ -811,6 +816,7 @@ test "freeJob frees compile_batch routing fields" {
         .compile_id = 1,
         .kind = .compile_batch,
         .tenant_id = try a.dupe(u8, "scope-tenant"),
+        .incarnation = .{ .token = try a.dupe(u8, "aaaa1111") },
         .inputs = inputs,
         .chain_tenant = try a.dupe(u8, "__admin__"),
         .fetch_id = try a.dupe(u8, "deadbeef"),

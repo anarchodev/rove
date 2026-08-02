@@ -35,6 +35,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("raft-kv");
+const blob_mod = @import("rove-blob");
 const tape_mod = @import("rove-tape");
 const log_mod = @import("rove-log");
 const tenant_mod = @import("rove-tenant");
@@ -2126,7 +2127,7 @@ fn resumeContinuation(
         // .wake_batch (with the drained fired prefixes) for an on.* wake.
         .activation = if (wake) .{ .wake_batch = .{ .wakes = batch_owned } } else .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .effects = .{
             .pending_wakes = &pending_wakes,
@@ -2366,7 +2367,7 @@ pub fn resumeBoundFetchChain(
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
@@ -2666,23 +2667,23 @@ const DurableBody = union(enum) {
 /// the caller consumes it is safe.
 fn pollDurableBodyRef(
     coord: anytype,
-    worker_id: u8,
+    queue_id: blob_mod.coordinator.QueueId,
     seq: u64,
     what: []const u8,
     tenant: []const u8,
 ) DurableBody {
     // Count semantics: durableSeq is the exclusive HWM (lowest
     // not-yet-durable seq), so `seq < durableSeq` ⇒ resolved.
-    if (seq >= coord.durableSeq(worker_id)) return .not_yet;
-    const ref = coord.bodyRef(worker_id, seq) catch |err| {
+    if (seq >= coord.durableSeq(queue_id)) return .not_yet;
+    const ref = coord.bodyRef(queue_id, seq) catch |err| {
         std.log.warn(
             "rove-js {s}: coord.bodyRef tenant={s} seq={d}: {s}",
             .{ what, tenant, seq, @errorName(err) },
         );
-        _ = coord.release(worker_id, seq);
+        _ = coord.release(queue_id, seq);
         return .failed;
     };
-    _ = coord.release(worker_id, seq);
+    _ = coord.release(queue_id, seq);
     return .{ .ready = .{ .batch_id = ref.batch_id, .offset = ref.offset, .len = ref.len } };
 }
 
@@ -2707,7 +2708,7 @@ pub fn drainBodyPending(worker: anytype) !void {
 
         // Durability gate (shared with drainFetchPendingDurability) —
         // poll the coord HWM, materialize + release on terminal.
-        switch (pollDurableBodyRef(coord, wait.worker_id, wait.worker_seq, "body-gate", wait.tenant_id)) {
+        switch (pollDurableBodyRef(coord, wait.queue_id, wait.worker_seq, "body-gate", wait.tenant_id)) {
             .not_yet => continue,
             // Body never became durable: mark failed. The dispatch
             // body-gate sees `.failed` and returns 503 (it does NOT
@@ -2753,7 +2754,7 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
         // coord HWM, materialize + release on terminal. The helper
         // releases the coord copy before we swapRemove `pe`, so no
         // pre-capture of (worker_id, seq) is needed.
-        switch (pollDurableBodyRef(coord, pe.worker_id, pe.worker_seq, "fetch-gate", pe.tenant_id_view)) {
+        switch (pollDurableBodyRef(coord, pe.queue_id, pe.worker_seq, "fetch-gate", pe.tenant_id_view)) {
             // Not durable yet — advance; the swapRemove cases below
             // stay at `i` so the swapped-in element is examined next.
             .not_yet => i += 1,
@@ -3046,7 +3047,7 @@ fn advanceInboundChunkGate(worker: anytype, job: anytype) bool {
     for (job.prepared.items) |*pf| {
         switch (pf.coord) {
             .unsubmitted => {
-                const wid = worker.coord_worker_id;
+                const wid = worker.coord_queue_id;
                 if (coord.submit(wid, pf.bytes)) |seq| {
                     pf.wid = wid;
                     pf.seq = seq;
@@ -3289,7 +3290,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .instance_incarnation = inst.incarnation, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,

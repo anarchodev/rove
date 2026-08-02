@@ -7,9 +7,11 @@
 //! and needs a shared backend across leader + followers.
 //!
 //! Each consumer that owns a per-tenant store holds a `BlobBackend`
-//! field; construction goes through `openPerTenant` which builds the
-//! key prefix `{key_prefix_base}{instance_id}/{subdir}/`. `deinit`
-//! and `blobStore()` delegate to the underlying `S3BlobStore`.
+//! field; per-tenant construction goes through
+//! `TenantStorage.openBackend` (rove-tenant's `storage.zig`), which
+//! owns the `{key_prefix_base}{instance_id}[/{incarnation}]/{subdir}/`
+//! prefix rule — this module never derives a per-tenant path itself.
+//! `deinit` and `blobStore()` delegate to the underlying `S3BlobStore`.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -20,10 +22,10 @@ const Error = root.Error;
 
 /// Operator-supplied configuration. Read from env by `env.zig`,
 /// threaded through `WorkerConfig` / `ApplyConfig` / files-server /
-/// log-server, and resolved per-tenant via `openPerTenant`. One
-/// bucket hosts the whole node; per-tenant scoping is the key prefix
-/// `{key_prefix_base}{instance_id}/{subdir}/`. `key_prefix_base` lets
-/// a single bucket host multiple deployments (staging + prod).
+/// log-server, and resolved per-tenant via `TenantStorage.openBackend`.
+/// One bucket hosts the whole node; per-tenant scoping is the key
+/// prefix `{key_prefix_base}{instance_id}/{subdir}/`. `key_prefix_base`
+/// lets a single bucket host multiple deployments (staging + prod).
 pub const BackendConfig = struct {
     endpoint: []const u8 = "",
     region: []const u8 = "",
@@ -71,64 +73,6 @@ pub const BlobBackend = struct {
         cfg: http_blob.HttpBlobStore.Config,
     ) !BlobBackend {
         return .{ .inner = .{ .http = try http_blob.HttpBlobStore.init(allocator, cfg) } };
-    }
-
-    /// Open a per-tenant S3 backend for one tenant's `{subdir}` (e.g.
-    /// `"file-blobs"` or `"log-blobs"`). Builds the key prefix
-    /// `"{key_prefix_base}{instance_id}/{subdir}/"`. Same factory used
-    /// by both `TenantFiles` and `TenantLog` so the per-tenant layout
-    /// in S3 mirrors the on-disk layout exactly.
-    pub fn openPerTenant(
-        allocator: std.mem.Allocator,
-        cfg: BackendConfig,
-        instance_id: []const u8,
-        subdir: []const u8,
-    ) !BlobBackend {
-        return openPerTenantIncarnation(allocator, cfg, instance_id, "", subdir);
-    }
-
-    /// `openPerTenant`, scoped to the tenant's storage INCARNATION — the token
-    /// minted per tenant lifetime (`rove-tenant`'s `MAX_INCARNATION_LEN`).
-    ///
-    /// Deprovision frees a name for reuse, so a prefix keyed on the name alone
-    /// would hand the next holder of that name the previous holder's deployed
-    /// bytes and captured request logs. Keying on the incarnation makes those
-    /// objects unaddressable by construction, whether or not teardown ever
-    /// managed to delete them.
-    ///
-    /// An empty incarnation keeps the legacy `{base}{id}/{subdir}/` layout, so
-    /// instances created before incarnations existed stay where their objects
-    /// already are — no migration, and no risk, since a name could not be
-    /// freed and reused before deprovision.
-    pub fn openPerTenantIncarnation(
-        allocator: std.mem.Allocator,
-        cfg: BackendConfig,
-        instance_id: []const u8,
-        incarnation: []const u8,
-        subdir: []const u8,
-    ) !BlobBackend {
-        const prefix = if (incarnation.len == 0)
-            try std.fmt.allocPrint(
-                allocator,
-                "{s}{s}/{s}/",
-                .{ cfg.key_prefix_base, instance_id, subdir },
-            )
-        else
-            try std.fmt.allocPrint(
-                allocator,
-                "{s}{s}/{s}/{s}/",
-                .{ cfg.key_prefix_base, instance_id, incarnation, subdir },
-            );
-        defer allocator.free(prefix);
-        return openS3(allocator, .{
-            .endpoint = cfg.endpoint,
-            .region = cfg.region,
-            .bucket = cfg.bucket,
-            .key_prefix = prefix,
-            .access_key = cfg.access_key,
-            .secret_key = cfg.secret_key,
-            .use_tls = cfg.use_tls,
-        });
     }
 
     pub fn deinit(self: *BlobBackend) void {
@@ -204,28 +148,3 @@ test "BlobBackend: http variant (no I/O)" {
     try testing.expect(be.inner == .http);
 }
 
-test "openPerTenant: builds {base}{id}/{subdir}/ prefix" {
-    var be = try BlobBackend.openPerTenant(testing.allocator, .{
-        .endpoint = "s3.gra.io.cloud.ovh.net",
-        .region = "gra",
-        .bucket = "loop46-shared",
-        .key_prefix_base = "prod/",
-        .access_key = "ak",
-        .secret_key = "sk",
-    }, "inst-0001", "file-blobs");
-    defer be.deinit();
-    try testing.expectEqualStrings("prod/inst-0001/file-blobs/", be.inner.s3.config.key_prefix);
-    try testing.expectEqualStrings("loop46-shared", be.inner.s3.config.bucket);
-}
-
-test "openPerTenant: empty key_prefix_base" {
-    var be = try BlobBackend.openPerTenant(testing.allocator, .{
-        .endpoint = "s3.gra.io.cloud.ovh.net",
-        .region = "gra",
-        .bucket = "b",
-        .access_key = "ak",
-        .secret_key = "sk",
-    }, "inst-abc", "log-blobs");
-    defer be.deinit();
-    try testing.expectEqualStrings("inst-abc/log-blobs/", be.inner.s3.config.key_prefix);
-}

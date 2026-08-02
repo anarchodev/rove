@@ -14,6 +14,7 @@
 //! home for per-entity cont/stream state.
 
 const std = @import("std");
+const blob_mod = @import("rove-blob");
 const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
 
@@ -530,25 +531,26 @@ pub const UpstreamFetchEvent = struct {
     /// process-global blob coordinator at upstream rate — durable
     /// ground truth decoupled from the held chain's raft cadence —
     /// and stamps the resulting per-worker submission seq here.
-    /// `coord_seq == 0` with `coord_worker_id == 0` and a non-empty
+    /// `coord_seq == 0` with `coord_queue_id == 0` and a non-empty
     /// `bytes` means "not submitted" (unbound chunk, coord absent, or
     /// owner unresolved); the consumer falls back to inline `bytes`.
     /// Consumers that ignore these fields treat `bytes` as the source
     /// of truth; the spool reads bytes back via
-    /// `coord.bodyRef(coord_worker_id, coord_seq)` once the chunk is
-    /// durable. Plain integers — no allocation, so `deinitItem` skips
-    /// them.
+    /// `coord.bodyRef(coord_queue_id, coord_seq)` once the chunk is
+    /// durable. No allocation, so `deinitItem` skips them.
     coord_seq: u64 = 0,
-    /// Companion to `coord_seq`: which coordinator per-worker queue
-    /// the bytes were submitted under (the bound-fetch owner worker's
-    /// id). The consumer polls `coord.durableSeq(coord_worker_id)`
-    /// against `coord_seq` to gate the spool head. See `coord_seq`.
-    coord_worker_id: u8 = 0,
+    /// Companion to `coord_seq`: which coordinator queue the bytes were
+    /// submitted under (the bound-fetch owner worker's queue — a distinct
+    /// type, never any other worker identity; see
+    /// `coordinator.QueueId`). The consumer polls
+    /// `coord.durableSeq(coord_queue_id)` against `coord_seq` to gate
+    /// the spool head. See `coord_seq`.
+    coord_queue_id: blob_mod.coordinator.QueueId = @enumFromInt(0),
     /// True iff the producer successfully submitted this chunk's bytes
-    /// to the coordinator (so `coord_seq`/`coord_worker_id` are
+    /// to the coordinator (so `coord_seq`/`coord_queue_id` are
     /// meaningful and the bytes can be read back via
     /// `coord.readBody`). Needed because `coord_seq == 0` /
-    /// `coord_worker_id == 0` are both legitimate values — there is no
+    /// `coord_queue_id == 0` are both legitimate values — there is no
     /// in-band sentinel. The spool only evicts inline bytes for chunks
     /// where this is set; un-submitted chunks (coord absent, owner
     /// unresolved) stay inline.

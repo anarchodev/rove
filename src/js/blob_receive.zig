@@ -36,6 +36,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const blob_mod = @import("rove-blob");
+const tenant_mod = @import("rove-tenant");
 const components_mod = @import("components.zig");
 const msg_router_mod = @import("msg_router.zig");
 
@@ -109,7 +110,8 @@ pub const Job = struct {
     /// The STAGING tenant's storage incarnation — whichever of the two above
     /// the bytes land under. Resolved at arm time, because the receive runs
     /// long after and must write where the serving path will read (#357).
-    stage_incarnation: []u8,
+    /// `.token` bytes owned by the job.
+    stage_incarnation: tenant_mod.Incarnation,
     /// Issue-time `ctx` (JSON) echoed back in the completion under `app` so the
     /// admin deploy app can thread {tenant, path, content_type} across the
     /// receive re-entry. Empty when absent.
@@ -139,7 +141,7 @@ pub const Job = struct {
         cfg: *const blob_mod.backend.BackendConfig,
         tenant_id: []const u8,
         target_id: ?[]const u8,
-        stage_incarnation: []const u8,
+        stage_incarnation: tenant_mod.Incarnation,
         app_ctx: []const u8,
         fetch_id: []const u8,
         name: []const u8,
@@ -150,7 +152,7 @@ pub const Job = struct {
         const tenant_owned = try allocator.dupe(u8, tenant_id);
         errdefer allocator.free(tenant_owned);
         const target_owned: ?[]u8 = if (target_id) |t| try allocator.dupe(u8, t) else null;
-        const inc_owned = try allocator.dupe(u8, stage_incarnation);
+        const inc_owned = try stage_incarnation.dupe(allocator);
         errdefer if (target_owned) |t| allocator.free(t);
         const ctx_owned = try allocator.dupe(u8, app_ctx);
         errdefer allocator.free(ctx_owned);
@@ -180,7 +182,7 @@ pub const Job = struct {
         for (self.chunks.items) |ch| self.allocator.free(ch);
         self.chunks.deinit(self.allocator);
         self.allocator.free(self.tenant_id);
-        self.allocator.free(self.stage_incarnation);
+        self.stage_incarnation.free(self.allocator);
         if (self.target_id) |t| self.allocator.free(t);
         self.allocator.free(self.app_ctx);
         self.allocator.free(self.fetch_id);
@@ -299,13 +301,8 @@ pub const Job = struct {
         // namespace (`file-blobs`); an own-tenant receive uses `app-blobs`.
         const stage_tenant = self.target_id orelse self.tenant_id;
         const subdir: []const u8 = if (self.target_id != null) "file-blobs" else "app-blobs";
-        var backend = try blob_mod.backend.BlobBackend.openPerTenantIncarnation(
-            a,
-            self.cfg.*,
-            stage_tenant,
-            self.stage_incarnation,
-            subdir,
-        );
+        const storage = tenant_mod.TenantStorage{ .id = stage_tenant, .incarnation = self.stage_incarnation };
+        var backend = try storage.openBackend(a, self.cfg.*, subdir);
         defer backend.deinit();
         const s3 = &backend.inner.s3;
 
