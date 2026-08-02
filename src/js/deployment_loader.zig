@@ -46,10 +46,49 @@
 
 const std = @import("std");
 
+/// What failed, in the callback's own words, for the loader's failure line.
+///
+/// A load failure is reported HERE and nowhere else: the release POST has
+/// already returned 200 (see the model above), so this line and
+/// `failures_total` are the only signal a deploy did not take effect. An
+/// error name alone ("SubscriptionSpecMissingField") does not say WHICH
+/// subscription or which field, and the callback cannot log it itself
+/// without duplicating what this line already reports.
+///
+/// Fixed buffer, copied — NOT a borrowed slice. The interesting text
+/// (subscription names, spec fields) points into a manifest the callback
+/// frees while unwinding, so a slice would dangle by the time it is read.
+pub const Detail = struct {
+    /// Sized for the longest message plus a long subscription name: the
+    /// retired-kind recipes run past 290 bytes on their own.
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+
+    /// Record the detail, truncating rather than failing — a diagnostic must
+    /// never be the reason an error path takes a different turn.
+    ///
+    /// `getWritten` reports exactly the bytes written, so the length can
+    /// never exceed them. `bufPrint` would report the overflow without
+    /// saying how much it wrote, leaving the recovery path to assume the
+    /// whole buffer was filled — true only as long as every formatter
+    /// writes partially before giving up, which is not a documented
+    /// guarantee. This does not depend on it.
+    pub fn set(self: *Detail, comptime fmt: []const u8, args: anytype) void {
+        var stream = std.io.fixedBufferStream(&self.buf);
+        stream.writer().print(fmt, args) catch {};
+        self.len = stream.getWritten().len;
+    }
+
+    pub fn slice(self: *const Detail) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 pub const LoadFn = *const fn (
     worker_ctx: ?*anyopaque,
     tenant_id: []const u8,
     dep_id: u64,
+    detail: *Detail,
 ) anyerror!void;
 
 pub const DeploymentLoader = struct {
@@ -242,11 +281,19 @@ pub const DeploymentLoader = struct {
 
     fn drainAll(self: *DeploymentLoader) void {
         while (self.popOne()) |entry| {
-            self.load_fn(self.worker_ctx, entry.tenant_id, entry.dep_id) catch |err| {
-                std.log.warn(
-                    "deployment loader: tenant {s} dep {d} failed (attempt {d}): {s}",
-                    .{ entry.tenant_id, entry.dep_id, entry.attempt + 1, @errorName(err) },
-                );
+            var detail: Detail = .{};
+            self.load_fn(self.worker_ctx, entry.tenant_id, entry.dep_id, &detail) catch |err| {
+                if (detail.len > 0) {
+                    std.log.warn(
+                        "deployment loader: tenant {s} dep {d} failed (attempt {d}): {s} — {s}",
+                        .{ entry.tenant_id, entry.dep_id, entry.attempt + 1, @errorName(err), detail.slice() },
+                    );
+                } else {
+                    std.log.warn(
+                        "deployment loader: tenant {s} dep {d} failed (attempt {d}): {s}",
+                        .{ entry.tenant_id, entry.dep_id, entry.attempt + 1, @errorName(err) },
+                    );
+                }
                 _ = self.failures_total.fetchAdd(1, .monotonic);
                 self.parkRetry(entry) catch |park_err| std.log.warn(
                     "deployment loader: tenant {s} retry park failed: {s} — load dropped until the next release/restart",
@@ -345,10 +392,60 @@ const TestCounter = struct {
     last_dep_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
-fn testLoadFn(ctx_opaque: ?*anyopaque, _: []const u8, dep_id: u64) anyerror!void {
+fn testLoadFn(ctx_opaque: ?*anyopaque, _: []const u8, dep_id: u64, _: *Detail) anyerror!void {
     const ctx: *TestCounter = @ptrCast(@alignCast(ctx_opaque.?));
     _ = ctx.calls.fetchAdd(1, .acq_rel);
     ctx.last_dep_id.store(dep_id, .release);
+}
+
+test "Detail: records, and truncates to what fit rather than undefined bytes" {
+    var d: Detail = .{};
+    try testing.expectEqualStrings("", d.slice());
+
+    d.set("subscription `{s}` kind=kv missing `{s}` field", .{ "orders", "prefix" });
+    try testing.expectEqualStrings(
+        "subscription `orders` kind=kv missing `prefix` field",
+        d.slice(),
+    );
+
+    // Overflow must yield a SHORT message, never `len` running past what was
+    // actually written — the loader logs `slice()` verbatim, so a too-long
+    // length would print the buffer's undefined tail. The retired-kind
+    // recipes are ~291 bytes, so this path is reachable in production, not
+    // theoretical.
+    var big: Detail = .{};
+    const long = "x" ** 900;
+    big.set("{s}", .{long});
+    try testing.expectEqual(big.buf.len, big.len);
+    try testing.expectEqualStrings(long[0..big.buf.len], big.slice());
+
+    // Every byte reported is a byte written — asserted for an overflow on a
+    // LATER segment, where a length taken from the buffer's capacity rather
+    // than from the write would be reporting bytes no formatter promised to
+    // have filled.
+    var edge: Detail = .{};
+    const pad = "y" ** 510;
+    edge.set("{s}{d}", .{ pad, 12345 });
+    try testing.expect(edge.len <= edge.buf.len);
+    for (edge.slice(), 0..) |c, i| {
+        if (i < pad.len) {
+            try testing.expectEqual(@as(u8, 'y'), c);
+        } else {
+            try testing.expect(c >= '0' and c <= '9');
+        }
+    }
+
+    // The longest real message fits without truncation.
+    var recipe: Detail = .{};
+    recipe.set(
+        "subscription `{s}` kind=cron is retired — register recurrence from any " ++
+            "handler activation instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) " ++
+            "or a self-re-arming `schedule({{in: ms}}, ..., {{key}})` for sub-minute intervals; " ++
+            "registrations are idempotent by key and survive deploys",
+        .{"a-subscription-with-a-fairly-long-name"},
+    );
+    try testing.expect(recipe.len < recipe.buf.len);
+    try testing.expect(std.mem.endsWith(u8, recipe.slice(), "survive deploys"));
 }
 
 test "enqueue + drainSync calls load_fn once per tenant" {
@@ -385,7 +482,7 @@ const FlakyCounter = struct {
     fail_first: u32,
 };
 
-fn flakyLoadFn(ctx_opaque: ?*anyopaque, _: []const u8, _: u64) anyerror!void {
+fn flakyLoadFn(ctx_opaque: ?*anyopaque, _: []const u8, _: u64, _: *Detail) anyerror!void {
     const ctx: *FlakyCounter = @ptrCast(@alignCast(ctx_opaque.?));
     const n = ctx.calls.fetchAdd(1, .acq_rel);
     if (n < ctx.fail_first) return error.TransientFetchFailure;

@@ -158,6 +158,7 @@ fn discoverSubscriptions(
     allocator: std.mem.Allocator,
     manifest: files_mod.manifest_json.Manifest,
     bs: anytype,
+    detail: ?*deployment_loader_mod.Detail,
 ) ![]globals.SubscriptionEntry {
     var handler_paths: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer handler_paths.deinit(allocator);
@@ -204,16 +205,16 @@ fn discoverSubscriptions(
         const hash = e.value_ptr.*;
 
         const handler_path = handler_paths.get(name) orelse {
-            std.log.err(
-                "rove-js: subscription `{s}` has spec.json but no index.mjs/index.js handler",
+            if (detail) |d| d.set(
+                "subscription `{s}` has spec.json but no index.mjs/index.js handler",
                 .{name},
             );
             return error.SubscriptionMissingHandler;
         };
 
         const spec_bytes = bs.get(&hash, allocator) catch |err| {
-            std.log.err(
-                "rove-js: subscription `{s}` spec.json fetch failed: {s}",
+            if (detail) |d| d.set(
+                "subscription `{s}` spec.json fetch failed: {s}",
                 .{ name, @errorName(err) },
             );
             return error.SubscriptionSpecFetch;
@@ -226,15 +227,15 @@ fn discoverSubscriptions(
             spec_bytes,
             .{ .ignore_unknown_fields = true },
         ) catch |err| {
-            std.log.err(
-                "rove-js: subscription `{s}` spec.json parse failed: {s}",
+            if (detail) |d| d.set(
+                "subscription `{s}` spec.json parse failed: {s}",
                 .{ name, @errorName(err) },
             );
             return error.SubscriptionSpecInvalidJson;
         };
         defer parsed.deinit();
 
-        const spec_typed = try translateSpec(allocator, name, parsed.value);
+        const spec_typed = try translateSpec(allocator, name, parsed.value, detail);
 
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
@@ -254,33 +255,38 @@ fn discoverSubscriptions(
 /// Convert the JSON-shape spec into the typed tagged-union. The
 /// returned `Spec` owns any inner allocations (allocator-duped
 /// strings); caller must `deinit` on error paths.
+/// Silent: every failure is a distinct error and the operator message is
+/// the loader's (`deployment_loader.Detail`). `detail` records WHICH
+/// subscription and what about it — the error value alone cannot, and the
+/// caller has no way to re-derive it.
 fn translateSpec(
     allocator: std.mem.Allocator,
     name: []const u8,
     raw: SubscriptionSpecJson,
+    detail: ?*deployment_loader_mod.Detail,
 ) !globals.SubscriptionEntry.Spec {
     if (std.mem.eql(u8, raw.kind, "cron")) {
         // The manifest cron subscription (a non-durable in-memory
         // interval clock) is not supported — the durable scheduler
         // replaces it. Fail the deploy loudly with the migration
         // recipe instead of silently ignoring the spec.
-        std.log.err(
-            "rove-js: subscription `{s}` kind=cron is retired — register recurrence from any " ++
+        if (detail) |d| d.set(
+            "subscription `{s}` kind=cron is retired — register recurrence from any " ++
                 "handler activation instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) " ++
                 "or a self-re-arming `schedule({{in: ms}}, ..., {{key}})` for sub-minute intervals; " ++
                 "registrations are idempotent by key and survive deploys",
             .{name},
         );
-        return error.SubscriptionSpecUnknownKind;
+        return error.SubscriptionKindRetiredCron;
     }
     if (std.mem.eql(u8, raw.kind, "kv")) {
         const prefix = raw.prefix orelse {
-            std.log.err("rove-js: subscription `{s}` kind=kv missing `prefix` field", .{name});
+            if (detail) |d| d.set("subscription `{s}` kind=kv missing `prefix` field", .{name});
             return error.SubscriptionSpecMissingField;
         };
         if (prefix.len == 0) {
-            std.log.err("rove-js: subscription `{s}` kind=kv has empty prefix", .{name});
-            return error.SubscriptionSpecMissingField;
+            if (detail) |d| d.set("subscription `{s}` kind=kv has empty prefix", .{name});
+            return error.SubscriptionSpecEmptyField;
         }
         return .{ .kv = .{ .prefix = try allocator.dupe(u8, prefix) } };
     }
@@ -291,15 +297,88 @@ fn translateSpec(
         // idempotent by key and `_sched/*` entries are durable kv
         // that survive deploys. Fail the deploy loudly with the
         // recipe, same posture as kind=cron.
-        std.log.err(
-            "rove-js: subscription `{s}` kind=boot is retired — seed registrations from any " ++
+        if (detail) |d| d.set(
+            "subscription `{s}` kind=boot is retired — seed registrations from any " ++
                 "handler activation instead (idempotent by key; durable across deploys)",
             .{name},
         );
-        return error.SubscriptionSpecUnknownKind;
+        return error.SubscriptionKindRetiredBoot;
     }
-    std.log.err("rove-js: subscription `{s}` has unknown kind `{s}`", .{ name, raw.kind });
+    if (detail) |d| d.set("subscription `{s}` has unknown kind `{s}`", .{ name, raw.kind });
     return error.SubscriptionSpecUnknownKind;
+}
+
+test "translateSpec: kv round-trips; every rejection is its own error" {
+    const a = std.testing.allocator;
+
+    const spec = try translateSpec(a, "orders", .{ .kind = "kv", .prefix = "orders/" }, null);
+    defer a.free(spec.kv.prefix);
+    try std.testing.expectEqualStrings("orders/", spec.kv.prefix);
+
+    // Missing and empty are DIFFERENT mistakes: one is a spec that forgot a
+    // field, the other a spec that set it to nothing. A single
+    // `SubscriptionSpecMissingField` for both sent the author looking for
+    // an absent key that was right there.
+    try std.testing.expectError(
+        error.SubscriptionSpecMissingField,
+        translateSpec(a, "orders", .{ .kind = "kv" }, null),
+    );
+    try std.testing.expectError(
+        error.SubscriptionSpecEmptyField,
+        translateSpec(a, "orders", .{ .kind = "kv", .prefix = "" }, null),
+    );
+
+    // The two retired kinds carry migration recipes, so they must not
+    // collapse into the generic unknown-kind error.
+    try std.testing.expectError(
+        error.SubscriptionKindRetiredCron,
+        translateSpec(a, "nightly", .{ .kind = "cron", .interval_ms = 60_000 }, null),
+    );
+    try std.testing.expectError(
+        error.SubscriptionKindRetiredBoot,
+        translateSpec(a, "seed", .{ .kind = "boot" }, null),
+    );
+    try std.testing.expectError(
+        error.SubscriptionSpecUnknownKind,
+        translateSpec(a, "weird", .{ .kind = "webhook" }, null),
+    );
+}
+
+test "translateSpec: the detail names the subscription and the problem" {
+    const a = std.testing.allocator;
+    var detail: deployment_loader_mod.Detail = .{};
+
+    // The error value cannot carry which subscription broke, and the loader
+    // that reports it has no way to re-derive that — this is the channel.
+    try std.testing.expectError(
+        error.SubscriptionSpecMissingField,
+        translateSpec(a, "orders", .{ .kind = "kv" }, &detail),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, detail.slice(), "orders") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.slice(), "prefix") != null);
+
+    // A retired kind carries its migration recipe, not just a rejection.
+    var recipe: deployment_loader_mod.Detail = .{};
+    try std.testing.expectError(
+        error.SubscriptionKindRetiredCron,
+        translateSpec(a, "nightly", .{ .kind = "cron" }, &recipe),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, recipe.slice(), "nightly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recipe.slice(), "crontab") != null);
+
+    // Unknown kinds echo the offending kind, so the typo is visible.
+    var unknown: deployment_loader_mod.Detail = .{};
+    try std.testing.expectError(
+        error.SubscriptionSpecUnknownKind,
+        translateSpec(a, "weird", .{ .kind = "webhoook" }, &unknown),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, unknown.slice(), "webhoook") != null);
+
+    // A success leaves no detail behind for a later failure to inherit.
+    var clean: deployment_loader_mod.Detail = .{};
+    const ok = try translateSpec(a, "orders", .{ .kind = "kv", .prefix = "p/" }, &clean);
+    defer a.free(ok.kv.prefix);
+    try std.testing.expectEqual(@as(usize, 0), clean.len);
 }
 
 test "subscriptionPathParts: handler + spec + rejects" {
@@ -934,6 +1013,7 @@ fn deploymentLoadFnNode(
     ctx_opaque: ?*anyopaque,
     tenant_id: []const u8,
     dep_id: u64,
+    detail: *deployment_loader_mod.Detail,
 ) anyerror!void {
     const dc: *DeploymentCache = @ptrCast(@alignCast(ctx_opaque.?));
     dc.tenant_files_lock.lock();
@@ -959,7 +1039,7 @@ fn deploymentLoadFnNode(
     // re-fetch + snapshot rebuild when the current snapshot already
     // matches.
     if (slot.currentDeploymentId() == dep_id) return;
-    try reloadDeployment(slot, dep_id);
+    try reloadDeployment(slot, dep_id, detail);
 }
 
 /// Open (or re-use) a tenant code state. Allocates a `*TenantFiles`
@@ -1106,7 +1186,9 @@ fn reloadAllBytecodes(slot: *TenantSlot) !void {
     };
     defer slot.allocator.free(cur_bytes);
     const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch return error.NoDeployment;
-    return reloadDeployment(slot, dep_id);
+    // Cold start / slot open: there is no loader failure line to enrich
+    // here (this path reports through its own caller), so no detail sink.
+    return reloadDeployment(slot, dep_id, null);
 }
 
 /// Stage the manifest's `_config/**.json` into the tenant's app.db
@@ -1210,7 +1292,7 @@ fn fetchBlobRetry(
 /// pinned in-flight readers keep it alive until they release. Used
 /// by `reloadAllBytecodes` (cold start / restart) and by the
 /// background `DeploymentLoader` thread (a release landed).
-fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
+fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_mod.Detail) !void {
     const allocator = slot.allocator;
     // Two-tier source for the manifest bytes:
     //   1. One-shot prefetch from cold-start. Transfer ownership
@@ -1485,7 +1567,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     // Failures abort the deploy (consistent with the trigger
     // discovery posture above — a misconfigured subscription is a
     // load-time error, not a silent skip).
-    const subscriptions_slice = try discoverSubscriptions(allocator, manifest, bs);
+    const subscriptions_slice = try discoverSubscriptions(allocator, manifest, bs, detail);
     errdefer {
         for (subscriptions_slice) |*s| {
             const mut: *globals.SubscriptionEntry = @constCast(s);
