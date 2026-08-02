@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `rewind` — the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6 + Track 3). The
 //! customer-shippable twin of `rewind-ops`: it carries an OIDC session, never
 //! a platform secret. Auth is the GATEWAY / session-bearer model — `login`

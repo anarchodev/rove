@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // after — connection wake triggers. This activation is dispatched
 // without a wake accumulator (the connectionless shape), so ms/kv are
 // inert-undefined per the documented model — but argument validation

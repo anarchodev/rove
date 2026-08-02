@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Operator-facing env-driven `BackendConfig` loader. Lives in
 //! rove-blob so every binary that owns blob storage — the `rewind`
 //! worker, `rewind-cp`, and the log-query surface — reads the same env

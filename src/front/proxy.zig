@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Streaming reverse-proxy core for rewind-front.
 //!
 //! Forwards each proxied request over same-poll-loop rove-h2 CLIENT

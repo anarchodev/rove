@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-log — request-id minting + node-wide log buffer.
 //!
 //! Two responsibilities, two structs:

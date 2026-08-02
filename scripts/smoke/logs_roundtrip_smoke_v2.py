@@ -50,7 +50,7 @@ def main() -> int:
         c.spawn_log_server(poll_interval_ms=200)
 
         r = c.provision("globex")
-        check("provision globex → 204/409", r.status in (204, 409),
+        check("provision globex → 200/409", r.status in (200, 409),
               f"got {r.status} {r.body!r}")
         c.deploy_handlers("globex", FIXTURE)
         c.wait_for_handler("globex", "/?fn=handler", want_body="ready", timeout_s=30.0)

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The bridge-wide error set, split into its own file so both `bridge.zig`
 //! (the module root) and `bridge_control.zig` can share it without the
 //! module-root import that referencing `bridge.zig` from a sibling would

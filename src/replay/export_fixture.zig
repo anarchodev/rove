@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `export-fixture` — transcode a captured recording (the base64-tape fixture
 //! `rewind pull` writes, which `rewind replay` consumes) into a **declarative
 //! world** (the authored form `rewind sim` consumes). This is the bridge from

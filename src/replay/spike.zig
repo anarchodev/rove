@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! De-risking spike for the native arenajs replay path.
 //!
 //! Proves, end to end and self-contained (no Node, no WASM), that we can:

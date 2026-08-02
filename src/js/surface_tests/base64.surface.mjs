@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // base64 — btoa/atob (binary-string, padded standard alphabet),
 // base64url (bytes, URL alphabet, unpadded), hex (bytes ⇄ lowercase).
 export default function () {

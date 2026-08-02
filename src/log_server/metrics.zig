@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Process-global operator metrics for the standalone log-server.
 //!
 //! Atomic counters bumped from the indexer poll loop (`indexer.runLoop`) and

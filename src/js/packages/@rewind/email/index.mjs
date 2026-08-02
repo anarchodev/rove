@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // `email.send` — transactional email via Resend, layered on
 // `webhook.send` (which composes durable outbound HTTP from `kv`
 // markers + the internal fetch primitive + durable scheduled wakes —

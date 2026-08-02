@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // The JS half of the shared-vector gate: assert the mirror
 // (interaction_digest.js) produces the same digests the Zig side does, from
 // the same element streams. Run with `node src/replay/js/digest_vectors_test.mjs`

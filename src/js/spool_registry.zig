@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `SpoolRegistry` — the bound-fetch / chunk-spool state grouped out of the
 //! `Worker` god-struct. Holds the three key-owning hash maps (bound-fetch
 //! entity index, per-fetch chunk spools, bound-send entity index), the

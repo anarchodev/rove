@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! HS256 JWT helpers for the standalone services' `Authorization:
 //! Bearer` gates (log-server) plus the worker's
 //! `/_system/release` and `/_system/admin-kv` endpoints. Not a

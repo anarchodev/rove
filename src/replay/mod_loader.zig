@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The sim's module resolution — the offline half of `@scope/pkg` package
 //! support (rove issue #50). Installed through the reactor's base-setup hook
 //! (`arena_reactor_new_open_with`): the sim pairs its own `normalize` with

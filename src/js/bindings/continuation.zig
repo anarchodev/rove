@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `_system.next` — the trampoline continuation primitive
 //! (the unified return-as-continuation model — the Continuation
 //! primitive; `docs/architecture/effects-and-handlers.md`). A handler

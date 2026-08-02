@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Dest side of the streaming snapshot transfer
 //! (`docs/architecture/raft-native-alignment.md`; codec in `raft-kv`'s `snapshot_stream`).
 //!

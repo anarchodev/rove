@@ -74,7 +74,7 @@ def main() -> int:
     with V2Cluster.spawn("durwake", nodes=3) as c:
         print("step 1: provision + deploy the scheduling handlers")
         r = c.provision("acme")
-        check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         # release() writes _deploy/current through raft — it must hit the
         # group's leader (else 503). The group formed at provision; target it.
         lead0 = c.leader_node("acme")

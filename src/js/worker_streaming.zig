@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Streaming-resume engine + Msg-driven activation firers.
 //!
 //! Despite the file name, this covers the broader post-commit /

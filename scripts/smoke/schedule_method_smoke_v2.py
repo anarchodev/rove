@@ -98,7 +98,7 @@ def main() -> int:
     with V2Cluster.spawn("schedmethod", nodes=1) as c:
         print("step 1: provision + deploy")
         r = c.provision("acme")
-        check("provision acme → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision acme → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("acme", HANDLERS)
             check("deploy handlers", True)

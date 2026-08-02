@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-acme — in-tree ACME (RFC 8555) HTTP-01 issuance.
 //!
 //! See `docs/architecture/auth-and-domains.md`. Public surface:

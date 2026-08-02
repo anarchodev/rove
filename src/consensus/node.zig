@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Data-plane node — thin module root. The real content lives in
 //! `node_core.zig` (the `Node` + `TenantSlot` structs, the apply/commit helper
 //! types, `Error`, and the config knobs), with the method bodies split by

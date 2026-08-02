@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // console — the request-log quartet. Output lands in the per-request
 // log buffer (not observable from JS), so the pinnable contract is:
 // accepts any arg shapes, coerces, returns undefined, never throws.

@@ -51,7 +51,7 @@ def main() -> int:
 
         print(f"step 1: provision 'aliasten' WITH custom host {CUSTOM_HOST}")
         r = c.provision("aliasten", host=CUSTOM_HOST)
-        check("provision --host -> 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision --host -> 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         print("step 2: deploy a root handler")
         try:

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `log_index.db` — local SQLite store the log-server polls into.
 //! Schema mirrors the log-server index model
 //! (`docs/architecture/deployment-and-logs.md`): one row per

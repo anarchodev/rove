@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Public `platform` surface — the documentation source of truth for
 // the admin control plane (docs/architecture/builtin-libs.md Phase A;
 // auth-domain-plan.md for the admin handler context).
@@ -20,6 +22,17 @@
   // `blob.receive` native — `platform.scope(t).blob.receive` lowers to a
   // cross-tenant streamed upload (extra target + ctx args, admin-gated).
   const sysBlobReceive = _system.blob.receive;
+
+  // Fail loud on a retired option spelling. Each shim keeps its own copy —
+  // the helper in after.js is inside that file's IIFE. Silence here is worse
+  // than a break: an ignored resume-export key ran the call anyway and
+  // resumed at the DEFAULT export, surfacing as a 404 somewhere unrelated.
+  function _rejectRenamed(verb, opts, renames) {
+    if (!opts || typeof opts !== "object") return;
+    for (const k in renames) {
+      if (k in opts) throw new TypeError(verb + ": option `" + k + "` was renamed — use `" + renames[k] + "`");
+    }
+  }
 
   /**
    * Admin control plane: cross-tenant kv access, the platform root
@@ -97,6 +110,7 @@
       s.deploy = {
         stampManifest(entries, opts) {
           opts = opts || {};
+          _rejectRenamed("deploy.stampManifest", opts, { name: "on", to: "on" });
           const req = { scope: id, entries };
           // PM P1: `opts.resolution` bakes the deploy's `{packages,
           // app_imports}` sections into the manifest (and its dep_id).
@@ -142,7 +156,14 @@
      * hashes + your statics and stamp it there. Stage/activate is still a
      * separate `platform.releases.publish`.
      *
-     * @param {Array<{path:string, source:string}>} files - Handler sources.
+     * Imports resolve — and are therefore VALIDATED — across the whole
+     * batch: a handler may import a sibling in the same call, and a
+     * specifier that resolves to nothing fails the compile.
+     *
+     * @param {Array<{path:string, source?:string, source_hash?:string}>} files
+     *   Handler sources, inline or by the `source_hex` a prior
+     *   {@link platform.stage} returned (the engine reads those back from
+     *   `scope`'s blobs — they never travel through JS twice).
      * @param {object} opts
      * @param {string} opts.scope - Target instance id (where blobs stage).
      * @param {string} [opts.on="onFetchResult"] - Resume export.
@@ -155,8 +176,46 @@
      * //   const { results } = request.ctx; ...stamp manifest...
      * // }
      */
+    /**
+     * Content-address handler sources into `scope`'s blobs WITHOUT
+     * compiling them, resuming with `{ok, results:[{path, source_hex}]}`.
+     *
+     * The staging half of a deploy. Compilation resolves every import
+     * eagerly, so a module can only be compiled once everything it imports
+     * exists — which, for a deploy that uploads files one at a time, is not
+     * true until the last file lands. Stage each file as it arrives, then
+     * {@link platform.compile} the finished bundle, where a sibling import
+     * resolves.
+     *
+     * **Bound, like {@link platform.compile}:** `return next()` after it.
+     *
+     * @param {Array<{path:string, source:string}>} files - Handler sources.
+     * @param {object} opts
+     * @param {string} opts.scope - Target instance id (where blobs land).
+     * @param {string} [opts.on="onFetchResult"] - Resume export.
+     * @param {*} [opts.ctx] - Threaded to the resume as `request.ctx.app`.
+     * @returns {string} The bound fetch id (`ftch_…`).
+     *
+     * @example
+     * platform.stage([{ path, source }], { scope: tenant, on: "onStaged" });
+     * return next();
+     */
+    stage(files, opts) {
+      opts = opts || {};
+      _rejectRenamed("platform.stage", opts, { name: "on", to: "on" });
+      const body = JSON.stringify({ scope: opts.scope, files, stage: true });
+      return sysOn.fetch(
+        "http://rove-compile.internal/",
+        { method: "POST", body, ctx: opts.ctx, on: opts.on || "onFetchResult" },
+      );
+    },
+
     compile(files, opts) {
       opts = opts || {};
+      // The resume export is `on` everywhere. A retired spelling used to be
+      // ignored in silence, so the call ran, resumed at the DEFAULT export,
+      // and 404'd somewhere else entirely.
+      _rejectRenamed("platform.compile", opts, { name: "on", to: "on" });
       const req = { scope: opts.scope, files };
       // PM P1: `opts.resolution` = the deploy's `{packages, app_imports}`
       // lockfile sections (manifest v2 shapes). The engine fetches the

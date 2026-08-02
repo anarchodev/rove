@@ -85,7 +85,7 @@ def main() -> int:
         # ── A. provision births the group {1,2,3} cold-multi ──────────
         print("leg A: provision (births the group with the full voter set {1,2,3})")
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
 
         # ── B. confirm formed at 3 voters (born, not grown) ───────────
         print("leg B: confirm the group formed with all 3 voters (cold-multi)")
@@ -115,7 +115,7 @@ def main() -> int:
         print("leg D: publish a handler bundle + serve through the front door")
         try:
             r = c.provision(APP)
-            check("provision app → 204/409", r.status in (204, 409), f"got {r.status}")
+            check("provision app → 200/409", r.status in (200, 409), f"got {r.status}")
             dep_id = c.deploy_handlers(APP, {"index.mjs": rpc_wrap(APP_SRC)})
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
             r = c.wait_for_handler(APP, "/?fn=handler", want_body="genesis-served",

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // surface test: platform — the customer-facing contract of the admin
 // surface is the natively-enforced gate: every method reached from a
 // normal tenant activation (request.admin all-null) throws. The admin
@@ -36,6 +38,14 @@ export default function () {
 
   check("platform.auth.checkRootToken", () => {
     throws(() => platform.auth.checkRootToken("tok"), NOT_ADMIN);
+  });
+
+  check("platform.stage", () => {
+    // Like compile, staging lowers to a bound fetch at a trusted door and is
+    // admin-checked door-side, so the emission itself succeeds here.
+    const id = platform.stage([{ path: "index.mjs", source: "export default ()=>1" }],
+                              { scope: "acme" });
+    ok(typeof id === "string" && id.startsWith("ftch_"), "bound fetch id: " + id);
   });
 
   check("platform.compile", () => {

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Reading and writing the storage-namespace marker (`namespace.zig` holds the
 //! grammar). Split from it so the grammar file stays `std`-only and the
 //! operator CLI — which links no system libraries — shares the same key name

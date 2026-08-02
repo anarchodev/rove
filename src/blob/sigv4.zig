@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! AWS Signature Version 4 signer for S3-compatible object stores.
 //!
 //! Builds the `Authorization` header for a single HTTP request.

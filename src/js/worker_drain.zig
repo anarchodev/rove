@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Post-raft-commit reconciliation + held-continuation resume engine.
 //!
 //! Covers the two systems the worker tick runs after `dispatchOnce`:

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `rewind-logs` — the request-log query API.
 //!
 //! The operator runs this binary alongside the `rewind` worker and

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Token-bucket rate limiter for noisy-neighbor protection (PLAN §2.10).
 //!
 //! Per-(instance, action) buckets. Each bucket has a capacity (the

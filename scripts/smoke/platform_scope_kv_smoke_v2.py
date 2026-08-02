@@ -71,7 +71,7 @@ def main() -> int:
         print("step 1: bring up __admin__ + provision the cross-tenant target")
         c._ensure_admin_app()
         r = c.provision(TARGET)
-        check("provision target → 204/409", r.status in (204, 409), f"got {r.status} {r.body!r}")
+        check("provision target → 200/409", r.status in (200, 409), f"got {r.status} {r.body!r}")
 
         print("step 2: deploy the platform-probe onto __admin__ (releases → writes a _release key)")
         try:

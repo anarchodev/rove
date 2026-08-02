@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The data-plane `Node`'s hot loop and the effects it drives: `pump` (tick →
 //! ready → apply → single fsync → send → release), `durabilizeTick`,
 //! `autoDemoteTick`, the hibernation active-set helpers, `propose*`, the

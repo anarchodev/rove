@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Trigger fire path (PLAN §2.5).
 //!
 //! Customer code under `_triggers/{prefix}/index.{mjs,js}` registers

@@ -64,7 +64,7 @@ def main() -> int:
                 capture_output=True)
 
         print("setup: provision acme [1,2,3] + deploy the single-key handler")
-        if c.provision("acme").status != 204:
+        if c.provision("acme").status != 200:
             print("  FAIL provision"); return 1
         lead = c.leader_node("acme")
         try:

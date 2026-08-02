@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! App-manifest seam (`docs/handler-shape.md` §8). A bundle-root
 //! `manifest.json` declares an app's identity, install-time config
 //! schema, declared/derived effects, and listing metadata — so apps

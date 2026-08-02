@@ -97,7 +97,7 @@ def main() -> int:
         c._ensure_admin_app()
 
         r = c.provision("acme")
-        check("provision acme → 204/409", r.status in (204, 409),
+        check("provision acme → 200/409", r.status in (200, 409),
               f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("acme", FIXTURE)

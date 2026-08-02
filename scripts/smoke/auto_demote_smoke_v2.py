@@ -76,7 +76,7 @@ def main() -> int:
     with V2Cluster.spawn("autodemote", nodes=3) as c:
         print("step 1: provision 'acme' + deploy the kv handler")
         r = c.provision("acme")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         lead0 = c.leader_node("acme")
         check("leader present", lead0 is not None, f"lead={lead0}")
         if lead0 is None:

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // `docs/architecture/routing-and-ingress.md`: blob.put's on_chunk handler. The
 // shim wrote a durable `_blob/owed/{hash}` marker (riding the
 // handler's writeset, envelope-0 atomic) and fired the signed PUT

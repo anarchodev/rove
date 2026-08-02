@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Public `stream` surface — connection output effects
 // (docs/handler-shape.md §2.2). Thin shim over the native
 // `_system.stream` binding.

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Connection/stream leaf state for the h2 runtime: the non-generic
 //! per-connection and per-stream types — `Conn`, `Http1Conn` (with its
 //! lifecycle arms), the `Stream` accumulator, the shared `HeaderBuf`

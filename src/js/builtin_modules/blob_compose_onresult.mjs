@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // docs/architecture/blob-write-recipes.md §4–5: the flip + customer handoff.
 // Arrives as the send_callback of blob_compose's PUT (via
 // __system/blob_onresult): request.status hoisted top-level (2xx = ok),

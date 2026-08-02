@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-log-server — standalone log-server module.
 //!
 //! Worker → BatchStore (S3 or fs, via `flush_writer`) → indexer

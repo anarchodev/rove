@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `starter.zig` — initial deployment content for freshly-created tenants.
 //!
 //! Extracted from `worker.zig`. Bakes the two starter files into the
@@ -131,6 +133,7 @@ pub fn deployBakedBundle(
         compile_ctx,
         inputs,
         "",
+        null, // baked bundles: a compile failure here is OUR bug, not an author's
     );
     defer allocator.free(compiled);
 

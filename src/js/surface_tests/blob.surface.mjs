@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // blob — content-addressed tenant object storage. put/get compose
 // kv markers + the fetch primitive (observable in-process); url is
 // native presign (fail-loud without a configured backend — that

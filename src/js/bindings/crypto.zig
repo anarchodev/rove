@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Core `crypto.*` JS bindings: randomness + hashing.
 //!
 //! Randomness draws from arenajs's per-context xorshift64star via

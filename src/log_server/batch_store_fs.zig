@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Filesystem `BatchStore` backend. Files live at
 //! `{base_dir}/{key}` — keys are hierarchical (`{tenant}/{node}/{batch}.{ext}`)
 //! so the on-disk layout mirrors S3 exactly. Used by the cross-

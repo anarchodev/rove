@@ -102,7 +102,7 @@ def main() -> int:
 
         print("step 1: provision tenant 'streamfi' (group forms across all 3 nodes)")
         r = c.provision("streamfi")
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         if r.status != 204:
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1

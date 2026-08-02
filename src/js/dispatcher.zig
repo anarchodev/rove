@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `Dispatcher` — runs one JS handler against a request.
 //!
 //! Each `Dispatcher` owns a `qjs.Snapshot` (an arenajs dual-arena

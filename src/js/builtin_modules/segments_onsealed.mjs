@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // `docs/architecture/blob-write-recipes.md` (the `segments.seal` recipe): segments.seal's on_result — the
 // SWAP half of the seal. The shim serialized the hot rows and fired
 // a durable blob.put; this module runs when that PUT settled and,

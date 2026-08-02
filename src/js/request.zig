@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `Request` — the input packet a `Dispatcher.runOutcome` consumes for
 //! one handler activation, plus the response/outcome types it produces.
 //!

@@ -94,6 +94,7 @@ def spawn_cp(
     hosts,
     placement,
     cp_data_dir,
+    public_suffix=None,
     move_secret=None,
     node_id=None,
     voters=None,
@@ -108,6 +109,9 @@ def spawn_cp(
 ):
     """Spawn a `rewind-cp` on `port`.
 
+    `public_suffix` turns on wildcard tenant routing (`{tenant}.{suffix}` →
+    the tenant's placement, no host row) and must match what the workers get.
+
     Directory config (required): `clusters` (`id=url,...;...`), `hosts`
     (`host=tenant;...`), `placement` (`tenant=cluster;...`), `cp_data_dir`
     (durable directory store). `move_secret` enables the move surface.
@@ -121,6 +125,11 @@ def spawn_cp(
     env["REWIND_HOSTS"] = hosts
     env["REWIND_PLACEMENT"] = placement
     env["REWIND_CP_DATA_DIR"] = cp_data_dir
+    # The CP resolves `{tenant}.{suffix}` for the front door and the worker
+    # resolves it again for itself, so BOTH must carry the same suffix — a CP
+    # without it 404s every tenant that has no explicit host row.
+    if public_suffix is not None:
+        env["REWIND_PUBLIC_SUFFIX"] = public_suffix
     if move_secret is not None:
         env["REWIND_MOVE_SECRET"] = move_secret
     if node_id is not None:

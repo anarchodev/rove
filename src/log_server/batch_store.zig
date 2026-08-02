@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! BatchStore — read+write surface for log batches under hierarchical
 //! `{tenant}/{node}/{batch}.{ext}` keys.
 //!

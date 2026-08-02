@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Shared crypto mechanism for the `crypto.*` binding surfaces.
 //!
 //! The JOSE/OIDC surface (`crypto_jose.zig`) and the raw-key ECDSA

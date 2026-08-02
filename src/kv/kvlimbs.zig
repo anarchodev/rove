@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The spine-free kv facade — the `raft-kv` module root, imported by the
 //! data plane and the rove-js worker in place of the consensus-carrying
 //! kv module. It re-exports the kvexp-backed "limbs" — `kvstore.zig`

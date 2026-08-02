@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rewind — the V2 worker binary (v2-build-order
 //! §Phase 2 "a v2 worker binary"). Named for the product (rewind.js) that
 //! V2 is the engine for.

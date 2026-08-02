@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // stream — connection output. Without a held socket (this harness
 // dispatches connectionless) both calls are documented inert no-ops;
 // that inertness IS the pinnable contract here. Live chunk emission

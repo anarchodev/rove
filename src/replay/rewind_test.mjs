@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // rewind:test — the saga test library (docs/architecture/replay-and-sim.md,
 // "The saga test model"). This is the JS layer over the ONE native atom,
 // `simulate(world) → bundle`: the scenario, the lazy activation tree, the

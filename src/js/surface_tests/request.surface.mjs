@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // request / response — the per-activation Zig-built surfaces, pinned
 // against the harness's standard inbound request (see
 // surface_tests.zig STD_HEADER_PAIRS/STD_BODY).

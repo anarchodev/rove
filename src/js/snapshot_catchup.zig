@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Background snapshot catch-up driver — the worker-thread half of raft-native
 //! snapshot alignment (native trigger + out-of-band data,
 //! `docs/architecture/raft-native-alignment.md`).

@@ -175,7 +175,7 @@ def main() -> int:
 
         print("step 1: provision + deploy the onMessage handler")
         r = c.provision(TENANT)
-        check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             dep_id = c.deploy_handlers(TENANT, {"index.mjs": HANDLER_SRC})
         except RuntimeError as e:

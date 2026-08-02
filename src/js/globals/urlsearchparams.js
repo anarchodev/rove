@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // `URLSearchParams` polyfill — spec-compliant subset for parsing
 // + building query strings without depending on the full URL class.
 //

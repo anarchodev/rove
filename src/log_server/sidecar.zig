@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Sidecar wire format for the S3-direct logs path. The sidecar is
 //! embedded at the head of the `.ndjson` object as a length-prefixed
 //! JSON blob; this module owns the sidecar's JSON shape (parse +

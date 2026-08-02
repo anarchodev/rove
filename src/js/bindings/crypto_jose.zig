@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! JOSE / OIDC crypto bindings: RSA + ECDSA JWS signature verification
 //! and OIDC RS256 key custody. The *policy* here is JOSE's: variable
 //! digest from the `alg` argument, JWK key inputs, curves P-256/384/521,

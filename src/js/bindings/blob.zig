@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `_system.blob.*` native bindings — blob-storage-plan P1.
 //!
 //! Only one verb lives natively; `docs/architecture/routing-and-ingress.md`: `presign`. It is the single blob

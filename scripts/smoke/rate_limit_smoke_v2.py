@@ -89,7 +89,7 @@ def main() -> int:
         print("step 1: provision + deploy rl1 + rl2 (trivial 200 handler)")
         for t in ("rl1", "rl2"):
             r = c.provision(t)
-            check(f"provision {t} → 204", r.status == 204, f"got {r.status} {r.body!r}")
+            check(f"provision {t} → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("rl1", {"index.mjs": INDEX_SRC})
             c.deploy_handlers("rl2", {"index.mjs": INDEX_SRC, "email/index.mjs": EMAIL_SRC})

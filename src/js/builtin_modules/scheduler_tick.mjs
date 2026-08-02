@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Durable scheduled wake — the baked `__system/scheduler_tick`
 // module (the durable-wake mechanism; docs/architecture/effects-and-handlers.md). Fired by the engine
 // (`durable_wake.sweepDurableWakes`) in a tenant's context whenever

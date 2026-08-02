@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // surface test: crypto — both signature families (JWK/JOSE vs raw
 // bytes) exercised with real keys; hash/hmac pinned to known-answer
 // vectors. First execution of this shim under zig build test (it is

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The sim base prelude — the COMPUTE half of the worker's handler surface,
 //! evaled into the replay/sim reactor's base (via arenajs 0.3.4's
 //! `arena_reactor_eval_base`, pre-freeze) so `rewind test`/`sim`/`replay`

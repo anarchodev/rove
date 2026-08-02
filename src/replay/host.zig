@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Native replay/sim host — the input side of the arenajs replay ABI
 //! (`qjs-arena-replay-bindings.h`).
 //!

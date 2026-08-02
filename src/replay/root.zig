@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The ONE replay/sim engine — `runWorld(world, code)`. Both `rewind replay`
 //! and `rewind sim` call it over the SAME declarative `world.json` (`world.zig`):
 //! the request surface, a **closed-world** key→value KV map, ctx, the flattened

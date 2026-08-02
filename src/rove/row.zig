@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 const std = @import("std");
 
 /// A Row is a comptime set of component types, sorted by @typeName and deduplicated.

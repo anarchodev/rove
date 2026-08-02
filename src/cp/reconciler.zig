@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Additive membership reconciler — the RC-6 state machine that converges
 //! each placed tenant's DP raft group to its cluster's node set, split out of
 //! `cp/main.zig`'s Router. Runs on the directory-leader tick; never touches

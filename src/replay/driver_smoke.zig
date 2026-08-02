@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! End-to-end native driver smoke. Drives `runWorld` — the ONE
 //! replay/sim engine — over declarative worlds on the real arenajs link, no
 //! cluster. Scenarios: an inbound request (kv.get + kv.set + console + response)

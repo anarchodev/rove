@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // @rewind/jwt — JWS / JWT decoding + verification helpers (P-Lift, rove#123).
 //
 // The lifted form of the former ambient `globalThis.jwt` (was

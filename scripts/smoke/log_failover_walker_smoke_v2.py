@@ -81,7 +81,7 @@ def main() -> int:
         c.spawn_log_server(poll_interval_ms=200)
 
         r = c.provision(TENANT)
-        check("provision → 204/409", r.status in (204, 409), f"{r.status} {r.body!r}")
+        check("provision → 200/409", r.status in (200, 409), f"{r.status} {r.body!r}")
         c.wait_for_membership(TENANT, voters=3)
         c.deploy_handlers(TENANT, FIXTURE)
         c.wait_for_handler(TENANT, "/?fn=ready", want_body="ok", timeout_s=30.0)

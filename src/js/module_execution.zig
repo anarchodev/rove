@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Module execution — loading + running a tenant's JS module against one
 //! request. These are the engine ops the
 //! `Dispatcher` drives each activation: load bytecode, evaluate the module
@@ -425,6 +427,18 @@ pub const module_loader = struct {
         /// per-importer. Null ⇒ no packages ⇒ plain path resolution (every
         /// current deployment). See `docs/architecture/package-resolution.md`.
         resolver: ?*const PackageResolver = null,
+        /// Path → SOURCE, consulted when `bytecodes` has no entry: the
+        /// deploy-time compile of a bundle, where a module's siblings exist
+        /// only as source that has not been compiled yet.
+        ///
+        /// Needed because compilation resolves imports EAGERLY — quickjs runs
+        /// `js_resolve_module` even under `COMPILE_ONLY` — so compiling
+        /// `index.mjs` pulls in every module it imports, transitively. Without
+        /// this a handler could not import a sibling handler at all (#344).
+        /// Compiling on demand here is the same recursion quickjs would drive
+        /// for bytecode; a source that imports another source resolves through
+        /// this path again.
+        sources: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     };
 
     /// Normalize `specifier` (relative or bare) against the importing
@@ -467,6 +481,36 @@ pub const module_loader = struct {
         return @ptrCast(out);
     }
 
+    /// Compile `src` as a module named `name` and hand quickjs its module
+    /// def. The mirror of the bytecode path below: `JS_ReadObject` yields a
+    /// module-tagged value there, `JS_Eval` under `COMPILE_ONLY` yields one
+    /// here, and both drop the value handle because the def carries its own
+    /// reference. A syntax error inside the sibling surfaces as that module's
+    /// exception, naming the file the author has to fix.
+    fn compileSourceModule(ctx: ?*c.JSContext, name: []const u8, src: []const u8) ?*c.JSModuleDef {
+        // quickjs reads one byte past `len` when validating UTF-8, so the
+        // buffer must be NUL-terminated (the same trap `compileToBytecode`
+        // documents). Sources here come from a HashMap and carry no sentinel.
+        const a = std.heap.c_allocator;
+        const src_z = a.allocSentinel(u8, src.len, 0) catch return null;
+        defer a.free(src_z);
+        @memcpy(src_z, src);
+        const name_z = a.allocSentinel(u8, name.len, 0) catch return null;
+        defer a.free(name_z);
+        @memcpy(name_z, name);
+
+        const val = c.JS_Eval(ctx, src_z.ptr, src.len, name_z.ptr, c.JS_EVAL_TYPE_MODULE | c.JS_EVAL_FLAG_COMPILE_ONLY);
+        if (c.JS_IsException(val)) return null;
+        if (val.tag != c.JS_TAG_MODULE) {
+            c.JS_FreeValue(ctx, val);
+            _ = c.JS_ThrowReferenceError(ctx, "source for '%s' did not compile to a module", name_z.ptr);
+            return null;
+        }
+        const def: ?*c.JSModuleDef = @ptrCast(@alignCast(val.u.ptr));
+        c.JS_FreeValue(ctx, val);
+        return def;
+    }
+
     pub fn load(
         ctx: ?*c.JSContext,
         name: [*c]const u8,
@@ -481,11 +525,17 @@ pub const module_loader = struct {
         // ("[uninitialized]"). Throw the canonical message ourselves so
         // compile-time validation and runtime load failures both name
         // the module.
-        const map = self.bytecodes orelse {
-            _ = c.JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
-            return null;
-        };
-        const bb = map.get(name_s) orelse {
+        const bb = blk: {
+            if (self.bytecodes) |map| {
+                if (map.get(name_s)) |hit| break :blk hit;
+            }
+            // No bytecode: at deploy time the module may exist only as a
+            // source sibling in the same bundle. Compile it here — the
+            // resolution quickjs is in the middle of doing needs a module
+            // def, and this is the only point that can supply one.
+            if (self.sources) |srcs| {
+                if (srcs.get(name_s)) |src| return compileSourceModule(ctx, name_s, src);
+            }
             _ = c.JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
             return null;
         };

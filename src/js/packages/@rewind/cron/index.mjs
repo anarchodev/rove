@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // @rewind/cron — recurring durable schedule verb (handler-surface §2.4),
 // plus the crontab/time helpers it carries as statics.
 //

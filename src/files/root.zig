@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-files — content-addressed deploy staging + manifest model.
 //!
 //! The staging layer under every deploy: compile handler sources to
@@ -157,6 +159,47 @@ pub const CompiledFile = struct {
     bytecode_hex: [HASH_HEX_LEN]u8,
 };
 
+/// Content-address handler sources into `blob` WITHOUT compiling them —
+/// the staging half of a deploy, split from the linking half.
+///
+/// Compilation resolves imports eagerly (quickjs runs `js_resolve_module`
+/// even under `COMPILE_ONLY`), so a module can only be compiled once every
+/// module it imports is present. A deploy that uploads files one at a time
+/// never has that until the last one lands, which is why staging and
+/// compiling are separate steps: stage each file as it arrives, then compile
+/// the finished bundle, where every sibling is resolvable.
+///
+/// Returns one `source_hex` per input; `path` borrows the input slice.
+pub fn stageSources(
+    allocator: std.mem.Allocator,
+    blob: BlobStore,
+    inputs: []const DeployInput,
+) Error![]StagedFile {
+    if (inputs.len > 256) return Error.InvalidManifest;
+    for (inputs, 0..) |in_a, i| {
+        try validatePath(in_a.path);
+        for (inputs[0..i]) |in_b| {
+            if (std.mem.eql(u8, in_a.path, in_b.path)) return Error.InvalidManifest;
+        }
+    }
+
+    const out = allocator.alloc(StagedFile, inputs.len) catch return Error.OutOfMemory;
+    errdefer allocator.free(out);
+    for (inputs, 0..) |in, i| {
+        var src_hex: [HASH_HEX_LEN]u8 = undefined;
+        hashHex(in.bytes, &src_hex);
+        try putBlobIfMissingTo(blob, &src_hex, in.bytes);
+        out[i] = .{ .path = in.path, .source_hex = src_hex };
+    }
+    return out;
+}
+
+/// One staged source's content hash (the result of `stageSources`).
+pub const StagedFile = struct {
+    path: []const u8,
+    source_hex: [HASH_HEX_LEN]u8,
+};
+
 /// Batch-compile handler sources and content-address BOTH the source and
 /// the bytecode blob into `blob` (the target tenant's file-blobs backend).
 /// Returns one `CompiledFile` per input — the caller stamps the manifest
@@ -180,6 +223,10 @@ pub const CompiledFile = struct {
 /// every load, so a package MUST compile under its package-virtual name
 /// (per-importer encapsulation + one-instance-per-version identity);
 /// `path` itself stays relative (validated, and the manifest key).
+/// `failed_path`, when given, receives the path of the input being compiled
+/// if compilation fails. The compiler's own message names the missing module
+/// or the syntax error; only the caller's loop knows which FILE was in hand,
+/// and that is the half the author acts on.
 pub fn compileAndStage(
     allocator: std.mem.Allocator,
     blob: BlobStore,
@@ -187,6 +234,7 @@ pub fn compileAndStage(
     compile_ctx: ?*anyopaque,
     inputs: []const DeployInput,
     virtual_dir: []const u8,
+    failed_path: ?*[]const u8,
 ) Error![]CompiledFile {
     if (inputs.len > 256) return Error.InvalidManifest;
     if (virtual_dir.len > MAX_VIRTUAL_DIR_LEN) return Error.InvalidPath;
@@ -214,8 +262,10 @@ pub fn compileAndStage(
         fname_buf[fname_len] = 0;
         const fname: [:0]const u8 = fname_buf[0..fname_len :0];
 
-        const bytecode = compile(compile_ctx, in.bytes, fname, allocator) catch
+        const bytecode = compile(compile_ctx, in.bytes, fname, allocator) catch {
+            if (failed_path) |report| report.* = in.path;
             return Error.CompileFailed;
+        };
         defer allocator.free(bytecode);
 
         var bc_hex: [HASH_HEX_LEN]u8 = undefined;
@@ -505,7 +555,7 @@ test "compileAndStage: stages source + bytecode blobs, returns hashes" {
         .{ .path = "index.mjs", .kind = .handler, .bytes = "export default () => 1;" },
         .{ .path = "api/index.mjs", .kind = .handler, .bytes = "export default () => 2;" },
     };
-    const out = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "");
+    const out = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "", null);
     defer a.free(out);
 
     try testing.expectEqual(@as(usize, 2), out.len);
@@ -526,15 +576,59 @@ test "compileAndStage: stages source + bytecode blobs, returns hashes" {
     try testing.expect(!std.mem.eql(u8, &out[0].bytecode_hex, &out[1].bytecode_hex));
 }
 
+test "stageSources: content-addresses the source and compiles nothing" {
+    const a = testing.allocator;
+    var blob = MemBlobStore.init(a);
+    defer blob.deinit();
+
+    // A source that CANNOT compile on its own: it imports a sibling that is
+    // not staged yet, which is exactly the state a per-file upload is in
+    // partway through. Staging must not care.
+    const inputs = [_]DeployInput{
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "import {x} from './lib.mjs'; export default () => x;" },
+    };
+    const out = try stageSources(a, blob.blobStore(), &inputs);
+    defer a.free(out);
+
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("index.mjs", out[0].path);
+    try testing.expect(try blob.blobStore().exists(&out[0].source_hex));
+
+    // The hash is the same one `compileAndStage` would derive, so a file
+    // staged now and compiled later keeps one identity.
+    var expect_hex: [HASH_HEX_LEN]u8 = undefined;
+    hashHex(inputs[0].bytes, &expect_hex);
+    try testing.expectEqualSlices(u8, &expect_hex, &out[0].source_hex);
+
+    // No bytecode was written — nothing under the `bc/` namespace at all.
+    var bc_key_buf: [BC_KEY_LEN]u8 = undefined;
+    try testing.expect(!(try blob.blobStore().exists(bcKey(&bc_key_buf, &out[0].source_hex))));
+}
+
+test "stageSources: rejects duplicate and invalid paths like the compile path" {
+    const a = testing.allocator;
+    var blob = MemBlobStore.init(a);
+    defer blob.deinit();
+
+    const dupes = [_]DeployInput{
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "a" },
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "b" },
+    };
+    try testing.expectError(Error.InvalidManifest, stageSources(a, blob.blobStore(), &dupes));
+
+    const escaping = [_]DeployInput{.{ .path = "../evil.mjs", .kind = .handler, .bytes = "a" }};
+    try testing.expectError(Error.InvalidPath, stageSources(a, blob.blobStore(), &escaping));
+}
+
 test "compileAndStage: idempotent — identical inputs yield identical hashes" {
     const a = testing.allocator;
     var blob = MemBlobStore.init(a);
     defer blob.deinit();
     const inputs = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "x" }};
 
-    const o1 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "");
+    const o1 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "", null);
     defer a.free(o1);
-    const o2 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "");
+    const o2 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "", null);
     defer a.free(o2);
     try testing.expectEqualSlices(u8, &o1[0].source_hex, &o2[0].source_hex);
     try testing.expectEqualSlices(u8, &o1[0].bytecode_hex, &o2[0].bytecode_hex);
@@ -545,7 +639,12 @@ test "compileAndStage: compile failure surfaces as CompileFailed" {
     var blob = MemBlobStore.init(a);
     defer blob.deinit();
     const inputs = [_]DeployInput{.{ .path = "bad.mjs", .kind = .handler, .bytes = "syntax(" }};
-    try testing.expectError(Error.CompileFailed, compileAndStage(a, blob.blobStore(), failingCompile, null, &inputs, ""));
+    // The failing file's path comes back so the caller can say WHICH file —
+    // a bundle compiles as a batch, and the compiler's own message names only
+    // the problem.
+    var failed: []const u8 = "";
+    try testing.expectError(Error.CompileFailed, compileAndStage(a, blob.blobStore(), failingCompile, null, &inputs, "", &failed));
+    try testing.expectEqualStrings(inputs[0].path, failed);
 }
 
 test "compileAndStage: rejects duplicate + traversal paths" {
@@ -556,7 +655,7 @@ test "compileAndStage: rejects duplicate + traversal paths" {
         .{ .path = "index.mjs", .kind = .handler, .bytes = "a" },
         .{ .path = "index.mjs", .kind = .handler, .bytes = "b" },
     };
-    try testing.expectError(Error.InvalidManifest, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &dup, ""));
+    try testing.expectError(Error.InvalidManifest, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &dup, "", null));
     const bad = [_]DeployInput{.{ .path = "../x.mjs", .kind = .handler, .bytes = "a" }};
-    try testing.expectError(Error.InvalidPath, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &bad, ""));
+    try testing.expectError(Error.InvalidPath, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &bad, "", null));
 }

@@ -139,7 +139,7 @@ def main() -> int:
                         written[k] = v
 
         print("step 1: provision acme [1,2,3] + deploy")
-        check("provision → 204", c.provision("acme").status == 204)
+        check("provision → 200", c.provision("acme").status == 200)
         lead = c.leader_node("acme")
         if lead is None:
             check("leader present", False)

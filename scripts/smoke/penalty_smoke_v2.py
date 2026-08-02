@@ -67,7 +67,7 @@ def main() -> int:
     with V2Cluster.spawn("penalty", nodes=1) as c:
         print("step 1: provision + deploy penalty (runaway while(true) handler)")
         r = c.provision("penalty")
-        check("provision penalty → 204", r.status == 204, f"got {r.status} {r.body!r}")
+        check("provision penalty → 200", r.status == 200, f"got {r.status} {r.body!r}")
         try:
             c.deploy_handlers("penalty", PENALTY_HANDLERS)
             check("deploy penalty", True)

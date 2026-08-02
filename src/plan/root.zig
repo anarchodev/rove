@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-plan — per-tenant plan tiers + effective limits (docs/architecture/control-plane.md).
 //!
 //! A LEAF module (std only) so every consumer can import it without a cycle:
