@@ -69,6 +69,9 @@ def make_cert(tmpdir: str) -> tuple[str, str]:
 
 def cp_env(with_mirror: bool) -> dict:
     env = dict(os.environ)
+    # No operator-metrics listener: concurrent smokes would all race
+    # for the fixed default and warn-spam the logs.
+    env.setdefault("REWIND_METRICS_PORT", "0")
     env["REWIND_CP_DATA_DIR"] = DATA_DIR
     env["REWIND_MOVE_SECRET"] = MOVE_SECRET
     env["REWIND_CLUSTERS"] = f"cluster-1=http://127.0.0.1:{CP_PORT + 1}"

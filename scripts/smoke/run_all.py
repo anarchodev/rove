@@ -66,6 +66,11 @@ EXCLUDED = {
 #                                pass and fail across runs; `--baseline` will
 #                                call it a regression on a run where it flips.
 #                                Check it against rove#362 before believing it.
+#   leader_failover_smoke_v2.py — rove#374, the "clean single re-election"
+#                                leg flakes ~2 of 5 (split votes after a
+#                                leader SIGKILL) — standalone, quiet box,
+#                                reproduced on the baseline commit. Same
+#                                check-the-issue-first rule as rove#362.
 
 # Members that run ALONE, after the parallel pool drains. These assert timing
 # that co-tenant CPU load can skew — an election-timeout soak or a
@@ -254,16 +259,46 @@ def main() -> int:
         for t in threads:
             t.join()
 
+        # One retry for pool failures, now that the box is quieter. A pass on
+        # retry is reported FLKY — visibly distinct, counted as passing (a
+        # transient S3 503 under 8-way load is not a regression), while a real
+        # break fails twice and stays red. Never applied to the serial tail:
+        # its members' flakiness is exactly what they exist to measure.
+        for p in pool_members:
+            if results[p.name]["status"] == "pass":
+                continue
+            first = results[p.name]
+            # Keep the first failure's log — the retry would overwrite the
+            # only evidence of what actually broke under load.
+            first_log = log_dir / f"{p.stem}.log"
+            if first_log.exists():
+                first_log.rename(log_dir / f"{p.stem}.first.log")
+            slot = slots.get()
+            res = run_one(p, TIMEOUTS.get(p.name, args.timeout), log_dir, slot)
+            slots.put(slot)
+            with print_lock:
+                if res["status"] == "pass":
+                    results[p.name] = {**res, "status": "flaky",
+                                       "first_try": first}
+                    print(f"  [retry  ] FLKY {p.name}  ({res['seconds']:.0f}s)"
+                          f" — failed under load, passed alone", flush=True)
+                else:
+                    results[p.name] = res
+                    print(f"  [retry  ] FAIL {p.name}  ({res['seconds']:.0f}s)"
+                          f" — failed twice", flush=True)
+
         # Serial tail: timing-sensitive members, alone on a quiet box.
         for p in serial_members:
             report(p, run_one(p, TIMEOUTS.get(p.name, args.timeout), log_dir,
                               slots.get()))
 
     elapsed = time.time() - started
-    passed = [n for n, r in results.items() if r["status"] == "pass"]
-    failed = [n for n, r in results.items() if r["status"] != "pass"]
+    passed = [n for n, r in results.items() if r["status"] in ("pass", "flaky")]
+    failed = [n for n, r in results.items() if r["status"] not in ("pass", "flaky")]
+    flaky = [n for n, r in results.items() if r["status"] == "flaky"]
     print(f"\n{'=' * 62}")
-    print(f"{len(passed)}/{len(results)} passed in {elapsed / 60:.0f}m")
+    print(f"{len(passed)}/{len(results)} passed in {elapsed / 60:.0f}m"
+          f"{f' ({len(flaky)} flaky)' if flaky else ''}")
 
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=2, sort_keys=True))
@@ -271,9 +306,10 @@ def main() -> int:
 
     if args.baseline and os.path.exists(args.baseline):
         base = json.loads(Path(args.baseline).read_text())
-        newly_broken = [n for n in failed if base.get(n, {}).get("status") == "pass"]
-        newly_fixed = [n for n in passed if base.get(n, {}).get("status") not in (None, "pass")]
-        still_broken = [n for n in failed if base.get(n, {}).get("status") not in (None, "pass")]
+        ok_states = ("pass", "flaky")
+        newly_broken = [n for n in failed if base.get(n, {}).get("status") in ok_states]
+        newly_fixed = [n for n in passed if base.get(n, {}).get("status") not in (None, *ok_states)]
+        still_broken = [n for n in failed if base.get(n, {}).get("status") not in (None, *ok_states)]
         print(f"\nvs baseline: {len(newly_broken)} newly broken, "
               f"{len(newly_fixed)} newly fixed, {len(still_broken)} still broken")
         for n in newly_broken:

@@ -84,15 +84,20 @@ size there will usually be something red, and the question worth answering is
 a backlog item; a new one is a regression, and only the second should block you.
 
 `smoke-baseline.json` in this directory is the last recorded full run:
-**140/142 in 33m**, the two reds being rove#361 (concurrent large static
-downloads abort mid-stream) and rove#362 (a leader that idles past the
-hibernation window spuriously steps down). Both are product defects, not
-stale fixtures. Refresh the baseline when you fix something, so the next
-person's diff is meaningful.
+**141/142 in 14m at `--jobs 8`** (33m of member-time), the one red being
+rove#362 (a leader that idles past the hibernation window spuriously steps
+down). rove#361 (concurrent large static downloads abort mid-stream) passed
+that run for the first time — see the issue for why that may be rove#377's
+mechanism rather than a fix. Product defects, not stale fixtures. Refresh the
+baseline when you fix something, so the next person's diff is meaningful.
 
-rove#362 is INTERMITTENT (~2 runs in 3), so a run where it flips will read as
-a regression or a fix when it is neither — check it against the issue before
-believing either.
+Three members are INTERMITTENT, so a run where one flips will read as a
+regression or a fix when it is neither — check the issue before believing
+either: rove#362 (~2 in 3), rove#374 (`leader_failover`'s clean-single-
+re-election leg, ~2 in 5), and `s3_blob_smoke` (transient object-store 503s
+under suite load; usually reported FLKY, not fail). A `"flaky"` status in the
+JSON means failed in the pool, passed on the automatic solo retry — counted
+as passing by `--baseline`, printed distinctly so it stays visible.
 
 ## Writing one
 
