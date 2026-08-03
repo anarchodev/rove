@@ -2735,6 +2735,24 @@ pub fn Worker(comptime opts: Options) type {
                 return;
             };
             defer stage_storage.incarnation.free(self.allocator);
+            // The per-receive ceiling comes from the STAGING tenant's plan —
+            // the one whose storage the bytes land in, which for a scoped
+            // deploy receive is not the tenant holding the chain. Resolved
+            // once, here: a plan change mid-upload must not move the goalposts
+            // on a stream already in flight. An unresolvable plan falls back to
+            // the module default, so the receive is bounded either way.
+            const receive_cap: u64 = blk: {
+                const inst = self.node.tenant.getInstance(stage_tenant) catch null orelse
+                    break :blk blob_receive_mod.MAX_RECEIVE_BYTES;
+                const slot = getOrOpenTenantSlot(self, inst) catch |err| {
+                    std.log.warn(
+                        "rove-js blob.receive: slot({s}): {s} — falling back to the default ceiling",
+                        .{ stage_tenant, @errorName(err) },
+                    );
+                    break :blk blob_receive_mod.MAX_RECEIVE_BYTES;
+                };
+                break :blk slot.effectivePlan().max_receive_bytes;
+            };
             const job = blob_receive_mod.Job.create(
                 self.allocator,
                 &self.node.router,
@@ -2746,6 +2764,7 @@ pub fn Worker(comptime opts: Options) type {
                 pf.id,
                 pf.name,
                 null,
+                receive_cap,
             ) catch {
                 std.log.warn("rove-js blob.receive: job alloc failed tenant={s}", .{pf.tenant_id});
                 return;
