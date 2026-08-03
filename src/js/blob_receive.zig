@@ -88,6 +88,21 @@ pub fn formatReceiveUrl(allocator: std.mem.Allocator, ent: rove.Entity) ![]u8 {
 /// per node is far past the launch envelope. Over-cap arms fail
 /// loud with an `ok:false` terminal event.
 pub const MAX_ACTIVE_JOBS: u32 = 64;
+
+/// Ceiling on ONE receive. The inbound-body gate (`max_body_bytes`) does not
+/// cover this path — that 413 sits below route resolution, so a module on the
+/// streaming path takes any-size bodies by design — and a receive is the one
+/// write that turns an open socket straight into stored objects. Without a
+/// ceiling here a single request stores without limit, and any quota built on
+/// top can be overshot by an unbounded amount rather than by one write.
+///
+/// 1 GiB matches what the `blob.write` / `seal` recipe path already permits
+/// for one object, so the two large-write paths agree on how big a single
+/// object can get. It bounds a request, not a tenant: with `MAX_ACTIVE_JOBS`
+/// concurrent receives the node-wide worst case is that multiple, which is why
+/// the per-tenant quota still has to layer on top rather than this standing in
+/// for it.
+pub const MAX_RECEIVE_BYTES: u64 = 1024 * 1024 * 1024;
 pub var active_jobs: std.atomic.Value(u32) = .init(0);
 
 /// S3 multipart minimum for every part except the last.
@@ -130,6 +145,15 @@ pub const Job = struct {
     chunks: std.ArrayListUnmanaged([]u8) = .empty,
     eof: bool = false,
     aborted: bool = false,
+    /// Bytes accepted off the socket so far, counted where they arrive rather
+    /// than where they are uploaded — the cap has to bite before the bytes are
+    /// spooled, not after.
+    received: u64 = 0,
+    /// The stream was cut for exceeding `MAX_RECEIVE_BYTES`. Distinguishes the
+    /// refusal from a transport failure so the terminal can say 413 instead of
+    /// the generic 0, and the handler can tell "too big" from "connection
+    /// died".
+    over_cap: bool = false,
 
     /// Bytes the job thread moved out of the queue since h2's last
     /// `drained()` sweep — the flow-control repayment counter.
@@ -222,6 +246,23 @@ pub const Job = struct {
             self.allocator.free(copy);
             return false;
         }
+        // Cut the stream the moment it would cross the ceiling. Enforced here,
+        // at the socket, rather than on the upload thread: a client that
+        // declares no content-length (or lies about it) is bounded only by
+        // what it has actually sent, so the running total is the sole honest
+        // measure. Overshoot is one chunk.
+        if (wouldExceedCeiling(self.received, bytes.len)) {
+            self.allocator.free(copy);
+            self.over_cap = true;
+            self.aborted = true;
+            self.cond.signal();
+            std.log.warn(
+                "rove-js blob.receive: tenant={s} id={s} exceeded the {d}-byte receive ceiling; stream cut",
+                .{ self.tenant_id, self.fetch_id, MAX_RECEIVE_BYTES },
+            );
+            return false;
+        }
+        self.received += bytes.len;
         self.chunks.append(self.allocator, copy) catch {
             self.allocator.free(copy);
             return false;
@@ -286,12 +327,31 @@ pub const Job = struct {
     fn threadMain(self: *Job) void {
         defer self.release();
         self.run() catch |err| {
+            // A cut-for-size stream fails the upload like any other abort, but
+            // the handler must be able to tell the two apart: 413 is the
+            // customer's own doing and retrying the same body will not help,
+            // where 0 is a transport failure that might. Nothing was stored
+            // either way — multipart is commit-gated.
+            if (self.overCap()) {
+                std.log.warn(
+                    "rove-js blob.receive: tenant={s} id={s} refused — over the receive ceiling",
+                    .{ self.tenant_id, self.fetch_id },
+                );
+                self.emitTerminal(false, 413, 0, null);
+                return;
+            }
             std.log.warn(
                 "rove-js blob.receive: upload failed tenant={s} id={s}: {s}",
                 .{ self.tenant_id, self.fetch_id, @errorName(err) },
             );
             self.emitTerminal(false, 0, 0, null);
         };
+    }
+
+    fn overCap(self: *Job) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.over_cap;
     }
 
     fn run(self: *Job) !void {
@@ -491,3 +551,36 @@ pub const Job = struct {
         };
     }
 };
+
+/// Would accepting `incoming` more bytes cross the per-receive ceiling?
+/// Saturating, so a chunk length near `maxInt` cannot wrap the sum into a
+/// false "fits". Exactly-at-ceiling fits: the cap is a ceiling, not a
+/// strict bound.
+pub fn wouldExceedCeiling(received: u64, incoming: usize) bool {
+    return received +| @as(u64, incoming) > MAX_RECEIVE_BYTES;
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "blob.receive: the ceiling admits exactly itself and nothing beyond" {
+    try testing.expect(!wouldExceedCeiling(0, 0));
+    try testing.expect(!wouldExceedCeiling(0, MAX_RECEIVE_BYTES));
+    try testing.expect(!wouldExceedCeiling(MAX_RECEIVE_BYTES, 0));
+    try testing.expect(wouldExceedCeiling(MAX_RECEIVE_BYTES, 1));
+    try testing.expect(wouldExceedCeiling(0, MAX_RECEIVE_BYTES + 1));
+}
+
+test "blob.receive: a chunk that crosses the ceiling is refused whole" {
+    // The stream is cut at the chunk that would cross, so the overshoot a
+    // quota built on this has to tolerate is one chunk, never a whole body.
+    const just_under = MAX_RECEIVE_BYTES - 16;
+    try testing.expect(!wouldExceedCeiling(just_under, 16));
+    try testing.expect(wouldExceedCeiling(just_under, 17));
+}
+
+test "blob.receive: a huge chunk cannot wrap the sum into fitting" {
+    try testing.expect(wouldExceedCeiling(1, std.math.maxInt(usize)));
+    try testing.expect(wouldExceedCeiling(std.math.maxInt(u64), 1));
+}
