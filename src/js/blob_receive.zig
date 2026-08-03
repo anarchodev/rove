@@ -449,6 +449,23 @@ pub const Job = struct {
             components_mod.UpstreamFetchEvent.deinitItem(&ev, a);
             return;
         };
+        // Storage accounting (`src/kv/usage.zig`): an own-tenant receive
+        // streams into THIS tenant's `app-blobs/`, so it owes a row exactly
+        // like a door PUT. The worker gates on the status, so a torn upload —
+        // which S3 multipart leaves invisible — records nothing.
+        //
+        // A SCOPED receive (`target_id`) streams into the TARGET's
+        // `file-blobs/`, so its bytes belong to a tenant that is not the event's
+        // `tenant_id`. Attributing across tenants needs a carrier this event
+        // does not have; it rides with the `file-blobs` writer instead of being
+        // silently charged to the issuer.
+        if (self.target_id == null) {
+            if (hash_hex) |h| {
+                ev.stored_hash = h.*;
+                ev.stored_bytes = len;
+                ev.stored_pool = .app;
+            }
+        }
         // `app` echoes the issue-time ctx (raw JSON) so a cross-tenant deploy
         // receive can thread {tenant, path, content_type} to its `{on}` export.
         const app: []const u8 = if (self.app_ctx.len == 0) "null" else self.app_ctx;
