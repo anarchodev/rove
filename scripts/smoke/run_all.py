@@ -48,10 +48,17 @@ NOT_SMOKES = {"smoke_lib.py", "smoke_lib_v2.py", "v2_topology.py", "run_all.py",
               "smoke_ports.py"}
 
 # Scripts that are deliberately not part of the suite. Each needs a REASON —
-# "it fails" is not one; that is what the report is for. (Currently empty:
-# front_write_reaim_repro.py graduated into the suite when rove#353's
-# leader-hint re-aim fix landed — it now guards that fix.)
-EXCLUDED: dict[str, str] = {}
+# "it fails" is not one; that is what the report is for. (A fixed repro
+# graduates INTO the suite instead: front_write_reaim_repro.py became
+# front_write_reaim_smoke.py when rove#353's leader-hint re-aim fix landed.)
+EXCLUDED = {
+    # Diagnostic capture harness, not a gate: loops the genesis A–E flow to
+    # print a Finding-1-vs-Finding-3 verdict on the leg-E failover flake,
+    # which the wake-to-elect fix closed. genesis_smoke_v2 gates the same
+    # flow once; run this BY HAND if that flake ever recurs.
+    "genesis_capture.py": "diagnostic harness for the fixed leg-E failover "
+                          "flake — genesis_smoke_v2 is the gate",
+}
 
 # A smoke that cannot run in this environment (e.g. no rewind-apps checkout)
 # exits with THIS code after printing why. The runner reports it as "skip" —
@@ -59,17 +66,21 @@ EXCLUDED: dict[str, str] = {}
 # silently bless members that never ran.
 SKIP_RC = 77
 
-# Known-red members that ARE in the suite, so the report keeps counting them.
-# Both are genuine product defects, not stale fixtures — which is why they stay
-# in and stay red rather than being excluded:
+# Known-INTERMITTENT members that stay in the suite so the report keeps
+# counting them. All are genuine product defects, not stale fixtures — which
+# is why they stay in rather than being excluded. Each moves between pass and
+# fail across runs, so `--baseline` will call one a regression (or a fix) on
+# the run where it flips: check the issue before believing either direction.
+#   dispatch_gate_smoke_v2.py  — rove#362, a leader that idles past the
+#                                hibernation window spuriously steps down
+#                                (~2 of 3).
 #   tls_large_body_smoke.py    — rove#361, concurrent large static downloads
 #                                abort mid-stream (sequential ones are fine).
-#   dispatch_gate_smoke_v2.py  — rove#362, a leader that idles past the
-#                                hibernation window spuriously steps down.
-#                                INTERMITTENT (~2 of 3), so it moves between
-#                                pass and fail across runs; `--baseline` will
-#                                call it a regression on a run where it flips.
-#                                Check it against rove#362 before believing it.
+#   raft_soak_v2.py            — rove#377, spurious elections at the DEFAULT
+#                                1ms tick when the disk's fsync tail exceeds
+#                                the election budget. Disk-dependent, not
+#                                time-dependent: consistently red on btrfs,
+#                                green elsewhere. Prod runs tick=10.
 
 # Members that run ALONE, after the parallel pool drains. These assert timing
 # that co-tenant CPU load can skew — an election-timeout soak or a
@@ -177,17 +188,19 @@ def main() -> int:
 
     # Preflight the binaries. Several smokes drive the h2/ws example servers,
     # which the DEFAULT `zig build` install step produces — not the `rewind-*`
-    # steps. Without this the suite reports a pile of unrelated-looking
-    # failures whose real cause is one missing build, which is exactly the
-    # kind of noise that teaches people to stop reading the report.
+    # steps — and five drive the `rewind` CUSTOMER CLI, which is its own step
+    # again (`zig build rewind`, no dash). Without this the suite reports a
+    # pile of unrelated-looking failures whose real cause is one missing
+    # build, which is exactly the kind of noise that teaches people to stop
+    # reading the report.
     bin_dir = HERE.parent.parent / "zig-out" / "bin"
     needed = ["rewind-worker", "rewind-cp", "rewind-front", "rewind-logs",
-              "rewind-ops", "h2-echo-server", "echo-server", "ws-echo"]
+              "rewind-ops", "rewind", "h2-echo-server", "echo-server", "ws-echo"]
     missing = [b for b in needed if not (bin_dir / b).exists()]
     if missing:
         print(f"missing binaries in {bin_dir}: {', '.join(missing)}", file=sys.stderr)
-        print("run `zig build` (default install) AND `zig build rewind-worker rewind-cp "
-              "rewind-front rewind-logs rewind-ops` first", file=sys.stderr)
+        print("run `zig build` (default install) AND `zig build rewind rewind-worker "
+              "rewind-cp rewind-front rewind-logs rewind-ops` first", file=sys.stderr)
         return 2
 
     jobs = max(1, args.jobs)
