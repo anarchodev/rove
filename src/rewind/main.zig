@@ -398,6 +398,13 @@ fn workerMain(args: *WorkerCtx) !void {
                     ms.publish(txt);
                     args.allocator.free(txt);
                 } else |_| {}
+                // The render runs on the serving thread, so its cost is
+                // request latency; it measures well under 1ms, and this
+                // tripwire keeps that claim honest if the text ever grows
+                // an expensive section.
+                const render_us = @divTrunc(@as(i64, @intCast(std.time.nanoTimestamp())) - now_ns, std.time.ns_per_us);
+                if (render_us > 1000)
+                    std.log.warn("metrics render took {d}us at={d}", .{ render_us, std.time.milliTimestamp() });
             }
         }
     }

@@ -14,7 +14,20 @@ const std = @import("std");
 const Error = @import("bridge_error.zig").Error;
 
 pub fn pumpLoop(self: anytype) void {
+    // Stall probes: a pump pause longer than the election timeout is a
+    // spurious-election trigger (ticks, heartbeat sends, and inbound
+    // message steps all ride this loop), so a slow cycle and a slow
+    // inter-cycle gap each warn with a wall-clock stamp. The cycle warn
+    // catches in-pump stalls (the WAL fsync tail is the dominant one —
+    // see the flush probe in node_pump.zig); the gap warn catches
+    // scheduler starvation between cycles. The idle 1ms sleep sits well
+    // under the threshold.
+    var last_cycle_end: i128 = std.time.nanoTimestamp();
     while (!self.stop.load(.acquire)) {
+        const cycle_start = std.time.nanoTimestamp();
+        const gap_us = @divTrunc(cycle_start - last_cycle_end, std.time.ns_per_us);
+        if (gap_us > 5000)
+            std.log.warn("pump inter-cycle gap {d}us at={d}", .{ gap_us, std.time.milliTimestamp() });
         // A pump error is an INFALLIBILITY VIOLATION, not an operational
         // hiccup: a committed entry failed to decode/apply (raft has
         // already consumed it via advance_apply — it will never be
@@ -30,6 +43,10 @@ pub fn pumpLoop(self: anytype) void {
         const did = self.pumpOnce() catch |e| {
             std.debug.panic("v2 bridge pump: unrecoverable apply/flush failure: {s}", .{@errorName(e)});
         };
+        const cycle_us = @divTrunc(std.time.nanoTimestamp() - cycle_start, std.time.ns_per_us);
+        if (cycle_us > 5000)
+            std.log.warn("pump cycle took {d}us (did_work={}) at={d}", .{ cycle_us, did, std.time.milliTimestamp() });
+        last_cycle_end = std.time.nanoTimestamp();
         // Idle backoff: nothing to drain and nothing committed this
         // cycle. Single-node has no election/heartbeat traffic to
         // service, so a short sleep is fine.

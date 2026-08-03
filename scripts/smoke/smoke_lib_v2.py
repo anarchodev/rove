@@ -308,7 +308,7 @@ class V2Cluster:
     # The log-server's operator-metrics port (the loopback :9113 listener in
     # production) — per-cluster allocation so concurrent smokes never scrape
     # each other's processes; readers use this instead of hardcoding 9113.
-    # (Worker metrics stay OFF in smokes — see _spawn_node / rove#377.)
+    # (Worker metrics stay OFF in smokes — see _spawn_node.)
     logs_metrics_port: int = 0
     _block_base: int = 0  # this cluster's port block; freed at shutdown
     root_token: str = ROOT_TOKEN
@@ -558,10 +558,10 @@ class V2Cluster:
         env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
         # Worker operator-metrics OFF by default (a smoke that pins
         # REWIND_METRICS_PORT in its own environ — to test the surface —
-        # wins). Not just port hygiene: the worker renders /metrics on its
-        # poll thread, and under a high-rate soak that render's pause tail
-        # eats the election budget (rove#377) — with per-node metrics on,
-        # raft_soak_v2 saw spurious elections it never sees with them off.
+        # wins): port hygiene, matching the suite's historical effective
+        # behavior where only one worker ever won the fixed :9110 bind.
+        # (The render itself is cheap — <1ms measured; the load-correlated
+        # pump stalls are the WAL fsync tail, rove#377.)
         env.setdefault("REWIND_METRICS_PORT", "0")
         # Step 3 B4: the CP base for the `rewind-cp.internal` door (the worker's
         # node.cp_internal_base = cp_urls[0]), so the __admin__ dashboard can

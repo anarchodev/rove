@@ -252,6 +252,17 @@ pub fn pump(self: *Node) Error!bool {
         }
 
         // ONE fsync per cycle regardless of how many groups committed.
+        //
+        // Timed because this fsync is the pump's dominant pause and every
+        // outbox send — heartbeats included — drains AFTER it: a leader
+        // stalled here past the election timeout (election_tick ×
+        // tick_interval; how to size it, docs/architecture/raft-best-practices.md)
+        // is heartbeat-silent and gets spuriously deposed. Filesystem
+        // commit tails reach 100-250ms (btrfs's periodic transaction
+        // commit), dwarfing a millisecond-tick election budget, so a slow
+        // flush is warned with a wall-clock stamp — one grep answers "what
+        // stalled the pump, and did it line up across nodes".
+        const flush_t0 = nowNs();
         const flushed = blk: {
             self.wal.flush() catch {
                 self.apply_err = self.apply_err orelse Error.Io;
@@ -259,6 +270,9 @@ pub fn pump(self: *Node) Error!bool {
             };
             break :blk true;
         };
+        const flush_us = @divTrunc(nowNs() - flush_t0, std.time.ns_per_us);
+        if (flush_us > 5000)
+            std.log.warn("wal fsync took {d}us at={d}", .{ flush_us, std.time.milliTimestamp() });
 
         if (flushed) {
             // Persist ack (the async-append handshake): the fsync now
