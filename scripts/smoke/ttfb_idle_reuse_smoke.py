@@ -30,6 +30,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -184,31 +185,58 @@ def main():
                 raise SystemExit("upstream/proxy not serving 200 — aborting sweep")
 
         # The sweep. Fresh client per gap so each gap starts from a clean pooled
-        # connection; reuse within the gap loop is what races the reaper.
+        # connection; reuse within the gap loop is what races the reaper. The
+        # gaps are independent (own client, own connection), so they run
+        # CONCURRENTLY — makespan is the longest gap's trials, not the sum of
+        # all gaps' (serially this smoke was ~7 minutes of time.sleep and set
+        # the whole pool's makespan in run_all). The verdict compares against
+        # STALL_S=1.0s where the prod stall was ~10s, so the ~ms of co-load
+        # jitter from a dozen mostly-sleeping local clients cannot blur it.
         print("\nsweep (reuse latency per gap; STALL = reuse > %.1fs or error):" % STALL_S)
-        for gap in GAPS:
+        stalls_lock = threading.Lock()
+        gap_results = {}
+
+        def sweep_gap(gap):
             worst = 0.0
             errs = 0
-            with httpx.Client(http2=True, verify=False, limits=limits, timeout=CLIENT_TIMEOUT_S) as c:
-                # establish the pooled conn
-                c.get(base + "/")
-                for _ in range(TRIALS):
-                    time.sleep(gap)
-                    t0 = time.perf_counter()
-                    try:
-                        rr = c.get(base + "/")
-                        dt = time.perf_counter() - t0
-                        if rr.status_code != 200:
+            local_stalls = []
+            try:
+                with httpx.Client(http2=True, verify=False, limits=limits,
+                                  timeout=CLIENT_TIMEOUT_S) as c:
+                    # establish the pooled conn
+                    c.get(base + "/")
+                    for _ in range(TRIALS):
+                        time.sleep(gap)
+                        t0 = time.perf_counter()
+                        try:
+                            rr = c.get(base + "/")
+                            dt = time.perf_counter() - t0
+                            if rr.status_code != 200:
+                                errs += 1
+                                local_stalls.append((gap, f"status {rr.status_code}", dt))
+                            if dt > worst:
+                                worst = dt
+                            if dt > STALL_S:
+                                local_stalls.append((gap, "slow reuse", dt))
+                        except Exception as e:  # noqa: BLE001
+                            dt = time.perf_counter() - t0
                             errs += 1
-                            stalls.append((gap, f"status {rr.status_code}", dt))
-                        if dt > worst:
-                            worst = dt
-                        if dt > STALL_S:
-                            stalls.append((gap, "slow reuse", dt))
-                    except Exception as e:  # noqa: BLE001
-                        dt = time.perf_counter() - t0
-                        errs += 1
-                        stalls.append((gap, type(e).__name__, dt))
+                            local_stalls.append((gap, type(e).__name__, dt))
+            except Exception as e:  # noqa: BLE001 — a dead thread must still report
+                errs += 1
+                local_stalls.append((gap, f"sweep aborted: {type(e).__name__}", 0.0))
+            with stalls_lock:
+                stalls.extend(local_stalls)
+                gap_results[gap] = (worst, errs)
+
+        threads = [threading.Thread(target=sweep_gap, args=(g,), daemon=True)
+                   for g in GAPS]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for gap in GAPS:
+            worst, errs = gap_results[gap]
             flag = "STALL" if (worst > STALL_S or errs) else "ok   "
             rel = gap / IDLE_S
             print(f"  {flag} gap={gap:5.2f}s ({rel:4.2f}× idle)  "

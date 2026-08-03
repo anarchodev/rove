@@ -38,7 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
+from smoke_lib_v2 import V2Cluster  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants" / "acme"
@@ -52,7 +52,7 @@ def _src(rel: str) -> str:
 # spec.json MUST deploy as `static` (the loader skips non-static specs) — so
 # this is a content-addressed manifest deploy with explicit per-file kinds.
 HANDLERS = {
-    "index.mjs": ("handler", rpc_wrap(_src("index.mjs"))),
+    "index.mjs": ("handler", _src("index.mjs")),  # default export; readiness probe only
     "writekv/index.mjs": ("handler", _src("writekv/index.mjs")),
     "readkey/index.mjs": ("handler", _src("readkey/index.mjs")),
     "_subscriptions/sub-react/index.mjs":
@@ -83,8 +83,8 @@ def main() -> int:
             return 1
 
         # Wait for the deployment to load + serve.
-        r = c.wait_for_handler("acme", "/?fn=handler", want_status=200,
-                               timeout_s=25.0)
+        r = c.wait_for_handler("acme", "/", want_status=200,
+                               want_body="acme hit count", timeout_s=25.0)
         if r.status != 200:
             check("acme reachable", False, f"got {r.status} {r.body!r}")
             c.dump_node_log(grep=["deploy", "loader", "manifest", "subscription",

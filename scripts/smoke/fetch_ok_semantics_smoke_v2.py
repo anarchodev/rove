@@ -94,8 +94,9 @@ def main() -> int:
         check("up/ok → 200", r.status == 200, f"got {r.status}")
         r = c.wait_for_handler("up", "/err", want_status=500, timeout_s=25.0)
         check("up/err → 500", r.status == 500, f"got {r.status}")
-        r = c.wait_for_handler("cli", "/", want_status=200, timeout_s=25.0)
-        check("cli reachable", r.status in (200, 404), f"got {r.status}")
+        r = c.wait_for_handler("cli", "/?fn=handler", want_status=200,
+                               want_body="cli-ready", timeout_s=25.0)
+        check("cli reachable", r.status == 200, f"got {r.status}")
         if failures:
             c.dump_node_log(grep=["deploy", "loader", "manifest", "error", "warn"])
             print("\nFAILURES:", failures)

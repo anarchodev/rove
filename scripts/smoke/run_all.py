@@ -48,24 +48,39 @@ NOT_SMOKES = {"smoke_lib.py", "smoke_lib_v2.py", "v2_topology.py", "run_all.py",
               "smoke_ports.py"}
 
 # Scripts that are deliberately not part of the suite. Each needs a REASON —
-# "it fails" is not one; that is what the report is for.
+# "it fails" is not one; that is what the report is for. (A fixed repro
+# graduates INTO the suite instead: front_write_reaim_repro.py became
+# front_write_reaim_smoke.py when rove#353's leader-hint re-aim fix landed.)
 EXCLUDED = {
-    # Standalone reproduction for an open bug: expected to fail until it is
-    # fixed, and a known-red member would train you to ignore the report.
-    "front_write_reaim_repro.py": "rove#353 repro — red by design until fixed",
+    # Diagnostic capture harness, not a gate: loops the genesis A–E flow to
+    # print a Finding-1-vs-Finding-3 verdict on the leg-E failover flake,
+    # which the wake-to-elect fix closed. genesis_smoke_v2 gates the same
+    # flow once; run this BY HAND if that flake ever recurs.
+    "genesis_capture.py": "diagnostic harness for the fixed leg-E failover "
+                          "flake — genesis_smoke_v2 is the gate",
 }
 
-# Known-red members that ARE in the suite, so the report keeps counting them.
-# Both are genuine product defects, not stale fixtures — which is why they stay
-# in and stay red rather than being excluded:
+# A smoke that cannot run in this environment (e.g. no rewind-apps checkout)
+# exits with THIS code after printing why. The runner reports it as "skip" —
+# NOT as a pass: a baseline recorded in a stripped environment must not
+# silently bless members that never ran.
+SKIP_RC = 77
+
+# Known-INTERMITTENT members that stay in the suite so the report keeps
+# counting them. All are genuine product defects, not stale fixtures — which
+# is why they stay in rather than being excluded. Each moves between pass and
+# fail across runs, so `--baseline` will call one a regression (or a fix) on
+# the run where it flips: check the issue before believing either direction.
+#   dispatch_gate_smoke_v2.py  — rove#362, a leader that idles past the
+#                                hibernation window spuriously steps down
+#                                (~2 of 3).
 #   tls_large_body_smoke.py    — rove#361, concurrent large static downloads
 #                                abort mid-stream (sequential ones are fine).
-#   dispatch_gate_smoke_v2.py  — rove#362, a leader that idles past the
-#                                hibernation window spuriously steps down.
-#                                INTERMITTENT (~2 of 3), so it moves between
-#                                pass and fail across runs; `--baseline` will
-#                                call it a regression on a run where it flips.
-#                                Check it against rove#362 before believing it.
+#   raft_soak_v2.py            — rove#377, spurious elections at the DEFAULT
+#                                1ms tick when the disk's fsync tail exceeds
+#                                the election budget. Disk-dependent, not
+#                                time-dependent: consistently red on btrfs,
+#                                green elsewhere. Prod runs tick=10.
 
 # Members that run ALONE, after the parallel pool drains. These assert timing
 # that co-tenant CPU load can skew — an election-timeout soak or a
@@ -133,7 +148,8 @@ def run_one(p: Path, budget: int, log_dir: Path, slot: int | None) -> dict:
                                 start_new_session=True)
         try:
             rc = proc.wait(timeout=budget)
-            status = "pass" if rc == 0 else "fail"
+            status = ("pass" if rc == 0
+                      else "skip" if rc == SKIP_RC else "fail")
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -172,17 +188,19 @@ def main() -> int:
 
     # Preflight the binaries. Several smokes drive the h2/ws example servers,
     # which the DEFAULT `zig build` install step produces — not the `rewind-*`
-    # steps. Without this the suite reports a pile of unrelated-looking
-    # failures whose real cause is one missing build, which is exactly the
-    # kind of noise that teaches people to stop reading the report.
+    # steps — and five drive the `rewind` CUSTOMER CLI, which is its own step
+    # again (`zig build rewind`, no dash). Without this the suite reports a
+    # pile of unrelated-looking failures whose real cause is one missing
+    # build, which is exactly the kind of noise that teaches people to stop
+    # reading the report.
     bin_dir = HERE.parent.parent / "zig-out" / "bin"
     needed = ["rewind-worker", "rewind-cp", "rewind-front", "rewind-logs",
-              "rewind-ops", "h2-echo-server", "echo-server", "ws-echo"]
+              "rewind-ops", "rewind", "h2-echo-server", "echo-server", "ws-echo"]
     missing = [b for b in needed if not (bin_dir / b).exists()]
     if missing:
         print(f"missing binaries in {bin_dir}: {', '.join(missing)}", file=sys.stderr)
-        print("run `zig build` (default install) AND `zig build rewind-worker rewind-cp "
-              "rewind-front rewind-logs rewind-ops` first", file=sys.stderr)
+        print("run `zig build` (default install) AND `zig build rewind rewind-worker "
+              "rewind-cp rewind-front rewind-logs rewind-ops` first", file=sys.stderr)
         return 2
 
     jobs = max(1, args.jobs)
@@ -211,10 +229,19 @@ def main() -> int:
         with print_lock:
             done_count += 1
             results[p.name] = res
-            mark = {"pass": "ok  ", "fail": "FAIL", "timeout": "HUNG"}[res["status"]]
+            mark = {"pass": "ok  ", "fail": "FAIL", "timeout": "HUNG",
+                    "skip": "SKIP"}[res["status"]]
             print(f"  [{done_count:3d}/{len(smokes)}] {mark} {p.name}  "
                   f"({res['seconds']:.0f}s)", flush=True)
-            if res["status"] != "pass":
+            if res["status"] == "skip":
+                # Show the smoke's own one-line reason (it prints "SKIP — why"
+                # before exiting SKIP_RC).
+                log_path = log_dir / f"{p.stem}.log"
+                for ln in log_path.read_text(errors="replace").splitlines():
+                    if "SKIP" in ln:
+                        print(f"         | {ln.strip()[:150]}", flush=True)
+                        break
+            elif res["status"] != "pass":
                 # The first failing assertion is usually the whole story; show
                 # a little of it inline so the report is readable without
                 # opening logs.
@@ -264,7 +291,7 @@ def main() -> int:
         # break fails twice and stays red. Never applied to the serial tail:
         # its members' flakiness is exactly what they exist to measure.
         for p in pool_members:
-            if results[p.name]["status"] == "pass":
+            if results[p.name]["status"] in ("pass", "skip"):
                 continue
             first = results[p.name]
             # Keep the first failure's log — the retry would overwrite the
@@ -293,11 +320,14 @@ def main() -> int:
 
     elapsed = time.time() - started
     passed = [n for n, r in results.items() if r["status"] in ("pass", "flaky")]
-    failed = [n for n, r in results.items() if r["status"] not in ("pass", "flaky")]
+    skipped = [n for n, r in results.items() if r["status"] == "skip"]
+    failed = [n for n, r in results.items()
+              if r["status"] not in ("pass", "flaky", "skip")]
     flaky = [n for n, r in results.items() if r["status"] == "flaky"]
     print(f"\n{'=' * 62}")
-    print(f"{len(passed)}/{len(results)} passed in {elapsed / 60:.0f}m"
-          f"{f' ({len(flaky)} flaky)' if flaky else ''}")
+    print(f"{len(passed)}/{len(results) - len(skipped)} passed in {elapsed / 60:.0f}m"
+          f"{f' ({len(flaky)} flaky)' if flaky else ''}"
+          f"{f' ({len(skipped)} skipped)' if skipped else ''}")
 
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=2, sort_keys=True))
@@ -307,14 +337,24 @@ def main() -> int:
         base = json.loads(Path(args.baseline).read_text())
         ok_states = ("pass", "flaky")
         newly_broken = [n for n in failed if base.get(n, {}).get("status") in ok_states]
-        newly_fixed = [n for n in passed if base.get(n, {}).get("status") not in (None, *ok_states)]
+        newly_fixed = [n for n in passed
+                       if base.get(n, {}).get("status") not in (None, "skip", *ok_states)]
         still_broken = [n for n in failed if base.get(n, {}).get("status") not in (None, *ok_states)]
+        # A member that PASSED in the baseline but only SKIPPED now never ran —
+        # its coverage silently vanished (missing checkout / env). Warn loudly;
+        # it is an environment problem, not a product regression, so it does
+        # not fail the run.
+        newly_skipped = [n for n in skipped if base.get(n, {}).get("status") in ok_states]
         print(f"\nvs baseline: {len(newly_broken)} newly broken, "
-              f"{len(newly_fixed)} newly fixed, {len(still_broken)} still broken")
+              f"{len(newly_fixed)} newly fixed, {len(still_broken)} still broken"
+              f"{f', {len(newly_skipped)} NEWLY SKIPPED' if newly_skipped else ''}")
         for n in newly_broken:
             print(f"  REGRESSION {n}")
         for n in newly_fixed:
             print(f"  fixed      {n}")
+        for n in newly_skipped:
+            print(f"  SKIPPED    {n} — passed in the baseline but did not run; "
+                  f"this run proves less than the baseline did")
         # A regression fails the run even if the absolute count improved.
         return 1 if newly_broken else 0
 

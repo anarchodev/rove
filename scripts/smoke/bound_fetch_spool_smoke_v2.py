@@ -113,8 +113,9 @@ def main() -> int:
             return 1
 
         # ── 2. acme reachable. ────────────────────────────────────────
-        r = c.wait_for_handler("acme", "/", want_status=200, timeout_s=25.0)
-        check("acme reachable", r.status in (200, 404),
+        r = c.wait_for_handler("acme", "/", want_status=200,
+                             want_body="acme hit count", timeout_s=25.0)
+        check("acme reachable", r.status == 200,
               f"got {r.status} {r.body!r}")
 
         # ── 3. THE multi-bind fetch. ──────────────────────────────────

@@ -82,7 +82,7 @@ def main() -> int:
     checker = os.path.join(apps, "e2e", "replay-digest-check.mjs")
     if not os.path.exists(checker):
         print(f"SKIP — no rewind-apps checkout at {apps} (set REWIND_APPS_DIR)")
-        return 0
+        return 77  # run_all.SKIP_RC — reported "skip", never "pass"
 
     with V2Cluster.spawn("demoreplay", nodes=1) as c:
         c.spawn_log_server(poll_interval_ms=200)

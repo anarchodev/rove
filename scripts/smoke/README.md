@@ -10,6 +10,7 @@ dispatcher together.
 ```bash
 zig build                         # the h2 example servers a few smokes drive
 zig build rewind-worker rewind-cp rewind-front rewind-logs rewind-ops
+zig build rewind                  # the customer CLI — five smokes drive it
 set -a; . ./.env; set +a          # S3 credentials — V2 has no fs blob backend
 export REWIND_APPS_DIR=~/src/rewind-apps    # only for smokes that deploy first-party apps
 
@@ -102,20 +103,42 @@ size there will usually be something red, and the question worth answering is
 a backlog item; a new one is a regression, and only the second should block you.
 
 `smoke-baseline.json` in this directory is the last recorded full run:
-**141/142 in 14m at `--jobs 8`** (33m of member-time), the one red being
-rove#362 (a leader that idles past the hibernation window spuriously steps
-down). rove#361 (concurrent large static downloads abort mid-stream) passed
-that run for the first time — see the issue for why that may be rove#377's
-mechanism rather than a fix. Product defects, not stale fixtures. Refresh the
-baseline when you fix something, so the next person's diff is meaningful.
+**141/143 in 10m at `--jobs 8`** (26m of member-time). The two reds are
+product defects, not stale fixtures: rove#361 (`tls_large_body`, concurrent
+large static downloads abort mid-stream — intermittent, ~1 in 2) and rove#377
+(`raft_soak_v2`'s spurious elections at the DEFAULT 1ms tick — the run that
+recorded this baseline was on btrfs, where the fsync tail exceeds the 1ms
+election budget; it may well be green on a different disk, which is the
+finding, not a flake). Refresh the baseline when you fix something, so the
+next person's diff is meaningful.
+
+Where the 10m goes: a ~2.5m parallel pool (bounded by its longest member,
+`churn_kv_convergence` at ~140s) plus a ~7.3m SERIAL tail. **The tail is the
+floor** — halving the pool again would buy almost nothing. Cutting further
+means cutting what the soaks prove (`raft_soak_prod` honours
+`REWIND_SOAK_ROUNDS`, default 6), which is a deliberate trade, not a tidy-up.
 
 Three members are INTERMITTENT, so a run where one flips will read as a
 regression or a fix when it is neither — check the issue before believing
-either: rove#362 (~2 in 3), rove#374 (`leader_failover`'s clean-single-
-re-election leg, ~2 in 5), and `s3_blob_smoke` (transient object-store 503s
-under suite load; usually reported FLKY, not fail). A `"flaky"` status in the
-JSON means failed in the pool, passed on the automatic solo retry — counted
-as passing by `--baseline`, printed distinctly so it stays visible.
+either: rove#361 (`tls_large_body`, ~1 in 2), rove#362 (`dispatch_gate`,
+~2 in 3 — green in the baseline run), and `s3_blob_smoke_v2` (transient
+object-store 503s under suite load; usually reported FLKY, not fail). A
+`"flaky"` status in the JSON means failed in the pool, passed on the
+automatic solo retry — counted as passing by `--baseline`, printed
+distinctly so it stays visible.
+
+`leader_failover`'s ~40% flake (rove#374) is FIXED — it was a test bug, not
+a product defect: `raft_leadership_acquisitions_total` is a NODE-WIDE counter
+summed over every raft group, and the smoke asserted a per-group property
+with it while the victim usually led two groups.
+
+A smoke that cannot run in the current environment (no rewind-apps checkout,
+say) prints `SKIP — <why>` and exits **77** (`run_all.SKIP_RC`); the runner
+reports it as `skip`, never `pass`. A skip is invisible coverage, and the
+distinction matters most under `--baseline`: a member that passed in the
+baseline but only skipped now gets a loud NEWLY SKIPPED warning — the run
+proves less than the baseline did, usually because the environment is
+stripped, and a green summary must not paper over that.
 
 ## Writing one
 
@@ -131,7 +154,12 @@ as passing by `--baseline`, printed distinctly so it stays visible.
   rather than assuming node 0 leads.
 - If a script is a reproduction for an open bug and is *meant* to be red, add it
   to `EXCLUDED` in `run_all.py` with the issue number. A permanently-red member
-  teaches people to ignore the report.
+  teaches people to ignore the report. When the bug is fixed, graduate the
+  script INTO the suite (rename `*_repro.py` → `*_smoke.py`) — an excluded
+  green repro is a regression gate nobody runs.
+- If a smoke needs something the environment may not have (a rewind-apps
+  checkout, a credential), print `SKIP — <why>` and exit 77 — never 0. Exit 0
+  records a pass for a smoke that never ran.
 - A smoke that legitimately runs long (the raft soak: 6 kill/wipe/heal rounds)
   needs an entry in `TIMEOUTS`, or it is reported HUNG and reads as a product
   hang rather than a slow test.

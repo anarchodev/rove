@@ -54,7 +54,7 @@ from smoke_lib_v2 import APPS_DIR, V2Cluster  # noqa: E402
 AGENT_MJS = APPS_DIR / "agent-sample" / "agent" / "index.mjs"
 if not AGENT_MJS.exists():
     print(f"SKIP — no rewind-apps checkout at {APPS_DIR} (set REWIND_APPS_DIR)")
-    raise SystemExit(0)
+    raise SystemExit(77)  # run_all.SKIP_RC — reported "skip", never "pass"
 AGENT_SRC = AGENT_MJS.read_text()
 READY_SRC = 'export default function () { return "ready"; }\n'
 
