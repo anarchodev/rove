@@ -40,10 +40,13 @@ pub const applyEncodedWriteSet = writeset.applyEncoded;
 pub const scanWriteSetPutValue = writeset.scanPutValue;
 pub const decodeWriteSetOps = writeset.decodeOps;
 
-// usage.zig (per-tenant stored-byte accounting, folded at apply time)
+// usage.zig (per-tenant stored-byte accounting: rows are stored, the total
+// is summed on read)
 pub const UsagePool = usage.Pool;
 pub const usageRowKey = usage.rowKey;
+pub const usageFormatLen = usage.formatLen;
 pub const storedBytes = usage.storedBytes;
+pub const storedBytesIn = usage.storedBytesIn;
 
 // snapshot_stream.zig (raft streaming transfer codec)
 pub const StreamDumper = snapshot_stream.StreamDumper;
