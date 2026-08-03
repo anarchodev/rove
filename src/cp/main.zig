@@ -1768,7 +1768,7 @@ pub fn main() !void {
     if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| {
             if (ms > 0) {
-                cp_bridge.node.tick_interval_ns = ms * std.time.ns_per_ms;
+                cp_bridge.node.setTickInterval(ms * std.time.ns_per_ms);
                 std.log.info("rewind-cp: raft tick interval = {d}ms (election timeout ≈ election_tick × {d}ms)", .{ ms, ms });
             }
         } else |_| {}

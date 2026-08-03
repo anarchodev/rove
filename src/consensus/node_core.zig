@@ -109,13 +109,18 @@ pub const group_raft_config: raft.manager.GroupConfig = blk: {
 /// with a short value so the hibernate/wake transitions are observable fast.
 pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 
-/// Default leaderless-escalation window (see `Node.leaderless_escalate_ns`): a
-/// group active + leaderless for this long gets a forced (lease-bypassing,
-/// pre-vote-free) campaign. ~15× the ~10ms election timeout — long enough that a
-/// normal election (cold start, or peers whose leases expire on their own)
-/// completes first and never triggers it, short enough that a genuinely wedged
-/// hard-failover recovers in a fraction of a second rather than waiting on luck.
-pub const DEFAULT_LEADERLESS_ESCALATE_NS: i64 = 150 * std.time.ns_per_ms;
+/// Leaderless-escalation window in TICKS (see `Node.leaderless_escalate_ns`):
+/// a group active + leaderless for this many tick intervals gets a forced
+/// (lease-bypassing, pre-vote-free) campaign. ~15 election timeouts
+/// (election_tick is 10) — long enough that a normal election (cold start, or
+/// peers whose leases expire on their own) completes first and never triggers
+/// it, short enough that a genuinely wedged hard-failover recovers promptly
+/// rather than waiting on luck. Tick-denominated because the window must keep
+/// that ratio when an operator widens the tick (`setTickInterval`): a fixed
+/// wall-clock window would fall INSIDE the widened election timeout and
+/// force-campaign past peers' leases mid-election.
+pub const LEADERLESS_ESCALATE_TICKS: i64 = 150;
+pub const DEFAULT_LEADERLESS_ESCALATE_NS: i64 = LEADERLESS_ESCALATE_TICKS * DEFAULT_TICK_NS;
 
 /// Default durabilize cadence: how often the pump folds each dirty tenant store's in-memory
 /// overlay into LMDB + stamps its raft watermark + (single-node) compacts the
@@ -521,10 +526,13 @@ pub const Node = struct {
     /// leaderless (this node not the leader AND `leaderId == 0`) before the pump
     /// FORCE-campaigns it past peers' `check_quorum` leases (`escalateLeaderless`
     /// → `mgr.campaignForce`). Comfortably above the election timeout
-    /// (`election_tick × tick_interval` ≈ 10ms) so the cheap normal pre-vote path
+    /// (`election_tick × tick_interval`) so the cheap normal pre-vote path
     /// gets a few rounds first — the force-campaign is the BACKSTOP that makes a
     /// hard (SIGKILL) failover deterministic instead of relying on the peers'
-    /// leases happening to expire in time. Tests override with a short value.
+    /// leases happening to expire in time. Tick-denominated ratio: a wider
+    /// tick widens this with it via `setTickInterval` (never set the tick by
+    /// assigning `tick_interval_ns` directly, or this window falls inside the
+    /// election timeout). Tests override with a short value.
     leaderless_escalate_ns: i64 = DEFAULT_LEADERLESS_ESCALATE_NS,
 
 
@@ -752,6 +760,18 @@ pub const Node = struct {
     pub fn heartbeatRttSnapshot(self: *Node) ?kvlimbs.MicrosHistogram.Snapshot {
         const t = self.transport orelse return null;
         return t.heartbeatRttSnapshot();
+    }
+
+    /// Set the raft logical-tick cadence, rescaling the tick-denominated
+    /// windows with it: the leaderless-escalation window keeps its
+    /// `LEADERLESS_ESCALATE_TICKS` ratio (~15 election timeouts), so widening
+    /// the tick cannot leave the force-campaign backstop inside the election
+    /// timeout, where it would bypass peers' leases mid-election. The
+    /// boot-time `REWIND_RAFT_TICK_MS` override goes through here; call
+    /// before the pump starts.
+    pub fn setTickInterval(self: *Node, interval_ns: i64) void {
+        self.tick_interval_ns = interval_ns;
+        self.leaderless_escalate_ns = LEADERLESS_ESCALATE_TICKS * interval_ns;
     }
 
     /// Snapshot the node-wide outbound dial-mesh (configured vs connected
@@ -1865,4 +1885,26 @@ test "Phase 6: an idle 3-node group hibernates with no spurious leader change, t
     }
     try testing.expect(woke);
     try testing.expect(nodes[ld].isLeader(tenant));
+}
+
+test "leaderless-escalation window sits above the randomized election timeout" {
+    // The backstop force-campaigns past peers' `check_quorum` leases, so it
+    // must never fire inside a normal election: raft randomizes the timeout
+    // in [election_tick, 2 × election_tick) ticks, and both windows scale
+    // with the same tick interval (`setTickInterval`), so this tick-count
+    // comparison is the whole invariant — at any operator-chosen tick.
+    try testing.expect(LEADERLESS_ESCALATE_TICKS > 2 * group_raft_config.election_tick);
+}
+
+test "setTickInterval rescales the leaderless-escalation window with the tick" {
+    var n: Node = undefined;
+    n.tick_interval_ns = DEFAULT_TICK_NS;
+    n.leaderless_escalate_ns = DEFAULT_LEADERLESS_ESCALATE_NS;
+    n.setTickInterval(10 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(i64, 10 * std.time.ns_per_ms), n.tick_interval_ns);
+    try testing.expectEqual(LEADERLESS_ESCALATE_TICKS * 10 * std.time.ns_per_ms, n.leaderless_escalate_ns);
+    // The rescaled window still clears the widened randomized election
+    // timeout (2 × election_tick × tick).
+    const election_ticks: i64 = @intCast(group_raft_config.election_tick);
+    try testing.expect(n.leaderless_escalate_ns > 2 * election_ticks * n.tick_interval_ns);
 }
