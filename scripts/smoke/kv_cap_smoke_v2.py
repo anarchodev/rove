@@ -64,7 +64,7 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    with V2Cluster.spawn("kvcap", nodes=1, http_base=19850, raft_base=19860) as c:
+    with V2Cluster.spawn("kvcap", nodes=1) as c:
 
         def set_plan(plan: str):
             return c._cp_post("/_control/plan", {"tenant": "acme", "plan": plan})
