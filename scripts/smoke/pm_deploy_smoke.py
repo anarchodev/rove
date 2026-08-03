@@ -33,16 +33,29 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 JWT19_HASH = "b" * 64
 JWT14_HASH = "c" * 64
 OIDC_HASH = "a" * 64
+MULTI_HASH = "d" * 64
 
 JWT19_SRC = 'export const v = "jwt19";\n'
 JWT14_SRC = 'export const v = "jwt14";\n'
 # oidc pins ITS OWN jwt@1.4 — the encapsulated dep.
 OIDC_SRC = 'import { v } from "@rewind/jwt";\nexport const jwtv = v;\n'
 
+# A MULTI-FILE package (the #344 remainder): its entry imports a sibling
+# (`./util.mjs`) AND a cross-package dep. The files dict lists index BEFORE
+# util, so the sibling is staged AFTER its importer — order must not matter
+# (staging is stage-only; the package compiles as one batch at cut).
+MULTI_INDEX_SRC = (
+    'import { tag } from "./util.mjs";\n'
+    'import { v } from "@rewind/jwt";\n'
+    'export const combined = tag + "+" + v;\n'
+)
+MULTI_UTIL_SRC = 'export const tag = "multi-util";\n'
+
 HANDLER_SRC = (
     'import { jwtv } from "@rewind/oidc";\n'
     'import { v } from "@rewind/jwt";\n'
-    'export function handler() { return "app=" + v + " oidc=" + jwtv + "\\n"; }\n'
+    'import { combined } from "@acme/multi";\n'
+    'export function handler() { return "app=" + v + " oidc=" + jwtv + " multi=" + combined + "\\n"; }\n'
 )
 
 BAD_HANDLER_SRC = (
@@ -57,8 +70,13 @@ EVIL_PKG_SRC = 'export const h = _system.http;\n'
 
 
 def packages(app_jwt_hash: str) -> list[dict]:
-    """The lockfile-shaped package set, dependency order (leaves first)."""
+    """The lockfile-shaped package set — deliberately NOT dependency-ordered
+    (@acme/multi, which imports jwt@1.9, is listed FIRST): the deploy app
+    topo-orders the batch compiles at cut, so client order carries nothing."""
     return [
+        {"spec": "@acme/multi", "version": "0.1.0", "pkg_hash": MULTI_HASH,
+         "files": {"index.mjs": MULTI_INDEX_SRC, "util.mjs": MULTI_UTIL_SRC},
+         "imports": {"@rewind/jwt": JWT19_HASH}},
         {"spec": "@rewind/jwt", "version": "1.9.0", "pkg_hash": JWT19_HASH,
          "files": {"index.mjs": JWT19_SRC}, "imports": {}},
         {"spec": "@rewind/jwt", "version": "1.4.0", "pkg_hash": JWT14_HASH,
@@ -88,18 +106,24 @@ def main() -> int:
             dep1 = c.deploy_with_packages(
                 "pkgacme", {"index.mjs": rpc_wrap(HANDLER_SRC)},
                 packages(JWT19_HASH),
-                {"@rewind/oidc": OIDC_HASH, "@rewind/jwt": JWT19_HASH})
+                {"@rewind/oidc": OIDC_HASH, "@rewind/jwt": JWT19_HASH,
+                 "@acme/multi": MULTI_HASH})
             check("package deploy → dep_id", bool(dep1), f"dep_id={dep1}")
         except RuntimeError as e:
             check("package deploy", False, str(e))
 
         if dep1:
-            print("step 3: multi-version + encapsulation through a real serve")
+            print("step 3: multi-version + encapsulation + multi-file pkg through a real serve")
             r = c.wait_for_handler("pkgacme", "/?fn=handler",
                                    want_body="app=jwt19 oidc=jwt14")
             check("GET → app=jwt19 oidc=jwt14",
                   r.status == 200 and "app=jwt19 oidc=jwt14" in r.body,
                   f"got {r.status} {r.body!r}")
+            # #344 remainder: the multi-file package's sibling import resolved
+            # (staged importer-first, compiled as a batch at cut) and its
+            # cross-package dep landed via the topo order.
+            check("GET → multi=multi-util+jwt19 (sibling + cross-pkg import)",
+                  "multi=multi-util+jwt19" in r.body, f"got {r.body!r}")
 
         print("step 4: undeclared package import fails AT DEPLOY, naming the module")
         try:
@@ -126,7 +150,7 @@ def main() -> int:
                     {"spec": "@evil/sys", "version": "1.0.0", "pkg_hash": "e" * 64,
                      "files": {"index.mjs": EVIL_PKG_SRC}, "imports": {}}],
                 {"@rewind/oidc": OIDC_HASH, "@rewind/jwt": JWT19_HASH,
-                 "@evil/sys": "e" * 64})
+                 "@acme/multi": MULTI_HASH, "@evil/sys": "e" * 64})
             check("privileged-surface package rejected", False,
                   "deploy unexpectedly succeeded")
         except RuntimeError as e:
@@ -139,7 +163,8 @@ def main() -> int:
                 dep2 = c.deploy_with_packages(
                     "pkgacme", {"index.mjs": rpc_wrap(HANDLER_SRC)},
                     packages(JWT14_HASH),
-                    {"@rewind/oidc": OIDC_HASH, "@rewind/jwt": JWT14_HASH})
+                    {"@rewind/oidc": OIDC_HASH, "@rewind/jwt": JWT14_HASH,
+                     "@acme/multi": MULTI_HASH})
                 check("repin deploy → new dep_id", bool(dep2) and dep2 != dep1,
                       f"dep1={dep1} dep2={dep2}")
                 r = c.wait_for_handler("pkgacme", "/?fn=handler",

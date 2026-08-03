@@ -55,6 +55,10 @@ by the package's identity hash `<pkg_hash>`:
   (`module_execution.zig:483`) — no new code. Only *cross-package*
   (`@scope/pkg`) imports hit the new resolver. The entry module is
   `index.mjs` by convention (a future `main` field could override it).
+  The deploy honors this too: `/v1/deploy/pkgfile` only *stages* a file,
+  and each package compiles as **one batch at cut** (dependency-ordered
+  across packages), so siblings resolve regardless of upload order —
+  the same stage-then-link split the handler workspace uses.
 
 ## 2. Per-importer resolution (flat surface / encapsulated internals)
 

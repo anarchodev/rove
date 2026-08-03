@@ -356,24 +356,23 @@ fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: 
 
     _ = deployStep(a, cfg, "reset", c.tenantBody(a, tenant), "reset");
 
-    // With packages: resolve → stage leaves-first → handlers/cut carry the
-    // resolution; the deploy app compiles + links against the pinned graph.
-    var resolution_json: ?[]const u8 = null; // the full staged resolution for handlers
+    // With packages: resolve → stage every package file (stage-only, order
+    // free) → cut carries the lockfile resolution; the deploy app compiles
+    // each package as a batch (dependency-ordered) and links the handlers
+    // against the pinned graph, all server-side at cut.
     var cut_body: []const u8 = c.tenantBody(a, tenant);
     if (deps.len != 0) {
         var rr = registryResolve(a, cfg, deps);
         packages.topoSort(&rr.res) catch c.fatal("resolved packages form a dependency cycle", .{});
-        const staged = stagePackages(a, cfg, tenant, &rr.res);
-        resolution_json = packages.emitResolution(a, &rr.res, staged) catch c.oom();
-        const lock = packages.emitResolution(a, &rr.res, null) catch c.oom();
+        stagePackages(a, cfg, tenant, &rr.res);
+        const lock = packages.emitResolution(a, &rr.res) catch c.oom();
         cut_body = cutBody(a, tenant, lock);
         writeLockfile(bundle, rr.body);
         std.debug.print("resolved {d} package(s) against the registry\n", .{rr.res.packages.len});
     }
 
     for (b.handlers) |h| {
-        const body = if (resolution_json) |r| fileBodyWithResolution(a, tenant, h, r) else c.fileBodyHandler(a, tenant, h);
-        _ = deployStep(a, cfg, "file", body, h.path);
+        _ = deployStep(a, cfg, "file", c.fileBodyHandler(a, tenant, h), h.path);
     }
     for (b.statics) |s| _ = uploadStep(a, cfg, c.uploadPath(a, tenant, s), s.bytes, s.path);
     const cut = deployStep(a, cfg, "cut", cut_body, "cut");
@@ -455,41 +454,29 @@ fn registryBlob(a: std.mem.Allocator, cfg: *const Cfg, hash: []const u8) []const
     return r.body;
 }
 
-/// Stage every resolved package's files leaves-first (`topoSort` first). Each
-/// file: fetch its source from the registry, POST `/v1/deploy/pkgfile` with
-/// the growing resolution, record the server-authoritative `{source_hex,
-/// bytecode_hex}` so later files/handlers compile against the pinned graph.
-/// Returns the final staged set (parallel to `res.packages`) for the handler
-/// resolution.
-fn stagePackages(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, res: *const packages.Resolution) []const []const packages.StagedFile {
-    const lists = a.alloc(std.ArrayListUnmanaged(packages.StagedFile), res.packages.len) catch c.oom();
-    for (lists) |*s| s.* = .empty;
-
-    for (res.packages, 0..) |p, pi| {
+/// Stage every resolved package's files: fetch each source from the
+/// registry, POST `/v1/deploy/pkgfile` (stage-only — no compile, no
+/// resolution: the deploy app batch-compiles each package at cut, so
+/// upload order carries no meaning). The response's `source_hex` is the
+/// server-authoritative content address; the registry's `source_hash` is
+/// only the blob-lookup key (nothing verifies they coincide today — that
+/// is #205's merkle identity work).
+fn stagePackages(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, res: *const packages.Resolution) void {
+    for (res.packages) |p| {
         for (p.files) |f| {
             const source = registryBlob(a, cfg, f.source_hash);
-            const reso = packages.emitResolution(a, res, snapshotStaged(a, lists)) catch c.oom();
-            const body = pkgfileBody(a, tenant, p.pkg_hash, f.path, source, reso);
+            const body = pkgfileBody(a, tenant, p.pkg_hash, f.path, source);
             const r = deployStep(a, cfg, "pkgfile", body, f.path);
-            const src_hex = c.extractField(a, r.body, "source_hex") orelse c.fatal("pkgfile {s}: no source_hex: {s}", .{ f.path, c.trunc(r.body) });
-            const bc_hex = c.extractField(a, r.body, "bytecode_hex") orelse c.fatal("pkgfile {s}: no bytecode_hex: {s}", .{ f.path, c.trunc(r.body) });
-            lists[pi].append(a, .{ .path = f.path, .source_hash = src_hex, .bytecode_hash = bc_hex }) catch c.oom();
+            _ = c.extractField(a, r.body, "source_hex") orelse c.fatal("pkgfile {s}: no source_hex: {s}", .{ f.path, c.trunc(r.body) });
         }
     }
-    return snapshotStaged(a, lists);
-}
-
-/// Snapshot the growing per-package staged-file `lists` into the
-/// `[][]const StagedFile` shape `emitResolution` wants.
-fn snapshotStaged(a: std.mem.Allocator, lists: []const std.ArrayListUnmanaged(packages.StagedFile)) []const []const packages.StagedFile {
-    const out = a.alloc([]const packages.StagedFile, lists.len) catch c.oom();
-    for (out, 0..) |*o, i| o.* = lists[i].items;
-    return out;
 }
 
 /// `{"tenant","pkg_hash","path","source","resolution":<raw json>}` for
 /// `/v1/deploy/pkgfile`.
-fn pkgfileBody(a: std.mem.Allocator, tenant: []const u8, pkg_hash: []const u8, path: []const u8, source: []const u8, resolution: []const u8) []const u8 {
+/// `{"tenant","pkg_hash","path","source"}` for `/v1/deploy/pkgfile`
+/// (stage-only; the package compiles as a batch at cut).
+fn pkgfileBody(a: std.mem.Allocator, tenant: []const u8, pkg_hash: []const u8, path: []const u8, source: []const u8) []const u8 {
     var out = std.ArrayList(u8){};
     out.appendSlice(a, "{\"tenant\":") catch c.oom();
     c.writeJsonString(&out, a, tenant);
@@ -499,24 +486,6 @@ fn pkgfileBody(a: std.mem.Allocator, tenant: []const u8, pkg_hash: []const u8, p
     c.writeJsonString(&out, a, path);
     out.appendSlice(a, ",\"source\":") catch c.oom();
     c.writeJsonString(&out, a, source);
-    out.appendSlice(a, ",\"resolution\":") catch c.oom();
-    out.appendSlice(a, resolution) catch c.oom();
-    out.append(a, '}') catch c.oom();
-    return out.items;
-}
-
-/// `{"tenant","path","kind":"handler","source","resolution":<raw json>}` for
-/// `/v1/deploy/file` (imports validate at compile against the resolution).
-fn fileBodyWithResolution(a: std.mem.Allocator, tenant: []const u8, h: c.Handler, resolution: []const u8) []const u8 {
-    var out = std.ArrayList(u8){};
-    out.appendSlice(a, "{\"tenant\":") catch c.oom();
-    c.writeJsonString(&out, a, tenant);
-    out.appendSlice(a, ",\"path\":") catch c.oom();
-    c.writeJsonString(&out, a, h.path);
-    out.appendSlice(a, ",\"kind\":\"handler\",\"source\":") catch c.oom();
-    c.writeJsonString(&out, a, h.source);
-    out.appendSlice(a, ",\"resolution\":") catch c.oom();
-    out.appendSlice(a, resolution) catch c.oom();
     out.append(a, '}') catch c.oom();
     return out.items;
 }
