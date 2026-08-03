@@ -139,6 +139,8 @@ pub fn tryHandleV2(
         try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
         try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-suspend")) {
+        try handleSuspend(server, allocator, worker, ent, sid, sess, method, path, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-domain")) {
         try handleDomain(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confchange")) {
@@ -526,6 +528,60 @@ fn handleEvict(
     worker.node.deploy.evictTenant(tenant);
     worker.node.tenant.deleteInstance(tenant) catch |err|
         std.log.warn("v2-evict: deleteInstance({s}) failed: {s}", .{ tenant, @errorName(err) });
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+// ── v2-suspend: live suspension delivery + diagnostic read ───────────
+
+/// `POST /_system/v2-suspend {tenant, suspended}` — install a tenant's
+/// suspension state on its hot-path slot (the CP's live push on
+/// `/_control/suspend`/`unsuspend`, re-pushed each reconcile pass so a
+/// worker restart re-learns it). 204 on success; 409 if the tenant is not
+/// active on this cluster. `GET /_system/v2-suspend?tenant=T` reads it
+/// back (diagnostic / smoke; kept in tree — diagnostic state is not
+/// temporary).
+fn handleSuspend(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+) !void {
+    if (std.mem.eql(u8, method, "GET")) {
+        const tenant = queryParam(path, "tenant") orelse
+            return reply(server, allocator, ent, sid, sess, 400, "missing tenant\n");
+        const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+            return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
+        const slot = worker.node.deploy.getOrOpenTenantSlot(inst) catch
+            return reply(server, allocator, ent, sid, sess, 500, "slot open failed\n");
+        const json = std.fmt.allocPrint(allocator, "{{\"suspended\":{}}}", .{
+            slot.suspended.load(.acquire),
+        }) catch return reply(server, allocator, ent, sid, sess, 500, "encode failed\n");
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 200, json, allocator, null, "application/json");
+        return;
+    }
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET or POST only\n");
+
+    var parsed = std.json.parseFromSlice(struct {
+        tenant: []const u8,
+        suspended: bool,
+    }, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\",\"suspended\"}\n");
+    defer parsed.deinit();
+    if (parsed.value.tenant.len == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "empty tenant\n");
+
+    const inst = (worker.node.tenant.getInstance(parsed.value.tenant) catch null) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
+    const slot = worker.node.deploy.getOrOpenTenantSlot(inst) catch
+        return reply(server, allocator, ent, sid, sess, 500, "slot open failed\n");
+    slot.suspended.store(parsed.value.suspended, .release);
+    std.log.warn("v2-suspend: tenant={s} suspended={}", .{ parsed.value.tenant, parsed.value.suspended });
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 

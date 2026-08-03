@@ -41,6 +41,10 @@ const CP_TOTAL_TIMEOUT_MS: u32 = 2000;
 pub const Outcome = union(enum) {
     placed: [][]u8,
     not_found,
+    /// The tenant resolves but is suspended (the suspension axis,
+    /// docs/architecture/control-plane.md) — the front answers an honest
+    /// 403, never a routing miss, and never proxies.
+    suspended,
     /// Every CP node failed (unreachable / bad status / bad body).
     err,
 };
@@ -245,8 +249,10 @@ pub const RouteResolver = struct {
                 cluster: []const u8 = "",
                 tenant: []const u8 = "",
                 nodes: []const []const u8 = &.{},
+                suspended: bool = false,
             }, a, body, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
+            if (parsed.value.suspended) return .suspended;
             const owned = dupNodes(a, parsed.value.nodes) catch return .err;
             return .{ .placed = owned };
         }

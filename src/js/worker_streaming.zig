@@ -2053,6 +2053,20 @@ pub fn proposeForgetfulWrites(
         stage_chunks.deinit(allocator);
     }
 
+    // Suspension gate (the suspension axis, docs/architecture/control-plane.md):
+    // wake-driven activations (fires, stream resumes, WS messages) keep
+    // running on parked state after the inbound door closes, so without this
+    // a suspended tenant's timers would keep writing and firing outbound.
+    // Drop the batch before the propose — callers already treat a propose
+    // error as a dropped fire. Checked BEFORE the kv-cap gate: a suspended
+    // tenant's refusal is the suspension, never a quota message.
+    if (worker.node.tenantSuspended(tenant_id)) {
+        std.log.warn("rove-js: fire writes dropped — tenant {s} is suspended", .{tenant_id});
+        txn.rollback() catch {};
+        allocator.destroy(txn);
+        return error.TenantSuspended;
+    }
+
     // Billing axis 1 — the same plan KV-cap gate `finalizeBatch` runs
     // (`worker_mod.kvCapRefusal` holds the contract). A fire / stream
     // resume / WS batch is a customer write path too; without this the

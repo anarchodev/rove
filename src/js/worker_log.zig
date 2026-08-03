@@ -24,6 +24,7 @@
 //! without forcing this file to depend on the comptime Worker type.
 
 const std = @import("std");
+const limiter_mod = @import("limiter.zig");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
 const jwt_mod = @import("rove-jwt");
@@ -660,6 +661,34 @@ fn captureLogInner(
 
     const id = request_id orelse try tl.id_minter.nextRequestId();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+
+    // Log-byte ingest charge — the lagging half of the ingest-rate
+    // guardrail (docs/strategy/pricing-model.md): this record already
+    // exists, so its RAW bytes are charged unconditionally and the
+    // tenant's NEXT admission pays if the bucket went negative
+    // (`hasCredit` → 429 in the dispatch walk). `effective = actual +
+    // k` per record, so tiny-record floods pay the fixed per-record
+    // overhead too. Comptime-gated so log-only test fixtures without a
+    // limiter still compile.
+    if (comptime @hasField(@TypeOf(worker.*), "limiter")) {
+        var raw: u64 = console_owned.len + exception_owned.len +
+            method.len + path.len + host.len;
+        inline for (std.meta.fields(log_mod.TapePayloads)) |f| {
+            if (comptime f.type == []const u8) {
+                raw += @field(tapes, f.name).len;
+            }
+        }
+        worker.limiter.charge(
+            instance_id,
+            .log_bytes,
+            raw + limiter_mod.LOG_BYTES_PER_RECORD_OVERHEAD,
+            .{},
+            now_ns,
+        ) catch |err| std.log.warn(
+            "rove-js: log_bytes charge({s}) failed: {s}",
+            .{ instance_id, @errorName(err) },
+        );
+    }
 
     try worker.log.log_buffer.append(.{
         .tenant_id = a_tenant,

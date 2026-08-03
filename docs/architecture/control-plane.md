@@ -160,6 +160,77 @@ re-provision 409 / unknown-cluster 400).
     gauges, `kv_cap_refusals_total`, and `platform.instances.usage(name)` for
     the dashboard — all reading the same figure the gate enforces.
 
+## The suspension axis — the reversible kill switch
+
+The abuse response that is not `/_control/delete`: **`suspend/{tenant}`**, a
+replicated directory axis whose *presence is the state* (value =
+`{"reason","at_ms"}` JSON — who/why/when survives in the raft log).
+Deliberately a **sibling axis to `plan/`, never a plan value**: a billing push
+(Stripe → `/_control/plan`) can never silently un-suspend an abuse response,
+and `/_control/unsuspend` is an axis delete that restores serving exactly —
+data, placement, plan, deployment all untouched. The platform singletons
+(`__admin__` et al.) refuse suspension.
+
+Enforcement is layered so no serving path survives it:
+
+- **Front door**: `/_cp/route` carries `"suspended":true` on the route (the
+  tenant still *resolves* — that is what makes suspension reversible), and the
+  front answers a cached, honest **403** — never the terminal 404 of a routing
+  miss — for both HTTP flows and WS upgrades. Cached at the positive route
+  TTL, so un-suspend propagates like a move.
+- **Worker admission**: the dispatch walk 403s a suspended tenant's own
+  handlers *before* the rate check. Keyed on the **handler** tenant, so an
+  admin-handler request scoped to a suspended customer still works — the
+  operator can inspect, export, and unsuspend; suspension must never become a
+  data hostage.
+- **Wake-driven paths**: `proposeForgetfulWrites` (fires / stream resumes /
+  WS batches) drops a suspended tenant's writes before the propose, and
+  `enqueuePendingFetches` — the single engine-bound funnel — drops its
+  outbound fetches, so parked timers can't keep writing or spamming after the
+  inbound door closes.
+
+Delivery mirrors the plan push: `/_control/suspend` live-pushes
+`/_system/v2-suspend {tenant, suspended}` to the serving cluster's slots, and
+the reconciler **re-pushes every suspended tenant each pass** (O(suspended),
+not O(tenants)) so a worker restart — which loses the in-memory flag —
+re-learns the state within one reconcile interval. The directory row stays
+the durable truth; `GET /_system/v2-suspend?tenant=` is the diagnostic
+read-back.
+
+## Abuse gates at the doors
+
+Mechanisms behind the acceptable-use surface, each at the narrowest door that
+cannot be bypassed:
+
+- **Host claims** (`hostClaimViolation`, shared by `/_control/host` and
+  provision's custom-host path — `Directory.setHost` stays the dumb
+  primitive, the doors carry the policy): **first-claim-wins** across tenants
+  (cross-tenant re-claim → 409; release is the delete path; operator
+  `force` resolves disputes), and the **platform zone is identity-bound** —
+  `{label}.{public_suffix}` is claimable only by the tenant named `label`
+  (403 otherwise), so no tenant can aim a platform-looking or
+  sibling-tenant-shaped host at itself on our own zone.
+- **Log-byte ingest** (the ingest-rate guardrail,
+  `docs/strategy/pricing-model.md`): a **lagging post-exec** `log_bytes`
+  bucket denominated in raw bytes — `captureLogInner` charges
+  `actual + k` per record (bodies and tapes included) unconditionally, the
+  bucket may run negative, and the *next* admission pays with a 429 until
+  the debt refills off. Uniform caps for now (the tier field comes with the
+  plan-table reshape); `log_ingest_limited_total` counts refusals.
+- **Sustained outbound** (the spam bound): a second, day-scale
+  `outbound_sustained` bucket over the same frozen-native funnel as the
+  burst bucket — capacity is a 10%-duty-cycle day of the plan's sustained
+  rate, so the free tier's "10/s forever ≈ 864k/day" collapses to ~86k/day.
+  Saturating it is an **incident signal, not a sales lead**: distinct error
+  code (`outbound_sustained_limited`) + `outbound_sustained_trips_total`.
+- **Creation velocity** (`/_control/provision`): one coarse CP-side token
+  bucket (burst 10, ~2/min sustained) behind whatever identity the caller
+  presents — ten tenants in a minute and ten in a year are different events,
+  and each tenant costs a raft group ×3 nodes, an LMDB env, a placement and
+  an S3 prefix. Refusals answer 429 + `cp_provision_limited_total`.
+  Per-identity allowances (instances per account, accounts per identity)
+  are the dashboard's plan-derived half.
+
 ## Zero-downtime move (the only move)
 
 > **Convergence (raft-native-alignment):** the brief-pause move (quiesce +

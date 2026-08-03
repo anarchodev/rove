@@ -374,8 +374,10 @@ pub fn Proxy(comptime FrontH2: type) type {
         count_resp_timeouts: u64 = 0,
         /// Aborts from the inbound body-stall budget (plan A5).
         count_body_stalls: u64 = 0,
-        /// CP route answers: not_found (negative-cached) / transient error.
+        /// CP route answers: not_found (negative-cached) / suspended
+        /// (403-cached) / transient error.
         count_route_not_found: u64 = 0,
+        count_route_suspended: u64 = 0,
         count_route_errors: u64 = 0,
         /// Flows 503'd out of a cold-route park past ROUTE_WAIT.
         count_route_expired: u64 = 0,
@@ -867,6 +869,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.server.wsUpgradeReject(ent, 404);
                         continue;
                     },
+                    .suspended => {
+                        self.server.wsUpgradeReject(ent, 403);
+                        continue;
+                    },
                     .nodes => |n| if (n.len == 0) {
                         self.server.wsUpgradeReject(ent, 502);
                         continue;
@@ -1012,6 +1018,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .not_found => {
                     std.log.warn("front: no placement for host {s} → 404", .{host});
                     try self.replyStatus(coll, ent, sid, sess, 404);
+                    return null;
+                },
+                .suspended => {
+                    try self.replyStatus(coll, ent, sid, sess, 403);
                     return null;
                 },
                 .nodes => |n| if (n.len == 0) {
@@ -2050,6 +2060,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             if (self.cache.get(host, now_ns)) |hit| switch (hit) {
                 .nodes => |nodes| return .{ .nodes = nodes },
                 .not_found => return .not_found,
+                .suspended => return .suspended,
             };
             self.enqueueResolve(host);
             return .pending;
@@ -2113,6 +2124,14 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.count_route_not_found += 1;
                         self.cache.putNegative(c.host, now_ns);
                         self.failRouteWaiters(c.host, 404);
+                    },
+                    // Suspended: an honest, cached 403 — the tenant exists
+                    // and stays placed; only serving is refused (the
+                    // suspension axis, docs/architecture/control-plane.md).
+                    .suspended => {
+                        self.count_route_suspended += 1;
+                        self.cache.putSuspended(c.host, now_ns);
+                        self.failRouteWaiters(c.host, 403);
                     },
                     // Transient CP failure: don't touch the cache (a
                     // fresh entry, if any, keeps serving other requests);

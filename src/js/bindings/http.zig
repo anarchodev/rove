@@ -44,6 +44,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 
 const globals = @import("../globals.zig");
+const limiter = @import("../limiter.zig");
 const log_mod = @import("rove-log");
 
 const js_undefined = globals.js_undefined;
@@ -109,13 +110,43 @@ fn outboundRateOk(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []cons
         std.log.warn("rove-js: limiter.check outbound for {s} failed: {s} — fail open", .{ state.instance_id, @errorName(err) });
         return true;
     };
-    if (allowed) return true;
+    if (!allowed) {
+        return throwOutboundLimited(ctx, state, lim, .outbound, "rate_limited", "outbound rate limit exceeded");
+    }
+    // The day-scale sustained ceiling (the spam bound — see
+    // `limiter.Action.outbound_sustained`). Checked AFTER the burst bucket:
+    // on a sustained refusal one burst token was consumed for nothing, which
+    // is harmless (the burst bucket refills in seconds; the send was refused
+    // either way). Saturation is an incident signal — distinct error code +
+    // the `sustained_trips` counter.
+    const sustained_ok = lim.check(state.instance_id, .outbound_sustained, state.plan_rate, state.plan_gen, now_ns) catch |err| {
+        std.log.warn("rove-js: limiter.check outbound_sustained for {s} failed: {s} — fail open", .{ state.instance_id, @errorName(err) });
+        return true;
+    };
+    if (!sustained_ok) {
+        lim.sustained_trips += 1;
+        std.log.warn("rove-js: OUTBOUND SUSTAINED CEILING tripped by {s} — day-scale budget exhausted", .{state.instance_id});
+        return throwOutboundLimited(ctx, state, lim, .outbound_sustained, "outbound_sustained_limited", "sustained outbound budget exhausted");
+    }
+    return true;
+}
 
-    const retry_after = lim.retryAfterSeconds(state.instance_id, .outbound);
+/// Throw the outbound-refusal Error (`{message, code}` with a Retry-After
+/// figure in the message). Shared by the burst and sustained refusals so
+/// the two differ only in `code` — which is what a caller alerts on.
+fn throwOutboundLimited(
+    ctx: ?*c.JSContext,
+    state: *globals.DispatchState,
+    lim: *limiter.RateLimiter,
+    action: limiter.Action,
+    code: []const u8,
+    what: []const u8,
+) bool {
+    const retry_after = lim.retryAfterSeconds(state.instance_id, action);
     const msg = std.fmt.allocPrintSentinel(
         state.allocator,
-        "outbound rate limit exceeded, retry after {d}s",
-        .{retry_after},
+        "{s}, retry after {d}s",
+        .{ what, retry_after },
         0,
     ) catch {
         _ = c.JS_ThrowOutOfMemory(ctx);
@@ -126,7 +157,7 @@ fn outboundRateOk(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []cons
     const err = c.JS_NewError(ctx);
     if (c.JS_IsException(err)) return false; // OOM building the Error — pending
     _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, "rate_limited", "rate_limited".len));
+    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, code.ptr, code.len));
     _ = c.JS_Throw(ctx, err);
     return false;
 }

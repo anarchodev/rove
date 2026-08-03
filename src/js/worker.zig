@@ -911,6 +911,11 @@ pub const NodeState = struct {
     /// figures are in the paired warn log line.
     kv_cap_refusals: std.atomic.Value(u64) = .init(0),
 
+    /// Admissions 429'd by the log-byte ingest guardrail (the lagging
+    /// `log_bytes` bucket — the runaway-S3-volume guard,
+    /// docs/strategy/pricing-model.md ingest-rate guardrail).
+    log_ingest_limited: std.atomic.Value(u64) = .init(0),
+
     // Fetch events route through the unified `msg_inboxes` registry
     // above: `FetchEngine` calls `enqueueFetchEventForTenant`, which
     // builds the appropriate `effect.Msg` and routes through the same
@@ -1015,7 +1020,30 @@ pub const NodeState = struct {
             }
             return;
         };
-        for (items) |pf| try engine.submit(pf);
+        for (items) |pf| {
+            // Suspension gate (the suspension axis,
+            // docs/architecture/control-plane.md): the single funnel every
+            // engine-bound outbound fetch passes, so a suspended tenant's
+            // wake-driven handlers (which never cross the inbound 403) can't
+            // keep firing outbound. Ownership contract unchanged — a dropped
+            // fetch is freed here exactly like the engine-down path.
+            if (self.tenantSuspended(pf.tenant_id)) {
+                std.log.warn("rove-js: outbound fetch dropped — tenant {s} is suspended", .{pf.tenant_id});
+                var dropped = pf;
+                dropped.deinit(self.allocator);
+                continue;
+            }
+            try engine.submit(pf);
+        }
+    }
+
+    /// Lock-free read of a tenant's suspension flag, for gates that hold
+    /// only a tenant id. False (never a refusal) when the instance or its
+    /// slot isn't materialized — the flag is delivered to live slots.
+    pub fn tenantSuspended(self: *NodeState, tenant_id: []const u8) bool {
+        const inst = (self.tenant.getInstance(tenant_id) catch null) orelse return false;
+        const slot = self.deploy.getOrOpenTenantSlot(inst) catch return false;
+        return slot.suspended.load(.acquire);
     }
 
     pub fn deinit(self: *NodeState) void {
