@@ -408,20 +408,26 @@ class V2Cluster:
         for i in range(nodes):
             self._spawn_node(i, voters, peers)
         nodes_csv = ",".join(f"http://127.0.0.1:{p}" for p in self.node_ports)
+        # File-log the CP and the front — NEVER leave a long-lived process on
+        # an undrained PIPE: the readiness tee stops at the needle, and a
+        # chatty process (the CP's reconciler cycles especially) fills the
+        # 64KB pipe buffer mid-run and BLOCKS on write. A frozen CP stops
+        # reconciling, so a wiped node is never healed — raft_soak_prod's
+        # wipe+heal rounds failed exactly this way, ~150s in, while the
+        # genesis boot path already file-logged the CP for the same reason.
+        # `dump_log("cp")` / `dump_log("front")` read these.
+        edge_log_dir = f"/tmp/v2smoke-{self.tag}-{os.getpid()}-edgelog"
+        subprocess.run(["mkdir", "-p", edge_log_dir])
+        self.log_paths["cp"] = os.path.join(edge_log_dir, f"cp-{os.getpid()}.log")
+        self.log_paths["front"] = os.path.join(edge_log_dir, f"front-{os.getpid()}.log")
         spawn_cp(self.procs, self.cp_port,
                  clusters=f"{self.cluster_id}={nodes_csv}",
                  hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
-                 public_suffix=PUBLIC_SUFFIX, move_secret=MOVE_SECRET)
-        # File-log the front. Its stdout pipe is only drained until the
-        # readiness needle, so anything it says afterwards — re-aims, forward
-        # failures, the reason behind a 5xx — was previously unreadable from a
-        # smoke. `dump_log("front")` reads this.
-        front_log_dir = f"/tmp/v2smoke-{self.tag}-{os.getpid()}-frontlog"
-        subprocess.run(["mkdir", "-p", front_log_dir])
-        self.log_paths["front"] = os.path.join(front_log_dir, f"front-{os.getpid()}.log")
+                 public_suffix=PUBLIC_SUFFIX, move_secret=MOVE_SECRET,
+                 log_dir=edge_log_dir)
         spawn_front(self.procs, self.front_port,
                     f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0,
-                    log_dir=front_log_dir)
+                    log_dir=edge_log_dir)
         if self.tls_front_port:
             # Second front, TLS-terminating, same CP. The workers' tenant door
             # pins outbound to THIS port (see _spawn_node), so RP→IdP rides real

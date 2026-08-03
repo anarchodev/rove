@@ -59,6 +59,7 @@ pub const PeerRegistry = @import("peer_registry.zig").PeerRegistry;
 /// `dirty` / `persist_ack` / `woke_scratch`) + the dedup-append invariant.
 /// `Node` embeds `ActiveSet`; `TenantSlot` embeds `SlotHib`.
 const active_set_mod = @import("active_set.zig");
+const wal_flusher_mod = @import("wal_flusher.zig");
 pub const ActiveSet = active_set_mod.ActiveSet;
 pub const SlotHib = active_set_mod.SlotHib;
 
@@ -415,6 +416,13 @@ pub const Node = struct {
 
     mgr: raft.Manager,
     wal: *raft.SharedWal,
+    /// Off-thread WAL fsync (started with the pump — `Bridge.startPump`).
+    /// While running, `pump` hands each appending cycle's fsync here and
+    /// keeps cycling, so ticks/steps/heartbeats never wait on the flush;
+    /// `onPersist` is deferred to the covering completion (`ackCovered`).
+    /// Not started = the inline synchronous flush path (tests drive
+    /// `pumpOnce` directly and keep propose→commit within one call).
+    wal_flusher: wal_flusher_mod.WalFlusher = .{},
 
     /// Node-local group manifest: the set of tenant groups this node has
     /// (id_str → birth/migration epoch, decimal). NOT replicated — each node
@@ -727,6 +735,9 @@ pub const Node = struct {
 
     pub fn deinit(self: *Node) void {
         const a = self.allocator;
+        // Flusher before the WAL it fsyncs (idempotent — Bridge.stopPump
+        // normally stops it first, with a tail flush).
+        self.wal_flusher.stop();
         // Stop the network first (it borrows the Manager via step).
         if (self.transport) |t| t.deinit();
         // Destroy groups first — `Manager.deinit` frees each group's
@@ -1907,4 +1918,56 @@ test "setTickInterval rescales the leaderless-escalation window with the tick" {
     // timeout (2 × election_tick × tick).
     const election_ticks: i64 = @intCast(group_raft_config.election_tick);
     try testing.expect(n.leaderless_escalate_ns > 2 * election_ticks * n.tick_interval_ns);
+}
+
+test "async flusher: propose commits through the deferred onPersist, sends never wait on the fsync" {
+    // The production persistence shape (`Bridge.startPump` starts the
+    // flusher): appends are handed to the flusher thread and `onPersist`
+    // fires on a later cycle once the covering fsync completes. A
+    // single-node propose must still commit — via fsync + a follow-up
+    // cycle rather than within one `pump()` call.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+    try node.wal_flusher.start();
+
+    const tenant: u64 = 7;
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v-async");
+
+    const ws_bytes = try ws.encode(a);
+    defer a.free(ws_bytes);
+    const env = try envelope.encodeWriteSet(a, "tenant-7", ws_bytes);
+    defer a.free(env);
+    const slot = try node.ensureGroup(tenant, "tenant-7");
+    const before = slot.applied_idx;
+    try node.propose(tenant, env);
+
+    // Pump with a small sleep: the commit needs the flusher's fsync to
+    // complete off-thread before a later cycle's ackCovered releases it.
+    var spins: u32 = 0;
+    while (slot.applied_idx == before) : (spins += 1) {
+        if (spins > 2000) return error.TestTimeout;
+        _ = try node.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    const got = try node.get(tenant, "k");
+    defer a.free(got);
+    try testing.expectEqualStrings("v-async", got);
+
+    // Nothing left awaiting once quiescent: drain until the ack list
+    // empties (the last append's completion may still be in flight).
+    spins = 0;
+    while (node.active_set.persist_ack.items.len > 0) : (spins += 1) {
+        if (spins > 2000) return error.TestTimeout;
+        _ = try node.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
 }

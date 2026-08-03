@@ -1809,6 +1809,15 @@ pub fn main() !void {
     // first (runs last) and `cp_bridge.deinit` second (runs first).
     defer directory.destroy();
     defer cp_bridge.deinit();
+    // WAL sync mode: async (default — the flusher thread keeps the fsync
+    // out of the pump cycle) or `inline` (the operator rollback lever;
+    // re-serializes heartbeats behind the fsync).
+    if (std.posix.getenv("REWIND_WAL_SYNC_MODE")) |v| {
+        if (std.mem.eql(u8, v, "inline")) {
+            cp_bridge.inline_fsync = true;
+            std.log.info("rewind-cp: WAL sync mode = inline (async flusher disabled)", .{});
+        }
+    }
     try cp_bridge.startPump();
 
     // Static config seeds ONLY a fresh (empty) directory — a restart over a

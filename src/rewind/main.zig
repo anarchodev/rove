@@ -833,6 +833,15 @@ pub fn main() !void {
     // directory's boot `ensureGroup` scan. No-op on a fresh data dir.
     const recovered = bridge.recoverGroups();
     if (recovered > 0) std.log.info("rewind: recovered {d} tenant group(s) at boot", .{recovered});
+    // WAL sync mode: async (default — the flusher thread keeps the fsync
+    // out of the pump cycle) or `inline` (the operator rollback lever;
+    // re-serializes heartbeats behind the fsync).
+    if (std.posix.getenv("REWIND_WAL_SYNC_MODE")) |v| {
+        if (std.mem.eql(u8, v, "inline")) {
+            bridge.inline_fsync = true;
+            std.log.info("rewind: WAL sync mode = inline (async flusher disabled)", .{});
+        }
+    }
     try bridge.startPump();
 
     // Per-tenant request-log / tape batches → S3. The only tape-query surface,

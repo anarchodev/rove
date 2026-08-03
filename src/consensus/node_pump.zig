@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Loop46, Inc.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The data-plane `Node`'s hot loop and the effects it drives: `pump` (tick →
-//! ready → apply → single fsync → send → release), `durabilizeTick`,
+//! ack completed fsyncs → ready → apply → send → hand the fsync to the
+//! flusher thread; or, inline without one: tick → ready → apply → fsync →
+//! ack → send), `durabilizeTick`,
 //! `autoDemoteTick`, the hibernation active-set helpers, `propose*`, the
 //! committed-entry apply path (`applyEntry` / `applyCb` / `notifyApply`), and the
 //! raft-rs C-ABI callbacks. Method bodies for `node_core.zig`'s `Node`; `node.zig`
@@ -30,9 +32,14 @@ pub fn growReadyBuf(self: *Node) Error!void {
 }
 
 /// Queue `gid` for the post-fsync `onPersist` ack (at most once per
-/// round — see `persist_ack`). Pump-thread only.
+/// round — see `persist_ack`). In async-fsync mode the note-time stamp is
+/// the LAST-REQUESTED seq: a group that appends this cycle is re-stamped
+/// with the new request right after the round, and one that appended
+/// nothing is covered by whatever was already requested (its raft stash
+/// is empty, so the eventual ack is a no-op). Pump-thread only.
 pub fn notePersistAck(self: *Node, gid: u64) void {
     const slot = self.groups.get(gid) orelse return;
+    slot.hib.persist_seq = self.wal_flusher.lastRequested();
     self.active_set.addPersistAck(slot, gid, self.allocator) catch {
         // Dropping the ack would stall the group's commits forever
         // (raft never counts its entries); surface loudly instead.
@@ -233,11 +240,78 @@ pub fn pump(self: *Node) Error!bool {
             _ = self.mgr.tickGroups(self.active_set.active.items);
         }
     }
+    self.apply_err = null;
+
+    // Async-fsync completions (flusher running): fire the deferred
+    // `onPersist` for every group whose latest append the flusher's
+    // completed fsync covers — BEFORE pollReady, so a commit advance the
+    // ack unlocks surfaces in this same cycle's ready set (a single-node
+    // propose commits in fsync + one cycle). A flusher fsync failure is a
+    // durability loss with no completion published — die loudly like an
+    // inline flush failure would; a restart replays the WAL.
+    var acked_any = false;
+    if (self.wal_flusher.started()) {
+        if (self.wal_flusher.failed.load(.acquire)) return Error.Io;
+        acked_any = ackCovered(self, self.wal_flusher.completed.load(.acquire));
+    }
+
     const ready = self.mgr.pollReady(self.ready_buf);
 
-    self.apply_err = null;
     var ready2: []u64 = self.ready_buf2[0..0];
-    if (ready.len > 0 or self.active_set.persist_ack.items.len > 0) {
+    if (self.wal_flusher.started()) {
+        if (ready.len > 0) {
+            self.commit_notify.clearRetainingCapacity();
+            // Append this round's writes (direct writevAll — in the kernel,
+            // not yet durable) and apply committed entries. Committed
+            // entries raft hands out here are already quorum-durable: its
+            // commit math counts this node only up to the persist watermark,
+            // which advances only via the post-fsync `onPersist` above — so
+            // the commit hook below needs no flush gate.
+            const seg_before = self.wal.next_seg_no;
+            const off_before = self.wal.wal_offset;
+            for (ready) |g| {
+                self.mgr.processReady(g, applyCb, self) catch |e| {
+                    self.apply_err = self.apply_err orelse mapRaftErr(e);
+                };
+                self.notePersistAck(g);
+            }
+
+            // Hand the fsync to the flusher and KEEP GOING — the send loop
+            // below runs before any fsync completes, which is the point:
+            // heartbeats (and a follower's heartbeat responses) are in the
+            // outbox now (the persistence-asserting messages are stashed in
+            // raft until `onPersist`), so a slow fsync no longer makes this
+            // node heartbeat-silent past the election timeout. Awaiting
+            // groups are stamped with the request's seq; a group that
+            // appended nothing keeps its note-time stamp (already covered).
+            if (self.wal.next_seg_no != seg_before or self.wal.wal_offset != off_before) {
+                const dupfd = std.posix.dup(self.wal.file.handle) catch {
+                    self.apply_err = self.apply_err orelse Error.Io;
+                    return self.apply_err.?;
+                };
+                const seq = self.wal_flusher.request(dupfd);
+                for (self.active_set.persist_ack.items) |g| {
+                    if (self.groups.get(g)) |slot| slot.hib.persist_seq = seq;
+                }
+            }
+
+            if (self.apply.commit_hook) |h| {
+                for (self.commit_notify.items) |n| h.func(h.ctx, n.gid, n.origin, n.seq, n.idx);
+            }
+            self.commit_notify.clearRetainingCapacity();
+
+            for (ready) |g| {
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
+                self.mgr.release(g);
+            }
+        }
+    } else if (ready.len > 0 or self.active_set.persist_ack.items.len > 0) {
+        // ── Inline flush path (no flusher thread): the synchronous
+        // append → fsync → ack → pass-2 round, kept for tests that drive
+        // `pumpOnce` directly and expect propose→commit within one call.
+        // Production runs the async path above (`Bridge.startPump` starts
+        // the flusher). ──
         self.commit_notify.clearRetainingCapacity();
         // Pass 1: append this round's writes (BUFFERED — the fsync is
         // below) and apply committed entries that were already durable
@@ -252,16 +326,9 @@ pub fn pump(self: *Node) Error!bool {
         }
 
         // ONE fsync per cycle regardless of how many groups committed.
-        //
-        // Timed because this fsync is the pump's dominant pause and every
-        // outbox send — heartbeats included — drains AFTER it: a leader
-        // stalled here past the election timeout (election_tick ×
-        // tick_interval; how to size it, docs/architecture/raft-best-practices.md)
-        // is heartbeat-silent and gets spuriously deposed. Filesystem
-        // commit tails reach 100-250ms (btrfs's periodic transaction
-        // commit), dwarfing a millisecond-tick election budget, so a slow
-        // flush is warned with a wall-clock stamp — one grep answers "what
-        // stalled the pump, and did it line up across nodes".
+        // Inline-path only: here the sends below do wait on the fsync, so
+        // the stall probe stays (the async path's probe lives in the
+        // flusher thread).
         const flush_t0 = nowNs();
         const flushed = blk: {
             self.wal.flush() catch {
@@ -391,7 +458,35 @@ pub fn pump(self: *Node) Error!bool {
         self.apply_err = null;
         return e;
     }
-    return ready.len > 0 or ready2.len > 0;
+    return ready.len > 0 or ready2.len > 0 or acked_any;
+}
+
+/// Async-fsync mode: `onPersist` every awaiting group whose latest append
+/// is covered by the flusher's completed fsync (`persist_seq ≤ completed`)
+/// and drop it from the awaiting list; later appends (a higher stamp) wait
+/// for their covering completion. A destroyed group's stale entry is
+/// dropped without an ack. Returns whether anything was acked (work — the
+/// released acks / unlocked commits surface via the ready channel).
+/// Pump-thread only.
+fn ackCovered(self: *Node, completed: u64) bool {
+    var acked = false;
+    var i: usize = 0;
+    while (i < self.active_set.persist_ack.items.len) {
+        const gid = self.active_set.persist_ack.items[i];
+        const slot = self.groups.get(gid) orelse {
+            _ = self.active_set.persist_ack.swapRemove(i);
+            continue;
+        };
+        if (slot.hib.persist_seq <= completed) {
+            self.mgr.onPersist(gid);
+            slot.hib.in_persist_ack = false;
+            _ = self.active_set.persist_ack.swapRemove(i);
+            acked = true;
+            continue;
+        }
+        i += 1;
+    }
+    return acked;
 }
 
 /// Checkpoint dirty stores. Interval-gated. For each group with
