@@ -1,0 +1,28 @@
+# Nightly smoke run (#363 class 10) — see scripts/smoke/nightly.sh.
+#
+# The dev toolchain (zig, node, gh) lives in a distrobox; the systemd user
+# manager runs on the HOST. So the unit crosses the boundary explicitly with
+# `distrobox enter` (which also starts the box if it is down) — a plain
+# ExecStart of the script would run on the host and die on `zig: command not
+# found`. Adjust the box name if yours differs (`distrobox list`).
+#
+# Install (user units, same pattern as rove-cert-renew):
+#   cp scripts/smoke/systemd/rove-smoke-nightly.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable rove-smoke-nightly.timer
+#   systemctl --user start rove-smoke-nightly.timer
+[Unit]
+Description=rove nightly smoke suite vs baseline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The script maintains its own dedicated checkout; the dev-checkout copy is
+# only how the timer FINDS it (the nightly checkout's copy of the suite is
+# what actually runs).
+ExecStart=/usr/local/bin/distrobox enter zdev-deb -- %h/src/rove/scripts/smoke/nightly.sh
+# The suite is ~10 min parallel; a wedged cluster must not pin the box all
+# night. run_all already process-groups + kills per-smoke timeouts; this is
+# the outer belt.
+TimeoutStartSec=2h

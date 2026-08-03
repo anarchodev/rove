@@ -60,6 +60,24 @@ None of these were bad changes. The lesson is narrower and duller: **a test
 suite nobody runs is not coverage, it is the appearance of coverage** — and it
 is worse than no suite, because it is counted.
 
+### How it runs now (nobody has to remember)
+
+Two standing hooks (rove#363 class 10):
+
+- **Nightly**: `nightly.sh`, fired by the `rove-smoke-nightly.timer` systemd
+  user unit (`systemd/` here has the units + install steps). It builds
+  `origin/main` in a dedicated checkout (`~/src/rove-nightly`), runs the full
+  suite with `--jobs`, diffs against the committed baseline, and comments on
+  the standing issue **rove#373** when something is newly broken — or when
+  the nightly itself could not run. Silence only ever means "nothing new".
+- **Deploy gate**: `scripts/ops/build.sh` (which every deploy drives) runs
+  the full suite against the ReleaseFast binaries it just built and refuses
+  to ship on a newly-broken smoke. `ROVE_SKIP_SMOKES=1` skips it — a
+  conscious act; a missing `.env` is a hard stop, not a silent skip.
+
+Self-test after touching either hook: `SMOKE_FILTER=ctl_smoke
+scripts/smoke/nightly.sh` runs the whole pipeline against one fast smoke.
+
 Running it once found three live production bugs, none of which any unit test
 could reach: an unconditional worker panic on every over-threshold inbound
 body, a `blob.url` that signed keys nothing had written, and a CP that

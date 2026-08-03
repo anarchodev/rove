@@ -80,6 +80,22 @@ def _acquire_slot() -> int:
         "a dead run may be holding /tmp/rove-smoke-slot-*.lock via a live child")
 
 
+def recycle() -> None:
+    """Reset the block cursor so the slot's range can be reused.
+
+    ONLY between fully torn-down clusters: the never-reuse-within-a-process
+    rule exists so a stopped-then-restarted NODE keeps its port, which
+    matters inside one live cluster. A smoke that runs many INDEPENDENT
+    cluster rounds in sequence (a repro loop like genesis_capture) tears
+    everything down between rounds, so reuse is safe — and without this the
+    rounds exhaust the slot's fixed budget (12 rounds x a 128-port cluster
+    block > SLOT_SIZE) even though at most one cluster is ever alive.
+    `alloc` still probes bindability, so a straggler holding a port skips
+    that block rather than colliding."""
+    global _cursor
+    _cursor = 0
+
+
 def alloc(n: int = CLUSTER_BLOCK) -> int:
     """Base port of a contiguous block of `n` free ports, disjoint from every
     other block handed out in this process and (via the slot) from every

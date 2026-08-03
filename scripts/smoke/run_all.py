@@ -78,6 +78,9 @@ SERIAL = {
     "raft_soak_v2.py",          # same shape, shorter
     "dispatch_gate_smoke_v2.py",  # rove#362: already intermittent serially —
                                   # co-load noise would make the flip unreadable
+    "leader_failover_smoke_v2.py",  # asserts exactly ONE re-election after the
+                                    # kill; co-load stretches heartbeats enough
+                                    # to fire a second (#362's fingerprint)
     "tls_large_body_smoke.py",  # rove#361: red via ITS OWN download
                                 # concurrency — keep the repro conditions fixed
 }

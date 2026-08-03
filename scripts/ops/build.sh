@@ -14,8 +14,9 @@
 # run this — `deploy.sh` ships whatever this leaves in zig-out/bin.
 #
 # Usage:
-#   scripts/ops/build.sh                 # build all deploy binaries + test gate
-#   ROVE_SKIP_TESTS=1 scripts/ops/build.sh   # binaries only (skip the heavy gate)
+#   scripts/ops/build.sh                 # build all deploy binaries + full gate
+#   ROVE_SKIP_TESTS=1 scripts/ops/build.sh    # binaries only (skip every gate)
+#   ROVE_SKIP_SMOKES=1 scripts/ops/build.sh   # unit gates only (skip the smoke gate)
 #
 set -euo pipefail
 
@@ -47,6 +48,29 @@ else
     ( cd "$REPO_ROOT" && zig build v2-test ) || die "v2-test failed — not shipping"
     ( cd "$REPO_ROOT" && zig build test )    || die "zig build test failed — not shipping"
     ok "tests green"
+fi
+
+# Smoke gate (#363 class 10): the suite is the ONLY coverage of raft + S3 +
+# the front door + the JS dispatcher together, and a deploy is exactly the
+# moment its answer matters. `--baseline` fails ONLY on a newly-broken smoke
+# (long-standing reds are backlog, not blockers). Runs the smokes against the
+# ReleaseFast binaries this build just produced — the bits that will ship.
+# Skipping is a conscious act (ROVE_SKIP_SMOKES=1), never a silent fallback:
+# a missing .env is a hard stop, because "the gate quietly didn't run" is the
+# rot this gate exists to prevent (rove#355).
+if [ "$SKIP_TESTS" = 1 ] || [ "${ROVE_SKIP_SMOKES:-0}" = 1 ]; then
+    warn "skipping smoke gate"
+else
+    log "Smoke gate (full suite vs scripts/smoke/smoke-baseline.json)"
+    [ -f "$REPO_ROOT/.env" ] || die "no $REPO_ROOT/.env — the smoke gate needs S3 credentials (ROVE_SKIP_SMOKES=1 to skip consciously)"
+    export REWIND_APPS_DIR="${REWIND_APPS_DIR:-$HOME/src/rewind-apps}"
+    ( cd "$REPO_ROOT" \
+        && zig build \
+        && set -a && . ./.env && set +a \
+        && python3 scripts/smoke/run_all.py --jobs "${SMOKE_JOBS:-8}" \
+             --baseline scripts/smoke/smoke-baseline.json ) \
+        || die "smoke regression vs baseline — not shipping (rove#373 has the nightly history)"
+    ok "smokes: nothing newly broken"
 fi
 
 ok "build complete — binaries in $OUT"
