@@ -67,13 +67,24 @@ else
     log "Smoke gate (full suite vs scripts/smoke/smoke-baseline.json)"
     [ -f "$REPO_ROOT/.env" ] || die "no $REPO_ROOT/.env — the smoke gate needs S3 credentials (ROVE_SKIP_SMOKES=1 to skip consciously)"
     export REWIND_APPS_DIR="${REWIND_APPS_DIR:-$HOME/src/rewind-apps}"
+    # The default-install build below (the suite's helper binaries:
+    # echo-server, ws-echo, …) MUST be ReleaseFast: a bare `zig build` here
+    # installs DEBUG binaries over the shippable set in zig-out — the suite
+    # then validates Debug bits and, worse, deploy.sh ships whatever install
+    # ran last (a mixed Debug/ReleaseFast prod roll, ~8× slower workers).
     ( cd "$REPO_ROOT" \
-        && zig build \
+        && zig build -Doptimize=ReleaseFast \
         && set -a && . ./.env && set +a \
         && python3 scripts/smoke/run_all.py --jobs "${SMOKE_JOBS:-8}" \
              --baseline scripts/smoke/smoke-baseline.json ) \
         || die "smoke regression vs baseline — not shipping (rove#373 has the nightly history)"
     ok "smokes: nothing newly broken"
 fi
+
+# Re-assert the shippable set LAST, whatever ran above (the gate's default
+# install, a concurrent session building in this checkout): deploy.sh ships
+# zig-out/bin verbatim, so the final write before handing over must be the
+# ReleaseFast BINS. Cheap when nothing changed (cache hit, install skips).
+( cd "$REPO_ROOT" && zig build "${BINS[@]}" -Doptimize=ReleaseFast ) || die "final ReleaseFast re-assert failed"
 
 ok "build complete — binaries in $OUT"
