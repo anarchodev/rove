@@ -141,10 +141,12 @@ pub fn escalateLeaderless(self: *Node, now: i64) void {
         const leaderless = !self.mgr.isLeader(gid) and self.mgr.leaderId(gid) == 0;
         if (!leaderless) {
             slot.hib.leaderless_since_ns = 0;
+            slot.hib.last_seen_leader = self.mgr.leaderId(gid);
             continue;
         }
         if (slot.hib.leaderless_since_ns == 0) {
             slot.hib.leaderless_since_ns = now;
+            logLeaderlessEdge(self, gid, slot, now);
         } else if (now - slot.hib.leaderless_since_ns >= self.leaderless_escalate_ns) {
             // WARN, not debug: a force-campaign bypasses pre-vote AND peers'
             // check_quorum leases, so it is the one action that can depose a
@@ -164,6 +166,44 @@ pub fn escalateLeaderless(self: *Node, now: i64) void {
             slot.hib.leaderless_since_ns = now;
         }
     }
+}
+
+/// Election forensics, fired once per leaderless edge — the first cycle a
+/// group that HAD a live leader is observed with none (a follower's election
+/// timeout fired, or this node — `prev_leader` = its own id — stepped down /
+/// was deposed). Logs the age of the group's last leader traffic from the
+/// transport's per-group stamps, which separates the three candidate causes
+/// of a spurious election: the leader never sent (its own edge shows a large
+/// `hb_sent_age`), the wire/receive path delayed it (leader sent fresh, this
+/// node's `hb_recv_age` large), or the traffic arrived but too late to beat
+/// the election window (`hb_recv_age` small, `hb_recv_gap` spans the window).
+/// A group born/woken leaderless (`last_seen_leader == 0`) is skipped —
+/// formation and cold recovery are not elections worth forensics. Ages are
+/// -1 when the stamp (or the transport) is absent. Pump-thread only.
+fn logLeaderlessEdge(self: *Node, gid: u64, slot: *TenantSlot, now: i64) void {
+    const prev = slot.hib.last_seen_leader;
+    if (prev == 0) return;
+    slot.hib.last_seen_leader = 0;
+    var hb_recv_age_us: i64 = -1;
+    var hb_recv_gap_us: i64 = -1;
+    var append_recv_age_us: i64 = -1;
+    var hb_sent_age_us: i64 = -1;
+    var append_sent_age_us: i64 = -1;
+    if (self.transport) |t| {
+        if (t.recvStampFor(gid)) |r| {
+            if (r.hb_ns != 0) hb_recv_age_us = @divTrunc(now - r.hb_ns, std.time.ns_per_us);
+            if (r.hb_gap_ns != 0) hb_recv_gap_us = @divTrunc(r.hb_gap_ns, std.time.ns_per_us);
+            if (r.append_ns != 0) append_recv_age_us = @divTrunc(now - r.append_ns, std.time.ns_per_us);
+        }
+        if (t.sendStampFor(gid)) |s| {
+            if (s.hb_ns != 0) hb_sent_age_us = @divTrunc(now - s.hb_ns, std.time.ns_per_us);
+            if (s.append_ns != 0) append_sent_age_us = @divTrunc(now - s.append_ns, std.time.ns_per_us);
+        }
+    }
+    std.log.warn(
+        "raft: leaderless-edge gid={d} prev_leader={d} self={d} hb_recv_age_us={d} hb_recv_gap_us={d} append_recv_age_us={d} hb_sent_age_us={d} append_sent_age_us={d} at={d}",
+        .{ gid, prev, self.node_id, hb_recv_age_us, hb_recv_gap_us, append_recv_age_us, hb_sent_age_us, append_sent_age_us, std.time.milliTimestamp() },
+    );
 }
 
 /// Propose an encoded envelope to `tenant_id`'s group with no origin

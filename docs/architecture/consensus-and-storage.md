@@ -31,7 +31,7 @@ frame V2 as a throughput win.
 |---|---|
 | `src/consensus/node.zig` | One `Node` per cluster node. Owns the raft-rs `Manager`, the two-pass async-append pump, the active-set/hibernation machinery, `ApplyMode`, `StoreResolver`, and the durabilize floor hook. |
 | `src/consensus/bridge.zig` | Per-tenant `Bridge` — the seam between a worker and consensus. `registerTenant` (deterministic gid), propose, the entry-identity seq binding (`origin_id` + pending set), the provenance skip query, the worker-ack durabilize floor, fault plumbing. |
-| `src/consensus/transport.zig` | Cross-node wire layer: per-recipient coalescing, the heartbeat-detect byte test, the woke-list that feeds hibernation, the `stepBatch` skip counter. |
+| `src/consensus/transport.zig` | Cross-node wire layer: per-recipient coalescing, the heartbeat-detect byte test, the woke-list that feeds hibernation, the `stepBatch` skip counter, the per-group leader-traffic stamps behind the `leaderless-edge` election forensics. |
 | `src/consensus/envelope.zig` | The replicated entry codec: the **entry origin frame** (`[0xF7][origin u64][seq u64]` — every entry's proposer identity), type byte + payload framing, the writeset readset-frame strip on apply. |
 | `src/kv/raft_net.zig`, `raft_rpc.zig` | liburing wire transport + frame codec, reused from V1 (std-only; the V1 raft *message types* are unused). |
 | `src/kv/writeset.zig`, `envelope_codec.zig` | Writeset encode/decode (`applyEncodedDirect` is the consensus-apply entry point) and the `ENVELOPE_TYPE_*` constants the apply path agrees on. |
@@ -97,6 +97,13 @@ Three ordering rules make "committed" mean **durable**:
   node's entry count toward the commit quorum (and only then do its
   persistence-asserting messages — append acks, vote responses — leave the
   node). The leader's own volatile tail can never be the deciding quorum vote.
+  The gate is per message *type*, not per role: a follower's **heartbeat
+  responses assert nothing durable and leave immediately** (raft-rs's own
+  per-role blanket would hold them too, which makes a loaded follower
+  leader-visibly silent for the WAL fsync's tail — a leader whose
+  check_quorum window elapses inside one correlated stall then deposes
+  itself, a spurious election with zero real failures; raft-rs-zig
+  partitions the stash the way etcd/raft's `msgsAfterAppend` does).
 - **The commit hook fires post-fsync.** Per-entry commit notifications are
   staged during apply and fired only after `wal.flush()` succeeds — the
   watermark a worker acks clients on never runs ahead of the fsync. On a flush
