@@ -55,6 +55,7 @@ pub const TrackedTxn = kvstore.KvStore.TrackedTxn;
 pub const SeqCounter = kvstore.SeqCounter;
 pub const SeqCounterRegistry = kvstore.SeqCounterRegistry;
 pub const hashStoreId = kvstore.hashStoreId;
+pub const StoreUsage = kvexp.StoreUsage;
 
 // kvexp metrics
 const kvexp = @import("kvexp");

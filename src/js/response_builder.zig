@@ -265,6 +265,39 @@ pub fn overwriteWith421(
     });
 }
 
+/// Overwrite an entity in `request_out` with the KV-quota refusal —
+/// `507 Insufficient Storage` + a JSON body naming the figures. Used
+/// by the `kvCapRefusal` gate (billing axis 1): the batch's txn
+/// ROLLED BACK and nothing entered the log, but unlike the 421 this
+/// is deliberately NON-retriable — retrying cannot succeed until the
+/// tenant deletes data or the plan is raised, so the status must be
+/// distinct from every transient platform failure (421 retry-safe,
+/// 503 ambiguous, 429 rate). Frees any body the handler wrote.
+/// Does NOT move into response_in — caller orchestrates that.
+pub fn overwriteWithKvQuotaExceeded(
+    server: anytype,
+    ent: rove.Entity,
+    allocator: std.mem.Allocator,
+    old_body_ptr: ?[*]u8,
+    old_body_len: u32,
+    used: u64,
+    cap: u64,
+) !void {
+    if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"error\":\"kv_quota_exceeded\",\"used_bytes\":{d},\"max_kv_bytes\":{d}," ++
+            "\"message\":\"KV storage quota exceeded — reads and deletes still work; " ++
+            "delete data or upgrade the plan\"}}\n",
+        .{ used, cap },
+    );
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 507 });
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body.ptr,
+        .len = @intCast(body.len),
+    });
+}
+
 /// Overwrite a parked entity's response with a 503. This is the
 /// AMBIGUOUS failure (commit-wait fault/timeout, leadership-loss
 /// sweep): the entry was proposed and may still commit under a new

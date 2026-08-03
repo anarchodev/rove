@@ -941,6 +941,47 @@ fn finalizeBatch(
         return processed;
     }
 
+    // Billing axis 1 — the plan KV-cap gate (`worker_mod.kvCapRefusal`
+    // holds the full contract: batch-level for replay determinism,
+    // delete-only writesets pass, admin exempt, fail-open on lookup
+    // errors). Sits BEFORE the propose so a refused batch never enters
+    // the raft log, and AFTER the handler walk so reads stay untouched.
+    // Side-effect batches (`has_side`) are platform machinery riding an
+    // admin handler — never gated.
+    if (has_writes and !has_side) {
+        if (worker_mod.kvCapRefusal(worker, anchor, txn.store, writeset)) |ref| {
+            _ = worker.node.kv_cap_refusals.fetchAdd(1, .monotonic);
+            std.log.warn(
+                "kv-cap: tenant={s} used={d} cap={d} — write batch refused (507: delete data or upgrade)",
+                .{ anchor_id, ref.used, ref.cap },
+            );
+            txn.rollback() catch |rb_err| panic_mod.invariantViolated(
+                "finalizeBatch.rollback(kv_cap)",
+                "tenant={s} err={s}",
+                .{ anchor_id, @errorName(rb_err) },
+            );
+            allocator.destroy(txn);
+            for (successes.items) |*s| {
+                contDiscardIfAny(allocator, s); // rolled back → refusal response, not a held stream
+                streamDiscardIfAny(allocator, s); // stream first-hop never reached the wire
+                respb.overwriteWithKvQuotaExceeded(server, s.ent, allocator, s.body_ptr, s.body_len, ref.used, ref.cap) catch |e2| panic_mod.invariantViolated(
+                    "finalizeBatch.respb.overwriteWithKvQuotaExceeded",
+                    "tenant={s} err={s}",
+                    .{ anchor_id, @errorName(e2) },
+                );
+                server.reg.move(s.ent, &server.request_out, &server.response_in) catch |e2| panic_mod.invariantViolated(
+                    "finalizeBatch.move(kv_cap)",
+                    "tenant={s} err={s}",
+                    .{ anchor_id, @errorName(e2) },
+                );
+                captureSuccess(worker, anchor_id, s, 507, .kv_error, 0);
+                processed += 1;
+            }
+            successes.clearRetainingCapacity();
+            return processed;
+        }
+    }
+
     // Writes and/or commands present. Release the dispatch lease NOW
     // — handler execution is done, the kvexp.Txn is already in the
     // tenant's chain, and the next worker can acquire the lease +

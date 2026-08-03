@@ -289,6 +289,50 @@ pub fn jsPlatformInstancesCreate(
     return js_undefined;
 }
 
+/// `platform.instances.usage(name)` — admin-only. This node's KV
+/// footprint for one instance: `{usedBytes, durableBytes,
+/// overlayBytes, entries}`. `usedBytes` (durable LMDB pages +
+/// committed overlay) is the same conservative figure the plan cap
+/// (`max_kv_bytes`) is enforced against and the `kv_store_used_bytes`
+/// gauge exports, so the dashboard renders exactly what enforcement
+/// reads. O(1) — an mdb_stat, no scan. Untaped, like every
+/// `platform.*` read. Throws `Error{code:"InstanceNotFound"}` for an
+/// unknown instance. Values are JS numbers — exact far beyond any
+/// sellable ceiling.
+pub fn jsPlatformInstancesUsage(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "platform.instances.usage requires (name)");
+        return js_exception;
+    }
+    const state = getState(ctx);
+    if (state.platform == null) {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    }
+
+    const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(name);
+
+    const inst = scopeResolve(state, name) orelse return jsThrowInstanceNotFound(ctx);
+    const u = inst.kv.usage() catch |err| {
+        state.pending_kv_error = err;
+        return js_null;
+    };
+
+    const obj = c.JS_NewObject(ctx);
+    if (c.JS_IsException(obj)) return obj;
+    _ = c.JS_SetPropertyStr(ctx, obj, "usedBytes", c.JS_NewFloat64(ctx, @floatFromInt(u.durable_bytes + u.overlay_bytes)));
+    _ = c.JS_SetPropertyStr(ctx, obj, "durableBytes", c.JS_NewFloat64(ctx, @floatFromInt(u.durable_bytes)));
+    _ = c.JS_SetPropertyStr(ctx, obj, "overlayBytes", c.JS_NewFloat64(ctx, @floatFromInt(u.overlay_bytes)));
+    _ = c.JS_SetPropertyStr(ctx, obj, "entries", c.JS_NewFloat64(ctx, @floatFromInt(u.durable_entries)));
+    return obj;
+}
+
 /// `platform.instances.deployStarter(name)` — admin-only. Writes
 /// the embedded starter content (`index.mjs` + `_static/index.html`)
 /// into the target instance's `file-blobs/` + writes a manifest
