@@ -106,11 +106,10 @@ a backlog item; a new one is a regression, and only the second should block you.
 **141/143 in 10m at `--jobs 8`** (26m of member-time). The two reds are
 product defects, not stale fixtures: rove#361 (`tls_large_body`, concurrent
 large static downloads abort mid-stream — intermittent, ~1 in 2) and rove#377
-(`raft_soak_v2`'s spurious elections at the DEFAULT 1ms tick — the run that
-recorded this baseline was on btrfs, where the fsync tail exceeds the 1ms
-election budget; it may well be green on a different disk, which is the
-finding, not a flake). Refresh the baseline when you fix something, so the
-next person's diff is meaningful.
+(`raft_soak_v2`'s spurious elections under load on btrfs — reproduces at the
+PROD `REWIND_RAFT_TICK_MS=10` as well as the 1ms default, so it is a live
+finding rather than the smoke measuring a config nobody runs). Refresh the
+baseline when you fix something, so the next person's diff is meaningful.
 
 Where the 10m goes: a ~2.5m parallel pool (bounded by its longest member,
 `churn_kv_convergence` at ~140s) plus a ~7.3m SERIAL tail. **The tail is the
