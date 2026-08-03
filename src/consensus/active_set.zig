@@ -69,6 +69,12 @@ pub const SlotHib = struct {
     /// after each force so the escalation re-arms (a cooldown), and to 0 the
     /// moment a leader appears.
     leaderless_since_ns: i64 = 0,
+    /// The last non-zero leader id observed for this group while it had one
+    /// (this node's own id when it led). Lets `escalateLeaderless` tell a
+    /// group that just LOST a live leader (the leaderless-edge worth
+    /// forensics — see the log there) from one that was born/woken leaderless.
+    /// Cleared once the edge is logged.
+    last_seen_leader: u64 = 0,
 };
 
 /// The four per-node gid worklists the pump drains each cycle. Embedded as

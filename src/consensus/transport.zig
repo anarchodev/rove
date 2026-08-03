@@ -174,6 +174,20 @@ pub const Transport = struct {
     hb_sent_ns: []i64,
     hb_rtt: MicrosHistogram = .{},
 
+    /// Per-group election forensics (docs/architecture/raft-best-practices.md,
+    /// sizing the election timeout): wall-clock stamps of the last
+    /// leader-traffic message (`MsgHeartbeat` / `MsgAppend`) RECEIVED and SENT
+    /// for each group. A follower campaigns only after its election window
+    /// passes with no leader traffic stepped, so at a leaderless edge these
+    /// stamps separate the three failure sites — the leader never sent
+    /// (send-side age large on the old leader), the wire/receive path delayed
+    /// it (send-side fresh, recv-side age large), or the follower stepped it
+    /// too late to matter (recv-side fresh but `hb_recv_gap` spans the
+    /// window). Read by `Node.escalateLeaderless`'s leaderless-edge log.
+    /// Pump-thread only (queueOut + onRecv + the pump's edge scan).
+    recv_stamp: std.AutoHashMapUnmanaged(u64, RecvStamp) = .empty,
+    send_stamp: std.AutoHashMapUnmanaged(u64, SendStamp) = .empty,
+
     /// Node-wide outbound-mesh health, published each `tick` (pump thread) and
     /// read lock-free by `/_system/metrics` (worker thread) — the same
     /// publish-an-atomic discipline as the per-group `is_leader` gauge.
@@ -181,6 +195,22 @@ pub const Transport = struct {
     /// partition: peers raft must reach but can't). See `RaftNet.meshCounts`.
     mesh_configured: std.atomic.Value(u32) = .init(0),
     mesh_connected: std.atomic.Value(u32) = .init(0),
+
+    /// Receive-side stamps for one group's leader traffic. `hb_gap_ns` is the
+    /// interval between the last two heartbeats received — it names a
+    /// just-ended silence that a barely-late heartbeat would otherwise hide
+    /// (the late arrival makes `hb_ns` look fresh at the edge scan).
+    pub const RecvStamp = struct {
+        hb_ns: i64 = 0,
+        hb_gap_ns: i64 = 0,
+        append_ns: i64 = 0,
+    };
+
+    /// Send-side stamps for one group's leader traffic (this node as leader).
+    pub const SendStamp = struct {
+        hb_ns: i64 = 0,
+        append_ns: i64 = 0,
+    };
 
     pub const Config = struct {
         /// This node's raft id (1-based, must be ≤ peers.len).
@@ -284,6 +314,8 @@ pub const Transport = struct {
         freePeers(a, self.static_peers);
         self.step_scratch.deinit(a);
         self.woke.deinit(a);
+        self.recv_stamp.deinit(a);
+        self.send_stamp.deinit(a);
         a.destroy(self);
     }
 
@@ -333,6 +365,25 @@ pub const Transport = struct {
         return bytes.len >= 2 and bytes[0] == 0x08 and bytes[1] == 9;
     }
 
+    /// `MsgAppend` (3) — leader→follower log replication. Like a heartbeat, it
+    /// resets the follower's election timer, so it counts as leader traffic
+    /// for the election-forensics stamps.
+    inline fn isAppendReq(bytes: []const u8) bool {
+        return bytes.len >= 2 and bytes[0] == 0x08 and bytes[1] == 3;
+    }
+
+    /// The group's last-received leader-traffic stamps, or null if none seen.
+    /// Pump-thread only.
+    pub fn recvStampFor(self: *const Transport, gid: u64) ?RecvStamp {
+        return self.recv_stamp.get(gid);
+    }
+
+    /// The group's last-sent leader-traffic stamps, or null if this node never
+    /// led it. Pump-thread only.
+    pub fn sendStampFor(self: *const Transport, gid: u64) ?SendStamp {
+        return self.send_stamp.get(gid);
+    }
+
     /// Buffer one outbound message (from `Manager.takeMessages`) for its
     /// destination node, to be coalesced + sent at `flush`. `to` is a raft
     /// node id; a message to self (shouldn't happen) is dropped.
@@ -354,6 +405,16 @@ pub const Transport = struct {
         // outstanding heartbeat per peer; a later send just overwrites the
         // stamp (a dropped response is harmless — it won't be matched).
         if (isHeartbeatReq(msg)) self.hb_sent_ns[to - 1] = nowNs();
+        // Election forensics: stamp the group's last-sent leader traffic (the
+        // per-peer fan-out overwrites within the cycle — the latest is what
+        // the leaderless-edge log wants). Best-effort on OOM.
+        if (isHeartbeatReq(msg) or isAppendReq(msg)) {
+            const gop = self.send_stamp.getOrPut(self.allocator, group_id) catch null;
+            if (gop) |g| {
+                if (!g.found_existing) g.value_ptr.* = .{};
+                if (isHeartbeatReq(msg)) g.value_ptr.hb_ns = nowNs() else g.value_ptr.append_ns = nowNs();
+            }
+        }
         const ob = &self.outbufs[to - 1];
         const a = self.allocator;
         // Cap the coalesced frame so it never exceeds the receiver's fixed recv
@@ -481,6 +542,21 @@ pub const Transport = struct {
             }) catch return;
             // Real raft traffic wakes a hibernated group; heartbeats do not.
             if (!isHeartbeatLike(msg)) self.woke.append(self.allocator, group_id) catch {};
+
+            // Election forensics: stamp the group's last-received leader
+            // traffic; on a heartbeat also record the interval since the
+            // previous one (`hb_gap_ns` — see `RecvStamp`). Best-effort on OOM.
+            if (isHeartbeatReq(msg) or isAppendReq(msg)) {
+                const gop = self.recv_stamp.getOrPut(self.allocator, group_id) catch null;
+                if (gop) |g| {
+                    if (!g.found_existing) g.value_ptr.* = .{};
+                    const t = nowNs();
+                    if (isHeartbeatReq(msg)) {
+                        if (g.value_ptr.hb_ns != 0) g.value_ptr.hb_gap_ns = t - g.value_ptr.hb_ns;
+                        g.value_ptr.hb_ns = t;
+                    } else g.value_ptr.append_ns = t;
+                }
+            }
 
             // Close the broadcast-time probe: a heartbeat response from `from_id`
             // pairs with the last heartbeat we sent that peer. Observe the RTT
