@@ -556,6 +556,38 @@ pub const UpstreamFetchEvent = struct {
     /// unresolved) stay inline.
     coord_submitted: bool = false,
 
+    /// Storage accounting (`src/kv/usage.zig`): the objects this transfer put
+    /// into a tenant's customer-controlled pools. Empty on the overwhelming
+    /// majority of events, which store nothing.
+    ///
+    /// Recorded by the worker on a 2xx terminal, independently of which
+    /// handler module (if any) the result routes to — the blob door is
+    /// reachable without the `blob.put` shim, so accounting that waited for a
+    /// customer callback would miss exactly the writes that declined to
+    /// declare themselves.
+    ///
+    /// A LIST rather than one object because a deploy stages many blobs behind
+    /// a single completion. Allocator-owned; freed by `deinitItem`.
+    stored: []StoredObject = &.{},
+    /// Which tenant the `stored` bytes belong to, when that is NOT the tenant
+    /// this event routes to. A scoped deploy receive streams into the TARGET
+    /// tenant's `file-blobs/` while the chain — and so the event — belongs to
+    /// the issuer, and charging the issuer would meter the wrong account.
+    /// Empty means "the event's own `tenant_id`". Allocator-owned.
+    stored_tenant: []u8 = &.{},
+
+    /// One stored object: where it went, what it is, and what it cost.
+    pub const StoredObject = struct {
+        pool: StoredPool,
+        hash: [64]u8,
+        bytes: u64,
+    };
+
+    /// The pools the storage quota meters. Named here rather than imported
+    /// from `raft-kv` so this module keeps depending on nothing but the
+    /// runtime.
+    pub const StoredPool = enum(u8) { app, file };
+
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
     }
@@ -592,6 +624,8 @@ pub const UpstreamFetchEvent = struct {
         if (item.fetch_headers) |h| allocator.free(h);
         if (item.bound_send_id.len > 0) allocator.free(item.bound_send_id);
         if (item.name.len > 0) allocator.free(item.name);
+        if (item.stored.len > 0) allocator.free(item.stored);
+        if (item.stored_tenant.len > 0) allocator.free(item.stored_tenant);
         item.* = .{};
     }
 };

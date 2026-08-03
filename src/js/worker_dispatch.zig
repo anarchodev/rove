@@ -895,6 +895,7 @@ fn finalizeBatch(
             for (batch_pending_fetches.items) |pf| {
                 // Trusted internal doors (receive/compile/stampManifest) →
                 // worker-local subsystem; everything else → the engine.
+                if (worker_mod.refuseIfOverStorageQuotaFor(worker, pf)) continue;
                 if (!worker.tryDoorFetch(pf)) {
                     batch_pending_fetches.items[keep] = pf;
                     keep += 1;

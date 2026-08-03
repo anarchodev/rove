@@ -94,6 +94,17 @@ pub const PlanLimits = struct {
     /// chose to write and where FIFO eviction at the ceiling is the fair
     /// answer.
     max_stored_bytes: u64,
+    /// Ceiling on ONE `blob.receive` — the largest single object a tenant can
+    /// create by streaming a request body straight into storage. A sibling of
+    /// `max_body_bytes` rather than of `max_stored_bytes`: it bounds one
+    /// write, not an accumulation. The inbound-body gate cannot serve here
+    /// because that 413 sits below route resolution, so a module on the
+    /// streaming path takes any-size bodies by design.
+    ///
+    /// A per-write ceiling is what makes the storage quota's overshoot
+    /// bounded: without one, a single request can store past the quota by an
+    /// unbounded amount instead of by one object.
+    max_receive_bytes: u64,
 };
 
 /// `max_stored_bytes` for a tier whose storage figure is not yet a product
@@ -107,6 +118,16 @@ pub const UNMETERED_BYTES: u64 = std.math.maxInt(u64);
 /// size is itself plan-derived. The tier table may not name a larger figure
 /// than the map it would have to fit in.
 pub const KV_BYTES_CEILING: u64 = 1 * 1024 * 1024 * 1024;
+
+/// Every tier's `max_receive_bytes` until the tier figures are set. 1 GiB
+/// matches what the `blob.write` / `seal` recipe path already permits for one
+/// object, so both large-write paths agree on how big a single object can get.
+/// Uniform across tiers deliberately: differentiating it is a product call —
+/// the same call that fills in the rest of the tier table — and holding it
+/// uniform preserves today's behaviour until that call is made. An enterprise
+/// deal can raise it now through `Overrides.max_receive_bytes` without touching
+/// this table.
+pub const RECEIVE_BYTES_DEFAULT: u64 = 1024 * 1024 * 1024;
 
 /// The baked tier table. The single source of what each named tier means.
 pub fn table(t: Tier) PlanLimits {
@@ -125,6 +146,7 @@ pub fn table(t: Tier) PlanLimits {
             .retention_days = 7,
             .max_kv_bytes = KV_BYTES_CEILING,
             .max_stored_bytes = UNMETERED_BYTES,
+            .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
         .pro => .{
             .rate = .{
@@ -138,6 +160,7 @@ pub fn table(t: Tier) PlanLimits {
             .retention_days = 30,
             .max_kv_bytes = KV_BYTES_CEILING,
             .max_stored_bytes = UNMETERED_BYTES,
+            .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
         .enterprise => .{
             .rate = .{
@@ -151,6 +174,7 @@ pub fn table(t: Tier) PlanLimits {
             .retention_days = 365,
             .max_kv_bytes = KV_BYTES_CEILING,
             .max_stored_bytes = UNMETERED_BYTES,
+            .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
     };
 }
@@ -168,6 +192,7 @@ pub const Overrides = struct {
     retention_days: ?u32 = null,
     max_kv_bytes: ?u64 = null,
     max_stored_bytes: ?u64 = null,
+    max_receive_bytes: ?u64 = null,
 };
 
 /// Fold overrides over the tier table: `override ?? table(tier).field`.
@@ -182,6 +207,7 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     if (ov.retention_days) |v| p.retention_days = v;
     if (ov.max_kv_bytes) |v| p.max_kv_bytes = v;
     if (ov.max_stored_bytes) |v| p.max_stored_bytes = v;
+    if (ov.max_receive_bytes) |v| p.max_receive_bytes = v;
     return p;
 }
 

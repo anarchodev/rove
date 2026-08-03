@@ -72,6 +72,7 @@ const log_subsystem_mod = @import("log_subsystem.zig");
 const jwt_mod = @import("rove-jwt");
 const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
+const plan_mod = @import("rove-plan");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
@@ -2386,7 +2387,7 @@ pub fn Worker(comptime opts: Options) type {
             const fail = struct {
                 fn emit(rt: *MsgRouter, alloc: std.mem.Allocator, p: *const globals.PendingFetch, status: u16, msg: []const u8) void {
                     const cj = std.fmt.allocPrint(alloc, "{{\"ok\":false,\"status\":{d},\"error\":\"{s}\"}}", .{ status, msg }) catch return;
-                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj);
+                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj, &.{}, "");
                 }
             }.emit;
 
@@ -2735,6 +2736,30 @@ pub fn Worker(comptime opts: Options) type {
                 return;
             };
             defer stage_storage.incarnation.free(self.allocator);
+            // The per-receive ceiling comes from the STAGING tenant's plan —
+            // the one whose storage the bytes land in, which for a scoped
+            // deploy receive is not the tenant holding the chain. Resolved
+            // once, here: a plan change mid-upload must not move the goalposts
+            // on a stream already in flight. An unresolvable plan falls back to
+            // the module default, so the receive is bounded either way.
+            const receive_cap: u64 = blk: {
+                const inst = self.node.tenant.getInstance(stage_tenant) catch null orelse
+                    break :blk blob_receive_mod.MAX_RECEIVE_BYTES;
+                const slot = getOrOpenTenantSlot(self, inst) catch |err| {
+                    std.log.warn(
+                        "rove-js blob.receive: slot({s}): {s} — falling back to the default ceiling",
+                        .{ stage_tenant, @errorName(err) },
+                    );
+                    break :blk blob_receive_mod.MAX_RECEIVE_BYTES;
+                };
+                break :blk slot.effectivePlan().max_receive_bytes;
+            };
+            // Clamp to what the storage quota still allows, so the socket is
+            // cut at the quota rather than after a large body has been
+            // spooled — #349's "check before streaming, not after". A tenant
+            // already at their ceiling gets a zero ceiling, so the first byte
+            // ends the stream and nothing is stored.
+            const ceiling = receiveCeiling(receive_cap, storageRemaining(self, stage_tenant));
             const job = blob_receive_mod.Job.create(
                 self.allocator,
                 &self.node.router,
@@ -2746,6 +2771,8 @@ pub fn Worker(comptime opts: Options) type {
                 pf.id,
                 pf.name,
                 null,
+                ceiling.cap,
+                ceiling.status,
             ) catch {
                 std.log.warn("rove-js blob.receive: job alloc failed tenant={s}", .{pf.tenant_id});
                 return;
@@ -2788,6 +2815,14 @@ pub fn Worker(comptime opts: Options) type {
         /// bound-resume flush) routes through this so a new door can't be
         /// half-wired — the bug class that hid `rove-stage.internal` from the
         /// resume path + `rove-compile.internal` from the read-only path.
+        /// Method form of the file-scope `refuseIfOverStorageQuota`, so the
+        /// release sites can reach it the same way they reach `tryDoorFetch`
+        /// (`effect/cmd.zig` holds the worker as `anytype` and cannot import
+        /// this module — that would close a cycle).
+        pub fn refuseIfOverStorageQuota(self: *Self, pf: globals.PendingFetch) bool {
+            return refuseIfOverStorageQuotaFor(self, pf);
+        }
+
         pub fn tryDoorFetch(self: *Self, pf: globals.PendingFetch) bool {
             if (blob_receive_mod.isReceiveUrl(pf.url)) {
                 self.armBlobReceive(pf);
@@ -2827,7 +2862,7 @@ pub fn Worker(comptime opts: Options) type {
             const fail = struct {
                 fn emit(rt: *MsgRouter, alloc: std.mem.Allocator, p: *const globals.PendingFetch, status: u16, msg: []const u8) void {
                     const cj = std.fmt.allocPrint(alloc, "{{\"ok\":false,\"status\":{d},\"error\":\"{s}\"}}", .{ status, msg }) catch return;
-                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj);
+                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj, &.{}, "");
                 }
             }.emit;
 
@@ -2868,6 +2903,24 @@ pub fn Worker(comptime opts: Options) type {
             if (p.scope.len == 0) return fail(router, a, &pf, 400, "scope required");
             if (p.files.len == 0) return fail(router, a, &pf, 400, "at least one file required");
             if (p.files.len > 256) return fail(router, a, &pf, 400, "too many files (max 256)");
+            // Storage quota (#349), against the SCOPE tenant — the one whose
+            // `file-blobs/` this deploy writes, never the admin tenant holding
+            // the chain.
+            //
+            // Gated on "already over", not on an estimate of what this deploy
+            // will add: the sources arrive JSON-encoded and the compile stores
+            // bytecode too, so any figure derived here would be a guess, and
+            // guessing HIGH refuses a deploy that would have fit. Deploying is
+            // also how a customer SHRINKS their storage, so a spurious refusal
+            // takes away the fix along with the problem. Over-cap already, and
+            // we decline to help them get further over.
+            if (storageCapRefusal(self, p.scope, 0)) |r| {
+                std.log.warn(
+                    "storage-cap: tenant={s} used={d} cap={d} — deploy refused (507: delete data or upgrade)",
+                    .{ p.scope, r.used, r.cap },
+                );
+                return fail(router, a, &pf, 507, "storage quota exceeded — delete data or upgrade");
+            }
             if (p.pkg_hash.len != 0) {
                 if (p.pkg_hash.len != files_mod.HASH_HEX_LEN)
                     return fail(router, a, &pf, 400, "pkg_hash must be 64 hex chars");
@@ -3313,6 +3366,131 @@ pub fn getOrOpenTenantSlot(
     inst: *const tenant_mod.Instance,
 ) !*TenantSlot {
     return worker.node.deploy.getOrOpenTenantSlot(inst);
+}
+
+/// Refuse a blob-door PUT that would carry its tenant past `max_stored_bytes`,
+/// emitting the terminal the handler would have got from a failed store.
+/// Returns true when the fetch was refused (and `pf` consumed).
+///
+/// Enforced HERE, where the worker releases a fetch to the engine, rather than
+/// in the `blob.put` shim: the door is reachable without the shim, so a check
+/// in JS is one a handler can decline to run.
+///
+/// The refusal is a 507 with the used/cap figures — the same status the KV cap
+/// answers with, so "you are out of room, delete data or upgrade" reads the
+/// same whichever resource ran out. `__system/blob_onresult` sees it as an
+/// ordinary non-2xx: the `_blob/owed/{hash}` marker persists as durable
+/// evidence and the customer's `on_result` runs with `ok: false`, which is the
+/// existing contract for a store that did not happen. Reads are untouched —
+/// `blob.get` and `blob.url` are GETs, so a tenant at their ceiling can still
+/// export their way out.
+pub fn refuseIfOverStorageQuotaFor(worker: anytype, pf: globals.PendingFetch) bool {
+    if (!std.mem.startsWith(u8, pf.url, fetch_engine_mod.BLOB_ORIGIN_PREFIX)) return false;
+    if (!std.mem.eql(u8, pf.method, "PUT")) return false;
+    const refusal = storageCapRefusal(worker, pf.tenant_id, pf.body.len) orelse return false;
+
+    std.log.warn(
+        "storage-cap: tenant={s} used={d} cap={d} incoming={d} — blob PUT refused (507: delete data or upgrade)",
+        .{ pf.tenant_id, refusal.used, refusal.cap, pf.body.len },
+    );
+
+    const a = worker.allocator;
+    var ev: components_mod.UpstreamFetchEvent = .{
+        .final = true,
+        .terminal_ok = false,
+        .terminal_status = 507,
+        .stream = pf.stream,
+        .bind = pf.bind,
+    };
+    ev.fetch_id = a.dupe(u8, pf.id) catch &.{};
+    ev.tenant_id = a.dupe(u8, pf.tenant_id) catch &.{};
+    ev.ctx_json = a.dupe(u8, pf.ctx_json) catch &.{};
+    ev.on_chunk_module = a.dupe(u8, pf.on_chunk_module) catch &.{};
+    if (pf.name.len > 0) ev.name = a.dupe(u8, pf.name) catch &.{};
+    if (pf.bound_send_id.len > 0) ev.bound_send_id = a.dupe(u8, pf.bound_send_id) catch &.{};
+    worker.node.router.enqueueFetchEventForTenant(pf.tenant_id, ev) catch |err| {
+        std.log.warn(
+            "storage-cap: refusal event route failed tenant={s}: {s}",
+            .{ pf.tenant_id, @errorName(err) },
+        );
+        var e = ev;
+        components_mod.UpstreamFetchEvent.deinitItem(&e, a);
+    };
+    var pfm = pf;
+    pfm.deinit(a);
+    return true;
+}
+
+/// A storage-quota verdict — billing axis 3's enforcement point (#351). The
+/// used/cap pair goes in both the 507 body and the log line, same as the KV
+/// cap's.
+pub const StorageCapRefusal = struct { used: u64, cap: u64 };
+
+/// Would storing `incoming` more bytes put `tenant` over its plan's
+/// `max_stored_bytes`? Null means "let it through".
+///
+/// **Refuse, never evict.** These are objects the customer deliberately
+/// stored; the log ring may evict at its ceiling precisely because that data
+/// is platform exhaust nobody chose to write, and applying the same policy
+/// here would destroy customer data to make room for more of it.
+///
+/// Fails OPEN on every error. A tenant we cannot resolve, or a store we cannot
+/// read, must not have its writes refused because of our own bookkeeping —
+/// the failure mode of a false refusal (a customer locked out of their own
+/// storage) is worse than the failure mode of a missed one (a little
+/// unbilled storage).
+pub fn storageCapRefusal(worker: anytype, tenant: []const u8, incoming: u64) ?StorageCapRefusal {
+    if (tenant.len == 0) return null;
+    if (std.mem.eql(u8, tenant, tenant_mod.ADMIN_INSTANCE_ID)) return null;
+    const inst_opt = worker.node.tenant.getInstance(tenant) catch null;
+    const inst = inst_opt orelse return null;
+    const slot = getOrOpenTenantSlot(worker, inst) catch |err| {
+        std.log.warn("storage-cap: slot({s}): {s} — fail open", .{ tenant, @errorName(err) });
+        return null;
+    };
+    const cap = slot.effectivePlan().max_stored_bytes;
+    // The overwhelming common case until the tier figures land: no ceiling, so
+    // no scan.
+    if (cap == plan_mod.UNMETERED_BYTES) return null;
+    return overStorageCap(cap, kv_mod.storedBytesCached(inst.kv, kv_mod.STORED_TTL_MS), incoming);
+}
+
+/// The quota decision itself, without the lookups — so the arithmetic is
+/// tested rather than reasoned about. Both directions are silent when wrong:
+/// refusing a write that fits locks a customer out of storage they paid for,
+/// and admitting one that does not is the ceiling failing to be a ceiling.
+pub fn overStorageCap(cap: u64, used: u64, incoming: u64) ?StorageCapRefusal {
+    if (cap == plan_mod.UNMETERED_BYTES) return null;
+    // Saturating: a tenant near the top of the u64 range plus a large write
+    // must not wrap into "fits".
+    if (used +| incoming <= cap) return null;
+    return .{ .used = used, .cap = cap };
+}
+
+/// What ceiling a receive runs under, and what it answers with if the stream
+/// hits it. Two different limits meet here and they are different problems for
+/// the customer: the object was too big for one write (413 — chunk it), or the
+/// tenant is out of room (507 — delete data or upgrade).
+pub fn receiveCeiling(plan_cap: u64, remaining: u64) struct { cap: u64, status: u16 } {
+    return if (remaining < plan_cap)
+        .{ .cap = remaining, .status = 507 }
+    else
+        .{ .cap = plan_cap, .status = 413 };
+}
+
+/// Bytes `tenant` may still store before its quota bites. `maxInt` when
+/// unmetered. Used where the size is not known up front — a receive clamps its
+/// per-stream ceiling to this, so the socket is cut at the quota rather than
+/// after a large body has already been spooled.
+pub fn storageRemaining(worker: anytype, tenant: []const u8) u64 {
+    if (tenant.len == 0) return std.math.maxInt(u64);
+    if (std.mem.eql(u8, tenant, tenant_mod.ADMIN_INSTANCE_ID)) return std.math.maxInt(u64);
+    const inst_opt = worker.node.tenant.getInstance(tenant) catch null;
+    const inst = inst_opt orelse return std.math.maxInt(u64);
+    const slot = getOrOpenTenantSlot(worker, inst) catch return std.math.maxInt(u64);
+    const cap = slot.effectivePlan().max_stored_bytes;
+    if (cap == plan_mod.UNMETERED_BYTES) return std.math.maxInt(u64);
+    return cap -| kv_mod.storedBytesCached(inst.kv, kv_mod.STORED_TTL_MS);
 }
 
 /// A `kvCapRefusal` verdict: the batch must be refused with this
@@ -3840,3 +4018,47 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
 // stamped-header / ctx shapes that the smoke can't easily inspect
 // without a tape harness — the bits most likely to drift on the next
 // shim-side change.
+
+
+// ── Storage-quota gate tests ───────────────────────────────────────────
+
+test "storage cap: an unmetered plan never refuses" {
+    try std.testing.expect(overStorageCap(plan_mod.UNMETERED_BYTES, 1 << 40, 1 << 40) == null);
+}
+
+test "storage cap: the ceiling admits exactly itself" {
+    try std.testing.expect(overStorageCap(1000, 900, 100) == null); // lands exactly on it
+    try std.testing.expect(overStorageCap(1000, 900, 101) != null); // one byte past
+    try std.testing.expect(overStorageCap(1000, 1000, 0) == null); // at cap, storing nothing
+}
+
+test "storage cap: an over-cap verdict reports the figures the customer needs" {
+    const v = overStorageCap(1000, 1200, 1).?;
+    try std.testing.expectEqual(@as(u64, 1200), v.used);
+    try std.testing.expectEqual(@as(u64, 1000), v.cap);
+}
+
+test "storage cap: a huge write cannot wrap into fitting" {
+    const near_max = std.math.maxInt(u64) - 4;
+    try std.testing.expect(overStorageCap(1000, near_max, 100) != null);
+    try std.testing.expect(overStorageCap(1000, 1, std.math.maxInt(u64)) != null);
+}
+
+test "receive ceiling: the binding limit decides what the customer is told" {
+    // Plenty of quota — the object size is what bounds the stream.
+    const roomy = receiveCeiling(1024, 1 << 30);
+    try std.testing.expectEqual(@as(u64, 1024), roomy.cap);
+    try std.testing.expectEqual(@as(u16, 413), roomy.status);
+
+    // Quota is tighter than the per-object ceiling: cut at the quota, and say
+    // so, because "chunk it smaller" would be the wrong advice.
+    const tight = receiveCeiling(1024, 100);
+    try std.testing.expectEqual(@as(u64, 100), tight.cap);
+    try std.testing.expectEqual(@as(u16, 507), tight.status);
+
+    // Already at the ceiling: a zero-byte ceiling ends the stream on its first
+    // byte, so nothing is spooled before the refusal.
+    const full = receiveCeiling(1024, 0);
+    try std.testing.expectEqual(@as(u64, 0), full.cap);
+    try std.testing.expectEqual(@as(u16, 507), full.status);
+}

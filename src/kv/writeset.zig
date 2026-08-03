@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const kvstore = @import("kvstore.zig");
+const usage = @import("usage.zig");
 
 pub const OpType = enum(u8) {
     put = 1,
@@ -333,6 +334,190 @@ const Reader = struct {
 // ── tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Which write path a test is standing in for.
+const Path = enum {
+    /// The LEADER: the worker writes rows straight into its speculative
+    /// overlay and proposes. Under `worker_overlay` the leader then SKIPS the
+    /// store apply, so the writeset never runs through `applyEncoded*` here.
+    leader_overlay,
+    /// A FOLLOWER: no worker, no overlay — the committed entry is written by
+    /// the apply path.
+    follower_apply,
+};
+
+const Row = struct { pool: usage.Pool, hash: []const u8, len: []const u8 };
+
+fn writeRows(kv: *kvstore.KvStore, path: Path, rows: []const Row) !void {
+    var ws = WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var key_buf: [usage.ROW_KEY_MAX]u8 = undefined;
+    for (rows) |r| {
+        const key = usage.rowKey(&key_buf, r.pool, r.hash);
+        switch (path) {
+            // The overlay write the worker performs before proposing.
+            .leader_overlay => try kv.put(key, r.len),
+            .follower_apply => try ws.addPut(key, r.len),
+        }
+    }
+    if (path == .follower_apply) {
+        const encoded = try ws.encode(testing.allocator);
+        defer testing.allocator.free(encoded);
+        try applyEncodedDirect(kv, 1, encoded);
+    }
+}
+
+test "usage: leader overlay and follower apply agree on the total" {
+    // The property a derived total has and a stored one does not. Under
+    // `worker_overlay` the leader skips the store apply, so anything computed
+    // inside the apply path exists on followers only. Summing rows on read is
+    // what makes both roles answer the same.
+    const allocator = testing.allocator;
+    const rows = [_]Row{
+        .{ .pool = .app, .hash = "a" ** 64, .len = "1000" },
+        .{ .pool = .file, .hash = "b" ** 64, .len = "2000" },
+        .{ .pool = .app, .hash = "c" ** 64, .len = "37" },
+    };
+
+    var lp_buf: [96]u8 = undefined;
+    const lp = tmpDbPath(&lp_buf, "ws-usage-leader");
+    defer cleanupDb(lp);
+    var leader = try kvstore.KvStore.open(allocator, lp);
+    defer leader.close();
+    try writeRows(leader, .leader_overlay, &rows);
+
+    var fp_buf: [96]u8 = undefined;
+    const fp = tmpDbPath(&fp_buf, "ws-usage-follower");
+    defer cleanupDb(fp);
+    var follower = try kvstore.KvStore.open(allocator, fp);
+    defer follower.close();
+    try writeRows(follower, .follower_apply, &rows);
+
+    try testing.expectEqual(@as(u64, 3037), usage.storedBytes(leader));
+    try testing.expectEqual(usage.storedBytes(leader), usage.storedBytes(follower));
+}
+
+test "usage: the total is order-independent and re-application is inert" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-order");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    const forward = [_]Row{
+        .{ .pool = .app, .hash = "a" ** 64, .len = "10" },
+        .{ .pool = .app, .hash = "b" ** 64, .len = "20" },
+    };
+    const backward = [_]Row{
+        .{ .pool = .app, .hash = "b" ** 64, .len = "20" },
+        .{ .pool = .app, .hash = "a" ** 64, .len = "10" },
+    };
+    try writeRows(kv, .follower_apply, &forward);
+    try testing.expectEqual(@as(u64, 30), usage.storedBytes(kv));
+
+    // Concurrent writers touch DIFFERENT keys, so interleaving and apply
+    // order cannot lose an increment — and a re-delivered entry re-writes
+    // rows that are already there.
+    try writeRows(kv, .follower_apply, &backward);
+    try writeRows(kv, .leader_overlay, &forward);
+    try testing.expectEqual(@as(u64, 30), usage.storedBytes(kv));
+}
+
+test "usage: content addressing dedups, and the pools do not" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-pools");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    // Same bytes stored twice in one pool: one object, counted once.
+    const hash = "b" ** 64;
+    try writeRows(kv, .follower_apply, &[_]Row{
+        .{ .pool = .app, .hash = hash, .len = "512" },
+        .{ .pool = .app, .hash = hash, .len = "512" },
+    });
+    try testing.expectEqual(@as(u64, 512), usage.storedBytes(kv));
+
+    // Same bytes deployed as a static AND stored via blob.put: two objects in
+    // the bucket, so they cost twice.
+    try writeRows(kv, .follower_apply, &[_]Row{.{ .pool = .file, .hash = hash, .len = "512" }});
+    try testing.expectEqual(@as(u64, 1024), usage.storedBytes(kv));
+    try testing.expectEqual(@as(u64, 512), usage.storedBytesIn(kv, .app));
+    try testing.expectEqual(@as(u64, 512), usage.storedBytesIn(kv, .file));
+}
+
+test "usage: deleting a row gives its bytes back" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-del");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    try writeRows(kv, .follower_apply, &[_]Row{
+        .{ .pool = .app, .hash = "c" ** 64, .len = "4096" },
+        .{ .pool = .app, .hash = "d" ** 64, .len = "1" },
+    });
+    try testing.expectEqual(@as(u64, 4097), usage.storedBytes(kv));
+
+    var key_buf: [usage.ROW_KEY_MAX]u8 = undefined;
+    const key = usage.rowKey(&key_buf, .app, "c" ** 64);
+    var ws = WriteSet.init(allocator);
+    defer ws.deinit();
+    try ws.addDelete(key);
+    const encoded = try ws.encode(allocator);
+    defer allocator.free(encoded);
+    try applyEncodedDirect(kv, 1, encoded);
+    try testing.expectEqual(@as(u64, 1), usage.storedBytes(kv));
+
+    // Deleting an absent row is a no-op, not an underflow.
+    try applyEncodedDirect(kv, 1, encoded);
+    try testing.expectEqual(@as(u64, 1), usage.storedBytes(kv));
+}
+
+test "usage: ordinary customer writes are not rows" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-inert");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    var ws = WriteSet.init(allocator);
+    defer ws.deinit();
+    try ws.addPut("media/1", "9999");
+    // A shim-writable marker beside the meter — customer-reachable, and
+    // deliberately not part of the accounting.
+    try ws.addPut("_blob/owed/" ++ "e" ** 64, "9999");
+    const encoded = try ws.encode(allocator);
+    defer allocator.free(encoded);
+    try applyEncodedDirect(kv, 1, encoded);
+    try testing.expectEqual(@as(u64, 0), usage.storedBytes(kv));
+}
+
+test "usage: the sum pages through more rows than one scan page" {
+    const allocator = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const path = tmpDbPath(&path_buf, "ws-usage-page");
+    defer cleanupDb(path);
+    var kv = try kvstore.KvStore.open(allocator, path);
+    defer kv.close();
+
+    // 600 rows > the 512-row scan page: a sum that stopped at the first page
+    // would silently under-report, which is the direction that matters for a
+    // quota.
+    var key_buf: [usage.ROW_KEY_MAX]u8 = undefined;
+    var hash_buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < 600) : (i += 1) {
+        _ = std.fmt.bufPrint(&hash_buf, "{x:0>64}", .{i}) catch unreachable;
+        const key = usage.rowKey(&key_buf, .app, &hash_buf);
+        try kv.put(key, "10");
+    }
+    try testing.expectEqual(@as(u64, 6000), usage.storedBytes(kv));
+}
 
 test "encode/decode round trip via KvStore" {
     const allocator = testing.allocator;

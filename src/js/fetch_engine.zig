@@ -655,7 +655,25 @@ pub const FetchEngine = struct {
         // hash from the URL BEFORE the rewrite replaces it, so the tee can warm
         // the LRU on completion.
         var static_cache_hash: ?[files_mod.HASH_HEX_LEN]u8 = null;
+        // Storage accounting (`src/kv/usage.zig`): a PUT through the blob door
+        // is bytes entering the tenant's own `app-blobs/`. Capture the content
+        // hash from the URL BEFORE the rewrite replaces it, same as the static
+        // door's cache target above, and the length from the body we are about
+        // to send. Stamped onto the terminal event so the worker records the
+        // object whether or not the caller registered a result module — the
+        // door is reachable without the `blob.put` shim.
+        var stored_hash: ?[64]u8 = null;
+        var stored_bytes: u64 = 0;
         if (is_blob_door) {
+            if (method == .PUT) {
+                const tail = pf.url[BLOB_ORIGIN_PREFIX.len..];
+                if (isSha256HexLower(tail)) {
+                    var hb: [64]u8 = undefined;
+                    @memcpy(&hb, tail[0..64]);
+                    stored_hash = hb;
+                    stored_bytes = pf.body.len;
+                }
+            }
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
         } else if (is_static_door) {
             const tail = pf.url[STATIC_ORIGIN_PREFIX.len..];
@@ -753,6 +771,8 @@ pub const FetchEngine = struct {
                 @as(u64, @max(@as(usize, pf.max_response_chunk_bytes), 1)),
             .held = pf.held,
             .cache_hash = static_cache_hash,
+            .stored_hash = stored_hash,
+            .stored_bytes = stored_bytes,
             .transfer = undefined, // wired below
         };
         // From here on, the FetchCtx owns the pf — clear the
@@ -1290,6 +1310,14 @@ const FetchCtx = struct {
     /// (evicted/cold assets self-heal). Null for every other fetch.
     cache_hash: ?[files_mod.HASH_HEX_LEN]u8 = null,
     cache_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    /// Storage accounting (`src/kv/usage.zig`): the object this transfer is
+    /// PUTting into the tenant's `app-blobs/`, captured from the door URL
+    /// before the S3 rewrite. Null for every transfer that stores nothing.
+    /// Copied onto the terminal event; the worker records the row only on a
+    /// 2xx, since a failed PUT stored no bytes.
+    stored_hash: ?[64]u8 = null,
+    stored_bytes: u64 = 0,
     /// Set once accumulation passes the per-asset cap — stop buffering + don't
     /// cache (the asset stays on the stream path; no huge blob held in RAM).
     cache_drop: bool = false,
@@ -1634,6 +1662,7 @@ fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_status = status;
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
+    stampStored(&ev, a, s);
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
@@ -1652,12 +1681,34 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_status = status;
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
+    stampStored(&ev, a, s);
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
         return err;
     };
     s.emitted_seq += 1;
+}
+
+/// Carry the storage-accounting facts onto a terminal event. Only the
+/// terminal carries them: intermediate chunks describe the RESPONSE, while
+/// what was stored is a property of the request, known once the transfer ends.
+/// The worker still gates on the status — a non-2xx PUT stored nothing.
+///
+/// An allocation failure drops the accounting for this object rather than
+/// failing the transfer: the bytes are already in the bucket, and refusing a
+/// customer's durable write over our own bookkeeping would be the worse trade.
+fn stampStored(ev: *UpstreamFetchEvent, a: std.mem.Allocator, s: *const FetchCtx) void {
+    const h = s.stored_hash orelse return;
+    const rows = a.alloc(UpstreamFetchEvent.StoredObject, 1) catch {
+        std.log.warn(
+            "rove-js fetch_engine: OOM stamping storage usage tenant={s} id={s}; {d} bytes unaccounted",
+            .{ s.pf.tenant_id, s.pf.id, s.stored_bytes },
+        );
+        return;
+    };
+    rows[0] = .{ .pool = .app, .hash = h, .bytes = s.stored_bytes };
+    ev.stored = rows;
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────

@@ -293,7 +293,7 @@ pub const DeployThread = struct {
             put_ok = false;
         }
         const ctx_json = std.fmt.allocPrint(a, "{{\"ok\":{s},\"dep_id\":\"{x:0>16}\"}}", .{ if (put_ok) "true" else "false", job.dep_id }) catch return;
-        routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, if (put_ok) 200 else 502, put_ok, ctx_json);
+        routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, if (put_ok) 200 else 502, put_ok, ctx_json, &.{}, "");
     }
 
     /// Compile + stage the batch into the SCOPE tenant, then emit ONE
@@ -310,7 +310,7 @@ pub const DeployThread = struct {
         const fail = struct {
             fn emit(dt: *DeployThread, r: *msg_router_mod.MsgRouter, j: *Job, status: u16, msg: []const u8) void {
                 const cj = errorCtxJson(dt.allocator, status, msg) catch return;
-                routeCompileEvent(r, dt.allocator, j.fetch_id, j.chain_tenant, j.name, status, false, cj);
+                routeCompileEvent(r, dt.allocator, j.fetch_id, j.chain_tenant, j.name, status, false, cj, &.{}, "");
             }
         }.emit;
 
@@ -355,7 +355,18 @@ pub const DeployThread = struct {
             defer a.free(staged);
             const ctx_json = buildStagedJson(a, staged, job.app_ctx) catch
                 return fail(self, router, job, 500, "out of memory");
-            routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, 200, true, ctx_json);
+            routeCompileEvent(
+                router,
+                a,
+                job.fetch_id,
+                job.chain_tenant,
+                job.name,
+                200,
+                true,
+                ctx_json,
+                stagedUsageRows(a, staged),
+                job.tenant_id,
+            );
             return;
         }
 
@@ -534,7 +545,18 @@ pub const DeployThread = struct {
 
         const ctx_json = buildResultsJson(a, compiled, job.app_ctx) catch
             return fail(self, router, job, 500, "out of memory");
-        routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, 200, true, ctx_json);
+        routeCompileEvent(
+            router,
+            a,
+            job.fetch_id,
+            job.chain_tenant,
+            job.name,
+            200,
+            true,
+            ctx_json,
+            compiledUsageRows(a, compiled),
+            job.tenant_id,
+        );
     }
 };
 
@@ -584,6 +606,40 @@ fn buildStagedJson(allocator: std.mem.Allocator, staged: []const files_mod.Stage
 /// resumes (mirrors `blob_receive.emitTerminal`). Takes ownership of
 /// `ctx_json_owned`. `bind=true` routes it to the worker holding the
 /// chain; `name` (empty → default `onFetchResult`) is the resume export.
+/// Usage rows for a stage-only job: one object per staged source.
+///
+/// Best-effort — an allocation failure yields no rows rather than failing a
+/// deploy whose blobs are already stored. The rows are keyed by content hash,
+/// so a deploy that re-stages bytes already present rewrites the same row and
+/// the tenant's total does not move; that is also why `putBlobIfMissingTo`
+/// skipping an existing object needs no special case here.
+fn stagedUsageRows(
+    allocator: std.mem.Allocator,
+    staged: []const files_mod.StagedFile,
+) []components_mod.UpstreamFetchEvent.StoredObject {
+    const rows = allocator.alloc(components_mod.UpstreamFetchEvent.StoredObject, staged.len) catch
+        return &.{};
+    for (staged, 0..) |f, i| {
+        rows[i] = .{ .pool = .file, .hash = f.source_hex, .bytes = f.source_len };
+    }
+    return rows;
+}
+
+/// Usage rows for a compile job: the source AND the bytecode, because a
+/// compile stores both into `file-blobs/` and both cost.
+fn compiledUsageRows(
+    allocator: std.mem.Allocator,
+    compiled: []const files_mod.CompiledFile,
+) []components_mod.UpstreamFetchEvent.StoredObject {
+    const rows = allocator.alloc(components_mod.UpstreamFetchEvent.StoredObject, compiled.len * 2) catch
+        return &.{};
+    for (compiled, 0..) |f, i| {
+        rows[i * 2] = .{ .pool = .file, .hash = f.source_hex, .bytes = f.source_len };
+        rows[i * 2 + 1] = .{ .pool = .file, .hash = f.bytecode_hex, .bytes = f.bytecode_len };
+    }
+    return rows;
+}
+
 pub fn routeCompileEvent(
     router: *msg_router_mod.MsgRouter,
     allocator: std.mem.Allocator,
@@ -593,6 +649,12 @@ pub fn routeCompileEvent(
     status: u16,
     ok: bool,
     ctx_json_owned: []u8,
+    /// Objects this job put into `stored_tenant`'s `file-blobs/`, or empty.
+    /// Ownership transfers to the event.
+    stored: []components_mod.UpstreamFetchEvent.StoredObject,
+    /// The tenant whose storage the blobs landed in — the SCOPE tenant, which
+    /// for an admin deploy is not `chain_tenant`.
+    stored_tenant: []const u8,
 ) void {
     var ev: components_mod.UpstreamFetchEvent = .{
         .final = true,
@@ -602,6 +664,16 @@ pub fn routeCompileEvent(
         .bind = true,
     };
     ev.ctx_json = ctx_json_owned; // take ownership
+    ev.stored = stored; // take ownership
+    if (stored.len > 0 and stored_tenant.len > 0) {
+        ev.stored_tenant = allocator.dupe(u8, stored_tenant) catch {
+            // Unowned rows would meter the chain tenant, which for an admin
+            // deploy is the wrong account — drop them instead.
+            allocator.free(ev.stored);
+            ev.stored = &.{};
+            return;
+        };
+    }
     ev.fetch_id = allocator.dupe(u8, fetch_id) catch {
         components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
         return;

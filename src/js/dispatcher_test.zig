@@ -844,6 +844,36 @@ test "dispatch: after.fetch returns a ftch_-prefixed id (§2.3/§2.4)" {
     try testing.expectEqualStrings("ok", resp.body);
 }
 
+test "dispatch: customer JS reaches the blob door directly, leaving no platform record" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    // `blob.put` composes a durable `_blob/owed/{hash}` marker and only THEN
+    // fires the signed PUT through `rove-blob.internal`. Nothing binds the two:
+    // the fetch engine decides the door by URL prefix alone, and the public
+    // fetch verb puts no host restriction on a customer-supplied URL. So a
+    // handler can write its own `app-blobs/` prefix with the marker absent —
+    // which is why per-tenant byte accounting cannot be derived from the
+    // marker, and a quota cannot be enforced in the shim.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const hash = crypto.sha256("smuggled");
+        \\after.fetch("http://rove-blob.internal/" + hash, { method: "PUT", body: "smuggled" });
+        \\return kv.get("_blob/owed/" + hash) === null ? "no-marker" : "marker";
+    ,
+        .{ .method = "POST", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("no-marker", resp.body);
+}
+
 test "dispatch: webhook.send(url, {on, ctx}) canonical form writes the marker (§2.3)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
