@@ -27,6 +27,7 @@ Build: `zig build rewind-worker rewind-cp rewind-front`
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -59,6 +60,15 @@ def main() -> int:
         print(f"  {'ok  ' if ok else 'FAIL'} {label}{(' — ' + detail) if detail else ''}")
         if not ok:
             failures.append(label)
+
+    # Run at the PROD raft tick. Step 10 asserts a production property —
+    # leadership is stable across an idle window — and the property's budget
+    # is the election timeout: at the harness default tick (1ms) that is a
+    # 10–20ms window, which ordinary OS scheduling jitter on a shared box can
+    # cross (a 15ms heartbeat-delivery gap flips the leader and the smoke
+    # fails on ANY commit). Prod runs tick=10 → a 100–200ms window; assert
+    # what prod runs. Respects an explicit override from the environment.
+    os.environ.setdefault("REWIND_RAFT_TICK_MS", "10")
 
     with V2Cluster.spawn("gate", nodes=3) as c:
         host = c.host_for("acme")

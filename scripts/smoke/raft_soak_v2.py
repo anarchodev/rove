@@ -109,8 +109,14 @@ def main() -> int:
     dur = float(os.environ.get("RAFT_SOAK_SECONDS", "90"))
     clients = int(os.environ.get("RAFT_SOAK_CLIENTS", "8"))
     streams = int(os.environ.get("RAFT_SOAK_STREAMS", "4"))
-    tick = os.environ.get("REWIND_RAFT_TICK_MS")
-    tick_label = f"{tick}ms" if tick else "default(1ms)"
+    # Default to the PROD raft tick: as a suite member this soak guards the
+    # production property "sustained write load causes zero spurious
+    # elections", and prod's election budget is tick=10 (100–200ms). The
+    # harness-default 1ms tick gives a 10–20ms budget that box jitter alone
+    # can cross — useful for manual sensitivity sweeps (set
+    # REWIND_RAFT_TICK_MS explicitly), wrong as a regression gate.
+    tick = os.environ.setdefault("REWIND_RAFT_TICK_MS", "10")
+    tick_label = f"{tick}ms"
     data_base = os.environ["V2_SMOKE_DATA_BASE"]
     os.makedirs(data_base, exist_ok=True)
     fstype = fstype_of(data_base)

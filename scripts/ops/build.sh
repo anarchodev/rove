@@ -28,7 +28,10 @@ OUT="$REPO_ROOT/zig-out/bin"
 # operator driver for genesis; runs on the deploy box, not shipped). Building
 # rewind-ops unconditionally keeps this mode-free; the deploy uses it only for
 # genesis.
-BINS=(rewind-worker rewind-cp rewind-front rewind-logs rewind-ops)
+# `rewind` (the customer CLI) is not shipped to prod hosts, but the smoke
+# gate below drives it against the freshly-built workers — a stale CLI in
+# zig-out fails the gate whenever the CLI↔worker deploy protocol moved.
+BINS=(rewind-worker rewind-cp rewind-front rewind-logs rewind-ops rewind)
 
 c_info=$'\033[1;36m'; c_ok=$'\033[1;32m'; c_err=$'\033[1;31m'; c_off=$'\033[0m'
 log(){ printf '%s== %s ==%s\n' "$c_info" "$*" "$c_off"; }
