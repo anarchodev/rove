@@ -54,6 +54,7 @@ const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
 const effect_mod = @import("effect/root.zig");
 const raft_propose = @import("raft_propose.zig");
+const blob_usage = @import("blob_usage.zig");
 const panic_mod = @import("panic.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
 
@@ -2889,6 +2890,12 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 // bind-call time — either way the chunk should
                 // still tape via the unbound path).
                 var ev = ev_const;
+                // Storage accounting (`src/kv/usage.zig`) BEFORE any routing
+                // decision: a blob-door PUT may name no result module, and one
+                // that does can throw before its first line, but the bytes are
+                // already in the tenant's bucket either way. This arm is the
+                // one point every fetch terminal passes through.
+                blob_usage.recordFromEvent(worker, &ev);
                 if (ev.bind) {
                     if (worker.lookupBoundFetch(ev.fetch_id) != null) {
                         // The chunk-spool dispatch path (`routing-and-ingress.md`): a bound

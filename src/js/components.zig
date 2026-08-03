@@ -556,6 +556,27 @@ pub const UpstreamFetchEvent = struct {
     /// unresolved) stay inline.
     coord_submitted: bool = false,
 
+    /// Storage accounting (`src/kv/usage.zig`): set when this transfer PUT
+    /// bytes into one of the tenant's own object pools. Recorded by the worker
+    /// on a 2xx terminal, independently of which handler module (if any) the
+    /// result routes to — the door is reachable without the `blob.put` shim,
+    /// so accounting that waited for a customer callback would miss exactly
+    /// the writes that declined to declare themselves.
+    ///
+    /// Fixed-size + plain integers, so `deinitItem` has nothing to free.
+    stored_hash: ?[64]u8 = null,
+    /// Bytes PUT — the object's stored length. Meaningful when
+    /// `stored_pool != .none`.
+    stored_bytes: u64 = 0,
+    /// Which pool the bytes landed in; `none` on the overwhelming majority of
+    /// transfers, which store nothing.
+    stored_pool: StoredPool = .none,
+
+    /// The pools the storage quota meters. Named here rather than imported
+    /// from `raft-kv` so this module keeps depending on nothing but the
+    /// runtime.
+    pub const StoredPool = enum(u8) { none, app, file };
+
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
     }
