@@ -1662,7 +1662,7 @@ fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_status = status;
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
-    stampStored(&ev, s);
+    stampStored(&ev, a, s);
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
@@ -1681,7 +1681,7 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_status = status;
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
-    stampStored(&ev, s);
+    stampStored(&ev, a, s);
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
@@ -1694,12 +1694,21 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
 /// terminal carries them: intermediate chunks describe the RESPONSE, while
 /// what was stored is a property of the request, known once the transfer ends.
 /// The worker still gates on the status — a non-2xx PUT stored nothing.
-fn stampStored(ev: *UpstreamFetchEvent, s: *const FetchCtx) void {
-    if (s.stored_hash) |h| {
-        ev.stored_hash = h;
-        ev.stored_bytes = s.stored_bytes;
-        ev.stored_pool = .app;
-    }
+///
+/// An allocation failure drops the accounting for this object rather than
+/// failing the transfer: the bytes are already in the bucket, and refusing a
+/// customer's durable write over our own bookkeeping would be the worse trade.
+fn stampStored(ev: *UpstreamFetchEvent, a: std.mem.Allocator, s: *const FetchCtx) void {
+    const h = s.stored_hash orelse return;
+    const rows = a.alloc(UpstreamFetchEvent.StoredObject, 1) catch {
+        std.log.warn(
+            "rove-js fetch_engine: OOM stamping storage usage tenant={s} id={s}; {d} bytes unaccounted",
+            .{ s.pf.tenant_id, s.pf.id, s.stored_bytes },
+        );
+        return;
+    };
+    rows[0] = .{ .pool = .app, .hash = h, .bytes = s.stored_bytes };
+    ev.stored = rows;
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────

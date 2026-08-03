@@ -157,6 +157,11 @@ pub const CompiledFile = struct {
     path: []const u8,
     source_hex: [HASH_HEX_LEN]u8,
     bytecode_hex: [HASH_HEX_LEN]u8,
+    /// Bytes each blob occupies in the tenant's `file-blobs/`. Reported so the
+    /// caller can meter what a deploy stored (`src/kv/usage.zig`) without
+    /// re-reading the objects back out of the store.
+    source_len: u64,
+    bytecode_len: u64,
 };
 
 /// Content-address handler sources into `blob` WITHOUT compiling them —
@@ -189,7 +194,7 @@ pub fn stageSources(
         var src_hex: [HASH_HEX_LEN]u8 = undefined;
         hashHex(in.bytes, &src_hex);
         try putBlobIfMissingTo(blob, &src_hex, in.bytes);
-        out[i] = .{ .path = in.path, .source_hex = src_hex };
+        out[i] = .{ .path = in.path, .source_hex = src_hex, .source_len = in.bytes.len };
     }
     return out;
 }
@@ -198,6 +203,9 @@ pub fn stageSources(
 pub const StagedFile = struct {
     path: []const u8,
     source_hex: [HASH_HEX_LEN]u8,
+    /// Bytes the staged source occupies in `file-blobs/` — see
+    /// `CompiledFile.source_len`.
+    source_len: u64,
 };
 
 /// Batch-compile handler sources and content-address BOTH the source and
@@ -273,7 +281,13 @@ pub fn compileAndStage(
         var bc_key_buf: [BC_KEY_LEN]u8 = undefined;
         try putBlobIfMissingTo(blob, bcKey(&bc_key_buf, &bc_hex), bytecode);
 
-        out[i] = .{ .path = in.path, .source_hex = src_hex, .bytecode_hex = bc_hex };
+        out[i] = .{
+            .path = in.path,
+            .source_hex = src_hex,
+            .bytecode_hex = bc_hex,
+            .source_len = in.bytes.len,
+            .bytecode_len = bytecode.len,
+        };
     }
 
     return out;

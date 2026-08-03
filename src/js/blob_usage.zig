@@ -109,41 +109,42 @@ pub fn recordStored(
     };
 }
 
-/// What an event says was stored, once it has earned a row.
-pub const Stored = struct {
-    pool: usage.Pool,
-    hash: [64]u8,
-    bytes: u64,
-};
-
-/// The gate: which events earn a row. Separated from the write so the decision
+/// The gate: which events earn rows. Separated from the write so the decision
 /// is testable without a worker, since every way of getting it wrong is
 /// silent — an event wrongly admitted inflates a tenant's usage toward a
 /// refusal they did not earn, and one wrongly skipped is storage nobody is
 /// charged for.
 ///
 /// Only the terminal carries the stored facts, and only a 2xx actually stored
-/// bytes: S3 either took the object or it did not, and a failed PUT leaves
-/// nothing to account for.
-pub fn storedFromEvent(ev: *const components_mod.UpstreamFetchEvent) ?Stored {
-    if (!ev.final) return null;
-    if (ev.terminal_status < 200 or ev.terminal_status >= 300) return null;
-    const hash = ev.stored_hash orelse return null;
-    return .{
-        .pool = switch (ev.stored_pool) {
-            .app => .app,
-            .file => .file,
-            .none => return null,
-        },
-        .hash = hash,
-        .bytes = ev.stored_bytes,
-    };
+/// bytes: S3 either took the objects or it did not, and a failed transfer
+/// leaves nothing to account for.
+pub fn storedFromEvent(
+    ev: *const components_mod.UpstreamFetchEvent,
+) []const components_mod.UpstreamFetchEvent.StoredObject {
+    if (!ev.final) return &.{};
+    if (ev.terminal_status < 200 or ev.terminal_status >= 300) return &.{};
+    return ev.stored;
+}
+
+/// Which tenant an event's stored bytes belong to. Normally the tenant the
+/// event routes to; a scoped deploy receive names the TARGET instead, because
+/// the bytes land in that tenant's storage and metering the issuer would
+/// charge the wrong account.
+pub fn storedTenant(ev: *const components_mod.UpstreamFetchEvent) []const u8 {
+    return if (ev.stored_tenant.len > 0) ev.stored_tenant else ev.tenant_id;
 }
 
 /// Record whatever a terminal fetch event says it stored.
 pub fn recordFromEvent(worker: anytype, ev: *const components_mod.UpstreamFetchEvent) void {
-    const s = storedFromEvent(ev) orelse return;
-    recordStored(worker, ev.tenant_id, s.pool, &s.hash, s.bytes);
+    const rows = storedFromEvent(ev);
+    if (rows.len == 0) return;
+    const tenant = storedTenant(ev);
+    for (rows) |r| {
+        recordStored(worker, tenant, switch (r.pool) {
+            .app => usage.Pool.app,
+            .file => usage.Pool.file,
+        }, &r.hash, r.bytes);
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -152,54 +153,57 @@ const testing = std.testing;
 
 const Ev = components_mod.UpstreamFetchEvent;
 
-fn storedEvent(status: u16, final: bool, pool: Ev.StoredPool) Ev {
-    return .{
-        .final = final,
-        .terminal_status = status,
-        .stored_hash = ("a" ** 64).*,
-        .stored_bytes = 4096,
-        .stored_pool = pool,
-    };
+fn storedEvent(status: u16, final: bool, rows: []Ev.StoredObject) Ev {
+    return .{ .final = final, .terminal_status = status, .stored = rows };
 }
 
-test "blob usage: a 2xx terminal blob-door PUT earns a row" {
-    const ev = storedEvent(200, true, .app);
-    const s = storedFromEvent(&ev).?;
-    try testing.expectEqual(usage.Pool.app, s.pool);
-    try testing.expectEqual(@as(u64, 4096), s.bytes);
-    try testing.expectEqualStrings("a" ** 64, &s.hash);
-
-    const file_ev = storedEvent(204, true, .file);
-    try testing.expectEqual(usage.Pool.file, storedFromEvent(&file_ev).?.pool);
+test "blob usage: a 2xx terminal earns every row it carries" {
+    var rows = [_]Ev.StoredObject{
+        .{ .pool = .app, .hash = ("a" ** 64).*, .bytes = 4096 },
+        .{ .pool = .file, .hash = ("b" ** 64).*, .bytes = 17 },
+    };
+    const ev = storedEvent(200, true, &rows);
+    const got = storedFromEvent(&ev);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(Ev.StoredPool.app, got[0].pool);
+    try testing.expectEqual(@as(u64, 17), got[1].bytes);
+    try testing.expectEqualStrings("a" ** 64, &got[0].hash);
 }
 
 test "blob usage: nothing stored, nothing recorded" {
     // The overwhelming majority of transfers: an ordinary outbound fetch.
-    const plain = storedEvent(200, true, .none);
-    try testing.expect(storedFromEvent(&plain) == null);
-
-    // A terminal that claims a pool but carries no hash is incoherent; it
-    // must not be charged against anyone.
-    var no_hash = storedEvent(200, true, .app);
-    no_hash.stored_hash = null;
-    try testing.expect(storedFromEvent(&no_hash) == null);
+    const plain = storedEvent(200, true, &.{});
+    try testing.expect(storedFromEvent(&plain).len == 0);
 }
 
-test "blob usage: a PUT that did not store is not charged" {
+test "blob usage: a write that did not store is not charged" {
     // S3 refused, or the transfer never got a response at all. Charging here
-    // would bill a tenant for bytes that are not in the bucket.
-    for ([_]u16{ 0, 403, 404, 500, 503 }) |status| {
-        const ev = storedEvent(status, true, .app);
-        try testing.expect(storedFromEvent(&ev) == null);
+    // would bill a tenant for bytes that are not in the bucket. 3xx is not
+    // success either — the object is not known to be there.
+    var rows = [_]Ev.StoredObject{.{ .pool = .app, .hash = ("c" ** 64).*, .bytes = 1 }};
+    for ([_]u16{ 0, 307, 403, 404, 500, 503 }) |status| {
+        const ev = storedEvent(status, true, &rows);
+        try testing.expect(storedFromEvent(&ev).len == 0);
     }
-    // 3xx is not success either — the object is not known to be there.
-    const redirect = storedEvent(307, true, .app);
-    try testing.expect(storedFromEvent(&redirect) == null);
 }
 
 test "blob usage: only the terminal event counts" {
     // Intermediate chunks describe the RESPONSE; counting them would charge a
     // tenant once per chunk for a single stored object.
-    const mid = storedEvent(200, false, .app);
-    try testing.expect(storedFromEvent(&mid) == null);
+    var rows = [_]Ev.StoredObject{.{ .pool = .app, .hash = ("d" ** 64).*, .bytes = 9 }};
+    const mid = storedEvent(200, false, &rows);
+    try testing.expect(storedFromEvent(&mid).len == 0);
+}
+
+test "blob usage: a scoped write is charged to the target, not the issuer" {
+    // A scoped deploy receive streams into the TARGET tenant's file-blobs
+    // while the chain — and so the event — belongs to the issuer. Metering the
+    // issuer would charge an admin tenant for every customer's deploy.
+    var rows = [_]Ev.StoredObject{.{ .pool = .file, .hash = ("e" ** 64).*, .bytes = 32 }};
+    var ev = storedEvent(200, true, &rows);
+    ev.tenant_id = @constCast("__admin__");
+    try testing.expectEqualStrings("__admin__", storedTenant(&ev));
+
+    ev.stored_tenant = @constCast("acme");
+    try testing.expectEqualStrings("acme", storedTenant(&ev));
 }

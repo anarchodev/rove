@@ -519,23 +519,37 @@ pub const Job = struct {
             components_mod.UpstreamFetchEvent.deinitItem(&ev, a);
             return;
         };
-        // Storage accounting (`src/kv/usage.zig`): an own-tenant receive
-        // streams into THIS tenant's `app-blobs/`, so it owes a row exactly
-        // like a door PUT. The worker gates on the status, so a torn upload —
-        // which S3 multipart leaves invisible — records nothing.
-        //
-        // A SCOPED receive (`target_id`) streams into the TARGET's
-        // `file-blobs/`, so its bytes belong to a tenant that is not the event's
-        // `tenant_id`. Attributing across tenants needs a carrier this event
-        // does not have; it rides with the `file-blobs` writer instead of being
-        // silently charged to the issuer.
-        if (self.target_id == null) {
-            if (hash_hex) |h| {
-                ev.stored_hash = h.*;
-                ev.stored_bytes = len;
-                ev.stored_pool = .app;
+        // Storage accounting (`src/kv/usage.zig`). A receive stores into the
+        // STAGING tenant's pool, which for a scoped deploy receive is not the
+        // tenant this event routes to — so it names that tenant explicitly
+        // rather than letting the issuer be metered for it. The worker gates
+        // on the status, so a torn upload — which S3 multipart leaves
+        // invisible — records nothing.
+        if (hash_hex) |h| stored: {
+            const rows = a.alloc(components_mod.UpstreamFetchEvent.StoredObject, 1) catch {
+                std.log.warn(
+                    "rove-js blob.receive: OOM stamping storage usage tenant={s}; {d} bytes unaccounted",
+                    .{ self.tenant_id, len },
+                );
+                break :stored;
+            };
+            rows[0] = .{
+                .pool = if (self.target_id != null) .file else .app,
+                .hash = h.*,
+                .bytes = len,
+            };
+            ev.stored = rows;
+            if (self.target_id) |t| {
+                ev.stored_tenant = a.dupe(u8, t) catch {
+                    // The rows without an owner would meter the issuer, so drop
+                    // them rather than charge the wrong account.
+                    a.free(rows);
+                    ev.stored = &.{};
+                    break :stored;
+                };
             }
         }
+
         // `app` echoes the issue-time ctx (raw JSON) so a cross-tenant deploy
         // receive can thread {tenant, path, content_type} to its `{on}` export.
         const app: []const u8 = if (self.app_ctx.len == 0) "null" else self.app_ctx;
