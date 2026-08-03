@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, rpc_wrap, _curl, MOVE_SECRET  # noqa: E402
+import smoke_ports  # noqa: E402
 
 TENANT = "genesistenant"
 APP = "genesisapp"
@@ -196,6 +197,9 @@ def main() -> int:
     max_runs = int(sys.argv[1]) if len(sys.argv) > 1 else 12
     tally = {"pass": 0, "fail-legE": 0, "fail-other": 0}
     for r in range(1, max_runs + 1):
+        # Each round spawns an independent, fully-torn-down cluster; recycle
+        # the port slot's range or 12 rounds exhaust its fixed budget.
+        smoke_ports.recycle()
         print(f"\n########## RUN {r}/{max_runs} ##########")
         try:
             outcome = run_once(r)

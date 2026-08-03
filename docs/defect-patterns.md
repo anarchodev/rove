@@ -321,15 +321,20 @@ that no process required.
   `thread panic: integer does not fit in destination type` — was in the log the
   whole time.
 
-**What would make it unlikely.**
+**The structural fix (landed, rove#363 — owner decision taken).**
 
-- Wire the suite to something that runs it. It needs S3 credentials, so this is
-  an owner decision, not a code change — but a suite whose entire value depends
-  on someone remembering is the thing this class is about.
-- `--baseline` diffing exists so a partly-red suite still answers the only
-  question that blocks a change: *did I break something?* A gate that cannot
-  distinguish "newly broken" from "long broken" gets ignored, which is how this
-  happened.
+- **The suite is wired to two things that run it** (see
+  `scripts/smoke/README.md`, "How it runs now"): a nightly systemd timer
+  (`scripts/smoke/nightly.sh` — dedicated checkout of `origin/main`, full
+  suite, baseline diff, alert to the standing issue rove#373 on anything
+  newly broken **or on a nightly that could not run** — a build break is an
+  alert, not silence) and a deploy gate in `scripts/ops/build.sh` that
+  refuses to ship on a newly-broken smoke (`ROVE_SKIP_SMOKES=1` is the
+  conscious override; a missing `.env` is a hard stop, never a silent skip).
+- `--baseline` diffing is what makes both livable: a partly-red suite still
+  answers the only question that blocks a change — *did I break something?* —
+  so long-standing reds stay backlog instead of teaching everyone to ignore
+  the gate. The baseline is refreshed manually, on purpose.
 
 ---
 
@@ -350,13 +355,15 @@ Worth preserving through any refactor:
 
 ## Suggested order for a refactor
 
-By expected defects prevented per unit of work:
+By expected defects prevented per unit of work. (All four landed via
+rove#363: classes 2+1 in PR #365, class 3 in PR #370, class 10 as the
+nightly timer + deploy gate above.)
 
 1. **Class 2** — the tenant-storage handle. Seven instances, one root, and the
    fix is mechanical once the handle exists.
 2. **Class 1** — distinct identity types in the worker. One instance so far, but
-   it was an unconditional production crash, and the surface (three integer
-   identity fields, mutually assignable) is unchanged.
+   it was an unconditional production crash that the surface (three
+   mutually-assignable integer identity fields) invited.
 3. **Class 3** — one definition of the attach envelope. Removes the duplication
    that made class 2's worst instance possible.
 4. **Class 10** — decide how the suite gets run. Everything above is only
