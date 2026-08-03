@@ -587,6 +587,15 @@ pub const TenantSlot = struct {
     /// size + retention read `effectivePlan()` fresh per request, so they pick
     /// up a change with no generation check.
     plan_gen: std.atomic.Value(u64) = .init(0),
+    /// The tenant's suspension state (the suspension axis,
+    /// docs/architecture/control-plane.md): true ⇒ every serving path
+    /// refuses — inbound admission 403s, and fire/stream/WS write batches
+    /// are dropped before the propose — while data, deployment, and plan
+    /// stay untouched. Delivered by the CP (`/_system/v2-suspend` live
+    /// push, re-pushed each reconcile pass so a worker restart re-learns
+    /// it); deliberately NOT part of `PlanLimits`, so a plan push can
+    /// never clear it. Lock-free read on the dispatch path.
+    suspended: std.atomic.Value(bool) = .init(false),
     /// Serializes `setPlan` (the rare, billing-driven write path) and owns the
     /// retired-pointer list. Never taken on a read.
     plan_lock: std.Thread.Mutex = .{},

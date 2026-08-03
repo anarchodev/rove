@@ -178,6 +178,42 @@ const Router = struct {
     confchange_total: u64 = 0,
     confchange_failed: u64 = 0,
 
+    /// Creation-velocity guard over `/_control/provision` (the rate half of
+    /// the signup-velocity control — ten tenants over a year and ten in a
+    /// minute are different events even at the same total). One coarse
+    /// token bucket for the whole door: per-identity totals belong to the
+    /// dashboard's plan-derived allowances, but a bulk-creation flood —
+    /// each tenant costing a raft group ×3 nodes, an LMDB env, a placement,
+    /// and an S3 prefix — is bounded HERE, behind whatever identity the
+    /// caller presents. Leader-gated door ⇒ the leader's bucket is
+    /// authoritative. Plain fields (main-loop only, like the counters).
+    provision_tokens: f64 = PROVISION_BURST,
+    provision_last_refill_ns: i64 = 0,
+    provision_limited: u64 = 0,
+
+    /// Burst: enough for a demo/test session's worth of creates in quick
+    /// succession.
+    const PROVISION_BURST: f64 = 10.0;
+    /// Sustained: one create per 30s (~2.9k/day) — far above any organic
+    /// signup curve the funnel could produce at launch, far below a flood.
+    const PROVISION_REFILL_PER_SEC: f64 = 1.0 / 30.0;
+
+    /// Take one provision token (refilling first). Main-loop only.
+    fn provisionTokenTake(self: *Router) bool {
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        if (self.provision_last_refill_ns != 0) {
+            const elapsed_s = @as(f64, @floatFromInt(now_ns - self.provision_last_refill_ns)) /
+                @as(f64, std.time.ns_per_s);
+            self.provision_tokens = @min(PROVISION_BURST, self.provision_tokens + elapsed_s * PROVISION_REFILL_PER_SEC);
+        }
+        self.provision_last_refill_ns = now_ns;
+        if (self.provision_tokens >= 1.0) {
+            self.provision_tokens -= 1.0;
+            return true;
+        }
+        return false;
+    }
+
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
     fn replyStatus(server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16) !void {
@@ -325,7 +361,13 @@ const Router = struct {
             if (i > 0) try w.writeByte(',');
             try w.print("\"{s}\"", .{n});
         }
-        try w.writeAll("]}");
+        try w.writeAll("]");
+        // A suspended tenant still RESOLVES (placement is untouched — that's
+        // what makes suspension reversible), but the front door must answer
+        // 403 instead of proxying. Carried on the route rather than a
+        // separate lookup so the front's route cache holds the whole answer.
+        if (self.directory.isSuspended(tenant)) try w.writeAll(",\"suspended\":true");
+        try w.writeAll("}");
         const owned = try buf.toOwnedSlice(a);
         try replyText(server, ent, sid, sess, 200, owned);
     }
@@ -456,7 +498,9 @@ const Router = struct {
         const is_cluster = std.mem.eql(u8, path, "/_control/cluster");
         const is_node_addr = std.mem.eql(u8, path, "/_control/node-address");
         const is_delete = std.mem.eql(u8, path, "/_control/delete");
-        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster or is_node_addr or is_delete) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_suspend = std.mem.eql(u8, path, "/_control/suspend");
+        const is_unsuspend = std.mem.eql(u8, path, "/_control/unsuspend");
+        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster or is_node_addr or is_delete or is_suspend or is_unsuspend) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -495,6 +539,10 @@ const Router = struct {
             try self.handleProvision(server, ent, sid, sess, body)
         else if (is_delete)
             try self.handleDelete(server, ent, sid, sess, body)
+        else if (is_suspend)
+            try self.handleSuspend(server, ent, sid, sess, body)
+        else if (is_unsuspend)
+            try self.handleUnsuspend(server, ent, sid, sess, body)
         else
             // `move` and `move-live` name the SAME (zero-downtime) move; both
             // route names are accepted so callers can use either.
@@ -633,6 +681,16 @@ const Router = struct {
             try self.replyProvisionError(server, ent, sid, sess, 409, "that name is taken");
             return;
         }
+
+        // Creation-velocity guard (see `provisionTokenTake`). After the
+        // cheap validation/409 reads — only a request that would actually
+        // create a group consumes a token — and before any expensive work.
+        if (!self.provisionTokenTake()) {
+            self.provision_limited += 1;
+            std.log.warn("rewind-cp: provision velocity guard tripped (requested: {s})", .{tenant});
+            try self.replyProvisionError(server, ent, sid, sess, 429, "tenant creation is rate limited — retry in a minute");
+            return;
+        }
         const cluster_ref = if (parsed.value.cluster.len > 0)
             self.directory.clusterById(parsed.value.cluster) orelse {
                 try self.replyProvisionError(server, ent, sid, sess, 400, "unknown cluster");
@@ -725,7 +783,7 @@ const Router = struct {
         //    an operator passes one. It is already provisioned (placed), so a
         //    host write failure is non-fatal; retry via `/_control/host`.
         if (parsed.value.host) |host| {
-            if (host.len > 0) {
+            if (host.len > 0 and self.hostClaimViolation(host, tenant) == null) {
                 self.directory.setHost(host, tenant) catch |err|
                     std.log.warn("rewind-cp: provision {s}: setHost({s}) failed: {s}", .{ tenant, host, @errorName(err) });
                 // Also push the worker-side `__root__/domain/{host}` alias to the
@@ -870,6 +928,10 @@ const Router = struct {
         }
         self.directory.removePlan(tenant) catch |err|
             std.log.warn("rewind-cp: delete {s}: removePlan failed: {s}", .{ tenant, @errorName(err) });
+        // A deleted tenant's suspension row must not outlive it — a future
+        // tenant reborn under this name starts unsuspended.
+        self.directory.removeSuspend(tenant) catch |err|
+            std.log.warn("rewind-cp: delete {s}: removeSuspend failed: {s}", .{ tenant, @errorName(err) });
         // The incarnation is per-LIFETIME: the next tenant to take this name
         // must mint a fresh one, never inherit this one.
         self.directory.removeIncarnation(tenant) catch |err|
@@ -952,17 +1014,181 @@ const Router = struct {
         try replyText(server, ent, sid, sess, 200, msg);
     }
 
+    /// Suspend a tenant: `POST /_control/suspend {tenant, reason?}` — the
+    /// reversible kill switch behind the AUP (the suspension axis,
+    /// docs/architecture/control-plane.md). Writes the replicated
+    /// `suspend/{tenant}` record ({reason, at_ms} — who/why/when survives in
+    /// the raft log) and live-pushes the state to the serving cluster so
+    /// enforcement lands without waiting for a re-attach. Non-destructive by
+    /// construction: placement, plan, hosts, and every stored byte are
+    /// untouched — `/_control/unsuspend` restores serving exactly.
+    /// Deliberately NOT a plan write, so a billing push can never
+    /// un-suspend an abuse response. The platform singletons refuse (a
+    /// suspended `__admin__` would take down the door that un-suspends).
+    fn handleSuspend(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            tenant: []const u8,
+            reason: []const u8 = "",
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const tenant = parsed.value.tenant;
+        if (tenant.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        for (id_spec.RESERVED_INSTANCE_IDS) |r| {
+            if (std.mem.eql(u8, tenant, r)) {
+                try self.replyProvisionError(server, ent, sid, sess, 403, "that tenant is part of the platform");
+                return;
+            }
+        }
+        const record = std.json.Stringify.valueAlloc(a, .{
+            .reason = parsed.value.reason,
+            .at_ms = std.time.milliTimestamp(),
+        }, .{}) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(record);
+        self.directory.setSuspend(tenant, record) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        std.log.warn("rewind-cp: SUSPENDED {s} ({s})", .{ tenant, parsed.value.reason });
+        // Best-effort live push (mirror of the plan push): the directory row
+        // is the durable truth; a failed push means the DP learns on the
+        // reconciler's next re-push pass instead.
+        self.pushSuspendToServingCluster(tenant, true);
+        const msg = std.fmt.allocPrint(a, "suspended {s}\n", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 200);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// Reverse a suspension: `POST /_control/unsuspend {tenant}` — delete the
+    /// `suspend/{tenant}` row and live-push the cleared state. Idempotent.
+    fn handleUnsuspend(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            tenant: []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const tenant = parsed.value.tenant;
+        if (tenant.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        self.directory.removeSuspend(tenant) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        std.log.info("rewind-cp: unsuspended {s}", .{tenant});
+        self.pushSuspendToServingCluster(tenant, false);
+        const msg = std.fmt.allocPrint(a, "unsuspended {s}\n", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 200);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// Reconcile-tick pass: re-push every suspended tenant's state to its
+    /// serving cluster (see the call site for why). Leader-only, like every
+    /// pass that writes to serving clusters on the directory's authority.
+    pub fn repushSuspensions(self: *Router) void {
+        if (!self.directory.isLeader()) return;
+        const a = self.allocator;
+        const ids = self.directory.suspendedTenantsOwned(a) catch return;
+        defer {
+            for (ids) |id| a.free(id);
+            a.free(ids);
+        }
+        for (ids) |tenant| self.pushSuspendToServingCluster(tenant, true);
+    }
+
+    /// Push a tenant's suspension state to its serving cluster's nodes
+    /// (`POST /_system/v2-suspend {tenant, suspended}`). Mirror of
+    /// `pushPlanToServingCluster`: best-effort, the directory row stays the
+    /// durable truth, and the reconciler re-pushes suspended tenants each
+    /// pass so a worker restart (which loses the in-memory flag) re-learns
+    /// the state within one reconcile interval.
+    fn pushSuspendToServingCluster(self: *Router, tenant: []const u8, suspended: bool) void {
+        const a = self.allocator;
+        const res = self.directory.resolve(tenant) orelse return; // unplaced
+        const payload = std.json.Stringify.valueAlloc(a, .{ .tenant = tenant, .suspended = suspended }, .{}) catch return;
+        defer a.free(payload);
+        for (res.cluster.nodes) |base| {
+            if (bc.call(self, base, "/_system/v2-suspend", .POST, payload, &.{})) |resp| {
+                var r = resp;
+                defer r.deinit(a);
+                if (r.status != 204)
+                    std.log.warn("rewind-cp: v2-suspend push for {s} on {s} → {d}", .{ tenant, base, r.status });
+            } else |err| {
+                std.log.warn("rewind-cp: v2-suspend push for {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
+            }
+        }
+    }
+
     /// Map a host to a tenant: `POST /_control/host {host, tenant}` (writes
     /// the replicated domain index). A directory WRITE: leader-gated, so a
     /// follower has already forwarded to the leader by the time we get here.
     /// Routing is a pure CP read (`/_cp/route`), so unlike a plan change there
     /// is nothing to push to a DP — the front door picks up the new mapping on
     /// its next CP route query (subject to its route-cache TTL).
+    const HostClaimViolation = struct { code: u16, msg: []const u8 };
+
+    /// The host-claim rules, shared by every door that writes a host row
+    /// (`/_control/host` and provision's optional custom host) so
+    /// `Directory.setHost` stays the dumb last-write-wins primitive while
+    /// the POLICY has one enforcement point:
+    ///
+    /// 1. First-claim-wins across tenants. A host already mapped to a
+    ///    DIFFERENT tenant refuses (409) — a later claim must never take a
+    ///    hostname another tenant is serving. Releasing a claim is the
+    ///    delete path (or an operator `force` resolving a dispute);
+    ///    same-tenant re-claims are idempotent.
+    /// 2. The platform zone is identity-bound. `{label}.{public_suffix}`
+    ///    belongs to the tenant named `label` by the wildcard route; an
+    ///    explicit row aiming it at any other tenant would let one tenant
+    ///    impersonate another (or a platform surface — `login.`-shaped
+    ///    labels are already unclaimable as tenant ids) on our own zone.
+    ///    403; operator `force` is the only escape hatch (platform
+    ///    surfaces on the zone).
+    ///
+    /// Returns the refusal to send, or null when the claim is allowed.
+    fn hostClaimViolation(self: *Router, host: []const u8, tenant: []const u8) ?HostClaimViolation {
+        if (id_spec.wildcardLabel(host, self.public_suffix)) |label| {
+            if (!std.mem.eql(u8, label, tenant)) {
+                std.log.warn("rewind-cp: host claim refused — {s} is on the platform zone and not tenant {s}'s own label", .{ host, tenant });
+                return .{ .code = 403, .msg = "hosts on the platform domain are fixed to the tenant of the same name" };
+            }
+        }
+        const existing = self.directory.hostTenantForOwned(self.allocator, host) catch null;
+        if (existing) |owner| {
+            defer self.allocator.free(owner);
+            if (!std.mem.eql(u8, owner, tenant)) {
+                std.log.warn("rewind-cp: host claim refused — {s} is already claimed by {s} (requested by {s})", .{ host, owner, tenant });
+                return .{ .code = 409, .msg = "that host is already claimed by another tenant" };
+            }
+        }
+        return null;
+    }
+
     fn handleHost(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
         const a = self.allocator;
         var parsed = std.json.parseFromSlice(struct {
             host: []const u8,
             tenant: []const u8,
+            /// Operator override for the claim rules below. The customer
+            /// door (#291's dashboard path) must never send it.
+            force: bool = false,
         }, a, body, .{ .ignore_unknown_fields = true }) catch {
             try replyStatus(server, ent, sid, sess, 400);
             return;
@@ -971,6 +1197,12 @@ const Router = struct {
         if (parsed.value.host.len == 0 or parsed.value.tenant.len == 0) {
             try replyStatus(server, ent, sid, sess, 400);
             return;
+        }
+        if (!parsed.value.force) {
+            if (self.hostClaimViolation(parsed.value.host, parsed.value.tenant)) |v| {
+                try self.replyProvisionError(server, ent, sid, sess, v.code, v.msg);
+                return;
+            }
         }
         self.directory.setHost(parsed.value.host, parsed.value.tenant) catch {
             try replyStatus(server, ent, sid, sess, 500);
@@ -1482,8 +1714,11 @@ fn buildCpMetricsText(allocator: std.mem.Allocator, router: *Router, bridge: *Br
         \\# HELP cp_reconcile_confchange_failed_total conf-change proposals that did not commit (non-204) — the stuck-grow signal; climbing while membership doesn't advance = a conf-change the leader can't commit (the __admin__-stuck-at-{{1,2}} wedge).
         \\# TYPE cp_reconcile_confchange_failed_total counter
         \\cp_reconcile_confchange_failed_total {d}
+        \\# HELP cp_provision_limited_total provisions refused by the creation-velocity guard (bulk tenant-creation flood signal).
+        \\# TYPE cp_provision_limited_total counter
+        \\cp_provision_limited_total {d}
         \\
-    , .{ router.reconcile_passes, router.confchange_total, router.confchange_failed });
+    , .{ router.reconcile_passes, router.confchange_total, router.confchange_failed, router.provision_limited });
 
     buf = aw.toArrayList();
     return try buf.toOwnedSlice(allocator);
@@ -1774,6 +2009,12 @@ pub fn main() !void {
             if (now_ns - last_reconcile_ns > reconcile_period_ns) {
                 last_reconcile_ns = now_ns;
                 reconciler.reconcileMembership(&router);
+                // Re-push suspension state to serving clusters. A worker
+                // restart loses the in-memory suspended flag; the directory
+                // row is the durable truth, so this pass re-delivers it
+                // within one reconcile interval. Suspended tenants are few —
+                // the pass is O(suspended), not O(tenants).
+                router.repushSuspensions();
                 // Re-install certificates this cluster already owns but whose
                 // raft copy is gone — the state after a cold bring-up. Leader
                 // only (the write goes through the leader's proposer), and

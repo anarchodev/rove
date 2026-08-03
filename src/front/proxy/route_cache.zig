@@ -64,15 +64,21 @@ pub const RouteCache = struct {
 
     const CacheEntry = struct {
         /// Empty and unowned for a negative entry (`negative` guards
-        /// the free).
+        /// the free) and for a suspended entry.
         nodes: [][]u8,
         negative: bool,
+        /// The tenant resolves but is suspended → cached 403. Uses the
+        /// POSITIVE TTL (like a placement): suspension state changes on
+        /// an operator un-suspend the way a placement changes on a move,
+        /// so the same TTL bounds how long the front lags it.
+        suspended: bool = false,
         expires_ns: i128,
     };
 
     pub const Hit = union(enum) {
         nodes: []const []const u8,
         not_found,
+        suspended,
     };
 
     pub fn init(allocator: std.mem.Allocator, ttl_ns: i128, neg_ttl_ns: i128) RouteCache {
@@ -92,6 +98,7 @@ pub const RouteCache = struct {
         const e = self.map.getPtr(host) orelse return null;
         if (now_ns >= e.expires_ns) return null;
         if (e.negative) return .not_found;
+        if (e.suspended) return .suspended;
         return .{ .nodes = e.nodes };
     }
 
@@ -111,6 +118,25 @@ pub const RouteCache = struct {
             };
         }
         gop.value_ptr.* = .{ .nodes = owned_nodes, .negative = false, .expires_ns = now_ns + self.ttl_ns };
+    }
+
+    /// Record a suspended tenant for `host` — a cached 403 at the positive
+    /// TTL. Best-effort like `putNegative` (a skip just re-asks the CP).
+    pub fn putSuspended(self: *RouteCache, host: []const u8, now_ns: i128) void {
+        const gop = self.map.getOrPut(self.allocator, host) catch return;
+        if (gop.found_existing) {
+            if (gop.value_ptr.negative) {
+                self.neg_count -= 1;
+            } else {
+                freeNodes(self.allocator, gop.value_ptr.nodes);
+            }
+        } else {
+            gop.key_ptr.* = self.allocator.dupe(u8, host) catch {
+                self.map.removeByPtr(gop.key_ptr);
+                return;
+            };
+        }
+        gop.value_ptr.* = .{ .nodes = &.{}, .negative = false, .suspended = true, .expires_ns = now_ns + self.ttl_ns };
     }
 
     /// Record a CP 404 for `host`. Best-effort (an allocation failure
@@ -232,6 +258,8 @@ pub const LeaderCache = struct {
 pub const RouteResult = union(enum) {
     nodes: []const []const u8, // cache-owned; valid for this loop iteration
     not_found,
+    /// The tenant resolves but is suspended → answer 403, never proxy.
+    suspended,
     /// No cached route — a resolve was enqueued; the caller parks the
     /// request until `drainRouteCompletions` lands the answer.
     pending,

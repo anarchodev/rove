@@ -1694,6 +1694,20 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         defer tc.release();
         const dep_id = snap.deployment_id;
 
+        // Suspension gate (the suspension axis, docs/architecture/control-plane.md):
+        // a suspended tenant's OWN handlers stop serving — an honest, stable
+        // 403 rather than a routing miss. Keyed on the HANDLER tenant, so an
+        // admin-handler request scoped to a suspended customer still works:
+        // the operator can inspect, export, and unsuspend — suspension must
+        // never be a data hostage. Runs BEFORE the rate check (a suspended
+        // tenant shouldn't drain its own buckets bouncing off the wall).
+        if (slot.suspended.load(.acquire)) {
+            try respb.setSimpleResponse(server, ent, sid, sess, 403, "this tenant is suspended\n", allocator);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 403, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
+            processed += 1;
+            continue;
+        }
+
         // Rate limiter: every request — admin AND customer — checks
         // the per-instance request bucket. Admin is NOT exempt: admin
         // traffic without a limiter can overwhelm the worker's
@@ -1732,6 +1746,24 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
+            try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
+            processed += 1;
+            continue;
+        }
+
+        // Log-byte ingest admission — the leading half of the ingest-rate
+        // guardrail (docs/strategy/pricing-model.md; the charge is post-exec
+        // in `captureLogInner`). A request whose log was already produced
+        // can't be un-logged, so the bucket runs negative and THIS check is
+        // where the debt bites: admission 429s until the balance refills
+        // positive. The 429 record itself still logs (small, and the charge
+        // keeps the meter honest while the tenant retries). Fail open on a
+        // limiter error, same as the request check.
+        const log_credit = worker.limiter.hasCredit(scope_inst.id, .log_bytes, plan.rate, plan_gen, received_ns) catch true;
+        if (!log_credit) {
+            _ = worker.node.log_ingest_limited.fetchAdd(1, .monotonic);
+            const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .log_bytes);
             try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;

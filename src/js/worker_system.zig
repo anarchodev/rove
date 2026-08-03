@@ -529,6 +529,20 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         , .{worker.node.kv_cap_refusals.load(.monotonic)});
     }
 
+    // ── abuse-gate counters ───────────────────────────────────────────
+    try w.print(
+        \\# HELP log_ingest_limited_total admissions 429'd by the log-byte ingest guardrail (lagging log_bytes bucket).
+        \\# TYPE log_ingest_limited_total counter
+        \\log_ingest_limited_total {d}
+        \\# HELP outbound_sustained_trips_total refusals from the day-scale sustained outbound bucket (spam/flood incident signal; worker-local).
+        \\# TYPE outbound_sustained_trips_total counter
+        \\outbound_sustained_trips_total {d}
+        \\
+    , .{
+        worker.node.log_ingest_limited.load(.monotonic),
+        worker.limiter.sustained_trips,
+    });
+
     // ── propose-pipeline histograms ──────────────────────────────────
     //
     // Two questions the operator wants answered: are we time-capped

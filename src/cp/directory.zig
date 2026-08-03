@@ -209,6 +209,15 @@ pub const Directory = struct {
     /// + serves the bytes verbatim; the DP parses them into effective limits
     /// (decisions.md §10.9 + docs/architecture/control-plane.md). Owned key + value.
     plans: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// tenant store id → suspension record (`{"reason":…,"at_ms":…}` JSON,
+    /// authored by `/_control/suspend`). Presence IS the suspended state —
+    /// deliberately a sibling axis to `plan/`, never a plan value, so a
+    /// billing push (Stripe → `/_control/plan`) can never silently
+    /// un-suspend an abuse response, and un-suspending is an axis DELETE
+    /// with an audit trail in the raft log. Serving stops; data and
+    /// placement are untouched (the whole point — reversible, unlike
+    /// `/_control/delete`). Owned key + value.
+    suspends: std.StringHashMapUnmanaged([]u8) = .empty,
     /// tenant → storage incarnation (#357). The CP mints one per tenant
     /// LIFETIME at provision and must be able to hand it to EVERY later attach
     /// — a move, a membership backfill, a node rejoining. A node that attaches
@@ -332,6 +341,13 @@ pub const Directory = struct {
             a.free(e.value_ptr.*);
         }
         self.plans.deinit(a);
+        // `suspends` keys AND values are owned dups (see `applySuspendLocal`).
+        var sit = self.suspends.iterator();
+        while (sit.next()) |e| {
+            a.free(e.key_ptr.*);
+            a.free(e.value_ptr.*);
+        }
+        self.suspends.deinit(a);
         // `hosts` keys AND values are owned dups (see `applyHostLocal`).
         var hit = self.hosts.iterator();
         while (hit.next()) |e| {
@@ -453,6 +469,26 @@ pub const Directory = struct {
                 const tenant = e.key["plan/".len..];
                 self.applyPlanLocal(tenant, e.value) catch |err| {
                     std.log.warn("cp directory replay: bad plan {s}: {s}", .{ tenant, @errorName(err) });
+                };
+            }
+            const done = rr.entries.len < 256;
+            const last = rr.entries[rr.entries.len - 1].key;
+            a.free(cursor);
+            cursor = try a.dupe(u8, last);
+            if (done) break;
+        }
+
+        // Suspensions — presence = suspended, independent of clusters.
+        a.free(cursor);
+        cursor = try a.dupe(u8, "");
+        while (true) {
+            var rr = node.prefix(self.dir_gid, "suspend/", cursor, 256) catch return Error.Replication;
+            defer rr.deinit();
+            if (rr.entries.len == 0) break;
+            for (rr.entries) |e| {
+                const tenant = e.key["suspend/".len..];
+                self.applySuspendLocal(tenant, e.value) catch |err| {
+                    std.log.warn("cp directory replay: bad suspend {s}: {s}", .{ tenant, @errorName(err) });
                 };
             }
             const done = rr.entries.len < 256;
@@ -636,6 +672,7 @@ pub const Directory = struct {
         .{ .prefix = "cluster/", .apply = applyClusterFromJoined },
         .{ .prefix = "placement/", .apply = applyPlacementFromValue, .remove = removePlacementLocal },
         .{ .prefix = "plan/", .apply = applyPlanLocal, .remove = removePlanLocal },
+        .{ .prefix = "suspend/", .apply = applySuspendLocal, .remove = removeSuspendLocal },
         .{ .prefix = "incarnation/", .apply = applyIncarnationLocal, .remove = removeIncarnationLocal },
         .{ .prefix = "host/", .apply = applyHostLocal, .remove = removeHostLocal },
         .{ .prefix = "cert/", .apply = applyCertLocal, .remove = removeCertLocal },
@@ -1072,6 +1109,100 @@ pub const Directory = struct {
             a.free(gop.value_ptr.*);
         }
         gop.value_ptr.* = val_dup;
+    }
+
+    // ── Suspension axis (tenant → suspension record) ─────────────────
+
+    /// Suspend a tenant: write its suspension record (`suspend/{tenant}` =
+    /// `{"reason":…,"at_ms":…}` JSON, authored by the control door). Presence
+    /// of the row IS the suspended state. A sibling axis to `plan/` by design
+    /// — see the `suspends` field doc for why it must never be a plan value.
+    pub fn setSuspend(self: *Directory, tenant_id: []const u8, value: []const u8) Error!void {
+        if (tenant_id.len == 0) return Error.BadConfig;
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "suspend/{s}", .{tenant_id}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirWrite(key, value);
+    }
+
+    /// Un-suspend: delete the suspension row. Idempotent (see `unassign`).
+    pub fn removeSuspend(self: *Directory, tenant_id: []const u8) Error!void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.suspends.getPtr(tenant_id) == null) return;
+        }
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "suspend/{s}", .{tenant_id}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirDelete(key);
+    }
+
+    /// A tenant's suspension record as an OWNED copy (caller frees), or null
+    /// if the tenant is not suspended. Owned for the same reason as
+    /// `planForOwned` — a concurrent apply can replace (free) the value.
+    pub fn suspendForOwned(self: *Directory, a: std.mem.Allocator, tenant_id: []const u8) Error!?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = self.suspends.get(tenant_id) orelse return null;
+        return a.dupe(u8, v) catch return Error.OutOfMemory;
+    }
+
+    /// True iff the tenant has a suspension row. The routing hot-path read
+    /// (`/_cp/route` consults this per resolve).
+    pub fn isSuspended(self: *Directory, tenant_id: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.suspends.contains(tenant_id);
+    }
+
+    /// Every suspended tenant id, owned (caller frees each id + the slice).
+    /// The reconciler's re-push read: suspended tenants are few, so copying
+    /// the id set under the lock is cheap.
+    pub fn suspendedTenantsOwned(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var list: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (list.items) |id| a.free(id);
+            list.deinit(a);
+        }
+        var it = self.suspends.keyIterator();
+        while (it.next()) |k| {
+            const dup = a.dupe(u8, k.*) catch return Error.OutOfMemory;
+            list.append(a, dup) catch {
+                a.free(dup);
+                return Error.OutOfMemory;
+            };
+        }
+        return list.toOwnedSlice(a) catch return Error.OutOfMemory;
+    }
+
+    /// Upsert a suspension record into the in-memory projection (no
+    /// replication). The committed-state applier, shared by replay + the
+    /// post-commit observer.
+    fn applySuspendLocal(self: *Directory, tenant: []const u8, value: []const u8) Error!void {
+        const a = self.allocator;
+        const val_dup = a.dupe(u8, value) catch return Error.OutOfMemory;
+        errdefer a.free(val_dup);
+        const gop = self.suspends.getOrPut(a, tenant) catch return Error.OutOfMemory;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = a.dupe(u8, tenant) catch {
+                _ = self.suspends.remove(tenant);
+                return Error.OutOfMemory;
+            };
+        } else {
+            a.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = val_dup;
+    }
+
+    /// Drop a suspension; both the key and the record are owned.
+    fn removeSuspendLocal(self: *Directory, tenant: []const u8) void {
+        if (self.suspends.fetchRemove(tenant)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
+        }
     }
 
     // ── Domain index (host → tenant) ─────────────────────────────────
@@ -1620,6 +1751,49 @@ test "directory: setPlan + planForOwned round-trip, update, unset→null" {
 
     // unrelated tenant stays null; plan is placement-independent
     try testing.expect((try dir.planForOwned(a, "other")) == null);
+}
+
+test "directory: suspend round-trip — presence is the state; unsuspend deletes; plan writes don't clear it" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    const a = testing.allocator;
+
+    // not suspended → false / null
+    try testing.expect(!dir.isSuspended("acme"));
+    try testing.expect((try dir.suspendForOwned(a, "acme")) == null);
+
+    // suspend → record readable, predicate flips
+    try dir.setSuspend("acme", "{\"reason\":\"spam report\",\"at_ms\":123}");
+    try testing.expect(dir.isSuspended("acme"));
+    {
+        const s = (try dir.suspendForOwned(a, "acme")).?;
+        defer a.free(s);
+        try testing.expectEqualStrings("{\"reason\":\"spam report\",\"at_ms\":123}", s);
+    }
+
+    // A plan write must NOT clear a suspension — the axes are siblings, so a
+    // billing push can never resurrect a suspended tenant.
+    try dir.setPlan("acme", "{\"tier\":\"pro\"}");
+    try testing.expect(dir.isSuspended("acme"));
+
+    // enumerate for the reconciler re-push
+    {
+        const ids = try dir.suspendedTenantsOwned(a);
+        defer {
+            for (ids) |id| a.free(id);
+            a.free(ids);
+        }
+        try testing.expectEqual(@as(usize, 1), ids.len);
+        try testing.expectEqualStrings("acme", ids[0]);
+    }
+
+    // unsuspend deletes the row; idempotent on a second call
+    try dir.removeSuspend("acme");
+    try testing.expect(!dir.isSuspended("acme"));
+    try dir.removeSuspend("acme");
+
+    // empty tenant rejected
+    try testing.expectError(error.BadConfig, dir.setSuspend("", "x"));
 }
 
 test "directory: setHost + hostTenantForOwned round-trip, update, unset→null" {

@@ -41,9 +41,52 @@ const plan_mod = @import("rove-plan");
 pub const Action = enum(u8) {
     request,
     outbound,
+    /// Log-byte ingest rate — the ingest-rate guardrail
+    /// (docs/strategy/pricing-model.md, throttle log-byte ingest RATE):
+    /// bytes are the cost currency, so this bucket is denominated in RAW
+    /// bytes, not calls. A LAGGING, post-exec bucket: a request whose log
+    /// was already produced cannot be un-logged, so `charge` lands after
+    /// execution (the bucket goes negative) and the NEXT admission pays
+    /// for it via `hasCredit` → 429.
+    log_bytes,
+    /// The coarse SUSTAINED ceiling over `outbound` — the spam bound.
+    /// The burst bucket is tuned for burst absorption, which makes its
+    /// sustained rate the wrong shape for abuse: the free tier's 10/s
+    /// held for a day is ~864k outbound calls from a tenant that cost an
+    /// email address to create. This second, day-scale bucket bounds
+    /// exactly that: capacity = a 10%-duty-cycle day of the plan's
+    /// sustained rate (`sustainedOutboundBudget`), refilling at
+    /// capacity/day. Checked at the same frozen-native funnel as
+    /// `outbound`; saturating it is an incident signal, not a sales
+    /// lead — the refusal carries a distinct error code and trips a
+    /// counter an operator can alert on.
+    outbound_sustained,
 };
 
 const ACTION_COUNT: usize = std.meta.fields(Action).len;
+
+/// `log_bytes` bucket caps — uniform across tiers for now. `PlanLimits` is
+/// the eventual home (the ingest-rate tier field), at which point these
+/// become that field's free-tier figures; until then one conservative
+/// number bounds every tenant's S3 log volume. 8 MiB of burst absorbs a
+/// traffic spike's logs; 64 KiB/s sustained is ≈5.3 GiB/day — generous for
+/// a legitimate tenant, a hard wall for a log flood.
+pub const LOG_BYTES_CAPACITY: u32 = 8 * 1024 * 1024;
+pub const LOG_BYTES_REFILL_PER_SEC: u32 = 64 * 1024;
+/// The `k` in `effective_bytes = actual + k` per record: fixed per-request
+/// overhead (index row, batch framing, S3 request amortization) is priced
+/// rather than free, so a flood of tiny requests can't ride under the
+/// byte meter.
+pub const LOG_BYTES_PER_RECORD_OVERHEAD: u32 = 512;
+
+/// A day's sustained outbound budget for a plan: a 10% duty cycle of the
+/// burst bucket's refill rate held for 24h (free tier: 10/s → 86,400/day).
+/// Derived from the existing caps rather than a new plan field for now;
+/// when the tier table grows an explicit sustained figure this becomes
+/// that field's fallback. Saturating so a pathological override can't wrap.
+pub fn sustainedOutboundBudget(caps: RateLimitCaps) u32 {
+    return caps.outbound_refill_per_sec *| 8640;
+}
 
 /// Re-exported from `rove-plan` (the leaf module that owns the tier table) so
 /// the limiter's existing callers keep using `limiter.RateLimitCaps`, while the
@@ -95,6 +138,24 @@ pub const TokenBucket = struct {
         self.last_refill_ns = now_ns;
     }
 
+    /// Unconditional take — the LAGGING half of a post-exec bucket. The
+    /// balance may go (further) negative: the cost already happened, so
+    /// it must be recorded either way; `hasCredit` is where a negative
+    /// balance bites. Refills first so debt is netted against elapsed time.
+    pub fn charge(self: *TokenBucket, n: f64, now_ns: i64) void {
+        self.refill(now_ns);
+        self.tokens -= n;
+    }
+
+    /// Admission read for a lagging bucket: true while the balance is
+    /// positive. Deliberately not "≥ n" — admission doesn't know the
+    /// upcoming cost; it only requires the tenant to have worked off
+    /// prior debt.
+    pub fn hasCredit(self: *TokenBucket, now_ns: i64) bool {
+        self.refill(now_ns);
+        return self.tokens > 0;
+    }
+
     /// Seconds until at least `n` tokens are available. Used to
     /// compute the `Retry-After` hint on 429 responses. Returns 0
     /// when the bucket already has `n` tokens. Caller should refill
@@ -128,6 +189,18 @@ const InstanceBuckets = struct {
             caps.outbound_refill_per_sec,
             now_ns,
         );
+        // Uniform (not yet plan-derived — see the constants' doc).
+        bs[@intFromEnum(Action.log_bytes)] = TokenBucket.init(
+            LOG_BYTES_CAPACITY,
+            LOG_BYTES_REFILL_PER_SEC,
+            now_ns,
+        );
+        const daily = sustainedOutboundBudget(caps);
+        bs[@intFromEnum(Action.outbound_sustained)] = TokenBucket.init(
+            daily,
+            @max(1, daily / 86_400),
+            now_ns,
+        );
         return .{ .buckets = bs, .gen = gen };
     }
 };
@@ -135,6 +208,11 @@ const InstanceBuckets = struct {
 pub const RateLimiter = struct {
     allocator: std.mem.Allocator,
     caps: RateLimitCaps,
+    /// Refusals from the `outbound_sustained` bucket — the incident
+    /// signal (a tenant saturating its day-scale outbound budget is a
+    /// spam/flood suspect, not a sales lead). Per-worker, unsynced,
+    /// like every field here; surfaced on `/_system/metrics`.
+    sustained_trips: u64 = 0,
     /// `instance_id` → per-action buckets. Lazily created on first
     /// `check` for an instance; never evicted in v1 (memory bounded
     /// by registered tenant count).
@@ -184,6 +262,46 @@ pub const RateLimiter = struct {
     ) !bool {
         const inst = try self.getOrCreate(instance_id, caps, gen, now_ns);
         return inst.buckets[@intFromEnum(action)].tryTake(@floatFromInt(n), now_ns);
+    }
+
+    /// Post-exec charge against `(instance_id, action)` — the lagging
+    /// half of a cost that already happened (see `TokenBucket.charge`).
+    /// Never refuses; the bucket may go negative and the next
+    /// `hasCredit` admission pays. Unlike `check`/`hasCredit` this NEVER
+    /// generation-refreshes: charge sites run off the dispatch path
+    /// without the resolved plan gen, and a refresh here would wipe every
+    /// bucket's state (including the debt being recorded). `caps` is used
+    /// only if the instance has no buckets yet.
+    pub fn charge(
+        self: *RateLimiter,
+        instance_id: []const u8,
+        action: Action,
+        n: u64,
+        caps: RateLimitCaps,
+        now_ns: i64,
+    ) !void {
+        const gop = try self.instances.getOrPut(self.allocator, instance_id);
+        if (!gop.found_existing) {
+            const owned = try self.allocator.dupe(u8, instance_id);
+            gop.key_ptr.* = owned;
+            gop.value_ptr.* = InstanceBuckets.init(caps, now_ns, 0);
+        }
+        gop.value_ptr.buckets[@intFromEnum(action)].charge(@floatFromInt(n), now_ns);
+    }
+
+    /// Admission read for a lagging bucket: true while `(instance_id,
+    /// action)` has a positive balance. A never-seen instance is
+    /// creditworthy by construction (fresh bucket starts full).
+    pub fn hasCredit(
+        self: *RateLimiter,
+        instance_id: []const u8,
+        action: Action,
+        caps: RateLimitCaps,
+        gen: u64,
+        now_ns: i64,
+    ) !bool {
+        const inst = try self.getOrCreate(instance_id, caps, gen, now_ns);
+        return inst.buckets[@intFromEnum(action)].hasCredit(now_ns);
     }
 
     /// Suggested `Retry-After` value (in seconds, rounded up) for a
@@ -350,6 +468,75 @@ test "limiter: per-instance caps come from the passed plan, not the default" {
     try testing.expect(try rl.check("acme", .request, pro, 1, 0));
     try testing.expect(try rl.check("acme", .request, pro, 1, 0));
     try testing.expect(!(try rl.check("acme", .request, pro, 1, 0))); // 3-burst from the plan
+}
+
+test "bucket: charge goes negative; credit returns only after the debt refills off" {
+    var b = TokenBucket.init(10, 5, 0); // 5 tokens/sec
+    // Post-exec: a 25-token cost lands on a 10-token bucket → -15.
+    b.charge(25, 0);
+    try testing.expect(!b.hasCredit(0));
+    // 2s later: -15 + 10 = -5 — still in debt.
+    try testing.expect(!b.hasCredit(2 * std.time.ns_per_s));
+    // 4s: -15 + 20 = +5 — credit restored (admission opens).
+    try testing.expect(b.hasCredit(4 * std.time.ns_per_s));
+    // secondsUntil accounts for the debt from a negative balance.
+    b.charge(30, 4 * std.time.ns_per_s); // 5 - 30 = -25
+    try testing.expectApproxEqAbs(@as(f64, 26.0 / 5.0), b.secondsUntil(1), 0.0001);
+}
+
+test "limiter: log_bytes is a lagging post-exec bucket — charge then 429 the next admission" {
+    var rl = RateLimiter.init(testing.allocator, .{});
+    defer rl.deinit();
+    const caps: RateLimitCaps = .{};
+
+    // Fresh tenant: creditworthy (bucket starts full at LOG_BYTES_CAPACITY).
+    try testing.expect(try rl.hasCredit("acme", .log_bytes, caps, 0, 0));
+
+    // A huge log lands post-exec — cannot be refused, drives the bucket
+    // deep negative.
+    try rl.charge("acme", .log_bytes, 2 * LOG_BYTES_CAPACITY, caps, 0);
+    try testing.expect(!(try rl.hasCredit("acme", .log_bytes, caps, 0, 0)));
+
+    // Sibling tenant unaffected; sibling ACTION on the same tenant too.
+    try testing.expect(try rl.hasCredit("beta", .log_bytes, caps, 0, 0));
+    try testing.expect(try rl.check("acme", .request, caps, 0, 0));
+
+    // The debt works off at LOG_BYTES_REFILL_PER_SEC: one capacity's worth
+    // of overdraft needs capacity/refill seconds.
+    const debt_sec: i64 = @intCast(LOG_BYTES_CAPACITY / LOG_BYTES_REFILL_PER_SEC + 1);
+    try testing.expect(try rl.hasCredit("acme", .log_bytes, caps, 0, debt_sec * std.time.ns_per_s));
+}
+
+test "limiter: outbound_sustained is a day-scale ceiling derived from the plan's refill rate" {
+    var rl = RateLimiter.init(testing.allocator, .{});
+    defer rl.deinit();
+    // A tiny plan: 1/s refill → 8,640/day sustained budget.
+    const caps: RateLimitCaps = .{ .outbound_capacity = 1000, .outbound_refill_per_sec = 1 };
+    try testing.expectEqual(@as(u32, 8640), sustainedOutboundBudget(caps));
+
+    // Drain the whole day budget at t=0 (checkN in one gulp).
+    try testing.expect(try rl.checkN("acme", .outbound_sustained, 8640, caps, 0, 0));
+    try testing.expect(!(try rl.check("acme", .outbound_sustained, caps, 0, 0)));
+
+    // Refill is capacity/day (≥1/s floor): after 100s at most ~100 back.
+    try testing.expect(try rl.checkN("acme", .outbound_sustained, 50, caps, 0, 100 * std.time.ns_per_s));
+    // But nowhere near the full budget again.
+    try testing.expect(!(try rl.checkN("acme", .outbound_sustained, 8640, caps, 0, 101 * std.time.ns_per_s)));
+}
+
+test "limiter: charge never generation-refreshes (a lagging charge can't wipe bucket state)" {
+    var rl = RateLimiter.init(testing.allocator, .{});
+    defer rl.deinit();
+    const tight: RateLimitCaps = .{ .request_capacity = 1, .request_refill_per_sec = 0 };
+
+    // Dispatch path creates the buckets at gen 7 and exhausts request.
+    try testing.expect(try rl.check("acme", .request, tight, 7, 0));
+    try testing.expect(!(try rl.check("acme", .request, tight, 7, 0)));
+
+    // A post-exec charge arrives with DEFAULT caps and no gen — it must
+    // record the debt without re-initializing anything.
+    try rl.charge("acme", .log_bytes, 123, .{}, 0);
+    try testing.expect(!(try rl.check("acme", .request, tight, 7, 0))); // still exhausted
 }
 
 test "limiter: a moved generation re-snapshots the caps (tier change)" {
