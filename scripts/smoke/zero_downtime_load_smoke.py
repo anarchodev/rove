@@ -60,6 +60,9 @@ def _spawn(name, argv, env):
 
 def spawn_rewind(name, port, data_dir, admin_domain):
     env = dict(os.environ)
+    # No operator-metrics listener: concurrent smokes would all race
+    # for the fixed default and warn-spam the logs.
+    env.setdefault("REWIND_METRICS_PORT", "0")
     env["REWIND_ADMIN_DOMAIN"] = admin_domain
     env["REWIND_MOVE_SECRET"] = SECRET
     env["REWIND_ROOT_TOKEN"] = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects unset/default

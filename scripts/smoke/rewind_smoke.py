@@ -40,6 +40,9 @@ def spawn():
     # rewind refuses to boot on an unset/default REWIND_ROOT_TOKEN, so set
     # it explicitly (the curl_put auth below uses the same value).
     env = dict(os.environ)
+    # No operator-metrics listener: concurrent smokes would all race
+    # for the fixed default and warn-spam the logs.
+    env.setdefault("REWIND_METRICS_PORT", "0")
     env["REWIND_ROOT_TOKEN"] = ROOT_TOKEN
     p = subprocess.Popen(
         [BIN, DATA_DIR, str(PORT)],

@@ -57,6 +57,9 @@ procs = []
 
 def spawn_rewind(name, port, data_dir, admin_domain, token):
     env = dict(os.environ)
+    # No operator-metrics listener: concurrent smokes would all race
+    # for the fixed default and warn-spam the logs.
+    env.setdefault("REWIND_METRICS_PORT", "0")
     env["REWIND_ADMIN_DOMAIN"] = admin_domain
     env["REWIND_ROOT_TOKEN"] = token
     p = subprocess.Popen(

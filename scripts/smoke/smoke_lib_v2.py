@@ -40,7 +40,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib import mint_jwt, HttpResponse  # noqa: E402
-from smoke_ports import alloc, alloc_port, CLUSTER_BLOCK  # noqa: E402,F401
+from smoke_ports import alloc, alloc_port, free, CLUSTER_BLOCK  # noqa: E402,F401
 from v2_topology import spawn_cp, spawn_front, await_ready, CP_BIN, FRONT_BIN  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -305,12 +305,12 @@ class V2Cluster:
     procs: list = field(default_factory=list)
     node_procs: dict = field(default_factory=dict)  # node index → Popen (for stop/start)
     log_paths: dict = field(default_factory=dict)
-    # Operator-metrics ports (the loopback :911x listeners in production).
-    # Per-cluster allocations so concurrent smokes never scrape each other's
-    # processes through a shared default port; a smoke reads them from here
-    # rather than hardcoding 9110/9113.
-    worker_metrics_ports: list[int] = field(default_factory=list)
+    # The log-server's operator-metrics port (the loopback :9113 listener in
+    # production) — per-cluster allocation so concurrent smokes never scrape
+    # each other's processes; readers use this instead of hardcoding 9113.
+    # (Worker metrics stay OFF in smokes — see _spawn_node / rove#377.)
     logs_metrics_port: int = 0
+    _block_base: int = 0  # this cluster's port block; freed at shutdown
     root_token: str = ROOT_TOKEN
     services_jwt: str = ""
     # Workers get REWIND_UNSAFE_OUTBOUND=1 by default: smoke upstream echo
@@ -385,8 +385,8 @@ class V2Cluster:
             unsafe_outbound=unsafe_outbound,
             genesis=genesis,
             worker_log_push=worker_log_push,
-            worker_metrics_ports=[base + 60 + i for i in range(nodes)],
             logs_metrics_port=base + 59,
+            _block_base=base,
         )
         for d in (*c.data_dirs, c.cp_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
@@ -556,9 +556,13 @@ class V2Cluster:
         env["REWIND_PEER_URLS"] = ",".join(
             f"http://127.0.0.1:{p}" for p in self.node_ports)
         env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
-        # Per-node operator-metrics port (setdefault: a smoke that pins
-        # REWIND_METRICS_PORT in its own environ — to test the surface — wins).
-        env.setdefault("REWIND_METRICS_PORT", str(self.worker_metrics_ports[i]))
+        # Worker operator-metrics OFF by default (a smoke that pins
+        # REWIND_METRICS_PORT in its own environ — to test the surface —
+        # wins). Not just port hygiene: the worker renders /metrics on its
+        # poll thread, and under a high-rate soak that render's pause tail
+        # eats the election budget (rove#377) — with per-node metrics on,
+        # raft_soak_v2 saw spurious elections it never sees with them off.
+        env.setdefault("REWIND_METRICS_PORT", "0")
         # Step 3 B4: the CP base for the `rewind-cp.internal` door (the worker's
         # node.cp_internal_base = cp_urls[0]), so the __admin__ dashboard can
         # drive CP control ops. cluster_id stays unset → serve-or-forward off
@@ -622,6 +626,12 @@ class V2Cluster:
                 print("\n".join("  | " + l for l in tail.splitlines()[-40:]))
         for d in (*self.data_dirs, self.cp_data_dir, self.log_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
+        # Every process bound to this block has exited — return it, so a smoke
+        # that cycles many clusters (a genesis flake harness) never exhausts
+        # its slot. Guarded for a repeated shutdown().
+        if self._block_base:
+            free(self._block_base, CLUSTER_BLOCK)
+            self._block_base = 0
 
     def __enter__(self) -> "V2Cluster":
         return self

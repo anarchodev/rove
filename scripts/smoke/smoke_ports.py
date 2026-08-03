@@ -43,6 +43,7 @@ CLUSTER_BLOCK = 128
 _slot: int | None = None
 _slot_lock_fd: int | None = None  # held open for the process lifetime
 _cursor = 0
+_freed: list[tuple[int, int]] = []  # (base, n) blocks returned by free()
 
 
 def _bindable(port: int) -> bool:
@@ -89,6 +90,13 @@ def alloc(n: int = CLUSTER_BLOCK) -> int:
     if n > SLOT_SIZE:
         raise ValueError(f"alloc({n}) exceeds the slot size {SLOT_SIZE}")
     slot = _acquire_slot()
+    # Freed blocks first (exact-size match) — a smoke that brings clusters up
+    # and down repeatedly (a genesis flake harness runs 12) would otherwise
+    # exhaust its slot.
+    for i, (base, fn) in enumerate(_freed):
+        if fn == n and all(_bindable(p) for p in range(base, base + n)):
+            _freed.pop(i)
+            return base
     lo = SLOT_BASE + slot * SLOT_SIZE
     while True:
         base = lo + _cursor
@@ -99,6 +107,13 @@ def alloc(n: int = CLUSTER_BLOCK) -> int:
         _cursor += n
         if all(_bindable(p) for p in range(base, base + n)):
             return base
+
+
+def free(base: int, n: int) -> None:
+    """Return a block for reuse by a LATER alloc in this process — only once
+    every process bound to it has exited (V2Cluster.shutdown waits). A live
+    block is never freed: a stopped-then-restarted node keeps its port."""
+    _freed.append((base, n))
 
 
 def alloc_port() -> int:
