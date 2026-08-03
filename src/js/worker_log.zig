@@ -678,6 +678,15 @@ fn captureLogInner(
                 raw += @field(tapes, f.name).len;
             }
         }
+        // A single record charging >1 MiB is worth a line: it names which
+        // requests actually eat a tenant's ingest budget (an oversized tape
+        // channel here usually means a recording-path bug, not big traffic).
+        if (raw > 1024 * 1024) {
+            std.log.warn(
+                "log-ingest: tenant={s} {s} {s} charged {d} bytes in one record (body={d} kv={d} fetch={d} reads={d})",
+                .{ instance_id, method, path, raw, tapes.request_body_bytes.len, tapes.kv_tape_bytes.len, tapes.fetch_responses_tape_bytes.len, tapes.request_reads_tape_bytes.len },
+            );
+        }
         worker.limiter.charge(
             instance_id,
             .log_bytes,

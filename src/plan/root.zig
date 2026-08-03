@@ -45,6 +45,17 @@ pub const RateLimitCaps = struct {
     outbound_capacity: u32 = 100,
     /// 10/sec → 600/min sustained — well under any sane provider quota.
     outbound_refill_per_sec: u32 = 10,
+    /// Log-byte ingest caps — the ingest-rate guardrail
+    /// (docs/strategy/pricing-model.md): a lagging post-exec bucket in RAW
+    /// bytes charged at log capture, with the NEXT admission 429ing while
+    /// the balance is negative. The burst must sit above the largest
+    /// single request body any tier accepts (one lawful request must never
+    /// overdraw the meter); the refill is the sustained S3-growth bound
+    /// (64 KiB/s ≈ 5.3 GiB/day). Plan-resolved like every other rate cap
+    /// so a high-traffic tenant (or a stress smoke) raises it by
+    /// override instead of the guard being a hidden wall.
+    log_burst_bytes: u32 = 256 * 1024 * 1024,
+    log_refill_bytes_per_sec: u32 = 64 * 1024,
 };
 
 /// The named tiers. Free is the default for any tenant with no CP plan blob.
@@ -187,6 +198,8 @@ pub const Overrides = struct {
     request_refill_per_sec: ?u32 = null,
     outbound_capacity: ?u32 = null,
     outbound_refill_per_sec: ?u32 = null,
+    log_burst_bytes: ?u32 = null,
+    log_refill_bytes_per_sec: ?u32 = null,
     max_body_bytes: ?u32 = null,
     max_resident_html_bytes: ?u32 = null,
     retention_days: ?u32 = null,
@@ -202,6 +215,8 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     if (ov.request_refill_per_sec) |v| p.rate.request_refill_per_sec = v;
     if (ov.outbound_capacity) |v| p.rate.outbound_capacity = v;
     if (ov.outbound_refill_per_sec) |v| p.rate.outbound_refill_per_sec = v;
+    if (ov.log_burst_bytes) |v| p.rate.log_burst_bytes = v;
+    if (ov.log_refill_bytes_per_sec) |v| p.rate.log_refill_bytes_per_sec = v;
     if (ov.max_body_bytes) |v| p.max_body_bytes = v;
     if (ov.max_resident_html_bytes) |v| p.max_resident_html_bytes = v;
     if (ov.retention_days) |v| p.retention_days = v;
@@ -302,6 +317,21 @@ test "plan: effective folds the byte-ceiling overrides" {
     try testing.expectEqual(@as(u64, 100 * 1024 * 1024 * 1024), p.max_stored_bytes);
     // Unset fields still fall through to the enterprise table.
     try testing.expectEqual(table(.enterprise).retention_days, p.retention_days);
+}
+
+test "plan: log-ingest caps default uniformly and fold overrides" {
+    for ([_]Tier{ .free, .pro, .enterprise }) |t| {
+        const p = table(t);
+        try testing.expectEqual(@as(u32, 256 * 1024 * 1024), p.rate.log_burst_bytes);
+        try testing.expectEqual(@as(u32, 64 * 1024), p.rate.log_refill_bytes_per_sec);
+    }
+    const p = effective(.free, .{ .log_burst_bytes = 1024, .log_refill_bytes_per_sec = 16 });
+    try testing.expectEqual(@as(u32, 1024), p.rate.log_burst_bytes);
+    try testing.expectEqual(@as(u32, 16), p.rate.log_refill_bytes_per_sec);
+    const a = testing.allocator;
+    const blob = parseBlob(a, "{\"tier\":\"free\",\"overrides\":{\"log_burst_bytes\":2048}}");
+    try testing.expectEqual(@as(u32, 2048), blob.rate.log_burst_bytes);
+    try testing.expectEqual(@as(u32, 64 * 1024), blob.rate.log_refill_bytes_per_sec);
 }
 
 test "plan: parseBlob carries the byte ceilings" {

@@ -65,14 +65,14 @@ pub const Action = enum(u8) {
 
 const ACTION_COUNT: usize = std.meta.fields(Action).len;
 
-/// `log_bytes` bucket caps — uniform across tiers for now. `PlanLimits` is
-/// the eventual home (the ingest-rate tier field), at which point these
-/// become that field's free-tier figures; until then one conservative
-/// number bounds every tenant's S3 log volume. 8 MiB of burst absorbs a
-/// traffic spike's logs; 64 KiB/s sustained is ≈5.3 GiB/day — generous for
-/// a legitimate tenant, a hard wall for a log flood.
-pub const LOG_BYTES_CAPACITY: u32 = 8 * 1024 * 1024;
-pub const LOG_BYTES_REFILL_PER_SEC: u32 = 64 * 1024;
+/// `log_bytes` bucket caps live on the PLAN (`RateLimitCaps.log_burst_bytes`
+/// / `.log_refill_bytes_per_sec` — see their doc for the sizing rules);
+/// these aliases exist for tests and the charge-site overhead constant's
+/// neighbors. Plan-resolved so a high-traffic tenant (or a stress smoke)
+/// raises the budget by override — the guard bounds strangers, never
+/// walls in a customer whose tier says otherwise.
+pub const LOG_BYTES_CAPACITY: u32 = (RateLimitCaps{}).log_burst_bytes;
+pub const LOG_BYTES_REFILL_PER_SEC: u32 = (RateLimitCaps{}).log_refill_bytes_per_sec;
 /// The `k` in `effective_bytes = actual + k` per record: fixed per-request
 /// overhead (index row, batch framing, S3 request amortization) is priced
 /// rather than free, so a flood of tiny requests can't ride under the
@@ -80,12 +80,17 @@ pub const LOG_BYTES_REFILL_PER_SEC: u32 = 64 * 1024;
 pub const LOG_BYTES_PER_RECORD_OVERHEAD: u32 = 512;
 
 /// A day's sustained outbound budget for a plan: a 10% duty cycle of the
-/// burst bucket's refill rate held for 24h (free tier: 10/s → 86,400/day).
-/// Derived from the existing caps rather than a new plan field for now;
-/// when the tier table grows an explicit sustained figure this becomes
-/// that field's fallback. Saturating so a pathological override can't wrap.
+/// burst bucket's refill rate held for 24h (free tier: 10/s → 86,400/day),
+/// floored at the burst capacity — the day ceiling must never be tighter
+/// than a single burst the plan itself permits, or a burst-only plan
+/// (refill 0, capacity N: "N calls, ever-slower after") would have every
+/// outbound refused by the SUSTAINED bucket before the burst bucket got
+/// to say yes. Derived from the existing caps rather than a new plan
+/// field for now; when the tier table grows an explicit sustained figure
+/// this becomes that field's fallback. Saturating so a pathological
+/// override can't wrap.
 pub fn sustainedOutboundBudget(caps: RateLimitCaps) u32 {
-    return caps.outbound_refill_per_sec *| 8640;
+    return @max(caps.outbound_capacity, caps.outbound_refill_per_sec *| 8640);
 }
 
 /// Re-exported from `rove-plan` (the leaf module that owns the tier table) so
@@ -189,10 +194,9 @@ const InstanceBuckets = struct {
             caps.outbound_refill_per_sec,
             now_ns,
         );
-        // Uniform (not yet plan-derived — see the constants' doc).
         bs[@intFromEnum(Action.log_bytes)] = TokenBucket.init(
-            LOG_BYTES_CAPACITY,
-            LOG_BYTES_REFILL_PER_SEC,
+            caps.log_burst_bytes,
+            caps.log_refill_bytes_per_sec,
             now_ns,
         );
         const daily = sustainedOutboundBudget(caps);
@@ -522,6 +526,21 @@ test "limiter: outbound_sustained is a day-scale ceiling derived from the plan's
     try testing.expect(try rl.checkN("acme", .outbound_sustained, 50, caps, 0, 100 * std.time.ns_per_s));
     // But nowhere near the full budget again.
     try testing.expect(!(try rl.checkN("acme", .outbound_sustained, 8640, caps, 0, 101 * std.time.ns_per_s)));
+}
+
+test "limiter: outbound_sustained never undercuts a burst-only plan" {
+    // refill 0 (burst-only: "N calls, refilling never") → the sustained
+    // budget floors at the burst capacity instead of collapsing to 0 and
+    // refusing every outbound before the burst bucket is consulted.
+    const caps: RateLimitCaps = .{ .outbound_capacity = 5, .outbound_refill_per_sec = 0 };
+    try testing.expectEqual(@as(u32, 5), sustainedOutboundBudget(caps));
+
+    var rl = RateLimiter.init(testing.allocator, .{});
+    defer rl.deinit();
+    var i: u32 = 0;
+    while (i < 5) : (i += 1)
+        try testing.expect(try rl.check("acme", .outbound_sustained, caps, 0, 0));
+    try testing.expect(!(try rl.check("acme", .outbound_sustained, caps, 0, 0)));
 }
 
 test "limiter: charge never generation-refreshes (a lagging charge can't wipe bucket state)" {

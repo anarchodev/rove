@@ -23,6 +23,7 @@ import concurrent.futures
 import hashlib
 import os
 import subprocess
+import json
 import sys
 import tempfile
 import time
@@ -69,8 +70,12 @@ def fetch(origin: str, host: str, name: str, proto: str, tag: str,
         code, _, errmsg = r.stdout.partition("|")
         got = os.path.getsize(p)
         if r.returncode != 0 or code != "200" or got != exp:
+            # The body names WHICH gate refused (429s carry it) — keep it
+            # in the failure line so a limiter trip is diagnosable from the
+            # suite output alone.
+            body_head = open(p, "rb").read()[:120]
             return (f"{tag} {name}[{proto}]: rc={r.returncode} http={code} "
-                    f"bytes={got}/{exp} err={errmsg!r}")
+                    f"bytes={got}/{exp} err={errmsg!r} body={body_head!r}")
         if hashlib.sha256(open(p, "rb").read()).hexdigest() != HASHES[name]:
             return f"{tag} {name}[{proto}]: hash mismatch (bytes={got})"
         return None
@@ -83,6 +88,20 @@ def main() -> int:
         r = c.provision("demo")
         if r.status not in (200, 204):
             print(f"provision failed: {r.status}")
+            return 1
+        # This smoke hammers ~300 MB of 5 MB statics at loopback speed —
+        # far past the default log-ingest budget (which is the point of
+        # that guard for a stranger, and beside the point here). Declare
+        # the need via a plan override, the same way blob_receive declares
+        # the pro body cap: stress smokes raise their plan, they don't get
+        # exempted from enforcement.
+        pr = c._cp_post("/_control/plan", {"tenant": "demo", "plan": json.dumps({
+            "tier": "free",
+            "overrides": {"log_burst_bytes": 2_000_000_000,
+                          "log_refill_bytes_per_sec": 100_000_000},
+        })})
+        if pr.status not in (200, 204):
+            print(f"plan override failed: {pr.status} {pr.body!r}")
             return 1
         c.deploy_with_static("demo", TRIVIAL, STATICS)
         for _ in range(120):
