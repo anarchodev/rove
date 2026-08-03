@@ -146,6 +146,17 @@ pub fn escalateLeaderless(self: *Node, now: i64) void {
         if (slot.hib.leaderless_since_ns == 0) {
             slot.hib.leaderless_since_ns = now;
         } else if (now - slot.hib.leaderless_since_ns >= self.leaderless_escalate_ns) {
+            // WARN, not debug: a force-campaign bypasses pre-vote AND peers'
+            // check_quorum leases, so it is the one action that can depose a
+            // healthy leader. It should be rare (a genuinely wedged group);
+            // seeing it during an ordinary failover means the escalation
+            // window closed on an election that was still progressing.
+            std.log.warn("raft: FORCE-CAMPAIGN gid={d} after {d}ms leaderless (window {d}ms) at={d}", .{
+                gid,
+                @divTrunc(now - slot.hib.leaderless_since_ns, std.time.ns_per_ms),
+                @divTrunc(self.leaderless_escalate_ns, std.time.ns_per_ms),
+                std.time.milliTimestamp(),
+            });
             self.mgr.campaignForce(gid);
             // Re-arm the window (cooldown) so the next escalation, if the
             // forced campaign also loses (split vote), waits another window

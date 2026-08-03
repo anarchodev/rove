@@ -64,6 +64,10 @@ export function handler() {
 }
 """
 
+# Every raft group in this cluster: the test tenant + the standing deploy
+# app. A leader kill orphans every group the victim led, so the acquisition
+# accounting below has to know the full set (rove#374).
+GROUPS = ("acme", "__admin__")
 KEY = "failover/value"
 VALUE1 = "committed-before-kill"
 VALUE2 = "committed-after-failover"
@@ -132,11 +136,23 @@ def main() -> int:
         survivors = [i for i in range(3) if i != lead]
 
         # Pre-kill baseline of each survivor's leadership-acquisition counter.
-        # A clean single re-election bumps exactly one survivor's count by 1;
-        # extra bumps would mean spurious elections during the failover.
+        #
+        # `raft_leadership_acquisitions_total` is NODE-WIDE — it sums promotion
+        # edges across every raft group on the node, not just this tenant's.
+        # The cluster runs TWO groups (this tenant + `__admin__`), and the
+        # victim leads both, so the kill orphans both and each legitimately
+        # elects once: the honest expectation is "one acquisition per orphaned
+        # group", not "exactly one, on one survivor". (Asserting the latter
+        # made this leg ~40% intermittent — it passed only when the metric read
+        # happened to land after this tenant's election but BEFORE
+        # `__admin__`'s, and failed on both real outcomes: both groups to the
+        # same survivor → +2, or one each → two survivors at +1. rove#374.)
         import time
         base_acq = {i: (metric_counter(c.metrics(i), "raft_leadership_acquisitions_total") or 0.0)
                     for i in survivors}
+        # Which groups the victim leads → exactly the set that must re-elect.
+        orphaned = [t for t in GROUPS if c.leader_now(t) == lead]
+        print(f"       victim leads {len(orphaned)} group(s): {orphaned}")
 
         # SIGKILL (NOT SIGTERM) so there's NO graceful transfer_leader handoff —
         # this measures the election-timeout failover, the latency election_tick
@@ -164,16 +180,27 @@ def main() -> int:
             print(f"       ELECTION_FAILOVER_S={failover_s:.3f}  (kill → survivor leads, "
                   f"node {new_lead_timed + 1 if new_lead_timed is not None else '?'})")
 
-        # Assert the re-election was a CLEAN single election: exactly one
-        # survivor's acquisition counter rose, and by exactly 1.
+        # Assert the re-election was CLEAN: across the survivors, exactly one
+        # acquisition per orphaned group — no more. Wait for every orphaned
+        # group to have a leader first, or the read races the second group's
+        # election and "clean" is indistinguishable from "hasn't happened yet".
+        for t in orphaned:
+            deadline_t = time.time() + 30.0
+            while time.time() < deadline_t and c.leader_now(t, nodes=survivors) is None:
+                time.sleep(0.01)
+        settled = {t: c.leader_now(t, nodes=survivors) for t in orphaned}
+        check("every orphaned group re-elected a leader",
+              all(v is not None for v in settled.values()), f"leaders={settled}")
         bumped = []
         for i in survivors:
             now = metric_counter(c.metrics(i), "raft_leadership_acquisitions_total") or 0.0
             delta = now - base_acq[i]
             if delta > 0:
                 bumped.append((i, delta))
-        check("clean single re-election (exactly one survivor +1 acquisition)",
-              len(bumped) == 1 and bumped[0][1] == 1.0,
+        total = sum(d for _, d in bumped)
+        check("clean re-election (one acquisition per orphaned group, no spurious extras)",
+              total == float(len(orphaned)),
+              f"total={total} orphaned={len(orphaned)} "
               f"bumped={[(i + 1, d) for i, d in bumped]}")
 
         print("step 6: ⭐ data survived the kill — each survivor holds it")
