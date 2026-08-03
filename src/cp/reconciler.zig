@@ -147,15 +147,12 @@ fn ensureMember(router: anytype, tenant: []const u8, node_url: []const u8, node_
     const is_voter = idIn(ms.voters, node_id);
     const is_learner = idIn(ms.learners, node_id);
     var voter_recent_active = false;
+    var voter_caught_up = false;
     if (is_voter) {
         for (ms.peers) |p| {
             if (p.id == node_id) {
                 voter_recent_active = p.recent_active;
-                if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) {
-                    clearDemoteTimer(router, tenant, node_id); // responsive + caught up → reset grace
-                    std.log.debug("reconcile observe {s} node={d}: caught-up voter (matched={d} leader_last={d} active={})", .{ tenant, node_id, p.matched, ms.leader_last, p.recent_active });
-                    return .done;
-                }
+                voter_caught_up = p.matched + RECONCILE_SLACK >= ms.leader_last;
                 break;
             }
         }
@@ -167,22 +164,32 @@ fn ensureMember(router: anytype, tenant: []const u8, node_url: []const u8, node_
     // its absence is confirmed — never on a probe failure, or a merely
     // rebooting/partitioned healthy voter gets torn out of the config (and a
     // rolling deploy makes voters transiently unreachable by design).
+    //
+    // Probed for EVERY node, including one the leader's view calls a
+    // caught-up voter: that view is a pump-published snapshot, and a group
+    // that hibernates freezes it — a voter wiped AFTER the freeze keeps
+    // reading as caught-up + recent-active from the fossilized Progress
+    // (matched == leader_last, forever), which without this probe
+    // short-circuited the heal every pass while the node served an empty
+    // store. "The leader says it's fine" is never sufficient; the node
+    // must also still HOLD the group.
     const host = nodeGroupState(router, node_url, tenant);
     // The reconciler's whole observation for this node, one debug line —
     // the quiet no-action passes are exactly the ones a stuck heal needs
     // explained (is the phantom read as a caught-up voter? host unknown?).
     std.log.debug("reconcile observe {s} node={d}: voter={} learner={} active={} matched≈{} host={s}", .{
-        tenant,                    node_id,
-        is_voter,                  is_learner,
-        voter_recent_active,       blk: {
-            for (ms.peers) |p| {
-                if (p.id == node_id) break :blk p.matched + RECONCILE_SLACK >= ms.leader_last;
-            }
-            break :blk false;
-        },
-        @tagName(host),
+        tenant, node_id, is_voter, is_learner, voter_recent_active, voter_caught_up, @tagName(host),
     });
     if (host == .unknown) return .failed; // can't observe → never mutate; retry next pass
+
+    // A caught-up, recent-active voter that still hosts the group is the
+    // steady state — nothing to do. (host == .absent falls through to the
+    // remove→re-add heal below regardless of what the possibly-fossilized
+    // leader view claims.)
+    if (is_voter and voter_recent_active and voter_caught_up and host == .hosted) {
+        clearDemoteTimer(router, tenant, node_id);
+        return .done;
+    }
 
     // RC-6 hysteresis bookkeeping: keep a demote grace timer ONLY while the
     // node is an actual demote candidate (a hosted voter the leader hasn't

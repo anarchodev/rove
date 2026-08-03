@@ -368,6 +368,11 @@ pub const Bridge = struct {
     /// behind the fsync — the spurious-election coupling the flusher exists
     /// to remove — so this is a rollback lever, not a tuning knob.
     inline_fsync: bool = false,
+    /// Proposes faulted because the group is not hosted on this multi-node
+    /// node (no lazy birth — see `pumpOnce` step 2). Rate-limits the warn;
+    /// a sustained climb means clients keep aiming writes at a non-member
+    /// (a wiped voter mid-heal, or stale routing). Pump-thread only.
+    unhosted_propose_count: u64 = 0,
 
     /// Stand up a single-node bridge over a fresh single-voter `Node`.
     /// Does NOT start the pump thread — call `startPump` (production) or
@@ -2063,4 +2068,86 @@ test "bridge: createGroupEpoch requires a running pump thread" {
     const gid = try bridge.registerTenant("x");
     // No startPump → control ops have no executor.
     try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1, null));
+}
+
+test "a multi-node propose for a locally-unhosted group faults — no husk is born" {
+    // The wipe+heal wedge regression: a wiped voter that accepted one stray
+    // write used to birth a fresh epoch-0 group (ensureGroup on first
+    // propose), answer `v2-confstate` 200, and read to the membership
+    // reconciler as a hosted-but-inactive voter — masking its own
+    // remove→re-add heal while its husk fenced out real replication and
+    // served an empty store. On a multi-node node the pump now FAULTS a
+    // propose whose group is not locally hosted and creates nothing;
+    // groups arrive only via the attach (createGroupAtEpoch) or boot
+    // recovery. (The worker-side pre-gate cannot check — `node.groups` is
+    // pump-owned — so the propose enters the inbox and faults there.)
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2, 3 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/b1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/b2", .{root}),
+        try std.fmt.allocPrint(a, "{s}/b3", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    var bridges: [3]*Bridge = undefined;
+    var alive = [_]bool{ false, false, false };
+    defer for (bridges, 0..) |b, i| if (alive[i]) b.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const bp: u16 = @intCast(24000 + ((pid +% 7 +% attempt *% 619) % 4000) * 8);
+        var ok = true;
+        for (0..3) |i| {
+            var peers: [3]node_mod.PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = bp + @as(u16, @intCast(k)) };
+            const addr = std.net.Address.parseIp("127.0.0.1", bp + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            bridges[i] = Bridge.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, &peers) catch {
+                ok = false;
+                break;
+            };
+            alive[i] = true;
+        }
+        if (ok) break;
+        for (0..3) |i| if (alive[i]) {
+            bridges[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest;
+
+    const gid = try bridges[0].registerTenant("t");
+    try testing.expectEqual(gid, try bridges[2].registerTenant("t"));
+
+    // Form the group on nodes 1+2 only — node 3 plays the wiped voter: a
+    // configured member with NO local instance.
+    _ = try bridges[0].node.ensureGroup(gid, "t");
+    _ = try bridges[1].node.ensureGroup(gid, "t");
+
+    // The stray write aimed at the blank node. Its GroupSig is fresh
+    // (formed=false), so the propose passes the worker-side pre-gate and
+    // enters the inbox — the pump must fault it, not birth a group.
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const env = try encodeWs(a, "t", &ws);
+    defer a.free(env);
+    const seq = try bridges[2].propose(gid, env);
+
+    var spins: u32 = 0;
+    while (spins < 2000 and bridges[2].faultedSeq(gid) < seq) : (spins += 1) {
+        _ = try bridges[2].pumpOnce();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(seq, bridges[2].faultedSeq(gid));
+    try testing.expect(bridges[2].node.groups.get(gid) == null);
 }

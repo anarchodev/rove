@@ -87,14 +87,30 @@ pub fn pumpOnce(self: anytype) Error!bool {
     //     attach's group exists before any post-move write lands.
     if (self.drainControl()) did_work = true;
 
-    // 2. Submit each drained propose to its tenant's group, creating
-    //    the group on first sight. Single-node: this drives it to
-    //    leader. Multi-node: an already-formed group is found; if this
-    //    node is NOT the group's leader, `node.propose` rejects and we
-    //    FAULT the tenant's in-flight so the worker fails fast (503) and
-    //    the client retries against the leader node.
+    // 2. Submit each drained propose to its tenant's group. Single-node:
+    //    created on first sight (`ensureGroup` — the sole voter is
+    //    trivially the whole group) and driven to leader. Multi-node: the
+    //    group must ALREADY exist — born by the provision/move attach
+    //    (`createGroupAtEpoch`) or boot recovery (`recoverGroups`); a
+    //    propose NEVER births one. A propose for a locally-unknown group
+    //    means this node is not (yet) a member — most dangerously a WIPED
+    //    voter whose re-bootstrap is pending: lazily birthing a fresh
+    //    epoch-0 group here makes the node answer `v2-confstate` 200, so
+    //    the membership reconciler reads it as a hosted-but-inactive voter
+    //    and holds the demote grace instead of the remove→re-add heal,
+    //    while the husk fences out real replication and serves an empty
+    //    store. Fault fast instead: the worker 503s and the client re-aims
+    //    at a real member. If this node IS a member but not the leader,
+    //    `node.propose` rejects and we fault the same way.
     for (batch.items) |item| {
         defer self.allocator.free(item.payload);
+        if (!self.node.isSingleNode() and self.node.groups.get(item.gid) == null) {
+            self.unhosted_propose_count +%= 1;
+            if (self.unhosted_propose_count == 1 or self.unhosted_propose_count % 1000 == 0)
+                std.log.warn("v2 bridge propose gid={d} ({s}): group not hosted on this node — faulted, no lazy birth on multi-node ({d} total)", .{ item.gid, item.id_str, self.unhosted_propose_count });
+            self.faultTenant(item.gid);
+            continue;
+        }
         _ = self.node.ensureGroup(item.gid, item.id_str) catch |e| {
             std.log.warn("v2 bridge ensureGroup gid={d}: {s}", .{ item.gid, @errorName(e) });
             self.faultTenant(item.gid);
