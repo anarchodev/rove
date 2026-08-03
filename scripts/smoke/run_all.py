@@ -66,11 +66,6 @@ EXCLUDED = {
 #                                pass and fail across runs; `--baseline` will
 #                                call it a regression on a run where it flips.
 #                                Check it against rove#362 before believing it.
-#   leader_failover_smoke_v2.py — rove#374, the "clean single re-election"
-#                                leg flakes ~2 of 5 (split votes after a
-#                                leader SIGKILL) — standalone, quiet box,
-#                                reproduced on the baseline commit. Same
-#                                check-the-issue-first rule as rove#362.
 
 # Members that run ALONE, after the parallel pool drains. These assert timing
 # that co-tenant CPU load can skew — an election-timeout soak or a
@@ -83,9 +78,10 @@ SERIAL = {
     "raft_soak_v2.py",          # same shape, shorter
     "dispatch_gate_smoke_v2.py",  # rove#362: already intermittent serially —
                                   # co-load noise would make the flip unreadable
-    "leader_failover_smoke_v2.py",  # asserts exactly ONE re-election after the
-                                    # kill; co-load stretches heartbeats enough
-                                    # to fire a second (#362's fingerprint)
+    "leader_failover_smoke_v2.py",  # asserts one acquisition per ORPHANED group
+                                    # after the kill — co-load can stretch
+                                    # heartbeats enough to fire a genuine extra
+                                    # election, which is the thing it measures
     "tls_large_body_smoke.py",  # rove#361: red via ITS OWN download
                                 # concurrency — keep the repro conditions fixed
 }

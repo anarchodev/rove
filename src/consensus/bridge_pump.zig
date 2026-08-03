@@ -264,6 +264,18 @@ pub fn refreshOneLocked(self: anytype, sig: anytype, gid: u64, single: bool) voi
     // for the spurious-election metric; the reader nets out the expected
     // one-per-group baseline.
     if (promoted_edge) _ = self.leadership_acquisitions.fetchAdd(1, .monotonic);
+    // Leadership EDGES, both directions, stamped: the raw material for
+    // "why did one kill produce two acquisitions" (rove#374). A demotion
+    // edge naming a new leader is a deposition (someone else won an
+    // election); one naming leader 0 is a self-step-down (check_quorum
+    // lost its follower).
+    if (promoted_edge or (!now and sig.was_leader))
+        std.log.debug("raft: leader-edge gid={d} {s} leader_id={d} at={d}", .{
+            gid,
+            if (promoted_edge) "GAINED" else "LOST",
+            self.node.leaderId(gid),
+            std.time.milliTimestamp(),
+        });
     // false→true promotion edge: queue for the worker's on-promotion
     // recovery hook. Skipped on a single node — the sole voter leads
     // every group from creation and never fails over, so there is no
