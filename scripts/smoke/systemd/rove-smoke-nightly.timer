@@ -2,8 +2,10 @@
 Description=nightly trigger for the rove smoke suite
 
 [Timer]
-# 03:30 local: after any late-evening sessions, before the day starts.
-OnCalendar=*-*-* 03:30:00
+# 03:30 in the operator's timezone, spelled explicitly: the host clock runs
+# UTC, so a bare 03:30 would fire at 20:30 local — mid-evening, exactly when
+# interactive sessions are using the box.
+OnCalendar=*-*-* 03:30:00 America/Los_Angeles
 # If the box was asleep/off at 03:30, run on next boot instead of skipping —
 # a skipped night is silent, and silence must only ever mean "nothing new".
 Persistent=true
