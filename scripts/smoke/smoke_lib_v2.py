@@ -963,16 +963,16 @@ class V2Cluster:
                              node: int = 0) -> str:
         """PM P1: deploy handlers that import `@scope/pkg` packages.
 
-        `packages` entries (IN DEPENDENCY ORDER, leaves first — a package's
-        files compile with the loader live, so its deps must already be
-        staged): `{"spec", "version", "pkg_hash", "files": {path: source},
-        "imports": {specifier: dep_pkg_hash}}`. `app_imports` maps the
-        app-surface specifiers to pkg_hashes. Stages each package file via
-        /v1/deploy/pkgfile (compiled under its /pkg/<pkg_hash>/ virtual
-        name), then handlers via /v1/deploy/file with the full resolution
-        (imports VALIDATE at compile — a bad import fails the deploy here),
-        then cuts with the lockfile + releases. Returns dep_id (decimal
-        str). (Tenant must be provisioned.)"""
+        `packages` entries (ANY order — staging is stage-only; the deploy
+        app batch-compiles each package at cut, dependency-ordered
+        server-side): `{"spec", "version", "pkg_hash",
+        "files": {path: source}, "imports": {specifier: dep_pkg_hash}}`.
+        `app_imports` maps the app-surface specifiers to pkg_hashes.
+        Stages each package file via /v1/deploy/pkgfile and each handler
+        via /v1/deploy/file (both stage-only), then cuts with the lockfile
+        — imports VALIDATE at cut's batch compiles (a bad import fails the
+        deploy there, naming the module) — and releases. Returns dep_id
+        (decimal str). (Tenant must be provisioned.)"""
         import json
         self._ensure_admin_app()
 
@@ -995,34 +995,17 @@ class V2Cluster:
                              for p in packages],
                 "app_imports": app_imports}
 
-        # Growing resolution for compile-time validation: packages staged so
-        # far, WITH their staged file hashes.
-        staged: dict[str, list[dict]] = {}
-
-        def resolution() -> dict:
-            return {"packages": [{"spec": p["spec"], "version": p["version"],
-                                  "pkg_hash": p["pkg_hash"],
-                                  "imports": p.get("imports", {}),
-                                  "files": staged.get(p["pkg_hash"], [])}
-                                 for p in packages],
-                    "app_imports": app_imports}
-
         for p in packages:
             for path, source in p["files"].items():
                 r = post("pkgfile", {"tenant": tenant, "pkg_hash": p["pkg_hash"],
-                                     "path": path, "source": source,
-                                     "resolution": resolution()})
+                                     "path": path, "source": source})
                 if r.status != 200:
                     raise RuntimeError(
                         f"deploy {tenant} pkgfile {p['spec']}/{path}: {r.status} {r.body}")
-                got = json.loads(r.body)
-                staged.setdefault(p["pkg_hash"], []).append(
-                    {"path": path, "source_hash": got["source_hex"],
-                     "bytecode_hash": got["bytecode_hex"]})
 
         for path, source in handler_files.items():
             r = post("file", {"tenant": tenant, "path": path, "kind": "handler",
-                              "source": source, "resolution": resolution()})
+                              "source": source})
             if r.status != 200:
                 raise RuntimeError(f"deploy {tenant} file {path}: {r.status} {r.body}")
 

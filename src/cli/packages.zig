@@ -11,11 +11,11 @@
 //!
 //!   - `buildResolveRequest` — the `{dependencies, overrides}` request body.
 //!   - `parseResolveResponse` — the registry response → an owned `Resolution`.
-//!     Files carry `source_hash` only (source-only ingestion); `bytecode_hash`
-//!     is filled per file during staging at the consumer's deploy.
-//!   - `emitResolution` — the `resolution` JSON the deploy wire expects on
-//!     `/v1/deploy/{pkgfile,file}` (with staged files) and `/v1/deploy/cut`
-//!     (files omitted; the deploy app joins the staged rows server-side).
+//!     Files carry `source_hash` only (source-only ingestion); bytecode is
+//!     minted server-side at cut, never seen by the client.
+//!   - `emitResolution` — the `resolution` JSON `/v1/deploy/cut` expects
+//!     (files omitted; the deploy app joins the staged rows server-side and
+//!     batch-compiles each package there).
 //!
 //! The wire shape is fixed by the engine and proven by
 //! `scripts/smoke/pm_deploy_smoke.py` / `V2Cluster.deploy_with_packages`:
@@ -47,23 +47,12 @@ pub const ImportPair = struct {
     pkg_hash: []const u8,
 };
 
-/// One package file. `source_hash` comes from the registry; `bytecode_hash`
-/// is null until the deploy stages the file (`/v1/deploy/pkgfile` returns the
-/// server-authoritative pair), then set on the in-memory file before the
-/// resolution is emitted on the wire.
+/// One package file, as the registry describes it: path + content hash of
+/// the source. Bytecode is minted server-side at cut — the client never
+/// carries it.
 pub const PkgFile = struct {
     path: []const u8,
     source_hash: []const u8,
-    bytecode_hash: ?[]const u8 = null,
-};
-
-/// A file the deploy has staged (`/v1/deploy/pkgfile` returned the
-/// server-authoritative pair). The wire's `files` entries during staging are
-/// these — accumulated per package as each file stages, empty until then.
-pub const StagedFile = struct {
-    path: []const u8,
-    source_hash: []const u8,
-    bytecode_hash: []const u8,
 };
 
 /// A resolved package version. `pkg_hash` is its content identity + the
@@ -283,7 +272,6 @@ fn parsePackage(a: std.mem.Allocator, v: std.json.Value) Error!Package {
         files[i] = .{
             .path = try dupField(a, fv.object, "path"),
             .source_hash = try dupField(a, fv.object, "source_hash"),
-            .bytecode_hash = null,
         };
     }
 
@@ -392,22 +380,16 @@ fn dfsVisit(
 
 // ── wire emission ───────────────────────────────────────────────────────────
 
-/// Emit the `resolution` JSON the deploy app consumes. Every package carries
-/// `{spec, version, pkg_hash, imports}`; `staged` selects the mode:
-///   - `null` → the `/v1/deploy/cut` lockfile skeleton (no `files` key; the
-///     deploy app joins the staged rows server-side).
-///   - non-null → the `/v1/deploy/{pkgfile,file}` compile-validation shape:
-///     each package i also carries `files` = `staged[i]` (empty `[]` until its
-///     files stage; growing as they do). `staged` is indexed parallel to
-///     `res.packages` (so call `topoSort` first, then keep them aligned).
-/// Shape + growing-resolution semantics per `pm_deploy_smoke.py`; no
-/// `capabilities`/`private` on the wire (the deploy app defaults them).
+/// Emit the `resolution` JSON the deploy app consumes on `/v1/deploy/cut`:
+/// every package carries `{spec, version, pkg_hash, imports}` and no
+/// `files` — the deploy app joins the staged `_workspace_pkg/` rows
+/// server-side (hashes stay server-authoritative) and batch-compiles each
+/// package there. No `capabilities`/`private` on the wire (the deploy app
+/// defaults them).
 pub fn emitResolution(
     a: std.mem.Allocator,
     res: *const Resolution,
-    staged: ?[]const []const StagedFile,
 ) Error![]u8 {
-    if (staged) |st| std.debug.assert(st.len == res.packages.len);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
 
@@ -422,20 +404,6 @@ pub fn emitResolution(
         try writeJsonString(&out, a, p.pkg_hash);
         try out.appendSlice(a, ",\"imports\":");
         try writeImportObject(&out, a, p.imports);
-        if (staged) |st| {
-            try out.appendSlice(a, ",\"files\":[");
-            for (st[pi], 0..) |f, fi| {
-                if (fi != 0) try out.append(a, ',');
-                try out.appendSlice(a, "{\"path\":");
-                try writeJsonString(&out, a, f.path);
-                try out.appendSlice(a, ",\"source_hash\":");
-                try writeJsonString(&out, a, f.source_hash);
-                try out.appendSlice(a, ",\"bytecode_hash\":");
-                try writeJsonString(&out, a, f.bytecode_hash);
-                try out.append(a, '}');
-            }
-            try out.append(a, ']');
-        }
         try out.append(a, '}');
     }
     try out.appendSlice(a, "],\"app_imports\":");
@@ -614,7 +582,6 @@ test "parseResolveResponse: parses packages + app_imports; encapsulation + priva
     const jwt14 = res.packages[2];
     try testing.expect(jwt14.private);
     try testing.expectEqualStrings("s4", jwt14.files[0].source_hash);
-    try testing.expect(jwt14.files[0].bytecode_hash == null);
     try testing.expectEqualStrings("crypto", jwt14.capabilities[0]);
 }
 
@@ -624,7 +591,7 @@ test "parseResolveResponse: an error body → Unresolved" {
     ));
 }
 
-test "emitResolution: cut skeleton omits files; staging carries the staged set" {
+test "emitResolution: the files-less lockfile skeleton (the deploy app joins staged rows)" {
     const json =
         \\{"packages":[
         \\ {"spec":"@rewind/jwt","version":"1.9.0","pkg_hash":"aa","files":[{"path":"index.mjs","source_hash":"s9"}],"imports":{}}
@@ -633,43 +600,14 @@ test "emitResolution: cut skeleton omits files; staging carries the staged set" 
     var res = try parseResolveResponse(testing.allocator, json);
     defer res.deinit();
 
-    // cut: no files (staged = null).
-    {
-        const wire = try emitResolution(testing.allocator, &res, null);
-        defer testing.allocator.free(wire);
-        try testing.expectEqualStrings(
-            "{\"packages\":[{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\"," ++
-                "\"pkg_hash\":\"aa\",\"imports\":{}}]," ++
-                "\"app_imports\":{\"@rewind/jwt\":\"aa\"}}",
-            wire,
-        );
-    }
-    // staging, before this package's file is staged → empty files array.
-    {
-        const staged = [_][]const StagedFile{&.{}};
-        const wire = try emitResolution(testing.allocator, &res, &staged);
-        defer testing.allocator.free(wire);
-        try testing.expectEqualStrings(
-            "{\"packages\":[{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\"," ++
-                "\"pkg_hash\":\"aa\",\"imports\":{},\"files\":[]}]," ++
-                "\"app_imports\":{\"@rewind/jwt\":\"aa\"}}",
-            wire,
-        );
-    }
-    // staging, after the file staged (as a pkgfile response would fill).
-    {
-        const files = [_]StagedFile{.{ .path = "index.mjs", .source_hash = "s9", .bytecode_hash = "b9" }};
-        const staged = [_][]const StagedFile{&files};
-        const wire = try emitResolution(testing.allocator, &res, &staged);
-        defer testing.allocator.free(wire);
-        try testing.expectEqualStrings(
-            "{\"packages\":[{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\"," ++
-                "\"pkg_hash\":\"aa\",\"imports\":{},\"files\":[{\"path\":\"index.mjs\"," ++
-                "\"source_hash\":\"s9\",\"bytecode_hash\":\"b9\"}]}]," ++
-                "\"app_imports\":{\"@rewind/jwt\":\"aa\"}}",
-            wire,
-        );
-    }
+    const wire = try emitResolution(testing.allocator, &res);
+    defer testing.allocator.free(wire);
+    try testing.expectEqualStrings(
+        "{\"packages\":[{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\"," ++
+            "\"pkg_hash\":\"aa\",\"imports\":{}}]," ++
+            "\"app_imports\":{\"@rewind/jwt\":\"aa\"}}",
+        wire,
+    );
 }
 
 test "topoSort: orders deps before importers (leaves first)" {

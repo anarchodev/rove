@@ -309,26 +309,14 @@ pub const DeployThread = struct {
 
         const fail = struct {
             fn emit(dt: *DeployThread, r: *msg_router_mod.MsgRouter, j: *Job, status: u16, msg: []const u8) void {
-                const cj = errorCtxJson(dt.allocator, status, msg) catch return;
+                // Failure events carry the job's `app` ctx exactly like
+                // success events do: a resume handler that can fall back
+                // (e.g. try-compile → stage-only on an incomplete bundle)
+                // needs its own context to act on the failure.
+                const cj = errorCtxJson(dt.allocator, status, msg, j.app_ctx) catch return;
                 routeCompileEvent(r, dt.allocator, j.fetch_id, j.chain_tenant, j.name, status, false, cj, &.{}, "");
             }
         }.emit;
-
-        // PM P2 static gate: package source must not name the privileged
-        // surface. Best-effort lexical backstop — the real boundary is the
-        // natives' own `is_system_module` self-gate; this exists to reject
-        // a package that even *mentions* `_system` / `__rove` with a clear
-        // deploy-time error instead of a confusing runtime one (and it
-        // deliberately hits comments/strings too — a distributed package
-        // has no business naming the privileged surface at all).
-        if (job.pkg_hash.len != 0) {
-            for (job.inputs) |in| {
-                if (referencesPrivilegedSurface(in.bytes)) {
-                    std.log.warn("deploy thread: package {s} file {s} references the privileged surface; rejecting", .{ job.pkg_hash, in.path });
-                    return fail(self, router, job, 400, "package source must not reference the privileged surface (_system / __rove)");
-                }
-            }
-        }
 
         const jstorage = tenant_mod.TenantStorage{ .id = job.tenant_id, .incarnation = job.incarnation };
         var file_be = jstorage.openBackend(a, self.blob_cfg, "file-blobs") catch |err| {
@@ -386,6 +374,25 @@ pub const DeployThread = struct {
                 };
                 a.free(job.inputs[i].bytes);
                 job.inputs[i].bytes = bytes;
+            }
+        }
+
+        // PM P2 static gate: package source must not name the privileged
+        // surface. Best-effort lexical backstop — the real boundary is the
+        // natives' own `is_system_module` self-gate; this exists to reject
+        // a package that even *mentions* `_system` / `__rove` with a clear
+        // deploy-time error instead of a confusing runtime one (and it
+        // deliberately hits comments/strings too — a distributed package
+        // has no business naming the privileged surface at all). MUST run
+        // AFTER hash-input hydration: a package batch compiled from staged
+        // hashes has empty inline bytes until the fetch above, and scanning
+        // those would wave the gate at nothing.
+        if (job.pkg_hash.len != 0) {
+            for (job.inputs) |in| {
+                if (referencesPrivilegedSurface(in.bytes)) {
+                    std.log.warn("deploy thread: package {s} file {s} references the privileged surface; rejecting", .{ job.pkg_hash, in.path });
+                    return fail(self, router, job, 400, "package source must not reference the privileged surface (_system / __rove)");
+                }
             }
         }
 
@@ -712,11 +719,13 @@ fn compileThunk(
     return ctx.compileToBytecode(source, filename, allocator, kind);
 }
 
-/// `{"ok":false,"status":N,"error":<msg>}` with `msg` JSON-escaped
-/// (compile-failure detail carries quickjs exception text, which can
-/// contain quotes/backslashes). Caller owns the result — in practice
-/// `routeCompileEvent` takes ownership.
-fn errorCtxJson(allocator: std.mem.Allocator, status: u16, msg: []const u8) ![]u8 {
+/// `{"ok":false,"status":N,"error":<msg>,"app":<app_ctx>}` with `msg`
+/// JSON-escaped (compile-failure detail carries quickjs exception text,
+/// which can contain quotes/backslashes). `app_ctx` is the job's opaque
+/// caller context (already JSON; empty = omitted) — failures carry it
+/// exactly like successes so a resume handler can act on them. Caller
+/// owns the result — in practice `routeCompileEvent` takes ownership.
+fn errorCtxJson(allocator: std.mem.Allocator, status: u16, msg: []const u8, app_ctx: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     {
@@ -724,6 +733,10 @@ fn errorCtxJson(allocator: std.mem.Allocator, status: u16, msg: []const u8) ![]u
         defer buf = aw.toArrayList();
         try aw.writer.print("{{\"ok\":false,\"status\":{d},\"error\":", .{status});
         try std.json.Stringify.value(msg, .{}, &aw.writer);
+        if (app_ctx.len != 0) {
+            try aw.writer.writeAll(",\"app\":");
+            try aw.writer.writeAll(app_ctx);
+        }
         try aw.writer.writeByte('}');
     }
     return try buf.toOwnedSlice(allocator);
@@ -864,13 +877,25 @@ test "referencesPrivilegedSurface: catches _system + __rove*, not lookalikes" {
 
 test "errorCtxJson escapes quotes in the message" {
     const a = testing.allocator;
-    const cj = try errorCtxJson(a, 400, "compile failed: could not load module '@x/y' \"quoted\"");
+    const cj = try errorCtxJson(a, 400, "compile failed: could not load module '@x/y' \"quoted\"", "");
     defer a.free(cj);
     try testing.expectEqualStrings(
         "{\"ok\":false,\"status\":400,\"error\":\"compile failed: could not load module '@x/y' \\\"quoted\\\"\"}",
         cj,
     );
     // Parses back as JSON.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, cj, .{});
+    defer parsed.deinit();
+}
+
+test "errorCtxJson carries the app ctx on failures (the try-compile fallback reads it)" {
+    const a = testing.allocator;
+    const cj = try errorCtxJson(a, 400, "compile failed", "{\"path\":\"index.mjs\"}");
+    defer a.free(cj);
+    try testing.expectEqualStrings(
+        "{\"ok\":false,\"status\":400,\"error\":\"compile failed\",\"app\":{\"path\":\"index.mjs\"}}",
+        cj,
+    );
     var parsed = try std.json.parseFromSlice(std.json.Value, a, cj, .{});
     defer parsed.deinit();
 }
