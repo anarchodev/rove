@@ -76,11 +76,13 @@ SKIP_RC = 77
 #                                (~2 of 3).
 #   tls_large_body_smoke.py    — rove#361, concurrent large static downloads
 #                                abort mid-stream (sequential ones are fine).
-#   raft_soak_v2.py            — rove#377, spurious elections at the DEFAULT
-#                                1ms tick when the disk's fsync tail exceeds
-#                                the election budget. Disk-dependent, not
-#                                time-dependent: consistently red on btrfs,
-#                                green elsewhere. Prod runs tick=10.
+#   raft_soak_v2.py            — rove#377, spurious elections under load on
+#                                btrfs. Reproduces at the PROD tick=10 too
+#                                (1-2 per 90s run), not just the 1ms default
+#                                (3-4), so neither the tick flip nor #384's
+#                                off-thread fsync clears it here. The fsync
+#                                tail is no longer the coupling — measure
+#                                before blaming it (rove#377).
 
 # Members that run ALONE, after the parallel pool drains. These assert timing
 # that co-tenant CPU load can skew — an election-timeout soak or a
