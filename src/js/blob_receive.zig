@@ -155,7 +155,12 @@ pub const Job = struct {
     /// already in flight. Falls back to `MAX_RECEIVE_BYTES` when no plan
     /// resolves, so an unresolvable tenant is bounded rather than unbounded.
     max_bytes: u64 = MAX_RECEIVE_BYTES,
-    /// The stream was cut for exceeding `MAX_RECEIVE_BYTES`. Distinguishes the
+    /// What to report when the ceiling bites: 507 when the tenant's storage
+    /// QUOTA is the binding limit (delete data or upgrade), 413 when the
+    /// object was simply too big for one write (chunk it). The two are
+    /// different problems with different fixes, so they are different answers.
+    over_cap_status: u16 = 413,
+    /// The stream was cut for exceeding the ceiling. Distinguishes the
     /// refusal from a transport failure so the terminal can say 413 instead of
     /// the generic 0, and the handler can tell "too big" from "connection
     /// died".
@@ -177,6 +182,7 @@ pub const Job = struct {
         name: []const u8,
         content_type: ?[]const u8,
         max_bytes: u64,
+        over_cap_status: u16,
     ) !*Job {
         const self = try allocator.create(Job);
         errdefer allocator.destroy(self);
@@ -202,6 +208,7 @@ pub const Job = struct {
             .name = name_owned,
             .content_type = ct_owned,
             .max_bytes = max_bytes,
+            .over_cap_status = over_cap_status,
             .router = router,
             .cfg = cfg,
         };
@@ -344,10 +351,10 @@ pub const Job = struct {
             // either way — multipart is commit-gated.
             if (self.overCap()) {
                 std.log.warn(
-                    "rove-js blob.receive: tenant={s} id={s} refused — over the receive ceiling",
-                    .{ self.tenant_id, self.fetch_id },
+                    "rove-js blob.receive: tenant={s} id={s} refused with {d} — over its ceiling",
+                    .{ self.tenant_id, self.fetch_id, self.over_cap_status },
                 );
-                self.emitTerminal(false, 413, 0, null);
+                self.emitTerminal(false, self.over_cap_status, 0, null);
                 return;
             }
             std.log.warn(

@@ -347,6 +347,9 @@ pub fn interpretCmd(
             // stampManifest) never reach libcurl — route to the worker-local
             // subsystem. ONE partition for every submit site (worker.zig).
             if (worker.tryDoorFetch(pf)) return;
+            // Storage quota (#349): refuse a blob PUT that would carry the
+            // tenant past `max_stored_bytes`, before it reaches the wire.
+            if (worker.refuseIfOverStorageQuota(pf)) return;
             const engine = worker.node.fetch_engine orelse {
                 var pfm = pf;
                 pfm.deinit(allocator);

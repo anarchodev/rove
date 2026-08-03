@@ -142,6 +142,28 @@ pub fn storedBytes(kv: *kvstore.KvStore) u64 {
     return sum(kv, null);
 }
 
+/// TTL for the cached figure the storage gate reads. Mirrors the KV cap's
+/// `KV_USAGE_TTL_MS`: it bounds the gate's cost (one prefix scan per tenant
+/// per TTL, never one per write) and its staleness (a tenant can overshoot by
+/// at most TTL x its own store throughput before the fresh figure bites).
+/// That is the accepted trade — a quota is a billing ceiling, and what bounds
+/// how far a SINGLE write can carry a tenant past it is the per-write ceiling
+/// (`max_receive_bytes`), not this.
+pub const STORED_TTL_MS: i64 = 2000;
+
+/// `storedBytes` behind a TTL cache. The cache lives on the store (the same
+/// atomics posture as `usageBytesCached`: sibling threads share one handle,
+/// and a racing refresh is benign because both write a fresh figure).
+pub fn storedBytesCached(kv: *kvstore.KvStore, ttl_ms: i64) u64 {
+    const now = std.time.milliTimestamp();
+    const at = kv.stored_cached_at_ms.load(.monotonic);
+    if (at != 0 and now -| at < ttl_ms) return kv.stored_cached_bytes.load(.monotonic);
+    const total = storedBytes(kv);
+    kv.stored_cached_bytes.store(total, .monotonic);
+    kv.stored_cached_at_ms.store(now, .monotonic);
+    return total;
+}
+
 /// One pool's stored bytes. For reporting and teardown; enforcement uses the
 /// combined `storedBytes`.
 pub fn storedBytesIn(kv: *kvstore.KvStore, pool: Pool) u64 {

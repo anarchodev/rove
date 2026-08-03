@@ -237,6 +237,10 @@ pub const KvStore = struct {
     /// refreshed.
     usage_cached_bytes: std.atomic.Value(u64) = .init(0),
     usage_cached_at_ms: std.atomic.Value(i64) = .init(0),
+    /// `storedBytesCached` TTL cache — the object-storage sibling of the two
+    /// above. Same atomics rationale.
+    stored_cached_bytes: std.atomic.Value(u64) = .init(0),
+    stored_cached_at_ms: std.atomic.Value(i64) = .init(0),
 
     /// Open a standalone, self-contained KvStore against `path`. The
     /// file is created if missing; a single store (id =

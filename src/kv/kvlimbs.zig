@@ -46,6 +46,8 @@ pub const UsagePool = usage.Pool;
 pub const usageRowKey = usage.rowKey;
 pub const usageFormatLen = usage.formatLen;
 pub const storedBytes = usage.storedBytes;
+pub const storedBytesCached = usage.storedBytesCached;
+pub const STORED_TTL_MS = usage.STORED_TTL_MS;
 pub const storedBytesIn = usage.storedBytesIn;
 
 // snapshot_stream.zig (raft streaming transfer codec)
