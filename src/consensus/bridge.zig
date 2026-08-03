@@ -362,6 +362,12 @@ pub const Bridge = struct {
 
     pump_thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
+    /// Operator kill-switch (env `REWIND_WAL_SYNC_MODE=inline`, set before
+    /// `startPump`): keep the WAL fsync inline in the pump cycle instead of
+    /// on the flusher thread. The inline cycle serializes heartbeat sends
+    /// behind the fsync — the spurious-election coupling the flusher exists
+    /// to remove — so this is a rollback lever, not a tuning knob.
+    inline_fsync: bool = false,
 
     /// Stand up a single-node bridge over a fresh single-voter `Node`.
     /// Does NOT start the pump thread — call `startPump` (production) or
@@ -987,8 +993,18 @@ pub const Bridge = struct {
     /// guard: a second call is a no-op.
     pub fn startPump(self: *Bridge) Error!void {
         if (self.pump_thread != null) return;
+        // The WAL flusher rides with the pump thread: production persistence
+        // is async (the pump never blocks on an fsync — heartbeats/ticks keep
+        // flowing through a slow flush), while tests that drive `pumpOnce`
+        // directly, without startPump, get the inline synchronous path.
+        // `inline_fsync` (env `REWIND_WAL_SYNC_MODE=inline`) is the operator
+        // kill-switch back to the synchronous path.
+        if (!self.inline_fsync) self.node.wal_flusher.start() catch return Error.Io;
         self.stop.store(false, .release);
-        self.pump_thread = std.Thread.spawn(.{}, pumpLoop, .{self}) catch return Error.Io;
+        self.pump_thread = std.Thread.spawn(.{}, pumpLoop, .{self}) catch {
+            self.node.wal_flusher.stop();
+            return Error.Io;
+        };
     }
 
     /// Signal the pump thread to stop and join it. Then fail any still-
@@ -999,6 +1015,14 @@ pub const Bridge = struct {
         if (self.pump_thread) |t| {
             t.join();
             self.pump_thread = null;
+        }
+        // Tail flush: the pump has stopped appending; cover anything whose
+        // async fsync had not completed, then stop the flusher. Acks for the
+        // tail never fire (the pump is gone) — in-flight proposes are
+        // faulted below, which is the existing unknown-outcome contract.
+        if (self.node.wal_flusher.started()) {
+            self.node.wal.flush() catch {};
+            self.node.wal_flusher.stop();
         }
         self.mutex.lock();
         defer self.mutex.unlock();

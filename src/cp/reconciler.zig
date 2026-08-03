@@ -44,7 +44,10 @@ pub fn reconcileMembership(router: anytype) void {
         defer res.deinit(a);
         const nodes = res.nodes;
         if (nodes.len == 0) continue;
-        const leader_url = move.findDestLeaderUrl(router, nodes, tenant) orelse continue;
+        const leader_url = move.findDestLeaderUrl(router, nodes, tenant) orelse {
+            std.log.debug("reconcile: no reachable leader for {s} this pass", .{tenant});
+            continue;
+        };
         defer a.free(leader_url);
         // One membership CHANGE per group per pass: a node that's already
         // good (.done) → check the next; a transient failure (.failed) →
@@ -150,6 +153,7 @@ fn ensureMember(router: anytype, tenant: []const u8, node_url: []const u8, node_
                 voter_recent_active = p.recent_active;
                 if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) {
                     clearDemoteTimer(router, tenant, node_id); // responsive + caught up → reset grace
+                    std.log.debug("reconcile observe {s} node={d}: caught-up voter (matched={d} leader_last={d} active={})", .{ tenant, node_id, p.matched, ms.leader_last, p.recent_active });
                     return .done;
                 }
                 break;
@@ -164,6 +168,20 @@ fn ensureMember(router: anytype, tenant: []const u8, node_url: []const u8, node_
     // rebooting/partitioned healthy voter gets torn out of the config (and a
     // rolling deploy makes voters transiently unreachable by design).
     const host = nodeGroupState(router, node_url, tenant);
+    // The reconciler's whole observation for this node, one debug line —
+    // the quiet no-action passes are exactly the ones a stuck heal needs
+    // explained (is the phantom read as a caught-up voter? host unknown?).
+    std.log.debug("reconcile observe {s} node={d}: voter={} learner={} active={} matched≈{} host={s}", .{
+        tenant,                    node_id,
+        is_voter,                  is_learner,
+        voter_recent_active,       blk: {
+            for (ms.peers) |p| {
+                if (p.id == node_id) break :blk p.matched + RECONCILE_SLACK >= ms.leader_last;
+            }
+            break :blk false;
+        },
+        @tagName(host),
+    });
     if (host == .unknown) return .failed; // can't observe → never mutate; retry next pass
 
     // RC-6 hysteresis bookkeeping: keep a demote grace timer ONLY while the

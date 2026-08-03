@@ -49,8 +49,16 @@ pub fn pumpLoop(self: anytype) void {
         last_cycle_end = std.time.nanoTimestamp();
         // Idle backoff: nothing to drain and nothing committed this
         // cycle. Single-node has no election/heartbeat traffic to
-        // service, so a short sleep is fine.
-        if (!did) std.Thread.sleep(1 * std.time.ns_per_ms);
+        // service, so a short sleep is fine — EXCEPT while an async WAL
+        // flush is outstanding: a commit is one `ackCovered` away the
+        // moment the fsync lands, and the full millisecond would dominate
+        // per-write latency (an fsync is typically a fraction of it). Poll
+        // finely instead until the awaiting list drains.
+        if (!did) {
+            const awaiting = self.node.wal_flusher.started() and
+                self.node.active_set.persist_ack.items.len > 0;
+            std.Thread.sleep(if (awaiting) 50 * std.time.ns_per_us else 1 * std.time.ns_per_ms);
+        }
     }
 }
 

@@ -53,6 +53,12 @@ pub const SlotHib = struct {
     /// buffered writes await the next fsync's `onPersist` ack), so the pump
     /// enqueues the slot at most once per ack round.
     in_persist_ack: bool = false,
+    /// The WAL-flusher request seq that covers this group's latest append
+    /// (async-fsync mode): `ackCovered` fires `onPersist` only once the
+    /// flusher's completed seq reaches it. Re-stamped on every appending
+    /// cycle, so an ack can never assert bytes a later append left
+    /// un-fsynced. Unused in the inline (test) flush path.
+    persist_seq: u64 = 0,
     /// Wall-clock at which this group was first observed leaderless (this node
     /// not the leader AND `leaderId == 0`) while in the active set; 0 while a
     /// leader is known. `escalateLeaderless` arms it and, once the group has
