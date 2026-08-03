@@ -48,12 +48,16 @@ NOT_SMOKES = {"smoke_lib.py", "smoke_lib_v2.py", "v2_topology.py", "run_all.py",
               "smoke_ports.py"}
 
 # Scripts that are deliberately not part of the suite. Each needs a REASON —
-# "it fails" is not one; that is what the report is for.
-EXCLUDED = {
-    # Standalone reproduction for an open bug: expected to fail until it is
-    # fixed, and a known-red member would train you to ignore the report.
-    "front_write_reaim_repro.py": "rove#353 repro — red by design until fixed",
-}
+# "it fails" is not one; that is what the report is for. (Currently empty:
+# front_write_reaim_repro.py graduated into the suite when rove#353's
+# leader-hint re-aim fix landed — it now guards that fix.)
+EXCLUDED: dict[str, str] = {}
+
+# A smoke that cannot run in this environment (e.g. no rewind-apps checkout)
+# exits with THIS code after printing why. The runner reports it as "skip" —
+# NOT as a pass: a baseline recorded in a stripped environment must not
+# silently bless members that never ran.
+SKIP_RC = 77
 
 # Known-red members that ARE in the suite, so the report keeps counting them.
 # Both are genuine product defects, not stale fixtures — which is why they stay
@@ -133,7 +137,8 @@ def run_one(p: Path, budget: int, log_dir: Path, slot: int | None) -> dict:
                                 start_new_session=True)
         try:
             rc = proc.wait(timeout=budget)
-            status = "pass" if rc == 0 else "fail"
+            status = ("pass" if rc == 0
+                      else "skip" if rc == SKIP_RC else "fail")
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -211,10 +216,19 @@ def main() -> int:
         with print_lock:
             done_count += 1
             results[p.name] = res
-            mark = {"pass": "ok  ", "fail": "FAIL", "timeout": "HUNG"}[res["status"]]
+            mark = {"pass": "ok  ", "fail": "FAIL", "timeout": "HUNG",
+                    "skip": "SKIP"}[res["status"]]
             print(f"  [{done_count:3d}/{len(smokes)}] {mark} {p.name}  "
                   f"({res['seconds']:.0f}s)", flush=True)
-            if res["status"] != "pass":
+            if res["status"] == "skip":
+                # Show the smoke's own one-line reason (it prints "SKIP — why"
+                # before exiting SKIP_RC).
+                log_path = log_dir / f"{p.stem}.log"
+                for ln in log_path.read_text(errors="replace").splitlines():
+                    if "SKIP" in ln:
+                        print(f"         | {ln.strip()[:150]}", flush=True)
+                        break
+            elif res["status"] != "pass":
                 # The first failing assertion is usually the whole story; show
                 # a little of it inline so the report is readable without
                 # opening logs.
@@ -264,7 +278,7 @@ def main() -> int:
         # break fails twice and stays red. Never applied to the serial tail:
         # its members' flakiness is exactly what they exist to measure.
         for p in pool_members:
-            if results[p.name]["status"] == "pass":
+            if results[p.name]["status"] in ("pass", "skip"):
                 continue
             first = results[p.name]
             # Keep the first failure's log — the retry would overwrite the
@@ -293,11 +307,14 @@ def main() -> int:
 
     elapsed = time.time() - started
     passed = [n for n, r in results.items() if r["status"] in ("pass", "flaky")]
-    failed = [n for n, r in results.items() if r["status"] not in ("pass", "flaky")]
+    skipped = [n for n, r in results.items() if r["status"] == "skip"]
+    failed = [n for n, r in results.items()
+              if r["status"] not in ("pass", "flaky", "skip")]
     flaky = [n for n, r in results.items() if r["status"] == "flaky"]
     print(f"\n{'=' * 62}")
-    print(f"{len(passed)}/{len(results)} passed in {elapsed / 60:.0f}m"
-          f"{f' ({len(flaky)} flaky)' if flaky else ''}")
+    print(f"{len(passed)}/{len(results) - len(skipped)} passed in {elapsed / 60:.0f}m"
+          f"{f' ({len(flaky)} flaky)' if flaky else ''}"
+          f"{f' ({len(skipped)} skipped)' if skipped else ''}")
 
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=2, sort_keys=True))
@@ -307,14 +324,24 @@ def main() -> int:
         base = json.loads(Path(args.baseline).read_text())
         ok_states = ("pass", "flaky")
         newly_broken = [n for n in failed if base.get(n, {}).get("status") in ok_states]
-        newly_fixed = [n for n in passed if base.get(n, {}).get("status") not in (None, *ok_states)]
+        newly_fixed = [n for n in passed
+                       if base.get(n, {}).get("status") not in (None, "skip", *ok_states)]
         still_broken = [n for n in failed if base.get(n, {}).get("status") not in (None, *ok_states)]
+        # A member that PASSED in the baseline but only SKIPPED now never ran —
+        # its coverage silently vanished (missing checkout / env). Warn loudly;
+        # it is an environment problem, not a product regression, so it does
+        # not fail the run.
+        newly_skipped = [n for n in skipped if base.get(n, {}).get("status") in ok_states]
         print(f"\nvs baseline: {len(newly_broken)} newly broken, "
-              f"{len(newly_fixed)} newly fixed, {len(still_broken)} still broken")
+              f"{len(newly_fixed)} newly fixed, {len(still_broken)} still broken"
+              f"{f', {len(newly_skipped)} NEWLY SKIPPED' if newly_skipped else ''}")
         for n in newly_broken:
             print(f"  REGRESSION {n}")
         for n in newly_fixed:
             print(f"  fixed      {n}")
+        for n in newly_skipped:
+            print(f"  SKIPPED    {n} — passed in the baseline but did not run; "
+                  f"this run proves less than the baseline did")
         # A regression fails the run even if the absolute count improved.
         return 1 if newly_broken else 0
 

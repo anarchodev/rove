@@ -1,47 +1,26 @@
 #!/usr/bin/env python3
-"""rove#353 repro + gate: a body-carrying WRITE through the front door can fail
-with 502 `write-ambiguous` when the front must re-aim off a 421.
-
-NOT wired into any suite — it is a standalone investigation tool, and it is
-EXPECTED to fail until the residual below is fixed. Keeping it out of the suites
-is deliberate: a flaky-red gate trains you to re-run instead of read.
-
-## What it does
+"""Front-door write re-aim gate (originated as the rove#353 repro): a
+body-carrying WRITE through the front door must survive a leader kill.
 
 Provisions a tenant, warms the front's leader cache, then KILLS the leader so
 leadership moves and the cache goes stale — the production condition, since a
 rolling restart does exactly that. Then it hammers a body-carrying POST and
-reports the status distribution.
+requires a clean status distribution: every write 2xx, zero 502
+`write-ambiguous`.
 
-A warm cache gives a clean 24/24; only the stale-cache burst fails. That is what
-identifies the trigger as the re-aim path rather than writes in general.
+The invariants this guards (both shipped for rove#353):
 
-## Fixed by this branch
+  * `handle421` aims the retry at the leader named by the `x-rewind-leader`
+    hint — not at `node_idx + 1`, which lands on another follower (another
+    421 → 503) or a downed node (dead leg → unretryable 502).
+  * A forward that dies before the request head was written to a live socket
+    (`head_sent = false` — e.g. a stale pooled leg to the new leader) is
+    retryable even for a non-idempotent write: the 421 proved nothing entered
+    the log, and nothing was sent on the dead leg. This is the nginx line —
+    only a failure AFTER the head went out is ambiguous.
 
-`handle421` learned the leader from the `x-rewind-leader` hint, cached it for
-FUTURE requests, and then re-aimed THIS one at `node_idx + 1` — another
-follower (another 421, ultimately a 503 once the list ran out) or a node that
-was down (a dead leg → an unretryable 502). It now aims at the hinted leader.
-That takes the failure rate from roughly 2-in-3 bursts to about 1-in-5.
-
-## Residual (still open)
-
-```
-forward … failed (conn_died=true, replayable=true, saw_421=true,
-                  body=75B, idempotent=false)
-```
-
-The front re-aims at the correct leader and the POOLED connection to it is
-already dead. The body is buffered and replayable and the 421 proved nothing
-entered the log at the first node — but `attemptFailed` is called with
-`head_sent` hardcoded `true`, so a non-idempotent flow can never be retried and
-the client gets a 502 for a write no node accepted.
-
-nginx draws this line differently: a failure at CONNECT time (nothing was sent)
-is retried even for a POST, and only a failure AFTER the request went out is
-treated as ambiguous. Closing this means the h2 client layer reporting whether
-the head was actually written to a live socket, so the stale-pooled-leg case
-becomes `head_sent = false` and retries safely.
+A warm cache passes trivially; only the stale-cache burst exercises the re-aim
+path, which is why the kill sits between the warm-up and the burst.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -112,16 +91,17 @@ def main() -> int:
         print(f"    new leader node index: {new_leader}")
         check("a new leader was elected", new_leader is not None, "none elected")
 
-        print(f"step 3c: {ATTEMPTS} POSTs against the STALE cache (the repro)")
+        print(f"step 3c: {ATTEMPTS} POSTs against the STALE cache (the re-aim burst)")
         codes = burst(ATTEMPTS)
         print(f"    status distribution: {codes}")
 
         print("step 4: what the front logged about the re-aims")
         c.dump_log("front", grep=["re-aim", "forward", "ambiguous", "no-leader"], tail=14)
-        # The bug: any non-200 for a write the leader would have accepted.
+        # The failure shape: any non-200 for a write the leader would have
+        # accepted (rove#353's 502 `write-ambiguous`).
         bad = {k: v for k, v in codes.items() if k != 200}
         check("every write through the front succeeded", not bad,
-              f"reproduced #353: {bad} of {ATTEMPTS}")
+              f"non-200s: {bad} of {ATTEMPTS}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

@@ -126,8 +126,9 @@ def main() -> int:
         check("wb/bigbody upstream ready + byte-exact",
               r.status == 200 and r.body == EXPECTED_CANCEL_UPSTREAM,
               f"status={r.status} len={len(r.body)}")
-        r = c.wait_for_handler("acme", "/", want_status=200, timeout_s=25.0)
-        check("acme reachable", r.status in (200, 404), f"got {r.status}")
+        r = c.wait_for_handler("acme", "/", want_status=200,
+                             want_body="acme hit count", timeout_s=25.0)
+        check("acme reachable", r.status == 200, f"got {r.status}")
         if failures:
             c.dump_node_log(grep=["deploy", "loader", "manifest", "404",
                                   "error", "warn"])
@@ -180,7 +181,7 @@ def main() -> int:
               f"status={r.status} len={len(r.body)}")
         # acme worker also still healthy.
         r = c.get("acme", "/")
-        check("acme worker still healthy", r.status in (200, 404),
+        check("acme worker still healthy", r.status == 200,
               f"got {r.status}")
         if failures:
             c.dump_node_log(grep=["spoolcancel", "boundproxy", "drip",

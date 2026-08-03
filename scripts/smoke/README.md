@@ -117,6 +117,14 @@ under suite load; usually reported FLKY, not fail). A `"flaky"` status in the
 JSON means failed in the pool, passed on the automatic solo retry — counted
 as passing by `--baseline`, printed distinctly so it stays visible.
 
+A smoke that cannot run in the current environment (no rewind-apps checkout,
+say) prints `SKIP — <why>` and exits **77** (`run_all.SKIP_RC`); the runner
+reports it as `skip`, never `pass`. A skip is invisible coverage, and the
+distinction matters most under `--baseline`: a member that passed in the
+baseline but only skipped now gets a loud NEWLY SKIPPED warning — the run
+proves less than the baseline did, usually because the environment is
+stripped, and a green summary must not paper over that.
+
 ## Writing one
 
 - Copy the shape of `ctl_smoke_v2.py` — it is the canonical example.
@@ -131,7 +139,12 @@ as passing by `--baseline`, printed distinctly so it stays visible.
   rather than assuming node 0 leads.
 - If a script is a reproduction for an open bug and is *meant* to be red, add it
   to `EXCLUDED` in `run_all.py` with the issue number. A permanently-red member
-  teaches people to ignore the report.
+  teaches people to ignore the report. When the bug is fixed, graduate the
+  script INTO the suite (rename `*_repro.py` → `*_smoke.py`) — an excluded
+  green repro is a regression gate nobody runs.
+- If a smoke needs something the environment may not have (a rewind-apps
+  checkout, a credential), print `SKIP — <why>` and exit 77 — never 0. Exit 0
+  records a pass for a smoke that never ran.
 - A smoke that legitimately runs long (the raft soak: 6 kill/wipe/heal rounds)
   needs an entry in `TIMEOUTS`, or it is reported HUNG and reads as a product
   hang rather than a slow test.
