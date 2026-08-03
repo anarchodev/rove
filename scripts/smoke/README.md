@@ -103,9 +103,9 @@ size there will usually be something red, and the question worth answering is
 a backlog item; a new one is a regression, and only the second should block you.
 
 `smoke-baseline.json` in this directory is the last recorded full run:
-**141/143 in 10m at `--jobs 8`** (25m of member-time). The two reds are both
-known-intermittent product defects, not stale fixtures: rove#374
-(`leader_failover`'s clean-single-re-election leg) and rove#377
+**141/143 in 10m at `--jobs 8`** (26m of member-time). The two reds are
+product defects, not stale fixtures: rove#361 (`tls_large_body`, concurrent
+large static downloads abort mid-stream — intermittent, ~1 in 2) and rove#377
 (`raft_soak_v2`'s spurious elections at the DEFAULT 1ms tick — the run that
 recorded this baseline was on btrfs, where the fsync tail exceeds the 1ms
 election budget; it may well be green on a different disk, which is the
@@ -118,14 +118,19 @@ floor** — halving the pool again would buy almost nothing. Cutting further
 means cutting what the soaks prove (`raft_soak_prod` honours
 `REWIND_SOAK_ROUNDS`, default 6), which is a deliberate trade, not a tidy-up.
 
-Four members are INTERMITTENT, so a run where one flips will read as a
+Three members are INTERMITTENT, so a run where one flips will read as a
 regression or a fix when it is neither — check the issue before believing
-either: rove#374 (`leader_failover`, ~2 in 5), rove#362 (`dispatch_gate`,
-~2 in 3 — green in the baseline run), rove#361 (`tls_large_body`, green in
-the baseline run), and `s3_blob_smoke_v2` (transient object-store 503s under
-suite load; usually reported FLKY, not fail). A `"flaky"` status in the JSON
-means failed in the pool, passed on the automatic solo retry — counted as
-passing by `--baseline`, printed distinctly so it stays visible.
+either: rove#361 (`tls_large_body`, ~1 in 2), rove#362 (`dispatch_gate`,
+~2 in 3 — green in the baseline run), and `s3_blob_smoke_v2` (transient
+object-store 503s under suite load; usually reported FLKY, not fail). A
+`"flaky"` status in the JSON means failed in the pool, passed on the
+automatic solo retry — counted as passing by `--baseline`, printed
+distinctly so it stays visible.
+
+`leader_failover`'s ~40% flake (rove#374) is FIXED — it was a test bug, not
+a product defect: `raft_leadership_acquisitions_total` is a NODE-WIDE counter
+summed over every raft group, and the smoke asserted a per-group property
+with it while the victim usually led two groups.
 
 A smoke that cannot run in the current environment (no rewind-apps checkout,
 say) prints `SKIP — <why>` and exits **77** (`run_all.SKIP_RC`); the runner
