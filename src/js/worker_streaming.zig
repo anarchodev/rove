@@ -2052,6 +2052,25 @@ pub fn proposeForgetfulWrites(
         stage_chunks.deinit(allocator);
     }
 
+    // Billing axis 1 — the same plan KV-cap gate `finalizeBatch` runs
+    // (`worker_mod.kvCapRefusal` holds the contract). A fire / stream
+    // resume / WS batch is a customer write path too; without this the
+    // cap would be bypassable from any wake-driven handler. Refusal
+    // drops the fire's writes (rollback, nothing proposed) — callers
+    // already treat a propose error as a dropped fire.
+    if (worker.node.tenant.getInstance(tenant_id) catch null) |inst| {
+        if (worker_mod.kvCapRefusal(worker, inst, txn.store, writeset)) |ref| {
+            _ = worker.node.kv_cap_refusals.fetchAdd(1, .monotonic);
+            std.log.warn(
+                "kv-cap: tenant={s} used={d} cap={d} — fire writes refused (delete data or upgrade)",
+                .{ tenant_id, ref.used, ref.cap },
+            );
+            txn.rollback() catch {};
+            allocator.destroy(txn);
+            return error.KvQuotaExceeded;
+        }
+    }
+
     txn.releaseLease();
     // Serialize the activation's readset (with the caller-supplied
     // LogHeader stamped into it) wrapped as the 1-item

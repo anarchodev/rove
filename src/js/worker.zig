@@ -905,6 +905,12 @@ pub const NodeState = struct {
     /// many customer requests ride one raft log entry".
     dispatch_writeset_size: kv_mod.CountHistogram = .{},
 
+    /// Write batches refused at the plan KV cap (billing axis 1 —
+    /// the `kvCapRefusal` gate). The count says "a tenant on this
+    /// node is bouncing off its ceiling"; the tenant, used and cap
+    /// figures are in the paired warn log line.
+    kv_cap_refusals: std.atomic.Value(u64) = .init(0),
+
     // Fetch events route through the unified `msg_inboxes` registry
     // above: `FetchEngine` calls `enqueueFetchEventForTenant`, which
     // builds the appropriate `effect.Msg` and routes through the same
@@ -3260,6 +3266,72 @@ pub fn getOrOpenTenantSlot(
     return worker.node.deploy.getOrOpenTenantSlot(inst);
 }
 
+/// A `kvCapRefusal` verdict: the batch must be refused with this
+/// used/cap pair (both in the 507 body and the log line).
+pub const KvCapRefusal = struct { used: u64, cap: u64 };
+
+/// TTL for the cached per-store usage figure the KV-cap gate reads.
+/// Bounds the gate's cost (one O(1) kvexp stat per tenant per TTL)
+/// and its staleness (a tenant can overshoot its cap by at most
+/// TTL × its own write throughput before the fresh figure bites).
+pub const KV_USAGE_TTL_MS: i64 = 2000;
+
+/// The per-tenant KV-cap gate — billing axis 1's enforcement point
+/// (the hard cap with throttle-to-upgrade semantics,
+/// `docs/strategy/pricing-model.md`): non-null when a finished
+/// batch's writes must be REFUSED instead of proposed, because the
+/// scope tenant sits over its plan's `max_kv_bytes` and the writeset
+/// grows the store (contains ≥1 put).
+///
+/// Runs once per batch AFTER the handler walk, never per `kv.set`:
+/// - A handler outcome must stay a pure function of its taped reads
+///   (replay determinism); a live size check inside the handler would
+///   be an untaped input. The refusal is therefore batch-level — the
+///   txn rolls back and the response is replaced with the 507
+///   disposition, the same posture as a platform-side raft fault.
+/// - Deletes stay allowed over cap (a delete-only writeset has no
+///   put): the recovery path out of an over-cap state is never
+///   blocked. Reads are untouched — the tenant stays fully readable.
+/// - Admin batches are exempt (`__admin__` anchor): platform
+///   machinery (provisioning, releases, root writes) must not wedge
+///   on a tenant quota; customer handlers are the surface being
+///   metered.
+///
+/// Fails OPEN on any plan/usage lookup error (the rate limiter's
+/// posture): a broken stat must not take a tenant's writes down. The
+/// node-safety backstop is `CLUSTER_MAP_SIZE`, not this gate.
+pub fn kvCapRefusal(
+    worker: anytype,
+    anchor: *const tenant_mod.Instance,
+    store: *kv_mod.KvStore,
+    writeset: *const kv_mod.WriteSet,
+) ?KvCapRefusal {
+    if (std.mem.eql(u8, anchor.id, tenant_mod.ADMIN_INSTANCE_ID)) return null;
+    if (!writesetGrowsStore(writeset)) return null;
+    const slot = getOrOpenTenantSlot(worker, anchor) catch |err| {
+        std.log.warn("kv-cap: slot({s}): {s} — fail open", .{ anchor.id, @errorName(err) });
+        return null;
+    };
+    const cap = slot.effectivePlan().max_kv_bytes;
+    const used = store.usageBytesCached(KV_USAGE_TTL_MS) catch |err| {
+        std.log.warn("kv-cap: usage({s}): {s} — fail open", .{ anchor.id, @errorName(err) });
+        return null;
+    };
+    if (used <= cap) return null;
+    return .{ .used = used, .cap = cap };
+}
+
+/// True iff the writeset contains at least one put. A delete-only
+/// writeset shrinks the store, so the KV-cap gate lets it through —
+/// deleting one's way back under the cap must always work.
+pub fn writesetGrowsStore(writeset: *const kv_mod.WriteSet) bool {
+    for (writeset.ops.items) |op| switch (op) {
+        .put => return true,
+        .delete => {},
+    };
+    return false;
+}
+
 // ── Per-tenant log loading ────────────────────────────────────────────
 //
 // These helpers live in `worker_log.zig`. Re-exported here so external
@@ -3518,6 +3590,17 @@ test "triggerPathToPrefix: single segment" {
 test "triggerPathToPrefix: nested segments" {
     try std.testing.expectEqualStrings("users/sessions/", deployment_cache.triggerPathToPrefix("_triggers/users/sessions/index.mjs").?);
     try std.testing.expectEqualStrings("a/b/c/d/", deployment_cache.triggerPathToPrefix("_triggers/a/b/c/d/index.mjs").?);
+}
+
+test "writesetGrowsStore: only puts grow; delete-only passes the cap gate" {
+    var ws = kv_mod.WriteSet.init(std.testing.allocator);
+    defer ws.deinit();
+    try std.testing.expect(!writesetGrowsStore(&ws)); // empty
+    try ws.addDelete("gone");
+    try ws.addDelete("also-gone");
+    try std.testing.expect(!writesetGrowsStore(&ws)); // delete-only = recovery path
+    try ws.addPut("k", "v");
+    try std.testing.expect(writesetGrowsStore(&ws));
 }
 
 test "triggerPathToPrefix: non-trigger paths return null" {

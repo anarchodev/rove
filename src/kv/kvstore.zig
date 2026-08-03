@@ -178,6 +178,19 @@ const StandaloneStack = struct {
 /// scratch-only consumers (bootstrap.zig, tests).
 const STANDALONE_MAP_SIZE: usize = 1 * 1024 * 1024 * 1024;
 
+/// LMDB mmap size for manifests that hold real cluster data — the
+/// node-wide `cluster.kv` (`openClusterOwned`) and any file a whole-
+/// manifest snapshot is replayed into (`writeManifestFile`). The map is
+/// virtual address space, not RAM or disk: only touched pages cost
+/// anything, so the figure is a ceiling to never hit, not a budget.
+/// It must sit with ample headroom above `N_tenants ×` the largest
+/// sellable per-tenant KV cap (`rove-plan`'s `max_kv_bytes`), because
+/// every tenant on the node shares this one env — the per-tenant cap is
+/// enforced at the write path (plan-derived, attributable), and this
+/// map exists so LMDB's own `MDB_MAP_FULL` cliff (unattributed,
+/// node-wide) can never bite first.
+pub const CLUSTER_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024;
+
 /// Reserved store_id for standalone-mode KvStores. The file holds
 /// exactly one store (this caller's data).
 const STANDALONE_STORE_ID: u64 = 1;
@@ -218,6 +231,12 @@ pub const KvStore = struct {
     /// effect: the kvexp dispatch lease guarantees one active txn
     /// per tenant at a time.
     active_txn: ?*TrackedTxn = null,
+    /// `usageBytesCached` TTL cache. Atomics because sibling worker
+    /// threads share one handle per instance; a racing refresh is
+    /// benign (both write a fresh figure). `at_ms == 0` = never
+    /// refreshed.
+    usage_cached_bytes: std.atomic.Value(u64) = .init(0),
+    usage_cached_at_ms: std.atomic.Value(i64) = .init(0),
 
     /// Open a standalone, self-contained KvStore against `path`. The
     /// file is created if missing; a single store (id =
@@ -264,6 +283,7 @@ pub const KvStore = struct {
             .read_write,
             null,
             hashStoreId(store_name),
+            CLUSTER_MAP_SIZE,
         );
         return handle;
     }
@@ -333,6 +353,8 @@ pub const KvStore = struct {
         self.store_id = store_id;
         self.owned = null;
         self.active_txn = null;
+        self.usage_cached_bytes = .init(0);
+        self.usage_cached_at_ms = .init(0);
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -351,7 +373,7 @@ pub const KvStore = struct {
         mode: OpenMode,
         shared_counter: ?*SeqCounter,
     ) Error!*KvStore {
-        return openStandaloneWithStoreId(allocator, path, mode, shared_counter, STANDALONE_STORE_ID);
+        return openStandaloneWithStoreId(allocator, path, mode, shared_counter, STANDALONE_STORE_ID, STANDALONE_MAP_SIZE);
     }
 
     /// Standalone open with caller-chosen store_id. Used by
@@ -365,6 +387,7 @@ pub const KvStore = struct {
         mode: OpenMode,
         shared_counter: ?*SeqCounter,
         store_id: u64,
+        map_size: usize,
     ) Error!*KvStore {
         const self = allocator.create(KvStore) catch return Error.OutOfMemory;
         errdefer allocator.destroy(self);
@@ -388,7 +411,7 @@ pub const KvStore = struct {
         errdefer allocator.free(path_owned);
         stack.path = path_owned;
         stack.manifest.init(allocator, path_owned, .{
-            .max_map_size = STANDALONE_MAP_SIZE,
+            .max_map_size = map_size,
         }) catch return Error.Sqlite;
         errdefer stack.manifest.deinit();
 
@@ -408,6 +431,8 @@ pub const KvStore = struct {
         self.store_id = store_id;
         self.owned = stack;
         self.active_txn = null;
+        self.usage_cached_bytes = .init(0);
+        self.usage_cached_at_ms = .init(0);
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -721,6 +746,35 @@ pub const KvStore = struct {
     /// the same node-wide totals.
     pub fn manifestMetricsSnapshot(self: *KvStore) kvexp.MetricsSnapshot {
         return self.manifest.metricsSnapshot();
+    }
+
+    /// This store's point-in-time size, split by residence (kvexp
+    /// `Manifest.storeUsage`): durable LMDB pages + committed overlay
+    /// bytes awaiting durabilize. O(1) — an `mdb_stat` of the store's
+    /// DBI plus an in-memory counter read; nothing is scanned.
+    pub fn usage(self: *KvStore) Error!kvexp.StoreUsage {
+        return self.manifest.storeUsage(self.store_id) catch Error.Sqlite;
+    }
+
+    /// Conservative total bytes this store occupies (durable +
+    /// committed overlay), cached for `ttl_ms`. The quota read for the
+    /// per-tenant KV cap: the write-path gate calls this once per
+    /// write batch, so the stat cost is bounded per tenant per TTL —
+    /// never per `kv.set`, and never an all-tenants sweep. Staleness
+    /// is bounded by the TTL: a tenant can overshoot its cap by at
+    /// most TTL × its own write throughput before the fresh figure
+    /// bites, which is the accepted trade for keeping the dispatch
+    /// path O(1) (the cap is a billing ceiling, not a safety limit —
+    /// the safety backstop is `CLUSTER_MAP_SIZE`).
+    pub fn usageBytesCached(self: *KvStore, ttl_ms: i64) Error!u64 {
+        const now = std.time.milliTimestamp();
+        const at = self.usage_cached_at_ms.load(.monotonic);
+        if (at != 0 and now -| at < ttl_ms) return self.usage_cached_bytes.load(.monotonic);
+        const u = try self.usage();
+        const total = u.durable_bytes + u.overlay_bytes;
+        self.usage_cached_bytes.store(total, .monotonic);
+        self.usage_cached_at_ms.store(now, .monotonic);
+        return total;
     }
 
     /// Force a durabilize. Only meaningful in standalone mode (the
@@ -1250,9 +1304,11 @@ fn writeManifestFile(
         std.fs.cwd().makePath(parent) catch return Error.Io;
     }
 
+    // Cluster-sized map: the replayed dump may be a whole node's
+    // `cluster.kv` (the raft snapshot transfer path).
     var target_manifest: kvexp.Manifest = undefined;
     target_manifest.init(allocator, target_path, .{
-        .max_map_size = STANDALONE_MAP_SIZE,
+        .max_map_size = CLUSTER_MAP_SIZE,
     }) catch return Error.Sqlite;
     defer target_manifest.deinit();
 
@@ -1489,6 +1545,51 @@ test "tracked txn savepoint + rollbackTo" {
         try testing.expectEqualStrings("first", v);
     }
     try txn.commit();
+}
+
+test "usage: bytes move overlay → durable across a checkpoint; cache honors TTL" {
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    // Fresh store: zero on both axes.
+    {
+        const u = try kv.usage();
+        try testing.expectEqual(@as(u64, 0), u.durable_bytes);
+        try testing.expectEqual(@as(u64, 0), u.overlay_bytes);
+    }
+
+    // Committed writes live in the overlay until a checkpoint.
+    const value = [_]u8{0xEE} ** 200;
+    try kv.put("usage-key", &value);
+    {
+        const u = try kv.usage();
+        try testing.expectEqual(@as(u64, "usage-key".len + value.len), u.overlay_bytes);
+        try testing.expectEqual(@as(u64, 0), u.durable_bytes);
+    }
+
+    // ttl=0 forces a refresh every call — the cached figure tracks live.
+    try testing.expectEqual(@as(u64, "usage-key".len + value.len), try kv.usageBytesCached(0));
+
+    // A long TTL pins the cached figure across subsequent writes.
+    try kv.put("usage-key-2", &value);
+    try testing.expectEqual(
+        @as(u64, "usage-key".len + value.len),
+        try kv.usageBytesCached(std.time.ms_per_hour),
+    );
+
+    // Checkpoint: bytes drain to LMDB pages; overlay empties, durable
+    // appears page-granular (> raw byte count).
+    try kv.checkpoint();
+    {
+        const u = try kv.usage();
+        try testing.expectEqual(@as(u64, 0), u.overlay_bytes);
+        try testing.expectEqual(@as(u64, 2), u.durable_entries);
+        try testing.expect(u.durable_bytes > 0);
+    }
 }
 
 test "attached vacuumInto round-trips data via standalone re-open" {

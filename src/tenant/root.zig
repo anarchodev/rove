@@ -134,6 +134,22 @@ pub const InstanceList = struct {
     }
 };
 
+pub const InstanceUsageEntry = struct {
+    id: []u8,
+    usage: kv_mod.StoreUsage,
+};
+
+pub const InstanceUsageList = struct {
+    entries: []InstanceUsageEntry,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *InstanceUsageList) void {
+        for (self.entries) |e| self.allocator.free(e.id);
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+};
+
 pub const DomainEntry = struct {
     host: []u8,
     instance_id: []u8,
@@ -567,6 +583,49 @@ pub const Tenant = struct {
         // never appear, but the guard keeps the slice tight).
         const final = if (filled == ids.len) ids else ids[0..filled];
         return .{ .ids = final, .allocator = self.allocator };
+    }
+
+    /// Per-instance KV usage across the MATERIALIZED instances — the
+    /// ones this process has opened a store handle for. Instances that
+    /// exist in the root store but have taken no traffic since boot are
+    /// absent (deliberate: a metrics scrape must not create worker-side
+    /// instances). Each figure is one O(1) kvexp `storeUsage`; the
+    /// whole walk runs under `maps_mutex` so a concurrent
+    /// `deleteInstance` can't close a store mid-read. Scrape-cadence
+    /// cost, never on the dispatch path.
+    pub fn listInstanceUsage(self: *Tenant) Error!InstanceUsageList {
+        self.maps_mutex.lock();
+        defer self.maps_mutex.unlock();
+
+        const n = self.instances.count();
+        const entries = self.allocator.alloc(InstanceUsageEntry, n) catch
+            return Error.OutOfMemory;
+        var filled: usize = 0;
+        errdefer {
+            for (entries[0..filled]) |e| self.allocator.free(e.id);
+            self.allocator.free(entries);
+        }
+
+        var it = self.instances.valueIterator();
+        while (it.next()) |inst_ptr| {
+            const inst = inst_ptr.*;
+            const usage = inst.kv.usage() catch |err| {
+                std.log.warn("tenant.listInstanceUsage({s}): {s} — skipped", .{ inst.id, @errorName(err) });
+                continue;
+            };
+            entries[filled] = .{
+                .id = self.allocator.dupe(u8, inst.id) catch return Error.OutOfMemory,
+                .usage = usage,
+            };
+            filled += 1;
+        }
+        // Shrink to the filled prefix so `deinit` frees the exact
+        // allocation (a skipped store leaves a gap).
+        const final = if (filled == n)
+            entries
+        else
+            self.allocator.realloc(entries, filled) catch entries[0..filled];
+        return .{ .entries = final, .allocator = self.allocator };
     }
 
     /// Enumerate domain → instance aliases (up to `max`). Values point

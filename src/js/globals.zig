@@ -1147,6 +1147,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
         .{ .name = "create", .cfunc = platform_bindings.jsPlatformInstancesCreate, .argc = 1 },
         .{ .name = "deployStarter", .cfunc = platform_bindings.jsPlatformInstancesDeployStarter, .argc = 1 },
+        .{ .name = "usage", .cfunc = platform_bindings.jsPlatformInstancesUsage, .argc = 1 },
     } },
     .{ .path = &.{ "_system", "platform", "releases" }, .fns = &.{
         .{ .name = "publish", .cfunc = platform_bindings.jsPlatformReleasesPublish, .argc = 2 },

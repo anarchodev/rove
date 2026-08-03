@@ -487,6 +487,48 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
     // convention (kvexp records nanoseconds internally; we convert).
     try writeKvexpMetrics(w, worker.node.tenant.root.manifestMetricsSnapshot());
 
+    // ── per-tenant KV footprint (billing axis 1, pricing-model §2) ────
+    //
+    // One gauge pair per MATERIALIZED instance (a scrape must not
+    // create worker-side instances, so dark tenants appear once they
+    // take traffic). `used` = durable LMDB pages + committed overlay
+    // bytes — the same conservative figure the write-path cap gate
+    // reads, so the dashboard, the operator, and the enforcement all
+    // agree on what "used" means. O(1) per instance (mdb_stat).
+    {
+        var ul = worker.node.tenant.listInstanceUsage() catch |err| blk: {
+            std.log.warn("metrics: listInstanceUsage: {s}", .{@errorName(err)});
+            break :blk tenant_mod.InstanceUsageList{ .entries = &.{}, .allocator = worker.allocator };
+        };
+        defer if (ul.entries.len > 0) ul.deinit();
+        try w.print(
+            \\# HELP kv_store_used_bytes per-instance KV footprint: durable LMDB pages + committed overlay bytes (the figure the plan cap is enforced against).
+            \\# TYPE kv_store_used_bytes gauge
+            \\
+        , .{});
+        for (ul.entries) |e| {
+            try w.print("kv_store_used_bytes{{instance=\"{s}\"}} {d}\n", .{
+                e.id, e.usage.durable_bytes + e.usage.overlay_bytes,
+            });
+        }
+        try w.print(
+            \\# HELP kv_store_durable_entries per-instance live key count in the durable store.
+            \\# TYPE kv_store_durable_entries gauge
+            \\
+        , .{});
+        for (ul.entries) |e| {
+            try w.print("kv_store_durable_entries{{instance=\"{s}\"}} {d}\n", .{
+                e.id, e.usage.durable_entries,
+            });
+        }
+        try w.print(
+            \\# HELP kv_cap_refusals_total write batches refused at the plan KV cap (tenant/figures in the paired kv-cap log line).
+            \\# TYPE kv_cap_refusals_total counter
+            \\kv_cap_refusals_total {d}
+            \\
+        , .{worker.node.kv_cap_refusals.load(.monotonic)});
+    }
+
     // ── propose-pipeline histograms ──────────────────────────────────
     //
     // Two questions the operator wants answered: are we time-capped

@@ -125,7 +125,7 @@ re-provision 409 / unknown-cluster 400).
   The resolved `PlanLimits` is cached on the tenant's `TenantSlot` with a
   **plan generation** counter, so dispatch reads a field, never a store (the
   no-`O(N_tenants)`-on-dispatch invariant).
-- **Enforcement (DP-local, three levers, all off `slot.effectivePlan()`)**:
+- **Enforcement (DP-local, four levers, all off `slot.effectivePlan()`)**:
   - **Lever 1 — rate** (`src/js/limiter.zig`): per-`(instance, action)` token buckets
     sourced per-instance from the cached tier; **generation-refresh** re-inits
     a stale bucket's caps at `getOrCreate`, so a paying customer's raise lands
@@ -141,6 +141,24 @@ re-provision 409 / unknown-cluster 400).
     downgrade *hides, never deletes*. The clamp is a **billing boundary, not a
     UI nicety** — it must hold server-side, or a direct query bypasses it.
     Real compacting GC is deferred until the storage cost matters.
+  - **Lever 4 — KV cap** (billing axis 1, `docs/strategy/pricing-model.md`):
+    a **batch-level write-path gate** (`worker.zig kvCapRefusal`, run from
+    `finalizeBatch` and the fire/stream propose) — when the scope tenant's
+    conservative usage figure (durable LMDB pages + committed overlay, kvexp
+    `storeUsage`, TTL-cached per store handle) exceeds `max_kv_bytes` and the
+    batch's writeset contains a put, the txn rolls back before the propose and
+    the response is replaced with a **non-retriable `507`** + a
+    `kv_quota_exceeded` JSON body naming used/cap. Hard cap with
+    throttle-to-upgrade semantics: never elastic billing, never eviction.
+    Deliberate carve-outs: **reads untouched, delete-only writesets pass**
+    (the recovery path out of over-cap is never blocked), admin batches
+    exempt, and the check is batch-level — never a mid-handler throw — so a
+    handler outcome stays a pure function of its taped reads (replay
+    determinism). Fails open on lookup errors; the node-safety backstop is
+    the shared env's `CLUSTER_MAP_SIZE` headroom, not this gate. Observability:
+    `kv_store_used_bytes{instance}` / `kv_store_durable_entries{instance}`
+    gauges, `kv_cap_refusals_total`, and `platform.instances.usage(name)` for
+    the dashboard — all reading the same figure the gate enforces.
 
 ## Zero-downtime move (the only move)
 

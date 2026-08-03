@@ -639,13 +639,15 @@ fn handlePlan(
             return reply(server, allocator, ent, sid, sess, 500, "slot open failed\n");
         const p = slot.effectivePlan();
         const gen = slot.plan_gen.load(.acquire);
-        const json = std.fmt.allocPrint(allocator, "{{\"request_capacity\":{d},\"request_refill_per_sec\":{d},\"outbound_capacity\":{d},\"outbound_refill_per_sec\":{d},\"max_body_bytes\":{d},\"retention_days\":{d},\"plan_gen\":{d}}}", .{
+        const json = std.fmt.allocPrint(allocator, "{{\"request_capacity\":{d},\"request_refill_per_sec\":{d},\"outbound_capacity\":{d},\"outbound_refill_per_sec\":{d},\"max_body_bytes\":{d},\"retention_days\":{d},\"max_kv_bytes\":{d},\"max_stored_bytes\":{d},\"plan_gen\":{d}}}", .{
             p.rate.request_capacity,
             p.rate.request_refill_per_sec,
             p.rate.outbound_capacity,
             p.rate.outbound_refill_per_sec,
             p.max_body_bytes,
             p.retention_days,
+            p.max_kv_bytes,
+            p.max_stored_bytes,
             gen,
         }) catch return reply(server, allocator, ent, sid, sess, 500, "encode failed\n");
         try respb.setSystemResponseOwned(server, ent, sid, sess, 200, json, allocator, null, "application/json");
