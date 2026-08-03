@@ -404,21 +404,24 @@ pub fn setSystemResponseOwned(
     try finalizeResponse(server, ent, sid, sess, status_code, resp_hdrs, body.ptr, @intCast(body.len));
 }
 
-/// 429 response with a `Retry-After: <sec>` header. Body text mentions
-/// the wait time so curl-style clients without header inspection still
-/// get the hint.
+/// 429 response with a `Retry-After: <sec>` header. Body text names WHICH
+/// budget was exhausted (`what`) plus the wait time — two different buckets
+/// answer 429 on this path (request rate, log-byte ingest) and a customer
+/// or operator debugging one must be able to tell them apart from the body
+/// alone; curl-style clients without header inspection still get the hint.
 pub fn setRateLimitedResponse(
     server: anytype,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
     allocator: std.mem.Allocator,
+    what: []const u8,
     retry_after_sec: u32,
 ) !void {
     const body = try std.fmt.allocPrint(
         allocator,
-        "rate limit exceeded, retry after {d}s\n",
-        .{retry_after_sec},
+        "{s}, retry after {d}s\n",
+        .{ what, retry_after_sec },
     );
     const ra_str = try std.fmt.allocPrint(allocator, "{d}", .{retry_after_sec});
     defer allocator.free(ra_str);

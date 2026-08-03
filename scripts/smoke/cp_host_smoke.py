@@ -74,8 +74,11 @@ def _curl(args):
         return (0, out[:nl])
 
 
-def set_host(host, tenant, secret=MOVE_SECRET):
-    body = json.dumps({"host": host, "tenant": tenant}, separators=(",", ":"))
+def set_host(host, tenant, secret=MOVE_SECRET, force=False):
+    doc = {"host": host, "tenant": tenant}
+    if force:
+        doc["force"] = True
+    body = json.dumps(doc, separators=(",", ":"))
     args = ["-X", "POST", f"http://127.0.0.1:{PCP}/_control/host",
             "-H", "Content-Type: application/json", "--data", body]
     if secret is not None:
@@ -154,9 +157,16 @@ def main():
         check("acme.com → cluster-1", (r or {}).get("cluster"), "cluster-1")
 
         # ── C. re-point to a tenant on another cluster ───────────────
-        print("leg C: re-point acme.com → globex (on cluster-2)")
+        # Host claims are first-claim-wins across tenants (the host-claim
+        # rules, docs/architecture/control-plane.md): a bare cross-tenant
+        # re-point refuses 409; the operator `force` override re-points.
+        print("leg C: re-point acme.com → globex (409 bare, then force)")
         st, _ = set_host("acme.com", "globex")
-        check("POST /_control/host re-point accepted", st in HOST_WRITE_OK, True)
+        check("bare cross-tenant re-point → 409 (first-claim-wins)", st, 409)
+        st, r = route("acme.com")
+        check("mapping unchanged after the 409", (r or {}).get("tenant"), "acme")
+        st, _ = set_host("acme.com", "globex", force=True)
+        check("POST /_control/host force re-point accepted", st in HOST_WRITE_OK, True)
         st, r = route("acme.com")
         check("acme.com now → cluster-2", (r or {}).get("cluster"), "cluster-2")
         check("acme.com now → tenant globex", (r or {}).get("tenant"), "globex")

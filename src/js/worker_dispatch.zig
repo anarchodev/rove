@@ -1747,7 +1747,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
-            try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
+            try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, "rate limit exceeded", retry_after);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
@@ -1765,7 +1765,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (!log_credit) {
             _ = worker.node.log_ingest_limited.fetchAdd(1, .monotonic);
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .log_bytes);
-            try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
+            try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, "log ingest budget exhausted", retry_after);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;

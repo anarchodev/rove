@@ -1165,7 +1165,19 @@ const Router = struct {
     /// Returns the refusal to send, or null when the claim is allowed.
     fn hostClaimViolation(self: *Router, host: []const u8, tenant: []const u8) ?HostClaimViolation {
         if (id_spec.wildcardLabel(host, self.public_suffix)) |label| {
-            if (!std.mem.eql(u8, label, tenant)) {
+            // The zone rule protects against CUSTOMER impersonation on our
+            // own zone. The platform singletons (`__admin__`, `__auth__`, …)
+            // ARE the platform — their serving hosts (`app.`, `auth.`, …)
+            // are deliberately not their tenant ids, and a customer can
+            // never provision a reserved id, so exempting them opens no
+            // spoof. First-claim-wins below still applies to them.
+            const is_reserved = blk: {
+                for (id_spec.RESERVED_INSTANCE_IDS) |r| {
+                    if (std.mem.eql(u8, tenant, r)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_reserved and !std.mem.eql(u8, label, tenant)) {
                 std.log.warn("rewind-cp: host claim refused — {s} is on the platform zone and not tenant {s}'s own label", .{ host, tenant });
                 return .{ .code = 403, .msg = "hosts on the platform domain are fixed to the tenant of the same name" };
             }
