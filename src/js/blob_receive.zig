@@ -250,7 +250,9 @@ pub const Job = struct {
         // at the socket, rather than on the upload thread: a client that
         // declares no content-length (or lies about it) is bounded only by
         // what it has actually sent, so the running total is the sole honest
-        // measure. Overshoot is one chunk.
+        // measure. The crossing chunk is refused rather than trimmed, so
+        // `received` never exceeds the ceiling and a refused upload stores
+        // nothing at all — the abort path drops the multipart.
         if (wouldExceedCeiling(self.received, bytes.len)) {
             self.allocator.free(copy);
             self.over_cap = true;
@@ -573,8 +575,8 @@ test "blob.receive: the ceiling admits exactly itself and nothing beyond" {
 }
 
 test "blob.receive: a chunk that crosses the ceiling is refused whole" {
-    // The stream is cut at the chunk that would cross, so the overshoot a
-    // quota built on this has to tolerate is one chunk, never a whole body.
+    // The crossing chunk is refused whole, not trimmed to fit: the ceiling is
+    // a limit on the object, and a truncated object is worse than no object.
     const just_under = MAX_RECEIVE_BYTES - 16;
     try testing.expect(!wouldExceedCeiling(just_under, 16));
     try testing.expect(wouldExceedCeiling(just_under, 17));
