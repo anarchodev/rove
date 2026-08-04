@@ -220,6 +220,20 @@ pub const PendingFetch = struct {
     /// COMPUTED at the handler-success seam (only `connection_scoped`
     /// on.fetch binds), not a JS keyword.
     bind: bool = false,
+    /// The CAS→connection relay (`docs/architecture/routing-and-ingress.md`):
+    /// when true AND the fetch is a bound streaming read of a
+    /// content-addressed door (`rove-static.internal`, or a
+    /// `rove-blob.internal` GET), the engine splices intermediate
+    /// chunk bytes straight onto the held stream — no per-chunk
+    /// activation, no per-chunk log record. Exactly two activations
+    /// remain: the first event (the decider — it commits the head +
+    /// `stream.start()`) and the terminal (the observer — existing
+    /// error handling applies). Ignored for any other fetch shape:
+    /// the engine must own BOTH ends (immutable hash-named source,
+    /// held connection sink) for the no-JS pump to be sound — a
+    /// customer URL would drag the SSRF gate / caps / redirect
+    /// policy into the pump (rove#441, option (a)).
+    relay: bool = false,
     /// Cross-worker held state
     /// (`docs/architecture/effects-and-handlers.md`): when the
     /// `webhook.send` JS shim issues an `http.fetch` to drive a

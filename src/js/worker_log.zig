@@ -365,6 +365,12 @@ pub const FetchEvent = struct {
     /// — a `{on}` override, or onFetchResult/Chunk/Done). Recorded so replay
     /// invokes the same export (`docs/architecture/replay-and-sim.md` §5 G3).
     export_name: []const u8 = "",
+    /// This chunk belongs to the engine's own static streamer, so its Msg is
+    /// recorded by reference rather than by value (rove#391).
+    static_serve: bool = false,
+    /// sha256 of the OBJECT this chunk is a slice of — identical on every
+    /// chunk of the fetch. The slice is `(byte_offset, body_ref.len)`.
+    content_hash: []const u8 = "",
 };
 
 /// Record a `fetch_chunk` activation's triggering event onto its readset's
@@ -382,18 +388,39 @@ pub fn captureFetchChunkTapes(
     ctx_body: []const u8,
     ev: FetchEvent,
 ) log_mod.TapePayloads {
-    const inline_ok = ev.bytes.len <= REQUEST_BODY_CAP;
+    // An engine static chunk records its Msg BY REFERENCE, not by value.
+    // `__system/static` streams a non-resident asset as a BOUND fetch, so its
+    // chunks resume through here rather than through
+    // `fireFetchEventActivation` — one record per chunk, each carrying the
+    // payload verbatim, which made S3 log volume track static egress ~1:1.
+    //
+    // Dropping the entry outright is NOT an option: L3 requires every
+    // `fetch_chunk` activation to record its Msg, and the guard below fails
+    // loud if one does not. A `{hash, len}` entry satisfies that — the Msg IS
+    // recorded, by a reference to immutable content-addressed bytes — while
+    // costing a digest instead of the asset.
+    const ref_only = ev.static_serve and ev.content_hash.len == 64;
+    const inline_ok = ev.bytes.len <= REQUEST_BODY_CAP and !ref_only;
     readset.fetch_responses.appendFetchResponse(
         ev.fetch_id,
         ev.seq,
         ev.byte_offset,
-        .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(if (inline_ok) ev.bytes.len else 0) },
+        // A ref-only entry MUST carry the slice length: the reconstruction key
+        // is (content_hash, byte_offset, len), and a zero length would leave
+        // replay deriving it from the NEXT chunk's offset — which the last
+        // chunk does not have.
+        .{
+            .batch_id = bodies_mod.NO_BATCH,
+            .offset = 0,
+            .len = @intCast(if (inline_ok or ref_only) ev.bytes.len else 0),
+        },
         ev.final,
         ev.terminal_status,
         ev.terminal_ok,
         ev.body_truncated,
         ev.headers,
         if (inline_ok) ev.bytes else "",
+        if (ref_only) ev.content_hash else "",
     ) catch |err| {
         std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
     };

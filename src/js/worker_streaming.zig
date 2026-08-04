@@ -48,6 +48,8 @@ const tape_mod = @import("rove-tape");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
+const msg_router_mod = @import("msg_router.zig");
+const spool_registry = @import("spool_registry.zig");
 const router_mod = @import("router.zig");
 const Request = dispatcher_mod.Request;
 const components_mod = @import("components.zig");
@@ -1332,7 +1334,9 @@ pub fn resumeBoundFetchStream(
         .terminal_status = if (ev.final) ev.terminal_status else 0,
         .terminal_ok = if (ev.final) ev.terminal_ok else false,
         .body_truncated = if (ev.final) ev.body_truncated else false,
-        .export_name = fn_name, // record the resolved export ({on} / onFetch*) — G3
+        .export_name = fn_name, // record the resolved export ({on} / onFetch*)
+        .static_serve = ev.static_serve,
+        .content_hash = if (ev.content_hash) |*h| h[0..] else "",
     };
     const req: Request = .{
         .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
@@ -2839,6 +2843,239 @@ pub fn drainSpools(worker: anytype) void {
     }
 }
 
+// ── CAS→connection relay drain ────────────────────────────────────────
+//
+// The worker half of the CAS→connection relay
+// (`docs/architecture/routing-and-ingress.md`, rove#441): the fetch
+// engine pushes intermediate byte runs of a relay-engaged bound fetch
+// onto this worker's `relay_inbox` (no Msg, no activation); each tick
+// moves them into per-fetch backlogs and appends them straight onto
+// the held entity's `StreamChunks`. The transfer's terminal event
+// rides the same FIFO and is re-injected into the NORMAL bound-fetch
+// dispatch once every byte before it has been appended — so exactly
+// one terminal activation observes the outcome, with the decider
+// module's existing error handling intact.
+
+/// Worker-tick system: ingest the relay inbox into per-fetch backlogs,
+/// then progress each backlog. Cheap no-op when no relay is active.
+pub fn drainRelay(worker: anytype) void {
+    const allocator = worker.allocator;
+
+    // 1) Inbox → per-fetch backlogs, preserving arrival order.
+    var incoming: std.ArrayListUnmanaged(msg_router_mod.RelayItem) = .empty;
+    defer incoming.deinit(allocator);
+    worker.relay_inbox.drainInto(allocator, &incoming);
+    for (incoming.items) |item_const| {
+        var item = item_const;
+        ingest: {
+            const gop = worker.spools.relay_backlogs.getOrPut(allocator, item.fetch_id) catch break :ingest;
+            if (!gop.found_existing) {
+                const bl = allocator.create(spool_registry.RelayBacklog) catch {
+                    _ = worker.spools.relay_backlogs.remove(item.fetch_id);
+                    break :ingest;
+                };
+                bl.* = .{};
+                const key_dup = allocator.dupe(u8, item.fetch_id) catch {
+                    allocator.destroy(bl);
+                    _ = worker.spools.relay_backlogs.remove(item.fetch_id);
+                    break :ingest;
+                };
+                gop.key_ptr.* = key_dup;
+                gop.value_ptr.* = bl;
+            }
+            gop.value_ptr.*.append(allocator, item) catch break :ingest;
+            continue;
+        }
+        // Ingest failure (OOM): the relay's byte stream now has a gap,
+        // so the ONLY sound outcome is killing the transfer — a later
+        // append would ship bytes with a hole under a committed 200
+        // (the truncated-asset failure). Cancel first (needs the id),
+        // drop whatever partial backlog exists, then free the item.
+        std.log.warn(
+            "rove-js relay: backlog ingest OOM fetch_id={s}; cancelling transfer",
+            .{item.fetch_id},
+        );
+        if (worker.node.fetch_engine) |fe| fe.cancel(item.fetch_id);
+        dropRelayBacklog(worker, item.fetch_id, false);
+        item.deinit(allocator);
+    }
+
+    if (worker.spools.relay_backlogs.count() == 0) return;
+
+    // 2) Progress each backlog. Snapshot duped keys — progress can
+    // drop entries (stale entity, terminal consumed), same shape as
+    // `drainSpools`.
+    var keys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+    var it = worker.spools.relay_backlogs.iterator();
+    while (it.next()) |entry| {
+        const kd = allocator.dupe(u8, entry.key_ptr.*) catch return;
+        keys.append(allocator, kd) catch {
+            allocator.free(kd);
+            return;
+        };
+    }
+    for (keys.items) |k| {
+        if (worker.spools.relay_backlogs.get(k) == null) continue;
+        progressRelayBacklog(worker, k);
+    }
+}
+
+/// Apply one backlog to its held entity: append byte runs while the
+/// stream is receivable and under the soft cap, consume-ack what was
+/// appended (the engine's pause window shrinks on the ack), and
+/// re-inject the terminal once the bytes are gone. Readiness mirrors
+/// `dispatchSpoolHead`: bytes only land on an entity in
+/// `stream_response_in`/`stream_data_out` — which the seq-0 decider
+/// activation put it in — so relayed bytes can never precede the
+/// committed response head.
+fn progressRelayBacklog(worker: anytype, fetch_id: []const u8) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    // Private key dupe: the terminal dispatch below can drop this
+    // backlog (and free the map's key) from under us — all map ops go
+    // by content against this stable copy.
+    const key: []u8 = blk: {
+        const e = worker.spools.relay_backlogs.getEntry(fetch_id) orelse return;
+        break :blk allocator.dupe(u8, e.key_ptr.*) catch return;
+    };
+    defer allocator.free(key);
+
+    const bl = worker.spools.relay_backlogs.get(key) orelse return;
+    if (bl.isEmpty()) return;
+
+    const held_ent = worker.lookupBoundFetch(key) orelse {
+        // Held chain gone (cancelled, already terminal, client left):
+        // these bytes have nowhere to go and never will. Drop + cancel
+        // (the cancel also unsticks a transfer paused on the window).
+        std.log.info(
+            "rove-js relay: no held entity for fetch_id={s}; dropping backlog",
+            .{key},
+        );
+        dropRelayBacklog(worker, key, true);
+        return;
+    };
+    if (server.reg.isStale(held_ent)) {
+        dropRelayBacklog(worker, key, true);
+        return;
+    }
+    if (server.reg.isMoving(held_ent)) return;
+
+    var appended: u64 = 0;
+    defer if (appended > 0) {
+        if (worker.node.fetch_engine) |fe| fe.ackRelay(key, appended);
+    };
+
+    while (true) {
+        const head = bl.headItem() orelse return;
+        switch (head.payload) {
+            .bytes => {
+                const in_out = server.reg.isInCollection(held_ent, &server.stream_data_out);
+                const in_resp = !in_out and server.reg.isInCollection(held_ent, &server.stream_response_in);
+                // Not in the stream pipeline yet: the decider (seq-0)
+                // activation hasn't run/committed. Stay backlogged;
+                // retry next tick. (A dead-end chain resolves via the
+                // stale/lookup gates above on a later tick.)
+                if (!in_out and !in_resp) return;
+                const chunks: *components_mod.StreamChunks = blk: {
+                    if (in_out) {
+                        if (server.reg.get(held_ent, &server.stream_data_out, components_mod.StreamChunks)) |p| break :blk p else |_| return;
+                    }
+                    if (server.reg.get(held_ent, &server.stream_response_in, components_mod.StreamChunks)) |p| break :blk p else |_| return;
+                };
+                // Lossless backpressure: don't feed a queue at the
+                // high-water; the backlog holds, the engine window
+                // paces upstream via CURL pause.
+                if (chunks.atSoftCap()) return;
+                const item = bl.popHead();
+                const blen = item.payload.bytes.len;
+                chunks.tryAppend(allocator, item.payload.bytes) catch |err| {
+                    // tryAppend freed the chunk. The byte stream now
+                    // has a gap — kill the relay rather than ever
+                    // shipping around it; drain-then-close what was
+                    // already queued.
+                    allocator.free(item.fetch_id);
+                    std.log.warn(
+                        "rove-js relay: tryAppend fetch_id={s}: {s}; aborting relay",
+                        .{ key, @errorName(err) },
+                    );
+                    markStreamDrainingAnywhere(server, held_ent);
+                    dropRelayBacklog(worker, key, true);
+                    return;
+                };
+                allocator.free(item.fetch_id);
+                appended += blen;
+            },
+            .terminal => {
+                // The terminal must not overtake the DECIDER: the
+                // first event rides the ordinary Msg lane, and for a
+                // small asset both are emitted in the same instant —
+                // un-gated, this lane's terminal would reach the spool
+                // first and close the chain empty before the decider
+                // ever ran. A relay-engaged transfer always has a
+                // first event (engage happens at the first writeback),
+                // and consuming it is what opens the stream — so
+                // stream membership is the "decider has run" signal,
+                // the same gate the bytes arm uses. A decider that
+                // went terminal instead tears the chain down
+                // (`scanAndCancelBoundFetches`), which drops this
+                // backlog rather than leaving it waiting.
+                if (!server.reg.isInCollection(held_ent, &server.stream_data_out) and
+                    !server.reg.isInCollection(held_ent, &server.stream_response_in))
+                    return;
+                // Every relayed byte before it has been appended (FIFO)
+                // — hand the terminal to the normal bound-fetch dispatch
+                // so exactly one activation observes the outcome.
+                const item = bl.popHead();
+                allocator.free(item.fetch_id);
+                var ev = item.payload.terminal;
+                // Destroy the (now empty) backlog BEFORE dispatching:
+                // the resume can re-enter relay cleanup
+                // (`scanAndCancelBoundFetches` on chain-terminal), and
+                // a live entry here would double-free.
+                dropRelayBacklog(worker, key, false);
+                blob_usage.recordFromEvent(worker, &ev);
+                if (worker.lookupBoundFetch(key) != null) {
+                    if (pushToSpool(worker, ev)) |_| {
+                        dispatchSpoolHead(worker, key);
+                    } else |err| {
+                        std.log.warn(
+                            "rove-js relay: terminal pushToSpool fetch_id={s}: {s}",
+                            .{ key, @errorName(err) },
+                        );
+                        components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
+                    }
+                } else {
+                    // Chain gone between the byte drain and the
+                    // terminal — nothing to resume.
+                    components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
+                }
+                return;
+            },
+        }
+    }
+}
+
+/// Remove + free one relay backlog (items included). Idempotent.
+/// `cancel_fetch` additionally cancels the engine transfer — required
+/// on every path that abandons undelivered bytes, both for
+/// correctness (no partial delivery may ever resume) and liveness (a
+/// transfer paused on the relay window is only unstuck by acks or
+/// cancel).
+pub fn dropRelayBacklog(worker: anytype, fetch_id: []const u8, cancel_fetch: bool) void {
+    const entry = worker.spools.relay_backlogs.fetchRemove(fetch_id) orelse return;
+    const bl = entry.value;
+    bl.deinit(worker.allocator);
+    worker.allocator.destroy(bl);
+    worker.allocator.free(entry.key);
+    if (cancel_fetch) {
+        if (worker.node.fetch_engine) |fe| fe.cancel(fetch_id);
+    }
+}
+
 /// Worker-tick system: dequeue Msgs from `worker.msg_queue` (up to
 /// `BATCH` per tick) and dispatch each by variant. Per-tick cap
 /// bounds tail latency on the request hot path: a misbehaving
@@ -3042,7 +3279,7 @@ pub fn flushResumeFetches(
         // the worker-local subsystem, never the engine — AFTER the bind
         // registration above so the door's completion event resumes THIS
         // held chain. `tryDoorFetch` consumes the fetch.
-        if (worker.tryDoorFetch(pf.*)) continue;
+        if (worker.tryDoorFetch(pf)) continue;
         submit.append(allocator, pf.*) catch {
             pf.deinit(allocator);
             continue;

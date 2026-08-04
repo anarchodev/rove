@@ -556,6 +556,36 @@ pub const UpstreamFetchEvent = struct {
     /// unresolved) stay inline.
     coord_submitted: bool = false,
 
+    /// This chunk belongs to an ENGINE-FIRED static serve (`__system/static`
+    /// streaming a non-resident asset out of `file-blobs/`), not to a
+    /// customer fetch.
+    ///
+    /// Such chunks are not recorded at all (rove#391). They are small, so
+    /// they rode the tape verbatim one record per chunk — which made S3 log
+    /// volume grow ~1:1 with static egress and billed the tenant's
+    /// log-ingest budget for serving traffic. Nothing is lost: the bytes are
+    /// immutable and content-addressed, and the record they would have made
+    /// replayable runs no customer code (see `Outcome.static_served`).
+    /// No allocation, so `deinitItem` skips it.
+    static_serve: bool = false,
+
+    /// sha256 hex of the OBJECT this chunk is a slice of, when that object is
+    /// already in content-addressed storage — a `blob.get` (`app-blobs/`) or
+    /// the static streamer (`file-blobs/`). Set on every event of such a
+    /// fetch, and identical across them: it names the object, NOT the chunk.
+    ///
+    /// The chunk is located within it by `(byte_offset, len)`, so the
+    /// reconstruction key is the triple. For a whole-object fetch the two
+    /// coincide, which is why a single-event `blob.get` can be read either
+    /// way — a streaming one cannot.
+    ///
+    /// The recorder uses it to reference the payload instead of copying it
+    /// (never tape blobs — rove#430): without it, a `blob.get` writes a
+    /// second permanent copy of the object, inline on the tape under 16 KiB
+    /// and into the un-evicted body pool above it. No allocation, so
+    /// `deinitItem` skips it.
+    content_hash: ?[64]u8 = null,
+
     /// Storage accounting (`src/kv/usage.zig`): the objects this transfer put
     /// into a tenant's customer-controlled pools. Empty on the overwhelming
     /// majority of events, which store nothing.

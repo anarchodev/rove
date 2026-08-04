@@ -111,7 +111,12 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// minimal kv read set + seed-not-draws). The parser accepts exactly this version and
 /// rejects anything else loudly — the version byte is a format guard,
 /// not a compatibility band; no older tapes need to remain readable.
-pub const VERSION: u16 = 5;
+/// v5 → v6: `fetch_responses` entries gained a trailing content-hash, so a
+/// chunk whose bytes already live in content-addressed storage can be
+/// REFERENCED rather than copied (never tape blobs — rove#430). Appended at
+/// the END of the entry, so nothing else moved and the reader's v5 branch is
+/// simply "no such field" (`src/replay/tape_decode.zig` `MIN_VERSION`).
+pub const VERSION: u16 = 6;
 
 /// Magic + version for the whole-Readset wire format used by
 /// `Readset.serialize` (readset replication, `docs/architecture/effects-and-handlers.md`).
@@ -339,6 +344,25 @@ pub const Entry = union(Channel) {
         /// `body_ref.len == inline_bytes.len`). Empty for the
         /// BodyRef-to-S3 path and for terminal-only events.
         inline_bytes: []const u8,
+        /// sha256 hex of the OBJECT this chunk is a slice of, when the bytes
+        /// were LEFT in content-addressed storage instead of copied here — a
+        /// `blob.get` (`app-blobs/`) or a static serve (`file-blobs/`).
+        /// Identical across every chunk of one fetch: it names the object, not
+        /// the chunk. The slice is `(byte_offset, body_ref.len)`, so the
+        /// reconstruction key is the TRIPLE, and `body_ref.len` is therefore
+        /// recorded on a referenced chunk even though no bytes ride here.
+        ///
+        /// Empty otherwise, and mutually exclusive with `inline_bytes`: a
+        /// chunk is carried OR referenced, never both.
+        ///
+        /// This is the "never tape blobs" entry shape (rove#430): the record
+        /// keeps everything that makes it an activation event (seq, final,
+        /// status) and drops only the payload, which is recoverable by hash.
+        /// Sound because `blob.*` has no delete verb — an object is immutable
+        /// for the tenant's lifetime — and #367 makes the door refuse a PUT
+        /// whose body does not hash to its key, so the hash provably names
+        /// those bytes.
+        content_hash: []const u8 = "",
     };
 
     /// One inbound request's body — either by-reference into the
@@ -536,15 +560,25 @@ pub const Tape = struct {
         body_truncated: bool,
         headers: []const u8,
         inline_bytes: []const u8,
+        /// Non-empty ⇒ the payload was left in content-addressed storage and
+        /// this names it; `inline_bytes` is then empty by construction.
+        content_hash: []const u8,
     ) !void {
         std.debug.assert(self.channel == .fetch_responses);
+        // Alternatives, never both: a chunk is carried or referenced. Both
+        // would be two records of the same bytes — the thing this field
+        // exists to stop.
+        std.debug.assert(content_hash.len == 0 or inline_bytes.len == 0);
         const fid_copy = try self.allocator.dupe(u8, fetch_id);
         errdefer self.allocator.free(fid_copy);
         const headers_copy = try self.allocator.dupe(u8, headers);
         errdefer self.allocator.free(headers_copy);
         const inline_copy = try self.allocator.dupe(u8, inline_bytes);
         errdefer self.allocator.free(inline_copy);
+        const hash_copy = try self.allocator.dupe(u8, content_hash);
+        errdefer self.allocator.free(hash_copy);
         try self.entries.append(self.allocator, .{ .fetch_responses = .{
+            .content_hash = hash_copy,
             .fetch_id = fid_copy,
             .seq = seq,
             .byte_offset = byte_offset,
@@ -556,7 +590,7 @@ pub const Tape = struct {
             .headers = headers_copy,
             .inline_bytes = inline_copy,
         } });
-        self.owned_bytes += fid_copy.len + headers_copy.len + inline_copy.len;
+        self.owned_bytes += fid_copy.len + headers_copy.len + inline_copy.len + hash_copy.len;
     }
 
     /// Append one inbound trigger payload entry. The channel
@@ -1261,6 +1295,9 @@ fn encodeEntry(
             try buf.append(allocator, @intFromBool(f.body_truncated));
             try appendLenPrefixed(allocator, buf, f.headers);
             try appendLenPrefixed(allocator, buf, f.inline_bytes);
+            // v6 trailing field — see `VERSION`. Appended LAST so the older
+            // layout is a strict prefix of this one.
+            try appendLenPrefixed(allocator, buf, f.content_hash);
         },
         .trigger_payload => |t| {
             // BodyRef: batch_id (u64), offset (u64), len (u32).
@@ -1359,8 +1396,15 @@ fn decodeEntry(
             cur += 1;
             const headers = try readLenPrefixed(bytes, &cur);
             const inline_bytes = try readLenPrefixed(bytes, &cur);
+            // v6 trailing content hash. Tolerated-absent so this decoder
+            // reads a v5 entry too — the whole point of appending it last.
+            const content_hash: []const u8 = if (cur < bytes.len)
+                try readLenPrefixed(bytes, &cur)
+            else
+                "";
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .fetch_responses = .{
+                .content_hash = content_hash,
                 .fetch_id = fid,
                 .seq = seq,
                 .byte_offset = byte_offset,
@@ -1544,6 +1588,7 @@ test "readset: serialize + parseReadset roundtrip" {
         true,
         false,
         "{}",
+        "",
         "",
     );
     try rs.trigger_payload.appendTriggerPayload(
@@ -1909,6 +1954,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         false,
         "{\"content-type\":\"application/json\"}",
         "",
+        "",
     );
     // Mid-stream chunk: no headers, BodyRef path.
     try tape.appendFetchResponse(
@@ -1922,6 +1968,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         false,
         "",
         "",
+        "",
     );
     // Terminal: empty body, status + ok set.
     try tape.appendFetchResponse(
@@ -1933,6 +1980,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         200,
         true,
         false,
+        "",
         "",
         "",
     );
@@ -1984,6 +2032,7 @@ test "fetch_responses tape: inline small-chunk roundtrip" {
         false,
         "{\"content-type\":\"application/json\"}",
         chunk,
+        "",
     );
     const bytes = try tape.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -2139,8 +2188,12 @@ test "cross-decoder: fetch_responses channel reads back via tape_decode" {
     var tape = Tape.init(a, .fetch_responses);
     defer tape.deinit();
     // Seq-0 inline chunk with headers; then a BodyRef terminal.
-    try tape.appendFetchResponse("ftch_1", 0, 0, .{ .batch_id = 0, .offset = 0, .len = 4 }, false, 0, false, false, "{\"content-type\":\"text/plain\"}", "body");
-    try tape.appendFetchResponse("ftch_1", 1, 4, .{ .batch_id = 7, .offset = 100, .len = 256 }, true, 200, true, false, "", "");
+    try tape.appendFetchResponse("ftch_1", 0, 0, .{ .batch_id = 0, .offset = 0, .len = 4 }, false, 0, false, false, "{\"content-type\":\"text/plain\"}", "body",
+        "",
+);
+    try tape.appendFetchResponse("ftch_1", 1, 4, .{ .batch_id = 7, .offset = 100, .len = 256 }, true, 200, true, false, "", "",
+        "",
+);
     const bytes = try tape.serialize(a);
     defer a.free(bytes);
 
