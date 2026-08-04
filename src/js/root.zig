@@ -160,6 +160,7 @@ test {
     _ = @import("bindings/stream.zig");
     _ = @import("bindings/textcodec.zig");
     _ = @import("blob_sessions.zig");
+    _ = @import("kv_export.zig");
     _ = @import("builtin_modules.zig");
     _ = @import("bytecode_cache.zig");
     _ = @import("deployment_cache.zig");
