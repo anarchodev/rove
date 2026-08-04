@@ -757,7 +757,16 @@ pub fn fireFetchEventActivation(
             // BodyRef.
         }
     }
-    p.readset.fetch_responses.appendFetchResponse(
+    // An engine-fired static chunk records no BYTES (rove#391). These chunks
+    // are small, so one record per chunk rode the tape verbatim and S3 log
+    // volume tracked static egress ~1:1 — the tenant paying its log-ingest
+    // budget to SERVE. Nothing a replay could use is lost: the bytes are
+    // immutable and content-addressed, and the inbound record they belong to
+    // runs no customer code (`Outcome.static_served`).
+    //
+    // The activation still FIRES — only the recording is skipped. Returning
+    // here instead would stop the streamer mid-asset.
+    if (!event.static_serve) p.readset.fetch_responses.appendFetchResponse(
         event.fetch_id,
         event.seq,
         event.byte_offset,
@@ -784,12 +793,28 @@ pub fn fireFetchEventActivation(
     // `runFire` captures them on every log record (`spec.tape = .activation`) so
     // replay reconstitutes the same handler invocation from the same
     // captured bytes.
-    runFire(worker, &p, req, .{
-        .act = .fetch_chunk,
-        .site = "fetch-event",
-        .on_cont = .enqueue,
-        .on_stream = .warn,
-        .readonly_cont_commits = true,
-        .tape = .activation,
-    }, module_path, corr_full, module_path, event.bytes);
+    // `activation_bytes` is the SECOND copy of a chunk's payload — the
+    // `fetch_responses` entry above is the first — so an engine static chunk
+    // has to skip both, or the 1:1 growth this fixes just moves channels.
+    // `spec.tape` is comptime, so the choice is two specialised calls rather
+    // than a runtime flag.
+    if (event.static_serve) {
+        runFire(worker, &p, req, .{
+            .act = .fetch_chunk,
+            .site = "fetch-event",
+            .on_cont = .enqueue,
+            .on_stream = .warn,
+            .readonly_cont_commits = true,
+            .tape = .none,
+        }, module_path, corr_full, module_path, "");
+    } else {
+        runFire(worker, &p, req, .{
+            .act = .fetch_chunk,
+            .site = "fetch-event",
+            .on_cont = .enqueue,
+            .on_stream = .warn,
+            .readonly_cont_commits = true,
+            .tape = .activation,
+        }, module_path, corr_full, module_path, event.bytes);
+    }
 }

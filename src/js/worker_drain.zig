@@ -2345,6 +2345,8 @@ pub fn resumeBoundFetchChain(
         .terminal_ok = ev.terminal_ok,
         .body_truncated = ev.body_truncated,
         .export_name = fn_name, // record the resolved export ({on} / onFetch*)
+        .static_serve = ev.static_serve,
+        .content_hash = if (ev.content_hash) |*h| h[0..] else "",
     };
     const req: Request = .{
         .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, cont_path),

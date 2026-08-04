@@ -86,9 +86,11 @@ pub const FetchResponseEntry = struct {
     body_truncated: bool,
     headers: []const u8,
     inline_bytes: []const u8,
-    /// sha256 hex of the chunk's bytes when they were LEFT in
-    /// content-addressed storage rather than copied onto the tape — a
-    /// `blob.get` result, whose object already lives at `app-blobs/{hash}`
+    /// sha256 hex of the OBJECT this chunk is a slice of, when the bytes were
+    /// LEFT in content-addressed storage rather than copied onto the tape — a
+    /// `blob.get` (`app-blobs/`) or a static serve (`file-blobs/`). Identical
+    /// across the fetch's chunks; resolve a chunk as
+    /// `(content_hash, byte_offset, len)`
     /// and is immutable (`blob.*` has no delete) and hash-verified on the
     /// way in (#367). Empty when the bytes rode inline or spilled to the
     /// body pool, and always empty on a v5 tape.
