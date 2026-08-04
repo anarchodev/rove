@@ -4352,6 +4352,142 @@ const PlatformFixture = struct {
     }
 };
 
+/// Find the taped kv entry for `key`, or null. Cross-store reads ride the kv
+/// channel under `__rove_store/{tag}/` (globals_platform.zig).
+fn tapedKv(rs: *tape_mod.Readset, key: []const u8) ?tape_mod.Entry.KvEntry {
+    for (rs.kv.entries.items) |e| {
+        if (std.mem.eql(u8, e.kv.key, key)) return e.kv;
+    }
+    return null;
+}
+
+test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed by store" {
+    // #410: a cross-store read returns data to the handler, so it is an input
+    // and must be recorded — the first input class that leaves the activation's
+    // own tenant. The kv channel is tenant-implicit, so the STORE rides as a
+    // key prefix, in the layout the offline facade already resolves against.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    try pf.tenant.createInstance("acme");
+    try pf.tenant.root.put("account/acme", "ROOTVAL");
+    const inst = (try pf.tenant.getInstance("acme")).?;
+    try inst.kv.put("profile", "SCOPEDVAL");
+    try inst.kv.put("p/1", "one");
+
+    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs.deinit();
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const s = platform.scope("acme");
+        \\return [
+        \\  platform.root.get("account/acme"),
+        \\  s.kv.get("profile"),
+        \\  s.kv.prefix("p/", null, 10).map((e) => e.key + "=" + e.value).join(","),
+        \\  String(platform.root.get("account/ghost")),
+        \\].join("|");
+    ,
+        .{
+            .method = "GET",
+            .path = "/",
+            .trace = .{ .readset = &rs },
+            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    // The handler still sees exactly what it saw before — taping is additive.
+    try testing.expectEqualStrings("ROOTVAL|SCOPEDVAL|p/1=one|null", resp.body);
+
+    // Root read → the `r` namespace.
+    const root_hit = tapedKv(&rs, "__rove_store/r/account/acme") orelse
+        return error.RootReadNotTaped;
+    try testing.expectEqual(tape_mod.KvOp.get, root_hit.op);
+    try testing.expectEqual(tape_mod.KvOutcome.ok, root_hit.outcome);
+    try testing.expectEqualStrings("ROOTVAL", root_hit.value);
+
+    // Scoped read → the `i/{id}` namespace, so two instances can't collide.
+    const scoped_hit = tapedKv(&rs, "__rove_store/i/acme/profile") orelse
+        return error.ScopedReadNotTaped;
+    try testing.expectEqualStrings("SCOPEDVAL", scoped_hit.value);
+
+    // A not_found is recorded as such — replay must reproduce the null, or a
+    // handler's `if (!x)` branch diverges.
+    const missing = tapedKv(&rs, "__rove_store/r/account/ghost") orelse
+        return error.MissingReadNotTaped;
+    try testing.expectEqual(tape_mod.KvOutcome.not_found, missing.outcome);
+
+    // The prefix scan records the namespaced prefix AND namespaced row keys —
+    // the row keys are what seed the transcoded world's map, so an un-namespaced
+    // row would land in the TENANT's keyspace offline.
+    const scan = tapedKv(&rs, "__rove_store/i/acme/p/") orelse
+        return error.ScopedPrefixNotTaped;
+    try testing.expectEqual(tape_mod.KvOp.prefix, scan.op);
+    try testing.expectEqual(@as(usize, 1), scan.results.len);
+    try testing.expectEqualStrings("__rove_store/i/acme/p/1", scan.results[0].key);
+    try testing.expectEqualStrings("one", scan.results[0].value);
+
+    // Nothing leaked into the tenant's own keyspace: every entry is namespaced.
+    for (rs.kv.entries.items) |e| {
+        try testing.expect(std.mem.startsWith(u8, e.kv.key, "__rove_store/"));
+    }
+}
+
+test "dispatch: a root read-your-write stays off the tape (minimal readset)" {
+    // Mirrors the `globals_kv.zig` skip_tape rule: a key this activation wrote
+    // is reproduced offline by re-running the write into the same namespace, so
+    // it carries no replay information. Keeping it out also keeps the readset
+    // disjoint from the writeset.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    try pf.tenant.root.put("seen/by/nobody", "PRE");
+
+    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs.deinit();
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\platform.root.set("mine", "WROTE");
+        \\return platform.root.get("mine") + "|" + platform.root.get("seen/by/nobody");
+    ,
+        .{
+            .method = "GET",
+            .path = "/",
+            .trace = .{ .readset = &rs },
+            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("WROTE|PRE", resp.body);
+
+    // The read-your-write is absent; the foreign read is present.
+    try testing.expect(tapedKv(&rs, "__rove_store/r/mine") == null);
+    try testing.expect(tapedKv(&rs, "__rove_store/r/seen/by/nobody") != null);
+}
+
 test "dispatch: platform.instances.create creates instance and mirrors to root_writeset" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

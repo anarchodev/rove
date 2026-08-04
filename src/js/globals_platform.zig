@@ -15,6 +15,7 @@
 const std = @import("std");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
+const tape_mod = @import("rove-tape");
 const rove = @import("rove");
 const reserved = @import("reserved.zig");
 
@@ -35,6 +36,114 @@ const kvSizeViolation = globals_mod.kvSizeViolation;
 const throwKvTooLarge = globals_mod.throwKvTooLarge;
 const throwReservedKey = globals_mod.throwReservedKey;
 const KvSizeViolation = globals_mod.KvSizeViolation;
+
+// ── cross-store read taping ───────────────────────────────────────
+//
+// A `platform.root.get` / `platform.scope(id).kv.get` returns data to the
+// handler, so it is an INPUT under the determinism boundary
+// (`docs/effect-algebra.md`) and must be recorded or the activation can't be
+// replayed. It is the first input class that leaves the activation's own
+// tenant: a **cross-raft-group read**. The kv tape channel is tenant-implicit,
+// so the store rides as a **key prefix** —
+// `__rove_store/r/{key}` for the platform root store, `__rove_store/i/{id}/{key}`
+// for another instance's — the same layout the offline facade already resolves
+// against (`src/replay/js/system_recorders.js`, `src/replay/rewind_test.mjs`).
+//
+// Carrying the store as a prefix rather than a new wire field keeps
+// `READSET_VERSION` at 7 (no format change), and the namespace is unforgeable
+// for free: `__rove_store/` leads with `_`, and customer writes to `_`-leading
+// keys outside the shim allowlist are rejected (`reserved.zig`).
+//
+// The readset rides the raft entry for the TAPE, not the store
+// (`consensus/node_pump.zig` — the frame is stripped before apply), so a
+// foreign-store key here can never reach a store it doesn't belong to.
+
+/// Namespace every cross-store tape key lives under. Must match the offline
+/// facade's `NS_STORE` (`src/replay/js/system_recorders.js`).
+pub const STORE_NS = "__rove_store/";
+
+/// `__rove_store/{tag}/{key}` — the tape spelling of a read against another
+/// store. `tag` is `r` (platform root) or `i/{instance_id}`. Caller frees.
+fn namespacedKey(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    key: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, STORE_NS ++ "{s}/{s}", .{ tag, key });
+}
+
+/// Record a cross-store `get` onto the kv channel under `tag`'s namespace.
+/// Best-effort: a tape failure must never fail the handler's read (the same
+/// posture as `globals_kv.zig`), but it IS a replay hole, so it logs.
+fn tapeStoreGet(
+    state: *DispatchState,
+    tag: []const u8,
+    key: []const u8,
+    value: []const u8,
+    outcome: tape_mod.KvOutcome,
+) void {
+    const rs = state.readset orelse return;
+    const nk = namespacedKey(state.allocator, tag, key) catch |err| {
+        std.log.warn("rove-js platform read tape: key {s}/{s}: {s}", .{ tag, key, @errorName(err) });
+        return;
+    };
+    defer state.allocator.free(nk);
+    rs.kv.appendKv(.get, nk, value, outcome) catch |err| {
+        std.log.warn("rove-js platform read tape: append {s}: {s}", .{ nk, @errorName(err) });
+    };
+}
+
+/// Record a cross-store `prefix` scan. Both the scanned prefix AND every
+/// returned row key are namespaced, so the transcoded world's kv map is keyed
+/// exactly the way the offline facade scans it (it re-prefixes, then strips).
+fn tapeStorePrefix(
+    state: *DispatchState,
+    tag: []const u8,
+    prefix: []const u8,
+    cursor: []const u8,
+    limit: u32,
+    entries: anytype,
+    outcome: tape_mod.KvOutcome,
+) void {
+    const rs = state.readset orelse return;
+    const a = state.allocator;
+    const np = namespacedKey(a, tag, prefix) catch |err| {
+        std.log.warn("rove-js platform read tape: prefix {s}/{s}: {s}", .{ tag, prefix, @errorName(err) });
+        return;
+    };
+    defer a.free(np);
+
+    if (outcome != .ok) {
+        rs.kv.appendKvPrefix(np, cursor, limit, &.{}, outcome) catch {};
+        return;
+    }
+
+    // `appendKvPrefix` dups everything into tape storage, so these namespaced
+    // keys only need to outlive the call.
+    const pairs = a.alloc(tape_mod.KvPair, entries.len) catch |err| {
+        std.log.warn("rove-js platform read tape: prefix rows: {s}", .{@errorName(err)});
+        return;
+    };
+    defer a.free(pairs);
+    var built: usize = 0;
+    defer for (pairs[0..built]) |p| a.free(@constCast(p.key));
+    for (entries, 0..) |e, i| {
+        const rk = namespacedKey(a, tag, e.key) catch |err| {
+            std.log.warn("rove-js platform read tape: row key: {s}", .{@errorName(err)});
+            return;
+        };
+        pairs[i] = .{ .key = rk, .value = e.value };
+        built = i + 1;
+    }
+    rs.kv.appendKvPrefix(np, cursor, limit, pairs[0..built], .ok) catch |err| {
+        std.log.warn("rove-js platform read tape: append prefix {s}: {s}", .{ np, @errorName(err) });
+    };
+}
+
+/// The `i/{instance_id}` tape tag for a scoped read. Caller frees.
+fn scopeTag(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "i/{s}", .{id});
+}
 
 // ── platform.root.* (admin singleton only) ────────────────────────
 //
@@ -63,14 +172,25 @@ pub fn jsPlatformRootGet(
     const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key);
 
+    // Read-your-write minimality, mirroring `globals_kv.zig`: a key this
+    // activation already wrote to the root store is reproduced offline by
+    // re-running the write into the same namespace, so it carries no replay
+    // information and stays off the tape.
+    const skip_tape = if (state.root_writeset) |ws| ws.containsKey(key) else false;
+
     const value = tenant.root.get(key) catch |err| switch (err) {
-        error.NotFound => return js_null,
+        error.NotFound => {
+            if (!skip_tape) tapeStoreGet(state, "r", key, "", .not_found);
+            return js_null;
+        },
         else => {
             state.pending_kv_error = err;
+            if (!skip_tape) tapeStoreGet(state, "r", key, "", .err);
             return js_null;
         },
     };
     defer state.allocator.free(value);
+    if (!skip_tape) tapeStoreGet(state, "r", key, value, .ok);
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
@@ -176,9 +296,13 @@ pub fn jsPlatformRootPrefix(
 
     var scan = tenant.root.prefix(prefix_str, cursor_str, limit) catch |err| {
         state.pending_kv_error = err;
+        // Tape the failure too: replay must surface the same null so a
+        // defensive `if (page === null)` branch can't diverge.
+        tapeStorePrefix(state, "r", prefix_str, cursor_str, limit, &.{}, .err);
         return js_null;
     };
     defer scan.deinit();
+    tapeStorePrefix(state, "r", prefix_str, cursor_str, limit, scan.entries, .ok);
 
     const arr = c.JS_NewArray(ctx);
     for (scan.entries, 0..) |e, i| {
@@ -581,14 +705,22 @@ fn jsScopeKvGet(
     const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key);
 
+    const tag = scopeTag(state.allocator, id) catch return js_exception;
+    defer state.allocator.free(tag);
+
     const value = inst.kv.get(key) catch |err| switch (err) {
-        error.NotFound => return js_null,
+        error.NotFound => {
+            tapeStoreGet(state, tag, key, "", .not_found);
+            return js_null;
+        },
         else => {
             state.pending_kv_error = err;
+            tapeStoreGet(state, tag, key, "", .err);
             return js_null;
         },
     };
     defer state.allocator.free(value);
+    tapeStoreGet(state, tag, key, value, .ok);
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
@@ -621,11 +753,16 @@ fn jsScopeKvPrefix(
         break :blk @min(@as(u32, @intCast(n)), SCOPE_PREFIX_MAX);
     } else SCOPE_PREFIX_DEFAULT;
 
+    const tag = scopeTag(state.allocator, id) catch return js_exception;
+    defer state.allocator.free(tag);
+
     var scan = inst.kv.prefix(prefix_str, cursor_str, limit) catch |err| {
         state.pending_kv_error = err;
+        tapeStorePrefix(state, tag, prefix_str, cursor_str, limit, &.{}, .err);
         return js_null;
     };
     defer scan.deinit();
+    tapeStorePrefix(state, tag, prefix_str, cursor_str, limit, scan.entries, .ok);
 
     const arr = c.JS_NewArray(ctx);
     for (scan.entries, 0..) |e, i| {
