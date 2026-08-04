@@ -1272,6 +1272,7 @@ pub fn H2(comptime opts: Options) type {
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
 
             _ = c.nghttp2_session_set_stream_user_data(session, frame.*.hd.stream_id, @ptrCast(stream));
+            if (getConn(nctx.h2, nctx.conn_entity)) |cp| cp.open_streams += 1;
             return 0;
         }
 
@@ -1574,6 +1575,10 @@ pub fn H2(comptime opts: Options) type {
 
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
+
+            // Pairs with the increment where this stream's user data was
+            // attached; nghttp2 fires this exactly once per opened stream.
+            if (getConn(nctx.h2, nctx.conn_entity)) |cp| cp.open_streams -|= 1;
 
             // headers_first: bytes held un-consumed on a stream that
             // dies still occupy the CONNECTION window (the stream
@@ -1955,6 +1960,10 @@ pub fn H2(comptime opts: Options) type {
 
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
+
+            // Pairs with the increment where this stream's user data was
+            // attached; nghttp2 fires this exactly once per opened stream.
+            if (getConn(nctx.h2, nctx.conn_entity)) |cp| cp.open_streams -|= 1;
 
             // client_headers_first: bytes held un-consumed on a dying
             // stream still occupy the CONNECTION window — repay it or
@@ -4939,6 +4948,16 @@ pub fn H2(comptime opts: Options) type {
 
                 // Direction-aware idle budget: client legs may reap
                 // sooner than server connections (LB-idle < backend-idle).
+                // A connection with work in flight is NOT idle, however long
+                // its socket has been quiet. A large response whose peer
+                // reads slowly stops the byte flow legitimately — the receive
+                // window stays unrepaid until the reader drains — so reaping
+                // on elapsed-bytes alone truncates that response mid-body,
+                // after its 200 was already committed. Stalls are the
+                // business of the per-stream deadlines, which can answer with
+                // a status; this reaper only frees genuinely unused slots.
+                if (conn_ptr.open_streams > 0) continue;
+
                 const timeout: u64 = if (conn_ptr.direction == .client and
                     self.h2_opts.client_idle_timeout_ns > 0)
                     self.h2_opts.client_idle_timeout_ns
@@ -5147,6 +5166,7 @@ pub fn H2(comptime opts: Options) type {
                 stream.send_data = body_data_ptr;
                 stream.ng_stream_id = stream_id;
                 _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
+                if (getConn(self, sess.entity)) |cp| cp.open_streams += 1;
 
                 try self.reg.set(ent, &self.client_request_in, StreamId, .{ .id = @intCast(stream_id) });
                 try self.reg.move(ent, &self.client_request_in, &self._client_request_sending);
@@ -5260,6 +5280,7 @@ pub fn H2(comptime opts: Options) type {
                 stream.send_data = body_data_ptr;
                 stream.ng_stream_id = stream_id;
                 _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
+                if (getConn(self, sess.entity)) |cp| cp.open_streams += 1;
 
                 try self.reg.set(ent, &self.client_stream_request_in, StreamId, .{ .id = @intCast(stream_id) });
                 try self.reg.move(ent, &self.client_stream_request_in, &self.client_stream_data_out);

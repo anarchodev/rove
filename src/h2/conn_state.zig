@@ -103,6 +103,19 @@ pub const Conn = struct {
     draining: bool = false,
     drain_deadline_ns: u64 = 0,
 
+    /// Streams currently open on this connection. The idle reaper skips a
+    /// connection with any, because "idle" must mean NO WORK IN FLIGHT, not
+    /// "no bytes moved recently": a large response whose peer reads slowly
+    /// legitimately stops the byte flow — the receive window goes unrepaid
+    /// until the reader drains — and reaping it there truncates a response
+    /// mid-body after its 200 was already committed (an
+    /// `INTERNAL_ERROR` RST the client cannot distinguish from a fault).
+    /// Maintained in lockstep with the per-stream `Stream` user data:
+    /// incremented where that is attached (a server HCAT_REQUEST, a client
+    /// `submit_request`), decremented in the matching stream-close callback,
+    /// which nghttp2 fires exactly once per opened stream.
+    open_streams: u32 = 0,
+
     /// Egress serialization (h2 server DATA path). A single TCP socket is
     /// one ordered byte stream, and for TLS every record's MAC binds an
     /// implicit sequence number — so two concurrent `prep_send` SQEs for
