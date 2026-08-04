@@ -62,6 +62,7 @@ const Bridge = bridge_mod.Bridge;
 const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
 const blob_receive_mod = @import("blob_receive.zig");
+const kv_export_mod = @import("kv_export.zig");
 const inbound_chunk_mod = @import("worker_inbound_chunk.zig");
 const snapshot_sink_mod = @import("snapshot_sink.zig");
 const snapshot_catchup_mod = @import("snapshot_catchup.zig");
@@ -2823,21 +2824,99 @@ pub fn Worker(comptime opts: Options) type {
             return refuseIfOverStorageQuotaFor(self, pf);
         }
 
-        pub fn tryDoorFetch(self: *Self, pf: globals.PendingFetch) bool {
+        /// The kv-export door (#340): build ONE part from this tenant's store
+        /// and rewrite the Cmd into an ordinary content-addressed PUT at the
+        /// blob door.
+        ///
+        /// Returns true to continue with `pf` (either untouched, because this
+        /// is not an export Cmd, or rewritten), false when the Cmd was
+        /// consumed and freed.
+        ///
+        /// The scan runs HERE, on the worker thread, deliberately:
+        /// `KvStore.prefix` routes through the store's active txn, so reading
+        /// from a background thread would race the handler's own writes. What
+        /// must not block the loop is the upload, and the rewrite hands that
+        /// to the existing async fetch path — signing, the storage-quota gate,
+        /// accounting and terminal-event routing all come along unchanged
+        /// instead of growing a second upload mechanism.
+        ///
+        /// Failure drops the Cmd rather than routing a failure event: the
+        /// export job re-arms a watchdog wake before issuing each part (the
+        /// `__system/webhook_fire` discipline), so a dropped attempt is
+        /// exactly what that watchdog exists to recover.
+        pub fn rewriteKvExport(self: *Self, pf: *globals.PendingFetch) bool {
+            if (!kv_export_mod.isExportUrl(pf.url)) return true;
+            const a = self.allocator;
+
+            const failed = struct {
+                fn drop(w: *Self, p: *globals.PendingFetch, why: []const u8) bool {
+                    std.log.warn(
+                        "rove-js kv-export: tenant={s} dropped: {s} — the job's watchdog re-fires it",
+                        .{ p.tenant_id, why },
+                    );
+                    p.deinit(w.allocator);
+                    return false;
+                }
+            }.drop;
+
+            const inst = (self.node.tenant.getInstance(pf.tenant_id) catch null) orelse
+                return failed(self, pf, "no such instance");
+
+            var rw = kv_export_mod.buildRewrite(a, inst.kv, pf.body, kv_export_mod.PART_MAX_BYTES) catch |err|
+                return failed(self, pf, @errorName(err));
+            // NOT `errdefer`: this function returns a bool, so the failure
+            // paths below are ordinary returns and an errdefer would never
+            // fire — the part would leak on exactly the OOM path it looks
+            // like it covers.
+            var rw_owned = true;
+            defer if (rw_owned) rw.deinit(a);
+
+            const new_url = std.fmt.allocPrint(a, "{s}{s}", .{ blob_sessions_mod.BLOB_ORIGIN_PREFIX, rw.hash }) catch
+                return failed(self, pf, "out of memory");
+            const new_method = a.dupe(u8, "PUT") catch {
+                a.free(new_url);
+                return failed(self, pf, "out of memory");
+            };
+            // Past here the part's buffers move to the fetch.
+            rw_owned = false;
+
+            a.free(pf.url);
+            pf.url = new_url;
+            a.free(pf.method);
+            pf.method = new_method;
+            a.free(pf.body);
+            pf.body = rw.body; // ownership moves to the fetch
+            a.free(pf.ctx_json);
+            pf.ctx_json = rw.ctx_json; // ownership moves to the fetch
+            return true;
+        }
+
+        /// True ⇒ the fetch was CONSUMED here (routed to a worker-local
+        /// subsystem, or dropped); the caller does nothing more with it.
+        /// False ⇒ carry on submitting `pf.*`, which may have been REWRITTEN
+        /// in place (the kv-export door turns itself into a blob PUT).
+        ///
+        /// Takes a pointer because of that rewrite: this is the one partition
+        /// every submit site goes through, so a door that mutates its fetch
+        /// has to mutate the caller's copy, not a temporary.
+        pub fn tryDoorFetch(self: *Self, pf: *globals.PendingFetch) bool {
+            // #340: builds one export part and rewrites this into an ordinary
+            // content-addressed PUT, which then takes the normal path below.
+            if (kv_export_mod.isExportUrl(pf.url)) return !self.rewriteKvExport(pf);
             if (blob_receive_mod.isReceiveUrl(pf.url)) {
-                self.armBlobReceive(pf);
+                self.armBlobReceive(pf.*);
                 return true;
             }
             if (worker_fire.isComposeUrl(pf.url)) {
-                worker_fire.fireBlobCompose(self, pf);
+                worker_fire.fireBlobCompose(self, pf.*);
                 return true;
             }
             if (deploy_thread_mod.isCompileUrl(pf.url)) {
-                self.submitCompile(pf);
+                self.submitCompile(pf.*);
                 return true;
             }
             if (deploy_thread_mod.isStageUrl(pf.url)) {
-                self.submitStampManifest(pf);
+                self.submitStampManifest(pf.*);
                 return true;
             }
             return false;

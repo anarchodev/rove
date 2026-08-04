@@ -619,6 +619,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "builtin_scheduler_tick_mjs", .path = "src/js/builtin_modules/scheduler_tick.mjs" },
         // Handler-surface Phase 5 — the `cron(...)` recurrence engine.
         .{ .name = "builtin_cron_tick_mjs", .path = "src/js/builtin_modules/cron_tick.mjs" },
+        .{ .name = "builtin_export_run_mjs", .path = "src/js/builtin_modules/export_run.mjs" },
         // blob-storage P1 (docs/architecture/routing-and-ingress.md) — blob.put's marker-settling
         // result handler.
         .{ .name = "builtin_blob_onresult_mjs", .path = "src/js/builtin_modules/blob_onresult.mjs" },

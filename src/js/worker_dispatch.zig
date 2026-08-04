@@ -892,12 +892,14 @@ fn finalizeBatch(
             // on this worker (thread-affine h2 sink attach), never the
             // engine. Partition them out in place.
             var keep: usize = 0;
-            for (batch_pending_fetches.items) |pf| {
+            for (batch_pending_fetches.items) |*pf| {
                 // Trusted internal doors (receive/compile/stampManifest) →
-                // worker-local subsystem; everything else → the engine.
-                if (worker_mod.refuseIfOverStorageQuotaFor(worker, pf)) continue;
+                // worker-local subsystem; everything else → the engine. By
+                // POINTER: a door may rewrite the fetch in place (kv-export
+                // → blob PUT), and the rewritten form is what must be kept.
+                if (worker_mod.refuseIfOverStorageQuotaFor(worker, pf.*)) continue;
                 if (!worker.tryDoorFetch(pf)) {
-                    batch_pending_fetches.items[keep] = pf;
+                    batch_pending_fetches.items[keep] = pf.*;
                     keep += 1;
                 }
             }
