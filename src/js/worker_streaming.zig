@@ -3010,6 +3010,22 @@ fn progressRelayBacklog(worker: anytype, fetch_id: []const u8) void {
                 appended += blen;
             },
             .terminal => {
+                // The terminal must not overtake the DECIDER: the
+                // first event rides the ordinary Msg lane, and for a
+                // small asset both are emitted in the same instant —
+                // un-gated, this lane's terminal would reach the spool
+                // first and close the chain empty before the decider
+                // ever ran. A relay-engaged transfer always has a
+                // first event (engage happens at the first writeback),
+                // and consuming it is what opens the stream — so
+                // stream membership is the "decider has run" signal,
+                // the same gate the bytes arm uses. A decider that
+                // went terminal instead tears the chain down
+                // (`scanAndCancelBoundFetches`), which drops this
+                // backlog rather than leaving it waiting.
+                if (!server.reg.isInCollection(held_ent, &server.stream_data_out) and
+                    !server.reg.isInCollection(held_ent, &server.stream_response_in))
+                    return;
                 // Every relayed byte before it has been appended (FIFO)
                 // — hand the terminal to the normal bound-fetch dispatch
                 // so exactly one activation observes the outcome.

@@ -846,17 +846,27 @@ pub const FetchEngine = struct {
         }
 
         // CAS→connection relay eligibility (rove#441, option (a)):
-        // ONLY a bound streaming read whose source is a content-
-        // addressed door the engine owns — the deploy-static door, or
-        // an own-tenant blob GET. Anything else keeps today's
-        // per-chunk event path; the `relay` option is inert there
-        // (the pump must never carry a customer-supplied URL — it
-        // runs with no SSRF gate, no caps re-check, no JS in the
-        // loop). Whether the relay actually ENGAGES is decided at
-        // the first writeback (upstream 2xx + resolvable bound
-        // owner) in `onChunkCb`.
-        const relay_eligible = pf.relay and pf.stream and pf.bind and
-            (is_static_door or (is_blob_door and method == .GET));
+        // ONLY a bound streaming read of the deploy-static door.
+        // Two fences, one per clause:
+        //   - content-addressed door only — the pump must never carry
+        //     a customer-supplied URL (it runs with no SSRF gate, no
+        //     caps re-check, no JS in the loop);
+        //   - static door only, not the blob GET door yet — the
+        //     relay's byte-ordering proof needs the chain to START as
+        //     a continuation (the first event is the decider that
+        //     opens the stream, and stream membership is the worker's
+        //     "decider consumed" signal). `__system/static`
+        //     guarantees that shape; an arbitrary handler relaying a
+        //     blob GET from an already-streaming chain would race its
+        //     own seq-0 event (see the CAS→connection relay,
+        //     `docs/architecture/routing-and-ingress.md`). Extending
+        //     to the blob door means moving the first event onto the
+        //     relay FIFO for total order.
+        // Anything else keeps today's per-chunk event path; the
+        // `relay` option is inert there. Whether the relay actually
+        // ENGAGES is decided at the first writeback (upstream 2xx +
+        // resolvable bound owner) in `onChunkCb`.
+        const relay_eligible = pf.relay and pf.stream and pf.bind and is_static_door;
 
         const req: blob_curl_multi.Request = .{
             .method = method,
