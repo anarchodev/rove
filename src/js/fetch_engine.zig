@@ -696,6 +696,11 @@ pub const FetchEngine = struct {
                 var hb: [files_mod.HASH_HEX_LEN]u8 = undefined;
                 @memcpy(&hb, tail[0..files_mod.HASH_HEX_LEN]);
                 static_cache_hash = hb;
+                // Same hash, second consumer: the recorder references the
+                // chunk's bytes by it instead of taping them (rove#391).
+                var gb: [64]u8 = undefined;
+                @memcpy(&gb, tail[0..64]);
+                get_hash = gb;
             }
             // Own-tenant deploy-static READ door (`__system/static` streamer):
             // rewrite to THIS tenant's `file-blobs/{hash}` + SigV4-sign. Tenant
@@ -786,6 +791,7 @@ pub const FetchEngine = struct {
                 @as(u64, @max(@as(usize, pf.max_response_chunk_bytes), 1)),
             .held = pf.held,
             .cache_hash = static_cache_hash,
+            .static_serve = is_static_door,
             .stored_hash = stored_hash,
             .get_hash = get_hash,
             .stored_bytes = stored_bytes,
@@ -1346,6 +1352,9 @@ const FetchCtx = struct {
     /// Copied onto the terminal event; the worker records the row only on a
     /// 2xx, since a failed PUT stored no bytes.
     stored_hash: ?[64]u8 = null,
+    /// True for the `__system/static` streamer's own fetches — their chunks
+    /// are never recorded (rove#391).
+    static_serve: bool = false,
     /// Set for a `blob.get`: the content hash the fetch names. Stamped onto
     /// every event so the recorder can reference the payload rather than
     /// copy it (rove#430).
@@ -1383,8 +1392,15 @@ const FetchCtx = struct {
             if (headers_json) |hj| self.allocator.free(hj);
             return false;
         };
-        self.engine.routeEvent(self.pf.tenant_id, ev) catch |err| {
-            var e = ev;
+        // The STREAMING emitter needs the same stamps as the terminal ones
+        // below, and it is the one that matters most: a streamed transfer is
+        // where the per-chunk records pile up. `__system/static` streams, so
+        // without this every static chunk is recorded verbatim (rove#391).
+        var ev_stamped = ev;
+        ev_stamped.static_serve = self.static_serve;
+        ev_stamped.content_hash = self.get_hash;
+        self.engine.routeEvent(self.pf.tenant_id, ev_stamped) catch |err| {
+            var e = ev_stamped;
             UpstreamFetchEvent.deinitItem(&e, self.allocator);
             std.log.warn(
                 "rove-js fetch_engine: route chunk seq={d}: {s}",
@@ -1697,6 +1713,7 @@ fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.body_truncated = s.capped;
     stampStored(&ev, a, s);
     ev.content_hash = s.get_hash;
+    ev.static_serve = s.static_serve;
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
@@ -1717,6 +1734,7 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.body_truncated = s.capped;
     stampStored(&ev, a, s);
     ev.content_hash = s.get_hash;
+    ev.static_serve = s.static_serve;
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);

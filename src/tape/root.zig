@@ -344,11 +344,16 @@ pub const Entry = union(Channel) {
         /// `body_ref.len == inline_bytes.len`). Empty for the
         /// BodyRef-to-S3 path and for terminal-only events.
         inline_bytes: []const u8,
-        /// sha256 hex of the chunk's bytes when they were LEFT in
-        /// content-addressed storage instead of copied here — today a
-        /// `blob.get` result, whose object already lives at
-        /// `app-blobs/{hash}`. Empty otherwise, and mutually exclusive with
-        /// `inline_bytes`: a chunk is carried OR referenced, never both.
+        /// sha256 hex of the OBJECT this chunk is a slice of, when the bytes
+        /// were LEFT in content-addressed storage instead of copied here — a
+        /// `blob.get` (`app-blobs/`) or a static serve (`file-blobs/`).
+        /// Identical across every chunk of one fetch: it names the object, not
+        /// the chunk. The slice is `(byte_offset, body_ref.len)`, so the
+        /// reconstruction key is the TRIPLE, and `body_ref.len` is therefore
+        /// recorded on a referenced chunk even though no bytes ride here.
+        ///
+        /// Empty otherwise, and mutually exclusive with `inline_bytes`: a
+        /// chunk is carried OR referenced, never both.
         ///
         /// This is the "never tape blobs" entry shape (rove#430): the record
         /// keeps everything that makes it an activation event (seq, final,
