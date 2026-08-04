@@ -1,29 +1,24 @@
-// platform.auth.checkRootToken (docs/architecture/replay-and-sim.md). The sim now
-// validates the token against the configured operator root token rather than
-// always succeeding, so an admin gate can actually be tested for rejection.
+// `request.rewind.isRoot` — the operator-root verdict
+// (docs/architecture/replay-and-sim.md). A scenario declares the ANSWER, not a
+// token to compare: prod computes the verdict in the engine and the bearer is
+// unreachable from the handler, so there is no token for a test to supply.
 import { scenario, expect } from "rewind:test";
 
-const s = scenario({ admin: true, rootToken: "s3cret" }); // platform.* is admin-only
-
-// Correct token → admitted.
-const good = s.inbound({ method: "GET", path: "/admin", headers: { "x-root-token": "s3cret" } });
+// Root-credentialed request → admitted. `admin: true` is what installs
+// `request.rewind` at all (platform-bound); `isRoot` is the verdict on it.
+const good = scenario({ admin: true, isRoot: true })
+  .inbound({ method: "GET", path: "/admin" });
 expect(good.status).toBe(200);
 expect(good.body).toEqual({ ok: true, admin: true });
 
-// Wrong token → rejected.
-const bad = s.inbound({ method: "GET", path: "/admin", headers: { "x-root-token": "nope" } });
+// Same handler, no root credential → rejected. An admin run always declares
+// the verdict, so the unauthenticated branch needs no extra knob.
+const bad = scenario({ admin: true, isRoot: false })
+  .inbound({ method: "GET", path: "/admin" });
 expect(bad.status).toBe(403);
 expect(bad.body.ok).toBe(false);
 
-// Missing token → rejected.
-const none = s.inbound({ method: "GET", path: "/admin", headers: {} });
-expect(none.status).toBe(403);
-
-// Admin handler but no root token configured → nothing authenticates, even the
-// "right" string.
-const unconf = scenario({ admin: true }).inbound({ method: "GET", path: "/admin", headers: { "x-root-token": "s3cret" } });
-expect(unconf.status).toBe(403);
-
-// The check surfaces its result in the effect log.
-expect(good.effects.some((e) => e.op === "auth.checkRootToken" && e.ok === true)).toBe(true);
-expect(bad.effects.some((e) => e.op === "auth.checkRootToken" && e.ok === false)).toBe(true);
+// Omitting `isRoot` on an admin run defaults to false — nothing authenticates
+// as root unless the scenario says so.
+const unset = scenario({ admin: true }).inbound({ method: "GET", path: "/admin" });
+expect(unset.status).toBe(403);

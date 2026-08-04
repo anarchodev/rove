@@ -71,7 +71,10 @@ expect(req).toHaveFetched(/stripe/);
 - `instances` / `root` — seed other stores for a `platform.*` handler:
   `instances: { acme: { kv: {…} } }` seeds another instance's store, `root: { kv: {…} }`
   the platform root store (see [Platform and admin handlers](#platform-and-admin-handlers)).
-- `rootToken` — the operator token `platform.auth.checkRootToken` validates against.
+- `isRoot` — did this request arrive with a valid operator root token? Production
+  computes the verdict in the engine and exposes it as `request.rewind.isRoot`;
+  the token itself never reaches the handler, so a scenario declares the
+  **answer**, not a token to compare. Only meaningful alongside `admin: true`.
 - `admin` — mark the run as the admin handler so `platform.*` is allowed. It's
   admin-only and **off by default**, so a normal handler that touches it throws.
 - `emailBudget` — a per-activation outbound-send allowance. Production meters
@@ -526,32 +529,27 @@ the same ghost-id behavior as production.
 ```js
 const s = scenario({
   admin: true,                                    // platform.* is admin-only
-  rootToken: "op-secret",                         // what checkRootToken validates
+  isRoot: true,                                   // arrived with the operator credential
   instances: { acme: { kv: { profile: "{}" } } }, // seed acme's isolated store
 });
 
-const r = s.inbound({
-  method: "POST", path: "/provision",
-  headers: { authorization: "op-secret" },
-});
+const r = s.inbound({ method: "POST", path: "/provision" });
 expect(r.instanceKv("acme", "profile")).toEqual({ plan: "pro" });  // a platform.scope write
 expect(r.rootKv("instance/acme")).toEqual({ created: true });      // a platform.root write
 
-// A wrong (or missing) root token is rejected — checkRootToken returns true only
-// for the configured token, so both paths are testable:
-const denied = s.inbound({
-  method: "POST", path: "/provision",
-  headers: { authorization: "wrong" },
-});
+// The un-credentialed path is a scenario, not a header: auth is a property of
+// the activation, so both branches are testable without a token anywhere.
+const denied = scenario({ admin: true, isRoot: false })
+  .inbound({ method: "POST", path: "/provision" });
 expect(denied.status).toBe(403);
 ```
 
 The handler behind this writes into the scoped and root stores and gates on the
-token:
+engine-computed verdict:
 
 ```js
 export default function () {
-  if (!platform.auth.checkRootToken(request.headers["authorization"])) {
+  if (!request.rewind.isRoot) {
     response.status = 403; return "forbidden";
   }
   platform.scope("acme").kv.set("profile", JSON.stringify({ plan: "pro" }));

@@ -61,6 +61,10 @@ pub const RequestReadKind = enum(u8) {
     body_read = 2,
     ip_masked = 3,
     ip_raw = 4,
+    /// `request.rewind.isRoot` — the operator-root verdict. `value` is
+    /// `"1"` for true, empty for false. Never the bearer that produced
+    /// it (`src/tape/root.zig` RequestReadKind).
+    root_verdict = 5,
 };
 pub const RequestReadEntry = struct {
     kind: RequestReadKind,

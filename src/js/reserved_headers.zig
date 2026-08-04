@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Loop46, Inc.
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Platform-reserved HTTP header name prefixes — the header analogue of
-//! `reserved.zig`'s kv-key reservation.
+//! Platform-reserved HTTP header names — the header analogue of
+//! `reserved.zig`'s kv-key reservation. Three lists, one theme: what a handler
+//! must not be able to reach. Two reserved *prefixes* (below), the IP-transport
+//! headers (`STRIPPED_IP_HEADERS`), and the platform credentials
+//! (`PLATFORM_CREDENTIAL_HEADERS`). The last two exist because on a replay
+//! platform a handler-readable input is a RECORDED input, and read-taping
+//! cannot redact — so the surface is minimized instead.
 //!
 //! Two prefixes are reserved for platform use and must never be a
 //! customer-observable or customer-settable contract:
@@ -68,6 +73,40 @@ pub const STRIPPED_IP_HEADERS = [_][]const u8{
     "forwarded",
 };
 
+/// Headers carrying a PLATFORM credential, hidden from `request.headers` on a
+/// platform-bound handler (`state.platform != null` — the `__admin__` tenant).
+/// The operator root token arrives here, and a handler-readable input is a
+/// RECORDED input: the header getter tapes the value it returns
+/// (`globals_request.zig` `jsHeaderGetter` → `request_reads`), so a handler
+/// that reads it puts a platform-wide credential in the replay archive.
+/// Read-taping can't redact (a redacted input breaks replay determinism), so
+/// the surface is minimized instead — the same lever, and for the same reason,
+/// as `STRIPPED_IP_HEADERS` above.
+///
+/// What replaces it is the VERDICT, not the value: `request.rewind.isRoot`,
+/// computed by the engine (which already holds both the header and the
+/// secret) and taped as `RequestReadKind.root_verdict`. Unlike the IP there is
+/// no escalation rung, because nothing legitimately consumes the raw bearer —
+/// so the credential never becomes a JS string at all.
+///
+/// Scoped to platform-bound handlers on purpose: a CUSTOMER tenant's
+/// `authorization` header is its own application's auth, its own tape, and its
+/// own controller responsibility (`docs/decisions.md`, GDPR-safe request
+/// capture). This list is about the platform's credential on the platform's
+/// tape.
+pub const PLATFORM_CREDENTIAL_HEADERS = [_][]const u8{
+    "authorization",
+};
+
+/// True when `name` (already-lowercase wire form) carries a platform
+/// credential and must be hidden from a platform-bound handler.
+pub fn isPlatformCredentialHeader(name: []const u8) bool {
+    for (PLATFORM_CREDENTIAL_HEADERS) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
+
 /// True when `name` (already-lowercase wire form) is an IP-transport
 /// header hidden from the handler surface.
 pub fn isStrippedIpHeader(name: []const u8) bool {
@@ -100,4 +139,22 @@ test "isReservedInternalHeader: customer-facing + ordinary headers allowed" {
     // A customer header that merely mentions "rewind" but isn't the prefix.
     try std.testing.expect(!isReservedInternalHeader("my-x-rewind-thing"));
     try std.testing.expect(!isReservedInternalHeader(""));
+}
+
+test "isPlatformCredentialHeader: authorization only, exact match" {
+    try std.testing.expect(isPlatformCredentialHeader("authorization"));
+    // Exact wire-form match — inbound HTTP/2 names are already lowercase, so
+    // there is no case folding to do and no prefix to widen.
+    try std.testing.expect(!isPlatformCredentialHeader("proxy-authorization"));
+    try std.testing.expect(!isPlatformCredentialHeader("authorization-scheme"));
+    try std.testing.expect(!isPlatformCredentialHeader("content-type"));
+    try std.testing.expect(!isPlatformCredentialHeader(""));
+}
+
+test "isPlatformCredentialHeader is orthogonal to the other two lists" {
+    // The strip is scoped to platform-bound handlers, so `authorization` must
+    // stay OUT of the unconditional lists — a customer tenant reads its own
+    // bearer as before.
+    try std.testing.expect(!isReservedInternalHeader("authorization"));
+    try std.testing.expect(!isStrippedIpHeader("authorization"));
 }

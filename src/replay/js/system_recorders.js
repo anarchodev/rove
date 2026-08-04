@@ -495,10 +495,10 @@
       // the exists marker keyed by name so a later platform.scope(name) folds.
       instances: { create: gate(function(name){ push({ kind: "platform", op: "instances.create", name: name }); push({ kind: "write", store: "exists", key: "i/" + name, value: "1" }); globalThis.kv.set(NS_STORE + "exists/i/" + name, "1"); }), deployStarter: gate(function(name){ push({ kind: "platform", op: "instances.deployStarter", name: name }); }) },
       releases: { publish: gate(function(tenant, depId){ push({ kind: "platform", op: "releases.publish", tenant: tenant, depId: depId }); }) },
-      // checkRootToken(token) → true iff it matches the operator root token
-      // (env-supplied in prod); the sim carries it as a hidden reserved kv key
-      // seeded by `scenario({ rootToken })`. Unconfigured → nothing is root.
-      auth: { checkRootToken: gate(function(token){ var rt = globalThis.kv.get(NS_STORE + "auth/token"); var ok = (typeof rt === "string" && rt.length > 0 && token === rt); push({ kind: "platform", op: "auth.checkRootToken", ok: ok }); return ok; }) },
+      // No `auth` verb: the operator-root verdict is `request.rewind.isRoot`,
+      // supplied by the world (scenario({ isRoot })) and folded from the
+      // root_verdict tape entry — never a call taking the bearer. A token the
+      // handler holds is a token the request surface records.
     },
   };
 })();

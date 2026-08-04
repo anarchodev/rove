@@ -3,36 +3,34 @@
 // gained `scenario.inboundHeaders` + `node.receive().stored()`, neither leg of a
 // streamed-upload handler was reachable, so the whole path (auth branches, the
 // receive→store handoff, the scoped workspace write) was dark. This exercises all
-// of it. The handler touches `platform.*`, so the run is admin + carries the
-// operator root token.
+// of it. The handler touches `platform.*`, so the run is admin; `isRoot`
+// declares the operator-root verdict the engine computes in prod.
 import { scenario, expect } from "rewind:test";
 
 // `instances` declares the scope target — platform.scope resolves eagerly
 // (ghost id ⇒ InstanceNotFound, like prod).
-const s = scenario({ admin: true, rootToken: "root-secret", now: "2026-07-01T00:00:00Z", instances: { acme: {} } });
+const s = scenario({ admin: true, isRoot: true, now: "2026-07-01T00:00:00Z", instances: { acme: {} } });
 
-function upload(query, auth) {
-  return s.inboundHeaders({
-    method: "PUT",
-    path: "/v1/upload?" + query,
-    headers: auth ? { authorization: auth } : {},
-  });
+function upload(query, sc = s) {
+  return sc.inboundHeaders({ method: "PUT", path: "/v1/upload?" + query });
 }
+
+// The un-credentialed twin. Auth is a property of the ACTIVATION, not a header
+// the handler parses — so it is declared per scenario, not per request.
+const anon = scenario({ admin: true, isRoot: false, now: "2026-07-01T00:00:00Z", instances: { acme: {} } });
 
 // ── auth branches (all terminal, no receive armed) ──
 // Missing tenant/path → 400 before auth even runs.
-const bad = upload("tenant=acme", "Bearer root-secret");
+const bad = upload("tenant=acme");
 expect(bad.status).toBe(400);
 expect(bad.disposition).toBe("terminal");
 
-// No/invalid token → 401.
-const noauth = upload("tenant=acme&path=logo.png", "");
+// No operator credential → 401.
+const noauth = upload("tenant=acme&path=logo.png", anon);
 expect(noauth.status).toBe(401);
-const wrong = upload("tenant=acme&path=logo.png", "Bearer nope");
-expect(wrong.status).toBe(401);
 
 // ── authed: onHeaders holds + arms the receive ──
-const h = upload("tenant=acme&path=logo.png&content_type=image/png", "Bearer root-secret");
+const h = upload("tenant=acme&path=logo.png&content_type=image/png");
 expect(h.disposition).toBe("held");
 // the streamed receive is armed (the only body-accepting move from onHeaders)
 expect(h.effects.some((e) => e.kind === "blob" && e.op === "receive")).toBe(true);

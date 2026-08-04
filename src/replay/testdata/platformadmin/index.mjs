@@ -14,7 +14,9 @@ export default function () {
   probe("root", () => platform.root.get("x"));
   probe("instances", () => platform.instances.create("x"));
   probe("releases", () => platform.releases.publish("acme", "0123456789abcdef"));
-  probe("auth", () => platform.auth.checkRootToken("t"));
+  // `request.rewind` is not gated — it simply doesn't EXIST off a
+  // platform-bound handler, so the probe reports presence rather than a throw.
+  out.rewind = typeof request.rewind === "undefined" ? "absent" : String(request.rewind.isRoot);
   probe("compile", () => platform.compile([{ path: "a.mjs", source: "export default () => {}" }], { scope: "acme" }));
   return out;
 }

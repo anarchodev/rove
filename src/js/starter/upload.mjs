@@ -26,9 +26,10 @@ function ownsTenant(sub, tenant) {
 // after stamping the error response. Root token → operator; else an OIDC
 // session that owns `tenant`.
 function authFor(tenant) {
-  const hdr = request.headers["authorization"] || "";
-  const tok = hdr.indexOf("Bearer ") === 0 ? hdr.slice(7) : "";
-  if (tok && platform.auth.checkRootToken(tok)) return { is_root: true };
+  // Engine-computed operator-root verdict; the bearer itself is stripped from
+  // `request.headers` on this handler so it can't reach the tape
+  // (docs/architecture/privileged-surface.md).
+  if (request.rewind.isRoot) return { is_root: true };
   // Inline OIDC RP session read — the oidc lib is now the @rewind/oidc
   // package, unreachable from this baked genesis module. Mirrors
   // OIDCRelyingParty.guard: the default (only) session path is

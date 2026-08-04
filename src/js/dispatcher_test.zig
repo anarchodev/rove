@@ -4488,6 +4488,128 @@ test "dispatch: a root read-your-write stays off the tape (minimal readset)" {
     try testing.expect(tapedKv(&rs, "__rove_store/r/seen/by/nobody") != null);
 }
 
+test "dispatch: a platform-bound handler cannot reach the root bearer, and the tape records only the verdict" {
+    // The invariant behind the credential rule (docs/decisions.md §4.6b): on a
+    // replay platform a handler-readable input is a RECORDED input, so the
+    // operator credential must not be reachable at all. Two halves, both
+    // asserted here because either one alone leaks: the header is absent from
+    // `request.headers`, AND the readset carries no `authorization` entry —
+    // only the boolean verdict.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    const token = "a" ** 64;
+    pf.tenant.root_token_secret = token;
+
+    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs.deinit();
+
+    const bearer = "Bearer " ++ token;
+    var fields = [_]h2.HeaderField{
+        .{
+            .name = "authorization".ptr,
+            .name_len = "authorization".len,
+            .value = bearer.ptr,
+            .value_len = @intCast(bearer.len),
+        },
+        .{
+            .name = "content-type".ptr,
+            .name_len = "content-type".len,
+            .value = "application/json".ptr,
+            .value_len = @intCast("application/json".len),
+        },
+    };
+    const hdrs = h2.ReqHeaders{ .fields = @ptrCast(&fields), .count = fields.len };
+
+    var resp = try runOne(
+        &d,
+        kv,
+        // `Object.keys` sees the enumerable header set — so this also proves the
+        // stripped name never reaches enumeration, not merely the getter.
+        \\return JSON.stringify({
+        \\  authVisible: Object.keys(request.headers).indexOf("authorization") !== -1,
+        \\  authValue: String(request.headers["authorization"]),
+        \\  otherVisible: Object.keys(request.headers).indexOf("content-type") !== -1,
+        \\  isRoot: request.rewind.isRoot,
+        \\});
+    ,
+        .{
+            .method = "POST",
+            .path = "/",
+            .headers = hdrs,
+            .trace = .{ .readset = &rs },
+            .admin = .{ .platform = pf.tenant },
+        },
+    );
+    defer resp.deinit(testing.allocator);
+
+    // The credential is gone from the handler surface; an ordinary header is
+    // untouched (the strip is scoped, not a blanket header purge).
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"authVisible\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"authValue\":\"undefined\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"otherVisible\":true") != null);
+    // ...and the verdict still comes out right, computed from the wire header
+    // the handler can no longer see.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"isRoot\":true") != null);
+
+    // The tape half. Nothing anywhere in request_reads may carry the token —
+    // not as a header value, not as a name — and the verdict must be present as
+    // its own kind.
+    var saw_verdict = false;
+    for (rs.request_reads.entries.items) |e| {
+        const rr = e.request_reads;
+        try testing.expect(std.mem.indexOf(u8, rr.value, token) == null);
+        try testing.expect(!std.mem.eql(u8, rr.name, "authorization"));
+        if (rr.kind == .root_verdict) {
+            saw_verdict = true;
+            try testing.expectEqualStrings("1", rr.value);
+        }
+    }
+    try testing.expect(saw_verdict);
+}
+
+test "dispatch: a non-platform handler still reads its own authorization header" {
+    // The strip is scoped to platform-bound handlers. A customer tenant's
+    // bearer is its own application's auth, on its own tape — §4.6's accepted
+    // posture, and not this rule's business.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var fields = [_]h2.HeaderField{.{
+        .name = "authorization".ptr,
+        .name_len = "authorization".len,
+        .value = "Bearer customer-token".ptr,
+        .value_len = @intCast("Bearer customer-token".len),
+    }};
+    const hdrs = h2.ReqHeaders{ .fields = @ptrCast(&fields), .count = fields.len };
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return String(request.headers["authorization"]) + "|" + String(request.rewind);
+    ,
+        .{ .method = "POST", .path = "/", .headers = hdrs },
+    );
+    defer resp.deinit(testing.allocator);
+    // Readable — and `request.rewind` doesn't exist off a platform-bound
+    // handler, so there is no verdict surface to probe either.
+    try testing.expectEqualStrings("Bearer customer-token|undefined", resp.body);
+}
+
 test "dispatch: platform.instances.create creates instance and mirrors to root_writeset" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
