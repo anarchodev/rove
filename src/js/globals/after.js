@@ -121,6 +121,11 @@ function _rejectRenamed(verb, opts, renames) {
      * @param {*} [opts.ctx] - Threaded to each wake as `request.ctx`.
      * @param {string} [opts.on] - Export the result wakes; overrides the
      *   per-event-shape defaults for every event of this fetch.
+     * @param {boolean} [opts.relay=false] - CAS→connection relay
+     *   (platform-internal; today only the `__system/static` streamer's
+     *   door engages it): intermediate chunks are spliced straight onto
+     *   the held stream — `{on}` fires only for the first event and the
+     *   terminal. Inert on any other fetch.
      * @returns {string} The fetch id (`ftch_…`, opaque — compare to
      *   `request.fetchId`).
      * @throws {Error} `code:"rate_limited"` when the per-tenant outbound
@@ -143,6 +148,7 @@ function _rejectRenamed(verb, opts, renames) {
         headers: opts.headers,
         body: opts.body,
         stream: opts.stream,
+        relay: opts.relay,
         ctx: opts.ctx,
       };
       if (typeof opts.on === "string") native.on = opts.on;
