@@ -54,8 +54,9 @@ pub const Action = enum(u8) {
     /// sustained rate the wrong shape for abuse: the free tier's 10/s
     /// held for a day is ~864k outbound calls from a tenant that cost an
     /// email address to create. This second, day-scale bucket bounds
-    /// exactly that: capacity = a 10%-duty-cycle day of the plan's
-    /// sustained rate (`sustainedOutboundBudget`), refilling at
+    /// exactly that: capacity = the plan's `outbound_sustained_per_day`
+    /// (`sustainedOutboundBudget`, which falls back to a rate-derived
+    /// estimate when the tier leaves it 0), refilling at
     /// capacity/day. Checked at the same frozen-native funnel as
     /// `outbound`; saturating it is an incident signal, not a sales
     /// lead — the refusal carries a distinct error code and trips a
@@ -79,18 +80,25 @@ pub const LOG_BYTES_REFILL_PER_SEC: u32 = (RateLimitCaps{}).log_refill_bytes_per
 /// byte meter.
 pub const LOG_BYTES_PER_RECORD_OVERHEAD: u32 = 512;
 
-/// A day's sustained outbound budget for a plan: a 10% duty cycle of the
-/// burst bucket's refill rate held for 24h (free tier: 10/s → 86,400/day),
-/// floored at the burst capacity — the day ceiling must never be tighter
-/// than a single burst the plan itself permits, or a burst-only plan
-/// (refill 0, capacity N: "N calls, ever-slower after") would have every
-/// outbound refused by the SUSTAINED bucket before the burst bucket got
-/// to say yes. Derived from the existing caps rather than a new plan
-/// field for now; when the tier table grows an explicit sustained figure
-/// this becomes that field's fallback. Saturating so a pathological
-/// override can't wrap.
+/// A day's sustained outbound budget for a plan.
+///
+/// The plan's explicit `outbound_sustained_per_day` is the answer when set —
+/// it is a product decision about how much outbound a tier may do in a day,
+/// which is not derivable from a burst rate tuned for spike absorption.
+/// A 0 there falls back to the old rate-derived estimate: a 10% duty cycle of
+/// the refill rate held for 24h.
+///
+/// Either way the result is floored at the burst capacity — the day ceiling
+/// must never be tighter than a single burst the plan itself permits, or a
+/// burst-only plan (refill 0, capacity N: "N calls, ever-slower after") would
+/// have every outbound refused by the SUSTAINED bucket before the burst
+/// bucket got to say yes. Saturating so a pathological override can't wrap.
 pub fn sustainedOutboundBudget(caps: RateLimitCaps) u32 {
-    return @max(caps.outbound_capacity, caps.outbound_refill_per_sec *| 8640);
+    const daily = if (caps.outbound_sustained_per_day != 0)
+        caps.outbound_sustained_per_day
+    else
+        caps.outbound_refill_per_sec *| 8640;
+    return @max(caps.outbound_capacity, daily);
 }
 
 /// Re-exported from `rove-plan` (the leaf module that owns the tier table) so
@@ -511,11 +519,34 @@ test "limiter: log_bytes is a lagging post-exec bucket — charge then 429 the n
     try testing.expect(try rl.hasCredit("acme", .log_bytes, caps, 0, debt_sec * std.time.ns_per_s));
 }
 
+test "limiter: an explicit plan day-ceiling overrides the rate-derived estimate" {
+    // The product decision, not the burst rate, sets the spam bound: the free
+    // tier's 10/s would derive 86,400/day, an order of magnitude above what
+    // the tier actually grants.
+    const free = plan_mod.table(.free).rate;
+    try testing.expectEqual(@as(u32, 5_000), free.outbound_sustained_per_day);
+    try testing.expectEqual(@as(u32, 5_000), sustainedOutboundBudget(free));
+
+    // The day ceiling is never tighter than one burst the same plan permits —
+    // otherwise the sustained bucket would refuse a burst the burst bucket
+    // was about to allow.
+    const burst_heavy: RateLimitCaps = .{
+        .outbound_capacity = 10_000,
+        .outbound_refill_per_sec = 0,
+        .outbound_sustained_per_day = 100,
+    };
+    try testing.expectEqual(@as(u32, 10_000), sustainedOutboundBudget(burst_heavy));
+}
+
 test "limiter: outbound_sustained is a day-scale ceiling derived from the plan's refill rate" {
     var rl = RateLimiter.init(testing.allocator, .{});
     defer rl.deinit();
-    // A tiny plan: 1/s refill → 8,640/day sustained budget.
-    const caps: RateLimitCaps = .{ .outbound_capacity = 1000, .outbound_refill_per_sec = 1 };
+    // A tiny plan with NO explicit day figure: 1/s refill → 8,640/day.
+    const caps: RateLimitCaps = .{
+        .outbound_capacity = 1000,
+        .outbound_refill_per_sec = 1,
+        .outbound_sustained_per_day = 0,
+    };
     try testing.expectEqual(@as(u32, 8640), sustainedOutboundBudget(caps));
 
     // Drain the whole day budget at t=0 (checkN in one gulp).
@@ -529,10 +560,15 @@ test "limiter: outbound_sustained is a day-scale ceiling derived from the plan's
 }
 
 test "limiter: outbound_sustained never undercuts a burst-only plan" {
-    // refill 0 (burst-only: "N calls, refilling never") → the sustained
-    // budget floors at the burst capacity instead of collapsing to 0 and
-    // refusing every outbound before the burst bucket is consulted.
-    const caps: RateLimitCaps = .{ .outbound_capacity = 5, .outbound_refill_per_sec = 0 };
+    // refill 0 (burst-only: "N calls, refilling never") and no explicit day
+    // figure → the sustained budget floors at the burst capacity instead of
+    // collapsing to 0 and refusing every outbound before the burst bucket is
+    // consulted.
+    const caps: RateLimitCaps = .{
+        .outbound_capacity = 5,
+        .outbound_refill_per_sec = 0,
+        .outbound_sustained_per_day = 0,
+    };
     try testing.expectEqual(@as(u32, 5), sustainedOutboundBudget(caps));
 
     var rl = RateLimiter.init(testing.allocator, .{});
