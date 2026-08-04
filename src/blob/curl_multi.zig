@@ -60,6 +60,17 @@ pub const Error = error{
 
 pub const Method = enum { GET, POST, PUT, HEAD, DELETE };
 
+/// What a streaming `on_chunk` hook did with the writeback:
+///   - `.consume` — bytes taken; libcurl proceeds.
+///   - `.pause` — bytes NOT taken; libcurl holds them and re-delivers the
+///     same data after `Transfer.unpause`. The flow-control arm of a relay
+///     consumer whose downstream is full (the CAS→connection relay,
+///     `docs/architecture/routing-and-ingress.md`).
+///   - `.abort` — abort the transfer (surfaces as `CURLE_WRITE_ERROR` in the
+///     Result). Lossless-or-fail: a consumer that can neither take nor hold
+///     the bytes kills the transfer rather than dropping them.
+pub const WriteAction = enum { consume, pause, abort };
+
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
@@ -167,11 +178,12 @@ pub const Transfer = struct {
     alloc_failed: bool,
     /// Optional per-writeback streaming hook. When non-null,
     /// `writeBodyCb` forwards each writeback to this fn instead of
-    /// appending to `resp_body` (which stays empty). Returns true to
-    /// continue, false to abort the transfer (libcurl surfaces this
-    /// as `CURLE_WRITE_ERROR` in the Result). `FetchEngine` uses this
+    /// appending to `resp_body` (which stays empty). The returned
+    /// `WriteAction` controls libcurl: consume / pause (bytes
+    /// re-delivered after `unpause`) / abort (surfaces as
+    /// `CURLE_WRITE_ERROR` in the Result). `FetchEngine` uses this
     /// to drive per-chunk event emission.
-    on_chunk: ?*const fn (bytes: []const u8, ctx: ?*anyopaque) bool,
+    on_chunk: ?*const fn (bytes: []const u8, ctx: ?*anyopaque) WriteAction,
     /// Optional per-header-line streaming hook. When non-null,
     /// `writeHeaderCb` forwards each raw libcurl-delivered line
     /// (`Name: value\r\n` + the status line + blank terminator) to
@@ -299,7 +311,7 @@ pub const Transfer = struct {
     pub fn initStreaming(
         allocator: std.mem.Allocator,
         req: Request,
-        on_chunk: *const fn (bytes: []const u8, ctx: ?*anyopaque) bool,
+        on_chunk: *const fn (bytes: []const u8, ctx: ?*anyopaque) WriteAction,
         on_header_line: *const fn (line: []const u8, ctx: ?*anyopaque) void,
         on_done: *const fn (*Transfer, Result, ?*anyopaque) void,
         user_ctx: ?*anyopaque,
@@ -327,10 +339,24 @@ pub const Transfer = struct {
         self.allocator.destroy(self);
     }
 
-    fn statusCode(self: *const Transfer) u16 {
+    /// HTTP response status as known so far. Valid from the first
+    /// writeback on (libcurl has parsed the status line by then);
+    /// zero before that. Public so a streaming consumer can gate a
+    /// relay decision on the upstream verdict mid-transfer.
+    pub fn statusCode(self: *const Transfer) u16 {
         var st: c_long = 0;
         _ = c.curl_easy_getinfo(self.handle, c.CURLINFO_RESPONSE_CODE, &st);
         return @intCast(@max(st, 0));
+    }
+
+    /// Resume a transfer paused by an `on_chunk` `.pause` return.
+    /// MUST run on the thread driving this transfer's Multi — curl
+    /// easy handles are not thread-safe, and libcurl may re-enter the
+    /// write callback (delivering the held bytes) from inside this
+    /// call. Cross-thread consumers signal the driving thread
+    /// (`Multi.wakeup`) and let it call this.
+    pub fn unpause(self: *Transfer) void {
+        _ = c.curl_easy_pause(self.handle, c.CURLPAUSE_CONT);
     }
 };
 
@@ -505,11 +531,14 @@ fn writeBodyCb(
     if (total == 0) return 0;
     const bytes = @as([*]const u8, @ptrCast(ptr))[0..total];
     // Streaming variant: forward to caller's on_chunk; their return
-    // controls libcurl (true → consume, false → abort with
+    // controls libcurl (consume / pause-and-redeliver / abort with
     // CURLE_WRITE_ERROR).
     if (transfer.on_chunk) |cb| {
-        const cont = cb(bytes, transfer.user_ctx);
-        return if (cont) total else 0;
+        return switch (cb(bytes, transfer.user_ctx)) {
+            .consume => total,
+            .pause => c.CURL_WRITEFUNC_PAUSE,
+            .abort => 0,
+        };
     }
     // Whole-body variant (default): append to resp_body for
     // surfacing in `Result.body` on completion.
@@ -836,6 +865,48 @@ test "Multi: cancel removes transfer without firing on_done" {
     // Drain shouldn't find anything.
     try testing.expectEqual(@as(usize, 0), multi.drainCompleted());
     try testing.expectEqual(@as(usize, 0), collector.completed);
+}
+
+test "writeBodyCb maps WriteAction to libcurl's contract" {
+    const allocator = testing.allocator;
+    const Hook = struct {
+        var action: WriteAction = .consume;
+        fn onChunk(bytes: []const u8, ctx: ?*anyopaque) WriteAction {
+            _ = bytes;
+            _ = ctx;
+            return action;
+        }
+        fn onLine(line: []const u8, ctx: ?*anyopaque) void {
+            _ = line;
+            _ = ctx;
+        }
+        fn onDone(t: *Transfer, r: Result, ctx: ?*anyopaque) void {
+            _ = t;
+            _ = r;
+            _ = ctx;
+        }
+    };
+    const t = try Transfer.initStreaming(
+        allocator,
+        .{ .url = "http://127.0.0.1:1/" },
+        &Hook.onChunk,
+        &Hook.onLine,
+        &Hook.onDone,
+        null,
+    );
+    defer t.deinit();
+
+    var payload = "abcd".*;
+    // `.consume` → full length (libcurl proceeds).
+    Hook.action = .consume;
+    try testing.expectEqual(@as(usize, 4), writeBodyCb(&payload, 1, 4, t));
+    // `.pause` → CURL_WRITEFUNC_PAUSE: bytes NOT consumed, libcurl holds +
+    // re-delivers them after `unpause`. The relay backpressure arm.
+    Hook.action = .pause;
+    try testing.expectEqual(@as(usize, c.CURL_WRITEFUNC_PAUSE), writeBodyCb(&payload, 1, 4, t));
+    // `.abort` → short write (CURLE_WRITE_ERROR).
+    Hook.action = .abort;
+    try testing.expectEqual(@as(usize, 0), writeBodyCb(&payload, 1, 4, t));
 }
 
 test "runDriver: cooperative shutdown via stop_flag" {

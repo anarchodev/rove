@@ -2983,6 +2983,11 @@ pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
         // while `dropSpool` frees the (separate) spool-map key — so
         // `fetch_id` must still be valid here.
         worker_streaming.dropSpool(worker, fetch_id);
+        // Same for any relay backlog (the CAS→connection relay,
+        // `docs/architecture/routing-and-ingress.md`) — the engine
+        // cancel above already unsticks a window-paused transfer, so
+        // no second cancel here.
+        worker_streaming.dropRelayBacklog(worker, fetch_id, false);
         // unregisterBoundFetch frees the key via fetchRemove. The
         // slice in `doomed` borrows the same bytes — read fetch_id
         // BEFORE the unregister call.

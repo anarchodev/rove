@@ -37,6 +37,76 @@ const globals = @import("globals.zig");
 
 const KvWakeInbox = worker_mod.KvWakeInbox;
 
+/// One CAS→connection relay hand-off (`docs/architecture/routing-and-ingress.md`):
+/// either a run of upstream bytes destined for the bound entity's
+/// `StreamChunks` (no activation), or the transfer's terminal event —
+/// which rides the SAME per-worker FIFO so it can never overtake the
+/// bytes ahead of it. The worker re-injects the terminal into the
+/// normal bound-fetch dispatch once every byte before it has been
+/// appended, which is what keeps the "exactly one terminal
+/// activation observes the outcome" contract ordered.
+pub const RelayItem = struct {
+    /// Allocator-owned dupe; names the bound fetch this item belongs to.
+    fetch_id: []u8,
+    payload: union(enum) {
+        /// Allocator-owned upstream bytes (one libcurl writeback's worth).
+        bytes: []u8,
+        /// The transfer's terminal `UpstreamFetchEvent` (owned slices).
+        terminal: components_mod.UpstreamFetchEvent,
+    },
+
+    pub fn deinit(item: *RelayItem, allocator: std.mem.Allocator) void {
+        if (item.fetch_id.len > 0) allocator.free(item.fetch_id);
+        switch (item.payload) {
+            .bytes => |b| if (b.len > 0) allocator.free(b),
+            .terminal => |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator),
+        }
+        item.* = .{ .fetch_id = &.{}, .payload = .{ .bytes = &.{} } };
+    }
+};
+
+/// Cross-thread FIFO from the fetch-engine thread to one worker —
+/// the relay's transport lane. Deliberately NOT an `effect.MsgInbox`
+/// variant: every `effect.Msg` IS an activation, and a relay byte-run
+/// is precisely not one. Mutex-guarded; the worker drains per tick
+/// (`drainRelay`) into its per-fetch backlogs.
+pub const RelayInbox = struct {
+    mutex: std.Thread.Mutex = .{},
+    items: std.ArrayListUnmanaged(RelayItem) = .empty,
+
+    /// Ownership of `item`'s slices transfers in on success; on error
+    /// the caller retains and frees.
+    pub fn push(self: *RelayInbox, allocator: std.mem.Allocator, item: RelayItem) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.items.append(allocator, item);
+    }
+
+    /// Move every queued item into `out` (ownership transfers). On
+    /// append failure the un-moved tail stays queued for next tick.
+    pub fn drainInto(
+        self: *RelayInbox,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(RelayItem),
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.items.items.len == 0) return;
+        out.ensureUnusedCapacity(allocator, self.items.items.len) catch return;
+        for (self.items.items) |it| out.appendAssumeCapacity(it);
+        self.items.clearRetainingCapacity();
+    }
+
+    /// Free any still-queued items (shutdown path).
+    pub fn deinit(self: *RelayInbox, allocator: std.mem.Allocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.items.items) |*it| it.deinit(allocator);
+        self.items.deinit(allocator);
+        self.items = .empty;
+    }
+};
+
 pub const MsgRouter = struct {
     allocator: std.mem.Allocator,
 
@@ -62,6 +132,16 @@ pub const MsgRouter = struct {
     /// variant and route through it.
     msg_inboxes_mutex: std.Thread.Mutex = .{},
     msg_inboxes: std.ArrayListUnmanaged(*effect_mod.MsgInbox) = .empty,
+
+    /// Per-worker relay inboxes (the CAS→connection relay,
+    /// `docs/architecture/routing-and-ingress.md`), keyed by the SAME
+    /// index `registerMsgInbox` returned for that worker — the relay
+    /// producer targets `bound_fetch_owners[fetch_id]`, whose values
+    /// are msg-inbox indexes, so the two registries must share the
+    /// key space. Borrowed pointers; workers unregister before
+    /// tearing their inbox down.
+    relay_inboxes_mutex: std.Thread.Mutex = .{},
+    relay_inboxes: std.AutoHashMapUnmanaged(usize, *RelayInbox) = .empty,
 
     /// Held-state ownership registries (held state in
     /// `docs/architecture/effects-and-handlers.md`). The accept worker
@@ -112,6 +192,7 @@ pub const MsgRouter = struct {
         // are owned by this allocator.
         self.wake_inboxes.deinit(self.allocator);
         self.msg_inboxes.deinit(self.allocator);
+        self.relay_inboxes.deinit(self.allocator);
 
         // Free every owned key in the held-state registries (held
         // state in `docs/architecture/effects-and-handlers.md`). Values
@@ -177,6 +258,42 @@ pub const MsgRouter = struct {
                 return;
             }
         }
+    }
+
+    /// Register a worker's relay inbox under its msg-inbox index
+    /// (`registerMsgInbox`'s return — the identity the bound-fetch
+    /// owner registry speaks). Pointer is borrowed; the worker must
+    /// `unregisterRelayInbox` before tearing the inbox down.
+    pub fn registerRelayInbox(self: *MsgRouter, msg_inbox_idx: usize, inbox: *RelayInbox) !void {
+        self.relay_inboxes_mutex.lock();
+        defer self.relay_inboxes_mutex.unlock();
+        try self.relay_inboxes.put(self.allocator, msg_inbox_idx, inbox);
+    }
+
+    pub fn unregisterRelayInbox(self: *MsgRouter, msg_inbox_idx: usize) void {
+        self.relay_inboxes_mutex.lock();
+        defer self.relay_inboxes_mutex.unlock();
+        _ = self.relay_inboxes.remove(msg_inbox_idx);
+    }
+
+    /// Push one relay item onto the worker at `msg_inbox_idx`.
+    /// Ownership of `item` transfers on success; on error the caller
+    /// retains and frees. `error.NoWorkers` when the worker never
+    /// registered a relay inbox (or already unregistered) — the
+    /// producer treats that as fatal for the transfer (abort, never a
+    /// silent byte drop).
+    pub fn enqueueRelayToWorker(
+        self: *MsgRouter,
+        msg_inbox_idx: usize,
+        item: RelayItem,
+    ) !void {
+        self.relay_inboxes_mutex.lock();
+        const inbox = self.relay_inboxes.get(msg_inbox_idx) orelse {
+            self.relay_inboxes_mutex.unlock();
+            return error.NoWorkers;
+        };
+        self.relay_inboxes_mutex.unlock();
+        try inbox.push(self.allocator, item);
     }
 
     /// Hash-route `msg` onto the destination worker's `MsgInbox` by

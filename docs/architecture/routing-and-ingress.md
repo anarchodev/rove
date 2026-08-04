@@ -223,6 +223,47 @@ streaming path. h1→h2c translation is **edge-only**.
   the coordinator and read back on dispatch. The spool is ephemeral — taped bytes
   are captured at activation time, so the spool never affects replay.
 
+## CAS→connection relay
+
+The symmetric twin of `blob.receive`'s Case B (which streams a held connection →
+CAS with zero chunk activations): a **bound streaming read of a
+content-addressed door** (`rove-static.internal`, or a `rove-blob.internal` GET)
+issued with `relay: true` splices its bytes straight onto the held stream with
+no JS in the loop. `__system/static` is the platform caller — one cold 5 MB
+asset serve costs 2 log records and 2 dispatches instead of one per ~16 KiB.
+
+- **Exactly two activations remain.** The first event routes normally — the
+  *decider*: it commits the response head + `stream.start()` (relayed bytes can
+  only land on a stream that activation opened, which is also what orders them
+  after it). The terminal event rides the relay FIFO **behind** the bytes and is
+  re-injected into the normal bound dispatch once they are all appended — the
+  *observer*: the module's terminal error handling (non-2xx / truncated /
+  mid-stream abort) is unchanged.
+- **Engage rules.** Shape-gated at `startTransfer` (bound + `stream: true` +
+  CAS door — the pump must never carry a customer URL: it runs with no SSRF
+  gate, caps re-check, or JS in the loop) and decided at the first writeback
+  (upstream 2xx + resolvable bound owner). Anything else keeps the per-chunk
+  event path, so failure shapes look exactly like a non-relay fetch.
+- **Transport.** Engine thread → per-worker `RelayInbox` (`msg_router.zig`) →
+  per-fetch `RelayBacklog` (`spool_registry.zig`) → `StreamChunks.tryAppend`
+  (`drainRelay`, each worker tick). Deliberately NOT an `effect.Msg` variant —
+  every Msg is an activation, and a relay byte-run is precisely not one.
+- **Backpressure is lossless, end-to-end.** The engine bounds
+  relayed-but-unconsumed bytes per transfer (`RELAY_WINDOW_BYTES`); at the cap
+  the curl write callback returns `CURL_WRITEFUNC_PAUSE` (bytes held +
+  re-delivered, never dropped). The worker consume-acks appended bytes
+  (`FetchEngine.ackRelay`); the engine thread unpauses at half-window. The
+  worker side feeds the stream only under `StreamChunks`' soft cap, so the h2
+  egress pacing is unchanged. Relay transfers run untimed (client-paced
+  lifetime); a client disconnect cancels the fetch via the held chain's
+  teardown, which is also what unsticks a paused transfer whose consumer died.
+- **Failure posture.** Any path that cannot both keep and order the bytes kills
+  the transfer (abort → `CURLE_WRITE_ERROR` → terminal `ok=false`) — never a
+  silent drop under a committed 200 (the truncated-asset bug class).
+- **Recording.** Relayed bytes produce no record and no tape: they are
+  immutable, content-addressed, and reproducible from the hash the two
+  remaining records reference (never-tape-blobs).
+
 ## Customer blob storage (`blob.*`) — ingress & signing
 
 The customer surface (`blob.put/get/url/write/seal/receive`, contract in

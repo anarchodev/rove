@@ -209,6 +209,12 @@ calls that re-invoke a handler still holding the socket. Ephemeral
   fetch's own `{ctx}` option if you passed one, else the connection's
   `next({ctx})` memory (decisions.md §4.14) — one rule on WS and HTTP. So a
   no-ctx fetch on a held chain still reads the state you threaded via `next()`.
+  With `{ relay: true }` on a streamed read of the platform's
+  content-addressed stores (the CAS→connection relay,
+  `architecture/routing-and-ingress.md`), intermediate chunks are spliced
+  straight onto the held stream by the engine — your `{on}` export fires only
+  for the first event (commit the head + `stream.start()` there) and the
+  terminal. Inert on any other fetch.
 
 `{ on: "module.method" }` routes the wake to a different export (still
 holding *this* connection) — the UNIVERSAL callback-target key, the

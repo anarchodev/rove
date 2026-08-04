@@ -1554,6 +1554,13 @@ pub fn Worker(comptime opts: Options) type {
         /// `drainMsgInbox` (once per tick from `serviceSubscriptionFires`
         /// / `serviceFetchEvents`) moves Msgs onto `msg_queue`.
         msg_inbox: effect_mod.MsgInbox = undefined,
+        /// CAS→connection relay lane (`docs/architecture/routing-and-ingress.md`):
+        /// the fetch-engine thread pushes relayed byte runs (+ the
+        /// ordering-critical terminal) here; `drainRelay` moves them
+        /// into per-fetch backlogs (`spools.relay_backlogs`) each tick.
+        /// Registered on the router under `msg_inbox_idx` — the same
+        /// identity `bound_fetch_owners` resolves to.
+        relay_inbox: msg_router_mod.RelayInbox = .{},
         /// §2.6 durable-wake: monotonic-ns of the last
         /// `sweepDurableWakes` invocation on THIS worker. Throttles the
         /// per-tick durable-wake sweep to one pass per
@@ -1848,6 +1855,11 @@ pub fn Worker(comptime opts: Options) type {
             // partitioned sweeps (`sweepOwedRetries`).
             self.msg_inbox_idx = try config.node.router.registerMsgInbox(&self.msg_inbox);
             errdefer config.node.router.unregisterMsgInbox(&self.msg_inbox);
+            // The relay lane registers under the SAME slot index — the
+            // fetch engine targets `bound_fetch_owners[fetch_id]`,
+            // whose values are msg-inbox indexes.
+            try config.node.router.registerRelayInbox(self.msg_inbox_idx, &self.relay_inbox);
+            errdefer config.node.router.unregisterRelayInbox(self.msg_inbox_idx);
             // The blob coordinator's queue for this worker IS that slot — the
             // same identity `registerBoundFetchOwner` hands the fetch engine,
             // so the inbound-body and bound-chunk submit paths share one queue
@@ -1970,6 +1982,10 @@ pub fn Worker(comptime opts: Options) type {
             // variant-aware via `freeOwnedMsg`.
             self.node.router.unregisterMsgInbox(&self.msg_inbox);
             self.msg_inbox.deinit();
+            // Relay lane: unregister BEFORE freeing queued items, same
+            // producer-race rule as the two inboxes above.
+            self.node.router.unregisterRelayInbox(self.msg_inbox_idx);
+            self.relay_inbox.deinit(allocator);
             // MsgQueue.deinit walks variants (subscription_fire +
             // fetch_chunk / fetch_done / fetch_pipe_done) to free
             // in-flight Msg payloads at shutdown.
@@ -3705,6 +3721,7 @@ pub const proposeForgetfulWrites = worker_streaming.proposeForgetfulWrites;
 pub const serviceSubscriptionFires = worker_streaming.serviceSubscriptionFires;
 pub const dispatchPendingMsgs = worker_streaming.dispatchPendingMsgs;
 pub const drainSpools = worker_streaming.drainSpools;
+pub const drainRelay = worker_streaming.drainRelay;
 pub const dispatchSubscriptionFires = worker_streaming.dispatchSubscriptionFires;
 pub const dispatchFetchEvents = worker_streaming.dispatchFetchEvents;
 pub const serviceFetchEvents = worker_streaming.serviceFetchEvents;

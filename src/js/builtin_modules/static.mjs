@@ -53,16 +53,25 @@ export default function () {
   // as a stray third arg left the target defaulting to `onFetchChunk`,
   // which this module doesn't export → every cold/oversized static read
   // 404'd ("module export onFetchChunk not found").
+  //
+  // `relay`: the CAS→connection relay (rove#441). The engine splices
+  // intermediate chunks straight onto the held stream — onChunk fires
+  // exactly twice: the FIRST event (commits the head + stream.start())
+  // and the TERMINAL (observes the outcome; the error handling below).
+  // Sound here because between those two, onChunk was a pure relay
+  // anyway — status/headers/stream.start() are idempotent no-ops after
+  // the first chunk and the only work was stream.write.
   after.fetch(
     "http://rove-static.internal/" + c.hash,
-    { method: "GET", stream: true, maxChunkBytes: 256 * 1024, ctx: c, on: "onChunk" },
+    { method: "GET", stream: true, relay: true, maxChunkBytes: 256 * 1024, ctx: c, on: "onChunk" },
   );
   return next();
 }
 
-// Each upstream chunk from the file-blobs read arrives here. The first chunk
-// commits the response head (with the content-type from request.ctx); every
-// chunk relays its bytes. The final event closes the held connection.
+// The first upstream event and the terminal arrive here (intermediate
+// bytes relay natively — see the `relay` note above). The first chunk
+// commits the response head (with the content-type from request.ctx);
+// the final event closes the held connection.
 export function onChunk() {
   const a = request.activation;
   // Honor the upstream read's outcome on the terminal event. A failed
