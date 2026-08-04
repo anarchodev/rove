@@ -666,7 +666,20 @@ pub const FetchEngine = struct {
         // door is reachable without the `blob.put` shim.
         var stored_hash: ?[64]u8 = null;
         var stored_bytes: u64 = 0;
+        // A blob READ names an object that is already durable and immutable in
+        // this tenant's own store, so its bytes never need recording — the
+        // recorder references them by this hash instead (rove#430). Captured
+        // BEFORE the rewrite replaces the URL, same as the two above.
+        var get_hash: ?[64]u8 = null;
         if (is_blob_door) {
+            if (method == .GET) {
+                const tail = pf.url[BLOB_ORIGIN_PREFIX.len..];
+                if (isSha256HexLower(tail)) {
+                    var gb: [64]u8 = undefined;
+                    @memcpy(&gb, tail[0..64]);
+                    get_hash = gb;
+                }
+            }
             if (method == .PUT) {
                 const tail = pf.url[BLOB_ORIGIN_PREFIX.len..];
                 if (isSha256HexLower(tail)) {
@@ -774,6 +787,7 @@ pub const FetchEngine = struct {
             .held = pf.held,
             .cache_hash = static_cache_hash,
             .stored_hash = stored_hash,
+            .get_hash = get_hash,
             .stored_bytes = stored_bytes,
             .transfer = undefined, // wired below
         };
@@ -1332,6 +1346,10 @@ const FetchCtx = struct {
     /// Copied onto the terminal event; the worker records the row only on a
     /// 2xx, since a failed PUT stored no bytes.
     stored_hash: ?[64]u8 = null,
+    /// Set for a `blob.get`: the content hash the fetch names. Stamped onto
+    /// every event so the recorder can reference the payload rather than
+    /// copy it (rove#430).
+    get_hash: ?[64]u8 = null,
     stored_bytes: u64 = 0,
     /// Set once accumulation passes the per-asset cap — stop buffering + don't
     /// cache (the asset stays on the stream path; no huge blob held in RAM).
@@ -1678,6 +1696,7 @@ fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
     stampStored(&ev, a, s);
+    ev.content_hash = s.get_hash;
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
@@ -1697,6 +1716,7 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
     stampStored(&ev, a, s);
+    ev.content_hash = s.get_hash;
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
