@@ -394,6 +394,7 @@ pub fn captureFetchChunkTapes(
         ev.body_truncated,
         ev.headers,
         if (inline_ok) ev.bytes else "",
+        "",
     ) catch |err| {
         std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
     };

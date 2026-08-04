@@ -556,6 +556,17 @@ pub const UpstreamFetchEvent = struct {
     /// unresolved) stay inline.
     coord_submitted: bool = false,
 
+    /// sha256 hex of this chunk's bytes when they are ALREADY in
+    /// content-addressed storage — a `blob.get`, whose object lives at
+    /// `app-blobs/{hash}`. Set for every event of such a fetch.
+    ///
+    /// The recorder uses it to reference the payload instead of copying it
+    /// (never tape blobs — rove#430): without it, a `blob.get` writes a
+    /// second permanent copy of the object, inline on the tape under 16 KiB
+    /// and into the un-evicted body pool above it. No allocation, so
+    /// `deinitItem` skips it.
+    content_hash: ?[64]u8 = null,
+
     /// Storage accounting (`src/kv/usage.zig`): the objects this transfer put
     /// into a tenant's customer-controlled pools. Empty on the overwhelming
     /// majority of events, which store nothing.
