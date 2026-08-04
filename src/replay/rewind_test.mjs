@@ -401,10 +401,12 @@ class Scenario {
     // `__rove_store/{tag}/` layout the base facades + host use at runtime.
     this.instances = cfg.instances || {}; // { "<id>": { kv: {…} } }
     this.rootKv = (cfg.root && cfg.root.kv) || {};
-    // The operator root token `platform.auth.checkRootToken(t)` validates against
-    // (env-supplied in prod). Carried as a hidden reserved kv key; unset → nothing
-    // authenticates as root.
-    this.rootToken = cfg.rootToken || null;
+    // Did this request arrive with a valid operator root token? Prod computes
+    // the verdict in the engine and exposes it as `request.rewind.isRoot`; the
+    // token itself is unreachable from the handler, so a scenario declares the
+    // ANSWER, never a token to compare. Only meaningful with `admin: true` —
+    // `request.rewind` exists solely on a platform-bound handler.
+    this.isRoot = cfg.isRoot || false;
     // `platform.*` is admin-only (prod throws off the `__admin__` handler). Fail
     // closed: a run is admin only when opted in, so a non-admin handler that
     // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
@@ -457,10 +459,14 @@ class Scenario {
   /** Stamp the scenario's per-chain identity onto a world's `request`, without
    *  clobbering a per-activation override already present. */
   _stampIdentity(w) {
-    if (this.tenant == null && this.correlationId == null) return w;
+    if (this.tenant == null && this.correlationId == null && !this.admin) return w;
     const r = (w.request = w.request || {});
     if (this.tenant != null && r.tenant === undefined) r.tenant = this.tenant;
     if (this.correlationId != null && r.correlationId === undefined) r.correlationId = this.correlationId;
+    // `request.rewind` exists iff the handler is platform-bound, so an admin
+    // run always declares the verdict — including `false`, which is what makes
+    // the "no root token" branch driveable without a second knob.
+    if (this.admin && r.isRoot === undefined) r.isRoot = this.isRoot;
     return w;
   }
 
@@ -475,7 +481,6 @@ class Scenario {
       kv["__rove_store/exists/i/" + id] = "1";
     }
     for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
-    if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
     if (this.admin) kv["__rove_store/admin"] = "1";
     if (this.emailBudget != null) kv["__rove_store/email_budget"] = String(this.emailBudget);
     if (this.subscriptions.length) kv["__rove_store/subscriptions"] = JSON.stringify(this.subscriptions);

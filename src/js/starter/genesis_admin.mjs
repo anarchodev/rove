@@ -433,9 +433,10 @@ export default function () {
     response.status = 405;
     return "POST only\n";
   }
-  const auth = request.headers["authorization"] || "";
-  const tok = auth.indexOf("Bearer ") === 0 ? auth.slice(7) : "";
-  if (!platform.auth.checkRootToken(tok)) {
+  // The operator-root verdict, computed by the engine. `authorization` is not
+  // readable here — a bearer the handler reads is a bearer the tape records
+  // (docs/architecture/privileged-surface.md).
+  if (!request.rewind.isRoot) {
     response.status = 401;
     return "unauthenticated\n";
   }

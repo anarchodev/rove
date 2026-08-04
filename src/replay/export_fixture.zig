@@ -147,11 +147,18 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // ── request surface: request_reads ──
     var headers = std.ArrayList(decode.RequestReadEntry){};
     var ip: ?[]const u8 = null;
+    // The operator-root verdict, present iff the recorded activation was
+    // platform-bound AND read it. `""` is a recorded false, not an absence —
+    // absence means `request.rewind` never existed, so the world must not
+    // declare it. The bearer is not on the tape and never was
+    // (`src/js/reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS).
+    var is_root: ?bool = null;
     var body_read = body_bytes != null;
     for (reads) |r| switch (r.kind) {
         .header_value => try headers.append(a, r),
         .body_read => body_read = true,
         .ip_masked => ip = r.value,
+        .root_verdict => is_root = std.mem.eql(u8, r.value, "1"),
         .header_names, .ip_raw => {},
     };
 
@@ -272,6 +279,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll(",\n    \"ip\": ");
         try jsonStr(w, v);
     }
+    if (is_root) |b| try w.writeAll(if (b) ",\n    \"isRoot\": true" else ",\n    \"isRoot\": false");
     // flattened fetch-result surface (fetch_chunk) — no `ok` (see above)
     if (fetch_status) |s| try w.print(",\n    \"status\": {d}", .{s});
     if (fetch_done) |b| try w.writeAll(if (b) ",\n    \"done\": true" else ",\n    \"done\": false");

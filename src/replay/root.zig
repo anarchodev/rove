@@ -304,6 +304,15 @@ pub const Engine = struct {
                 try reads.append(a, .{ .kind = .ip_raw, .name = "", .value = ip });
             }
         }
+        // The operator-root verdict for a platform-bound activation. Declared
+        // (or transcoded) as a bool and recorded as the same `"1"` / `""` the
+        // worker tapes — the VERDICT is the whole input, because the bearer is
+        // unreachable from the handler by construction
+        // (`src/js/reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS). Absent
+        // ⇒ not platform-bound ⇒ no `request.rewind` at all.
+        if (wv.is_root) |is_root| {
+            try reads.append(a, .{ .kind = .root_verdict, .name = "", .value = if (is_root) "1" else "" });
+        }
 
         // ── kv readset → map ──
         var kv_map = std.StringHashMapUnmanaged([]const u8){};

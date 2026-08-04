@@ -15,10 +15,9 @@ export function onHeaders() {
   const path = q.get("path");
   const ct = q.get("content_type") || "";
   if (!tenant || !path) { response.status = 400; return "tenant + path required\n"; }
-  // Operator auth: a valid Bearer root token (the genesis path — no session).
-  const hdr = request.headers["authorization"] || "";
-  const tok = hdr.indexOf("Bearer ") === 0 ? hdr.slice(7) : "";
-  if (!tok || !platform.auth.checkRootToken(tok)) { response.status = 401; return "unauthorized\n"; }
+  // Operator auth (the genesis path — no session). The verdict is
+  // engine-computed; the bearer is unreachable here by construction.
+  if (!request.rewind.isRoot) { response.status = 401; return "unauthorized\n"; }
   // Stream the body → target's blobs; onStored records the entry, threading
   // {tenant, path, content_type} across the receive re-entry as `request.ctx.app`.
   platform.scope(tenant).blob.receive({

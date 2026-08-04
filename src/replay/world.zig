@@ -66,6 +66,13 @@ pub const World = struct {
     /// activation it is the *response* body (delivered on `request.body`).
     body: ?[]const u8 = null,
     ip: ?[]const u8 = null,
+    /// The operator-root verdict for a platform-bound activation —
+    /// `request.rewind.isRoot`. Tri-state on purpose: **null means the handler
+    /// was not platform-bound**, so `request.rewind` does not exist at all
+    /// (prod installs it only when `state.platform != null`). true/false is the
+    /// verdict itself. The bearer that produced it is never carried, here or on
+    /// the tape (`src/js/reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS).
+    is_root: ?bool = null,
     /// The KV readset as a key→value map — a closed world: a key not present
     /// reads `not_found`.
     kv: []const KvPair = &.{},
@@ -168,6 +175,7 @@ const REQ_KEYS = [_][]const u8{
     "method",  "path",       "host",          "ip",       "body",   "bodyB64",
     "status",  "done",       "fetchId",       "chunkSeq", "fetchesPending",
     "bodyTruncated", "activation", "session",  "tenant",   "correlationId", "headers",
+    "isRoot",
 };
 
 /// Reject any key in `obj` outside `known`, naming the object (`world` /
@@ -265,6 +273,10 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         if (jStr(r, "path")) |s| w.path = s;
         if (jStr(r, "host")) |s| w.host = s;
         if (jStr(r, "ip")) |s| w.ip = s;
+        if (r.get("isRoot")) |iv| {
+            if (iv != .bool) return Error.BadWorld;
+            w.is_root = iv.bool;
+        }
         if (r.get("body")) |bv| {
             if (bv != .null) w.body = try valueToStr(a, bv);
         }

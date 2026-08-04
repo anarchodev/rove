@@ -909,8 +909,12 @@ change (Hyrum's law). See `architecture/format-versioning.md` §7.1/§7.3/§7.6.
   block). Unknown keys are ignored today — keep your own option keys to plain
   identifiers so a future platform directive can't collide with them.
 - **`request.*` fields.** The request object reserves the `request.rewind`
-  namespace for future platform-provided per-activation metadata. Your own
-  per-chain state lives on `request.ctx` (your shape, threaded via `next({ctx})`).
+  namespace for platform-provided per-activation metadata. Your own per-chain
+  state lives on `request.ctx` (your shape, threaded via `next({ctx})`). Today
+  the namespace carries `isRoot` and exists only on the platform-bound
+  (`__admin__`) handler — the operator-root verdict, computed by the engine so
+  the credential itself never reaches handler code
+  (`architecture/privileged-surface.md`).
 - **`kv` keys.** Any leading-`_` key is platform-reserved (§2.5;
   `architecture/format-versioning.md` §7.1). Customer keys use the non-`_` space.
 - **HTTP headers.** `x-rewind-*` and `x-rove-internal-*` are stripped from the

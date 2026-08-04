@@ -1155,9 +1155,11 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "platform", "releases" }, .fns = &.{
         .{ .name = "publish", .cfunc = platform_bindings.jsPlatformReleasesPublish, .argc = 2 },
     } },
-    .{ .path = &.{ "_system", "platform", "auth" }, .fns = &.{
-        .{ .name = "checkRootToken", .cfunc = platform_bindings.jsPlatformAuthCheckRootToken, .argc = 1 },
-    } },
+    // No `_system.platform.auth`: the operator-root verdict is engine-computed
+    // and reaches the handler as `request.rewind.isRoot`, never as a native
+    // taking the bearer. A platform credential must not be handler-readable,
+    // because a handler-readable input is a recorded input
+    // (`src/js/reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS).
     // The continuation primitive behind the public `next()` disposition.
     // A `_system.*` capability (deleted after base-eval): the `next.js`
     // shim captures it in a closure; baked `__system/` modules that need

@@ -139,6 +139,9 @@ const Folded = struct {
     body_read: bool = false,
     ip_masked: ?[]const u8 = null,
     ip_raw: ?[]const u8 = null,
+    /// `request.rewind.isRoot` — `"1"` / `""`. Absent ⇒ the activation was not
+    /// platform-bound, so `request.rewind` is not installed.
+    root_verdict: ?[]const u8 = null,
 };
 
 fn fold(a: std.mem.Allocator, entries: []const decode.RequestReadEntry) !Folded {
@@ -150,6 +153,7 @@ fn fold(a: std.mem.Allocator, entries: []const decode.RequestReadEntry) !Folded 
         .body_read => out.body_read = true,
         .ip_masked => out.ip_masked = e.value,
         .ip_raw => out.ip_raw = e.value,
+        .root_verdict => out.root_verdict = e.value,
     };
     out.values = values.items;
     return out;
@@ -231,6 +235,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try optValue(w, f.ip_masked);
     try w.writeAll(",\"ipRaw\":");
     try optValue(w, f.ip_raw);
+    try w.writeAll(",\"rootVerdict\":");
+    try optValue(w, f.root_verdict);
     // ctx / activation are pre-serialized JSON values (null for inbound, so the
     // inbound surface carries neither).
     try w.writeAll(",\"ctx\":");
@@ -431,6 +437,19 @@ const EPILOGUE_BODY =
     \\  Object.defineProperty(request, "ip", { enumerable: true, configurable: true,
     \\    get() { if (!D.ipMasked) { if (D.captured) miss("request.ip"); return null; } return D.ipMasked.value || null; } });
     \\  request.unmaskedIp = function () { if (!D.ipRaw) { if (D.captured) miss("request.unmaskedIp()"); return null; } return D.ipRaw.value || null; };
+    \\  // `request.rewind` — the platform-metadata namespace, installed ONLY for
+    \\  // a platform-bound activation, exactly as prod gates it on
+    \\  // `state.platform != null`. A recorded root_verdict entry IS that proof;
+    \\  // a captured world installs it regardless so a read the original run
+    \\  // never made surfaces as a divergence rather than a bare TypeError.
+    \\  // `isRoot` is the whole surface: the bearer that produced the verdict is
+    \\  // unreachable live (stripped from request.headers) and untaped, so there
+    \\  // is nothing else to reconstruct.
+    \\  if (D.rootVerdict || D.captured) {
+    \\    request.rewind = {};
+    \\    Object.defineProperty(request.rewind, "isRoot", { enumerable: true, configurable: true,
+    \\      get() { if (!D.rootVerdict) { if (D.captured) miss("request.rewind.isRoot"); return false; } return D.rootVerdict.value === "1"; } });
+    \\  }
     \\  // Non-inbound activation surface (null for inbound → no-ops):
     \\  // the threaded ctx, the request.activation metadata bag, and the
     \\  // flattened fetch/callback result (request.status/.done/...; the
