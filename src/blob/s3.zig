@@ -613,10 +613,15 @@ pub const S3BlobStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// Keys one `DeleteObjects` request may carry — the S3 API limit, and
+    /// therefore also the listing page size: a sweep pairs one page with one
+    /// batch, so the two must be the same number.
+    pub const DELETE_BATCH_MAX: usize = 1000;
+
     /// One ListObjectsV2 page: the keys under `{key_prefix}{sub_prefix}` plus
     /// the continuation token that fetches the next page (null = last page).
     /// Keys are FULLY QUALIFIED (they include `key_prefix`), which is what
-    /// `deleteAbsolute` wants.
+    /// `deleteObjects` wants.
     pub const ListPage = struct {
         keys: [][]u8,
         next_token: ?[]u8,
@@ -651,7 +656,10 @@ pub const S3BlobStore = struct {
             try sigv4.uriEncodeComponent(self.allocator, &q, t);
             try q.append(self.allocator, '&');
         }
-        try q.appendSlice(self.allocator, "list-type=2&max-keys=1000&prefix=");
+        try q.appendSlice(
+            self.allocator,
+            std.fmt.comptimePrint("list-type=2&max-keys={d}&prefix=", .{DELETE_BATCH_MAX}),
+        );
         const full_prefix = try std.fmt.allocPrint(
             self.allocator,
             "{s}{s}",
@@ -686,11 +694,16 @@ pub const S3BlobStore = struct {
         // Walk `<Contents>` blocks rather than every `<Key>` in the document:
         // a `<CommonPrefixes>` entry also carries a key-shaped child, and the
         // listing echoes the request `<Prefix>` at the top level.
+        //
+        // Keys are XML-UNESCAPED on the way out, so a caller holds the real
+        // key rather than its document spelling. A listing writes `a&b` as
+        // `a&amp;b`, and every use of the result — deleting it, addressing it,
+        // comparing it — needs the bytes S3 actually stored.
         var cursor: usize = 0;
         while (std.mem.indexOfPos(u8, body, cursor, "<Contents>")) |start| {
             const end = std.mem.indexOfPos(u8, body, start, "</Contents>") orelse break;
             if (extractXmlText(body[start..end], "Key")) |k| {
-                try keys.append(a, try a.dupe(u8, k));
+                try keys.append(a, try xmlUnescapeAlloc(a, k));
             }
             cursor = end + "</Contents>".len;
         }
@@ -701,42 +714,106 @@ pub const S3BlobStore = struct {
         const truncated = extractXmlText(body, "IsTruncated");
         if (truncated != null and std.mem.eql(u8, truncated.?, "true")) {
             if (extractXmlText(body, "NextContinuationToken")) |t| {
-                next_token = try a.dupe(u8, t);
+                // Unescaped for the same reason keys are: the token goes back
+                // out percent-encoded, and a document spelling would resume
+                // the walk at a position that does not exist.
+                next_token = try xmlUnescapeAlloc(a, t);
             }
         }
         return ListPage{ .keys = try keys.toOwnedSlice(a), .next_token = next_token };
     }
 
-    /// DELETE one fully-qualified key (one that already includes
-    /// `key_prefix`) — the counterpart to what `listPrefix` returns.
-    pub fn deleteAbsolute(self: *S3BlobStore, full_key: []const u8) !void {
+    /// Delete a batch of FULLY-QUALIFIED keys (ones that already include
+    /// `key_prefix` — what `listPrefix` returns) in ONE request, and return
+    /// how many the store reported gone.
+    ///
+    /// This is the whole reason a sweep is affordable on a request path: a
+    /// per-key DELETE costs one round trip per object, so a tenant holding
+    /// 10k objects would hold its caller open for `10k × RTT`. One batch
+    /// covers `DELETE_BATCH_MAX` of them, which is also exactly one listing
+    /// page, so a sweep is two round trips per 1000 objects.
+    ///
+    /// PARTIAL failure is reported, not thrown: the keys S3 could not remove
+    /// come back individually, and the rest really are gone. Returning the
+    /// true count keeps the caller's retry cheap — it re-lists and finds only
+    /// what is left.
+    pub fn deleteObjects(self: *S3BlobStore, keys: []const []const u8) !u64 {
+        if (keys.len == 0) return 0;
+        std.debug.assert(keys.len <= DELETE_BATCH_MAX);
+
+        // `<Quiet>` suppresses the per-key success entries, so the response to
+        // a clean batch is a few bytes regardless of how many objects went —
+        // and anything the body DOES carry is a failure.
+        var xml = std.ArrayList(u8){};
+        defer xml.deinit(self.allocator);
+        try xml.appendSlice(self.allocator, "<Delete><Quiet>true</Quiet>");
+        for (keys) |k| {
+            try xml.appendSlice(self.allocator, "<Object><Key>");
+            try appendXmlEscaped(self.allocator, &xml, k);
+            try xml.appendSlice(self.allocator, "</Key></Object>");
+        }
+        try xml.appendSlice(self.allocator, "</Delete>");
+
+        // DeleteObjects is the one request here that must carry `Content-MD5`.
+        // Every other body authenticates through the SigV4 payload hash, but
+        // S3 mandates this one so a truncated key list is REJECTED rather than
+        // silently deleting the prefix of it that arrived.
+        var digest: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+        std.crypto.hash.Md5.hash(xml.items, &digest, .{});
+        var md5_b64: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&md5_b64, &digest);
+
         var resp = try self.requestExt(.{
-            .method = .DELETE,
+            .method = .POST,
             .key = "",
-            .absolute_key = full_key,
+            // A bucket-level op: the keys ride in the body, not the path.
+            .absolute_key = "",
+            .query_wire = "delete=",
+            .body = xml.items,
+            .content_type = "application/xml",
+            .content_md5 = &md5_b64,
         }, self.allocator);
         defer resp.deinit(self.allocator);
-        // S3 DELETE is idempotent: a missing key is 204, which is exactly the
-        // convergence property a retried teardown needs.
-        if (resp.status != 204 and resp.status != 200 and resp.status != 404) {
+
+        if (resp.status != 200) {
             std.log.warn(
-                "rove-blob s3: DELETE {s} status={d}: {s}",
-                .{ full_key, resp.status, resp.bodySnippet() },
+                "rove-blob s3: DELETE batch of {d} status={d}: {s}",
+                .{ keys.len, resp.status, resp.bodySnippet() },
             );
             if (resp.status == 503 or resp.status == 429) return Error.SlowDown;
             return Error.Io;
         }
+
+        // In quiet mode the body is exactly the keys that did NOT go — the
+        // canonical S3 200-with-`<Error>`-body, here carrying per-key results
+        // rather than a whole-request failure.
+        var failed: usize = 0;
+        if (resp.body_owned) |body| {
+            var cursor: usize = 0;
+            while (std.mem.indexOfPos(u8, body, cursor, "<Error>")) |start| {
+                const end = std.mem.indexOfPos(u8, body, start, "</Error>") orelse break;
+                failed += 1;
+                std.log.warn("rove-blob s3: DELETE batch: {s}: {s} — retry the sweep", .{
+                    extractXmlText(body[start..end], "Key") orelse "?",
+                    extractXmlText(body[start..end], "Code") orelse "?",
+                });
+                cursor = end + "</Error>".len;
+            }
+        }
+        // A body S3 shaped some other way must not read as "all deleted".
+        if (failed > keys.len) return Error.Io;
+        return keys.len - failed;
     }
 
     /// Delete every object under `{key_prefix}{sub_prefix}`, returning how
     /// many were removed.
     ///
     /// Idempotent and retry-safe by construction: it re-lists each pass, and
-    /// per-key DELETE is idempotent, so a partial sweep converges when run
+    /// deleting an absent key succeeds, so a partial sweep converges when run
     /// again — the property tenant teardown depends on, since a failure there
     /// must not strand bytes that nothing else will ever enumerate.
     ///
-    /// Errors propagate AFTER the pass, so one unreachable key does not
+    /// Errors propagate AFTER the walk, so one unreachable page does not
     /// abandon the rest of the prefix.
     pub fn deletePrefix(self: *S3BlobStore, sub_prefix: []const u8) !u64 {
         var deleted: u64 = 0;
@@ -747,13 +824,17 @@ pub const S3BlobStore = struct {
         while (true) {
             var page = try self.listPrefix(self.allocator, sub_prefix, token);
             defer page.deinit(self.allocator);
-            for (page.keys) |k| {
-                self.deleteAbsolute(k) catch |err| {
-                    first_err = first_err orelse err;
-                    continue;
-                };
-                deleted += 1;
-            }
+            // One listing page is one delete batch by construction — the page
+            // size IS `DELETE_BATCH_MAX`.
+            const n = self.deleteObjects(page.keys) catch |err| blk: {
+                first_err = first_err orelse err;
+                break :blk 0;
+            };
+            deleted += n;
+            // Keys the batch could not remove are still listed next pass; the
+            // error makes the caller run one.
+            if (n < page.keys.len) first_err = first_err orelse Error.Io;
+
             if (token) |t| self.allocator.free(t);
             token = null;
             const next = page.next_token orelse break;
@@ -762,6 +843,74 @@ pub const S3BlobStore = struct {
         }
         if (first_err) |e| return e;
         return deleted;
+    }
+
+    /// XML-escape `text` into `out` — the key list a `DeleteObjects` body
+    /// carries is the only place this store WRITES a caller-supplied string
+    /// into XML, and a key is an arbitrary byte string.
+    fn appendXmlEscaped(a: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+        for (text) |c| switch (c) {
+            '&' => try out.appendSlice(a, "&amp;"),
+            '<' => try out.appendSlice(a, "&lt;"),
+            '>' => try out.appendSlice(a, "&gt;"),
+            else => try out.append(a, c),
+        };
+    }
+
+    /// The inverse, for text READ out of an S3 document. A key that round-trips
+    /// through a listing must come back as the bytes S3 stored, not as their
+    /// XML spelling — otherwise `a&b` lists as `a&amp;b` and every subsequent
+    /// request addresses an object that does not exist.
+    ///
+    /// Handles the five predefined entities plus numeric character references.
+    /// An entity this does not recognise is passed through verbatim: leaving
+    /// the key untouched loses nothing that dropping the `&` wouldn't.
+    fn xmlUnescapeAlloc(a: std.mem.Allocator, text: []const u8) ![]u8 {
+        var out = std.ArrayList(u8){};
+        errdefer out.deinit(a);
+        try out.ensureTotalCapacity(a, text.len);
+
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] != '&') {
+                out.appendAssumeCapacity(text[i]);
+                i += 1;
+                continue;
+            }
+            // Bounded: an unterminated `&` is literal text, not a truncated
+            // entity, so the scan must not run to the end of the string.
+            const semi = std.mem.indexOfScalarPos(u8, text, i, ';') orelse {
+                out.appendAssumeCapacity('&');
+                i += 1;
+                continue;
+            };
+            const ent = text[i + 1 .. semi];
+            const decoded: ?u8 = blk: {
+                if (std.mem.eql(u8, ent, "amp")) break :blk '&';
+                if (std.mem.eql(u8, ent, "lt")) break :blk '<';
+                if (std.mem.eql(u8, ent, "gt")) break :blk '>';
+                if (std.mem.eql(u8, ent, "quot")) break :blk '"';
+                if (std.mem.eql(u8, ent, "apos")) break :blk '\'';
+                if (ent.len > 1 and ent[0] == '#') {
+                    const hex = ent[1] == 'x' or ent[1] == 'X';
+                    const digits = if (hex) ent[2..] else ent[1..];
+                    const cp = std.fmt.parseInt(u21, digits, if (hex) 16 else 10) catch break :blk null;
+                    // Only the single-byte range: a key is validated printable
+                    // ASCII (`root.validateKey`), so a multi-byte code point is
+                    // not a key this store wrote.
+                    break :blk if (cp <= 0x7f) @as(u8, @intCast(cp)) else null;
+                }
+                break :blk null;
+            };
+            if (decoded) |c| {
+                out.appendAssumeCapacity(c);
+                i = semi + 1;
+            } else {
+                out.appendAssumeCapacity('&');
+                i += 1;
+            }
+        }
+        return out.toOwnedSlice(a);
     }
 
     /// `<Tag>text</Tag>` extraction — the only XML S3 makes us read.
@@ -798,6 +947,11 @@ pub const S3BlobStore = struct {
         content_type: ?[]const u8 = null,
         /// Signed + sent `x-amz-copy-source` (CopyObject).
         copy_source: ?[]const u8 = null,
+        /// Signed + sent `Content-MD5` (base64 of the raw digest). Only
+        /// `DeleteObjects` needs it: S3 requires that request to carry an
+        /// integrity check over the key list independent of the transport,
+        /// so a truncated body is rejected rather than half-deleted.
+        content_md5: ?[]const u8 = null,
         /// Response header to capture (case-insensitive), returned
         /// on `ExtResp.captured_header`.
         capture_header: ?[]const u8 = null,
@@ -852,10 +1006,16 @@ pub const S3BlobStore = struct {
         var ts_buf: [16]u8 = undefined;
         sigv4.formatAmzDate(&ts_buf, std.time.timestamp());
 
-        var extra: [1]sigv4.ExtraHeader = undefined;
+        // `sign` sorts these into the canonical header block itself, so the
+        // order they're appended in here doesn't matter.
+        var extra: [2]sigv4.ExtraHeader = undefined;
         var extra_n: usize = 0;
         if (opts.copy_source) |cs| {
             extra[extra_n] = .{ .name = "x-amz-copy-source", .value = cs };
+            extra_n += 1;
+        }
+        if (opts.content_md5) |md5| {
+            extra[extra_n] = .{ .name = "content-md5", .value = md5 };
             extra_n += 1;
         }
 
@@ -877,7 +1037,7 @@ pub const S3BlobStore = struct {
         });
         defer signed.deinit(self.allocator);
 
-        var headers_buf: [5]curl_mod.Header = undefined;
+        var headers_buf: [6]curl_mod.Header = undefined;
         var hn: usize = 0;
         headers_buf[hn] = .{ .name = "x-amz-date", .value = signed.x_amz_date };
         hn += 1;
@@ -891,6 +1051,10 @@ pub const S3BlobStore = struct {
         }
         if (opts.content_type) |ct| {
             headers_buf[hn] = .{ .name = "content-type", .value = ct };
+            hn += 1;
+        }
+        if (opts.content_md5) |md5| {
+            headers_buf[hn] = .{ .name = "content-md5", .value = md5 };
             hn += 1;
         }
 
@@ -1040,4 +1204,42 @@ test "init: accepts dev TLS-off MinIO config" {
         .use_tls = false,
     });
     defer s.deinit();
+}
+
+test "xml key escaping round-trips the characters a listing rewrites" {
+    // S3 hands keys back in their XML spelling; every use of the result
+    // addresses the object by its real bytes, so the pair must be exact.
+    const raw = "sweep/a&b<c>d\"e'f";
+    var doc = std.ArrayList(u8){};
+    defer doc.deinit(testing.allocator);
+    try S3BlobStore.appendXmlEscaped(testing.allocator, &doc, raw);
+    try testing.expectEqualStrings("sweep/a&amp;b&lt;c&gt;d\"e'f", doc.items);
+
+    // The escaper leaves quotes alone (they need no escaping in element
+    // text), but the parser must still accept them — a store is free to
+    // emit the entity form.
+    const back = try S3BlobStore.xmlUnescapeAlloc(testing.allocator, "sweep/a&amp;b&lt;c&gt;d&quot;e&apos;f");
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings(raw, back);
+}
+
+test "xml unescape: numeric refs, and text that only looks like an entity" {
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "a&#38;b", .want = "a&b" },
+        .{ .in = "a&#x26;b", .want = "a&b" },
+        // A bare `&` and an unknown entity are literal text: dropping them
+        // would corrupt a key just as badly as failing to decode one.
+        .{ .in = "a&b", .want = "a&b" },
+        .{ .in = "a&nosuch;b", .want = "a&nosuch;b" },
+        .{ .in = "trailing&", .want = "trailing&" },
+        // Out of the single-byte range validateKey permits — passed through
+        // rather than truncated into a different key.
+        .{ .in = "a&#x1F600;b", .want = "a&#x1F600;b" },
+        .{ .in = "", .want = "" },
+    };
+    for (cases) |c| {
+        const got = try S3BlobStore.xmlUnescapeAlloc(testing.allocator, c.in);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
 }

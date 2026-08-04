@@ -375,6 +375,13 @@ pub fn main() !void {
                 fail(msg);
             };
         }
+        // A fourth whose key carries XML metacharacters. The batch delete
+        // writes keys into a `<Delete>` document, so an unescaped one would
+        // either be silently skipped or malform the request — and S3 accepts
+        // these bytes in a key, so nothing upstream rules them out.
+        var xml_buf: [128]u8 = undefined;
+        const xml_key = try std.fmt.bufPrint(&xml_buf, "{s}a&b<c>d", .{sub});
+        try bs.put(xml_key, "x");
         var neighbour_buf: [128]u8 = undefined;
         const neighbour = try std.fmt.bufPrint(&neighbour_buf, "sweep-{x}-sibling/obj", .{seed});
         try bs.put(neighbour, "keep");
@@ -386,14 +393,19 @@ pub fn main() !void {
         };
         const listed = page.keys.len;
         page.deinit(allocator);
-        if (listed != 3) fail("listPrefix did not return exactly the 3 objects under the prefix");
+        if (listed != 4) fail("listPrefix did not return exactly the 4 objects under the prefix");
 
         const deleted = store.deletePrefix(sub) catch |err| {
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "deletePrefix failed: {s}", .{@errorName(err)}) catch "sweep failed";
             fail(msg);
         };
-        if (deleted != 3) fail("deletePrefix did not delete exactly 3 objects");
+        if (deleted != 4) fail("deletePrefix did not delete exactly 4 objects");
+
+        // The count S3 reports is not proof on its own — a quiet batch answers
+        // with an empty body either way, so ask the store directly whether the
+        // metacharacter key actually went.
+        if (try bs.exists(xml_key)) fail("batch delete left the XML-metacharacter key behind");
 
         // Idempotent: a re-run of a completed sweep is a no-op, which is what
         // makes a partially-failed teardown safe to retry.
@@ -404,7 +416,7 @@ pub fn main() !void {
         bs.delete(neighbour) catch {};
 
         try out.print(
-            "[+{d:>6}ms] ok  prefix sweep: listed 3, deleted 3, re-run 0, neighbour intact ({d}ms)\n",
+            "[+{d:>6}ms] ok  prefix sweep: listed 4, batch-deleted 4 (incl. `a&b<c>d`), re-run 0, neighbour intact ({d}ms)\n",
             .{ elapsedMs(start_ns), elapsedMsSince(t) },
         );
         try out.flush();
