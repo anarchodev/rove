@@ -253,6 +253,12 @@ pub fn build(b: *std.Build) void {
             // IP-transport strip list) — shared with the sim's
             // authored-header hygiene (root.zig) so the filters can't drift.
             mod.addAnonymousImport("reserved_headers", .{ .root_source_file = bb.path("src/js/reserved_headers.zig") });
+            // The interaction digest's JS mirror — the SAME file the browser
+            // replay arena's prelude embeds (scripts/ops/gen_replay_prelude.py),
+            // so the sim folds the identical hash rather than a third
+            // implementation. `src/tape/testdata/digest_vectors.json` remains
+            // the reference for both; neither JS copy is authoritative.
+            mod.addAnonymousImport("js_interaction_digest", .{ .root_source_file = bb.path("src/tape/js_interaction_digest.js") });
         }
     }.f;
 

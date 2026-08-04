@@ -158,16 +158,23 @@ them `unverified` instead of manufacturing agreement:
 
 | field | engine | why |
 |---|---|---|
-| `digest` | sim | the sim folds no interaction digest (rove#416) |
 | `headers` | replay | the parked outcome carries only a status (rove#437) |
 | `error` | replay | a throwing handler parks nothing, so the message is unrecoverable |
+
+`digest` used to be on this list. Since rove#416 both offline engines fold one,
+and they agree — which is the strongest assertion the suite makes, because it
+compares the SEQUENCE of reads and effects rather than the response two engines
+could reach down different paths.
 
 ## Status
 
 Phase 0 (rove#415) is the runner, the outcome shape, and the allowlist;
-rove#418 added the replay adapter. With sim and replay both running, the suite
-compares real outcomes today. prod is rove#417 and the sim's missing digest is
-rove#416 — until those land, `digest` in particular is produced by one engine
-only and proves nothing.
+rove#418 added the replay adapter; rove#416 gave the sim an interaction digest,
+so the two offline engines now agree on the interaction SEQUENCE and not merely
+the response. prod is rove#417.
+
+Findings so far, all filed rather than worked around: rove#436 (the replay
+epilogue has no authored-world mode), rove#437 (no response headers in the
+parked outcome), rove#442 (harness bookkeeping folded into replay's digest).
 
 Tracker: rove#195.

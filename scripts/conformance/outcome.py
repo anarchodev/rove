@@ -14,8 +14,9 @@ Two rules carry the weight:
 
 **A field is compared only across engines that supply it.** A field exactly one
 engine produces is `unverified`, never agreement. Without this the suite reads
-green while proving nothing — the sim folds no interaction digest today, so a
-naive comparison would "agree" with itself and call the spec verified.
+green while proving nothing — for a stretch only the replay engine folded an
+interaction digest, and a naive comparison would have "agreed" with itself and
+called the sequence verified.
 
 **Absent is not equal to null.** An engine that cannot produce a field says so
 (the field is missing); an engine that produces an empty value says *that*.
@@ -199,6 +200,11 @@ def from_sim_bundle(bundle: dict, *, compared_headers=DEFAULT_COMPARED_HEADERS) 
     The sim's `body` is the handler's RETURN VALUE, not wire bytes, so it sets
     `body` and leaves `body_sha256` absent — the wire-byte comparison starts
     existing when a second engine that has wire bytes lands (rove#417).
+
+    `interaction_digest` is present since rove#416; a bundle without it (an
+    older `rewind` binary) leaves the field ABSENT rather than null, so the
+    runner reports the comparison as unverified instead of manufacturing
+    agreement with an engine that did fold one.
     """
     o = Outcome(engine="sim")
     resp = bundle.get("response")
@@ -234,8 +240,8 @@ def from_sim_bundle(bundle: dict, *, compared_headers=DEFAULT_COMPARED_HEADERS) 
     # run is a failed run, surfaced by the adapter, not a field to compare.
     if bundle.get("divergence") is not None:
         o.notes["divergence"] = bundle["divergence"]
-    # The sim folds no interaction digest (rove#416), so `digest` stays ABSENT
-    # rather than null — see the module docstring on absent-vs-null.
+    # ABSENT (not null) when the bundle carries none — see the module docstring
+    # on absent-vs-null.
     if "interaction_digest" in bundle:
         o.digest = bundle["interaction_digest"]
     return o

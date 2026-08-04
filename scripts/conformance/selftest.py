@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Non-vacuity check for the conformance machinery itself.
 
-The suite currently runs one engine, so it cannot yet catch a real divergence —
-which means the comparison, the allowlist, and the stale-entry rule are all
-unexercised, and unexercised gate machinery is decoration. Something has to
-prove the gate CAN go red before the engine that would make it go red exists.
+The corpus exercises this machinery only where two engines happen to disagree —
+a thin and shifting slice, and on a box without the replay porcelain, no slice
+at all. Left to the corpus alone, the comparison, the allowlist and the
+stale-entry rule would go unexercised, and unexercised gate machinery is
+decoration.
 
 So this drives the comparison with synthetic outcomes and asserts each rule the
 runner depends on. It is pure Python: no engines, no cluster, ~instant, and it
@@ -69,9 +70,9 @@ def main() -> int:
     check("agreement produces no divergence", not divs)
 
     # ── ABSENT is not a value ──
-    # The trap this guards: the sim folds no interaction digest, so if ABSENT
-    # compared equal to a produced null, a prod digest of null would "agree"
-    # with a sim that never computed one.
+    # The trap this guards: if ABSENT compared equal to a produced null, an
+    # engine that folds no digest would "agree" with one whose digest is null,
+    # and the sequence would read as verified without ever being compared.
     divs, unver = _cmp(
         Outcome(engine="sim"),  # digest ABSENT
         Outcome(engine="prod", digest=None),  # digest produced, and null
