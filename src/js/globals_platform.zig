@@ -27,8 +27,6 @@ const ScopeKvOp = globals_mod.ScopeKvOp;
 const js_exception = globals_mod.js_exception;
 const js_undefined = globals_mod.js_undefined;
 const js_null = globals_mod.js_null;
-const js_true = globals_mod.js_true;
-const js_false = globals_mod.js_false;
 const valueToOwnedString = globals_mod.valueToOwnedString;
 const kvWriteArgToOwnedString = globals_mod.kvWriteArgToOwnedString;
 const kvSizeViolation = globals_mod.kvSizeViolation;
@@ -190,48 +188,14 @@ pub fn jsPlatformRootPrefix(
     return arr;
 }
 
-/// `platform.auth.checkRootToken(token_hex)` — admin-only. Returns `true`
-/// iff `token_hex` matches the operator root token supplied to the worker at
-/// startup, constant-time via `tenant.authenticate`. The admin deploy
-/// `_middlewares` M2M gate and `/v1/login` call this, so the secret never
-/// crosses into JS state.
-///
-/// Emits a low-volume auth-audit log (result + token length — NEVER the
-/// token). Root-token traffic is operator-only, so this line is both the
-/// privileged-access audit trail and the FIRST place to look when a deploy
-/// 401s: no line for a request that should have carried a Bearer means the
-/// `authorization` header never reached this native (lost upstream — front
-/// proxy or header ingestion); a `denied` line means the token itself didn't
-/// match (e.g. a per-node token drift). See `docs/architecture/control-plane.md`.
-pub fn jsPlatformAuthCheckRootToken(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_false;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        // A root-token check reached this native on a tenant with no platform
-        // binding (not `__admin__`) — a routing / platform-grant gap. Throwing
-        // silently here surfaces upstream as an opaque 401; name it instead.
-        std.log.warn("auth: checkRootToken invoked with no platform binding (non-admin tenant) — denying", .{});
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const token = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(token);
-
-    const auth = tenant.authenticate(token) catch |err| {
-        state.pending_kv_error = err;
-        std.log.warn("auth: root-token check errored: {s}", .{@errorName(err)});
-        return js_false;
-    };
-    const granted = auth != null;
-    std.log.info("auth: root-token check {s} (token_len={d})", .{ if (granted) "granted" else "denied", token.len });
-    return if (granted) js_true else js_false;
-}
+/// The operator-root check does NOT live here. A native taking the bearer
+/// would mean the handler holds the token, and a handler-held value arrives
+/// via `request.headers` — which the read-recorder TAPES. The verdict is
+/// computed in the engine and surfaces as `request.rewind.isRoot`
+/// (`globals_request.zig` `jsIsRootGetter`); the header itself is stripped on
+/// a platform-bound handler (`reserved_headers.zig`
+/// PLATFORM_CREDENTIAL_HEADERS). See `docs/architecture/control-plane.md` for
+/// the audit line and `docs/decisions.md` for the surface-minimization rule.
 
 /// `platform.instances.create(name)` — admin-only. Creates the
 /// instance directory, opens its app.db, writes the local

@@ -241,7 +241,8 @@ fn cmdBootstrap(a: std.mem.Allocator, env: *const c.Env) void {
 // publishing bootstrap cycle can never start. Run once, after the registry
 // tenant is provisioned + its app deployed.
 //
-// The registry is a normal tenant with no platform.auth.checkRootToken, and at
+// The registry is a normal tenant — it is not platform-bound, so it has no
+// `request.rewind.isRoot` (the operator-root verdict is admin-only), and at
 // genesis there is no OIDC IdP to log into. So this authenticates publish via a
 // seeded operator-token hash: kv-put sha256(root_token) into the registry's own
 // kv (its middleware grants is_root to a Bearer that hashes to it), then POST

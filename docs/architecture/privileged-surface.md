@@ -171,6 +171,55 @@ per-worker primitive is a forever commitment. Build only on demand.
 outbound boundary (3a); customer rate limiting → kv recipe / `@rewind/
 ratelimit` (3b); per-worker primitive deferred (3c).
 
+## 3.5 Platform credentials are not on any handler surface
+
+The two-surface model (§1) governs *natives*. There is a third thing a
+privileged handler can reach — the **credential the platform authenticates
+itself with** — and it needs its own rule, because on a replay platform a
+handler-readable input is a **recorded** input.
+
+The operator root token used to arrive as an ordinary header the admin
+middleware read and handed to a native:
+
+```js
+const hdr = request.headers["authorization"] || "";     // ← taped, verbatim
+if (platform.auth.checkRootToken(hdr.slice(7))) { … }
+```
+
+`request.headers` is a read-recording accessor (`globals_request.zig`
+`jsHeaderGetter` → `request_reads`), so line 1 put a platform-wide credential in
+the tenant's replay archive. Gating the *native* fixes nothing: the value was
+already recorded one line above it, by a different mechanism.
+
+**The rule.** A platform credential must not be reachable from a handler
+surface. Read-taping can't redact (a redacted input replays differently), so the
+surface is minimized instead — the same lever `STRIPPED_IP_HEADERS` applies to
+the client IP, for the same reason.
+
+**As-built.** On a platform-bound handler (`state.platform != null`):
+
+- `authorization` is stripped from `request.headers`
+  (`reserved_headers.zig` `PLATFORM_CREDENTIAL_HEADERS`)
+- the worker computes the verdict — it holds both the header and the secret —
+  and exposes it as **`request.rewind.isRoot`** (`globals_request.zig`
+  `jsIsRootGetter`), lazily, recorded as `RequestReadKind.root_verdict`
+- there is **no escalation rung**. `request.ip` needs one because handlers
+  consume the IP *value*; nothing consumes the raw bearer, so the ladder
+  collapses to one rung and the token never becomes a JS string.
+
+```js
+if (!request.rewind.isRoot) { response.status = 403; return { error: "forbidden" }; }
+```
+
+`request.rewind` is the reserved platform-metadata namespace
+(`../handler-shape.md`) and does not exist off a platform-bound handler, so a
+customer tenant has no surface to probe. Offline, a scenario declares the
+**answer** (`scenario({ admin: true, isRoot: true })`) — there is no token to
+supply, because prod has none to compare.
+
+**When this recurs.** Any credential that reaches a handler surface. Compute the
+verdict in the engine; expose the verdict. See `../decisions.md` §4.6b.
+
 ## 4. Migration steps
 
 1. **Collapse `__rove_*` → `__rove.*`** (globals.zig `GLOBAL_BUILTINS` →

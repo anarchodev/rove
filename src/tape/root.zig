@@ -243,6 +243,16 @@ pub const RequestReadKind = enum(u8) {
     /// raw-IP escalation. `name = ""`; `value` = the unmasked IP
     /// returned (empty value ⇒ null was returned).
     ip_raw = 4,
+    /// First `request.rewind.isRoot` access on a platform-bound
+    /// handler. `name = ""`; `value` = `"1"` when the request carried
+    /// a valid operator root token, empty otherwise. The VERDICT is
+    /// the recorded input — the bearer that produced it is never
+    /// taped, and is not reachable from the handler at all
+    /// (`reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS). A
+    /// platform credential must never be handler-readable, because on
+    /// a replay platform every handler-readable input is a recorded
+    /// input (`docs/decisions.md`, the surface-minimization rule).
+    root_verdict = 5,
 };
 
 /// Single captured event. Owned storage: the `Tape` that holds this
@@ -1856,6 +1866,7 @@ test "request_reads tape: all kinds roundtrip" {
     try tape.appendRequestReadOnce(.body_read, "", "");
     try tape.appendRequestReadOnce(.ip_masked, "", "203.0.113.0");
     try tape.appendRequestReadOnce(.ip_raw, "", "203.0.113.7");
+    try tape.appendRequestReadOnce(.root_verdict, "", "1");
 
     const bytes = try tape.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1863,7 +1874,7 @@ test "request_reads tape: all kinds roundtrip" {
     defer parsed.deinit();
 
     try testing.expectEqual(Channel.request_reads, parsed.channel);
-    try testing.expectEqual(@as(usize, 6), parsed.entries.len);
+    try testing.expectEqual(@as(usize, 7), parsed.entries.len);
     const names = parsed.entries[0].request_reads;
     try testing.expectEqual(RequestReadKind.header_names, names.kind);
     try testing.expectEqualStrings("[\"user-agent\",\"cookie\"]", names.value);
@@ -1880,6 +1891,11 @@ test "request_reads tape: all kinds roundtrip" {
     const raw = parsed.entries[5].request_reads;
     try testing.expectEqual(RequestReadKind.ip_raw, raw.kind);
     try testing.expectEqualStrings("203.0.113.7", raw.value);
+    // The verdict, never the bearer that produced it.
+    const root = parsed.entries[6].request_reads;
+    try testing.expectEqual(RequestReadKind.root_verdict, root.kind);
+    try testing.expectEqualStrings("", root.name);
+    try testing.expectEqualStrings("1", root.value);
 }
 
 test "request_reads tape: appendRequestReadOnce dedupes on (kind, name)" {

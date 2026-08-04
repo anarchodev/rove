@@ -535,6 +535,39 @@ behavior, and what handler-shape.md promised). Three reasons:
   (the read-recording model makes it the handler-code author's explicit,
   auditable choice instead).
 
+### 4.6b A platform credential is never handler-readable
+- **The rule**: on a replay platform, **a handler-readable input is a recorded
+  input**. Redaction is not available as a mitigation (§4.6 — a redacted input
+  replays differently), so the only lever is what a handler can reach at all.
+  A *platform* credential — as opposed to a tenant's own application auth —
+  must therefore not be reachable from any handler surface.
+- **The pattern, generalized from `request.ip`**: **strip** the raw channel from
+  the ambient surface, **derive** an ergonomic lower-fidelity value, and offer
+  raw only through a deliberate **escalation** that tapes the escalation. Part
+  one is the load-bearing part: with the raw channel visible, everyone reads it.
+- **Applied to the operator root token**: `authorization` is stripped from
+  `request.headers` on a platform-bound handler
+  (`reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS), and the worker — which
+  already holds both the header and the secret — computes the verdict and
+  exposes it as **`request.rewind.isRoot`**, taped as
+  `RequestReadKind.root_verdict`. There is **no escalation rung**: unlike an IP,
+  nothing legitimately consumes the raw bearer, so the ladder collapses to one
+  and the credential never becomes a JS string.
+- **Not a re-proposal of §4.6's rejected redaction**: nothing is redacted. The
+  *shape of the input changes* so the secret was never an input — the boolean is
+  a complete, faithful, recorded input that replay serves exactly. Same move as
+  stripping XFF.
+- **Retired**: `platform.auth.checkRootToken(token)`. A verb taking the bearer
+  means the handler holds the bearer, and a handler holds it by reading
+  `request.headers` — which tapes it. The verb's disappearance is the fix, not a
+  cleanup after it.
+- **Scope**: customer tenants are unaffected; a tenant's own `authorization`
+  header stays readable and stays that tenant's controller responsibility per
+  §4.6. This is about the platform's credential on the platform's tape.
+- **Where it comes up next**: any future credential reaching a handler surface —
+  e.g. the `services-token` if `/_system/*` ever grows a JS path. Compute the
+  verdict, expose the verdict.
+
 ### 4.7 One effect-result surface — flattened, no `request.result`
 - **Partially superseded by §4.9** (2026-06-15): the flatten-the-result decision
   stands, but where the *threaded ctx* and *delivery metadata* live changed —

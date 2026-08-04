@@ -343,24 +343,14 @@
       },
     },
 
-    /**
-     * Root-token auth.
-     *
-     * @namespace platform.auth
-     */
-    auth: {
-      /**
-       * Validate a platform root token.
-       *
-       * @param {string} token - The bearer token to check.
-       * @returns {boolean} `true` if the token authenticates.
-       * @example
-       * if (!platform.auth.checkRootToken(bearer))
-       *   return new Response("forbidden", { status: 403 });
-       */
-      checkRootToken(token) {
-        return sys.auth.checkRootToken(token);
-      },
-    },
+    // Root-token auth is NOT here. The operator-root verdict is
+    // `request.rewind.isRoot` — computed by the engine, which holds both the
+    // wire `authorization` header and the secret, and taped as the verdict
+    // alone. There is no verb taking the bearer, because a token the handler
+    // holds is a token `request.headers` recorded onto the tape; the header is
+    // stripped on this handler for the same reason. See
+    // `docs/architecture/privileged-surface.md`.
+    //
+    //   if (!request.rewind.isRoot) { response.status = 403; return { error: "forbidden" }; }
   };
 })();

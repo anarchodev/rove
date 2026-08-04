@@ -7,29 +7,28 @@
 // saw `request.ctx.ok === undefined` → 500. These drivers place the door result
 // on the resume's `request.ctx`, matching the prod `routeCompileEvent` /
 // `processManifestPut` contract (`deploy_thread.zig`). The handler touches
-// `platform.*`, so the run is admin + carries the operator root token.
+// `platform.*`, so the run is admin; `isRoot` declares the operator-root
+// verdict the engine computes in prod (there is no bearer to pass).
 import { scenario, expect } from "rewind:test";
 
 const s = scenario({
   admin: true,
-  rootToken: "root-secret",
+  isRoot: true,
   now: "2026-07-01T00:00:00Z",
   // platform.scope resolves eagerly (ghost id ⇒ InstanceNotFound, like
   // prod) — declare every tenant the handler scopes.
   instances: { acme: {}, other: {} },
 });
 
-function post(path, body, auth = "Bearer root-secret") {
-  return s.inbound({
-    method: "POST",
-    path,
-    headers: auth ? { authorization: auth } : {},
-    body: JSON.stringify(body),
-  });
+function post(path, body, sc = s) {
+  return sc.inbound({ method: "POST", path, body: JSON.stringify(body) });
 }
 
-// ── auth branch: no/invalid token → 401 before any door arms ──
-const noauth = post("/v1/deploy/file", { tenant: "acme", path: "index.mjs" }, "");
+// ── auth branch: no operator credential → 401 before any door arms ──
+// Auth is a property of the ACTIVATION (request.rewind.isRoot), not a header
+// the handler parses, so the negative case is a scenario rather than a header.
+const anon = scenario({ admin: true, isRoot: false, now: "2026-07-01T00:00:00Z", instances: { acme: {} } });
+const noauth = post("/v1/deploy/file", { tenant: "acme", path: "index.mjs" }, anon);
 expect(noauth.status).toBe(401);
 expect(noauth.disposition).toBe("terminal");
 
@@ -91,7 +90,7 @@ expect(pkgStaged.instanceKv("acme", "_workspace_pkg/pk99/lib.mjs")).toEqual({
 // door to rove-stage.internal.
 const cutScenario = scenario({
   admin: true,
-  rootToken: "root-secret",
+  isRoot: true,
   now: "2026-07-01T00:00:00Z",
   instances: {
     acme: {
@@ -106,7 +105,6 @@ const cutScenario = scenario({
 const cut = cutScenario.inbound({
   method: "POST",
   path: "/v1/deploy/cut",
-  headers: { authorization: "Bearer root-secret" },
   body: JSON.stringify({ tenant: "acme" }),
 });
 expect(cut.disposition).toBe("held");

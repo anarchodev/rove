@@ -36,9 +36,11 @@ export default function () {
     throws(() => platform.releases.publish("acme", "0123456789abcdef"), NOT_ADMIN);
   });
 
-  check("platform.auth.checkRootToken", () => {
-    throws(() => platform.auth.checkRootToken("tok"), NOT_ADMIN);
-  });
+  // No `platform.auth` check: the verb is gone. The operator-root verdict is
+  // `request.rewind.isRoot`, installed only on a platform-bound handler, so a
+  // customer tenant has no surface to probe. If a bearer-taking verb ever comes
+  // back, direction 1 of the inventory gate ("public name with no covering
+  // test") fails loudly — which is the guard that matters here.
 
   check("platform.stage", () => {
     // Like compile, staging lowers to a bound fetch at a trusted door and is

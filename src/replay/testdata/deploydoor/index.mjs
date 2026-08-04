@@ -111,9 +111,9 @@ export function onCut() {
 
 export default function () {
   if (request.method !== "POST") { response.status = 405; return "POST only\n"; }
-  const hdr = request.headers["authorization"] || "";
-  const tok = hdr.indexOf("Bearer ") === 0 ? hdr.slice(7) : "";
-  if (!tok || !platform.auth.checkRootToken(tok)) {
+  // Engine-computed operator-root verdict; the bearer is stripped from
+  // request.headers on a platform-bound handler so it can't reach the tape.
+  if (!request.rewind.isRoot) {
     response.status = 401;
     return "unauthorized\n";
   }

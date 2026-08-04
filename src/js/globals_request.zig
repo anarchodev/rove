@@ -97,7 +97,7 @@ pub fn installRequest(
     defer c.JS_FreeValue(ctx, global);
 
     // request = { method, path, host, body, query, headers, cookies,
-    //             ip, unmaskedIp() }
+    //             ip, unmaskedIp(), rewind? }
     //
     // The request surface is READ-TAPED (`docs/handler-shape.md`):
     // method/path/host/query are eager data properties (they already
@@ -135,6 +135,11 @@ pub fn installRequest(
     // body-read marker that keeps the body's tape/log reference
     // alive (unread bodies are elided from the replay record —
     // `Readset.elideUnreadBody`).
+    //
+    // `rewind` exists only on a platform-bound handler and holds
+    // `isRoot`, the operator-root verdict. It is the reserved
+    // platform-metadata namespace (`docs/handler-shape.md`), and it is how
+    // the root credential stays off both the handler surface and the tape.
     const req_obj = c.JS_NewObject(ctx);
     // The shared payload prototype (globals/request.js): `text`/`json`
     // accessors deriving from `request.bytes`
@@ -169,6 +174,17 @@ pub fn installRequest(
     definePropertyGetter(ctx, req_obj, "cookies", c.JS_NewCFunction2(ctx, @ptrCast(&jsCookiesGetter), "cookies", 0, c.JS_CFUNC_getter_magic, 0));
     definePropertyGetter(ctx, req_obj, "ip", c.JS_NewCFunction2(ctx, @ptrCast(&jsIpGetter), "ip", 0, c.JS_CFUNC_getter_magic, 0));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "unmaskedIp", c.JS_NewCFunction2(ctx, jsUnmaskedIp, "unmaskedIp", 0, c.JS_CFUNC_generic, 0));
+    // `request.rewind` — the reserved namespace for platform-provided
+    // per-activation metadata (`docs/handler-shape.md`, the reserved-names
+    // section). Installed only on a platform-bound handler, and carrying only
+    // `isRoot` today: the operator-root VERDICT, which replaces reading the
+    // bearer off `request.headers` (stripped — `reserved_headers.zig`
+    // PLATFORM_CREDENTIAL_HEADERS).
+    if (state.platform != null) {
+        const rewind_obj = c.JS_NewObject(ctx);
+        definePropertyGetter(ctx, rewind_obj, "isRoot", c.JS_NewCFunction2(ctx, @ptrCast(&jsIsRootGetter), "isRoot", 0, c.JS_CFUNC_getter_magic, 0));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "rewind", rewind_obj);
+    }
     // request.tag(key, value): attach a low-cardinality index tag to
     // this request's log record (see `jsRequestTag`).
     _ = c.JS_SetPropertyStr(ctx, req_obj, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
@@ -773,6 +789,15 @@ fn installHeaders(
             // is NOT reserved and stays visible.)
             if (reserved_headers.isReservedInternalHeader(name)) continue;
 
+            // Strip the platform credential headers on a platform-bound
+            // handler: the operator root token arrives on `authorization`, and
+            // this getter TAPES the value it returns, so a read would put a
+            // platform-wide credential in the replay archive. The verdict is
+            // reachable instead, as `request.rewind.isRoot` — see
+            // `reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS. Customer
+            // tenants are unaffected (their bearer is their own app's auth).
+            if (state.platform != null and reserved_headers.isPlatformCredentialHeader(name)) continue;
+
             // The getter's magic is the FIELD INDEX — no per-getter
             // heap state; the getter reads name+value back out of
             // `state.req_headers` on call. Duplicate names: the later
@@ -959,6 +984,71 @@ fn jsUnmaskedIp(
     recordRequestRead(state, .ip_raw, "", raw orelse "");
     if (raw) |r| return c.JS_NewStringLen(ctx, r.ptr, r.len);
     return js_null;
+}
+
+/// `request.rewind.isRoot` accessor — true iff this request carried a valid
+/// operator root token. Installed ONLY on a platform-bound handler (the
+/// `__admin__` tenant); `request.rewind` doesn't exist elsewhere.
+///
+/// The engine computes the verdict because it already holds both halves — the
+/// wire `authorization` header and the operator secret — and because the
+/// handler must not hold either. The bearer is stripped from `request.headers`
+/// (`reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS), so the credential
+/// never becomes a JS string and never reaches the tape; what is taped is this
+/// boolean (`RequestReadKind.root_verdict`), which is the complete input the
+/// handler consumes. Unlike `request.ip` there is no raw escalation rung: no
+/// handler legitimately needs the token itself.
+///
+/// Lazy, like every other read-recorded field — an admin request whose path
+/// never asks pays neither the constant-time compare nor a tape entry.
+fn jsIsRootGetter(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    magic: c_int,
+) callconv(.c) c.JSValue {
+    _ = magic;
+    const state = getState(ctx);
+    const granted = blk: {
+        const tenant = state.platform orelse break :blk false;
+        const token = deriveBearerToken(state.req_headers) orelse break :blk false;
+        const auth = tenant.authenticate(token) catch |err| {
+            std.log.warn("auth: root-token check errored: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        break :blk auth != null;
+    };
+    // Low-volume privileged-access audit line. Root-token traffic is
+    // operator-only, so this is both the audit trail and the FIRST place to
+    // look when a deploy 401s: no line for a request that should have carried
+    // a Bearer means the header never reached the worker (lost upstream — front
+    // proxy or header ingestion); a `denied` line means the token itself didn't
+    // match (e.g. a per-node token drift). NEVER logs the token.
+    // See `docs/architecture/control-plane.md`.
+    std.log.info("auth: root-token check {s}", .{if (granted) "granted" else "denied"});
+    recordRequestRead(state, .root_verdict, "", if (granted) "1" else "");
+    return selfReplaceWithValue(ctx, this_val, "isRoot", if (granted) js_true else js_false);
+}
+
+/// The bearer token off the wire `authorization` header, or null when absent /
+/// not a `Bearer ` credential / empty. Borrows the header storage. Reads
+/// `state.req_headers` (the full wire set) rather than `request.headers`,
+/// which no longer exposes the header on a platform-bound handler — the same
+/// shape as `deriveClientIp` reading the stripped IP-transport headers.
+fn deriveBearerToken(hdrs_opt: ?h2.ReqHeaders) ?[]const u8 {
+    const hdrs = hdrs_opt orelse return null;
+    const fields_ptr = hdrs.fields orelse return null;
+    const PREFIX = "Bearer ";
+    var found: ?[]const u8 = null;
+    for (fields_ptr[0..hdrs.count]) |f| {
+        const name = f.name[0..f.name_len];
+        // Last occurrence wins, matching the header property table's
+        // duplicate-name rule.
+        if (std.mem.eql(u8, name, "authorization")) found = f.value[0..f.value_len];
+    }
+    const value = found orelse return null;
+    if (!std.mem.startsWith(u8, value, PREFIX)) return null;
+    const token = std.mem.trim(u8, value[PREFIX.len..], " \t");
+    return if (token.len == 0) null else token;
 }
 
 /// Derive the client IP from the wire headers: the last

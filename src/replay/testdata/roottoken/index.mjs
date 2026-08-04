@@ -1,10 +1,11 @@
-// platform.auth.checkRootToken gate. An admin endpoint that only proceeds when
-// the request carries the operator root token — the sim validates the token
-// against the configured value (scenario({ rootToken })) instead of blanket
-// success, so a broken/absent token is actually rejected.
+// The operator-root gate. An admin endpoint that proceeds only when the
+// request carried a valid operator root token — the verdict arrives as
+// `request.rewind.isRoot`, computed by the engine. The handler never sees a
+// bearer: `authorization` is stripped on a platform-bound handler, because a
+// header the handler reads is a header the tape records
+// (docs/architecture/privileged-surface.md).
 export default function () {
-  const tok = request.headers["x-root-token"];
-  if (!platform.auth.checkRootToken(tok)) {
+  if (!request.rewind.isRoot) {
     response.status = 403;
     return { ok: false };
   }
