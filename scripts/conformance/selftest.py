@@ -125,7 +125,8 @@ def main() -> int:
 
     # ── the allowlist excuses only its own signature ──
     probe = allowlist.Known(
-        pattern="selftest/w/status/prod~sim", issue=0, why="selftest probe"
+        pattern="selftest/w/status/prod~sim", engines=("sim", "prod"), issue=1,
+        why="selftest probe"
     )
     saved = allowlist.KNOWN
     allowlist.KNOWN = (probe,)
@@ -152,10 +153,54 @@ def main() -> int:
     finally:
         allowlist.KNOWN = saved
 
-    # ── the shipped allowlist obeys its own rules ──
+    # ── an entry whose engines did not run is NOT stale ──
+    # The bug this guards: the shipped entry concerns sim↔replay, and on a box
+    # with no replay porcelain only the sim runs. Judging it there fails the
+    # build because an ENGINE was missing, which is the opposite of what rule 4
+    # is for.
+    probe2 = allowlist.Known(
+        pattern="x/y/effects/replay~sim",
+        engines=("sim", "replay"),
+        by_design=True,
+        why="probe",
+    )
+    saved = allowlist.KNOWN
+    allowlist.KNOWN = (probe2,)
+    try:
+        check(
+            "an unfired entry IS stale when its engines ran",
+            [k.pattern for k in allowlist.stale([], engines_ran={"sim", "replay"})]
+            == [probe2.pattern],
+        )
+        check(
+            "an unfired entry is NOT stale when an engine did not run",
+            allowlist.stale([], engines_ran={"sim"}) == [],
+        )
+    finally:
+        allowlist.KNOWN = saved
+
+    # ── rule 1: an entry is owned OR by-design, never neither, never both ──
+    # Construction enforces it, so this checks the enforcement rather than the
+    # entries: a rule that only lives in review is a rule that erodes.
+    for bad, label in (
+        ({"pattern": "a/b/c/d~e", "why": "x", "engines": ("a",)}, "neither issue nor by_design"),
+        ({"pattern": "a/b/c/d~e", "why": "x", "engines": ("a",), "issue": 1, "by_design": True}, "both"),
+        ({"pattern": "a/b/c/d~e", "why": "", "engines": ("a",), "issue": 1}, "no rationale"),
+    ):
+        try:
+            allowlist.Known(**bad)
+            check(f"allowlist rejects an entry with {label}", False, "constructed")
+        except ValueError:
+            check(f"allowlist rejects an entry with {label}", True)
+
     check(
-        "every shipped allowlist entry names an issue",
-        all(k.issue > 0 and k.why for k in allowlist.KNOWN),
+        "every shipped allowlist entry is owned or by-design",
+        all((bool(k.issue) != bool(k.by_design)) and k.why for k in allowlist.KNOWN),
+    )
+    check(
+        "owner() reads as an issue or as 'by design'",
+        all(k.owner().startswith("rove#") or k.owner() == "by design"
+            for k in allowlist.KNOWN),
     )
 
     print()

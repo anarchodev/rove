@@ -11,25 +11,28 @@ be an engine grading its own homework.
 Three engines run customer handlers, so there are three adapters:
 
 - `sim`    — the offline reactor, via `rewind sim`. No cluster, no network.
-- `prod`   — the worker on a live V2Cluster (rove#417).
-- `replay` — the browser WASM arena, driven headless from node (rove#418).
+- `replay` — the browser WASM arena, driven headless from node through
+             `replay_driver.mjs`. No cluster either; it needs `$REWIND_APPS_DIR`
+             for the porcelain, and reports itself unavailable without it.
+- `prod`   — the worker on a live V2Cluster (rove#417), still a stub.
 
-The prod and replay adapters are declared here and raise `EngineUnavailable`.
-They are NOT omitted: a case that names an engine must visibly not-run on it,
-because "did not run" and "ran and agreed" have to stay distinguishable — that
-distinction is what makes a three-way disagreement localize a fault instead of
-merely reporting one.
+An adapter that cannot run raises `EngineUnavailable` rather than being omitted:
+a case that names an engine must visibly not-run on it, because "did not run"
+and "ran and agreed" have to stay distinguishable — that distinction is what
+makes a three-way disagreement localize a fault instead of merely reporting
+one.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
-from outcome import Outcome, from_sim_bundle
+from outcome import Outcome, from_replay_result, from_sim_bundle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -118,12 +121,81 @@ def run_prod(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
 # ── replay (rove#418) ────────────────────────────────────────────────────────
 
 
-def run_replay(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
+def _apps_dir() -> Path:
+    """The rewind-apps checkout holding the replay porcelain (rtap /
+    request-replay / qjs_arena_wasm). `$REWIND_APPS_DIR` is the smoke harness's
+    convention; honour it rather than inventing a second one."""
+    env = os.environ.get("REWIND_APPS_DIR")
+    if env and (Path(env) / "replay" / "_static" / "qjs_arena_wasm.js").exists():
+        return Path(env)
     raise EngineUnavailable(
-        "replay adapter not built — rove#418 (headless WASM arena over a "
-        "captured case). Note this engine re-executes a RECORDED world, so it "
-        "composes with the prod adapter rather than standing alone."
+        "REWIND_APPS_DIR is not set to a rewind-apps checkout — the replay "
+        "porcelain lives there (private repo)"
     )
+
+
+# Source files the replay engine is handed. `_tests/` is the sim's own
+# assertion tree, not handler code: shipping it would put modules in the replay
+# that no other engine loads.
+_SOURCE_SUFFIXES = (".mjs", ".js")
+
+
+def _collect_sources(source_dir: Path) -> dict:
+    out = {}
+    for p in sorted(source_dir.rglob("*")):
+        if not p.is_file() or p.suffix not in _SOURCE_SUFFIXES:
+            continue
+        rel = p.relative_to(source_dir)
+        if "_tests" in rel.parts:
+            continue
+        out[str(rel)] = p.read_text(encoding="utf-8")
+    return out
+
+
+def run_replay(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
+    apps = _apps_dir()
+    if not shutil.which("node"):
+        raise EngineUnavailable("node is not on PATH — it drives the WASM arena")
+
+    job = {
+        "apps_dir": str(apps),
+        "world": world,
+        "sources": _collect_sources(source_dir),
+    }
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as fh:
+        json.dump(job, fh)
+        job_path = Path(fh.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(Path(__file__).resolve().parent / "replay_driver.mjs"), str(job_path)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    finally:
+        job_path.unlink(missing_ok=True)
+
+    # Exit 3/4 are the driver's own preconditions (no porcelain, no entry
+    # source) — not an engine result, so they are unavailability rather than a
+    # failed comparison.
+    if proc.returncode == 3:
+        raise EngineUnavailable(proc.stderr.strip() or "replay porcelain missing")
+    if proc.returncode not in (0, 4):
+        raise AdapterError(
+            f"replay driver exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+        )
+    if not proc.stdout.strip():
+        raise AdapterError(
+            f"replay driver produced no output: {proc.stderr.strip()[:500]}"
+        )
+    try:
+        res = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as e:
+        raise AdapterError(f"replay driver output is not JSON: {e}")
+
+    return from_replay_result(res, stderr=proc.stderr)
 
 
 ADAPTERS = {

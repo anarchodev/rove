@@ -48,6 +48,41 @@ DEFAULT_COMPARED_HEADERS = (
 ABSENT = object()
 
 
+def _wire_text(value: Any) -> Any:
+    """The response body as it goes on the wire, mirroring the replay
+    epilogue's `__ser`: null/undefined → None, a string passes through
+    UNCHANGED, anything else is JSON-serialized.
+
+    Mirrored rather than chosen. `__ser` is what the replay engine parks and
+    what its interaction digest folds, and prod puts the same text on the wire,
+    so deriving it identically for every engine is what makes one `body` field
+    comparable at all.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _body_from_wire(text: Any) -> Any:
+    """Wire text → the comparable body value.
+
+    Parsed when the text is JSON so that two engines building the same object in
+    a different key order still compare equal. Note this cannot distinguish a
+    handler that returned the object `{"a":1}` from one that returned the
+    STRING `'{"a":1}'` — `__ser` erases that difference before anything can
+    observe it, so no engine can report it. Exact wire-text equality is the
+    interaction digest's job (it folds `__ser`'s output), not this field's.
+    """
+    if text is None or not isinstance(text, str):
+        return _canon(text)
+    try:
+        return _canon(json.loads(text))
+    except json.JSONDecodeError:
+        return text
+
+
 def _canon(v: Any) -> Any:
     """Recursively key-sort objects so two engines that built the same value in
     a different insertion order compare equal. Arrays keep their order — order
@@ -180,7 +215,11 @@ def from_sim_bundle(bundle: dict, *, compared_headers=DEFAULT_COMPARED_HEADERS) 
         raw = base64.b64decode(bundle["bodyB64"])
         o.body = {"kind": "bytes", "b64": base64.b64encode(raw).decode()}
     elif "body" in bundle:
-        o.body = _canon(bundle["body"])
+        # Through wire text, the same route the replay engine's body takes —
+        # the sim reports the handler's RETURN VALUE while replay reports
+        # `__ser` of it, and comparing those directly made a returned string
+        # look like a divergence from an identical wire body.
+        o.body = _body_from_wire(_wire_text(bundle["body"]))
 
     if "disposition" in bundle:
         o.disposition = bundle["disposition"]
@@ -199,6 +238,70 @@ def from_sim_bundle(bundle: dict, *, compared_headers=DEFAULT_COMPARED_HEADERS) 
     # rather than null — see the module docstring on absent-vs-null.
     if "interaction_digest" in bundle:
         o.digest = bundle["interaction_digest"]
+    return o
+
+
+def from_replay_result(res: dict, *, stderr: str = "") -> Outcome:
+    """Normalize the WASM replay engine's parked outcome.
+
+    The epilogue parks `{status, result, effects, digest}` under
+    `__replay_output__` in the host kv overlay — the same side channel the
+    native driver's OUTPUT_KEY uses.
+
+    What this engine can observe is narrower than the sim's, and the gaps are
+    left ABSENT rather than filled with a plausible value:
+
+    - **headers** — the parked outcome carries only a status, so response
+      headers cannot be read back (rove#437). Filling in `{}` would assert the handler set
+      none, which is a different claim from "this engine cannot see them".
+    - **error** — a throwing handler parks nothing at all, so the message is not
+      recoverable here. `ok` still compares, because a non-zero rc with no
+      parked output IS observable.
+    """
+    o = Outcome(engine="replay")
+    parked = res.get("parked")
+    rc = res.get("rc")
+    o.notes["rc"] = rc
+    if res.get("oom"):
+        o.notes["oom"] = True
+    if stderr.strip():
+        o.notes["stderr"] = stderr.strip()[:2000]
+
+    # A non-zero rc with nothing parked is how an undeclared kv read surfaces:
+    # the binding returns -4, the epilogue throws REPLAY DIVERGENCE, and the run
+    # dies before parking. Name it, because "the replay engine has no
+    # closed-world default" is a finding about the engine, not a driver bug.
+    if parked is None:
+        o.ok = False
+        if rc != 0 and "REPLAY DIVERGENCE" in stderr:
+            o.notes["divergence"] = (
+                "undeclared read — the replay engine has no closed-world "
+                "default (rove#436)"
+            )
+        return o
+
+    o.ok = rc == 0
+    if "status" in parked:
+        o.status = parked["status"]
+
+    # `result` is already the wire text (`__ser` of the return value), so it
+    # goes through the same wire→body route as every other engine.
+    if "result" in parked:
+        body = _body_from_wire(parked["result"])
+        o.body = body
+        # Same rule the sim applies: a returned `next(...)` holds the
+        # connection. Derived identically on both sides so the comparison tests
+        # the engines rather than two different definitions of "held".
+        if isinstance(body, dict) and body.get("__rove_disposition") == "next":
+            o.disposition = "held"
+        else:
+            o.disposition = "terminal"
+
+    if "effects" in parked:
+        o.effects = normalize_effects(parked["effects"])
+        o.writes = writes_of(o.effects)
+    if parked.get("digest") is not None:
+        o.digest = parked["digest"]
     return o
 
 

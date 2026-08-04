@@ -13,6 +13,8 @@ against hand-copied expected values:
 | `prod` | the worker on a live cluster | `scripts/smoke/*_smoke_v2.py` |
 | `replay` | the browser WASM arena | a human replaying a record and hitting the next wall |
 
+`sim` and `replay` both run today. `prod` is rove#417.
+
 `src/replay/testdata/utf8encode` and `scripts/smoke/utf8_encode_smoke_v2.py`
 are the shape in miniature: the *same nine expected values*, written out twice
 in two languages, each asserting against a literal rather than against the
@@ -33,6 +35,26 @@ python3 scripts/conformance/selftest.py        # the gate's own non-vacuity chec
 The **cheap lane** (`sim`, `replay`) needs no cluster and hangs off `zig build
 test`. The **cluster lane** adds `prod`, which needs S3 credentials and port
 slots, so it gets a scheduled runner instead (rove#420).
+
+The replay engine needs **`REWIND_APPS_DIR`** pointing at a rewind-apps
+checkout — the replay porcelain (`rtap.mjs`, `request-replay.mjs`,
+`qjs_arena_wasm`) lives in that private repo. Without it the engine reports
+itself unavailable and the run degrades to sim-only, which is reported as
+`unproven` rather than as a pass.
+
+### Running an AUTHORED world on a replay engine
+
+Replay normally re-executes a CAPTURED world: tapes carry the reads the original
+run made, and a read the tape lacks is a divergence. Conformance cases are
+authored, so `replay_driver.mjs` seeds the world's closed-world kv map into the
+host kv **overlay**, which `_arena_host_kv_get` consults *before* the tape.
+
+What that does not buy is the sim's closed-world default: a read of a key the
+world does not declare falls through to an empty tape and dies with REPLAY
+DIVERGENCE where the sim answers `not_found`. That is an engine property, not a
+driver limitation, and it means a case whose handler reads undeclared keys
+cannot run on this engine (rove#436) — exactly the "declares its backends"
+signal of rove#419.
 
 ## What a case looks like
 
@@ -86,25 +108,39 @@ replay+prod agreeing while sim differs points at the sim's recorders.
 `allowlist.py` holds the reviewed set of legitimate engine differences. Four
 rules, each because an allowlist without it becomes a junk drawer:
 
-1. every entry names the issue that deletes it
+1. every entry is **owned** (names the issue that deletes it) or **by-design**
+   (permanent, with the rationale) — never neither, never both; construction
+   rejects it
 2. entries match by **signature**, never by value
 3. every entry prints on every run
-4. **a stale entry fails the gate** — if an entry matched nothing, either the
-   divergence was fixed or the case stopped exercising it, and both need a human
+4. **a stale entry fails the gate** — if an entry matched nothing *and the
+   engines it concerns both ran*, either the divergence was fixed or the case
+   stopped exercising it, and both need a human
 
-It is currently **empty**, which is not an oversight: one engine produces no
-pairs, so there is nothing yet to excuse. Entries are expected with the prod
-adapter — wall clock vs. the sim's virtual clock, S3-backed blob bytes the sim
-carries inline, node-partitioned request ids.
+Rule 4's engine clause matters: an entry about sim↔replay is not stale on a box
+with no replay porcelain. Without it the gate would fail because an engine was
+missing, which is the opposite of what the rule is for.
+
+One entry ships today, and it is by-design: the replay engine has no console
+recorder, because live console output is already on the LogRecord
+(`gen_replay_prelude.py` excludes `console.js`). The interaction digest does not
+fold console either, so the engines still agree on the sequence that matters.
+More are expected with the prod adapter — wall clock vs. the sim's virtual
+clock, S3-backed blob bytes the sim carries inline, node-partitioned request
+ids.
 
 ## Why `selftest.py` exists
 
-The suite runs one engine today, so it cannot catch a real divergence — which
-means the comparison, the allowlist, and the stale-entry rule are all
-unexercised, and unexercised gate machinery is decoration. `selftest.py` drives
-them with synthetic outcomes so the gate is provably able to go red *before* the
-engine that would turn it red exists. It runs first in the same build step, and
-is not optional.
+The corpus exercises the machinery only where two engines happen to disagree,
+which is a thin and shifting slice — and on a box without the replay porcelain
+it is no slice at all. `selftest.py` drives the comparison, the allowlist, and
+the stale rule with synthetic outcomes, so the gate is provably able to go red
+independently of which engines are available. It runs first in the same build
+step and is not optional.
+
+It has caught two of its own kind already: the rule that ABSENT never compares
+as agreement, and the rule that an entry whose engines did not run is not
+stale.
 
 ## Adding a case
 
@@ -115,12 +151,23 @@ is not optional.
 3. Run `zig build conformance`. A case that runs on one engine reports
    `unproven`, which is accurate: it has established nothing yet.
 
+## What each engine cannot report
+
+Left ABSENT rather than filled with a plausible value, so the runner reports
+them `unverified` instead of manufacturing agreement:
+
+| field | engine | why |
+|---|---|---|
+| `digest` | sim | the sim folds no interaction digest (rove#416) |
+| `headers` | replay | the parked outcome carries only a status (rove#437) |
+| `error` | replay | a throwing handler parks nothing, so the message is unrecoverable |
+
 ## Status
 
-Phase 0 (rove#415) is the runner, the outcome shape, and the allowlist. The
-adapters land separately: prod is rove#417, replay is rove#418, and the sim's
-missing interaction digest is rove#416. Until a second adapter exists the suite
-is wired but not load-bearing, and it says so in its own summary line rather
-than reporting a pass.
+Phase 0 (rove#415) is the runner, the outcome shape, and the allowlist;
+rove#418 added the replay adapter. With sim and replay both running, the suite
+compares real outcomes today. prod is rove#417 and the sim's missing digest is
+rove#416 — until those land, `digest` in particular is produced by one engine
+only and proves nothing.
 
 Tracker: rove#195.

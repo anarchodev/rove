@@ -135,7 +135,7 @@ def run_case(case: dict, engines: list[str], verbose: bool) -> dict:
             {
                 "signature": d.signature(),
                 "pattern": k.pattern,
-                "issue": k.issue,
+                "owner": k.owner(),
                 "why": k.why,
                 "detail": d.describe(),
             }
@@ -217,7 +217,7 @@ def main() -> int:
     if excused:
         print("\nexcused divergences (allowlist):")
         for x in excused:
-            print(f"  rove#{x['issue']}  {x['detail']}\n            {x['why']}")
+            print(f"  {x['owner']:<10} {x['detail']}\n             {x['why']}")
 
     if unavailable:
         print("\nengines that did not run:")
@@ -257,11 +257,17 @@ def main() -> int:
     # re-match would consult the current KNOWN a second time and could quietly
     # disagree with the first.
     fired = {x["pattern"] for x in excused}
-    stale = [k for k in allowlist.KNOWN if k.pattern not in fired]
+    # Only judge entries whose engines actually ran — see allowlist.stale().
+    engines_ran = {e for r in results for w in r["worlds"] for e in w["engines_ran"]}
+    stale = [
+        k
+        for k in allowlist.KNOWN
+        if k.pattern not in fired and set(k.engines).issubset(engines_ran)
+    ]
     if stale:
         print("\nSTALE ALLOWLIST ENTRIES — matched nothing this run:")
         for k in stale:
-            print(f"  rove#{k.issue}  {k.pattern}\n            {k.why}")
+            print(f"  {k.owner():<10} {k.pattern}\n             {k.why}")
 
     if args.json:
         Path(args.json).write_text(
@@ -289,8 +295,8 @@ def main() -> int:
     if not failed and not comparisons:
         print(
             "  Nothing was compared: every field came from a single engine. "
-            "The suite is wired, not yet load-bearing — it becomes an actual "
-            "gate when a second adapter lands (rove#417 / rove#418)."
+            "Set REWIND_APPS_DIR to a rewind-apps checkout to run the replay "
+            "engine, or add prod to --engines once rove#417 lands."
         )
     return 1 if failed else 0
 
