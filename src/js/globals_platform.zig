@@ -16,6 +16,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 const tape_mod = @import("rove-tape");
+const digest_mod = tape_mod.interaction_digest;
 const rove = @import("rove");
 const reserved = @import("reserved.zig");
 
@@ -72,15 +73,41 @@ fn namespacedKey(
     return std.fmt.allocPrint(allocator, STORE_NS ++ "{s}/{s}", .{ tag, key });
 }
 
-/// Record a cross-store `get` onto the kv channel under `tag`'s namespace.
-/// Best-effort: a tape failure must never fail the handler's read (the same
-/// posture as `globals_kv.zig`), but it IS a replay hole, so it logs.
-fn tapeStoreGet(
+/// Fold one already-namespaced element into the interaction digest
+/// (`src/tape/interaction_digest.zig`). Cross-store ops get NO verb of their
+/// own — the store is data in the key — so this is the ordinary kv element,
+/// which is exactly what the offline facade produces for the same call.
+fn foldStore(state: *DispatchState, comptime what: enum { get, prefix, put, delete }, args: anytype) void {
+    const rs = state.readset orelse return;
+    var d = digest_mod.Digest{ .h = if (rs.interaction_digest == 0)
+        digest_mod.Digest.init().h
+    else
+        rs.interaction_digest };
+    switch (what) {
+        .get => d.kvRead(args[0], args[1], args[2]),
+        .prefix => d.kvPrefix(args[0], args[1], args[2], args[3]),
+        .put => d.kvWrite(args[0], args[1]),
+        .delete => d.kvDelete(args[0]),
+    }
+    rs.interaction_digest = d.h;
+}
+
+/// Record a cross-store `get`: ALWAYS fold it into the digest, and tape it
+/// unless `tape` says the read is a read-your-write (reproduced offline by
+/// re-running the write). The split mirrors `globals_kv.zig`, where `foldRead`
+/// sits outside the `skip_tape` gate — the digest hashes what the handler DID,
+/// and a read-your-write is still a read it performed. Folding it on one engine
+/// and not the other is precisely the drift the digest exists to catch.
+///
+/// Best-effort: a tape failure must never fail the handler's read, but it IS a
+/// replay hole, so it logs.
+fn recordStoreGet(
     state: *DispatchState,
     tag: []const u8,
     key: []const u8,
     value: []const u8,
     outcome: tape_mod.KvOutcome,
+    tape: bool,
 ) void {
     const rs = state.readset orelse return;
     const nk = namespacedKey(state.allocator, tag, key) catch |err| {
@@ -88,9 +115,35 @@ fn tapeStoreGet(
         return;
     };
     defer state.allocator.free(nk);
+    foldStore(state, .get, .{ nk, outcome == .ok, value });
+    if (!tape) return;
     rs.kv.appendKv(.get, nk, value, outcome) catch |err| {
         std.log.warn("rove-js platform read tape: append {s}: {s}", .{ nk, @errorName(err) });
     };
+}
+
+/// A cross-store write / delete. Folded, never taped — a write is an OUTPUT,
+/// reproduced by re-running the handler (`docs/effect-algebra.md`).
+fn recordStoreWrite(state: *DispatchState, tag: []const u8, key: []const u8, value: ?[]const u8) void {
+    if (state.readset == null) return;
+    const nk = namespacedKey(state.allocator, tag, key) catch |err| {
+        std.log.warn("rove-js platform write digest: key {s}/{s}: {s}", .{ tag, key, @errorName(err) });
+        return;
+    };
+    defer state.allocator.free(nk);
+    if (value) |v| foldStore(state, .put, .{ nk, v }) else foldStore(state, .delete, .{nk});
+}
+
+/// A privileged lifecycle op — folded only (nothing to tape: the handler reads
+/// nothing back). `a2` is empty for the single-argument ops.
+fn foldPlatformOp(state: *DispatchState, op: []const u8, a1: []const u8, a2: []const u8) void {
+    const rs = state.readset orelse return;
+    var d = digest_mod.Digest{ .h = if (rs.interaction_digest == 0)
+        digest_mod.Digest.init().h
+    else
+        rs.interaction_digest };
+    d.platformOp(op, a1, a2);
+    rs.interaction_digest = d.h;
 }
 
 /// Record a cross-store `prefix` scan. Both the scanned prefix AND every
@@ -114,6 +167,7 @@ fn tapeStorePrefix(
     defer a.free(np);
 
     if (outcome != .ok) {
+        foldStore(state, .prefix, .{ np, false, @as(usize, 0), @as(u64, 0) });
         rs.kv.appendKvPrefix(np, cursor, limit, &.{}, outcome) catch {};
         return;
     }
@@ -135,6 +189,20 @@ fn tapeStorePrefix(
         pairs[i] = .{ .key = rk, .value = e.value };
         built = i + 1;
     }
+    // The rows-fold the digest hashes: `key=<valuehash>;` per row, in returned
+    // order — the same accumulator the JS mirror builds, over the NAMESPACED
+    // keys, so both engines fold the identical string.
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(a);
+    var acc_ok = true;
+    for (pairs[0..built]) |pr| {
+        acc.writer(a).print("{s}={x};", .{ pr.key, digest_mod.foldValue(pr.value) }) catch {
+            acc_ok = false;
+            break;
+        };
+    }
+    if (acc_ok) foldStore(state, .prefix, .{ np, true, built, digest_mod.foldValue(acc.items) });
+
     rs.kv.appendKvPrefix(np, cursor, limit, pairs[0..built], .ok) catch |err| {
         std.log.warn("rove-js platform read tape: append prefix {s}: {s}", .{ np, @errorName(err) });
     };
@@ -180,17 +248,17 @@ pub fn jsPlatformRootGet(
 
     const value = tenant.root.get(key) catch |err| switch (err) {
         error.NotFound => {
-            if (!skip_tape) tapeStoreGet(state, "r", key, "", .not_found);
+            recordStoreGet(state, "r", key, "", .not_found, !skip_tape);
             return js_null;
         },
         else => {
             state.pending_kv_error = err;
-            if (!skip_tape) tapeStoreGet(state, "r", key, "", .err);
+            recordStoreGet(state, "r", key, "", .err, !skip_tape);
             return js_null;
         },
     };
     defer state.allocator.free(value);
-    if (!skip_tape) tapeStoreGet(state, "r", key, value, .ok);
+    recordStoreGet(state, "r", key, value, .ok, !skip_tape);
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
@@ -215,6 +283,7 @@ pub fn jsPlatformRootSet(
     tenant.root.put(key, val) catch |err| {
         state.pending_kv_error = err;
     };
+    recordStoreWrite(state, "r", key, val);
     // Mirror the write into the root writeset so the worker can
     // propose it through raft. Admin handlers ALWAYS have this
     // set (dispatcher init checks `platform != null`), so an unset
@@ -243,6 +312,7 @@ pub fn jsPlatformRootDelete(
     const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key);
 
+    recordStoreWrite(state, "r", key, null);
     tenant.root.delete(key) catch |err| switch (err) {
         error.NotFound => {
             // Still propagate the delete to followers so their state
@@ -402,6 +472,8 @@ pub fn jsPlatformInstancesCreate(
         },
     };
 
+    foldPlatformOp(state, "instances.create", name, "");
+
     if (state.root_writeset) |ws| {
         var key_buf: [16 + tenant_mod.MAX_INSTANCE_ID_LEN]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{name}) catch
@@ -500,6 +572,8 @@ pub fn jsPlatformInstancesDeployStarter(
     const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(name);
 
+    foldPlatformOp(state, "instances.deployStarter", name, "");
+
     fn_ptr(fn_ctx, state.allocator, name) catch |err| switch (err) {
         error.InstanceNotFound => {
             const err_obj = c.JS_NewError(ctx);
@@ -588,6 +662,14 @@ pub fn jsPlatformReleasesPublish(
         }
         dep_id = @intFromFloat(dep_id_f64);
     }
+
+    // The CANONICAL 16-hex spelling of the resolved u64, not the caller's
+    // spelling: the native accepts a hex string or a number for the same
+    // deployment, and two runs that publish the same dep_id must fold
+    // identically on every engine. The mirror normalizes the same way.
+    var dep_hex: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&dep_hex, "{x:0>16}", .{dep_id}) catch unreachable;
+    foldPlatformOp(state, "releases.publish", tenant_id, &dep_hex);
 
     fn_ptr(fn_ctx, state.allocator, tenant_id, dep_id) catch |err| switch (err) {
         error.InstanceNotFound => {
@@ -710,17 +792,17 @@ fn jsScopeKvGet(
 
     const value = inst.kv.get(key) catch |err| switch (err) {
         error.NotFound => {
-            tapeStoreGet(state, tag, key, "", .not_found);
+            recordStoreGet(state, tag, key, "", .not_found, true);
             return js_null;
         },
         else => {
             state.pending_kv_error = err;
-            tapeStoreGet(state, tag, key, "", .err);
+            recordStoreGet(state, tag, key, "", .err, true);
             return js_null;
         },
     };
     defer state.allocator.free(value);
-    tapeStoreGet(state, tag, key, value, .ok);
+    recordStoreGet(state, tag, key, value, .ok, true);
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
@@ -816,6 +898,16 @@ fn scopeKvWrite(
     // `ensureOpen`'s `tryAcquire` returns null → Error.Conflict → KvFailed (the
     // __admin__ deploy-reset wedge). Riding the dispatch writeset also commits
     // atomically with the handler's own batch.
+    // Folded for BOTH branches below and before either runs: the offline facade
+    // routes every `scope(id).kv.set/delete` through the same namespaced key
+    // whether or not `id` is the dispatching tenant, so the digest must not
+    // depend on which local path the write took.
+    {
+        const tag = scopeTag(state.allocator, id) catch return js_exception;
+        defer state.allocator.free(tag);
+        recordStoreWrite(state, tag, key, if (op == .put) val else null);
+    }
+
     if (std.mem.eql(u8, id, state.instance_id)) {
         // Write to BOTH the dispatch's speculative overlay (`state.txn`) and
         // the writeset — exactly as `jsKvSet`/`jsKvDelete` do. `state.txn` is
