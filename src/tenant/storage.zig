@@ -74,6 +74,18 @@ pub const Incarnation = union(enum) {
     }
 };
 
+/// Every per-tenant S3 subdir, in one place. This is the set a teardown
+/// sweeps, so it is also the definition of "the tenant's stored objects": a
+/// new subdir that is not listed here outlives its tenant, costing storage
+/// forever and leaving bytes behind that an account deletion promised to
+/// remove. Add to this list in the same change that introduces the subdir.
+pub const SUBDIRS = [_][]const u8{
+    "app-blobs",
+    "file-blobs",
+    "log-blobs",
+    "deployments",
+};
+
 /// The handle every per-tenant derivation goes through. Both fields are
 /// borrowed slices — `Tenant.Instance` owns one for its lifetime; transient
 /// callers get an owned-token one from `Tenant.storageOf`.

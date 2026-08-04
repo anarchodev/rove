@@ -25,8 +25,13 @@
 //! - Server-side encryption headers (S3 SSE / SSE-KMS). Loop46's
 //!   own page-encryption (PLAN Phase 9) handles this client-side;
 //!   no need for S3-side enc on top.
-//! - Listing operations. The blob store is keyed by hash; we never
-//!   enumerate. Enumeration would also be expensive at scale.
+//! - Listing on the read/write path. The blob store is keyed by hash, so
+//!   serving never enumerates — enumeration is expensive at scale, and a
+//!   reader that needed it would be reaching for a name the store does not
+//!   have. `listPrefix` / `deletePrefix` exist only for whole-prefix sweeps
+//!   (tenant teardown, GC), where the prefix IS the unit of work: S3 has no
+//!   prefix delete, so removing a tenant's objects is necessarily a
+//!   list-then-delete walk. Do not reach for them to find an object.
 //! - Retry logic. Caller (rove-files / rove-log apply) retries via
 //!   the raft state machine — a failed blob fetch on one apply
 //!   pass will retry on the next.
@@ -608,6 +613,157 @@ pub const S3BlobStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// One ListObjectsV2 page: the keys under `{key_prefix}{sub_prefix}` plus
+    /// the continuation token that fetches the next page (null = last page).
+    /// Keys are FULLY QUALIFIED (they include `key_prefix`), which is what
+    /// `deleteAbsolute` wants.
+    pub const ListPage = struct {
+        keys: [][]u8,
+        next_token: ?[]u8,
+
+        pub fn deinit(self: *ListPage, a: std.mem.Allocator) void {
+            for (self.keys) |k| a.free(k);
+            a.free(self.keys);
+            if (self.next_token) |t| a.free(t);
+            self.* = undefined;
+        }
+    };
+
+    /// Enumerate one page of `{key_prefix}{sub_prefix}`.
+    ///
+    /// Enumeration is deliberately absent from the hash-keyed read/write path
+    /// (see this file's header) — it exists only for the whole-prefix sweeps
+    /// that tenant teardown needs, because S3 has no prefix delete: removing a
+    /// tenant's objects IS a list-then-delete walk.
+    pub fn listPrefix(
+        self: *S3BlobStore,
+        a: std.mem.Allocator,
+        sub_prefix: []const u8,
+        continuation_token: ?[]const u8,
+    ) !ListPage {
+        // Canonical query: keys sorted, each value percent-encoded once and
+        // signed exactly as it goes on the wire. Sorted order here is
+        // `continuation-token` < `list-type` < `max-keys` < `prefix`.
+        var q = std.ArrayList(u8){};
+        defer q.deinit(self.allocator);
+        if (continuation_token) |t| {
+            try q.appendSlice(self.allocator, "continuation-token=");
+            try sigv4.uriEncodeComponent(self.allocator, &q, t);
+            try q.append(self.allocator, '&');
+        }
+        try q.appendSlice(self.allocator, "list-type=2&max-keys=1000&prefix=");
+        const full_prefix = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}",
+            .{ self.config.key_prefix, sub_prefix },
+        );
+        defer self.allocator.free(full_prefix);
+        try sigv4.uriEncodeComponent(self.allocator, &q, full_prefix);
+
+        var resp = try self.requestExt(.{
+            .method = .GET,
+            .key = "",
+            .absolute_key = "", // the bucket root; the prefix rides the query
+            .query_wire = q.items,
+        }, self.allocator);
+        defer resp.deinit(self.allocator);
+
+        if (resp.status != 200 or bodyHasS3Error(resp.body_owned)) {
+            std.log.warn(
+                "rove-blob s3: LIST {s} status={d}: {s}",
+                .{ full_prefix, resp.status, resp.bodySnippet() },
+            );
+            if (resp.status == 503 or resp.status == 429) return Error.SlowDown;
+            return Error.Io;
+        }
+        const body = resp.body_owned orelse return ListPage{ .keys = &.{}, .next_token = null };
+
+        var keys = std.ArrayList([]u8){};
+        errdefer {
+            for (keys.items) |k| a.free(k);
+            keys.deinit(a);
+        }
+        // Walk `<Contents>` blocks rather than every `<Key>` in the document:
+        // a `<CommonPrefixes>` entry also carries a key-shaped child, and the
+        // listing echoes the request `<Prefix>` at the top level.
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, body, cursor, "<Contents>")) |start| {
+            const end = std.mem.indexOfPos(u8, body, start, "</Contents>") orelse break;
+            if (extractXmlText(body[start..end], "Key")) |k| {
+                try keys.append(a, try a.dupe(u8, k));
+            }
+            cursor = end + "</Contents>".len;
+        }
+
+        // `IsTruncated` is the authority on whether another page exists; the
+        // token is only meaningful alongside it.
+        var next_token: ?[]u8 = null;
+        const truncated = extractXmlText(body, "IsTruncated");
+        if (truncated != null and std.mem.eql(u8, truncated.?, "true")) {
+            if (extractXmlText(body, "NextContinuationToken")) |t| {
+                next_token = try a.dupe(u8, t);
+            }
+        }
+        return ListPage{ .keys = try keys.toOwnedSlice(a), .next_token = next_token };
+    }
+
+    /// DELETE one fully-qualified key (one that already includes
+    /// `key_prefix`) — the counterpart to what `listPrefix` returns.
+    pub fn deleteAbsolute(self: *S3BlobStore, full_key: []const u8) !void {
+        var resp = try self.requestExt(.{
+            .method = .DELETE,
+            .key = "",
+            .absolute_key = full_key,
+        }, self.allocator);
+        defer resp.deinit(self.allocator);
+        // S3 DELETE is idempotent: a missing key is 204, which is exactly the
+        // convergence property a retried teardown needs.
+        if (resp.status != 204 and resp.status != 200 and resp.status != 404) {
+            std.log.warn(
+                "rove-blob s3: DELETE {s} status={d}: {s}",
+                .{ full_key, resp.status, resp.bodySnippet() },
+            );
+            if (resp.status == 503 or resp.status == 429) return Error.SlowDown;
+            return Error.Io;
+        }
+    }
+
+    /// Delete every object under `{key_prefix}{sub_prefix}`, returning how
+    /// many were removed.
+    ///
+    /// Idempotent and retry-safe by construction: it re-lists each pass, and
+    /// per-key DELETE is idempotent, so a partial sweep converges when run
+    /// again — the property tenant teardown depends on, since a failure there
+    /// must not strand bytes that nothing else will ever enumerate.
+    ///
+    /// Errors propagate AFTER the pass, so one unreachable key does not
+    /// abandon the rest of the prefix.
+    pub fn deletePrefix(self: *S3BlobStore, sub_prefix: []const u8) !u64 {
+        var deleted: u64 = 0;
+        var token: ?[]u8 = null;
+        defer if (token) |t| self.allocator.free(t);
+        var first_err: ?anyerror = null;
+
+        while (true) {
+            var page = try self.listPrefix(self.allocator, sub_prefix, token);
+            defer page.deinit(self.allocator);
+            for (page.keys) |k| {
+                self.deleteAbsolute(k) catch |err| {
+                    first_err = first_err orelse err;
+                    continue;
+                };
+                deleted += 1;
+            }
+            if (token) |t| self.allocator.free(t);
+            token = null;
+            const next = page.next_token orelse break;
+            // Survive `page.deinit` — the token drives the next iteration.
+            token = try self.allocator.dupe(u8, next);
+        }
+        if (first_err) |e| return e;
+        return deleted;
+    }
+
     /// `<Tag>text</Tag>` extraction — the only XML S3 makes us read.
     fn extractXmlText(body: []const u8, comptime tag: []const u8) ?[]const u8 {
         const open = "<" ++ tag ++ ">";
@@ -626,6 +782,14 @@ pub const S3BlobStore = struct {
     const ExtOpts = struct {
         method: curl_mod.Method,
         key: []const u8,
+        /// Target `/{bucket}/{absolute_key}` VERBATIM, without prepending
+        /// `config.key_prefix` (and ignoring `key`). Set by the two
+        /// prefix-sweep operations, which already hold fully-qualified keys:
+        /// ListObjectsV2 passes `""` to address the bucket root and carries
+        /// the prefix in the query instead, and the delete that follows
+        /// passes back the keys the listing returned — those already include
+        /// `key_prefix`, so prepending it again would address nothing.
+        absolute_key: ?[]const u8 = null,
         /// Query string EXACTLY as it goes on the wire (already
         /// percent-encoded). Signed via `query_canonical` after a
         /// sort-preserving pass — callers keep keys pre-sorted.
@@ -666,17 +830,22 @@ pub const S3BlobStore = struct {
     ) !ExtResp {
         const scheme = if (self.config.use_tls) "https" else "http";
         const qsep: []const u8 = if (opts.query_wire.len > 0) "?" else "";
+        // An absolute key replaces `key_prefix ++ key` on BOTH the wire URL
+        // and the signed path — they must be built from the same pieces or
+        // the signature covers a path the request never used.
+        const eff_prefix: []const u8 = if (opts.absolute_key != null) "" else self.config.key_prefix;
+        const eff_key: []const u8 = opts.absolute_key orelse opts.key;
         const url = try std.fmt.allocPrint(
             self.allocator,
             "{s}://{s}/{s}/{s}{s}{s}{s}",
-            .{ scheme, self.config.endpoint, self.config.bucket, self.config.key_prefix, opts.key, qsep, opts.query_wire },
+            .{ scheme, self.config.endpoint, self.config.bucket, eff_prefix, eff_key, qsep, opts.query_wire },
         );
         defer self.allocator.free(url);
 
         const path = try std.fmt.allocPrint(
             self.allocator,
             "/{s}/{s}{s}",
-            .{ self.config.bucket, self.config.key_prefix, opts.key },
+            .{ self.config.bucket, eff_prefix, eff_key },
         );
         defer self.allocator.free(path);
 

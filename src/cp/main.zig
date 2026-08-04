@@ -34,6 +34,8 @@ const cert_mirror = @import("cert_mirror.zig");
 const curl = blob.curl;
 const bc = @import("backend_client.zig");
 const move = @import("move.zig");
+const storage_sweep = @import("storage_sweep.zig");
+const tenant_mod = @import("rove-tenant");
 const reconciler = @import("reconciler.zig");
 const BackendResp = bc.BackendResp;
 const MOVE_SECRET_HEADER = bc.MOVE_SECRET_HEADER;
@@ -137,6 +139,12 @@ const Router = struct {
     /// `REWIND_ACME_DIRECTORY` is unset. Serves `/_cp/acme-challenge?token=`
     /// from its in-memory challenge store.
     acme: ?*acme_issuer.Handle = null,
+    /// S3 connection params, for the object sweep a deprovision runs
+    /// (`storage_sweep.zig`). Null when the CP has no S3 configured — the
+    /// delete then reports loudly that the tenant's bytes were left behind
+    /// rather than silently claiming a clean teardown.
+    blob_cfg: ?blob.BackendConfig = null,
+
     /// Opt-in: run the additive membership reconciler each reconcile tick
     /// (`REWIND_CP_RECONCILE_MEMBERSHIP=1`). OFF by default — a continuous
     /// unattended actor on prod must be deliberately enabled.
@@ -870,9 +878,12 @@ const Router = struct {
     /// came out but some node's eviction did not, so the caller knows to retry;
     /// the tenant is already unroutable at that point.
     ///
-    /// NOTE: this does NOT delete the tenant's stored objects (`file-blobs/`,
-    /// `log-blobs/`, …) — that is #350, and it is both a cost leak and the
-    /// deletion path a privacy policy will lean on.
+    /// Step 4 sweeps the tenant's stored objects (`app-blobs/`, `file-blobs/`,
+    /// `log-blobs/`, `deployments/`) — nothing else ever removes them, so
+    /// without it a deleted tenant bills forever and an account-closure
+    /// erasure promise has no code behind it. It runs after eviction (nothing
+    /// is still writing) and before the incarnation row is withdrawn (that row
+    /// names the prefix). See `storage_sweep.zig`.
     fn handleDelete(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
         const a = self.allocator;
         var parsed = std.json.parseFromSlice(struct {
@@ -905,6 +916,13 @@ const Router = struct {
         defer if (nodes_owned) |*r| r.deinit(a);
         nodes_owned = (self.directory.resolveOwned(a, tenant) catch null) orelse null;
 
+        // The storage incarnation names the tenant's object prefix (#357), and
+        // the sweep in step 4 needs it. Read it here alongside the other
+        // captures; empty means a legacy, name-keyed layout.
+        const inc_owned = self.directory.incarnationForOwned(a, tenant) catch a.dupe(u8, "") catch "";
+        defer if (inc_owned.len != 0) a.free(inc_owned);
+        const incarnation: ?[]const u8 = if (inc_owned.len == 0) null else inc_owned;
+
         // Host rows must be collected before removal too — the host index has
         // no reverse direction.
         const hosts = self.directory.hostsForOwned(a, tenant) catch &[_][]u8{};
@@ -932,10 +950,10 @@ const Router = struct {
         // tenant reborn under this name starts unsuspended.
         self.directory.removeSuspend(tenant) catch |err|
             std.log.warn("rewind-cp: delete {s}: removeSuspend failed: {s}", .{ tenant, @errorName(err) });
-        // The incarnation is per-LIFETIME: the next tenant to take this name
-        // must mint a fresh one, never inherit this one.
-        self.directory.removeIncarnation(tenant) catch |err|
-            std.log.warn("rewind-cp: delete {s}: removeIncarnation failed: {s}", .{ tenant, @errorName(err) });
+        // The incarnation row is withdrawn LAST, after the object sweep below:
+        // it is the handle to the tenant's storage prefix, so dropping it
+        // first would strand the objects under a prefix nothing can name
+        // again. See `storage_sweep.zig`.
 
         // 3. Tear the group down on every node that could hold it. `v2-evict`
         //    destroys the raft group AND the instance (its store, its
@@ -954,7 +972,37 @@ const Router = struct {
             try self.replyProvisionError(server, ent, sid, sess, 502, "tenant is unroutable, but its group was not fully torn down — retry");
             return;
         }
-        std.log.info("rewind-cp: deleted {s} ({d} node(s), {d} host row(s))", .{ tenant, nodes.len, hosts.len });
+
+        // 4. Delete the tenant's stored objects. AFTER eviction, so no node is
+        //    still serving (or writing) the bytes being removed, and BEFORE
+        //    the incarnation row goes — that row names the prefix, so a failed
+        //    sweep must leave it in place for the retry to find.
+        var swept: u64 = 0;
+        if (self.blob_cfg) |cfg| {
+            const storage = tenant_mod.TenantStorage{
+                .id = tenant,
+                .incarnation = if (incarnation) |i| .{ .token = i } else .legacy,
+            };
+            swept = storage_sweep.deleteTenantObjects(a, cfg, storage) catch {
+                try self.replyProvisionError(server, ent, sid, sess, 502, "tenant is torn down, but its stored objects were not fully deleted — retry");
+                return;
+            };
+        } else {
+            // No S3 configured: say so rather than reporting a clean delete —
+            // the bytes are still there and still billing.
+            std.log.warn("rewind-cp: delete {s}: no S3 config — stored objects NOT deleted", .{tenant});
+        }
+
+        // 5. The incarnation is per-LIFETIME: the next tenant to take this
+        //    name must mint a fresh one, never inherit this one. Safe to drop
+        //    now — the objects it named are gone.
+        self.directory.removeIncarnation(tenant) catch |err|
+            std.log.warn("rewind-cp: delete {s}: removeIncarnation failed: {s}", .{ tenant, @errorName(err) });
+
+        std.log.info(
+            "rewind-cp: deleted {s} ({d} node(s), {d} host row(s), {d} object(s))",
+            .{ tenant, nodes.len, hosts.len, swept },
+        );
         try replyStatus(server, ent, sid, sess, 204);
     }
 
@@ -1977,7 +2025,7 @@ pub fn main() !void {
         const ms = std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t"), 10) catch break :blk 60 * std.time.ns_per_s;
         break :blk @as(i128, ms) * std.time.ns_per_ms;
     };
-    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns, .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX") };
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns, .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX"), .blob_cfg = if (blob_owned) |b| b.cfg else null };
 
     // Periodic membership reconciliation on the directory leader (between
     // request batches). last=0 → the first iteration reconciles, so a CP

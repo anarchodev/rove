@@ -349,6 +349,67 @@ pub fn main() !void {
         try out.flush();
     }
 
+    // ── prefix sweep: list + deletePrefix ────────────────────────────
+    // The teardown primitives (`src/cp/storage_sweep.zig`). Worth exercising
+    // against a real endpoint rather than only in unit tests: pagination and
+    // the XML shape are the parts a mock would get wrong, and a sweep that
+    // silently deletes nothing looks identical to a clean teardown.
+    {
+        t = std.time.nanoTimestamp();
+        try out.print("[+{d:>6}ms] →  prefix sweep ...\n", .{elapsedMs(start_ns)});
+        try out.flush();
+
+        var sub_buf: [96]u8 = undefined;
+        const sub = try std.fmt.bufPrint(&sub_buf, "sweep-{x}/", .{seed});
+
+        // Three objects under the prefix, plus one just outside it that must
+        // SURVIVE — a sweep that takes neighbours is the failure that would
+        // erase a sibling tenant.
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            var k_buf: [128]u8 = undefined;
+            const k = try std.fmt.bufPrint(&k_buf, "{s}obj-{d}", .{ sub, i });
+            bs.put(k, "x") catch |err| {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "sweep put failed: {s}", .{@errorName(err)}) catch "put failed";
+                fail(msg);
+            };
+        }
+        var neighbour_buf: [128]u8 = undefined;
+        const neighbour = try std.fmt.bufPrint(&neighbour_buf, "sweep-{x}-sibling/obj", .{seed});
+        try bs.put(neighbour, "keep");
+
+        var page = store.listPrefix(allocator, sub, null) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "listPrefix failed: {s}", .{@errorName(err)}) catch "list failed";
+            fail(msg);
+        };
+        const listed = page.keys.len;
+        page.deinit(allocator);
+        if (listed != 3) fail("listPrefix did not return exactly the 3 objects under the prefix");
+
+        const deleted = store.deletePrefix(sub) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "deletePrefix failed: {s}", .{@errorName(err)}) catch "sweep failed";
+            fail(msg);
+        };
+        if (deleted != 3) fail("deletePrefix did not delete exactly 3 objects");
+
+        // Idempotent: a re-run of a completed sweep is a no-op, which is what
+        // makes a partially-failed teardown safe to retry.
+        const again = try store.deletePrefix(sub);
+        if (again != 0) fail("deletePrefix was not idempotent");
+
+        if (!(try bs.exists(neighbour))) fail("prefix sweep deleted an object outside the prefix");
+        bs.delete(neighbour) catch {};
+
+        try out.print(
+            "[+{d:>6}ms] ok  prefix sweep: listed 3, deleted 3, re-run 0, neighbour intact ({d}ms)\n",
+            .{ elapsedMs(start_ns), elapsedMsSince(t) },
+        );
+        try out.flush();
+    }
+
     try out.writeAll("\nPASS s3-blob smoke\n");
     try out.flush();
 }

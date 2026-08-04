@@ -62,6 +62,8 @@ const storage_mod = @import("storage.zig");
 /// `storage.zig` for why the bare id must never be the input to any of them.
 pub const TenantStorage = storage_mod.TenantStorage;
 pub const Incarnation = storage_mod.Incarnation;
+/// Every per-tenant S3 subdir — the set a teardown sweep must cover.
+pub const SUBDIRS = storage_mod.SUBDIRS;
 
 pub const Error = error{
     InvalidInstanceId,

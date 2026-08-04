@@ -1315,6 +1315,9 @@ pub fn build(b: *std.Build) void {
     cp_mod.addImport("rove-boot", boot_mod);
     cp_mod.addImport("rove-h2", h2_mod);
     cp_mod.addImport("rove-blob", blob_mod);
+    // Teardown's object sweep derives the tenant's S3 prefix through the same
+    // `TenantStorage` handle every reader and writer uses (`storage_sweep.zig`).
+    cp_mod.addImport("rove-tenant", tenant_mod);
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
     cp_mod.addImport("rove-instance-id", instance_id_mod);
     cp_mod.addImport("rove-wire", wire_mod);

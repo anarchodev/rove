@@ -424,6 +424,11 @@ class V2Cluster:
                  clusters=f"{self.cluster_id}={nodes_csv}",
                  hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
                  public_suffix=PUBLIC_SUFFIX, move_secret=MOVE_SECRET,
+                 # The CP opens per-tenant object storage too (the cert mirror,
+                 # and deprovision's object sweep), so it must share the run's
+                 # storage namespace with the nodes — a CP on a different
+                 # key_prefix_base sweeps a prefix nothing was written under.
+                 extra_env={"S3_KEY_PREFIX_BASE": self.s3_prefix},
                  log_dir=edge_log_dir)
         spawn_front(self.procs, self.front_port,
                     f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0,
@@ -473,6 +478,7 @@ class V2Cluster:
                  clusters=f"{self.cluster_id}={nodes_csv}",
                  hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
                  public_suffix=PUBLIC_SUFFIX, move_secret=MOVE_SECRET,
+                 extra_env={"S3_KEY_PREFIX_BASE": self.s3_prefix},
                  log_dir=log_dir)
         # Register each node's raft transport address with the CP registry
         # (node/{cluster}/{id} → raft_addr). Not needed to FORM a cold-multi group,
