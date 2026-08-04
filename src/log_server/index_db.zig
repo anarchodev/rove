@@ -267,6 +267,58 @@ pub const IndexDb = struct {
         }
     };
 
+    /// Newest-first list of records for `tenant_id`, unfiltered.
+    /// Driven by `log_idx_recv (tenant_id, received_ns DESC)`, so the
+    /// `LIMIT` is satisfied by walking the head of that index.
+    ///
+    /// Shares parameter numbering with `LIST_SQL_TAGGED` (?1 tenant,
+    /// ?2/?3 cursor, ?4 limit, ?5 floor) so both bind identically.
+    const LIST_SQL_UNTAGGED: [:0]const u8 =
+        \\SELECT tenant_id, request_id, received_ns, duration_ns, method, path, host,
+        \\       status, outcome, deployment_id
+        \\FROM log_index
+        \\WHERE tenant_id = ?1
+        \\  AND (?2 = 0 OR
+        \\       received_ns < ?2 OR
+        \\       (received_ns = ?2 AND request_id < ?3))
+        \\  AND (?5 = 0 OR received_ns >= ?5)
+        \\ORDER BY received_ns DESC, request_id DESC
+        \\LIMIT ?4
+    ;
+
+    /// The same list, restricted to records carrying a `log_tags` row.
+    ///
+    /// **Drives from `log_tags`, and must keep doing so.** The obvious
+    /// spelling — one statement with `(?6 IS NULL OR EXISTS (…))` — is
+    /// unusable: SQLite cannot flatten an `EXISTS` guarded by a
+    /// parameter test into a semi-join (the subquery may or may not
+    /// apply, so it stays correlated), which forces a full scan of the
+    /// tenant's window with a per-row probe into `log_tags`. Cost then
+    /// tracks *scan distance to fill the LIMIT*, not the number of
+    /// matching rows, so the worst case is a **small** result: a tag
+    /// matching fewer records than `limit` never fills it and scans to
+    /// the retention floor. Measured at 2 s vs 0 ms on a 2M-record
+    /// index — which is the whole reason this is a separate statement
+    /// rather than one with a conditional clause.
+    ///
+    /// `log_tags.received_ns` is denormalized from the record
+    /// (`bindTagRow`) precisely so the cursor and the retention clamp
+    /// can be applied on the driving table; the plan-shape test below
+    /// pins the resulting index use.
+    const LIST_SQL_TAGGED: [:0]const u8 =
+        \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
+        \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id
+        \\FROM log_tags t
+        \\JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
+        \\WHERE t.tenant_id = ?1 AND t.key = ?6 AND t.value = ?7
+        \\  AND (?2 = 0 OR
+        \\       t.received_ns < ?2 OR
+        \\       (t.received_ns = ?2 AND t.request_id < ?3))
+        \\  AND (?5 = 0 OR t.received_ns >= ?5)
+        \\ORDER BY t.received_ns DESC, t.request_id DESC
+        \\LIMIT ?4
+    ;
+
     /// Newest-first list of records for `tenant_id`. Pagination cursor:
     /// pass `(after_received_ns, after_request_id)` from the previous
     /// page's tail to advance. `(0, 0)` starts at the newest.
@@ -286,22 +338,11 @@ pub const IndexDb = struct {
         tag_key: ?[]const u8,
         tag_value: ?[]const u8,
     ) Error!ListResult {
-        const sql =
-            \\SELECT tenant_id, request_id, received_ns, duration_ns, method, path, host,
-            \\       status, outcome, deployment_id
-            \\FROM log_index li
-            \\WHERE li.tenant_id = ?
-            \\  AND (?2 = 0 OR
-            \\       received_ns < ?2 OR
-            \\       (received_ns = ?2 AND request_id < ?3))
-            \\  AND (?5 = 0 OR received_ns >= ?5)
-            \\  AND (?6 IS NULL OR EXISTS (
-            \\       SELECT 1 FROM log_tags t
-            \\        WHERE t.tenant_id = li.tenant_id AND t.request_id = li.request_id
-            \\          AND t.key = ?6 AND t.value = ?7))
-            \\ORDER BY received_ns DESC, request_id DESC
-            \\LIMIT ?4
-        ;
+        // Two statements, not one with a conditional tag clause — see
+        // LIST_SQL_TAGGED for why the conditional spelling can't be
+        // planned.
+        const tagged = tag_key != null and tag_value != null;
+        const sql = if (tagged) LIST_SQL_TAGGED else LIST_SQL_UNTAGGED;
         var st: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &st, null) != c.SQLITE_OK)
             return Error.Sqlite;
@@ -311,12 +352,11 @@ pub const IndexDb = struct {
         _ = c.sqlite3_bind_int64(st, 3, @intCast(after_request_id));
         _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
         _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
-        if (tag_key != null and tag_value != null) {
+        if (tagged) {
+            // ?6/?7 exist only in the tagged statement; binding them on
+            // the untagged one would be out of range.
             bindText(st.?, 6, tag_key.?);
             bindText(st.?, 7, tag_value.?);
-        } else {
-            _ = c.sqlite3_bind_null(st, 6);
-            _ = c.sqlite3_bind_null(st, 7);
         }
 
         var rows: std.ArrayListUnmanaged(ListRow) = .empty;
@@ -797,6 +837,128 @@ test "queryList filters by tag (user session + reserved _corr)" {
     var none = try idx.queryList("acme", 0, 0, 0, 10, "session", "nope");
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.rows.len);
+}
+
+/// Concatenated `detail` column of `EXPLAIN QUERY PLAN <sql>`. SQLite
+/// fixes the plan at prepare time without consulting bound values, so
+/// the shape can be inspected without binding anything.
+fn explainQueryPlan(a: std.mem.Allocator, db: *c.sqlite3, sql: [:0]const u8) ![]u8 {
+    const eqp = try std.fmt.allocPrintSentinel(a, "EXPLAIN QUERY PLAN {s}", .{sql}, 0);
+    defer a.free(eqp);
+    var st: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, eqp.ptr, -1, &st, null) != c.SQLITE_OK) return error.Sqlite;
+    defer _ = c.sqlite3_finalize(st);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(a);
+    while (c.sqlite3_step(st) == c.SQLITE_ROW) {
+        const txt = c.sqlite3_column_text(st, 3) orelse continue;
+        try out.appendSlice(a, std.mem.span(@as([*:0]const u8, @ptrCast(txt))));
+        try out.append(a, '\n');
+    }
+    return out.toOwnedSlice(a);
+}
+
+test "the tag-filtered list drives from log_tags, never a tenant-window scan" {
+    // A plan-shape guard, not a timing test: timings are flaky, and the
+    // plan is what regressed. The prior spelling folded the tag filter
+    // into the untagged statement as `(?6 IS NULL OR EXISTS (…))`,
+    // which SQLite cannot flatten into a semi-join — so it scanned the
+    // tenant's whole window and probed `log_tags` per row (2 s vs 0 ms
+    // on a 2M-record index, worst on SMALL results, which never fill
+    // the LIMIT and so scan to the retention floor).
+    //
+    // No ANALYZE here, deliberately: production never runs it
+    // (`log_index.db` has no `sqlite_stat1`), so the planner must reach
+    // the right shape from the schema alone, which is the condition
+    // this pins.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "plan");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    const tagged = try explainQueryPlan(a, idx.db, IndexDb.LIST_SQL_TAGGED);
+    defer a.free(tagged);
+
+    // Drives from the tag index built for this lookup...
+    try testing.expect(std.mem.indexOf(u8, tagged, "log_tags_lookup") != null);
+    // ...and reaches log_index by primary key, one probe per matched row.
+    try testing.expect(std.mem.indexOf(u8, tagged, "sqlite_autoindex_log_index_1") != null);
+    // The two regression signatures of the old spelling. `SCAN` is
+    // SQLite's word for a full table/index walk (as opposed to
+    // `SEARCH`), and a re-correlated subquery means the filter stopped
+    // being a join again.
+    try testing.expect(std.mem.indexOf(u8, tagged, "SCAN") == null);
+    try testing.expect(std.mem.indexOf(u8, tagged, "CORRELATED") == null);
+
+    // The untagged list keeps its own plan: the (tenant_id,
+    // received_ns DESC) index, whose head satisfies the LIMIT directly.
+    const untagged = try explainQueryPlan(a, idx.db, IndexDb.LIST_SQL_UNTAGGED);
+    defer a.free(untagged);
+    try testing.expect(std.mem.indexOf(u8, untagged, "log_idx_recv") != null);
+    try testing.expect(std.mem.indexOf(u8, untagged, "log_tags") == null);
+}
+
+test "a tag row's received_ns equals its record's — the tagged cursor depends on it" {
+    // LIST_SQL_TAGGED applies the pagination cursor and the retention
+    // clamp to `log_tags.received_ns` because that is the driving
+    // table, while the cursor handed back to the caller comes from the
+    // `log_index` row. The two are the same value only because
+    // `bindTagRow` denormalizes the record's own `received_ns` onto
+    // every tag row. If that ever diverges, paging silently skips or
+    // repeats rows at page boundaries, so pin it here.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "tagns");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    var tags = [_]sidecar.Tag{.{ .key = "session", .value = "S1" }};
+    var records = [_]sidecar.Record{
+        .{ .tenant_id = "acme", .request_id = 7, .received_ns = 4_242, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .correlation_id = "C9", .tags = &tags, .offset = 0, .length = 10 },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "nsbatch",
+        .ndjson_size = 10,
+        .ndjson_sha256 = "d",
+        .first_received_ns = 4_242,
+        .last_received_ns = 4_242,
+        .records = &records,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/nsbatch.ndjson", 0);
+
+    var st: ?*c.sqlite3_stmt = null;
+    const sql =
+        \\SELECT COUNT(*) FROM log_tags t JOIN log_index li
+        \\  ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
+        \\ WHERE t.received_ns != li.received_ns
+    ;
+    try testing.expect(c.sqlite3_prepare_v2(idx.db, sql, -1, &st, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(st);
+    try testing.expect(c.sqlite3_step(st) == c.SQLITE_ROW);
+    try testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(st, 0));
+
+    // Both tag rows for the record (the user tag and the derived
+    // `_corr`) carry it, so either filter pages identically.
+    try testing.expectEqual(@as(usize, 2), blk: {
+        var st2: ?*c.sqlite3_stmt = null;
+        _ = c.sqlite3_prepare_v2(idx.db, "SELECT COUNT(*) FROM log_tags WHERE received_ns = 4242", -1, &st2, null);
+        defer _ = c.sqlite3_finalize(st2);
+        _ = c.sqlite3_step(st2);
+        break :blk @as(usize, @intCast(c.sqlite3_column_int64(st2, 0)));
+    });
 }
 
 test "a re-index counts as re-index, a collision counts as a CONFLICT" {

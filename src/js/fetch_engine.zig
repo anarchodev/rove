@@ -72,6 +72,10 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const NodeState = worker_mod.NodeState;
 const PendingFetch = globals.PendingFetch;
 const UpstreamFetchEvent = components_mod.UpstreamFetchEvent;
+const msg_router_mod = @import("msg_router.zig");
+
+/// One worker→engine relay-consume ack. `id` is an allocator-owned dupe.
+const RelayAck = struct { id: []u8, bytes: u64 };
 
 /// How long the engine thread blocks in `multi.poll` between wakeups.
 /// Long timeout is fine — `Multi.wakeup` unblocks on submit/cancel,
@@ -96,6 +100,23 @@ const ENGINE_MAX_INFLIGHT: usize = 10_000;
 /// defined `final: true, ok: false` rejection event so the
 /// customer's `on_chunk` handler fires once and can take action.
 const HELD_MAX_PER_TENANT: u32 = 16;
+
+/// CAS→connection relay (`docs/architecture/routing-and-ingress.md`):
+/// cap on relayed-but-unconsumed bytes per transfer (enqueued to the
+/// worker's relay lane, not yet appended to the held stream). At the
+/// cap the write callback returns `CURL_WRITEFUNC_PAUSE` — libcurl
+/// holds the writeback and re-delivers it after the worker's consume
+/// acks bring the window down. This is what makes a fast S3 read
+/// into a slow client bounded-RAM WITHOUT dropping bytes (dropping
+/// under a committed 200 is the truncated-asset failure the stream
+/// path exists to prevent). Comfortably above libcurl's writeback
+/// size and below `StreamChunks.QUEUE_HARD_CAP`'s order of magnitude.
+const RELAY_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Unpause hysteresis: resume the transfer once the unconsumed window
+/// has drained to half, so a 16 KiB-granular consumer doesn't flap
+/// pause/unpause per writeback.
+const RELAY_RESUME_BYTES: u64 = RELAY_WINDOW_BYTES / 2;
 
 /// The special origin the `blob.*` JS shims target — the blob trusted
 /// door (`docs/architecture/routing-and-ingress.md`). Never resolved — `startTransfer` rewrites it to
@@ -230,6 +251,19 @@ pub const FetchEngine = struct {
     /// no-op (the fetch may already have completed or never existed).
     cancel_mu: std.Thread.Mutex = .{},
     cancel_ids: std.ArrayListUnmanaged([]u8) = .empty,
+
+    /// Cross-thread relay-consume acks (the CAS→connection relay,
+    /// `docs/architecture/routing-and-ingress.md`). The worker pushes
+    /// `(fetch_id, bytes)` after appending relayed bytes to the held
+    /// stream; the engine drains at the top of each loop, shrinks the
+    /// transfer's in-flight window, and unpauses a paused transfer
+    /// once it drains to `RELAY_RESUME_BYTES`. Ack-of-unknown-id is a
+    /// silent no-op (transfer already completed/cancelled). No lost
+    /// wakeup by construction: acks are only consumed on the engine
+    /// thread, so any ack enqueued before OR after a pause decision is
+    /// seen by a later drain.
+    relay_ack_mu: std.Thread.Mutex = .{},
+    relay_acks: std.ArrayListUnmanaged(RelayAck) = .empty,
 
     /// Engine-thread-only: in-flight FetchCtxs keyed by `fetch_id`.
     /// Cancel uses this to map id → ctx; on_done removes via this
@@ -442,6 +476,13 @@ pub const FetchEngine = struct {
             self.cancel_ids.deinit(self.allocator);
             self.cancel_ids = .empty;
         }
+        {
+            self.relay_ack_mu.lock();
+            defer self.relay_ack_mu.unlock();
+            for (self.relay_acks.items) |a| self.allocator.free(a.id);
+            self.relay_acks.deinit(self.allocator);
+            self.relay_acks = .empty;
+        }
 
         // Free in-flight FetchCtxs whose transfers Multi.deinit
         // already cleaned up. The map's keys borrow into
@@ -484,6 +525,26 @@ pub const FetchEngine = struct {
         if (self.multi) |m| m.wakeup() catch {};
     }
 
+    /// Cross-thread: acknowledge `bytes` of relayed data consumed by
+    /// the worker (appended to the held stream, or dropped alongside a
+    /// cancel). Shrinks the transfer's pause window; silently no-ops
+    /// for a completed/unknown fetch. `id` is borrowed — duped onto
+    /// the queue. Alloc failure drops the ack: the window then stays
+    /// conservatively large, and either later acks or the worker's
+    /// drop-path cancel unstick the transfer.
+    pub fn ackRelay(self: *FetchEngine, id: []const u8, bytes: u64) void {
+        const dup = self.allocator.dupe(u8, id) catch return;
+        {
+            self.relay_ack_mu.lock();
+            defer self.relay_ack_mu.unlock();
+            self.relay_acks.append(self.allocator, .{ .id = dup, .bytes = bytes }) catch {
+                self.allocator.free(dup);
+                return;
+            };
+        }
+        if (self.multi) |m| m.wakeup() catch {};
+    }
+
     /// Cross-thread: request cancellation of an in-flight fetch by
     /// id. Silently no-ops if the fetch already completed or never
     /// existed. `id` is borrowed — duped onto the queue.
@@ -505,6 +566,7 @@ pub const FetchEngine = struct {
     fn threadMain(self: *FetchEngine) void {
         while (!self.stop.load(.acquire)) {
             self.drainCancels();
+            self.drainRelayAcks();
             self.drainInbound();
             const multi = self.multi orelse return;
             _ = multi.poll(ENGINE_POLL_TIMEOUT_MS) catch |err| {
@@ -567,6 +629,35 @@ pub const FetchEngine = struct {
                 }
                 pf.deinit(self.allocator);
             };
+        }
+    }
+
+    /// Engine-thread: apply queued relay-consume acks. Shrinks each
+    /// live transfer's in-flight window and unpauses once it drains
+    /// past the hysteresis mark. `Transfer.unpause` may re-enter the
+    /// write callback synchronously (libcurl re-delivers the held
+    /// writeback), which is safe here: this runs on the engine thread
+    /// outside `multi.poll`.
+    fn drainRelayAcks(self: *FetchEngine) void {
+        var batch: std.ArrayList(RelayAck) = .empty;
+        defer batch.deinit(self.allocator);
+        {
+            self.relay_ack_mu.lock();
+            defer self.relay_ack_mu.unlock();
+            if (self.relay_acks.items.len == 0) return;
+            batch.ensureUnusedCapacity(self.allocator, self.relay_acks.items.len) catch return;
+            for (self.relay_acks.items) |a| batch.appendAssumeCapacity(a);
+            self.relay_acks.clearRetainingCapacity();
+        }
+        defer for (batch.items) |a| self.allocator.free(a.id);
+
+        for (batch.items) |a| {
+            const ctx = self.inflight_by_id.get(a.id) orelse continue;
+            ctx.relay_inflight -|= a.bytes;
+            if (ctx.relay_paused and ctx.relay_inflight <= RELAY_RESUME_BYTES) {
+                ctx.relay_paused = false;
+                ctx.transfer.unpause();
+            }
         }
     }
 
@@ -666,7 +757,20 @@ pub const FetchEngine = struct {
         // door is reachable without the `blob.put` shim.
         var stored_hash: ?[64]u8 = null;
         var stored_bytes: u64 = 0;
+        // A blob READ names an object that is already durable and immutable in
+        // this tenant's own store, so its bytes never need recording — the
+        // recorder references them by this hash instead (rove#430). Captured
+        // BEFORE the rewrite replaces the URL, same as the two above.
+        var get_hash: ?[64]u8 = null;
         if (is_blob_door) {
+            if (method == .GET) {
+                const tail = pf.url[BLOB_ORIGIN_PREFIX.len..];
+                if (isSha256HexLower(tail)) {
+                    var gb: [64]u8 = undefined;
+                    @memcpy(&gb, tail[0..64]);
+                    get_hash = gb;
+                }
+            }
             if (method == .PUT) {
                 const tail = pf.url[BLOB_ORIGIN_PREFIX.len..];
                 if (isSha256HexLower(tail)) {
@@ -683,6 +787,11 @@ pub const FetchEngine = struct {
                 var hb: [files_mod.HASH_HEX_LEN]u8 = undefined;
                 @memcpy(&hb, tail[0..files_mod.HASH_HEX_LEN]);
                 static_cache_hash = hb;
+                // Same hash, second consumer: the recorder references the
+                // chunk's bytes by it instead of taping them (rove#391).
+                var gb: [64]u8 = undefined;
+                @memcpy(&gb, tail[0..64]);
+                get_hash = gb;
             }
             // Own-tenant deploy-static READ door (`__system/static` streamer):
             // rewrite to THIS tenant's `file-blobs/{hash}` + SigV4-sign. Tenant
@@ -736,6 +845,29 @@ pub const FetchEngine = struct {
                 );
         }
 
+        // CAS→connection relay eligibility (rove#441, option (a)):
+        // ONLY a bound streaming read of the deploy-static door.
+        // Two fences, one per clause:
+        //   - content-addressed door only — the pump must never carry
+        //     a customer-supplied URL (it runs with no SSRF gate, no
+        //     caps re-check, no JS in the loop);
+        //   - static door only, not the blob GET door yet — the
+        //     relay's byte-ordering proof needs the chain to START as
+        //     a continuation (the first event is the decider that
+        //     opens the stream, and stream membership is the worker's
+        //     "decider consumed" signal). `__system/static`
+        //     guarantees that shape; an arbitrary handler relaying a
+        //     blob GET from an already-streaming chain would race its
+        //     own seq-0 event (see the CAS→connection relay,
+        //     `docs/architecture/routing-and-ingress.md`). Extending
+        //     to the blob door means moving the first event onto the
+        //     relay FIFO for total order.
+        // Anything else keeps today's per-chunk event path; the
+        // `relay` option is inert there. Whether the relay actually
+        // ENGAGES is decided at the first writeback (upstream 2xx +
+        // resolvable bound owner) in `onChunkCb`.
+        const relay_eligible = pf.relay and pf.stream and pf.bind and is_static_door;
+
         const req: blob_curl_multi.Request = .{
             .method = method,
             .url = pf.url,
@@ -747,7 +879,15 @@ pub const FetchEngine = struct {
             // `pf.timeout_ms = 0` for `http.subscribe`; we defend
             // here too in case a caller routes a held pf through
             // some other entry point.
-            .timeout_ms = if (pf.held) 0 else pf.timeout_ms,
+            //
+            // Relay-eligible transfers also run untimed: the pump is
+            // paced by the CLIENT (pause/ack flow control), so its
+            // lifetime is the client's read speed — a wall-clock
+            // timeout would abort a legitimately slow reader
+            // mid-asset. The transfer can't leak: a client
+            // disconnect tears down the held chain, which cancels
+            // its bound fetches (`scanAndCancelBoundFetches`).
+            .timeout_ms = if (pf.held or relay_eligible) 0 else pf.timeout_ms,
             .verify_tls = !ssrf_mod.test_allow_plaintext,
             .follow_redirects = is_blob_door or is_blob_read_door or is_static_door,
             .resolve_pin = resolve_pin,
@@ -773,8 +913,11 @@ pub const FetchEngine = struct {
                 @as(u64, @max(@as(usize, pf.max_response_chunk_bytes), 1)),
             .held = pf.held,
             .cache_hash = static_cache_hash,
+            .static_serve = is_static_door,
             .stored_hash = stored_hash,
+            .get_hash = get_hash,
             .stored_bytes = stored_bytes,
+            .relay_eligible = relay_eligible,
             .transfer = undefined, // wired below
         };
         // From here on, the FetchCtx owns the pf — clear the
@@ -1332,10 +1475,42 @@ const FetchCtx = struct {
     /// Copied onto the terminal event; the worker records the row only on a
     /// 2xx, since a failed PUT stored no bytes.
     stored_hash: ?[64]u8 = null,
+    /// True for the `__system/static` streamer's own fetches — their chunks
+    /// are never recorded (rove#391).
+    static_serve: bool = false,
+    /// Set for a `blob.get`: the content hash the fetch names. Stamped onto
+    /// every event so the recorder can reference the payload rather than
+    /// copy it (rove#430).
+    get_hash: ?[64]u8 = null,
     stored_bytes: u64 = 0,
     /// Set once accumulation passes the per-asset cap — stop buffering + don't
     /// cache (the asset stays on the stream path; no huge blob held in RAM).
     cache_drop: bool = false,
+
+    // ── CAS→connection relay (`docs/architecture/routing-and-ingress.md`) ──
+    /// Shape gate, decided at `startTransfer`: bound + streaming + a
+    /// content-addressed door. Necessary but not sufficient — see
+    /// `relay_active`.
+    relay_eligible: bool = false,
+    /// One-shot latch: the engage decision has been taken (at the
+    /// first writeback).
+    relay_decided: bool = false,
+    /// The relay is live: upstream answered 2xx and the bound owner
+    /// worker resolved. Intermediate writebacks after the first event
+    /// bypass the Msg path (bytes → the owner's relay inbox, no
+    /// activation); the terminal rides the same relay FIFO.
+    relay_active: bool = false,
+    /// The owner worker's msg-inbox index, resolved once at engage.
+    /// Pinned for the transfer's lifetime — re-resolving per chunk
+    /// could split one fetch's bytes across two lanes and reorder them.
+    relay_owner_idx: usize = 0,
+    /// Bytes enqueued to the relay lane and not yet consume-acked by
+    /// the worker. Engine-thread only (acks are applied by
+    /// `drainRelayAcks` on this thread).
+    relay_inflight: u64 = 0,
+    /// The transfer is parked on `CURL_WRITEFUNC_PAUSE` waiting for
+    /// the window to drain. Engine-thread only.
+    relay_paused: bool = false,
 
     fn deinit(self: *FetchCtx) void {
         var pf = self.pf;
@@ -1365,8 +1540,15 @@ const FetchCtx = struct {
             if (headers_json) |hj| self.allocator.free(hj);
             return false;
         };
-        self.engine.routeEvent(self.pf.tenant_id, ev) catch |err| {
-            var e = ev;
+        // The STREAMING emitter needs the same stamps as the terminal ones
+        // below, and it is the one that matters most: a streamed transfer is
+        // where the per-chunk records pile up. `__system/static` streams, so
+        // without this every static chunk is recorded verbatim (rove#391).
+        var ev_stamped = ev;
+        ev_stamped.static_serve = self.static_serve;
+        ev_stamped.content_hash = self.get_hash;
+        self.engine.routeEvent(self.pf.tenant_id, ev_stamped) catch |err| {
+            var e = ev_stamped;
             UpstreamFetchEvent.deinitItem(&e, self.allocator);
             std.log.warn(
                 "rove-js fetch_engine: route chunk seq={d}: {s}",
@@ -1384,18 +1566,49 @@ const FetchCtx = struct {
 
 /// Per-writeback chunk callback — engine-thread, fires inside
 /// `multi.poll`.
-fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) bool {
+fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) blob_curl_multi.WriteAction {
     const s: *FetchCtx = @ptrCast(@alignCast(ctx.?));
-    if (s.failed or s.capped) return false;
-    if (bytes.len == 0) return true;
+    if (s.failed or s.capped) return .abort;
+    if (bytes.len == 0) return .consume;
 
-    var take = bytes;
-    const remaining: usize = @intCast(s.effective_total_cap - s.total);
-    if (bytes.len >= remaining) {
-        take = bytes[0..remaining];
-        s.capped = true;
+    // CAS→connection relay engage decision — once, at the first
+    // writeback (libcurl has parsed the status line by then). A
+    // non-2xx upstream or an unresolvable bound owner leaves the
+    // relay OFF: every event then routes through the per-chunk path,
+    // so the decider module's terminal-only error handling sees
+    // exactly what it sees today.
+    if (s.relay_eligible and !s.relay_decided) {
+        s.relay_decided = true;
+        const st = s.transfer.statusCode();
+        if (st >= 200 and st < 300) {
+            if (s.engine.node.router.lookupBoundFetchOwner(s.pf.id)) |idx| {
+                s.relay_active = true;
+                s.relay_owner_idx = idx;
+            }
+        }
     }
+
+    const remaining: usize = @intCast(s.effective_total_cap - s.total);
+    const will_cap = bytes.len >= remaining;
+    const take = if (will_cap) bytes[0..remaining] else bytes;
+
+    // Relay fast path applies to writebacks past the first EVENT: the
+    // first writeback still routes as the seq-0 event (the decider
+    // activation — it commits the head + `stream.start()`), and bytes
+    // can only be appended to a stream that activation has opened.
+    //
+    // Backpressure: the window check runs BEFORE any state mutation —
+    // a `.pause` return means libcurl holds this same writeback and
+    // re-delivers it after the worker's consume acks drain the
+    // window, so nothing here may have consumed it.
+    const relay_now = s.relay_active and s.emitted_seq > 0;
+    if (relay_now and s.relay_inflight + take.len > RELAY_WINDOW_BYTES) {
+        s.relay_paused = true;
+        return .pause;
+    }
+
     s.total += take.len;
+    if (will_cap) s.capped = true;
 
     // Read-through tee (static door): accumulate until the per-asset cap, then
     // give up caching this one (free the buffer; keep streaming).
@@ -1411,6 +1624,36 @@ fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) bool {
         }
     }
 
+    if (relay_now) {
+        // Splice: owned bytes → the bound owner's relay inbox. No Msg,
+        // no activation, no log record. Failure is LOSSLESS-or-fail:
+        // abort the transfer (CURLE_WRITE_ERROR → terminal ok=false →
+        // the decider's mid-stream error arm) rather than ever
+        // dropping a byte-run whose predecessors were delivered.
+        const owned = s.allocator.dupe(u8, take) catch {
+            s.failed = true;
+            return .abort;
+        };
+        const fid = s.allocator.dupe(u8, s.pf.id) catch {
+            s.allocator.free(owned);
+            s.failed = true;
+            return .abort;
+        };
+        var item: msg_router_mod.RelayItem = .{ .fetch_id = fid, .payload = .{ .bytes = owned } };
+        s.engine.node.router.enqueueRelayToWorker(s.relay_owner_idx, item) catch |err| {
+            item.deinit(s.allocator);
+            std.log.warn(
+                "rove-js relay: enqueue bytes fetch_id={s}: {s}; aborting transfer",
+                .{ s.pf.id, @errorName(err) },
+            );
+            s.failed = true;
+            return .abort;
+        };
+        s.relay_inflight += take.len;
+        s.byte_offset += take.len;
+        return if (s.capped) .abort else .consume;
+    }
+
     if (s.stream_mode) {
         // Stream mode: emit per writeback, split into ≤ max_chunk.
         var off: usize = 0;
@@ -1418,18 +1661,18 @@ fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) bool {
             const end = @min(off + s.max_chunk, take.len);
             if (!s.emitChunk(take[off..end])) {
                 s.failed = true;
-                return false;
+                return .abort;
             }
             off = end;
         }
-        return !s.capped;
+        return if (s.capped) .abort else .consume;
     } else {
         // Single-chunk: buffer; emit ONE final event in onDoneCb.
         s.body_buf.appendSlice(s.allocator, take) catch {
             s.failed = true;
-            return false;
+            return .abort;
         };
-        return !s.capped;
+        return if (s.capped) .abort else .consume;
     }
 }
 
@@ -1462,7 +1705,19 @@ fn onDoneCb(transfer: *blob_curl_multi.Transfer, result: blob_curl_multi.Result,
         );
     }
 
-    if (!s.stream_mode) {
+    if (s.relay_active) {
+        // Relay terminal rides the relay FIFO — behind every relayed
+        // byte-run, never the Msg path — so the worker re-injects it
+        // into the normal bound dispatch only once all bytes before
+        // it are appended. Ordering is the whole point: a terminal
+        // that overtook in-flight bytes would close the stream under
+        // them.
+        emitFinalRelay(s, result.status, transport_ok) catch |err|
+            std.log.warn(
+                "rove-js fetch_engine: relay terminal NOT delivered tenant={s} id={s}: {s} — held chain cleans up on disconnect",
+                .{ s.pf.tenant_id, s.pf.id, @errorName(err) },
+            );
+    } else if (!s.stream_mode) {
         // ONE event with `final: true` + the body + terminal fields.
         emitFinalWithBody(s, result.status, transport_ok) catch |err|
             std.log.warn(
@@ -1670,6 +1925,30 @@ fn emitFailedSetupEvent(engine: *FetchEngine, pf: *PendingFetch) !void {
     };
 }
 
+/// Relay-mode terminal: same event `emitFinalEmpty` builds, delivered
+/// via the relay FIFO for ordering behind the relayed bytes. No
+/// `stampStored` — the relay is GET-only by construction.
+fn emitFinalRelay(s: *FetchCtx, status: u16, ok: bool) !void {
+    const a = s.allocator;
+    var ev = try buildChunkEvent(a, &s.pf, s.emitted_seq, s.byte_offset, &.{}, null);
+    ev.final = true;
+    ev.terminal_status = status;
+    ev.terminal_ok = ok;
+    ev.body_truncated = s.capped;
+    ev.content_hash = s.get_hash;
+    ev.static_serve = s.static_serve;
+    const fid = a.dupe(u8, s.pf.id) catch |err| {
+        UpstreamFetchEvent.deinitItem(&ev, a);
+        return err;
+    };
+    var item: msg_router_mod.RelayItem = .{ .fetch_id = fid, .payload = .{ .terminal = ev } };
+    s.engine.node.router.enqueueRelayToWorker(s.relay_owner_idx, item) catch |err| {
+        item.deinit(a);
+        return err;
+    };
+    s.emitted_seq += 1;
+}
+
 fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
     const a = s.allocator;
     var ev = try buildChunkEvent(a, &s.pf, s.emitted_seq, s.byte_offset, &.{}, null);
@@ -1678,6 +1957,8 @@ fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
     stampStored(&ev, a, s);
+    ev.content_hash = s.get_hash;
+    ev.static_serve = s.static_serve;
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);
@@ -1697,6 +1978,8 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
     stampStored(&ev, a, s);
+    ev.content_hash = s.get_hash;
+    ev.static_serve = s.static_serve;
     s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
         var e = ev;
         UpstreamFetchEvent.deinitItem(&e, a);

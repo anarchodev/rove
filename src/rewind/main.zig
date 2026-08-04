@@ -366,6 +366,10 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainSnapshotStreams(worker);
         try rjs.drainSnapshotPushes(worker, catchup);
         rjs.drainSpools(worker);
+        // CAS→connection relay (`docs/architecture/routing-and-ingress.md`):
+        // append relayed static/blob bytes straight onto their held
+        // streams and re-inject relay terminals into the bound dispatch.
+        rjs.drainRelay(worker);
         try rjs.sweepParkedContinuations(worker);
         // docs/architecture/effects-and-handlers.md: fire the next staged
         // inbound body chunk into each held `onChunk` chain. Runs after

@@ -898,6 +898,18 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
         }
     }
 
+    // interaction_digest — the rolling hash of the reads served and effects
+    // emitted, in order, folded by the epilogue as they arrived. The same hash
+    // the worker stamps on a record and the browser replay arena recomputes, so
+    // the three engines can be compared on the SEQUENCE they performed rather
+    // than only on the response they reached. Null when no handler ran.
+    if (run) |r| {
+        if (r.get("digest")) |dv| if (dv == .string) {
+            try w.writeAll(",\"interaction_digest\":");
+            try jsonStr(w, dv.string);
+        };
+    }
+
     // effects — ONE ordered log (occurrence order), built in the epilogue: reads,
     // writes, and cmds interleaved as the handler performed them.
     try w.writeAll(",\"effects\":");

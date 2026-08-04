@@ -680,6 +680,10 @@ pub fn fireFetchEventActivation(
     const FETCH_INLINE_THRESHOLD: usize = 16 * 1024;
     var body_ref: bodies_mod.BodyRef = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
     var inline_bytes_for_tape: []const u8 = "";
+    var content_hash_for_tape: []const u8 = "";
+    // Only a chunk that actually carries bytes can be referenced; a
+    // terminal-only event has nothing to name.
+    const content_ref: ?[64]u8 = if (event.bytes.len > 0) event.content_hash else null;
     if (parked_body_ref) |saved| {
         // Resume from a previous park. The
         // body's batch was confirmed durable by
@@ -687,6 +691,24 @@ pub fn fireFetchEventActivation(
         // the saved ref directly + skip append. Re-appending
         // would mint a new batch and re-park.
         body_ref = saved;
+    } else if (content_ref) |h| {
+        // Content-addressed chunk (a `blob.get`): the bytes are ALREADY
+        // durable and immutable at this tenant's `app-blobs/{h}`, so
+        // recording them again would write a second permanent copy of an
+        // object we already store — inline on the tape below the threshold,
+        // and into the never-evicted body pool above it (rove#430, #304).
+        //
+        // So: reference, don't copy. `body_ref.len` still reports the chunk
+        // size (the record stays a complete activation event); the payload is
+        // recoverable by hash. Skipping the coordinator ALSO skips the
+        // durability park — there is nothing to make durable, which removes an
+        // S3 round trip from every large blob read.
+        content_hash_for_tape = &h;
+        body_ref = .{
+            .batch_id = bodies_mod.NO_BATCH,
+            .offset = 0,
+            .len = @intCast(event.bytes.len),
+        };
     } else if (event.bytes.len > 0 and event.bytes.len <= FETCH_INLINE_THRESHOLD) {
         // Inline fast path — no buffer append, the chunk bytes
         // ride on the tape entry directly. Raft entry fsync IS
@@ -735,7 +757,16 @@ pub fn fireFetchEventActivation(
             // BodyRef.
         }
     }
-    p.readset.fetch_responses.appendFetchResponse(
+    // An engine-fired static chunk records no BYTES (rove#391). These chunks
+    // are small, so one record per chunk rode the tape verbatim and S3 log
+    // volume tracked static egress ~1:1 — the tenant paying its log-ingest
+    // budget to SERVE. Nothing a replay could use is lost: the bytes are
+    // immutable and content-addressed, and the inbound record they belong to
+    // runs no customer code (`Outcome.static_served`).
+    //
+    // The activation still FIRES — only the recording is skipped. Returning
+    // here instead would stop the streamer mid-asset.
+    if (!event.static_serve) p.readset.fetch_responses.appendFetchResponse(
         event.fetch_id,
         event.seq,
         event.byte_offset,
@@ -746,6 +777,7 @@ pub fn fireFetchEventActivation(
         if (event.final) event.body_truncated else false,
         event.fetch_headers orelse "",
         inline_bytes_for_tape,
+        content_hash_for_tape,
     ) catch |err| {
         // Tape capture failures must never kill the request. Same
         // posture as `captureTapes`'s per-channel serialize
@@ -761,12 +793,28 @@ pub fn fireFetchEventActivation(
     // `runFire` captures them on every log record (`spec.tape = .activation`) so
     // replay reconstitutes the same handler invocation from the same
     // captured bytes.
-    runFire(worker, &p, req, .{
-        .act = .fetch_chunk,
-        .site = "fetch-event",
-        .on_cont = .enqueue,
-        .on_stream = .warn,
-        .readonly_cont_commits = true,
-        .tape = .activation,
-    }, module_path, corr_full, module_path, event.bytes);
+    // `activation_bytes` is the SECOND copy of a chunk's payload — the
+    // `fetch_responses` entry above is the first — so an engine static chunk
+    // has to skip both, or the 1:1 growth this fixes just moves channels.
+    // `spec.tape` is comptime, so the choice is two specialised calls rather
+    // than a runtime flag.
+    if (event.static_serve) {
+        runFire(worker, &p, req, .{
+            .act = .fetch_chunk,
+            .site = "fetch-event",
+            .on_cont = .enqueue,
+            .on_stream = .warn,
+            .readonly_cont_commits = true,
+            .tape = .none,
+        }, module_path, corr_full, module_path, "");
+    } else {
+        runFire(worker, &p, req, .{
+            .act = .fetch_chunk,
+            .site = "fetch-event",
+            .on_cont = .enqueue,
+            .on_stream = .warn,
+            .readonly_cont_commits = true,
+            .tape = .activation,
+        }, module_path, corr_full, module_path, event.bytes);
+    }
 }

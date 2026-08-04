@@ -115,6 +115,7 @@ pub const sweepDurableWakesOnPromotion = worker.sweepDurableWakesOnPromotion;
 pub const sweepDirtySubscriptionsOnPromotion = @import("worker_streaming.zig").sweepDirtySubscriptionsOnPromotion;
 pub const serviceFetchEvents = worker.serviceFetchEvents;
 pub const drainSpools = worker.drainSpools;
+pub const drainRelay = worker.drainRelay;
 
 /// Operator metrics: `buildMetricsText` renders the Prometheus snapshot (worker
 /// thread), `MetricsServer` serves it over a dedicated loopback HTTP/1.1 port.

@@ -286,6 +286,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .on_chunk_module = row.on_chunk_module,
         .ctx_json = row.ctx_json,
         .stream = row.stream,
+        .relay = row.relay,
         .max_response_chunk_bytes = row.max_response_chunk_bytes,
         .max_total_response_bytes = row.max_total_response_bytes,
         .held = row.held,
@@ -414,6 +415,12 @@ fn buildOnFetchRow(
     }
 
     const stream = try getBoolField(ctx, opts, "stream", false);
+    // The CAS→connection relay (rove#441): honored by the engine only
+    // for a bound streaming read of a content-addressed door
+    // (`rove-static.internal` / `rove-blob.internal` GET); inert on
+    // any other fetch shape, so passing it costs nothing and grants
+    // nothing.
+    const relay = try getBoolField(ctx, opts, "relay", false);
     const timeout_ms_i32 = try getIntField(ctx, opts, "timeout_ms", 30_000);
     const max_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 256 * 1024);
     const max_total_i64 = try getInt64Field(ctx, opts, "max_total_response_bytes", 50 * 1024 * 1024);
@@ -428,6 +435,7 @@ fn buildOnFetchRow(
         .on_chunk_module = fetched.on_chunk_module.?,
         .ctx_json = fetched.ctx_json.?,
         .stream = stream,
+        .relay = relay,
         .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
         .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
         .bound_send_id = fetched.bound_send_id.?,
@@ -589,6 +597,10 @@ const BuiltFetch = struct {
     /// cap-overflow sets `body_truncated`). `stream: true` → fire one
     /// event per upstream writeback, last carrying `final: true`.
     stream: bool,
+    /// The CAS→connection relay flag (rove#441) — see
+    /// `PendingFetch.relay` for the full contract. Threaded through
+    /// verbatim; the engine decides applicability.
+    relay: bool = false,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
     /// Held-transfer flag (outbound fetch / libcurl multi,

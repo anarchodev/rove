@@ -15,6 +15,49 @@ const std = @import("std");
 const rove = @import("rove");
 const blob_mod = @import("rove-blob");
 const chunk_spool_mod = @import("chunk_spool.zig");
+const msg_router_mod = @import("msg_router.zig");
+
+/// Per-fetch FIFO of relay items drained off the worker's `RelayInbox`
+/// (the CAS→connection relay, `docs/architecture/routing-and-ingress.md`)
+/// and not yet applied to the held stream. Strictly ordered: byte runs
+/// append in arrival order; the terminal event is always last and is
+/// re-injected into the normal bound dispatch only once the backlog's
+/// bytes are gone. `head` avoids O(n) pop-front; the buffer compacts
+/// whenever it fully drains (steady-state: every tick).
+pub const RelayBacklog = struct {
+    items: std.ArrayListUnmanaged(msg_router_mod.RelayItem) = .empty,
+    head: usize = 0,
+
+    pub fn headItem(self: *RelayBacklog) ?*msg_router_mod.RelayItem {
+        if (self.head >= self.items.items.len) return null;
+        return &self.items.items[self.head];
+    }
+
+    /// Pop the head (caller takes ownership). Asserts non-empty.
+    pub fn popHead(self: *RelayBacklog) msg_router_mod.RelayItem {
+        const item = self.items.items[self.head];
+        self.head += 1;
+        if (self.head >= self.items.items.len) {
+            self.items.clearRetainingCapacity();
+            self.head = 0;
+        }
+        return item;
+    }
+
+    pub fn isEmpty(self: *const RelayBacklog) bool {
+        return self.head >= self.items.items.len;
+    }
+
+    pub fn append(self: *RelayBacklog, allocator: std.mem.Allocator, item: msg_router_mod.RelayItem) !void {
+        try self.items.append(allocator, item);
+    }
+
+    pub fn deinit(self: *RelayBacklog, allocator: std.mem.Allocator) void {
+        for (self.items.items[self.head..]) |*it| it.deinit(allocator);
+        self.items.deinit(allocator);
+        self.* = .{};
+    }
+};
 
 /// Default K, the per-fetch RAM window depth (chunks within K of a spool's
 /// head keep their inline bytes; deeper chunks evict + read back from the
@@ -42,6 +85,11 @@ pub const SpoolRegistry = struct {
     /// Deferred coord releases for consumed/dropped bound chunks; retried by
     /// `drainSpools` each tick. Lossy-on-shutdown. Worker-thread only.
     coord_pending_releases: std.ArrayListUnmanaged(CoordPendingRelease) = .empty,
+    /// Per-fetch relay backlogs (the CAS→connection relay), keyed by
+    /// `fetch_id` like the two bound-fetch maps above. Heap-allocated for
+    /// pointer stability across rehash; keys are allocator-owned dupes.
+    /// Driven by `worker_streaming.drainRelay`.
+    relay_backlogs: std.StringHashMapUnmanaged(*RelayBacklog) = .empty,
     /// K, the per-fetch RAM window depth.
     bound_fetch_spool_depth: usize = DEFAULT_BOUND_FETCH_SPOOL_DEPTH,
     /// Peak `inlineBytes()` summed across live spools. Diagnostic, never reset.
@@ -80,5 +128,49 @@ pub const SpoolRegistry = struct {
             while (it.next()) |entry| allocator.free(entry.key_ptr.*);
             self.bound_send_entities.deinit(allocator);
         }
+        {
+            var it = self.relay_backlogs.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.*.deinit(allocator);
+                allocator.destroy(entry.value_ptr.*);
+                allocator.free(entry.key_ptr.*);
+            }
+            self.relay_backlogs.deinit(allocator);
+        }
     }
 };
+
+test "RelayBacklog: FIFO order, head compaction, deinit frees the tail" {
+    const a = std.testing.allocator;
+    var bl: RelayBacklog = .{};
+    defer bl.deinit(a);
+
+    try std.testing.expect(bl.isEmpty());
+    try bl.append(a, .{
+        .fetch_id = try a.dupe(u8, "f1"),
+        .payload = .{ .bytes = try a.dupe(u8, "aaaa") },
+    });
+    try bl.append(a, .{
+        .fetch_id = try a.dupe(u8, "f1"),
+        .payload = .{ .bytes = try a.dupe(u8, "bb") },
+    });
+    try std.testing.expect(!bl.isEmpty());
+
+    var first = bl.popHead();
+    try std.testing.expectEqualStrings("aaaa", first.payload.bytes);
+    first.deinit(a);
+
+    // One item left; popping it compacts the buffer back to empty.
+    var second = bl.popHead();
+    try std.testing.expectEqualStrings("bb", second.payload.bytes);
+    second.deinit(a);
+    try std.testing.expect(bl.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), bl.head);
+    try std.testing.expectEqual(@as(usize, 0), bl.items.items.len);
+
+    // Leave one item queued — deinit (the defer above) must free it.
+    try bl.append(a, .{
+        .fetch_id = try a.dupe(u8, "f1"),
+        .payload = .{ .bytes = try a.dupe(u8, "leftover") },
+    });
+}

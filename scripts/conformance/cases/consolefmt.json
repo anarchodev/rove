@@ -1,0 +1,16 @@
+{
+  "name": "consolefmt",
+  "description": "console.* argument formatting. Carried because it is the one behavior where the sim and the replay engine legitimately differ — replay has no console recorder by design — so it is what keeps the allowlist honest and exercised.",
+  "source_dir": "src/replay/testdata/consolefmt",
+  "engines": ["sim", "prod", "replay"],
+  "worlds": [
+    {
+      "label": "get",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": { "method": "GET", "path": "/" }
+      }
+    }
+  ]
+}
