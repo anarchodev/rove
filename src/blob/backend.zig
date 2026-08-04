@@ -89,6 +89,21 @@ pub const BlobBackend = struct {
         };
     }
 
+    /// Delete every object under `sub_prefix` (relative to this backend's
+    /// `key_prefix`), returning how many were removed. Idempotent, so a
+    /// partial sweep converges on re-run — see `S3BlobStore.deletePrefix`.
+    ///
+    /// Not on the `BlobStore` vtable: enumeration is a storage-lifecycle
+    /// operation (teardown, GC), not part of the hash-keyed read/write surface
+    /// that every caller shares. The read-only `http` variant has no delete
+    /// path at all.
+    pub fn deletePrefix(self: *BlobBackend, sub_prefix: []const u8) !u64 {
+        return switch (self.inner) {
+            .s3 => |*s| try s.deletePrefix(sub_prefix),
+            .http => root.Error.Io,
+        };
+    }
+
     /// Build a presigned GET URL for `key`. Returns null when the
     /// backend variant can't presign — today only the `http` (read
     /// through colocated files-server) variant; an S3 backend always

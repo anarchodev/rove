@@ -96,6 +96,24 @@ def main() -> int:
         r = cp("delete", {"tenant": TENANT})
         check("delete → 204", r.status == 204, f"got {r.status} {r.body!r}")
 
+        # rove#350: the delete must also remove the tenant's STORED OBJECTS.
+        # Nothing else ever GCs them, so without the sweep a deleted tenant
+        # bills forever and an account-closure erasure promise has no code
+        # behind it. The deploy above wrote `file-blobs/` + `deployments/`, so
+        # a correct sweep reports a non-zero count. Asserted through the CP's
+        # own report (there is no operator surface that lists S3); the
+        # primitives themselves are covered against a real endpoint by
+        # `examples/s3_blob_smoke.zig`'s prefix-sweep section.
+        swept = None
+        cp_log = c.log_paths.get("cp")
+        if cp_log:
+            with open(cp_log) as f:
+                for ln in f:
+                    if f"deleted {TENANT} (" in ln and "object(s)" in ln:
+                        swept = int(ln.split(", ")[-1].split(" object(s)")[0])
+        check("delete swept the tenant's stored objects (#350)",
+              swept is not None and swept > 0, f"objects deleted={swept}")
+
         print("step 3: it is gone — and gone the RIGHT way")
         r = c.get(TENANT, "/?fn=handler")
         # 404 (host maps to no tenant), NOT 421/502 — a 421 would mean the
