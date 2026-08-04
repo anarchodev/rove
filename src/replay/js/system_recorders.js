@@ -262,12 +262,20 @@
     };
   };
   // platform.* is admin-only (prod: throws off the `__admin__` handler). Fail
-  // closed — every sync method is gated unless the run is flagged admin
-  // (`scenario({ admin: true })` → the hidden `__rove_store/admin` key). Note
+  // closed for AUTHORED worlds — every sync method is gated unless the run opts
+  // in (`scenario({ admin: true })` → the hidden `__rove_store/admin` key). Note
   // `platform.compile` is NOT gated here: it lowers to a bound fetch (via the
   // real platform.js over `_system.after`), admin-checked door-side in prod.
+  //
+  // A CAPTURED world skips the gate for the same reason it skips `scope`'s
+  // resolve check below: the recording is proof the call was admitted live.
+  // Fail-closed is a harness affordance for worlds an author wrote, not a
+  // security boundary — the real gate is `state.platform` in the worker — and
+  // applying it to a capture turned every admin replay into a spurious
+  // "platform is only available on the admin handler" (docs/architecture/
+  // replay-and-sim.md, the privileged-surface section).
   var GATE_MSG = "platform is only available on the admin handler";
-  var gate = function(fn){ return function(){ if (globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
+  var gate = function(fn){ return function(){ if (!globalThis.__rove_captured && globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
   var rootStore_r = storeKv(NS_STORE + "r/", "r");
   // Fetch/subscribe recorder. Ids are unique per run (`ftch_<seq>` — the
   // epilogue resets the counter each activation), NOT prod's ftch_<64hex>:

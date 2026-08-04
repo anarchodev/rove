@@ -220,6 +220,34 @@ supply, because prod has none to compare.
 **When this recurs.** Any credential that reaches a handler surface. Compute the
 verdict in the engine; expose the verdict. See `../decisions.md` §4.6b.
 
+## 3.6 Privileged reads are recorded inputs
+
+The natives in §1 that **return data** — `platform.root.get`/`.prefix`,
+`platform.scope(id).kv.get`/`.prefix` — are inputs under the determinism
+boundary, and they are the first input class that leaves the activation's own
+tenant. They ride the kv tape channel with the store carried as a key prefix
+(`__rove_store/r/…`, `__rove_store/i/{id}/…`), so an `__admin__` activation
+replays against the same cross-store values it saw live. The layout, the
+no-format-change rationale, and why a foreign-store key can't reach a store it
+doesn't belong to are in
+[`replay-and-sim.md`](replay-and-sim.md) — see the cross-store reads section.
+
+Two consequences worth holding onto when adding to this surface:
+
+- **A new privileged verb that returns data needs a tape line.** Not a
+  follow-up: an untaped read is a silent replay hole, because the offline
+  closed world answers a missing key with `not_found` rather than a divergence.
+  `platform.instances.usage` is the open case — it is installed
+  (`globals.zig`) but no public shim forwards it, so it is unreachable from JS
+  today; exposing it (issue #299) means taping it in the same change.
+- **Recording cross-store reads puts other tenants' values, and platform root
+  records, in `__admin__`'s replay archive.** That is a deliberate consequence
+  of making admin replay work at all, not an oversight — see the
+  secrets-in-replay posture (issue #381). Note the asymmetry with a platform
+  *credential* (§3.5), which is stricter and goes the other way: data the
+  handler legitimately consumes gets recorded, whereas a credential it should
+  never hold is removed from the surface instead of taped.
+
 ## 4. Migration steps
 
 1. **Collapse `__rove_*` → `__rove.*`** (globals.zig `GLOBAL_BUILTINS` →

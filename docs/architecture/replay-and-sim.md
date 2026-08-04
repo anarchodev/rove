@@ -212,6 +212,54 @@ Capture writes five channels (`src/tape/root.zig:127`):
 | `trigger_payload` (3) | the request **body** (inbound) **or** a synthesized `{"ctx": …}` envelope (continuation resume) — `worker_drain.zig:1448`, `liftThreadedCtx` `globals.zig:2253` |
 | `request_reads` (4) | the read-recorded `request` surface (header names/values, body-read flag, ip) |
 
+### Cross-store reads — the kv channel is tenant-implicit, so the store rides in the key
+
+Every input class above lives inside the activation's **own** tenant. The
+privileged surface adds one that does not: `platform.root.get`/`.prefix` reads
+the platform root store, and `platform.scope(id).kv.get`/`.prefix` reads another
+tenant's — a **cross-raft-group read**. Read-taping records what the handler
+reads *through the tenant kv path*, so these were invisible by default, and the
+kv channel had no way to say which store a value came from.
+
+They ride the **same kv channel**, with the store carried as a **key prefix**:
+
+| store | tape key |
+|---|---|
+| the dispatching tenant's own kv | `{key}` (unchanged) |
+| the platform root store | `__rove_store/r/{key}` |
+| instance `id`'s store | `__rove_store/i/{id}/{key}` |
+
+A `prefix` scan namespaces both the scanned prefix and every returned row key —
+the row keys are what seed the transcoded world's map, so an un-namespaced row
+would land in the *dispatching tenant's* keyspace offline.
+
+Three properties make this cheap rather than a format change:
+
+- **No wire change.** The store is data in an existing field, so
+  `READSET_VERSION` stays at 7 and `export_fixture` is a pass-through (its kv
+  fold is key-agnostic).
+- **The namespace is unforgeable for free.** `__rove_store/` leads with `_`, and
+  customer writes to `_`-leading keys outside the shim allowlist are rejected
+  (`reserved.zig`), so a tenant cannot mint a key that impersonates another
+  store.
+- **It cannot reach a store it doesn't belong to.** The readset rides the raft
+  entry *for the tape, not the store* — `node_pump.zig` strips the readset frame
+  before applying the writeset.
+
+The offline side was already built for this layout and predates the recording:
+the sim facade namespaces its stores identically
+(`src/replay/js/system_recorders.js`), and the authored-world surface
+(`scenario({ instances, root })`) writes the same keys. So a captured world and
+an authored one are the same artifact.
+
+Read-your-write minimality applies as it does for tenant kv: a root key this
+activation already wrote is reproduced offline by re-running the write into the
+same namespace, so it stays off the tape.
+
+**The generative question for this row class** — the cross-store counterpart to
+"does production compute this around the handler rather than from a handler
+read?" — is: **which store did this value come from, and does the tape say so?**
+
 So the inputs for *every* activation kind are recorded — `ctx` rides
 `trigger_payload`, a fetch result rides `fetch_responses`. The capture side is
 (largely) complete for what the loader and the read-recorder see; what it
