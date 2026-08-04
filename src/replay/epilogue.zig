@@ -278,6 +278,18 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     // idempotent) — the same file the browser replay prelude evals, so the
     // sim and the browser arena can't drift codec-wise.
     try w.writeAll(TEXTCODEC_PURE);
+    // The interaction digest's JS mirror, installing `globalThis.__interactionDigest`
+    // for the fold below. AFTER the codec, not in the base prelude: the mirror
+    // builds a `TextEncoder` at eval time (it folds UTF-8 BYTES, since the Zig
+    // side does) and the base has no codec — evaluating it earlier dies with
+    // "TextEncoder is not defined" before any handler runs.
+    //
+    // The SAME file the browser replay arena's prelude embeds
+    // (scripts/ops/gen_replay_prelude.py), so the two offline engines fold one
+    // implementation rather than two. Neither JS copy is authoritative —
+    // `src/tape/testdata/digest_vectors.json` is, and `zig build
+    // replay-digest-vectors` holds both to it.
+    try w.writeAll(JS_INTERACTION_DIGEST);
     try w.writeAll(EPILOGUE_BODY);
     try w.print("  kv.set({s}, __out);\n}})();\n", .{quotedOutputKey});
 
@@ -311,6 +323,10 @@ const quotedOutputKey = "\"" ++ host.OUTPUT_KEY ++ "\"";
 /// surrogates included). One file shared with the browser replay prelude
 /// (scripts/ops/gen_replay_prelude.py reads the same source).
 const TEXTCODEC_PURE = @embedFile("js/textcodec_pure.js");
+/// The interaction digest's JS mirror (`src/tape/js_interaction_digest.js`),
+/// wired in through build.zig's `addSimGlobalEmbeds` since it lives outside this
+/// module's package. Shared verbatim with the browser replay arena.
+const JS_INTERACTION_DIGEST = @embedFile("js_interaction_digest");
 
 const EPILOGUE_BODY =
     \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
@@ -321,6 +337,39 @@ const EPILOGUE_BODY =
     \\  // (the sim_globals `_system.*` recorders) push to the SAME ordered log
     \\  // as these per-request shims. `__effects` is a local alias to it.
     \\  const __effects = (globalThis.__rove_effects = []);
+    \\  // ── the interaction digest ──
+    \\  // The ordered sequence of reads served and effects emitted, folded into
+    \\  // a rolling hash as entries ARRIVE. Order is the point and cannot be
+    \\  // recovered by walking the array afterwards (a later push could be
+    \\  // reordered by a filter), so `push` is patched rather than the log
+    \\  // walked at the end — the same shape the browser replay arena uses, so
+    \\  // the two offline engines fold at the same points.
+    \\  //
+    \\  // Only the worker's grammar folds (src/tape/interaction_digest.zig):
+    \\  // kv reads/writes/deletes/prefixes, fetches, wake arms, stream writes.
+    \\  // Logs, tags, platform and blob calls are recorded for the timeline but
+    \\  // NOT folded, because the worker does not fold them either — a digest
+    \\  // is only useful if every engine hashes the same set.
+    \\  const __DG = globalThis.__interactionDigest;
+    \\  const __dg = __DG ? new __DG.Digest() : null;
+    \\  const __foldEffect = (e) => {
+    \\    if (!__dg || !e) return;
+    \\    switch (e.kind) {
+    \\      case "read":
+    \\        if (e.op === "prefix") __dg.kvPrefix(e.key, true, e.count ?? 0, BigInt("0x" + (e.rowsFold ?? "0")));
+    \\        else __dg.kvRead(e.key, !!e.present, e.value ?? "");
+    \\        break;
+    \\      case "write":  __dg.kvWrite(e.key, e.value ?? ""); break;
+    \\      case "delete": __dg.kvDelete(e.key); break;
+    \\      case "fetch":  __dg.fetch(e.method || "GET", e.url || "", e.body ?? ""); break;
+    \\      case "timer":  __dg.wakeArm("t", String(e.ms), e.on ?? ""); break;
+    \\      case "kv-wake": __dg.wakeArm("k", e.prefix, e.on ?? ""); break;
+    \\      case "stream": __dg.streamWrite(e.data ?? ""); break;
+    \\      default: break;
+    \\    }
+    \\  };
+    \\  { const __rawPush = __effects.push.bind(__effects);
+    \\    __effects.push = (e) => { __foldEffect(e); return __rawPush(e); }; }
     \\  // Per-run fetch/subscribe id counter (the sim_globals recorders mint
     \\  // `ftch_<seq>`/`sub_<seq>` from it) — reset here so ids are deterministic
     \\  // per activation, like prod's per-request derived ids.
@@ -832,6 +881,11 @@ const EPILOGUE_BODY =
     \\  // body. `__bodyOverride` rides the bundle only when prod's wire body
     \\  // differs from the plain return value.
     \\  let __bodyOverride = null;
+    \\  // The bytes prod puts ON THE WIRE — what the worker folds into the
+    \\  // digest's closing element (dispatcher.zig folds `pending.body`, not the
+    \\  // return value). They differ whenever `__bodyOverride` exists, so the
+    \\  // digest has to follow the override rather than the plain result.
+    \\  let __wireBody = "";
     \\  {
     \\    if (!__held && !__err) {
     \\      const isBytes = __result instanceof Uint8Array;
@@ -851,18 +905,31 @@ const EPILOGUE_BODY =
     \\        const all = new Uint8Array(head.length + __result.length);
     \\        all.set(head, 0); all.set(__result, head.length);
     \\        __bodyOverride = { b64: b64(all) };
+    \\        __wireBody = all;
     \\      } else if (isBytes) {
     \\        __bodyOverride = { b64: b64(__result) };
+    \\        __wireBody = __result;
     \\      } else if (frames.length) {
     \\        __bodyOverride = { text: frames.join("") + (text === null ? "" : text) };
+    \\        __wireBody = __bodyOverride.text;
+    \\      } else {
+    \\        __wireBody = text === null ? "" : text;
     \\      }
     \\    }
     \\  }
+    \\  // Closed LAST, after every effect has folded — the element that makes the
+    \\  // digest a superset of a status comparison. Status is clamped exactly as
+    \\  // the worker clamps it (dispatcher.zig), so an out-of-range status folds
+    \\  // to the same element on both.
+    \\  if (__dg) {
+    \\    const __st = __held ? 0 : Math.max(100, Math.min(599, __vet && __vet.status !== undefined ? __vet.status : 200));
+    \\    if (!__held) __dg.response(__st, __wireBody);
+    \\  }
     \\  let __out;
     \\  try {
-    \\    __out = JSON.stringify({ response: __vet, result: __result, body_override: __bodyOverride, error: __err, effects: __effects });
+    \\    __out = JSON.stringify({ response: __vet, result: __result, body_override: __bodyOverride, error: __err, effects: __effects, digest: __dg ? __dg.hex() : null });
     \\  } catch (e) {
-    \\    __out = JSON.stringify({ response: __vet, result: null, body_override: __bodyOverride, effects: __effects,
+    \\    __out = JSON.stringify({ response: __vet, result: null, body_override: __bodyOverride, effects: __effects, digest: __dg ? __dg.hex() : null,
     \\      error: { message: "replay result not JSON-serialisable: " + String((e && e.message) || e), stack: "" } });
     \\  }
     \\

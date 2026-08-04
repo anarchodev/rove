@@ -179,6 +179,29 @@ exist only under `captured` so pinned old deployments still replay.
 > produce behaviour — it only answers "did this run do what the recorded
 > one did". Do not give the first the properties of the second.
 
+**All three engines fold that digest.** The worker folds it natively
+(`src/tape/interaction_digest.zig`, driven from `src/js/globals.zig`'s
+`digestBegin`/`digestCommit` and closed with the wire body in
+`src/js/dispatcher.zig`); the offline sim and the browser replay arena both fold
+it in JS from one shared mirror (`src/tape/js_interaction_digest.js`), embedded
+into the sim's epilogue and into the browser prelude.
+
+Neither JS copy nor the Zig one is the reference —
+`src/tape/testdata/digest_vectors.json` is, and `zig build
+replay-digest-vectors` holds the JS side to it while the Zig side asserts in its
+own unit tests. Two implementations of one hash is the shape that has bitten
+this codebase before (a latin1 codec that diverged on every non-ASCII byte), and
+a silent disagreement here would surface as an unexplained "replay diverged" on
+a real record — the hardest kind of bug to attribute.
+
+Only the worker's grammar folds: kv reads/writes/deletes/prefixes, fetches, wake
+arms, stream writes, and the closing response. Logs, tags, and platform/blob
+calls are recorded for the timeline but deliberately **not** folded, because the
+worker does not fold them either — a digest is only useful if every engine
+hashes the same set. Because all three fold the same sequence, two engines can
+be compared on *what they did* rather than only on the response they reached,
+which is what the behavior conformance suite (`scripts/conformance/`) asserts.
+
 Capture writes five channels (`src/tape/root.zig:127`):
 
 | channel | carries |

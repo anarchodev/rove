@@ -253,6 +253,12 @@ pub fn build(b: *std.Build) void {
             // IP-transport strip list) — shared with the sim's
             // authored-header hygiene (root.zig) so the filters can't drift.
             mod.addAnonymousImport("reserved_headers", .{ .root_source_file = bb.path("src/js/reserved_headers.zig") });
+            // The interaction digest's JS mirror — the SAME file the browser
+            // replay arena's prelude embeds (scripts/ops/gen_replay_prelude.py),
+            // so the sim folds the identical hash rather than a third
+            // implementation. `src/tape/testdata/digest_vectors.json` remains
+            // the reference for both; neither JS copy is authoritative.
+            mod.addAnonymousImport("js_interaction_digest", .{ .root_source_file = bb.path("src/tape/js_interaction_digest.js") });
         }
     }.f;
 
@@ -1667,4 +1673,59 @@ pub fn build(b: *std.Build) void {
         smoke_step.dependOn(&run.step);
         test_step.dependOn(&run.step);
     }
+
+    // ── the behavior conformance suite — the CHEAP LANE ──
+    //
+    // One corpus of behavior cases, run on every engine that executes customer
+    // handlers, failing when two of them disagree. The corpus is the spec: the
+    // engines' agreement is the assertion, not a hand-copied expected value on
+    // each side (the shape `src/replay/testdata/utf8encode` and
+    // `scripts/smoke/utf8_encode_smoke_v2.py` are in today — one literal,
+    // duplicated, keeping itself in sync by hand).
+    //
+    // This lane runs the engines that need no cluster: the offline sim, and the
+    // WASM replay arena once its adapter exists. The cluster lane (a live
+    // V2Cluster, S3 credentials, port slots) cannot hang off `test` and gets a
+    // scheduled runner instead.
+    //
+    // The selftest runs FIRST and is not optional. Until a second adapter
+    // lands the corpus compares one engine against itself — that is, nothing —
+    // so the comparison, the allowlist, and the stale-entry rule would all be
+    // unexercised. The selftest drives them with synthetic outcomes so the gate
+    // is provably able to go red before the engine that would turn it red
+    // exists.
+    const conf_selftest = b.addSystemCommand(&.{"python3"});
+    conf_selftest.addFileArg(b.path("scripts/conformance/selftest.py"));
+    conf_selftest.addFileInput(b.path("scripts/conformance/outcome.py"));
+    conf_selftest.addFileInput(b.path("scripts/conformance/allowlist.py"));
+    conf_selftest.expectExitCode(0);
+
+    const conf_run = b.addSystemCommand(&.{"python3"});
+    conf_run.addFileArg(b.path("scripts/conformance/run.py"));
+    conf_run.addArg("--engines");
+    conf_run.addArg("sim,replay");
+    // Hand the runner the CLI artifact this build just produced, rather than
+    // letting it discover one on disk: a discovered binary can be stale, and a
+    // gate quietly testing yesterday's engine is worse than no gate.
+    conf_run.addArg("--rewind-bin");
+    conf_run.addArtifactArg(cli_exe);
+    conf_run.addFileInput(b.path("scripts/conformance/adapters.py"));
+    conf_run.addFileInput(b.path("scripts/conformance/outcome.py"));
+    conf_run.addFileInput(b.path("scripts/conformance/allowlist.py"));
+    conf_run.addArg("--cases-dir");
+    conf_run.addDirectoryArg(b.path("scripts/conformance/cases"));
+    conf_run.expectExitCode(0);
+    // Always re-run. A source `addDirectoryArg` is hashed by PATH, not by
+    // contents, and the corpus reaches further still — a case names an app tree
+    // under `src/replay/testdata/`, so a handler edit changes what the step
+    // asserts without touching any declared input. Both were verified to leave
+    // the step `cached` while the runner itself failed, which is the worst
+    // possible state for a gate: green because it never ran. The corpus is
+    // sub-second; correctness is worth more than the cache hit.
+    conf_run.has_side_effects = true;
+    conf_run.step.dependOn(&conf_selftest.step);
+
+    const conf_step = b.step("conformance", "Behavior conformance suite — one corpus, every engine (cheap lane)");
+    conf_step.dependOn(&conf_run.step);
+    test_step.dependOn(&conf_run.step);
 }

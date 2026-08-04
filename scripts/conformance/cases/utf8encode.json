@@ -1,0 +1,16 @@
+{
+  "name": "utf8encode",
+  "description": "TextEncoder / TextDecoder / base64url / sha256 over non-ASCII. Pure compute: no clock, no network, no cluster effects — so every engine must agree byte-for-byte with an empty allowlist.",
+  "source_dir": "src/replay/testdata/utf8encode",
+  "engines": ["sim", "prod", "replay"],
+  "worlds": [
+    {
+      "label": "encode",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": { "method": "GET", "path": "/" }
+      }
+    }
+  ]
+}
