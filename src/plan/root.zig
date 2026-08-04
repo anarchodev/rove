@@ -45,6 +45,25 @@ pub const RateLimitCaps = struct {
     outbound_capacity: u32 = 100,
     /// 10/sec → 600/min sustained — well under any sane provider quota.
     outbound_refill_per_sec: u32 = 10,
+    /// Day-scale ceiling on outbound calls — the SPAM bound, and a
+    /// different question from the burst caps above.
+    ///
+    /// The burst bucket is tuned for absorbing spikes, which makes its
+    /// sustained rate the wrong shape for abuse: 10/s held for a day is
+    /// ~864k calls from a tenant that cost an email address to create.
+    /// The legitimate uses are all low-volume — an OAuth token exchange is
+    /// a handful of calls per login, a webhook callback is one per event,
+    /// a transactional email one per user action — so a low daily ceiling
+    /// costs real use essentially nothing while making a free tenant
+    /// worthless as a spam relay or credential-stuffing client. That
+    /// asymmetry is why this is a ceiling rather than an on/off switch:
+    /// disabling outbound on the free tier would block federated login
+    /// (`oauth`/`oidc` as a relying party) to stop abuse a day cap
+    /// already stops.
+    ///
+    /// 0 falls back to the rate-derived estimate in
+    /// `limiter.sustainedOutboundBudget`.
+    outbound_sustained_per_day: u32 = 5_000,
     /// Log-byte ingest caps — the ingest-rate guardrail
     /// (docs/strategy/pricing-model.md): a lagging post-exec bucket in RAW
     /// bytes charged at log capture, with the NEXT admission 429ing while
@@ -149,6 +168,9 @@ pub fn table(t: Tier) PlanLimits {
                 .request_refill_per_sec = 500,
                 .outbound_capacity = 100,
                 .outbound_refill_per_sec = 10,
+                // ~170x below the rate-derived 864k/day, and still ~50x a
+                // small app's real outbound traffic.
+                .outbound_sustained_per_day = 5_000,
             },
             // A few MB — generous-but-finite, coherent with the 256 KB
             // streaming QUEUE_BYTES_CAP (docs/architecture/control-plane.md Lever 2).
@@ -165,6 +187,7 @@ pub fn table(t: Tier) PlanLimits {
                 .request_refill_per_sec = 5_000,
                 .outbound_capacity = 1_000,
                 .outbound_refill_per_sec = 100,
+                .outbound_sustained_per_day = 50_000,
             },
             .max_body_bytes = 32 * 1024 * 1024,
             .max_resident_html_bytes = 32 * 1024 * 1024,
@@ -179,6 +202,7 @@ pub fn table(t: Tier) PlanLimits {
                 .request_refill_per_sec = 50_000,
                 .outbound_capacity = 10_000,
                 .outbound_refill_per_sec = 1_000,
+                .outbound_sustained_per_day = 500_000,
             },
             .max_body_bytes = 256 * 1024 * 1024,
             .max_resident_html_bytes = 256 * 1024 * 1024,
@@ -198,6 +222,7 @@ pub const Overrides = struct {
     request_refill_per_sec: ?u32 = null,
     outbound_capacity: ?u32 = null,
     outbound_refill_per_sec: ?u32 = null,
+    outbound_sustained_per_day: ?u32 = null,
     log_burst_bytes: ?u32 = null,
     log_refill_bytes_per_sec: ?u32 = null,
     max_body_bytes: ?u32 = null,
@@ -215,6 +240,7 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     if (ov.request_refill_per_sec) |v| p.rate.request_refill_per_sec = v;
     if (ov.outbound_capacity) |v| p.rate.outbound_capacity = v;
     if (ov.outbound_refill_per_sec) |v| p.rate.outbound_refill_per_sec = v;
+    if (ov.outbound_sustained_per_day) |v| p.rate.outbound_sustained_per_day = v;
     if (ov.log_burst_bytes) |v| p.rate.log_burst_bytes = v;
     if (ov.log_refill_bytes_per_sec) |v| p.rate.log_refill_bytes_per_sec = v;
     if (ov.max_body_bytes) |v| p.max_body_bytes = v;
