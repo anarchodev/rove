@@ -35,6 +35,8 @@
 const std = @import("std");
 const kvstore = @import("raft-kv").kvstore;
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 /// Scan pages this many entries at a time. The store's own page cap, not a
 /// tuning knob the caller picks: a bigger page buys nothing (the byte budget
 /// below is what actually bounds a part) and a smaller one costs round trips.
@@ -186,6 +188,96 @@ fn appendJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8
     try out.append(a, '"');
 }
 
+// ── The door ───────────────────────────────────────────────────────
+
+/// The trusted-door URL the export Cmd is stamped with. Never reaches
+/// libcurl: the Cmd release site builds one part from the tenant's store and
+/// REWRITES this fetch into an ordinary content-addressed PUT at the blob
+/// door, so the bytes reach S3 through the existing signed path rather than a
+/// second upload mechanism, and inherit its staging, accounting and
+/// terminal-event routing unchanged.
+pub const EXPORT_ORIGIN_PREFIX = "http://rove-kvexport.internal/";
+
+pub fn isExportUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, EXPORT_ORIGIN_PREFIX);
+}
+
+/// Bytes of one part, and therefore the bound on how long the walk holds the
+/// worker's poll loop — NOT a storage limit.
+///
+/// The read has to happen on the worker thread: `KvStore.prefix` routes
+/// through the store's active txn, so scanning from a background thread would
+/// race the handler's own writes. The upload is what must not block, and the
+/// rewrite hands that to the existing async fetch path. So the number is
+/// chosen for loop latency: small enough that a scan is a blip for other
+/// tenants on the worker, at the cost of more (bounded, resumable)
+/// activations for a large store.
+pub const PART_MAX_BYTES: usize = 1024 * 1024;
+
+/// The rewritten Cmd: what the blob door should PUT, and the descriptor the
+/// resuming activation observes.
+pub const Rewrite = struct {
+    /// Content hash of `body` — the blob door's key, and what the manifest
+    /// records.
+    hash: [64]u8,
+    /// The part's JSONL bytes. Caller owns; becomes the PUT body.
+    body: []u8,
+    /// `{"id":…,"part":{…}}` — the resume ctx. Caller owns.
+    ctx_json: []u8,
+
+    pub fn deinit(self: *Rewrite, a: std.mem.Allocator) void {
+        a.free(self.body);
+        a.free(self.ctx_json);
+        self.* = undefined;
+    }
+};
+
+/// Build the part named by an export Cmd's body (`{"id":…,"cursor":…}`).
+///
+/// The descriptor — hash, byte count, entry count, next cursor, done — is all
+/// the resuming handler ever sees of the data. It is an input and IS taped,
+/// but it is a cursor and a digest: bounded, and the same size whether the
+/// part held one entry or a million.
+pub fn buildRewrite(
+    a: std.mem.Allocator,
+    store: *kvstore.KvStore,
+    cmd_body: []const u8,
+    max_bytes: usize,
+) !Rewrite {
+    const Req = struct { id: []const u8 = "", cursor: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(Req, a, cmd_body, .{ .ignore_unknown_fields = true }) catch
+        return error.BadExportRequest;
+    defer parsed.deinit();
+    if (parsed.value.id.len == 0) return error.BadExportRequest;
+
+    var part = try buildPart(a, store, parsed.value.cursor, max_bytes);
+    defer part.deinit(a);
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(part.bytes, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+
+    var ctx: std.ArrayList(u8) = .empty;
+    errdefer ctx.deinit(a);
+    try ctx.appendSlice(a, "{\"id\":");
+    try appendJsonString(a, &ctx, parsed.value.id);
+    try ctx.appendSlice(a, ",\"part\":{\"hash\":\"");
+    try ctx.appendSlice(a, &hash);
+    try ctx.writer(a).print("\",\"bytes\":{d},\"entries\":{d},\"done\":{s},\"next_cursor\":", .{
+        part.bytes.len,
+        part.entries,
+        if (part.done) "true" else "false",
+    });
+    try appendJsonString(a, &ctx, part.next_cursor);
+    try ctx.appendSlice(a, "}}");
+
+    return .{
+        .hash = hash,
+        .body = try a.dupe(u8, part.bytes),
+        .ctx_json = try ctx.toOwnedSlice(a),
+    };
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -291,6 +383,76 @@ test "kv export: the job's own bookkeeping is excluded, everything else is not" 
     try testing.expect(std.mem.indexOf(u8, joined, "_sched/by_id/abc") != null);
     // The job's own record is self-referential and stale by seal time.
     try testing.expect(std.mem.indexOf(u8, joined, "_export/job-1") == null);
+}
+
+test "kv export: the rewrite yields a self-describing part the job can chain on" {
+    const a = testing.allocator;
+    var buf: [64]u8 = undefined;
+    const store = try openTempStore(a, &buf);
+    defer {
+        store.close();
+        std.fs.cwd().deleteFile(std.mem.sliceTo(&buf, 0)) catch {};
+    }
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        try store.put(try std.fmt.bufPrint(&kb, "k/{d:0>3}", .{i}), "value");
+    }
+
+    // A tiny budget so the first part stops mid-store and must chain.
+    var rw = try buildRewrite(a, store, "{\"id\":\"exp-1\",\"cursor\":\"\"}", 64);
+    defer rw.deinit(a);
+
+    // The door PUTs `body` under `hash`, and #367 makes the door refuse a
+    // mismatch — so a wrong hash here is not a silent corruption but a
+    // failed upload. Assert the invariant at the source anyway.
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(rw.body, &digest, .{});
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), &rw.hash);
+
+    const Ctx = struct {
+        id: []const u8,
+        part: struct {
+            hash: []const u8,
+            bytes: u64,
+            entries: u64,
+            done: bool,
+            next_cursor: []const u8,
+        },
+    };
+    const parsed = try std.json.parseFromSlice(Ctx, a, rw.ctx_json, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("exp-1", parsed.value.id);
+    try testing.expectEqualStrings(&rw.hash, parsed.value.part.hash);
+    try testing.expectEqual(rw.body.len, parsed.value.part.bytes);
+    try testing.expect(!parsed.value.part.done);
+    // Not done ⇒ the cursor must name where to resume, or the job stalls.
+    try testing.expect(parsed.value.part.next_cursor.len > 0);
+
+    // Chaining from that cursor eventually terminates and reports done.
+    const body2 = try std.fmt.allocPrint(
+        a,
+        "{{\"id\":\"exp-1\",\"cursor\":\"{s}\"}}",
+        .{parsed.value.part.next_cursor},
+    );
+    defer a.free(body2);
+    var rw2 = try buildRewrite(a, store, body2, 1 << 20);
+    defer rw2.deinit(a);
+    const p2 = try std.json.parseFromSlice(Ctx, a, rw2.ctx_json, .{});
+    defer p2.deinit();
+    try testing.expect(p2.value.part.done);
+}
+
+test "kv export: a request with no export id is refused" {
+    const a = testing.allocator;
+    var buf: [64]u8 = undefined;
+    const store = try openTempStore(a, &buf);
+    defer {
+        store.close();
+        std.fs.cwd().deleteFile(std.mem.sliceTo(&buf, 0)) catch {};
+    }
+    try testing.expectError(error.BadExportRequest, buildRewrite(a, store, "{\"cursor\":\"\"}", 1024));
+    try testing.expectError(error.BadExportRequest, buildRewrite(a, store, "not json", 1024));
 }
 
 test "kv export: a skipped key still advances the cursor" {
