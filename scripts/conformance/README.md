@@ -13,7 +13,7 @@ against hand-copied expected values:
 | `prod` | the worker on a live cluster | `scripts/smoke/*_smoke_v2.py` |
 | `replay` | the browser WASM arena | a human replaying a record and hitting the next wall |
 
-`sim` and `replay` both run today. `prod` is rove#417.
+All three run today.
 
 `src/replay/testdata/utf8encode` and `scripts/smoke/utf8_encode_smoke_v2.py`
 are the shape in miniature: the *same nine expected values*, written out twice
@@ -30,11 +30,28 @@ python3 scripts/conformance/run.py -v          # same, with each outcome printed
 python3 scripts/conformance/run.py --list
 python3 scripts/conformance/run.py --case utf8encode --engines sim
 python3 scripts/conformance/selftest.py        # the gate's own non-vacuity check
+
+# the cluster lane — all three engines
+set -a; . ./.env; set +a                       # S3 credentials, mandatory
+zig build rewind-worker rewind-cp rewind-front rewind-logs rewind-ops rewind
+python3 scripts/conformance/run.py --engines sim,replay,prod
 ```
 
 The **cheap lane** (`sim`, `replay`) needs no cluster and hangs off `zig build
 test`. The **cluster lane** adds `prod`, which needs S3 credentials and port
 slots, so it gets a scheduled runner instead (rove#420).
+
+The prod engine brings up **one** `V2Cluster` per process and reuses it for the
+whole corpus — bring-up is the most expensive thing here and it is per-process
+work, not per-case. Each case gets its **own tenant**, so one case's kv writes
+cannot be read by the next.
+
+That tenant-per-case choice runs straight into the platform's own
+creation-velocity gate: the CP allows a burst of 10 then one per 30s, with no
+env knob, so a full-corpus prod sweep is bounded at roughly half an hour by the
+abuse control rather than by the work. The adapter waits it out. Sharing tenants
+would dodge the limit and buy a corpus whose results depend on ordering, which
+is a worse trade than a slow lane.
 
 The replay engine needs **`REWIND_APPS_DIR`** pointing at a rewind-apps
 checkout — the replay porcelain (`rtap.mjs`, `request-replay.mjs`,
@@ -168,6 +185,10 @@ them `unverified` instead of manufacturing agreement:
 |---|---|---|
 | `headers` | replay | the parked outcome carries only a status (rove#437) |
 | `error` | replay | a throwing handler parks nothing, so the message is unrecoverable |
+| `effects` | prod | the record carries tapes (the reads a run made), not the ordered read/write/effect log the offline engines build |
+| `writes` | prod | the record has no writeset, and there is no read-only kv listing door to reconstruct one (rove#83) |
+| `disposition` | prod | not exposed on the record |
+| `body_sha256` | sim | its bundle body has been through Zig's JSON re-serialization, so hashing it would test that round-trip rather than the engine |
 
 `digest` used to be on this list. Since rove#416 both offline engines fold one,
 and they agree — which is the strongest assertion the suite makes, because it

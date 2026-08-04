@@ -26,6 +26,7 @@ Collapsing the two is how a capture gap disguises itself as a match.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -295,6 +296,14 @@ def from_replay_result(res: dict, *, stderr: str = "") -> Outcome:
     if "result" in parked:
         body = _body_from_wire(parked["result"])
         o.body = body
+        # `result` is the engine's OWN wire text, so its hash is a genuine
+        # byte-exact check against prod's wire bytes — the equality `body`
+        # deliberately gives up by canonicalizing key order. The sim cannot
+        # join: its bundle body has already been through Zig's JSON
+        # re-serialization, so hashing it would test that round-trip rather
+        # than the engine.
+        if isinstance(parked["result"], str):
+            o.body_sha256 = hashlib.sha256(parked["result"].encode("utf-8")).hexdigest()
         # Same rule the sim applies: a returned `next(...)` holds the
         # connection. Derived identically on both sides so the comparison tests
         # the engines rather than two different definitions of "held".
@@ -308,6 +317,54 @@ def from_replay_result(res: dict, *, stderr: str = "") -> Outcome:
         o.writes = writes_of(o.effects)
     if parked.get("digest") is not None:
         o.digest = parked["digest"]
+    return o
+
+
+def from_prod_response(resp, *, record=None, compared_headers=DEFAULT_COMPARED_HEADERS) -> Outcome:
+    """Normalize a live worker's response plus its captured log record.
+
+    Prod is the only engine with a real HTTP response, so it is the only one
+    that can supply `headers` from the wire. It is also the only one whose
+    `effects` cannot be supplied: the record carries tapes (the reads the run
+    made), not the ordered read/write/effect log the two offline engines build,
+    and half a log compared against a whole one is worse than none. `writes` is
+    absent for the same reason — the record has no writeset, and there is no
+    read-only kv listing door to reconstruct one (rove#83).
+
+    What prod does bring is the interaction digest as a THIRD producer, which
+    is what lets a disagreement be localized rather than merely noticed.
+    """
+    o = Outcome(engine="prod")
+    o.status = getattr(resp, "status", None)
+    o.headers = _pick_headers(getattr(resp, "headers", None), compared_headers)
+
+    raw_body = getattr(resp, "body", None)
+    o.body = _body_from_wire(raw_body)
+    if isinstance(raw_body, str):
+        # Prod's actual wire bytes. The replay engine supplies the same field
+        # from its own `__ser` output, so this is a real two-way byte-exact
+        # check — it catches a key-ordering difference that `body` forgives by
+        # canonicalizing.
+        o.body_sha256 = hashlib.sha256(raw_body.encode("utf-8")).hexdigest()
+
+    if record is None:
+        # The response is real but the record never surfaced — the digest and
+        # the exception are unknowable, so they stay ABSENT rather than null.
+        # `ok` still follows from the status.
+        o.notes["record"] = "no log record found for this request"
+    else:
+        tapes = record.get("tapes") or {}
+        if "interaction_digest" in tapes:
+            o.digest = tapes["interaction_digest"]
+        exc = record.get("exception")
+        o.error = _canon_error(exc) if exc else None
+        o.notes["request_id"] = record.get("request_id")
+        o.notes["outcome"] = record.get("outcome")
+
+    # A thrown handler is a 500 in prod, which is what the sim reports as
+    # `ok: false` — so the two agree on the thrown-handler path rather than
+    # disagreeing about how to spell it.
+    o.ok = bool(o.status) and int(o.status) < 500
     return o
 
 
