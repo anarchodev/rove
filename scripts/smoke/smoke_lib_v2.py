@@ -922,6 +922,7 @@ class V2Cluster:
     # missing one shows up as a resolve failure at deploy, not at edit time.
     FIRSTPARTY_PKG_DEPS = {
         "@rewind/cron": ["@rewind/schedule"],
+        "@rewind/export": ["@rewind/schedule"],
         "@rewind/oauth": ["@rewind/jwt"],
         "@rewind/oidc": ["@rewind/jwt"],
     }

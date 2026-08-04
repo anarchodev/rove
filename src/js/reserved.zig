@@ -116,6 +116,12 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
 /// (`_admin/operator/` is READ-only from shims — the is_root allowlist,
 /// seeded out-of-band via rewind-ops — so it stays fully reserved.)
 pub const SHIM_WRITABLE_PREFIXES = [_][]const u8{
+    // `@rewind/export` writes the export job's marker from handler context,
+    // the same way `webhook.send` writes `_send/owed/`. A tenant can
+    // therefore alter its OWN export bookkeeping — identical posture to
+    // `_sched/` and `_send/`, and `__system/export_run` treats the record
+    // defensively (unparseable ⇒ drop the chain rather than re-fire).
+    "_export/",
     "_send/",
     "_blob/",
     "_sched/",

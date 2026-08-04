@@ -26,6 +26,7 @@ Needs S3 env: `set -a; . ./.env; set +a` first.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,7 +36,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 TENANT = "acme"
-EXPORT_ID = "exp-smoke-1"
 SEEDED_KEYS = 200
 
 # Seeds customer data, then reports how many of its own keys it can see.
@@ -56,12 +56,12 @@ export function seed() {
 }
 """
 
-# `_export/` is platform-reserved, so a handler cannot start an export by
-# writing the marker — the smoke seeds it through the operator kv door and
-# this handler only arms the wake. That split is the point: a customer can
-# fire the job but cannot fabricate one.
+# The customer-facing surface: a handler starts an export and reads it back
+# with no operator involvement. `start()` writes the marker + arms the wake;
+# `get()` returns the manifest, and `blob.url` turns each part into a
+# download link.
 START_SRC = """\
-import schedule from "@rewind/schedule";
+import { start, get } from "@rewind/export";
 function _param(name) {
     for (const pair of (request.query || "").split("&")) {
         const eq = pair.indexOf("=");
@@ -69,10 +69,18 @@ function _param(name) {
     }
     return "";
 }
-export function start() {
-    const id = _param("id") || "";
-    schedule({ in: 0 }, "__system/export_run", { id: id });
-    return "armed:" + id;
+export function begin() {
+    return start();
+}
+export function status() {
+    const st = get(_param("id"));
+    if (!st) return "none";
+    // Presigned links come from the ordinary content-addressed primitive —
+    // the export adds no download surface of its own.
+    if (st.state === "done") {
+        st.links = (st.parts || []).map((p) => blob.url(p.hash));
+    }
+    return JSON.stringify(st);
 }
 """
 
@@ -94,7 +102,7 @@ def main() -> int:
         print("step 1: provision + deploy")
         r = c.provision(TENANT)
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
-        pkgs, imports = c.firstparty_packages(["@rewind/schedule"])
+        pkgs, imports = c.firstparty_packages(["@rewind/export"])
         dep = c.deploy_with_packages(TENANT, HANDLERS, pkgs, imports)
         check("deploy → dep_id", bool(dep), f"dep_id={dep}")
         c.wait_for_handler(TENANT, "/seed?fn=seed&n=0")
@@ -103,20 +111,18 @@ def main() -> int:
         r = c.request(TENANT, f"/seed?fn=seed&n={SEEDED_KEYS}", method="POST", data=b"x")
         check("seed → 200", r.status == 200 and "seeded" in r.body, f"got {r.status} {r.body!r}")
 
-        print("step 3: start the export (operator seeds the marker, handler arms the wake)")
-        seeded = json.dumps({"state": "running", "cursor": "", "parts": []})
-        r = c.admin_kv_put(TENANT, f"_export/{EXPORT_ID}", seeded)
-        check("seed the export marker → 204", r.status == 204, f"got {r.status} {r.body!r}")
-        r = c.request(TENANT, f"/start?fn=start&id={EXPORT_ID}", method="POST", data=b"x")
-        check("arm the wake → 200", r.status == 200 and "armed" in r.body,
+        print("step 3: ⭐ a handler starts the export — no operator involvement")
+        r = c.request(TENANT, "/start?fn=begin", method="POST", data=b"x")
+        export_id = r.body.strip()
+        check("export.start() → an id", r.status == 200 and len(export_id) > 10,
               f"got {r.status} {r.body!r}")
 
         print("step 4: ⭐ the job walks the store to completion")
         state = None
         deadline = time.time() + 60
         while time.time() < deadline:
-            rr = c.admin_kv_get(TENANT, f"_export/{EXPORT_ID}")
-            if rr.status == 200:
+            rr = c.request(TENANT, f"/start?fn=status&id={export_id}", method="POST", data=b"x")
+            if rr.status == 200 and rr.body.strip().startswith("{"):
                 try:
                     state = json.loads(rr.body)
                 except ValueError:
@@ -154,12 +160,38 @@ def main() -> int:
         check("the export recorded a non-zero byte count",
               state.get("bytes", 0) > 0, f"bytes={state.get('bytes')}")
 
-        print("step 5: the finished job stops costing wakes")
-        # A terminal export cancels its watchdog; a lingering `_sched/by_id`
-        # row would re-fire `export_run` forever against a done record.
-        rr = c.admin_kv_get(TENANT, "_export/" + EXPORT_ID)
-        check("state is still terminal after settling", rr.status == 200 and '"done"' in rr.body,
-              f"got {rr.status} {rr.body[:120]!r}")
+        print("step 5: ⭐ every part has a download link")
+        links = state.get("links") or []
+        check("a presigned link per part", len(links) == len(parts), f"links={len(links)}")
+        check("links presign the content-addressed part",
+              all(isinstance(u, str) and u.startswith("http") and p["hash"] in u
+                  for u, p in zip(links, parts)),
+              f"links={links[:1]}")
+
+        print("step 6: ⭐ the link actually yields the customer's data back")
+        # The whole point of an export: a link the customer can follow to
+        # bytes they can read. Anything short of downloading and parsing it
+        # is testing bookkeeping.
+        # NOT the harness `_curl`: that forces HTTP/2 prior-knowledge for rove
+        # services, which S3 does not speak. A customer follows this link with
+        # an ordinary client, so the smoke should too.
+        proc = subprocess.run(["curl", "-sS", "--fail-with-body", links[0]],
+                              capture_output=True, text=True, timeout=60)
+        check("GET the presigned part → 200", proc.returncode == 0,
+              f"rc={proc.returncode} {proc.stderr[:120]}")
+        got = proc.stdout
+        lines = [ln for ln in got.splitlines() if ln.strip()]
+        check("part parses as JSONL", len(lines) == parts[0]["entries"],
+              f"lines={len(lines)} entries={parts[0]['entries']}")
+        seen = {}
+        for ln in lines:
+            rec = json.loads(ln)
+            seen[rec["key"]] = rec["value"]
+        missing = [f"data/{i:04d}" for i in range(SEEDED_KEYS) if f"data/{i:04d}" not in seen]
+        check(f"all {SEEDED_KEYS} seeded keys came back", not missing,
+              f"missing={missing[:5]}")
+        check("values round-trip byte-exact", seen.get("data/0007") == "value-7",
+              f"got {seen.get('data/0007')!r}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
