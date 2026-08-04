@@ -67,6 +67,8 @@ const tenant_mod = @import("rove-tenant");
 const files_mod = @import("rove-files");
 const static_cache = @import("static_cache.zig");
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 const NodeState = worker_mod.NodeState;
 const PendingFetch = globals.PendingFetch;
 const UpstreamFetchEvent = components_mod.UpstreamFetchEvent;
@@ -846,6 +848,19 @@ pub const FetchEngine = struct {
             .HEAD => "HEAD",
             else => return error.BlobMethodDenied,
         };
+
+        // Content-addressing is an INVARIANT of this store, not a naming
+        // convention: a PUT whose body does not hash to its own key is
+        // refused. `blob.put` derives the key from the bytes, so the shim can
+        // never trip this; the door is reachable WITHOUT the shim (a handler
+        // may fetch it directly), and unchecked it would make the hash an
+        // ordinary name — objects become mutable under a key a customer has
+        // already indexed in kv, and dedup-by-hash ("same hash ⇒ same object,
+        // already counted") stops being sound, which the per-tenant byte
+        // accounting in `src/kv/usage.zig` depends on. Confinement is not at
+        // stake either way — it is the tenant's own prefix — so the blast
+        // radius is one tenant's own integrity.
+        if (method == .PUT and !bodyHashesToKey(pf.body, hash)) return error.BlobHashMismatch;
 
         // Path used both for signing and the wire URL (path-style S3),
         // derived through the tenant-storage handle so this door and the
@@ -1780,6 +1795,42 @@ test "isSha256HexLower accepts a digest and rejects malformed keys" {
     try std.testing.expect(!isSha256HexLower("e3b0c44298fc1c149afbf4c8996fb924"));
     try std.testing.expect(!isSha256HexLower("../../../../../../../etc/passwd0000000000000000000000000000000000"));
     try std.testing.expect(!isSha256HexLower(""));
+}
+
+/// True when `body` actually hashes to `key` — the content-addressing
+/// invariant the blob door enforces on every PUT (see
+/// `rewriteAndSignBlobFetch`, which rejects a mismatch rather than storing
+/// bytes under a key that does not name them). `key` is assumed already
+/// shape-checked by `isSha256HexLower`.
+fn bodyHashesToKey(body: []const u8, key: []const u8) bool {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(body, &digest, .{});
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    return key.len == actual.len and std.mem.eql(u8, &actual, key);
+}
+
+test "bodyHashesToKey holds the blob door's content-addressing invariant" {
+    // The empty-string digest — the canonical sha256 test vector.
+    const empty = "e3b0c44298fc1c14 9afbf4c8996fb924 27ae41e4649b934c a495991b7852b855";
+    var empty_key: [64]u8 = undefined;
+    var n: usize = 0;
+    for (empty) |ch| if (ch != ' ') {
+        empty_key[n] = ch;
+        n += 1;
+    };
+    try std.testing.expect(bodyHashesToKey("", &empty_key));
+
+    // A body that does NOT hash to the key is refused — the direct-door
+    // write that would otherwise make the hash an ordinary mutable name.
+    try std.testing.expect(!bodyHashesToKey("smuggled", &empty_key));
+
+    // The honest case `blob.put` always produces: key derived from the bytes.
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash("smuggled", &digest, .{});
+    const honest = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expect(bodyHashesToKey("smuggled", &honest));
+    // ...and the same bytes cannot be re-filed under a second key.
+    try std.testing.expect(!bodyHashesToKey("other bytes", &honest));
 }
 
 fn parseHeadersJson(
