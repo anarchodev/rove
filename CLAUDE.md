@@ -21,6 +21,8 @@ zig build rewind-worker # Build the V2 worker binary (src/rewind/main.zig)
 zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
 zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
 zig build v2-test      # Focused SUBSET of `test`: the raft substrate alone
+zig build conformance  # Behavior conformance — one corpus on every engine
+                       # (cheap lane: no cluster). Folded into `test`.
 zig build echo-server  # Run the TCP echo server example
 zig build h2-echo-server  # Run the HTTP/2 echo server example
 ```
@@ -31,7 +33,18 @@ the consensus-linked steps — anything that pulls in the bridge (`rewind-worker
 every binary) builds raft-rs-zig's Rust FFI via cargo; the bare `zig build`
 install step does not. System libraries: nghttp2, OpenSSL (ssl + crypto),
 libcurl, liblmdb (via kvexp), zlib, SQLite3 (`rewind-logs` + the log-server
-tests, both of which `test` covers).
+tests, both of which `test` covers). `test` also shells out to **node** (the
+interaction-digest mirror gate) and **python3** (the conformance runner).
+
+## Behavior conformance
+
+`scripts/conformance/` is the executable spec: one corpus of behavior cases run
+against every engine that executes customer handlers — the offline sim, the prod
+worker, and the browser WASM replay arena — failing when two of them disagree.
+It replaces the pattern where a sim fixture and a prod smoke assert the same
+hand-copied literal in two languages and nothing detects drift (`build.zig`'s
+`↔ <smoke>` comments are that pairing today; nothing executes them). Read
+`scripts/conformance/README.md` before adding a case. Tracker: rove#195.
 
 ## Smoke tests
 
