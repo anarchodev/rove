@@ -347,11 +347,12 @@ pub fn interpretCmd(
             // of one part, so it runs BEFORE the door partition below and
             // then falls through as an ordinary content-addressed upload.
             var pf_mut = pf;
-            if (!worker.rewriteKvExport(&pf_mut)) return;
             // Trusted internal doors (blob.receive / platform.compile /
             // stampManifest) never reach libcurl — route to the worker-local
-            // subsystem. ONE partition for every submit site (worker.zig).
-            if (worker.tryDoorFetch(pf_mut)) return;
+            // subsystem. ONE partition for every submit site (worker.zig);
+            // the kv-export door rewrites `pf_mut` and returns false so it
+            // continues below as an ordinary blob PUT.
+            if (worker.tryDoorFetch(&pf_mut)) return;
             // Storage quota (#349): refuse a blob PUT that would carry the
             // tenant past `max_stored_bytes`, before it reaches the wire.
             if (worker.refuseIfOverStorageQuota(pf_mut)) return;

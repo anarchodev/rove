@@ -75,6 +75,12 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_cron_tick_mjs"),
     },
     .{
+        // rove#340: the durable data-export job — walks the tenant's KV into
+        // content-addressed parts, one part per activation.
+        .path = "__system/export_run.mjs",
+        .src = @embedFile("builtin_export_run_mjs"),
+    },
+    .{
         // blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: blob.put's marker-settling
         // result handler.
         .path = "__system/blob_onresult.mjs",

@@ -2891,21 +2891,32 @@ pub fn Worker(comptime opts: Options) type {
             return true;
         }
 
-        pub fn tryDoorFetch(self: *Self, pf: globals.PendingFetch) bool {
+        /// True ⇒ the fetch was CONSUMED here (routed to a worker-local
+        /// subsystem, or dropped); the caller does nothing more with it.
+        /// False ⇒ carry on submitting `pf.*`, which may have been REWRITTEN
+        /// in place (the kv-export door turns itself into a blob PUT).
+        ///
+        /// Takes a pointer because of that rewrite: this is the one partition
+        /// every submit site goes through, so a door that mutates its fetch
+        /// has to mutate the caller's copy, not a temporary.
+        pub fn tryDoorFetch(self: *Self, pf: *globals.PendingFetch) bool {
+            // #340: builds one export part and rewrites this into an ordinary
+            // content-addressed PUT, which then takes the normal path below.
+            if (kv_export_mod.isExportUrl(pf.url)) return !self.rewriteKvExport(pf);
             if (blob_receive_mod.isReceiveUrl(pf.url)) {
-                self.armBlobReceive(pf);
+                self.armBlobReceive(pf.*);
                 return true;
             }
             if (worker_fire.isComposeUrl(pf.url)) {
-                worker_fire.fireBlobCompose(self, pf);
+                worker_fire.fireBlobCompose(self, pf.*);
                 return true;
             }
             if (deploy_thread_mod.isCompileUrl(pf.url)) {
-                self.submitCompile(pf);
+                self.submitCompile(pf.*);
                 return true;
             }
             if (deploy_thread_mod.isStageUrl(pf.url)) {
-                self.submitStampManifest(pf);
+                self.submitStampManifest(pf.*);
                 return true;
             }
             return false;
