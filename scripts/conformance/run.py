@@ -88,6 +88,7 @@ def run_case(case: dict, engines: list[str], verbose: bool) -> dict:
         "unverified": [],
         "unavailable": [],
         "errors": [],
+        "degenerate": [],
     }
 
     for entry in case["worlds"]:
@@ -108,6 +109,19 @@ def run_case(case: dict, engines: list[str], verbose: bool) -> dict:
                 result["errors"].append(
                     {"world": label, "engine": engine, "error": str(e)}
                 )
+
+        # An engine that produced no observable outcome — it crashed, threw
+        # before parking, or never terminated — still reports `ok: False`, and
+        # two such `ok: False` values COMPARE EQUAL. That reads as agreement
+        # while proving nothing: the other engine may have produced a full
+        # outcome the failed one never got near. Flag it so the case reports
+        # `unproven` rather than `ok`.
+        degenerate = [
+            o.engine for o in outcomes if len(o.fields()) <= 1
+        ]
+        result["degenerate"] += [
+            {"world": label, "engine": e} for e in degenerate
+        ]
 
         divs, unver = compare(name, label, outcomes)
         unexcused, excused = allowlist.partition(divs)
@@ -196,6 +210,10 @@ def main() -> int:
         ran = sorted({e for w in r["worlds"] for e in w["engines_ran"]})
         if r["divergences"] or r["errors"]:
             status = "DIVERGED"
+        elif r["degenerate"]:
+            # One engine produced nothing; whatever "agreed" was agreement
+            # between a real outcome and a failure.
+            status = "unproven"
         elif r.get("comparisons", 0) == 0:
             # Ran, did not disagree, and compared nothing. "ok" would be a lie
             # by omission — the case established no agreement whatsoever.
@@ -229,6 +247,15 @@ def main() -> int:
             seen.add(key)
             print(f"  {u['engine']:<7} {u['why']}")
 
+    degenerate = [g for r in results for g in r["degenerate"]]
+    if degenerate:
+        by_engine: dict[str, list[str]] = {}
+        for g in degenerate:
+            by_engine.setdefault(g["engine"], []).append(g["world"])
+        print("\nENGINES THAT PRODUCED NO OUTCOME — these cases proved nothing:")
+        for engine, worlds in sorted(by_engine.items()):
+            print(f"  {engine:<7} {len(worlds)} world(s)")
+
     if unverified:
         by_engine: dict[str, list[str]] = {}
         for u in unverified:
@@ -257,13 +284,21 @@ def main() -> int:
     # re-match would consult the current KNOWN a second time and could quietly
     # disagree with the first.
     fired = {x["pattern"] for x in excused}
-    # Only judge entries whose engines actually ran — see allowlist.stale().
+    # Only judge entries whose engines actually ran — see allowlist.stale() —
+    # and only on a FULL run. A `--case` subset deliberately skips most of the
+    # corpus, so an entry that did not fire there says nothing about whether it
+    # is stale; failing on it would make the narrowing flag unusable and train
+    # people to ignore the rule.
     engines_ran = {e for r in results for w in r["worlds"] for e in w["engines_ran"]}
-    stale = [
-        k
-        for k in allowlist.KNOWN
-        if k.pattern not in fired and set(k.engines).issubset(engines_ran)
-    ]
+    stale = (
+        []
+        if args.case
+        else [
+            k
+            for k in allowlist.KNOWN
+            if k.pattern not in fired and set(k.engines).issubset(engines_ran)
+        ]
+    )
     if stale:
         print("\nSTALE ALLOWLIST ENTRIES — matched nothing this run:")
         for k in stale:

@@ -65,6 +65,7 @@ const {
     READ_KIND_HEADER_VALUE,
     READ_KIND_BODY_READ,
     READ_KIND_IP_MASKED,
+    READ_KIND_IP_RAW,
 } = await imp("rtap.mjs");
 // The baked `__system/*` entry modules. Without them every send_callback-shaped
 // record is unloadable — the gap #236 closed.
@@ -156,8 +157,19 @@ if (headerNames.length) {
         });
     }
 }
-if (req.ip != null)
-    requestReads.push({ kind: READ_KIND_IP_MASKED, name: "", value: String(req.ip) });
+// Unconditional, for the same reason as the body-read marker below: on a
+// capture, an absent ip entry means "the original run never read `request.ip`"
+// and reading it is a divergence — but an authored world has no original run,
+// and prod/the sim let the handler read it and hand back null when no ip was
+// declared. An empty value is precisely how the channel spells "null was
+// returned" (`RequestReadKind.ip_masked`, src/tape/root.zig).
+for (const kind of [READ_KIND_IP_MASKED, READ_KIND_IP_RAW]) {
+    // Both channels: `request.ip` (masked) and `request.unmaskedIp()` (the
+    // deliberate escalation). A world declares one address; which of the two a
+    // handler reads is the handler's business, and gating either on the world
+    // makes an authored world throw where prod returns a value or null.
+    requestReads.push({ kind, name: "", value: req.ip != null ? String(req.ip) : "" });
+}
 
 // The body-read marker is unconditional on payload-carrying activations, not
 // gated on the world declaring a body. On a capture the marker means "the

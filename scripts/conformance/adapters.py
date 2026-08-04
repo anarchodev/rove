@@ -44,7 +44,15 @@ class EngineUnavailable(Exception):
 
 class AdapterError(Exception):
     """The engine ran and failed in a way that is not a behavioral outcome — a
-    crashed binary, unparseable output. A real failure, not a divergence."""
+    crashed binary, unparseable output, a run that never terminated. A real
+    failure, not a divergence."""
+
+
+# Per-engine wall-clock ceilings. Deliberately generous: they exist to stop one
+# non-terminating case from taking the whole run down, not to measure anything.
+# A timeout is reported as an adapter error, never as agreement.
+SIM_TIMEOUT_S = 120
+REPLAY_TIMEOUT_S = 60
 
 
 # ── sim ──────────────────────────────────────────────────────────────────────
@@ -85,7 +93,15 @@ def run_sim(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
             [str(binary), "sim", str(world_path), "--source-dir", str(source_dir)],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=SIM_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung engine is an outcome the suite has to REPORT, not an exception
+        # that takes the whole run down with it — one non-terminating case would
+        # otherwise hide the results of every case after it.
+        raise AdapterError(
+            f"`rewind sim` did not terminate within {SIM_TIMEOUT_S}s — the "
+            f"handler may not terminate on this engine"
         )
     finally:
         world_path.unlink(missing_ok=True)
@@ -172,7 +188,13 @@ def run_replay(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
             ["node", str(Path(__file__).resolve().parent / "replay_driver.mjs"), str(job_path)],
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=REPLAY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        raise AdapterError(
+            f"the replay driver did not terminate within {REPLAY_TIMEOUT_S}s — "
+            f"the WASM arena has no CPU budget, so a handler the sim bounds with "
+            f"a 504 runs forever here (rove#443)"
         )
     finally:
         job_path.unlink(missing_ok=True)

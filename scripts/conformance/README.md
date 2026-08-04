@@ -149,7 +149,15 @@ stale.
    unless there is a reason, and if there is a reason it belongs in an issue,
    not in a silent omission (rove#419).
 3. Run `zig build conformance`. A case that runs on one engine reports
-   `unproven`, which is accurate: it has established nothing yet.
+   `unproven`, which is accurate: it has established nothing yet. So does a case
+   where an engine produced **no outcome** — two failed runs both report
+   `ok: false` and would otherwise compare equal, which is agreement between a
+   real result and a crash.
+
+A naive `GET /` world is not enough for most of the corpus: cases needing
+packages, a threaded ctx, or a non-inbound activation fail on *both* engines and
+report `unproven`. That is the runner telling you the world is wrong, not the
+engines agreeing.
 
 ## What each engine cannot report
 
@@ -173,8 +181,26 @@ rove#418 added the replay adapter; rove#416 gave the sim an interaction digest,
 so the two offline engines now agree on the interaction SEQUENCE and not merely
 the response. prod is rove#417.
 
-Findings so far, all filed rather than worked around: rove#436 (the replay
-epilogue has no authored-world mode), rove#437 (no response headers in the
-parked outcome), rove#442 (harness bookkeeping folded into replay's digest).
+### Findings
+
+A full sweep of `src/replay/testdata/` (57 cases) across sim and replay: **23
+agree on all 7 comparable fields including the digest**, 22 are `unproven` (the
+probe world is inadequate — packages, ctx, or a non-inbound activation), and 12
+diverge. Every divergence is filed rather than worked around:
+
+| issue | what | cases |
+|---|---|---|
+| rove#436 | the replay epilogue has no authored-world mode | `instancefold`, `platformadmin`, `roottoken`, `requestsurface`, `argvalidation` |
+| rove#442 | harness bookkeeping folded into replay's effect log + digest | `concurrent`, `concurrentctx`, `fetchrecorder`, `ssrfgate`, `nexttarget` |
+| rove#452 | the WASM arena has no CPU budget — a runaway handler hangs | `cpubudget` |
+| rove#453 | module specifiers looked up verbatim, no `../` clamping | `importclamp` |
+| rove#250 | request surface: `tag()` inert, activation bag null, no corr/session | `requestsurface` |
+| rove#437 | no response headers in the parked outcome | (all — `headers` is unverified) |
+
+Two nearby symptoms were *driver* bugs, fixed here rather than filed: the
+body-read and ip-read markers were gated on the world declaring a body/ip, which
+made a bodyless world throw where prod returns `""` and `request.ip` throw where
+prod returns null. On a capture an absent marker means "the original run never
+read this"; an authored world has no original run.
 
 Tracker: rove#195.
