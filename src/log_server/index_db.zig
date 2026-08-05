@@ -54,6 +54,7 @@ const SCHEMA: [:0]const u8 =
     \\    status         INTEGER,
     \\    outcome        TEXT,
     \\    deployment_id  INTEGER,
+    \\    activation     TEXT,
     \\    ndjson_key     TEXT NOT NULL,
     \\    offset         INTEGER NOT NULL,
     \\    length         INTEGER NOT NULL,
@@ -137,11 +138,48 @@ pub const IndexDb = struct {
         if (run_schema) {
             if (c.sqlite3_exec(db, SCHEMA.ptr, null, null, null) != c.SQLITE_OK)
                 return Error.Sqlite;
+            try migrate(db.?);
         }
 
         const self = allocator.create(IndexDb) catch return Error.OutOfMemory;
         self.* = .{ .allocator = allocator, .db = db.? };
         return self;
+    }
+
+    /// Bring an already-created `log_index.db` up to the current
+    /// schema. `CREATE TABLE IF NOT EXISTS` is a no-op on a file that
+    /// already has the table, so a column added to `SCHEMA` never
+    /// reaches a deployed index — every node's `log_index.db` predates
+    /// it. Additive columns therefore need an explicit `ALTER`.
+    ///
+    /// Idempotent by inspection (`PRAGMA table_info`) rather than by a
+    /// stored schema version: the check is one pragma on a table that
+    /// is open anyway, and it stays correct if a file is restored from
+    /// a backup or hand-repaired, where a version counter would lie.
+    /// Runs on the writer connection only — the reader attaches after
+    /// it (see `openReader`), so it never races a migration.
+    fn migrate(db: *c.sqlite3) Error!void {
+        if (!try hasColumn(db, "log_index", "activation")) {
+            // NULL for every pre-existing row, which reads as "kind
+            // unknown" — see `sidecar.Record.activation`. Backfilling
+            // them to 'inbound' would assert something the index never
+            // recorded.
+            if (c.sqlite3_exec(db, "ALTER TABLE log_index ADD COLUMN activation TEXT", null, null, null) != c.SQLITE_OK)
+                return Error.Sqlite;
+        }
+    }
+
+    fn hasColumn(db: *c.sqlite3, table: [:0]const u8, column: []const u8) Error!bool {
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info(?) WHERE name = ?", -1, &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, table);
+        bindText(st.?, 2, column);
+        const rc = c.sqlite3_step(st);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return Error.Sqlite;
     }
 
     pub fn close(self: *IndexDb) void {
@@ -247,6 +285,10 @@ pub const IndexDb = struct {
         status: u16,
         outcome: []u8,
         deployment_id: u64,
+        /// Activation kind that produced the record. Empty when the
+        /// row was indexed before the field existed (stored NULL) —
+        /// "unknown", never `inbound`.
+        activation: []u8,
 
         pub fn deinit(self: *ListRow, a: std.mem.Allocator) void {
             a.free(self.tenant_id);
@@ -254,6 +296,7 @@ pub const IndexDb = struct {
             a.free(self.path);
             a.free(self.host);
             a.free(self.outcome);
+            a.free(self.activation);
         }
     };
 
@@ -275,7 +318,7 @@ pub const IndexDb = struct {
     /// ?2/?3 cursor, ?4 limit, ?5 floor) so both bind identically.
     const LIST_SQL_UNTAGGED: [:0]const u8 =
         \\SELECT tenant_id, request_id, received_ns, duration_ns, method, path, host,
-        \\       status, outcome, deployment_id
+        \\       status, outcome, deployment_id, activation
         \\FROM log_index
         \\WHERE tenant_id = ?1
         \\  AND (?2 = 0 OR
@@ -307,7 +350,8 @@ pub const IndexDb = struct {
     /// pins the resulting index use.
     const LIST_SQL_TAGGED: [:0]const u8 =
         \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
-        \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id
+        \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id,
+        \\       li.activation
         \\FROM log_tags t
         \\JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
         \\WHERE t.tenant_id = ?1 AND t.key = ?6 AND t.value = ?7
@@ -383,6 +427,9 @@ pub const IndexDb = struct {
                 // INTEGER stores all 64 bits; reinterpret without
                 // a sign check.
                 .deployment_id = @bitCast(c.sqlite3_column_int64(st, 9)),
+                // NULL (pre-migration row) reads back as "" — the
+                // unknown-kind sentinel.
+                .activation = try dupeColumnText(self.allocator, st.?, 10),
             };
             rows.append(self.allocator, row) catch return Error.OutOfMemory;
         }
@@ -492,8 +539,8 @@ fn execLogIndexInserts(
         \\INSERT OR IGNORE INTO log_index
         \\(tenant_id, request_id, received_ns, duration_ns,
         \\ method, path, host, status, outcome, deployment_id,
-        \\ ndjson_key, offset, length)
-        \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        \\ activation, ndjson_key, offset, length)
+        \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ;
     var st: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, sql.ptr, -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
@@ -521,9 +568,13 @@ fn execLogIndexInserts(
         // u64 → i64 bit-cast (high-bit-set deployment_ids are valid
         // content hashes).
         _ = c.sqlite3_bind_int64(st, 10, @bitCast(r.deployment_id));
-        bindText(st.?, 11, ndjson_key);
-        _ = c.sqlite3_bind_int64(st, 12, @intCast(r.offset + header_size));
-        _ = c.sqlite3_bind_int(st, 13, @intCast(r.length));
+        // An older sidecar carries no activation kind. Store NULL, not
+        // '', so "this index predates the field" stays distinguishable
+        // from a kind that was recorded — see `sidecar.Record`.
+        if (r.activation.len > 0) bindText(st.?, 11, r.activation) else _ = c.sqlite3_bind_null(st, 11);
+        bindText(st.?, 12, ndjson_key);
+        _ = c.sqlite3_bind_int64(st, 13, @intCast(r.offset + header_size));
+        _ = c.sqlite3_bind_int(st, 14, @intCast(r.length));
         if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
 
         // `INSERT OR IGNORE` swallows a primary-key clash, and the two things
@@ -959,6 +1010,126 @@ test "a tag row's received_ns equals its record's — the tagged cursor depends 
         _ = c.sqlite3_step(st2);
         break :blk @as(usize, @intCast(c.sqlite3_column_int64(st2, 0)));
     });
+}
+
+test "an index_db created before the activation column is migrated in place" {
+    // The failure this pins is invisible to every other test: they all
+    // start from a fresh file, where `SCHEMA` supplies the column. A
+    // DEPLOYED `log_index.db` has the table already, so
+    // `CREATE TABLE IF NOT EXISTS` is a no-op and the new column never
+    // arrives — every insert then fails on an unknown column, and the
+    // log-server stops indexing. Build the hostile shape explicitly.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "migrate");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+
+    // A v0 file: log_index exactly as it was before this change.
+    {
+        var raw: ?*c.sqlite3 = null;
+        try testing.expect(c.sqlite3_open_v2(
+            db_path.ptr,
+            &raw,
+            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE,
+            null,
+        ) == c.SQLITE_OK);
+        defer _ = c.sqlite3_close_v2(raw);
+        const old_schema =
+            \\CREATE TABLE log_index (
+            \\    tenant_id TEXT NOT NULL, request_id INTEGER NOT NULL,
+            \\    received_ns INTEGER NOT NULL, duration_ns INTEGER NOT NULL,
+            \\    method TEXT, path TEXT, host TEXT, status INTEGER,
+            \\    outcome TEXT, deployment_id INTEGER,
+            \\    ndjson_key TEXT NOT NULL, offset INTEGER NOT NULL,
+            \\    length INTEGER NOT NULL,
+            \\    PRIMARY KEY (tenant_id, request_id)
+            \\);
+            \\INSERT INTO log_index VALUES
+            \\  ('acme',1,1000,1,'GET','/old','h',200,'ok',1,'k',0,10);
+        ;
+        try testing.expect(c.sqlite3_exec(raw, old_schema, null, null, null) == c.SQLITE_OK);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    // Opening migrated it, and the pre-existing row reads as UNKNOWN —
+    // not backfilled to 'inbound', which would invent a fact the index
+    // never recorded.
+    var pre = try idx.queryList("acme", 0, 0, 0, 10, null, null);
+    defer pre.deinit();
+    try testing.expectEqual(@as(usize, 1), pre.rows.len);
+    try testing.expectEqualStrings("", pre.rows[0].activation);
+
+    // And a record indexed after the migration carries its kind.
+    var records = [_]sidecar.Record{
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/new", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .activation = "disconnect", .offset = 0, .length = 10 },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "migbatch",
+        .ndjson_size = 10,
+        .ndjson_sha256 = "d",
+        .first_received_ns = 2_000,
+        .last_received_ns = 2_000,
+        .records = &records,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/migbatch.ndjson", 0);
+
+    var post = try idx.queryList("acme", 0, 0, 0, 10, null, null);
+    defer post.deinit();
+    try testing.expectEqual(@as(usize, 2), post.rows.len);
+    try testing.expectEqualStrings("disconnect", post.rows[0].activation);
+    try testing.expectEqualStrings("", post.rows[1].activation);
+
+    // Idempotent: re-opening an already-migrated file must not fail on
+    // a duplicate-column ALTER.
+    var again = try IndexDb.open(a, db_path);
+    defer again.close();
+    try testing.expect(try IndexDb.hasColumn(again.db, "log_index", "activation"));
+}
+
+test "the activation kind survives the tag-filtered path too" {
+    // A saga's steps are listed through the tagged statement (#443), so
+    // the kind has to come back on THAT path, not just the plain list —
+    // the two select their columns separately.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "actkind");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    var records = [_]sidecar.Record{
+        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 101, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .activation = "inbound", .offset = 0, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 0, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .activation = "ws_message", .offset = 10, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 3, .received_ns = 3_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 0, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .activation = "disconnect", .offset = 20, .length = 10 },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "wsbatch",
+        .ndjson_size = 30,
+        .ndjson_sha256 = "d",
+        .first_received_ns = 1_000,
+        .last_received_ns = 3_000,
+        .records = &records,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/wsbatch.ndjson", 0);
+
+    // The whole saga, newest-first: close, frame, open.
+    var saga = try idx.queryList("acme", 0, 0, 0, 10, "_corr", "C1");
+    defer saga.deinit();
+    try testing.expectEqual(@as(usize, 3), saga.rows.len);
+    try testing.expectEqualStrings("disconnect", saga.rows[0].activation);
+    try testing.expectEqualStrings("ws_message", saga.rows[1].activation);
+    try testing.expectEqualStrings("inbound", saga.rows[2].activation);
 }
 
 test "a re-index counts as re-index, a collision counts as a CONFLICT" {

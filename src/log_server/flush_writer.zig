@@ -140,6 +140,10 @@ pub fn writeBatch(
             .outcome = outcomeName(r.outcome),
             .deployment_id = r.deployment_id,
             .correlation_id = r.correlation_id,
+            // Same table that spells the kind into the ndjson line, so
+            // the sidecar and the record body can never disagree about
+            // what an activation was called.
+            .activation = activationName(r.activation),
             .tags = all_tags[tags_start..tag_cursor],
             .offset = offset,
             .length = @intCast(length),
@@ -593,6 +597,53 @@ test "writeBatch emits one object with embedded sidecar + frames" {
     const expected_hex = try bytesToHex(a, sha[0..]);
     defer a.free(expected_hex);
     try testing.expectEqualStrings(expected_hex, idx.ndjson_sha256);
+}
+
+test "the activation kind reaches the sidecar, not just the record body" {
+    // The kind was always spelled into the ndjson line, where reading
+    // it costs a GET + inflate. The indexer only ever reads the
+    // sidecar, so a kind that lives solely in the frame is invisible
+    // to it — which is the point of carrying it here. Assert BOTH
+    // copies, from one record, so they cannot drift apart.
+    const a = testing.allocator;
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+
+    var r0 = try makeRecord(a, 1, "/ws");
+    defer r0.deinit(a);
+    r0.activation = .ws_message;
+    var r1 = try makeRecord(a, 2, "/ws");
+    defer r1.deinit(a);
+    r1.activation = .disconnect;
+    const records = [_]log_mod.LogRecord{ r0, r1 };
+
+    const key = (try writeBatch(a, store, "00000001", &records, 1730764800000000000)).?;
+    defer a.free(key);
+    const obj = try store.get(key, a);
+    defer a.free(obj);
+
+    const sidecar_size = std.mem.readInt(u32, obj[0..4], .little);
+    var idx = try sidecar.parse(a, obj[4 .. 4 + sidecar_size]);
+    defer idx.deinit(a);
+
+    try testing.expectEqualStrings("ws_message", idx.records[0].activation);
+    try testing.expectEqualStrings("disconnect", idx.records[1].activation);
+
+    // The frame body agrees — one `activationName` table serves both.
+    const frames = obj[4 + sidecar_size ..];
+    const frame = frames[idx.records[0].offset .. idx.records[0].offset + idx.records[0].length];
+    var z: c.z_stream = std.mem.zeroes(c.z_stream);
+    try testing.expectEqual(@as(c_int, c.Z_OK), c.inflateInit2_(&z, -15, c.zlibVersion(), @sizeOf(c.z_stream)));
+    defer _ = c.inflateEnd(&z);
+    z.next_in = @constCast(frame.ptr);
+    z.avail_in = @intCast(frame.len);
+    var out_buf: [4096]u8 = undefined;
+    z.next_out = &out_buf;
+    z.avail_out = out_buf.len;
+    try testing.expectEqual(@as(c_int, c.Z_STREAM_END), c.inflate(&z, c.Z_FINISH));
+    const json = out_buf[0 .. out_buf.len - z.avail_out];
+    try testing.expect(std.mem.indexOf(u8, json, "\"activation\":\"ws_message\"") != null);
 }
 
 test "writeBatch key sorts by flush time, not request_id (poll-cursor monotonicity)" {
