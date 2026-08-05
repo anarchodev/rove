@@ -1,0 +1,24 @@
+{
+  "name": "errorsemantics",
+  "description": "A thrown handler: 500, the `handler threw:` body, and a full rollback. Carried on both the success and the throw path because the throw path is where the engines were found to disagree — prod folds a wrong digest element (rove#459) and spells the error differently (rove#460).",
+  "source_dir": "src/replay/testdata/errorsemantics",
+  "engines": ["sim", "prod", "replay"],
+  "worlds": [
+    {
+      "label": "ok",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": { "method": "GET", "path": "/" }
+      }
+    },
+    {
+      "label": "throw",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": { "method": "GET", "path": "/throw" }
+      }
+    }
+  ]
+}

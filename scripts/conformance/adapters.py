@@ -182,6 +182,40 @@ def _tenant_for(source_dir: Path) -> str:
     return f"c{name}" if name else "ccase"
 
 
+def _manifest_specs(source_dir: Path) -> list[str]:
+    """The `@rewind/*` specifiers a case's `manifest.json` declares.
+
+    A manifest is not itself deployable — the customer CLI READS it and resolves
+    the declared dependencies into the deploy, rather than shipping the file
+    (`classify` in `src/cli/common.zig` picks up only `.mjs`). Mirroring that is
+    what lets a case that imports a first-party package deploy at all.
+    """
+    manifest = source_dir / "manifest.json"
+    if not manifest.exists():
+        return []
+    try:
+        doc = json.loads(manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    deps = doc.get("dependencies") or doc.get("imports") or {}
+    if isinstance(deps, dict):
+        return [s for s in deps if str(s).startswith("@rewind/")]
+    if isinstance(deps, list):
+        return [str(s) for s in deps if str(s).startswith("@rewind/")]
+    return []
+
+
+def _deploy_case(cluster, tenant: str, source_dir: Path) -> None:
+    """Deploy a case's tree, resolving first-party packages the way the CLI does."""
+    sources = _collect_sources(source_dir)
+    specs = _manifest_specs(source_dir)
+    if not specs:
+        cluster.deploy_handlers(tenant, sources)
+        return
+    packages, app_imports = cluster.firstparty_packages(specs)
+    cluster.deploy_with_packages(tenant, sources, packages, app_imports)
+
+
 def _provision_patiently(cluster, tenant: str, timeout_s: float = 180.0):
     """Provision, waiting out the platform's own creation-velocity gate.
 
@@ -273,7 +307,7 @@ def run_prod(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
         if r.status not in (200, 409):
             raise AdapterError(f"provision {tenant} → {r.status}: {r.body[:200]}")
         try:
-            cluster.deploy_handlers(tenant, _collect_sources(source_dir))
+            _deploy_case(cluster, tenant, source_dir)
         except RuntimeError as e:
             # A bundle prod refuses to compile is a real outcome for the case,
             # but not one this adapter can normalize into a response — surface

@@ -942,7 +942,12 @@ const EPILOGUE_BODY =
     \\  // to the same element on both.
     \\  if (__dg) {
     \\    const __st = __held ? 0 : Math.max(100, Math.min(599, __vet && __vet.status !== undefined ? __vet.status : 200));
-    \\    if (!__held) __dg.response(__st, __wireBody);
+    \\    // A THROWN handler's wire body is the "handler threw: …" text set in
+    \\    // the catch above — prod folds `pending.body`, which is that same
+    \\    // text. The body-derivation block below only runs on the success path,
+    \\    // so reading `__wireBody` alone folded an empty body here and made a
+    \\    // throwing activation digest differently from prod's.
+    \\    if (!__held) __dg.response(__st, __err ? String(__result) : __wireBody);
     \\  }
     \\  let __out;
     \\  try {
