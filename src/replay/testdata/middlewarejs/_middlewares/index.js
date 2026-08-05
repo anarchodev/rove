@@ -1,10 +1,5 @@
-// The SAME gate as testdata/middleware, spelled `.js` — prod resolves
-// `_middlewares/index.mjs` THEN `_middlewares/index.js` (dispatcher.zig), so
-// the sim must run this spelling too. Mutates request.auth or
-// short-circuits 401.
+// Deliberately `.js`, and deliberately never run — see ../index.mjs. If this
+// executes, `request.auth` becomes non-null and the fixture fails.
 export function before() {
-  const tok = request.headers["authorization"] || "";
-  if (tok === "Bearer good") { request.auth = { user: "jess", scopes: ["read"] }; return; }
-  response.status = 401;
-  return "denied";
+  request.auth = { user: "jess", scopes: ["read"] };
 }

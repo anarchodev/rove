@@ -345,6 +345,22 @@ fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: 
         std.debug.print("  ! skipping (non-deployable): ", .{});
         for (b.skipped, 0..) |s, i| std.debug.print("{s}{s}", .{ if (i != 0) ", " else "", s });
         std.debug.print("\n", .{});
+        // A skipped `.js` is called out separately. In the mixed list above it
+        // reads like a README — but it is code the developer wrote and very
+        // likely expects to run, and the consequence is silent: the file is
+        // absent in production with no further error. `_middlewares/index.js`
+        // is the dangerous instance, since that is where auth gates live.
+        var js_skipped: usize = 0;
+        for (b.skipped) |s| {
+            if (std.mem.endsWith(u8, s, ".js")) js_skipped += 1;
+        }
+        if (js_skipped != 0) {
+            std.debug.print(
+                "  ! {d} `.js` file(s) above are NOT deployed — handlers must be `.mjs`.\n" ++
+                    "    Rename them, or they will simply be absent in production.\n",
+                .{js_skipped},
+            );
+        }
     }
     if (b.handlers.len == 0 and b.statics.len == 0) c.fatal("bundle {s} has nothing to publish", .{bundle});
     std.debug.print("bundle: {d} handler(s), {d} static(s)\n", .{ b.handlers.len, b.statics.len });

@@ -442,26 +442,46 @@ test "classify: handlers vs statics vs skipped, and _tests/ is stripped" {
     try tmp.dir.writeFile(.{ .sub_path = "_tests/orders.mjs", .data = "// a test" });
     try tmp.dir.writeFile(.{ .sub_path = "_tests/__snapshots__/orders.json", .data = "{}" });
     try tmp.dir.writeFile(.{ .sub_path = "README.txt", .data = "ignore me" });
+    // `.mjs` is the only handler source. A `.js` — including the one place it
+    // matters most, `_middlewares/index.js` — is NOT deployable and must land
+    // in `skipped`, where `cmdDeploy` calls it out by name.
+    try tmp.dir.makePath("_middlewares");
+    try tmp.dir.writeFile(.{ .sub_path = "_middlewares/index.js", .data = "export function before(){}" });
+    // A browser asset under `_static/` keeps its `.js` — statics are routed
+    // before any extension check, so this rule never touches them.
+    try tmp.dir.writeFile(.{ .sub_path = "_static/app.js", .data = "console.log(1)" });
 
     const base = try tmp.dir.realpathAlloc(a, ".");
     const b = classify(a, base);
 
     try testing.expectEqual(@as(usize, 1), b.handlers.len);
     try testing.expectEqualStrings("index.mjs", b.handlers[0].path);
-    try testing.expectEqual(@as(usize, 1), b.statics.len);
-    try testing.expectEqualStrings("_static/app.css", b.statics[0].path);
+    try testing.expectEqual(@as(usize, 2), b.statics.len);
+    var saw_css = false;
+    var saw_static_js = false;
+    for (b.statics) |st| {
+        if (std.mem.eql(u8, st.path, "_static/app.css")) saw_css = true;
+        if (std.mem.eql(u8, st.path, "_static/app.js")) saw_static_js = true;
+    }
+    try testing.expect(saw_css);
+    try testing.expect(saw_static_js); // a `.js` STATIC still ships
 
     // Both `_tests/` files AND README.txt land in skipped — never shipped.
     var saw_test = false;
     var saw_snap = false;
+    var saw_js_mw = false;
     for (b.skipped) |s| {
         if (std.mem.eql(u8, s, "_tests/orders.mjs")) saw_test = true;
         if (std.mem.eql(u8, s, "_tests/__snapshots__/orders.json")) saw_snap = true;
+        if (std.mem.eql(u8, s, "_middlewares/index.js")) saw_js_mw = true;
         // No handler/static should carry a `_tests/` path.
         try testing.expect(!std.mem.startsWith(u8, s, "_tests/") or true);
     }
     try testing.expect(saw_test);
     try testing.expect(saw_snap);
+    try testing.expect(saw_js_mw);
+    // …and it is never mistaken for a handler.
+    for (b.handlers) |h| try testing.expect(!std.mem.endsWith(u8, h.path, ".js"));
     for (b.handlers) |h| try testing.expect(!std.mem.startsWith(u8, h.path, "_tests/"));
     for (b.statics) |s| try testing.expect(!std.mem.startsWith(u8, s.path, "_tests/"));
 }

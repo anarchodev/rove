@@ -354,17 +354,13 @@ pub fn hashHex(bytes: []const u8, out: *[HASH_HEX_LEN]u8) void {
 /// source of truth for the module/script choice — every JS compiler
 /// hook in the tree (worker, dual-worker example) uses this to set
 /// `qjs.EvalFlags.kind`.
+/// `.mjs` is the ONLY handler source extension. A `.js` is not deployable:
+/// the CLI does not ship one (`classify` in `src/cli/common.zig`) and this
+/// predicate makes the compiler build it as a classic script, so `export` is a
+/// syntax error. Browser assets under `_static/` are unaffected — they are
+/// routed as statics before any extension check.
 pub fn isJsModule(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".mjs");
-}
-
-/// True when `path` is a JavaScript handler source file by extension
-/// (`.mjs` or `.js`). Used by the deploy/upload paths to classify
-/// uploads as `Kind.handler` and by file walkers (rove-files-cli) to
-/// pick out compileable sources.
-pub fn isJsSource(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".mjs") or
-        std.mem.endsWith(u8, path, ".js");
 }
 
 /// Canonical allowed path: lowercase letters, digits, and `-_./`. Reject
@@ -504,17 +500,6 @@ test "isJsModule: only .mjs is a module" {
     try testing.expect(!isJsModule("a.html"));
     try testing.expect(!isJsModule("mjs")); // no leading dot
     try testing.expect(!isJsModule(""));
-}
-
-test "isJsSource: .mjs and .js" {
-    try testing.expect(isJsSource("a.mjs"));
-    try testing.expect(isJsSource("a.js"));
-    try testing.expect(isJsSource("deep/index.mjs"));
-    try testing.expect(isJsSource("deep/index.js"));
-    try testing.expect(!isJsSource("a.html"));
-    try testing.expect(!isJsSource("a.css"));
-    try testing.expect(!isJsSource("ajs")); // no dot
-    try testing.expect(!isJsSource(""));
 }
 
 test "validatePath rejects traversal, absolute, empty, control chars" {

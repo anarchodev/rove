@@ -356,11 +356,14 @@ pub const Engine = struct {
         // Run the real `_middlewares` `before` iff it's resolvable AND this is
         // an inbound-family (trust-boundary) activation — the worker skips
         // middleware for continuations (a resume already ran behind the gate).
-        // Resolvable = inline in `sources`, or on disk under `src_dir` —
-        // probing BOTH spellings in prod's order, `.mjs` then `.js`
-        // (dispatcher.zig's bytecode lookup), so a `.js`-spelled middleware
-        // gates offline exactly as it does live.
-        const MW_PATHS = [_][]const u8{ "_middlewares/index.mjs", "_middlewares/index.js" };
+        // Resolvable = inline in `sources`, or on disk under `src_dir`.
+        //
+        // `.mjs` ONLY. A `.js` is not a deployable handler source: the CLI does
+        // not ship one, and the compiler builds `.js` as a classic script so
+        // `export` is a syntax error. Running one offline would gate a request
+        // here that reaches production ungated — the worst direction for this
+        // file to be wrong in, since `_middlewares` is where auth lives.
+        const MW_PATHS = [_][]const u8{"_middlewares/index.mjs"};
         const is_trust_boundary = std.mem.eql(u8, wv.activation, "inbound") or
             std.mem.eql(u8, wv.activation, "inbound_headers") or
             std.mem.eql(u8, wv.activation, "inbound_chunk") or
