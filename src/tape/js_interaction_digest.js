@@ -20,7 +20,7 @@
   const OFFSET = 0xcbf29ce484222325n;
   const PRIME = 0x100000001b3n;
   const MASK = (1n << 64n) - 1n;
-  const VERSION = 1;
+  const VERSION = 2;
   // Must equal MAX_INLINE_KEY in interaction_digest.zig, and be measured in
   // BYTES — a char-length check diverges on any non-ASCII key.
   const MAX_INLINE_KEY = 320;
@@ -78,6 +78,12 @@
     streamWrite(bytes) {
       const b = typeof bytes === "string" ? enc.encode(bytes) : bytes;
       this.line(`s ${b.length} ${foldValue(b).toString(16)}`);
+    }
+    // A privileged lifecycle op. Cross-store READS have no method here: they
+    // fold as ordinary kv elements under the `__rove_store/…` key, which is
+    // exactly what the offline facade already produces.
+    platformOp(op, a1, a2) {
+      this.line(`o ${op} ${foldValue(a1 ?? "").toString(16)} ${foldValue(a2 ?? "").toString(16)}`);
     }
     response(status, body) {
       this.line(`x ${status} ${foldValue(body ?? "").toString(16)}`);

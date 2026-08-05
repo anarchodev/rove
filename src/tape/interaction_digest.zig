@@ -36,6 +36,17 @@
 //! The test for adding an element: *could the handler tell the difference?*
 //! If not, it does not belong in the hash.
 //!
+//! ## Cross-store reads reuse the kv elements
+//!
+//! `platform.root.*` and `platform.scope(id).kv.*` read and write stores
+//! outside the dispatching tenant. They get NO verb of their own: they fold as
+//! ordinary `kvRead`/`kvPrefix`/`kvWrite`/`kvDelete` under the namespaced key
+//! the tape already uses (`__rove_store/r/…`, `__rove_store/i/{id}/…` — see
+//! `src/js/globals_platform.zig`). The store is data in the key, so the
+//! grammar does not need to grow, and the offline engines — whose facade
+//! namespaces the same way — fold the identical element without a special
+//! case.
+//!
 //! ## Format
 //!
 //! Elements are appended as ASCII lines and folded with FNV-1a/64. The
@@ -55,7 +66,12 @@ const std = @import("std");
 
 /// Grammar version. Hashed first, so a grammar change cannot silently
 /// produce comparable-looking digests.
-pub const VERSION: u8 = 1;
+///
+/// `2` — the privileged surface joined the fold: cross-store reads/writes
+/// (`platform.root.*`, `platform.scope(id).kv.*`) and the instance/release
+/// lifecycle ops. Digests from grammar 1 are not comparable, which is the
+/// point of hashing the version first.
+pub const VERSION: u8 = 2;
 
 /// Longest key/prefix spelled inline in an element. Beyond this the key is
 /// folded to its own hash instead (see `overlong`). It is an EXPLICIT limit,
@@ -167,6 +183,30 @@ pub const Digest = struct {
     pub fn streamWrite(self: *Digest, bytes: []const u8) void {
         var buf: [64]u8 = undefined;
         const l = std.fmt.bufPrint(&buf, "s {d} {x}", .{ bytes.len, foldValue(bytes) }) catch return;
+        self.line(l);
+    }
+
+    /// `o <op> <a1hash> <a2hash>` — a privileged lifecycle op
+    /// (`instances.create`, `instances.deployStarter`, `releases.publish`).
+    /// Arguments are folded rather than spelled, like `fetch`'s url: an
+    /// instance id is short but unbounded, and folding sidesteps the
+    /// inline-length question entirely. Absent second argument folds `""`.
+    ///
+    /// The handler cannot read these back, but neither can it read back a
+    /// `kv.set`, and that is folded for the same reason: the digest hashes
+    /// what the handler observably DID.
+    ///
+    /// `platform.scope(id)` is deliberately NOT here. It resolves a handle;
+    /// the id it resolved is already carried by every read and write the
+    /// handle performs (`__rove_store/i/{id}/…`), so folding the resolve adds
+    /// an element that cannot distinguish two runs the rest of the sequence
+    /// does not already separate. The one case it would catch — a `scope` of a
+    /// missing instance — throws, and a throw diverges the run anyway.
+    pub fn platformOp(self: *Digest, op: []const u8, a1: []const u8, a2: []const u8) void {
+        var buf: [128]u8 = undefined;
+        const l = std.fmt.bufPrint(&buf, "o {s} {x} {x}", .{
+            op, foldValue(a1), foldValue(a2),
+        }) catch return;
         self.line(l);
     }
 
@@ -311,6 +351,23 @@ test "vectors: overlong key takes the folded fallback" {
     var d = Digest.init();
     d.kvRead("k" ** 400, true, "v");
     try std.testing.expectEqualStrings(vectorDigest("overlong"), &d.hex());
+}
+
+test "vectors: the privileged surface folds as namespaced kv + `o` ops" {
+    var d = Digest.init();
+    // Cross-store reads/writes are ORDINARY kv elements — the store is data in
+    // the key, not a verb. A mirror that special-cased them, or that folded the
+    // facade's store-tagged timeline entry as a second element, fails here.
+    d.kvRead("__rove_store/r/account/acme", true, "{\"plan\":\"pro\"}");
+    d.kvRead("__rove_store/i/acme/profile", false, "");
+    var rows_buf: [128]u8 = undefined;
+    const rows = std.fmt.bufPrint(&rows_buf, "__rove_store/i/acme/_workspace/index.mjs={x};", .{foldValue("{}")}) catch unreachable;
+    d.kvPrefix("__rove_store/i/acme/_workspace/", true, 1, foldValue(rows));
+    d.kvWrite("__rove_store/i/acme/flag", "on");
+    d.platformOp("instances.create", "acme", "");
+    d.platformOp("releases.publish", "acme", "0123456789abcdef");
+    d.response(200, "ok");
+    try std.testing.expectEqualStrings(vectorDigest("platform"), &d.hex());
 }
 
 test "vectors: non-ASCII folds bytes" {

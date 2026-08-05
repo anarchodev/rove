@@ -1,6 +1,6 @@
 {
-  "_comment": "Shared vectors pinning the interaction digest across its two implementations (src/replay/interaction_digest.zig and src/replay/js/interaction_digest.js). NEITHER implementation is the reference — this file is. Both assert against it, so a change to one side that the other does not mirror fails loudly instead of surfacing later as an unexplained fidelity mismatch. Regenerating these values is a grammar change: bump VERSION on both sides and treat it as a format change (docs/architecture/format-versioning.md).",
-  "version": 1,
+  "_comment": "Shared vectors pinning the interaction digest across its two implementations (src/tape/interaction_digest.zig and src/tape/js_interaction_digest.js). NEITHER implementation is the reference — this file is. Both assert against it, so a change to one side that the other does not mirror fails loudly instead of surfacing later as an unexplained fidelity mismatch. Regenerating these values is a grammar change: bump VERSION on both sides and treat it as a format change (docs/architecture/format-versioning.md).",
+  "version": 2,
   "maxInlineKey": 320,
   "cases": {
     "basic": {
@@ -23,7 +23,7 @@
           "ok"
         ]
       ],
-      "digest": "b7da1abbd05105a3"
+      "digest": "f3fd29ea2f29b7c2"
     },
     "mixed": {
       "why": "every element kind, including a not-found read and a scan",
@@ -67,7 +67,7 @@
           ""
         ]
       ],
-      "digest": "0f6a96aca186e0d2"
+      "digest": "c6d5032ad4cf6f2d"
     },
     "overlong": {
       "why": "a key past maxInlineKey must take the folded fallback on BOTH sides at the same byte",
@@ -80,7 +80,7 @@
           "v"
         ]
       ],
-      "digest": "7ce3952ce64b3236"
+      "digest": "144770c85604addf"
     },
     "nonascii": {
       "why": "folds UTF-8 BYTES, not chars — a char-length or latin1 path diverges here",
@@ -97,7 +97,7 @@
           ""
         ]
       ],
-      "digest": "bfe6b84121dd6677"
+      "digest": "4153d8c8c231fefe"
     },
     "byteThreshold": {
       "why": "200 two-byte chars = 400 BYTES but 200 chars: the overlong fallback must trigger on the BYTE length. A char-length threshold passes every other vector and fails only this one.",
@@ -109,7 +109,54 @@
           "v"
         ]
       ],
-      "digest": "4f450aa96dc07994"
+      "digest": "34b7ed788f589625"
+    },
+    "platform": {
+      "why": "the privileged surface. Cross-store reads and writes fold as ORDINARY kv elements under the namespaced key (`__rove_store/r/…`, `__rove_store/i/{id}/…`) — no verb of their own, because the store is data in the key. Only the lifecycle ops get `o`. A mirror that special-cased platform reads, or that folded the facade's store-tagged timeline entry as a SECOND element, fails here and nowhere else.",
+      "elements": [
+        [
+          "kvRead",
+          "__rove_store/r/account/acme",
+          true,
+          "{\"plan\":\"pro\"}"
+        ],
+        [
+          "kvRead",
+          "__rove_store/i/acme/profile",
+          false,
+          ""
+        ],
+        [
+          "kvPrefixFold",
+          "__rove_store/i/acme/_workspace/",
+          true,
+          1,
+          "__rove_store/i/acme/_workspace/index.mjs=8f44b07b5901a25;"
+        ],
+        [
+          "kvWrite",
+          "__rove_store/i/acme/flag",
+          "on"
+        ],
+        [
+          "platformOp",
+          "instances.create",
+          "acme",
+          ""
+        ],
+        [
+          "platformOp",
+          "releases.publish",
+          "acme",
+          "0123456789abcdef"
+        ],
+        [
+          "response",
+          200,
+          "ok"
+        ]
+      ],
+      "digest": "2c752d93fa089cd0"
     }
   }
 }

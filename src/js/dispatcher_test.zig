@@ -5817,6 +5817,95 @@ test "interaction digest: folds reads, writes and the response as they happen" {
     try testing.expect(rs.interaction_digest != rs3.interaction_digest); // different behaviour
 }
 
+test "interaction digest: the privileged surface moves it, and a same-response admin run is not mistaken for identical" {
+    // #413. Before this, `platform.*` was invisible to the digest: two admin
+    // runs that read DIFFERENT tenants' state, or published DIFFERENT
+    // deployments, digested identically as long as the response matched — so
+    // the one standing check on admin replay fidelity could not see the half of
+    // the surface that only admin handlers use.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    try pf.tenant.createInstance("acme");
+    try pf.tenant.createInstance("other");
+    (try pf.tenant.getInstance("acme")).?.kv.put("profile", "A") catch {};
+    (try pf.tenant.getInstance("other")).?.kv.put("profile", "A") catch {};
+
+    // Same value in both stores, so the RESPONSE is byte-identical and only the
+    // store read apart tells the two runs apart.
+    const src_acme =
+        \\return platform.scope("acme").kv.get("profile");
+    ;
+    const src_other =
+        \\return platform.scope("other").kv.get("profile");
+    ;
+
+    const run = struct {
+        fn go(dd: *Dispatcher, k: *kv_mod.KvStore, pfx: *PlatformFixture, src: []const u8, rid: u64, out: *u64) !Response {
+            const rs = try testing.allocator.create(tape_mod.Readset);
+            rs.* = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+            defer {
+                out.* = rs.interaction_digest;
+                rs.deinit();
+                testing.allocator.destroy(rs);
+            }
+            return runOne(dd, k, src, .{
+                .method = "GET",
+                .path = "/",
+                .trace = .{ .request_id = rid, .readset = rs },
+                .admin = .{ .platform = pfx.tenant },
+            });
+        }
+    }.go;
+
+    var dg_acme: u64 = 0;
+    var r1 = try run(&d, kv, &pf, src_acme, 1, &dg_acme);
+    defer r1.deinit(testing.allocator);
+    var dg_acme2: u64 = 0;
+    var r2 = try run(&d, kv, &pf, src_acme, 2, &dg_acme2);
+    defer r2.deinit(testing.allocator);
+    var dg_other: u64 = 0;
+    var r3 = try run(&d, kv, &pf, src_other, 3, &dg_other);
+    defer r3.deinit(testing.allocator);
+
+    try testing.expect(dg_acme != 0);
+    // Identical behaviour → identical digest (the property replay depends on).
+    try testing.expectEqual(dg_acme, dg_acme2);
+    // Byte-identical response, DIFFERENT store read → different digest. This is
+    // the case a status-only or response-only check misses entirely.
+    try testing.expectEqualStrings(r1.body, r3.body);
+    try testing.expect(dg_acme != dg_other);
+
+    // A lifecycle op moves it too, and its ARGUMENTS show: two creates that
+    // differ only in the instance name must not digest alike. `instances.create`
+    // rather than `releases.publish` because it needs no worker trampoline —
+    // publish would throw "not configured" on this fixture and prove nothing.
+    var dg_c1: u64 = 0;
+    var p1 = try run(&d, kv, &pf,
+        \\platform.instances.create("made-one");
+        \\return "ok";
+    , 4, &dg_c1);
+    defer p1.deinit(testing.allocator);
+    var dg_c2: u64 = 0;
+    var p2 = try run(&d, kv, &pf,
+        \\platform.instances.create("made-two");
+        \\return "ok";
+    , 5, &dg_c2);
+    defer p2.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", p1.body);
+    try testing.expectEqualStrings(p1.body, p2.body);
+    try testing.expect(dg_c1 != 0);
+    try testing.expect(dg_c1 != dg_c2);
+}
+
 test "interaction digest: effects move it, and a same-response handler is not mistaken for identical" {
     // Before the effect hooks existed, a handler whose only effect was an
     // outbound send digested as if it had merely responded — the digest would
