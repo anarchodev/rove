@@ -1,8 +1,12 @@
-// Depends on the `.js`-spelled middleware having run: request.auth is only
-// set by _middlewares/index.js `before`. If the sim skips the .js spelling,
-// this handler runs UNAUTHENTICATED and throws on request.auth.user — the
-// worst direction to diverge in.
+// A `.js` middleware must NOT run. `_middlewares/index.js` sits next to this
+// handler and would set `request.auth` if the sim honoured the spelling — so
+// `auth: null` here is the assertion, not an accident.
+//
+// The rule is prod's: the CLI ships only `.mjs`, and the compiler builds a
+// `.js` as a classic script (`export` is a syntax error). A sim that ran the
+// `.js` would gate a request offline that reaches production UNGATED, which is
+// the worst direction to diverge in for the file where auth lives.
 export default function () {
   response.status = 200;
-  return { user: request.auth.user, scopes: request.auth.scopes };
+  return { auth: request.auth ?? null };
 }

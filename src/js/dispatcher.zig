@@ -365,9 +365,13 @@ pub const Dispatcher = struct {
             // already passed — running the auth middleware on them re-gates and
             // 401s the tenant's own callbacks (`Activation.isContinuation`).
             if (request.activation.isContinuation()) break :blk null;
+            // `.mjs` only. A `.js` is not a deployable handler source anywhere
+            // in the pipeline — the CLI does not ship one and the compiler
+            // builds `.js` as a classic script, so `export` is a syntax error —
+            // and a `.js` fallback here could only ever match bytecode no
+            // supported path can produce.
             if (bytecodes) |bcs| {
                 if (bcs.get("_middlewares/index.mjs")) |bb| break :blk bb.bytes;
-                if (bcs.get("_middlewares/index.js")) |bb| break :blk bb.bytes;
             }
             break :blk null;
         };
