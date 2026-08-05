@@ -688,6 +688,9 @@ fn fireWsMessage(
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
+        // The disconnect handler died mid-run (CPU budget, kv failure): its
+        // digest is a prefix, not a verdict.
+        worker_mod.dropPartialDigest(&p.readset);
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .ws_message, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};

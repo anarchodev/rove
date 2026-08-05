@@ -109,6 +109,33 @@ pub fn getOrOpenTenantLog(
 /// replay fetches on demand.
 pub const REQUEST_BODY_CAP: usize = 16 * 1024;
 
+/// Drop a partial interaction digest before capture.
+///
+/// The rule: **a digest is closed on the run's real result, or it is null —
+/// never a prefix.** An activation that did not complete has folded some
+/// elements and will never fold its closing one, and that prefix is not a
+/// verdict about anything:
+///
+///   - it compares to nothing. A CPU-budget kill is a WALL-CLOCK deadline, so a
+///     rerun stops somewhere else and folds a different prefix; a cascaded or
+///     write-layer failure is not reproducible at all.
+///   - it records effects that did not happen — these branches roll the txn
+///     back, so a `kv.set` folded before the failure is in the hash and nowhere
+///     else.
+///   - it LOOKS complete, so every reader treats it as a digest.
+///
+/// The TAPES still ship: they are inputs, and the replay shell wants them to
+/// step through the same reads and see why the handler died. Only the verdict
+/// goes. Zero is already the record's spelling for "not computed"
+/// (`flush_writer` emits null; static-served and route-miss records carry it),
+/// so readers need no new case.
+///
+/// Not for HELD activations: those complete normally and simply have no
+/// response element, which every engine agrees on.
+pub fn dropPartialDigest(readset: *tape_mod.Readset) void {
+    readset.interaction_digest = 0;
+}
+
 /// Serialize each non-empty tape into the request's `TapePayloads`,
 /// owned by the caller's allocator. The bytes ride inline in the
 /// next ndjson flush — no per-request S3 PUT, no separate blob
