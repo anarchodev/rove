@@ -53,6 +53,22 @@ pub const Record = struct {
     /// the record had no chain context. Optional on parse (older
     /// sidecars omit it). Owned on parse.
     correlation_id: []const u8 = "",
+    /// What kind of activation produced this record — the string
+    /// spelling of `rove-log`'s `ActivationSource` (`inbound`,
+    /// `ws_message`, `disconnect`, …), mirroring how `outcome` is
+    /// carried as a string so the sidecar stays human-readable.
+    ///
+    /// Carried here so the indexer can tell a held connection's frames
+    /// apart from its close **without decompressing the ndjson frame**,
+    /// which is the sidecar's whole purpose. A saga's end is a
+    /// `disconnect` activation, and a per-step view labels each row by
+    /// kind; both are index-time questions.
+    ///
+    /// Empty means **unknown**, not `inbound`: older sidecars omit the
+    /// field, and defaulting them to the dominant kind would silently
+    /// mislabel every pre-existing WS frame as an inbound request.
+    /// Optional on parse. Owned on parse.
+    activation: []const u8 = "",
     /// User-defined index tags (≤`MAX_TAGS`). Carried so the indexer
     /// inserts `log_tags` rows without decompressing. Optional on parse.
     /// Owned key/value on parse.
@@ -71,6 +87,7 @@ pub const Record = struct {
         allocator.free(self.host);
         allocator.free(self.outcome);
         if (self.correlation_id.len > 0) allocator.free(self.correlation_id);
+        if (self.activation.len > 0) allocator.free(self.activation);
         for (self.tags) |t| {
             allocator.free(t.key);
             allocator.free(t.value);
@@ -172,6 +189,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
             .outcome = try dupeStr(allocator, ro, "outcome"),
             .deployment_id = try getInt(ro, "deployment_id"),
             .correlation_id = try dupeStrOpt(allocator, ro, "correlation_id"),
+            .activation = try dupeStrOpt(allocator, ro, "activation"),
             .tags = try parseTags(allocator, ro),
             .offset = try getInt(ro, "offset"),
             .length = @intCast(try getInt(ro, "length")),
@@ -218,6 +236,8 @@ pub fn encode(allocator: std.mem.Allocator, idx: *const IdxFile) ![]u8 {
         try writeJsonString(w, r.outcome);
         try w.print(",\"deployment_id\":{d},\"correlation_id\":", .{r.deployment_id});
         try writeJsonString(w, r.correlation_id);
+        try w.writeAll(",\"activation\":");
+        try writeJsonString(w, r.activation);
         try w.writeAll(",\"tags\":");
         try writeTags(w, r.tags);
         try w.print(",\"offset\":{d},\"length\":{d}}}", .{
@@ -358,6 +378,7 @@ test "encode → parse round-trip" {
             .outcome = "ok",
             .deployment_id = 7,
             .correlation_id = "corr-1",
+            .activation = "ws_message",
             .tags = &tags0,
             .offset = 0,
             .length = 412,
@@ -408,6 +429,32 @@ test "encode → parse round-trip" {
     try testing.expectEqualStrings("S1", parsed.records[0].tags[0].value);
     try testing.expectEqualStrings("", parsed.records[1].correlation_id);
     try testing.expectEqual(@as(usize, 0), parsed.records[1].tags.len);
+    // The activation kind rides the same way: present on record 0,
+    // defaulted empty on record 1.
+    try testing.expectEqualStrings("ws_message", parsed.records[0].activation);
+    try testing.expectEqualStrings("", parsed.records[1].activation);
+}
+
+test "a sidecar written before the activation field parses with an empty kind" {
+    // Backward compatibility with sidecars already in object storage.
+    // The field is additive, so VERSION stays 1 (same posture as
+    // correlation_id and tags) — but that only holds if an older blob
+    // still parses, which is what this pins. Empty must mean UNKNOWN:
+    // reading it as `inbound` would relabel every archived WS frame as
+    // an inbound request.
+    const a = testing.allocator;
+    const old =
+        \\{"v":1,"node_id":"00000001","batch_id":"b","ndjson_size":10,
+        \\ "ndjson_sha256":"d","first_received_ns":1,"last_received_ns":2,
+        \\ "records":[{"tenant_id":"acme","request_id":1,"received_ns":1,
+        \\ "duration_ns":1,"method":"GET","path":"/a","host":"h","status":200,
+        \\ "outcome":"ok","deployment_id":1,"offset":0,"length":10}]}
+    ;
+    var parsed = try parse(a, old);
+    defer parsed.deinit(a);
+    try testing.expectEqual(@as(usize, 1), parsed.records.len);
+    try testing.expectEqualStrings("", parsed.records[0].activation);
+    try testing.expectEqualStrings("ok", parsed.records[0].outcome);
 }
 
 test "parse rejects wrong version" {

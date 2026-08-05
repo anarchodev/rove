@@ -843,6 +843,11 @@ fn writeRowJson(
     try writeJsonString(&aw.writer, r.host);
     try aw.writer.writeAll(",\"outcome\":");
     try writeJsonString(&aw.writer, r.outcome);
+    // Per-step kind, so a caller listing a saga's activations can
+    // label each one without a `/show` per row. Empty on rows indexed
+    // before the field existed.
+    try aw.writer.writeAll(",\"activation\":");
+    try writeJsonString(&aw.writer, r.activation);
     try aw.writer.writeAll("}");
 }
 

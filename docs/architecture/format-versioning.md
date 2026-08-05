@@ -71,7 +71,7 @@ Legend — **Ver?**: explicit version field present today. **Tier**: see §2.
 | Blob keys (source/bytecode/static) | `src/blob/backend.zig:74-100` | `{prefix_base}{instance}/{file-blobs\|deployments\|log-blobs}/{sha256}` | **no key-prefix version** | B |
 | Deployment manifest | `src/files/manifest_json.zig:42,86` | JSON `{v:1, deployment_id, entries[{path,kind,content_type,hash,bytecode_hash}]}` | **yes (v1)** | B |
 | Log batch object | `src/log_server/flush_writer.zig:6-18` | `[u32 LE sidecar_len][sidecar JSON][deflate frames…]` | sidecar **v1**; records none | B |
-| Log sidecar JSON | `src/log_server/sidecar.zig:23,80-104` | JSON `{v:1, node_id, batch_id, records[…]}` | **yes (v1)** | B |
+| Log sidecar JSON | `src/log_server/sidecar.zig:26,36-103` | JSON `{v:1, node_id, batch_id, records[…]}` | **yes (v1)** | B |
 | Per-record JSON (+ inline tapes) | `src/log_server/flush_writer.zig:232-266` | deflate-wrapped JSON incl. base64 tape payloads | none | B |
 | Body-batch pool object | `src/bodies/` (`_pool/{batch_id}`) | concatenated bodies referenced by `BodyRef{batch_id,offset,len}` | none | B |
 
