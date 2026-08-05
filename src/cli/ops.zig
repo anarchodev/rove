@@ -15,6 +15,14 @@
 //!   deploy <tenant> <bundle> [--release]   classify + POST to the standing app.
 //!   release <tenant> <dep_id_hex>   flip _deploy/current (leader-aware retry).
 //!   provision <tenant> [--cluster C] [--host H]   create+place a tenant (CP).
+//!
+//!   CP control verbs (provision / delete / move / host add / plan set) go
+//!   through the `__admin__` chokepoint by default: the worker attaches the
+//!   move-secret at the `rewind-cp.internal` door, so this shell needs only
+//!   REWIND_ROOT_TOKEN, and the action lands as a replayable admin record.
+//!   `--direct` posts at the CP instead — needs REWIND_MOVE_SECRET here and
+//!   leaves NO record. For a broken/undeployed admin app (and for `bootstrap`,
+//!   which provisions `__admin__` itself and so cannot route through it).
 //!   delete <tenant> --yes           deprovision: unroute + tear down the group (CP).
 //!   move <tenant> <cluster> --yes                 relocate a tenant (zero-downtime) (CP).
 //!   host add <host> <tenant>        map a domain → tenant (CP index; CP pushes the worker alias).
@@ -46,6 +54,84 @@ fn authHeaders(a: std.mem.Allocator, env: *const c.Env) []const Header {
     hs[1] = .{ .name = "Authorization", .value = std.fmt.allocPrint(a, "Bearer {s}", .{rt}) catch oom() };
     hs[2] = .{ .name = "Content-Type", .value = "application/json" };
     return hs;
+}
+
+/// POST a CP control op through the `__admin__` CHOKEPOINT rather than at the
+/// control plane directly (`docs/architecture/control-plane.md`; rove#414).
+///
+/// The dashboard has always driven control ops this way — `handleCpPost` in the
+/// admin app relays any `_control/*` op through the `rewind-cp.internal` door,
+/// which the worker opens only for `__admin__` and only with the move-secret it
+/// attaches itself. This routes the CLI through the same door, for two reasons:
+///
+///   1. **The operator shell stops holding the move-secret.** That was already
+///      the stated posture in the admin app ("operators drive CP control ops
+///      through the dashboard, NOT by holding the move-secret on a shell"); the
+///      CLI was the one caller that did not honour it.
+///   2. **The action becomes a recorded activation.** A direct CP POST runs no
+///      handler, so it produces no log record and cannot be replayed — the
+///      operator plane had no audit trail at all. Through the chokepoint it is
+///      an ordinary `__admin__` request: logged, taped, digested.
+///
+/// Tries each worker in turn like `cmdReset` — the admin group is leader-gated,
+/// and a follower answers with a redirect/5xx rather than acting.
+fn cpOpViaAdmin(
+    a: std.mem.Allocator,
+    env: *const c.Env,
+    op: []const u8,
+    body: []const u8,
+    timeout_s: u32,
+) c.Resp {
+    const headers = authHeaders(a, env);
+    const path = std.fmt.allocPrint(a, "/v1/cp/{s}", .{op}) catch oom();
+    var last: ?c.Resp = null;
+    for (c.workerUrls(env, a)) |w| {
+        const r = c.workerPost(a, env, w, path, headers, body, timeout_s);
+        // 2xx is the op's own answer; a 4xx that is not the leader-gate is the
+        // CP's verdict (e.g. 409 already-placed) and must NOT be retried
+        // elsewhere, or a second node re-runs a non-idempotent op.
+        if (r.code >= 200 and r.code < 500 and r.code != 404) return r;
+        last = r;
+        std.debug.print("  cp/{s} via {s}: {d} {s} (trying next)\n", .{ op, w, r.code, c.trunc(r.body) });
+    }
+    const r = last orelse fatal("cp/{s}: no worker answered", .{op});
+    // Every worker 404'd: the deployed `__admin__` app has no `/v1/cp/:op`
+    // route. The BAKED genesis app does not — the chokepoint exists only once
+    // the real dashboard is deployed. Fail loud with the way out rather than
+    // silently falling back to the direct path, which would quietly put the
+    // move-secret back on this shell and drop the record.
+    if (r.code == 404) {
+        fatal(
+            "cp/{s}: the deployed __admin__ app has no /v1/cp/ route (the baked genesis app does not).\n" ++
+                "  Deploy the dashboard, or re-run with --direct (needs REWIND_MOVE_SECRET; leaves no record).",
+            .{op},
+        );
+    }
+    return r;
+}
+
+/// A CP control op: through the `__admin__` chokepoint by default, at the CP
+/// directly when `direct` is set.
+///
+/// `direct` is NOT a convenience. It is required for the two cases the
+/// chokepoint structurally cannot serve:
+///
+///   - **bootstrap / genesis**, where the op being run IS `provision __admin__`
+///     — there is no admin app to route through yet (`cmdGenesis`);
+///   - **break-glass**, where the admin app is down or mis-deployed and the
+///     operator still has to move or delete a tenant.
+///
+/// Both need `REWIND_MOVE_SECRET`; the default path does not.
+fn cpOp(
+    a: std.mem.Allocator,
+    env: *const c.Env,
+    op: []const u8,
+    body: []const u8,
+    timeout_s: u32,
+    direct: bool,
+) c.Resp {
+    if (direct) return c.cpPost(a, env, std.fmt.allocPrint(a, "/_control/{s}", .{op}) catch oom(), body, timeout_s);
+    return cpOpViaAdmin(a, env, op, body, timeout_s);
 }
 
 // ── content verbs (workers, root) ───────────────────────────────────────────
@@ -190,13 +276,13 @@ fn cmdKvPut(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, key: []
 /// directory rows (unroutable from that moment, name freed) and tears its raft
 /// group down on every node. 204 = gone; 502 = unrouted but not fully torn
 /// down, so re-run. Destroys the tenant's data — gated behind `--yes`.
-fn cmdDelete(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, yes: bool) void {
+fn cmdDelete(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, yes: bool, direct: bool) void {
     if (!yes) fatal("delete {s}: refusing without --yes (this destroys the tenant)", .{tenant});
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
     c.writeJsonString(&body, a, tenant);
     body.append(a, '}') catch oom();
-    const r = c.cpPost(a, env, "/_control/delete", body.items, 120);
+    const r = cpOp(a, env, "delete", body.items, 120, direct);
     switch (r.code) {
         204 => std.debug.print("deleted {s} — unroutable, rows withdrawn, group evicted\n", .{tenant}),
         502 => fatal("delete {s}: unroutable but NOT fully torn down — re-run `delete` ({s})", .{ tenant, c.trunc(r.body) }),
@@ -208,7 +294,7 @@ fn cmdDelete(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, yes: b
 /// reports the host it answers on; 204 is the same outcome from a CP that
 /// couldn't build the report), 409 = already placed. A 4xx carries
 /// `{"error": reason}` naming the rule the id broke.
-fn cmdProvision(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, host: ?[]const u8) void {
+fn cmdProvision(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, host: ?[]const u8, direct: bool) void {
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
     c.writeJsonString(&body, a, tenant);
@@ -219,7 +305,7 @@ fn cmdProvision(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, clu
         c.writeJsonString(&body, a, h);
     }
     body.append(a, '}') catch oom();
-    const r = c.cpPost(a, env, "/_control/provision", body.items, 60);
+    const r = cpOp(a, env, "provision", body.items, 60, direct);
     switch (r.code) {
         200 => std.debug.print("provisioned {s} on {s} — {s}\n", .{ tenant, cluster, c.trunc(r.body) }),
         204 => std.debug.print("provisioned {s} on {s}{s}\n", .{ tenant, cluster, if (host) |h| std.fmt.allocPrint(a, " (host {s})", .{h}) catch "" else "" }),
@@ -230,7 +316,9 @@ fn cmdProvision(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, clu
 
 fn cmdBootstrap(a: std.mem.Allocator, env: *const c.Env) void {
     const cluster = env.get("ROVE_CLUSTER") orelse "prod";
-    cmdProvision(a, env, "__admin__", cluster, env.require("REWIND_ADMIN_DOMAIN"));
+    // Structurally DIRECT: the op being run IS `provision __admin__`, so there
+    // is no admin app to route the chokepoint through yet (rove#414).
+    cmdProvision(a, env, "__admin__", cluster, env.require("REWIND_ADMIN_DOMAIN"), true);
     _ = cmdReset(a, env);
     std.debug.print("bootstrap complete — deploy capability live; publish with `rewind-ops deploy`\n", .{});
 }
@@ -532,7 +620,7 @@ fn cmdGenesis(a: std.mem.Allocator, env: *const c.Env, cluster: []const u8) void
 /// it repoints live routing). The move is zero-downtime (the source serves
 /// throughout); a large tenant can take a while to stream, hence the long CP
 /// deadline.
-fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, yes: bool) void {
+fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, yes: bool, direct: bool) void {
     if (!yes) fatal("move repoints live routing for {s} → {s}. Re-run with --yes to confirm.", .{ tenant, cluster });
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
@@ -540,7 +628,7 @@ fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster:
     body.appendSlice(a, ",\"cluster\":") catch oom();
     c.writeJsonString(&body, a, cluster);
     body.append(a, '}') catch oom();
-    const r = c.cpPost(a, env, "/_control/move", body.items, 3600);
+    const r = cpOp(a, env, "move", body.items, 3600, direct);
     if (r.code == 200 or r.code == 204) {
         std.debug.print("moved {s} → {s}\n", .{ tenant, cluster });
     } else {
@@ -555,7 +643,7 @@ fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster:
 /// host→tenant end-to-end — no second operator secret
 /// (docs/architecture/auth-consolidation.md B3). A 503 means the alias didn't land (tenant
 /// unplaced / no reachable leader) — provision the tenant first, then retry.
-fn cmdHostAdd(a: std.mem.Allocator, env: *const c.Env, host: []const u8, tenant: []const u8) void {
+fn cmdHostAdd(a: std.mem.Allocator, env: *const c.Env, host: []const u8, tenant: []const u8, direct: bool) void {
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"host\":") catch oom();
     c.writeJsonString(&body, a, host);
@@ -563,20 +651,20 @@ fn cmdHostAdd(a: std.mem.Allocator, env: *const c.Env, host: []const u8, tenant:
     c.writeJsonString(&body, a, tenant);
     body.append(a, '}') catch oom();
 
-    const r = c.cpPost(a, env, "/_control/host", body.items, 30);
+    const r = cpOp(a, env, "host", body.items, 30, direct);
     if (r.code != 200 and r.code != 204) fatal("host map {s}: {d} {s}", .{ host, r.code, c.trunc(r.body) });
     std.debug.print("host {s} → {s} (CP directory + worker alias)\n", .{ host, tenant });
 }
 
 /// POST /_control/plan {tenant, plan} — set the tenant's opaque plan/limits blob.
-fn cmdPlan(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, plan: []const u8) void {
+fn cmdPlan(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, plan: []const u8, direct: bool) void {
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
     c.writeJsonString(&body, a, tenant);
     body.appendSlice(a, ",\"plan\":") catch oom();
     c.writeJsonString(&body, a, plan);
     body.append(a, '}') catch oom();
-    const r = c.cpPost(a, env, "/_control/plan", body.items, 30);
+    const r = cpOp(a, env, "plan", body.items, 30, direct);
     if (r.code == 200 or r.code == 204) {
         std.debug.print("plan set for {s}: {s}\n", .{ tenant, plan });
     } else {
@@ -640,6 +728,11 @@ const Flags = struct {
     host: ?[]const u8 = null,
     release: bool = false,
     yes: bool = false,
+    /// Break-glass: talk to the control plane directly instead of through the
+    /// `__admin__` chokepoint. Needs REWIND_MOVE_SECRET on this shell and leaves
+    /// NO record of the action (rove#414) — for a broken or undeployed admin
+    /// app, not for convenience.
+    direct: bool = false,
 };
 
 pub fn main() void {
@@ -677,6 +770,8 @@ pub fn main() void {
         } else if (std.mem.eql(u8, arg, "--live")) {
             // Tolerated no-op: the move is always zero-downtime. Accepted
             // so old invocations don't error.
+        } else if (std.mem.eql(u8, arg, "--direct")) {
+            flags.direct = true;
         } else if (std.mem.eql(u8, arg, "--yes")) {
             flags.yes = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -718,22 +813,30 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "provision")) {
         if (p.len < 1) fatal("provision needs <tenant>", .{});
         const cluster = flags.cluster orelse env.get("ROVE_CLUSTER") orelse "prod";
-        cmdProvision(a, &env, p[0], cluster, flags.host);
+        cmdProvision(a, &env, p[0], cluster, flags.host, flags.direct);
+    } else if (std.mem.eql(u8, cmd, "delete")) {
+        // The verb was documented in the usage text and implemented, but never
+        // dispatched — `rewind-ops delete` fell through to "unknown command"
+        // from the commit that added it. Wired here because this change routes
+        // it through the chokepoint and a deprovision that cannot be invoked
+        // has no audit trail worth arguing about.
+        if (p.len < 1) fatal("delete needs <tenant>", .{});
+        cmdDelete(a, &env, p[0], flags.yes, flags.direct);
     } else if (std.mem.eql(u8, cmd, "move")) {
         if (p.len < 2) fatal("move needs <tenant> <cluster>", .{});
-        cmdMove(a, &env, p[0], p[1], flags.yes);
+        cmdMove(a, &env, p[0], p[1], flags.yes, flags.direct);
     } else if (std.mem.eql(u8, cmd, "host")) {
         if (p.len < 1) fatal("host needs a subcommand: add <host> <tenant>", .{});
         if (std.mem.eql(u8, p[0], "add")) {
             if (p.len < 3) fatal("host add needs <host> <tenant>", .{});
-            cmdHostAdd(a, &env, p[1], p[2]);
+            cmdHostAdd(a, &env, p[1], p[2], flags.direct);
         } else if (std.mem.eql(u8, p[0], "rm")) {
             fatal("host rm: no CP delete primitive yet (only setHost) — see plan §2", .{});
         } else fatal("unknown host subcommand '{s}' (want: add)", .{p[0]});
     } else if (std.mem.eql(u8, cmd, "plan")) {
         if (p.len < 1 or !std.mem.eql(u8, p[0], "set")) fatal("plan needs: set <tenant> <plan>", .{});
         if (p.len < 3) fatal("plan set needs <tenant> <plan>", .{});
-        cmdPlan(a, &env, p[1], p[2]);
+        cmdPlan(a, &env, p[1], p[2], flags.direct);
     } else if (std.mem.eql(u8, cmd, "kv-put")) {
         if (p.len < 2) fatal("kv-put needs <tenant> <key> [value] (value defaults to empty)", .{});
         cmdKvPut(a, &env, p[0], p[1], if (p.len >= 3) p[2] else "");
