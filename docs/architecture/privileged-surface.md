@@ -232,9 +232,19 @@ no-format-change rationale, and why a foreign-store key can't reach a store it
 doesn't belong to are in
 [`replay-and-sim.md`](replay-and-sim.md) — see the cross-store reads section.
 
+They are also **folded into the interaction digest**, which is what turns "the
+reads are recorded" into "replay is checked to serve them". Cross-store reads and
+writes get no digest verb of their own — they fold as ordinary kv elements under
+the same namespaced key — and the instance/release lifecycle ops fold as `o`.
+`platform.scope(id)` is deliberately not folded: the id is already carried by
+every read and write the handle performs. The grammar and the reasoning live in
+`src/tape/interaction_digest.zig`; the pair of implementations is pinned by
+`src/tape/testdata/digest_vectors.json`.
+
 Two consequences worth holding onto when adding to this surface:
 
-- **A new privileged verb that returns data needs a tape line.** Not a
+- **A new privileged verb that returns data needs a tape line AND a digest
+  fold**, in the same change, on BOTH engines. Not a
   follow-up: an untaped read is a silent replay hole, because the offline
   closed world answers a missing key with `not_found` rather than a divergence.
   `platform.instances.usage` is the open case — it is installed

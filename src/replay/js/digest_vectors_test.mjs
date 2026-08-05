@@ -35,6 +35,10 @@ const apply = (d, [op, ...args]) => {
     case "fetch":        return d.fetch(args[0], args[1], args[2]);
     case "wakeArm":      return d.wakeArm(args[0], args[1], args[2]);
     case "streamWrite":  return d.streamWrite(args[0]);
+    // Privileged lifecycle op. Note there is no platform READ element: those
+    // fold as ordinary kvRead/kvPrefix under the `__rove_store/…` key, which is
+    // the whole point — the store is data in the key, not a verb.
+    case "platformOp":   return d.platformOp(args[0], args[1], args[2]);
     case "response":     return d.response(args[0], args[1]);
     default: throw new Error("unknown vector element: " + op);
   }
