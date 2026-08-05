@@ -233,6 +233,27 @@ Read-your-write minimality applies as it does for tenant kv: a root key this
 activation already wrote is reproduced offline by re-running the write into the
 same namespace, so it stays off the tape.
 
+### Fail-closed is a harness affordance, not a security boundary
+
+The offline `platform.*` facade is gated: every sync verb throws unless the run
+opts in (`scenario({ admin: true })`). That is right for an **authored** world —
+a non-admin handler that reaches for `platform.*` should fail the way production
+fails — but it is wrong for a **captured** one, where the recording is itself
+proof the call was admitted live. The real gate is `state.platform` in the
+worker; the offline check only mirrors it.
+
+Applied to a capture, fail-closed turned every admin replay into a spurious
+`platform is only available on the admin handler` **before it reached a single
+taped read**, so the recording work above was unobservable. Captured worlds
+therefore stand down both the gate and `scope()`'s instance-exists check, for
+the same reason and by the same flag (`__rove_captured`).
+
+Note what this does NOT require: seeding the harness's hidden keys into the
+transcoded world. The two consumers of `__rove_store/admin` and
+`__rove_store/exists/…` are exactly those two checks, and both are exempt on a
+capture — so `export_fixture` carries only real recorded data, and a world
+stays a transcription of what happened rather than part harness state.
+
 **The generative question for this row class** — the cross-store counterpart to
 "does production compute this around the handler rather than from a handler
 read?" — is: **which store did this value come from, and does the tape say so?**

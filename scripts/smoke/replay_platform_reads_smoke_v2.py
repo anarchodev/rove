@@ -15,11 +15,17 @@ recording layer. So this asserts against a live cut on the standing `__admin__`
 deploy app, whose `cutStamp` does a real `platform.scope(t).kv.prefix` over the
 target's workspace.
 
-Two halves, both against that real record:
+Three halves, all against real records:
   1. RECORDING — the pulled record's kv tape carries namespaced cross-store
      rows, and nothing un-namespaced leaked into the tenant's own keyspace.
   2. TRANSCODE — `rewind export-fixture` carries them into the world's kv map,
      which is what the offline `platform.*` facade resolves against.
+  3. REPLAY — a captured `__admin__` world actually RUNS and reproduces the
+     cross-store values it read live. Before the captured-world exemption, every
+     admin replay threw "platform is only available on the admin handler" before
+     reaching a single taped read: the sim's fail-closed gate is armed by a
+     scenario key that no capture carries. Steps 1-2 can pass while 3 fails,
+     which is why the reproduction is asserted rather than "it did not throw".
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -45,6 +51,23 @@ REWIND_BIN = REPO_ROOT / "zig-out" / "bin" / "rewind"
 TARGET = "crossread"
 NS = "__rove_store/"
 HANDLER_SRC = 'export default function () { return "cross-read-ok\\n"; }'
+
+# The replay subject (rove#411): an ADMIN handler whose entire observable output
+# is cross-store reads. If the captured world replays, every link in the chain
+# holds — the reads were taped under the namespaced key, export-fixture carried
+# them into the world's map, and the offline facade resolved them there.
+ADMIN_PROBE_SRC = """
+export default function () {
+  const root = platform.root.get("probe/root");
+  const scoped = platform.scope("REPLACE_TARGET").kv.get("probe/scoped");
+  const rows = platform.scope("REPLACE_TARGET").kv.prefix("probe/p/", "", 10)
+    .map(function (e) { return e.key + "=" + e.value; }).join(",");
+  const missing = String(platform.root.get("probe/absent"));
+  kv.set("probe/seen", root + "|" + scoped + "|" + rows + "|" + missing);
+  response.status = 200;
+  return root + "|" + scoped + "|" + rows + "|" + missing;
+}
+"""
 
 
 def find_record_with_store_reads(c, tries=60):
@@ -81,7 +104,7 @@ def _kv_keys(rec):
     return sorted((world.get("kv") or {}).keys())
 
 
-def transcode(rec):
+def transcode(rec, source=HANDLER_SRC):
     tapes = rec.get("tapes", {})
     fixture = {
         "request_id": rec.get("request_id", ""), "tenant": "__admin__",
@@ -91,7 +114,7 @@ def transcode(rec):
         "recorded": {"status": rec.get("status", 0)},
         "seed": tapes.get("seed", "0"), "timestamp_ns": tapes.get("timestamp_ns", "0"),
         "tapes": {fx: tapes[rf] for rf, fx in _REMAP if tapes.get(rf)},
-        "sources": [{"path": "index.mjs", "kind": "handler", "source": HANDLER_SRC}],
+        "sources": [{"path": "index.mjs", "kind": "handler", "source": source}],
     }
     if tapes.get("export"):
         fixture["export"] = tapes["export"]
@@ -171,6 +194,89 @@ def main() -> int:
             check("the world's kv map is keyed the way the facade scans",
                   any(k.startswith(f"{NS}i/{TARGET}/_workspace/") for k in wkv),
                   f"world kv keys={sorted(wkv)[:8]}")
+
+        # ── the REPLAY half (rove#411) ──
+        #
+        # Steps 3-4 prove the reads are recorded and transcode. They do not
+        # prove a captured admin world RUNS: before the gate exemption, every
+        # admin replay threw "platform is only available on the admin handler"
+        # before reaching a single taped read, because the sim's fail-closed
+        # gate is armed by a scenario key no capture carries.
+        print("step 5: a captured __admin__ world actually REPLAYS")
+        probe_src = ADMIN_PROBE_SRC.replace("REPLACE_TARGET", TARGET)
+        c.admin_kv_put(TARGET, "probe/scoped", "S")
+        c.admin_kv_put(TARGET, "probe/p/1", "one")
+        c.admin_kv_put("__admin__", "_x", "")  # ensure the store exists
+        # Our own bundle replaces the standing deploy app; nothing after this
+        # step needs it.
+        c.deploy_handlers("__admin__", {"index.mjs": probe_src})
+        live = None
+        deadline = time.time() + 45.0
+        while time.time() < deadline:
+            rr = c.request("__admin__", "/probe", timeout=15.0)
+            if rr.status == 200 and "|" in rr.body:
+                live = rr
+                break
+            time.sleep(1.0)
+        check("the admin probe handler is live", live is not None,
+              "" if live is not None else "deploy did not take")
+        if live is None:
+            print("\nFAIL platform-reads replay smoke (v2)")
+            return 1
+        # `probe/root` was never written, so it reads null both live and on
+        # replay — the point is that the two AGREE, not what the value is.
+        print(f"    live body: {live.body!r}")
+
+        prec = None
+        deadline = time.time() + 40.0
+        while time.time() < deadline and prec is None:
+            lr = c.log_get("__admin__/list?limit=50", timeout=15.0)
+            if lr.status == 200:
+                try:
+                    recs = json.loads(lr.body).get("records", [])
+                except json.JSONDecodeError:
+                    recs = []
+                # The readiness loop above polls /probe while the BAKED app is
+                # still serving, and each 405 is a record at this path too.
+                # Select the successful one, or the world gets transcoded from a
+                # different handler's activation entirely.
+                hit = next((x for x in recs
+                            if "/probe" in (x.get("path") or "")
+                            and int(x.get("status") or 0) == 200), None)
+                if hit:
+                    sr = c.log_get(f"__admin__/show/{hit.get('request_id')}", timeout=15.0)
+                    if sr.status == 200:
+                        prec = json.loads(sr.body).get("record")
+            if prec is None:
+                time.sleep(1.0)
+        check("the probe request produced a record", prec is not None)
+        if prec is None:
+            print("\nFAIL platform-reads replay smoke (v2)")
+            return 1
+
+        world = transcode(prec, source=probe_src)
+        check("export-fixture produced a world for the probe", world is not None)
+        if world is not None:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                json.dump(world, f)
+                wpath = f.name
+            proc = subprocess.run([str(REWIND_BIN), "replay", wpath],
+                                  capture_output=True, text=True, timeout=60)
+            raw = (proc.stdout or "") + (proc.stderr or "")
+            out = next((json.loads(ln) for ln in raw.splitlines()
+                        if ln.strip().startswith("{") and '"effects"' in ln), None)
+            replayed_ok = out is not None and not (out.get("error") or {}).get("message")
+            check("the captured admin world replays without throwing", replayed_ok,
+                  "" if replayed_ok else
+                  (((out or {}).get("error") or {}).get("message") or raw[-300:]))
+            if out is not None:
+                # The handler's own kv write is the reproduction witness: its
+                # value is built entirely from cross-store reads.
+                w = next((e for e in (out.get("effects") or [])
+                          if e.get("kind") == "write" and e.get("key") == "probe/seen"), None)
+                check("...and reproduces the cross-store values it read live",
+                      w is not None and w.get("value") == live.body.strip(),
+                      f"replay={(w or {}).get('value')!r} live={live.body.strip()!r}")
 
     if failures:
         print(f"\nFAIL platform-reads replay smoke (v2): {len(failures)} check(s)")
