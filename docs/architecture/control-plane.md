@@ -10,6 +10,39 @@
 > Why: [decisions.md §10.1](../decisions.md) (CP/DP split), §10.6 (move), §10.5
 > (faulted-not-lost).
 
+
+## Operator control ops go through the `__admin__` chokepoint
+
+Every `/_control/*` op is reachable two ways, and only one of them leaves a
+trace:
+
+- **Through `__admin__`** (the default for both the dashboard and
+  `rewind-ops`): the handler issues a bound `after.fetch` at the
+  `rewind-cp.internal` door, which the worker opens **only** for `__admin__` and
+  where it attaches the move-secret itself. The operator shell therefore needs
+  only `REWIND_ROOT_TOKEN`, and — because a handler ran — the action is an
+  ordinary admin activation: logged, taped, digested, replayable.
+- **Directly at the CP** (`rewind-ops --direct`): needs `REWIND_MOVE_SECRET` on
+  the shell and runs no handler, so it produces **no record at all**.
+
+The direct path is not merely discouraged, it is structurally required in two
+cases, which is why it still exists:
+
+1. **bootstrap / genesis** — the op being run *is* `provision __admin__`, so
+   there is no admin app to route through yet;
+2. **break-glass** — the admin app is down or mis-deployed and a tenant still
+   has to be moved or deleted.
+
+The chokepoint lives in the **deployed dashboard**, not the baked genesis app.
+On a freshly-genesis'd cluster `rewind-ops` fails loud with the two ways forward
+(deploy the dashboard, or `--direct`) rather than silently falling back — a
+silent fallback would put the move-secret back on the shell and drop the record,
+which is the whole thing this arrangement exists to prevent.
+
+Authority at the door is `is_root`, **not** a session. The M2M root-token grant
+is deliberately `{sub: null, is_root: true}`, so gating on `sub` rejects exactly
+the operator this path serves.
+
 ## The shape in one paragraph
 
 The control plane is a small dedicated raft cluster (`rewind-cp`, 3–5 voters)
