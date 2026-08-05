@@ -91,6 +91,28 @@ class Known:
 # ids.
 KNOWN: tuple[Known, ...] = (
     Known(
+        pattern="errorsemantics/throw/digest/prod~sim",
+        engines=("sim", "prod"),
+        issue=459,
+        why=(
+            "prod folds `response(200, \"\")` for a THROWN handler: the dispatcher "
+            "closes the digest before worker_dispatch composes the 500 and its "
+            "`handler threw:` body, and never re-closes it. The sim folds the real "
+            "result, so the two disagree on every throw. Delete this the moment "
+            "#459 lands — the runner fails on a stale entry, so it cannot be "
+            "forgotten."
+        ),
+    ),
+    Known(
+        pattern="errorsemantics/throw/error/prod~sim",
+        engines=("sim", "prod"),
+        issue=460,
+        why=(
+            "prod reports a thrown error's toString (`Error: boom`); the sim "
+            "reports its `.message` (`boom`), dropping the class name."
+        ),
+    ),
+    Known(
         # Scoped to the one case that proves it rather than `*/*/effects/…`:
         # a pattern that wide would excuse every effect-log divergence between
         # these two engines, which is most of what the suite is for. Widen it

@@ -72,6 +72,54 @@ def load_cases(only: list[str] | None, cases_dir: Path | None = None) -> list[di
     return cases
 
 
+
+def augment_world(world: dict, source_dir: Path) -> dict:
+    """Fill in the first-party packages a case's `manifest.json` declares.
+
+    A manifest is a DECLARATION, not a deployable file: the customer CLI reads
+    it and resolves the dependencies into the deploy (`classify` in
+    `src/cli/common.zig` ships only `.mjs`). `rewind test` does the equivalent
+    offline — but `rewind sim`, which the sim adapter drives, takes a world and
+    resolves nothing, so a case importing `@rewind/jwt` fails to load.
+
+    Resolving here rather than in each adapter keeps every engine running the
+    SAME world. Doing it per-adapter is how two engines end up disagreeing
+    because they were handed different inputs, which is a divergence the suite
+    would report as if it were the engines' fault.
+
+    A world that declares its own `packages` is left alone — an explicit
+    declaration beats an inferred one.
+    """
+    if world.get("packages") or world.get("app_imports"):
+        return world
+    manifest = source_dir / "manifest.json"
+    if not manifest.exists():
+        return world
+    try:
+        deps = (json.loads(manifest.read_text(encoding="utf-8")).get("dependencies") or {})
+    except json.JSONDecodeError:
+        return world
+    specs = [s for s in deps if str(s).startswith("@rewind/")]
+    if not specs:
+        return world
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "scripts" / "smoke"))
+        from smoke_lib_v2 import V2Cluster
+
+        # A pure helper over the repo's own `src/js/packages/@rewind/` tree —
+        # it reads no cluster state, so it needs no live cluster. Called through
+        # the class for exactly that reason.
+        packages, app_imports = V2Cluster.firstparty_packages(V2Cluster, specs)
+    except Exception:  # noqa: BLE001
+        # No harness, no packages — the case will fail to load and say so,
+        # which is more useful than a world silently missing its imports.
+        return world
+    out = dict(world)
+    out["packages"] = packages
+    out["app_imports"] = app_imports
+    return out
+
+
 def run_case(case: dict, engines: list[str], verbose: bool) -> dict:
     name = case["name"]
     source_dir = REPO_ROOT / case["source_dir"]
@@ -93,7 +141,7 @@ def run_case(case: dict, engines: list[str], verbose: bool) -> dict:
 
     for entry in case["worlds"]:
         label = entry.get("label", "world")
-        world = entry["world"]
+        world = augment_world(entry["world"], source_dir)
         outcomes = []
         for engine in declared:
             try:
