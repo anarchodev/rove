@@ -73,6 +73,22 @@ const SCHEMA: [:0]const u8 =
     \\    PRIMARY KEY (tenant_id, request_id, key)
     \\);
     \\CREATE INDEX IF NOT EXISTS log_tags_lookup ON log_tags (tenant_id, key, value, received_ns DESC);
+    \\CREATE TABLE IF NOT EXISTS log_sagas (
+    \\    tenant_id         TEXT NOT NULL,
+    \\    corr_id           TEXT NOT NULL,
+    \\    first_received_ns INTEGER NOT NULL,
+    \\    last_received_ns  INTEGER NOT NULL,
+    \\    activation_count  INTEGER NOT NULL,
+    \\    root_method       TEXT,
+    \\    root_path         TEXT,
+    \\    root_host         TEXT,
+    \\    last_status       INTEGER,
+    \\    last_outcome      TEXT,
+    \\    error_count       INTEGER NOT NULL,
+    \\    closed_at_ns      INTEGER,
+    \\    PRIMARY KEY (tenant_id, corr_id)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS log_sagas_recent ON log_sagas (tenant_id, last_received_ns DESC, corr_id DESC);
 ;
 
 /// Owning handle for a `log_index.db` connection.
@@ -439,6 +455,128 @@ pub const IndexDb = struct {
         };
     }
 
+    /// One saga in a saga-list response — the roll-up row, not its
+    /// activations. `closed_at_ns` is 0 for "no close was seen"; see
+    /// `execSagaUpsert` for why that is not the same as "still live".
+    pub const SagaRow = struct {
+        corr_id: []u8,
+        first_received_ns: i64,
+        last_received_ns: i64,
+        activation_count: u64,
+        root_method: []u8,
+        root_path: []u8,
+        root_host: []u8,
+        last_status: u16,
+        last_outcome: []u8,
+        error_count: u64,
+        closed_at_ns: i64,
+
+        pub fn deinit(self: *SagaRow, a: std.mem.Allocator) void {
+            a.free(self.corr_id);
+            a.free(self.root_method);
+            a.free(self.root_path);
+            a.free(self.root_host);
+            a.free(self.last_outcome);
+        }
+    };
+
+    pub const SagaListResult = struct {
+        rows: []SagaRow,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *SagaListResult) void {
+            for (self.rows) |*r| r.deinit(self.allocator);
+            self.allocator.free(self.rows);
+        }
+    };
+
+    /// Sagas for `tenant_id`, most-recently-active first. Cursor is
+    /// `(after_last_received_ns, after_corr_id)` from the previous
+    /// page's tail; `(0, "")` starts at the newest.
+    ///
+    /// Index-only against `log_sagas_recent` — the whole reason the
+    /// roll-up row is materialized. The natural alternative,
+    /// `GROUP BY value ORDER BY MAX(received_ns)` over `log_tags`,
+    /// reads every tag row in the window AND cannot be keyset-paginated
+    /// at all, because its sort key is an aggregate.
+    ///
+    /// **Rows accumulate forward only — there is no backfill.** The
+    /// table is built by the indexer as records arrive, so an index
+    /// that already held records when the table was created lists no
+    /// sagas for them. Their *activations* stay fully queryable by
+    /// correlation id (the tag-filtered record list); it is only the
+    /// enumeration of past sagas that starts empty and fills with new
+    /// traffic. Reconstructing them means a one-time grouped pass over
+    /// `log_tags` + `log_index` whose cost scales with the whole
+    /// retained window — deliberately not paid at open, where it would
+    /// block the log-server's startup for as long as that takes.
+    ///
+    /// `floor_received_ns` is the same retention read-clamp the record
+    /// list applies, on `last_received_ns`: a saga whose every
+    /// activation predates the floor has nothing left to show, so
+    /// listing it would offer a row that opens empty.
+    pub fn querySagas(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        after_last_received_ns: i64,
+        after_corr_id: []const u8,
+        floor_received_ns: i64,
+        limit: u32,
+    ) Error!SagaListResult {
+        const sql =
+            \\SELECT corr_id, first_received_ns, last_received_ns, activation_count,
+            \\       root_method, root_path, root_host, last_status, last_outcome,
+            \\       error_count, closed_at_ns
+            \\FROM log_sagas
+            \\WHERE tenant_id = ?1
+            \\  AND (?2 = 0 OR
+            \\       last_received_ns < ?2 OR
+            \\       (last_received_ns = ?2 AND corr_id < ?3))
+            \\  AND (?4 = 0 OR last_received_ns >= ?4)
+            \\ORDER BY last_received_ns DESC, corr_id DESC
+            \\LIMIT ?5
+        ;
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        _ = c.sqlite3_bind_int64(st, 2, after_last_received_ns);
+        bindText(st.?, 3, after_corr_id);
+        _ = c.sqlite3_bind_int64(st, 4, floor_received_ns);
+        _ = c.sqlite3_bind_int64(st, 5, @intCast(limit));
+
+        var rows: std.ArrayListUnmanaged(SagaRow) = .empty;
+        errdefer {
+            for (rows.items) |*r| r.deinit(self.allocator);
+            rows.deinit(self.allocator);
+        }
+        while (true) {
+            const rc = c.sqlite3_step(st);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return Error.Sqlite;
+            const row: SagaRow = .{
+                .corr_id = try dupeColumnText(self.allocator, st.?, 0),
+                .first_received_ns = c.sqlite3_column_int64(st, 1),
+                .last_received_ns = c.sqlite3_column_int64(st, 2),
+                .activation_count = @intCast(c.sqlite3_column_int64(st, 3)),
+                .root_method = try dupeColumnText(self.allocator, st.?, 4),
+                .root_path = try dupeColumnText(self.allocator, st.?, 5),
+                .root_host = try dupeColumnText(self.allocator, st.?, 6),
+                .last_status = @intCast(c.sqlite3_column_int(st, 7)),
+                .last_outcome = try dupeColumnText(self.allocator, st.?, 8),
+                .error_count = @intCast(c.sqlite3_column_int64(st, 9)),
+                // NULL → 0, the "no close seen" sentinel.
+                .closed_at_ns = c.sqlite3_column_int64(st, 10),
+            };
+            rows.append(self.allocator, row) catch return Error.OutOfMemory;
+        }
+        return .{
+            .rows = rows.toOwnedSlice(self.allocator) catch return Error.OutOfMemory,
+            .allocator = self.allocator,
+        };
+    }
+
     pub const ShowResult = struct {
         ndjson_key: []u8,
         offset: u64,
@@ -546,6 +684,16 @@ fn execLogIndexInserts(
     if (c.sqlite3_prepare_v2(db, sql.ptr, -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
     defer _ = c.sqlite3_finalize(st);
 
+    // The saga roll-up rides this loop rather than a second pass,
+    // because it must fire ONLY for a record the index actually
+    // accepted — `activation_count` is a running total with no primary
+    // key to protect it, so a re-indexed batch would inflate every
+    // count it touched. `log_index`'s PK gives us that signal here and
+    // nowhere else.
+    var saga_st: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, SAGA_UPSERT_SQL.ptr, -1, &saga_st, null) != c.SQLITE_OK) return Error.Sqlite;
+    defer _ = c.sqlite3_finalize(saga_st);
+
     for (idx.records) |r| {
         _ = c.sqlite3_reset(st);
         _ = c.sqlite3_clear_bindings(st);
@@ -579,8 +727,85 @@ fn execLogIndexInserts(
 
         // `INSERT OR IGNORE` swallows a primary-key clash, and the two things
         // it can be swallowing are opposites. Ask which one happened.
-        if (c.sqlite3_changes(db) == 0) classifyIgnored(db, r, ndjson_key, header_size);
+        if (c.sqlite3_changes(db) == 0) {
+            classifyIgnored(db, r, ndjson_key, header_size);
+        } else {
+            // Accepted, so it is exactly one new activation of its saga.
+            // A record with no correlation id has no saga to roll up
+            // (early-error captures before request handling started).
+            if (r.correlation_id.len > 0) try execSagaUpsert(saga_st.?, r);
+        }
     }
+}
+
+/// Fold one accepted record into its saga's roll-up row.
+///
+/// **Order-independent by construction.** The indexer walks S3 batches
+/// per node, and a saga's connectionless hops (`fireChainedActivation`,
+/// `send_callback`) can be logged by a different node than the one
+/// holding the connection — so records do NOT arrive in saga order, and
+/// this must produce the same row whichever order they land in. Hence
+/// MIN/MAX on the timestamps and a `CASE` on every field that describes
+/// a specific end of the saga: the root columns move only for a record
+/// that is genuinely earlier, the `last_*` columns only for one that is
+/// genuinely later. A plain "last writer wins" makes saga rows flicker
+/// their identity as late batches arrive — visible only in production,
+/// under multi-node, days later.
+///
+/// SQLite evaluates every `DO UPDATE SET` right-hand side against the
+/// PRE-update row, so the `CASE`s comparing against `first_received_ns`
+/// see the old value even though the same statement also assigns it.
+/// The clause order is therefore not load-bearing.
+///
+/// `closed_at_ns` takes the first close seen and keeps it
+/// (`COALESCE`), so a replayed batch cannot move a saga's end.
+const SAGA_UPSERT_SQL: [:0]const u8 =
+    \\INSERT INTO log_sagas
+    \\  (tenant_id, corr_id, first_received_ns, last_received_ns, activation_count,
+    \\   root_method, root_path, root_host, last_status, last_outcome,
+    \\   error_count, closed_at_ns)
+    \\VALUES (?1,?2,?3,?3,1,?4,?5,?6,?7,?8,?9,?10)
+    \\ON CONFLICT(tenant_id, corr_id) DO UPDATE SET
+    \\  first_received_ns = MIN(first_received_ns, excluded.first_received_ns),
+    \\  last_received_ns  = MAX(last_received_ns,  excluded.last_received_ns),
+    \\  activation_count  = activation_count + 1,
+    \\  error_count       = error_count + excluded.error_count,
+    \\  root_method  = CASE WHEN excluded.first_received_ns < first_received_ns
+    \\                      THEN excluded.root_method  ELSE root_method  END,
+    \\  root_path    = CASE WHEN excluded.first_received_ns < first_received_ns
+    \\                      THEN excluded.root_path    ELSE root_path    END,
+    \\  root_host    = CASE WHEN excluded.first_received_ns < first_received_ns
+    \\                      THEN excluded.root_host    ELSE root_host    END,
+    \\  last_status  = CASE WHEN excluded.last_received_ns > last_received_ns
+    \\                      THEN excluded.last_status  ELSE last_status  END,
+    \\  last_outcome = CASE WHEN excluded.last_received_ns > last_received_ns
+    \\                      THEN excluded.last_outcome ELSE last_outcome END,
+    \\  closed_at_ns = COALESCE(closed_at_ns, excluded.closed_at_ns)
+;
+
+fn execSagaUpsert(st: *c.sqlite3_stmt, r: sidecar.Record) Error!void {
+    _ = c.sqlite3_reset(st);
+    _ = c.sqlite3_clear_bindings(st);
+    bindText(st, 1, r.tenant_id);
+    bindText(st, 2, r.correlation_id);
+    _ = c.sqlite3_bind_int64(st, 3, r.received_ns);
+    bindText(st, 4, r.method);
+    bindText(st, 5, r.path);
+    bindText(st, 6, r.host);
+    _ = c.sqlite3_bind_int(st, 7, @intCast(r.status));
+    bindText(st, 8, r.outcome);
+    _ = c.sqlite3_bind_int64(st, 9, if (std.mem.eql(u8, r.outcome, "ok")) 0 else 1);
+    // A `disconnect` activation is a saga's explicit end. NULL
+    // otherwise — and NULL forever is the NORMAL case for plenty of
+    // sagas (a crashed worker, an abandoned upload session, a chain
+    // that simply stops), so a reader must treat NULL as "no close was
+    // seen", never as "still live". Idle is derived at read time from
+    // `last_received_ns`; nothing sweeps these rows.
+    if (std.mem.eql(u8, r.activation, "disconnect"))
+        _ = c.sqlite3_bind_int64(st, 10, r.received_ns)
+    else
+        _ = c.sqlite3_bind_null(st, 10);
+    if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
 }
 
 /// A record the index refused. Same record arriving again, or a genuine
@@ -1090,6 +1315,310 @@ test "an index_db created before the activation column is migrated in place" {
     var again = try IndexDb.open(a, db_path);
     defer again.close();
     try testing.expect(try IndexDb.hasColumn(again.db, "log_index", "activation"));
+}
+
+// ── saga roll-up (#445) ───────────────────────────────────────────
+
+/// One record of a saga. Defaults are the boring case; tests override
+/// the field under examination so the interesting bit is the only thing
+/// visible at the call site.
+fn sagaRec(
+    id: u64,
+    ns: i64,
+    corr: []const u8,
+    opts: struct {
+        method: []const u8 = "GET",
+        path: []const u8 = "/",
+        host: []const u8 = "h",
+        status: u16 = 200,
+        outcome: []const u8 = "ok",
+        activation: []const u8 = "inbound",
+        tenant: []const u8 = "acme",
+    },
+) sidecar.Record {
+    return .{
+        .tenant_id = opts.tenant,
+        .request_id = id,
+        .received_ns = ns,
+        .duration_ns = 1,
+        .method = opts.method,
+        .path = opts.path,
+        .host = opts.host,
+        .status = opts.status,
+        .outcome = opts.outcome,
+        .deployment_id = 1,
+        .correlation_id = corr,
+        .activation = opts.activation,
+        .offset = 0,
+        .length = 10,
+    };
+}
+
+fn putBatch(idx: *IndexDb, batch_id: []const u8, records: []sidecar.Record) !void {
+    const b = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = batch_id,
+        .ndjson_size = 10,
+        .ndjson_sha256 = "d",
+        .first_received_ns = records[0].received_ns,
+        .last_received_ns = records[records.len - 1].received_ns,
+        .records = records,
+    };
+    var key_buf: [128]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "_logs/00000001/{s}.ndjson", .{batch_id});
+    try idx.insertBatch(&b, key, 0);
+}
+
+test "the saga roll-up is identical whichever order its batches arrive in" {
+    // THE trap. Records do not arrive in saga order — a saga's
+    // connectionless hops can be logged by a different node than the
+    // one holding the connection, so batches interleave arbitrarily.
+    // Build the same three-activation saga twice, feeding the batches
+    // in opposite orders, and require byte-identical roll-ups. A
+    // "last writer wins" upsert passes the forward case and fails
+    // here, which is exactly the shape that would otherwise surface in
+    // production days later.
+    const a = testing.allocator;
+
+    var results: [2]struct {
+        first: i64 = 0,
+        last: i64 = 0,
+        count: u64 = 0,
+        root_path: [16]u8 = undefined,
+        root_path_len: usize = 0,
+        last_status: u16 = 0,
+        closed: i64 = 0,
+    } = .{ .{}, .{} };
+
+    for (0..2) |variant| {
+        const db_path = try tempPath(a, "sagaorder");
+        defer {
+            std.fs.cwd().deleteFile(db_path) catch {};
+            deleteWalSidecars(db_path);
+            a.free(db_path);
+        }
+        var idx = try IndexDb.open(a, db_path);
+        defer idx.close();
+
+        // The saga: open (earliest) → frame → close (latest).
+        var early = [_]sidecar.Record{sagaRec(1, 1_000, "C1", .{ .path = "/open", .status = 101 })};
+        var mid = [_]sidecar.Record{sagaRec(2, 2_000, "C1", .{ .path = "/mid", .activation = "ws_message", .status = 0 })};
+        var late = [_]sidecar.Record{sagaRec(3, 3_000, "C1", .{ .path = "/close", .activation = "disconnect", .status = 0 })};
+
+        if (variant == 0) {
+            try putBatch(idx, "b1", &early);
+            try putBatch(idx, "b2", &mid);
+            try putBatch(idx, "b3", &late);
+        } else {
+            // Reverse: the close lands before the open is even indexed.
+            try putBatch(idx, "b3", &late);
+            try putBatch(idx, "b2", &mid);
+            try putBatch(idx, "b1", &early);
+        }
+
+        var list = try idx.querySagas("acme", 0, "", 0, 10);
+        defer list.deinit();
+        try testing.expectEqual(@as(usize, 1), list.rows.len);
+        const row = list.rows[0];
+        results[variant].first = row.first_received_ns;
+        results[variant].last = row.last_received_ns;
+        results[variant].count = row.activation_count;
+        @memcpy(results[variant].root_path[0..row.root_path.len], row.root_path);
+        results[variant].root_path_len = row.root_path.len;
+        results[variant].last_status = row.last_status;
+        results[variant].closed = row.closed_at_ns;
+    }
+
+    const fwd = results[0];
+    const rev = results[1];
+    try testing.expectEqual(fwd.first, rev.first);
+    try testing.expectEqual(fwd.last, rev.last);
+    try testing.expectEqual(fwd.count, rev.count);
+    try testing.expectEqual(fwd.last_status, rev.last_status);
+    try testing.expectEqual(fwd.closed, rev.closed);
+    try testing.expectEqualStrings(
+        fwd.root_path[0..fwd.root_path_len],
+        rev.root_path[0..rev.root_path_len],
+    );
+
+    // And the values are the RIGHT ones, not merely equal: root from
+    // the earliest activation, bounds spanning the whole saga.
+    try testing.expectEqual(@as(i64, 1_000), fwd.first);
+    try testing.expectEqual(@as(i64, 3_000), fwd.last);
+    try testing.expectEqual(@as(u64, 3), fwd.count);
+    try testing.expectEqualStrings("/open", fwd.root_path[0..fwd.root_path_len]);
+    try testing.expectEqual(@as(i64, 3_000), fwd.closed);
+}
+
+test "re-indexing a batch does not inflate the activation count" {
+    // `activation_count` is a running total with no primary key to
+    // protect it, unlike every other column the indexer writes. The
+    // indexer's cursor-lag buffer re-LISTs a trailing window every
+    // poll, so a batch WILL be offered twice; the count must be driven
+    // by whether `log_index` accepted the row, not by the record
+    // arriving.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "sagaidem");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    var recs = [_]sidecar.Record{
+        sagaRec(1, 1_000, "C1", .{}),
+        sagaRec(2, 2_000, "C1", .{ .activation = "ws_message" }),
+    };
+    try putBatch(idx, "b1", &recs);
+    try putBatch(idx, "b1", &recs); // same batch again
+    try putBatch(idx, "b1", &recs); // and again
+
+    var list = try idx.querySagas("acme", 0, "", 0, 10);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 1), list.rows.len);
+    try testing.expectEqual(@as(u64, 2), list.rows[0].activation_count);
+}
+
+test "closed_at_ns is set only by a disconnect, and only once" {
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "sagaclose");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    // An open saga: frames, no close. NULL → 0, and a reader must NOT
+    // read that as "still live" — plenty of sagas never get a close.
+    var open = [_]sidecar.Record{
+        sagaRec(1, 1_000, "OPEN", .{}),
+        sagaRec(2, 2_000, "OPEN", .{ .activation = "ws_message" }),
+    };
+    try putBatch(idx, "bo", &open);
+
+    // A closed one, whose disconnect arrives in a LATER batch.
+    var c_open = [_]sidecar.Record{sagaRec(10, 1_500, "DONE", .{})};
+    try putBatch(idx, "bc1", &c_open);
+    var c_close = [_]sidecar.Record{sagaRec(11, 2_500, "DONE", .{ .activation = "disconnect" })};
+    try putBatch(idx, "bc2", &c_close);
+
+    var list = try idx.querySagas("acme", 0, "", 0, 10);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 2), list.rows.len);
+
+    for (list.rows) |row| {
+        if (std.mem.eql(u8, row.corr_id, "OPEN")) {
+            try testing.expectEqual(@as(i64, 0), row.closed_at_ns);
+        } else {
+            try testing.expectEqualStrings("DONE", row.corr_id);
+            try testing.expectEqual(@as(i64, 2_500), row.closed_at_ns);
+        }
+    }
+
+    // A replayed close cannot move the saga's end.
+    try putBatch(idx, "bc2", &c_close);
+    var again = try idx.querySagas("acme", 0, "", 0, 10);
+    defer again.deinit();
+    for (again.rows) |row| {
+        if (std.mem.eql(u8, row.corr_id, "DONE"))
+            try testing.expectEqual(@as(i64, 2_500), row.closed_at_ns);
+    }
+}
+
+test "the saga list keyset-pages, clamps to retention, and counts errors" {
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "sagapage");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    // Five sagas, one activation each, 1000ns apart. The middle one
+    // errors.
+    var i: u64 = 0;
+    while (i < 5) : (i += 1) {
+        var corr_buf: [8]u8 = undefined;
+        const corr = try std.fmt.bufPrint(&corr_buf, "S{d}", .{i});
+        var batch_buf: [8]u8 = undefined;
+        const bid = try std.fmt.bufPrint(&batch_buf, "b{d}", .{i});
+        var recs = [_]sidecar.Record{sagaRec(
+            i + 1,
+            @intCast((i + 1) * 1_000),
+            corr,
+            if (i == 2) .{ .outcome = "handler_error", .status = 500 } else .{},
+        )};
+        try putBatch(idx, bid, &recs);
+    }
+
+    // Page 1: newest two.
+    var p1 = try idx.querySagas("acme", 0, "", 0, 2);
+    defer p1.deinit();
+    try testing.expectEqual(@as(usize, 2), p1.rows.len);
+    try testing.expectEqualStrings("S4", p1.rows[0].corr_id);
+    try testing.expectEqualStrings("S3", p1.rows[1].corr_id);
+
+    // Page 2 from the previous tail — no repeat, no gap.
+    const tail = p1.rows[1];
+    var p2 = try idx.querySagas("acme", tail.last_received_ns, tail.corr_id, 0, 2);
+    defer p2.deinit();
+    try testing.expectEqual(@as(usize, 2), p2.rows.len);
+    try testing.expectEqualStrings("S2", p2.rows[0].corr_id);
+    try testing.expectEqualStrings("S1", p2.rows[1].corr_id);
+    // The error saga carries its count; a healthy one does not.
+    try testing.expectEqual(@as(u64, 1), p2.rows[0].error_count);
+    try testing.expectEqual(@as(u16, 500), p2.rows[0].last_status);
+    try testing.expectEqual(@as(u64, 0), p2.rows[1].error_count);
+
+    // Retention clamp: a floor above a saga's last activity hides it,
+    // because every step it could show is clamped away too.
+    var clamped = try idx.querySagas("acme", 0, "", 3_500, 10);
+    defer clamped.deinit();
+    try testing.expectEqual(@as(usize, 2), clamped.rows.len);
+    try testing.expectEqualStrings("S4", clamped.rows[0].corr_id);
+    try testing.expectEqualStrings("S3", clamped.rows[1].corr_id);
+}
+
+test "the saga list is index-only — no scan, no aggregate" {
+    // Same posture as the tag-filtered list guard: pin the PLAN, since
+    // the whole point of materializing `log_sagas` is that listing
+    // sagas never degrades into the `GROUP BY` over `log_tags` this
+    // table exists to replace. No ANALYZE — production has none.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "sagaplan");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    const sql =
+        \\SELECT corr_id, first_received_ns, last_received_ns, activation_count,
+        \\       root_method, root_path, root_host, last_status, last_outcome,
+        \\       error_count, closed_at_ns
+        \\FROM log_sagas
+        \\WHERE tenant_id = ?1
+        \\  AND (?2 = 0 OR last_received_ns < ?2 OR (last_received_ns = ?2 AND corr_id < ?3))
+        \\  AND (?4 = 0 OR last_received_ns >= ?4)
+        \\ORDER BY last_received_ns DESC, corr_id DESC
+        \\LIMIT ?5
+    ;
+    const plan = try explainQueryPlan(a, idx.db, sql);
+    defer a.free(plan);
+    try testing.expect(std.mem.indexOf(u8, plan, "log_sagas_recent") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "SCAN") == null);
+    // A temp b-tree here would mean the index isn't supplying the sort,
+    // which is the property that makes paging O(page) instead of
+    // O(all sagas) per request.
+    try testing.expect(std.mem.indexOf(u8, plan, "TEMP B-TREE") == null);
 }
 
 test "the activation kind survives the tag-filtered path too" {
