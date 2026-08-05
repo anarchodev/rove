@@ -183,12 +183,24 @@ const STANDALONE_MAP_SIZE: usize = 1 * 1024 * 1024 * 1024;
 /// manifest snapshot is replayed into (`writeManifestFile`). The map is
 /// virtual address space, not RAM or disk: only touched pages cost
 /// anything, so the figure is a ceiling to never hit, not a budget.
-/// It must sit with ample headroom above `N_tenants ×` the largest
-/// sellable per-tenant KV cap (`rove-plan`'s `max_kv_bytes`), because
-/// every tenant on the node shares this one env — the per-tenant cap is
-/// enforced at the write path (plan-derived, attributable), and this
-/// map exists so LMDB's own `MDB_MAP_FULL` cliff (unattributed,
+///
+/// Every tenant on the node shares this one env, and the figure is
+/// deliberately OVER-SUBSCRIBED against `N_tenants ×` their
+/// `max_kv_bytes` (`rove-plan`): reserving for every tenant filling its cap at
+/// once would size for a case that never arrives and cap the tenant count far
+/// below what the drive carries. What makes that safe is that the per-tenant
+/// cap is enforced at the write path (plan-derived, attributable — a runaway
+/// tenant meets its own 507), usage is metered per tenant, and a node
+/// approaching its drive sheds tenants with the zero-downtime move
+/// (`docs/architecture/control-plane.md`) rather than having pre-reserved for
+/// them. This map exists so LMDB's own `MDB_MAP_FULL` cliff (unattributed,
 /// node-wide) can never bite first.
+///
+/// Raising it is cheap: LMDB accepts a larger map on a later open, so a bigger
+/// figure costs one restart and no migration. The one hard bound is the node's
+/// drive — a map larger than free disk trades `MDB_MAP_FULL` for `ENOSPC`,
+/// which takes the raft WAL and the log spool down with it rather than just
+/// refusing a write.
 pub const CLUSTER_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024;
 
 /// Reserved store_id for standalone-mode KvStores. The file holds
