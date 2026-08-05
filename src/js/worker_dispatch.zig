@@ -2512,6 +2512,23 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // replay shell uses to re-run the request up to the same
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
+            //
+            // The INPUTS survive; the digest does not. A digest is a verdict —
+            // "this run performed the same interactions as that one" — and this
+            // run has no interaction sequence to be the same as. It was killed
+            // at a wall-clock deadline (or cascaded off a sibling's txn, or hit
+            // a write-layer failure replay cannot reproduce at all), so a rerun
+            // stops somewhere else and folds a different prefix. Worse, the
+            // prefix records effects that did NOT happen: the txn above was
+            // rolled back, so a `kv.set` folded before the kill is in the hash
+            // and nowhere else.
+            //
+            // Zero is the record's existing spelling for "not computed"
+            // (`flush_writer` emits null, and static-served / route-miss
+            // records already carry it), so readers need no new case. A
+            // truncated hash that merely LOOKS complete is the one outcome with
+            // no defensible reading.
+            readset.interaction_digest = 0;
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
             processed += 1;
