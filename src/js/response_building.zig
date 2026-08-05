@@ -17,6 +17,31 @@ const reserved_headers = @import("reserved_headers.zig");
 const request_mod = @import("request.zig");
 const ResponseHeader = request_mod.ResponseHeader;
 
+/// The wire body prod ships for a THROWN handler: `handler threw: {ToString}\n`.
+///
+/// Shared rather than formatted at each site, because two places need the exact
+/// same bytes and for different reasons: `worker_dispatch` puts them on the
+/// wire, and `dispatcher` folds them into the interaction digest's closing
+/// element. A digest that hashes a body one character different from the one
+/// served is worse than no digest — it reports every faithful replay of that
+/// request as diverged.
+///
+/// The empty-exception fallback matches the serving site: a failed format must
+/// still produce a stable, non-empty body rather than a silent 500 with nothing
+/// in it.
+pub const THROWN_BODY_FALLBACK = "handler threw\n";
+
+pub fn thrownBody(allocator: std.mem.Allocator, exception: []const u8) []const u8 {
+    if (exception.len == 0) return THROWN_BODY_FALLBACK;
+    return std.fmt.allocPrint(allocator, "handler threw: {s}\n", .{exception}) catch
+        THROWN_BODY_FALLBACK;
+}
+
+/// True when `thrownBody` allocated (so the caller must free it).
+pub fn thrownBodyOwned(body: []const u8) bool {
+    return body.ptr != THROWN_BODY_FALLBACK.ptr;
+}
+
 pub const Unwrapped = struct {
     val: c.JSValue,
     rejected: bool,
