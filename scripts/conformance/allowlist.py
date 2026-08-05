@@ -104,15 +104,6 @@ KNOWN: tuple[Known, ...] = (
         ),
     ),
     Known(
-        pattern="errorsemantics/throw/error/prod~sim",
-        engines=("sim", "prod"),
-        issue=460,
-        why=(
-            "prod reports a thrown error's toString (`Error: boom`); the sim "
-            "reports its `.message` (`boom`), dropping the class name."
-        ),
-    ),
-    Known(
         # Scoped to the one case that proves it rather than `*/*/effects/…`:
         # a pattern that wide would excuse every effect-log divergence between
         # these two engines, which is most of what the suite is for. Widen it
