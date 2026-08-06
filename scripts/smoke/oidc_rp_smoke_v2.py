@@ -216,9 +216,36 @@ def main() -> int:
             return 1
         r = c.tls_curl(app_origin + "/v1/session", headers={"Cookie": op_cookie})
         who = json.loads(r.body) if r.status == 200 else {}
-        check("operator session is_root=true (sub=operator)",
-              r.status == 200 and who.get("is_root") is True and who.get("sub") == OPERATOR,
+        op_is_root_ok = (r.status == 200 and who.get("is_root") is True
+                         and who.get("sub") == OPERATOR)
+        check("operator session is_root=true (sub=operator)", op_is_root_ok,
               f"got {r.status} {who}")
+        if not op_is_root_ok:
+            # Every operator-gated check below reads this one stored boolean,
+            # so a miss here cascades into six more failures that say nothing
+            # new. `is_root` is computed ONCE, when the RP mints the session
+            # (`@rewind/oidc` completeCallback: `kv.get(operator_prefix +
+            # sha256(sub)) != null`) and frozen into `_rp/sess/{sid}` — so the
+            # question is always which of its three inputs was wrong AT MINT
+            # TIME, and none of them is recoverable after the cluster is torn
+            # down. Dump them here rather than re-running an investigation
+            # against a flake that has already vanished (#489).
+            print("  --- #489 diagnostics: the three inputs to is_root ---")
+            akey = "_admin/operator/" + sha256_hex(OPERATOR)
+            g = c.admin_kv_get("__admin__", akey)
+            print(f"      allowlist {akey}")
+            print(f"        -> {g.status} {g.body[:40]!r}"
+                  f"   (want 200; 404 = the seed did not land before login)")
+            for k in ("_oidc/rp/default", "_config/oidc/rp/default"):
+                gg = c.admin_kv_get("__admin__", k)
+                print(f"      {k} -> {gg.status} {gg.body[:200]!r}")
+            print("        (an empty/absent `operator_prefix` means is_root is"
+                  " always false, by design)")
+            sid_m = re.search(r"__Host-rove_sid=([^;]+)", op_cookie or "")
+            if sid_m:
+                gs = c.admin_kv_get("__admin__", "_rp/sess/" + sid_m.group(1))
+                print(f"      _rp/sess/{sid_m.group(1)[:16]}… -> {gs.status} {gs.body[:200]!r}")
+            c.dump_node_log(grep=["rp", "oidc", "operator", "is_root"])
 
         # Non-operator login → is_root:false.
         cust_cookie = None
