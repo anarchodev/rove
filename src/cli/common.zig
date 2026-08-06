@@ -380,6 +380,74 @@ pub fn classify(a: std.mem.Allocator, bundle_path: []const u8) Bundle {
 // and the rewind customer CLI.
 
 /// `{"tenant":"<id>"}` — for /v1/deploy/{reset,cut}.
+/// The raw text of a top-level JSON object field, braces included — e.g.
+/// `dependencies` out of a bundle manifest. Returns a slice of `doc`, so the
+/// value is passed onward EXACTLY as written: the registry owns its own range
+/// grammar, and re-encoding a dependency map here would fork it.
+///
+/// Deliberately a scanner, not a parser: the CLI is std-only and this needs no
+/// allocator, no error union, and no schema. Depth-counts braces/brackets and
+/// skips strings (with escapes), so a nested object or a `}` inside a string
+/// cannot end the value early. Null when the key is absent or the value is not
+/// an object.
+pub fn jsonObjectField(doc: []const u8, key: []const u8) ?[]const u8 {
+    var needle_buf: [128]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, doc, search, needle)) |at| {
+        search = at + needle.len;
+        var i = search;
+        while (i < doc.len and (doc[i] == ' ' or doc[i] == '\t' or doc[i] == '\n' or doc[i] == '\r')) i += 1;
+        if (i >= doc.len or doc[i] != ':') continue;
+        i += 1;
+        while (i < doc.len and (doc[i] == ' ' or doc[i] == '\t' or doc[i] == '\n' or doc[i] == '\r')) i += 1;
+        if (i >= doc.len or doc[i] != '{') return null;
+        const start = i;
+        var depth: usize = 0;
+        var in_str = false;
+        var esc = false;
+        while (i < doc.len) : (i += 1) {
+            const ch = doc[i];
+            if (in_str) {
+                if (esc) esc = false else if (ch == '\\') esc = true else if (ch == '"') in_str = false;
+                continue;
+            }
+            switch (ch) {
+                '"' => in_str = true,
+                '{', '[' => depth += 1,
+                '}', ']' => {
+                    depth -= 1;
+                    if (depth == 0) return doc[start .. i + 1];
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
+test "jsonObjectField: extracts a nested object verbatim" {
+    const doc =
+        \\{"name":"admin","dependencies":{"@rewind/oidc":"^1.0.0","@rewind/email":"^1.0.0"},"version":"1.0.0"}
+    ;
+    try std.testing.expectEqualStrings(
+        "{\"@rewind/oidc\":\"^1.0.0\",\"@rewind/email\":\"^1.0.0\"}",
+        jsonObjectField(doc, "dependencies").?,
+    );
+}
+
+test "jsonObjectField: absent, empty, and non-object values" {
+    try std.testing.expect(jsonObjectField("{\"a\":1}", "dependencies") == null);
+    try std.testing.expect(jsonObjectField("{\"dependencies\":\"x\"}", "dependencies") == null);
+    try std.testing.expectEqualStrings("{}", jsonObjectField("{\"dependencies\":{}}", "dependencies").?);
+}
+
+test "jsonObjectField: a brace inside a string does not end the value" {
+    const doc = "{\"dependencies\":{\"a\":\"}\",\"b\":\"^1\"},\"z\":1}";
+    try std.testing.expectEqualStrings("{\"a\":\"}\",\"b\":\"^1\"}", jsonObjectField(doc, "dependencies").?);
+}
+
 pub fn tenantBody(a: std.mem.Allocator, tenant: []const u8) []const u8 {
     var out = std.ArrayList(u8){};
     out.appendSlice(a, "{\"tenant\":") catch oom();
