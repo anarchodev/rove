@@ -253,6 +253,17 @@
   // epilogue kv wrapper skips recording and hides the namespaced keys, so a
   // tenant read / prefix scan never sees another store.
   var NS_STORE = "__rove_store/";
+  // Published so every consumer tests the SAME prefix. This namespace is a
+  // harness construct: it exists nowhere in the worker, so a key under it is
+  // bookkeeping no production run ever performed. Anything that records what a
+  // handler did — the sim epilogue's kv wrapper, the browser arena's — has to
+  // exclude it, or it reports reads and writes the worker never made and folds
+  // them into the interaction digest.
+  //
+  // One definition rather than one per engine: the sim excluded these from the
+  // start and the browser arena did not, which is exactly the drift a repeated
+  // string literal invites (rove#442).
+  globalThis.__roveStorePrefix = NS_STORE;
   var storeKv = function(P, tag){
     return {
       get: function(k){ var v = globalThis.kv.get(P + k); push({ kind: "read", store: tag, key: k, present: v !== undefined && v !== null }); return v; },
