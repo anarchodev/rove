@@ -689,7 +689,7 @@ fn finishStreamResume(
                         return;
                     }
                 }
-                const lh_term = fireLogHeader(ctx.request_id, dep_id, @intCast(@max(@min(r.status, 599), 100)), ctx.act, mpath, corr, ctx.now_ns);
+                const lh_term = fireLogHeader(ctx.request_id, dep_id, @intCast(@max(@min(r.status, 599), 100)), ctx.act, "POST", mpath, "", corr, ctx.now_ns);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (`docs/architecture/deployment-and-logs.md`).
                 const tapes = streamTapes(worker, spec.tape, &ctx);
@@ -816,7 +816,7 @@ fn finishStreamResume(
                 // no chunks to stage.
                 var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = false };
                 defer stage.chunks.deinit(allocator);
-                const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr, ctx.now_ns);
+                const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (held + writes): propose failed: {s}", .{@errorName(perr)});
                     cval.deinit(allocator);
@@ -908,7 +908,7 @@ fn finishStreamResume(
                     allocator.free(s2.chunks);
                     s2.chunks = &.{};
                 }
-                const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr, ctx.now_ns);
+                const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the outer defer
@@ -1583,12 +1583,22 @@ const FireTape = enum { none, activation, callback };
 
 /// The LogHeader every propose path ships. Also used by the WS seam
 /// (`worker_ws.zig`) with its own activation tags.
+/// `method`/`path`/`host` are the request line for the rebuilt record.
+/// They are passed in rather than defaulted here so the value is
+/// visible at each call site: a resume activation has no request of its
+/// own, and the chains that have not yet adopted
+/// `ChainContext.root_*` (#467) still pass the dispatch target plus
+/// `"POST"` / `""` filler. Leader-captured and follower-rebuilt records
+/// MUST agree — a saga's `root_*` would otherwise depend on which
+/// node's copy the indexer saw.
 pub fn fireLogHeader(
     request_id: u64,
     deployment_id: u64,
     status: u16,
     act: log_mod.ActivationSource,
+    method: []const u8,
     path: []const u8,
+    host: []const u8,
     corr: ?[]const u8,
     received_ns: i64,
 ) log_mod.LogHeader {
@@ -1602,9 +1612,9 @@ pub fn fireLogHeader(
         .status = status,
         .outcome = .ok,
         .activation = act,
-        .method = "POST",
+        .method = method,
         .path = path,
-        .host = "",
+        .host = host,
         .correlation_id = corr orelse "",
     };
 }
@@ -1738,7 +1748,7 @@ pub fn runFire(
                 );
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, log_path, corr, p.now_ns);
+                const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, "POST", log_path, "", corr, p.now_ns);
                 // Capture tapes BEFORE the propose so the input channels
                 // (ctx/Msg on `trigger_payload`, the fetch event on
                 // `fetch_responses`) ride the raft entry's readset — the
@@ -1795,7 +1805,7 @@ pub fn runFire(
                 },
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr, p.now_ns);
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
@@ -1835,7 +1845,7 @@ pub fn runFire(
                 },
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr, p.now_ns);
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");

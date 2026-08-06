@@ -97,6 +97,31 @@ fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
 /// Routing for a WS identity entity, transport-agnostic: an Extended-CONNECT
 /// stream's identity entity (h2, `wsStreamRouting` — architecture/websockets.md) or
 /// an h1 ws-mode conn entity (`wsConnRouting`).
+/// The request line to stamp on a WS activation's log record: the
+/// CONNECTION's identity, not the module the frame dispatched to.
+///
+/// Every activation of a held connection belongs to one saga, and the
+/// saga's `root_*` come from whichever record is earliest — so a frame
+/// that described its dispatch target left the whole connection
+/// labelled `POST index` instead of the endpoint the client opened.
+///
+/// Falls back to the dispatch-target shape when the chain carries no
+/// identity, so a record is never blank: `ChainContext.root_*` is set
+/// at `establishWsChain`, but a chain that predates it (or any future
+/// path that skips it) still logs something addressable.
+fn wsRootLine(chain_ctx: *const components_mod.ChainContext, module_path: []const u8) struct {
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+} {
+    if (chain_ctx.root_path.len > 0) return .{
+        .method = chain_ctx.root_method,
+        .path = chain_ctx.root_path,
+        .host = chain_ctx.root_host,
+    };
+    return .{ .method = "POST", .path = module_path, .host = "" };
+}
+
 fn wsRouting(server: anytype, ent: rove.Entity) ?struct { authority: []const u8, path: []const u8 } {
     if (server.wsStreamRouting(ent)) |r| return .{ .authority = r.authority, .path = r.path };
     if (server.wsConnRouting(ent)) |r| return .{ .authority = r.authority, .path = r.path };
@@ -200,10 +225,24 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
         errdefer allocator.free(tid_dup);
         const corr_dup = try allocator.dupe(u8, corr);
         errdefer allocator.free(corr_dup);
+        // The connection's own identity, kept for every activation this
+        // chain will log (`ChainContext.root_*`). `GET` because that is
+        // what the client wrote — `new WebSocket("wss://host/live")` is
+        // a GET upgrade at the edge — not the `CONNECT` the worker sees
+        // after the front tunnels it (RFC 8441, `websockets.md`).
+        const method_dup = try allocator.dupe(u8, "GET");
+        errdefer allocator.free(method_dup);
+        const host_dup = try allocator.dupe(u8, host);
+        errdefer allocator.free(host_dup);
+        const path_dup = try allocator.dupe(u8, routing.path);
+        errdefer allocator.free(path_dup);
         try server.reg.set(ent, &worker.parked_continuations, components_mod.ChainContext, .{
             .tenant_id = tid_dup,
             .correlation_id = corr_dup,
             .deployment_id = dep.tc.snap.deployment_id,
+            .root_method = method_dup,
+            .root_host = host_dup,
+            .root_path = path_dup,
         });
     }
     {
@@ -472,6 +511,8 @@ fn finishWsResume(
     const allocator = worker.allocator;
     const tc = p.dep.tc;
     const path = chain_st.module_path;
+    // Log records name the CONNECTION, not the module — see wsRootLine.
+    const rl = wsRootLine(chain_ctx, path);
     // The `{"ctx":…}` envelope → trigger_payload (→ request.ctx). One capture
     // site fires per call, via `wsResumeTapes(worker, &p.readset, ws_ctx_body, msg)`.
     const ws_ctx_body: []const u8 = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch "";
@@ -482,14 +523,14 @@ fn finishWsResume(
             if (r.exception.len > 0) {
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
             }
-            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), act, path, chain_ctx.correlation_id, p.now_ns);
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), act, rl.method, rl.path, rl.host, chain_ctx.correlation_id, p.now_ns);
             // Tapes before shipWsFrames' propose so the input channels (ctx on
             // trigger_payload, fetch event on fetch_responses) ride the raft
             // readset for the promotion walker
@@ -499,13 +540,13 @@ fn finishWsResume(
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
                 std.log.warn("rove-js {s} (terminal+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
                 tearDownWsChain(worker, conn_ent);
                 return;
             };
             p.txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, tapes, chain_ctx.correlation_id, r.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, tapes, chain_ctx.correlation_id, r.tags, act, fw_seq);
             r.console = &.{};
             r.exception = &.{};
             tearDownWsChain(worker, conn_ent);
@@ -524,12 +565,12 @@ fn finishWsResume(
                 p.txn.rollback() catch {};
                 p.txn_done = true;
                 const errmsg = allocator.dupe(u8, "next({fn}) is not supported on a WebSocket chain — frames dispatch to onMessage; name a wake export via after.*(..., {on})") catch @constCast("");
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, errmsg, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, errmsg, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
             }
-            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, path, chain_ctx.correlation_id, p.now_ns);
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, rl.method, rl.path, rl.host, chain_ctx.correlation_id, p.now_ns);
             const wrote = p.ws.ops.items.len > 0;
             // Snap the §8.4 read baseline before shipWsFrames may transfer txn.
             const read_version = p.txn.readVersion();
@@ -540,7 +581,7 @@ fn finishWsResume(
                 std.log.warn("rove-js {s} (next+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 cval.deinit(allocator);
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
@@ -557,7 +598,7 @@ fn finishWsResume(
             // ws_message frames return next(), so this is the dominant
             // browser-agent capture path — without it the per-frame
             // activations carry no `session` tag.
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, chain_ctx.correlation_id, cval.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, chain_ctx.correlation_id, cval.tags, act, fw_seq);
             // Re-aim on an explicit cross-module target — every later
             // frame/wake on this connection dispatches at the target
             // module. AFTER the capture above: the `path` local
@@ -600,7 +641,7 @@ fn finishWsResume(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
@@ -628,6 +669,8 @@ fn fireWsMessage(
     const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
 
     const path = chain_st.module_path;
+    // Log records name the CONNECTION, not the module — see wsRootLine.
+    const rl = wsRootLine(chain_ctx, path);
     var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-message") orelse {
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
@@ -692,7 +735,7 @@ fn fireWsMessage(
         // digest is a prefix, not a verdict.
         worker_mod.dropPartialDigest(&p.readset);
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .ws_message, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .ws_message, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -811,6 +854,8 @@ pub fn resumeBoundFetchChainWs(
     const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
 
     const path = chain_st.module_path;
+    // Log records name the CONNECTION, not the module — see wsRootLine.
+    const rl = wsRootLine(chain_ctx, path);
     var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-fetch-resume") orelse {
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
@@ -904,7 +949,7 @@ pub fn resumeBoundFetchChainWs(
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -950,6 +995,8 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     defer if (wake_export_owned.len > 0) allocator.free(wake_export_owned);
 
     const path = chain_st.module_path;
+    // Log records name the CONNECTION, not the module — see wsRootLine.
+    const rl = wsRootLine(chain_ctx, path);
     var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-wake") orelse {
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
@@ -1011,7 +1058,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .wake_batch, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .wake_batch, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -1111,6 +1158,8 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
 
     const path = chain_st.module_path;
+    // Log records name the CONNECTION, not the module — see wsRootLine.
+    const rl = wsRootLine(chain_ctx, path);
     var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-disconnect") orelse return;
     defer p.deinit(allocator);
     const tc = p.dep.tc;
@@ -1135,7 +1184,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     };
 
@@ -1150,17 +1199,17 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .no_onheaders, .no_onchunk => {},
     }
     if (wrote) {
-        const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, path, chain_ctx.correlation_id, p.now_ns);
+        const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, rl.method, rl.path, rl.host, chain_ctx.correlation_id, p.now_ns);
         _ = proposeForgetfulWrites(worker, &p.ws, p.txn, chain_ctx.tenant_id, null, null, &p.readset, lh) catch |perr| {
             std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
             p.txn_owned = false;
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
             return;
         };
         p.txn_owned = false;
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     }
     p.txn.commit() catch |e| switch (e) {
@@ -1176,5 +1225,50 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         ),
     };
     p.txn_done = true;
-    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "wsRootLine prefers the connection's identity over the dispatch target" {
+    // A held connection's activations all belong to one saga, whose
+    // `root_*` come from whichever record is earliest. Describing the
+    // module here labelled the whole connection `POST index` instead
+    // of the endpoint the client opened (#467).
+    const ctx: components_mod.ChainContext = .{
+        .root_method = @constCast("GET"),
+        .root_host = @constCast("app.example.com"),
+        .root_path = @constCast("/live"),
+    };
+    const rl = wsRootLine(&ctx, "index");
+    try testing.expectEqualStrings("GET", rl.method);
+    try testing.expectEqualStrings("/live", rl.path);
+    try testing.expectEqualStrings("app.example.com", rl.host);
+}
+
+test "wsRootLine falls back to the dispatch target rather than logging blanks" {
+    // A chain carrying no identity still has to produce an
+    // addressable record — better the module than an empty request
+    // line, which would read as a capture bug rather than a chain
+    // that predates the field.
+    const ctx: components_mod.ChainContext = .{};
+    const rl = wsRootLine(&ctx, "index");
+    try testing.expectEqualStrings("POST", rl.method);
+    try testing.expectEqualStrings("index", rl.path);
+    try testing.expectEqualStrings("", rl.host);
+}
+
+test "wsRootLine keys off the path, so a host-less connection still uses its own line" {
+    // The discriminator is `root_path`, not `root_host`: an authority
+    // can legitimately be empty, and keying off the host would send
+    // such a connection back to the module label.
+    const ctx: components_mod.ChainContext = .{
+        .root_method = @constCast("GET"),
+        .root_path = @constCast("/live"),
+    };
+    const rl = wsRootLine(&ctx, "index");
+    try testing.expectEqualStrings("/live", rl.path);
+    try testing.expectEqualStrings("", rl.host);
 }
