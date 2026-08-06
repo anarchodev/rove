@@ -212,6 +212,12 @@ const epilogue = buildRequestEpilogue({
     binaryBody,
     exportName: world.export || "default",
     activation: world.activation || "inbound",
+    // A conformance case is AUTHORED, not captured. The distinction is the
+    // engine's, not this driver's: `world.zig` carries the same flag and
+    // `export_fixture` stamps it. Declaring it turns off the postures that only
+    // make sense for a world that actually happened — strict read-your-tape,
+    // the admin grant, the retired `request.body` alias (rove#436).
+    captured: world.captured === true,
     ctx: world.ctx,
     middlewarePath,
     tenant: req.tenant ?? null,
