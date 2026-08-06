@@ -151,6 +151,116 @@ fn cmdReset(a: std.mem.Allocator, env: *const c.Env) []const u8 {
     fatal("/_system/reset failed on every worker", .{});
 }
 
+/// A registry request, routed by Host like every other worker call. `/v1/resolve`
+/// and `/v1/blobs/:hash` are both "open" routes — no bearer — so this carries
+/// only the Host + content type.
+fn registryCall(
+    a: std.mem.Allocator,
+    env: *const c.Env,
+    method: []const u8,
+    path: []const u8,
+    body: ?[]const u8,
+) c.Resp {
+    const reg_host = env.require("REWIND_REGISTRY_DOMAIN");
+    const hs = a.alloc(Header, 2) catch oom();
+    hs[0] = .{ .name = "Host", .value = reg_host };
+    hs[1] = .{ .name = "Content-Type", .value = "application/json" };
+    var last: ?c.Resp = null;
+    for (c.workerUrls(env, a)) |w| {
+        const url = std.fmt.allocPrint(a, "{s}{s}", .{ w, path }) catch oom();
+        const r = c.call(a, env, method, url, hs, body, 60);
+        if (r.code >= 200 and r.code < 500) return r;
+        last = r;
+    }
+    return last orelse fatal("registry {s}: no worker answered", .{path});
+}
+
+/// Just enough of `/v1/resolve`'s answer to stage the files it names. The rest
+/// of the document is passed to `cut` VERBATIM — re-serializing a resolution
+/// risks changing the bytes the deploy pins, and the registry is authoritative
+/// for its own shape.
+const Resolution = struct {
+    packages: []const struct {
+        pkg_hash: []const u8,
+        files: []const struct {
+            path: []const u8,
+            source_hash: []const u8,
+        },
+    },
+};
+
+/// Resolve the bundle's `@rewind/*` dependencies against the registry and stage
+/// every package file into the workspace, so `cut` can compile imports that
+/// leave the bundle. Returns the resolution to hand `cut`, or null when the
+/// bundle declares no dependencies.
+///
+/// Without this a bundle importing a package fails at cut with
+/// `could not load module '@rewind/…'` — the deploy protocol has carried
+/// `pkgfile` + `resolution` since rove#344, but no operator path drove them
+/// (rove#477), so only the customer CLI and the smoke harness could publish a
+/// package-importing tenant.
+fn stagePackages(
+    a: std.mem.Allocator,
+    env: *const c.Env,
+    headers: []const Header,
+    tenant: []const u8,
+    bundle_path: []const u8,
+) ?[]const u8 {
+    const mpath = std.fmt.allocPrint(a, "{s}/manifest.json", .{bundle_path}) catch oom();
+    const manifest = std.fs.cwd().readFileAlloc(a, mpath, 1 << 20) catch return null;
+
+    // Pass the declared `dependencies` object through verbatim — the registry
+    // owns range syntax, and re-encoding it here would fork that grammar.
+    const deps = c.jsonObjectField(manifest, "dependencies") orelse return null;
+    if (std.mem.indexOfScalar(u8, deps, ':') == null) return null; // `{}` — nothing declared
+
+    const req = std.fmt.allocPrint(a, "{{\"dependencies\":{s}}}", .{deps}) catch oom();
+    const rr = registryCall(a, env, "POST", "/v1/resolve", req);
+    if (rr.code != 200) fatal("resolve dependencies: {d} {s}", .{ rr.code, c.trunc(rr.body) });
+
+    const parsed = std.json.parseFromSlice(Resolution, a, rr.body, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| fatal("resolve: unparseable answer ({s}): {s}", .{ @errorName(err), c.trunc(rr.body) });
+    defer parsed.deinit();
+
+    var files: usize = 0;
+    for (parsed.value.packages) |pkg| {
+        for (pkg.files) |f| {
+            const bpath = std.fmt.allocPrint(a, "/v1/blobs/{s}", .{f.source_hash}) catch oom();
+            const br = registryCall(a, env, "GET", bpath, null);
+            if (br.code != 200)
+                fatal("package source {s} ({s}): {d} {s}", .{ f.path, f.source_hash, br.code, c.trunc(br.body) });
+
+            var body = std.ArrayList(u8){};
+            body.appendSlice(a, "{\"tenant\":") catch oom();
+            c.writeJsonString(&body, a, tenant);
+            body.appendSlice(a, ",\"pkg_hash\":") catch oom();
+            c.writeJsonString(&body, a, pkg.pkg_hash);
+            body.appendSlice(a, ",\"path\":") catch oom();
+            c.writeJsonString(&body, a, f.path);
+            body.appendSlice(a, ",\"source\":") catch oom();
+            c.writeJsonString(&body, a, br.body);
+            body.append(a, '}') catch oom();
+            _ = deployPost(a, env, "/v1/deploy/pkgfile", headers, body.items, f.path);
+            files += 1;
+        }
+    }
+    std.debug.print("packages: {d} resolved, {d} file(s) staged\n", .{ parsed.value.packages.len, files });
+    return a.dupe(u8, rr.body) catch oom();
+}
+
+/// `{"tenant": t}` plus the resolution `cut` compiles against.
+fn cutBody(a: std.mem.Allocator, tenant: []const u8, resolution: ?[]const u8) []const u8 {
+    const res = resolution orelse return c.tenantBody(a, tenant);
+    var out = std.ArrayList(u8){};
+    out.appendSlice(a, "{\"tenant\":") catch oom();
+    c.writeJsonString(&out, a, tenant);
+    out.appendSlice(a, ",\"resolution\":") catch oom();
+    out.appendSlice(a, res) catch oom();
+    out.append(a, '}') catch oom();
+    return out.items;
+}
+
 fn cmdDeploy(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, bundle_path: []const u8, release: bool) void {
     const b = c.classify(a, bundle_path);
     if (b.skipped.len != 0) {
@@ -174,7 +284,11 @@ fn cmdDeploy(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, bundle
     for (b.statics) |s| {
         _ = uploadStatic(a, env, c.uploadPath(a, tenant, s), headers, s.bytes, s.path);
     }
-    const cut = deployPost(a, env, "/v1/deploy/cut", headers, c.tenantBody(a, tenant), "cut");
+    // Packages stage AFTER the handlers/statics and BEFORE cut: cut compiles the
+    // whole bundle, so every import it must resolve has to be in the workspace
+    // by then.
+    const resolution = stagePackages(a, env, headers, tenant, bundle_path);
+    const cut = deployPost(a, env, "/v1/deploy/cut", headers, cutBody(a, tenant, resolution), "cut");
     const dep_id = c.extractDepId(a, cut.body) orelse fatal("cut: 200 but no dep_id: {s}", .{cut.body});
     std.debug.print("deployment staged: {s} ({d} file(s)) — NOT released\n", .{ dep_id, b.handlers.len + b.statics.len });
     if (release) cmdRelease(a, env, tenant, dep_id);
@@ -345,7 +459,16 @@ const SeedPkg = struct {
     dep_jwt: bool = false, // imports @rewind/jwt (frozen to jwt's pkg_hash at publish)
 };
 
-const SEED_VERSION = "1.0.0"; // genesis versions are immutable once seeded
+// A published spec@version is FROZEN: re-seeding the same version with
+// different bytes is a 409 from the registry (`registry/index.mjs` publish).
+// So a re-seed after the package sources move needs a new version — bump this,
+// which republishes the whole first-party set at the new version. Unchanged
+// packages simply get an identical-content record under the new number; the
+// version identifies "the set as of this commit", not per-package semver.
+//
+// 1.0.1: the SPDX license headers (#343). No behavioural change to any package
+// — the sources diverged from the 1.0.0 seed by two comment lines each.
+const SEED_VERSION = "1.0.1";
 const REGISTRY_TENANT = "registry";
 
 // LEAVES-FIRST: @rewind/jwt has no intra-set dependency and MUST publish before
