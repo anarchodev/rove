@@ -53,6 +53,13 @@ abuse control rather than by the work. The adapter waits it out. Sharing tenants
 would dodge the limit and buy a corpus whose results depend on ordering, which
 is a worse trade than a slow lane.
 
+The replay engine's prelude is **generated** from this repo's shim sources into
+rewind-apps, so it can go stale without anything noticing — and it did once, when
+a digest grammar bump left the arena folding a different version than the worker
+and the sim. The runner now runs `gen_replay_prelude.py --check` before using
+the replay engine and fails with the regeneration command, rather than letting
+the staleness surface as a scatter of digest divergences (rove#474).
+
 The replay engine needs **`REWIND_APPS_DIR`** pointing at a rewind-apps
 checkout — the replay porcelain (`rtap.mjs`, `request-replay.mjs`,
 `qjs_arena_wasm`) lives in that private repo. Without it the engine reports

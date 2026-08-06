@@ -369,10 +369,70 @@ def _collect_sources(source_dir: Path) -> dict:
     return out
 
 
+# Checked once per process, not per case: the answer cannot change mid-run and
+# the check shells out to a generator that rebuilds the whole prelude. The
+# VERDICT is cached, not merely the fact of having checked — caching only "we
+# looked" let the first case report the real cause and every later one run
+# against the stale prelude anyway, turning one legible failure back into a
+# scatter of digest divergences.
+_PRELUDE_VERDICT: str | None | bool = False  # False = not yet checked
+
+
+def _check_prelude_fresh(apps: Path) -> None:
+    """Fail if the replay engine's prelude is stale against the engine sources.
+
+    `arena-prelude.js` is GENERATED from this repo's shim sources into a
+    DIFFERENT repo, so there is no natural moment where drift gets noticed. It
+    went stale exactly once already: rove#413 bumped the interaction digest's
+    grammar to `VERSION = 2`, the prelude kept `VERSION = 1`, and because the
+    version is hashed first, EVERY digest disagreed. That surfaced as three
+    unrelated-looking digest divergences instead of one legible line — and, far
+    worse than a red test, a shell built on that prelude reports every replay of
+    a v2 record as diverged.
+
+    The generator has always been able to detect this (`--check` exits 1).
+    Nothing ran it. Running it here costs one subprocess per run and turns the
+    failure into the sentence that names the fix.
+
+    This is deliberately an AdapterError rather than `EngineUnavailable`: a
+    stale prelude is not "this engine cannot run", it is "this engine will
+    quietly give wrong answers", which has to fail the gate.
+    """
+    global _PRELUDE_VERDICT
+    if _PRELUDE_VERDICT is not False:
+        if _PRELUDE_VERDICT is None:
+            return
+        raise AdapterError(_PRELUDE_VERDICT)
+
+    gen = REPO_ROOT / "scripts" / "ops" / "gen_replay_prelude.py"
+    if not gen.exists():
+        _PRELUDE_VERDICT = None
+        return
+    proc = subprocess.run(
+        [sys.executable, str(gen), "--apps-dir", str(apps), "--check"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode == 0:
+        _PRELUDE_VERDICT = None
+        return
+    _PRELUDE_VERDICT = (
+        "the replay engine's prelude is STALE against this repo's engine "
+        "sources, so its digests and shims are a different build's:\n"
+        f"    {(proc.stderr or proc.stdout).strip()[:300]}\n"
+        f"    fix: python3 scripts/ops/gen_replay_prelude.py --apps-dir {apps}\n"
+        "    then commit the regenerated arena-prelude.js in rewind-apps "
+        "(rove#474)"
+    )
+    raise AdapterError(_PRELUDE_VERDICT)
+
+
 def run_replay(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
     apps = _apps_dir()
     if not shutil.which("node"):
         raise EngineUnavailable("node is not on PATH — it drives the WASM arena")
+    _check_prelude_fresh(apps)
 
     job = {
         "apps_dir": str(apps),

@@ -317,9 +317,17 @@ def main() -> int:
             print(f"  {engine:<7} {pretty}")
 
     if errors:
+        # Grouped by (engine, message). One broken engine fails every world the
+        # same way, and printing that block once per world buries the cause it
+        # is trying to make obvious — which is the whole point of reporting an
+        # adapter error rather than letting it surface as N divergences.
         print("\nADAPTER ERRORS:")
+        grouped: dict[tuple[str, str], list[str]] = {}
         for e in errors:
-            print(f"  {e['engine']} [{e['world']}]: {e['error']}")
+            grouped.setdefault((e["engine"], e["error"]), []).append(e["world"])
+        for (engine, msg), worlds in grouped.items():
+            where = worlds[0] if len(worlds) == 1 else f"{len(worlds)} worlds"
+            print(f"  {engine} [{where}]: {msg}")
 
     if divergences:
         print("\nDIVERGENCES:")
@@ -338,9 +346,15 @@ def main() -> int:
     # is stale; failing on it would make the narrowing flag unusable and train
     # people to ignore the rule.
     engines_ran = {e for r in results for w in r["worlds"] for e in w["engines_ran"]}
+    # An adapter ERROR means that engine did not produce results this run, so
+    # entries concerning it never had the chance to fire — judging them would
+    # report "stale" for an engine that was broken, piling noise on top of a
+    # failure that already has a cause. Same reasoning as the engines_ran
+    # clause, one step further: erroring is a kind of not-running.
+    errored_engines = {e["engine"] for r in results for e in r["errors"]}
     stale = (
         []
-        if args.case
+        if args.case or errored_engines
         else [
             k
             for k in allowlist.KNOWN
