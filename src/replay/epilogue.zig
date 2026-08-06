@@ -782,7 +782,15 @@ const EPILOGUE_BODY =
     \\    }
     \\    globalThis.__replay_result = __result;
     \\  } catch (e) {
-    \\    __err = { message: String((e && e.message) || e), stack: String((e && e.stack) || "") };
+    \\    // `message` is the exception's ToString, not its `.message` — prod's
+    \\    // spelling. `takeExceptionMessage` (qjs/root.zig) is `toOwnedString`,
+    \\    // so the worker records `Error: boom` on the log record and in the
+    \\    // wire body; reporting a bare `boom` offline dropped the error CLASS,
+    \\    // which is often the whole diagnosis (SyntaxError vs TypeError vs a
+    \\    // thrown string). No information is lost — the ToString contains the
+    \\    // message. The body below already used `String(e)`, so this only makes
+    \\    // the structured field agree with the text beside it.
+    \\    __err = { message: String(e), stack: String((e && e.stack) || "") };
     \\    // Prod parity (worker_dispatch): a JS exception → 500 with
     \\    // "handler threw: {ToString}\n" as the body, the handler-set response
     \\    // head DISCARDED, and the txn rolled back. Mark this activation's
