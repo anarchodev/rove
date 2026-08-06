@@ -20,6 +20,13 @@ Why that matters: the obvious implementation — a JS job looping
 the tenant's log-ingest budget to export its own data (rove#391's defect at
 export scale). Here the job only ever sees a cursor and a digest.
 
+The final arm is rove#429: the tenant is pinned AT its storage quota and must
+still be able to export. Export parts go to an unmetered `exports/` pool, so
+the customer most likely to be leaving — the one at their cap — is not the one
+the feature refuses. Before that pool existed the parts landed in the metered
+`app-blobs/`, the PUT was refused with a 507, and the job retried the same
+part forever with the customer seeing only "running".
+
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
 
@@ -54,14 +61,33 @@ export function seed() {
     }
     return "seeded:" + n;
 }
+// An ORDINARY metered write, used as the control for the at-cap arm: it must
+// be refused once the storage quota is pinned, or "the export still works at
+// the cap" would be passing against a cap that never bit.
+//
+// `blob.put` is a Cmd — the handler returns before the PUT is attempted — so
+// the response says nothing about whether it landed. The platform's record is
+// the owed marker: cleared on success, kept and stamped on failure (the same
+// observation `storage_cap_smoke_v2.py` makes).
+export function store() {
+    const hash = blob.put("payload-" + _param("k"));
+    kv.set("h/" + _param("k"), hash);
+    return hash;
+}
+export function marker() {
+    const h = kv.get("h/" + _param("k"));
+    if (!h) return "no-hash";
+    const m = kv.get("_blob/owed/" + h);
+    return m === null ? "cleared" : "owed " + m;
+}
 """
 
 # The customer-facing surface: a handler starts an export and reads it back
 # with no operator involvement. `start()` writes the marker + arms the wake;
-# `get()` returns the manifest, and `blob.url` turns each part into a
+# `get()` returns the manifest, and `links()` turns each part into a
 # download link.
 START_SRC = """\
-import { start, get } from "@rewind/export";
+import { start, get, links } from "@rewind/export";
 function _param(name) {
     for (const pair of (request.query || "").split("&")) {
         const eq = pair.indexOf("=");
@@ -75,10 +101,11 @@ export function begin() {
 export function status() {
     const st = get(_param("id"));
     if (!st) return "none";
-    // Presigned links come from the ordinary content-addressed primitive —
-    // the export adds no download surface of its own.
+    // `links()`, not `blob.url`: parts live in the tenant's unmetered
+    // `exports/` pool (rove#429), so signing them against `app-blobs/`
+    // would mint URLs that 404.
     if (st.state === "done") {
-        st.links = (st.parts || []).map((p) => blob.url(p.hash));
+        st.links = links(_param("id"));
     }
     return JSON.stringify(st);
 }
@@ -193,11 +220,61 @@ def main() -> int:
         check("values round-trip byte-exact", seen.get("data/0007") == "value-7",
               f"got {seen.get('data/0007')!r}")
 
+        print("step 7: ⭐ a tenant AT its storage cap can still export (#429)")
+        # Pin the quota below what this tenant already stores, so any metered
+        # write is refused. The export must be unaffected — that is the whole
+        # point of the separate pool.
+        pr = c._cp_post("/_control/plan", {"tenant": TENANT, "plan": json.dumps({
+            "tier": "free", "overrides": {"max_stored_bytes": 1},
+        })})
+        check("pin max_stored_bytes=1 → 2xx", pr.status in (200, 204),
+              f"got {pr.status} {pr.body!r}")
+        # A metered write really is refused at this cap — otherwise the arm
+        # below proves nothing (it would pass on a cap that never bit). The
+        # usage figure the gate reads is TTL-cached, so let it expire first.
+        time.sleep(2.5)
+        c.request(TENANT, "/seed?fn=store&k=capped", method="POST", data=b"x")
+        refused = ""
+        for _ in range(40):
+            rr = c.request(TENANT, "/seed?fn=marker&k=capped", method="POST", data=b"x")
+            if rr.status == 200 and rr.body.strip().startswith("owed ") and "failed" in rr.body:
+                refused = rr.body.strip()
+                break
+            time.sleep(0.5)
+        check("a metered blob.put at the cap → refused (507 on the owed marker)",
+              '"last_status":507' in refused, f"marker={refused[:160]!r}")
+
+        r = c.request(TENANT, "/start?fn=begin", method="POST", data=b"x")
+        capped_id = r.body.strip()
+        check("export.start() at the cap → an id", r.status == 200 and len(capped_id) > 10,
+              f"got {r.status} {r.body[:120]!r}")
+        capped = None
+        for _ in range(120):
+            rr = c.request(TENANT, f"/start?fn=status&id={capped_id}", method="POST", data=b"x")
+            if rr.status == 200 and rr.body.strip() not in ("none", ""):
+                st = json.loads(rr.body)
+                if st.get("state") in ("done", "failed"):
+                    capped = st
+                    break
+            time.sleep(0.5)
+        check("the at-cap export reached done (not failed, not stuck)",
+              bool(capped) and capped.get("state") == "done",
+              f"state={(capped or {}).get('state')} error={(capped or {}).get('error')}")
+        if capped and capped.get("state") == "done":
+            check("the at-cap export produced parts",
+                  len(capped.get("parts") or []) > 0, f"parts={len(capped.get('parts') or [])}")
+            cl = capped.get("links") or []
+            check("its links download", bool(cl) and subprocess.run(
+                ["curl", "-sS", "--fail-with-body", "-o", "/dev/null", cl[0]],
+                capture_output=True, timeout=60).returncode == 0,
+                f"links={cl[:1]}")
+
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
     print("\nPASS kv-export smoke (v2) — the store walks into content-addressed "
-          "parts, and the job only ever sees a cursor and a digest")
+          "parts, the job only ever sees a cursor and a digest, and a tenant at "
+          "its storage cap can still get its data out")
     return 0
 
 

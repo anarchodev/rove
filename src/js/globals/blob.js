@@ -244,6 +244,33 @@ globalThis.blob = {
   },
 
   /**
+   * Presign one part of a data export — the `exports/` twin of
+   * {@link blob.url}.
+   *
+   * Export parts are written by the platform into a separate, unmetered
+   * pool (they are not objects you stored, and you cannot delete them
+   * individually), so `blob.url` — which signs your `app-blobs/` pool —
+   * cannot address them. Hashes come from `@rewind/export`'s
+   * `get(id).parts`; that library's `links(id)` is the ordinary way to
+   * reach this.
+   *
+   * @param {string} hash - A part hash from an export manifest.
+   * @param {object} [opts]
+   * @param {number} [opts.ttl] - Validity in seconds (default 300,
+   *   max 604800 = 7 days).
+   * @returns {string} The presigned URL.
+   */
+  exportUrl(hash, opts) {
+    opts = opts || {};
+    assertHash(hash, "blob.exportUrl");
+    // No `_assertMaterialized`: that guard reads `_blob/pending/{hash}`,
+    // which tracks YOUR writes through `blob.put`. An export part is written
+    // by the engine and has no such marker, so the check would fail every
+    // legitimate call.
+    return sysBlob.presign(hash, opts.ttl != null ? opts.ttl : null, null, "exports");
+  },
+
+  /**
    * Append bytes to this chain's open recipe (created on the first
    * write). The accumulation is kv rows + a sha256 midstate — nothing
    * lives in worker RAM, so it spans activations, replicates, and

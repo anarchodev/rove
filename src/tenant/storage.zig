@@ -84,6 +84,11 @@ pub const SUBDIRS = [_][]const u8{
     "file-blobs",
     "log-blobs",
     "deployments",
+    // Data-export parts (rove#429). Unmetered — so the ONLY thing that bounds
+    // it is this sweep: an export pool missing from this list would outlive
+    // its tenant *and* have never been charged for, via the feature that
+    // exists to honour erasure.
+    "exports",
 };
 
 /// The handle every per-tenant derivation goes through. Both fields are
