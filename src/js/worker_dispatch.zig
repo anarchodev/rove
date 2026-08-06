@@ -136,12 +136,12 @@ const SuccessRec = struct {
     /// the entity's `ContDescriptor` (`bound_schedule_id`) by the cont
     /// helpers. null = hop fired 0 or >1 sends → deadline-only resume.
     cont_bound_sched_id: ?[]const u8 = null,
-    /// Per-chain correlation id (streaming handlers;
+    /// Per-saga id (streaming handlers;
     /// `docs/architecture/routing-and-ingress.md`). Borrows
     /// from the dispatch `Request`; duped into the entity's
     /// `ChainContext` component by the cont helpers so the resume
     /// inherits the same chain id.
-    correlation_id: ?[]const u8 = null,
+    saga_id: ?[]const u8 = null,
     /// `on.timer`/`on.kv` registrations drained
     /// from this activation's `pending_wakes` accumulator when it
     /// returned `next(...)`. Owned slice; `parkSuccessesOnSiblings` arms
@@ -166,7 +166,7 @@ const SuccessRec = struct {
 /// `.stream` dispatch outcome and `finalizeBatch`. All slices are
 /// owned; `deinit` frees them in the discard path.
 ///
-/// `tenant_id` / `correlation_id` / `deployment_id` are populated by
+/// `tenant_id` / `saga_id` / `deployment_id` are populated by
 /// `streamRecordIfAnyAt` right before it sets them as entity stream
 /// components (via `setStreamComponents`). The fields are unused on
 /// the read-only commit fast path where `streamParkIfAny` reads them
@@ -205,7 +205,7 @@ const StreamFirstHopMeta = struct {
     tenant_id: []u8 = &.{},
     /// Owned. Correlation id from the originating inbound request.
     /// Same population rule as `tenant_id`.
-    correlation_id: ?[]u8 = null,
+    saga_id: ?[]u8 = null,
     /// Deployment id the chain is bound to.
     deployment_id: u64 = 0,
 
@@ -221,7 +221,7 @@ const StreamFirstHopMeta = struct {
         if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
         if (self.timer_on) |t| allocator.free(t);
         if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
-        if (self.correlation_id) |c| allocator.free(c);
+        if (self.saga_id) |c| allocator.free(c);
         self.* = undefined;
     }
 };
@@ -313,11 +313,11 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
     {
         const tid = try allocator.dupe(u8, tenant_id);
         errdefer allocator.free(tid);
-        const corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
+        const corr: ?[]u8 = if (s.saga_id) |c| try allocator.dupe(u8, c) else null;
         errdefer if (corr) |x| allocator.free(x);
         try server.reg.set(s.ent, &server.request_out, components_mod.ChainContext, .{
             .tenant_id = tid,
-            .correlation_id = corr,
+            .saga_id = corr,
             .deployment_id = s.deployment_id,
         });
     }
@@ -354,11 +354,11 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
     {
         const tid = try allocator.dupe(u8, tenant_id);
         errdefer allocator.free(tid);
-        const corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
+        const corr: ?[]u8 = if (s.saga_id) |c| try allocator.dupe(u8, c) else null;
         errdefer if (corr) |x| allocator.free(x);
         try server.reg.set(s.ent, &server.request_out, components_mod.ChainContext, .{
             .tenant_id = tid,
-            .correlation_id = corr,
+            .saga_id = corr,
             .deployment_id = s.deployment_id,
         });
     }
@@ -481,7 +481,7 @@ fn streamParkIfAny(
         s.ent,
         worker.allocator,
         tenant_id,
-        s.correlation_id,
+        s.saga_id,
         s.deployment_id,
         meta.module_path,
         meta.ctx_json,
@@ -532,7 +532,7 @@ fn streamRecordIfAnyAt(
         s.ent,
         allocator,
         anchor_id,
-        s.correlation_id,
+        s.saga_id,
         s.deployment_id,
         meta_opt.module_path,
         meta_opt.ctx_json,
@@ -591,7 +591,7 @@ fn captureSuccess(
     // BORROWED into the record (duped); we free the terminal copy
     // after (the continuation copy is freed via `s.cont.deinit`).
     const tags_for_log: []const log_mod.Tag = if (s.cont) |*ct| ct.tags else s.tags;
-    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes, s.correlation_id, tags_for_log, .inbound, raft_seq);
+    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes, s.saga_id, tags_for_log, .inbound, raft_seq);
     if (s.cont == null) {
         for (s.tags) |t| {
             worker.allocator.free(t.key);
@@ -2289,7 +2289,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var sid_prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
         const session_resolved = session_mod.resolve(rh, sid_prng.random());
 
-        // Per-chain correlation id (streaming handlers;
+        // Per-saga id (streaming handlers;
         // `docs/architecture/routing-and-ingress.md`).
         // Honor `X-Rove-Correlation-Id` from the wire when present
         // (≤256 bytes, no NUL — distributed-tracing posture); else
@@ -2297,16 +2297,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // stable, deterministic under tape replay, and unique per
         // activation when no upstream chain id is supplied. Backing
         // buffer lives in this loop iteration alongside the Request.
-        var correlation_id_buf: [16]u8 = undefined;
-        const correlation_id: []const u8 = blk: {
+        var saga_id_buf: [16]u8 = undefined;
+        const saga_id: []const u8 = blk: {
             if (respb.findHeader(rh, "x-rove-correlation-id")) |h| {
                 if (h.len > 0 and h.len <= 256 and std.mem.indexOfScalar(u8, h, 0) == null) {
                     break :blk h;
                 }
             }
-            break :blk std.fmt.bufPrint(&correlation_id_buf, "{x:0>16}", .{request_id}) catch unreachable;
+            break :blk std.fmt.bufPrint(&saga_id_buf, "{x:0>16}", .{request_id}) catch unreachable;
         };
-        std.log.debug("rove-js corr: inbound corr={s} request_id={d} tenant={s}", .{ correlation_id, request_id, scope_inst.id });
+        std.log.debug("rove-js corr: inbound corr={s} request_id={d} tenant={s}", .{ saga_id, request_id, scope_inst.id });
 
         // Gap 2.3: per-request accumulator for
         // `http.fetch` calls. The binding appends into it via
@@ -2380,7 +2380,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .trace = .{
                 .readset = &readset,
                 .request_id = request_id,
-                .correlation_id = correlation_id,
+                .saga_id = saga_id,
             },
             .plan = .{
                 // Limiter scope: the SCOPE tenant (the kv this handler
@@ -2481,7 +2481,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // (e.g. what the __admin__ deploy-reset delete hit). Corr-tagged.
             if (err == dispatcher_mod.DispatchError.KvFailed) std.log.warn(
                 "rove-js KvFailed cause: tenant={s} path={s} corr={s} kv_error={s}",
-                .{ scope_inst.id, path, correlation_id, if (worker.dispatcher.last_kv_error) |lke| @errorName(lke) else "(null)" },
+                .{ scope_inst.id, path, saga_id, if (worker.dispatcher.last_kv_error) |lke| @errorName(lke) else "(null)" },
             );
             const outcome: log_mod.Outcome = if (interrupted) .timeout else if (invalidated) .fault else .handler_error;
             const status: u16 = if (interrupted) 504 else if (invalidated) 503 else 500;
@@ -2496,12 +2496,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 try respb.setSimpleResponse(server, ent, sid, sess, 503, "speculative dependency rolled back; retry\n", allocator);
             } else {
                 // Surface the actual DispatchError in BOTH the response body
-                // and journald, tagged with the correlation id so it ties to
+                // and journald, tagged with the saga id so it ties to
                 // the tape/replay record — a bodyless, journald-silent 500
                 // (visible only in the tape) is undiagnosable in prod.
                 std.log.warn(
                     "rove-js dispatch error: tenant={s} method={s} path={s} corr={s} err={s}",
-                    .{ scope_inst.id, method, path, correlation_id, @errorName(err) },
+                    .{ scope_inst.id, method, path, saga_id, @errorName(err) },
                 );
                 const msg = std.fmt.allocPrint(allocator, "dispatch error: {s}\n", .{@errorName(err)}) catch null;
                 defer if (msg) |m| allocator.free(m);
@@ -2514,7 +2514,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // why the handler hit the CPU budget).
             worker_mod.dropPartialDigest(&readset);
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, saga_id, &.{}, .inbound, 0);
             processed += 1;
             continue;
         };
@@ -2661,7 +2661,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         .{ scope_inst.id, @errorName(re) },
                     );
                     try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY, allocator);
-                    worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), correlation_id, &.{}, .inbound, 0);
+                    worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), saga_id, &.{}, .inbound, 0);
                     processed += 1;
                     continue;
                 }
@@ -2790,7 +2790,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // message (e.g. `Date.now()`) resolves to the same value
             // it did originally.
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, correlation_id, &.{}, .inbound, 0);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, saga_id, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -2810,7 +2810,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // survive: this activation never reached its result.
             worker_mod.dropPartialDigest(&readset);
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, saga_id, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -2853,7 +2853,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .{ scope_inst.id, @errorName(re) },
                 );
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY, allocator);
-                worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), correlation_id, &.{}, .inbound, 0);
+                worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), saga_id, &.{}, .inbound, 0);
                 processed += 1;
                 continue;
             }
@@ -2923,7 +2923,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // Stamp a `LogHeader` so any follower can
         // reconstruct the customer LogRecord from the raft entry
         // alone. The strings borrow the dispatch-local
-        // `method`/`path`/`host`/`correlation_id` slices, which
+        // `method`/`path`/`host`/`saga_id` slices, which
         // outlive `readset.serialize`'s synchronous copy into the
         // blob bytes.
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -2940,7 +2940,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .method = method,
             .path = path,
             .host = host,
-            .correlation_id = correlation_id,
+            .saga_id = saga_id,
         };
         if (readset.serialize(allocator, log_header)) |rs_bytes| {
             batch_readset_blobs.append(allocator, rs_bytes) catch |err| {
@@ -3075,7 +3075,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             else
                 0,
             .cont_bound_sched_id = cont_bound_sched_id,
-            .correlation_id = correlation_id,
+            .saga_id = saga_id,
             .cont_wakes = cont_wakes_owned,
             .cont_read_version = cont_rv,
             .stream = stream_meta_opt,

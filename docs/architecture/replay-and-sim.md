@@ -151,7 +151,7 @@ on transcoded records, and the strict read-your-tape posture above applies to
 those. An *authored* world (no flag — everything `rewind test`/`sim` builds)
 mirrors the LIVE surface instead: payload accessors read `undefined` on
 payload-less kinds, identity is always pinned (`session` `null` / `tenant` /
-`correlation_id` `""`), the ip channels read `null` when un-authored, and the
+`sagaId` `""`), the ip channels read `null` when un-authored, and the
 retired driver-only surfaces (`request.body`, the pre-rename `on.*` alias)
 exist only under `captured` so pinned old deployments still replay.
 

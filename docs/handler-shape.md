@@ -686,8 +686,8 @@ export function onReplay() {                        // fetch callback (read-only
 It reads through the internal `rewind-logs.internal` door, which the engine pins
 to **this handler's own tenant** — a customer can read only its own logs, never
 another's (`decisions.md` §4.8/§4.10). By default it filters by the engine
-per-connection session key (`request.correlation_id`, auto-stamped on every
-activation as the reserved `_corr` tag), so no per-frame tagging is needed; pass
+per-saga key (`request.sagaId`, auto-stamped on every activation of a
+saga as the reserved `_saga` tag), so no per-frame tagging is needed; pass
 `{session}` to filter by a `request.tag("session", …)` value instead (survives
 reconnects).
 
@@ -696,7 +696,7 @@ can attach low-cardinality index tags to its request's log record:
 `request.tag("flow", "checkout")`. The log query surface then filters
 `?tag.flow=checkout` (and `/v1/{tenant}/session/{id}` is sugar for
 `tag.session`). Bounded + fail-loud: ≤4 tags/record, keys `[a-z0-9_]` (a leading
-`_` is reserved for engine tags like `_corr`), value ≤64 bytes — a violation
+`_` is reserved for engine tags like `_saga`), value ≤64 bytes — a violation
 throws (it's a handler bug, not a silent drop). Keep values low-cardinality (a
 plan, a flow, a session — never a per-row unique like a raw user id).
 
@@ -909,7 +909,7 @@ change (Hyrum's law). See `architecture/format-versioning.md` §7.1/§7.3/§7.6.
   block). Unknown keys are ignored today — keep your own option keys to plain
   identifiers so a future platform directive can't collide with them.
 - **`request.*` fields.** The request object reserves the `request.rewind`
-  namespace for platform-provided per-activation metadata. Your own per-chain
+  namespace for platform-provided per-activation metadata. Your own per-saga
   state lives on `request.ctx` (your shape, threaded via `next({ctx})`). Today
   the namespace carries `isRoot` and exists only on the platform-bound
   (`__admin__`) handler — the operator-root verdict, computed by the engine so

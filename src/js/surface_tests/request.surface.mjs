@@ -47,9 +47,9 @@ export default function () {
   });
 
   // No chain context in this dispatch → empty string (documented).
-  check("request.correlation_id", () => {
-    eq(typeof request.correlation_id, "string");
-    eq(request.correlation_id, "");
+  check("request.sagaId", () => {
+    eq(typeof request.sagaId, "string");
+    eq(request.sagaId, "");
   });
 
   check("request.tenant", () => {

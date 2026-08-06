@@ -7,7 +7,7 @@
 //! `on.fetch`'s chunk resumes) and `blob.seal` turns the accumulated
 //! buffer into a single content-addressed PUT through the P1 signing
 //! door. Connection-scoped by construction: keyed on
-//! `(tenant_id, correlation_id)`, the chain's stable identity.
+//! `(tenant_id, saga_id)`, the chain's stable identity.
 //!
 //! ## P2 shape: bounded single-PUT, not multipart
 //!
@@ -77,7 +77,7 @@ pub const Error = error{
 /// `blob_sessions` collection.
 pub const Session = struct {
     tenant_id: []u8,
-    correlation_id: []u8,
+    saga_id: []u8,
     buf: std.ArrayListUnmanaged(u8) = .empty,
     /// Incremental content hash — updated per `write` so `seal`
     /// never pays a full-buffer hash on the worker thread at once.
@@ -87,7 +87,7 @@ pub const Session = struct {
     pub fn deinit(allocator: std.mem.Allocator, items: []Session) void {
         for (items) |*item| {
             allocator.free(item.tenant_id);
-            allocator.free(item.correlation_id);
+            allocator.free(item.saga_id);
             item.buf.deinit(allocator);
         }
     }
@@ -120,7 +120,7 @@ pub fn write(
         const ent = reg.create(coll) catch return Error.OutOfMemory;
         reg.set(ent, coll, Session, .{
             .tenant_id = t_dup,
-            .correlation_id = c_dup,
+            .saga_id = c_dup,
             .buf = .empty,
             .hasher = Sha256.init(.{}),
             .last_touch_ns = now_ns,
@@ -163,7 +163,7 @@ pub fn seal(
     const sessions = coll.column(Session);
     for (ents, sessions) |ent, *s| {
         if (!std.mem.eql(u8, s.tenant_id, tenant_id)) continue;
-        if (!std.mem.eql(u8, s.correlation_id, corr)) continue;
+        if (!std.mem.eql(u8, s.saga_id, corr)) continue;
 
         var digest: [32]u8 = undefined;
         s.hasher.final(&digest);
@@ -212,7 +212,7 @@ const testing = std.testing;
 fn findSession(coll: anytype, tenant_id: []const u8, corr: []const u8) ?*Session {
     for (coll.column(Session)) |*s| {
         if (std.mem.eql(u8, s.tenant_id, tenant_id) and
-            std.mem.eql(u8, s.correlation_id, corr)) return s;
+            std.mem.eql(u8, s.saga_id, corr)) return s;
     }
     return null;
 }
@@ -267,7 +267,7 @@ test "blob session per-tenant cap + isolation" {
     _ = try write(testing.allocator, &reg, &coll, "t2", "c1", "d", 1);
     _ = try write(testing.allocator, &reg, &coll, "t1", "c1", "aa", 2);
 
-    // Sessions are tenant-isolated even on equal correlation ids.
+    // Sessions are tenant-isolated even on equal saga ids.
     const s1 = try seal(testing.allocator, &reg, &coll, "t1", "c1");
     defer testing.allocator.free(s1.body);
     try testing.expectEqualStrings("aaa", s1.body);

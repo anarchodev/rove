@@ -28,8 +28,8 @@ pub const ChainContext = struct {
     /// Tenant id the chain is scoped to. Allocator-owned when
     /// `tenant_id.len > 0`; empty slice = uninitialized.
     tenant_id: []u8 = &.{},
-    /// Per-chain correlation id. Allocator-owned when non-null.
-    correlation_id: ?[]u8 = null,
+    /// Per-saga id. Allocator-owned when non-null.
+    saga_id: ?[]u8 = null,
     /// Deployment id active when the chain opened. Zero ⇒
     /// uninitialized; deployments use the full u64 space so zero
     /// would never be a real value on a populated entity.
@@ -62,7 +62,7 @@ pub const ChainContext = struct {
     pub fn deinit(allocator: std.mem.Allocator, items: []ChainContext) void {
         for (items) |*item| {
             if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
-            if (item.correlation_id) |c| allocator.free(c);
+            if (item.saga_id) |c| allocator.free(c);
             if (item.root_method.len > 0) allocator.free(item.root_method);
             if (item.root_host.len > 0) allocator.free(item.root_host);
             if (item.root_path.len > 0) allocator.free(item.root_path);
@@ -757,14 +757,14 @@ test "ChainContext default-init is benign + deinit is no-op" {
     var items = [_]ChainContext{ .{}, .{}, .{} };
     ChainContext.deinit(testing.allocator, &items);
     try testing.expectEqualStrings("", items[0].tenant_id);
-    try testing.expectEqual(@as(?[]u8, null), items[0].correlation_id);
+    try testing.expectEqual(@as(?[]u8, null), items[0].saga_id);
     try testing.expectEqual(@as(u64, 0), items[0].deployment_id);
 }
 
 test "ChainContext deinit frees populated entry" {
     var items = [_]ChainContext{.{
         .tenant_id = try testing.allocator.dupe(u8, "acme"),
-        .correlation_id = try testing.allocator.dupe(u8, "0000000000000001"),
+        .saga_id = try testing.allocator.dupe(u8, "0000000000000001"),
         .deployment_id = 12345,
         // The chain's opening request line is owned too; the testing
         // allocator fails this test if deinit forgets any of the three.
@@ -774,7 +774,7 @@ test "ChainContext deinit frees populated entry" {
     }};
     ChainContext.deinit(testing.allocator, &items);
     try testing.expectEqualStrings("", items[0].tenant_id);
-    try testing.expectEqual(@as(?[]u8, null), items[0].correlation_id);
+    try testing.expectEqual(@as(?[]u8, null), items[0].saga_id);
     try testing.expectEqual(@as(u64, 0), items[0].deployment_id);
     try testing.expectEqualStrings("", items[0].root_method);
     try testing.expectEqualStrings("", items[0].root_host);

@@ -138,11 +138,11 @@ pub const World = struct {
     session_json: ?[]const u8 = null,
     /// Per-chain identity the engine pins on every activation (the worker sets
     /// them, there's no handler code to run) — `request.tenant` (this handler's
-    /// tenant id) and `request.correlation_id` (minted by inbound, inherited by
+    /// tenant id) and `request.sagaId` (minted by inbound, inherited by
     /// every resume). A test supplies them so a handler branch keyed on either is
     /// driveable (e.g. `browser.getReplay`). Plain strings.
     tenant: ?[]const u8 = null,
-    correlation_id: ?[]const u8 = null,
+    saga_id: ?[]const u8 = null,
     /// The flattened fetch/callback result surface — top-level on `request`.
     /// `status` is the single success signal (2xx = ok, 0 = transport
     /// failure); there is no `ok`.
@@ -174,7 +174,11 @@ const TOP_KEYS = [_][]const u8{
 const REQ_KEYS = [_][]const u8{
     "method",  "path",       "host",          "ip",       "body",   "bodyB64",
     "status",  "done",       "fetchId",       "chunkSeq", "fetchesPending",
-    "bodyTruncated", "activation", "session",  "tenant",   "correlationId", "headers",
+    "bodyTruncated", "activation", "session",  "tenant",   "sagaId",        "headers",
+    // `correlationId` is the retired spelling of `sagaId`, accepted so
+    // world.json fixtures authored before the rename still load. Read
+    // side only — `export-fixture` and the epilogue emit `sagaId`.
+    "correlationId",
     "isRoot",
 };
 
@@ -312,7 +316,12 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         }
         // Per-chain identity the engine pins (worker-set; no code to run).
         if (jStr(r, "tenant")) |s| w.tenant = s;
-        if (jStr(r, "correlationId")) |s| w.correlation_id = s;
+        if (jStr(r, "sagaId")) |s| w.saga_id = s;
+        // Retired spelling, still honoured for pre-rename fixtures. Never
+        // overrides an explicit `sagaId`.
+        if (w.saga_id == null) {
+            if (jStr(r, "correlationId")) |s| w.saga_id = s;
+        }
         if (r.get("headers")) |hv| {
             if (hv != .object) return Error.BadWorld;
             var hs = std.ArrayList(Header){};

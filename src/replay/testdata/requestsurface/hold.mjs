@@ -13,7 +13,7 @@ export function onWake() {
     jsonUndef: request.json === undefined,
     kind: request.activation.kind,
     sessionNull: request.session === null,
-    corr: request.correlation_id,
+    corr: request.sagaId,
     tenant: request.tenant,
   });
 }

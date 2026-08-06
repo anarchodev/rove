@@ -64,7 +64,7 @@ const RECIPE_TOTAL_MAX = 1024 * 1024 * 1024;
 // one local recipe, matching the one-session-per-chain semantics the
 // RAM implementation had.
 function _recipeSid() {
-  return request.correlation_id || "local";
+  return request.sagaId || "local";
 }
 
 function _recipeMetaKey(sid) { return "_blob/recipe/" + sid + "/meta"; }

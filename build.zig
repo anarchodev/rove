@@ -1623,7 +1623,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/concurrent", // whenConcurrent: cross-order fetch interleavings + invariant
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
         "src/replay/testdata/nexttarget", // cross-module next(target, ctx) parks the target: timer/kv/fetch/disconnect resumes re-enter it
-        "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
+        "src/replay/testdata/getreplay", // request.tenant/sagaId identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
         "src/replay/testdata/responsevetting", // emit-side response vetting: header/cookie sanitize, status clamp, content-type rule, binary body, stream-prepend
         "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone

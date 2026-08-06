@@ -83,13 +83,13 @@ expect(req).toHaveFetched(/stripe/);
   unmetered unless this is set, in which case the N+1-th outbound in an
   activation throws the same `Error` prod does (`e.code === "rate_limited"`),
   so the catch branch is testable.
-- `tenant` / `correlationId` — the per-chain identity the engine pins on every
-  activation (`request.tenant` and `request.correlation_id`). The worker sets them
+- `tenant` / `sagaId` — the per-saga identity the engine pins on every
+  activation (`request.tenant` and `request.sagaId`). The worker sets them
   in prod — inbound mints the correlation id, every resume inherits it — so a
   scenario supplies them once and they thread through inbound → WS frame →
   fetch/receive resumes automatically. Set them when a handler branches on the
   per-connection identity (e.g. `browser.getReplay`, which needs both). A single
-  activation can override with `inbound({ correlationId })`. Un-supplied, they
+  activation can override with `inbound({ sagaId })`. Un-supplied, they
   are still pinned — prod always sets them — with the placeholders `"sim"`
   (tenant) and `""` (correlation id), and `request.session` is `null` unless
   injected, so the documented `session === null` branch is reachable offline.

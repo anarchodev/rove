@@ -2597,7 +2597,7 @@ pub fn Worker(comptime opts: Options) type {
             var matched = false;
             if (map_hit) |ent| {
                 if (server.reg.isInCollection(ent, &self.parked_continuations)) {
-                    // Verify the chain context matches the
+                    // Verify the saga context matches the
                     // claimed tenant. (Defense in depth: a stale
                     // entry could conceivably point at a recycled
                     // entity from another tenant — gen check
@@ -4046,13 +4046,13 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     try testing.expectEqual(@as(u64, 42), buffered.deployment_id);
     try testing.expectEqual(log_mod.Outcome.ok, buffered.outcome);
     // The tape fields make the round-trip.
-    try testing.expectEqualStrings("test-correlation-id", buffered.correlation_id);
+    try testing.expectEqualStrings("test-correlation-id", buffered.saga_id);
     try testing.expectEqual(log_mod.ActivationSource.inbound, buffered.activation);
     // raft_seq round-trips through the buffer.
     try testing.expectEqual(@as(u64, 12345), buffered.raft_seq);
 }
 
-test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
+test "captureLog records saga_id + send_callback activation (Phase 1b)" {
     // Same fixture as the test above, asserting the tape fields
     // round-trip when the activation source is a §6.4 resume.
     const allocator = testing.allocator;
@@ -4116,7 +4116,7 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
 
     try testing.expectEqual(@as(usize, 1), fake.log.log_buffer.buffer.items.len);
     const buffered = &fake.log.log_buffer.buffer.items[0];
-    try testing.expectEqualStrings("chain-abc-123", buffered.correlation_id);
+    try testing.expectEqualStrings("chain-abc-123", buffered.saga_id);
     try testing.expectEqual(log_mod.ActivationSource.send_callback, buffered.activation);
 }
 

@@ -618,13 +618,13 @@ pub const DispatchState = struct {
     /// with no resolved plan (tests, async activations).
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
-    /// Gap 2.3: correlation_id of the chain this handler
+    /// Gap 2.3: saga_id of the chain this handler
     /// run belongs to. `http.fetch({pipe_to})` stamps it onto the
     /// `PendingFetch` so the upstream bytes can later be routed to
     /// the held stream entity carrying the matching
-    /// `ChainContext.correlation_id`. Empty on test paths / when
-    /// the dispatch carries no correlation_id.
-    correlation_id: []const u8 = "",
+    /// `ChainContext.saga_id`. Empty on test paths / when
+    /// the dispatch carries no saga_id.
+    saga_id: []const u8 = "",
     /// Admin-tenant platform-capability trampolines (deployStarter /
     /// releases.publish / scope().kv writes). Non-null only on admin-
     /// handler requests (gated by `platform != null` in

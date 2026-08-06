@@ -31,7 +31,7 @@
 //!
 //! `x-rove-correlation-id` is deliberately NOT reserved — it is the one
 //! intentionally customer-facing tracing header (read inbound to seed the
-//! chain correlation id). Note the `x-rove-internal-` prefix does not match
+//! saga id). Note the `x-rove-internal-` prefix does not match
 //! it, so it stays visible.
 //!
 //! Pre-launch reservation: claiming these prefixes now (before customers can

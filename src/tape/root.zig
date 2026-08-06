@@ -1647,7 +1647,7 @@ test "readset: serialize + parseReadset roundtrip with LogHeader" {
         .method = "POST",
         .path = "/api/echo",
         .host = "x.rewindjsapp.localhost",
-        .correlation_id = "corr-aa",
+        .saga_id = "corr-aa",
     };
     const bytes = try rs.serialize(testing.allocator, lh);
     defer testing.allocator.free(bytes);
@@ -1665,7 +1665,7 @@ test "readset: serialize + parseReadset roundtrip with LogHeader" {
     try testing.expectEqualStrings(lh.method, p_lh.method);
     try testing.expectEqualStrings(lh.path, p_lh.path);
     try testing.expectEqualStrings(lh.host, p_lh.host);
-    try testing.expectEqualStrings(lh.correlation_id, p_lh.correlation_id);
+    try testing.expectEqualStrings(lh.saga_id, p_lh.saga_id);
 }
 
 test "readset: parseReadset rejects bad magic + bad version" {

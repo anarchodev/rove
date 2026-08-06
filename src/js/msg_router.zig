@@ -513,7 +513,7 @@ pub const MsgRouter = struct {
         module_path: []const u8,
         ctx_json: []const u8,
         fn_name: ?[]const u8,
-        correlation_id: ?[]const u8,
+        saga_id: ?[]const u8,
     ) !void {
         const allocator = self.allocator;
         const tid = try allocator.dupe(u8, tenant_id);
@@ -524,15 +524,15 @@ pub const MsgRouter = struct {
         errdefer allocator.free(ctx);
         const fn_dup: ?[]u8 = if (fn_name) |f| try allocator.dupe(u8, f) else null;
         errdefer if (fn_dup) |f| allocator.free(f);
-        const corr_dup: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
-        errdefer if (corr_dup) |c| allocator.free(c);
+        const saga_dup: ?[]u8 = if (saga_id) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (saga_dup) |c| allocator.free(c);
 
         const payload: effect_mod.msg.SendCallback = .{
             .tenant_id = tid,
             .module_path = mod,
             .ctx_json = ctx,
             .fn_name = fn_dup,
-            .correlation_id = corr_dup,
+            .saga_id = saga_dup,
         };
         try self.enqueueMsgForTenant(tenant_id, .{ .send_callback = payload });
     }

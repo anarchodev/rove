@@ -582,7 +582,7 @@ pub fn captureLog(
     console_owned: []u8,
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
-    correlation_id: ?[]const u8,
+    saga_id: ?[]const u8,
     /// User-defined index tags (`request.tag`). BORROWED — duped into
     /// the record here, caller keeps ownership (freed when its
     /// Response/Continuation deinits). Pass `&.{}` on paths with no
@@ -609,7 +609,7 @@ pub fn captureLog(
         console_owned,
         exception_owned,
         tapes,
-        correlation_id,
+        saga_id,
         tags,
         activation,
         raft_seq,
@@ -637,7 +637,7 @@ pub fn captureLogWithId(
     console_owned: []u8,
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
-    correlation_id: ?[]const u8,
+    saga_id: ?[]const u8,
     tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
     raft_seq: u64,
@@ -657,7 +657,7 @@ pub fn captureLogWithId(
         console_owned,
         exception_owned,
         tapes,
-        correlation_id,
+        saga_id,
         tags,
         activation,
         raft_seq,
@@ -685,7 +685,7 @@ fn captureLogInner(
     console_owned: []u8,
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
-    correlation_id: ?[]const u8,
+    saga_id: ?[]const u8,
     tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
     raft_seq: u64,
@@ -704,11 +704,11 @@ fn captureLogInner(
     errdefer allocator.free(a_path);
     const a_host = try allocator.dupe(u8, host);
     errdefer allocator.free(a_host);
-    const a_corr: []const u8 = if (correlation_id) |c|
+    const a_saga: []const u8 = if (saga_id) |c|
         if (c.len > 0) try allocator.dupe(u8, c) else ""
     else
         "";
-    errdefer if (a_corr.len > 0) allocator.free(a_corr);
+    errdefer if (a_saga.len > 0) allocator.free(a_saga);
 
     const a_tags = try dupeTags(allocator, tags);
     errdefer freeTags(allocator, a_tags);
@@ -767,7 +767,7 @@ fn captureLogInner(
         .console = console_owned,
         .exception = exception_owned,
         .tapes = tapes,
-        .correlation_id = a_corr,
+        .saga_id = a_saga,
         .tags = a_tags,
         .activation = activation,
         .raft_seq = raft_seq,
