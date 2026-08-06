@@ -174,12 +174,21 @@ def main() -> int:
         check("deployed __auth__ (IdP) + web/admin (RP)", True)
 
         # RP config + operator allowlist (the move-secret v2-kv seam).
-        c.admin_kv_put("__admin__", "_oidc/rp/default", json.dumps({
+        c.admin_kv_put("__admin__", "_oidc/rp/default", retry_s=20.0, value=json.dumps({
             "issuer": auth_base, "client_id": "admin-dashboard",
             "redirect_uri": app_origin + "/_rp/callback",
             "post_login": "/", "operator_prefix": "_admin/operator/",
         }, separators=(",", ":")))
-        c.admin_kv_put("__admin__", "_admin/operator/" + sha256_hex(OPERATOR), "")
+        _op_key = "_admin/operator/" + sha256_hex(OPERATOR)
+        _seed = c.admin_kv_put("__admin__", _op_key, "", retry_s=20.0)
+        # The operator allowlist is a PRECONDITION for every is_root check
+        # below, and the readiness probes further down do not observe it (they
+        # gate on the RP config, a different key). A refused write used to be
+        # discarded here, so the run continued and `is_root` came back false —
+        # seven checks failing with 403s that read like an authorization bug
+        # rather than a missing seed (rove#438).
+        check("seeded the operator allowlist", _seed.status in (200, 204),
+              "" if _seed.status in (200, 204) else f"got {_seed.status} {_seed.body!r}")
 
         # Readiness (over TLS): RP /_rp/login → 302, IdP /login → 200.
         r = None
