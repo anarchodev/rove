@@ -423,6 +423,14 @@ function buildResolution(sk, b, done) {
   return res;
 }
 
+// Relay the control plane's answer verbatim — status included. A control op's
+// STATUS is its result (204 placed, 409 name taken, 4xx refused), so collapsing
+// it to 200 would make every outcome read as success to the caller.
+export function onCpRelay() {
+  response.status = request.status || 502;
+  return request.text || "";
+}
+
 export function onCut() {
   response.status = 200;
   return JSON.stringify(request.ctx); // { ok, dep_id }
@@ -448,5 +456,27 @@ export default function () {
   if (p === "/v1/deploy/file") return wsFile(b);
   if (p === "/v1/deploy/pkgfile") return wsPkgFile(b);
   if (p === "/v1/deploy/cut") return wsCut(b);
+  // Control-plane relay (rove#414). The operator CLI drives provision / move /
+  // delete / host / plan through this chokepoint rather than by holding the
+  // move-secret on a shell, and doing so makes the action an ordinary
+  // `__admin__` activation — logged, taped, replayable. The deployed dashboard
+  // has the same route; the BAKED app needs it too, or the CLI's primary verb
+  // is unusable on every cluster that has not published the dashboard yet —
+  // which includes every freshly-genesis'd one, since genesis itself ends here.
+  //
+  // The worker opens `rewind-cp.internal` only for `__admin__` and attaches the
+  // move-secret itself, so nothing secret passes through this handler. The
+  // root-token gate above is the authority check.
+  if (p.indexOf("/v1/cp/") === 0) {
+    const op = p.slice("/v1/cp/".length);
+    if (!op || op.indexOf("/") !== -1) return jerr(404, "unknown cp op");
+    after.fetch("http://rewind-cp.internal/_control/" + op, {
+      method: "POST",
+      body: JSON.stringify(b === undefined ? {} : b),
+      headers: { "content-type": "application/json" },
+      on: "onCpRelay",
+    });
+    return next();
+  }
   return jerr(404, "unknown deploy route");
 }

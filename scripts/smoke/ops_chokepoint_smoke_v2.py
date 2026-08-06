@@ -17,9 +17,12 @@ Two properties, and the security one is the interesting half:
      ordinary `__admin__` activation, so `/v1/cp/provision` shows up in the
      tenant's log.
 
-Needs the real dashboard on `__admin__`: the BAKED genesis app has no `/v1/cp/`
-route, which is exactly why the CLI fails loud (rather than falling back) when
-the route is missing. That case is asserted too.
+Both the BAKED genesis app and the deployed dashboard carry the `/v1/cp/:op`
+relay, and the smoke asserts BOTH — because the baked one is what a cluster runs
+between genesis and its first dashboard publish, and without it the CLI's
+primary verb would be unusable exactly then. (It was: routing the CLI through
+the chokepoint before the baked app had the route broke `rewind-ops provision`
+on every baked-app cluster, which is how this check earned its place.)
 
 Needs S3 env: `set -a; . ./.env; set +a` first, and a rewind-apps checkout.
 """
@@ -78,13 +81,15 @@ def main() -> int:
         c.spawn_log_server()
         c._ensure_admin_app()
 
-        print("step 1: the BAKED app has no /v1/cp/ route — the CLI must fail LOUD")
-        r = run_ops(c, "provision", TENANT + "-early")
-        check("provision through a chokepoint-less admin app fails", r.returncode != 0,
-              f"rc={r.returncode}")
-        check("...and names the way out (--direct / deploy the dashboard)",
-              "--direct" in (r.stdout + r.stderr) and "/v1/cp/" in (r.stdout + r.stderr),
-              repr((r.stdout + r.stderr)[-300:]))
+        print("step 1: the BAKED app relays the chokepoint — a freshly-genesis'd\n"
+              "      cluster can provision before any dashboard exists")
+        r = run_ops(c, "provision", TENANT + "-baked")
+        out0 = r.stdout + r.stderr
+        check("provision through the BAKED app succeeded", r.returncode == 0,
+              "" if r.returncode == 0 else repr(out0[-400:]))
+        check("...and reported the placement",
+              "provisioned" in out0 or "already placed" in out0,
+              "" if ("provisioned" in out0 or "already placed" in out0) else repr(out0[-300:]))
 
         print("step 2: deploy the real dashboard, which carries the chokepoint")
         try:
