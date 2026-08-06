@@ -145,6 +145,10 @@ test {
     _ = reserved;
     _ = session;
     _ = deployment_loader;
+    // `worker.zig` reaches worker_ws only through generic (`anytype`)
+    // call sites, which a test build never instantiates — so its tests
+    // are collected only if the file is named here.
+    _ = @import("worker_ws.zig");
     _ = @import("worker_inbound_chunk.zig");
     _ = @import("worker_upload_walker.zig");
     _ = @import("log_walker.zig");

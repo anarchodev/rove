@@ -1308,7 +1308,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
 
     if (ctx.wrote) {
         // status=0: parked-hop convention (matches repark).
-        const lh = worker_streaming.fireLogHeader(ctx.request_id, ctx.deployment_id, 0, ctx.activation, ctx.cont_path, ctx.correlation_id, ctx.now_ns);
+        const lh = worker_streaming.fireLogHeader(ctx.request_id, ctx.deployment_id, 0, ctx.activation, "POST", ctx.cont_path, "", ctx.correlation_id, ctx.now_ns);
         const stream_seq = proposeAndParkContResume(
             worker,
             ctx.ent,
@@ -1681,7 +1681,7 @@ fn finishContResume(
                 const exception_owned = r.exception;
                 r.console = &.{};
                 r.exception = &.{};
-                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, st, ctx.act, ctx.cont_path, ctx.correlation_id, ctx.now_ns);
+                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, st, ctx.act, "POST", ctx.cont_path, "", ctx.correlation_id, ctx.now_ns);
                 // Tapes before the propose so the input channels (ctx/Msg on
                 // trigger_payload, fetch event on fetch_responses) ride the raft
                 // readset for the promotion walker
@@ -1840,7 +1840,7 @@ fn finishContResume(
                 }
                 // status=0: the parked-hop convention (same shape as the
                 // inbound trampoline open hop) so replay surfaces it.
-                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, 0, ctx.act, ctx.cont_path, ctx.correlation_id, ctx.now_ns);
+                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, 0, ctx.act, "POST", ctx.cont_path, "", ctx.correlation_id, ctx.now_ns);
                 // Tapes before the propose — input channels ride the raft
                 // readset for the promotion walker (see the terminal arm above).
                 const tapes = contTapes(worker, spec.tape, &ctx);

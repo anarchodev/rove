@@ -34,11 +34,38 @@ pub const ChainContext = struct {
     /// uninitialized; deployments use the full u64 space so zero
     /// would never be a real value on a populated entity.
     deployment_id: u64 = 0,
+    /// The request line that OPENED this chain — what a client
+    /// addressed to start it, as opposed to what any one activation
+    /// dispatched to. Allocator-owned; empty = not captured.
+    ///
+    /// A resume activation has no request of its own, so its log
+    /// record would otherwise describe the dispatch target (the
+    /// module) in fields that mean "request identity" everywhere
+    /// else. That reads fine per-activation and breaks the moment
+    /// activations are rolled up into a saga, which then cannot say
+    /// what it *is*: a held connection reported `POST index` rather
+    /// than the endpoint the client opened.
+    ///
+    /// Named to match `log_sagas.root_*`, which these feed — the saga
+    /// roll-up's root columns are exactly this, carried forward from
+    /// whichever activation is earliest.
+    ///
+    /// Captured on the chain rather than read live at log time: a
+    /// `disconnect` activation runs from the seam sweep AFTER stream
+    /// close, so the transport's routing state can already be gone by
+    /// the time the saga's last record — the one that closes it — is
+    /// written.
+    root_method: []u8 = &.{},
+    root_host: []u8 = &.{},
+    root_path: []u8 = &.{},
 
     pub fn deinit(allocator: std.mem.Allocator, items: []ChainContext) void {
         for (items) |*item| {
             if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
             if (item.correlation_id) |c| allocator.free(c);
+            if (item.root_method.len > 0) allocator.free(item.root_method);
+            if (item.root_host.len > 0) allocator.free(item.root_host);
+            if (item.root_path.len > 0) allocator.free(item.root_path);
             item.* = .{};
         }
     }
@@ -739,11 +766,32 @@ test "ChainContext deinit frees populated entry" {
         .tenant_id = try testing.allocator.dupe(u8, "acme"),
         .correlation_id = try testing.allocator.dupe(u8, "0000000000000001"),
         .deployment_id = 12345,
+        // The chain's opening request line is owned too; the testing
+        // allocator fails this test if deinit forgets any of the three.
+        .root_method = try testing.allocator.dupe(u8, "GET"),
+        .root_host = try testing.allocator.dupe(u8, "app.example.com"),
+        .root_path = try testing.allocator.dupe(u8, "/live"),
     }};
     ChainContext.deinit(testing.allocator, &items);
     try testing.expectEqualStrings("", items[0].tenant_id);
     try testing.expectEqual(@as(?[]u8, null), items[0].correlation_id);
     try testing.expectEqual(@as(u64, 0), items[0].deployment_id);
+    try testing.expectEqualStrings("", items[0].root_method);
+    try testing.expectEqualStrings("", items[0].root_host);
+    try testing.expectEqualStrings("", items[0].root_path);
+}
+
+test "ChainContext deinit tolerates a partially-captured request line" {
+    // `root_*` are populated together at chain establish, but each is
+    // freed on its own `len > 0` guard — a chain that carries none of
+    // them (every non-WS chain today) must not free a zero-length
+    // slice it never owned.
+    var items = [_]ChainContext{.{
+        .tenant_id = try testing.allocator.dupe(u8, "acme"),
+        .root_path = try testing.allocator.dupe(u8, "/only-path"),
+    }};
+    ChainContext.deinit(testing.allocator, &items);
+    try testing.expectEqualStrings("", items[0].root_path);
 }
 
 test "ContDescriptor default-init is benign + deinit is no-op" {
