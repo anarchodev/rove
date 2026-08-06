@@ -594,7 +594,10 @@ const EPILOGUE_BODY =
     \\  // under `__rove_store/` for per-store isolation and push their OWN clean
     \\  // store-tagged effect entries, so the wrapper neither records nor surfaces
     \\  // those namespaced keys — a tenant read / prefix scan must never see them.
-    \\  const __NS = "__rove_store/";
+    \\  // From the shared shim, not re-spelled here: the browser arena's epilogue
+    \\  // reads the same global, so the two offline engines cannot disagree about
+    \\  // which keys are harness bookkeeping (rove#442).
+    \\  const __NS = globalThis.__roveStorePrefix;
     \\  // Prod kv guardrails (globals.zig / reserved.zig) enforced offline so a
     \\  // handler that throws instantly in prod also throws under `rewind test`,
     \\  // with the same error shapes (`err.code` branches are testable). The
