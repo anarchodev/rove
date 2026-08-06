@@ -285,15 +285,25 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
     var txn = inst.kv.beginTrackedImmediate() catch return 500;
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    txn.put(key, value) catch {
+    // `Conflict` is single-writer CONTENTION, not a failure: the store's lease
+    // is held by another dispatch right now (`kvstore.ensureOpen` — the same
+    // condition the dispatcher answers by skipping the tick and re-anchoring).
+    // It clears on its own, so it has to reach the caller as a RETRYABLE 503;
+    // collapsing it into 500 told every caller "permanent, do not retry".
+    //
+    // That mattered: seeding `__admin__`'s kv right after a deploy contends
+    // with the deployment-load dispatch, so `POST /_system/v2-kv` returned
+    // `500 write failed` for ~40% of runs. Callers that discard the status then
+    // continued against a key that was never written (rove#438).
+    txn.put(key, value) catch |err| {
         txn.rollback() catch {};
-        return 500;
+        return if (err == error.Conflict) 503 else 500;
     };
     ws.addPut(key, value) catch {
         txn.rollback() catch {};
         return 500;
     };
-    txn.commit() catch return 500;
+    txn.commit() catch |err| return if (err == error.Conflict) 503 else 500;
 
     const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch return 503;
     // The txn committed BEFORE the propose (immediate-commit path): its

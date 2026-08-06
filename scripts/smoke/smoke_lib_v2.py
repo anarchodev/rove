@@ -1121,19 +1121,44 @@ class V2Cluster:
             headers={"X-Rewind-Move-Secret": MOVE_SECRET})
 
     def admin_kv_put(self, tenant: str, key: str, value: str, *,
-                     node: int = 0) -> HttpResponse:
+                     node: int = 0, retry_s: float = 0.0) -> HttpResponse:
         """Write a tenant KV key via the worker's `/_system/v2-kv` (move-secret
         gated, same surface `three_node_smoke` seeds through). The PUT goes
         through the addressed node's leader propose→commit path, so target the
         leader node (a follower 503s). Symmetric to `admin_kv_get` — together
         they assert replication/durability across moves + failovers without
-        needing the deployment-load path."""
-        import json
-        return _curl(
-            f"{self.node_url(node)}/_system/v2-kv", method="PUT",
-            headers={"X-Rewind-Move-Secret": MOVE_SECRET,
-                     "Content-Type": "application/json"},
-            data=json.dumps({"tenant": tenant, "key": key, "value": value}))
+        needing the deployment-load path.
+
+        `retry_s > 0` retries the RETRYABLE refusals for that long, rotating
+        nodes: `421` (not leader here) and `503` (single-writer contention, or a
+        propose still settling). Use it when the write is a PRECONDITION and the
+        caller would otherwise discard the status — a dropped seed surfaces far
+        away as a wrong ANSWER rather than an error. That was rove#438: seeding
+        `__admin__`'s operator allowlist right after a deploy contends with the
+        deployment-load dispatch, the smoke ignored the refusal, and the login
+        under test then computed `is_root: false`, failing seven downstream
+        checks with 403s that read like an authorization bug.
+
+        Default 0 keeps the immediate-return behaviour, because the failover /
+        transfer smokes drive their OWN leader-re-resolution loops through
+        deliberately leaderless windows — a helper that blocked in there would
+        fight them.
+        """
+        import json, time as _t
+        n = max(1, len(self.node_ports))
+        deadline = _t.time() + retry_s
+        attempt = 0
+        while True:
+            i = (node + attempt) % n
+            r = _curl(
+                f"{self.node_url(i)}/_system/v2-kv", method="PUT",
+                headers={"X-Rewind-Move-Secret": MOVE_SECRET,
+                         "Content-Type": "application/json"},
+                data=json.dumps({"tenant": tenant, "key": key, "value": value}))
+            if r.status not in (421, 503, 0) or _t.time() >= deadline:
+                return r
+            attempt += 1
+            _t.sleep(0.3)
 
     def set_plan(self, tenant: str, plan_blob: str, *, node: int = 0) -> HttpResponse:
         """Install a tenant's resolved plan limits on its hot-path slot via the
