@@ -220,6 +220,24 @@ pub const PendingFetch = struct {
     /// COMPUTED at the handler-success seam (only `connection_scoped`
     /// on.fetch binds), not a JS keyword.
     bind: bool = false,
+    /// This PUT carries one part of a data export, so it stores into the
+    /// tenant's `exports/` pool instead of `app-blobs/` and is NOT metered
+    /// against `max_stored_bytes` (rove#429).
+    ///
+    /// A FLAG rather than a distinct door URL, and that is the whole security
+    /// argument: the blob door is reachable by ordinary customer JS (which is
+    /// why #367 exists), so an `exports/`-selecting URL would be an
+    /// unmetered-storage hole any handler could name. This field is written in
+    /// exactly one place — the engine's own export-Cmd rewrite
+    /// (`Worker.rewriteKvExport`) — and no JS option maps to it, the same
+    /// posture that makes `tenant_id` and `bind` unforgeable.
+    ///
+    /// Unmetered because the tenant did not choose to write these bytes and
+    /// cannot delete them selectively; charging them makes a tenant at its cap
+    /// unable to export, which lands on exactly the customer most likely to be
+    /// leaving (`docs/strategy/pricing-model.md` — axis 3 is customer-chosen
+    /// storage).
+    export_part: bool = false,
     /// The CAS→connection relay (`docs/architecture/routing-and-ingress.md`):
     /// when true AND the fetch is a bound streaming read of a
     /// content-addressed door (`rove-static.internal`, or a
@@ -1129,7 +1147,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{
         .path = &.{ "_system", "blob" },
         .fns = &.{
-            .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
+            .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 4 },
             // Upload sessions (`docs/architecture/routing-and-ingress.md`, customer blob storage).
             .{ .name = "write", .cfunc = blob_b.jsBlobWrite, .argc = 1 },
             .{ .name = "seal", .cfunc = blob_b.jsBlobSeal, .argc = 2 },

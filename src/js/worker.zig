@@ -2904,6 +2904,13 @@ pub fn Worker(comptime opts: Options) type {
             pf.body = rw.body; // ownership moves to the fetch
             a.free(pf.ctx_json);
             pf.ctx_json = rw.ctx_json; // ownership moves to the fetch
+            // THE one writer of this flag (rove#429): it sends the part to the
+            // tenant's unmetered `exports/` pool instead of `app-blobs/`, so a
+            // tenant at its storage cap can still take its data out — the
+            // customer most likely to be exporting is the one most likely to
+            // be at the cap. No JS option maps to it, so the unmetered pool is
+            // reachable only through this rewrite.
+            pf.export_part = true;
             return true;
         }
 
@@ -3482,6 +3489,14 @@ pub fn getOrOpenTenantSlot(
 pub fn refuseIfOverStorageQuotaFor(worker: anytype, pf: globals.PendingFetch) bool {
     if (!std.mem.startsWith(u8, pf.url, fetch_engine_mod.BLOB_ORIGIN_PREFIX)) return false;
     if (!std.mem.eql(u8, pf.method, "PUT")) return false;
+    // An export part is never refused (rove#429). It stores into the unmetered
+    // `exports/` pool, so it cannot carry the tenant past a quota it is not
+    // counted in — and refusing here would deny data exactly to the tenant at
+    // its cap, which is the one the export exists for. Reads were already
+    // exempt for the same reason ("a tenant at their ceiling can still export
+    // their way out"); this closes the half of that promise the write path
+    // was breaking.
+    if (pf.export_part) return false;
     const refusal = storageCapRefusal(worker, pf.tenant_id, pf.body.len) orelse return false;
 
     std.log.warn(

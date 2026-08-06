@@ -47,6 +47,25 @@ export default function () {
     ok(url.includes("text%2Fplain") || url.includes("text/plain"), "signed content-type present");
   });
 
+  check("blob.exportUrl", () => {
+    throws(() => blob.exportUrl("nope"), /hash must be 64 lowercase hex chars/);
+    throws(() => blob.exportUrl(SHA_HELLO, { ttl: 0 }), /ttl must be 1\.\.604800/);
+    // The whole point of the verb: the SAME hash signs into `exports/`
+    // rather than `app-blobs/`, because export parts live in the unmetered
+    // pool (rove#429) and `blob.url` would sign a path that 404s.
+    const url = blob.exportUrl(SHA_HELLO, { ttl: 300 });
+    ok(url.startsWith("https://s3.test.example/surface-bucket/sfx/surface/exports/" + SHA_HELLO),
+      "export-pool path, got " + url);
+    ok(!url.includes("/app-blobs/"), "must not sign the metered pool");
+    // Still the tenant's OWN prefix — a separate pool is not a separate
+    // confinement boundary.
+    ok(url.includes("/sfx/surface/"), "tenant-prefixed, got " + url);
+    for (const param of ["X-Amz-Algorithm=AWS4-HMAC-SHA256", "X-Amz-Expires=300",
+                         "X-Amz-Signature=", "X-Amz-Date="]) {
+      ok(url.includes(param), "presigned URL carries " + param);
+    }
+  });
+
   check("blob.write", () => {
     throws(() => blob.write(42), /bytes must be a string or Uint8Array/);
     // The recipe substrate: appends are kv rows + a sha256 midstate —

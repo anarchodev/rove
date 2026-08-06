@@ -44,6 +44,17 @@
 // has definitively failed, so a live attempt is never duplicated.
 const WATCHDOG_MS = 60_000;
 
+// Consecutive failures on the SAME part before the export gives up (rove#429).
+//
+// Retrying is right for a transient upload failure and wrong for a permanent
+// one: without a bound, a part that can never land re-fires every WATCHDOG_MS
+// forever, and the customer sees an export stuck at "running" with no reason —
+// which is exactly how the storage-quota refusal presented before the export
+// pool made it unmetered. Counted per part (reset on progress) rather than per
+// export, so a long export is not failed by unrelated blips accumulated across
+// hundreds of successful parts.
+const MAX_PART_ATTEMPTS = 5;
+
 // Durable-scheduler arm/cancel, inlined over the ambient `kv`/`crypto`: a
 // baked `__system/*` module runs post-harden and cannot reach the private
 // `_system.sched` closure. Writes the exact `_sched/` rows
@@ -124,7 +135,26 @@ export default function () {
         // The terminal status rides the ACTIVATION (`a.status`), the same
         // place `webhook_onresult` reads its result from.
         const ok = a.status >= 200 && a.status < 300;
+        if (!ok) {
+            // Bound the retry. The cursor deliberately does not advance (the
+            // watchdog re-issues the same part, reproducing the same bytes
+            // under the same hash), so without this the job re-fires forever
+            // on a permanent failure and never reports one.
+            st.attempts = (st.attempts || 0) + 1;
+            if (st.attempts >= MAX_PART_ATTEMPTS) {
+                st.state = "failed";
+                st.error = "part upload failed with status " + a.status +
+                    " after " + st.attempts + " attempts";
+                st.finished_at = Date.now();
+                kv.set(key, JSON.stringify(st));
+                schedCancel(crypto.sha256b64url(key));
+                return { status: 200 };
+            }
+        }
         if (ok) {
+            // Progress resets the budget: attempts bound consecutive failures
+            // on one part, not lifetime failures across the whole walk.
+            st.attempts = 0;
             st.parts = st.parts || [];
             // Idempotent on the hash: at-least-once firing can re-issue a
             // part, and the re-issue produces the identical object.

@@ -771,7 +771,13 @@ pub const FetchEngine = struct {
                     get_hash = gb;
                 }
             }
-            if (method == .PUT) {
+            // An export part stores into `exports/` and is deliberately NOT
+            // accounted: `stored_hash` stays null, so no usage row is written
+            // and the bytes never enter the `max_stored_bytes` sum (rove#429).
+            // `pf.export_part` is engine-set at the export-Cmd rewrite and has
+            // no JS spelling, so this cannot be used to smuggle unmetered
+            // bytes into the pool.
+            if (method == .PUT and !pf.export_part) {
                 const tail = pf.url[BLOB_ORIGIN_PREFIX.len..];
                 if (isSha256HexLower(tail)) {
                     var hb: [64]u8 = undefined;
@@ -1013,7 +1019,7 @@ pub const FetchEngine = struct {
         // objects, or nothing at all.
         const storage = try self.node.tenant.storageOf(self.allocator, pf.tenant_id);
         defer storage.incarnation.free(self.allocator);
-        const path = try storage.s3ObjectPath(self.allocator, cfg.*, "app-blobs", hash);
+        const path = try storage.s3ObjectPath(self.allocator, cfg.*, blobSubdirFor(pf), hash);
         defer self.allocator.free(path);
 
         const scheme = if (cfg.use_tls) "https" else "http";
@@ -1026,6 +1032,16 @@ pub const FetchEngine = struct {
         pf.url = new_url;
 
         try self.signAndAttachS3(method_name, path, pf.body, headers_list);
+    }
+
+    /// Which per-tenant pool a blob-door transfer targets. `app-blobs/` for
+    /// everything a handler stores, `exports/` for the engine's own export
+    /// parts (rove#429) — the latter unmetered, and selected by an
+    /// engine-set flag rather than anything in the URL, so customer JS
+    /// cannot choose it. Both are in `tenant_mod.SUBDIRS`, so both are swept
+    /// at teardown.
+    fn blobSubdirFor(pf: *const PendingFetch) []const u8 {
+        return if (pf.export_part) "exports" else "app-blobs";
     }
 
     /// Own-tenant deploy-static READ door (`rove-static.internal`) — rewrite

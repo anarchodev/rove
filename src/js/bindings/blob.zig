@@ -36,9 +36,17 @@ const js_undefined = globals.js_undefined;
 const PRESIGN_DEFAULT_TTL_SECS: u32 = 300;
 const PRESIGN_MAX_TTL_SECS: u32 = 604_800;
 
-/// `_system.blob.presign(hash, ttl_secs?, content_type?)` → URL
+/// `_system.blob.presign(hash, ttl_secs?, content_type?, pool?)` → URL
 /// string. Presigned GET against the calling tenant's
-/// `{key_prefix_base}{instance_id}/app-blobs/{hash}` key.
+/// `{key_prefix_base}{instance_id}/{pool}/{hash}` key, where `pool` is
+/// `app-blobs` (default) or `exports` — the unmetered pool the data-export
+/// job writes its parts into (rove#429), whose download links would
+/// otherwise have nothing to sign them.
+///
+/// The pool is a closed set resolved here, never a caller-supplied path
+/// fragment, so no argument can escape the tenant's own prefix. Both pools
+/// hold only this tenant's bytes (the prefix comes from `state.storage`), so
+/// naming either is not an escalation — a hash that isn't there simply 404s.
 pub fn jsBlobPresign(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -82,6 +90,23 @@ pub fn jsBlobPresign(
         content_type = @as([*]const u8, @ptrCast(ct_c))[0..ct_len];
     }
 
+    // Pool selector — matched against a fixed set, so the argument selects
+    // among known subdirs and never becomes one.
+    var subdir: []const u8 = "app-blobs";
+    if (argc >= 4 and c.JS_IsString(argv[3])) {
+        var pool_len: usize = 0;
+        const pool_c = c.JS_ToCStringLen(ctx, &pool_len, argv[3]);
+        if (pool_c == null) return js_exception;
+        defer c.JS_FreeCString(ctx, pool_c);
+        const pool = @as([*]const u8, @ptrCast(pool_c))[0..pool_len];
+        if (std.mem.eql(u8, pool, "exports")) {
+            subdir = "exports";
+        } else if (!std.mem.eql(u8, pool, "app-blobs")) {
+            _ = c.JS_ThrowTypeError(ctx, "blob presign: unknown pool");
+            return js_exception;
+        }
+    }
+
     const cfg = state.blob_cfg orelse {
         _ = c.JS_ThrowTypeError(ctx, "blob.url: blob storage backend is not configured");
         return js_exception;
@@ -110,7 +135,7 @@ pub fn jsBlobPresign(
     // path's backend prefix cannot drift — a prefix that omitted the
     // incarnation once signed URLs for objects the write path never wrote,
     // and every customer presign 404'd (#357).
-    const path = storage.s3ObjectPath(a, cfg.*, "app-blobs", hash) catch {
+    const path = storage.s3ObjectPath(a, cfg.*, subdir, hash) catch {
         state.pending_kv_error = error.OutOfMemory;
         return js_exception;
     };

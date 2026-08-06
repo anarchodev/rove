@@ -500,3 +500,39 @@ test "kv export: a JSON line escapes structural bytes and control characters" {
     try testing.expectEqualStrings("k\"1", parsed.value.key);
     try testing.expectEqualStrings("a\nb\\c\x01", parsed.value.value);
 }
+
+test "kv export: the pool selector is engine-set, and defaults to the metered pool" {
+    // rove#429. Two halves of one invariant, asserted on the type rather than
+    // on a live transfer because the consequence is a QUOTA hole, not a
+    // behaviour bug: a fetch reaches the unmetered `exports/` pool only when
+    // the engine's own rewrite says so.
+    const globals = @import("globals.zig");
+
+    // Default is the metered pool. Everything a handler can build — every
+    // `blob.put`, every raw fetch at the blob door — takes this path, so the
+    // unmetered pool is unreachable unless something sets the flag.
+    const from_js: globals.PendingFetch = .{
+        .tenant_id = &.{},
+        .id = &.{},
+        .url = &.{},
+        .method = &.{},
+        .headers_json = &.{},
+        .body = &.{},
+        .timeout_ms = 0,
+        .on_chunk_module = &.{},
+        .ctx_json = &.{},
+        .stream = false,
+        .max_response_chunk_bytes = 0,
+        .max_total_response_bytes = 0,
+    };
+    try testing.expect(!from_js.export_part);
+
+    // The flag also has to survive being copied around: `PendingFetch` is
+    // passed by value through submit/rewrite/door paths, so a pool selector
+    // that lived anywhere but the struct itself (a side table keyed by fetch
+    // id, say) could desync from the fetch it describes.
+    var copied = from_js;
+    copied.export_part = true;
+    const moved = copied;
+    try testing.expect(moved.export_part);
+}

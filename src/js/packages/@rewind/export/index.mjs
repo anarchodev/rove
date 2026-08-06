@@ -27,9 +27,14 @@
 //
 // A SET of content-addressed parts plus the record above, never one object: a
 // write chain caps at 64 MiB while a tenant may hold a plan's whole
-// `max_kv_bytes`. `get(id).parts` is the manifest, in store order;
-// `blob.url(part.hash)` presigns each part, so the download links compose
-// from the primitive that already serves content-addressed bytes.
+// `max_kv_bytes`. `get(id).parts` is the manifest, in store order, and
+// `links(id)` presigns them.
+//
+// Parts land in the tenant's `exports/` pool, which is UNMETERED (rove#429):
+// charging an export against `max_stored_bytes` would deny it to a tenant at
+// its cap — the one most likely to be leaving, and the case #313's "always be
+// able to get their data out" is about. The pool is swept with the tenant at
+// teardown, so unmetered does not mean unbounded.
 
 import schedule from "@rewind/schedule";
 
@@ -51,7 +56,7 @@ function _key(id) {
  * // ...later, from another request
  * const st = get(id);
  * if (st.state === "done") {
- *   const links = st.parts.map((p) => blob.url(p.hash));
+ *   const urls = links(id);
  * }
  */
 export function start() {
@@ -77,9 +82,10 @@ export function start() {
  *
  * @param {string} id - The id {@link start} returned.
  * @returns {?object} `null` when there is no such export. Otherwise
- *   `{state, parts, bytes, entries, ...}`, where `state` is `"running"` or
- *   `"done"` and `parts` is `[{hash, bytes, entries}]` in store order — the
- *   manifest. Pass each `hash` to `blob.url` for a download link.
+ *   `{state, parts, bytes, entries, ...}`, where `state` is `"running"`,
+ *   `"done"`, or `"failed"` (with `error` naming why), and `parts` is
+ *   `[{hash, bytes, entries}]` in store order — the manifest. {@link links}
+ *   turns those hashes into download URLs.
  */
 export function get(id) {
   if (typeof id !== "string" || id.length === 0) return null;
@@ -92,4 +98,32 @@ export function get(id) {
   }
 }
 
-export default { start, get };
+/**
+ * Download links for a finished export — one presigned URL per part, in
+ * store order. Concatenating the parts in this order reproduces the export
+ * exactly.
+ *
+ * @param {string} id - The id {@link start} returned.
+ * @param {object} [opts]
+ * @param {number} [opts.ttl] - Link validity in seconds (default 300,
+ *   max 604800 = 7 days).
+ * @returns {string[]} Empty when the export does not exist or has produced
+ *   no parts yet, so a caller can render progress without special-casing.
+ *
+ * @example
+ * const st = get(id);
+ * if (st.state === "done") {
+ *   response.headers = { "content-type": "application/json" };
+ *   return JSON.stringify({ parts: links(id) });
+ * }
+ */
+export function links(id, opts) {
+  const st = get(id);
+  if (st === null || !Array.isArray(st.parts)) return [];
+  // `blob.exportUrl`, not `blob.url`: parts live in the unmetered `exports/`
+  // pool rather than the tenant's own `app-blobs/` (rove#429), so that a
+  // tenant at its storage cap can still produce and fetch an export.
+  return st.parts.map((p) => blob.exportUrl(p.hash, opts));
+}
+
+export default { start, get, links };
