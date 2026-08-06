@@ -5817,6 +5817,67 @@ test "interaction digest: folds reads, writes and the response as they happen" {
     try testing.expect(rs.interaction_digest != rs3.interaction_digest); // different behaviour
 }
 
+test "interaction digest: a THROWN handler closes on its real 500, not (200, \"\")" {
+    // #459. The throw is captured into `pending.exception` while status stays
+    // 200 and body stays empty — the real 500 + `handler threw: …` body is
+    // composed downstream. Closing the digest on `pending` directly meant every
+    // failed request folded `(200, "")`: two handlers that failed DIFFERENTLY
+    // digested identically, and a replay that faithfully reproduced the 500
+    // computed a different hash and was reported as diverged.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Two handlers that read the same state and then fail in DIFFERENT ways.
+    const boom =
+        \\throw new Error("boom");
+    ;
+    const other =
+        \\throw new TypeError("a different failure");
+    ;
+
+    var rs_a = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs_a.deinit();
+    var resp_a = try runOne(&d, kv, boom, .{ .method = "GET", .path = "/", .trace = .{ .request_id = 1, .readset = &rs_a } });
+    defer resp_a.deinit(testing.allocator);
+    try testing.expect(resp_a.exception.len > 0);
+
+    var rs_b = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs_b.deinit();
+    var resp_b = try runOne(&d, kv, other, .{ .method = "GET", .path = "/", .trace = .{ .request_id = 2, .readset = &rs_b } });
+    defer resp_b.deinit(testing.allocator);
+    try testing.expect(resp_b.exception.len > 0);
+
+    // A failed run still closes its digest.
+    try testing.expect(rs_a.interaction_digest != 0);
+    // …and the two failures are DISTINGUISHABLE. This is the assertion that
+    // fails when the closing element is `(200, "")` for both.
+    try testing.expect(rs_a.interaction_digest != rs_b.interaction_digest);
+
+    // The same failure twice digests identically — the property a replay
+    // depends on, and the reason the fix must be deterministic rather than
+    // merely different.
+    var rs_c = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs_c.deinit();
+    var resp_c = try runOne(&d, kv, boom, .{ .method = "GET", .path = "/", .trace = .{ .request_id = 3, .readset = &rs_c } });
+    defer resp_c.deinit(testing.allocator);
+    try testing.expectEqual(rs_a.interaction_digest, rs_c.interaction_digest);
+
+    // A THROWN run digests differently from a SUCCEEDING one whose body is the
+    // thrown one's text — i.e. the status is folded too, not just the body.
+    var rs_d = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs_d.deinit();
+    var resp_d = try runOne(&d, kv, "return \"handler threw: Error: boom\\n\";", .{ .method = "GET", .path = "/", .trace = .{ .request_id = 4, .readset = &rs_d } });
+    defer resp_d.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp_d.exception);
+    try testing.expect(rs_a.interaction_digest != rs_d.interaction_digest);
+}
+
 test "interaction digest: the privileged surface moves it, and a same-response admin run is not mistaken for identical" {
     // #413. Before this, `platform.*` was invisible to the digest: two admin
     // runs that read DIFFERENT tenants' state, or published DIFFERENT
