@@ -33,6 +33,7 @@ const stream_mod = @import("bindings/stream.zig");
 const globals = @import("globals.zig");
 const router_mod = @import("router.zig");
 const respb = @import("response_builder.zig");
+const response_building = @import("response_building.zig");
 const auth = @import("auth.zig");
 const raft_propose = @import("raft_propose.zig");
 const v2_move = @import("v2_move.zig");
@@ -2511,6 +2512,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // replay shell uses to re-run the request up to the same
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
+            worker_mod.dropPartialDigest(&readset);
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
             processed += 1;
@@ -2772,9 +2774,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const exception_owned = resp.exception;
             resp.console = &.{};
             resp.exception = &.{};
-            const ex_body = std.fmt.allocPrint(allocator, "handler threw: {s}\n", .{exception_owned}) catch &.{};
-            defer if (ex_body.len > 0) allocator.free(ex_body);
-            const ex_body_slice: []const u8 = if (ex_body.len > 0) ex_body else "handler threw\n";
+            // The SAME formatter the dispatcher folds into the interaction
+            // digest's closing element. Shared so the bytes served and the
+            // bytes hashed cannot drift — a digest over a body one character
+            // off from the one shipped reports every faithful replay of this
+            // request as diverged.
+            const ex_body_slice = response_building.thrownBody(allocator, exception_owned);
+            defer if (response_building.thrownBodyOwned(ex_body_slice)) allocator.free(ex_body_slice);
             try respb.setSimpleResponse(server, ent, sid, sess, 500, ex_body_slice, allocator);
             // Preserve the tape prefix the handler captured before
             // throwing. Replay can re-execute the handler with the
@@ -2800,7 +2806,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
             // Preserve whatever tapes the handler captured before
             // the kv error — lets replay reach the same failure
-            // point with the same prior reads.
+            // point with the same prior reads. The digest does not
+            // survive: this activation never reached its result.
+            worker_mod.dropPartialDigest(&readset);
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
             processed += 1;

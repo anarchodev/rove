@@ -142,11 +142,26 @@ pub const PlanLimits = struct {
 /// write path needs no sentinel special-case.
 pub const UNMETERED_BYTES: u64 = std.math.maxInt(u64);
 
-/// Every tier's `max_kv_bytes`. Uniform across tiers because a tenant's
-/// `app.db` is a single LMDB env opened at one baked map size
-/// (`src/kv/kvstore.zig`), so no tier can be sold more than this until that
-/// size is itself plan-derived. The tier table may not name a larger figure
-/// than the map it would have to fit in.
+/// Every tier's `max_kv_bytes` — a uniform placeholder until the tier figures
+/// are a product call, NOT a limit the engine imposes.
+///
+/// What the engine constrains is a per-NODE total, not a per-tenant file:
+/// every tenant's KV is a sibling store inside the one node-wide `cluster.kv`
+/// env (`src/tenant/root.zig` attaches it; there is no per-instance `app.db`
+/// in production). That total is deliberately OVER-SUBSCRIBED — the map is
+/// sparse address space, so sizing it to `tenants × cap` would reserve for a
+/// simultaneous worst case that never arrives, and would cap the tenant count
+/// far below what the hardware carries. Three things make that safe, and they
+/// are the reason this cap exists at all: a single tenant's growth is bounded
+/// and attributable (it meets its own 507, never the node's cliff), real usage
+/// is metered per tenant (`kv_store_used_bytes`), and a node approaching its
+/// drive sheds tenants with the zero-downtime move
+/// (`docs/architecture/control-plane.md`) instead of having pre-reserved for
+/// them.
+///
+/// So selling more KV per tenant is a capacity + pricing decision, not blocked
+/// engine work. `CLUSTER_MAP_SIZE` (`src/kv/kvstore.zig`) carries the one hard
+/// bound: the map stays under free disk.
 pub const KV_BYTES_CEILING: u64 = 1 * 1024 * 1024 * 1024;
 
 /// Every tier's `max_receive_bytes` until the tier figures are set. 1 GiB

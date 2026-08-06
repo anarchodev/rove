@@ -8,8 +8,10 @@
 > for and why" that sits upstream of that one. It **revises** the
 > retention lever of the plan-tiers enforcement (`architecture/control-plane.md`) (§Lever 3) from a time-window clamp
 > to a capacity ring with a derived time floor — see §7 for the
-> reconciliation. Nothing here is built; the load-bearing unmeasured
-> assumption is the per-record deflate ratio (§8).
+> reconciliation. Axis 1 (§2) is now built — measured, plan-derived, and
+> enforced — while axes 2 and 3 remain proposals; the load-bearing
+> unmeasured assumption is the per-record deflate ratio (§8), and §9 is
+> the break-even arithmetic those tier numbers get chosen against.
 
 ## 1. The principle — price the scarce resources, guard the rest
 
@@ -62,22 +64,40 @@ axis.
   asymmetry vs. axis 2: meter all three, bill elastically only on the
   elastic one.
 
-- **Nothing measures this today.** An earlier draft claimed the snapshot
-  manifest already computes a per-tenant `db_size`; it does not, and no
-  per-tenant KV size figure exists anywhere in the tree. The measurement
-  is a real (small) build: kvexp gives each store its own LMDB DBI, so
-  the durable size is a stat on that DBI —
-  `(branch + leaf + overflow pages) × page_size` — which is O(1)-ish and
-  respects the no-`O(N_tenants)`-on-dispatch rule.
+- **Measured and enforced as of #296/#298.** The durable size is an
+  O(1)-ish stat on the store's own LMDB DBI —
+  `(branch + leaf + overflow pages) × page_size`, plus committed-overlay
+  bytes — cached with a short TTL and exposed per tenant as
+  `kv_store_used_bytes`. Enforcement is batch-level (checked after the
+  handler walk, before the propose), because a live size check *inside* a
+  handler would be an untaped replay input. Over the cap a write batch is
+  refused with a non-retriable **507** naming used/cap; reads and deletes
+  keep working, so the recovery path is never blocked.
 
-- **A hard ceiling already exists, as a cliff.** Every tenant's `app.db`
-  is its own LMDB environment opened at `STANDALONE_MAP_SIZE` = 1 GiB, so
-  tenants already hit `MDB_MAP_FULL` today: an unattributed write
-  failure, at a number no tier mentions, with no warning. Axis 1 is
-  therefore not "add a cap" but "make the existing cliff explicit,
-  plan-derived, and graceful" — and **no tier can sell more than 1 GiB of
-  KV until that constant becomes plan-derived or is raised above the
-  highest sellable tier.**
+- **The cliff was real, and node-wide rather than per-tenant.** In
+  production every tenant's KV is a sibling store inside the one node-wide
+  `cluster.kv` env, not a per-tenant `app.db` file (an earlier draft of
+  this section said otherwise, and so did the code comment it was taken
+  from). So the ceiling to respect is a per-NODE total against
+  `CLUSTER_MAP_SIZE`, and axis 1 is "make that cliff explicit,
+  plan-derived, and graceful" — which is what shipped: a runaway tenant
+  now meets its own attributable 507 instead of LMDB's unattributed
+  `MDB_MAP_FULL`.
+
+  **That total is deliberately over-subscribed, and no tier is capped by
+  it.** Sizing the map to `tenants × cap` would reserve for a
+  simultaneous worst case that never arrives. What makes oversubscription
+  safe is the trio above plus the relief valve: usage is metered per
+  tenant, any one tenant is bounded attributably, and a node approaching
+  its drive sheds tenants with the zero-downtime move
+  (`architecture/control-plane.md`) rather than having pre-reserved for
+  them. The map is sparse address space — 64 GiB mapped against under a
+  megabyte resident in production — and LMDB accepts a larger size on a
+  later open, so raising it costs one restart and no migration. The one
+  hard bound is the node's drive: past free disk, `MDB_MAP_FULL` becomes
+  `ENOSPC`, which takes the raft WAL and log spool down instead of
+  refusing a single write. Selling a larger KV tier is therefore a
+  capacity + pricing decision, not blocked engine work.
 
 ## 3. Axis 2 — Replay-log storage as a capacity ring (not a time window)
 
@@ -538,8 +558,10 @@ flush seams, so neither adds hot-path work.
 - **Concrete tier rows.** `kv_max_bytes` / `stored_max_bytes` /
   `log_capacity_bytes` / `log_max_ingest_rate` per named tier — a product
   call, gated on the axis-1 and axis-3 measurements landing first so the
-  numbers are chosen against a real distribution. Note the 1 GiB LMDB
-  ceiling of §2 constrains what the top tier can offer on axis 1.
+  numbers are chosen against a real distribution. The shipped
+  `max_kv_bytes` is a uniform 1 GiB placeholder; per §2 that is not a
+  ceiling the engine imposes, so the axis-1 figure is chosen from expected
+  usage and blast radius rather than from `disk ÷ tenants`.
 - **Backend pricing.** COGS math elsewhere in this doc uses S3-standard
   rates; the live backend is OVHcloud US. Published list price as of
   2026-08-01 is **$0.0081/GB/month** standard and **$0.0203/GB/month**
@@ -553,3 +575,53 @@ flush seams, so neither adds hot-path work.
   `_pool/` batch objects (§3.2) is the one substantial new build this
   model requires — and it is scoped to bodies alone, not to the whole
   ring.
+
+## 9. Break-even — how many paying customers cover the platform
+
+Everything above prices *what* to sell. This section is the other
+direction: given a price, how many subscribers clear the floor. It is
+parameterised rather than tabulated-in-stone, because both inputs move.
+
+**The cost shape is unusual, and it is what makes the answer small.**
+Dedicated hardware, zero egress fees, and no per-request cloud billing
+mean there is **no meaningful marginal cost per paying customer** — a
+tenant that fits on an existing cluster is served by hardware already
+paid for. So this is not a per-unit-margin question at all; it is fixed
+cost divided by net revenue per subscriber.
+
+```
+  N  =  fixed_monthly  /  (price × (1 − payment_fee) − per_txn_fee)
+```
+
+- `fixed_monthly` = 3 × server + the small tail (domains, corporate
+  filings). Servers dominate by an order of magnitude; object storage is
+  rounding error at current volumes ($0.0081/GB/mo, §8) and egress is
+  free.
+- Payment fees are the only per-subscriber deduction: card processing
+  plus subscription billing, roughly 3.4% + $0.30 on the current
+  provider's published rates.
+
+At any plausible price point the answer lands in the **low tens of
+subscribers** — single digits at a $50+ price, a few dozen at $10.
+Substitute the real invoice line before this reaches a pricing page; §8
+records that the OVH API credential is expired, so we have list price
+rather than our bill.
+
+**Three properties of the curve matter more than its precision:**
+
+- **It is a step function, not a line.** Capacity scales by adding
+  *clusters*, not nodes — every tenant's raft group spans all three nodes
+  of its cluster, so growth is free until a cluster fills and then costs
+  three servers at once. Each step re-runs the same division. Knowing
+  where the next step falls is a capacity-telemetry question, which is
+  why the size + growth-rate alerting is a pricing input and not only an
+  ops one.
+- **Free tenants are the variable cost, not paying ones.** The
+  free-to-paid ratio decides how soon a step arrives. That is the
+  economic return on the per-tenant caps (§2, §4) and the abuse
+  gates — they bound what a non-paying tenant can consume before the
+  step.
+- **This is the infrastructure floor, not the business floor.** No
+  salary, support time, or marketing spend is in it. Read it as "what
+  the platform costs to keep running", which is the number that decides
+  whether the service can exist at low volume — not as a target.

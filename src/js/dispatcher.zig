@@ -801,15 +801,30 @@ fn finishResponse(
 
     // Close the interaction digest with the run's own result — the last
     // element, and the one that makes the digest a superset of the status
-    // comparison the fidelity gate does today. Folded HERE because this is the
-    // one point where both the status and the body are known; the log record is
-    // built later and never sees the body.
+    // comparison the fidelity gate does today.
+    //
+    // A THROWN handler does not carry its result in `pending`: the throw is
+    // captured into `pending.exception` while status stays at the default 200
+    // and body stays empty, and the real 500 + `handler threw: …` body is
+    // composed downstream in `worker_dispatch`. Folding `pending` directly
+    // therefore closed every failed request with `(200, "")` — so two handlers
+    // that failed differently digested identically, and a replay that faithfully
+    // reproduced the 500 was reported as diverged. Derive the effective terminal
+    // here instead, from the one shared formatter the serving site uses.
     if (state.readset) |rs| {
+        const threw = pending.exception.len > 0;
+        const eff_body: []const u8 = if (threw)
+            response_building.thrownBody(d.allocator, pending.exception)
+        else
+            pending.body;
+        defer if (threw and response_building.thrownBodyOwned(eff_body)) d.allocator.free(eff_body);
+        const eff_status = if (threw) @as(@TypeOf(pending.status), 500) else pending.status;
+
         var dg = tape_mod.interaction_digest.Digest{ .h = if (rs.interaction_digest == 0)
             tape_mod.interaction_digest.Digest.init().h
         else
             rs.interaction_digest };
-        dg.response(@intCast(@max(@min(pending.status, 599), 100)), pending.body);
+        dg.response(@intCast(@max(@min(eff_status, 599), 100)), eff_body);
         rs.interaction_digest = dg.h;
     }
 

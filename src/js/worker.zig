@@ -3664,6 +3664,7 @@ pub fn writesetGrowsStore(writeset: *const kv_mod.WriteSet) bool {
 pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
 pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
 pub const captureTapes = worker_log.captureTapes;
+pub const dropPartialDigest = worker_log.dropPartialDigest;
 pub const captureTapesWithActivation = worker_log.captureTapesWithActivation;
 pub const captureFetchChunkTapes = worker_log.captureFetchChunkTapes;
 pub const captureWsFrameTapes = worker_log.captureWsFrameTapes;
