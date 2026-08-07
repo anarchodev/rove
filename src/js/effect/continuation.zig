@@ -333,9 +333,9 @@ pub const WakeKey = union(enum) {
     /// Wait on a raft seq to commit (the H2-reference shape,
     /// `RaftWait.seq`). Most parked units use this.
     seq: u64,
-    /// Wait on a chain's correlation_id wake (held-sync resume,
+    /// Wait on a chain's saga_id wake (held-sync resume,
     /// `parked_continuations`).
-    correlation_id: []const u8,
+    saga_id: []const u8,
     /// Wait on an `effect.Msg` arrival of a specific kind
     /// (fully-typed wake routing).
     msg: msg_mod.ActivationSource,
@@ -407,7 +407,7 @@ pub fn Continuation(comptime Buffered: type, comptime Txn: type) type {
                 }
                 if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
                 if (item.wake_key) |wk| switch (wk) {
-                    .correlation_id => |cid| if (cid.len > 0) allocator.free(@constCast(cid)),
+                    .saga_id => |cid| if (cid.len > 0) allocator.free(@constCast(cid)),
                     else => {},
                 };
                 item.* = .{};

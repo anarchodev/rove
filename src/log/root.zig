@@ -43,7 +43,7 @@ pub const Error = error{
 /// Bounded by design (rove's low-cardinality posture): ≤`MAX_TAGS`
 /// per record, key/value lengths capped, keys restricted to
 /// `[a-z0-9_]`. A leading `_` is RESERVED for engine-populated tags
-/// (e.g. `_corr`, derived from `correlation_id`) — `request.tag`
+/// (e.g. `_saga`, derived from `saga_id`) — `request.tag`
 /// rejects it. `key`/`value` are allocator-owned by the `LogRecord`.
 pub const Tag = struct {
     key: []const u8,
@@ -387,11 +387,11 @@ pub const LogRecord = struct {
     tags: []Tag = &.{},
     /// Per-chain identifier — the streaming-handler chain model
     /// (`docs/architecture/effects-and-handlers.md`). Empty
-    /// string when the record has no chain context (paths where the
+    /// string when the record has no saga context (paths where the
     /// runtime couldn't synthesize one
     /// — early-error captures before request handling started).
     /// Allocator-owned alongside the other `[]const u8` fields.
-    correlation_id: []const u8 = "",
+    saga_id: []const u8 = "",
     /// What caused this activation — the activation-source model
     /// (`docs/architecture/effects-and-handlers.md`).
     /// Defaults to `.inbound` for code paths that don't set it
@@ -413,7 +413,7 @@ pub const LogRecord = struct {
         allocator.free(self.host);
         allocator.free(self.console);
         allocator.free(self.exception);
-        if (self.correlation_id.len > 0) allocator.free(self.correlation_id);
+        if (self.saga_id.len > 0) allocator.free(self.saga_id);
         for (self.tags) |t| {
             allocator.free(t.key);
             allocator.free(t.value);
@@ -466,7 +466,7 @@ pub const LogHeader = struct {
     method: []const u8,
     path: []const u8,
     host: []const u8,
-    correlation_id: []const u8,
+    saga_id: []const u8,
 
     /// Big-endian wire layout. Scalars first (fixed width), then four
     /// length-prefixed strings in canonical order:
@@ -487,7 +487,7 @@ pub const LogHeader = struct {
     /// 4×u32 length prefixes + the variable string payloads).
     pub fn serialize(self: *const LogHeader, allocator: std.mem.Allocator) ![]u8 {
         const fixed: usize = 8 + 8 + 8 + 2 + 1 + 1;
-        const var_bytes = self.method.len + self.path.len + self.host.len + self.correlation_id.len;
+        const var_bytes = self.method.len + self.path.len + self.host.len + self.saga_id.len;
         const len_prefixes: usize = 4 * 4;
         const total = fixed + len_prefixes + var_bytes + 8;
         const out = try allocator.alloc(u8, total);
@@ -504,7 +504,7 @@ pub const LogHeader = struct {
         cur += 1;
         out[cur] = @intFromEnum(self.activation);
         cur += 1;
-        const strings = [_][]const u8{ self.method, self.path, self.host, self.correlation_id };
+        const strings = [_][]const u8{ self.method, self.path, self.host, self.saga_id };
         for (strings) |s| {
             std.mem.writeInt(u32, out[cur..][0..4], @intCast(s.len), .big);
             cur += 4;
@@ -565,7 +565,7 @@ pub fn parseLogHeader(bytes: []const u8) LogHeaderParseError!LogHeader {
         .method = strings[0],
         .path = strings[1],
         .host = strings[2],
-        .correlation_id = strings[3],
+        .saga_id = strings[3],
     };
 }
 
@@ -1053,7 +1053,7 @@ test "LogHeader: serialize + parseLogHeader roundtrip" {
         .method = "POST",
         .path = "/api/users",
         .host = "tenant.rewindjsapp.localhost",
-        .correlation_id = "corr-7f1a-9e4b",
+        .saga_id = "corr-7f1a-9e4b",
     };
     const bytes = try header.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1067,7 +1067,7 @@ test "LogHeader: serialize + parseLogHeader roundtrip" {
     try testing.expectEqualStrings(header.method, parsed.method);
     try testing.expectEqualStrings(header.path, parsed.path);
     try testing.expectEqualStrings(header.host, parsed.host);
-    try testing.expectEqualStrings(header.correlation_id, parsed.correlation_id);
+    try testing.expectEqualStrings(header.saga_id, parsed.saga_id);
 }
 
 test "LogHeader: empty strings roundtrip" {
@@ -1082,7 +1082,7 @@ test "LogHeader: empty strings roundtrip" {
         .method = "",
         .path = "",
         .host = "",
-        .correlation_id = "",
+        .saga_id = "",
     };
     const bytes = try header.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1090,7 +1090,7 @@ test "LogHeader: empty strings roundtrip" {
     try testing.expectEqualStrings("", parsed.method);
     try testing.expectEqualStrings("", parsed.path);
     try testing.expectEqualStrings("", parsed.host);
-    try testing.expectEqualStrings("", parsed.correlation_id);
+    try testing.expectEqualStrings("", parsed.saga_id);
 }
 
 test "LogHeader: non-default outcome + activation" {
@@ -1105,7 +1105,7 @@ test "LogHeader: non-default outcome + activation" {
         .method = "GET",
         .path = "/",
         .host = "",
-        .correlation_id = "",
+        .saga_id = "",
     };
     const bytes = try header.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1119,7 +1119,7 @@ test "LogHeader: received_ns round-trips" {
         .request_id = 7, .deployment_id = 9, .duration_ns = 123,
         .received_ns = 1_785_453_109_497_854_452,
         .status = 200, .outcome = .ok, .activation = .inbound,
-        .method = "GET", .path = "/p", .host = "h", .correlation_id = "c",
+        .method = "GET", .path = "/p", .host = "h", .saga_id = "c",
     };
     const bytes = try header.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1140,7 +1140,7 @@ test "LogHeader: a header without received_ns is rejected, not tolerated" {
     const header: LogHeader = .{
         .request_id = 42, .deployment_id = 1, .duration_ns = 5, .received_ns = 999,
         .status = 404, .outcome = .handler_error, .activation = .inbound,
-        .method = "POST", .path = "/old", .host = "h.test", .correlation_id = "",
+        .method = "POST", .path = "/old", .host = "h.test", .saga_id = "",
     };
     const full = try header.serialize(a);
     defer a.free(full);
@@ -1155,7 +1155,7 @@ test "LogHeader: extra trailing bytes are rejected" {
     const header: LogHeader = .{
         .request_id = 1, .deployment_id = 1, .duration_ns = 1, .received_ns = 1,
         .status = 200, .outcome = .ok, .activation = .inbound,
-        .method = "GET", .path = "/", .host = "h", .correlation_id = "",
+        .method = "GET", .path = "/", .host = "h", .saga_id = "",
     };
     const full = try header.serialize(a);
     defer a.free(full);
@@ -1185,7 +1185,7 @@ test "LogHeader: parseLogHeader rejects bad outcome enum" {
         .method = "",
         .path = "",
         .host = "",
-        .correlation_id = "",
+        .saga_id = "",
     };
     const bytes = try header.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1208,7 +1208,7 @@ test "LogHeader: parseLogHeader rejects truncated trailing string" {
         .method = "GET",
         .path = "/x",
         .host = "h",
-        .correlation_id = "c",
+        .saga_id = "c",
     };
     const bytes = try header.serialize(testing.allocator);
     defer testing.allocator.free(bytes);

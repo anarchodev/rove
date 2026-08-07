@@ -1582,7 +1582,7 @@ test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
     var resp = try runOne(
         &d,
         kv,
-        \\request.tag("_corr", "nope");
+        \\request.tag("_saga", "nope");
         \\return "x";
     ,
         .{ .method = "GET", .path = "/" },

@@ -121,7 +121,7 @@ pub fn setStreamComponents(
     ent: rove.Entity,
     allocator: std.mem.Allocator,
     tenant_id: []const u8,
-    correlation_id: ?[]const u8,
+    saga_id: ?[]const u8,
     deployment_id: u64,
     module_path: []const u8,
     ctx_json: []const u8,
@@ -143,11 +143,11 @@ pub fn setStreamComponents(
     {
         const tid = try allocator.dupe(u8, tenant_id);
         errdefer allocator.free(tid);
-        const corr: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
+        const corr: ?[]u8 = if (saga_id) |c| try allocator.dupe(u8, c) else null;
         errdefer if (corr) |c| allocator.free(c);
         try server.reg.set(ent, current_coll, components_mod.ChainContext, .{
             .tenant_id = tid,
-            .correlation_id = corr,
+            .saga_id = corr,
             .deployment_id = deployment_id,
         });
     }
@@ -317,7 +317,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
                 std.log.warn(
                     "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
-                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)" },
+                    .{ ctx_comp.tenant_id, ctx_comp.saga_id orelse "(none)" },
                 );
                 try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
                 continue;
@@ -325,7 +325,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             resumeStream(worker, p.ent, p.sid, p.sess, .wake_batch) catch |err| {
                 std.log.warn(
                     "rove-js stream-resume (wake_batch): tenant={s} corr={s}: {s}; closing",
-                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
+                    .{ ctx_comp.tenant_id, ctx_comp.saga_id orelse "(none)", @errorName(err) },
                 );
                 server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
             };
@@ -639,7 +639,7 @@ fn finishStreamResume(
     const server = worker.h2;
     const dep_id = ctx.deployment_id;
     const tid = ctx.chain_ctx.tenant_id;
-    const corr = ctx.chain_ctx.correlation_id;
+    const corr = ctx.chain_ctx.saga_id;
     const mpath = ctx.chain_st.module_path;
     switch (oc.*) {
         .terminal => |*r| {
@@ -1132,7 +1132,7 @@ fn resumeStream(
         .trace = .{
             .readset = &readset,
             .request_id = request_id,
-            .correlation_id = chain_ctx.correlation_id,
+            .saga_id = chain_ctx.saga_id,
         },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
@@ -1147,7 +1147,7 @@ fn resumeStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDraining(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, activation, 0);
         return;
     };
 
@@ -1361,7 +1361,7 @@ pub fn resumeBoundFetchStream(
         .trace = .{
             .readset = &readset,
             .request_id = request_id,
-            .correlation_id = chain_ctx.correlation_id,
+            .saga_id = chain_ctx.saga_id,
         },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
@@ -1386,7 +1386,7 @@ pub fn resumeBoundFetchStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDrainingAnywhere(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0);
         return;
     };
 
@@ -1547,7 +1547,7 @@ const ContAction = enum {
     rollback_silent,
     /// Honor it: enqueue the target module as a chained SendCallback
     /// hop on the next tick (bounded recursion via the dispatch BATCH
-    /// cap), inheriting this chain's correlation_id — the
+    /// cap), inheriting this chain's saga_id — the
     /// connectionless meaning of "re-enter the target module".
     enqueue,
 };
@@ -1615,7 +1615,7 @@ pub fn fireLogHeader(
         .method = method,
         .path = path,
         .host = host,
-        .correlation_id = corr orelse "",
+        .saga_id = corr orelse "",
     };
 }
 
@@ -1664,7 +1664,7 @@ fn commitReadOnlyFire(p: *FirePrep, comptime site: []const u8) void {
 
 /// Run the handler + apply its outcome — the shared tail of every
 /// connectionless fire. `log_path` is the module path on log records
-/// (no leading slash); `corr` must match `req.trace.correlation_id`;
+/// (no leading slash); `corr` must match `req.trace.saga_id`;
 /// `label` identifies the firer in warn messages (name / module /
 /// tenant); `activation_bytes` feeds tape capture when `spec.tape ==
 /// .activation` (fetch chunk payloads) — pass "" otherwise (a

@@ -71,17 +71,17 @@ pub const SendCallback = struct {
     /// Optional named-export selector (the `fn` field on the cont
     /// descriptor). Null = default export.
     fn_name: ?[]u8 = null,
-    /// Inherit the originating chain's correlation_id so replay UX
+    /// Inherit the originating chain's saga_id so replay UX
     /// groups the parent fetch + this chained hop. Null = generate
     /// a fresh one at dispatch time.
-    correlation_id: ?[]u8 = null,
+    saga_id: ?[]u8 = null,
 
     pub fn deinit(self: *SendCallback, allocator: std.mem.Allocator) void {
         if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
         if (self.module_path.len > 0) allocator.free(self.module_path);
         if (self.ctx_json.len > 0) allocator.free(self.ctx_json);
         if (self.fn_name) |fn_n| allocator.free(fn_n);
-        if (self.correlation_id) |c| allocator.free(c);
+        if (self.saga_id) |c| allocator.free(c);
         self.* = undefined;
     }
 };

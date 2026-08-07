@@ -203,7 +203,7 @@ const browser = {
      * shape as `after.fetch`.
      *
      * Defaults to filtering by the engine per-connection session key
-     * (`request.correlation_id`, indexed as the reserved `_corr` tag),
+     * (`request.sagaId`, indexed as the reserved `_saga` tag),
      * which is stamped on EVERY activation automatically — no per-frame
      * tagging needed. Pass `opts.session` to filter by a
      * `request.tag("session", …)` value instead (survives reconnects).
@@ -225,10 +225,10 @@ const browser = {
         url = "http://rewind-logs.internal/v1/" + tenant +
           "/session/" + encodeURIComponent(opts.session) + "?limit=" + limit;
       } else {
-        const corr = (request.correlation_id) || "";
+        const corr = (request.sagaId) || "";
         if (!corr) return false;
         url = "http://rewind-logs.internal/v1/" + tenant +
-          "/list?tag._corr=" + encodeURIComponent(corr) + "&limit=" + limit;
+          "/list?tag._saga=" + encodeURIComponent(corr) + "&limit=" + limit;
       }
       if (opts.since) url += "&after_received_ns=" + opts.since;
       // The result-target `on` rides IN opts — `after.fetch(url, opts)` takes two

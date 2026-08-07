@@ -434,12 +434,12 @@ class Scenario {
         ? { prefix: t, module: __trigModOf(t) }
         : { prefix: t.prefix, module: t.module || __trigModOf(t.prefix) });
     // Per-chain identity the engine pins on EVERY activation (worker-set in
-    // prod). `tenant` is this handler's tenant id; `correlationId` is minted by
+    // prod). `tenant` is this handler's tenant id; `sagaId` is minted by
     // inbound and inherited by every resume — so it's scenario-level (set once,
     // threads through inbound → frame → fetch/receive resumes, like the ctx). A
-    // per-activation `inbound({ correlationId })` override is honored over these.
+    // per-activation `inbound({ sagaId })` override is honored over these.
     this.tenant = cfg.tenant != null ? cfg.tenant : null;
-    this.correlationId = cfg.correlationId != null ? cfg.correlationId : null;
+    this.sagaId = cfg.sagaId != null ? cfg.sagaId : null;
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
@@ -459,10 +459,10 @@ class Scenario {
   /** Stamp the scenario's per-chain identity onto a world's `request`, without
    *  clobbering a per-activation override already present. */
   _stampIdentity(w) {
-    if (this.tenant == null && this.correlationId == null && !this.admin) return w;
+    if (this.tenant == null && this.sagaId == null && !this.admin) return w;
     const r = (w.request = w.request || {});
     if (this.tenant != null && r.tenant === undefined) r.tenant = this.tenant;
-    if (this.correlationId != null && r.correlationId === undefined) r.correlationId = this.correlationId;
+    if (this.sagaId != null && r.sagaId === undefined) r.sagaId = this.sagaId;
     // `request.rewind` exists iff the handler is platform-bound, so an admin
     // run always declares the verdict — including `false`, which is what makes
     // the "no root token" branch driveable without a second knob.
@@ -514,7 +514,7 @@ class Scenario {
       session: req.session,
       // Per-activation override (undefined ⇒ inherit the scenario default).
       tenant: req.tenant,
-      correlationId: req.correlationId,
+      sagaId: req.sagaId,
     };
     // A binary inbound body rides base64 (`bodyB64`) so arbitrary bytes survive
     // JSON and read back byte-exact on `request.bytes` — the same channel a
@@ -555,7 +555,7 @@ class Scenario {
         ip: req.ip,
         session: req.session,
         tenant: req.tenant,
-        correlationId: req.correlationId,
+        sagaId: req.sagaId,
       },
     });
     // onHeaders normally carries no ctx; thread one only if the caller supplies
@@ -587,7 +587,7 @@ class Scenario {
       ip: req.ip,
       session: req.session,
       tenant: req.tenant,
-      correlationId: req.correlationId,
+      sagaId: req.sagaId,
     };
     let node = null;
     let kv = null;
@@ -1628,14 +1628,14 @@ function carrySources(parentWorld, world) {
   // when it resumes (e.g. an OIDC callback that imports `@rewind/oidc`).
   if (parentWorld.packages) world.packages = parentWorld.packages;
   if (parentWorld.app_imports) world.app_imports = parentWorld.app_imports;
-  // Per-chain identity (tenant / correlation_id) threads to every resume, like
+  // Per-chain identity (tenant / sagaId) threads to every resume, like
   // the connection ctx — inbound mints, resumes inherit. The parent world always
   // carries it (stamped at construction), so copy it into the resume's request.
   const pr = parentWorld.request || {};
-  if (pr.tenant !== undefined || pr.correlationId !== undefined) {
+  if (pr.tenant !== undefined || pr.sagaId !== undefined) {
     const r = (world.request = world.request || {});
     if (pr.tenant !== undefined && r.tenant === undefined) r.tenant = pr.tenant;
-    if (pr.correlationId !== undefined && r.correlationId === undefined) r.correlationId = pr.correlationId;
+    if (pr.sagaId !== undefined && r.sagaId === undefined) r.sagaId = pr.sagaId;
   }
   return world;
 }

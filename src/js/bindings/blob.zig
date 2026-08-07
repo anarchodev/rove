@@ -196,7 +196,7 @@ pub fn jsBlobWrite(
     const total = write_fn(
         state.blob_session_ctx.?,
         state.instance_id,
-        state.correlation_id,
+        state.saga_id,
         bytes,
     ) catch |err| {
         _ = switch (err) {
@@ -268,7 +268,7 @@ pub fn jsBlobSeal(
     const sealed = seal_fn(
         state.blob_session_ctx.?,
         state.instance_id,
-        state.correlation_id,
+        state.saga_id,
     ) catch |err| {
         _ = switch (err) {
             error.NoSession => c.JS_ThrowTypeError(ctx, "blob.seal: no open session (nothing written, or already sealed)"),

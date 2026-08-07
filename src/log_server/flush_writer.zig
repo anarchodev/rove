@@ -139,7 +139,7 @@ pub fn writeBatch(
             .status = r.status,
             .outcome = outcomeName(r.outcome),
             .deployment_id = r.deployment_id,
-            .correlation_id = r.correlation_id,
+            .saga_id = r.saga_id,
             // Same table that spells the kind into the ndjson line, so
             // the sidecar and the record body can never disagree about
             // what an activation was called.
@@ -283,8 +283,8 @@ fn encodeRecordJson(
     try writeJsonString(w, r.console);
     try w.writeAll(",\"exception\":");
     try writeJsonString(w, r.exception);
-    try w.writeAll(",\"correlation_id\":");
-    try writeJsonString(w, r.correlation_id);
+    try w.writeAll(",\"saga_id\":");
+    try writeJsonString(w, r.saga_id);
     try w.writeAll(",\"tags\":");
     try writeTags(w, r.tags);
     try w.writeAll(",\"activation\":");
