@@ -15,6 +15,7 @@ const h2 = @import("rove-h2");
 const rove = @import("rove");
 
 const globals = @import("globals.zig");
+const limiter_mod = @import("limiter.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 const c = qjs.c;
@@ -290,6 +291,86 @@ test "dispatch: kv.set + kv.get round trip" {
     try testing.expectEqualStrings("rove", r2.body);
 }
 
+
+/// Run `body` as a handler for a tenant whose plan is `caps`, with a real
+/// limiter wired. The outbound gate reads `state.plan_rate` and keys its
+/// buckets off `state.instance_id` (which comes from `plan.storage.id`), so
+/// both have to be present or the gate short-circuits open and the test
+/// proves nothing.
+fn runWithPlan(
+    d: *Dispatcher,
+    kv: *kv_mod.KvStore,
+    lim: *limiter_mod.RateLimiter,
+    caps: limiter_mod.RateLimitCaps,
+    body: []const u8,
+) !Response {
+    return runOne(d, kv, body, .{
+        .method = "POST",
+        .path = "/",
+        .trace = .{ .request_id = 11 },
+        .plan = .{
+            .limiter = lim,
+            .storage = .{ .id = "acme", .incarnation = .legacy },
+            .plan_rate = caps,
+        },
+    });
+}
+
+test "dispatch: a plan without outbound refuses third-party egress, by code" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var lim = limiter_mod.RateLimiter.init(testing.allocator, .{});
+    defer lim.deinit();
+
+    // The refusal is permanent, so it carries its own code rather than the
+    // rate-limit one: a caller (or a `retry` wrapper) must be able to tell
+    // "wait and it will work" from "it will never work".
+    var resp = try runWithPlan(&d, kv, &lim, .{ .outbound_enabled = false },
+        \\try {
+        \\  webhook.send("https://api.example.com/hook", { body: "x" });
+        \\  return "sent";
+        \\} catch (e) { return "refused:" + e.code; }
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("refused:outbound_not_enabled", resp.body);
+    try testing.expectEqual(@as(u64, 1), lim.outbound_disabled_refusals);
+}
+
+// The other half of the gate — that `*.internal` doors stay open for a
+// tenant with no outbound budget — cannot be written here: the doors are
+// reachable only through `_system.*`, which `_harden.js` deletes from
+// customer scope, so a handler in this harness has no way to name one.
+// `outbound_gate_smoke_v2.py` covers it against a real worker, where
+// `blob.*` lowers to the door the way it does in production.
+
+test "dispatch: a plan WITH outbound still sends (the gate is not a wall)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var lim = limiter_mod.RateLimiter.init(testing.allocator, .{});
+    defer lim.deinit();
+
+    var resp = try runWithPlan(&d, kv, &lim, .{ .outbound_enabled = true },
+        \\try {
+        \\  webhook.send("https://api.example.com/hook", { body: "x" });
+        \\  return "sent";
+        \\} catch (e) { return "refused:" + e.code; }
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("sent", resp.body);
+    try testing.expectEqual(@as(u64, 0), lim.outbound_disabled_refusals);
+}
 
 test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)" {
     var buf: [64]u8 = undefined;

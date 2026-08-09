@@ -537,10 +537,14 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         \\# HELP outbound_sustained_trips_total refusals from the day-scale sustained outbound bucket (spam/flood incident signal; worker-local).
         \\# TYPE outbound_sustained_trips_total counter
         \\outbound_sustained_trips_total {d}
+        \\# HELP outbound_not_enabled_total outbound refused because the tenant's plan grants no third-party egress (demand meeting policy: an upgrade lead or an abuser held at the door; worker-local).
+        \\# TYPE outbound_not_enabled_total counter
+        \\outbound_not_enabled_total {d}
         \\
     , .{
         worker.node.log_ingest_limited.load(.monotonic),
         worker.limiter.sustained_trips,
+        worker.limiter.outbound_disabled_refusals,
     });
 
     // ── propose-pipeline histograms ──────────────────────────────────

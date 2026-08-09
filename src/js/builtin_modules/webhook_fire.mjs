@@ -95,8 +95,64 @@ export default function () {
     // onresult commit.
     schedArm(BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
 
-    // (3) the attempt.
+    // (3) the attempt. A deferred fire is metered against the tenant's
+    // outbound quota exactly like an inline one (`bindings/http.zig`), so
+    // this throws when the tenant is over budget or its plan grants no
+    // third-party egress at all.
+    //
+    // It MUST be caught. An uncaught throw rolls this activation's writeset
+    // back — including the `_sched/` cleanup the fan-out injected — so the
+    // entry stays due and re-fires on the next 1 Hz tick, forever, for as
+    // long as the tenant is refused. Catching leaves the (2) re-arm
+    // committed, which turns a refusal into a WATCHDOG_MS backoff.
+    //
+    // The refusal still costs an attempt: a permanent one (no quota on this
+    // plan) must terminate rather than re-fire until the heat death of the
+    // watchdog, and a rate refusal that never counted would let a
+    // 40-second retry loop outlive the marker's retry budget.
     const attempts = typeof owed.attempts === "number" ? owed.attempts : 0;
+    try {
+        fireAttempt(owed, id, attempts);
+    } catch (e) {
+        const code = (e && e.code) || "";
+        const max_attempts = (typeof owed.max_attempts === "number" && owed.max_attempts >= 1)
+            ? owed.max_attempts
+            : DEFAULT_MAX_ATTEMPTS;
+        const permanent = code === "outbound_not_enabled";
+        if (permanent || attempts + 1 >= max_attempts) {
+            // Terminal: drop the marker and cancel the wake, the same
+            // shape `webhook_onresult` uses for a give-up.
+            kv.delete(markerKey);
+            schedCancel("_send/" + id);
+        } else {
+            owed.attempts = attempts + 1;
+            kv.set(markerKey, JSON.stringify(owed));
+        }
+    }
+    return { status: 200 };
+}
+
+// Default cap when the marker omits `max_attempts` — mirrors
+// `webhook_onresult`'s, so a refused attempt and a failed one count
+// against the same budget.
+const DEFAULT_MAX_ATTEMPTS = 5;
+
+/// Cancel the send's scheduler entry (both `_sched/` rows), so a terminal
+/// refusal ends the watchdog chain instead of re-firing at WATCHDOG_MS
+/// forever. Mirror of `webhook_onresult`'s cancel.
+function schedCancel(key) {
+    const id = crypto.sha256b64url(key);
+    const byIdKey = "_sched/by_id/" + id;
+    const raw = kv.get(byIdKey);
+    if (raw !== null) {
+        try {
+            kv.delete(schedByTimeKey(BigInt(JSON.parse(raw).when_ns), id));
+        } catch (_e) { /* corrupt record — the by_id delete below still ends it */ }
+    }
+    kv.delete(byIdKey);
+}
+
+function fireAttempt(owed, id, attempts) {
     __rove.fetch({
         url: owed.url,
         method: owed.method || "POST",
@@ -116,5 +172,4 @@ export default function () {
             context: owed.context !== undefined ? owed.context : null,
         },
     });
-    return { status: 200 };
 }

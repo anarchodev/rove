@@ -719,7 +719,7 @@ fn fireWsMessage(
         .activation = .{ .ws_message = .{ .opcode = opcode, .data = payload } },
         .activation_entity = chain_ent,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .effects = .{
             .pending_stream_chunks = &stream_chunks,
@@ -935,7 +935,7 @@ pub fn resumeBoundFetchChainWs(
         .activation_entity = chain_ent,
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .effects = .{
             .pending_stream_chunks = &stream_chunks,
@@ -1044,7 +1044,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .activation = .{ .wake_batch = .{ .wakes = batch_owned } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .effects = .{
             .pending_stream_chunks = &stream_chunks,
@@ -1177,7 +1177,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .query = null,
         .activation = .disconnect,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);

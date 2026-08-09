@@ -225,6 +225,13 @@ pub const RateLimiter = struct {
     /// spam/flood suspect, not a sales lead). Per-worker, unsynced,
     /// like every field here; surfaced on `/_system/metrics`.
     sustained_trips: u64 = 0,
+    /// Refusals from the plan's `outbound_enabled` admission gate — a
+    /// tenant asking for third-party egress its tier does not grant.
+    /// Distinct from `sustained_trips` because it means something else:
+    /// not an incident, but demand meeting policy. A tenant driving this
+    /// counter is either a customer to upgrade or an abuser being held at
+    /// the door, and only the destination tells you which.
+    outbound_disabled_refusals: u64 = 0,
     /// `instance_id` → per-action buckets. Lazily created on first
     /// `check` for an instance; never evicted in v1 (memory bounded
     /// by registered tenant count).

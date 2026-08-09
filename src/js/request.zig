@@ -243,9 +243,14 @@ pub const Activation = union(enum) {
 
 /// Rate-limit / plan inputs, threaded to `DispatchState` so both the
 /// request-rate check and the `email.send` rate check size their buckets
-/// from the tenant's plan (docs/architecture/control-plane.md Lever 1). Defaults = the
-/// free/default caps for paths with no resolved plan (tests, internal
-/// callback dispatch).
+/// from the tenant's plan (docs/architecture/control-plane.md Lever 1).
+///
+/// The `plan_rate` / `plan_gen` defaults are for paths with no tenant at all
+/// (unit tests) and are deliberately PERMISSIVE — struct defaults, not the
+/// free tier. Any dispatch that runs a real tenant's code must set them from
+/// that tenant's slot, or the tenant is metered against numbers nobody sold
+/// it: the outbound admission gate rides `plan_rate`, so an unset plan reads
+/// as "outbound allowed" no matter what the tier says.
 pub const PlanLimits = struct {
     /// Per-worker rate limiter. Null in test paths that don't exercise it.
     limiter: ?*limiter_mod.RateLimiter = null,
