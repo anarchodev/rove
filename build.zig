@@ -519,6 +519,11 @@ pub fn build(b: *std.Build) void {
     const instance_id_tests = b.addTest(.{ .root_module = instance_id_mod });
     test_step.dependOn(&b.addRunArtifact(instance_id_tests).step);
 
+    // The tier table resolves a tenant with no plan blob from its ID (the
+    // reserved platform singletons default to the platform tier), so it needs
+    // the one reserved-id list. Both are leaves, so this adds no cycle.
+    plan_mod.addImport("rove-instance-id", instance_id_mod);
+
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
     // M1 slice: just `Instance` + `Domain` with an in-memory cache and

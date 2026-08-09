@@ -309,7 +309,8 @@ const RetentionCache = struct {
 };
 
 /// Fetch + resolve a tenant's retention window (ns) from the CP. 404 ⇒ unset ⇒
-/// free tier. Any transport error / non-200-non-404 ⇒ null (don't clamp).
+/// the tenant's default tier. Any transport error / non-200-non-404 ⇒ null
+/// (don't clamp).
 fn fetchRetentionNs(allocator: std.mem.Allocator, cp_url: []const u8, tenant: []const u8, insecure_tls: bool) ?i64 {
     const url = std.fmt.allocPrint(allocator, "{s}/_cp/plan?tenant={s}", .{ cp_url, tenant }) catch return null;
     defer allocator.free(url);
@@ -322,10 +323,10 @@ fn fetchRetentionNs(allocator: std.mem.Allocator, cp_url: []const u8, tenant: []
         .verify_tls = !insecure_tls,
     }) catch return null;
     defer resp.deinit(allocator);
-    if (resp.status == 404) return plan_mod.retentionNs(plan_mod.table(.free));
+    if (resp.status == 404) return plan_mod.retentionNs(plan_mod.defaultFor(tenant));
     if (resp.status != 200) return null; // transient / error → don't clamp
     const body = resp.body orelse return null;
-    return plan_mod.retentionNs(plan_mod.parseBlob(allocator, body));
+    return plan_mod.retentionNs(plan_mod.parseBlob(allocator, tenant, body));
 }
 
 fn processRequests(
