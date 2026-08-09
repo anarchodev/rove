@@ -133,6 +133,11 @@ hard-coded domain in this path as a bug.
   allowlist (seeded from `LOOP46_OPERATOR_EMAILS`). Admin app paths require an
   operator OIDC session; `/_system/*` accepts a separate root **token**
   (`LOOP46_ROOT_TOKEN`) as an independent operator-recovery surface.
+  The verdict is resolved **at login** and frozen on the session, so **editing
+  the allowlist requires the affected person to log in again** before it takes
+  effect — in either direction (decisions.md §4.6c). Worth saying out loud when
+  granting access, because the pre-re-login state is an ordinary-looking 403
+  rather than an error that names the cause.
 - **Cross-tenant access** is the explicit `platform.scope(id).kv.*` accessor, not
   a global rebind. `X-Rove-Scope` was **deleted** — do not reintroduce it
   (decisions.md §6). (The `LOOP46_*` env names persist because the internal
