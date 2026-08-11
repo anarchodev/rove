@@ -568,6 +568,31 @@ behavior, and what handler-shape.md promised). Three reasons:
   e.g. the `services-token` if `/_system/*` ever grows a JS path. Compute the
   verdict, expose the verdict.
 
+### 4.6c Operator authority is resolved at login, so granting it needs a re-login (2026-08-09)
+- **The rule**: an OIDC session's `is_root` is computed **once**, when the RP
+  mints the session (`@rewind/oidc`: `kv.get(operator_prefix + sha256(sub)) !=
+  null`), and frozen into `_rp/sess/{sid}`. Adding someone to the operator
+  allowlist therefore has **no effect on their existing sessions** — they must
+  log in again. Accepted deliberately.
+- **Why not re-evaluate per request**: authority would then cost a kv read on
+  every request to every operator-gated surface, to track a list that changes
+  a handful of times in a platform's life. The session already carries `sub`
+  and an expiry; `is_root` rides the same lifetime as the rest of what the
+  session asserts, which is the consistent story rather than one field that
+  silently means something newer than its neighbours.
+- **The cost, stated plainly**: granting operator authority is not instant, and
+  the failure mode is confusing rather than loud — a freshly-allowlisted
+  operator sees ordinary-customer 403s, not an error that names the cause. The
+  mitigation is documentation at the point of configuration (the
+  `operator_prefix` docs) plus the re-login instruction wherever the allowlist
+  is edited, NOT a shorter session TTL.
+- **The direction it does NOT license**: *revoking* authority is the asymmetric
+  half — removing someone from the allowlist likewise leaves their live session
+  operator until it expires. Revocation that must take effect immediately needs
+  session invalidation (drop `_rp/sess/*` for that `sub`), which is a different
+  mechanism from this one and is not built. Decide it when a real revocation
+  requirement appears; do not reach for per-request evaluation to get it.
+
 ### 4.7 One effect-result surface — flattened, no `request.result`
 - **Partially superseded by §4.9** (2026-06-15): the flatten-the-result decision
   stands, but where the *threaded ctx* and *delivery metadata* live changed —
