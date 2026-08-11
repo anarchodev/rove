@@ -266,7 +266,13 @@
   globalThis.__roveStorePrefix = NS_STORE;
   var storeKv = function(P, tag){
     return {
-      get: function(k){ var v = globalThis.kv.get(P + k); push({ kind: "read", store: tag, key: k, present: v !== undefined && v !== null }); return v; },
+      // `value` is load-bearing, not decoration: the digest folds
+      // `r <key> <found> <valuehash>`, so an entry without it hashes the
+      // empty string and every cross-store read of a DIFFERENT value
+      // digests alike. The ordinary kv wrapper carries it; this one did
+      // not, which is what made an admin replay disagree with capture
+      // while the store's prefix scan agreed (rove#487).
+      get: function(k){ var v = globalThis.kv.get(P + k); var present = v !== undefined && v !== null; push(present ? { kind: "read", store: tag, key: k, present: true, value: v } : { kind: "read", store: tag, key: k, present: false }); return v; },
       set: function(k, val){ push({ kind: "write", store: tag, key: k, value: val }); return globalThis.kv.set(P + k, val); },
       delete: function(k){ push({ kind: "delete", store: tag, key: k }); return globalThis.kv.delete(P + k); },
       // The digest folds a cross-store prefix as `p <namespaced> <found>
