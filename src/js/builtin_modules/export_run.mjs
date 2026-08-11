@@ -104,10 +104,18 @@ export default function () {
     const id = msg.id;
     if (typeof id !== "string" || id.length === 0) return { status: 200 };
 
-    // `_export/` is platform-reserved, so this record cannot be forged by
-    // customer JS. Absent ⇒ nothing was ever started under this id (or it was
-    // reaped): a stale watchdog, or an arm by a handler that guessed an id.
-    // Either way, no-op — the same defence every baked module makes.
+    // This record CAN be forged: `_export/` is shim-writable (`reserved.zig`)
+    // precisely so the `@rewind/export` verb can write the marker from handler
+    // context, and a tenant can therefore author its own export bookkeeping —
+    // or arm a wake here under an id it invented. So the record is treated as
+    // customer input throughout, and nothing below grants authority on the
+    // strength of it: the walk is scoped to the calling tenant's own store by
+    // the engine, and the door that does the walking refuses a handler-issued
+    // Cmd outright (rove#494).
+    //
+    // Absent ⇒ nothing was ever started under this id (or it was reaped): a
+    // stale watchdog, or an arm by a handler that guessed an id. Either way,
+    // no-op — the same defence every baked module makes.
     const key = "_export/" + id;
     const raw = kv.get(key);
     if (raw === null) return { status: 200 };
