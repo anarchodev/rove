@@ -497,6 +497,19 @@ test "plan: a blob resolves against the tenant it belongs to" {
     try testing.expect(ov_only.rate.outbound_enabled);
     try testing.expectEqual(table(.platform).max_body_bytes, ov_only.max_body_bytes);
 
+    // The grant path: an overrides-only blob turns outbound on for ONE
+    // customer without naming a tier. Naming one would be the trap — it
+    // pins that tenant to today's meaning of "free", so a later tier-table
+    // edit silently skips them; and a typo'd tier name resolves to free
+    // rather than failing, which is invisible until a limit bites.
+    const grant = parseBlob(a, "acme", "{\"overrides\":{\"outbound_enabled\":true}}");
+    try testing.expect(grant.rate.outbound_enabled);
+    // …and the grant is ONLY that. Every other limit still comes from the
+    // tier, so granting egress never quietly grants enterprise numbers.
+    try testing.expectEqual(table(.free).rate.outbound_sustained_per_day, grant.rate.outbound_sustained_per_day);
+    try testing.expectEqual(table(.free).max_body_bytes, grant.max_body_bytes);
+    try testing.expectEqual(table(.free).retention_days, grant.retention_days);
+
     // An explicit tier still wins over the id-derived default — that is
     // what makes the default a default rather than a hardcode.
     try testing.expectEqual(

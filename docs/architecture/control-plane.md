@@ -270,7 +270,12 @@ cannot be bypassed:
   A refusal is permanent, so it carries its own code
   (`outbound_not_enabled`) and **no Retry-After**: telling a caller to
   retry a policy is how a `retry` wrapper turns one refusal into a loop.
-  Counted by `outbound_not_enabled_total`. Platform-internal doors
+  Counted by `outbound_not_enabled_total`. Granting one tenant egress is an
+  **overrides-only blob** — `{"overrides":{"outbound_enabled":true}}`, no
+  `tier` key — so the tenant keeps its derived tier and every other limit
+  moves when the table does. Naming a tier to state an override is the trap:
+  it pins that tenant to today's meaning of "free", and a typo'd tier name
+  resolves to free rather than failing. Platform-internal doors
   (`*.internal`) are not egress, so a tenant without outbound keeps `kv.*`,
   `blob.*`, statics and packages; what stops is `http.send` /
   `webhook.send` / `email.send` and acting as an OAuth/OIDC relying party.
