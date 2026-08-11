@@ -45,6 +45,7 @@ const c = qjs.c;
 
 const globals = @import("../globals.zig");
 const limiter = @import("../limiter.zig");
+const kv_export = @import("../kv_export.zig");
 const log_mod = @import("rove-log");
 
 const js_undefined = globals.js_undefined;
@@ -72,6 +73,52 @@ fn targetsInternalDoor(url: []const u8) bool {
     const after = url[scheme + 3 ..];
     const host_end = std.mem.indexOfAny(u8, after, "/:?#") orelse after.len;
     return std.mem.endsWith(u8, after[0..host_end], INTERNAL_DOOR_TLD);
+}
+
+/// The decision behind `exportDoorAllowed`, split out so it is testable
+/// without a JS context — the throw needs one, the policy does not.
+fn exportDoorRefused(url: []const u8, is_system_module: bool) bool {
+    return kv_export.isExportUrl(url) and !is_system_module;
+}
+
+/// Refuse a CUSTOMER-issued fetch at the kv-export door (rove#494).
+///
+/// Most `*.internal` origins are the lowering target of a customer verb —
+/// `blob.*` reaches `rove-blob.internal`, a static serve reaches
+/// `rove-static.internal` — so customer code names them by construction, and
+/// each is guarded on its own terms (the blob door verifies a PUT body
+/// against the hash it is stored under).
+///
+/// The kv-export door is not one of those. It has no customer spelling: the
+/// `@rewind/export` verb writes a durable marker and arms a wake, and only
+/// the baked `__system/export_run` issues the Cmd. Naming it from a handler
+/// is therefore always illegitimate — and it matters, because the engine
+/// rewrites that Cmd into a PUT flagged for the UNMETERED `exports/` pool
+/// (rove#429). The cursor is caller-chosen, so a handler looping over
+/// cursors mints a distinct part per call (different page boundary ⇒
+/// different bytes ⇒ different hash) and `max_stored_bytes` stops bounding
+/// anything.
+///
+/// Note the direction, because the sibling bug ran the other way:
+/// RESTRICTING an action to the platform is sound, since the flag is
+/// engine-set and a customer cannot claim it. EXEMPTING the platform from a
+/// limit is not, because the platform re-issues work on the customer's
+/// behalf and the evidence it was ever admitted is customer data (rove#336).
+fn exportDoorAllowed(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []const u8) bool {
+    if (!exportDoorRefused(url, state.is_system_module)) return true;
+
+    const msg = "this door is not callable from handler code";
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return false; // OOM building the Error — pending
+    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+    const code = "door_forbidden";
+    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, code.ptr, code.len));
+    _ = c.JS_Throw(ctx, err);
+    std.log.warn(
+        "rove-js: tenant={s} named the kv-export door from handler code — refused",
+        .{state.instance_id},
+    );
+    return false;
 }
 
 /// Enforce the per-tenant OUTBOUND plan-rate at the fetch chokepoint.
@@ -187,7 +234,7 @@ pub fn jsHttpFetch(
     };
     // Outbound plan-rate — checked after the row is built (reuses row.url)
     // but before it is accumulated, so a rejected send has no side effect.
-    if (!outboundRateOk(ctx, state, row.url)) {
+    if (!exportDoorAllowed(ctx, state, row.url) or !outboundRateOk(ctx, state, row.url)) {
         row.deinit(state.allocator);
         return js_exception;
     }
@@ -347,7 +394,7 @@ pub fn jsOnFetch(
             return js_exception;
         },
     };
-    if (!outboundRateOk(ctx, state, row.url)) {
+    if (!exportDoorAllowed(ctx, state, row.url) or !outboundRateOk(ctx, state, row.url)) {
         row.deinit(state.allocator);
         return js_exception;
     }
@@ -534,7 +581,7 @@ pub fn jsHttpSubscribe(
             return js_exception;
         },
     };
-    if (!outboundRateOk(ctx, state, row.url)) {
+    if (!exportDoorAllowed(ctx, state, row.url) or !outboundRateOk(ctx, state, row.url)) {
         row.deinit(state.allocator);
         return js_exception;
     }
@@ -901,6 +948,31 @@ fn getBoolField(
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "exportDoorAllowed: the kv-export door is the one internal door a handler may not name" {
+    // The predicate half, asserted without a JS context: everything that is
+    // not the export door passes through untouched, so this gate can never
+    // become a general internal-door ban. `blob.*` and a static serve reach
+    // their doors from ordinary handler code and must keep doing so — the
+    // failure mode of over-tightening here is silent, since it looks like
+    // storage being broken rather than a policy being applied.
+    try testing.expect(!kv_export.isExportUrl("http://rove-blob.internal/deadbeef"));
+    try testing.expect(!kv_export.isExportUrl("http://rove-static.internal/abc"));
+    try testing.expect(!kv_export.isExportUrl("http://rove-compose.internal/sid"));
+    try testing.expect(!kv_export.isExportUrl("https://api.example.com/x"));
+    // And the door itself, which only `__system/export_run` may issue.
+    try testing.expect(kv_export.isExportUrl("http://rove-kvexport.internal/"));
+
+    // The gate keys on the module, and `is_system_module` is engine-set from
+    // the module path — a handler cannot claim it. This is the RESTRICTING
+    // direction, which is why keying on it is sound here (rove#494) and was
+    // not at the quota gate (rove#336).
+    try testing.expect(exportDoorRefused("http://rove-kvexport.internal/", false));
+    try testing.expect(!exportDoorRefused("http://rove-kvexport.internal/", true));
+    // Every other door stays reachable from handler code either way.
+    try testing.expect(!exportDoorRefused("http://rove-blob.internal/deadbeef", false));
+    try testing.expect(!exportDoorRefused("https://api.example.com/x", false));
+}
 
 test "targetsInternalDoor: platform-internal hosts are exempt, third parties are not" {
     // Internal doors (blob / compose / platform / logs) — the outbound
