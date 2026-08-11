@@ -47,12 +47,12 @@ pub const Record = struct {
     /// Stored as a string in JSON so the sidecar is human-readable.
     outcome: []const u8,
     deployment_id: u64,
-    /// Per-chain correlation id (engine per-connection session key).
+    /// Per-saga id (stable across every activation of one saga).
     /// Carried in the sidecar so the indexer can populate the reserved
-    /// `_corr` tag without decompressing the ndjson frame. Empty when
-    /// the record had no chain context. Optional on parse (older
+    /// `_saga` tag without decompressing the ndjson frame. Empty when
+    /// the record had no saga context. Optional on parse (older
     /// sidecars omit it). Owned on parse.
-    correlation_id: []const u8 = "",
+    saga_id: []const u8 = "",
     /// What kind of activation produced this record — the string
     /// spelling of `rove-log`'s `ActivationSource` (`inbound`,
     /// `ws_message`, `disconnect`, …), mirroring how `outcome` is
@@ -86,7 +86,7 @@ pub const Record = struct {
         allocator.free(self.path);
         allocator.free(self.host);
         allocator.free(self.outcome);
-        if (self.correlation_id.len > 0) allocator.free(self.correlation_id);
+        if (self.saga_id.len > 0) allocator.free(self.saga_id);
         if (self.activation.len > 0) allocator.free(self.activation);
         for (self.tags) |t| {
             allocator.free(t.key);
@@ -188,7 +188,12 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
             .status = @intCast(try getInt(ro, "status")),
             .outcome = try dupeStr(allocator, ro, "outcome"),
             .deployment_id = try getInt(ro, "deployment_id"),
-            .correlation_id = try dupeStrOpt(allocator, ro, "correlation_id"),
+            // `saga_id` is the current key. `saga_id` is the
+            // retired spelling, still read so sidecars already in
+            // object storage keep their saga id — the same read-side
+            // alias posture the `activation` field documents. Write
+            // side emits `saga_id` only.
+            .saga_id = try dupeStrOptEither(allocator, ro, "saga_id", "correlation_id"),
             .activation = try dupeStrOpt(allocator, ro, "activation"),
             .tags = try parseTags(allocator, ro),
             .offset = try getInt(ro, "offset"),
@@ -234,8 +239,8 @@ pub fn encode(allocator: std.mem.Allocator, idx: *const IdxFile) ![]u8 {
         try writeJsonString(w, r.host);
         try w.print(",\"status\":{d},\"outcome\":", .{r.status});
         try writeJsonString(w, r.outcome);
-        try w.print(",\"deployment_id\":{d},\"correlation_id\":", .{r.deployment_id});
-        try writeJsonString(w, r.correlation_id);
+        try w.print(",\"deployment_id\":{d},\"saga_id\":", .{r.deployment_id});
+        try writeJsonString(w, r.saga_id);
         try w.writeAll(",\"activation\":");
         try writeJsonString(w, r.activation);
         try w.writeAll(",\"tags\":");
@@ -277,6 +282,21 @@ fn dupeStrOpt(
     };
     if (s.len == 0) return "";
     return allocator.dupe(u8, s) catch ParseError.OutOfMemory;
+}
+
+/// `dupeStrOpt` over two keys: the current spelling, then a retired
+/// one. Read-side only, so a sidecar already sitting in object storage
+/// keeps a field the writer has since renamed. The current key always
+/// wins — a blob carrying both is not ambiguous.
+fn dupeStrOptEither(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    name: []const u8,
+    retired: []const u8,
+) ParseError![]const u8 {
+    const current = try dupeStrOpt(allocator, obj, name);
+    if (current.len > 0) return current;
+    return dupeStrOpt(allocator, obj, retired);
 }
 
 /// Parse the optional `tags` object (`{"k":"v",...}`) into an owned
@@ -377,7 +397,7 @@ test "encode → parse round-trip" {
             .status = 200,
             .outcome = "ok",
             .deployment_id = 7,
-            .correlation_id = "corr-1",
+            .saga_id = "corr-1",
             .activation = "ws_message",
             .tags = &tags0,
             .offset = 0,
@@ -421,13 +441,13 @@ test "encode → parse round-trip" {
     try testing.expectEqualStrings("/api/foo", parsed.records[0].path);
     try testing.expectEqualStrings("handler_error", parsed.records[1].outcome);
     try testing.expectEqual(@as(u32, 380), parsed.records[1].length);
-    // correlation_id + tags round-trip on record 0; record 1 omitted
+    // saga_id + tags round-trip on record 0; record 1 omitted
     // them (defaults stay empty).
-    try testing.expectEqualStrings("corr-1", parsed.records[0].correlation_id);
+    try testing.expectEqualStrings("corr-1", parsed.records[0].saga_id);
     try testing.expectEqual(@as(usize, 2), parsed.records[0].tags.len);
     try testing.expectEqualStrings("session", parsed.records[0].tags[0].key);
     try testing.expectEqualStrings("S1", parsed.records[0].tags[0].value);
-    try testing.expectEqualStrings("", parsed.records[1].correlation_id);
+    try testing.expectEqualStrings("", parsed.records[1].saga_id);
     try testing.expectEqual(@as(usize, 0), parsed.records[1].tags.len);
     // The activation kind rides the same way: present on record 0,
     // defaulted empty on record 1.
@@ -438,7 +458,7 @@ test "encode → parse round-trip" {
 test "a sidecar written before the activation field parses with an empty kind" {
     // Backward compatibility with sidecars already in object storage.
     // The field is additive, so VERSION stays 1 (same posture as
-    // correlation_id and tags) — but that only holds if an older blob
+    // saga_id and tags) — but that only holds if an older blob
     // still parses, which is what this pins. Empty must mean UNKNOWN:
     // reading it as `inbound` would relabel every archived WS frame as
     // an inbound request.
@@ -455,6 +475,39 @@ test "a sidecar written before the activation field parses with an empty kind" {
     try testing.expectEqual(@as(usize, 1), parsed.records.len);
     try testing.expectEqualStrings("", parsed.records[0].activation);
     try testing.expectEqualStrings("ok", parsed.records[0].outcome);
+}
+
+test "a sidecar written before the saga rename still yields its saga id" {
+    // Read-side alias, one way: `saga_id` is what the writer emits, but
+    // sidecars already sitting in object storage carry `correlation_id`
+    // and must not lose the field.
+    const a = testing.allocator;
+    const old =
+        \\{"v":1,"node_id":"00000001","batch_id":"b","ndjson_size":10,
+        \\ "ndjson_sha256":"d","first_received_ns":1,"last_received_ns":2,
+        \\ "records":[{"tenant_id":"acme","request_id":1,"received_ns":1,
+        \\ "duration_ns":1,"method":"GET","path":"/a","host":"h","status":200,
+        \\ "outcome":"ok","deployment_id":1,"correlation_id":"C-OLD",
+        \\ "offset":0,"length":10}]}
+    ;
+    var parsed = try parse(a, old);
+    defer parsed.deinit(a);
+    try testing.expectEqualStrings("C-OLD", parsed.records[0].saga_id);
+}
+
+test "the current spelling wins when a sidecar somehow carries both" {
+    const a = testing.allocator;
+    const both =
+        \\{"v":1,"node_id":"00000001","batch_id":"b","ndjson_size":10,
+        \\ "ndjson_sha256":"d","first_received_ns":1,"last_received_ns":2,
+        \\ "records":[{"tenant_id":"acme","request_id":1,"received_ns":1,
+        \\ "duration_ns":1,"method":"GET","path":"/a","host":"h","status":200,
+        \\ "outcome":"ok","deployment_id":1,"saga_id":"C-NEW",
+        \\ "correlation_id":"C-OLD","offset":0,"length":10}]}
+    ;
+    var parsed = try parse(a, both);
+    defer parsed.deinit(a);
+    try testing.expectEqualStrings("C-NEW", parsed.records[0].saga_id);
 }
 
 test "parse rejects wrong version" {

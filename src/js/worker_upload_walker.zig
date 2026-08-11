@@ -175,11 +175,11 @@ fn buildLogRecord(
     errdefer allocator.free(host);
     const console: []u8 = &.{};
     const exception: []u8 = &.{};
-    const correlation_id: []const u8 = if (lh.correlation_id.len > 0)
-        try allocator.dupe(u8, lh.correlation_id)
+    const saga_id: []const u8 = if (lh.saga_id.len > 0)
+        try allocator.dupe(u8, lh.saga_id)
     else
         "";
-    errdefer if (correlation_id.len > 0) allocator.free(correlation_id);
+    errdefer if (saga_id.len > 0) allocator.free(saga_id);
 
     var tapes: log_mod.TapePayloads = .{
         .seed = seed,
@@ -214,7 +214,7 @@ fn buildLogRecord(
         .console = console,
         .exception = exception,
         .tapes = tapes,
-        .correlation_id = correlation_id,
+        .saga_id = saga_id,
         .activation = lh.activation,
         .raft_seq = raft_seq,
     };
@@ -243,7 +243,7 @@ const sample_lh: log_mod.LogHeader = .{
     .method = "GET",
     .path = "/x",
     .host = "acme.example",
-    .correlation_id = "corr-1",
+    .saga_id = "corr-1",
 };
 
 fn freeRecords(a: std.mem.Allocator, records: []log_mod.LogRecord) void {
@@ -277,7 +277,7 @@ test "hydrate: single type-0 envelope → one LogRecord" {
     try testing.expectEqual(log_mod.ActivationSource.inbound, r.activation);
     try testing.expectEqualStrings("GET", r.method);
     try testing.expectEqualStrings("/x", r.path);
-    try testing.expectEqualStrings("corr-1", r.correlation_id);
+    try testing.expectEqualStrings("corr-1", r.saga_id);
     try testing.expectEqual(@as(u64, 17), r.raft_seq);
     // kv + module channels carried through.
     try testing.expect(r.tapes.kv_tape_bytes.len > 0);

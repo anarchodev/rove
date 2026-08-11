@@ -92,7 +92,7 @@ is *allowed* to grow.
 
 This is the engine-side half of determinism. arenajs handles
 within-activation; L3 handles between. Tape volume is bounded on the
-per-tenant retention axis, not by a per-chain cap (`decisions.md` §3.6) —
+per-tenant retention axis, not by a per-saga cap (`decisions.md` §3.6) —
 the intent is recorded, not recorded *forever*. Note the bound is not yet
 enforced: `retention_days` clamps the read window, and nothing reclaims the
 bytes. The reclamation engine is the retention/GC design (issue #91), and

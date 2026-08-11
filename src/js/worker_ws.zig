@@ -182,7 +182,7 @@ fn serviceWsConnects(worker: anytype) void {
 
 /// Establish the held chain for a new WS connection on its first inbound
 /// frame: resolve the tenant (from the upgrade Host) + handler module (from
-/// the upgrade path), mint a per-connection correlation id, create the parked
+/// the upgrade path), mint a per-connection saga id, create the parked
 /// continuation entity carrying the chain identity, and index it by conn.
 /// Returns the chain entity, or an error if routing/tenant/module can't be
 /// resolved (the caller closes the socket).
@@ -209,8 +209,8 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    var corr_buf: [16]u8 = undefined;
-    const corr = std.fmt.bufPrint(&corr_buf, "{x:0>16}", .{request_id}) catch unreachable;
+    var saga_buf: [16]u8 = undefined;
+    const corr = std.fmt.bufPrint(&saga_buf, "{x:0>16}", .{request_id}) catch unreachable;
 
     const ent = try server.reg.create(&worker.parked_continuations);
     errdefer server.reg.destroy(ent) catch {};
@@ -223,8 +223,8 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
     {
         const tid_dup = try allocator.dupe(u8, inst.id);
         errdefer allocator.free(tid_dup);
-        const corr_dup = try allocator.dupe(u8, corr);
-        errdefer allocator.free(corr_dup);
+        const saga_dup = try allocator.dupe(u8, corr);
+        errdefer allocator.free(saga_dup);
         // The connection's own identity, kept for every activation this
         // chain will log (`ChainContext.root_*`). `GET` because that is
         // what the client wrote — `new WebSocket("wss://host/live")` is
@@ -238,7 +238,7 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
         errdefer allocator.free(path_dup);
         try server.reg.set(ent, &worker.parked_continuations, components_mod.ChainContext, .{
             .tenant_id = tid_dup,
-            .correlation_id = corr_dup,
+            .saga_id = saga_dup,
             .deployment_id = dep.tc.snap.deployment_id,
             .root_method = method_dup,
             .root_host = host_dup,
@@ -523,14 +523,14 @@ fn finishWsResume(
             if (r.exception.len > 0) {
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
             }
-            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), act, rl.method, rl.path, rl.host, chain_ctx.correlation_id, p.now_ns);
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), act, rl.method, rl.path, rl.host, chain_ctx.saga_id, p.now_ns);
             // Tapes before shipWsFrames' propose so the input channels (ctx on
             // trigger_payload, fetch event on fetch_responses) ride the raft
             // readset for the promotion walker
@@ -540,13 +540,13 @@ fn finishWsResume(
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
                 std.log.warn("rove-js {s} (terminal+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.saga_id, &.{}, act, 0);
                 tearDownWsChain(worker, conn_ent);
                 return;
             };
             p.txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, tapes, chain_ctx.correlation_id, r.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, tapes, chain_ctx.saga_id, r.tags, act, fw_seq);
             r.console = &.{};
             r.exception = &.{};
             tearDownWsChain(worker, conn_ent);
@@ -565,12 +565,12 @@ fn finishWsResume(
                 p.txn.rollback() catch {};
                 p.txn_done = true;
                 const errmsg = allocator.dupe(u8, "next({fn}) is not supported on a WebSocket chain — frames dispatch to onMessage; name a wake export via after.*(..., {on})") catch @constCast("");
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, errmsg, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, errmsg, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
             }
-            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, rl.method, rl.path, rl.host, chain_ctx.correlation_id, p.now_ns);
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, rl.method, rl.path, rl.host, chain_ctx.saga_id, p.now_ns);
             const wrote = p.ws.ops.items.len > 0;
             // Snap the §8.4 read baseline before shipWsFrames may transfer txn.
             const read_version = p.txn.readVersion();
@@ -581,7 +581,7 @@ fn finishWsResume(
                 std.log.warn("rove-js {s} (next+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 cval.deinit(allocator);
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.saga_id, &.{}, act, 0);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
@@ -598,7 +598,7 @@ fn finishWsResume(
             // ws_message frames return next(), so this is the dominant
             // browser-agent capture path — without it the per-frame
             // activations carry no `session` tag.
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, chain_ctx.correlation_id, cval.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, chain_ctx.saga_id, cval.tags, act, fw_seq);
             // Re-aim on an explicit cross-module target — every later
             // frame/wake on this connection dispatches at the target
             // module. AFTER the capture above: the `path` local
@@ -641,7 +641,7 @@ fn finishWsResume(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
@@ -718,7 +718,7 @@ fn fireWsMessage(
         .query = null,
         .activation = .{ .ws_message = .{ .opcode = opcode, .data = payload } },
         .activation_entity = chain_ent,
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .effects = .{
@@ -735,7 +735,7 @@ fn fireWsMessage(
         // digest is a prefix, not a verdict.
         worker_mod.dropPartialDigest(&p.readset);
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .ws_message, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, .ws_message, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -934,7 +934,7 @@ pub fn resumeBoundFetchChainWs(
         } },
         .activation_entity = chain_ent,
         .activation_fetches_pending = fetches_pending,
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .effects = .{
@@ -949,7 +949,7 @@ pub fn resumeBoundFetchChainWs(
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, body, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -1043,7 +1043,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         .fn_override = resume_fn,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .activation = .{ .wake_batch = .{ .wakes = batch_owned } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .effects = .{
@@ -1058,7 +1058,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .wake_batch, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, .wake_batch, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -1176,7 +1176,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .body = body,
         .query = null,
         .activation = .disconnect,
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -1184,7 +1184,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0);
         return;
     };
 
@@ -1199,17 +1199,17 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .no_onheaders, .no_onchunk => {},
     }
     if (wrote) {
-        const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, rl.method, rl.path, rl.host, chain_ctx.correlation_id, p.now_ns);
+        const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, rl.method, rl.path, rl.host, chain_ctx.saga_id, p.now_ns);
         _ = proposeForgetfulWrites(worker, &p.ws, p.txn, chain_ctx.tenant_id, null, null, &p.readset, lh) catch |perr| {
             std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
             p.txn_owned = false;
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0);
             return;
         };
         p.txn_owned = false;
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0);
         return;
     }
     p.txn.commit() catch |e| switch (e) {
@@ -1225,7 +1225,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         ),
     };
     p.txn_done = true;
-    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
+    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

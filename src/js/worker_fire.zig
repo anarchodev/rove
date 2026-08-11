@@ -53,7 +53,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     const chain_ctx = server.reg.get(ent, &server.response_out, components_mod.ChainContext) catch return;
     std.log.info(
         "rove-js stream-disconnect: tenant={s} corr={s} activations={d}",
-        .{ chain_ctx.tenant_id, chain_ctx.correlation_id orelse "(none)", chain_st.activation_count },
+        .{ chain_ctx.tenant_id, chain_ctx.saga_id orelse "(none)", chain_st.activation_count },
     );
 
     const path = chain_st.module_path;
@@ -71,7 +71,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .body = body,
         .query = null,
         .activation = .disconnect,
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -84,7 +84,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .site = "stream-disconnect",
         .on_cont = .warn,
         .on_stream = .warn,
-    }, path, chain_ctx.correlation_id, chain_ctx.tenant_id, "");
+    }, path, chain_ctx.saga_id, chain_ctx.tenant_id, "");
 }
 
 /// Fire a subscription handler as a fresh chain
@@ -96,7 +96,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 ///   - **Msg**: `(subscription_fire, source)` where source is
 ///     one of {cron firedAt, kv key+op, boot deployment_id}.
 ///   - **prep**: resolveDeployment(tenant_id, module_path); mint
-///     a fresh correlation_id; synthesize Request body `{ctx:{}}`.
+///     a fresh saga_id; synthesize Request body `{ctx:{}}`.
 ///   - **run**: `dispatcher.runOutcome` (chain-origin txn).
 ///   - **apply (Cmd-list)**:
 ///       • terminal → propose writes (if any) + log; bytes go
@@ -149,7 +149,7 @@ pub fn fireSubscriptionActivation(
     };
 
     // Subscription chains start fresh — empty ctx, fresh
-    // correlation_id. (The handler can pass ctx forward via its
+    // saga_id. (The handler can pass ctx forward via its
     // own kv state if it wants persistent chain state across
     // fires; the platform doesn't carry any.)
     const body = synthCtxBody(allocator, "{}") catch return;
@@ -157,17 +157,17 @@ pub fn fireSubscriptionActivation(
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
 
-    // Mint a fresh correlation_id for this chain origin. Format:
+    // Mint a fresh saga_id for this chain origin. Format:
     // `sub-{name-prefix}-{request_id-hex}` — name-scoped + unique
     // enough to dedup in the replay UX. Truncated to keep length
     // bounded.
-    var corr_buf: [80]u8 = undefined;
+    var saga_buf: [80]u8 = undefined;
     const name_prefix_len: usize = @min(subscription_name.len, 32);
     const corr_full = std.fmt.bufPrint(
-        &corr_buf,
+        &saga_buf,
         "sub-{s}-{x:0>16}",
         .{ subscription_name[0..name_prefix_len], p.request_id },
-    ) catch corr_buf[0..0];
+    ) catch saga_buf[0..0];
 
     // Named-export dispatch by trigger source (handler-shape.md §3):
     // a kv-react fire lands in `onSubscription`.
@@ -185,7 +185,7 @@ pub fn fireSubscriptionActivation(
         .body = body,
         .fn_override = subscriptionExport(source),
         .activation = .{ .subscription_fire = .{ .name = subscription_name, .source = source } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -227,8 +227,8 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
 
-    var corr_buf: [48]u8 = undefined;
-    const corr_full = std.fmt.bufPrint(&corr_buf, "sched-{x:0>16}", .{p.request_id}) catch corr_buf[0..0];
+    var saga_buf: [48]u8 = undefined;
+    const corr_full = std.fmt.bufPrint(&saga_buf, "sched-{x:0>16}", .{p.request_id}) catch saga_buf[0..0];
 
     const req: Request = .{
         .method = "POST",
@@ -237,7 +237,7 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .query = null,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .{ .subscription_fire = .{ .name = "__scheduler_tick", .source = null } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{
@@ -289,8 +289,8 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
 
-    var corr_buf: [48]u8 = undefined;
-    const corr_full = std.fmt.bufPrint(&corr_buf, "compose-{x:0>16}", .{p.request_id}) catch corr_buf[0..0];
+    var saga_buf: [48]u8 = undefined;
+    const corr_full = std.fmt.bufPrint(&saga_buf, "compose-{x:0>16}", .{p.request_id}) catch saga_buf[0..0];
 
     const req: Request = .{
         .method = "POST",
@@ -307,7 +307,7 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
             .scheduled_at_ns = 0,
             .msg_json = ctx_json,
         } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -427,9 +427,9 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
         };
     }
 
-    var corr_buf: [80]u8 = undefined;
+    var saga_buf: [80]u8 = undefined;
     const id_prefix_len: usize = @min(dw.id.len, 32);
-    const corr_full = std.fmt.bufPrint(&corr_buf, "wake-{s}-{x:0>16}", .{ dw.id[0..id_prefix_len], p.request_id }) catch corr_buf[0..0];
+    const corr_full = std.fmt.bufPrint(&saga_buf, "wake-{s}-{x:0>16}", .{ dw.id[0..id_prefix_len], p.request_id }) catch saga_buf[0..0];
 
     const req: Request = .{
         .method = "POST",
@@ -446,7 +446,7 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
             .scheduled_at_ns = dw.scheduled_at_ns,
             .msg_json = dw.msg_json,
         } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -468,11 +468,11 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
 /// twin of `fireSubscriptionActivation`:
 ///
 ///   - **Msg**: `SendCallback{tenant_id, module_path, ctx_json,
-///     fn_name?, correlation_id?}`.
+///     fn_name?, saga_id?}`.
 ///   - **prep**: resolve the cont's module on its tenant; build
 ///     `body = {"ctx":<ctx>}` (mirrors fireSubscriptionActivation
 ///     so customers' `JSON.parse(request.body).ctx` pattern is
-///     uniform); reuse the inherited correlation_id when present
+///     uniform); reuse the inherited saga_id when present
 ///     (replay UX groups multi-hop chains) or mint one based on
 ///     the request_id.
 ///   - **run**: `dispatcher.runOutcome`. `activation_source ==
@@ -502,15 +502,15 @@ pub fn fireChainedActivation(
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
 
-    // Inherit correlation_id when the cont carried one (chained from
+    // Inherit saga_id when the cont carried one (chained from
     // a fetch handler — preserves the parent fetch's chain identity).
     // Otherwise mint `chain-<request_id>` so the hop self-identifies
     // in the replay tape.
-    var corr_buf: [80]u8 = undefined;
-    const corr_full: []const u8 = if (sc.correlation_id) |c|
+    var saga_buf: [80]u8 = undefined;
+    const corr_full: []const u8 = if (sc.saga_id) |c|
         c
     else
-        std.fmt.bufPrint(&corr_buf, "chain-{x:0>16}", .{p.request_id}) catch corr_buf[0..0];
+        std.fmt.bufPrint(&saga_buf, "chain-{x:0>16}", .{p.request_id}) catch saga_buf[0..0];
 
     // First-class target for the named-export case (decisions.md
     // §4.5); default-export when fn_name is null/empty (parseDispatch
@@ -522,13 +522,13 @@ pub fn fireChainedActivation(
         .fn_override = sc.fn_name,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .send_callback,
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
     // `.enqueue`: chained-from-chained re-enqueues another
     // SendCallback hop on the next tick (bounded recursion via the
-    // dispatch BATCH cap), inheriting the same correlation_id.
+    // dispatch BATCH cap), inheriting the same saga_id.
     // `.tape = .callback`: the body envelope IS this hop's Msg — the
     // callee outcome for an on_result delivery, the bare threaded ctx
     // for an internal chained hop — recorded (with the resolved
@@ -554,7 +554,7 @@ pub fn fireChainedActivation(
 ///     and carries terminal fields (status / ok / body_truncated);
 ///     intermediates have `final == false`.
 ///   - **prep**: resolve the `on_chunk` module on the event's
-///     tenant; correlation_id `fetch-<id>` so every activation of
+///     tenant; saga_id `fetch-<id>` so every activation of
 ///     one fetch shares a chain identity; body `{ctx: <ctx_json>}`.
 ///   - **run**: `dispatcher.runOutcome`.
 ///   - **apply**: terminal → propose writes (if any) + log;
@@ -610,13 +610,13 @@ pub fn fireFetchEventActivation(
 
     // Correlation: all activations of one fetch share `fetch-<id>`
     // so the replay UX groups the chunk chain with its terminal.
-    var corr_buf: [80]u8 = undefined;
+    var saga_buf: [80]u8 = undefined;
     const id_len: usize = @min(event.fetch_id.len, 64);
     const corr_full = std.fmt.bufPrint(
-        &corr_buf,
+        &saga_buf,
         "fetch-{s}",
         .{event.fetch_id[0..id_len]},
-    ) catch corr_buf[0..0];
+    ) catch saga_buf[0..0];
 
     const req: Request = .{
         .method = "POST",
@@ -635,7 +635,7 @@ pub fn fireFetchEventActivation(
             .terminal_ok = if (event.final) event.terminal_ok else false,
             .body_truncated = if (event.final) event.body_truncated else false,
         } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{

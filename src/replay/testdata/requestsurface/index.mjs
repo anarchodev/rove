@@ -1,5 +1,5 @@
 // Reads back the engine-pinned request surface (globals.zig installRequest):
-// identity always set (session null / tenant / correlation_id ""), the two ip
+// identity always set (session null / tenant / sagaId ""), the two ip
 // channels, the activation bag, prod's request.tag validation, and the
 // ABSENCE of the retired driver-only surfaces (request.body, on.*).
 export default function () {
@@ -10,7 +10,7 @@ export default function () {
   return JSON.stringify({
     session: request.session,
     tenant: request.tenant,
-    corr: request.correlation_id,
+    corr: request.sagaId,
     ip: request.ip,
     unmasked: request.unmaskedIp(),
     hasBody: "body" in request,
@@ -18,7 +18,7 @@ export default function () {
     activation: request.activation,
     tagValid: request.tag("attempt", "1") === undefined,
     tagBadChars: throws(() => request.tag("Bad-Key", "v")),
-    tagReserved: throws(() => request.tag("_corr", "v")),
+    tagReserved: throws(() => request.tag("_saga", "v")),
     tagNonString: throws(() => request.tag("k", 42)),
     tagLongKey: throws(() => request.tag("k".repeat(33), "v")),
     tagLongVal: throws(() => request.tag("k2", "v".repeat(65))),

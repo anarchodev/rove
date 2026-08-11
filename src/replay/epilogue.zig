@@ -55,9 +55,9 @@ pub const Opts = struct {
     /// Injected `request.session` as JSON text (worker-resolved in prod).
     session_json: ?[]const u8 = null,
     /// Per-chain identity the engine pins on every activation → `request.tenant`
-    /// / `request.correlation_id`. Plain strings (null → not set).
+    /// / `request.sagaId`. Plain strings (null → not set).
     tenant: ?[]const u8 = null,
-    correlation_id: ?[]const u8 = null,
+    saga_id: ?[]const u8 = null,
     /// The RESOLVED specifier of the tenant's real `_middlewares` module
     /// (`_middlewares/index.mjs` or the `.js` spelling — prod probes both,
     /// `.mjs` first) whose `before` runs ahead of the handler (inbound trust
@@ -73,7 +73,7 @@ pub const Opts = struct {
     /// surfaces (`request.body`, the pre-rename `on.*` alias) so pinned old
     /// deployments replay. Authored worlds mirror the LIVE surface: payload
     /// accessors read `undefined` on payload-less kinds, identity is always
-    /// pinned (`session` null / `tenant` / `correlation_id` ""), the ip
+    /// pinned (`session` null / `tenant` / `sagaId` ""), the ip
     /// channels default to null, and the retired surfaces don't exist.
     captured: bool = false,
     /// World-build warnings (e.g. an authored header the prod filter would
@@ -247,8 +247,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try w.writeAll(opts.session_json orelse "null");
     try w.writeAll(",\"tenant\":");
     if (opts.tenant) |t| try jsonStr(w, t) else try w.writeAll("null");
-    try w.writeAll(",\"correlationId\":");
-    if (opts.correlation_id) |cid| try jsonStr(w, cid) else try w.writeAll("null");
+    try w.writeAll(",\"sagaId\":");
+    if (opts.saga_id) |cid| try jsonStr(w, cid) else try w.writeAll("null");
     try w.writeAll(",\"result\":");
     if (opts.result) |r| {
         try w.writeAll("{\"status\":");
@@ -352,21 +352,45 @@ const EPILOGUE_BODY =
     \\  // the two offline engines fold at the same points.
     \\  //
     \\  // Only the worker's grammar folds (src/tape/interaction_digest.zig):
-    \\  // kv reads/writes/deletes/prefixes, fetches, wake arms, stream writes.
-    \\  // Logs, tags, platform and blob calls are recorded for the timeline but
-    \\  // NOT folded, because the worker does not fold them either — a digest
-    \\  // is only useful if every engine hashes the same set.
+    \\  // kv reads/writes/deletes/prefixes, fetches, wake arms, stream writes,
+    \\  // and the three privileged LIFECYCLE ops the worker folds
+    \\  // (globals_platform.zig foldPlatformOp). Logs, tags, blob calls and
+    \\  // platform.scope are recorded for the timeline but NOT folded, because
+    \\  // the worker does not fold those — a digest is only useful if every
+    \\  // engine hashes the same set.
     \\  const __DG = globalThis.__interactionDigest;
     \\  const __dg = __DG ? new __DG.Digest() : null;
+    \\  // A cross-store element's digest key is the NAMESPACED one
+    \\  // (`__rove_store/<tag>/<key>`): the worker gives cross-store ops no
+    \\  // verb of their own, so the store is data in the key
+    \\  // (globals_platform.zig namespacedKey). Folding the bare key both
+    \\  // disagrees with capture AND erases the store, so scope("a").kv.get(k)
+    \\  // and root.get(k) would hash alike — a false agreement.
+    \\  const __dgKey = (e) => (e.store === undefined || e.store === null)
+    \\    ? e.key
+    \\    : "__rove_store/" + e.store + "/" + e.key;
     \\  const __foldEffect = (e) => {
     \\    if (!__dg || !e) return;
+    \\    // The harness's own scope-resolution marker. It exists so a resume can
+    \\    // rebuild kv from the folded effect log; the worker records instance
+    \\    // creation in the ROOT WRITESET (raft), never in the digest. Folding
+    \\    // it would add an element capture has no counterpart for.
+    \\    if (e.store === "exists") return;
     \\    switch (e.kind) {
     \\      case "read":
-    \\        if (e.op === "prefix") __dg.kvPrefix(e.key, true, e.count ?? 0, BigInt("0x" + (e.rowsFold ?? "0")));
-    \\        else __dg.kvRead(e.key, !!e.present, e.value ?? "");
+    \\        if (e.op === "prefix") __dg.kvPrefix(__dgKey(e), true, e.count ?? 0, BigInt("0x" + (e.rowsFold ?? "0")));
+    \\        else __dg.kvRead(__dgKey(e), !!e.present, e.value ?? "");
     \\        break;
-    \\      case "write":  __dg.kvWrite(e.key, e.value ?? ""); break;
-    \\      case "delete": __dg.kvDelete(e.key); break;
+    \\      case "write":  __dg.kvWrite(__dgKey(e), e.value ?? ""); break;
+    \\      case "delete": __dg.kvDelete(__dgKey(e)); break;
+    \\      // Exactly the ops globals_platform.zig folds, with the same
+    \\      // arguments. `scope` is deliberately absent: the worker resolves a
+    \\      // scope handle without folding anything.
+    \\      case "platform":
+    \\        if (e.op === "instances.create") __dg.platformOp(e.op, e.name ?? "", "");
+    \\        else if (e.op === "instances.deployStarter") __dg.platformOp(e.op, e.name ?? "", "");
+    \\        else if (e.op === "releases.publish") __dg.platformOp(e.op, e.tenant ?? "", e.depId ?? "");
+    \\        break;
     \\      case "fetch":  __dg.fetch(e.method || "GET", e.url || "", e.body ?? ""); break;
     \\      case "timer":  __dg.wakeArm("t", String(e.ms), e.on ?? ""); break;
     \\      case "kv-wake": __dg.wakeArm("k", e.prefix, e.on ?? ""); break;
@@ -506,18 +530,18 @@ const EPILOGUE_BODY =
     \\  if (D.ctx !== null) request.ctx = D.ctx;
     \\  // Engine-pinned identity (worker-set — no code to run): prod ALWAYS
     \\  // sets these on every activation (globals.zig installRequest) —
-    \\  // `session` null when no cookie resolved, `correlation_id` "" when no
-    \\  // chain context, `tenant` = the instance id ("sim" is the
+    \\  // `session` null when no cookie resolved, `sagaId` "" when no
+    \\  // saga context, `tenant` = the instance id ("sim" is the
     \\  // authored-world placeholder). A captured world sets only what its
     \\  // tape carries.
     \\  if (D.captured) {
     \\    if (D.session !== null) request.session = D.session;
     \\    if (D.tenant !== null) request.tenant = D.tenant;
-    \\    if (D.correlationId !== null) request.correlation_id = D.correlationId;
+    \\    if (D.sagaId !== null) request.sagaId = D.sagaId;
     \\  } else {
     \\    request.session = D.session;
     \\    request.tenant = D.tenant !== null ? D.tenant : "sim";
-    \\    request.correlation_id = D.correlationId !== null ? D.correlationId : "";
+    \\    request.sagaId = D.sagaId !== null ? D.sagaId : "";
     \\  }
     \\  // request.activation = { kind, ...payload }: prod installs the bag on
     \\  // EVERY activation, so the sim does too — the authored bag (if any)

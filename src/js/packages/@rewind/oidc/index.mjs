@@ -818,6 +818,14 @@ class OIDCRelyingParty {
    *   `redirect_uri`. Optional: `post_login` (default `/`),
    *   `operator_prefix` (empty ⇒ `is_root` always false), kv-path /
    *   TTL / `leewaySeconds` overrides.
+   *
+   *   `operator_prefix` names the allowlist that decides `is_root`, and that
+   *   verdict is resolved **at login and frozen on the session** — so adding
+   *   someone to the allowlist does not affect sessions they already hold, and
+   *   they must log in again to gain operator authority (rove decisions.md
+   *   §4.6c, an accepted trade: authority costs one read per login rather than
+   *   one per request). Removal is the same in reverse — a live session stays
+   *   operator until it expires.
    * @param {string} name - Config name; namespaces the kv key paths.
    * @throws {TypeError} Missing `issuer`/`client_id`/`redirect_uri`.
    */

@@ -957,7 +957,7 @@ fn proposeAndParkContResume(
             //
             // The existing ContDescriptor on the entity becomes
             // stale — deinit its Continuation and clear the fields.
-            // ChainContext stays — same tenant / correlation id;
+            // ChainContext stays — same tenant / saga id;
             // only the deployment_id and slices are reused unchanged.
             const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
             if (desc.cont) |*old_c| old_c.deinit(allocator);
@@ -1200,7 +1200,7 @@ const StreamResumeCtx = struct {
     tenant_id: []const u8,
     readset: *tape_mod.Readset,
     cont_path: []const u8,
-    correlation_id: ?[]const u8,
+    saga_id: ?[]const u8,
     request_id: u64,
     now_ns: i64,
     deployment_id: u64,
@@ -1258,7 +1258,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         ctx.txn.rollback() catch {};
         ctx.txn_done.* = true;
         resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch {};
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, .{}, ctx.saga_id, &.{}, ctx.activation, 0);
         return;
     }
 
@@ -1287,7 +1287,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         ctx.txn.rollback() catch {};
         ctx.txn_done.* = true;
         resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume alloc failed\n") catch {};
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.saga_id, &.{}, ctx.activation, 0);
         return;
     };
 
@@ -1308,7 +1308,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
 
     if (ctx.wrote) {
         // status=0: parked-hop convention (matches repark).
-        const lh = worker_streaming.fireLogHeader(ctx.request_id, ctx.deployment_id, 0, ctx.activation, "POST", ctx.cont_path, "", ctx.correlation_id, ctx.now_ns);
+        const lh = worker_streaming.fireLogHeader(ctx.request_id, ctx.deployment_id, 0, ctx.activation, "POST", ctx.cont_path, "", ctx.saga_id, ctx.now_ns);
         const stream_seq = proposeAndParkContResume(
             worker,
             ctx.ent,
@@ -1337,13 +1337,13 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
             ctx.txn_owned.* = false;
             ctx.txn_done.* = true;
             resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume write replication failed\n") catch {};
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.saga_id, &.{}, ctx.activation, 0);
             return;
         };
         ctx.txn_owned.* = false;
         ctx.txn_done.* = true;
         hop_tapes_consumed = true;
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.correlation_id, &.{}, ctx.activation, stream_seq);
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.saga_id, &.{}, ctx.activation, stream_seq);
         return;
     }
 
@@ -1402,7 +1402,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         if (stream_kv_prefixes.len > 0) allocator.free(stream_kv_prefixes);
         if (stream_timer_on) |t| allocator.free(t);
         resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume header build failed\n") catch {};
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.saga_id, &.{}, ctx.activation, 0);
         return;
     };
     for (parsed_headers) |h| {
@@ -1419,7 +1419,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     // soft-fails there) — they drop with a register failure.
     if (ctx.pending_fetches) |pf| worker_streaming.flushResumeFetches(worker, ctx.ent, pf, false);
     hop_tapes_consumed = true;
-    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.correlation_id, &.{}, ctx.activation, 0);
+    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.saga_id, &.{}, ctx.activation, 0);
 }
 
 /// 503 (retriable) when this activation's failure was an invalidated txn
@@ -1482,7 +1482,7 @@ const ContFinishCtx = struct {
     /// `cont_path_log` snapshot for post-mutation log records.
     cont_path: []const u8,
     cont_path_log: []const u8,
-    correlation_id: ?[]const u8,
+    saga_id: ?[]const u8,
     request_id: u64,
     now_ns: i64,
     deployment_id: u64,
@@ -1658,7 +1658,7 @@ fn finishContResume(
                 ctx.txn.rollback() catch {};
                 ctx.txn_done.* = true;
                 resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " handler error\n") catch {};
-                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, 0);
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.saga_id, r.tags, ctx.act, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1672,7 +1672,7 @@ fn finishContResume(
                     ctx.txn.rollback() catch {};
                     ctx.txn_done.* = true;
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " alloc failed\n") catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, 0);
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.saga_id, r.tags, ctx.act, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -1681,7 +1681,7 @@ fn finishContResume(
                 const exception_owned = r.exception;
                 r.console = &.{};
                 r.exception = &.{};
-                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, st, ctx.act, "POST", ctx.cont_path, "", ctx.correlation_id, ctx.now_ns);
+                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, st, ctx.act, "POST", ctx.cont_path, "", ctx.saga_id, ctx.now_ns);
                 // Tapes before the propose so the input channels (ctx/Msg on
                 // trigger_payload, fetch event on fetch_responses) ride the raft
                 // readset for the promotion walker
@@ -1709,14 +1709,14 @@ fn finishContResume(
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, console_owned, exception_owned, tapes, ctx.correlation_id, &.{}, ctx.act, 0);
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, console_owned, exception_owned, tapes, ctx.saga_id, &.{}, ctx.act, 0);
                     return;
                 };
                 // Helper took ownership of txn (moved into pending_txns)
                 // and body_dup (stamped onto the entity).
                 ctx.txn_owned.* = false;
                 ctx.txn_done.* = true;
-                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, console_owned, exception_owned, tapes, ctx.correlation_id, r.tags, ctx.act, seq);
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, console_owned, exception_owned, tapes, ctx.saga_id, r.tags, ctx.act, seq);
                 if (ctx.pending_fetches.items.len > 0) std.log.warn(
                     "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ ctx.pending_fetches.items.len, ctx.tenant_id },
@@ -1735,7 +1735,7 @@ fn finishContResume(
             // fetches drop (scope rule), unbound ones still fire.
             worker_streaming.flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, false);
             resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st, r.body) catch {};
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, 0);
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.saga_id, r.tags, ctx.act, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1815,7 +1815,7 @@ fn finishContResume(
                 ctx.txn_done.* = true;
                 resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch {};
                 const errmsg = allocator.dupe(u8, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch @constCast("");
-                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, errmsg, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, errmsg, contTapes(worker, spec.tape, &ctx), ctx.saga_id, &.{}, ctx.act, 0);
                 return;
             }
             if (ctx.wrote) {
@@ -1840,7 +1840,7 @@ fn finishContResume(
                 }
                 // status=0: the parked-hop convention (same shape as the
                 // inbound trampoline open hop) so replay surfaces it.
-                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, 0, ctx.act, "POST", ctx.cont_path, "", ctx.correlation_id, ctx.now_ns);
+                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, 0, ctx.act, "POST", ctx.cont_path, "", ctx.saga_id, ctx.now_ns);
                 // Tapes before the propose — input channels ride the raft
                 // readset for the promotion walker (see the terminal arm above).
                 const tapes = contTapes(worker, spec.tape, &ctx);
@@ -1863,13 +1863,13 @@ fn finishContResume(
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, ctx.correlation_id, &.{}, ctx.act, 0);
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, ctx.saga_id, &.{}, ctx.act, 0);
                     return;
                 };
                 ctx.txn_owned.* = false;
                 ctx.txn_done.* = true;
                 // The repark hop's tape row: status=0, parked.
-                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, tapes, ctx.correlation_id, &.{}, ctx.act, seq);
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, tapes, ctx.saga_id, &.{}, ctx.act, seq);
                 if (ctx.pending_fetches.items.len > 0) std.log.warn(
                     "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ ctx.pending_fetches.items.len, ctx.tenant_id },
@@ -1900,7 +1900,7 @@ fn finishContResume(
             // this record the hop is unreplayable (a ctx-only accumulating
             // handler hops read-only on EVERY chunk). Status 0 = the
             // parked-hop convention.
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.saga_id, &.{}, ctx.act, 0);
         },
         .stream => |*s| {
             resumeIntoStream(worker, s, .{
@@ -1912,7 +1912,7 @@ fn finishContResume(
                 .tenant_id = ctx.tenant_id,
                 .readset = ctx.readset,
                 .cont_path = ctx.cont_path,
-                .correlation_id = ctx.correlation_id,
+                .saga_id = ctx.saga_id,
                 .request_id = ctx.request_id,
                 .now_ns = ctx.now_ns,
                 .deployment_id = dep_id,
@@ -1933,7 +1933,7 @@ fn finishContResume(
             ctx.txn.rollback() catch {};
             ctx.txn_done.* = true;
             resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "export probe on a resume path\n") catch {};
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.saga_id, &.{}, ctx.act, 0);
         },
     }
 }
@@ -1961,11 +1961,11 @@ fn resumeContinuation(
     // A wake resume's tape rows are
     // `.wake_batch` (an `on.*` connection wake), not `.send_callback`.
     // Used for every captureLog / LogHeader below so replay groups the
-    // wake activation correctly under the chain's correlation_id.
+    // wake activation correctly under the chain's saga_id.
     const act_src: log_mod.ActivationSource = if (wake) .wake_batch else .send_callback;
     // Resolve-once guard: membership in `parked_continuations` IS
     // the cont-state discriminant. Cont state (path / fn_name /
-    // ctx_json / tenant_id / correlation_id) reads from the
+    // ctx_json / tenant_id / saga_id) reads from the
     // entity's components. The slices borrow into the component's
     // heap allocations; they stay valid across moves
     // (`merged_request_row` carries the components on every
@@ -1978,7 +1978,7 @@ fn resumeContinuation(
     const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
     const c = desc.cont orelse return;
     const tenant_id = chain.tenant_id;
-    const correlation_id = chain.correlation_id;
+    const saga_id = chain.saga_id;
     const cont_path = c.path;
     const cont_fn_name = c.fn_name;
     const cont_ctx_json = c.ctx_json;
@@ -2122,11 +2122,11 @@ fn resumeContinuation(
         // `request.ctx` / `request.body` — no positional args.
         .fn_override = if (named) resume_fn else null,
         // Inherit the chain id from the parking request so every tape row
-        // of this chain shares one correlation_id; mark this activation as
+        // of this chain shares one saga_id; mark this activation as
         // a send-callback resume (streaming-handlers-plan §6) — or
         // .wake_batch (with the drained fired prefixes) for an on.* wake.
         .activation = if (wake) .{ .wake_batch = .{ .wakes = batch_owned } } else .send_callback,
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
+        .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .effects = .{
@@ -2135,7 +2135,7 @@ fn resumeContinuation(
             .pending_fetches = &pending_fetches,
         },
     };
-    std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
+    std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ saga_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget, path) catch {
         txn.rollback() catch {};
@@ -2143,7 +2143,7 @@ fn resumeContinuation(
         try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "continuation handler error\n");
         // Log the failed hop — a resume that dies at dispatch was invisible
         // in tenant logs while every other family records a 500 here.
-        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, correlation_id, &.{}, act_src, 0);
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, saga_id, &.{}, act_src, 0);
         return;
     };
 
@@ -2163,7 +2163,7 @@ fn resumeContinuation(
         .readset = &readset,
         .cont_path = cont_path,
         .cont_path_log = cont_path_log,
-        .correlation_id = correlation_id,
+        .saga_id = saga_id,
         .request_id = request_id,
         .now_ns = now_ns,
         .deployment_id = tc.snap.deployment_id,
@@ -2227,7 +2227,7 @@ pub fn resumeBoundFetchChain(
     const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
     const c = desc.cont orelse return;
     const tenant_id = chain.tenant_id;
-    const correlation_id = chain.correlation_id;
+    const saga_id = chain.saga_id;
     const cont_path = c.path;
     // Snapshot for log records: `cont_path` borrows into desc.cont's
     // backing memory, which a write-repark (`proposeAndParkContResume`
@@ -2368,7 +2368,7 @@ pub fn resumeBoundFetchChain(
         } },
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
+        .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
@@ -2401,7 +2401,7 @@ pub fn resumeBoundFetchChain(
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
-        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), saga_id, &.{}, .fetch_chunk, 0);
         return;
     };
 
@@ -2422,7 +2422,7 @@ pub fn resumeBoundFetchChain(
         .readset = &readset,
         .cont_path = cont_path,
         .cont_path_log = cont_path_log,
-        .correlation_id = correlation_id,
+        .saga_id = saga_id,
         .request_id = request_id,
         .now_ns = now_ns,
         .deployment_id = tc.snap.deployment_id,
@@ -3161,7 +3161,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return false;
     const c = desc.cont orelse return false;
     const tenant_id = chain.tenant_id;
-    const correlation_id = chain.correlation_id;
+    const saga_id = chain.saga_id;
     const cont_path = c.path;
     const cont_ctx_json = c.ctx_json;
     // Snapshot for log records: `cont_path` borrows into desc.cont's
@@ -3296,7 +3296,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         } },
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
+        .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
@@ -3325,7 +3325,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
-        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), saga_id, &.{}, .inbound_chunk, 0);
         return true;
     };
 
@@ -3346,7 +3346,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .readset = &readset,
         .cont_path = cont_path,
         .cont_path_log = cont_path_log,
-        .correlation_id = correlation_id,
+        .saga_id = saga_id,
         .request_id = request_id,
         .now_ns = now_ns,
         .deployment_id = tc.snap.deployment_id,

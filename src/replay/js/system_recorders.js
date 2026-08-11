@@ -266,10 +266,31 @@
   globalThis.__roveStorePrefix = NS_STORE;
   var storeKv = function(P, tag){
     return {
-      get: function(k){ var v = globalThis.kv.get(P + k); push({ kind: "read", store: tag, key: k, present: v !== undefined && v !== null }); return v; },
+      // `value` is load-bearing, not decoration: the digest folds
+      // `r <key> <found> <valuehash>`, so an entry without it hashes the
+      // empty string and every cross-store read of a DIFFERENT value
+      // digests alike. The ordinary kv wrapper carries it; this one did
+      // not, which is what made an admin replay disagree with capture
+      // while the store's prefix scan agreed (rove#487).
+      get: function(k){ var v = globalThis.kv.get(P + k); var present = v !== undefined && v !== null; push(present ? { kind: "read", store: tag, key: k, present: true, value: v } : { kind: "read", store: tag, key: k, present: false }); return v; },
       set: function(k, val){ push({ kind: "write", store: tag, key: k, value: val }); return globalThis.kv.set(P + k, val); },
       delete: function(k){ push({ kind: "delete", store: tag, key: k }); return globalThis.kv.delete(P + k); },
-      prefix: function(p, cursor, limit){ var r = globalThis.kv.prefix(P + (p || ""), cursor, limit); push({ kind: "read", op: "prefix", store: tag, key: (p || "") }); return (r || []).map(function(e){ return { key: e.key.slice(P.length), value: e.value }; }); },
+      // The digest folds a cross-store prefix as `p <namespaced> <found>
+      // <count> <rowsfold>` (interaction_digest.zig kvPrefix), where the
+      // rows-fold is `key=<valuehash>;` per returned row IN ORDER, over the
+      // NAMESPACED keys — see globals_platform.zig's accumulator. Compute it
+      // here, because only the recorder sees the rows; the fold downstream
+      // gets a scalar. Folding 0/0 instead (what this used to push) makes
+      // every prefix scan digest alike, which is a false AGREEMENT, not
+      // merely a mismatch.
+      prefix: function(p, cursor, limit){
+        var r = globalThis.kv.prefix(P + (p || ""), cursor, limit) || [];
+        var acc = "";
+        for (var i = 0; i < r.length; i++) acc += r[i].key + "=" + globalThis.__interactionDigest.foldValue(r[i].value) + ";";
+        push({ kind: "read", op: "prefix", store: tag, key: (p || ""), count: r.length,
+               rowsFold: globalThis.__interactionDigest.foldValue(acc) });
+        return r.map(function(e){ return { key: e.key.slice(P.length), value: e.value }; });
+      },
     };
   };
   // platform.* is admin-only (prod: throws off the `__admin__` handler). Fail

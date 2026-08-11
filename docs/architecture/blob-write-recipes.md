@@ -303,7 +303,7 @@ log to the effect bundle or return values — contradicting the
    ordinary tenant kv — no reserved changes. **sid = the chain's
    correlation id** (recorded → replay-pure), with `req{request_id}`
    as the chain-less fallback (test paths). **One open recipe per
-   chain**, matching today's session-per-chain semantics; a second
+   chain**, matching today's session-per-saga semantics; a second
    concurrent recipe on one chain is NOT supported. Abandoned unsealed
    recipes are deleted by the materializer when idle > 15 min
    (activation-clock `updated_at`) — the kv analog of today's

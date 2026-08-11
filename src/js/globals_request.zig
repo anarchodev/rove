@@ -188,12 +188,14 @@ pub fn installRequest(
     // request.tag(key, value): attach a low-cardinality index tag to
     // this request's log record (see `jsRequestTag`).
     _ = c.JS_SetPropertyStr(ctx, req_obj, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
-    // request.correlation_id: the engine per-chain id (stable across a
-    // held connection's activations). The reserved `_corr` index tag is
-    // derived from it; a handler can also store it to map its own app
-    // session id ↔ correlation_id across reconnects. Empty string when
-    // the dispatch carries no chain context.
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "correlation_id", c.JS_NewStringLen(ctx, state.correlation_id.ptr, state.correlation_id.len));
+    // request.sagaId: the engine's per-saga id, stable across every
+    // activation of one saga (a held connection's frames, a callback
+    // chain's hops). The reserved `_saga` index tag is derived from it;
+    // a handler can also store it to map its own app session id ↔ saga
+    // id across reconnects. Empty string when the dispatch carries no
+    // saga context. Camel-case like the rest of the request surface
+    // (`chunkSeq`, `fetchId`).
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "sagaId", c.JS_NewStringLen(ctx, state.saga_id.ptr, state.saga_id.len));
     // request.tenant: the handler's own instance id. Needed to address
     // the self-tenant `rewind-logs.internal/v1/{tenant}/…` door (the
     // engine pins the read to this same id, so it can't reach another

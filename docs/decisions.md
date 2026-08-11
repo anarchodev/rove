@@ -146,7 +146,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   `SendDispatch`, and later the per-feature owed sweep were all retired.
 - **Inputs durable / outputs derivable**: `blob.put` / `blob.get` are likewise
   **JS shims, not Zig Cmd primitives** — the marker key holds a pointer
-  (`{correlation_id, seq, call_index, dest_key}`), never the bytes; recovery is
+  (`{saga_id, seq, call_index, dest_key}`), never the bytes; recovery is
   re-execution against the recorded readset. Decision rule: small+bounded payload
   (webhook body) → body-in-marker; arbitrary size (blob bytes) →
   pointer+re-execution.
@@ -207,7 +207,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   structurally-untaped stream (chunk bytes tape by reference — §3.9).
 
 ### 3.6 Per-chain tape cap removed; retention is the right axis
-- **Decision** (2026-05-26): the §6 per-chain tape cap was removed. Its
+- **Decision** (2026-05-26): the §6 per-saga tape cap was removed. Its
   worst-case (a single chain emitting hundreds of thousands of small
   activations) is already bounded by sequential commit latency (~ms/activation),
   while aggregate traffic outpaces any single chain by 2–3 orders of magnitude.
@@ -624,6 +624,31 @@ behavior, and what handler-shape.md promised). Three reasons:
   e.g. the `services-token` if `/_system/*` ever grows a JS path. Compute the
   verdict, expose the verdict.
 
+### 4.6c Operator authority is resolved at login, so granting it needs a re-login (2026-08-09)
+- **The rule**: an OIDC session's `is_root` is computed **once**, when the RP
+  mints the session (`@rewind/oidc`: `kv.get(operator_prefix + sha256(sub)) !=
+  null`), and frozen into `_rp/sess/{sid}`. Adding someone to the operator
+  allowlist therefore has **no effect on their existing sessions** — they must
+  log in again. Accepted deliberately.
+- **Why not re-evaluate per request**: authority would then cost a kv read on
+  every request to every operator-gated surface, to track a list that changes
+  a handful of times in a platform's life. The session already carries `sub`
+  and an expiry; `is_root` rides the same lifetime as the rest of what the
+  session asserts, which is the consistent story rather than one field that
+  silently means something newer than its neighbours.
+- **The cost, stated plainly**: granting operator authority is not instant, and
+  the failure mode is confusing rather than loud — a freshly-allowlisted
+  operator sees ordinary-customer 403s, not an error that names the cause. The
+  mitigation is documentation at the point of configuration (the
+  `operator_prefix` docs) plus the re-login instruction wherever the allowlist
+  is edited, NOT a shorter session TTL.
+- **The direction it does NOT license**: *revoking* authority is the asymmetric
+  half — removing someone from the allowlist likewise leaves their live session
+  operator until it expires. Revocation that must take effect immediately needs
+  session invalidation (drop `_rp/sess/*` for that `sub`), which is a different
+  mechanism from this one and is not built. Decide it when a real revocation
+  requirement appears; do not reach for per-request evaluation to get it.
+
 ### 4.7 One effect-result surface — flattened, no `request.result`
 - **Partially superseded by §4.9** (2026-06-15): the flatten-the-result decision
   stands, but where the *threaded ctx* and *delivery metadata* live changed —
@@ -754,10 +779,10 @@ behavior, and what handler-shape.md promised). Three reasons:
   indexes them in a `log_tags` companion table, so queries filter `?tag.k=v`
   (and `/v1/{tenant}/session/{id}` is sugar for `tag.session`). Session-replay
   is then just *a tag query*, not a one-off.
-- **Session key = the engine `correlation_id`**, auto-stamped on EVERY activation
+- **Saga key = the engine `saga_id`**, auto-stamped on EVERY activation
   of a held connection (verified stable across `ws_message` + bound-fetch
-  resumes) and surfaced to JS as `request.correlation_id`. The indexer derives a
-  reserved **`_corr`** tag from it, so `getReplay` returns a whole connection's
+  resumes) and surfaced to JS as `request.sagaId`. The indexer derives a
+  reserved **`_saga`** tag from it, so `getReplay` returns a whole connection's
   activations with **zero per-frame handler tagging**. The user `session` tag
   (the app's own id) is the cross-reconnect bonus.
 - **Bounds (low-cardinality posture, fail-loud)**: ≤4 tags/record, keys
@@ -776,8 +801,41 @@ behavior, and what handler-shape.md promised). Three reasons:
 - **Rejected**: positional `user1…userN` columns (opaque; meaning drifts across
   deploys) — named tags are self-documenting and the write cost is off the
   request hot path (the async indexer writes `log_tags`). Also rejected: a
-  bespoke `session_id` column threaded end-to-end — `correlation_id` already
+  bespoke `session_id` column threaded end-to-end — `saga_id` already
   exists captured + replicated + in the ndjson, so it only needed indexing.
+
+### 4.10a One name for the unit: **saga** (2026-08-05)
+
+- **Decision**: the sequence of activations linked by one engine id is a
+  **saga**, everywhere a human reads it. It had three names — *chain* (the
+  engine's word), *fold*/`foldl` (the mechanism), and *saga* (already shipped
+  in `rewind:test` and the `rewind test` runner). Saga wins because it is the
+  only one that covers connectionless sequences (`durable_wake`, `cron`,
+  `send_callback`, `onSubscription`) as naturally as held connections, and it
+  had existing surface area.
+- **The identifier moved with it.** `request.correlation_id` →
+  **`request.sagaId`** (camel-case like the rest of the request surface —
+  `chunkSeq`, `fetchId`); the reserved index tag `_corr` → **`_saga`**; the
+  sidecar/ndjson wire key `correlation_id` → `saga_id`; the Zig field
+  likewise. This was NOT treated as an internal name: the property is on
+  `request`, in the handler contract, pinned by the surface-test gate, and
+  consumed by the shipped `@rewind/browser` package.
+- **Compat is read-side and one-way.** A world.json fixture may still carry
+  `correlationId`, and a sidecar already in object storage may still carry
+  `correlation_id`; both are read, neither is written. The `log_tags` rows are
+  MIGRATED (`_corr` → `_saga`) rather than aliased, because an alias would put
+  an `OR` back into the tag filter — the exact shape that cannot be planned
+  (§ the tag-index fix, rove#443).
+- **Rejected**: keeping `correlation_id` as "the internal id" while the
+  customer surface said saga. That is the two-names-forever state the rename
+  exists to prevent, and the field is not internal.
+- **Accepted cost**: "saga" carries distributed-transaction baggage
+  (compensating actions), which rewind's sagas do not have. Recorded so it is
+  not re-litigated. "Session" was the alternative and collides with auth
+  sessions.
+- **Not renamed**: `ChainContext` and friends inside the worker, and the ~800
+  uses of "chain" in `src/` (some unrelated — a PEM certificate chain). Zig
+  identifiers with no external surface; a separate pass if it is ever worth it.
 
 ### 4.11 The ergonomics arc — one grammar, one payload surface (2026-07-04/05)
 

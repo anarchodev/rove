@@ -183,6 +183,25 @@ pub const IndexDb = struct {
             if (c.sqlite3_exec(db, "ALTER TABLE log_index ADD COLUMN activation TEXT", null, null, null) != c.SQLITE_OK)
                 return Error.Sqlite;
         }
+
+        // The engine's reserved tag was `_saga` before the saga rename.
+        // Rewrite the rows rather than aliasing on read: an alias would
+        // put an `OR` back into the tag filter, which is precisely the
+        // shape that cannot be planned (#443) — the fix there was to
+        // delete a conditional from that query, and this would
+        // reintroduce one.
+        //
+        // Bounded and one-time: it touches only rows whose key is the
+        // retired constant, and once none remain the statement is a
+        // no-op on every subsequent open. Safe to interrupt — a partial
+        // run leaves a mix, and the next open finishes it.
+        if (c.sqlite3_exec(
+            db,
+            "UPDATE OR IGNORE log_tags SET key = '" ++ RESERVED_SAGA_TAG ++ "' WHERE key = '" ++ RETIRED_CORR_TAG ++ "'",
+            null,
+            null,
+            null,
+        ) != c.SQLITE_OK) return Error.Sqlite;
     }
 
     fn hasColumn(db: *c.sqlite3, table: [:0]const u8, column: []const u8) Error!bool {
@@ -491,7 +510,7 @@ pub const IndexDb = struct {
     };
 
     /// Sagas for `tenant_id`, most-recently-active first. Cursor is
-    /// `(after_last_received_ns, after_corr_id)` from the previous
+    /// `(after_last_received_ns, after_saga_id)` from the previous
     /// page's tail; `(0, "")` starts at the newest.
     ///
     /// Index-only against `log_sagas_recent` — the whole reason the
@@ -504,7 +523,7 @@ pub const IndexDb = struct {
     /// table is built by the indexer as records arrive, so an index
     /// that already held records when the table was created lists no
     /// sagas for them. Their *activations* stay fully queryable by
-    /// correlation id (the tag-filtered record list); it is only the
+    /// saga id (the tag-filtered record list); it is only the
     /// enumeration of past sagas that starts empty and fills with new
     /// traffic. Reconstructing them means a one-time grouped pass over
     /// `log_tags` + `log_index` whose cost scales with the whole
@@ -519,7 +538,7 @@ pub const IndexDb = struct {
         self: *IndexDb,
         tenant_id: []const u8,
         after_last_received_ns: i64,
-        after_corr_id: []const u8,
+        after_saga_id: []const u8,
         floor_received_ns: i64,
         limit: u32,
     ) Error!SagaListResult {
@@ -542,7 +561,7 @@ pub const IndexDb = struct {
         defer _ = c.sqlite3_finalize(st);
         bindText(st.?, 1, tenant_id);
         _ = c.sqlite3_bind_int64(st, 2, after_last_received_ns);
-        bindText(st.?, 3, after_corr_id);
+        bindText(st.?, 3, after_saga_id);
         _ = c.sqlite3_bind_int64(st, 4, floor_received_ns);
         _ = c.sqlite3_bind_int64(st, 5, @intCast(limit));
 
@@ -731,9 +750,9 @@ fn execLogIndexInserts(
             classifyIgnored(db, r, ndjson_key, header_size);
         } else {
             // Accepted, so it is exactly one new activation of its saga.
-            // A record with no correlation id has no saga to roll up
+            // A record with no saga id has no saga to roll up
             // (early-error captures before request handling started).
-            if (r.correlation_id.len > 0) try execSagaUpsert(saga_st.?, r);
+            if (r.saga_id.len > 0) try execSagaUpsert(saga_st.?, r);
         }
     }
 }
@@ -787,7 +806,7 @@ fn execSagaUpsert(st: *c.sqlite3_stmt, r: sidecar.Record) Error!void {
     _ = c.sqlite3_reset(st);
     _ = c.sqlite3_clear_bindings(st);
     bindText(st, 1, r.tenant_id);
-    bindText(st, 2, r.correlation_id);
+    bindText(st, 2, r.saga_id);
     _ = c.sqlite3_bind_int64(st, 3, r.received_ns);
     bindText(st, 4, r.method);
     bindText(st, 5, r.path);
@@ -877,14 +896,20 @@ fn classifyIgnored(
     );
 }
 
-/// Reserved tag key: the engine-populated per-chain correlation id.
-/// `request.tag` rejects `_`-prefixed keys, so this can't collide with
-/// a user tag. Lets `?tag._corr=<id>` filter by the engine session key
-/// even when the handler set no `session` tag of its own.
-pub const RESERVED_CORR_TAG = "_corr";
+/// Reserved tag key: the engine-populated per-saga id. `request.tag`
+/// rejects `_`-prefixed keys, so this can't collide with a user tag.
+/// Lets `?tag._saga=<id>` filter to one saga's activations even when
+/// the handler set no `session` tag of its own.
+pub const RESERVED_SAGA_TAG = "_saga";
 
-/// Insert each record's user tags (+ the reserved `_corr` tag derived
-/// from its correlation_id) into `log_tags`. `INSERT OR IGNORE` on the
+/// The retired spelling. Rows written before the rename carry it, and
+/// `migrate` rewrites them in place — this constant exists so that
+/// migration has a name for what it is looking for, not as a fallback
+/// on the read path. Nothing writes it.
+pub const RETIRED_CORR_TAG = "_corr";
+
+/// Insert each record's user tags (+ the reserved `_saga` tag derived
+/// from its saga id) into `log_tags`. `INSERT OR IGNORE` on the
 /// (tenant_id, request_id, key) primary key keeps re-indexing
 /// idempotent. Runs inside the same transaction as the log_index
 /// inserts.
@@ -899,8 +924,8 @@ fn execLogTagsInserts(db: *c.sqlite3, idx: *const sidecar.IdxFile) Error!void {
     defer _ = c.sqlite3_finalize(st);
 
     for (idx.records) |r| {
-        if (r.correlation_id.len > 0)
-            try bindTagRow(st.?, r.tenant_id, r.request_id, RESERVED_CORR_TAG, r.correlation_id, r.received_ns);
+        if (r.saga_id.len > 0)
+            try bindTagRow(st.?, r.tenant_id, r.request_id, RESERVED_SAGA_TAG, r.saga_id, r.received_ns);
         for (r.tags) |t| {
             if (t.key.len == 0 or t.value.len == 0) continue;
             try bindTagRow(st.?, r.tenant_id, r.request_id, t.key, t.value, r.received_ns);
@@ -1069,7 +1094,7 @@ test "insertBatch + queryList round-trips, newest-first" {
     try testing.expectEqual(@as(u64, 1), try idx.queryCount("acme", 1_500)); // clamped
 }
 
-test "queryList filters by tag (user session + reserved _corr)" {
+test "queryList filters by tag (user session + reserved _saga)" {
     const a = testing.allocator;
     const db_path = try tempPath(a, "tags");
     defer {
@@ -1083,8 +1108,8 @@ test "queryList filters by tag (user session + reserved _corr)" {
     var tags_a = [_]sidecar.Tag{.{ .key = "session", .value = "S1" }};
     var tags_b = [_]sidecar.Tag{.{ .key = "session", .value = "S2" }};
     var records = [_]sidecar.Record{
-        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .tags = &tags_a, .offset = 0, .length = 10 },
-        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/b", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .tags = &tags_b, .offset = 10, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "C1", .tags = &tags_a, .offset = 0, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/b", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "C1", .tags = &tags_b, .offset = 10, .length = 10 },
     };
     const batch = sidecar.IdxFile{
         .node_id = "00000001",
@@ -1103,9 +1128,9 @@ test "queryList filters by tag (user session + reserved _corr)" {
     try testing.expectEqual(@as(usize, 1), s1.rows.len);
     try testing.expectEqual(@as(u64, 1), s1.rows[0].request_id);
 
-    // Reserved _corr tag is auto-derived from correlation_id → both rows
+    // Reserved _saga tag is auto-derived from saga_id → both rows
     // share C1, so the engine session key returns the whole connection.
-    var c1 = try idx.queryList("acme", 0, 0, 0, 10, "_corr", "C1");
+    var c1 = try idx.queryList("acme", 0, 0, 0, 10, "_saga", "C1");
     defer c1.deinit();
     try testing.expectEqual(@as(usize, 2), c1.rows.len);
 
@@ -1202,7 +1227,7 @@ test "a tag row's received_ns equals its record's — the tagged cursor depends 
 
     var tags = [_]sidecar.Tag{.{ .key = "session", .value = "S1" }};
     var records = [_]sidecar.Record{
-        .{ .tenant_id = "acme", .request_id = 7, .received_ns = 4_242, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .correlation_id = "C9", .tags = &tags, .offset = 0, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 7, .received_ns = 4_242, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "C9", .tags = &tags, .offset = 0, .length = 10 },
     };
     const batch = sidecar.IdxFile{
         .node_id = "00000001",
@@ -1227,7 +1252,7 @@ test "a tag row's received_ns equals its record's — the tagged cursor depends 
     try testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(st, 0));
 
     // Both tag rows for the record (the user tag and the derived
-    // `_corr`) carry it, so either filter pages identically.
+    // `_saga`) carry it, so either filter pages identically.
     try testing.expectEqual(@as(usize, 2), blk: {
         var st2: ?*c.sqlite3_stmt = null;
         _ = c.sqlite3_prepare_v2(idx.db, "SELECT COUNT(*) FROM log_tags WHERE received_ns = 4242", -1, &st2, null);
@@ -1235,6 +1260,75 @@ test "a tag row's received_ns equals its record's — the tagged cursor depends 
         _ = c.sqlite3_step(st2);
         break :blk @as(usize, @intCast(c.sqlite3_column_int64(st2, 0)));
     });
+}
+
+test "the retired _corr tag is migrated to _saga, so old sagas stay queryable" {
+    // The engine's reserved tag was `_corr` before the saga rename.
+    // Rows already in a deployed index carry it, and nothing on the
+    // read path looks for it any more — so without this migration a
+    // tenant silently loses the ability to query every saga recorded
+    // before the rename.
+    //
+    // Migrated rather than aliased on read: an alias would put an `OR`
+    // back into the tag filter, which is the exact shape SQLite cannot
+    // plan (the two-statement fix, `LIST_SQL_TAGGED`).
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "corrmig");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+
+    // Seed a pre-rename index: rows tagged `_corr`, plus a user tag
+    // that must be left alone.
+    {
+        var idx0 = try IndexDb.open(a, db_path);
+        defer idx0.close();
+        var recs = [_]sidecar.Record{
+            sagaRec(1, 1_000, "C1", .{}),
+            sagaRec(2, 2_000, "C1", .{ .activation = "ws_message" }),
+        };
+        try putBatch(idx0, "b1", &recs);
+        try testing.expect(c.sqlite3_exec(
+            idx0.db,
+            "UPDATE log_tags SET key='_corr' WHERE key='_saga';" ++
+                "INSERT OR IGNORE INTO log_tags VALUES ('acme',1,'session','S1',1000);",
+            null,
+            null,
+            null,
+        ) == c.SQLITE_OK);
+
+        // Precondition: the new spelling finds nothing.
+        var pre = try idx0.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1");
+        defer pre.deinit();
+        try testing.expectEqual(@as(usize, 0), pre.rows.len);
+    }
+
+    // Re-opening migrates.
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    var post = try idx.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1");
+    defer post.deinit();
+    try testing.expectEqual(@as(usize, 2), post.rows.len);
+
+    // The retired key is gone, not duplicated.
+    var stale = try idx.queryList("acme", 0, 0, 0, 10, RETIRED_CORR_TAG, "C1");
+    defer stale.deinit();
+    try testing.expectEqual(@as(usize, 0), stale.rows.len);
+
+    // A user tag is untouched — the migration is scoped to the engine key.
+    var user = try idx.queryList("acme", 0, 0, 0, 10, "session", "S1");
+    defer user.deinit();
+    try testing.expectEqual(@as(usize, 1), user.rows.len);
+
+    // Idempotent: a second open must not fail or double-write.
+    var again = try IndexDb.open(a, db_path);
+    defer again.close();
+    var post2 = try again.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1");
+    defer post2.deinit();
+    try testing.expectEqual(@as(usize, 2), post2.rows.len);
 }
 
 test "an index_db created before the activation column is migrated in place" {
@@ -1347,7 +1441,7 @@ fn sagaRec(
         .status = opts.status,
         .outcome = opts.outcome,
         .deployment_id = 1,
-        .correlation_id = corr,
+        .saga_id = corr,
         .activation = opts.activation,
         .offset = 0,
         .length = 10,
@@ -1544,8 +1638,8 @@ test "the saga list keyset-pages, clamps to retention, and counts errors" {
     // errors.
     var i: u64 = 0;
     while (i < 5) : (i += 1) {
-        var corr_buf: [8]u8 = undefined;
-        const corr = try std.fmt.bufPrint(&corr_buf, "S{d}", .{i});
+        var saga_buf: [8]u8 = undefined;
+        const corr = try std.fmt.bufPrint(&saga_buf, "S{d}", .{i});
         var batch_buf: [8]u8 = undefined;
         const bid = try std.fmt.bufPrint(&batch_buf, "b{d}", .{i});
         var recs = [_]sidecar.Record{sagaRec(
@@ -1637,9 +1731,9 @@ test "the activation kind survives the tag-filtered path too" {
     defer idx.close();
 
     var records = [_]sidecar.Record{
-        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 101, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .activation = "inbound", .offset = 0, .length = 10 },
-        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 0, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .activation = "ws_message", .offset = 10, .length = 10 },
-        .{ .tenant_id = "acme", .request_id = 3, .received_ns = 3_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 0, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .activation = "disconnect", .offset = 20, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 101, .outcome = "ok", .deployment_id = 1, .saga_id = "C1", .activation = "inbound", .offset = 0, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 0, .outcome = "ok", .deployment_id = 1, .saga_id = "C1", .activation = "ws_message", .offset = 10, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 3, .received_ns = 3_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 0, .outcome = "ok", .deployment_id = 1, .saga_id = "C1", .activation = "disconnect", .offset = 20, .length = 10 },
     };
     const batch = sidecar.IdxFile{
         .node_id = "00000001",
@@ -1653,7 +1747,7 @@ test "the activation kind survives the tag-filtered path too" {
     try idx.insertBatch(&batch, "_logs/00000001/wsbatch.ndjson", 0);
 
     // The whole saga, newest-first: close, frame, open.
-    var saga = try idx.queryList("acme", 0, 0, 0, 10, "_corr", "C1");
+    var saga = try idx.queryList("acme", 0, 0, 0, 10, "_saga", "C1");
     defer saga.deinit();
     try testing.expectEqual(@as(usize, 3), saga.rows.len);
     try testing.expectEqualStrings("disconnect", saga.rows[0].activation);

@@ -221,7 +221,7 @@ const epilogue = buildRequestEpilogue({
     ctx: world.ctx,
     middlewarePath,
     tenant: req.tenant ?? null,
-    correlationId: req.correlationId ?? null,
+    sagaId: req.sagaId ?? req.correlationId ?? null,
 });
 
 const logs = [];

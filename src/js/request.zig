@@ -287,7 +287,7 @@ pub const Trace = struct {
     /// logical interaction (streaming handlers, `docs/architecture/effects-and-handlers.md`). Inbound mints
     /// it (accepting an `X-Rove-Correlation-Id` header when present);
     /// resumes inherit. Null on test paths that don't care.
-    correlation_id: ?[]const u8 = null,
+    saga_id: ?[]const u8 = null,
 };
 
 /// Admin-tenant platform surface. All-null for every non-admin request;

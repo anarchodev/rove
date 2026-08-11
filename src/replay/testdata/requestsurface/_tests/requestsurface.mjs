@@ -1,6 +1,6 @@
 // The epilogue's request surface mirrors prod's installRequest
 // (src/js/globals.zig) on authored worlds: identity always pinned
-// (session null / tenant "sim" / correlation_id ""), the ip channels
+// (session null / tenant "sim" / sagaId ""), the ip channels
 // masked+raw (null when un-authored, never a throw), the activation bag on
 // every kind, prod's request.tag validation, payload accessors reading
 // undefined on payload-less resumes, and the retired driver-only surfaces
@@ -32,7 +32,7 @@ expect(out.tagCap).toContain("max 4");
 expect(r.effects.some((e) => e.kind === "tag" && e.key === "route" && e.value === "surface")).toBe(true);
 
 // authored identity + session win over the defaults
-const s2 = scenario({ tenant: "acme", correlationId: "corr-9" });
+const s2 = scenario({ tenant: "acme", sagaId: "corr-9" });
 const r2 = s2.inbound({ path: "/x", session: { id: "sess_" + "a".repeat(64) } });
 const out2 = JSON.parse(r2.body);
 expect(out2.tenant).toBe("acme");

@@ -286,7 +286,7 @@ naming layer is the customer's kv (decisions.md §3.8). Engine pieces:
   customer kv, deliberately not platform-reserved (the `_send/` rule).
 - **Upload sessions** (`blob.write`/`seal`): a capped Zig-side buffer (64 MiB,
   2/tenant, 120 s idle-TTL sweep) on the worker-owned `blob_sessions`
-  collection, keyed `(tenant, correlation_id)`, **connection-scoped** — one
+  collection, keyed `(tenant, saga_id)`, **connection-scoped** — one
   implicit session per connection, abandoned on disconnect (pure RAM reclaim;
   nothing reaches storage before `seal`). `seal` hashes incrementally, returns
   the hash synchronously, PUTs once through the door, and resumes `{on}` with

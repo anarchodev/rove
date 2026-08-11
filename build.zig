@@ -1628,7 +1628,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/concurrent", // whenConcurrent: cross-order fetch interleavings + invariant
         "src/replay/testdata/xmodule", // cross-module fetch continuation + scenario.fetchResult
         "src/replay/testdata/nexttarget", // cross-module next(target, ctx) parks the target: timer/kv/fetch/disconnect resumes re-enter it
-        "src/replay/testdata/getreplay", // request.tenant/correlation_id identity → browser.getReplay both branches
+        "src/replay/testdata/getreplay", // request.tenant/sagaId identity → browser.getReplay both branches
         "src/replay/testdata/bodyless", // authored bodyless inbound reads empty (not a divergence throw)
         "src/replay/testdata/responsevetting", // emit-side response vetting: header/cookie sanitize, status clamp, content-type rule, binary body, stream-prepend
         "src/replay/testdata/requestsurface", // pinned identity, ip channels, activation bag, tag validation, retired body/on.* gone
@@ -1699,6 +1699,29 @@ pub fn build(b: *std.Build) void {
     // unexercised. The selftest drives them with synthetic outcomes so the gate
     // is provably able to go red before the engine that would turn it red
     // exists.
+    // The browser replay arena's prelude is GENERATED from the engine's own
+    // shim sources into rewind-apps (`scripts/ops/gen_replay_prelude.py`).
+    // Nothing downstream notices when a shim moves and the generated file
+    // does not: the browser engine simply runs older shim code than the
+    // worker, silently, which is the drift the shared prelude exists to
+    // prevent. It has happened twice.
+    //
+    // The artifact lives in another repo, so this gate checks the half that
+    // is local — that the shim sources still match the digest recorded
+    // beside the generator. Changing a shim turns this red at the moment of
+    // the change, naming the two commands that propagate it. rewind-apps'
+    // own CI checks the other half (its committed prelude vs the rove commit
+    // it pins).
+    const prelude_fresh = b.addSystemCommand(&.{"python3"});
+    prelude_fresh.addFileArg(b.path("scripts/ops/gen_replay_prelude.py"));
+    prelude_fresh.addArg("--verify");
+    // Always run. Declaring inputs would mean mirroring the generator's
+    // source list here, and a shim added there but not here would leave the
+    // gate cached-green on the very change it exists to catch. Hashing
+    // ~170 KB is cheaper than that failure.
+    prelude_fresh.has_side_effects = true;
+    prelude_fresh.expectExitCode(0);
+
     const conf_selftest = b.addSystemCommand(&.{"python3"});
     conf_selftest.addFileArg(b.path("scripts/conformance/selftest.py"));
     conf_selftest.addFileInput(b.path("scripts/conformance/outcome.py"));
@@ -1733,4 +1756,5 @@ pub fn build(b: *std.Build) void {
     const conf_step = b.step("conformance", "Behavior conformance suite — one corpus, every engine (cheap lane)");
     conf_step.dependOn(&conf_run.step);
     test_step.dependOn(&conf_run.step);
+    test_step.dependOn(&prelude_fresh.step);
 }
