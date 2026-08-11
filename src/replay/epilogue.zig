@@ -352,21 +352,45 @@ const EPILOGUE_BODY =
     \\  // the two offline engines fold at the same points.
     \\  //
     \\  // Only the worker's grammar folds (src/tape/interaction_digest.zig):
-    \\  // kv reads/writes/deletes/prefixes, fetches, wake arms, stream writes.
-    \\  // Logs, tags, platform and blob calls are recorded for the timeline but
-    \\  // NOT folded, because the worker does not fold them either — a digest
-    \\  // is only useful if every engine hashes the same set.
+    \\  // kv reads/writes/deletes/prefixes, fetches, wake arms, stream writes,
+    \\  // and the three privileged LIFECYCLE ops the worker folds
+    \\  // (globals_platform.zig foldPlatformOp). Logs, tags, blob calls and
+    \\  // platform.scope are recorded for the timeline but NOT folded, because
+    \\  // the worker does not fold those — a digest is only useful if every
+    \\  // engine hashes the same set.
     \\  const __DG = globalThis.__interactionDigest;
     \\  const __dg = __DG ? new __DG.Digest() : null;
+    \\  // A cross-store element's digest key is the NAMESPACED one
+    \\  // (`__rove_store/<tag>/<key>`): the worker gives cross-store ops no
+    \\  // verb of their own, so the store is data in the key
+    \\  // (globals_platform.zig namespacedKey). Folding the bare key both
+    \\  // disagrees with capture AND erases the store, so scope("a").kv.get(k)
+    \\  // and root.get(k) would hash alike — a false agreement.
+    \\  const __dgKey = (e) => (e.store === undefined || e.store === null)
+    \\    ? e.key
+    \\    : "__rove_store/" + e.store + "/" + e.key;
     \\  const __foldEffect = (e) => {
     \\    if (!__dg || !e) return;
+    \\    // The harness's own scope-resolution marker. It exists so a resume can
+    \\    // rebuild kv from the folded effect log; the worker records instance
+    \\    // creation in the ROOT WRITESET (raft), never in the digest. Folding
+    \\    // it would add an element capture has no counterpart for.
+    \\    if (e.store === "exists") return;
     \\    switch (e.kind) {
     \\      case "read":
-    \\        if (e.op === "prefix") __dg.kvPrefix(e.key, true, e.count ?? 0, BigInt("0x" + (e.rowsFold ?? "0")));
-    \\        else __dg.kvRead(e.key, !!e.present, e.value ?? "");
+    \\        if (e.op === "prefix") __dg.kvPrefix(__dgKey(e), true, e.count ?? 0, BigInt("0x" + (e.rowsFold ?? "0")));
+    \\        else __dg.kvRead(__dgKey(e), !!e.present, e.value ?? "");
     \\        break;
-    \\      case "write":  __dg.kvWrite(e.key, e.value ?? ""); break;
-    \\      case "delete": __dg.kvDelete(e.key); break;
+    \\      case "write":  __dg.kvWrite(__dgKey(e), e.value ?? ""); break;
+    \\      case "delete": __dg.kvDelete(__dgKey(e)); break;
+    \\      // Exactly the ops globals_platform.zig folds, with the same
+    \\      // arguments. `scope` is deliberately absent: the worker resolves a
+    \\      // scope handle without folding anything.
+    \\      case "platform":
+    \\        if (e.op === "instances.create") __dg.platformOp(e.op, e.name ?? "", "");
+    \\        else if (e.op === "instances.deployStarter") __dg.platformOp(e.op, e.name ?? "", "");
+    \\        else if (e.op === "releases.publish") __dg.platformOp(e.op, e.tenant ?? "", e.depId ?? "");
+    \\        break;
     \\      case "fetch":  __dg.fetch(e.method || "GET", e.url || "", e.body ?? ""); break;
     \\      case "timer":  __dg.wakeArm("t", String(e.ms), e.on ?? ""); break;
     \\      case "kv-wake": __dg.wakeArm("k", e.prefix, e.on ?? ""); break;
