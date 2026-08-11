@@ -53,6 +53,22 @@ const MODULES = [_]struct {
     path: []const u8,
     /// Source string (`@embedFile`'d).
     src: []const u8,
+    /// May a durable wake fire this module? (rove#495)
+    ///
+    /// A `_sched/` record names its own dispatch target, and `_sched/` is
+    /// customer-writable by design (`reserved.zig`'s
+    /// `SHIM_WRITABLE_PREFIXES`) so the `schedule` shim can arm wakes from
+    /// handler context. So the target of a wake is customer input, and a
+    /// baked module reached that way runs with `is_system_module` — the
+    /// engine grants it from the module PATH, not from who armed the entry.
+    ///
+    /// Default false: a module is unreachable by wake unless it says
+    /// otherwise. That inverts the old default, where every baked module was
+    /// reachable and safety rested on each one independently choosing to be
+    /// defensive about its ctx and its marker. Modules fired by a fetch
+    /// result (`on_chunk` targets) or directly by the engine are not wake
+    /// targets and stay false.
+    wake_targetable: bool = false,
 }{
     .{
         .path = "__system/webhook_onresult.mjs",
@@ -63,6 +79,7 @@ const MODULES = [_]struct {
         // (scheduled fires, retry re-arms, crash-recovery watchdog).
         .path = "__system/webhook_fire.mjs",
         .src = @embedFile("builtin_webhook_fire_mjs"),
+        .wake_targetable = true,
     },
     .{
         // §2.6 durable scheduled wake (durable-wake P1; docs/architecture/effects-and-handlers.md).
@@ -73,12 +90,14 @@ const MODULES = [_]struct {
         // The `cron(...)` recurrence engine.
         .path = "__system/cron_tick.mjs",
         .src = @embedFile("builtin_cron_tick_mjs"),
+        .wake_targetable = true,
     },
     .{
         // rove#340: the durable data-export job — walks the tenant's KV into
         // content-addressed parts, one part per activation.
         .path = "__system/export_run.mjs",
         .src = @embedFile("builtin_export_run_mjs"),
+        .wake_targetable = true,
     },
     .{
         // blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: blob.put's marker-settling
@@ -171,6 +190,28 @@ pub fn isBuiltinPath(module_path: []const u8) bool {
     return std.mem.startsWith(u8, module_path, "__system/");
 }
 
+/// True iff a durable wake may fire `target` (rove#495).
+///
+/// Only meaningful for `__system/` targets; a customer module is always a
+/// legitimate wake target (it is the tenant's own code, running with no
+/// platform privilege), so callers check this only when `isBuiltinPath`.
+///
+/// EXACT match against a `wake_targetable` entry, in either the extensionless
+/// spelling the shims write (`__system/webhook_fire`) or the registry's own
+/// (`…​.mjs`). Exactness is the point: it also refuses the `module.method`
+/// form, so a customer cannot reach an arbitrary named export of a baked
+/// module by arming `__system/webhook_fire.mjs.someExport`. Baked modules are
+/// entered through their default export or not at all.
+pub fn isWakeTargetable(target: []const u8) bool {
+    for (MODULES) |m| {
+        if (!m.wake_targetable) continue;
+        if (std.mem.eql(u8, target, m.path)) return true;
+        const bare = m.path[0 .. m.path.len - ".mjs".len];
+        if (std.mem.eql(u8, target, bare)) return true;
+    }
+    return false;
+}
+
 test "init compiles every built-in to non-empty bytecode" {
     const testing = std.testing;
     var map = try init(testing.allocator);
@@ -187,4 +228,63 @@ test "isBuiltinPath matches the __system/ prefix only" {
     try testing.expect(!isBuiltinPath("hooks/onDelivered"));
     try testing.expect(!isBuiltinPath("_subscriptions/foo/index.mjs"));
     try testing.expect(!isBuiltinPath(""));
+}
+
+test "isWakeTargetable: only the three wake-driven jobs, and only by exact name" {
+    const testing = std.testing;
+
+    // The legitimate wake targets: a scheduled/retried send, the export
+    // job's watchdog, and the cron recurrence engine. Both spellings — the
+    // shims arm the extensionless form, the registry holds the `.mjs` one.
+    for ([_][]const u8{ "webhook_fire", "export_run", "cron_tick" }) |name| {
+        var bare_buf: [64]u8 = undefined;
+        const bare = try std.fmt.bufPrint(&bare_buf, "__system/{s}", .{name});
+        try testing.expect(isWakeTargetable(bare));
+        var mjs_buf: [64]u8 = undefined;
+        const mjs = try std.fmt.bufPrint(&mjs_buf, "__system/{s}.mjs", .{name});
+        try testing.expect(isWakeTargetable(mjs));
+    }
+
+    // Everything else baked in is reachable only by the engine or by a fetch
+    // result. A tenant can write the `_sched/` row naming one of these — the
+    // prefix is customer-writable — so this list is what stops the row from
+    // becoming a dispatch.
+    for ([_][]const u8{
+        "__system/scheduler_tick",
+        "__system/webhook_onresult",
+        "__system/blob_compose",
+        "__system/blob_onresult",
+        "__system/blob_compose_onresult",
+        "__system/segments_onsealed",
+        "__system/static",
+    }) |path| {
+        try testing.expect(!isWakeTargetable(path));
+    }
+
+    // Exactness matters as much as membership: the `module.method` form must
+    // not smuggle an arbitrary named export of a wake-targetable module.
+    try testing.expect(!isWakeTargetable("__system/webhook_fire.mjs.someExport"));
+    try testing.expect(!isWakeTargetable("__system/export_run.mjs.default"));
+    // Neither may a look-alike.
+    try testing.expect(!isWakeTargetable("__system/webhook_fire_evil"));
+    try testing.expect(!isWakeTargetable("__system/"));
+    try testing.expect(!isWakeTargetable(""));
+    // A customer module is not this predicate's business — callers ask only
+    // when `isBuiltinPath`, and it is false for these.
+    try testing.expect(!isBuiltinPath("jobs/reminder"));
+    try testing.expect(!isBuiltinPath("reports.mjs.weekly"));
+}
+
+test "every wake-targetable module is one the platform actually arms" {
+    // The list is a grant, so it should be justified rather than inherited:
+    // each entry below is armed by name somewhere in the tree (webhook.js and
+    // webhook_onresult arm `webhook_fire`; the export package and export_run
+    // arm `export_run`; the cron package and cron_tick arm `cron_tick`). If a
+    // module stops being armed, it should lose the flag rather than keep a
+    // standing invitation.
+    var count: usize = 0;
+    for (MODULES) |m| {
+        if (m.wake_targetable) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
 }

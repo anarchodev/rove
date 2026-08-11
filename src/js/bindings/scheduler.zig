@@ -25,6 +25,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 
 const globals = @import("../globals.zig");
+const builtin_modules = @import("../builtin_modules.zig");
 
 const js_undefined = globals.js_undefined;
 const js_exception = globals.js_exception;
@@ -188,6 +189,29 @@ pub fn jsFireWake(
         };
     }
 
+    // A `_sched/` record names its own target and the prefix is
+    // customer-writable by design, so the target is customer input — and
+    // `fireDurableWakeActivation` grants `is_system_module` from the module
+    // PATH, not from who armed the entry. Two `kv.set` calls would otherwise
+    // invoke ANY baked module, as a system module, with a `msg` the tenant
+    // chose (rove#495).
+    //
+    // Refused as a `false` RETURN rather than a throw: this runs inside
+    // `__system/scheduler_tick`'s fan-out loop, and a throw would roll the
+    // whole tick back — including the `_sched/` deletes of the entries that
+    // fired legitimately, which re-fires them next tick, forever. The caller
+    // drops the offending entry instead (the same treatment a corrupt record
+    // gets), so a refusal ends the chain rather than looping it.
+    if (builtin_modules.isBuiltinPath(target.slice) and
+        !builtin_modules.isWakeTargetable(target.slice))
+    {
+        std.log.warn(
+            "rove-js: tenant={s} armed a wake at {s} — not a wake-targetable module; entry dropped",
+            .{ state.instance_id, target.slice },
+        );
+        return globals.js_false;
+    }
+
     const input: globals.FireWakeInput = .{
         .tenant_id = state.instance_id,
         .target = target.slice,
@@ -200,9 +224,16 @@ pub fn jsFireWake(
 
     if (state.side_effects_flag) |f| f.* = true;
     const fn_ptr = state.fire_wake orelse {
-        // Test / non-worker dispatch: nothing to enqueue. Report
-        // false so a caller can detect the no-op (scheduler_tick
-        // treats it as "not fired"); not an error on test paths.
+        // Test / non-worker dispatch: nothing to enqueue. Report false so a
+        // caller can detect the no-op; not an error on test paths.
+        //
+        // `false` therefore means two things — "refused" above, and "no
+        // worker" here — and `scheduler_tick` responds to both by dropping
+        // the entry. That is deliberate: both say this entry did not
+        // dispatch and re-offering it will not change that, so keeping it
+        // only re-runs the same decision every tick. No test drives the tick
+        // through this path today; if one ever does, it gets a dropped entry
+        // rather than a retained one.
         return globals.js_false;
     };
     const fn_ctx = state.fire_wake_ctx orelse return globals.js_false;

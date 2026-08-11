@@ -102,7 +102,13 @@ export default function () {
         // Fan out. The two cleanup keys ride into the target's writeset
         // (see fireDurableWakeActivation) so the delete commits with the
         // handler's effects — exactly-once on the normal path.
-        __rove.wake.fire(
+        //
+        // A `false` return means the engine refused the target (a baked
+        // module that is not wake-targetable — rove#495). The entry never
+        // dispatched, so nothing else will delete its rows: drop them here,
+        // exactly as the corrupt-record paths above do. Leaving them would
+        // re-offer the same refused entry on every tick forever.
+        const ok = __rove.wake.fire(
             target,
             id,
             wakeKey,
@@ -110,6 +116,11 @@ export default function () {
             JSON.stringify(msg),
             [byIdKey, key],
         );
+        if (!ok) {
+            kv.delete(byIdKey);
+            kv.delete(key);
+            continue;
+        }
         fired++;
     }
 
