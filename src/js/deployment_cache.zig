@@ -683,10 +683,14 @@ pub const TenantSlot = struct {
     }
 
     /// The tenant's resolved plan limits — a lock-free read for the dispatch
-    /// path. Null cached plan ⇒ the free tier.
+    /// path. Null cached plan ⇒ this tenant's default tier: free for a
+    /// customer, platform for a reserved platform id. A slot commonly has no
+    /// cached plan — nothing writes a plan blob at provision — so this
+    /// default, not the CP, is what the platform's own tenants actually run
+    /// under (`plan.defaultFor`).
     pub fn effectivePlan(self: *TenantSlot) plan_mod.PlanLimits {
         if (self.plan.load(.acquire)) |p| return p.*;
-        return plan_mod.table(.free);
+        return plan_mod.defaultFor(self.instance_id);
     }
 
     /// Install a resolved plan (from the CP attach handshake or a live push)

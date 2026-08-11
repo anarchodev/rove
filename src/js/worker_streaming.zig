@@ -48,6 +48,7 @@ const tape_mod = @import("rove-tape");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
+const limiter_mod = @import("limiter.zig");
 const msg_router_mod = @import("msg_router.zig");
 const spool_registry = @import("spool_registry.zig");
 const router_mod = @import("router.zig");
@@ -1134,7 +1135,7 @@ fn resumeStream(
             .request_id = request_id,
             .saga_id = chain_ctx.saga_id,
         },
-        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .effects = .{
             .pending_wakes = &pending_wakes,
@@ -1363,7 +1364,7 @@ pub fn resumeBoundFetchStream(
             .request_id = request_id,
             .saga_id = chain_ctx.saga_id,
         },
-        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .blob_cfg = &worker.node.blob_backend_cfg },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
@@ -1475,6 +1476,14 @@ pub const FirePrep = struct {
     readset: tape_mod.Readset,
     now_ns: i64,
     request_id: u64,
+    /// The firing tenant's resolved rate caps + plan generation, for the
+    /// `Request.plan` every fire site builds. Resolved HERE rather than at
+    /// each site because a site that forgets them silently meters the
+    /// tenant against struct defaults instead of its tier — and the
+    /// outbound gate rides these, so "forgot the plan" reads as "the quota
+    /// is wrong" from a long way away.
+    plan_rate: limiter_mod.RateLimitCaps,
+    plan_gen: u64,
 
     pub fn deinit(p: *FirePrep, allocator: std.mem.Allocator) void {
         if (!p.txn_done) p.txn.rollback() catch {};
@@ -1523,6 +1532,12 @@ pub fn firePrep(
         .ws = kv_mod.WriteSet.init(allocator),
         .readset = rs_init,
         .now_ns = now_ns,
+        // Same slot the inbound path reads (`worker_dispatch.zig`), so a
+        // wake-fired egress meters against the tenant's tier and shares
+        // its buckets rather than re-snapshotting them at a stale
+        // generation.
+        .plan_rate = dep.tc.slot.effectivePlan().rate,
+        .plan_gen = dep.tc.slot.plan_gen.load(.acquire),
         .request_id = blk: {
             const tl = worker.tenant_logs.get(dep.inst.id) orelse break :blk 0;
             break :blk tl.id_minter.nextRequestId() catch 0;

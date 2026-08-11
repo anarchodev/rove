@@ -135,22 +135,43 @@ fn exportDoorAllowed(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []c
 /// email-specific native. Enforcing at the native (not in a JS shim) is
 /// what makes the plan quota un-bypassable.
 ///
-/// Two carve-outs, both correct-by-construction:
-///   - Deferred platform delivery (the baked `__system/webhook_fire` retry
-///     / scheduled fire runs with `is_system_module == true`) re-issues an
-///     already-admitted send, is bounded by the webhook retry budget +
-///     backoff, and re-counting it would burn a retry attempt / hot-loop
-///     the crash-recovery watchdog.
-///   - Fetches to platform-internal doors (`*.internal`) are storage /
-///     control-plane I/O, not third-party egress (`targetsInternalDoor`).
+/// ONE carve-out, correct by construction: fetches to platform-internal
+/// doors (`*.internal`) are storage / control-plane I/O, not third-party
+/// egress (`targetsInternalDoor`). A tenant cannot reach a third party
+/// through a `.internal` host, so exempting them opens no bypass.
+///
+/// Being a baked `__system/*` module is NOT a carve-out, though it reads
+/// like one: the exemption was written for a webhook RETRY, which re-issues
+/// an already-admitted send — but `is_system_module` is set from the module
+/// path (`worker_fire.zig`'s `isBuiltinPath`), so it is equally true of a
+/// FIRST fire the tenant armed itself. Both `webhook.send({at})` and a
+/// hand-written `_send/`+`_sched/` row pair (both prefixes are
+/// customer-writable by design — `reserved.zig`'s `SHIM_WRITABLE_PREFIXES`)
+/// arrive here as platform delivery, so the exemption made the whole quota
+/// opt-in: a tenant bypassed it by deferring. Nothing at this seam can tell
+/// an admitted send from an invented one, because the marker is customer
+/// data — so every third-party egress is charged to the tenant that owns
+/// the activation, retries included. `scripts/smoke/outbound_gate_smoke_v2.py`
+/// holds the three paths that must all refuse.
+///
+/// A refused retry is not a lost send: `__system/webhook_fire` catches the
+/// refusal and lets its already-armed watchdog re-fire (an UNCAUGHT throw
+/// there would roll back the entry's own cleanup and re-fire at 1 Hz).
 ///
 /// Fails OPEN on limiter OOM (same posture as the inbound request-rate
 /// check in `worker_dispatch.zig`).
 fn outboundRateOk(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []const u8) bool {
-    if (state.is_system_module) return true; // platform delivery — exempt
     if (targetsInternalDoor(url)) return true; // internal storage/CP I/O — exempt
     const lim = state.limiter orelse return true; // test paths
     if (state.instance_id.len == 0) return true;
+
+    // Admission before rate: a tenant whose plan grants no third-party
+    // egress is refused permanently, so it must not consume a burst token
+    // or read as a throttle the caller should retry.
+    if (!state.plan_rate.outbound_enabled) {
+        lim.outbound_disabled_refusals += 1;
+        return throwOutboundDisabled(ctx, state);
+    }
 
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const allowed = lim.check(state.instance_id, .outbound, state.plan_rate, state.plan_gen, now_ns) catch |err| {
@@ -176,6 +197,29 @@ fn outboundRateOk(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []cons
         return throwOutboundLimited(ctx, state, lim, .outbound_sustained, "outbound_sustained_limited", "sustained outbound budget exhausted");
     }
     return true;
+}
+
+/// Throw the plan-admission refusal: this tenant's plan grants no
+/// third-party egress at all.
+///
+/// Deliberately NOT shaped like the rate refusals below — it carries no
+/// Retry-After, because there is no delay after which the answer changes.
+/// Telling a caller to retry a permanent refusal is how a `retry` wrapper
+/// turns one refusal into an infinite loop, and how an operator reading the
+/// logs sees congestion where there is a policy.
+fn throwOutboundDisabled(ctx: ?*c.JSContext, state: *globals.DispatchState) bool {
+    const msg = "outbound HTTP is not enabled for this tenant's plan";
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return false; // OOM building the Error — pending
+    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+    const code = "outbound_not_enabled";
+    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, code.ptr, code.len));
+    _ = c.JS_Throw(ctx, err);
+    std.log.warn(
+        "rove-js: outbound refused for {s} — plan grants no third-party egress",
+        .{state.instance_id},
+    );
+    return false;
 }
 
 /// Throw the outbound-refusal Error (`{message, code}` with a Retry-After

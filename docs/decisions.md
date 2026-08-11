@@ -334,6 +334,62 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   (`*.localhost` resolves to `::1` first; a v4-only listener then refuses) —
   the gate vets ALL addresses, so pinning all is strictly safer AND compatible.
 
+### 3.8b Third-party egress is a paid capability, metered on every path
+- **Decision** (2026-08-09, rove#336): a plan either grants third-party
+  egress or it does not (`RateLimitCaps.outbound_enabled`), checked before
+  any rate bucket. **The free tier does not get outbound.** Payment is the
+  identity signal that gates it; the refusal carries its own code
+  (`outbound_not_enabled`) and no Retry-After, because no delay changes the
+  answer. As-built: `architecture/control-plane.md` "Outbound admission".
+- **Why not a ceiling alone**: a rate bound only bounds the *rate* of abuse.
+  Outbound is the one capability whose victim is a third party, and a tenant
+  costs an email address to create, so the useful question is admission, not
+  throughput. The ceilings remain, and bound a tenant that *has* been granted
+  outbound.
+- **Why not self-serve opt-in**: a toggle the customer flips is only a gate if
+  it is coupled to a signal a spammer cannot cheaply forge. Without a card on
+  file (Stripe track, #310/#312) there is no such signal, so an opt-in buys
+  one click. When that signal exists, "card on file → outbound granted"
+  becomes a dashboard policy writing an override — no engine change.
+- **The exemption that made the quota opt-in**: enforcement had exempted
+  `is_system_module`, meaning "the platform re-issuing an already-admitted
+  send". But that flag comes from the module path, so it is equally true of a
+  FIRST fire the tenant armed itself — via `webhook.send({at})`, or by
+  hand-writing the `_send/`+`_sched/` rows (both prefixes are
+  customer-writable by design, §3.3). Nothing at that seam can distinguish an
+  admitted send from an invented one, because the marker is customer data. So
+  **every** third-party egress is charged to the tenant that owns the
+  activation, retries included; only `*.internal` doors (storage / control
+  plane) are exempt. A refused deferred fire is caught by
+  `__system/webhook_fire` and backed off on its watchdog — an uncaught throw
+  there rolls back the scheduler entry's own cleanup and re-fires at 1 Hz.
+- **Cost accepted**: a free tenant cannot act as an OAuth/OIDC relying party,
+  send webhooks, or send email. A tier wanting the middle ground (enough for
+  federated login, worthless for bulk) grants `outbound_enabled` with a low
+  daily ceiling — a one-line table edit, not a new mechanism.
+
+### 3.8c The platform's own tenants are not customers
+- **Decision** (2026-08-09): the reserved singletons (`__admin__`, `__auth__`,
+  `__replay__`) resolve to a `platform` tier when the CP holds no plan blob,
+  rather than to free. They run the dashboard, the identity provider and the
+  replay arena; a customer-facing abuse limit landing on one is an outage, not
+  a bound — `__auth__` is an OIDC relying party, so free-tier outbound-off
+  would have taken the login path down.
+- **Why derived from the id**: nothing writes a plan blob at provision, so
+  "no blob" is the normal state. A rule that depends on an operator running
+  `plan set` after every genesis is a rule that breaks on the next genesis.
+  The set is closed against customers (`__…__` fails the DNS-label spec every
+  customer id is validated against), so resolving a privilege from a name
+  opens nothing. An explicit blob still wins.
+- **Accepted trade**: our own apps stop dogfooding the free tier's limits. It
+  was accidental coverage; deliberate limit exercise belongs in the smokes and
+  the conformance corpus, not in whether prod happens to trip.
+- **Not covered**: first-party tenants that are *not* reserved ids
+  (`marketing`, `docs`, `registry`, `replay`, `agent-sample`) are ordinary
+  tenants and stay on free. None of the operator-kind ones make handler
+  outbound calls; `agent-sample` (an example tenant) does, and needs an
+  explicit plan to keep working.
+
 ### 3.9 The minimal tape: four record kinds
 - **Decision** (2026-05-26, §3–§5 shipped; consolidated here when
   `tape-minimization.md` was retired): a deterministic replay tape records

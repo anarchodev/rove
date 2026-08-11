@@ -899,12 +899,13 @@ fn ensureInstanceWithIncarnation(worker: anytype, tenant: []const u8, incarnatio
 /// Resolve a CP plan blob into effective limits and cache them on the tenant's
 /// hot-path slot (`TenantSlot.setPlan`, which bumps the plan generation so the
 /// rate limiter re-snapshots caps). The blob is opaque `{tier, overrides}`
-/// JSON; an empty/malformed blob resolves to the free tier (`plan.parseBlob`).
+/// JSON; an empty/malformed blob resolves to the tenant's default tier
+/// (`plan.parseBlob` — free for a customer, platform for a reserved id).
 /// `error.UnknownTenant` if the tenant has no instance on this cluster.
 fn applyPlanBlob(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8, plan_blob: []const u8) !void {
     const inst = (try worker.node.tenant.getInstance(tenant)) orelse return error.UnknownTenant;
     const slot = try worker.node.deploy.getOrOpenTenantSlot(inst);
-    try slot.setPlan(plan_mod.parseBlob(allocator, plan_blob));
+    try slot.setPlan(plan_mod.parseBlob(allocator, tenant, plan_blob));
 }
 
 /// Block (bounded by `commit_wait_timeout_ns`) until the tenant's raft

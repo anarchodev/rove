@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! rove-plan — per-tenant plan tiers + effective limits (docs/architecture/control-plane.md).
 //!
-//! A LEAF module (std only) so every consumer can import it without a cycle:
+//! A LEAF module (std + `rove-instance-id`, itself std-only) so every
+//! consumer can import it without a cycle:
 //! the worker (`rove-js`) resolves rate/body limits from it, and the
 //! log-query surface (`rove-log-server`) resolves the retention window from it
 //! (docs/architecture/control-plane.md Lever 3). It owns `RateLimitCaps` too — the limiter
@@ -27,6 +28,7 @@
 //! means is a one-line table edit, never a per-customer migration.
 
 const std = @import("std");
+const id_spec = @import("rove-instance-id");
 
 /// Per-(instance, action) token-bucket caps. Lives here (not in the limiter)
 /// so `rove-plan` stays a leaf the limiter can depend on; the limiter
@@ -41,10 +43,31 @@ pub const RateLimitCaps = struct {
     /// / `email.send` (which composes over it). The platform's egress /
     /// third-party-bill guard, enforced at the frozen fetch primitive
     /// (`bindings/http.zig`) so a tenant-pinnable email/webhook package
-    /// can't bypass it. Deferred webhook retries don't re-count.
+    /// can't bypass it. Deferred fires — scheduled sends, retries, anything
+    /// a baked `__system/*` module issues — count too: being
+    /// platform-issued is not evidence the send was admitted.
     outbound_capacity: u32 = 100,
     /// 10/sec → 600/min sustained — well under any sane provider quota.
     outbound_refill_per_sec: u32 = 10,
+    /// Whether this tenant may reach a third party AT ALL.
+    ///
+    /// The buckets below shape a rate; this decides admission. It is the
+    /// abuse floor: outbound is what makes a tenant that cost an email
+    /// address to create useful as a spam relay or a credential-stuffing
+    /// client, and a tenant that cannot egress is worthless for both no
+    /// matter how patient the operator is. A ceiling only bounds the rate
+    /// of abuse; this removes the capability.
+    ///
+    /// Off is a REFUSAL, not a throttle — a disabled tenant gets a distinct
+    /// error code and no Retry-After, because no amount of waiting changes
+    /// the answer (`bindings/http.zig`'s `outboundRateOk`).
+    ///
+    /// Platform-internal doors (`*.internal` — storage, control plane, the
+    /// log surface) are not third-party egress and are unaffected: a tenant
+    /// with outbound off keeps `kv.*`, `blob.*`, statics and packages.
+    /// What stops is `http.send` / `webhook.send` / `email.send` and any
+    /// federated-login flow that acts as an OAuth/OIDC relying party.
+    outbound_enabled: bool = true,
     /// Day-scale ceiling on outbound calls — the SPAM bound, and a
     /// different question from the burst caps above.
     ///
@@ -54,12 +77,15 @@ pub const RateLimitCaps = struct {
     /// The legitimate uses are all low-volume — an OAuth token exchange is
     /// a handful of calls per login, a webhook callback is one per event,
     /// a transactional email one per user action — so a low daily ceiling
-    /// costs real use essentially nothing while making a free tenant
-    /// worthless as a spam relay or credential-stuffing client. That
-    /// asymmetry is why this is a ceiling rather than an on/off switch:
-    /// disabling outbound on the free tier would block federated login
-    /// (`oauth`/`oidc` as a relying party) to stop abuse a day cap
-    /// already stops.
+    /// costs real use essentially nothing.
+    ///
+    /// This bounds a tenant that MAY egress; `outbound_enabled` decides
+    /// whether it may at all. Both exist because they answer different
+    /// questions: a tier that grants outbound still needs a daily bound,
+    /// and a tier that withholds it is not expressible as a number. A tier
+    /// wanting the middle ground — enough for federated login, worthless
+    /// for bulk — sets `outbound_enabled` with a low ceiling here rather
+    /// than a new mechanism.
     ///
     /// 0 falls back to the rate-derived estimate in
     /// `limiter.sustainedOutboundBudget`.
@@ -77,7 +103,8 @@ pub const RateLimitCaps = struct {
     log_refill_bytes_per_sec: u32 = 64 * 1024,
 };
 
-/// The named tiers. Free is the default for any tenant with no CP plan blob.
+/// The named tiers. A tenant with no CP plan blob resolves through
+/// `defaultTierFor` — free for a customer, platform for a reserved id.
 /// `pro` / `enterprise` numbers below are launch placeholders — the concrete
 /// figures are a product call (decisions.md §10.9 — a product call), not an
 /// engineering one, and live here so changing them is a one-line edit.
@@ -85,16 +112,51 @@ pub const Tier = enum(u8) {
     free,
     pro,
     enterprise,
+    /// The platform's own singleton tenants — the dashboard, the identity
+    /// provider, the replay arena. Not a commercial tier and never sold:
+    /// what distinguishes it is that the tenants on it are US, so a
+    /// customer-facing abuse limit landing on one is an outage rather than
+    /// a bound. `defaultTierFor` resolves the reserved ids here.
+    ///
+    /// ROLLING-UPGRADE ORDER: `parse` maps an unknown tier to free, so a
+    /// node running a build that predates this tier resolves a
+    /// `{"tier":"platform"}` blob to FREE — the platform's own app, gated
+    /// by customer limits, on one node out of three. Deploy the binary to
+    /// every node BEFORE writing a blob that names a tier. The reserved-id
+    /// default needs no blob and so has no such window.
+    platform,
 
     /// Parse a tier name; unknown / absent → free (forward-compatible: a
     /// blob naming a tier this build doesn't know falls back to free rather
-    /// than failing the request).
+    /// than failing the request). Callers resolving a tenant's default
+    /// should use `defaultTierFor`, which knows the reserved ids.
     pub fn parse(s: []const u8) Tier {
         if (std.mem.eql(u8, s, "pro")) return .pro;
         if (std.mem.eql(u8, s, "enterprise")) return .enterprise;
+        if (std.mem.eql(u8, s, "platform")) return .platform;
         return .free;
     }
 };
+
+/// The tier a tenant gets when the CP holds no plan blob for it.
+///
+/// Reserved platform ids (`__admin__`, `__auth__`, `__replay__`) resolve to
+/// the platform tier; everything else to free. Deriving this from the ID
+/// rather than from an operator-written blob is deliberate: nothing writes a
+/// plan blob at provision, so a rule that depends on an operator remembering
+/// is a rule that breaks on the next genesis — and the failure is the
+/// dashboard losing outbound, i.e. the login path. The set is closed against
+/// customers (`instance_id.isReservedInstanceId`), so resolving a privilege
+/// from a name opens nothing.
+pub fn defaultTierFor(instance_id: []const u8) Tier {
+    return if (id_spec.isReservedInstanceId(instance_id)) .platform else .free;
+}
+
+/// `defaultTierFor` resolved to limits — what a tenant with no plan blob is
+/// enforced against.
+pub fn defaultFor(instance_id: []const u8) PlanLimits {
+    return table(defaultTierFor(instance_id));
+}
 
 /// The resolved limits a tenant is enforced against. Small + copyable —
 /// cached by value behind an atomic pointer on the worker's slot.
@@ -181,8 +243,27 @@ pub fn table(t: Tier) PlanLimits {
             .rate = .{
                 .request_capacity = 1000,
                 .request_refill_per_sec = 500,
+                // Third-party egress is a paid capability. A free tenant
+                // costs an email address, so anything it can do at volume
+                // is something an abuser can do for free — and outbound is
+                // the one capability whose victim is someone else. Payment
+                // is the identity signal that gates it; there is no
+                // self-serve flip, because a signal a spammer can forge
+                // for free buys one click.
+                //
+                // The cost is real and accepted: a free tenant cannot act
+                // as an OAuth/OIDC relying party, send webhooks or send
+                // email. Everything else — kv, blobs, statics, packages,
+                // inbound — is untouched (`outbound_enabled`).
+                //
+                // Softening this is a one-line edit here, not a code
+                // change: grant `outbound_enabled` and set the ceiling
+                // below to what a login-shaped workload needs.
+                .outbound_enabled = false,
                 .outbound_capacity = 100,
                 .outbound_refill_per_sec = 10,
+                // Bounds a free tenant that has been granted outbound by
+                // override (support/trial), rather than being dead numbers:
                 // ~170x below the rate-derived 864k/day, and still ~50x a
                 // small app's real outbound traffic.
                 .outbound_sustained_per_day = 5_000,
@@ -226,6 +307,28 @@ pub fn table(t: Tier) PlanLimits {
             .max_stored_bytes = UNMETERED_BYTES,
             .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
+        // The platform's own tenants. The ceilings mirror enterprise —
+        // what makes this tier different is not its numbers but that a
+        // refusal here is an outage, so the limits that PRICE a customer
+        // are lifted while the ones that PROTECT THE NODE stay:
+        // `max_kv_bytes` cannot exceed the map its store opens at, and the
+        // log-ingest caps stay finite so a runaway platform app fails loud
+        // instead of quietly filling a disk.
+        .platform => .{
+            .rate = .{
+                .request_capacity = 100_000,
+                .request_refill_per_sec = 50_000,
+                .outbound_capacity = 10_000,
+                .outbound_refill_per_sec = 1_000,
+                .outbound_sustained_per_day = 500_000,
+            },
+            .max_body_bytes = 256 * 1024 * 1024,
+            .max_resident_html_bytes = 256 * 1024 * 1024,
+            .retention_days = 365,
+            .max_kv_bytes = KV_BYTES_CEILING,
+            .max_stored_bytes = UNMETERED_BYTES,
+            .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
+        },
     };
 }
 
@@ -235,6 +338,7 @@ pub fn table(t: Tier) PlanLimits {
 pub const Overrides = struct {
     request_capacity: ?u32 = null,
     request_refill_per_sec: ?u32 = null,
+    outbound_enabled: ?bool = null,
     outbound_capacity: ?u32 = null,
     outbound_refill_per_sec: ?u32 = null,
     outbound_sustained_per_day: ?u32 = null,
@@ -253,6 +357,7 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     var p = table(tier);
     if (ov.request_capacity) |v| p.rate.request_capacity = v;
     if (ov.request_refill_per_sec) |v| p.rate.request_refill_per_sec = v;
+    if (ov.outbound_enabled) |v| p.rate.outbound_enabled = v;
     if (ov.outbound_capacity) |v| p.rate.outbound_capacity = v;
     if (ov.outbound_refill_per_sec) |v| p.rate.outbound_refill_per_sec = v;
     if (ov.outbound_sustained_per_day) |v| p.rate.outbound_sustained_per_day = v;
@@ -268,23 +373,33 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
 }
 
 /// Parse a CP plan blob (`{"tier":"pro","overrides":{…}}`) into resolved
-/// limits. An empty blob, malformed JSON, or an unknown tier all resolve to
-/// the FREE tier — the blob is operator/admin-authored, but a consumer must
-/// never fail a request on a bad plan record (fail toward the free tier,
-/// never toward unbounded). `overrides` is optional and sparse.
-pub fn parseBlob(allocator: std.mem.Allocator, blob: []const u8) PlanLimits {
+/// limits for `instance_id`. An empty blob or malformed JSON resolves to that
+/// tenant's DEFAULT (`defaultFor`) — the blob is operator/admin-authored, but
+/// a consumer must never fail a request on a bad plan record. For a customer
+/// that means failing toward the free tier, never toward unbounded; for a
+/// reserved platform id it means failing toward the platform tier, because
+/// there the conservative direction is the one that keeps our own dashboard
+/// serving. A customer cannot hold a reserved id, so the two rules never meet.
+/// `overrides` is optional and sparse.
+pub fn parseBlob(allocator: std.mem.Allocator, instance_id: []const u8, blob: []const u8) PlanLimits {
     const trimmed = std.mem.trim(u8, blob, " \t\r\n");
-    if (trimmed.len == 0) return table(.free);
+    if (trimmed.len == 0) return defaultFor(instance_id);
     const Doc = struct {
-        tier: []const u8 = "free",
+        tier: ?[]const u8 = null,
         overrides: Overrides = .{},
     };
     var parsed = std.json.parseFromSlice(Doc, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch {
-        std.log.warn("plan: unparseable plan blob ({d} bytes) — defaulting to free tier", .{trimmed.len});
-        return table(.free);
+        std.log.warn(
+            "plan: unparseable plan blob for {s} ({d} bytes) — defaulting to {s}",
+            .{ instance_id, trimmed.len, @tagName(defaultTierFor(instance_id)) },
+        );
+        return defaultFor(instance_id);
     };
     defer parsed.deinit();
-    return effective(Tier.parse(parsed.value.tier), parsed.value.overrides);
+    // A blob that names no tier states only overrides; it must not silently
+    // demote a platform singleton to free.
+    const tier = if (parsed.value.tier) |t| Tier.parse(t) else defaultTierFor(instance_id);
+    return effective(tier, parsed.value.overrides);
 }
 
 /// Seconds of retention for a resolved plan — the read-clamp floor is
@@ -321,26 +436,106 @@ test "plan: effective folds sparse overrides over the table" {
 test "plan: Tier.parse unknown → free" {
     try testing.expectEqual(Tier.pro, Tier.parse("pro"));
     try testing.expectEqual(Tier.enterprise, Tier.parse("enterprise"));
+    try testing.expectEqual(Tier.platform, Tier.parse("platform"));
     try testing.expectEqual(Tier.free, Tier.parse("free"));
     try testing.expectEqual(Tier.free, Tier.parse("platinum")); // unknown
     try testing.expectEqual(Tier.free, Tier.parse(""));
 }
 
+test "plan: outbound is a paid capability — free tier is off, paid tiers are on" {
+    try testing.expect(!table(.free).rate.outbound_enabled);
+    try testing.expect(table(.pro).rate.outbound_enabled);
+    try testing.expect(table(.enterprise).rate.outbound_enabled);
+    try testing.expect(table(.platform).rate.outbound_enabled);
+    // The free tier's outbound NUMBERS stay meaningful — they bound a free
+    // tenant granted outbound by override (support/trial), so an operator
+    // flipping one field doesn't hand out an unbounded budget.
+    try testing.expect(table(.free).rate.outbound_capacity > 0);
+    try testing.expect(table(.free).rate.outbound_sustained_per_day > 0);
+}
+
+test "plan: an override is what grants a free tenant outbound" {
+    const granted = effective(.free, .{ .outbound_enabled = true });
+    try testing.expect(granted.rate.outbound_enabled);
+    // …and it grants ONLY that: the ceilings still come from the tier.
+    try testing.expectEqual(table(.free).rate.outbound_sustained_per_day, granted.rate.outbound_sustained_per_day);
+    // The reverse works too — a paid tenant can be cut off without a
+    // downgrade (the abuse response that isn't suspension).
+    try testing.expect(!effective(.pro, .{ .outbound_enabled = false }).rate.outbound_enabled);
+}
+
+test "plan: reserved platform ids default to the platform tier, customers to free" {
+    // The platform's own singletons must never run under a customer-facing
+    // abuse limit — `__auth__` is an OIDC relying party, so a free-tier
+    // outbound gate on it is the login path going down.
+    try testing.expectEqual(Tier.platform, defaultTierFor("__admin__"));
+    try testing.expectEqual(Tier.platform, defaultTierFor("__auth__"));
+    try testing.expectEqual(Tier.platform, defaultTierFor("__replay__"));
+    try testing.expect(defaultFor("__auth__").rate.outbound_enabled);
+
+    // Everything else is a customer, including ids that merely look
+    // platform-ish. A customer cannot hold a reserved id (the `__…__` form
+    // fails the DNS-label spec), so this is not a name a tenant can claim.
+    try testing.expectEqual(Tier.free, defaultTierFor("acme"));
+    try testing.expectEqual(Tier.free, defaultTierFor("__admin"));
+    try testing.expectEqual(Tier.free, defaultTierFor("admin"));
+    try testing.expectEqual(Tier.free, defaultTierFor("__notreal__"));
+    try testing.expect(!defaultFor("acme").rate.outbound_enabled);
+}
+
+test "plan: a blob resolves against the tenant it belongs to" {
+    const a = testing.allocator;
+    // No blob / unparseable blob → that tenant's default, which for a
+    // platform singleton is platform, not free. Failing toward free here
+    // would take the dashboard's outbound down on a bad record.
+    try testing.expect(parseBlob(a, "__admin__", "").rate.outbound_enabled);
+    try testing.expect(parseBlob(a, "__admin__", "not json").rate.outbound_enabled);
+    try testing.expect(!parseBlob(a, "acme", "").rate.outbound_enabled);
+
+    // A blob naming only overrides must not silently demote a platform
+    // singleton to free.
+    const ov_only = parseBlob(a, "__admin__", "{\"overrides\":{\"retention_days\":30}}");
+    try testing.expectEqual(@as(u32, 30), ov_only.retention_days);
+    try testing.expect(ov_only.rate.outbound_enabled);
+    try testing.expectEqual(table(.platform).max_body_bytes, ov_only.max_body_bytes);
+
+    // The grant path: an overrides-only blob turns outbound on for ONE
+    // customer without naming a tier. Naming one would be the trap — it
+    // pins that tenant to today's meaning of "free", so a later tier-table
+    // edit silently skips them; and a typo'd tier name resolves to free
+    // rather than failing, which is invisible until a limit bites.
+    const grant = parseBlob(a, "acme", "{\"overrides\":{\"outbound_enabled\":true}}");
+    try testing.expect(grant.rate.outbound_enabled);
+    // …and the grant is ONLY that. Every other limit still comes from the
+    // tier, so granting egress never quietly grants enterprise numbers.
+    try testing.expectEqual(table(.free).rate.outbound_sustained_per_day, grant.rate.outbound_sustained_per_day);
+    try testing.expectEqual(table(.free).max_body_bytes, grant.max_body_bytes);
+    try testing.expectEqual(table(.free).retention_days, grant.retention_days);
+
+    // An explicit tier still wins over the id-derived default — that is
+    // what makes the default a default rather than a hardcode.
+    try testing.expectEqual(
+        table(.free).max_body_bytes,
+        parseBlob(a, "__admin__", "{\"tier\":\"free\"}").max_body_bytes,
+    );
+    try testing.expect(parseBlob(a, "acme", "{\"tier\":\"pro\"}").rate.outbound_enabled);
+}
+
 test "plan: parseBlob round-trips tier + overrides" {
     const a = testing.allocator;
     {
-        const p = parseBlob(a, "{\"tier\":\"pro\"}");
+        const p = parseBlob(a, "acme", "{\"tier\":\"pro\"}");
         try testing.expectEqual(table(.pro).max_body_bytes, p.max_body_bytes);
     }
     {
-        const p = parseBlob(a, "{\"tier\":\"pro\",\"overrides\":{\"retention_days\":90}}");
+        const p = parseBlob(a, "acme", "{\"tier\":\"pro\",\"overrides\":{\"retention_days\":90}}");
         try testing.expectEqual(@as(u32, 90), p.retention_days);
         try testing.expectEqual(table(.pro).max_body_bytes, p.max_body_bytes);
     }
 }
 
 test "plan: every tier carries both byte ceilings" {
-    for ([_]Tier{ .free, .pro, .enterprise }) |t| {
+    for ([_]Tier{ .free, .pro, .enterprise, .platform }) |t| {
         const p = table(t);
         // No tier may promise more KV than the map its `app.db` opens at.
         try testing.expect(p.max_kv_bytes <= KV_BYTES_CEILING);
@@ -361,7 +556,7 @@ test "plan: effective folds the byte-ceiling overrides" {
 }
 
 test "plan: log-ingest caps default uniformly and fold overrides" {
-    for ([_]Tier{ .free, .pro, .enterprise }) |t| {
+    for ([_]Tier{ .free, .pro, .enterprise, .platform }) |t| {
         const p = table(t);
         try testing.expectEqual(@as(u32, 256 * 1024 * 1024), p.rate.log_burst_bytes);
         try testing.expectEqual(@as(u32, 64 * 1024), p.rate.log_refill_bytes_per_sec);
@@ -370,27 +565,27 @@ test "plan: log-ingest caps default uniformly and fold overrides" {
     try testing.expectEqual(@as(u32, 1024), p.rate.log_burst_bytes);
     try testing.expectEqual(@as(u32, 16), p.rate.log_refill_bytes_per_sec);
     const a = testing.allocator;
-    const blob = parseBlob(a, "{\"tier\":\"free\",\"overrides\":{\"log_burst_bytes\":2048}}");
+    const blob = parseBlob(a, "acme", "{\"tier\":\"free\",\"overrides\":{\"log_burst_bytes\":2048}}");
     try testing.expectEqual(@as(u32, 2048), blob.rate.log_burst_bytes);
     try testing.expectEqual(@as(u32, 64 * 1024), blob.rate.log_refill_bytes_per_sec);
 }
 
 test "plan: parseBlob carries the byte ceilings" {
     const a = testing.allocator;
-    const p = parseBlob(a, "{\"tier\":\"pro\",\"overrides\":{\"max_stored_bytes\":42}}");
+    const p = parseBlob(a, "acme", "{\"tier\":\"pro\",\"overrides\":{\"max_stored_bytes\":42}}");
     try testing.expectEqual(@as(u64, 42), p.max_stored_bytes);
     // A blob that names neither ceiling resolves to the tier's own figures.
     try testing.expectEqual(table(.pro).max_kv_bytes, p.max_kv_bytes);
-    const bare = parseBlob(a, "{\"tier\":\"free\"}");
+    const bare = parseBlob(a, "acme", "{\"tier\":\"free\"}");
     try testing.expectEqual(table(.free).max_stored_bytes, bare.max_stored_bytes);
 }
 
 test "plan: parseBlob fails toward the free tier" {
     const a = testing.allocator;
-    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "").max_body_bytes);
-    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "   ").max_body_bytes);
-    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "not json").max_body_bytes);
-    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "{\"tier\":\"galaxy\"}").max_body_bytes);
+    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "acme", "").max_body_bytes);
+    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "acme", "   ").max_body_bytes);
+    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "acme", "not json").max_body_bytes);
+    try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "acme", "{\"tier\":\"galaxy\"}").max_body_bytes);
 }
 
 test "plan: retentionNs scales days to ns" {

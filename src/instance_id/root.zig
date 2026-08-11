@@ -136,6 +136,21 @@ pub fn isValid(id: []const u8) bool {
     return check(id) == null;
 }
 
+/// True for the platform's own singleton tenants (`RESERVED_INSTANCE_IDS`).
+///
+/// The set is closed and cannot grow by customer action: the `__…__` form
+/// fails the DNS-label spec above, and only these exact ids are exempted from
+/// it. Callers can therefore treat membership as "the platform operates this
+/// tenant" — see `rove-plan`'s `defaultTierFor`, which resolves these to the
+/// platform tier so the dashboard and the identity provider are never gated by
+/// a customer-facing abuse limit.
+pub fn isReservedInstanceId(id: []const u8) bool {
+    for (RESERVED_INSTANCE_IDS) |r| {
+        if (std.mem.eql(u8, id, r)) return true;
+    }
+    return false;
+}
+
 fn isReservedSubdomainLabel(id: []const u8) bool {
     for (RESERVED_SUBDOMAIN_LABELS) |r| {
         if (std.mem.eql(u8, id, r)) return true;

@@ -158,6 +158,19 @@ re-provision 409 / unknown-cluster 400).
   The resolved `PlanLimits` is cached on the tenant's `TenantSlot` with a
   **plan generation** counter, so dispatch reads a field, never a store (the
   no-`O(N_tenants)`-on-dispatch invariant).
+- **The default is derived from the tenant id, not from a blob.** Nothing
+  writes a plan row at provision, so "no blob" is the common case, not an
+  edge one — `plan.defaultTierFor` answers it: free for a customer, and the
+  **platform tier** for the reserved singletons (`__admin__`, `__auth__`,
+  `__replay__`). Those are us, not customers: `__auth__` is an OIDC relying
+  party, so a customer-facing outbound gate landing on it takes the login
+  path down. Deriving it from the id rather than an operator-written blob
+  means it survives a genesis; the set cannot grow by customer action
+  (the `__…__` form fails the DNS-label spec every customer id is validated
+  against). An explicit blob still wins. Note the ordering hazard when
+  naming a tier in a blob: an older binary parses an unknown tier as
+  **free**, so roll the binary everywhere before writing a blob that names
+  one.
 - **Enforcement (DP-local, four levers, all off `slot.effectivePlan()`)**:
   - **Lever 1 — rate** (`src/js/limiter.zig`): per-`(instance, action)` token buckets
     sourced per-instance from the cached tier; **generation-refresh** re-inits
@@ -250,12 +263,41 @@ cannot be bypassed:
   bucket may run negative, and the *next* admission pays with a 429 until
   the debt refills off. Uniform caps for now (the tier field comes with the
   plan-table reshape); `log_ingest_limited_total` counts refusals.
+- **Outbound admission** (`outbound_enabled`, the abuse floor): before any
+  bucket is consulted, a plan either grants third-party egress or it does
+  not. **The free tier does not** — outbound is the one capability whose
+  victim is someone else, and payment is the identity signal that gates it.
+  A refusal is permanent, so it carries its own code
+  (`outbound_not_enabled`) and **no Retry-After**: telling a caller to
+  retry a policy is how a `retry` wrapper turns one refusal into a loop.
+  Counted by `outbound_not_enabled_total`. Granting one tenant egress is an
+  **overrides-only blob** — `{"overrides":{"outbound_enabled":true}}`, no
+  `tier` key — so the tenant keeps its derived tier and every other limit
+  moves when the table does. Naming a tier to state an override is the trap:
+  it pins that tenant to today's meaning of "free", and a typo'd tier name
+  resolves to free rather than failing. Platform-internal doors
+  (`*.internal`) are not egress, so a tenant without outbound keeps `kv.*`,
+  `blob.*`, statics and packages; what stops is `http.send` /
+  `webhook.send` / `email.send` and acting as an OAuth/OIDC relying party.
 - **Sustained outbound** (the spam bound): a second, day-scale
   `outbound_sustained` bucket over the same frozen-native funnel as the
-  burst bucket — capacity is a 10%-duty-cycle day of the plan's sustained
-  rate, so the free tier's "10/s forever ≈ 864k/day" collapses to ~86k/day.
+  burst bucket — `outbound_sustained_per_day`, 5,000/day on free, against a
+  rate-derived ~864k/day if the burst bucket were the only bound.
   Saturating it is an **incident signal, not a sales lead**: distinct error
   code (`outbound_sustained_limited`) + `outbound_sustained_trips_total`.
+- **Every path, not just the inline one.** Both of the above are enforced at
+  the frozen fetch native for *all* third-party egress, including fires from
+  baked `__system/*` modules. Being platform-issued is **not** an exemption,
+  though it reads like one: a deferred `webhook.send({at})` and a
+  hand-written `_send/`+`_sched/` row pair (those prefixes are
+  customer-writable by design) both arrive as platform delivery, so
+  exempting them made the whole quota opt-in — a tenant bypassed it by
+  deferring. Nothing at that seam can tell an admitted send from an invented
+  one, because the marker is customer data. `__system/webhook_fire` catches
+  the refusal and backs off on its watchdog rather than throwing (an
+  uncaught throw would roll back the entry's own cleanup and re-fire at
+  1 Hz). Held by `scripts/smoke/outbound_gate_smoke_v2.py`, which runs all
+  three paths against a tenant with outbound and one without.
 - **Creation velocity** (`/_control/provision`): one coarse CP-side token
   bucket (burst 10, ~2/min sustained) behind whatever identity the caller
   presents — ten tenants in a minute and ten in a year are different events,

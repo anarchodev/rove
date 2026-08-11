@@ -27,8 +27,11 @@
 //! protects the platform's egress reputation + third-party bill). The
 //! outbound bucket is enforced at the frozen fetch primitive
 //! (`bindings/http.zig`), not in a pinnable email/webhook shim, so a
-//! tenant-pinnable package can't bypass it; deferred webhook retries
-//! (`is_system_module` fires) don't re-count. Other actions in PLAN §2.10
+//! tenant-pinnable package can't bypass it. Deferred fires — a scheduled
+//! send, a retry, a wake-fired attempt from a baked `__system/*` module —
+//! DO count: whether the platform is the one issuing the request says
+//! nothing about whether the send was ever admitted, so exempting them made
+//! the budget opt-in. Other actions in PLAN §2.10
 //! (`deploy`, `kv_write`) are deferred — deploys are low-volume; kv_write
 //! is a hot path with real per-call cost to add bucket math.
 //!
@@ -225,6 +228,13 @@ pub const RateLimiter = struct {
     /// spam/flood suspect, not a sales lead). Per-worker, unsynced,
     /// like every field here; surfaced on `/_system/metrics`.
     sustained_trips: u64 = 0,
+    /// Refusals from the plan's `outbound_enabled` admission gate — a
+    /// tenant asking for third-party egress its tier does not grant.
+    /// Distinct from `sustained_trips` because it means something else:
+    /// not an incident, but demand meeting policy. A tenant driving this
+    /// counter is either a customer to upgrade or an abuser being held at
+    /// the door, and only the destination tells you which.
+    outbound_disabled_refusals: u64 = 0,
     /// `instance_id` → per-action buckets. Lazily created on first
     /// `check` for an instance; never evicted in v1 (memory bounded
     /// by registered tenant count).
