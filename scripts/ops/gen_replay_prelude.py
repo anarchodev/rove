@@ -41,6 +41,7 @@ manifest `generate` hook.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import sys
 
@@ -98,6 +99,28 @@ PIECES = [
 # customer surface. Every shim above captured what it needs in a closure.
 EPILOGUE = "\n;delete globalThis._system;\n"
 
+# Digest of the composed prelude, committed HERE in rove.
+#
+# The freshness problem is cross-repo: the artifact lives in rewind-apps,
+# so a rove-side check would need that checkout to compare against — and
+# a gate that depends on a sibling clone either does not run or is not a
+# gate. But `build()` composes the expected text from rove sources
+# ALONE. Recording its digest here makes the contract checkable without
+# leaving the repo: change a shim, and the digest moves, and the gate
+# says so at the moment of the change rather than whenever someone next
+# happens to regenerate.
+#
+# The two halves catch different drift and both are needed:
+#   - this digest      — a rove shim moved and rewind-apps has not been
+#                        told. Runs on every `zig build test`.
+#   - `--check`        — the committed prelude does not match the rove
+#                        commit rewind-apps pins. Runs in that repo's CI.
+DIGEST_FILE = ROVE / "scripts" / "ops" / "arena-prelude.sha256"
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 BANNER = """\
 // GENERATED — do not edit. scripts/ops/gen_replay_prelude.py (rove)
 // composes this from the engine's own shim sources; regenerated at
@@ -122,16 +145,62 @@ def build() -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--apps-dir", required=True, help="rewind-apps checkout")
+    ap.add_argument("--apps-dir", help="rewind-apps checkout (required to write or --check)")
     ap.add_argument(
         "--check",
         action="store_true",
         help="fail (exit 1) if the committed output is stale instead of writing",
     )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="fail (exit 1) if the shim sources no longer match the recorded "
+             "digest — the rove-side gate; needs no apps checkout",
+    )
+    ap.add_argument(
+        "--record",
+        action="store_true",
+        help="rewrite the recorded digest; run this WITH regenerating the "
+             "prelude in rewind-apps, never instead of it",
+    )
     args = ap.parse_args()
 
-    out = pathlib.Path(args.apps_dir).expanduser() / "replay" / "_static" / "arena-prelude.js"
     text = build()
+
+    if args.verify:
+        want = DIGEST_FILE.read_text(encoding="utf-8").split()[0] if DIGEST_FILE.exists() else ""
+        have = digest(text)
+        if want != have:
+            print(
+                f"STALE: the replay prelude's engine shim sources changed.\n"
+                f"  recorded {want or '(none)'}\n"
+                f"  current  {have}\n"
+                f"\n"
+                f"`replay/_static/arena-prelude.js` in rewind-apps is GENERATED from\n"
+                f"these sources. It does not update itself, and nothing downstream\n"
+                f"notices — the browser replay engine just runs older shim code than\n"
+                f"the worker, silently. Propagate the change:\n"
+                f"\n"
+                f"  python3 scripts/ops/gen_replay_prelude.py --apps-dir <rewind-apps>\n"
+                f"  python3 scripts/ops/gen_replay_prelude.py --record\n"
+                f"\n"
+                f"then commit the regenerated prelude in rewind-apps AND the digest\n"
+                f"here. Recording without regenerating defeats the check.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"fresh: shim sources match the recorded digest ({have[:16]}…)")
+        return 0
+
+    if args.record:
+        DIGEST_FILE.write_text(digest(text) + "  arena-prelude.js\n", encoding="utf-8")
+        print(f"recorded {digest(text)} → {DIGEST_FILE}")
+        return 0
+
+    if not args.apps_dir:
+        print("--apps-dir is required to write or --check", file=sys.stderr)
+        return 2
+    out = pathlib.Path(args.apps_dir).expanduser() / "replay" / "_static" / "arena-prelude.js"
     if args.check:
         if not out.exists() or out.read_text(encoding="utf-8") != text:
             print(f"STALE: {out} does not match the engine shim sources — "
