@@ -27,8 +27,11 @@
 //! protects the platform's egress reputation + third-party bill). The
 //! outbound bucket is enforced at the frozen fetch primitive
 //! (`bindings/http.zig`), not in a pinnable email/webhook shim, so a
-//! tenant-pinnable package can't bypass it; deferred webhook retries
-//! (`is_system_module` fires) don't re-count. Other actions in PLAN §2.10
+//! tenant-pinnable package can't bypass it. Deferred fires — a scheduled
+//! send, a retry, a wake-fired attempt from a baked `__system/*` module —
+//! DO count: whether the platform is the one issuing the request says
+//! nothing about whether the send was ever admitted, so exempting them made
+//! the budget opt-in. Other actions in PLAN §2.10
 //! (`deploy`, `kv_write`) are deferred — deploys are low-volume; kv_write
 //! is a hot path with real per-call cost to add bucket math.
 //!

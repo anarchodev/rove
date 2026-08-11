@@ -43,7 +43,9 @@ pub const RateLimitCaps = struct {
     /// / `email.send` (which composes over it). The platform's egress /
     /// third-party-bill guard, enforced at the frozen fetch primitive
     /// (`bindings/http.zig`) so a tenant-pinnable email/webhook package
-    /// can't bypass it. Deferred webhook retries don't re-count.
+    /// can't bypass it. Deferred fires — scheduled sends, retries, anything
+    /// a baked `__system/*` module issues — count too: being
+    /// platform-issued is not evidence the send was admitted.
     outbound_capacity: u32 = 100,
     /// 10/sec → 600/min sustained — well under any sane provider quota.
     outbound_refill_per_sec: u32 = 10,
