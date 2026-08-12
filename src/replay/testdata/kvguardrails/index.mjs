@@ -49,6 +49,13 @@ export default function () {
       seg: cap(() => kv.set("_seg/idx/1", "v")),
       oidc: cap(() => kv.set("_oidc/session/s", "v")),
       rp: cap(() => kv.set("_rp/sess/s", "v")),
+      // The other side of the allowlist: a reserved prefix that is NOT on it
+      // must be refused, by the same code and message, in every engine. This
+      // probe is why the case exists — the browser arena used to allow it
+      // (rove#502), which is replay being more permissive than prod.
+      reserved: cap(() => kv.set("_secret/x", "v")),
+      // …and the size caps, which came from the same shared file.
+      bigKey: cap(() => kv.set("K".repeat(257), "v")),
     };
   }
   if (p === "/page-default") return { n: kv.prefix("orders/").length };

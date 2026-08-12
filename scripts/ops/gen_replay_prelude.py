@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import pathlib
+import re
 import sys
 
 ROVE = pathlib.Path(__file__).resolve().parents[2]
@@ -99,6 +100,65 @@ PIECES = [
 # customer surface. Every shim above captured what it needs in a closure.
 EPILOGUE = "\n;delete globalThis._system;\n"
 
+# ── the kv guardrails (rove#502) ──────────────────────────────────────────
+#
+# The arena had NONE of the worker's kv write guards: a handler writing a
+# platform-reserved key threw in prod and in the sim, and succeeded here —
+# replay being more permissive than prod, which makes a run look successful
+# where the real one refused.
+#
+# The rules now have one implementation (`src/replay/js/kv_guards.js`, shared
+# with the sim's prelude). Their DATA is generated from Zig below, so a new
+# reserved prefix or a raised cap reaches this arena without a second edit.
+# Reading the Zig rather than restating it is the whole point; a regex that
+# stops matching must fail loudly, never silently emit an empty list.
+RESERVED_ZIG = ROVE / "src" / "reserved" / "root.zig"
+
+
+def _zig_prefix_list() -> list[str]:
+    src = RESERVED_ZIG.read_text(encoding="utf-8")
+    m = re.search(
+        r"pub const SHIM_WRITABLE_PREFIXES\s*=\s*\[_\]\[\]const u8\{(.*?)\};",
+        src, re.S)
+    if not m:
+        raise SystemExit(f"{RESERVED_ZIG}: SHIM_WRITABLE_PREFIXES not found — "
+                         "the arena's kv guard would ship an empty allowlist")
+    prefixes = re.findall(r'"([^"]+)"', m.group(1))
+    if not prefixes:
+        raise SystemExit(f"{RESERVED_ZIG}: SHIM_WRITABLE_PREFIXES parsed empty")
+    return prefixes
+
+
+def _zig_cap(name: str) -> int:
+    src = RESERVED_ZIG.read_text(encoding="utf-8")
+    m = re.search(rf"pub const {name}: usize = ([0-9]+)(?:\s*<<\s*([0-9]+))?;", src)
+    if not m:
+        raise SystemExit(f"{RESERVED_ZIG}: {name} not found")
+    v = int(m.group(1))
+    return v << int(m.group(2)) if m.group(2) else v
+
+
+def kv_guard_data() -> str:
+    """The data globals `kv_guards.js` declares it needs, from the Zig."""
+    prefixes = ", ".join(f'"{p}"' for p in _zig_prefix_list())
+    return (
+        f"\nconst __SHIM_WRITABLE = [{prefixes}];\n"
+        f"const __KV_KEY_MAX = {_zig_cap('KV_KEY_MAX')}, "
+        f"__KV_VAL_MAX = {_zig_cap('KV_VAL_MAX')};\n"
+    )
+
+
+# The arena attaches these rules in its OWN epilogue (rewind-apps
+# `replay/_static/request-replay.mjs`, where it builds the kv wrapper), the
+# same way the sim's epilogue calls them from inside its recording wrapper.
+# It cannot be attached here: at base-eval time the arena's `kv` host binding
+# is not yet a callable object, so wrapping it from the prelude threw and took
+# every case down with it. The prelude's job is to make the RULES available;
+# where they bite is each engine's own business.
+
+
+
+
 # Digest of the composed prelude, committed HERE in rove.
 #
 # The freshness problem is cross-repo: the artifact lives in rewind-apps,
@@ -139,6 +199,13 @@ def build() -> str:
         rel = path.relative_to(ROVE)
         parts.append(f"\n// ── {rel} ──\n;")
         parts.append(f"(function () {{\n{src}\n}})();" if iife else src)
+    # The kv guardrails: generated data, then the shared rules, then the
+    # wrapper that puts them on this engine's kv. Before EPILOGUE, which
+    # deletes `_system` — the guard needs nothing from it, but the ordering
+    # keeps "everything the arena installs" above that line.
+    parts.append("\n// ── kv guardrails (generated data + src/replay/js/kv_guards.js) ──\n")
+    parts.append(kv_guard_data())
+    parts.append((ROVE / "src" / "replay" / "js" / "kv_guards.js").read_text(encoding="utf-8"))
     parts.append(EPILOGUE)
     return "".join(parts)
 

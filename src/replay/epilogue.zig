@@ -359,10 +359,30 @@ const SHIM_WRITABLE_JS = blk: {
         if (i > 0) out = out ++ ", ";
         out = out ++ "\"" ++ prefix ++ "\"";
     }
-    break :blk out ++ "];\n";
+    out = out ++ "];\n";
+    // The caps ride the same fragment rather than being transcribed into the
+    // shared guard file: they are Zig constants with a reason (the snapshot
+    // stream's frame bounds), so the JS should never hold a second opinion
+    // about them.
+    out = out ++ std.fmt.comptimePrint(
+        "  const __KV_KEY_MAX = {d}, __KV_VAL_MAX = {d};\n",
+        .{ kv_guard_key_max, kv_guard_val_max },
+    );
+    break :blk out;
 };
 
-const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ SHIM_WRITABLE_JS ++ EPILOGUE_BODY_TAIL;
+/// The kv guard RULES, shared verbatim with the browser replay arena
+/// (`scripts/ops/gen_replay_prelude.py` splices the same file) — the same
+/// arrangement `textcodec_pure.js` already has. Only the data above is
+/// generated; the logic has one copy (rove#502).
+const KV_GUARDS_JS = @embedFile("js/kv_guards.js");
+
+/// Bytes the worker accepts for a kv key / value, from the shared leaf so
+/// the prelude and the native enforce one number.
+const kv_guard_key_max: usize = reserved.KV_KEY_MAX;
+const kv_guard_val_max: usize = reserved.KV_VAL_MAX;
+
+const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ SHIM_WRITABLE_JS ++ KV_GUARDS_JS ++ "\n" ++ EPILOGUE_BODY_TAIL;
 
 const EPILOGUE_BODY_HEAD =
     \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
@@ -652,34 +672,26 @@ const EPILOGUE_BODY_HEAD =
     \\  // reads the same global, so the two offline engines cannot disagree about
     \\  // which keys are harness bookkeeping (rove#442).
     \\  const __NS = globalThis.__roveStorePrefix;
+    \\  // The sim's own bookkeeping writes land under the store namespace and
+    \\  // are not customer writes, so they skip the guard — the one per-engine
+    \\  // decision the shared rules take as a parameter (the arena has no such
+    \\  // prefix and passes nothing).
+    \\  const __kvExempt = (ks) => ks.startsWith(__NS);
     \\  // Prod kv guardrails (globals.zig / reserved.zig) enforced offline so a
     \\  // handler that throws instantly in prod also throws under `rewind test`,
     \\  // with the same error shapes (`err.code` branches are testable). The
     \\  // `__rove_store/` facade namespace bypasses them, mirroring prod's
     \\  // is_system_module / privileged-write exemption. Order matches the worker:
     \\  // coerce key type, coerce value type, reserved-prefix, then size (key
-    \\  // reported before value). Byte lengths use __utf8Len — the UTF-8 byte
+    \\  // reported before value). The rules themselves live in the shared
+    \\  // guard file spliced above; this is only where they attach.
+    \\  // Byte lengths use __utf8Len — the UTF-8 byte
     \\  // COUNT the worker measures, computed WITHOUT materializing the encoded
     \\  // array (measuring a 1 MiB value via __utf8Encode would blow the request
     \\  // arena). It mirrors __utf8Encode's byte output, incl. WTF-8 surrogates.
-    \\  const __KV_KEY_MAX = 256, __KV_VAL_MAX = 1 << 20;
-    \\  const __utf8Len = (s) => { s = String(s == null ? "" : s); let n = 0; for (let i = 0; i < s.length; i++) { let cp = s.charCodeAt(i); if (cp >= 0xD800 && cp <= 0xDBFF) { const lo = i + 1 < s.length ? s.charCodeAt(i + 1) : 0; if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000; i++; } } if (cp < 0x80) n += 1; else if (cp < 0x800) n += 2; else if (cp < 0x10000) n += 3; else n += 4; } return n; };
 ;
 
 const EPILOGUE_BODY_TAIL =
-    \\  const __kvReserved = (k) => { if (k.length === 0 || k[0] !== "_") return false; for (const p of __SHIM_WRITABLE) if (k.startsWith(p)) return false; return true; };
-    \\  const __kvErr = (message, code) => { const e = new Error(message); e.code = code; return e; };
-    \\  const __kvCoerce = (x, what) => { if (x === null || x === undefined || typeof x === "object" || typeof x === "function") throw new TypeError("kv: " + what + " must be a string (or number/boolean/bigint); JSON.stringify objects explicitly"); return String(x); };
-    \\  const __kvGuardWrite = (k, hasVal, val) => {
-    \\    const ks = __kvCoerce(k, "key");
-    \\    const vs = hasVal ? __kvCoerce(val, "value") : "";
-    \\    if (!ks.startsWith(__NS)) {
-    \\      if (__kvReserved(ks)) throw __kvErr("kv: '" + ks + "' is in a platform-reserved prefix", "reserved_key");
-    \\      if (__utf8Len(ks) > __KV_KEY_MAX) throw __kvErr("kv: key exceeds the " + __KV_KEY_MAX + "-byte limit", "key_too_large");
-    \\      if (hasVal && __utf8Len(vs) > __KV_VAL_MAX) throw __kvErr("kv: value exceeds the " + __KV_VAL_MAX + "-byte limit", "value_too_large");
-    \\    }
-    \\    return ks;
-    \\  };
     \\  // Durable kv subscriptions (issue #38): scenario({subscriptions}) carries
     \\  // the registration (name + watched kv prefix) prod derives from
     \\  // `_subscriptions/<name>/spec.json`. A customer write under a watched
@@ -740,8 +752,8 @@ const EPILOGUE_BODY_TAIL =
     \\  };
     \\  globalThis.kv = {
     \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
-    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val); if (ks.startsWith(__NS)) return __kvNative.set(k, val); const mutated = __runTriggers("put", "before", ks, val); const r = __kvNative.set(k, mutated); __effects.push({ kind: "write", key: ks, value: mutated }); __markDirty(ks); __runTriggers("put", "after", ks, mutated); return r; },
-    \\    delete(k) { const ks = __kvGuardWrite(k, false); if (ks.startsWith(__NS)) return __kvNative.delete(k); __runTriggers("delete", "before", ks, null); const r = __kvNative.delete(k); __effects.push({ kind: "delete", key: ks }); __markDirty(ks); __runTriggers("delete", "after", ks, null); return r; },
+    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val, __kvExempt); if (ks.startsWith(__NS)) return __kvNative.set(k, val); const mutated = __runTriggers("put", "before", ks, val); const r = __kvNative.set(k, mutated); __effects.push({ kind: "write", key: ks, value: mutated }); __markDirty(ks); __runTriggers("put", "after", ks, mutated); return r; },
+    \\    delete(k) { const ks = __kvGuardWrite(k, false, undefined, __kvExempt); if (ks.startsWith(__NS)) return __kvNative.delete(k); __runTriggers("delete", "before", ks, null); const r = __kvNative.delete(k); __effects.push({ kind: "delete", key: ks }); __markDirty(ks); __runTriggers("delete", "after", ks, null); return r; },
     \\    // Straight through: the native takes the worker's positional
     \\    // (prefix, cursor, limit), so offline paging matches live paging with
     \\    // no adapter. A scan under the store namespace (a facade call) returns
@@ -1134,5 +1146,19 @@ test "the generated list keeps its own line in the prelude" {
     // split first shipped, and it broke the two engines' agreement without
     // breaking the build.
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "\n  const __SHIM_WRITABLE = [") != null);
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "];\n  const __kvReserved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "];\n  const __KV_KEY_MAX = ") != null);
+    // …and the shared guard file lands after it, on its own line, with the
+    // data globals it needs already defined above.
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, ";\n// SPDX-FileCopyrightText") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __kvGuardWrite = (k, hasVal, val, isExempt)") != null);
+}
+
+test "the caps reach the prelude as numbers, from the shared leaf" {
+    var buf: [64]u8 = undefined;
+    const expect_caps = try std.fmt.bufPrint(
+        &buf,
+        "const __KV_KEY_MAX = {d}, __KV_VAL_MAX = {d};",
+        .{ reserved.KV_KEY_MAX, reserved.KV_VAL_MAX },
+    );
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, expect_caps) != null);
 }

@@ -262,3 +262,21 @@ test "isCustomerWriteReserved: customer (non-_) keys allowed" {
     try std.testing.expect(!isCustomerWriteReserved("my_audit/"));
     try std.testing.expect(!isCustomerWriteReserved("orders/123"));
 }
+
+/// The customer-facing kv write caps, in BYTES.
+///
+/// They live in this leaf because they are a CONTRACT — "a key is at most
+/// 256 bytes" is something a handler author reads and every engine must
+/// agree on — while their physical justification is the snapshot stream's
+/// frame bounds (`kv/snapshot_stream.zig`). The worker enforces them at the
+/// native; the offline engines enforce them in JS through the shared guard
+/// (`src/replay/js/kv_guards.js`), which reads these values generated into
+/// its prelude rather than transcribing them.
+///
+/// `src/js/globals.zig` holds a test binding these to the stream constants,
+/// so raising the frame bound without raising the contract (or the reverse)
+/// fails the build rather than surfacing as one engine refusing a write
+/// another accepted. Conservative by design: these can be RAISED later
+/// without breaking anyone, never lowered.
+pub const KV_KEY_MAX: usize = 256;
+pub const KV_VAL_MAX: usize = 1 << 20;
