@@ -75,6 +75,11 @@ def _plan_blob(*, request_capacity: int, outbound_capacity: int) -> str:
     return json.dumps({
         "tier": "free",
         "overrides": {
+            # The free tier grants no outbound at all (rove#336), and this
+            # smoke is about the outbound RATE bucket — without the grant
+            # every send is refused by admission before a bucket is consulted,
+            # and the rate assertions test nothing.
+            "outbound_enabled": True,
             "request_capacity": request_capacity,
             "request_refill_per_sec": 0,
             "outbound_capacity": outbound_capacity,
