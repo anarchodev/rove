@@ -628,9 +628,14 @@ fn handlePlan(
             return reply(server, allocator, ent, sid, sess, 500, "slot open failed\n");
         const p = slot.effectivePlan();
         const gen = slot.plan_gen.load(.acquire);
-        const json = std.fmt.allocPrint(allocator, "{{\"request_capacity\":{d},\"request_refill_per_sec\":{d},\"outbound_capacity\":{d},\"outbound_refill_per_sec\":{d},\"max_body_bytes\":{d},\"retention_days\":{d},\"max_kv_bytes\":{d},\"max_stored_bytes\":{d},\"plan_gen\":{d}}}", .{
+        const json = std.fmt.allocPrint(allocator, "{{\"request_capacity\":{d},\"request_refill_per_sec\":{d},\"outbound_enabled\":{},\"outbound_capacity\":{d},\"outbound_refill_per_sec\":{d},\"max_body_bytes\":{d},\"retention_days\":{d},\"max_kv_bytes\":{d},\"max_stored_bytes\":{d},\"plan_gen\":{d}}}", .{
             p.rate.request_capacity,
             p.rate.request_refill_per_sec,
+            // The admission gate, not just the buckets: an operator asking
+            // "why is this tenant's outbound refused" reads THIS, and a
+            // readback that showed only the rate caps answered a question
+            // they were not asking (rove#336).
+            p.rate.outbound_enabled,
             p.rate.outbound_capacity,
             p.rate.outbound_refill_per_sec,
             p.max_body_bytes,

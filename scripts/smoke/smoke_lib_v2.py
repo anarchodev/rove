@@ -725,16 +725,32 @@ class V2Cluster:
                      timeout=timeout)
 
     # ── provisioning + deploy ──────────────────────────────────────────
-    def provision(self, tenant: str, *, host: Optional[str] = None) -> HttpResponse:
+    def provision(self, tenant: str, *, host: Optional[str] = None,
+                  outbound: bool = True) -> HttpResponse:
         """Provision a tenant on the CP. No `host` = the production shape: the
         tenant answers on `{tenant}.{PUBLIC_SUFFIX}` through the wildcard both
         the CP and the worker derive, with no host row written. Pass `host`
-        only for a CUSTOM domain, which is the one case that needs a mapping."""
+        only for a CUSTOM domain, which is the one case that needs a mapping.
+
+        `outbound=True` (the default) also grants the tenant third-party
+        egress, because the free tier does not (rove#336 — outbound is a paid
+        capability). Most smokes here predate that gate and use
+        `webhook.send` / `after.fetch` on a plain provisioned tenant to test
+        something else entirely; without the grant they fail on a quota
+        they were never about.
+
+        Granted with an OVERRIDES-ONLY plan blob, no `tier` key, so the tenant
+        still resolves its own tier and every other limit continues to track
+        the table. A smoke that IS about the gate passes `outbound=False` and
+        gets what a real signup gets — `outbound_gate_smoke_v2.py` does
+        exactly that, and it is what keeps this default from quietly
+        un-testing the free tier.
+        """
         import json
         body = {"tenant": tenant, "cluster": self.cluster_id}
         if host:
             body["host"] = host
-        return _curl(
+        r = _curl(
             f"{self.front_url().replace(str(self.front_port), str(self.cp_port))}"
             f"/_control/provision",
             method="POST",
@@ -742,6 +758,19 @@ class V2Cluster:
                      "Content-Type": "application/json"},
             data=json.dumps(body),
         )
+        if outbound and r.status == 200:
+            # Through the CP, not `set_plan`. `set_plan` is a single-target
+            # push at ONE worker, so granting across a 3-node cluster meant
+            # three round-trips at provision — which measurably perturbed the
+            # timing-sensitive smokes (`raft_soak_prod` failed with the
+            # per-node loop and passes through the CP). The CP write is one
+            # call, replicates the row, and fans out to the serving cluster
+            # itself, which is also what production does.
+            self._cp_post("/_control/plan", {
+                "tenant": tenant,
+                "plan": json.dumps({"overrides": {"outbound_enabled": True}}),
+            })
+        return r
 
     @staticmethod
     def _b64(content: bytes | str) -> str:

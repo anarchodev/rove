@@ -179,7 +179,11 @@ def main() -> int:
 
     with V2Cluster.spawn("outbound", nodes=1) as c:
         for t in (DENIED, GRANTED):
-            r = c.provision(t)
+            # DENIED opts out of the harness's default outbound grant — it has
+            # to run under what a real signup resolves to, or this smoke tests
+            # nothing. That opt-out is also what keeps the harness default
+            # from silently un-testing the free tier everywhere else.
+            r = c.provision(t, outbound=(t == GRANTED))
             check(f"provision {t} → 200", r.status == 200, f"got {r.status}")
             try:
                 c.deploy_handlers(t, {"index.mjs": rpc_wrap(HANDLER_SRC)})
