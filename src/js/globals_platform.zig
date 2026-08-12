@@ -18,7 +18,7 @@ const tenant_mod = @import("rove-tenant");
 const tape_mod = @import("rove-tape");
 const digest_mod = tape_mod.interaction_digest;
 const rove = @import("rove");
-const reserved = @import("reserved.zig");
+const reserved = @import("rove-reserved");
 
 const c = qjs.c;
 

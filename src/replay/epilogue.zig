@@ -23,6 +23,7 @@
 const std = @import("std");
 const decode = @import("tape_decode.zig");
 const host = @import("host.zig");
+const reserved = @import("rove-reserved");
 
 pub const Opts = struct {
     method: []const u8 = "GET",
@@ -334,7 +335,36 @@ const TEXTCODEC_PURE = @embedFile("js/textcodec_pure.js");
 /// module's package. Shared verbatim with the browser replay arena.
 const JS_INTERACTION_DIGEST = @embedFile("js_interaction_digest");
 
-const EPILOGUE_BODY =
+/// The reserved-prefix guard's allowlist, generated from the ONE list the
+/// worker enforces (`rove-reserved`) rather than hand-copied here.
+///
+/// The two used to be authored independently and had drifted: `_export/`
+/// joined the worker's list when the export verb shipped and never reached
+/// this one, so a handler using `@rewind/export` wrote its marker fine in
+/// prod and hit a reserved-key throw in replay — the engines disagreeing
+/// about what a handler is allowed to do, which is the divergence class the
+/// conformance suite exists to catch (rove#499).
+///
+/// Generated at comptime into the prelude, the same way `__rove_triggers` and
+/// `quotedOutputKey` are: a new prefix is now reachable in replay the moment
+/// it is reachable in the worker, with no second edit to remember.
+const SHIM_WRITABLE_JS = blk: {
+    // Leads with a newline: a Zig multiline literal carries no trailing
+    // newline, so without it this fragment welds onto the last line of
+    // EPILOGUE_BODY_HEAD. That produced valid JS and a green build while
+    // silently changing what the sim emitted — the engines stopped agreeing
+    // and nothing said so until the conformance run compared them.
+    var out: []const u8 = "\n  const __SHIM_WRITABLE = [";
+    for (reserved.SHIM_WRITABLE_PREFIXES, 0..) |prefix, i| {
+        if (i > 0) out = out ++ ", ";
+        out = out ++ "\"" ++ prefix ++ "\"";
+    }
+    break :blk out ++ "];\n";
+};
+
+const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ SHIM_WRITABLE_JS ++ EPILOGUE_BODY_TAIL;
+
+const EPILOGUE_BODY_HEAD =
     \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
     \\  // One ordered effect log for the whole activation (reads/writes/cmds — see
     \\  // the shims below). console.* lands here too, as {kind:"log"}, so the
@@ -634,7 +664,9 @@ const EPILOGUE_BODY =
     \\  // arena). It mirrors __utf8Encode's byte output, incl. WTF-8 surrogates.
     \\  const __KV_KEY_MAX = 256, __KV_VAL_MAX = 1 << 20;
     \\  const __utf8Len = (s) => { s = String(s == null ? "" : s); let n = 0; for (let i = 0; i < s.length; i++) { let cp = s.charCodeAt(i); if (cp >= 0xD800 && cp <= 0xDBFF) { const lo = i + 1 < s.length ? s.charCodeAt(i + 1) : 0; if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000; i++; } } if (cp < 0x80) n += 1; else if (cp < 0x800) n += 2; else if (cp < 0x10000) n += 3; else n += 4; } return n; };
-    \\  const __SHIM_WRITABLE = ["_send/", "_blob/", "_sched/", "_seg/", "_oidc/", "_rp/"];
+;
+
+const EPILOGUE_BODY_TAIL =
     \\  const __kvReserved = (k) => { if (k.length === 0 || k[0] !== "_") return false; for (const p of __SHIM_WRITABLE) if (k.startsWith(p)) return false; return true; };
     \\  const __kvErr = (message, code) => { const e = new Error(message); e.code = code; return e; };
     \\  const __kvCoerce = (x, what) => { if (x === null || x === undefined || typeof x === "object" || typeof x === "function") throw new TypeError("kv: " + what + " must be a string (or number/boolean/bigint); JSON.stringify objects explicitly"); return String(x); };
@@ -1075,4 +1107,32 @@ test "build: GET embeds request meta + parks output under sentinel" {
     try testing.expect(std.mem.indexOf(u8, src, "\"content-type\":\"application/json\"") != null);
     try testing.expect(std.mem.indexOf(u8, src, "__arena_entry_ns()") != null);
     try testing.expect(std.mem.indexOf(u8, src, "kv.set(\"" ++ host.OUTPUT_KEY ++ "\"") != null);
+}
+
+test "the prelude's reserved-prefix guard covers every shim-writable prefix" {
+    // The guard is generated, so this is not re-asserting the generator's
+    // arithmetic — it pins the PAIRING. `_export/` drifted between the two
+    // lists for as long as it did because nothing executed the pairing
+    // (rove#499); a build failure is a cheaper messenger than a replay that
+    // refuses a write prod allows.
+    for (reserved.SHIM_WRITABLE_PREFIXES) |prefix| {
+        var quoted_buf: [64]u8 = undefined;
+        const quoted = try std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{prefix});
+        try std.testing.expect(std.mem.indexOf(u8, SHIM_WRITABLE_JS, quoted) != null);
+        // And it has to reach the emitted prelude, not just the fragment.
+        try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, quoted) != null);
+    }
+    // The guard itself must still be there to consume the list — a split that
+    // dropped the tail would pass the loop above and ship no guard at all.
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __kvReserved = (k) =>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __SHIM_WRITABLE = [") != null);
+}
+
+test "the generated list keeps its own line in the prelude" {
+    // A Zig multiline literal has NO trailing newline, so `HEAD ++ FRAGMENT`
+    // welds the fragment onto the end of the last HEAD line. That is how this
+    // split first shipped, and it broke the two engines' agreement without
+    // breaking the build.
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "\n  const __SHIM_WRITABLE = [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "];\n  const __kvReserved") != null);
 }

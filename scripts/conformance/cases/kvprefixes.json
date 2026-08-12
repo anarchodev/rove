@@ -1,0 +1,16 @@
+{
+  "name": "kvprefixes",
+  "description": "The reserved-prefix write rule, per shim-writable prefix. Carried because the shim-writable allowlist is the one guard each engine enforces from its own copy of a list — the worker from `rove-reserved`, the replay prelude from a fragment generated off it — and those copies drifted once (rove#499: `_export/` was writable in prod and refused in replay). This case is what executes the pairing at runtime; the build-time assert in epilogue.zig only proves the two lists agree, not that a handler writing one of those prefixes actually replays.",
+  "source_dir": "src/replay/testdata/kvguardrails",
+  "engines": ["sim", "prod", "replay"],
+  "worlds": [
+    {
+      "label": "prefixes",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": { "method": "GET", "path": "/prefixes" }
+      }
+    }
+  ]
+}
