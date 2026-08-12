@@ -519,6 +519,23 @@ pub fn build(b: *std.Build) void {
     const instance_id_tests = b.addTest(.{ .root_module = instance_id_mod });
     test_step.dependOn(&b.addRunArtifact(instance_id_tests).step);
 
+    // ── rove-reserved: the platform-reserved KV prefixes ──
+    //
+    // A std-only leaf so the WORKER (which enforces the customer-write guard)
+    // and the REPLAY/sim engine (which mirrors that guard offline, in JS) read
+    // ONE list. They used to hold two hand-authored copies and had already
+    // drifted — `_export/` reached the worker and never reached replay, so a
+    // handler using the export verb was writable in prod and refused offline
+    // (rove#499). The engines disagreeing about what a handler may do is the
+    // exact failure the conformance suite exists to catch.
+    const reserved_mod = b.addModule("rove-reserved", .{
+        .root_source_file = b.path("src/reserved/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reserved_tests = b.addTest(.{ .root_module = reserved_mod });
+    test_step.dependOn(&b.addRunArtifact(reserved_tests).step);
+
     // The tier table resolves a tenant with no plan blob from its ID (the
     // reserved platform singletons default to the platform tier), so it needs
     // the one reserved-id list. Both are leaves, so this adds no cycle.
@@ -584,6 +601,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-wire", wire_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
     js_mod.addImport("rove-plan", plan_mod);
+    js_mod.addImport("rove-reserved", reserved_mod);
     js_mod.addImport("metrics-server", metrics_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
     // context after the native CFunction bindings install.
@@ -1415,6 +1433,8 @@ pub fn build(b: *std.Build) void {
     linkReplayEngine(replay_mod, arenajs_dep);
     addSimGlobalEmbeds(b, replay_mod);
     replay_mod.addImport("package_resolver", pkgres_mod);
+    // The prelude generates its reserved-prefix guard from this list (rove#499).
+    replay_mod.addImport("rove-reserved", reserved_mod);
     replay_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
     // The first-party @rewind/* package sources, so `rewind test` auto-resolves
     // an app's declared @rewind deps offline (src/replay/first_party.zig) without

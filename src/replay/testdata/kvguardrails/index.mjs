@@ -30,6 +30,27 @@ export default function () {
       maxKeyOk: cap(() => kv.set("K".repeat(256), "v")), // boundary: exactly at cap
     };
   }
+  // Every shim-writable prefix on its own route. The engines each enforce
+  // this allowlist from their own copy of one list — the worker from
+  // `rove-reserved`, the replay prelude from a fragment generated off it —
+  // and those copies drifted once (rove#499). Kept separate from `/guards`
+  // so the cross-engine comparison covers exactly this and is not carrying
+  // the rest of the guard matrix with it. Deliberately ALLOWLIST-ONLY: a
+  // refused prefix belongs here too, but the browser replay arena does not
+  // enforce the reserved-key rule at all (its prelude is generated
+  // separately from this one) — tracked apart from the drift this case
+  // exists for, so one open gap does not keep the other unproven.
+  if (p === "/prefixes") {
+    return {
+      send: cap(() => kv.set("_send/owed/abc", "v")),
+      export_: cap(() => kv.set("_export/job-1", "v")),
+      blob: cap(() => kv.set("_blob/recipe/s/meta", "v")),
+      sched: cap(() => kv.set("_sched/by_id/s", "v")),
+      seg: cap(() => kv.set("_seg/idx/1", "v")),
+      oidc: cap(() => kv.set("_oidc/session/s", "v")),
+      rp: cap(() => kv.set("_rp/sess/s", "v")),
+    };
+  }
   if (p === "/page-default") return { n: kv.prefix("orders/").length };
   if (p === "/page-explicit") return { n: kv.prefix("orders/", null, 5).length };
   if (p === "/page-over") return { n: kv.prefix("orders/", null, 5000).length };

@@ -18,7 +18,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
-const reserved = @import("reserved.zig");
+const reserved = @import("rove-reserved");
 const reserved_headers = @import("reserved_headers.zig");
 
 const c = qjs.c;

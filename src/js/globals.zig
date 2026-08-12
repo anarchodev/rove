@@ -39,7 +39,7 @@ const blob_b = @import("bindings/blob.zig");
 const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
 const textcodec_b = @import("bindings/textcodec.zig");
-const reserved = @import("reserved.zig");
+const reserved = @import("rove-reserved");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 const request_bindings = @import("globals_request.zig");
 /// Interaction-digest folding, shared by every effect binding
