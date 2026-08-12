@@ -120,6 +120,18 @@ test "guards: the Zig and the emitted JS return the same verdict" {
     const kv_keys = [_][]const u8{
         "orders/1", "a", "_secret/x", "_usage/total", "_send/owed/1",
         "_export/j", "_sched/by_id/1", "_", "_x", big_key, "_secret/" ++ ("k" ** 300),
+        // Multi-byte, straddling KV_KEY_MAX (256) by BYTES. This is the one
+        // place the two length implementations do different work: Zig takes
+        // `s.len` on the already-decoded bytes, JS re-derives via `__utf8Len`
+        // over UTF-16 code units. ASCII can't tell them apart; these can.
+        "é" ** 128, //         256 bytes exactly — at the cap, allowed
+        "é" ** 128 ++ "a", //  257 bytes — one over, key_too_large
+        "€" ** 85 ++ "a", //   256 bytes (3×85 + 1) — allowed
+        "€" ** 86, //          258 bytes — over
+        // Astral: one code point, TWO UTF-16 code units (a surrogate pair) —
+        // `__utf8Len` must combine the pair into 4 bytes, not count 3+3.
+        "🚀" ** 64, //         256 bytes — allowed
+        "🚀" ** 64 ++ "x", //  257 bytes — over
     };
     for (kv_keys) |k| {
         const want = try zigVerdictString(a, guards.checkKvWrite(k, "v", false), k);
@@ -159,6 +171,18 @@ test "guards: the Zig and the emitted JS return the same verdict" {
         .{ "_A", "v" },
         .{ "_x", "v" ** 65 },
         .{ "ok", "sp ace" },
+        // Multi-byte, same seam as the kv keys above. A tag KEY has a
+        // [a-z0-9_] charset rule that runs AFTER the length check, so a
+        // multi-byte key exercises both engines' ORDER: over-cap → length
+        // wins; under-cap → charset wins. Both must agree which.
+        .{ "€" ** 11, "v" }, //   key 33 bytes → length wins (before charset)
+        .{ "€" ** 10, "v" }, //   key 30 bytes → passes length, charset wins
+        // Tag VALUES have no charset rule, so they test the value-length
+        // branch cleanly. Includes the astral/surrogate-pair case.
+        .{ "ok", "€" ** 21 }, //  value 63 bytes — allowed
+        .{ "ok", "€" ** 22 }, //  value 66 bytes — value length
+        .{ "ok", "🚀" ** 16 }, // value 64 bytes (astral) — at cap, allowed
+        .{ "ok", "🚀" ** 17 }, // value 68 bytes — over
     };
     for (tag_pairs) |p| {
         const want = try zigVerdictString(a, guards.checkTagPair(p[0], p[1]), p[0]);
