@@ -11,6 +11,14 @@
         "activation": "inbound",
         "request": { "method": "GET", "path": "/prefixes" }
       }
+    },
+    {
+      "label": "page-rw",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": { "method": "GET", "path": "/page-rw" }
+      }
     }
   ]
 }

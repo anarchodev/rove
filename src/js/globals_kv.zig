@@ -94,6 +94,27 @@ fn foldDelete(state: *DispatchState, key: []const u8) void {
     }
 }
 
+/// Fold a customer `kv.prefix` scan: `p <prefix> 1 <count> <rowsfold>`, where
+/// the rows-fold is `key=<valuehash>;` per returned row IN ORDER — the same
+/// accumulator the cross-store recorder builds (`globals_platform.zig`
+/// tapeStorePrefix) and the offline engines' kv wrappers compute, over the
+/// plain keys (a customer scan has no store namespace). Folds ALL returned
+/// rows, read-your-writes included — the digest is a behaviour log, and the
+/// scan the handler observed contains them. Best-effort like the other folds:
+/// an accumulator OOM skips the fold rather than failing the read.
+fn foldPrefix(state: *DispatchState, prefix: []const u8, entries: anytype) void {
+    if (state.readset) |rs| {
+        var acc: std.ArrayList(u8) = .empty;
+        defer acc.deinit(state.allocator);
+        for (entries) |e| {
+            acc.writer(state.allocator).print("{s}={x};", .{ e.key, digest_mod.foldValue(e.value) }) catch return;
+        }
+        var d = digestOf(rs);
+        d.kvPrefix(prefix, true, entries.len, digest_mod.foldValue(acc.items));
+        rs.interaction_digest = d.h;
+    }
+}
+
 pub fn jsKvGet(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -456,6 +477,12 @@ pub fn jsKvPrefix(
         }
         rs.kv.appendKvPrefix(prefix_str, cursor_str, limit, pairs[0..np], .ok) catch {};
     }
+
+    // Folded outside the tape's read-your-write filtering, like `foldRead`
+    // sits outside `skip_tape`: the digest hashes the scan the handler
+    // observed. The error path above folds nothing, matching `jsKvGet`'s —
+    // the offline engines have no storage-error path to agree with.
+    foldPrefix(state, prefix_str, scan.entries);
 
     const arr = c.JS_NewArray(ctx);
     for (scan.entries, 0..) |e, i| {
