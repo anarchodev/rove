@@ -52,10 +52,14 @@ ROVE = pathlib.Path(__file__).resolve().parents[2]
 # from rove sources alone, which is the same property the digest gate rests
 # on.
 def _worker_surface() -> str:
-    return "\n".join(
-        (ROVE / "src" / "js" / p).read_text(encoding="utf-8")
-        for p in ("globals.zig", "globals_kv.zig", "globals_request.zig")
-    )
+    # `src/guards/root.zig` first: the rules moved there, and a surface list
+    # that lags the code reports the move as a gap. That has now happened
+    # twice — once for the arena's second file, once here — which is the
+    # standing weakness of defining a surface by enumerating paths.
+    paths = [ROVE / "src" / "guards" / "root.zig"]
+    paths += [ROVE / "src" / "js" / p
+              for p in ("globals.zig", "globals_kv.zig", "globals_request.zig")]
+    return "\n".join(p.read_text(encoding="utf-8") for p in paths)
 
 
 def _sim_surface() -> str:

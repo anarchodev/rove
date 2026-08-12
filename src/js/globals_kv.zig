@@ -15,6 +15,7 @@ const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const rove = @import("rove");
 const reserved = @import("rove-reserved");
+const guards = @import("rove-guards");
 const td = @import("trigger_dispatch.zig");
 const tape_mod = @import("rove-tape");
 const digest_mod = tape_mod.interaction_digest;
@@ -32,6 +33,15 @@ const js_false = globals_mod.js_false;
 const valueToOwnedString = globals_mod.valueToOwnedString;
 const kvWriteArgToOwnedString = globals_mod.kvWriteArgToOwnedString;
 const kvSizeViolation = globals_mod.kvSizeViolation;
+
+/// Raise a `rove-guards` verdict as the JS error the contract specifies.
+/// The reserved-key message names the offending key, so it is formatted here
+/// rather than carried on the verdict; every other message is a constant the
+/// guards module owns.
+fn throwKvRefusal(ctx: ?*c.JSContext, refusal: guards.Refusal, key: []const u8) c.JSValue {
+    if (refusal.message.len == 0) return throwReservedKey(ctx, key);
+    return globals_mod.throwKvError(ctx, refusal.message, refusal.code);
+}
 const throwKvTooLarge = globals_mod.throwKvTooLarge;
 const throwReservedKey = globals_mod.throwReservedKey;
 const KvSizeViolation = globals_mod.KvSizeViolation;
@@ -191,16 +201,13 @@ pub fn jsKvSet(
     // `__system/` built-in modules (the webhook shim's onresult
     // handler) are platform-trusted and bypass the check — they need
     // to write `_send/owed/{id}` markers.
-    if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
-        return throwReservedKey(ctx, key_str);
-    }
-
-    // Reject oversized writes fail-fast with a clean error (see KV_KEY_MAX /
-    // KV_VAL_MAX). Applies to system writes too — anything over the kvexp cap
-    // fails at snapshot regardless, so checking early can't break a working
-    // path, only surface the failure cleanly.
-    if (kvSizeViolation(key_str.len, val_str.len)) |which| {
-        return throwKvTooLarge(ctx, which);
+    //
+    // Both rules — the namespace and the size caps — are evaluated by
+    // `rove-guards`, the ONE authority the offline engines also read (they
+    // evaluate its emitted JS, because their storage seam cannot report a
+    // refusal). The order is part of the contract and lives there, not here.
+    if (guards.checkKvWrite(key_str, val_str, state.is_system_module)) |refusal| {
+        return throwKvRefusal(ctx, refusal, key_str);
     }
 
     // The minimal readset (`docs/architecture/effects-and-handlers.md`):
@@ -296,16 +303,10 @@ pub fn jsKvDelete(
     const key_str = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key_str);
 
-    // Same reserved-namespace guard as jsKvSet — see the comment there.
-    // `__system/` built-ins bypass.
-    if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
-        return throwReservedKey(ctx, key_str);
-    }
-
-    // Reject an over-long key (no value to check on delete). A key over the
-    // cap can't exist (puts are capped), so this is mostly contract hygiene.
-    if (kvSizeViolation(key_str.len, null)) |which| {
-        return throwKvTooLarge(ctx, which);
+    // Same rules as jsKvSet, from the same authority — `null` value because a
+    // delete has none to size-check.
+    if (guards.checkKvWrite(key_str, null, state.is_system_module)) |refusal| {
+        return throwKvRefusal(ctx, refusal, key_str);
     }
 
     // Fast path mirrors jsKvSet — no triggers means no savepoint, no

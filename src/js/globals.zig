@@ -822,6 +822,18 @@ pub fn throwKvTooLarge(ctx: ?*c.JSContext, which: KvSizeViolation) c.JSValue {
     return c.JS_Throw(ctx, err);
 }
 
+/// Throw `Error{message, code}` for a `rove-guards` verdict whose message is
+/// a constant. The size/namespace helpers above predate the guards module and
+/// stay as the formatting sites for their own messages; this is the generic
+/// one for a verdict that already carries its text.
+pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c.JSValue {
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return err;
+    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, message.ptr, message.len));
+    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, code.ptr, code.len));
+    return c.JS_Throw(ctx, err);
+}
+
 test "kvSizeViolation enforces canonical kv limits" {
     // Drift guard: these must stay the kvexp caps (via snapshot_stream).
     try std.testing.expectEqual(@as(usize, 256), KV_KEY_MAX);

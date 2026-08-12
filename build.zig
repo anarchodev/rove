@@ -541,6 +541,39 @@ pub fn build(b: *std.Build) void {
     // the one reserved-id list. Both are leaves, so this adds no cycle.
     plan_mod.addImport("rove-instance-id", instance_id_mod);
 
+    // ── rove-guards: the handler-facing checks, one authority ──
+    //
+    // Every engine that runs a customer handler must answer "is this allowed"
+    // identically. Three run natively and call the Zig here directly. The
+    // offline pair cannot: their storage seam (`replay/host.zig`'s kv_set)
+    // reports ok/not_found/exhausted/divergence and has no way to say
+    // "refused", so a Zig verdict cannot become a thrown error in their QJS.
+    // They evaluate the same rules as JS, emitted from this module.
+    const guards_mod = b.addModule("rove-guards", .{
+        .root_source_file = b.path("src/guards/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    guards_mod.addImport("rove-reserved", reserved_mod);
+    // `zig build gen-guards` writes the JS interpreter of the shared rules.
+    // Committed rather than generated at build time because the Python that
+    // composes the arena prelude cannot run Zig comptime; `epilogue.zig`
+    // asserts the committed copy still matches the emitter.
+    const gen_guards_mod = b.createModule(.{
+        .root_source_file = b.path("src/guards/gen_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gen_guards_mod.addImport("rove-guards", guards_mod);
+    const gen_guards_exe = b.addExecutable(.{ .name = "gen-guards", .root_module = gen_guards_mod });
+    const gen_guards_run = b.addRunArtifact(gen_guards_exe);
+    gen_guards_run.addArg("src/replay/js/guards.generated.js");
+    b.step("gen-guards", "Regenerate src/replay/js/guards.generated.js from rove-guards")
+        .dependOn(&gen_guards_run.step);
+
+    const guards_tests = b.addTest(.{ .root_module = guards_mod });
+    test_step.dependOn(&b.addRunArtifact(guards_tests).step);
+
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
     // M1 slice: just `Instance` + `Domain` with an in-memory cache and
@@ -602,6 +635,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-ssrf", ssrf_mod);
     js_mod.addImport("rove-plan", plan_mod);
     js_mod.addImport("rove-reserved", reserved_mod);
+    js_mod.addImport("rove-guards", guards_mod);
     js_mod.addImport("metrics-server", metrics_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
     // context after the native CFunction bindings install.
@@ -1435,6 +1469,7 @@ pub fn build(b: *std.Build) void {
     replay_mod.addImport("package_resolver", pkgres_mod);
     // The prelude generates its reserved-prefix guard from this list (rove#499).
     replay_mod.addImport("rove-reserved", reserved_mod);
+    replay_mod.addImport("rove-guards", guards_mod);
     replay_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
     // The first-party @rewind/* package sources, so `rewind test` auto-resolves
     // an app's declared @rewind deps offline (src/replay/first_party.zig) without

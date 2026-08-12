@@ -19,6 +19,7 @@ const h2 = @import("rove-h2");
 const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
 const reserved = @import("rove-reserved");
+const guards = @import("rove-guards");
 const reserved_headers = @import("reserved_headers.zig");
 
 const c = qjs.c;
@@ -1151,30 +1152,12 @@ fn jsRequestTag(
     const val = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
     defer state.allocator.free(val);
 
-    if (key.len == 0 or key.len > log_mod.MAX_TAG_KEY_LEN) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: key length must be 1..32 bytes");
+    // Every pair rule, in the contract's order, from `rove-guards` — the same
+    // authority the offline engines evaluate (as emitted JS, since their
+    // storage seam cannot report a refusal).
+    if (guards.checkTagPair(key, val)) |refusal| {
+        _ = c.JS_ThrowTypeError(ctx, refusal.message.ptr);
         return js_exception;
-    }
-    if (key[0] == '_') {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: keys starting with '_' are reserved");
-        return js_exception;
-    }
-    for (key) |ch| {
-        const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '_';
-        if (!ok) {
-            _ = c.JS_ThrowTypeError(ctx, "request.tag: key must match [a-z0-9_]");
-            return js_exception;
-        }
-    }
-    if (val.len == 0 or val.len > log_mod.MAX_TAG_VALUE_LEN) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: value length must be 1..64 bytes");
-        return js_exception;
-    }
-    for (val) |ch| {
-        if (ch < 0x20) {
-            _ = c.JS_ThrowTypeError(ctx, "request.tag: value must not contain control characters");
-            return js_exception;
-        }
     }
 
     // Update in place if the key is already set this activation.
@@ -1187,8 +1170,10 @@ fn jsRequestTag(
         }
     }
     // New key — enforce the per-record cap (fail loud, don't truncate).
-    if (state.tags.items.len >= log_mod.MAX_TAGS) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag: too many tags (max 4 per request)");
+    // Checked separately from the pair because whether a call adds or
+    // replaces is engine state, which is why the guards module splits them.
+    if (guards.checkTagCapacity(state.tags.items.len)) |refusal| {
+        _ = c.JS_ThrowTypeError(ctx, refusal.message.ptr);
         return js_exception;
     }
     const k = state.allocator.dupe(u8, key) catch return js_exception;
