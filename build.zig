@@ -1583,6 +1583,12 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_more = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_more.addArg("morepkgs");
     driver_smoke_step.dependOn(&driver_smoke_more.step);
+    // `poison`: an off-tape read on a captured world poisons the run —
+    // survives try/catch, brakes via the uncatchable interrupt, reports
+    // post-run (the divergence model of the engine-parity epic).
+    const driver_smoke_poison = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_poison.addArg("poison");
+    driver_smoke_step.dependOn(&driver_smoke_poison.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
