@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Every handler-facing guard is enforced by every engine — or the gap is tracked.
+
+Three engines run customer handlers, and each enforces the handler-facing
+rules in its own code: the worker in Zig at the natives, the sim + native
+replay in the prelude `src/replay/epilogue.zig` composes, the browser arena
+in the prelude `gen_replay_prelude.py` composes. Sharing the rule TEXT (as
+`src/replay/js/kv_guards.js` now does) removes the drift between copies, but
+it cannot make a MISSING guard visible: the arena went without every kv guard
+for as long as it did because nobody had a list saying it should have them
+(rove#502). Absence has no author and shows up in no diff.
+
+This is that list, as a check rather than a document. Each entry names a
+guard by the marker a customer would see — the error code where there is one,
+otherwise a distinctive fragment of the message — and asserts it appears in
+every engine's enforcement surface. A guard added to one engine and not the
+others fails here, at the moment of the change.
+
+What it deliberately does NOT do is compare behaviour; that is the
+conformance corpus' job, and it is strictly better evidence. This is the
+cheap half: presence, so a rule cannot be silently absent from an engine no
+one was thinking about. A marker present but wrong is what conformance
+catches; a marker missing entirely is what this catches, and the corpus can
+only catch that with a case somebody remembered to write.
+
+Known gaps are declared, not discovered. An engine that legitimately (or
+merely currently) lacks a guard needs an entry with an issue number and a
+reason, mirroring the conformance allowlist — so the inventory shows the gap
+instead of hiding it, and the gap has somewhere to be argued about.
+
+Usage:
+    guard_parity_lint.py            check; non-zero on an untracked gap
+    guard_parity_lint.py --table    print the inventory as markdown
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import pathlib
+import sys
+
+ROVE = pathlib.Path(__file__).resolve().parents[2]
+
+
+# ── the engines, and where each one's enforcement lives ──────────────────
+#
+# `worker` is Zig; the other two are the JS text each prelude builder
+# composes. Reading the composed text rather than the source files is what
+# makes the arena checkable from this repo at all — `build()` assembles it
+# from rove sources alone, which is the same property the digest gate rests
+# on.
+def _worker_surface() -> str:
+    return "\n".join(
+        (ROVE / "src" / "js" / p).read_text(encoding="utf-8")
+        for p in ("globals.zig", "globals_kv.zig", "globals_request.zig")
+    )
+
+
+def _sim_surface() -> str:
+    # The epilogue's own literal plus every JS file it splices — the guards
+    # moved into `js/kv_guards.js`, so reading only the .zig would report
+    # them missing (the check would then be measuring the refactor, not the
+    # rule).
+    parts = [(ROVE / "src" / "replay" / "epilogue.zig").read_text(encoding="utf-8")]
+    for js in sorted((ROVE / "src" / "replay" / "js").glob("*.js")):
+        parts.append(js.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
+def _arena_surface() -> str:
+    spec = importlib.util.spec_from_file_location(
+        "gen_replay_prelude", ROVE / "scripts" / "ops" / "gen_replay_prelude.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.build()
+
+
+ENGINES = {
+    "worker": _worker_surface,
+    "sim": _sim_surface,
+    "arena": _arena_surface,
+}
+
+
+# ── the inventory ────────────────────────────────────────────────────────
+#
+# `marker` is what a customer sees, so the check tracks the contract rather
+# than an implementation detail: renaming an internal helper does not move
+# it, and changing the error a handler catches does.
+GUARDS = [
+    # (surface, rule, marker)
+    ("kv.set / kv.delete", "key or value is not a string-coercible type",
+     "must be a string (or number"),
+    ("kv.set / kv.delete", "key is in a platform-reserved prefix", "reserved_key"),
+    ("kv.set / kv.delete", "key exceeds the byte cap", "key_too_large"),
+    ("kv.set", "value exceeds the byte cap", "value_too_large"),
+    ("request.tag", "key length must be 1..32 bytes", "key length must be 1..32 bytes"),
+    ("request.tag", "key may not start with '_'", "keys starting with '_' are reserved"),
+    ("request.tag", "key charset is [a-z0-9_]", "key must match"),
+    ("request.tag", "value length must be 1..64 bytes", "value length must be 1..64 bytes"),
+    ("request.tag", "value has no control characters", "must not contain control characters"),
+    ("request.tag", "at most 4 tags per request", "too many tags"),
+]
+
+# (marker, engine) -> (issue, why). A declared gap is still a gap; this only
+# means someone looked at it and it has a home.
+KNOWN_GAPS = {
+    ("key length must be 1..32 bytes", "arena"): (
+        "rove#505",
+        "the arena's epilogue (rewind-apps request-replay.mjs) builds its own "
+        "request surface and has no tag guards; the kv guards were shared "
+        "first because they gate WRITES, which reach the digest",
+    ),
+    ("keys starting with '_' are reserved", "arena"): ("rove#505", "as above"),
+    ("key must match", "arena"): ("rove#505", "as above"),
+    ("value length must be 1..64 bytes", "arena"): ("rove#505", "as above"),
+    ("must not contain control characters", "arena"): ("rove#505", "as above"),
+    ("too many tags", "arena"): ("rove#505", "as above"),
+}
+
+
+def check() -> int:
+    surfaces = {name: fn() for name, fn in ENGINES.items()}
+    untracked: list[str] = []
+    tracked: list[str] = []
+    stale: list[str] = []
+
+    for surface, rule, marker in GUARDS:
+        for engine in ENGINES:
+            present = marker in surfaces[engine]
+            gap = KNOWN_GAPS.get((marker, engine))
+            if present and gap:
+                stale.append(
+                    f"{engine}: '{rule}' is enforced now — drop its KNOWN_GAPS "
+                    f"entry ({gap[0]})")
+            elif not present and gap:
+                tracked.append(f"{engine:7} {surface:19} {rule}  [{gap[0]}]")
+            elif not present:
+                untracked.append(f"{engine:7} {surface:19} {rule}   marker: {marker!r}")
+
+    if tracked:
+        print("tracked gaps (declared, with an issue):")
+        for t in tracked:
+            print("  " + t)
+        print()
+    if stale:
+        print("STALE KNOWN_GAPS — the guard landed and the entry outlived it:")
+        for s in stale:
+            print("  " + s)
+        print()
+    if untracked:
+        print("UNTRACKED GAPS — an engine does not enforce a rule the others do:")
+        for u in untracked:
+            print("  " + u)
+        print()
+        print("Either enforce it in that engine, or add a KNOWN_GAPS entry with an")
+        print("issue number. A guard missing from one engine means a handler behaves")
+        print("differently there — and for replay that means a run can look")
+        print("successful where the real one refused.")
+
+    if untracked or stale:
+        return 1
+    print(f"guard parity OK — {len(GUARDS)} guard(s) across {len(ENGINES)} engines"
+          f", {len(tracked)} tracked gap(s)")
+    return 0
+
+
+def table() -> int:
+    surfaces = {name: fn() for name, fn in ENGINES.items()}
+    print("| surface | rule | worker | sim | arena |")
+    print("|---|---|---|---|---|")
+    for surface, rule, marker in GUARDS:
+        cells = []
+        for engine in ENGINES:
+            if marker in surfaces[engine]:
+                cells.append("yes")
+            else:
+                gap = KNOWN_GAPS.get((marker, engine))
+                cells.append(f"no ({gap[0]})" if gap else "**NO**")
+        print(f"| `{surface}` | {rule} | " + " | ".join(cells) + " |")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--table", action="store_true",
+                    help="print the inventory as markdown instead of checking")
+    args = ap.parse_args()
+    return table() if args.table else check()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
