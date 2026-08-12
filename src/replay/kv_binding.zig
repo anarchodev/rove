@@ -231,6 +231,34 @@ pub const OfflineKv = struct {
 
 const B = binding.Kv(c, OfflineKv);
 
+/// `__rove_poison(what)` — the epilogue's divergence verdict, as a native so
+/// the flag lives on the HOST (post-run reportable, interrupt-visible), not
+/// in catchable JS. Calling it never throws: the whole point is that a
+/// divergence is not an exception a handler can swallow — the read returns
+/// absent, this records the verdict, and the uncatchable interrupt brakes
+/// the run. A handler calling it directly only poisons its own run.
+fn jsPoison(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const undef = c.JSValue{ .u = .{ .int32 = 0 }, .tag = c.JS_TAG_UNDEFINED };
+    if (argc < 1) {
+        host.poisonActive("an input");
+        return undef;
+    }
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (cstr == null) {
+        host.poisonActive("an input");
+        return undef;
+    }
+    defer c.JS_FreeCString(ctx, cstr);
+    host.poisonActive(@as([*]const u8, @ptrCast(cstr))[0..len]);
+    return undef;
+}
+
 /// Replace arenajs's replay kv object with the common binding. Called from
 /// the reactor base-setup hook, after `arena_install_replay_bindings` (which
 /// still owns the module loader and the crypto surface).
@@ -243,5 +271,6 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "delete", c.JS_NewCFunction2(ctx, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
+    _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
     return 0;
 }

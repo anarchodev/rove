@@ -51,6 +51,33 @@ pub fn setHost(vt: *const ReplayHost, user: ?*anyopaque) void {
     arena_replay_set_host(vt, user);
 }
 
+/// The poison door (the divergence model of the engine-parity epic): a
+/// captured-world read the tape cannot answer records its verdict here and
+/// the read RETURNS ABSENT — nothing is thrown at the read site, so a
+/// handler cannot `catch` a divergence and keep running on fiction
+/// invisibly. The uncatchable interrupt (`root.zig` simInterruptHandler)
+/// brakes the run once poisoned, and the driver reports from this flag
+/// POST-RUN regardless — a run that completes before the next interrupt
+/// poll still reports diverged. Only the sim/replay run host can be
+/// poisoned; under the rewind-test harness host this is a no-op (the
+/// harness runs no captured worlds).
+pub fn poisonActive(what: []const u8) void {
+    if (active_vtable != &HOST_VTABLE) return;
+    const h: *Host = @ptrCast(@alignCast(active_user orelse return));
+    h.setDiv(
+        "REPLAY DIVERGENCE: {s} was read by the handler but is not on the capture tape — the handler observed an input the original run never read",
+        .{what},
+    );
+}
+
+/// Whether the active run host carries a divergence verdict — the interrupt
+/// handler's second trigger (`return poisoned || over_budget`).
+pub fn activePoisoned() bool {
+    if (active_vtable != &HOST_VTABLE) return false;
+    const h: *Host = @ptrCast(@alignCast(active_user orelse return false));
+    return h.diverged != null;
+}
+
 /// The sentinel key the replay epilogue writes its captured run output under.
 /// The `kv_set` responder intercepts it (it is NOT a handler write) — the side
 /// channel that extracts results without reaching the reactor's static context.
@@ -92,9 +119,10 @@ pub const Host = struct {
     /// When set, `module_load` reads `{source_dir}/{spec}` from the working
     /// tree instead of `sources` — the what-if lever for local changes.
     source_dir: ?[]const u8 = null,
-    /// First divergence message, if any — only `module_load` can diverge (a
-    /// module the source tree / fixture lacks). Distinct from a handler-thrown
-    /// error.
+    /// First divergence message, if any. Two producers: `module_load` (a
+    /// module the source tree / fixture lacks) and the poison door
+    /// (`poisonActive` — a captured-world request-surface read the tape
+    /// cannot answer). Distinct from a handler-thrown error.
     diverged: ?[]const u8 = null,
 
     pub fn install(self: *Host) void {

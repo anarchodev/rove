@@ -362,7 +362,16 @@ const GUARDS_JS = @embedFile("js/guards.generated.js");
 const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ GUARDS_JS ++ "\n" ++ EPILOGUE_BODY_TAIL;
 
 const EPILOGUE_BODY_HEAD =
-    \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
+    \\  // An off-tape read POISONS the run and returns absent — it does not
+    \\  // throw. Nothing thrown means nothing a handler can `catch` to keep
+    \\  // running on fiction invisibly: the verdict lives on the HOST
+    \\  // (__rove_poison → host.zig poisonActive), the uncatchable interrupt
+    \\  // brakes the run, and the driver reports the divergence post-run
+    \\  // from the flag. Each call site falls through to its authored-absent
+    \\  // shape (undefined header, empty payload, null ip, false isRoot), so
+    \\  // the JS contract of a read is identical in the authored-miss and
+    \\  // captured-divergence cases.
+    \\  const miss = (what) => { if (globalThis.__rove_poison) __rove_poison(what); return undefined; };
     \\  // One ordered effect log for the whole activation (reads/writes/cmds — see
     \\  // the shims below). console.* lands here too, as {kind:"log"}, so the
     \\  // developer's own log lines stay INTERLEAVED with the effects they annotate.

@@ -94,6 +94,13 @@ const CpuBudget = struct { deadline_ns: i64 = 0, fired: bool = false };
 const SIM_CPU_BUDGET_NS: i64 = 5 * std.time.ns_per_s;
 
 fn simInterruptHandler(_: ?*anyopaque, opaque_ctx: ?*anyopaque) callconv(.c) c_int {
+    // The brake for a POISONED run (a captured-world read the tape cannot
+    // answer, `host.poisonActive`): the run is fiction from the divergence
+    // on, so it must not burn unbounded CPU — and because the interrupt's
+    // unwind is uncatchable, a handler cannot `try/catch` its way past the
+    // verdict. `budget.fired` stays false: the bundle reports the divergence
+    // from the host flag, not a 504.
+    if (hostmod.activePoisoned()) return 1;
     const b: *CpuBudget = @ptrCast(@alignCast(opaque_ctx.?));
     if (@as(i64, @intCast(std.time.nanoTimestamp())) >= b.deadline_ns) {
         b.fired = true;

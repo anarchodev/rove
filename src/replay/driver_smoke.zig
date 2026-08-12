@@ -131,6 +131,80 @@ fn runMulti(a: std.mem.Allocator) !void {
     std.debug.print("MULTI OK — resettable runtime: 3 runs, 1 process, isolated\n", .{});
 }
 
+/// Reads a channel the capture never recorded (`request.ip` on a captured
+/// world with no ip on tape), inside a try/catch that would have swallowed
+/// the old thrown REPLAY DIVERGENCE. Under the poison model nothing is
+/// thrown — the read returns the authored-absent shape (null) and the
+/// verdict lands on the host — so `probe` must be "null", never "caught".
+const POISON_SWALLOW_HANDLER =
+    \\export default function () {
+    \\  let probe = "unread";
+    \\  try { probe = String(request.ip); } catch (e) { probe = "caught"; }
+    \\  return { probe };
+    \\}
+;
+
+/// Same off-tape read, then an infinite loop — the run is fiction from the
+/// divergence on, and the poisoned interrupt must brake it (uncatchably)
+/// without waiting for the 5 s CPU budget or reporting its 504 shape.
+const POISON_BRAKE_HANDLER =
+    \\export default function () {
+    \\  try { String(request.ip); } catch (_) {}
+    \\  for (;;) {}
+    \\}
+;
+
+fn runPoison(a: std.mem.Allocator) !void {
+    // (a) swallow-proof: the run completes; the verdict survives post-run.
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"captured\":true,");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(POISON_SWALLOW_HANDLER, .{}, w);
+    try w.writeAll("}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("POISON_SWALLOW: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    check(out.items, &.{
+        "\"divergence\":", "request.ip", "\"ok\":false",
+    }, &.{ "caught", "exceeded cpu budget" }, "POISON SWALLOW (verdict survives a try/catch)");
+
+    // (b) the brake: a poisoned run must not burn the whole CPU budget.
+    var world2 = std.ArrayList(u8){};
+    var aw2 = std.Io.Writer.Allocating.fromArrayList(a, &world2);
+    const w2 = &aw2.writer;
+    try w2.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"captured\":true,");
+    try w2.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w2.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(POISON_BRAKE_HANDLER, .{}, w2);
+    try w2.writeAll("}]}");
+    world2 = aw2.toArrayList();
+
+    const started_ns = std.time.nanoTimestamp();
+    var out2 = std.ArrayList(u8){};
+    try root.runWorld(a, world2.items, null, &out2);
+    const elapsed_ns = std.time.nanoTimestamp() - started_ns;
+    try stdout.writeAll("POISON_BRAKE: ");
+    try stdout.writeAll(out2.items);
+    try stdout.writeAll("\n");
+    check(out2.items, &.{
+        "\"divergence\":", "request.ip", "\"ok\":false",
+    }, &.{"exceeded cpu budget"}, "POISON BRAKE (uncatchable interrupt, not the 504)");
+    // Well under the 5 s budget: the poison poll fires on loop back-edges.
+    if (elapsed_ns >= 4 * std.time.ns_per_s) {
+        std.debug.print("POISON BRAKE FAIL: took {d} ms — the budget braked it, not the poison\n", .{@divTrunc(elapsed_ns, std.time.ns_per_ms)});
+        std.process.exit(1);
+    }
+    std.debug.print("POISON OK — off-tape reads poison, survive catch, and brake\n", .{});
+}
+
 /// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
 /// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
 /// complete because the GC arena reclaims the dead strings mid-run. Same shape
@@ -204,6 +278,10 @@ pub fn main() !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "arena-gc")) {
         try runArenaGc(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "poison")) {
+        try runPoison(a);
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "packages")) {
