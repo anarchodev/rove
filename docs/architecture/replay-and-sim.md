@@ -498,6 +498,41 @@ result/ctx surface directly. See
 [`../guides/testing.md`](../guides/testing.md) for the authored-world
 (`scenario`) surface in practice.
 
+## 6.5 Handler-facing guards, per engine
+
+Three engines run customer handlers, and each enforces the handler-facing
+rules in its own code — the worker in Zig at the natives, the sim + native
+replay in `epilogue.zig`'s prelude, the browser arena in the prelude
+`gen_replay_prelude.py` composes. Sharing a rule's text (as
+`src/replay/js/kv_guards.js` does) removes drift between copies. It cannot
+make a MISSING guard visible, and that is the failure that actually happened:
+the arena went without every kv guard until a conformance case looked, because
+absence has no author and appears in no diff.
+
+So the inventory is a check, not prose. `scripts/ops/guard_parity_lint.py`
+runs on `zig build test` and fails when an engine lacks a guard the others
+have, unless the gap is declared with an issue. The table below is generated
+from it (`--table`) — regenerate rather than hand-edit, or it becomes another
+copy that drifts:
+
+| surface | rule | worker | sim | arena |
+|---|---|---|---|---|
+| `kv.set / kv.delete` | key or value is not a string-coercible type | yes | yes | yes |
+| `kv.set / kv.delete` | key is in a platform-reserved prefix | yes | yes | yes |
+| `kv.set / kv.delete` | key exceeds the byte cap | yes | yes | yes |
+| `kv.set` | value exceeds the byte cap | yes | yes | yes |
+| `request.tag` | key length must be 1..32 bytes | yes | yes | no (rove#505) |
+| `request.tag` | key may not start with '_' | yes | yes | no (rove#505) |
+| `request.tag` | key charset is [a-z0-9_] | yes | yes | no (rove#505) |
+| `request.tag` | value length must be 1..64 bytes | yes | yes | no (rove#505) |
+| `request.tag` | value has no control characters | yes | yes | no (rove#505) |
+| `request.tag` | at most 4 tags per request | yes | yes | no (rove#505) |
+
+Presence is all this proves. Whether a guard *behaves* the same across engines
+is the conformance corpus' question and is strictly better evidence — but a
+case only covers what someone remembered to write, and this covers what nobody
+did.
+
 ## 7. See also
 
 - [`effect-algebra.md`](../effect-algebra.md) — §1 determinism boundary, §2.5

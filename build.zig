@@ -1742,6 +1742,27 @@ pub fn build(b: *std.Build) void {
     prelude_fresh.has_side_effects = true;
     prelude_fresh.expectExitCode(0);
 
+    // Every handler-facing guard is enforced by every engine, or the gap is
+    // declared with an issue (`scripts/ops/guard_parity_lint.py`). Sharing a
+    // rule's TEXT stops two copies from drifting; it cannot make a MISSING
+    // guard visible, and absence is the failure that has no author and shows
+    // up in no diff — the arena went without every kv guard until a
+    // conformance case happened to look (rove#502).
+    //
+    // Presence only. Whether the guard BEHAVES the same is the conformance
+    // corpus' job and is better evidence; this is the cheap half that does
+    // not depend on someone having remembered to write a case.
+    //
+    // Always run, for the same reason the prelude digest does: declaring
+    // inputs would mean mirroring the lint's own source list here, and a new
+    // guard surface added there but not here would leave the gate
+    // cached-green on exactly the change it exists to catch.
+    const guard_parity = b.addSystemCommand(&.{"python3"});
+    guard_parity.addFileArg(b.path("scripts/ops/guard_parity_lint.py"));
+    guard_parity.has_side_effects = true;
+    guard_parity.expectExitCode(0);
+    test_step.dependOn(&guard_parity.step);
+
     const conf_selftest = b.addSystemCommand(&.{"python3"});
     conf_selftest.addFileArg(b.path("scripts/conformance/selftest.py"));
     conf_selftest.addFileInput(b.path("scripts/conformance/outcome.py"));
