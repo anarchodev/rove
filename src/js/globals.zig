@@ -784,8 +784,8 @@ pub fn kvWriteArgToOwnedString(
 /// here at write time with a clean, branchable JS error instead
 /// (docs/architecture/format-versioning.md §7.2). Conservative by design: these can
 /// be RAISED later without breaking anyone, never lowered.
-const KV_KEY_MAX: usize = kv_mod.snapshot_stream.STREAM_KEY_MAX;
-const KV_VAL_MAX: usize = kv_mod.snapshot_stream.STREAM_VAL_MAX;
+const KV_KEY_MAX: usize = reserved.KV_KEY_MAX;
+const KV_VAL_MAX: usize = reserved.KV_VAL_MAX;
 
 pub const KvSizeViolation = enum { key, value };
 
@@ -1565,4 +1565,16 @@ test "SubscriptionEntry.deinit frees kv spec" {
         .spec = .{ .kv = .{ .prefix = try a.dupe(u8, "jobs/") } },
     };
     entry.deinit(a);
+}
+
+
+test "the kv write caps match the snapshot stream's frame bounds" {
+    // The caps are a CONTRACT and live in `rove-reserved`, where the offline
+    // engines can read them without importing the kv stack. Their REASON is
+    // the stream frame, which lives here. This is the seam between the two:
+    // raise the frame without raising the contract (or the reverse) and the
+    // engines start disagreeing about which writes are legal — the shape of
+    // rove#502, one layer down.
+    try std.testing.expectEqual(kv_mod.snapshot_stream.STREAM_KEY_MAX, reserved.KV_KEY_MAX);
+    try std.testing.expectEqual(kv_mod.snapshot_stream.STREAM_VAL_MAX, reserved.KV_VAL_MAX);
 }
