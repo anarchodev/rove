@@ -35,6 +35,22 @@ pub const ReplayHost = extern struct {
 };
 extern fn arena_replay_set_host(host: *const ReplayHost, user: ?*anyopaque) void;
 
+/// The rove-side mirror of the registered replay host. The common kv binding
+/// (`kv_binding.zig`) dispatches through THIS pair exactly the way arenajs's
+/// own kv binding dispatches through its static copy — the indirection is
+/// what keeps the two host implementations (this run host and the rewind-test
+/// harness's, which re-takes the host around nested sim runs) polymorphic
+/// under one registered JS surface. Every installer goes through `setHost`,
+/// so the mirror cannot drift from what arenajs sees.
+pub var active_vtable: ?*const ReplayHost = null;
+pub var active_user: ?*anyopaque = null;
+
+pub fn setHost(vt: *const ReplayHost, user: ?*anyopaque) void {
+    active_vtable = vt;
+    active_user = user;
+    arena_replay_set_host(vt, user);
+}
+
 /// The sentinel key the replay epilogue writes its captured run output under.
 /// The `kv_set` responder intercepts it (it is NOT a handler write) — the side
 /// channel that extracts results without reaching the reactor's static context.
@@ -82,7 +98,7 @@ pub const Host = struct {
     diverged: ?[]const u8 = null,
 
     pub fn install(self: *Host) void {
-        arena_replay_set_host(&HOST_VTABLE, self);
+        setHost(&HOST_VTABLE, self);
     }
 
     fn setDiv(self: *Host, comptime fmt: []const u8, args: anytype) void {

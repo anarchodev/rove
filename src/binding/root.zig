@@ -34,9 +34,17 @@
 //! fromCtx(ctx: ?*q.JSContext) D          // recover engine state (ctx opaque, …)
 //! allocator(d) std.mem.Allocator          // for coercion buffers + messages
 //! isSystemModule(d) bool                  // the guard's namespace exemption
-//! get(d, key) ?[]const u8                 // value (owned) | null = absent OR
-//!                                         //   storage error — the delegate
-//!                                         //   records/tapes/folds internally
+//! isExempt(d, key) bool                   // key is NOT a customer write —
+//!                                         //   skip every check (the offline
+//!                                         //   engines' harness namespace +
+//!                                         //   output sentinel; the worker
+//!                                         //   returns false: its platform
+//!                                         //   writers bypass the binding
+//!                                         //   entirely). Same parameter the
+//!                                         //   JS-side __kvGuardWrite takes.
+//! get(d, key) GetResult                   // value (owned) | absent | thrown
+//!                                         //   — the delegate records/tapes/
+//!                                         //   folds internally
 //! release(d, bytes) void                  // free a get() result
 //! put(d, ctx, key, value) bool            // false = a JS exception is pending
 //! del(d, ctx, key) bool                   //   (trigger rejection, …)
@@ -60,6 +68,18 @@ const guards = @import("rove-guards");
 /// host encode the same numbers; this is the binding-side statement of them.
 pub const KV_PREFIX_DEFAULT: u32 = 100;
 pub const KV_PREFIX_MAX: u32 = 1000;
+
+/// A read's classification, delegate → binding. The worker classifies
+/// `{value, absent}` (its storage errors park on the dispatch state and read
+/// as absent — a read never throws in prod); an offline engine adds `thrown`
+/// for a recorded failure it has already raised on the context. The
+/// captured-divergence direction (the poison classification) extends this
+/// union rather than adding a read path — see the engine-parity epic.
+pub const GetResult = union(enum) {
+    value: []const u8,
+    absent,
+    thrown,
+};
 
 pub fn Kv(comptime q: type, comptime D: type) type {
     return struct {
@@ -149,9 +169,14 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             const key = coerce(d, ctx, argv[0]) catch return js_exception;
             defer d.allocator().free(key);
 
-            const value = d.get(key) orelse return js_null;
-            defer d.release(value);
-            return q.JS_NewStringLen(ctx, value.ptr, value.len);
+            switch (d.get(key)) {
+                .value => |v| {
+                    defer d.release(v);
+                    return q.JS_NewStringLen(ctx, v.ptr, v.len);
+                },
+                .absent => return js_null,
+                .thrown => return js_exception,
+            }
         }
 
         pub fn jsKvSet(
@@ -170,9 +195,13 @@ pub fn Kv(comptime q: type, comptime D: type) type {
 
             // ONE call, here, for every engine that registers this binding.
             // The rule order is part of the contract and lives in the guards
-            // module, not at any call site.
-            if (guards.checkKvWrite(key, value, d.isSystemModule())) |refusal| {
-                return throwRefusal(d, ctx, refusal, key);
+            // module, not at any call site. An exempt key is not a customer
+            // write at all and skips the table, exactly as the JS evaluator's
+            // isExempt parameter does.
+            if (!d.isExempt(key)) {
+                if (guards.checkKvWrite(key, value, d.isSystemModule())) |refusal| {
+                    return throwRefusal(d, ctx, refusal, key);
+                }
             }
 
             if (!d.put(ctx, key, value)) return js_exception;
@@ -193,8 +222,10 @@ pub fn Kv(comptime q: type, comptime D: type) type {
 
             // Same rules, same authority — null value: a delete has none to
             // size-check.
-            if (guards.checkKvWrite(key, null, d.isSystemModule())) |refusal| {
-                return throwRefusal(d, ctx, refusal, key);
+            if (!d.isExempt(key)) {
+                if (guards.checkKvWrite(key, null, d.isSystemModule())) |refusal| {
+                    return throwRefusal(d, ctx, refusal, key);
+                }
             }
 
             if (!d.del(ctx, key)) return js_exception;

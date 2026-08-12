@@ -14,6 +14,7 @@
 const std = @import("std");
 const c = @import("qjs_c.zig").c;
 const package_resolver = @import("package_resolver");
+const kv_binding = @import("kv_binding.zig");
 
 /// Per-run module context, pointed at by the loader's opaque. Its address is
 /// stable (heap-owned by the `Engine`); `simulate` sets `resolver` before each
@@ -46,6 +47,11 @@ threadlocal var scratch: [512]u8 = undefined;
 /// `@cImport` — can name this hook's type when declaring the reactor extern.
 pub fn simSetup(ctx: ?*anyopaque, rt: ?*anyopaque, user: ?*anyopaque) callconv(.c) c_int {
     if (arena_install_replay_bindings(@ptrCast(ctx)) < 0) return -1;
+    // Replace arenajs's replay kv object with the common binding
+    // (`rove-binding` over the replay-host vtable) — the same coercion,
+    // guards, refusal shapes and result shaping the worker registers. The
+    // module loader + crypto surface stay arenajs's.
+    if (kv_binding.installKv(@ptrCast(ctx)) < 0) return -1;
     _ = arena_install_replay_module_loader_normalize(@ptrCast(rt), &normalize, user);
     return 0;
 }

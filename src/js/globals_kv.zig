@@ -165,6 +165,14 @@ pub const WorkerKv = struct {
         return self.state.is_system_module;
     }
 
+    /// The worker has no per-key exemption: its platform writers
+    /// (markSubscriptionsDirty, the shims' owed markers, …) bypass the
+    /// binding and write the txn directly, so every key that arrives here IS
+    /// a customer write.
+    pub fn isExempt(_: WorkerKv, _: []const u8) bool {
+        return false;
+    }
+
     /// The minimal readset (`docs/architecture/effects-and-handlers.md`,
     /// readset replication). A `kv.get(k)` where `k` is in this activation's
     /// own writeset reads a value the activation itself produced,
@@ -173,7 +181,7 @@ pub const WorkerKv = struct {
     /// information, so only those make it onto the tape. Saves tape size +
     /// S3 bytes per request without losing replay determinism. The digest
     /// folds them regardless (see the fold header above).
-    pub fn get(self: WorkerKv, key: []const u8) ?[]const u8 {
+    pub fn get(self: WorkerKv, key: []const u8) binding.GetResult {
         const state = self.state;
         const skip_tape = state.writeset.containsKey(key);
 
@@ -181,18 +189,20 @@ pub const WorkerKv = struct {
             error.NotFound => {
                 if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key, "", .not_found) catch {};
                 foldRead(state, key, false, "");
-                return null;
+                return .absent;
             },
             else => {
+                // A read never throws in prod: the storage error parks on the
+                // dispatch state and the handler sees absent.
                 state.pending_kv_error = err;
                 if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key, "", .err) catch {};
-                return null;
+                return .absent;
             },
         };
 
         if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key, value, .ok) catch {};
         foldRead(state, key, true, value);
-        return value;
+        return .{ .value = value };
     }
 
     pub fn release(self: WorkerKv, bytes: []const u8) void {

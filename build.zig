@@ -1488,6 +1488,7 @@ pub fn build(b: *std.Build) void {
     // The prelude generates its reserved-prefix guard from this list (rove#499).
     replay_mod.addImport("rove-reserved", reserved_mod);
     replay_mod.addImport("rove-guards", guards_mod);
+    replay_mod.addImport("rove-binding", binding_mod);
     replay_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
     // The first-party @rewind/* package sources, so `rewind test` auto-resolves
     // an app's declared @rewind deps offline (src/replay/first_party.zig) without
@@ -1514,6 +1515,7 @@ pub fn build(b: *std.Build) void {
     linkReplayEngine(driver_smoke_mod, arenajs_dep);
     addSimGlobalEmbeds(b, driver_smoke_mod);
     driver_smoke_mod.addImport("package_resolver", pkgres_mod);
+    driver_smoke_mod.addImport("rove-binding", binding_mod);
     driver_smoke_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
     // The lifted first-party @rewind/* package sources (P-Lift, rove#123),
     // embedded so the driver smoke can prove the real libs resolve + run
