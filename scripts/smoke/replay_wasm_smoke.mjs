@@ -71,14 +71,25 @@ const Module = await getArenaJs({
     locateFile: (name) => path.join(static_dir, name),
 });
 
-const arena_init           = Module.cwrap("arena_init",           "number", ["number","number"]);
+const arena_init_open      = Module.cwrap("arena_init_open",      "number", ["number","number"]);
+const arena_eval_base      = Module.cwrap("arena_eval_base",      "number", ["string"]);
+const arena_freeze         = Module.cwrap("arena_freeze",         null,     []);
 const arena_run_module     = Module.cwrap("arena_run_module",     "number", ["string","string"]);
 const arena_set_trace_mode = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
 const arena_set_random_seed = Module.cwrap("arena_set_random_seed", null,   ["number","number"]);
 const arena_set_date_now   = Module.cwrap("arena_set_date_now",   null,    ["number","number"]);
 const arena_destroy        = Module.cwrap("arena_destroy",        null,     []);
 
-if (arena_init(8192, 8192) !== 0) fail("arena_init failed");
+// Boot the way the browser shell (and the conformance replay driver) does:
+// open the base arena, eval the generated prelude, freeze. The epilogue
+// `buildRequestEpilogue` appends references the prelude's globals — the
+// shared guard rules (`__kvGuardWrite`), the effect recorders, the
+// interaction-digest mirror — so a bare `arena_init` boot throws a
+// top-level ReferenceError on the first kv write and replays nothing.
+const preludeSrc = fs.readFileSync(path.join(static_dir, "arena-prelude.js"), "utf-8");
+if (arena_init_open(8192, 8192) !== 0) fail("arena_init_open failed");
+if (arena_eval_base(preludeSrc) !== 0) fail("arena_eval_base(prelude) failed");
+arena_freeze();
 
 try {
     Module.tapes = buildTapesFromBlobs(tape_blobs);
