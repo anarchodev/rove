@@ -21,6 +21,7 @@ const MockState = struct {
     a: std.mem.Allocator,
     map: std.StringArrayHashMapUnmanaged([]const u8) = .{},
     system_module: bool = false,
+    exempt_prefix: []const u8 = "",
     fail_prefix: bool = false,
     last_prefix: [64]u8 = undefined,
     last_prefix_len: usize = 0,
@@ -53,9 +54,14 @@ const MockKv = struct {
         return self.st.system_module;
     }
 
-    pub fn get(self: MockKv, key: []const u8) ?[]const u8 {
-        const v = self.st.map.get(key) orelse return null;
-        return self.st.a.dupe(u8, v) catch null;
+    pub fn isExempt(self: MockKv, key: []const u8) bool {
+        return self.st.exempt_prefix.len > 0 and
+            std.mem.startsWith(u8, key, self.st.exempt_prefix);
+    }
+
+    pub fn get(self: MockKv, key: []const u8) binding.GetResult {
+        const v = self.st.map.get(key) orelse return .absent;
+        return .{ .value = self.st.a.dupe(u8, v) catch return .absent };
     }
 
     pub fn release(self: MockKv, bytes: []const u8) void {
@@ -229,6 +235,18 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((1 << 20) + 1)))",
         "Error|value_too_large|kv: value exceeds the 1048576-byte limit");
     st.system_module = false;
+
+    // ── the per-key exemption: NOT a customer write, EVERY check skipped ──
+    // (the offline engines' harness namespace / output sentinel — unlike the
+    // system-module exemption, the caps are skipped too, because the key is
+    // not subject to the customer contract at all)
+    st.exempt_prefix = "__h/";
+    try expectEval(ctx, a, "__t(() => kv.set('__h/_secret-ish', 'x'.repeat((1 << 20) + 1)))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.delete('__h/_secret-ish'))", "ok:null");
+    // …and a non-matching key is still a customer write.
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/y', 'v'))",
+        "Error|reserved_key|kv: '_secret/y' is in a platform-reserved prefix");
+    st.exempt_prefix = "";
 
     // ── argc short-circuits: undefined, nothing stored, nothing thrown ──
     try expectEval(ctx, a, "__t(() => kv.get())", "ok:null");

@@ -32,7 +32,6 @@ const path_confine = @import("path_confine.zig");
 extern fn arena_reactor_new(base_kb: c_int, request_kb: c_int) ?*root.ArenaReactor;
 extern fn arena_set_request_mode_r(r: *root.ArenaReactor, mode: c_int) void;
 extern fn arena_run_module_r(r: *root.ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
-extern fn arena_replay_set_host(host: *const hostmod.ReplayHost, user: ?*anyopaque) void;
 
 /// The embedded saga library. `import { scenario, expect } from "rewind:test"`
 /// in a test file resolves here (served by `moduleLoad`).
@@ -135,7 +134,9 @@ const Harness = struct {
     snap_asserted: std.StringHashMapUnmanaged(void) = .{},
 
     fn install(self: *Harness) void {
-        arena_replay_set_host(&VTABLE, self);
+        // Through the rove-side mirror (hostmod.setHost) so the common kv
+        // binding dispatches to THIS host while it is the active one.
+        hostmod.setHost(&VTABLE, self);
     }
 };
 
