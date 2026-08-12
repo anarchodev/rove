@@ -57,6 +57,10 @@ def _worker_surface() -> str:
     # twice — once for the arena's second file, once here — which is the
     # standing weakness of defining a surface by enumerating paths.
     paths = [ROVE / "src" / "guards" / "root.zig"]
+    # The common binding (`rove-binding`) is where the worker's coercion +
+    # guard call live now; the globals_* files hold the worker delegate and
+    # the surfaces that have not yet moved onto the binding.
+    paths += [ROVE / "src" / "binding" / "root.zig"]
     paths += [ROVE / "src" / "js" / p
               for p in ("globals.zig", "globals_kv.zig", "globals_request.zig")]
     return "\n".join(p.read_text(encoding="utf-8") for p in paths)

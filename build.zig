@@ -574,6 +574,23 @@ pub fn build(b: *std.Build) void {
     const guards_tests = b.addTest(.{ .root_module = guards_mod });
     test_step.dependOn(&b.addRunArtifact(guards_tests).step);
 
+    // ── rove-binding: the common JS↔Zig binding, one implementation ──
+    //
+    // rove-guards made the CHECKS one authority; this is the same move for
+    // the whole binding — coercion, guard call, refusal throw, result shape —
+    // with a comptime delegate per engine for storage/reads/effect recording
+    // (the engine-parity direction, docs/architecture/effects-and-handlers.md).
+    // Deliberately generic over each engine's own quickjs @cImport instance,
+    // so it links nothing and carries no C import of its own; its behavioural
+    // tests live in rove-js (`kv_binding_test.zig`), where a real QJS is
+    // linked.
+    const binding_mod = b.addModule("rove-binding", .{
+        .root_source_file = b.path("src/binding/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    binding_mod.addImport("rove-guards", guards_mod);
+
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
     // M1 slice: just `Instance` + `Domain` with an in-memory cache and
@@ -636,6 +653,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-plan", plan_mod);
     js_mod.addImport("rove-reserved", reserved_mod);
     js_mod.addImport("rove-guards", guards_mod);
+    js_mod.addImport("rove-binding", binding_mod);
     js_mod.addImport("metrics-server", metrics_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
     // context after the native CFunction bindings install.
