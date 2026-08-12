@@ -14,6 +14,12 @@
 //!   platform starts with customer prefix. The catch-all `""` is
 //!   allowed; the fire-time guard skips dispatch on platform keys.
 //!
+//! Also home to the handler-facing LIMITS every engine must agree on (the kv
+//! byte caps, the `request.tag` bounds). They sit in this leaf for the same
+//! reason the prefixes do: the offline engines have to read them without
+//! importing the stack that gives them meaning, and a number transcribed into
+//! three preludes is three numbers waiting to disagree.
+//!
 //! - `isCustomerWriteReserved` (runtime guard on `kv.set` / `kv.delete`):
 //!   the ENTIRE leading-`_` keyspace is platform-reserved against customer
 //!   writes, EXCEPT the `SHIM_WRITABLE_PREFIXES` the JS shims must write
@@ -280,3 +286,13 @@ test "isCustomerWriteReserved: customer (non-_) keys allowed" {
 /// without breaking anyone, never lowered.
 pub const KV_KEY_MAX: usize = 256;
 pub const KV_VAL_MAX: usize = 1 << 20;
+
+/// `request.tag` limits — the low-cardinality index tags a handler may set.
+///
+/// Same reason the kv caps are here: a handler author reads "at most 4 tags"
+/// as a contract, and three engines have to agree on it. `src/log/root.zig`
+/// owns the storage-side meaning (`MAX_TAGS` et al) and a test in
+/// `globals_request.zig` binds the two.
+pub const TAG_MAX: usize = 4;
+pub const TAG_KEY_MAX: usize = 32;
+pub const TAG_VAL_MAX: usize = 64;

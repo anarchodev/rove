@@ -24,6 +24,7 @@ const std = @import("std");
 const decode = @import("tape_decode.zig");
 const host = @import("host.zig");
 const reserved = @import("rove-reserved");
+const guards = @import("rove-guards");
 
 pub const Opts = struct {
     method: []const u8 = "GET",
@@ -348,41 +349,17 @@ const JS_INTERACTION_DIGEST = @embedFile("js_interaction_digest");
 /// Generated at comptime into the prelude, the same way `__rove_triggers` and
 /// `quotedOutputKey` are: a new prefix is now reachable in replay the moment
 /// it is reachable in the worker, with no second edit to remember.
-const SHIM_WRITABLE_JS = blk: {
-    // Leads with a newline: a Zig multiline literal carries no trailing
-    // newline, so without it this fragment welds onto the last line of
-    // EPILOGUE_BODY_HEAD. That produced valid JS and a green build while
-    // silently changing what the sim emitted — the engines stopped agreeing
-    // and nothing said so until the conformance run compared them.
-    var out: []const u8 = "\n  const __SHIM_WRITABLE = [";
-    for (reserved.SHIM_WRITABLE_PREFIXES, 0..) |prefix, i| {
-        if (i > 0) out = out ++ ", ";
-        out = out ++ "\"" ++ prefix ++ "\"";
-    }
-    out = out ++ "];\n";
-    // The caps ride the same fragment rather than being transcribed into the
-    // shared guard file: they are Zig constants with a reason (the snapshot
-    // stream's frame bounds), so the JS should never hold a second opinion
-    // about them.
-    out = out ++ std.fmt.comptimePrint(
-        "  const __KV_KEY_MAX = {d}, __KV_VAL_MAX = {d};\n",
-        .{ kv_guard_key_max, kv_guard_val_max },
-    );
-    break :blk out;
-};
 
 /// The kv guard RULES, shared verbatim with the browser replay arena
 /// (`scripts/ops/gen_replay_prelude.py` splices the same file) — the same
 /// arrangement `textcodec_pure.js` already has. Only the data above is
 /// generated; the logic has one copy (rove#502).
-const KV_GUARDS_JS = @embedFile("js/kv_guards.js");
+const GUARDS_JS = @embedFile("js/guards.generated.js");
 
-/// Bytes the worker accepts for a kv key / value, from the shared leaf so
-/// the prelude and the native enforce one number.
-const kv_guard_key_max: usize = reserved.KV_KEY_MAX;
-const kv_guard_val_max: usize = reserved.KV_VAL_MAX;
 
-const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ SHIM_WRITABLE_JS ++ KV_GUARDS_JS ++ "\n" ++ EPILOGUE_BODY_TAIL;
+
+
+const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ GUARDS_JS ++ "\n" ++ EPILOGUE_BODY_TAIL;
 
 const EPILOGUE_BODY_HEAD =
     \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
@@ -769,17 +746,11 @@ const EPILOGUE_BODY_TAIL =
     \\  // {kind:"tag"} so tests can assert what would index the log record.
     \\  const __tags = [];
     \\  request.tag = function (k, v) {
-    \\    if (arguments.length < 2 || typeof k !== "string" || typeof v !== "string") throw new TypeError("request.tag(key, value) requires two string arguments");
-    \\    const kb = __utf8Encode(k).length, vb = __utf8Encode(v).length;
-    \\    if (kb < 1 || kb > 32) throw new TypeError("request.tag: key length must be 1..32 bytes");
-    \\    if (k[0] === "_") throw new TypeError("request.tag: keys starting with '_' are reserved");
-    \\    if (!/^[a-z0-9_]+$/.test(k)) throw new TypeError("request.tag: key must match [a-z0-9_]");
-    \\    if (vb < 1 || vb > 64) throw new TypeError("request.tag: value length must be 1..64 bytes");
-    \\    for (let i = 0; i < v.length; i++) if (v.charCodeAt(i) < 0x20) throw new TypeError("request.tag: value must not contain control characters");
+    \\    __tagGuardPair(k, v, arguments.length);
     \\    const hit = __tags.find((t) => t.key === k);
     \\    if (hit) hit.value = v;
     \\    else {
-    \\      if (__tags.length >= 4) throw new TypeError("request.tag: too many tags (max 4 per request)");
+    \\      __tagGuardCapacity(__tags.length);
     \\      __tags.push({ key: k, value: v });
     \\    }
     \\    __effects.push({ kind: "tag", key: k, value: v });
@@ -1121,44 +1092,34 @@ test "build: GET embeds request meta + parks output under sentinel" {
     try testing.expect(std.mem.indexOf(u8, src, "kv.set(\"" ++ host.OUTPUT_KEY ++ "\"") != null);
 }
 
-test "the prelude's reserved-prefix guard covers every shim-writable prefix" {
-    // The guard is generated, so this is not re-asserting the generator's
-    // arithmetic — it pins the PAIRING. `_export/` drifted between the two
-    // lists for as long as it did because nothing executed the pairing
-    // (rove#499); a build failure is a cheaper messenger than a replay that
-    // refuses a write prod allows.
+test "the committed guards.generated.js is what the emitter produces" {
+    // The offline preludes splice a COMMITTED artifact, because the Python
+    // that composes the arena's cannot run Zig comptime. That artifact is a
+    // rendering of `rove-guards`, not a second statement of the rules — and
+    // this is what makes that true. Regenerate with `zig build gen-guards`.
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try guards.emitJs(buf.writer(a));
+    if (!std.mem.eql(u8, buf.items, GUARDS_JS)) {
+        std.debug.print(
+            "\nsrc/replay/js/guards.generated.js is stale — run `zig build gen-guards`\n",
+            .{},
+        );
+        return error.StaleGeneratedGuards;
+    }
+}
+
+test "the prelude carries the guards, and the guards carry the data they read" {
+    // Structural, cheap, and catches a splice that silently dropped: the
+    // rules have to reach the emitted prelude, and the data globals they
+    // read have to be defined above them in the same text.
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __kvGuardWrite = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __tagGuardPair = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __GUARD_SHIM_WRITABLE = [") != null);
     for (reserved.SHIM_WRITABLE_PREFIXES) |prefix| {
         var quoted_buf: [64]u8 = undefined;
         const quoted = try std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{prefix});
-        try std.testing.expect(std.mem.indexOf(u8, SHIM_WRITABLE_JS, quoted) != null);
-        // And it has to reach the emitted prelude, not just the fragment.
         try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, quoted) != null);
     }
-    // The guard itself must still be there to consume the list — a split that
-    // dropped the tail would pass the loop above and ship no guard at all.
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __kvReserved = (k) =>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __SHIM_WRITABLE = [") != null);
-}
-
-test "the generated list keeps its own line in the prelude" {
-    // A Zig multiline literal has NO trailing newline, so `HEAD ++ FRAGMENT`
-    // welds the fragment onto the end of the last HEAD line. That is how this
-    // split first shipped, and it broke the two engines' agreement without
-    // breaking the build.
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "\n  const __SHIM_WRITABLE = [") != null);
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "];\n  const __KV_KEY_MAX = ") != null);
-    // …and the shared guard file lands after it, on its own line, with the
-    // data globals it needs already defined above.
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, ";\n// SPDX-FileCopyrightText") != null);
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __kvGuardWrite = (k, hasVal, val, isExempt)") != null);
-}
-
-test "the caps reach the prelude as numbers, from the shared leaf" {
-    var buf: [64]u8 = undefined;
-    const expect_caps = try std.fmt.bufPrint(
-        &buf,
-        "const __KV_KEY_MAX = {d}, __KV_VAL_MAX = {d};",
-        .{ reserved.KV_KEY_MAX, reserved.KV_VAL_MAX },
-    );
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, expect_caps) != null);
 }

@@ -132,6 +132,7 @@ test {
     std.testing.log_level = .err;
     _ = dispatcher;
     _ = @import("dispatcher_test.zig");
+    _ = @import("guards_differential_test.zig");
     _ = effect;
     _ = globals;
     _ = worker;
