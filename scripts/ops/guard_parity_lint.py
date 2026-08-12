@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import pathlib
 import sys
 
@@ -68,12 +69,33 @@ def _sim_surface() -> str:
     return "\n".join(parts)
 
 
-def _arena_surface() -> str:
+def _arena_surface() -> str | None:
+    """The arena's enforcement is in TWO places, and reading one of them was
+    a bug in the first version of this lint.
+
+    Its base prelude is composed from rove sources, so it is readable here.
+    But the arena also has its OWN epilogue — `replay/_static/request-replay.mjs`
+    in rewind-apps, which builds the `request` surface and holds guards of its
+    own. Checking only the base reported six `request.tag` guards as missing
+    when the arena had every one of them, and a lint that invents gaps teaches
+    people to skip reading it.
+
+    So: read both when the sibling checkout is reachable, and return None when
+    it is not. None means UNVERIFIABLE, which is reported and is not a gap —
+    "I could not look" and "it is not there" are different claims and only one
+    of them is this lint's to make.
+    """
     spec = importlib.util.spec_from_file_location(
         "gen_replay_prelude", ROVE / "scripts" / "ops" / "gen_replay_prelude.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.build()
+    base = mod.build()
+
+    apps = os.environ.get("REWIND_APPS_DIR")
+    epilogue = pathlib.Path(apps).expanduser() / "replay" / "_static" / "request-replay.mjs" if apps else None
+    if epilogue is None or not epilogue.is_file():
+        return None
+    return base + "\n" + epilogue.read_text(encoding="utf-8")
 
 
 ENGINES = {
@@ -88,6 +110,12 @@ ENGINES = {
 # `marker` is what a customer sees, so the check tracks the contract rather
 # than an implementation detail: renaming an internal helper does not move
 # it, and changing the error a handler catches does.
+#
+# Use the INVARIANT part of the message. A shared guard builds "…must be
+# 1..32 bytes" by interpolating the cap it was generated with, so a marker
+# carrying the number matches the worker's Zig literal and misses the JS that
+# produces the identical string at runtime — a false gap, which is worse than
+# no check because it trains people to skip the output.
 GUARDS = [
     # (surface, rule, marker)
     ("kv.set / kv.delete", "key or value is not a string-coercible type",
@@ -95,39 +123,32 @@ GUARDS = [
     ("kv.set / kv.delete", "key is in a platform-reserved prefix", "reserved_key"),
     ("kv.set / kv.delete", "key exceeds the byte cap", "key_too_large"),
     ("kv.set", "value exceeds the byte cap", "value_too_large"),
-    ("request.tag", "key length must be 1..32 bytes", "key length must be 1..32 bytes"),
+    ("request.tag", "key length within the byte cap", "request.tag: key length must be 1.."),
     ("request.tag", "key may not start with '_'", "keys starting with '_' are reserved"),
     ("request.tag", "key charset is [a-z0-9_]", "key must match"),
-    ("request.tag", "value length must be 1..64 bytes", "value length must be 1..64 bytes"),
+    ("request.tag", "value length within the byte cap", "request.tag: value length must be 1.."),
     ("request.tag", "value has no control characters", "must not contain control characters"),
     ("request.tag", "at most 4 tags per request", "too many tags"),
 ]
 
 # (marker, engine) -> (issue, why). A declared gap is still a gap; this only
 # means someone looked at it and it has a home.
-KNOWN_GAPS = {
-    ("key length must be 1..32 bytes", "arena"): (
-        "rove#505",
-        "the arena's epilogue (rewind-apps request-replay.mjs) builds its own "
-        "request surface and has no tag guards; the kv guards were shared "
-        "first because they gate WRITES, which reach the digest",
-    ),
-    ("keys starting with '_' are reserved", "arena"): ("rove#505", "as above"),
-    ("key must match", "arena"): ("rove#505", "as above"),
-    ("value length must be 1..64 bytes", "arena"): ("rove#505", "as above"),
-    ("must not contain control characters", "arena"): ("rove#505", "as above"),
-    ("too many tags", "arena"): ("rove#505", "as above"),
-}
+# (marker, engine) -> (issue, why). A declared gap is still a gap; this only
+# means someone looked at it and it has a home. Empty today.
+KNOWN_GAPS: dict[tuple[str, str], tuple[str, str]] = {}
 
 
 def check() -> int:
     surfaces = {name: fn() for name, fn in ENGINES.items()}
+    unreadable = [e for e, text in surfaces.items() if text is None]
     untracked: list[str] = []
     tracked: list[str] = []
     stale: list[str] = []
 
     for surface, rule, marker in GUARDS:
         for engine in ENGINES:
+            if surfaces[engine] is None:
+                continue
             present = marker in surfaces[engine]
             gap = KNOWN_GAPS.get((marker, engine))
             if present and gap:
@@ -139,6 +160,11 @@ def check() -> int:
             elif not present:
                 untracked.append(f"{engine:7} {surface:19} {rule}   marker: {marker!r}")
 
+    if unreadable:
+        for e in unreadable:
+            print(f"UNVERIFIABLE: {e} — part of its enforcement lives in the "
+                  f"rewind-apps checkout; set REWIND_APPS_DIR to check it")
+        print()
     if tracked:
         print("tracked gaps (declared, with an issue):")
         for t in tracked:
@@ -161,8 +187,10 @@ def check() -> int:
 
     if untracked or stale:
         return 1
-    print(f"guard parity OK — {len(GUARDS)} guard(s) across {len(ENGINES)} engines"
-          f", {len(tracked)} tracked gap(s)")
+    checked = len(ENGINES) - len(unreadable)
+    print(f"guard parity OK — {len(GUARDS)} guard(s) across {checked}/{len(ENGINES)} "
+          f"engines, {len(tracked)} tracked gap(s)"
+          + (f", {len(unreadable)} unverifiable" if unreadable else ""))
     return 0
 
 
@@ -173,7 +201,9 @@ def table() -> int:
     for surface, rule, marker in GUARDS:
         cells = []
         for engine in ENGINES:
-            if marker in surfaces[engine]:
+            if surfaces[engine] is None:
+                cells.append("?")
+            elif marker in surfaces[engine]:
                 cells.append("yes")
             else:
                 gap = KNOWN_GAPS.get((marker, engine))

@@ -100,7 +100,7 @@ PIECES = [
 # customer surface. Every shim above captured what it needs in a closure.
 EPILOGUE = "\n;delete globalThis._system;\n"
 
-# ── the kv guardrails (rove#502) ──────────────────────────────────────────
+# ── the shared guardrails (rove#502, rove#505) ──────────────────────────────────────────
 #
 # The arena had NONE of the worker's kv write guards: a handler writing a
 # platform-reserved key threw in prod and in the sim, and succeeded here —
@@ -139,12 +139,15 @@ def _zig_cap(name: str) -> int:
 
 
 def kv_guard_data() -> str:
-    """The data globals `kv_guards.js` declares it needs, from the Zig."""
+    """The data globals the shared guard files declare they need, from the Zig."""
     prefixes = ", ".join(f'"{p}"' for p in _zig_prefix_list())
     return (
         f"\nconst __SHIM_WRITABLE = [{prefixes}];\n"
         f"const __KV_KEY_MAX = {_zig_cap('KV_KEY_MAX')}, "
         f"__KV_VAL_MAX = {_zig_cap('KV_VAL_MAX')};\n"
+        f"const __TAG_MAX = {_zig_cap('TAG_MAX')}, "
+        f"__TAG_KEY_MAX = {_zig_cap('TAG_KEY_MAX')}, "
+        f"__TAG_VAL_MAX = {_zig_cap('TAG_VAL_MAX')};\n"
     )
 
 
@@ -206,6 +209,9 @@ def build() -> str:
     parts.append("\n// ── kv guardrails (generated data + src/replay/js/kv_guards.js) ──\n")
     parts.append(kv_guard_data())
     parts.append((ROVE / "src" / "replay" / "js" / "kv_guards.js").read_text(encoding="utf-8"))
+    # `tag_guards.js` measures with `__utf8Len`, which the kv guards define —
+    # order is load-bearing, not cosmetic.
+    parts.append((ROVE / "src" / "replay" / "js" / "tag_guards.js").read_text(encoding="utf-8"))
     parts.append(EPILOGUE)
     return "".join(parts)
 

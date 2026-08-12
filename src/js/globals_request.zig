@@ -1203,3 +1203,13 @@ fn jsRequestTag(
     };
     return js_undefined;
 }
+
+test "the request.tag limits match the log record's own bounds" {
+    // The limits are a CONTRACT and live in `rove-reserved`, where the offline
+    // engines read them without importing the log stack. Their meaning — how
+    // many tags a log record can carry — lives in `rove-log`. This binds the
+    // two, so raising one without the other fails the build instead of
+    // surfacing as a handler that is refused by one engine and not another.
+    try std.testing.expectEqual(log_mod.MAX_TAGS, reserved.TAG_MAX);
+    try std.testing.expectEqual(log_mod.MAX_TAG_KEY_LEN, reserved.TAG_KEY_MAX);
+}

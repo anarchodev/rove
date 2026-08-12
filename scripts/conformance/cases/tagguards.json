@@ -1,0 +1,16 @@
+{
+  "name": "tagguards",
+  "description": "`request.tag` validation, per rule and at the capacity boundary. Carried because this guard had FOUR hand-written copies — the worker, the sim prelude, the arena's epilogue, each restating the same rules — and they had already drifted on the refusal MESSAGE for the tag cap, which a handler can catch and read. Presence checks cannot see that; only running the rule on both engines can.",
+  "source_dir": "src/replay/testdata/kvguardrails",
+  "engines": ["sim", "prod", "replay"],
+  "worlds": [
+    {
+      "label": "tags",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": { "method": "GET", "path": "/tags" }
+      }
+    }
+  ]
+}

@@ -368,6 +368,10 @@ const SHIM_WRITABLE_JS = blk: {
         "  const __KV_KEY_MAX = {d}, __KV_VAL_MAX = {d};\n",
         .{ kv_guard_key_max, kv_guard_val_max },
     );
+    out = out ++ std.fmt.comptimePrint(
+        "  const __TAG_MAX = {d}, __TAG_KEY_MAX = {d}, __TAG_VAL_MAX = {d};\n",
+        .{ reserved.TAG_MAX, reserved.TAG_KEY_MAX, reserved.TAG_VAL_MAX },
+    );
     break :blk out;
 };
 
@@ -377,12 +381,16 @@ const SHIM_WRITABLE_JS = blk: {
 /// generated; the logic has one copy (rove#502).
 const KV_GUARDS_JS = @embedFile("js/kv_guards.js");
 
+/// `request.tag` validation, shared with the arena the same way. Spliced
+/// AFTER the kv guards, which define the `__utf8Len` it measures with.
+const TAG_GUARDS_JS = @embedFile("js/tag_guards.js");
+
 /// Bytes the worker accepts for a kv key / value, from the shared leaf so
 /// the prelude and the native enforce one number.
 const kv_guard_key_max: usize = reserved.KV_KEY_MAX;
 const kv_guard_val_max: usize = reserved.KV_VAL_MAX;
 
-const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ SHIM_WRITABLE_JS ++ KV_GUARDS_JS ++ "\n" ++ EPILOGUE_BODY_TAIL;
+const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ SHIM_WRITABLE_JS ++ KV_GUARDS_JS ++ "\n" ++ TAG_GUARDS_JS ++ "\n" ++ EPILOGUE_BODY_TAIL;
 
 const EPILOGUE_BODY_HEAD =
     \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
@@ -769,17 +777,11 @@ const EPILOGUE_BODY_TAIL =
     \\  // {kind:"tag"} so tests can assert what would index the log record.
     \\  const __tags = [];
     \\  request.tag = function (k, v) {
-    \\    if (arguments.length < 2 || typeof k !== "string" || typeof v !== "string") throw new TypeError("request.tag(key, value) requires two string arguments");
-    \\    const kb = __utf8Encode(k).length, vb = __utf8Encode(v).length;
-    \\    if (kb < 1 || kb > 32) throw new TypeError("request.tag: key length must be 1..32 bytes");
-    \\    if (k[0] === "_") throw new TypeError("request.tag: keys starting with '_' are reserved");
-    \\    if (!/^[a-z0-9_]+$/.test(k)) throw new TypeError("request.tag: key must match [a-z0-9_]");
-    \\    if (vb < 1 || vb > 64) throw new TypeError("request.tag: value length must be 1..64 bytes");
-    \\    for (let i = 0; i < v.length; i++) if (v.charCodeAt(i) < 0x20) throw new TypeError("request.tag: value must not contain control characters");
+    \\    __tagGuardPair(k, v, arguments.length);
     \\    const hit = __tags.find((t) => t.key === k);
     \\    if (hit) hit.value = v;
     \\    else {
-    \\      if (__tags.length >= 4) throw new TypeError("request.tag: too many tags (max 4 per request)");
+    \\      __tagGuardCapacity(__tags.length);
     \\      __tags.push({ key: k, value: v });
     \\    }
     \\    __effects.push({ kind: "tag", key: k, value: v });

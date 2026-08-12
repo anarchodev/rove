@@ -509,6 +509,11 @@ make a MISSING guard visible, and that is the failure that actually happened:
 the arena went without every kv guard until a conformance case looked, because
 absence has no author and appears in no diff.
 
+The check is presence, and presence is a weak signal on purpose. It cannot
+see a guard whose message drifted — the arena had all six `request.tag`
+rules and one of them said something different (rove#505). That is the
+conformance corpus' half of the job, and the two are complements.
+
 So the inventory is a check, not prose. `scripts/ops/guard_parity_lint.py`
 runs on `zig build test` and fails when an engine lacks a guard the others
 have, unless the gap is declared with an issue. The table below is generated
@@ -517,16 +522,16 @@ copy that drifts:
 
 | surface | rule | worker | sim | arena |
 |---|---|---|---|---|
-| `kv.set / kv.delete` | key or value is not a string-coercible type | yes | yes | yes |
-| `kv.set / kv.delete` | key is in a platform-reserved prefix | yes | yes | yes |
-| `kv.set / kv.delete` | key exceeds the byte cap | yes | yes | yes |
-| `kv.set` | value exceeds the byte cap | yes | yes | yes |
-| `request.tag` | key length must be 1..32 bytes | yes | yes | no (rove#505) |
-| `request.tag` | key may not start with '_' | yes | yes | no (rove#505) |
-| `request.tag` | key charset is [a-z0-9_] | yes | yes | no (rove#505) |
-| `request.tag` | value length must be 1..64 bytes | yes | yes | no (rove#505) |
-| `request.tag` | value has no control characters | yes | yes | no (rove#505) |
-| `request.tag` | at most 4 tags per request | yes | yes | no (rove#505) |
+| `kv.set / kv.delete` | key or value is not a string-coercible type | yes | yes | ? |
+| `kv.set / kv.delete` | key is in a platform-reserved prefix | yes | yes | ? |
+| `kv.set / kv.delete` | key exceeds the byte cap | yes | yes | ? |
+| `kv.set` | value exceeds the byte cap | yes | yes | ? |
+| `request.tag` | key length within the byte cap | yes | yes | ? |
+| `request.tag` | key may not start with '_' | yes | yes | ? |
+| `request.tag` | key charset is [a-z0-9_] | yes | yes | ? |
+| `request.tag` | value length within the byte cap | yes | yes | ? |
+| `request.tag` | value has no control characters | yes | yes | ? |
+| `request.tag` | at most 4 tags per request | yes | yes | ? |
 
 Presence is all this proves. Whether a guard *behaves* the same across engines
 is the conformance corpus' question and is strictly better evidence — but a
