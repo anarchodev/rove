@@ -91,24 +91,6 @@ class Known:
 # ids.
 KNOWN: tuple[Known, ...] = (
     Known(
-        # Every comparison involving the arena on the prefix-read world, and
-        # only those — prod~sim must stay compared, which is what proves the
-        # worker-side fix this world was added with. "replay" appears only in
-        # engine-pair names, so the glob cannot leak onto another field.
-        pattern="kvprefixes/page-rw/*replay*",
-        engines=("replay",),
-        issue=517,
-        why=(
-            "the arena's kv.prefix host serves the recorded-scan index only and "
-            "never consults the write overlay (_arena_host_kv_prefix, arenajs "
-            "qjs-arena-replay-bindings.c) — an authored world's scan returns [] "
-            "and same-activation writes are invisible, where prod and the sim "
-            "reconstruct the page from live/closed-world state. Fix is "
-            "cross-repo (arenajs EM_JS + the committed wasm in rewind-apps); "
-            "this entry is deleted by the rove change that proves it green."
-        ),
-    ),
-    Known(
         # Scoped to the one case that proves it rather than `*/*/effects/…`:
         # a pattern that wide would excuse every effect-log divergence between
         # these two engines, which is most of what the suite is for. Widen it
