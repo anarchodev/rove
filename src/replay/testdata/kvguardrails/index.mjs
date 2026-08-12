@@ -81,6 +81,21 @@ export default function () {
     out.overflow = cap(() => request.tag("dd", "1"));
     return out;
   }
+  // A customer prefix READ that every engine can run identically: the prod
+  // conformance adapter deploys sources and fires requests — it has no
+  // kv-seed channel — so the rows are written by the handler itself. This is
+  // the route that executes the prefix element of the interaction digest
+  // cross-engine (`p <prefix> 1 <count> <rowsfold>`): the worker folds it in
+  // globals_kv.zig foldPrefix, the sim in the epilogue kv wrapper, the arena
+  // in request-replay.mjs — three call sites of one accumulator, and this is
+  // what proves they agree.
+  if (p === "/page-rw") {
+    kv.set("pagerw/1", "a");
+    kv.set("pagerw/2", "bb");
+    kv.set("pagerw/3", "ccc");
+    const rows = kv.prefix("pagerw/");
+    return { n: rows.length, keys: rows.map((r) => r.key) };
+  }
   if (p === "/page-default") return { n: kv.prefix("orders/").length };
   if (p === "/page-explicit") return { n: kv.prefix("orders/", null, 5).length };
   if (p === "/page-over") return { n: kv.prefix("orders/", null, 5000).length };

@@ -735,8 +735,13 @@ const EPILOGUE_BODY_TAIL =
     \\    // (prefix, cursor, limit), so offline paging matches live paging with
     \\    // no adapter. A scan under the store namespace (a facade call) returns
     \\    // raw for the facade to strip; any other scan filters the namespaced
-    \\    // keys out.
-    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, cursor, limit); if (p.startsWith(__NS)) return r; __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return (r || []).filter((e) => !e.key.startsWith(__NS)); },
+    \\    // keys out. The digest entry carries `count` + `rowsFold`
+    \\    // (`key=<valuehash>;` per row IN ORDER, over the rows the handler
+    \\    // observes) — the same accumulator the worker (globals_kv.zig
+    \\    // foldPrefix) and the browser arena's kv wrapper build, so all three
+    \\    // engines fold the identical scan. Folding 0/0 instead makes every
+    \\    // prefix scan digest alike — a false AGREEMENT, not merely a mismatch.
+    \\    prefix(p, cursor, limit) { const raw = __kvNative.prefix(p, cursor, limit); if (p.startsWith(__NS)) return raw; const rows = (raw || []).filter((e) => !e.key.startsWith(__NS)); const enc = globalThis.__interactionDigest; let fold = "0"; if (enc) { let acc = ""; for (const r of rows) acc += r.key + "=" + enc.foldValue(r.value) + ";"; fold = enc.foldValue(acc); } __effects.push({ kind: "read", op: "prefix", key: p, count: rows.length, rowsFold: fold }); return rows; },
     \\  };
     \\  // request.tag(key, value) — prod's validation verbatim (globals.zig
     \\  // jsRequestTag): two strings; key 1..32 BYTES of [a-z0-9_], non-'_'
