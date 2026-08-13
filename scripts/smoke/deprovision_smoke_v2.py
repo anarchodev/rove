@@ -41,7 +41,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import MOVE_SECRET, PUBLIC_SUFFIX, V2Cluster, _curl, rpc_wrap  # noqa: E402
+from smoke_lib_v2 import (  # noqa: E402
+    MOVE_SECRET, PUBLIC_SUFFIX, V2Cluster, _curl, attach_bundle, rpc_wrap,
+)
 
 TENANT = "tobedeleted"
 SRC = 'export function handler() { return "alive\\n"; }\n'
@@ -150,6 +152,69 @@ def main() -> int:
         check("delete __admin__ → 403", r.status == 403, f"got {r.status} {r.body!r}")
         r = c.get("__admin__", "/", host=c.host_for("__admin__"))
         check("__admin__ still serves", r.status in (200, 405), f"got {r.status}")
+
+        print("step 8: ⭐ residue of a previous lifetime yields to the minted"
+              " incarnation (rove#531)")
+        # Plant a stale-lifetime instance on node 1 ONLY — the shape a node is
+        # left in when its instance-marker deletion doesn't survive a restart.
+        # On prod, one node re-attached a reborn tenant under the DELETED
+        # lifetime's incarnation while its peers minted fresh: the deploy then
+        # staged its manifest under one storage prefix, the serving leader
+        # loaded from another, and the tenant answered "no deployment"
+        # forever. The attach door is how the CP creates instances, so it is
+        # also the door that plants one.
+        T2 = "reborn531"
+        empty_bundle = str(c.data_dirs[0].parent / "empty-bundle-531")
+        Path(empty_bundle).write_bytes(b"")
+        st = attach_bundle(f"{c.node_url(0)}/_system/v2-attach", empty_bundle,
+                           tenant=T2, incarnation="deadbeefdeadbeef")
+        check("plant a stale-lifetime instance on node 1 → 204", st == "204",
+              f"got {st}")
+        r = cp("provision", {"tenant": T2})
+        check("provision the same name → 200 (mints a fresh incarnation)",
+              r.status == 200, f"got {r.status} {r.body!r}")
+        dep = c.deploy_handlers(T2, {"index.mjs": rpc_wrap(
+            'export function handler() { kv.set("alive531", "yes");'
+            ' return "reborn531-alive\\n"; }\n')})
+        check("deploy despite the planted residue → dep_id", bool(dep),
+              f"dep_id={dep}")
+        r = c.wait_for_handler(T2, "/?fn=handler", want_body="reborn531-alive")
+        check("serves through the front (no 'no deployment')",
+              r.status == 200 and "reborn531-alive" in r.body,
+              f"got {r.status} {r.body!r}")
+        # Every node must resolve the SAME (minted) store: a node still
+        # holding the planted marker resolves the stale store and reads
+        # absent. The write replicates via raft; poll briefly per node.
+        for i in range(len(c.node_ports)):
+            deadline = time.time() + 15.0
+            rr = None
+            while time.time() < deadline:
+                rr = _curl(f"{c.node_url(i)}/_system/v2-kv?tenant={T2}"
+                           "&key=alive531",
+                           headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+                if rr.status == 200 and "yes" in rr.body:
+                    break
+                time.sleep(0.5)
+            check(f"node {i + 1} resolves the reborn store (kv readable)",
+                  rr is not None and rr.status == 200 and "yes" in rr.body,
+                  f"got {rr.status} {rr.body!r}" if rr else "no response")
+        # THE decisive assertion: no node's deployment loader may be spinning
+        # on the reborn tenant. With split incarnations the deploy stages its
+        # manifest under ONE node's prefix, and every node on the other side
+        # of the split retries `NoDeployment` forever — whichever node the
+        # stale marker survives on. The serve-through-the-front check above
+        # can pass regardless (the front reaches whichever node loaded), so
+        # the loader logs are the only place the split is always visible.
+        time.sleep(3.0)  # give a mis-keyed loader a beat to log its retry
+        for i in range(len(c.node_ports)):
+            log_path = c.log_paths.get(f"n{i + 1}", "")
+            spinning = False
+            if log_path and Path(log_path).exists():
+                spinning = f"deployment loader: tenant {T2}" in \
+                    Path(log_path).read_text(errors="replace")
+            check(f"node {i + 1} loader is not spinning on {T2}", not spinning,
+                  "" if not spinning else
+                  "loader retries NoDeployment — incarnations split across nodes")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
