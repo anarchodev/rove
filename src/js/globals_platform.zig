@@ -242,7 +242,10 @@ pub fn jsPlatformRootGet(
     // activation already wrote to the root store is reproduced offline by
     // re-running the write into the same namespace, so it carries no replay
     // information and stays off the tape.
-    const skip_tape = if (state.root_writeset) |ws| ws.containsKey(key) else false;
+    const skip_tape = if (state.root_writeset) |ws|
+        ws.containsKeySince(state.root_ws_base, key)
+    else
+        false;
 
     const value = tenant.root.get(key) catch |err| switch (err) {
         error.NotFound => {

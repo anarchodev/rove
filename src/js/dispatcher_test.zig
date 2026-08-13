@@ -2007,6 +2007,86 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     try testing.expect(ws.containsKey("own"));
 }
 
+test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (rove#532)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export function first() {
+        \\    kv.set("count", "1");
+        \\    return "a";
+        \\}
+        \\export function second() {
+        \\    const v = kv.get("count");
+        \\    kv.set("count", "2");
+        \\    return String(v);
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
+    // ONE txn + ONE writeset across both runs — the worker's batch shape
+    // (several same-tenant activations share them; one raft `multi` entry).
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+
+    var rs1 = tape_mod.Readset.init(testing.allocator, 0, 0);
+    defer rs1.deinit();
+    var budget1 = Budget.fromNow(Budget.default_duration_ns);
+    var r1 = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        .method = "POST",
+        .path = "/",
+        .fn_override = "first",
+        .trace = .{ .readset = &rs1 },
+    }, &budget1);
+    defer r1.deinit(testing.allocator);
+
+    var rs2 = tape_mod.Readset.init(testing.allocator, 0, 0);
+    defer rs2.deinit();
+    var budget2 = Budget.fromNow(Budget.default_duration_ns);
+    var r2 = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        .method = "POST",
+        .path = "/",
+        .fn_override = "second",
+        .trace = .{ .readset = &rs2 },
+    }, &budget2);
+    defer r2.deinit(testing.allocator);
+
+    // The second activation read the first's write through the shared txn.
+    try testing.expectEqualStrings("1", r2.body);
+
+    // Its record replays ALONE, so that read is FOREIGN and must be taped —
+    // eliding it against the shared batch writeset left the record
+    // unreplayable (rove#532: the value exists nowhere the replay can
+    // reach; the host-side poison fires "read by the handler but not on
+    // the capture tape").
+    try testing.expectEqual(@as(usize, 1), rs2.kv.entries.items.len);
+    const e = rs2.kv.entries.items[0].kv;
+    try testing.expectEqual(tape_mod.KvOp.get, e.op);
+    try testing.expectEqualStrings("count", e.key);
+    try testing.expectEqualStrings("1", e.value);
+    try testing.expectEqual(tape_mod.KvOutcome.ok, e.outcome);
+
+    // The first activation taped nothing (it only wrote), and the batch
+    // writeset holds both activations' writes for replication.
+    try testing.expectEqual(@as(usize, 0), rs1.kv.entries.items.len);
+    try testing.expectEqual(@as(usize, 2), ws.ops.items.len);
+}
+
 test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

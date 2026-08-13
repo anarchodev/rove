@@ -68,10 +68,16 @@ wire only after the activation that produced it commits — and a blob coordinat
   synchronously on a formed group it doesn't lead — nothing enters the log, so
   re-executing elsewhere is safe), and a write self-routes to the leader; a
   read is served by any synced node. Streaming changes the mechanics, not the
-  contract: a 421 (or transport error before any response) re-aims at the next
-  node by REPLAYING the request body from a replay buffer — kept whole for
-  body-complete (classic/h1) requests at any size, and up to 256 KiB for
-  streamed bodies. A streamed body past the cap maps a 421 to a plain
+  contract: a 421 (or a transport error before the request head reached the
+  wire) re-aims at the next node by REPLAYING the request body from a replay
+  buffer — kept whole for body-complete (classic/h1) requests at any size, and
+  up to 256 KiB for streamed bodies. A transport error AFTER the head went out
+  is ambiguous for **every method** — the worker may have executed the handler
+  and committed before the connection died, and a rewind GET writes kv exactly
+  like a POST (one client GET became two committed counter increments when
+  read-shaped methods still had the RFC 9110 benefit of the doubt) — so it
+  502s and the client's retry policy owns the at-least-once decision. A
+  streamed body past the cap maps a 421 to a plain
   retryable 503 (nothing executed — the follower refused at the door). A
   **503 is never retried by the platform**: the worker's post-propose failures
   (commit-wait fault/timeout, leadership-loss sweep) are ambiguous — the entry

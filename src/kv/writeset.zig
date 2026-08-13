@@ -99,7 +99,20 @@ pub const WriteSet = struct {
     /// tape-size reduction; revisit if writesets routinely grow
     /// past dozens of ops.
     pub fn containsKey(self: *const WriteSet, key: []const u8) bool {
-        for (self.ops.items) |op| {
+        return self.containsKeySince(0, key);
+    }
+
+    /// `containsKey`, scanning only ops appended at index `base` or later.
+    /// The capture-side gate passes the writeset length captured at ITS
+    /// activation's start: the worker batches several same-tenant
+    /// activations into ONE writeset (the raft `multi` entry), and a read
+    /// of a key an EARLIER activation in the batch wrote is a FOREIGN read
+    /// for this one — its record replays alone, so eliding it as an
+    /// own-read leaves the tape unreplayable (rove#532: the value exists
+    /// nowhere the replay can reach).
+    pub fn containsKeySince(self: *const WriteSet, base: usize, key: []const u8) bool {
+        if (base >= self.ops.items.len) return false;
+        for (self.ops.items[base..]) |op| {
             const op_key = switch (op) {
                 .put => |p| p.key,
                 .delete => |d| d.key,
@@ -365,6 +378,21 @@ fn writeRows(kv: *kvstore.KvStore, path: Path, rows: []const Row) !void {
         defer testing.allocator.free(encoded);
         try applyEncodedDirect(kv, 1, encoded);
     }
+}
+
+test "containsKeySince: only ops at or after the baseline count" {
+    var ws = WriteSet.init(std.testing.allocator);
+    defer ws.deinit();
+    try ws.addPut("a", "1");
+    const base = ws.ops.items.len;
+    try ws.addPut("b", "2");
+    try ws.addDelete("c");
+
+    try std.testing.expect(ws.containsKey("a"));
+    try std.testing.expect(!ws.containsKeySince(base, "a"));
+    try std.testing.expect(ws.containsKeySince(base, "b"));
+    try std.testing.expect(ws.containsKeySince(base, "c"));
+    try std.testing.expect(!ws.containsKeySince(ws.ops.items.len, "b"));
 }
 
 test "usage: leader overlay and follower apply agree on the total" {
