@@ -6,67 +6,67 @@
   },
   "admin_deploy_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.0,
+    "seconds": 3.5,
     "status": "pass"
   },
   "agent_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.8,
+    "seconds": 2.7,
     "status": "pass"
   },
   "auto_demote_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.9,
+    "seconds": 3.1,
     "status": "pass"
   },
   "blob_receive_smoke_v2.py": {
     "rc": 0,
-    "seconds": 15.7,
+    "seconds": 17.4,
     "status": "pass"
   },
   "blob_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.1,
+    "seconds": 5.0,
     "status": "pass"
   },
   "bound_fetch_large_body_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.6,
+    "seconds": 4.2,
     "status": "pass"
   },
   "bound_fetch_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.5,
+    "seconds": 2.6,
     "status": "pass"
   },
   "bound_fetch_spool_cleanup_smoke_v2.py": {
     "rc": 0,
-    "seconds": 4.8,
+    "seconds": 5.1,
     "status": "pass"
   },
   "bound_fetch_spool_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.7,
+    "seconds": 2.6,
     "status": "pass"
   },
   "cert_survives_genesis_smoke.py": {
     "rc": 0,
-    "seconds": 10.8,
+    "seconds": 10.7,
     "status": "pass"
   },
   "churn_kv_convergence_smoke_v2.py": {
     "rc": 0,
-    "seconds": 158.9,
+    "seconds": 146.9,
     "status": "pass"
   },
   "confchange_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.7,
+    "seconds": 4.3,
     "status": "pass"
   },
   "config_mirror_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.0,
+    "seconds": 3.6,
     "status": "pass"
   },
   "cp_acme_issue_smoke.py": {
@@ -86,7 +86,7 @@
   },
   "cp_ha_smoke.py": {
     "rc": 0,
-    "seconds": 0.7,
+    "seconds": 0.9,
     "status": "pass"
   },
   "cp_host_smoke.py": {
@@ -101,7 +101,7 @@
   },
   "cp_plan_smoke.py": {
     "rc": 0,
-    "seconds": 0.3,
+    "seconds": 0.2,
     "status": "pass"
   },
   "cp_provision_smoke.py": {
@@ -111,57 +111,62 @@
   },
   "cp_restart_smoke.py": {
     "rc": 0,
-    "seconds": 0.7,
+    "seconds": 0.6,
     "status": "pass"
   },
   "cp_tls_edge_smoke.py": {
     "rc": 0,
-    "seconds": 1.8,
+    "seconds": 1.7,
     "status": "pass"
   },
   "ctl_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.0,
+    "seconds": 2.1,
     "status": "pass"
   },
   "demo_replay_fidelity_smoke_v2.py": {
     "rc": 0,
-    "seconds": 7.9,
+    "seconds": 8.4,
     "status": "pass"
   },
   "deprovision_smoke_v2.py": {
     "rc": 0,
-    "seconds": 9.8,
+    "seconds": 8.0,
     "status": "pass"
   },
   "dispatch_gate_smoke_v2.py": {
     "rc": 0,
-    "seconds": 8.5,
+    "seconds": 8.6,
     "status": "pass"
   },
   "durable_wake_smoke_v2.py": {
     "rc": 0,
-    "seconds": 14.9,
+    "seconds": 15.0,
     "status": "pass"
   },
   "epoch_join_smoke_v2.py": {
     "rc": 0,
-    "seconds": 20.3,
+    "seconds": 20.7,
+    "status": "pass"
+  },
+  "export_door_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 2.2,
     "status": "pass"
   },
   "fetch_ok_semantics_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.3,
+    "seconds": 2.8,
     "status": "pass"
   },
   "fresh_voter_join_smoke_v2.py": {
     "rc": 0,
-    "seconds": 14.8,
+    "seconds": 14.5,
     "status": "pass"
   },
   "front_body_stall_smoke.py": {
     "rc": 0,
-    "seconds": 17.1,
+    "seconds": 17.2,
     "status": "pass"
   },
   "front_connect_timeout_smoke.py": {
@@ -196,42 +201,42 @@
   },
   "front_streaming_smoke_v2.py": {
     "rc": 0,
-    "seconds": 6.1,
+    "seconds": 5.7,
     "status": "pass"
   },
   "front_write_reaim_smoke.py": {
     "rc": 0,
-    "seconds": 5.3,
+    "seconds": 4.0,
     "status": "pass"
   },
   "genesis_ops_smoke.py": {
     "rc": 0,
-    "seconds": 1.2,
+    "seconds": 1.5,
     "status": "pass"
   },
   "genesis_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.8,
+    "seconds": 4.5,
     "status": "pass"
   },
   "graceful_transfer_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.4,
+    "seconds": 2.7,
     "status": "pass"
   },
   "group_recovery_smoke_v2.py": {
     "rc": 0,
-    "seconds": 4.4,
+    "seconds": 4.6,
     "status": "pass"
   },
   "h1_streaming_smoke_v2.py": {
     "rc": 0,
-    "seconds": 17.1,
+    "seconds": 17.8,
     "status": "pass"
   },
   "h2spec_front_smoke_v2.py": {
     "rc": 0,
-    "seconds": 17.8,
+    "seconds": 18.0,
     "status": "pass"
   },
   "held_wakes_smoke_v2.py": {
@@ -241,37 +246,47 @@
   },
   "heldsync_concurrent_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.6,
+    "seconds": 2.5,
     "status": "pass"
   },
   "heldsync_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.7,
+    "seconds": 2.6,
     "status": "pass"
   },
   "http_send_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.6,
+    "seconds": 2.4,
+    "status": "pass"
+  },
+  "idle_write_repro.py": {
+    "rc": 0,
+    "seconds": 226.8,
     "status": "pass"
   },
   "inbound_body_smoke_v2.py": {
     "rc": 0,
-    "seconds": 13.6,
+    "seconds": 13.0,
     "status": "pass"
   },
   "inbound_chunk_smoke_v2.py": {
     "rc": 0,
-    "seconds": 17.8,
+    "seconds": 17.1,
     "status": "pass"
   },
   "interaction_digest_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.8,
+    "seconds": 7.7,
     "status": "pass"
   },
   "kv_cap_smoke_v2.py": {
     "rc": 0,
-    "seconds": 4.5,
+    "seconds": 4.6,
+    "status": "pass"
+  },
+  "kv_export_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 7.2,
     "status": "pass"
   },
   "leader_failover_smoke_v2.py": {
@@ -281,22 +296,22 @@
   },
   "learner_add_smoke_v2.py": {
     "rc": 0,
-    "seconds": 14.4,
+    "seconds": 12.4,
     "status": "pass"
   },
   "log_failover_walker_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.8,
+    "seconds": 7.3,
     "status": "pass"
   },
   "log_tenant_scope_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.3,
+    "seconds": 5.4,
     "status": "pass"
   },
   "logs_door_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.4,
+    "seconds": 3.3,
     "status": "pass"
   },
   "logs_roundtrip_smoke_v2.py": {
@@ -306,42 +321,42 @@
   },
   "manifest_overwrite_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.2,
+    "seconds": 2.0,
     "status": "pass"
   },
   "membership_from_snapshot_smoke_v2.py": {
     "rc": 0,
-    "seconds": 8.8,
+    "seconds": 8.6,
     "status": "pass"
   },
   "membership_reconciler_smoke_v2.py": {
     "rc": 0,
-    "seconds": 16.1,
+    "seconds": 15.1,
     "status": "pass"
   },
   "multi_dest_forward_smoke.py": {
     "rc": 0,
-    "seconds": 1.1,
+    "seconds": 3.1,
     "status": "pass"
   },
   "next_target_smoke_v2.py": {
     "rc": 0,
-    "seconds": 9.8,
+    "seconds": 7.2,
     "status": "pass"
   },
   "oidc_rp_smoke_v2.py": {
     "rc": 0,
-    "seconds": 8.4,
+    "seconds": 9.5,
     "status": "pass"
   },
   "oidc_smoke_v2.py": {
     "rc": 0,
-    "seconds": 4.0,
+    "seconds": 4.3,
     "status": "pass"
   },
   "on_fetch_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.8,
+    "seconds": 2.5,
     "status": "pass"
   },
   "on_kv_smoke_v2.py": {
@@ -351,7 +366,17 @@
   },
   "on_timer_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.5,
+    "seconds": 3.8,
+    "status": "pass"
+  },
+  "ops_chokepoint_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.0,
+    "status": "pass"
+  },
+  "outbound_gate_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 8.3,
     "status": "pass"
   },
   "penalty_smoke_v2.py": {
@@ -361,17 +386,17 @@
   },
   "per_arm_wake_export_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.5,
+    "seconds": 3.6,
     "status": "pass"
   },
   "platform_compile_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.5,
+    "seconds": 2.7,
     "status": "pass"
   },
   "platform_deploy_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.4,
+    "seconds": 2.6,
     "status": "pass"
   },
   "platform_scope_kv_smoke_v2.py": {
@@ -381,57 +406,67 @@
   },
   "pm_cli_smoke.py": {
     "rc": 0,
-    "seconds": 3.0,
+    "seconds": 3.1,
     "status": "pass"
   },
   "pm_deploy_smoke.py": {
     "rc": 0,
-    "seconds": 3.9,
+    "seconds": 4.8,
     "status": "pass"
   },
   "pm_genesis_seed_smoke.py": {
     "rc": 0,
-    "seconds": 6.1,
+    "seconds": 7.1,
+    "status": "pass"
+  },
+  "pm_ops_deploy_smoke.py": {
+    "rc": 0,
+    "seconds": 7.1,
     "status": "pass"
   },
   "promote_back_smoke_v2.py": {
     "rc": 0,
-    "seconds": 22.2,
+    "seconds": 20.7,
     "status": "pass"
   },
   "provision_host_alias_smoke_v2.py": {
     "rc": 0,
-    "seconds": 1.9,
+    "seconds": 2.0,
     "status": "pass"
   },
   "raft_pending_parity_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.3,
+    "seconds": 5.4,
     "status": "pass"
   },
   "raft_soak_prod.py": {
     "rc": 0,
-    "seconds": 203.5,
+    "seconds": 202.1,
     "status": "pass"
   },
   "raft_soak_v2.py": {
-    "rc": 1,
-    "seconds": 100.9,
-    "status": "fail"
+    "rc": 0,
+    "seconds": 101.4,
+    "status": "pass"
   },
   "rate_limit_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.8,
+    "seconds": 3.5,
     "status": "pass"
   },
   "replay_matrix_smoke_v2.py": {
     "rc": 0,
-    "seconds": 35.9,
+    "seconds": 36.2,
+    "status": "pass"
+  },
+  "replay_platform_reads_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.4,
     "status": "pass"
   },
   "replay_prefix_writeset_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.8,
+    "seconds": 3.0,
     "status": "pass"
   },
   "replay_reorder_smoke.py": {
@@ -441,17 +476,17 @@
   },
   "replay_tags_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.7,
+    "seconds": 3.8,
     "status": "pass"
   },
   "replay_wasm_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.3,
+    "seconds": 3.5,
     "status": "pass"
   },
   "repro_admin_deploy.py": {
     "rc": 0,
-    "seconds": 1.6,
+    "seconds": 1.7,
     "status": "pass"
   },
   "reset_smoke_v2.py": {
@@ -461,7 +496,7 @@
   },
   "resume_rearm_wake_smoke_v2.py": {
     "rc": 0,
-    "seconds": 4.0,
+    "seconds": 4.1,
     "status": "pass"
   },
   "rewind_cli_smoke_v2.py": {
@@ -471,7 +506,7 @@
   },
   "rewind_customer_smoke_v2.py": {
     "rc": 0,
-    "seconds": 6.2,
+    "seconds": 5.6,
     "status": "pass"
   },
   "rewind_publish_smoke_v2.py": {
@@ -481,37 +516,37 @@
   },
   "rewind_smoke.py": {
     "rc": 0,
-    "seconds": 0.6,
+    "seconds": 0.5,
     "status": "pass"
   },
   "s3_blob_smoke_v2.py": {
     "rc": 0,
-    "seconds": 1.4,
+    "seconds": 2.3,
     "status": "pass"
   },
   "schedule_cron_smoke_v2.py": {
     "rc": 0,
-    "seconds": 65.5,
+    "seconds": 24.2,
     "status": "pass"
   },
   "schedule_method_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.8,
+    "seconds": 7.9,
     "status": "pass"
   },
   "scheduler_heartbeat_smoke_v2.py": {
     "rc": 0,
-    "seconds": 27.3,
+    "seconds": 28.6,
     "status": "pass"
   },
   "self_serve_provision_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.4,
+    "seconds": 2.5,
     "status": "pass"
   },
   "serve_or_forward_smoke.py": {
     "rc": 0,
-    "seconds": 5.0,
+    "seconds": 4.9,
     "status": "pass"
   },
   "snap_catchup_smoke_v2.py": {
@@ -521,37 +556,37 @@
   },
   "snapshot_catchup_no_fork_smoke_v2.py": {
     "rc": 0,
-    "seconds": 21.1,
+    "seconds": 28.9,
     "status": "pass"
   },
   "snapshot_stream_large_smoke_v2.py": {
     "rc": 0,
-    "seconds": 38.2,
+    "seconds": 44.3,
     "status": "pass"
   },
   "snapshot_trigger_smoke_v2.py": {
     "rc": 0,
-    "seconds": 9.7,
+    "seconds": 8.7,
     "status": "pass"
   },
   "ssrf_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.6,
+    "seconds": 5.7,
     "status": "pass"
   },
   "static_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.1,
+    "seconds": 5.7,
     "status": "pass"
   },
   "storage_cap_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.9,
+    "seconds": 5.1,
     "status": "pass"
   },
   "storage_namespace_smoke_v2.py": {
     "rc": 0,
-    "seconds": 55.3,
+    "seconds": 54.9,
     "status": "pass"
   },
   "stream_effect_smoke_v2.py": {
@@ -561,12 +596,12 @@
   },
   "streaming_disconnect_writes_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.1,
+    "seconds": 3.2,
     "status": "pass"
   },
   "streaming_first_hop_writes_smoke_v2.py": {
     "rc": 0,
-    "seconds": 3.8,
+    "seconds": 4.1,
     "status": "pass"
   },
   "streaming_heartbeat_smoke_v2.py": {
@@ -576,7 +611,7 @@
   },
   "streaming_kv_wake_smoke_v2.py": {
     "rc": 0,
-    "seconds": 6.0,
+    "seconds": 6.3,
     "status": "pass"
   },
   "streaming_kv_wake_writes_smoke_v2.py": {
@@ -586,12 +621,12 @@
   },
   "streaming_resume_fault_inj_smoke_v2.py": {
     "rc": 0,
-    "seconds": 4.5,
+    "seconds": 6.5,
     "status": "pass"
   },
   "streaming_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.0,
+    "seconds": 2.2,
     "status": "pass"
   },
   "streaming_subscription_kv_smoke_v2.py": {
@@ -601,27 +636,27 @@
   },
   "streaming_wake_coalesce_smoke_v2.py": {
     "rc": 0,
-    "seconds": 6.1,
+    "seconds": 6.2,
     "status": "pass"
   },
   "streaming_write_pressure_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.1,
+    "seconds": 5.0,
     "status": "pass"
   },
   "subscription_cap_smoke_v2.py": {
     "rc": 0,
-    "seconds": 5.7,
+    "seconds": 5.6,
     "status": "pass"
   },
   "subscription_smoke_v2.py": {
     "rc": 0,
-    "seconds": 4.8,
+    "seconds": 5.1,
     "status": "pass"
   },
   "teams_smoke_v2.py": {
     "rc": 0,
-    "seconds": 8.0,
+    "seconds": 9.7,
     "status": "pass"
   },
   "tenant_door_smoke_v2.py": {
@@ -631,18 +666,18 @@
   },
   "tenant_move_smoke.py": {
     "rc": 0,
-    "seconds": 0.6,
+    "seconds": 0.5,
     "status": "pass"
   },
   "three_node_smoke.py": {
     "rc": 0,
-    "seconds": 1.0,
+    "seconds": 1.1,
     "status": "pass"
   },
   "tls_large_body_smoke.py": {
-    "rc": 1,
-    "seconds": 128.8,
-    "status": "fail"
+    "rc": 0,
+    "seconds": 114.3,
+    "status": "pass"
   },
   "triggers_smoke_v2.py": {
     "rc": 0,
@@ -651,7 +686,7 @@
   },
   "ttfb_idle_reuse_smoke.py": {
     "rc": 0,
-    "seconds": 58.6,
+    "seconds": 58.5,
     "status": "pass"
   },
   "two_cluster_smoke.py": {
@@ -661,17 +696,22 @@
   },
   "utf8_encode_smoke_v2.py": {
     "rc": 0,
-    "seconds": 1.8,
+    "seconds": 2.1,
+    "status": "pass"
+  },
+  "wake_target_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 21.9,
     "status": "pass"
   },
   "webhook_recovery_smoke_v2.py": {
     "rc": 0,
-    "seconds": 8.9,
+    "seconds": 8.8,
     "status": "pass"
   },
   "webhook_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.5,
+    "seconds": 2.7,
     "status": "pass"
   },
   "ws_echo_smoke.py": {
@@ -681,22 +721,22 @@
   },
   "ws_fetch_smoke_v2.py": {
     "rc": 0,
-    "seconds": 1.9,
+    "seconds": 2.1,
     "status": "pass"
   },
   "ws_ordering_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.3,
+    "seconds": 2.0,
     "status": "pass"
   },
   "ws_wake_smoke_v2.py": {
     "rc": 0,
-    "seconds": 2.5,
+    "seconds": 2.4,
     "status": "pass"
   },
   "ws_worker_smoke_v2.py": {
     "rc": 0,
-    "seconds": 1.9,
+    "seconds": 2.0,
     "status": "pass"
   },
   "zero_downtime_forward_smoke.py": {
