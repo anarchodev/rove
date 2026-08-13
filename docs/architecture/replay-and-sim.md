@@ -500,43 +500,22 @@ result/ctx surface directly. See
 
 ## 6.5 Handler-facing guards, per engine
 
-Three engines run customer handlers, and each enforces the handler-facing
-rules in its own code — the worker in Zig at the natives, the sim + native
-replay in `epilogue.zig`'s prelude, the browser arena in the prelude
-`gen_replay_prelude.py` composes. Sharing a rule's text (as
-`src/replay/js/kv_guards.js` does) removes drift between copies. It cannot
-make a MISSING guard visible, and that is the failure that actually happened:
-the arena went without every kv guard until a conformance case looked, because
-absence has no author and appears in no diff.
+There is exactly ONE evaluator of the handler-facing rules. Every engine —
+the worker, the sim / native replay driver, and the browser WASM arena —
+registers the same compiled binding (`rove-binding`, calling `rove-guards`):
+the native engines link it directly, and the arena links it via the in-tree
+wasm build (`zig build wasm-arena`, rove Zig + arenajs C through the
+reactor's ROVE_ARENA seam). Coercion, the rule order, every refusal shape,
+the effect entries, outcome-replay (taped refusals, tape v7) and the
+poison-model divergence verdict are the same machine code everywhere.
 
-The check is presence, and presence is a weak signal on purpose. It cannot
-see a guard whose message drifted — the arena had all six `request.tag`
-rules and one of them said something different (rove#505). That is the
-conformance corpus' half of the job, and the two are complements.
+Because there is no second statement of the rules, there is nothing whose
+PRESENCE can lag — the guard-parity lint and the Zig↔JS differential test
+retired with the emitted-JS evaluator they policed. What remains checkable
+is behaviour, and that is the conformance corpus' job (`scripts/conformance/`,
+folded into `zig build test`): one corpus of handler behaviour, executed on
+every engine, failing when any two disagree.
 
-So the inventory is a check, not prose. `scripts/ops/guard_parity_lint.py`
-runs on `zig build test` and fails when an engine lacks a guard the others
-have, unless the gap is declared with an issue. The table below is generated
-from it (`--table`) — regenerate rather than hand-edit, or it becomes another
-copy that drifts:
-
-| surface | rule | worker | sim | arena |
-|---|---|---|---|---|
-| `kv.set / kv.delete` | key or value is not a string-coercible type | yes | yes | ? |
-| `kv.set / kv.delete` | key is in a platform-reserved prefix | yes | yes | ? |
-| `kv.set / kv.delete` | key exceeds the byte cap | yes | yes | ? |
-| `kv.set` | value exceeds the byte cap | yes | yes | ? |
-| `request.tag` | key length within the byte cap | yes | yes | ? |
-| `request.tag` | key may not start with '_' | yes | yes | ? |
-| `request.tag` | key charset is [a-z0-9_] | yes | yes | ? |
-| `request.tag` | value length within the byte cap | yes | yes | ? |
-| `request.tag` | value has no control characters | yes | yes | ? |
-| `request.tag` | at most 4 tags per request | yes | yes | ? |
-
-Presence is all this proves. Whether a guard *behaves* the same across engines
-is the conformance corpus' question and is strictly better evidence — but a
-case only covers what someone remembered to write, and this covers what nobody
-did.
 
 ## 7. See also
 

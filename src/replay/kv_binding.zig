@@ -173,99 +173,9 @@ pub const OfflineKv = struct {
         return responder(key.ptr, @intCast(key.len), value.ptr, @intCast(value.len), &outcome, host.active_user) == 0;
     }
 
-    // ── the effect log ───────────────────────────────────────────────────
+    // ── the effect log — the shared binding helpers (binding.Effects) ────
 
-    /// Push one entry through `globalThis.__rove_effects`'s PATCHED push, so
-    /// the interaction digest folds it at the same point the JS pushes fold.
-    /// Consumes `obj`. Best-effort: with no effect sink installed (a bare
-    /// run) the entry is dropped, matching a wrapper-less run before.
-    fn pushEffect(self: OfflineKv, obj: c.JSValue) void {
-        const g = c.JS_GetGlobalObject(self.ctx);
-        defer c.JS_FreeValue(self.ctx, g);
-        const arr = c.JS_GetPropertyStr(self.ctx, g, "__rove_effects");
-        defer c.JS_FreeValue(self.ctx, arr);
-        if (!c.JS_IsObject(arr)) {
-            c.JS_FreeValue(self.ctx, obj);
-            return;
-        }
-        const push = c.JS_GetPropertyStr(self.ctx, arr, "push");
-        defer c.JS_FreeValue(self.ctx, push);
-        var argv = [1]c.JSValue{obj};
-        const r = c.JS_Call(self.ctx, push, arr, 1, &argv);
-        if (c.JS_IsException(r)) {
-            // A throwing push must not fail the kv op — clear and continue.
-            const ex = c.JS_GetException(self.ctx);
-            c.JS_FreeValue(self.ctx, ex);
-        }
-        c.JS_FreeValue(self.ctx, r);
-        c.JS_FreeValue(self.ctx, obj);
-    }
-
-    fn newStr(self: OfflineKv, s: []const u8) c.JSValue {
-        return c.JS_NewStringLen(self.ctx, s.ptr, s.len);
-    }
-
-    /// A present read carries its value — the digest folds `r <key> 1
-    /// <valuehash>`, and the worker folds the real bytes (foldRead), so an
-    /// entry without the value folds a different element on every present
-    /// read. The browser arena's wrapper pushes exactly this shape; the old
-    /// sim wrapper pushed present-only entries and silently folded "" — a
-    /// latent cross-engine digest divergence no corpus case exercised. An
-    /// absent read omits the field rather than spelling it "" (the arena's
-    /// posture: an entry differing only in how it spells absence reads as a
-    /// divergence while the digest says the runs agreed).
-    fn effectRead(self: OfflineKv, key: []const u8, value: ?[]const u8) void {
-        const o = c.JS_NewObject(self.ctx);
-        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("read"));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(key));
-        // Hand-built bool JSValue: this header's JS_NewBool translates to
-        // invalid Zig (a bool assigned to the int32 union arm).
-        const present = c.JSValue{ .u = .{ .int32 = @intFromBool(value != null) }, .tag = c.JS_TAG_BOOL };
-        _ = c.JS_SetPropertyStr(self.ctx, o, "present", present);
-        if (value) |v| _ = c.JS_SetPropertyStr(self.ctx, o, "value", self.newStr(v));
-        self.pushEffect(o);
-    }
-
-    fn effectWrite(self: OfflineKv, key: []const u8, value: []const u8) void {
-        const o = c.JS_NewObject(self.ctx);
-        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("write"));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(key));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "value", self.newStr(value));
-        self.pushEffect(o);
-    }
-
-    fn effectDelete(self: OfflineKv, key: []const u8) void {
-        const o = c.JS_NewObject(self.ctx);
-        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("delete"));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(key));
-        self.pushEffect(o);
-    }
-
-    /// `count` + `rowsFold` (`key=<valuehash>;` per row IN ORDER, lowercase
-    /// hex) — the same accumulator the worker folds (globals_kv.foldPrefix)
-    /// and the browser arena's wrapper computes, over the rows the handler
-    /// observes.
-    fn effectPrefix(self: OfflineKv, p: []const u8, entries: anytype) void {
-        var acc: std.ArrayList(u8) = .empty;
-        defer acc.deinit(std.heap.c_allocator);
-        var acc_ok = true;
-        for (entries) |e| {
-            acc.writer(std.heap.c_allocator).print("{s}={x};", .{ e.key, digest_mod.foldValue(e.value) }) catch {
-                acc_ok = false;
-                break;
-            };
-        }
-        if (!acc_ok) return;
-        var fold_buf: [16]u8 = undefined;
-        const fold_hex = std.fmt.bufPrint(&fold_buf, "{x}", .{digest_mod.foldValue(acc.items)}) catch return;
-        const o = c.JS_NewObject(self.ctx);
-        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("read"));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "op", self.newStr("prefix"));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(p));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "count", c.JS_NewInt64(self.ctx, @intCast(entries.len)));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "rowsFold", self.newStr(fold_hex));
-        self.pushEffect(o);
-    }
+    const FX = binding.Effects(c);
 
     // ── kv-trigger chains ────────────────────────────────────────────────
 
@@ -298,11 +208,11 @@ pub const OfflineKv = struct {
         const undef = c.JSValue{ .u = .{ .int32 = 0 }, .tag = c.JS_TAG_UNDEFINED };
         const nul = c.JSValue{ .u = .{ .int32 = 0 }, .tag = c.JS_TAG_NULL };
         var argv = [5]c.JSValue{
-            self.newStr(op),
-            self.newStr(timing),
-            self.newStr(key),
-            if (value) |v| self.newStr(v) else nul,
-            if (prev) |p| self.newStr(p) else nul,
+            c.JS_NewStringLen(self.ctx, op.ptr, op.len),
+            c.JS_NewStringLen(self.ctx, timing.ptr, timing.len),
+            c.JS_NewStringLen(self.ctx, key.ptr, key.len),
+            if (value) |v| c.JS_NewStringLen(self.ctx, v.ptr, v.len) else nul,
+            if (prev) |p| c.JS_NewStringLen(self.ctx, p.ptr, p.len) else nul,
         };
         defer for (argv) |a| c.JS_FreeValue(self.ctx, a);
         const r = c.JS_Call(self.ctx, f, undef, argv.len, &argv);
@@ -343,7 +253,7 @@ pub const OfflineKv = struct {
             var mbuf: [96]u8 = undefined;
             const mkey = std.fmt.bufPrint(&mbuf, "_sub/dirty/{s}", .{sub.name}) catch continue;
             if (!self.rawSet(mkey, sub.prefix)) continue;
-            self.effectWrite(mkey, sub.prefix);
+            FX.write(self.ctx, mkey, sub.prefix);
         }
     }
 
@@ -374,16 +284,16 @@ pub const OfflineKv = struct {
                 // pointer only when the slice is non-empty).
                 if (val == null or val_len == 0) {
                     if (val != null) std.c.free(val);
-                    if (!facade) self.effectRead(key, "");
+                    if (!facade) FX.read(self.ctx, key, "");
                     return .{ .value = "" };
                 }
                 const v: []const u8 = val[0..@intCast(val_len)];
-                if (!facade) self.effectRead(key, v);
+                if (!facade) FX.read(self.ctx, key, v);
                 return .{ .value = v };
             },
             .not_found => {
                 if (val != null) std.c.free(val);
-                if (!facade) self.effectRead(key, null);
+                if (!facade) FX.read(self.ctx, key, null);
                 return .absent;
             },
             .err => {
@@ -453,7 +363,7 @@ pub const OfflineKv = struct {
             return false;
         }
 
-        self.effectWrite(key, write_value);
+        FX.write(self.ctx, key, write_value);
         self.markSubscriptionsDirty(key);
 
         switch (self.runTriggers("put", "after", key, write_value, prev)) {
@@ -499,7 +409,7 @@ pub const OfflineKv = struct {
             return false;
         }
 
-        self.effectDelete(key);
+        FX.del(self.ctx, key);
         self.markSubscriptionsDirty(key);
 
         switch (self.runTriggers("delete", "after", key, null, prev)) {
@@ -565,7 +475,7 @@ pub const OfflineKv = struct {
             n += 1;
         }
         const rows = parsed.value[0..n];
-        self.effectPrefix(p, rows);
+        FX.prefixScan(self.ctx, std.heap.c_allocator, p, rows);
         return .{ .parsed = parsed, .json_ptr = json, .entries = rows };
     }
 };
@@ -610,12 +520,7 @@ pub const OfflineTag = struct {
     }
 
     fn effectTag(self: OfflineTag, key: []const u8, val: []const u8) void {
-        const kv = OfflineKv{ .ctx = self.ctx };
-        const o = c.JS_NewObject(self.ctx);
-        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", kv.newStr("tag"));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "key", kv.newStr(key));
-        _ = c.JS_SetPropertyStr(self.ctx, o, "value", kv.newStr(val));
-        kv.pushEffect(o);
+        binding.Effects(c).tag(self.ctx, key, val);
     }
 
     pub fn tagUpdate(self: OfflineTag, key: []const u8, val: []const u8) bool {

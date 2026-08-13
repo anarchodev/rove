@@ -567,21 +567,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     guards_mod.addImport("rove-reserved", reserved_mod);
-    // `zig build gen-guards` writes the JS interpreter of the shared rules.
-    // Committed rather than generated at build time because the Python that
-    // composes the arena prelude cannot run Zig comptime; `epilogue.zig`
-    // asserts the committed copy still matches the emitter.
-    const gen_guards_mod = b.createModule(.{
-        .root_source_file = b.path("src/guards/gen_main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    gen_guards_mod.addImport("rove-guards", guards_mod);
-    const gen_guards_exe = b.addExecutable(.{ .name = "gen-guards", .root_module = gen_guards_mod });
-    const gen_guards_run = b.addRunArtifact(gen_guards_exe);
-    gen_guards_run.addArg("src/replay/js/guards.generated.js");
-    b.step("gen-guards", "Regenerate src/replay/js/guards.generated.js from rove-guards")
-        .dependOn(&gen_guards_run.step);
 
     const guards_tests = b.addTest(.{ .root_module = guards_mod });
     test_step.dependOn(&b.addRunArtifact(guards_tests).step);
@@ -607,6 +592,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     binding_mod.addImport("rove-guards", guards_mod);
+    binding_mod.addImport("interaction-digest", idigest_mod);
+
+    // ── wasm-arena: the browser replay arena, built IN-TREE ──
+    //
+    // rove's Zig (src/arena/root.zig — the common binding + guards + the
+    // arena delegate) compiled to a wasm32-emscripten archive and linked
+    // into arenajs's qjs_arena_wasm via its ROVE_ARENA seam, so the browser
+    // engine runs the SAME compiled checks the worker and the sim run. An
+    // explicit step, not part of `test`: it needs emsdk, and the shipped
+    // artifact is committed in rewind-apps (the replay tenant) — rebuild
+    // here, copy there, republish.
+    const wasm_arena = b.addSystemCommand(&.{"bash"});
+    wasm_arena.addFileArg(b.path("scripts/ops/build_wasm_arena.sh"));
+    wasm_arena.addDirectoryArg(arenajs_dep.path("."));
+    wasm_arena.addArg(b.pathJoin(&.{ b.install_path, "wasm-arena" }));
+    wasm_arena.has_side_effects = true;
+    b.step("wasm-arena", "Build the browser replay arena wasm (rove Zig + arenajs C via emscripten)")
+        .dependOn(&wasm_arena.step);
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
@@ -1827,26 +1830,12 @@ pub fn build(b: *std.Build) void {
     prelude_fresh.has_side_effects = true;
     prelude_fresh.expectExitCode(0);
 
-    // Every handler-facing guard is enforced by every engine, or the gap is
-    // declared with an issue (`scripts/ops/guard_parity_lint.py`). Sharing a
-    // rule's TEXT stops two copies from drifting; it cannot make a MISSING
-    // guard visible, and absence is the failure that has no author and shows
-    // up in no diff — the arena went without every kv guard until a
-    // conformance case happened to look (rove#502).
-    //
-    // Presence only. Whether the guard BEHAVES the same is the conformance
-    // corpus' job and is better evidence; this is the cheap half that does
-    // not depend on someone having remembered to write a case.
-    //
-    // Always run, for the same reason the prelude digest does: declaring
-    // inputs would mean mirroring the lint's own source list here, and a new
-    // guard surface added there but not here would leave the gate
-    // cached-green on exactly the change it exists to catch.
-    const guard_parity = b.addSystemCommand(&.{"python3"});
-    guard_parity.addFileArg(b.path("scripts/ops/guard_parity_lint.py"));
-    guard_parity.has_side_effects = true;
-    guard_parity.expectExitCode(0);
-    test_step.dependOn(&guard_parity.step);
+    // The guard-parity lint is GONE, on purpose: every engine — the worker,
+    // the sim/replay driver, and the browser arena (via the in-tree wasm) —
+    // now executes the ONE compiled implementation of the handler-facing
+    // rules (`rove-binding` + `rove-guards`), so there is no second surface
+    // whose PRESENCE could lag. What remains checkable is behaviour, and
+    // that is the conformance corpus' job.
 
     const conf_selftest = b.addSystemCommand(&.{"python3"});
     conf_selftest.addFileArg(b.path("scripts/conformance/selftest.py"));

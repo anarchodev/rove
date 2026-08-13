@@ -26,7 +26,6 @@ const std = @import("std");
 const decode = @import("tape_decode.zig");
 const host = @import("host.zig");
 const reserved = @import("rove-reserved");
-const guards = @import("rove-guards");
 
 pub const Opts = struct {
     method: []const u8 = "GET",
@@ -335,14 +334,6 @@ const TEXTCODEC_PURE = @embedFile("js/textcodec_pure.js");
 /// wired in through build.zig's `addSimGlobalEmbeds` since it lives outside this
 /// module's package. Shared verbatim with the browser replay arena.
 const JS_INTERACTION_DIGEST = @embedFile("js_interaction_digest");
-
-/// The emitted guard rules — NOT part of this epilogue any more: the native
-/// engines run the checks inside the common binding (`rove-binding`), one
-/// implementation with the worker. Embedded here only so the freshness test
-/// below can hold the COMMITTED file to the emitter for its one remaining
-/// consumer, the browser replay arena (`scripts/ops/gen_replay_prelude.py`
-/// splices it), until the in-tree wasm retires that too.
-const GUARDS_JS = @embedFile("js/guards.generated.js");
 
 const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ EPILOGUE_BODY_TAIL;
 
@@ -1030,26 +1021,6 @@ test "build: GET embeds request meta + parks output under sentinel" {
     try testing.expect(std.mem.indexOf(u8, src, "__rove_park_output(__out)") != null);
 }
 
-test "the committed guards.generated.js is what the emitter produces" {
-    // The browser arena's prelude splices a COMMITTED artifact, because the
-    // Python that composes it cannot run Zig comptime. That artifact is a
-    // rendering of `rove-guards`, not a second statement of the rules — and
-    // this is what makes that true. Regenerate with `zig build gen-guards`.
-    // (The native engines stopped evaluating it: their checks run inside the
-    // common binding. This gate lives on for the arena, until the in-tree
-    // wasm.)
-    const a = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(a);
-    try guards.emitJs(buf.writer(a));
-    if (!std.mem.eql(u8, buf.items, GUARDS_JS)) {
-        std.debug.print(
-            "\nsrc/replay/js/guards.generated.js is stale — run `zig build gen-guards`\n",
-            .{},
-        );
-        return error.StaleGeneratedGuards;
-    }
-}
 
 test "no guard evaluation is left in the epilogue" {
     // The inverse of the old splice assertion: the native engines' checks
