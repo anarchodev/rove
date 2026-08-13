@@ -216,6 +216,27 @@ def main() -> int:
             check(f"node {i + 1} loader is not spinning on {T2}", not spinning,
                   "" if not spinning else
                   "loader retries NoDeployment — incarnations split across nodes")
+        # The system seed door has NO authority over the incarnation: a PUT
+        # through it must land in the live token-keyed instance, not re-key
+        # the tenant to a default and orphan its deployment (the regression
+        # the first cut of the #531 fix shipped — every seed 503'd the
+        # tenant afterward).
+        seeded = None
+        for i in range(len(c.node_ports)):
+            rr = _curl(f"{c.node_url(i)}/_system/v2-kv", method="PUT",
+                       headers={"X-Rewind-Move-Secret": MOVE_SECRET,
+                                "Content-Type": "application/json"},
+                       data=json.dumps({"tenant": T2, "key": "seeded531",
+                                        "value": "ok"}))
+            if rr.status in (200, 204):
+                seeded = rr
+                break
+        check("v2-kv seed onto the reborn tenant → 204", seeded is not None,
+              "" if seeded is not None else "no node accepted the seed")
+        r = c.wait_for_handler(T2, "/?fn=handler", want_body="reborn531-alive")
+        check("still serves after the seed (the door re-keyed nothing)",
+              r.status == 200 and "reborn531-alive" in r.body,
+              f"got {r.status} {r.body!r}")
 
         print("step 9: ⭐ the reborn tenant's writes reach every node's CURRENT"
               " store (rove#534)")
