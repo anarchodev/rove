@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Every handler-facing guard is enforced by every engine — or the gap is tracked.
 
-Three engines run customer handlers, and each enforces the handler-facing
-rules in its own code: the worker in Zig at the natives, the sim + native
-replay in the prelude `src/replay/epilogue.zig` composes, the browser arena
-in the prelude `gen_replay_prelude.py` composes. Sharing the rule TEXT (as
-`src/replay/js/kv_guards.js` now does) removes the drift between copies, but
-it cannot make a MISSING guard visible: the arena went without every kv guard
-for as long as it did because nobody had a list saying it should have them
-(rove#502). Absence has no author and shows up in no diff.
+Two enforcement surfaces remain. The NATIVE engines — the worker AND the
+sim/native replay driver — run the checks inside the common binding
+(`rove-binding`), one implementation, so they are one surface here; the
+browser arena still evaluates the emitted JS its prelude composes
+(`gen_replay_prelude.py`), until the in-tree wasm. Sharing rule text removes
+drift between copies, but it cannot make a MISSING guard visible: the arena
+went without every kv guard for as long as it did because nobody had a list
+saying it should have them (rove#502). Absence has no author and shows up in
+no diff.
 
 This is that list, as a check rather than a document. Each entry names a
 guard by the marker a customer would see — the error code where there is one,
@@ -46,7 +47,8 @@ ROVE = pathlib.Path(__file__).resolve().parents[2]
 
 # ── the engines, and where each one's enforcement lives ──────────────────
 #
-# `worker` is Zig; the other two are the JS text each prelude builder
+# `native` is Zig (the common binding + the worker's delegate files); the
+# arena is the JS text its prelude builder
 # composes. Reading the composed text rather than the source files is what
 # makes the arena checkable from this repo at all — `build()` assembles it
 # from rove sources alone, which is the same property the digest gate rests
@@ -66,15 +68,11 @@ def _worker_surface() -> str:
     return "\n".join(p.read_text(encoding="utf-8") for p in paths)
 
 
-def _sim_surface() -> str:
-    # The epilogue's own literal plus every JS file it splices — the guards
-    # moved into `js/kv_guards.js`, so reading only the .zig would report
-    # them missing (the check would then be measuring the refactor, not the
-    # rule).
-    parts = [(ROVE / "src" / "replay" / "epilogue.zig").read_text(encoding="utf-8")]
-    for js in sorted((ROVE / "src" / "replay" / "js").glob("*.js")):
-        parts.append(js.read_text(encoding="utf-8"))
-    return "\n".join(parts)
+# There is no separate sim surface any more: the sim / native replay driver
+# registers the SAME common binding the worker registers (rove-binding), so
+# its enforcement lives in the worker row's files. Listing it again would
+# either read the generated JS it no longer evaluates (a false "yes") or
+# duplicate the worker row.
 
 
 def _arena_surface() -> str | None:
@@ -107,8 +105,7 @@ def _arena_surface() -> str | None:
 
 
 ENGINES = {
-    "worker": _worker_surface,
-    "sim": _sim_surface,
+    "native": _worker_surface,
     "arena": _arena_surface,
 }
 
@@ -204,8 +201,8 @@ def check() -> int:
 
 def table() -> int:
     surfaces = {name: fn() for name, fn in ENGINES.items()}
-    print("| surface | rule | worker | sim | arena |")
-    print("|---|---|---|---|---|")
+    print("| surface | rule | native | arena |")
+    print("|---|---|---|---|")
     for surface, rule, marker in GUARDS:
         cells = []
         for engine in ENGINES:

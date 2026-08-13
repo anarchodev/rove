@@ -543,7 +543,87 @@ pub const OfflineKv = struct {
     }
 };
 
+// ── request.tag — the common Tag binding's offline delegate ─────────────
+//
+// Per-run tag storage (the worker keeps state.tags on its DispatchState; the
+// offline engine keeps the equivalent here), generation-keyed like the
+// subscription-marker dedup. Each accepted call also lands a {kind:"tag"}
+// entry on the effect log so tests can assert what would index the record —
+// timeline-only, like the old wrapper's push: the worker does not fold tags
+// into the digest, so neither does anyone.
+
+const TagPair = struct { key: []u8, value: []u8 };
+var tag_gen: u64 = 0;
+var tag_list: std.ArrayList(TagPair) = .empty;
+
+fn tagsReset() void {
+    if (tag_gen == host.generation) return;
+    tag_gen = host.generation;
+    for (tag_list.items) |t| {
+        std.heap.c_allocator.free(t.key);
+        std.heap.c_allocator.free(t.value);
+    }
+    tag_list.clearRetainingCapacity();
+}
+
+pub const OfflineTag = struct {
+    ctx: ?*c.JSContext,
+
+    pub fn fromCtx(ctx: ?*c.JSContext) OfflineTag {
+        return .{ .ctx = ctx };
+    }
+
+    pub fn allocator(_: OfflineTag) std.mem.Allocator {
+        return std.heap.c_allocator;
+    }
+
+    pub fn tagCount(_: OfflineTag) usize {
+        tagsReset();
+        return tag_list.items.len;
+    }
+
+    fn effectTag(self: OfflineTag, key: []const u8, val: []const u8) void {
+        const kv = OfflineKv{ .ctx = self.ctx };
+        const o = c.JS_NewObject(self.ctx);
+        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", kv.newStr("tag"));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "key", kv.newStr(key));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "value", kv.newStr(val));
+        kv.pushEffect(o);
+    }
+
+    pub fn tagUpdate(self: OfflineTag, key: []const u8, val: []const u8) bool {
+        tagsReset();
+        for (tag_list.items) |*t| {
+            if (std.mem.eql(u8, t.key, key)) {
+                const new_v = std.heap.c_allocator.dupe(u8, val) catch return true;
+                std.heap.c_allocator.free(t.value);
+                t.value = new_v;
+                self.effectTag(key, val);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn tagAppend(self: OfflineTag, key: []const u8, val: []const u8) bool {
+        tagsReset();
+        const k = std.heap.c_allocator.dupe(u8, key) catch return false;
+        const v = std.heap.c_allocator.dupe(u8, val) catch {
+            std.heap.c_allocator.free(k);
+            return false;
+        };
+        tag_list.append(std.heap.c_allocator, .{ .key = k, .value = v }) catch {
+            std.heap.c_allocator.free(k);
+            std.heap.c_allocator.free(v);
+            return false;
+        };
+        self.effectTag(key, val);
+        return true;
+    }
+};
+
 const B = binding.Kv(c, OfflineKv);
+const T = binding.Tag(c, OfflineTag);
 
 /// `__rove_poison(what)` — the epilogue's divergence verdict, as a native so
 /// the flag lives on the HOST (post-run reportable, interrupt-visible), not
@@ -619,6 +699,9 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
+    // The common request.tag binding — the epilogue assigns it onto the
+    // per-request `request` object (`request.tag = __rove_request_tag`).
+    _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_tag", c.JS_NewCFunction2(ctx, T.jsRequestTag, "__rove_request_tag", 2, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_park_output", c.JS_NewCFunction2(ctx, jsParkOutput, "__rove_park_output", 1, c.JS_CFUNC_generic, 0));
     return 0;
 }

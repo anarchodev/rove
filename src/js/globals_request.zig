@@ -20,6 +20,7 @@ const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
 const reserved = @import("rove-reserved");
 const guards = @import("rove-guards");
+const binding = @import("rove-binding");
 const reserved_headers = @import("reserved_headers.zig");
 
 const c = qjs.c;
@@ -1136,58 +1137,57 @@ fn parseCookies(
 // session's activations. Bounded + fail-loud (a cap/charset violation
 // is a handler bug → throws, surfacing in the record's exception/console
 // rather than silently dropping). Re-tagging an existing key updates it.
-fn jsRequestTag(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    const state = getState(ctx);
-    if (argc < 2 or !c.JS_IsString(argv[0]) or !c.JS_IsString(argv[1])) {
-        _ = c.JS_ThrowTypeError(ctx, "request.tag(key, value) requires two string arguments");
-        return js_exception;
-    }
-    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(key);
-    const val = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
-    defer state.allocator.free(val);
+/// The worker's tag delegate behind the common binding (`rove-binding.Tag`):
+/// the arity gate, the pair rules, the capacity rule and every refusal shape
+/// run in the binding — one implementation with the offline engines — and
+/// this carries only the worker's storage, `state.tags` (what the log record
+/// indexes).
+pub const WorkerTag = struct {
+    state: *DispatchState,
 
-    // Every pair rule, in the contract's order, from `rove-guards` — the same
-    // authority the offline engines evaluate (as emitted JS, since their
-    // storage seam cannot report a refusal).
-    if (guards.checkTagPair(key, val)) |refusal| {
-        _ = c.JS_ThrowTypeError(ctx, refusal.message.ptr);
-        return js_exception;
+    pub fn fromCtx(ctx: ?*c.JSContext) WorkerTag {
+        return .{ .state = getState(ctx) };
     }
 
-    // Update in place if the key is already set this activation.
-    for (state.tags.items) |*t| {
-        if (std.mem.eql(u8, t.key, key)) {
-            const new_v = state.allocator.dupe(u8, val) catch return js_exception;
-            state.allocator.free(t.value);
-            t.value = new_v;
-            return js_undefined;
+    pub fn allocator(self: WorkerTag) std.mem.Allocator {
+        return self.state.allocator;
+    }
+
+    pub fn tagCount(self: WorkerTag) usize {
+        return self.state.tags.items.len;
+    }
+
+    /// Update in place if the key is already set this activation.
+    pub fn tagUpdate(self: WorkerTag, key: []const u8, val: []const u8) bool {
+        const state = self.state;
+        for (state.tags.items) |*t| {
+            if (std.mem.eql(u8, t.key, key)) {
+                const new_v = state.allocator.dupe(u8, val) catch return true;
+                state.allocator.free(t.value);
+                t.value = new_v;
+                return true;
+            }
         }
+        return false;
     }
-    // New key — enforce the per-record cap (fail loud, don't truncate).
-    // Checked separately from the pair because whether a call adds or
-    // replaces is engine state, which is why the guards module splits them.
-    if (guards.checkTagCapacity(state.tags.items.len)) |refusal| {
-        _ = c.JS_ThrowTypeError(ctx, refusal.message.ptr);
-        return js_exception;
+
+    pub fn tagAppend(self: WorkerTag, key: []const u8, val: []const u8) bool {
+        const state = self.state;
+        const k = state.allocator.dupe(u8, key) catch return false;
+        const v = state.allocator.dupe(u8, val) catch {
+            state.allocator.free(k);
+            return false;
+        };
+        state.tags.append(state.allocator, .{ .key = k, .value = v }) catch {
+            state.allocator.free(k);
+            state.allocator.free(v);
+            return false;
+        };
+        return true;
     }
-    const k = state.allocator.dupe(u8, key) catch return js_exception;
-    const v = state.allocator.dupe(u8, val) catch {
-        state.allocator.free(k);
-        return js_exception;
-    };
-    state.tags.append(state.allocator, .{ .key = k, .value = v }) catch {
-        state.allocator.free(k);
-        state.allocator.free(v);
-        return js_exception;
-    };
-    return js_undefined;
-}
+};
+
+const jsRequestTag = binding.Tag(c, WorkerTag).jsRequestTag;
 
 test "the request.tag limits match the log record's own bounds" {
     // The limits are a CONTRACT and live in `rove-reserved`, where the offline

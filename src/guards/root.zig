@@ -3,18 +3,19 @@
 //! rove-guards — the handler-facing checks, as ONE authority for every engine.
 //!
 //! Given the same inputs, every engine that runs a customer handler must
-//! behave the same, which means they must run the same checks. Three of the
-//! four run natively and could simply call the Zig here. The fourth cannot:
-//! the offline engines' storage seam (`src/replay/host.zig`'s `kv_set`) has
-//! no way to say "refused" — `KvOutcome` is ok / not_found / exhausted /
-//! divergence — so a refusal cannot travel from Zig back into their QJS as a
-//! thrown error. The check has to EXECUTE in JS there.
+//! behave the same, which means they must run the same checks. Every NATIVE
+//! engine — the worker and the sim/replay driver — now calls the Zig here
+//! through the common binding (`rove-binding`), one implementation. The one
+//! engine that cannot is the browser WASM arena: its host half is
+//! JavaScript, so until the wasm is built in-tree from arenajs C + rove Zig
+//! the check has to EXECUTE in JS there.
 //!
 //! So there are two evaluators, and this module owns both:
 //!
-//!   - `check*()` — the rules in Zig. The worker calls these directly.
+//!   - `check*()` — the rules in Zig, called from the common binding.
 //!   - `emitJs()`  — the same rules rendered as JavaScript, generated into
-//!     `src/replay/js/guards.generated.js` for the offline preludes.
+//!     `src/replay/js/guards.generated.js` for the ARENA's prelude
+//!     (`scripts/ops/gen_replay_prelude.py`).
 //!
 //! Be precise about what that does and does not buy. Every CONSTANT and every
 //! MESSAGE has one home here, so a cap, a prefix or a wording cannot drift —
