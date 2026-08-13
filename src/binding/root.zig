@@ -81,17 +81,25 @@ pub const GetResult = union(enum) {
     thrown,
 };
 
-pub fn Kv(comptime q: type, comptime D: type) type {
+/// quickjs.h defines JS_UNDEFINED etc. as compound-literal macros the C
+/// translator cannot expand; reconstruct them per import instance. The layout
+/// is stable in non-NaN-boxing mode (our Linux x86_64 builds).
+fn Vals(comptime q: type) type {
     return struct {
-        // quickjs.h defines JS_UNDEFINED etc. as compound-literal macros the
-        // C translator cannot expand; reconstruct them. The layout is stable
-        // in non-NaN-boxing mode (our Linux x86_64 builds).
         inline fn mkVal(tag: i64, val: i32) q.JSValue {
             return .{ .u = .{ .int32 = val }, .tag = tag };
         }
         const js_undefined: q.JSValue = mkVal(q.JS_TAG_UNDEFINED, 0);
         const js_null: q.JSValue = mkVal(q.JS_TAG_NULL, 0);
         const js_exception: q.JSValue = mkVal(q.JS_TAG_EXCEPTION, 0);
+    };
+}
+
+pub fn Kv(comptime q: type, comptime D: type) type {
+    return struct {
+        const js_undefined = Vals(q).js_undefined;
+        const js_null = Vals(q).js_null;
+        const js_exception = Vals(q).js_exception;
 
         /// JSValue → owned bytes via the engine allocator, no type
         /// restriction — `kv.get({})` reads the key `"[object Object]"`,
@@ -271,6 +279,69 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 _ = q.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
             }
             return arr;
+        }
+    };
+}
+
+/// `request.tag(key, value)` — the common binding for the tag surface. The
+/// arity/type gate, the pair rules, and the capacity rule (checked only when
+/// a call would ADD — re-tagging updates in place, which is engine state and
+/// why the guards module splits them) run here, once, in the contract's
+/// order. The delegate carries the engine's tag storage and its recording:
+///
+/// ```
+/// fromCtx(ctx) D
+/// allocator(d) std.mem.Allocator
+/// tagCount(d) usize                       // distinct keys so far
+/// tagUpdate(d, key, value) bool           // true = key existed, updated
+/// tagAppend(d, key, value) bool           // false = engine failure, a JS
+///                                         //   exception is pending
+/// ```
+pub fn Tag(comptime q: type, comptime D: type) type {
+    return struct {
+        const js_undefined = Vals(q).js_undefined;
+        const js_exception = Vals(q).js_exception;
+
+        pub fn jsRequestTag(
+            ctx: ?*q.JSContext,
+            _: q.JSValue,
+            argc: c_int,
+            argv: [*c]q.JSValue,
+        ) callconv(.c) q.JSValue {
+            const d = D.fromCtx(ctx);
+            if (argc < 2 or !q.JS_IsString(argv[0]) or !q.JS_IsString(argv[1])) {
+                _ = q.JS_ThrowTypeError(ctx, std.fmt.comptimePrint("{s}", .{guards.tag_args_message}));
+                return js_exception;
+            }
+            const key = coerceVal(d, ctx, argv[0]) catch return js_exception;
+            defer d.allocator().free(key);
+            const val = coerceVal(d, ctx, argv[1]) catch return js_exception;
+            defer d.allocator().free(val);
+
+            // Every pair rule, in the contract's order, from rove-guards.
+            if (guards.checkTagPair(key, val)) |refusal| {
+                _ = q.JS_ThrowTypeError(ctx, refusal.message.ptr);
+                return js_exception;
+            }
+
+            if (d.tagUpdate(key, val)) return js_undefined;
+
+            if (guards.checkTagCapacity(d.tagCount())) |refusal| {
+                _ = q.JS_ThrowTypeError(ctx, refusal.message.ptr);
+                return js_exception;
+            }
+            if (!d.tagAppend(key, val)) return js_exception;
+            return js_undefined;
+        }
+
+        fn coerceVal(d: D, ctx: ?*q.JSContext, val: q.JSValue) ![]u8 {
+            var len: usize = 0;
+            const cstr = q.JS_ToCStringLen(ctx, &len, val);
+            if (cstr == null) return error.JsException;
+            defer q.JS_FreeCString(ctx, cstr);
+            const out = try d.allocator().alloc(u8, len);
+            if (len > 0) @memcpy(out, @as([*]const u8, @ptrCast(cstr))[0..len]);
+            return out;
         }
     };
 }

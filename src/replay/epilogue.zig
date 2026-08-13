@@ -336,30 +336,15 @@ const TEXTCODEC_PURE = @embedFile("js/textcodec_pure.js");
 /// module's package. Shared verbatim with the browser replay arena.
 const JS_INTERACTION_DIGEST = @embedFile("js_interaction_digest");
 
-/// The reserved-prefix guard's allowlist, generated from the ONE list the
-/// worker enforces (`rove-reserved`) rather than hand-copied here.
-///
-/// The two used to be authored independently and had drifted: `_export/`
-/// joined the worker's list when the export verb shipped and never reached
-/// this one, so a handler using `@rewind/export` wrote its marker fine in
-/// prod and hit a reserved-key throw in replay — the engines disagreeing
-/// about what a handler is allowed to do, which is the divergence class the
-/// conformance suite exists to catch (rove#499).
-///
-/// Generated at comptime into the prelude, the same way `__rove_triggers`
-/// is: a new prefix is now reachable in replay the moment
-/// it is reachable in the worker, with no second edit to remember.
-
-/// The kv guard RULES, shared verbatim with the browser replay arena
-/// (`scripts/ops/gen_replay_prelude.py` splices the same file) — the same
-/// arrangement `textcodec_pure.js` already has. Only the data above is
-/// generated; the logic has one copy (rove#502).
+/// The emitted guard rules — NOT part of this epilogue any more: the native
+/// engines run the checks inside the common binding (`rove-binding`), one
+/// implementation with the worker. Embedded here only so the freshness test
+/// below can hold the COMMITTED file to the emitter for its one remaining
+/// consumer, the browser replay arena (`scripts/ops/gen_replay_prelude.py`
+/// splices it), until the in-tree wasm retires that too.
 const GUARDS_JS = @embedFile("js/guards.generated.js");
 
-
-
-
-const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ GUARDS_JS ++ "\n" ++ EPILOGUE_BODY_TAIL;
+const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ EPILOGUE_BODY_TAIL;
 
 const EPILOGUE_BODY_HEAD =
     \\  // An off-tape read POISONS the run and returns absent — it does not
@@ -704,24 +689,12 @@ const EPILOGUE_BODY_TAIL =
     \\  // Installed only when this run registered triggers, so the delegate
     \\  // skips the prev fetch + dispatch entirely otherwise.
     \\  if (globalThis.__rove_triggers && globalThis.__rove_triggers.length) globalThis.__rove_run_triggers = __runTriggers;
-    \\  // request.tag(key, value) — prod's validation verbatim (globals.zig
-    \\  // jsRequestTag): two strings; key 1..32 BYTES of [a-z0-9_], non-'_'
-    \\  // leading; value 1..64 BYTES, no control chars; max 4 distinct keys
-    \\  // per activation (re-tagging a key updates in place); returns
-    \\  // undefined. Each accepted call lands in the effect log as
-    \\  // {kind:"tag"} so tests can assert what would index the log record.
-    \\  const __tags = [];
-    \\  request.tag = function (k, v) {
-    \\    __tagGuardPair(k, v, arguments.length);
-    \\    const hit = __tags.find((t) => t.key === k);
-    \\    if (hit) hit.value = v;
-    \\    else {
-    \\      __tagGuardCapacity(__tags.length);
-    \\      __tags.push({ key: k, value: v });
-    \\    }
-    \\    __effects.push({ kind: "tag", key: k, value: v });
-    \\    return undefined;
-    \\  };
+    \\  // request.tag — the common native binding (rove-binding.Tag over the
+    \\  // offline delegate): arity gate, pair rules, capacity and refusal
+    \\  // shapes are ONE implementation with the worker. Each accepted call
+    \\  // lands in the effect log as {kind:"tag"} (the delegate pushes it) so
+    \\  // tests can assert what would index the record.
+    \\  request.tag = __rove_request_tag;
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  let __result = null, __err = null, __short = false;
@@ -1058,10 +1031,13 @@ test "build: GET embeds request meta + parks output under sentinel" {
 }
 
 test "the committed guards.generated.js is what the emitter produces" {
-    // The offline preludes splice a COMMITTED artifact, because the Python
-    // that composes the arena's cannot run Zig comptime. That artifact is a
+    // The browser arena's prelude splices a COMMITTED artifact, because the
+    // Python that composes it cannot run Zig comptime. That artifact is a
     // rendering of `rove-guards`, not a second statement of the rules — and
     // this is what makes that true. Regenerate with `zig build gen-guards`.
+    // (The native engines stopped evaluating it: their checks run inside the
+    // common binding. This gate lives on for the arena, until the in-tree
+    // wasm.)
     const a = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
@@ -1075,16 +1051,11 @@ test "the committed guards.generated.js is what the emitter produces" {
     }
 }
 
-test "the prelude carries the guards, and the guards carry the data they read" {
-    // Structural, cheap, and catches a splice that silently dropped: the
-    // rules have to reach the emitted prelude, and the data globals they
-    // read have to be defined above them in the same text.
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __kvGuardWrite = ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __tagGuardPair = ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __GUARD_SHIM_WRITABLE = [") != null);
-    for (reserved.SHIM_WRITABLE_PREFIXES) |prefix| {
-        var quoted_buf: [64]u8 = undefined;
-        const quoted = try std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{prefix});
-        try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, quoted) != null);
-    }
+test "no guard evaluation is left in the epilogue" {
+    // The inverse of the old splice assertion: the native engines' checks
+    // run inside the common binding, so a guard CALL reappearing in this
+    // per-request JS would be a second evaluator sneaking back in.
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__kvGuardWrite(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__tagGuardPair(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__tagGuardCapacity(") == null);
 }
