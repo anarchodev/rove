@@ -128,6 +128,19 @@ pub const Conn = struct {
     /// remainder here.
     send_inflight: bool = false,
     send_queue: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Retry-safety watermark over the ordered conn-send queue (rove#532).
+    /// Buffers handed to `enqueueConnSend` get 1-based seqs (`send_seq`);
+    /// completions arrive in the same order (one write in flight), counted
+    /// by `send_done`; `send_fail_seq` records the FIRST failed write's seq
+    /// (0 = none). A failed TCP write queues nothing, so bytes serialized
+    /// into buffer `>= send_fail_seq` provably never reached the peer —
+    /// while anything earlier is on the wire (or unknowably in flight) and
+    /// must be treated as delivered. Consulted only for h2 CLIENT legs
+    /// (pure conn-send traffic, so the counts align); h1/TLS-handshake
+    /// conns interleave direct writes and never read these.
+    send_seq: u64 = 0,
+    send_done: u64 = 0,
+    send_fail_seq: u64 = 0,
 
     pub fn deinit(allocator: std.mem.Allocator, items: []Conn) void {
         for (items) |*item| {
@@ -661,6 +674,13 @@ pub const Stream = struct {
     client_stream: bool = false,
     stream_eof: bool = false,
     ng_stream_id: i32 = 0,
+    /// Client streams: 1-based seq of the conn-send buffer this stream's
+    /// HEADERS were serialized into (0 = never serialized). Stamped by the
+    /// client `on_frame_send` callback; compared against the conn's
+    /// `send_fail_seq` at stream close to decide whether the request head
+    /// provably never reached the peer — the front's retry-safety signal
+    /// (rove#532).
+    head_send_mark: u64 = 0,
     /// headers_first window policy for inbound body DATA — see the
     /// `BodyMode` doc. `.auto` on non-headers_first instances.
     body_mode: BodyMode = .auto,

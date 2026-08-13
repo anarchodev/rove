@@ -1709,19 +1709,26 @@ pub fn Proxy(comptime FrontH2: type) type {
                         flow.saw_421, flow.body_total,
                     },
                 );
-                // Was anything actually PUT ON THE WIRE? The front learns
-                // `up_sid` when the HEADERS frame is serialized for this
-                // attempt, so a zero id means the request never left — no
-                // worker can have seen it, and replaying it cannot
-                // double-execute. A non-zero id means a stream existed
-                // upstream and the failure stays ambiguous.
+                // Was anything actually PUT ON THE WIRE? The h2 layer
+                // answers on the terminal itself: `head_written` is true
+                // iff this attempt's HEADERS were serialized and not
+                // covered by a FAILED socket write (rove#532). That is the
+                // delivery question, which neither of the earlier proxies
+                // could answer: `flow.up_sid` is learned a poll-pass after
+                // submit (a conn death inside the window made an executing
+                // request read as "never left" and replay — the second
+                // rove#532 duplicate source), while submit-time StreamId
+                // over-counts (a write onto a dead leg fails without
+                // queueing a byte, and 502ing that re-run-safe case is the
+                // regression `front_write_reaim_smoke` guards). `up_sid`
+                // stays OR'd in as a belt: it can only add conservatism.
                 //
                 // This is the line nginx draws: a connect-time failure is
                 // retried even for a POST; only a failure AFTER the request
                 // went out is treated as unsafe. Hardcoding "sent" here made
                 // a stale pooled leg — which delivered nothing — look
                 // identical to a worker that may have committed (rove#353).
-                self.attemptFailed(flow, conn_died, flow.up_sid != 0);
+                self.attemptFailed(flow, conn_died, io_res.head_written or flow.up_sid != 0);
             }
         }
 
