@@ -38,9 +38,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, APPS_DIR, BIN_DIR  # noqa: E402
+from smoke_lib_v2 import V2Cluster, APPS_DIR, BIN_DIR, MOVE_SECRET, _curl  # noqa: E402
 
 TENANT = "chokepointed"
+
+
+def follower_first_urls(c) -> str:
+    """Every worker URL, with the `__admin__` group's LEADER deliberately
+    LAST. The chokepoint is leader-gated, so a worker list that leads with a
+    follower forces the CLI through its 421-retry path on every op — which
+    is exactly the path that was broken (rove#535: the 421 was returned as
+    final) and which a single-node cluster can never exercise."""
+    leader = None
+    for i in range(len(c.node_ports)):
+        r = _curl(f"{c.node_url(i)}/_system/v2-leader?tenant=__admin__",
+                  headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        if r.status == 200:
+            leader = i
+            break
+    order = [i for i in range(len(c.node_ports)) if i != leader]
+    if leader is not None:
+        order.append(leader)
+    return ",".join(c.node_url(i) for i in order)
 
 
 def run_ops(c, *args, with_secrets: bool = False, timeout: int = 120):
@@ -50,7 +69,7 @@ def run_ops(c, *args, with_secrets: bool = False, timeout: int = 120):
     env = dict(os.environ)
     env.pop("REWIND_MOVE_SECRET", None)
     env.pop("ROVE_CP_URL_INTERNAL", None)
-    env["ROVE_WORKER_URLS"] = c.node_url(0)
+    env["ROVE_WORKER_URLS"] = follower_first_urls(c)
     env["REWIND_ROOT_TOKEN"] = c.root_token
     env["REWIND_ADMIN_DOMAIN"] = c.host_for("__admin__")
     env["ROVE_CLUSTER"] = c.cluster_id
@@ -77,7 +96,9 @@ def main() -> int:
                    ("index.mjs", "_middlewares/index.mjs",
                     "_rp/complete.mjs", "_rp/jwks.mjs", "v1/upload/index.mjs")}
 
-    with V2Cluster.spawn("opschoke", nodes=1) as c:
+    # 3 nodes, so the follower-first worker list (see `follower_first_urls`)
+    # exercises the CLI's leader-gate retry on every chokepointed op (#535).
+    with V2Cluster.spawn("opschoke", nodes=3) as c:
         c.spawn_log_server()
         c._ensure_admin_app()
 
