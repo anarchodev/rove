@@ -72,6 +72,14 @@ pub const Incarnation = union(enum) {
             .token => |t| a.free(t),
         }
     }
+
+    /// Same tenant LIFETIME? The CP mints one incarnation per lifetime, so
+    /// two that differ can only be two different lifetimes of the name —
+    /// which is how an attach detects that a local instance is residue of a
+    /// deleted predecessor (#531).
+    pub fn matches(self: Incarnation, other: Incarnation) bool {
+        return std.mem.eql(u8, self.marker(), other.marker());
+    }
 };
 
 /// Every per-tenant S3 subdir, in one place. This is the set a teardown
@@ -200,6 +208,17 @@ test "Incarnation.fromMarker: empty is legacy, non-empty is a token" {
     try testing.expectEqualStrings("aaaa1111", inc.marker());
     const legacy: Incarnation = .legacy;
     try testing.expectEqualStrings("", legacy.marker());
+}
+
+test "Incarnation.matches: lifetime equality, legacy distinct from any token" {
+    const a = Incarnation.fromMarker("aaaa1111");
+    const b = Incarnation.fromMarker("bbbb2222");
+    const legacy: Incarnation = .legacy;
+    try testing.expect(a.matches(.{ .token = "aaaa1111" }));
+    try testing.expect(!a.matches(b));
+    try testing.expect(legacy.matches(.legacy));
+    try testing.expect(!legacy.matches(a));
+    try testing.expect(!a.matches(legacy));
 }
 
 test "keyPrefix: legacy and incarnation layouts" {

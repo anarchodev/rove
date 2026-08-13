@@ -442,6 +442,16 @@ pub const Tenant = struct {
             }
         }
 
+        // Fold the marker + domain deletions out of the volatile overlay
+        // NOW (see `writeInstanceMarker`): a deletion that only lives in the
+        // overlay is undone by the next restart, resurrecting the marker —
+        // and the resurrected instance then wins the re-provision attach on
+        // this node while its peers start the new lifetime fresh, splitting
+        // the reborn tenant across two storage incarnations (#531).
+        self.root.checkpoint() catch |err| std.log.warn(
+            "tenant: instance delete durabilize ({s}) failed: {s} (deletion may not survive a restart)",
+            .{ id, @errorName(err) },
+        );
         self.invalidateHostCache();
     }
 
@@ -689,6 +699,20 @@ pub const Tenant = struct {
         const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{id}) catch
             return Error.InvalidInstanceId;
         self.root.put(key, incarnation) catch return Error.Kv;
+        // The put lands in the kvexp VOLATILE overlay, and nothing else is
+        // obligated to fold the root store: durabilize ticks fold stores
+        // dirtied by raft applies, and a direct marker write dirties
+        // nothing. Without an explicit fold the marker's durability rides
+        // whichever incidental fold happens (or doesn't) before the next
+        // restart — which is how a deprovisioned tenant's marker outlived
+        // its deletion on one node and split the reborn tenant across two
+        // incarnations (#531). Same pattern as the group manifest's
+        // record/forget (`node_groups.zig`). Best-effort: the marker is
+        // live either way; only crash-survival is at stake.
+        self.root.checkpoint() catch |err| std.log.warn(
+            "tenant: instance marker durabilize ({s}) failed: {s} (marker may not survive a restart)",
+            .{ id, @errorName(err) },
+        );
         self.invalidateHostCache();
     }
 

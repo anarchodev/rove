@@ -895,8 +895,27 @@ fn ensureInstance(worker: anytype, tenant: []const u8) !*const tenant_mod.Instan
 /// the CP minted for this tenant lifetime (#357). An instance that already
 /// exists keeps the incarnation its data is keyed by — re-attach must not
 /// re-key a live tenant.
+/// The attach's incarnation is AUTHORITATIVE: the CP mints one per tenant
+/// lifetime, so a local instance whose incarnation differs can only be
+/// residue of a deleted predecessor — a marker whose deletion didn't survive
+/// a restart, or a first-sight legacy open. Keeping it would silently pin
+/// this node to the previous lifetime's storage while its peers serve the
+/// new one, and the split surfaces far away as an undeployable tenant
+/// (#531). Same incarnation → plain idempotent re-attach (move retries, the
+/// reconciler's backfill).
 fn ensureInstanceWithIncarnation(worker: anytype, tenant: []const u8, incarnation: tenant_mod.Incarnation) !*const tenant_mod.Instance {
-    if (try worker.node.tenant.getInstance(tenant)) |inst| return inst;
+    if (try worker.node.tenant.getInstance(tenant)) |inst| {
+        if (inst.storage.incarnation.matches(incarnation)) return inst;
+        std.log.warn(
+            "v2-attach: {s} has residue of a previous lifetime (incarnation '{s}', attach carries '{s}') — replacing it",
+            .{ tenant, inst.storage.incarnation.marker(), incarnation.marker() },
+        );
+        // The deploy slot is keyed by tenant NAME and holds the residue's
+        // store handle — evict it before the instance goes, or the reborn
+        // tenant is served the predecessor's cached bundle (#357).
+        worker.node.deploy.evictTenant(tenant);
+        try worker.node.tenant.deleteInstance(tenant);
+    }
     try worker.node.tenant.createInstanceWithIncarnation(tenant, incarnation);
     return (try worker.node.tenant.getInstance(tenant)) orelse error.ProvisionFailed;
 }
