@@ -108,6 +108,26 @@ pub const OfflineKv = struct {
         return exempt(key);
     }
 
+    /// Authored worlds (and the harness) DECIDE — the same rules as the
+    /// worker, through the same binding. A CAPTURED world replays outcomes
+    /// instead: a write with no taped refusal succeeded at capture and must
+    /// succeed here, whatever today's rules would say — rule evolution
+    /// cannot manufacture a false divergence.
+    pub fn decides(_: OfflineKv) bool {
+        return !host.activeReplaysOutcomes();
+    }
+
+    pub fn tapedRefusal(_: OfflineKv, op: binding.WriteOp, key: []const u8) ?[]const u8 {
+        return host.activeTapedRefusal(switch (op) {
+            .set => 's',
+            .delete => 'd',
+        }, key);
+    }
+
+    /// The offline engines produce no tapes — a live refusal in an authored
+    /// world has nowhere to be recorded.
+    pub fn recordRefusal(_: OfflineKv, _: binding.WriteOp, _: []const u8, _: anytype) void {}
+
     fn vtable(self: OfflineKv) ?*const host.ReplayHost {
         _ = self;
         return host.active_vtable;
@@ -371,6 +391,13 @@ pub const OfflineKv = struct {
                 // "recorded failure" spelling).
                 if (val != null) std.c.free(val);
                 _ = c.JS_ThrowInternalError(self.ctx, "kv.get: recorded failure");
+                return .thrown;
+            },
+            // `refused` exists only on write entries; a host answering a GET
+            // with it is a protocol bug — loud, not absent.
+            .refused => {
+                if (val != null) std.c.free(val);
+                _ = c.JS_ThrowInternalError(self.ctx, "kv.get: malformed host outcome");
                 return .thrown;
             },
         }

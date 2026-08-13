@@ -23,6 +23,15 @@ const MockState = struct {
     system_module: bool = false,
     exempt_prefix: []const u8 = "",
     fail_prefix: bool = false,
+    /// Outcome-replay knobs: `decide` false = captured mode (rules skipped);
+    /// a taped refusal replays for exactly this key ("set" op).
+    decide: bool = true,
+    taped_refusal_key: []const u8 = "",
+    taped_refusal_code: []const u8 = "",
+    /// The last refusal the binding asked to record (op char + code).
+    recorded_refusal_key: [512]u8 = undefined,
+    recorded_refusal_key_len: usize = 0,
+    recorded_refusal_code: []const u8 = "",
     last_prefix: [64]u8 = undefined,
     last_prefix_len: usize = 0,
     last_cursor: [64]u8 = undefined,
@@ -57,6 +66,23 @@ const MockKv = struct {
     pub fn isExempt(self: MockKv, key: []const u8) bool {
         return self.st.exempt_prefix.len > 0 and
             std.mem.startsWith(u8, key, self.st.exempt_prefix);
+    }
+
+    pub fn decides(self: MockKv) bool {
+        return self.st.decide;
+    }
+
+    pub fn tapedRefusal(self: MockKv, op: binding.WriteOp, key: []const u8) ?[]const u8 {
+        if (op != .set) return null;
+        if (self.st.taped_refusal_key.len == 0 or !std.mem.eql(u8, key, self.st.taped_refusal_key)) return null;
+        return self.st.taped_refusal_code;
+    }
+
+    pub fn recordRefusal(self: MockKv, _: binding.WriteOp, key: []const u8, refusal: anytype) void {
+        const st = self.st;
+        @memcpy(st.recorded_refusal_key[0..key.len], key);
+        st.recorded_refusal_key_len = key.len;
+        st.recorded_refusal_code = refusal.code;
     }
 
     pub fn get(self: MockKv, key: []const u8) binding.GetResult {
@@ -273,4 +299,30 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     // ── delete round-trip ──
     try expectEval(ctx, a, "__t(() => kv.delete('p/1'))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.get('p/1'))", "ok:null");
+
+    // ── outcome-replay (captured worlds) ──
+    // A taped refusal replays verbatim, before any rule runs — even for a
+    // key today's rules would ALLOW.
+    st.taped_refusal_key = "orders/fine";
+    st.taped_refusal_code = "reserved_key";
+    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))",
+        "Error|reserved_key|kv: 'orders/fine' is in a platform-reserved prefix");
+    // A RETIRED code (rule gone from today's table) still throws, code
+    // verbatim, with the generic capture message.
+    st.taped_refusal_code = "some_retired_rule";
+    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))",
+        "Error|some_retired_rule|kv: 'orders/fine' was refused at capture");
+    st.taped_refusal_key = "";
+    // In captured mode (decides = false) the rules are not consulted at all:
+    // a write with no taped refusal succeeded at capture and must succeed
+    // here, whatever today's table says.
+    st.decide = false;
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/captured-ok', 'v'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.get('_secret/captured-ok'))", "ok:\"v\"");
+    st.decide = true;
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/captured-ok', 'v'))",
+        "Error|reserved_key|kv: '_secret/captured-ok' is in a platform-reserved prefix");
+    // …and a LIVE refusal is offered to the delegate for taping.
+    try testing.expectEqualStrings("_secret/captured-ok", st.recorded_refusal_key[0..st.recorded_refusal_key_len]);
+    try testing.expectEqualStrings("reserved_key", st.recorded_refusal_code);
 }

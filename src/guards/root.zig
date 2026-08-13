@@ -83,6 +83,12 @@ pub const kv_reserved_code = "reserved_key";
 pub const kv_key_too_large_code = "key_too_large";
 pub const kv_value_too_large_code = "value_too_large";
 
+/// The size-cap messages, exported so a TAPED refusal (outcome-replay: the
+/// capture said no, replay throws the recorded code without re-deciding) can
+/// be re-materialized with the same text the live refusal carried.
+pub const kv_key_too_large_message = kvTooLargeMessage("key", reserved.KV_KEY_MAX);
+pub const kv_value_too_large_message = kvTooLargeMessage("value", reserved.KV_VAL_MAX);
+
 fn kvTooLargeMessage(comptime which: []const u8, comptime limit: usize) []const u8 {
     return std.fmt.comptimePrint("kv: {s} exceeds the {d}-byte limit", .{ which, limit });
 }

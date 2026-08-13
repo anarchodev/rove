@@ -205,6 +205,49 @@ fn runPoison(a: std.mem.Allocator) !void {
     std.debug.print("POISON OK — off-tape reads poison, survive catch, and brake\n", .{});
 }
 
+/// Outcome-replay (the engine-parity epic's #516): a captured world throws
+/// the refusals its tape recorded and decides NOTHING itself. Two probes:
+/// `taped` writes a key today's rules ALLOW but the capture refused — must
+/// throw the recorded code; `evolved` writes a key today's rules REFUSE but
+/// the capture allowed (no refusal entry) — must succeed, because the tape
+/// is faithful to the rules that were live when it was cut.
+const REFUSAL_HANDLER =
+    \\export default function () {
+    \\  const cap = (fn) => { try { fn(); return "ok"; } catch (e) { return (e.code || "?") + "|" + e.message; } };
+    \\  const taped = cap(() => kv.set("orders/fine", "v"));
+    \\  const evolved = cap(() => kv.set("_secret/allowed-at-capture", "v"));
+    \\  const readback = kv.get("_secret/allowed-at-capture");
+    \\  return { taped, evolved, readback };
+    \\}
+;
+
+fn runRefusals(a: std.mem.Allocator) !void {
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"captured\":true,");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"kv_refusals\":[{\"op\":\"set\",\"key\":\"orders/fine\",\"code\":\"reserved_key\"}],");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(REFUSAL_HANDLER, .{}, w);
+    try w.writeAll("}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("REFUSALS: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    check(out.items, &.{
+        "\"taped\":\"reserved_key|kv: 'orders/fine' is in a platform-reserved prefix\"",
+        "\"evolved\":\"ok\"",
+        "\"readback\":\"v\"",
+        "\"ok\":true",
+    }, &.{"divergence"}, "REFUSAL OUTCOME-REPLAY (taped refusal throws; capture-allowed write proceeds)");
+    std.debug.print("REFUSALS OK — captured replay throws the tape's verdicts and re-decides nothing\n", .{});
+}
+
 /// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
 /// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
 /// complete because the GC arena reclaims the dead strings mid-run. Same shape
@@ -282,6 +325,10 @@ pub fn main() !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "poison")) {
         try runPoison(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "refusals")) {
+        try runRefusals(a);
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "packages")) {

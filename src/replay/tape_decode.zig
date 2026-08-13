@@ -19,7 +19,7 @@
 const std = @import("std");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 6; // lockstep-asserted against src/tape/root.zig
+pub const VERSION: u16 = 7; // lockstep-asserted against src/tape/root.zig
 /// The oldest layout this reader still understands. Records already in S3 were
 /// written at v5, so a reader that demanded equality would make every tape
 /// predating the bump undecodable — the guard has to be a RANGE, and each
@@ -39,7 +39,7 @@ pub const Channel = enum(u16) {
 };
 
 pub const KvOp = enum(u8) { get = 0, set = 1, delete = 2, prefix = 3 };
-pub const KvOutcome = enum(u8) { ok = 0, not_found = 1, err = 2 };
+pub const KvOutcome = enum(u8) { ok = 0, not_found = 1, err = 2, refused = 3 };
 
 /// One kv tape entry. For `prefix`, `value` is empty and `results` holds the
 /// returned pairs; otherwise `results` is empty and `value` is the read/written

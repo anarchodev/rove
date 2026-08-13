@@ -125,13 +125,17 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // (+ the handler's own re-executed writes), honoring cursor/limit. ──
     var seen = std.StringHashMapUnmanaged(void){};
     var kv = std.ArrayList(KvPair){};
+    // Guard refusals the capture recorded (KvOutcome.refused; value = the
+    // code) → the world's `kv_refusals`, so replay throws the recorded
+    // verdict instead of re-deciding the rules (outcome-replay).
+    var refusals = std.ArrayList(struct { op: []const u8, key: []const u8, code: []const u8 }){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
             if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
             try seen.put(a, e.key, {});
             switch (e.outcome) {
                 .ok => try kv.append(a, .{ .key = e.key, .value = e.value }),
-                .not_found, .err => {}, // omit — closed world resolves to not_found
+                .not_found, .err, .refused => {}, // omit — closed world resolves to not_found
             }
         },
         .prefix => {
@@ -141,7 +145,15 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
                 try kv.append(a, .{ .key = row.key, .value = row.value });
             }
         },
-        .set, .delete => {},
+        .set, .delete => {
+            if (e.outcome == .refused) {
+                try refusals.append(a, .{
+                    .op = if (e.op == .delete) "delete" else "set",
+                    .key = e.key,
+                    .code = e.value,
+                });
+            }
+        },
     };
 
     // ── request surface: request_reads ──
@@ -370,6 +382,20 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try jsonStr(w, p.value);
     }
     try w.writeAll(if (kv.items.len != 0) "\n  }" else "}");
+    if (refusals.items.len != 0) {
+        try w.writeAll(",\n  \"kv_refusals\": [");
+        for (refusals.items, 0..) |r, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.writeAll("\n    { \"op\": ");
+            try jsonStr(w, r.op);
+            try w.writeAll(", \"key\": ");
+            try jsonStr(w, r.key);
+            try w.writeAll(", \"code\": ");
+            try jsonStr(w, r.code);
+            try w.writeAll(" }");
+        }
+        try w.writeAll("\n  ]");
+    }
     // The recorded status becomes an `expected` assertion — replay verifies the
     // re-run reproduces it.
     if (recorded) |r| {

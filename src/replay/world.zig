@@ -44,6 +44,8 @@ const HASH_HEX_LEN = @import("rove-files").HASH_HEX_LEN;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
+/// One captured guard refusal (outcome-replay): `op` is "set"/"delete".
+pub const KvRefusal = struct { op: []const u8, key: []const u8, code: []const u8 };
 pub const Source = struct { path: []const u8, kind: []const u8, source: []const u8 };
 /// A registered kv trigger (issue #38): watched key `prefix` + the `module`
 /// specifier of its `_triggers/<prefix>/index` handler.
@@ -76,6 +78,12 @@ pub const World = struct {
     /// The KV readset as a key→value map — a closed world: a key not present
     /// reads `not_found`.
     kv: []const KvPair = &.{},
+    /// Guard refusals the CAPTURE recorded (`op` "set"/"delete", `key`,
+    /// `code`) — outcome-replay: a captured world throws the recorded
+    /// refusal at the matching write instead of re-deciding the rules, and a
+    /// write with no entry succeeded at capture and proceeds unguarded.
+    /// Meaningful only with `captured`; an authored world decides live.
+    kv_refusals: []const KvRefusal = &.{},
     /// Optional `expected` output — a PARTIAL, order-independent assertion over
     /// the produced bundle (response.status / writes / cmds / disposition). When
     /// present, `runWorld` appends a `verify` result. Stored as JSON text.
@@ -168,7 +176,7 @@ pub const Error = error{BadWorld} || std.mem.Allocator.Error;
 const TOP_KEYS = [_][]const u8{
     "entry",   "activation", "export",  "source_dir", "ctx",     "seed",
     "now_ms",  "arena_gc",   "captured", "request",   "kv",      "expected",
-    "sources", "app_imports", "packages", "triggers",
+    "sources", "app_imports", "packages", "triggers", "kv_refusals",
 };
 /// The full set of `request.*` keys (same strictness rationale).
 const REQ_KEYS = [_][]const u8{
@@ -342,6 +350,22 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             try ps.append(a, .{ .key = e.key_ptr.*, .value = try valueToStr(a, e.value_ptr.*) });
         }
         w.kv = try ps.toOwnedSlice(a);
+    }
+
+    // ── captured guard refusals (outcome-replay) ──
+    if (obj.get("kv_refusals")) |rv| {
+        if (rv != .array) return Error.BadWorld;
+        var rs = std.ArrayList(KvRefusal){};
+        for (rv.array.items) |item| {
+            if (item != .object) return Error.BadWorld;
+            const op = item.object.get("op") orelse return Error.BadWorld;
+            const key = item.object.get("key") orelse return Error.BadWorld;
+            const code = item.object.get("code") orelse return Error.BadWorld;
+            if (op != .string or key != .string or code != .string) return Error.BadWorld;
+            if (!std.mem.eql(u8, op.string, "set") and !std.mem.eql(u8, op.string, "delete")) return Error.BadWorld;
+            try rs.append(a, .{ .op = op.string, .key = key.string, .code = code.string });
+        }
+        w.kv_refusals = try rs.toOwnedSlice(a);
     }
 
     // ── expected output — a partial assertion over the produced bundle ──
