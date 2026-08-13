@@ -138,6 +138,13 @@ fn notableStatusIndex(code: u16) ?usize {
 
 pub const H2IoResult = struct {
     err: i32 = 0,
+    /// Client terminals only (rove#532): the request HEADERS were serialized
+    /// and NOT covered by a failed socket write — i.e. the head is on the
+    /// wire, or unknowably in flight; either way a proxy must treat the
+    /// request as possibly executed. False means the head provably never
+    /// left this process (never serialized, or its covering write failed
+    /// before any byte was queued), so a re-send cannot double-execute.
+    head_written: bool = false,
 };
 
 /// Per-WebSocket-message metadata on a WS seam entity
@@ -677,11 +684,11 @@ pub fn H2(comptime opts: Options) type {
         }
 
         /// Find the current collection of a client stream entity, set H2IoResult, and move to client_response_out.
-        fn clientStreamClose(h2: *Self, entity: Entity, err: i32) void {
+        fn clientStreamClose(h2: *Self, entity: Entity, err: i32, head_written: bool) void {
             if (!has_client) return;
             for (h2.clientStreamColls()) |src| {
                 if (h2.reg.isInCollection(entity, src)) {
-                    h2.reg.set(entity, src, H2IoResult, .{ .err = err }) catch {};
+                    h2.reg.set(entity, src, H2IoResult, .{ .err = err, .head_written = head_written }) catch {};
                     h2.reg.move(entity, src, &h2.client_response_out) catch {};
                     return;
                 }
@@ -1997,12 +2004,58 @@ pub fn H2(comptime opts: Options) type {
 
             if (!s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
                 const err: i32 = if (error_code == 0) 0 else -1;
-                clientStreamClose(nctx.h2, s.entity, err);
+                // Did the request head reach the peer? (rove#532 — the
+                // proxy's retry-safety signal; see `H2IoResult.head_written`.)
+                // Three ways to prove it did NOT: never serialized;
+                // serialized into a buffer at/after the conn's first failed
+                // socket write (a failed write queues nothing); or the PEER
+                // attested it — REFUSED_STREAM is h2's contract that the
+                // stream was not processed (a draining server's GOAWAY
+                // refuses streams above last_stream_id exactly so a proxy
+                // can re-send them, RFC 9113 §8.7). Conn already gone → the
+                // fail seq is unknowable; a serialized head then stays
+                // ambiguous.
+                const head_written = blk: {
+                    if (s.head_send_mark == 0) break :blk false;
+                    if (error_code == c.NGHTTP2_REFUSED_STREAM) break :blk false;
+                    if (getConn(nctx.h2, nctx.conn_entity)) |cp| {
+                        if (cp.send_fail_seq != 0 and s.head_send_mark >= cp.send_fail_seq)
+                            break :blk false;
+                    }
+                    break :blk true;
+                };
+                clientStreamClose(nctx.h2, s.entity, err, head_written);
             }
 
             s.send_data = null;
             _ = c.nghttp2_session_set_stream_user_data(session, stream_id, null);
             s.free();
+            return 0;
+        }
+
+        /// Client on_frame_send: stamp the stream's `head_send_mark` the
+        /// moment its request HEADERS are serialized. Serialization happens
+        /// inside `nghttp2_session_mem_send` while `driveAllSends` is
+        /// filling the accumulation buffer that will be handed to
+        /// `enqueueConnSend` as seq `send_seq + 1` — so that is the seq
+        /// whose write completion decides whether the head reached the
+        /// peer (rove#532).
+        fn onFrameSendClientCb(
+            session: ?*c.nghttp2_session,
+            frame: [*c]const c.nghttp2_frame,
+            user_data: ?*anyopaque,
+        ) callconv(.c) c_int {
+            if (frame.*.hd.type != c.NGHTTP2_HEADERS) return 0;
+            const stream: ?*Stream = @ptrCast(@alignCast(
+                c.nghttp2_session_get_stream_user_data(session, frame.*.hd.stream_id),
+            ));
+            if (stream == null) return 0;
+            const s = stream.?;
+            if (s.head_send_mark != 0) return 0;
+            const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
+            if (getConn(nctx.h2, nctx.conn_entity)) |cp| {
+                s.head_send_mark = cp.send_seq + 1;
+            }
             return 0;
         }
 
@@ -2018,6 +2071,7 @@ pub fn H2(comptime opts: Options) type {
             c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &onDataChunkRecvCb);
             c.nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &onFrameRecvClientCb);
             c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &onStreamCloseClientCb);
+            c.nghttp2_session_callbacks_set_on_frame_send_callback(cbs, &onFrameSendClientCb);
 
             ng_client_callbacks = cbs;
         }
@@ -4426,6 +4480,7 @@ pub fn H2(comptime opts: Options) type {
         /// submit/enqueue failure the buffer is freed (the caller has
         /// already relinquished it).
         fn enqueueConnSend(self: *Self, conn_ptr: *Conn, conn_entity: Entity, data: []u8) void {
+            conn_ptr.send_seq += 1;
             if (conn_ptr.send_inflight) {
                 conn_ptr.send_queue.append(self.allocator, data) catch self.allocator.free(data);
                 return;
@@ -4617,6 +4672,14 @@ pub fn H2(comptime opts: Options) type {
                 // previous drains), so `sending_entity` unambiguously names it.
                 if (!self.reg.isStale(conn_ent.entity)) {
                     if (getConn(self, conn_ent.entity)) |conn_ptr| {
+                        // Retry-safety watermark (see `Conn.send_seq`):
+                        // completions arrive in submit order, so the
+                        // just-completed buffer's seq is `send_done`
+                        // after the bump; a failure pins the FIRST
+                        // never-delivered seq.
+                        conn_ptr.send_done += 1;
+                        if (failed and conn_ptr.send_fail_seq == 0)
+                            conn_ptr.send_fail_seq = conn_ptr.send_done;
                         if (conn_ptr.h1) |h1c| {
                             if (h1c.wsWrite()) |wr| {
                                 // WS backpressure: the single in-flight flush

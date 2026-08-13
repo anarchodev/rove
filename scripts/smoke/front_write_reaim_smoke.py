@@ -5,19 +5,22 @@ body-carrying WRITE through the front door must survive a leader kill.
 Provisions a tenant, warms the front's leader cache, then KILLS the leader so
 leadership moves and the cache goes stale — the production condition, since a
 rolling restart does exactly that. Then it hammers a body-carrying POST and
-requires a clean status distribution: every write 2xx, zero 502
-`write-ambiguous`.
+requires: nothing but 200s and (rare) honest ambiguous 502s, and — the
+load-bearing invariant — a kv counter that moved exactly once per confirmed
+write, so no request was ever silently double-executed (rove#532).
 
-The invariants this guards (both shipped for rove#353):
+The invariants this guards (rove#353 + rove#532):
 
   * `handle421` aims the retry at the leader named by the `x-rewind-leader`
     hint — not at `node_idx + 1`, which lands on another follower (another
     421 → 503) or a downed node (dead leg → unretryable 502).
-  * A forward that dies before the request head was written to a live socket
-    (`head_sent = false` — e.g. a stale pooled leg to the new leader) is
-    retryable even for a non-idempotent write: the 421 proved nothing entered
-    the log, and nothing was sent on the dead leg. This is the nginx line —
-    only a failure AFTER the head went out is ambiguous.
+  * A forward whose request head provably never reached the peer (never
+    serialized, its covering socket write failed, or the peer REFUSED_STREAM'd
+    it) is retryable even for a non-idempotent write — nothing was delivered.
+    Only a head that may be on the wire is ambiguous, and ambiguity goes to
+    the client as a 502 for EVERY method (decisions.md §10.5d): a request
+    racing the kill onto a half-closed socket can land in the dead peer's
+    kernel buffer, and no userspace signal can prove it wasn't read.
 
 A warm cache passes trivially; only the stale-cache burst exercises the re-aim
 path, which is why the kill sits between the warm-up and the burst.
@@ -43,6 +46,9 @@ export function put() {
   const n = (parseInt(kv.get("n") || "0", 10) || 0) + 1;
   kv.set("n", String(n));
   return { n: n };
+}
+export function get() {
+  return { n: parseInt(kv.get("n") || "0", 10) || 0 };
 }
 """
 ATTEMPTS = 24
@@ -77,6 +83,9 @@ def main() -> int:
                 out[rr.status] = out.get(rr.status, 0) + 1
             return dict(sorted(out.items()))
 
+        rr = c.request(TENANT, "/?fn=get")
+        n0 = int(json.loads(rr.body)["n"]) if rr.status == 200 else 0
+
         print(f"step 3a: {ATTEMPTS} POSTs with a WARM leader cache")
         warm = burst(ATTEMPTS)
         print(f"    status distribution: {warm}")
@@ -97,16 +106,35 @@ def main() -> int:
 
         print("step 4: what the front logged about the re-aims")
         c.dump_log("front", grep=["re-aim", "forward", "ambiguous", "no-leader"], tail=14)
-        # The failure shape: any non-200 for a write the leader would have
-        # accepted (rove#353's 502 `write-ambiguous`).
-        bad = {k: v for k, v in codes.items() if k != 200}
-        check("every write through the front succeeded", not bad,
-              f"non-200s: {bad} of {ATTEMPTS}")
+        # The failure shapes, post-rove#532:
+        #   * anything that is neither a 200 nor an ambiguous 502 is a re-aim
+        #     regression (rove#353's original bug class);
+        #   * ambiguous 502s must stay RARE — a request racing the kill onto a
+        #     half-closed socket is genuinely wire-ambiguous and the honest
+        #     answer is a 502 the client may retry, but the COMMON path is the
+        #     421 re-aim / failed-write replay, both silent;
+        #   * and the load-bearing invariant: NO SILENT DOUBLE-EXECUTION. Every
+        #     200 executed exactly once; a 502'd write executed at most once.
+        #     The counter bounds both directions — a silently replayed request
+        #     pushes the count past the ceiling (the rove#532 duplicate shape).
+        bad = {k: v for k, v in codes.items() if k not in (200, 502)}
+        check("stale-cache writes: only 200s or honest ambiguous 502s", not bad,
+              f"unexpected statuses: {bad} of {ATTEMPTS}")
+        amb = codes.get(502, 0)
+        check("ambiguous 502s are the exception, not the path", amb <= 3,
+              f"{amb} of {ATTEMPTS} — the re-aim machinery is not doing its job")
+        ok_total = warm.get(200, 0) + codes.get(200, 0)
+        rr = c.request_retry(TENANT, "/?fn=get", deadline_s=20.0)
+        n_final = int(json.loads(rr.body)["n"]) if rr.status == 200 else -1
+        delta = n_final - n0
+        check("no silent double-execution (counter bounded by outcomes)",
+              ok_total <= delta <= ok_total + amb,
+              f"counter moved {delta} for {ok_total} confirmed + {amb} ambiguous writes")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print(f"\nPASS — {ATTEMPTS}/{ATTEMPTS} body-carrying writes through the front succeeded")
+    print(f"\nPASS — {ATTEMPTS * 2} writes through the front: every 200 executed exactly once")
     return 0
 
 
