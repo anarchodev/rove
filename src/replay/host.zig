@@ -45,9 +45,14 @@ extern fn arena_replay_set_host(host: *const ReplayHost, user: ?*anyopaque) void
 pub var active_vtable: ?*const ReplayHost = null;
 pub var active_user: ?*anyopaque = null;
 
+/// Bumped on every install — per-run state keyed on it (the kv delegate's
+/// subscription-marker dedup) resets when a new host takes over.
+pub var generation: u64 = 0;
+
 pub fn setHost(vt: *const ReplayHost, user: ?*anyopaque) void {
     active_vtable = vt;
     active_user = user;
+    generation +%= 1;
     arena_replay_set_host(vt, user);
 }
 
