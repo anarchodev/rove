@@ -442,6 +442,13 @@ const PumpStores = struct {
     map: std.StringHashMapUnmanaged(*kv.KvStore) = .empty,
     /// Pump-owned sibling of the node-wide `__root__` store.
     root_handle: ?*kv.KvStore = null,
+    /// `Tenant.deletionGen` at the last (re)build of `map`. A handle cached
+    /// before a deprovision is attached at the DELETED lifetime's store id
+    /// under the same name, so applies for the reborn tenant would land in
+    /// the predecessor's store while the serving side reads the new one
+    /// (#534). Deletes are rare and re-attach is one map insert, so the map
+    /// is simply dropped whenever the generation moves.
+    deletion_gen: u64 = 0,
 
     fn deinit(self: *PumpStores) void {
         var it = self.map.iterator();
@@ -465,6 +472,18 @@ const PumpStores = struct {
     fn resolve(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*kv.KvStore {
         _ = gid;
         const self: *PumpStores = @ptrCast(@alignCast(ctx));
+        // Revalidate against deprovisions (see `deletion_gen`). The root
+        // handle stays — `__root__`'s store id never changes.
+        const gen = self.tenant.deletionGen();
+        if (gen != self.deletion_gen) {
+            var it = self.map.iterator();
+            while (it.next()) |e| {
+                e.value_ptr.*.close();
+                self.allocator.free(e.key_ptr.*);
+            }
+            self.map.clearRetainingCapacity();
+            self.deletion_gen = gen;
+        }
         if (id_str.len == 0) {
             if (self.root_handle) |h| return h;
             const h = kv.KvStore.attachSibling(

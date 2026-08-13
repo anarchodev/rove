@@ -133,7 +133,8 @@ def main() -> int:
         r = cp("provision", {"tenant": TENANT})
         check("re-provision the same name → 200", r.status == 200, f"got {r.status} {r.body!r}")
         dep2 = c.deploy_handlers(TENANT, {"index.mjs": rpc_wrap(
-            'export function handler() { return "reborn\\n"; }\n')})
+            'export function handler() { kv.set("reborn_key", "reborn_val");'
+            ' return "reborn\\n"; }\n')})
         check("deploy to the reborn tenant → dep_id", bool(dep2), f"dep_id={dep2}")
         r = c.wait_for_handler(TENANT, "/?fn=handler", want_body="reborn")
         check("serves the NEW content (fresh state, not the old store)",
@@ -215,6 +216,46 @@ def main() -> int:
             check(f"node {i + 1} loader is not spinning on {T2}", not spinning,
                   "" if not spinning else
                   "loader retries NoDeployment — incarnations split across nodes")
+
+        print("step 9: ⭐ the reborn tenant's writes reach every node's CURRENT"
+              " store (rove#534)")
+        # Followers apply through the pump's name-keyed store-handle cache. A
+        # handle cached during the FIRST lifetime is attached at the deleted
+        # store's id, so the reborn tenant's replicated writes land there
+        # while each node's serving side reads the new store. The leader's
+        # own (correct) writes hide it — so read the store DIRECTLY on every
+        # node: the reborn handler's kv write must be visible everywhere.
+        for i in range(len(c.node_ports)):
+            deadline = time.time() + 15.0
+            rr = None
+            while time.time() < deadline:
+                rr = _curl(f"{c.node_url(i)}/_system/v2-kv?tenant={TENANT}"
+                           "&key=reborn_key",
+                           headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+                if rr.status == 200 and "reborn_val" in rr.body:
+                    break
+                time.sleep(0.5)
+            check(f"node {i + 1} holds the reborn write in the CURRENT store",
+                  rr is not None and rr.status == 200 and "reborn_val" in rr.body,
+                  f"got {rr.status} {rr.body!r}" if rr else "no response")
+
+        print("step 10: the reborn tenant survives a failover")
+        leader = None
+        for i in range(len(c.node_ports)):
+            rr = _curl(f"{c.node_url(i)}/_system/v2-leader?tenant={TENANT}",
+                       headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+            if rr.status == 200:
+                leader = i
+                break
+        check("found the reborn tenant's serving leader", leader is not None,
+              f"leader=node {leader + 1}" if leader is not None else "no node claims it")
+        if leader is not None:
+            c.stop_node(leader)
+            rr = c.request_retry(TENANT, "/?fn=handler", want_body="reborn",
+                                 deadline_s=40.0)
+            check("a survivor serves the reborn content after failover",
+                  rr.status == 200 and "reborn" in rr.body,
+                  f"got {rr.status} {rr.body[:80]!r}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

@@ -237,6 +237,15 @@ pub const Tenant = struct {
     /// fixed-size iteration — so contention stays bounded at the
     /// per-tenant scale we run today.
     maps_mutex: std.Thread.Mutex = .{},
+    /// Bumped by every `deleteInstance`. Name-keyed caches OUTSIDE this
+    /// Tenant — the pump's sibling-store handles (`PumpStores`), attached at
+    /// a specific lifetime's store id — revalidate when this moves: a handle
+    /// cached before a deprovision addresses the deleted lifetime's store,
+    /// and writing a reborn tenant's data through it splits the follower's
+    /// state from what the serving side reads (#534, the #531 family).
+    /// Atomic because deletes run on the worker thread while the pump
+    /// thread polls it.
+    deletion_gen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Operator-supplied root bearer token (the `LOOP46_ROOT_TOKEN`
     /// env var). When non-null, presenting an `Authorization: Bearer
     /// <this>` proves "platform operator." When null, every request
@@ -453,6 +462,12 @@ pub const Tenant = struct {
             .{ id, @errorName(err) },
         );
         self.invalidateHostCache();
+        _ = self.deletion_gen.fetchAdd(1, .release);
+    }
+
+    /// The current deletion generation (see `deletion_gen`).
+    pub fn deletionGen(self: *const Tenant) u64 {
+        return self.deletion_gen.load(.acquire);
     }
 
     pub fn assignDomain(
@@ -1309,6 +1324,17 @@ test "reopening a tenant finds existing instances on lazy resolve" {
         defer allocator.free(got);
         try testing.expectEqualStrings("yes", got);
     }
+}
+
+test "deletionGen moves on deleteInstance, and only then" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const g0 = fx.tenant.deletionGen();
+    try fx.tenant.createInstanceWithIncarnation("acme", .{ .token = "aaaa1111" });
+    try testing.expectEqual(g0, fx.tenant.deletionGen());
+    try fx.tenant.deleteInstance("acme");
+    try testing.expect(fx.tenant.deletionGen() > g0);
 }
 
 test "instance storage is keyed by (id, incarnation), not id alone" {
