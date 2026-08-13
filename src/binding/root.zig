@@ -103,12 +103,18 @@ pub const GetResult = union(enum) {
 pub const WriteOp = enum { set, delete };
 
 /// quickjs.h defines JS_UNDEFINED etc. as compound-literal macros the C
-/// translator cannot expand; reconstruct them per import instance. The layout
-/// is stable in non-NaN-boxing mode (our Linux x86_64 builds).
+/// translator cannot expand; reconstruct them per import instance, branching
+/// on the value REPRESENTATION: 64-bit builds carry the {u, tag} struct,
+/// 32-bit builds (the wasm arena) NaN-box JSValue into a u64
+/// (JS_MKVAL: tag << 32 | (u32)val).
 fn Vals(comptime q: type) type {
     return struct {
         inline fn mkVal(tag: i64, val: i32) q.JSValue {
-            return .{ .u = .{ .int32 = val }, .tag = tag };
+            return switch (@typeInfo(q.JSValue)) {
+                .int => (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, @intCast(tag)))))) << 32) |
+                    @as(u64, @as(u32, @bitCast(val))),
+                else => .{ .u = .{ .int32 = val }, .tag = tag },
+            };
         }
         const js_undefined: q.JSValue = mkVal(q.JS_TAG_UNDEFINED, 0);
         const js_null: q.JSValue = mkVal(q.JS_TAG_NULL, 0);
@@ -402,6 +408,108 @@ pub fn Tag(comptime q: type, comptime D: type) type {
             const out = try d.allocator().alloc(u8, len);
             if (len > 0) @memcpy(out, @as([*]const u8, @ptrCast(cstr))[0..len]);
             return out;
+        }
+    };
+}
+
+/// The offline engines' effect-log helpers, shared by every delegate that
+/// records into the epilogue's `globalThis.__rove_effects` (the native
+/// sim/replay delegate and the wasm arena's): entries are pushed through the
+/// PATCHED push so the interaction digest folds at the same points JS pushes
+/// fold, and the entry shapes are the cross-engine contract (conformance
+/// compares them field-strict). The worker records nothing here — its
+/// effects are the readset tape + digest folds on its own delegate.
+pub fn Effects(comptime q: type) type {
+    return struct {
+        const digest_mod = @import("interaction-digest");
+
+        fn newStr(ctx: ?*q.JSContext, s: []const u8) q.JSValue {
+            return q.JS_NewStringLen(ctx, s.ptr, s.len);
+        }
+
+        /// Push one entry through `__rove_effects`' patched push. Consumes
+        /// `obj`. Best-effort: with no effect sink installed (a bare run)
+        /// the entry is dropped.
+        pub fn push(ctx: ?*q.JSContext, obj: q.JSValue) void {
+            const g = q.JS_GetGlobalObject(ctx);
+            defer q.JS_FreeValue(ctx, g);
+            const arr = q.JS_GetPropertyStr(ctx, g, "__rove_effects");
+            defer q.JS_FreeValue(ctx, arr);
+            if (!q.JS_IsObject(arr)) {
+                q.JS_FreeValue(ctx, obj);
+                return;
+            }
+            const pushfn = q.JS_GetPropertyStr(ctx, arr, "push");
+            defer q.JS_FreeValue(ctx, pushfn);
+            var argv = [1]q.JSValue{obj};
+            const r = q.JS_Call(ctx, pushfn, arr, 1, &argv);
+            if (q.JS_IsException(r)) {
+                // A throwing push must not fail the kv op — clear + continue.
+                const ex = q.JS_GetException(ctx);
+                q.JS_FreeValue(ctx, ex);
+            }
+            q.JS_FreeValue(ctx, r);
+            q.JS_FreeValue(ctx, obj);
+        }
+
+        /// A present read carries its value (the digest folds the real
+        /// bytes, like the worker's foldRead); an absent read OMITS the
+        /// field rather than spelling it "".
+        pub fn read(ctx: ?*q.JSContext, key: []const u8, value: ?[]const u8) void {
+            const o = q.JS_NewObject(ctx);
+            _ = q.JS_SetPropertyStr(ctx, o, "kind", newStr(ctx, "read"));
+            _ = q.JS_SetPropertyStr(ctx, o, "key", newStr(ctx, key));
+            _ = q.JS_SetPropertyStr(ctx, o, "present", Vals(q).mkVal(q.JS_TAG_BOOL, @intFromBool(value != null)));
+            if (value) |v| _ = q.JS_SetPropertyStr(ctx, o, "value", newStr(ctx, v));
+            push(ctx, o);
+        }
+
+        pub fn write(ctx: ?*q.JSContext, key: []const u8, value: []const u8) void {
+            const o = q.JS_NewObject(ctx);
+            _ = q.JS_SetPropertyStr(ctx, o, "kind", newStr(ctx, "write"));
+            _ = q.JS_SetPropertyStr(ctx, o, "key", newStr(ctx, key));
+            _ = q.JS_SetPropertyStr(ctx, o, "value", newStr(ctx, value));
+            push(ctx, o);
+        }
+
+        pub fn del(ctx: ?*q.JSContext, key: []const u8) void {
+            const o = q.JS_NewObject(ctx);
+            _ = q.JS_SetPropertyStr(ctx, o, "kind", newStr(ctx, "delete"));
+            _ = q.JS_SetPropertyStr(ctx, o, "key", newStr(ctx, key));
+            push(ctx, o);
+        }
+
+        pub fn tag(ctx: ?*q.JSContext, key: []const u8, value: []const u8) void {
+            const o = q.JS_NewObject(ctx);
+            _ = q.JS_SetPropertyStr(ctx, o, "kind", newStr(ctx, "tag"));
+            _ = q.JS_SetPropertyStr(ctx, o, "key", newStr(ctx, key));
+            _ = q.JS_SetPropertyStr(ctx, o, "value", newStr(ctx, value));
+            push(ctx, o);
+        }
+
+        /// `count` + `rowsFold` (`key=<valuehash>;` per row IN ORDER,
+        /// lowercase hex) — the same accumulator the worker folds
+        /// (globals_kv.foldPrefix), over the rows the handler observes.
+        pub fn prefixScan(ctx: ?*q.JSContext, a: std.mem.Allocator, p: []const u8, entries: anytype) void {
+            var acc: std.ArrayList(u8) = .empty;
+            defer acc.deinit(a);
+            var acc_ok = true;
+            for (entries) |e| {
+                acc.writer(a).print("{s}={x};", .{ e.key, digest_mod.foldValue(e.value) }) catch {
+                    acc_ok = false;
+                    break;
+                };
+            }
+            if (!acc_ok) return;
+            var fold_buf: [16]u8 = undefined;
+            const fold_hex = std.fmt.bufPrint(&fold_buf, "{x}", .{digest_mod.foldValue(acc.items)}) catch return;
+            const o = q.JS_NewObject(ctx);
+            _ = q.JS_SetPropertyStr(ctx, o, "kind", newStr(ctx, "read"));
+            _ = q.JS_SetPropertyStr(ctx, o, "op", newStr(ctx, "prefix"));
+            _ = q.JS_SetPropertyStr(ctx, o, "key", newStr(ctx, p));
+            _ = q.JS_SetPropertyStr(ctx, o, "count", Vals(q).mkVal(q.JS_TAG_INT, @intCast(entries.len)));
+            _ = q.JS_SetPropertyStr(ctx, o, "rowsFold", newStr(ctx, fold_hex));
+            push(ctx, o);
         }
     };
 }

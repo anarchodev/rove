@@ -100,24 +100,10 @@ PIECES = [
 # customer surface. Every shim above captured what it needs in a closure.
 EPILOGUE = "\n;delete globalThis._system;\n"
 
-# ── the shared guardrails (rove#502, rove#505) ──────────────────────────────────────────
-#
-# The arena had NONE of the worker's kv write guards: a handler writing a
-# platform-reserved key threw in prod and in the sim, and succeeded here —
-# replay being more permissive than prod, which makes a run look successful
-# where the real one refused.
-#
-# The rules now have one implementation (`src/replay/js/kv_guards.js`, shared
-# with the sim's prelude). Their DATA is generated from Zig below, so a new
-# reserved prefix or a raised cap reaches this arena without a second edit.
-# Reading the Zig rather than restating it is the whole point; a regex that
-# stops matching must fail loudly, never silently emit an empty list.
-# The arena attaches these rules in its OWN epilogue (rewind-apps
-# `replay/_static/request-replay.mjs`, where it builds the kv wrapper), the
-# same way the sim's epilogue calls them from inside its recording wrapper.
-# It cannot be attached here: at base-eval time the arena's `kv` host binding
-# is not yet a callable object, so wrapping it from the prelude threw and took
-# every case down with it. The prelude's job is to make the RULES available;
+# The handler-facing RULES are not in this prelude any more: the arena's
+# wasm links rove's compiled binding (the in-tree build, `zig build
+# wasm-arena`), so the checks run in-module — identical bytes to the worker
+# and the sim — and there is no JS rendering of them left to splice.
 # where they bite is each engine's own business.
 
 
@@ -163,16 +149,6 @@ def build() -> str:
         rel = path.relative_to(ROVE)
         parts.append(f"\n// ── {rel} ──\n;")
         parts.append(f"(function () {{\n{src}\n}})();" if iife else src)
-    # The kv guardrails: generated data, then the shared rules, then the
-    # wrapper that puts them on this engine's kv. Before EPILOGUE, which
-    # deletes `_system` — the guard needs nothing from it, but the ordering
-    # keeps "everything the arena installs" above that line.
-    parts.append("\n// ── the shared guardrails (src/replay/js/guards.generated.js) ──\n")
-    # One file, generated from `rove-guards` by `zig build gen-guards`: the
-    # rules AND the data they read. Nothing to compose here, and nothing for
-    # this script to restate — which is why the Zig-side regexes that used to
-    # extract the prefixes and caps are gone.
-    parts.append((ROVE / "src" / "replay" / "js" / "guards.generated.js").read_text(encoding="utf-8"))
     parts.append(EPILOGUE)
     return "".join(parts)
 
