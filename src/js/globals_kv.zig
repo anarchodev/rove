@@ -20,6 +20,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const binding = @import("rove-binding");
+const guards = @import("rove-guards");
 const td = @import("trigger_dispatch.zig");
 const tape_mod = @import("rove-tape");
 const digest_mod = tape_mod.interaction_digest;
@@ -171,6 +172,32 @@ pub const WorkerKv = struct {
     /// a customer write.
     pub fn isExempt(_: WorkerKv, _: []const u8) bool {
         return false;
+    }
+
+    /// The worker always decides — it IS the rules' live authority.
+    pub fn decides(_: WorkerKv) bool {
+        return true;
+    }
+
+    /// Live traffic has no capture to replay outcomes from.
+    pub fn tapedRefusal(_: WorkerKv, _: binding.WriteOp, _: []const u8) ?[]const u8 {
+        return null;
+    }
+
+    /// A refused write goes on the tape (outcome-replay: value = the refusal
+    /// CODE), so captured replay can throw the recorded verdict instead of
+    /// re-deciding — an old tape stays faithful to the rules that were live
+    /// when it was cut. Refusals fold NOTHING into the digest (a refused
+    /// write never happened), which is already true in every engine.
+    pub fn recordRefusal(self: WorkerKv, op: binding.WriteOp, key: []const u8, refusal: guards.Refusal) void {
+        const state = self.state;
+        if (state.readset) |rs| {
+            const tape_op: tape_mod.KvOp = switch (op) {
+                .set => .set,
+                .delete => .delete,
+            };
+            rs.kv.appendKv(tape_op, key, refusal.code, .refused) catch {};
+        }
     }
 
     /// The minimal readset (`docs/architecture/effects-and-handlers.md`,

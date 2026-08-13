@@ -86,7 +86,12 @@ export function handler() {
   const prior = parseInt(kv.get("count") ?? "0", 10);
   const next = bumpCount(prior);
   kv.set("count", String(next));
-  return `replay-demo count=${next} die=${die} at=${at} probe=${probe} blen=${blen} ip=${ip}\\n`;
+  // A guard refusal, caught: prod refuses + TAPES it (outcome-replay,
+  // rove#516) and the WASM replay must throw the recorded verdict — same
+  // code, same branch — WITHOUT re-deciding the rules.
+  let refused = "none";
+  try { kv.set("_secret/spoof", "x"); } catch (e) { refused = e.code || "?"; }
+  return `replay-demo count=${next} die=${die} at=${at} probe=${probe} blen=${blen} ip=${ip} refused=${refused}\\n`;
 }
 """
 
@@ -269,6 +274,17 @@ def main() -> int:
                         check("replay traced the handler call tree (>=3 FUNC_ENTER)",
                               summary.get("func_enter_count", 0) >= 3,
                               f"func_enter_count={summary.get('func_enter_count')}")
+                        parked = summary.get("parked_result") or ""
+                        check("replayed output reproduces the handler body",
+                              parked.startswith("replay-demo count="),
+                              f"parked_result={parked!r}")
+                        # Outcome-replay (rove#516): prod REFUSED the reserved
+                        # write and taped the verdict; the WASM replay must
+                        # throw the recorded code — same catch branch, same
+                        # output — WITHOUT re-deciding the rules.
+                        check("⭐ taped guard refusal replayed (refused=reserved_key)",
+                              "refused=reserved_key" in parked,
+                              f"parked_result={parked!r}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

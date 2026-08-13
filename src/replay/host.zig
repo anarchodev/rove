@@ -75,6 +75,28 @@ pub fn poisonActive(what: []const u8) void {
     );
 }
 
+/// Whether the active run host replays a CAPTURE's outcomes: the kv binding
+/// consults the recorded refusals and never re-decides the rules — the tape
+/// stays faithful to the rules that were live when it was cut.
+pub fn activeReplaysOutcomes() bool {
+    if (active_vtable != &HOST_VTABLE) return false;
+    const h: *Host = @ptrCast(@alignCast(active_user orelse return false));
+    return h.captured;
+}
+
+/// The refusal CODE the capture recorded for this write, if any. `op_ch` is
+/// 's' (set) / 'd' (delete).
+pub fn activeTapedRefusal(op_ch: u8, key: []const u8) ?[]const u8 {
+    if (active_vtable != &HOST_VTABLE) return null;
+    const h: *Host = @ptrCast(@alignCast(active_user orelse return null));
+    if (h.refusals.count() == 0) return null;
+    var buf: [300]u8 = undefined;
+    if (key.len + 1 > buf.len) return null; // keys are ≤256 by the capture's own rules
+    buf[0] = op_ch;
+    @memcpy(buf[1 .. 1 + key.len], key);
+    return h.refusals.get(buf[0 .. 1 + key.len]);
+}
+
 /// Whether the active run host carries a divergence verdict — the interrupt
 /// handler's second trigger (`return poisoned || over_budget`).
 pub fn activePoisoned() bool {
@@ -129,6 +151,13 @@ pub const Host = struct {
     /// (`poisonActive` — a captured-world request-surface read the tape
     /// cannot answer). Distinct from a handler-thrown error.
     diverged: ?[]const u8 = null,
+    /// The world was transcoded from a CAPTURE → the kv binding replays
+    /// outcomes instead of re-deciding the rules (`activeReplaysOutcomes`).
+    captured: bool = false,
+    /// Guard refusals the capture recorded, keyed `"s"/"d" ++ key` → the
+    /// refusal CODE. A hit replays the refusal; on a captured world a write
+    /// with NO entry succeeded at capture and proceeds unguarded.
+    refusals: std.StringHashMapUnmanaged([]const u8) = .{},
 
     pub fn install(self: *Host) void {
         setHost(&HOST_VTABLE, self);

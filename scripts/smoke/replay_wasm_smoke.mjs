@@ -234,6 +234,9 @@ const wrapped_source =
     buildRequestEpilogue({
         record: raw.request || {},
         requestReads: Module.tapes.request_reads,
+        // Outcome-replay (rove#516): the capture's guard refusals ride the
+        // kv tape; the wrapper throws them verbatim and re-decides nothing.
+        kvRefusals: Module.tapes.kv,
         bodyBytes: raw.request?.body ?? null,
         exportName: raw.entry_fn || "default",
     });
@@ -243,9 +246,20 @@ const rc = arena_run_module(entry_path, wrapped_source);
 arena_set_trace_mode(0);
 arena_destroy();
 
+// The parked run output (the epilogue writes it to the sentinel key; the
+// wasm host's write overlay holds it) — lets the orchestrator compare the
+// REPLAYED body to the live one, which is the whole game.
+let parked = null;
+try {
+    const ov = Module._kvOverlay;
+    const rawParked = ov && ov.get("__replay_output__");
+    if (rawParked) parked = JSON.parse(rawParked);
+} catch (_) {}
+
 const summary = {
     ok: rc === 0,
     rc,
+    parked_result: parked && typeof parked.result === "string" ? parked.result : null,
     entry_path,
     event_count,
     func_enter_count,

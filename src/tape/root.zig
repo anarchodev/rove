@@ -116,7 +116,12 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// REFERENCED rather than copied (never tape blobs — rove#430). Appended at
 /// the END of the entry, so nothing else moved and the reader's v5 branch is
 /// simply "no such field" (`src/replay/tape_decode.zig` `MIN_VERSION`).
-pub const VERSION: u16 = 6;
+/// v6 → v7: `KvOutcome` gained `refused` — a guard-refused `kv.set`/`kv.delete`
+/// is recorded (value = the refusal CODE) so captured replay can REPLAY the
+/// outcome instead of re-deciding the rules; same entry width, new byte
+/// value, so the bump exists to make a stale reader reject loudly rather
+/// than misread (the engine-parity epic's outcome-replay model).
+pub const VERSION: u16 = 7;
 
 /// Magic + version for the whole-Readset wire format used by
 /// `Readset.serialize` (readset replication, `docs/architecture/effects-and-handlers.md`).
@@ -197,6 +202,14 @@ pub const KvOutcome = enum(u8) {
     /// I/O error). We record it so replay sees the same failure — the
     /// handler's error-handling path is itself under test.
     err = 2,
+    /// A guard-refused write (`kv.set`/`kv.delete` only): the rules said no
+    /// at capture time, and the entry's `value` carries the refusal CODE
+    /// (`reserved_key` / `key_too_large` / …). Captured replay throws the
+    /// recorded refusal instead of re-deciding, so a tape stays faithful to
+    /// the rules that were live when it was cut — rule evolution cannot
+    /// manufacture a false divergence. Refusals fold nothing into the
+    /// interaction digest, in any engine: a refused write never happened.
+    refused = 3,
 };
 
 pub const KvOp = enum(u8) {
@@ -1480,6 +1493,8 @@ test "kv tape: roundtrip with mixed ops and outcomes" {
     try tape.appendKv(.set, "name", "rove", .ok);
     try tape.appendKv(.delete, "name", "", .ok);
     try tape.appendKv(.get, "broken", "", .err);
+    // A guard-refused write (outcome-replay, v7): value carries the CODE.
+    try tape.appendKv(.set, "_secret/x", "reserved_key", .refused);
 
     const bytes = try tape.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1488,7 +1503,7 @@ test "kv tape: roundtrip with mixed ops and outcomes" {
     defer parsed.deinit();
 
     try testing.expectEqual(Channel.kv, parsed.channel);
-    try testing.expectEqual(@as(usize, 5), parsed.entries.len);
+    try testing.expectEqual(@as(usize, 6), parsed.entries.len);
 
     try testing.expectEqual(KvOp.get, parsed.entries[0].kv.op);
     try testing.expectEqualStrings("hits", parsed.entries[0].kv.key);
@@ -1500,6 +1515,9 @@ test "kv tape: roundtrip with mixed ops and outcomes" {
     try testing.expectEqualStrings("rove", parsed.entries[2].kv.value);
     try testing.expectEqual(KvOp.delete, parsed.entries[3].kv.op);
     try testing.expectEqual(KvOutcome.err, parsed.entries[4].kv.outcome);
+    try testing.expectEqual(KvOutcome.refused, parsed.entries[5].kv.outcome);
+    try testing.expectEqualStrings("_secret/x", parsed.entries[5].kv.key);
+    try testing.expectEqualStrings("reserved_key", parsed.entries[5].kv.value);
 }
 
 test "kv tape: prefix capture round-trips inputs and results" {

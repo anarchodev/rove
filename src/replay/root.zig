@@ -325,6 +325,16 @@ pub const Engine = struct {
         var kv_map = std.StringHashMapUnmanaged([]const u8){};
         for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
 
+        // ── captured guard refusals → the outcome-replay map ("s"/"d" ++ key)
+        var refusals = std.StringHashMapUnmanaged([]const u8){};
+        for (wv.kv_refusals) |r| {
+            const keyed = try std.mem.concat(a, u8, &.{
+                if (std.mem.eql(u8, r.op, "delete")) "d" else "s",
+                r.key,
+            });
+            try refusals.put(a, keyed, r.code);
+        }
+
         // ── module sources (inline) ──
         var sources = std.StringHashMapUnmanaged([]const u8){};
         for (wv.sources) |s| {
@@ -437,6 +447,8 @@ pub const Engine = struct {
             .kv_map = kv_map,
             .sources = sources,
             .source_dir = src_dir,
+            .captured = wv.captured,
+            .refusals = refusals,
         };
         host.install();
 

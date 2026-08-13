@@ -42,6 +42,23 @@
 //!                                         //   writers bypass the binding
 //!                                         //   entirely). Same parameter the
 //!                                         //   JS-side __kvGuardWrite takes.
+//! decides(d) bool                         // false = a CAPTURED world in
+//!                                         //   outcome-replay: the rules are
+//!                                         //   not re-decided at all — a
+//!                                         //   write with no taped refusal
+//!                                         //   proceeds, so rule evolution
+//!                                         //   cannot manufacture a false
+//!                                         //   divergence. Live/authored
+//!                                         //   engines return true.
+//! tapedRefusal(d, op, key) ?[]const u8    // the refusal CODE the capture
+//!                                         //   recorded for this write, or
+//!                                         //   null. Checked before the
+//!                                         //   rules; a hit replays the
+//!                                         //   refusal verbatim.
+//! recordRefusal(d, op, key, refusal) void // a live refusal happened — tape
+//!                                         //   it (the worker) or ignore it
+//!                                         //   (engines that produce no
+//!                                         //   tapes). Best-effort.
 //! get(d, key) GetResult                   // value (owned) | absent | thrown
 //!                                         //   — the delegate records/tapes/
 //!                                         //   folds internally
@@ -80,6 +97,10 @@ pub const GetResult = union(enum) {
     absent,
     thrown,
 };
+
+/// Which write surface a refusal belongs to, for taping and replaying it —
+/// mirrors the tape's `KvOp` without importing the tape module here.
+pub const WriteOp = enum { set, delete };
 
 /// quickjs.h defines JS_UNDEFINED etc. as compound-literal macros the C
 /// translator cannot expand; reconstruct them per import instance. The layout
@@ -165,6 +186,32 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             return throwKvError(ctx, msg, guards.kv_reserved_code);
         }
 
+        /// Replay a refusal the CAPTURE recorded (outcome-replay). The code
+        /// is the contract a handler branches on; the message is
+        /// re-materialized from the current wording for the codes we know,
+        /// and a generic sentence for a code whose rule has since been
+        /// retired — the code survives verbatim either way, which is what
+        /// keeps an old tape's `catch (e) { if (e.code === …) }` path
+        /// faithful under rule evolution.
+        fn throwTapedRefusal(d: D, ctx: ?*q.JSContext, code: []const u8, key: []const u8) q.JSValue {
+            if (std.mem.eql(u8, code, guards.kv_reserved_code)) {
+                return throwRefusal(d, ctx, .{ .throw = .err, .code = guards.kv_reserved_code, .message = "" }, key);
+            }
+            if (std.mem.eql(u8, code, guards.kv_key_too_large_code)) {
+                return throwKvError(ctx, guards.kv_key_too_large_message, code);
+            }
+            if (std.mem.eql(u8, code, guards.kv_value_too_large_code)) {
+                return throwKvError(ctx, guards.kv_value_too_large_message, code);
+            }
+            const msg = std.fmt.allocPrint(
+                d.allocator(),
+                "kv: '{s}' was refused at capture",
+                .{key},
+            ) catch return q.JS_ThrowOutOfMemory(ctx);
+            defer d.allocator().free(msg);
+            return throwKvError(ctx, msg, code);
+        }
+
         pub fn jsKvGet(
             ctx: ?*q.JSContext,
             _: q.JSValue,
@@ -201,13 +248,22 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             const value = coerceWriteArg(d, ctx, argv[1], "value") catch return js_exception;
             defer d.allocator().free(value);
 
+            // A refusal the capture recorded replays verbatim, before any
+            // rule runs — and when the delegate does not DECIDE (a captured
+            // world in outcome-replay), the table is not consulted at all: a
+            // write with no taped refusal succeeded at capture and must
+            // succeed here, whatever today's rules would say.
+            if (d.tapedRefusal(.set, key)) |code| {
+                return throwTapedRefusal(d, ctx, code, key);
+            }
             // ONE call, here, for every engine that registers this binding.
             // The rule order is part of the contract and lives in the guards
             // module, not at any call site. An exempt key is not a customer
             // write at all and skips the table, exactly as the JS evaluator's
             // isExempt parameter does.
-            if (!d.isExempt(key)) {
+            if (d.decides() and !d.isExempt(key)) {
                 if (guards.checkKvWrite(key, value, d.isSystemModule())) |refusal| {
+                    d.recordRefusal(.set, key, refusal);
                     return throwRefusal(d, ctx, refusal, key);
                 }
             }
@@ -228,10 +284,14 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             const key = coerceWriteArg(d, ctx, argv[0], "key") catch return js_exception;
             defer d.allocator().free(key);
 
+            if (d.tapedRefusal(.delete, key)) |code| {
+                return throwTapedRefusal(d, ctx, code, key);
+            }
             // Same rules, same authority — null value: a delete has none to
             // size-check.
-            if (!d.isExempt(key)) {
+            if (d.decides() and !d.isExempt(key)) {
                 if (guards.checkKvWrite(key, null, d.isSystemModule())) |refusal| {
+                    d.recordRefusal(.delete, key, refusal);
                     return throwRefusal(d, ctx, refusal, key);
                 }
             }

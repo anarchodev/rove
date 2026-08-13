@@ -1608,6 +1608,11 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_poison = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_poison.addArg("poison");
     driver_smoke_step.dependOn(&driver_smoke_poison.step);
+    // `refusals`: outcome-replay — a captured world throws the tape's
+    // recorded refusals and re-decides nothing (#516).
+    const driver_smoke_refusals = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_refusals.addArg("refusals");
+    driver_smoke_step.dependOn(&driver_smoke_refusals.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
