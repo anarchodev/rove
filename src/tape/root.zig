@@ -76,7 +76,7 @@ const std = @import("std");
 /// produced at capture: the worker folds into it as interactions happen, which
 /// cannot be reconstructed afterwards from the readset and writeset, since the
 /// relative order of a read and a write across those two structures is lost.
-pub const interaction_digest = @import("interaction_digest.zig");
+pub const interaction_digest = @import("interaction-digest");
 const bodies_mod = @import("rove-bodies");
 const log_mod = @import("rove-log");
 // The lean CLI's std-only decoder for this same per-Tape wire format
@@ -2251,5 +2251,5 @@ test {
     // Test discovery: Zig compiles tests only from files a test build
     // reaches, and importing a file for its declarations does not reach it.
     // `scripts/ops/test_reachability_lint.py` fails when one is missing here.
-    _ = @import("interaction_digest.zig");
+    _ = interaction_digest;
 }

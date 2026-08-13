@@ -10,50 +10,81 @@
 //! indirection arenajs's own kv binding used — so the run host (`host.zig`,
 //! closed-world map) and the rewind-test harness host (`harness.zig`, which
 //! re-takes the vtable around nested sim runs) both keep serving without
-//! knowing the JS surface changed. What DID change is everything above the
-//! vtable: coercion, its TypeError, the guard call, the refusal shapes and
-//! the result shaping are now the binding's — one implementation with the
-//! worker.
+//! knowing the JS surface changed.
 //!
-//! The per-request JS wrapper (`epilogue.zig`) still runs its own guard
-//! calls ahead of this binding for now — double enforcement, same verdicts
-//! by the differential test — because the wrapper's trigger chains must stay
-//! ORDERED after the guard the way the worker's delegate orders them; they
-//! move into this delegate when the wrapper is retired. What this
-//! installation already closes: module top-level code (which runs before the
-//! per-request wrapper exists) used to see arenajs's guard-free kv — now it
-//! sees the guarded binding, like prod's top-level does.
+//! Everything ABOVE the vtable is one implementation with the worker now.
+//! The binding owns coercion + guards + refusal shapes + result shaping;
+//! this delegate owns the offline mirror of the worker delegate's duties, in
+//! the worker's order — guard, BEFORE-trigger chain, store, effect record,
+//! subscription markers, AFTER-trigger chain:
+//!
+//!   - the ordered effect log entries (`globalThis.__rove_effects`, pushed
+//!     through the epilogue's PATCHED push so the interaction digest folds
+//!     at the same points);
+//!   - the kv-trigger chains, dispatched to the epilogue-defined
+//!     `__rove_run_triggers` (the trigger table and its module namespaces
+//!     are per-request JS; the chain's `previousValue` is supplied from
+//!     here via a RAW read, effect-invisible exactly as the worker's
+//!     slow-path prev fetch is);
+//!   - the `_sub/dirty/{name}` subscription markers (the worker's
+//!     markSubscriptionsDirty, stated offline): raw reads/writes below the
+//!     binding, so no guard exemption is reachable from customer JS;
+//!   - the harness-namespace carve-outs (`__rove_store/` reads/writes are
+//!     the facade's own and never recorded; customer prefix scans never see
+//!     namespaced rows).
 
 const std = @import("std");
 const binding = @import("rove-binding");
 const c = @import("qjs_c.zig").c;
 const host = @import("host.zig");
 const decode = @import("tape_decode.zig");
+const digest_mod = @import("interaction-digest");
 
 /// Keys the binding's guards do not judge, because they are not customer
-/// writes (the JS evaluator's `isExempt` parameter, stated natively):
+/// writes (the JS evaluator's `isExempt` parameter, stated natively): the
+/// harness store namespace — `platform.scope/root` facade keys and the sim's
+/// own bookkeeping (`system_recorders.js` NS_STORE). The facade pushes its
+/// OWN store-tagged effect entries, so the delegate records nothing for
+/// them either.
 ///
-///   - the harness store namespace — `platform.scope/root` facade keys and
-///     the sim's own bookkeeping (`system_recorders.js` NS_STORE);
-///   - the parked-output sentinel the epilogue writes through the restored
-///     native (`host.OUTPUT_KEY`);
-///   - the `_sub/dirty/` markers the epilogue's subscription hook injects
-///     via the captured native — the worker's equivalent injection
-///     (markSubscriptionsDirty) writes the txn directly, below its binding.
+/// Deliberately NOT exempt: `_sub/dirty/` (the delegate's marker writes run
+/// below the binding, so a customer spoof hits the reserved-prefix refusal
+/// exactly as in prod) and the parked-output sentinel (output parks through
+/// `__rove_park_output`, not kv — a customer write to `__replay_output__`
+/// is refused like any reserved key).
 ///
-/// Reachability note: per-request customer code cannot reach this door — the
-/// epilogue's kv wrapper guards `_sub/`-spoofing in JS before the native is
-/// called, and the namespace/output keys are filtered there too. Module
-/// TOP-LEVEL code can (no wrapper exists yet) — which is narrower than what
-/// it had before this binding existed (arenajs's kv object, no guards on any
-/// key), and closes entirely when the wrapper's duties move into this
-/// delegate.
+/// Carried corner: a customer writing directly under `__rove_store/` is
+/// allowed here where prod refuses (the namespace is a harness construct
+/// prod has never heard of). Same posture the JS wrapper had; closes when
+/// the facade gets its own door.
 const STORE_NS = "__rove_store/";
 
 fn exempt(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, STORE_NS) or
-        std.mem.eql(u8, key, host.OUTPUT_KEY) or
-        std.mem.startsWith(u8, key, "_sub/dirty/");
+    return std.mem.startsWith(u8, key, STORE_NS);
+}
+
+/// Per-run `_sub/dirty/` marker dedup — the worker's `subs_marked` bitmask,
+/// keyed by subscription name hash. Reset whenever a host is (re)installed:
+/// each sim run installs its single-shot Host, so a generation bump is a new
+/// activation.
+var marked_gen: u64 = 0;
+var marked_names: [64]u64 = undefined;
+var marked_count: usize = 0;
+
+fn markedContains(name: []const u8) bool {
+    if (marked_gen != host.generation) {
+        marked_gen = host.generation;
+        marked_count = 0;
+    }
+    const h = std.hash.Wyhash.hash(0, name);
+    for (marked_names[0..marked_count]) |m| if (m == h) return true;
+    return false;
+}
+
+fn markedAdd(name: []const u8) void {
+    if (marked_count >= marked_names.len) return;
+    marked_names[marked_count] = std.hash.Wyhash.hash(0, name);
+    marked_count += 1;
 }
 
 pub const OfflineKv = struct {
@@ -91,6 +122,213 @@ pub const OfflineKv = struct {
         _ = c.JS_ThrowInternalError(self.ctx, "%s", msg.ptr);
     }
 
+    // ── raw storage (no effects, no guards — the delegate's own reads/writes) ──
+
+    /// malloc'd value (free via std.c.free) | null = absent/error. The
+    /// trigger chain's previousValue and the subscription-spec read use
+    /// this: prod's equivalents (`state.kv.get` direct) are effect-invisible
+    /// too.
+    fn rawGet(self: OfflineKv, key: []const u8) ?[]u8 {
+        const vt = self.vtable() orelse return null;
+        const responder = vt.kv_get orelse return null;
+        var outcome: c_int = 0;
+        var val: [*c]u8 = null;
+        var val_len: c_int = 0;
+        const rc = responder(key.ptr, @intCast(key.len), &outcome, &val, &val_len, host.active_user);
+        if (rc != 0 or outcome != @intFromEnum(decode.KvOutcome.ok) or val == null) {
+            if (val != null) std.c.free(val);
+            return null;
+        }
+        if (val_len == 0) {
+            std.c.free(val);
+            return null;
+        }
+        return val[0..@intCast(val_len)];
+    }
+
+    fn rawSet(self: OfflineKv, key: []const u8, value: []const u8) bool {
+        const vt = self.vtable() orelse return false;
+        const responder = vt.kv_set orelse return false;
+        var outcome: c_int = 0;
+        return responder(key.ptr, @intCast(key.len), value.ptr, @intCast(value.len), &outcome, host.active_user) == 0;
+    }
+
+    // ── the effect log ───────────────────────────────────────────────────
+
+    /// Push one entry through `globalThis.__rove_effects`'s PATCHED push, so
+    /// the interaction digest folds it at the same point the JS pushes fold.
+    /// Consumes `obj`. Best-effort: with no effect sink installed (a bare
+    /// run) the entry is dropped, matching a wrapper-less run before.
+    fn pushEffect(self: OfflineKv, obj: c.JSValue) void {
+        const g = c.JS_GetGlobalObject(self.ctx);
+        defer c.JS_FreeValue(self.ctx, g);
+        const arr = c.JS_GetPropertyStr(self.ctx, g, "__rove_effects");
+        defer c.JS_FreeValue(self.ctx, arr);
+        if (!c.JS_IsObject(arr)) {
+            c.JS_FreeValue(self.ctx, obj);
+            return;
+        }
+        const push = c.JS_GetPropertyStr(self.ctx, arr, "push");
+        defer c.JS_FreeValue(self.ctx, push);
+        var argv = [1]c.JSValue{obj};
+        const r = c.JS_Call(self.ctx, push, arr, 1, &argv);
+        if (c.JS_IsException(r)) {
+            // A throwing push must not fail the kv op — clear and continue.
+            const ex = c.JS_GetException(self.ctx);
+            c.JS_FreeValue(self.ctx, ex);
+        }
+        c.JS_FreeValue(self.ctx, r);
+        c.JS_FreeValue(self.ctx, obj);
+    }
+
+    fn newStr(self: OfflineKv, s: []const u8) c.JSValue {
+        return c.JS_NewStringLen(self.ctx, s.ptr, s.len);
+    }
+
+    /// A present read carries its value — the digest folds `r <key> 1
+    /// <valuehash>`, and the worker folds the real bytes (foldRead), so an
+    /// entry without the value folds a different element on every present
+    /// read. The browser arena's wrapper pushes exactly this shape; the old
+    /// sim wrapper pushed present-only entries and silently folded "" — a
+    /// latent cross-engine digest divergence no corpus case exercised. An
+    /// absent read omits the field rather than spelling it "" (the arena's
+    /// posture: an entry differing only in how it spells absence reads as a
+    /// divergence while the digest says the runs agreed).
+    fn effectRead(self: OfflineKv, key: []const u8, value: ?[]const u8) void {
+        const o = c.JS_NewObject(self.ctx);
+        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("read"));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(key));
+        // Hand-built bool JSValue: this header's JS_NewBool translates to
+        // invalid Zig (a bool assigned to the int32 union arm).
+        const present = c.JSValue{ .u = .{ .int32 = @intFromBool(value != null) }, .tag = c.JS_TAG_BOOL };
+        _ = c.JS_SetPropertyStr(self.ctx, o, "present", present);
+        if (value) |v| _ = c.JS_SetPropertyStr(self.ctx, o, "value", self.newStr(v));
+        self.pushEffect(o);
+    }
+
+    fn effectWrite(self: OfflineKv, key: []const u8, value: []const u8) void {
+        const o = c.JS_NewObject(self.ctx);
+        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("write"));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(key));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "value", self.newStr(value));
+        self.pushEffect(o);
+    }
+
+    fn effectDelete(self: OfflineKv, key: []const u8) void {
+        const o = c.JS_NewObject(self.ctx);
+        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("delete"));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(key));
+        self.pushEffect(o);
+    }
+
+    /// `count` + `rowsFold` (`key=<valuehash>;` per row IN ORDER, lowercase
+    /// hex) — the same accumulator the worker folds (globals_kv.foldPrefix)
+    /// and the browser arena's wrapper computes, over the rows the handler
+    /// observes.
+    fn effectPrefix(self: OfflineKv, p: []const u8, entries: anytype) void {
+        var acc: std.ArrayList(u8) = .empty;
+        defer acc.deinit(std.heap.c_allocator);
+        var acc_ok = true;
+        for (entries) |e| {
+            acc.writer(std.heap.c_allocator).print("{s}={x};", .{ e.key, digest_mod.foldValue(e.value) }) catch {
+                acc_ok = false;
+                break;
+            };
+        }
+        if (!acc_ok) return;
+        var fold_buf: [16]u8 = undefined;
+        const fold_hex = std.fmt.bufPrint(&fold_buf, "{x}", .{digest_mod.foldValue(acc.items)}) catch return;
+        const o = c.JS_NewObject(self.ctx);
+        _ = c.JS_SetPropertyStr(self.ctx, o, "kind", self.newStr("read"));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "op", self.newStr("prefix"));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "key", self.newStr(p));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "count", c.JS_NewInt64(self.ctx, @intCast(entries.len)));
+        _ = c.JS_SetPropertyStr(self.ctx, o, "rowsFold", self.newStr(fold_hex));
+        self.pushEffect(o);
+    }
+
+    // ── kv-trigger chains ────────────────────────────────────────────────
+
+    const TriggerResult = union(enum) {
+        /// Value to write: the original (borrowed) or a trigger-mutated copy
+        /// (owned via c_allocator — caller frees when `mutated`).
+        proceed: struct { value: ?[]const u8, mutated: bool },
+        thrown,
+    };
+
+    /// Dispatch one chain to the epilogue-defined `__rove_run_triggers` —
+    /// per-request JS (the trigger table + imported module namespaces live
+    /// there), called from here so the chain sits in the worker's ORDER:
+    /// after the guard, around the store. Absent global = no triggers
+    /// registered for this run.
+    fn runTriggers(
+        self: OfflineKv,
+        comptime op: []const u8,
+        comptime timing: []const u8,
+        key: []const u8,
+        value: ?[]const u8,
+        prev: ?[]const u8,
+    ) TriggerResult {
+        const g = c.JS_GetGlobalObject(self.ctx);
+        defer c.JS_FreeValue(self.ctx, g);
+        const f = c.JS_GetPropertyStr(self.ctx, g, "__rove_run_triggers");
+        defer c.JS_FreeValue(self.ctx, f);
+        if (!c.JS_IsFunction(self.ctx, f)) return .{ .proceed = .{ .value = value, .mutated = false } };
+
+        const undef = c.JSValue{ .u = .{ .int32 = 0 }, .tag = c.JS_TAG_UNDEFINED };
+        const nul = c.JSValue{ .u = .{ .int32 = 0 }, .tag = c.JS_TAG_NULL };
+        var argv = [5]c.JSValue{
+            self.newStr(op),
+            self.newStr(timing),
+            self.newStr(key),
+            if (value) |v| self.newStr(v) else nul,
+            if (prev) |p| self.newStr(p) else nul,
+        };
+        defer for (argv) |a| c.JS_FreeValue(self.ctx, a);
+        const r = c.JS_Call(self.ctx, f, undef, argv.len, &argv);
+        if (c.JS_IsException(r)) return .thrown;
+        defer c.JS_FreeValue(self.ctx, r);
+        if (c.JS_IsString(r)) {
+            var len: usize = 0;
+            const cstr = c.JS_ToCStringLen(self.ctx, &len, r);
+            if (cstr == null) return .thrown;
+            defer c.JS_FreeCString(self.ctx, cstr);
+            const dup = std.heap.c_allocator.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]) catch
+                return .{ .proceed = .{ .value = value, .mutated = false } };
+            return .{ .proceed = .{ .value = dup, .mutated = true } };
+        }
+        return .{ .proceed = .{ .value = value, .mutated = false } };
+    }
+
+    // ── subscription markers ─────────────────────────────────────────────
+
+    const Sub = struct { name: []const u8, prefix: []const u8 };
+
+    /// The worker's markSubscriptionsDirty, offline: a customer write under
+    /// a watched prefix injects ONE durable `_sub/dirty/{name}` marker —
+    /// coalesced per activation, recursion-guarded on `_sub/` keys. Raw
+    /// storage below the binding (a platform injection, not a customer
+    /// write); the marker's write EFFECT is recorded, so the digest folds it
+    /// exactly as the worker folds its foldWrite.
+    fn markSubscriptionsDirty(self: OfflineKv, key: []const u8) void {
+        if (std.mem.startsWith(u8, key, "_sub/")) return;
+        const spec = self.rawGet(STORE_NS ++ "subscriptions") orelse return;
+        defer std.c.free(@constCast(spec.ptr));
+        const parsed = std.json.parseFromSlice([]Sub, std.heap.c_allocator, spec, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        for (parsed.value) |sub| {
+            if (!std.mem.startsWith(u8, key, sub.prefix)) continue;
+            if (markedContains(sub.name)) continue;
+            markedAdd(sub.name);
+            var mbuf: [96]u8 = undefined;
+            const mkey = std.fmt.bufPrint(&mbuf, "_sub/dirty/{s}", .{sub.name}) catch continue;
+            if (!self.rawSet(mkey, sub.prefix)) continue;
+            self.effectWrite(mkey, sub.prefix);
+        }
+    }
+
+    // ── the delegate surface the binding calls ───────────────────────────
+
     pub fn get(self: OfflineKv, key: []const u8) binding.GetResult {
         const vt = self.vtable() orelse {
             self.throwHostError("get", 1);
@@ -109,18 +347,23 @@ pub const OfflineKv = struct {
             self.throwHostError("get", rc);
             return .thrown;
         }
+        const facade = exempt(key);
         switch (@as(decode.KvOutcome, @enumFromInt(outcome))) {
             .ok => {
                 // An empty value's buffer is freed here (release() frees by
                 // pointer only when the slice is non-empty).
                 if (val == null or val_len == 0) {
                     if (val != null) std.c.free(val);
+                    if (!facade) self.effectRead(key, "");
                     return .{ .value = "" };
                 }
-                return .{ .value = val[0..@intCast(val_len)] };
+                const v: []const u8 = val[0..@intCast(val_len)];
+                if (!facade) self.effectRead(key, v);
+                return .{ .value = v };
             },
             .not_found => {
                 if (val != null) std.c.free(val);
+                if (!facade) self.effectRead(key, null);
                 return .absent;
             },
             .err => {
@@ -140,6 +383,30 @@ pub const OfflineKv = struct {
     }
 
     pub fn put(self: OfflineKv, _: ?*c.JSContext, key: []const u8, value: []const u8) bool {
+        // Facade writes are the harness's own: stored raw, never recorded,
+        // no triggers, no markers.
+        if (exempt(key)) {
+            if (!self.rawSet(key, value)) {
+                self.throwHostError("set", -1);
+                return false;
+            }
+            return true;
+        }
+
+        // The worker's order: guard (already run by the binding) →
+        // BEFORE-chain (may mutate the value) → store → effect → markers →
+        // AFTER-chain. `prev` is fetched raw — effect-invisible, like the
+        // worker's slow-path previousValue.
+        const prev = self.rawGet(key);
+        defer if (prev) |p| std.c.free(@constCast(p.ptr));
+
+        const before = self.runTriggers("put", "before", key, value, prev);
+        const write_value: []const u8, const owned: bool = switch (before) {
+            .thrown => return false,
+            .proceed => |p| .{ p.value.?, p.mutated },
+        };
+        defer if (owned) std.heap.c_allocator.free(@constCast(write_value));
+
         const vt = self.vtable() orelse {
             self.throwHostError("set", 1);
             return false;
@@ -149,7 +416,7 @@ pub const OfflineKv = struct {
             return false;
         };
         var outcome: c_int = 0;
-        const rc = responder(key.ptr, @intCast(key.len), value.ptr, @intCast(value.len), &outcome, host.active_user);
+        const rc = responder(key.ptr, @intCast(key.len), write_value.ptr, @intCast(write_value.len), &outcome, host.active_user);
         if (rc != 0) {
             self.throwHostError("set", rc);
             return false;
@@ -158,10 +425,34 @@ pub const OfflineKv = struct {
             _ = c.JS_ThrowInternalError(self.ctx, "kv.set: recorded failure");
             return false;
         }
+
+        self.effectWrite(key, write_value);
+        self.markSubscriptionsDirty(key);
+
+        switch (self.runTriggers("put", "after", key, write_value, prev)) {
+            .thrown => return false,
+            .proceed => |p| if (p.mutated) std.heap.c_allocator.free(@constCast(p.value.?)),
+        }
         return true;
     }
 
     pub fn del(self: OfflineKv, _: ?*c.JSContext, key: []const u8) bool {
+        if (exempt(key)) {
+            const vt0 = self.vtable() orelse return true;
+            const resp0 = vt0.kv_delete orelse return true;
+            var oc0: c_int = 0;
+            _ = resp0(key.ptr, @intCast(key.len), &oc0, host.active_user);
+            return true;
+        }
+
+        const prev = self.rawGet(key);
+        defer if (prev) |p| std.c.free(@constCast(p.ptr));
+
+        switch (self.runTriggers("delete", "before", key, null, prev)) {
+            .thrown => return false,
+            .proceed => |p| if (p.mutated) std.heap.c_allocator.free(@constCast(p.value.?)),
+        }
+
         const vt = self.vtable() orelse {
             self.throwHostError("delete", 1);
             return false;
@@ -179,6 +470,14 @@ pub const OfflineKv = struct {
         if (outcome == @intFromEnum(decode.KvOutcome.err)) {
             _ = c.JS_ThrowInternalError(self.ctx, "kv.delete: recorded failure");
             return false;
+        }
+
+        self.effectDelete(key);
+        self.markSubscriptionsDirty(key);
+
+        switch (self.runTriggers("delete", "after", key, null, prev)) {
+            .thrown => return false,
+            .proceed => |p| if (p.mutated) std.heap.c_allocator.free(@constCast(p.value.?)),
         }
         return true;
     }
@@ -198,7 +497,10 @@ pub const OfflineKv = struct {
 
     /// The responder returns the page as JSON (`host.zig` builds it; arenajs
     /// parsed it with JS_ParseJSON). The binding shapes the JS array itself,
-    /// so parse it here — the rows are what the closed-world map answered.
+    /// so parse it here. A facade scan (`__rove_store/…`) returns raw rows
+    /// for the facade to strip and is not recorded; a customer scan never
+    /// sees namespaced rows and records `count` + `rowsFold` over what it
+    /// observed.
     pub fn prefix(self: OfflineKv, p: []const u8, cursor: []const u8, limit: u32) ?Page {
         const vt = self.vtable() orelse return null;
         const responder = vt.kv_prefix orelse return null;
@@ -221,11 +523,23 @@ pub const OfflineKv = struct {
             return null;
         }
         const bytes: []const u8 = json[0..@intCast(json_len)];
-        const parsed = std.json.parseFromSlice([]Row, std.heap.c_allocator, bytes, .{}) catch {
+        var parsed = std.json.parseFromSlice([]Row, std.heap.c_allocator, bytes, .{}) catch {
             std.c.free(json);
             return null;
         };
-        return .{ .parsed = parsed, .json_ptr = json, .entries = parsed.value };
+        if (exempt(p)) {
+            return .{ .parsed = parsed, .json_ptr = json, .entries = parsed.value };
+        }
+        // Strip harness-namespaced rows in place — prod has none to see.
+        var n: usize = 0;
+        for (parsed.value) |row| {
+            if (std.mem.startsWith(u8, row.key, STORE_NS)) continue;
+            parsed.value[n] = row;
+            n += 1;
+        }
+        const rows = parsed.value[0..n];
+        self.effectPrefix(p, rows);
+        return .{ .parsed = parsed, .json_ptr = json, .entries = rows };
     }
 };
 
@@ -259,9 +573,42 @@ fn jsPoison(
     return undef;
 }
 
-/// Replace arenajs's replay kv object with the common binding. Called from
-/// the reactor base-setup hook, after `arena_install_replay_bindings` (which
-/// still owns the module loader and the crypto surface).
+/// `__rove_park_output(json)` — the run-output side channel. The epilogue
+/// used to park through `kv.set(OUTPUT_KEY, …)` on a raw native; through the
+/// guarded binding that spelling would need a customer-reachable exemption
+/// for a reserved-looking key. A dedicated native keeps the door off the kv
+/// surface entirely: a customer `kv.set("__replay_output__", …)` now hits
+/// the reserved-prefix refusal exactly as in prod, and a customer calling
+/// THIS only overwrites a value the epilogue's own final park overwrites
+/// again.
+fn jsParkOutput(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const undef = c.JSValue{ .u = .{ .int32 = 0 }, .tag = c.JS_TAG_UNDEFINED };
+    if (argc < 1) return undef;
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (cstr == null) return undef;
+    defer c.JS_FreeCString(ctx, cstr);
+    const bytes = @as([*]const u8, @ptrCast(cstr))[0..len];
+    // Through the vtable's kv_set with the sentinel key: the run host
+    // intercepts it as the parked output (host.zig kvSet), which keeps one
+    // interception point rather than a second host channel.
+    const vt = host.active_vtable orelse return undef;
+    const responder = vt.kv_set orelse return undef;
+    var outcome: c_int = 0;
+    _ = responder(host.OUTPUT_KEY.ptr, @intCast(host.OUTPUT_KEY.len), bytes.ptr, @intCast(len), &outcome, host.active_user);
+    return undef;
+}
+
+/// Replace arenajs's replay kv object with the common binding, and register
+/// the offline-engine natives (`__rove_poison`, `__rove_park_output`).
+/// Called from the reactor base-setup hook, after
+/// `arena_install_replay_bindings` (which still owns the module loader and
+/// the crypto surface).
 pub fn installKv(ctx: ?*c.JSContext) c_int {
     const g = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, g);
@@ -272,5 +619,6 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, g, "__rove_park_output", c.JS_NewCFunction2(ctx, jsParkOutput, "__rove_park_output", 1, c.JS_CFUNC_generic, 0));
     return 0;
 }

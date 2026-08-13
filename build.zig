@@ -168,6 +168,17 @@ pub fn build(b: *std.Build) void {
     // record + captured tapes as the JSON document the browser-side
     // replay harness consumes. That brings rove-log + rove-blob in as
     // deps — bundle reads the LogRecord and fetches tape blobs.
+    // The interaction digest as its own std-only module (same arrangement as
+    // tape-decode below): rove-tape re-exports it, and the replay engine's kv
+    // delegate imports it directly — the lean CLI must not link rove-tape
+    // (rove-log + rove-blob + libcurl), and one file must belong to one
+    // module.
+    const idigest_mod = b.createModule(.{
+        .root_source_file = b.path("src/tape/interaction_digest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const tape_mod = b.addModule("rove-tape", .{
         .root_source_file = b.path("src/tape/root.zig"),
         .target = target,
@@ -195,6 +206,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     tape_mod.addImport("tape-decode", tape_decode_mod);
+    tape_mod.addImport("interaction-digest", idigest_mod);
 
     // ── rove-qjs: arenajs (quickjs-ng fork) wrapper ──
     //
@@ -573,6 +585,11 @@ pub fn build(b: *std.Build) void {
 
     const guards_tests = b.addTest(.{ .root_module = guards_mod });
     test_step.dependOn(&b.addRunArtifact(guards_tests).step);
+
+    // interaction-digest's inline tests (the reference vectors) no longer run
+    // under rove-tape's test binary now that the file is its own module.
+    const idigest_tests = b.addTest(.{ .root_module = idigest_mod });
+    test_step.dependOn(&b.addRunArtifact(idigest_tests).step);
 
     // ── rove-binding: the common JS↔Zig binding, one implementation ──
     //
@@ -1489,6 +1506,7 @@ pub fn build(b: *std.Build) void {
     replay_mod.addImport("rove-reserved", reserved_mod);
     replay_mod.addImport("rove-guards", guards_mod);
     replay_mod.addImport("rove-binding", binding_mod);
+    replay_mod.addImport("interaction-digest", idigest_mod);
     replay_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
     // The first-party @rewind/* package sources, so `rewind test` auto-resolves
     // an app's declared @rewind deps offline (src/replay/first_party.zig) without
@@ -1516,6 +1534,7 @@ pub fn build(b: *std.Build) void {
     addSimGlobalEmbeds(b, driver_smoke_mod);
     driver_smoke_mod.addImport("package_resolver", pkgres_mod);
     driver_smoke_mod.addImport("rove-binding", binding_mod);
+    driver_smoke_mod.addImport("interaction-digest", idigest_mod);
     driver_smoke_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
     // The lifted first-party @rewind/* package sources (P-Lift, rove#123),
     // embedded so the driver smoke can prove the real libs resolve + run

@@ -16,9 +16,11 @@
 //!   - installs a CAPTURING console (the bare arena has none) so the replayed
 //!     run's logs land in the output;
 //!   - invokes the activation's export via `__arena_entry_ns()` and parks the
-//!     run output — response / result / error / console — under the host's
-//!     sentinel kv key (`host.OUTPUT_KEY`), the side channel the native driver
-//!     reads back (the reactor's result context is static / unreachable).
+//!     run output — response / result / error / console — through the
+//!     `__rove_park_output` native (kv_binding.zig), the side channel the
+//!     native driver reads back (the reactor's result context is static /
+//!     unreachable). Not a kv write: through the guarded binding, the
+//!     sentinel key would need a customer-reachable exemption.
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
@@ -299,7 +301,7 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     // replay-digest-vectors` holds both to it.
     try w.writeAll(JS_INTERACTION_DIGEST);
     try w.writeAll(EPILOGUE_BODY);
-    try w.print("  kv.set({s}, __out);\n}})();\n", .{quotedOutputKey});
+    try w.writeAll("  __rove_park_output(__out);\n})();\n");
 
     // The real middleware, imported as a namespace so the async IIFE can run its
     // `before`. A static import (hoisted, loaded before the module body) — only
@@ -324,8 +326,6 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     return buf.toOwnedSlice(a);
 }
 
-/// `"__replay_output__"` as a JS string literal for the `kv.set` call.
-const quotedOutputKey = "\"" ++ host.OUTPUT_KEY ++ "\"";
 
 /// The pure-JS UTF-8 TextEncoder/TextDecoder (prod-byte-exact, WTF-8 lone
 /// surrogates included). One file shared with the browser replay prelude
@@ -346,8 +346,8 @@ const JS_INTERACTION_DIGEST = @embedFile("js_interaction_digest");
 /// about what a handler is allowed to do, which is the divergence class the
 /// conformance suite exists to catch (rove#499).
 ///
-/// Generated at comptime into the prelude, the same way `__rove_triggers` and
-/// `quotedOutputKey` are: a new prefix is now reachable in replay the moment
+/// Generated at comptime into the prelude, the same way `__rove_triggers`
+/// is: a new prefix is now reachable in replay the moment
 /// it is reachable in the worker, with no second edit to remember.
 
 /// The kv guard RULES, shared verbatim with the browser replay arena
@@ -647,71 +647,36 @@ const EPILOGUE_BODY_HEAD =
     \\  // pre-rename deployments still replay their pinned code. Aliases the
     \\  // base `after`. Authored worlds never see it (retired live).
     \\  if (D.captured) globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
-    \\  // Wrap the native kv so reads/writes interleave with the cmds above in true
-    \\  // occurrence order. Restored before the OUTPUT_KEY write (which stays native).
-    \\  const __kvNative = globalThis.kv;
-    \\  // `platform.scope(id)` / `platform.root` (sim_globals) namespace their keys
-    \\  // under `__rove_store/` for per-store isolation and push their OWN clean
-    \\  // store-tagged effect entries, so the wrapper neither records nor surfaces
-    \\  // those namespaced keys — a tenant read / prefix scan must never see them.
-    \\  // From the shared shim, not re-spelled here: the browser arena's epilogue
-    \\  // reads the same global, so the two offline engines cannot disagree about
-    \\  // which keys are harness bookkeeping (rove#442).
-    \\  const __NS = globalThis.__roveStorePrefix;
-    \\  // The sim's own bookkeeping writes land under the store namespace and
-    \\  // are not customer writes, so they skip the guard — the one per-engine
-    \\  // decision the shared rules take as a parameter (the arena has no such
-    \\  // prefix and passes nothing).
-    \\  const __kvExempt = (ks) => ks.startsWith(__NS);
-    \\  // Prod kv guardrails (globals.zig / reserved.zig) enforced offline so a
-    \\  // handler that throws instantly in prod also throws under `rewind test`,
-    \\  // with the same error shapes (`err.code` branches are testable). The
-    \\  // `__rove_store/` facade namespace bypasses them, mirroring prod's
-    \\  // is_system_module / privileged-write exemption. Order matches the worker:
-    \\  // coerce key type, coerce value type, reserved-prefix, then size (key
-    \\  // reported before value). The rules themselves live in the shared
-    \\  // guard file spliced above; this is only where they attach.
-    \\  // Byte lengths use __utf8Len — the UTF-8 byte
-    \\  // COUNT the worker measures, computed WITHOUT materializing the encoded
-    \\  // array (measuring a 1 MiB value via __utf8Encode would blow the request
-    \\  // arena). It mirrors __utf8Encode's byte output, incl. WTF-8 surrogates.
+    \\  // kv is the NATIVE common binding (rove-binding, installed at reactor
+    \\  // base setup) for the whole run — no per-request JS wrapper. The
+    \\  // binding owns coercion + guards + shaping (one implementation with
+    \\  // the worker); the offline delegate (kv_binding.zig) records the
+    \\  // effect entries, injects the `_sub/dirty/` subscription markers, and
+    \\  // dispatches the kv-trigger chains to `__rove_run_triggers` below.
 ;
 
 const EPILOGUE_BODY_TAIL =
-    \\  // Durable kv subscriptions (issue #38): scenario({subscriptions}) carries
-    \\  // the registration (name + watched kv prefix) prod derives from
-    \\  // `_subscriptions/<name>/spec.json`. A customer write under a watched
-    \\  // prefix injects ONE durable `_sub/dirty/{name}` marker — coalesced +
-    \\  // deduped per activation, atomic with the write, recursion-guarded on
-    \\  // `_sub/` keys — the marker that feeds `onSubscription`
-    \\  // (globals.zig markSubscriptionsDirty). It's an ordinary write in the
-    \\  // effect log; as a platform injection it bypasses the reserved-prefix
-    \\  // guard (`__kvNative` directly). Cleared before the fire runs
-    \\  // (scenario.subscriptionFire).
-    \\  const __subs = (() => { try { const s = __kvNative.get(__NS + "subscriptions"); return s ? JSON.parse(s) : []; } catch (_) { return []; } })();
-    \\  const __subsMarked = new Set();
-    \\  const __markDirty = (ks) => {
-    \\    if (__subs.length === 0 || ks.startsWith("_sub/")) return;
-    \\    for (const sub of __subs) {
-    \\      if (!ks.startsWith(sub.prefix) || __subsMarked.has(sub.name)) continue;
-    \\      __subsMarked.add(sub.name);
-    \\      const mkey = "_sub/dirty/" + sub.name;
-    \\      __kvNative.set(mkey, sub.prefix);
-    \\      __effects.push({ kind: "write", key: mkey, value: sub.prefix });
-    \\    }
-    \\  };
     \\  // kv triggers (issue #38): `_triggers/<prefix>/index` modules whose
-    \\  // before/after chains run on a matching customer write (trigger_dispatch.zig).
-    \\  // The registry (globalThis.__rove_triggers, set before the IIFE) carries each
-    \\  // trigger's watched prefix + imported namespace. A before-put that returns a
-    \\  // STRING mutates the written value; a handler that THROWS rejects the write as
-    \\  // Error{code:"trigger_rejected"} ("<module>: <message>"). Platform-owned key
-    \\  // prefixes never fire (matches prod isPlatformKey); a depth cap guards
-    \\  // trigger-writes-that-re-fire recursion.
+    \\  // before/after chains run on a matching customer write. The DISPATCH
+    \\  // comes from the native kv delegate (kv_binding.zig), which calls
+    \\  // `__rove_run_triggers(op, timing, key, value, prev)` in the worker's
+    \\  // order — after the guard, around the store — and supplies
+    \\  // `previousValue` from a raw, effect-invisible read (exactly the
+    \\  // worker's slow-path prev fetch). The table + imported module
+    \\  // namespaces are per-request, so the chain itself stays here. A
+    \\  // before-put that returns a STRING mutates the written value (the
+    \\  // final value is this function's return); a handler that THROWS
+    \\  // rejects the write as Error{code:"trigger_rejected"}
+    \\  // ("<module>: <message>"). Platform-owned key prefixes never fire
+    \\  // (matches prod isPlatformKey); a depth cap guards
+    \\  // trigger-writes-that-re-fire recursion. Subscription markers
+    \\  // (`_sub/dirty/{name}`) are the delegate's too — injected below the
+    \\  // binding like the worker's markSubscriptionsDirty, from the
+    \\  // scenario's `__rove_store/subscriptions` registration.
     \\  const __TRIG_PLATFORM = ["_audit/", "_deploy/", "_callback/", "_magic/", "_triggers/", "_sessions/"];
     \\  const __triggerHandler = (ns, op, timing) => { const nm = op === "put" ? (timing === "before" ? "beforePut" : "afterPut") : (timing === "before" ? "beforeDelete" : "afterDelete"); if (typeof ns[nm] === "function") return ns[nm]; if (typeof ns.default === "function") return ns.default; return null; };
     \\  let __triggerDepth = 0;
-    \\  const __runTriggers = (op, timing, key, value) => {
+    \\  const __runTriggers = (op, timing, key, value, prev) => {
     \\    const trigs = globalThis.__rove_triggers;
     \\    if (!trigs || trigs.length === 0 || __triggerDepth >= 16) return value;
     \\    for (const p of __TRIG_PLATFORM) if (key.startsWith(p)) return value;
@@ -721,7 +686,7 @@ const EPILOGUE_BODY_TAIL =
     \\    matched.sort((a, b) => a.prefix.length - b.prefix.length);
     \\    if (timing === "after") matched.reverse();
     \\    let evValue = value == null ? null : String(value);
-    \\    let prev = __kvNative.get(key); prev = (prev === undefined || prev === null) ? null : String(prev);
+    \\    prev = (prev === undefined || prev === null) ? null : String(prev);
     \\    __triggerDepth++;
     \\    try {
     \\      for (const t of matched) {
@@ -736,22 +701,9 @@ const EPILOGUE_BODY_TAIL =
     \\    } finally { __triggerDepth--; }
     \\    return value;
     \\  };
-    \\  globalThis.kv = {
-    \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
-    \\    set(k, val) { const ks = __kvGuardWrite(k, true, val, __kvExempt); if (ks.startsWith(__NS)) return __kvNative.set(k, val); const mutated = __runTriggers("put", "before", ks, val); const r = __kvNative.set(k, mutated); __effects.push({ kind: "write", key: ks, value: mutated }); __markDirty(ks); __runTriggers("put", "after", ks, mutated); return r; },
-    \\    delete(k) { const ks = __kvGuardWrite(k, false, undefined, __kvExempt); if (ks.startsWith(__NS)) return __kvNative.delete(k); __runTriggers("delete", "before", ks, null); const r = __kvNative.delete(k); __effects.push({ kind: "delete", key: ks }); __markDirty(ks); __runTriggers("delete", "after", ks, null); return r; },
-    \\    // Straight through: the native takes the worker's positional
-    \\    // (prefix, cursor, limit), so offline paging matches live paging with
-    \\    // no adapter. A scan under the store namespace (a facade call) returns
-    \\    // raw for the facade to strip; any other scan filters the namespaced
-    \\    // keys out. The digest entry carries `count` + `rowsFold`
-    \\    // (`key=<valuehash>;` per row IN ORDER, over the rows the handler
-    \\    // observes) — the same accumulator the worker (globals_kv.zig
-    \\    // foldPrefix) and the browser arena's kv wrapper build, so all three
-    \\    // engines fold the identical scan. Folding 0/0 instead makes every
-    \\    // prefix scan digest alike — a false AGREEMENT, not merely a mismatch.
-    \\    prefix(p, cursor, limit) { const raw = __kvNative.prefix(p, cursor, limit); if (p.startsWith(__NS)) return raw; const rows = (raw || []).filter((e) => !e.key.startsWith(__NS)); const enc = globalThis.__interactionDigest; let fold = "0"; if (enc) { let acc = ""; for (const r of rows) acc += r.key + "=" + enc.foldValue(r.value) + ";"; fold = enc.foldValue(acc); } __effects.push({ kind: "read", op: "prefix", key: p, count: rows.length, rowsFold: fold }); return rows; },
-    \\  };
+    \\  // Installed only when this run registered triggers, so the delegate
+    \\  // skips the prev fetch + dispatch entirely otherwise.
+    \\  if (globalThis.__rove_triggers && globalThis.__rove_triggers.length) globalThis.__rove_run_triggers = __runTriggers;
     \\  // request.tag(key, value) — prod's validation verbatim (globals.zig
     \\  // jsRequestTag): two strings; key 1..32 BYTES of [a-z0-9_], non-'_'
     \\  // leading; value 1..64 BYTES, no control chars; max 4 distinct keys
@@ -898,7 +850,6 @@ const EPILOGUE_BODY_TAIL =
     \\      __effects.push({ kind: "log", level: "warn", message: "dropped connection-scoped effect: " + __what + " — " + (__connless ? "a " + D.kind + " activation has no connection" : "the handler returned a terminal response instead of next(), so the socket was not held") + "; prod discards it and it never fires" });
     \\    }
     \\  }
-    \\  globalThis.kv = __kvNative;   // restore before the native OUTPUT_KEY write
     \\  // ── response vetting (prod parity) — the emit-side rules the worker
     \\  // applies to everything the handler set on `response`, mirrored from
     \\  // src/js/response_building.zig (extractResponseMetadata /
@@ -1103,7 +1054,7 @@ test "build: GET embeds request meta + parks output under sentinel" {
     try testing.expect(std.mem.indexOf(u8, src, "[\"content-type\"]") != null);
     try testing.expect(std.mem.indexOf(u8, src, "\"content-type\":\"application/json\"") != null);
     try testing.expect(std.mem.indexOf(u8, src, "__arena_entry_ns()") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "kv.set(\"" ++ host.OUTPUT_KEY ++ "\"") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "__rove_park_output(__out)") != null);
 }
 
 test "the committed guards.generated.js is what the emitter produces" {
