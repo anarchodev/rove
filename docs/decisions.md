@@ -1275,6 +1275,26 @@ prototype before V2 wrote code.
   visible in every log/proxy hop and 421 is semantically exact); disabling
   forwarding via raft-rs config (knob doesn't exist in 0.7).
 
+### 10.5d No method is read-shaped: ambiguous transport failures never replay (2026-08-13)
+- **Decision**: the front door re-sends a request after a transport failure
+  ONLY when the request head never reached the wire (no upstream stream id).
+  Once the head went out, a responseless death is ambiguous for **every**
+  method — GET/HEAD/OPTIONS included — and maps to a 502
+  (`write-ambiguous`); the client's retry policy owns the at-least-once
+  decision, mirroring §10.5c's never-retried post-propose 503.
+- **Why**: the previous carve-out granted read-shaped methods RFC 9110
+  §9.2.2's benefit of the doubt (nginx's `non_idempotent` line). But a
+  rewind handler's method semantics are customer code — a GET writes kv
+  exactly like a POST — and the doubt was observed double-executing in
+  production: one client GET, a pooled-leg death after the head was
+  submitted, two committed counter increments, first response lost
+  (rove#532; both duplicates journal-attributed to
+  `conn_died=true … idempotent=true` re-sends).
+- **Rejected**: keeping the carve-out with an idempotency-key dedup at the
+  worker (at-most-once machinery for a window the honest 502 already
+  closes); declaring GET pure by contract (contradicts the handler surface —
+  activations are method-agnostic customer code).
+
 ### 10.6 Tenant move = ship committed state to a fresh group
 - **Decision**: detach dumps committed KV state to a self-describing bundle;
   attach forms a **fresh** group at the migration epoch on every destination

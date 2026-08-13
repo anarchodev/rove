@@ -251,6 +251,12 @@ pub const Dispatcher = struct {
             .kv = kv,
             .txn = txn,
             .writeset = writeset,
+            // The writesets are batch-scoped; the read-your-write tape
+            // elision is activation-scoped (see `ws_base`). Captured here —
+            // after a failed attempt's rollback truncates the writeset, a
+            // retry recaptures the same baseline.
+            .ws_base = writeset.ops.items.len,
+            .root_ws_base = if (request.admin.root_writeset) |rws| rws.ops.items.len else 0,
             .console = &console_buf,
             .tags = &tags_buf,
             .readset = request.trace.readset,

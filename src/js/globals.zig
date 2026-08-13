@@ -401,6 +401,14 @@ pub const DispatchState = struct {
     /// local writes — followers replay the encoded writeset against
     /// their tenant stores via `applyEncodedWriteSet`.
     writeset: *kv_mod.WriteSet,
+    /// `writeset.ops` length when THIS activation began. The writeset is
+    /// BATCH-scoped (several same-tenant activations share it, one raft
+    /// `multi` entry), but a record replays one activation alone — so the
+    /// read-your-write tape elision must only treat keys written at or
+    /// after this baseline as own-writes. A key an earlier activation in
+    /// the batch wrote is a FOREIGN read for this one; eliding it leaves
+    /// the record unreplayable (rove#532).
+    ws_base: usize = 0,
     /// Accumulated `console.log` output. Owned by the dispatcher; reset
     /// between requests.
     console: *std.ArrayList(u8),
@@ -540,6 +548,9 @@ pub const DispatchState = struct {
     /// a type=2 envelope after commit so followers' copies of
     /// `__root__.db` stay in sync.
     root_writeset: ?*kv_mod.WriteSet = null,
+    /// `root_writeset.ops` length when this activation began — the root
+    /// twin of `ws_base` (the root writeset is batch-scoped the same way).
+    root_ws_base: usize = 0,
     /// Trigger registry for the active deployment (PLAN §2.5).
     /// Sorted longest-prefix-first → forward iteration visits
     /// innermost (most-specific) triggers first; AFTER chain uses

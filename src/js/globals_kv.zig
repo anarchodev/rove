@@ -210,7 +210,11 @@ pub const WorkerKv = struct {
     /// folds them regardless (see the fold header above).
     pub fn get(self: WorkerKv, key: []const u8) binding.GetResult {
         const state = self.state;
-        const skip_tape = state.writeset.containsKey(key);
+        // Since `ws_base`, not the whole writeset: the writeset is shared by
+        // the batch, and a key an earlier activation in the batch wrote is a
+        // foreign read for this one — it must be taped or this record's
+        // replay has nowhere to read it from (rove#532).
+        const skip_tape = state.writeset.containsKeySince(state.ws_base, key);
 
         const value = state.kv.get(key) catch |err| switch (err) {
             error.NotFound => {
@@ -444,7 +448,7 @@ pub const WorkerKv = struct {
             // refactored read of such a key can't be served a stale write value.
             var np: usize = 0;
             for (scan.entries) |e| {
-                if (state.writeset.containsKey(e.key)) continue;
+                if (state.writeset.containsKeySince(state.ws_base, e.key)) continue;
                 pairs[np] = .{ .key = e.key, .value = e.value };
                 np += 1;
             }

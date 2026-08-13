@@ -29,13 +29,16 @@
 //! not hold the whole body. Every flow keeps
 //! the request body in a replay buffer until it outgrows `REPLAY_CAP`
 //! (complete classic bodies are kept whole regardless of size — they
-//! are already in RAM). On 421 / transport-error-before-response with
-//! the buffer intact, the flow re-aims at the next node and replays.
-//! Once a streamed body has run past the cap, a 421 maps to a plain
-//! retryable 503 (nothing executed — the follower refused at the
-//! door) and the client's retry policy owns the decision, exactly
-//! like the ambiguous post-propose 503, which is never platform-
-//! retried (docs/architecture/routing-and-ingress.md §2).
+//! are already in RAM). On a 421, or a transport error BEFORE the
+//! request head reached the wire, the flow re-aims at the next node
+//! and replays — both prove nothing executed. A transport error AFTER
+//! the head went out is ambiguous for EVERY method (a GET handler
+//! writes kv exactly like a POST's — rove#532): it 502s, and the
+//! client's retry policy owns the decision. Once a streamed body has
+//! run past the cap, a 421 maps to a plain retryable 503 (nothing
+//! executed — the follower refused at the door), exactly like the
+//! ambiguous post-propose 503, which is never platform-retried
+//! (docs/architecture/routing-and-ingress.md §2).
 //!
 //! WebSocket: the h1 listener surfaces Upgrade heads
 //! (`websocket_surface`), and each accepted connection tunnels
@@ -175,18 +178,17 @@ fn leaderOriginHint(rh: h2.RespHeaders, nodes: []const []const u8) ?[]const u8 {
     return nodes[id - 1];
 }
 
-/// Methods a proxy may re-send after an ambiguous transport failure
-/// (request head handed to an upstream that died without responding —
-/// the worker may have executed the handler). Deliberately narrower
-/// than RFC 9110 §9.2.2: PUT/DELETE are formally idempotent, but a
-/// rewind handler's method semantics are customer code, so only the
-/// safe (read-shaped) methods get the benefit of the doubt. nginx's
-/// `proxy_next_upstream` draws the same line via `non_idempotent`.
-pub fn isIdempotentMethod(method: []const u8) bool {
-    return std.mem.eql(u8, method, "GET") or
-        std.mem.eql(u8, method, "HEAD") or
-        std.mem.eql(u8, method, "OPTIONS");
-}
+// NO method earns a silent re-send after an ambiguous transport failure
+// (request head handed to an upstream that died without responding). RFC
+// 9110 §9.2.2 — and nginx's `proxy_next_upstream` line — would grant
+// read-shaped methods the benefit of the doubt, but in rewind EVERY
+// method's semantics are customer code: a GET handler writes kv exactly
+// like a POST's. The doubt was granted once, and one client GET became two
+// committed counter increments with the first response lost (rove#532 —
+// pooled-leg death after the head went out; the worker executed both).
+// Ambiguity always goes to the client as a 502, whose retry policy owns
+// the at-least-once decision — the same discipline as the never-retried
+// post-propose 503 (decisions.md §10.5c).
 
 /// Strip a `:port` suffix from an `:authority` / Host value. Bracketed
 /// IPv6 literals (`[::1]`, `[::1]:443`) keep their brackets — the old
@@ -381,8 +383,9 @@ pub fn Proxy(comptime FrontH2: type) type {
         count_route_errors: u64 = 0,
         /// Flows 503'd out of a cold-route park past ROUTE_WAIT.
         count_route_expired: u64 = 0,
-        /// Non-idempotent flows 502'd at the ambiguous-transport-error
-        /// gate instead of replayed (plan A2).
+        /// Flows 502'd at the ambiguous-transport-error gate instead of
+        /// replayed (head sent, upstream died responseless — any method;
+        /// rove#532).
         count_ambiguous_502: u64 = 0,
         /// Requests shed 503 because every upstream leg was saturated
         /// (plan A3) — saturation surfaced as a shed rather than an
@@ -541,14 +544,6 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// by `expireStalledBodies`.
             last_body_progress_ns: i128 = 0,
             replayable: bool = true,
-            /// The request method is safe to re-send after an AMBIGUOUS
-            /// transport failure (upstream died after the head was
-            /// submitted, before any response). GET/HEAD/OPTIONS only —
-            /// rewind handlers make PUT/DELETE semantics customer-defined,
-            /// so they don't get the RFC 9110 idempotency benefit of the
-            /// doubt. 421 re-aim is NOT gated on this: a 421 proves
-            /// nothing executed (decisions.md §10.5).
-            idempotent: bool = false,
             down_sink_live: bool = false,
             /// Bytes forwarded upstream, not yet reported to the
             /// downstream sink's `drained` (window repayment).
@@ -1041,7 +1036,6 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .down_sess = sess.entity,
                 .down_sid = sid.id,
                 .down_home = home,
-                .idempotent = isIdempotentMethod(headerValue(rh, ":method") orelse "GET"),
             };
             flow.peer_ip_len = peer_len;
             if (peer_len > 0) @memcpy(flow.peer_ip[0..peer_len], peer_buf[0..peer_len]);
@@ -1201,12 +1195,13 @@ pub fn Proxy(comptime FrontH2: type) type {
         ///
         /// `head_sent` says the request head actually reached the wire —
         /// i.e. the attempt got an upstream stream id. That makes the failure
-        /// AMBIGUOUS for a non-idempotent request: the worker may have
-        /// dispatched the handler (an `onHeaders` export activates on the head
-        /// alone) and committed before the connection died — a replay would
-        /// double-execute. Same discipline as the never-retried post-propose
-        /// 503 (decisions.md §10.5): the client's retry policy owns the
-        /// ambiguous case, so it gets a 502, not a silent re-send.
+        /// AMBIGUOUS for EVERY method: the worker may have dispatched the
+        /// handler (an `onHeaders` export activates on the head alone; a GET
+        /// handler writes kv exactly like a POST's — rove#532) and committed
+        /// before the connection died — a replay would double-execute. Same
+        /// discipline as the never-retried post-propose 503 (decisions.md
+        /// §10.5c): the client's retry policy owns the ambiguous case, so it
+        /// gets a 502, not a silent re-send.
         ///
         /// It must be the SENT question, not "did we try": a leg that could
         /// not be acquired, or a submission that never got a stream id,
@@ -1220,7 +1215,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.teardownFlow(flow);
                 return;
             }
-            const replay_safe = flow.idempotent or !head_sent;
+            const replay_safe = !head_sent;
             if (!replay_safe) {
                 // The dead node shouldn't seed future requests' start
                 // index, even though this flow can't re-aim.
@@ -1707,12 +1702,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // reset after reading the head. Without these fields a 502 here
                 // is unattributable (rove#353).
                 std.log.warn(
-                    "front: forward {s} → {s} failed (conn_died={}, replayable={}, saw_421={}, body={d}B, idempotent={})",
+                    "front: forward {s} → {s} failed (conn_died={}, replayable={}, saw_421={}, body={d}B)",
                     .{
                         flow.host,    flow.nodes[flow.node_idx],
                         conn_died,    flow.replayable,
                         flow.saw_421, flow.body_total,
-                        flow.idempotent,
                     },
                 );
                 // Was anything actually PUT ON THE WIRE? The front learns
@@ -2391,22 +2385,6 @@ test "peerIpString: bare IP, no port, no IPv6 brackets" {
 
     const v6 = try std.net.Address.parseIp("2001:db8::1", 443);
     try testing.expectEqualStrings("2001:db8::1", buf[0..peerIpString(&buf, v6)]);
-}
-
-test "isIdempotentMethod: only read-shaped methods replay after ambiguous failure" {
-    // Safe to re-send after an upstream died post-head, pre-response.
-    try testing.expect(isIdempotentMethod("GET"));
-    try testing.expect(isIdempotentMethod("HEAD"));
-    try testing.expect(isIdempotentMethod("OPTIONS"));
-    // Handler-executing methods must NOT silently replay (the worker may
-    // have committed before the connection died — decisions.md §10.5).
-    try testing.expect(!isIdempotentMethod("POST"));
-    try testing.expect(!isIdempotentMethod("PATCH"));
-    // PUT/DELETE are RFC-idempotent but customer-defined here: excluded.
-    try testing.expect(!isIdempotentMethod("PUT"));
-    try testing.expect(!isIdempotentMethod("DELETE"));
-    // Case-sensitive by design: h2 methods are uppercase on the wire.
-    try testing.expect(!isIdempotentMethod("get"));
 }
 
 test "leaderOriginHint maps the x-rewind-leader raft id to its positional node" {
