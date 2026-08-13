@@ -885,24 +885,30 @@ fn forwardWriteOne(allocator: std.mem.Allocator, secret: []const u8, dest: []con
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-/// Resolve a tenant instance, creating it (existence marker + per-tenant
-/// `cluster.kv` store) on first sight. Idempotent.
+/// Resolve a tenant instance, creating a LEGACY one on first sight
+/// (existence marker + per-tenant `cluster.kv` store). Idempotent, and
+/// deliberately NOT the attach path's resolver: `.legacy` here means "this
+/// caller has no opinion about the incarnation", so an existing instance is
+/// returned exactly as it is — routing this through the attach's
+/// authoritative replace once re-keyed every live token-incarnation tenant
+/// this door touched into a fresh empty legacy store.
 fn ensureInstance(worker: anytype, tenant: []const u8) !*const tenant_mod.Instance {
-    return ensureInstanceWithIncarnation(worker, tenant, .legacy);
+    if (try worker.node.tenant.getInstance(tenant)) |inst| return inst;
+    try worker.node.tenant.createInstanceWithIncarnation(tenant, .legacy);
+    return (try worker.node.tenant.getInstance(tenant)) orelse error.ProvisionFailed;
 }
 
-/// `ensureInstance`, binding a first-sight instance to the storage incarnation
-/// the CP minted for this tenant lifetime (#357). An instance that already
-/// exists keeps the incarnation its data is keyed by — re-attach must not
-/// re-key a live tenant.
-/// The attach's incarnation is AUTHORITATIVE: the CP mints one per tenant
-/// lifetime, so a local instance whose incarnation differs can only be
-/// residue of a deleted predecessor — a marker whose deletion didn't survive
-/// a restart, or a first-sight legacy open. Keeping it would silently pin
-/// this node to the previous lifetime's storage while its peers serve the
-/// new one, and the split surfaces far away as an undeployable tenant
-/// (#531). Same incarnation → plain idempotent re-attach (move retries, the
-/// reconciler's backfill).
+/// The ATTACH path's resolver (#357): the incarnation comes off the attach
+/// envelope, and the CP — the only sender — mints exactly one per tenant
+/// lifetime, so it is AUTHORITATIVE. A local instance whose incarnation
+/// differs can only be residue of a deleted predecessor (a marker whose
+/// deletion didn't survive a restart, or a first-sight legacy open).
+/// Keeping it would silently pin this node to the previous lifetime's
+/// storage while its peers serve the new one, and the split surfaces far
+/// away as an undeployable tenant (#531). Same incarnation → plain
+/// idempotent re-attach (move retries, the reconciler's backfill). Only the
+/// attach may replace: any caller passing a DEFAULT rather than an
+/// envelope-carried incarnation belongs on `ensureInstance`.
 fn ensureInstanceWithIncarnation(worker: anytype, tenant: []const u8, incarnation: tenant_mod.Incarnation) !*const tenant_mod.Instance {
     if (try worker.node.tenant.getInstance(tenant)) |inst| {
         if (inst.storage.incarnation.matches(incarnation)) return inst;
