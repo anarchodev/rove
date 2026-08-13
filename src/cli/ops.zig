@@ -89,8 +89,12 @@ fn cpOpViaAdmin(
         const r = c.workerPost(a, env, w, path, headers, body, timeout_s);
         // 2xx is the op's own answer; a 4xx that is not the leader-gate is the
         // CP's verdict (e.g. 409 already-placed) and must NOT be retried
-        // elsewhere, or a second node re-runs a non-idempotent op.
-        if (r.code >= 200 and r.code < 500 and r.code != 404) return r;
+        // elsewhere, or a second node re-runs a non-idempotent op. 421 IS the
+        // leader-gate — the `__admin__` group's, on the worker that would
+        // relay the op, not a verdict — so it tries the next worker like a
+        // 5xx does; returning it final made the CLI's primary verb fail on
+        // any worker list that doesn't lead with the admin leader (#535).
+        if (r.code >= 200 and r.code < 500 and r.code != 404 and r.code != 421) return r;
         last = r;
         std.debug.print("  cp/{s} via {s}: {d} {s} (trying next)\n", .{ op, w, r.code, c.trunc(r.body) });
     }
