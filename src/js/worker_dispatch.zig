@@ -669,10 +669,31 @@ fn parkSuccessesOnSiblings(
         // `s.stream` (contRecordIfAny:307 / streamRecordIfAnyAt:421);
         // the move must see the pre-record outcome.
         const route = ParkRoute.of(s);
-        try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets the entity's ContDescriptor component
-        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets the entity's stream components
-        try server.reg.set(s.ent, &server.request_out, RaftWait, .{ .group_id = group_id, .seq = seq, .deadline_ns = deadline_ns });
-        try route.moveToSibling(worker, server, s.ent);
+        // The batch propose was ALREADY accepted, so this success's writes
+        // commit no matter what happens to its h2 entity — from here the
+        // log record is owed unconditionally: the log is the replay/audit
+        // surface, and a committed activation with no record is
+        // unattributable state. A per-entity failure (the stream torn down
+        // under us, OOM on a component set) must cost only the RESPONSE,
+        // never the record — and never the records of the batch-mates
+        // behind it in this loop.
+        const delivered = blk: {
+            contRecordIfAny(worker, server, allocator, anchor_id, s) catch break :blk false; // sets the entity's ContDescriptor component
+            streamRecordIfAnyAt(worker, server, allocator, anchor_id, s) catch break :blk false; // sets the entity's stream components
+            server.reg.set(s.ent, &server.request_out, RaftWait, .{ .group_id = group_id, .seq = seq, .deadline_ns = deadline_ns }) catch break :blk false;
+            route.moveToSibling(worker, server, s.ent) catch break :blk false;
+            break :blk true;
+        };
+        if (!delivered) {
+            std.log.warn(
+                "rove-js: park failed for {s} req {d} — response dropped, record kept",
+                .{ anchor_id, s.request_id },
+            );
+            // Whatever state the entity is in, it must not be re-dispatched
+            // from request_out next tick (that would double-execute the
+            // handler). Destroy is a no-op on an already-dead entity.
+            server.reg.destroy(s.ent) catch {};
+        }
         captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq);
     }
     return successes.items.len;
