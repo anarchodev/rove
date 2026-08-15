@@ -429,9 +429,27 @@ There is no auto-deploy-on-boot ("genesis") magic: bootstrap is the explicit
 an implicit leadership side-effect.
 
 The smoke harness's `deploy_bundle` POSTs to the app through the front door
-(`_ensure_admin_app` calls `/_system/reset` once per cluster to bootstrap it),
-so every smoke now exercises the *production* deploy path. `publish_tenant.py`
-likewise POSTs bundles to the app; only `/_system/reset` is operator-native.
+(`_ensure_admin_app` calls `/_system/reset` once per cluster to bootstrap it).
+`publish_tenant.py` likewise POSTs bundles to the app; only `/_system/reset` is
+operator-native.
+
+> **Two premises above expired (2026-08-15) — see `decisions.md` §11.5.** Both
+> held while the baked bundle *was* the production deploy app. It no longer is:
+> the released dashboard (`admin/index.mjs`) carries its own transcription of
+> these doors.
+> - *"every smoke now exercises the production deploy path"* is **false**.
+>   `_ensure_admin_app` installs the **baked** bundle, so the smokes exercise a
+>   different implementation than production runs. A three-line divergence in
+>   the dashboard's copy (`buildResolution` dropping the `done` map) made every
+>   package-importing publish fail while the suite stayed green.
+> - *"break-glass = restore a known-good `__admin__`"* now restores a
+>   **different, minimal** app, so recovery costs the operator UI and the OIDC
+>   RP until the real bundle is republished.
+>
+> The correction is not to re-add an arbitrary-bundle Zig route beside the app,
+> but to move the publish *mechanism* into the engine and leave *policy*
+> (who may deploy where, limits, approvals) in tenant code, joined by a
+> tenant-scoped deploy capability.
 
 ## 5. `/ops/assign-domain` — RETIRED (resolved by step3 B3)
 

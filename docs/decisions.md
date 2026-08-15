@@ -1510,6 +1510,65 @@ storage decisions that section assumes. (The customer-logs-vs-operator-signals
 - **Gotcha**: compression is **libz** (`windowBits=-15`), not the Zig stdlib —
   `std.compress.flate.Compress` is incomplete (panics on real payloads).
 
+### 11.5 The publish *mechanism* is engine surface; deploy *policy* stays tenant code (2026-08-15)
+- **The rule**: a surface that installs the code which would fix it cannot be
+  the tenant's to get wrong. Test to apply: **can a mistake here leave the
+  platform unable to repair itself without operator intervention?** Deploy and
+  module loading are the only yes. Everything else in the admin app fails
+  *open* — a broken teams page, log door, or CP chokepoint can still be
+  corrected by shipping a fix — while deploy fails *closed*.
+- **Decision**: the engine owns bundle intake, compile, content-addressing,
+  package staging/resolution, manifest stamping and the release flip, exposed as
+  one credential-gated door. The admin app owns **authorization and ceremony** —
+  who may deploy to which tenant, plan limits, approvals, audit, UI — and fronts
+  that door rather than reimplementing it. The seam is a short-lived
+  tenant-scoped **deploy capability**, the pattern already proven by the
+  `logs-read` cap the log door mints (`auth-and-domains.md`).
+- **What this changes about §4.1/§4.2 of `architecture/cli-and-deploy.md`**
+  (2026-06-15): that decision put arbitrary-bundle deploy into a standing
+  `__admin__` JS app so deploy logic would be "hackable JS on the same surface
+  customers use", deleted the Zig arbitrary-bundle route, and left
+  `POST /_system/reset` as the one native surface — bootstrap *and* break-glass,
+  body-less, redeploying only the `@embedFile`'d bundle. Its reasoning held
+  **because the baked bundle WAS the production deploy app**. Two of its
+  premises expired without anyone noticing:
+  - *"break-glass = restore a known-good `__admin__`"* — the baked bundle is no
+    longer the dashboard, so reset now restores a **different, minimal** app.
+    Break-glass costs the operator UI and the OIDC RP until a republish.
+  - *"every smoke now exercises the production deploy path"* — `_ensure_admin_app`
+    installs the baked bundle, so every smoke exercises the **baked**
+    implementation while production runs the dashboard's copy.
+- **The failure that forced it** (2026-08-15): `admin/index.mjs`'s
+  `buildResolution` ignored the `done` map, so any package that had to be
+  compiled *during* a cut reached `stampManifest` with no `bytecode_hash` and
+  the deploy died with `invalid resolution`. Its sibling `compiledResolution` in
+  the same file merged `done` correctly, and so did the baked
+  `genesis_admin.mjs`. One protocol, three transcriptions, one wrong — and the
+  wrong one was the copy every real publish goes through. Recovery required
+  `/_system/reset` (dashboard down) before the fix could ship.
+- **Ratio that makes the split cheap**: of the deploy surface in
+  `admin/index.mjs`, the product's own contribution is `deployGate` — validate
+  the tenant id, then `is_root || canAccess(...)`. The remaining ~400 lines
+  choreograph engine verbs (`platform.compile`, `stampManifest`, workspace kv)
+  whose formats the engine already defines and validates.
+- **Preserves the original goal.** "As much policy as possible writable as
+  tenant code" survives intact: authorization *is* the policy, and it stays in
+  JS. What moves is machinery no product differentiates on.
+- **Acceptance test (self-hosting)**: an operator can install the engine,
+  provision a tenant, deploy a bundle, release it and route a host **without
+  installing an admin app at all**. Today that is impossible — `rewind-ops
+  bootstrap` is "provision `__admin__` + reset", so the platform's own product
+  surface is a prerequisite for publishing anything.
+- **Rejected**: (a) keeping two implementations and syncing them by review — the
+  drift is silent and only surfaces as a bricked publish; (b) making the fix a
+  conformance case alone — worth doing either way, but a spec that catches drift
+  after it ships still leaves the bootstrap deadlock; (c) restoring the old
+  `/_system/deploy` as a *second* permanent path — the goal is one
+  implementation, not one more.
+- **Costs, accepted**: the engine gains a public protocol it must version
+  deliberately (§14), and a self-hosted door must be safe by default rather than
+  incidentally shielded by the admin app in front of it.
+
 ---
 
 ## 12. Rejected effect-surface primitives
