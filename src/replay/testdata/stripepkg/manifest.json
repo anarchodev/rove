@@ -1,0 +1,7 @@
+{
+  "name": "stripepkg",
+  "version": "1.0.0",
+  "dependencies": {
+    "@rewind/stripe": "^1.0.0"
+  }
+}

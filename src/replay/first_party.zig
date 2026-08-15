@@ -39,6 +39,7 @@ const EMBEDS = [_]Embed{
     .{ .spec = "@rewind/schedule", .src = @embedFile("pkg_schedule") },
     .{ .spec = "@rewind/segments", .src = @embedFile("pkg_segments") },
     .{ .spec = "@rewind/browser", .src = @embedFile("pkg_browser") },
+    .{ .spec = "@rewind/stripe", .src = @embedFile("pkg_stripe") },
 };
 
 pub const Graph = struct {

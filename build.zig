@@ -1476,6 +1476,7 @@ pub fn build(b: *std.Build) void {
         .{ "pkg_schedule", "src/js/packages/@rewind/schedule/index.mjs" },
         .{ "pkg_segments", "src/js/packages/@rewind/segments/index.mjs" },
         .{ "pkg_browser", "src/js/packages/@rewind/browser/index.mjs" },
+        .{ "pkg_stripe", "src/js/packages/@rewind/stripe/index.mjs" },
     }) |e| ops_mod.addAnonymousImport(e[0], .{ .root_source_file = b.path(e[1]) });
     // `storage-namespace` signs S3 requests itself (the CLI links no libcurl).
     // Both files are pure-std halves of rove-blob, imported rather than
@@ -1517,6 +1518,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         "jwt", "oauth", "cron", "sessions", "retry", "activitypub",
         "email", "users", "oidc", "schedule", "segments", "browser",
+        "stripe",
     }) |nm| replay_mod.addAnonymousImport("pkg_" ++ nm, .{
         .root_source_file = b.path("src/js/packages/@rewind/" ++ nm ++ "/index.mjs"),
     });
@@ -1554,6 +1556,7 @@ pub fn build(b: *std.Build) void {
     driver_smoke_mod.addAnonymousImport("pkg_schedule", .{ .root_source_file = b.path("src/js/packages/@rewind/schedule/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_segments", .{ .root_source_file = b.path("src/js/packages/@rewind/segments/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_browser", .{ .root_source_file = b.path("src/js/packages/@rewind/browser/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_stripe", .{ .root_source_file = b.path("src/js/packages/@rewind/stripe/index.mjs") });
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);

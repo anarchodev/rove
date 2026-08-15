@@ -489,6 +489,7 @@ const SEED_PACKAGES = [_]SeedPkg{
     .{ .spec = "@rewind/segments", .source = @embedFile("pkg_segments") },
     .{ .spec = "@rewind/schedule", .source = @embedFile("pkg_schedule") },
     .{ .spec = "@rewind/browser", .source = @embedFile("pkg_browser") },
+    .{ .spec = "@rewind/stripe", .source = @embedFile("pkg_stripe") },
     .{ .spec = "@rewind/oauth", .source = @embedFile("pkg_oauth"), .dep_jwt = true },
     .{ .spec = "@rewind/oidc", .source = @embedFile("pkg_oidc"), .dep_jwt = true },
 };
