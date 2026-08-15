@@ -127,7 +127,7 @@ pub const Runtime = struct {
     /// Create a new execution context under this runtime. Contexts hold
     /// the global object and installable intrinsics.
     ///
-    /// The rove-kv patch to vendor/quickjs-ng leaves `ctx.random_state`
+    /// arenajs's deterministic init leaves `ctx.random_state`
     /// and `ctx.time_origin` at 0 by default. For callers using the
     /// direct (non-snapshot) path, this method auto-seeds both so
     /// `Math.random()` and `performance.now()` behave normally out
@@ -217,8 +217,7 @@ pub const Context = struct {
         // has no such guarantee, so surprising "invalid UTF-8"
         // SyntaxErrors fire whenever the byte after the slice happens
         // to look like a UTF-8 continuation byte. Dup into a
-        // guaranteed-NUL-terminated buffer here — this was a subtle
-        // bug from the rove-files-server thread path.
+        // guaranteed-NUL-terminated buffer here.
         const src_z = try allocator.allocSentinel(u8, source.len, 0);
         defer allocator.free(src_z);
         @memcpy(src_z, source);

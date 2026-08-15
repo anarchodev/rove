@@ -381,7 +381,7 @@ pub const Job = struct {
         const storage = tenant_mod.TenantStorage{ .id = stage_tenant, .incarnation = self.stage_incarnation };
         var backend = try storage.openBackend(a, self.cfg.*, subdir);
         defer backend.deinit();
-        const s3 = &backend.inner.s3;
+        const s3 = &backend.s3;
 
         const temp_key = try std.fmt.allocPrint(a, ".uploads/{s}", .{self.fetch_id});
         defer a.free(temp_key);

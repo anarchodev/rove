@@ -3,9 +3,10 @@
 //! `rewind-logs` — the request-log query API.
 //!
 //! The operator runs this binary alongside the `rewind` worker and
-//! points the worker at it via `--log-public-base`. Both processes
-//! share the JWT secret (`LOOP46_SERVICES_JWT_SECRET`) so tokens
-//! minted at the worker's `/_system/services-token` verify here on
+//! points the worker at it via `REWIND_LOG_PUSH_BASES` (or
+//! `REWIND_LOG_INTERNAL_BASE`). Both processes share the JWT secret
+//! (`LOOP46_SERVICES_JWT_SECRET`) so the tenant-scoped `logs-read`
+//! tokens the worker mints verify here on
 //! every `/v1/*` request, AND share the same batch-store +
 //! blob-backend config so the standalone can index/serve what the
 //! worker writes.

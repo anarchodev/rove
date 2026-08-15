@@ -6,7 +6,7 @@
 //! (`indexer.zig`) → sqlite local index (`index_db.zig`) → query
 //! API (`standalone.zig`). The log-server runs as its own process
 //! (`src/log_server/main.zig`, the `rewind-logs` binary);
-//! the worker is pointed at it via `--log-public-base`. Both processes
+//! the worker is pointed at it via `REWIND_LOG_PUSH_BASES`. Both processes
 //! share `LOOP46_SERVICES_JWT_SECRET` for the JWT mint/verify
 //! handoff and the same `BLOB_BACKEND` config so the standalone
 //! reads what the worker writes.

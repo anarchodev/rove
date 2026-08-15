@@ -28,11 +28,10 @@ const manifest_json = files_mod.manifest_json;
 const CONFIG_PREFIX = "_config/";
 const JSON_SUFFIX = ".json";
 
-/// Maximum bytes for a single `_config/*.json` file. Matches the
-/// files-server upload cap (per-file 64 KB), so a config file
-/// that uploaded successfully always mirrors successfully — but
-/// stating it explicitly here means a future upload-cap bump
-/// doesn't silently inflate per-tenant raft envelope sizes.
+/// Maximum bytes for a single `_config/*.json` file. The mirror rides
+/// a per-tenant raft envelope, so this is a consensus-cost bound, not a
+/// storage one: an oversized config file is skipped with a warning
+/// rather than inflating every follower's log entry.
 /// Real-world configs are <1 KB; the headroom is for jwks caches,
 /// large allow-lists, etc.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;

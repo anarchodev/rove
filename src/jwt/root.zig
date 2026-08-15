@@ -9,18 +9,18 @@
 //!   `<base64url(header)>.<base64url(payload)>.<base64url(sig)>`
 //!
 //! Header is fixed: `{"alg":"HS256","typ":"JWT"}`.
-//! Payload is `{"exp":<unix_ms>}` for the basic services-token
-//! shape, or `{"exp":<unix_ms>,"tenant":"<id>"?,"caps":["<cap>",...]}`
+//! Payload is `{"exp":<unix_ms>}` for a bare proof-of-mint token, or
+//! `{"exp":<unix_ms>,"tenant":"<id>"?,"caps":["<cap>",...]}`
 //! when the token grants cluster-internal capabilities (e.g. `release`,
 //! `admin-kv`, `logs-read`). The optional `tenant` scope confines the
 //! token to one tenant: `verifyWithCapAndTenant` rejects it for any
 //! other tenant, and (crucially) rejects an unscoped token outright —
 //! so an "any authenticated caller" token can't read across tenants.
 //!
-//! The HMAC secret is shared between the worker process (which mints
-//! tokens at `/_system/services-token`) and every standalone service
-//! that verifies them. Operators set `LOOP46_SERVICES_JWT_SECRET`
-//! (hex) on every binary.
+//! The HMAC secret is shared between every process that mints or
+//! verifies one of these tokens — the worker, its raft peers, and the
+//! log-server. Operators set `LOOP46_SERVICES_JWT_SECRET` (hex) on
+//! every binary.
 
 const std = @import("std");
 
@@ -60,9 +60,9 @@ pub const Cap = struct {
     /// app can ship release flips without the root bearer.
     pub const RELEASE = "release";
     /// Token bearer may POST `/_system/admin-kv` to write key/value
-    /// pairs into `__admin__/app.db`. Issued to files-server for
-    /// platform-config bootstrap (resend_key, platform_email_from,
-    /// etc.).
+    /// pairs into `__admin__/app.db`. The cap alternative to the
+    /// operator root bearer for platform-config bootstrap (resend_key,
+    /// platform_email_from, etc.).
     pub const ADMIN_KV = "admin-kv";
     /// Token bearer may GET `/_system/raft-snapshot/{snap_id}` to
     /// stream a follower-catchup snapshot's bytes from the leader.
@@ -89,13 +89,11 @@ pub const Payload = struct {
 
 pub const MintOptions = struct {
     exp_ms: i64,
-    /// Optional capability list. Empty (default) for tokens served
-    /// to the dashboard via `/_system/services-token` — those only
-    /// need to prove "an authenticated session minted me," with
-    /// per-tenant authorization happening on the standalone service.
-    /// Internal cluster operations (release, admin-kv) carry the
-    /// matching cap so the receiving worker can authorize without
-    /// a separate root bearer.
+    /// Optional capability list. Empty (default) only proves "the
+    /// holder of the shared secret minted me". Every cluster-internal
+    /// operation (release, admin-kv, raft-snapshot, logs-read) carries
+    /// the matching cap so the receiver can authorize it without a
+    /// separate root bearer.
     caps: []const []const u8 = &.{},
     /// Optional tenant scope. When set, the token is only valid for
     /// operations on this tenant — a verifier calling

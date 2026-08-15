@@ -1443,9 +1443,10 @@ fn resolveRequest(
     // (default export AND named-export RPCs), checks cookie/bearer,
     // and either sets request.auth or short-circuits 401. Pre-auth
     // paths (signup / auth / login / logout) skip the gate inside
-    // the middleware. Zig is not in the admin auth path —
-    // `/_system/*` keeps its own auth gate via `tryHandleSystem`
-    // until the files-server + log-server detach (PLAN §10.13).
+    // the middleware. Zig is not in the admin auth path — `/_system/*`
+    // keeps its own root-token / capability gate via `tryHandleSystem`,
+    // because it must answer before (and independently of) any
+    // deployed handler.
 
     const admin_opt = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
     if (admin_opt == null) {
