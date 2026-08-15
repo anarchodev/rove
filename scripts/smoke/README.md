@@ -56,6 +56,7 @@ nobody re-ran:
 | — | `stream.write` became lossless (soft cap = back-pressure, hard cap throws) | a smoke that required drops, i.e. required data loss |
 | — | provision answers 200 + a body, not 204 | a guard that bailed out after a SUCCESSFUL provision |
 | — | the storage incarnation (#357) | joiners opening a legacy-keyed store and reading empty |
+| 2026-08-15 | the dashboard grew its own copy of the deploy doors | nothing — and that was the problem: every deploy smoke drives the BAKED app (`_ensure_admin_app` → `/_system/reset`), so a divergence in the copy production runs was invisible until a real publish bricked itself (#554). `admin_self_deploy_smoke_v2.py` now runs the same deploy through both. |
 
 None of these were bad changes. The lesson is narrower and duller: **a test
 suite nobody runs is not coverage, it is the appearance of coverage** — and it
