@@ -24,6 +24,12 @@ export default function () {
       { customer: "cus_1", items: [{ price: "price_1" }] },
       { idempotencyKey: "sub-acme-pro-1" }) };
   }
+  if (request.path === "/subscribe-incomplete") {
+    sk().subscriptions.createIncomplete(
+      { customer: "cus_1", items: [{ price: "price_1" }], metadata: { tier: "pro" } },
+      { on: "onIntent", idempotencyKey: "subinc-acme-pro" });
+    return next();                      // held — the browser needs the PI secret
+  }
   if (request.path === "/cancel") {
     return { id: sk().subscriptions.cancel("sub_9", { idempotencyKey: "cancel-1" }) };
   }
