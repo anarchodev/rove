@@ -62,6 +62,21 @@ expect(keyed).toHaveSent("webhook", {
   },
 });
 
+// ── createIncomplete is HELD: the browser needs the PI client_secret in this
+// response, and an incomplete subscription charges nothing server-side. The
+// body pins default_incomplete + the expand + saved-PM settings, and the
+// caller's idempotency key rides Stripe's header.
+const inc = scenario({ now: "2026-08-15T00:00:00Z", seed: 1 })
+  .inbound({ method: "POST", path: "/subscribe-incomplete", host: "s.localhost" });
+expect(inc.disposition).toBe("held");
+expect(inc).toHaveFetched(/api\.stripe\.com\/v1\/subscriptions/);
+const incReq = inc.effects.filter((e) => e.kind === "fetch")[0];
+expect(incReq.headers["Idempotency-Key"]).toBe("subinc-acme-pro");
+expect(incReq.body.indexOf("payment_behavior=default_incomplete") >= 0).toBe(true);
+expect(incReq.body.indexOf("expand%5B0%5D=latest_invoice.payment_intent") >= 0).toBe(true);
+expect(incReq.body.indexOf("payment_settings%5Bsave_default_payment_method%5D=on_subscription") >= 0).toBe(true);
+expect(incReq.body.indexOf("metadata%5Btier%5D=pro") >= 0).toBe(true);
+
 // ── cancel is durable + keyed, and sends no body ───────────────────────────
 const cancel = scenario({ now: "2026-08-15T00:00:00Z", seed: 1 })
   .inbound({ method: "POST", path: "/cancel", host: "s.localhost" });

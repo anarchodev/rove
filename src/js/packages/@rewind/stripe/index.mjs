@@ -152,6 +152,19 @@ const stripe = {
       if (o.timeoutMs != null) req.timeoutMs = o.timeoutMs;
       return after.fetch(API + path, req);
     };
+    const heldWithHeaders = (where, method, path, params, opts, extra) => {
+      rejectRenamed(where, opts);
+      const o = opts || {};
+      const on = typeof o.on === "string" ? o.on : defaultOn;
+      if (!on)
+        throw new TypeError(where + ": `on` is required (no default was set on the client)");
+      const headers = auth();
+      for (const k of Object.keys(extra)) headers[k] = extra[k];
+      const req = { method: method, headers: headers, on: on, body: form(params) };
+      if (o.ctx !== undefined) req.ctx = o.ctx;
+      if (o.timeoutMs != null) req.timeoutMs = o.timeoutMs;
+      return after.fetch(API + path, req);
+    };
 
     // ── durable: survives the response, retried, idempotency-keyed ──
     const durable = (where, method, path, params, opts) => {
@@ -263,6 +276,45 @@ const stripe = {
           if (!Array.isArray(p.items) || p.items.length === 0)
             throw new TypeError("stripe.subscriptions.create: `items` must be a non-empty array");
           return durable("stripe.subscriptions.create", "POST", "/subscriptions", p, opts);
+        },
+        /**
+         * Create a subscription in Stripe's `default_incomplete` mode and
+         * return `latest_invoice.payment_intent` expanded — the embedded
+         * Payment Element flow. HELD, and deliberately so: the browser
+         * cannot mount Elements without the payment intent's
+         * `client_secret` in THIS response, and no money moves
+         * server-side — an incomplete subscription charges nothing until
+         * the browser confirms it with Stripe directly, and expires
+         * unconfirmed, exactly like an abandoned intent. The durable
+         * rule ("money moves → webhook.send") applies to the browser
+         * confirmation, which Stripe owns, and to {@link create}, which
+         * stays durable for server-driven subscribing.
+         *
+         * `idempotencyKey` (optional) rides Stripe's Idempotency-Key
+         * header: a double-submit inside Stripe's window returns the
+         * SAME incomplete subscription rather than a second one.
+         *
+         * @param {object} params - Requires `customer` and `items`.
+         * @param {object} [opts] - `{on, ctx, timeoutMs, idempotencyKey}`.
+         * @returns {string} The `ftch_…` id.
+         */
+        createIncomplete(params, opts) {
+          const p = params || {};
+          if (typeof p.customer !== "string")
+            throw new TypeError("stripe.subscriptions.createIncomplete: `customer` is required");
+          if (!Array.isArray(p.items) || p.items.length === 0)
+            throw new TypeError("stripe.subscriptions.createIncomplete: `items` must be a non-empty array");
+          const body = Object.assign({}, p, {
+            payment_behavior: "default_incomplete",
+            payment_settings: { save_default_payment_method: "on_subscription" },
+            expand: ["latest_invoice.payment_intent"],
+          });
+          const o = opts || {};
+          if (typeof o.idempotencyKey === "string" && o.idempotencyKey.length > 0) {
+            return heldWithHeaders("stripe.subscriptions.createIncomplete", "POST",
+              "/subscriptions", body, o, { "Idempotency-Key": o.idempotencyKey });
+          }
+          return held("stripe.subscriptions.createIncomplete", "POST", "/subscriptions", body, o);
         },
         /**
          * Update a subscription (plan change). DURABLE.
