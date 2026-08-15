@@ -33,7 +33,8 @@ any host.
 | `src/js/bindings/crypto.zig` | RSA keygen + `crypto.oidcSign(priv_pem, signing_input)` + JWK export (the hybrid seam). |
 | `src/js/globals/oidc.js` | `oidc.provider(config)` (IdP) + `oidc.rp(config)` (relying-party helper). |
 | `src/js/globals.zig` | `platform.scope(id).kv.*` — the explicit cross-tenant accessor (replaced `X-Rove-Scope`). |
-| `src/js/worker_dispatch.zig` | HS256 services-token mint; `is_root` plumbing; `/_system/*` root-token gate. |
+| `src/js/worker_system.zig` | `/_system/*` root-token + capability gate. |
+| `src/js/worker_dispatch.zig` | `is_root` plumbing; the inbound auth gate. |
 
 ## OIDC IdP (`__auth__` tenant)
 
@@ -125,10 +126,12 @@ hard-coded domain in this path as a bug.
 
 ## Service & admin authorization
 
-- **Service-to-service** (worker → standalone files/logs): a shared-secret HS256
-  JWT (`LOOP46_SERVICES_JWT_SECRET`), minted at `/_system/services-token` (5-min
-  TTL), with scoped `caps`. Machine-to-machine — deliberately **not** OIDC
-  (decisions.md §6).
+- **Service-to-service** (worker → log-server, peer → peer): a shared-secret
+  HS256 JWT (`LOOP46_SERVICES_JWT_SECRET`) with scoped `caps`, minted by the
+  side that needs it — the worker's fetch engine mints tenant-scoped
+  `logs-read` tokens at the `rewind-logs.internal` rewrite, and a raft peer
+  mints its own `raft-snapshot` token on a SNAP_OFFER. Machine-to-machine —
+  deliberately **not** OIDC (decisions.md §6).
 - **Admin / root**: `is_root` is an OIDC `sub` in the `_admin/operator/*`
   allowlist (seeded from `LOOP46_OPERATOR_EMAILS`). Admin app paths require an
   operator OIDC session; `/_system/*` accepts a separate root **token**

@@ -257,8 +257,8 @@ test "openBackend: builds the per-tenant prefix" {
     const ts = TenantStorage{ .id = "inst-0001", .incarnation = .legacy };
     var be = try ts.openBackend(testing.allocator, cfg, "file-blobs");
     defer be.deinit();
-    try testing.expectEqualStrings("prod/inst-0001/file-blobs/", be.inner.s3.config.key_prefix);
-    try testing.expectEqualStrings("loop46-shared", be.inner.s3.config.bucket);
+    try testing.expectEqualStrings("prod/inst-0001/file-blobs/", be.s3.config.key_prefix);
+    try testing.expectEqualStrings("loop46-shared", be.s3.config.bucket);
 }
 
 test "storeId: legacy hashes the name, a token re-keys the store" {

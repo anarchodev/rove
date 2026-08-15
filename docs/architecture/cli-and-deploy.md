@@ -543,7 +543,7 @@ Three secrets + two OIDC planes — not five independent secrets:
 |---|---|---|
 | `REWIND_ROOT_TOKEN` | worker `/_system/*` (bearer) | yes (break-glass) |
 | `REWIND_MOVE_SECRET` | worker `/_system/v2-*` + CP `/_control/*` | yes **and** internal (cp↔worker) |
-| `LOOP46_SERVICES_JWT_SECRET` | minted at worker `/_system/services-token`; verified by log-server + files-server | **no** — internal S2S |
+| `LOOP46_SERVICES_JWT_SECRET` | signs the cap-scoped JWTs the worker and its raft peers mint; verified by the worker's `/_system/*` cap gate and by the log-server | **no** — internal S2S |
 | ~~`ADMIN_OPS_SECRET`~~ | ~~`/ops/assign-domain` on the interim admin bundle~~ | **RETIRED (step3 B3)** — CP propagates the alias |
 | OIDC session `__Host-rove_sid` | operator dashboard (`web/admin/`) | the *real* operator plane |
 | `__auth__` IdP | customer accounts | separate, correct — leave it |
@@ -557,9 +557,9 @@ the control-plane / cross-cluster orchestration secret.
 Key facts (`src/js/auth.zig:64-78`, `src/js/worker_dispatch.zig:1202-1292`,
 `src/jwt/root.zig:44-64`): the worker `/_system/*` surface **already accepts
 session-cookie OR root bearer**, and there is **already a capability-token
-system** (`release` / `admin-kv` / `raft-snapshot` caps) minted via
-`/_system/services-token`. So the model exists; it just isn't the default path
-and the caps are coarse.
+system** (`release` / `admin-kv` / `raft-snapshot` / `logs-read` caps) signed
+with `LOOP46_SERVICES_JWT_SECRET`. So the model exists; it just isn't the
+default path and the caps are coarse.
 
 ### Two gaps, not a redesign
 

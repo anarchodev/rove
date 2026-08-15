@@ -37,8 +37,6 @@ pub const env = @import("env.zig");
 pub const BlobBackendOwned = env.BlobBackendOwned;
 pub const namespace = @import("namespace.zig");
 pub const namespace_store = @import("namespace_store.zig");
-pub const http_blob = @import("http_blob.zig");
-pub const HttpBlobStore = http_blob.HttpBlobStore;
 pub const coordinator = @import("coordinator.zig");
 pub const BlobCoordinator = coordinator.BlobCoordinator;
 
@@ -180,7 +178,6 @@ test {
     _ = @import("sigv4.zig");
     _ = @import("s3.zig");
     _ = @import("backend.zig");
-    _ = @import("http_blob.zig");
     _ = @import("curl_multi.zig");
     _ = @import("coordinator.zig");
     _ = @import("namespace.zig");

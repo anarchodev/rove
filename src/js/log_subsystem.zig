@@ -22,8 +22,6 @@ pub const LogSubsystem = struct {
     minter_id: log_mod.MinterId,
     /// S3-backed batch store the flusher writes log batches to.
     log_batch_store: log_server_mod.batch_store.BatchStore,
-    /// Public base URL of the log-server (for the push notification), if any.
-    log_public_base: ?[]const u8,
     /// Log-server base URLs the push thread notifies of new batch keys.
     log_push_bases: []const []const u8,
     /// libcurl handle owned by the push thread (null when push is disabled).

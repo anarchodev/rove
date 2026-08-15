@@ -44,8 +44,9 @@ pub const Method = enum {
 /// HTTP version selector. Default `auto` lets libcurl pick: HTTP/1.1
 /// for plain HTTP, ALPN-negotiated HTTP/2 (or fallback) for HTTPS.
 /// `h2c_prior_knowledge` forces cleartext HTTP/2 — needed when
-/// talking to a server that's h2-only on a plaintext port (like
-/// `sse-server-standalone` running without TLS).
+/// talking to a server that's h2-only on a plaintext port, like the
+/// worker's and log-server's internal listeners (curl's
+/// `--http2-prior-knowledge`).
 pub const HttpVersion = enum {
     auto,
     h2c_prior_knowledge,
@@ -131,8 +132,7 @@ pub const Request = struct {
     /// h2-only server on a plaintext port set `h2c_prior_knowledge`.
     http_version: HttpVersion = .auto,
     /// TLS peer verification. Default on. Smokes / dev clusters with
-    /// self-signed certs (sse-server in the browser-in-the-loop
-    /// smoke, for instance) flip this to false. Production must
+    /// self-signed certs flip this to false. Production must
     /// leave it on; a misconfigured CA bundle will surface as a
     /// connection error rather than silently MITM-able traffic.
     verify_tls: bool = true,
@@ -606,7 +606,7 @@ pub const Easy = struct {
 };
 
 /// Process-wide pool of libcurl `Easy` handles, reused across every
-/// `S3BlobStore` / `HttpBlobStore` in the process. A per-store Easy
+/// `S3BlobStore` in the process. A per-store Easy
 /// would not scale: it puts a separate keep-alive TCP+TLS connection
 /// in flight for every per-tenant store × every worker thread × every
 /// backend (file-blobs + manifest + log-blobs), blowing the FD count

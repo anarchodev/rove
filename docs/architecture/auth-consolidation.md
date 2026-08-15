@@ -169,8 +169,9 @@ non-operator → 403).
 > the `index.mjs` that actually ran. `__system/*` modules were already
 > special-cased for the *same* footgun; this generalizes the fix.
 >
-> The dead `filesFetch`/services-token path (dissolved files-server) is flagged
-> in `api.js` for the separate files reckoning — logs no longer touch it.
+> The dead `filesFetch`/services-token path (dissolved files-server) is gone
+> on both sides: the browser helper and the worker's `/_system/services-token`
+> mint were deleted with the rest of the files-server vestiges.
 
 **Track A exit (reached):** the log-server rejects every non-tenant-scoped read
 token (A4); the worker mints tenant-scoped tokens only for `__admin__` via the

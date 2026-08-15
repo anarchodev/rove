@@ -121,9 +121,6 @@ pub const TenantFilesSnapshot = deployment_cache.TenantFilesSnapshot;
 pub const TenantFiles = deployment_cache.TenantFiles;
 pub const StaticEntry = deployment_cache.StaticEntry;
 pub const TriggerEntry = deployment_cache.TriggerEntry;
-pub const PrefetchedManifest = deployment_cache.PrefetchedManifest;
-pub const ManifestHttpConfig = deployment_cache.ManifestHttpConfig;
-pub const ManifestPrefetchMap = deployment_cache.ManifestPrefetchMap;
 const owed_retry = @import("owed_retry.zig");
 // The `_send/owed/` marker scan helpers. Deferred fires ride the
 // durable scheduler as `__system/webhook_fire` wakes. Re-exported so
@@ -1158,13 +1155,13 @@ pub const WorkerConfig = struct {
     /// the promotion walker (not the original flush) surfaces it.
     log_flush_interval_ns: ?i64 = null,
     log_flush_threshold_records: ?u32 = null,
-    /// HMAC-SHA256 secret used to sign JWTs minted at
-    /// `/_system/services-token`.
-    /// The standalone log-server + files-server (separate threads /
-    /// processes, addressable at `log_public_base` + `files_public_base`)
-    /// verify the same JWT on every request. Borrowed; the caller
-    /// keeps the bytes alive for the worker's lifetime. When null,
-    /// `/_system/services-token` returns 503.
+    /// HMAC-SHA256 secret shared with the cluster-internal peers that
+    /// present a services-JWT instead of the operator root bearer: the
+    /// capability-gated `/_system/*` endpoints (`release`, `admin-kv`,
+    /// `raft-snapshot/`) verify against it, and the standalone
+    /// log-server verifies the same signature on its query surface.
+    /// Borrowed; the caller keeps the bytes alive for the worker's
+    /// lifetime. Null disables every capability-gated endpoint.
     services_jwt_secret: ?[]const u8 = null,
     /// Shared secret for the cluster-internal tenant-move
     /// surface (`/_system/v2-*`: kv seed/read, bundle dump, attach,
@@ -1189,16 +1186,10 @@ pub const WorkerConfig = struct {
     /// CP node failure. Paired with `cluster_id`; empty disables serve-or-
     /// forward. Borrowed.
     cp_urls: []const []const u8 = &.{},
-    /// Public origin the dashboard uses to reach the log-server.
-    /// Returned in the `/_system/services-token` response. Borrowed.
-    log_public_base: ?[]const u8 = null,
     /// Worker→log-server push fan-out targets. The push thread POSTs each
     /// flushed batch key to every base (multi-node prod = one per node). Empty
     /// disables push. Borrowed.
     log_push_bases: []const []const u8 = &.{},
-    /// Public origin the dashboard / CLI uses to reach files-server.
-    /// Returned in the `/_system/services-token` response. Borrowed.
-    files_public_base: ?[]const u8 = null,
     /// Skip TLS peer verification on the worker's **internal-service**
     /// POSTs. Currently gates only the log-server push path
     /// (`sendPushChunk`). Set true in dev / smoke clusters with
@@ -1240,9 +1231,8 @@ pub const WorkerConfig = struct {
     /// each worker thread typically gets its own compiler instance
     /// because QuickJS runtimes aren't shareable across threads.
     compile_ctx: ?*anyopaque = null,
-    // Process-wide deployment config (blob_backend, manifest_http,
-    // manifest_easy, manifest_prefetch) lives on `NodeState`. Reach
-    // it via `worker.node`.
+    // Process-wide deployment config (blob_backend) lives on
+    // `NodeState`. Reach it via `worker.node`.
 
     /// The `BatchStore` the worker flushes log batches into. The
     /// embedding binary always supplies one — S3 if env wired, in-memory
@@ -1274,9 +1264,8 @@ pub fn resumeHeldBoundFetch(worker: anytype, held_ent: rove.Entity, ev: *compone
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
     // park entities in `raft_pending` without allocating side state.
-    // There are no proxy components: the standalone log-server and
-    // files-server live on their own subdomains, not behind
-    // `/_system/*` proxies.
+    // There are no proxy components: the standalone log-server lives
+    // on its own subdomain, not behind a `/_system/*` proxy.
     //
     // Cont + stream state components
     // (the Cmd pattern, `docs/architecture/effects-and-handlers.md`) ride on every h2 stream
@@ -1632,8 +1621,8 @@ pub fn Worker(comptime opts: Options) type {
         /// Borrowed pointer to the process-wide shared state. Holds
         /// the tenant resolver, the single `tenant_files_map` (shared
         /// across all workers — fan-out gone), the single deployment
-        /// loader, and the process-wide deployment config (blob
-        /// backend, manifest_http / manifest_easy / manifest_prefetch).
+        /// loader, and the process-wide deployment config (the blob
+        /// backend).
         /// Owned by `main.zig`; outlives every worker.
         node: *NodeState,
         raft: *Bridge,
@@ -1696,12 +1685,11 @@ pub fn Worker(comptime opts: Options) type {
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
         compile_ctx: ?*anyopaque,
-        // Process-wide deployment config (blob_backend_cfg,
-        // manifest_http, manifest_easy, manifest_prefetch) lives on
-        // `node`. Reach via `worker.node.blob_backend_cfg`, etc.
+        // Process-wide deployment config (blob_backend_cfg) lives on
+        // `node`. Reach via `worker.node.blob_backend_cfg`.
 
-        /// JWT secret + public origins for the standalone services.
-        /// Returned to the dashboard via `/_system/services-token`.
+        /// Signing/verification secret for cluster-internal
+        /// services-JWTs. See `WorkerConfig.services_jwt_secret`.
         services_jwt_secret: ?[]const u8,
         /// Shared secret gating the `/_system/v2-*` tenant-move
         /// surface. See `WorkerConfig.move_secret`.
@@ -1710,7 +1698,6 @@ pub fn Worker(comptime opts: Options) type {
         /// `cp_urls`. cluster_id null or cp_urls empty → forwarding disabled.
         cluster_id: ?[]const u8,
         cp_urls: []const []const u8,
-        files_public_base: ?[]const u8,
         /// Internal-service POST insecure-TLS toggle (log-push
         /// only — see the worker struct field doc).
         internal_insecure_tls: bool,
@@ -1790,7 +1777,6 @@ pub fn Worker(comptime opts: Options) type {
                     // rewind/main.zig and arrives via `config.minter_id`.
                     .minter_id = config.minter_id orelse @enumFromInt(@as(u16, @intCast(config.raft.config.node_id))),
                     .log_batch_store = config.log_batch_store,
-                    .log_public_base = config.log_public_base,
                     .log_push_bases = config.log_push_bases,
                     .log_push_curl = blk: {
                         if (config.log_push_bases.len == 0) break :blk null;
@@ -1812,7 +1798,6 @@ pub fn Worker(comptime opts: Options) type {
                 .move_secret = config.move_secret,
                 .cluster_id = config.cluster_id,
                 .cp_urls = config.cp_urls,
-                .files_public_base = config.files_public_base,
                 .internal_insecure_tls = config.internal_insecure_tls,
                 .wake_inbox = KvWakeInbox.init(allocator),
             };
@@ -1929,9 +1914,8 @@ pub fn Worker(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
-            // NodeState owns the deployment loader + tenant_files_map
-            // + manifest_prefetch. Tenant-files cleanup runs from
-            // `NodeState.deinit`, not here.
+            // NodeState owns the deployment loader + tenant_files_map.
+            // Tenant-files cleanup runs from `NodeState.deinit`, not here.
             // Stop + join the flusher and push threads in order, then free the
             // queued keys — the ordering (flusher first, since it enqueues to
             // push_queue on its final tick; free only after both joined) is
@@ -2055,7 +2039,6 @@ pub fn Worker(comptime opts: Options) type {
             self.fetch_pending_durability.deinit(allocator);
             self.dispatcher.deinit();
             if (self.log.log_push_curl) |easy| easy.deinit();
-            // `manifest_easy` lives on NodeState — main.zig owns it.
             self.h2.destroy();
             allocator.destroy(self);
         }

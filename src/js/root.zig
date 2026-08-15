@@ -82,9 +82,6 @@ pub const DispatchError = dispatcher.DispatchError;
 
 pub const Worker = worker.Worker;
 pub const WorkerConfig = worker.WorkerConfig;
-pub const ManifestHttpConfig = worker.ManifestHttpConfig;
-pub const PrefetchedManifest = worker.PrefetchedManifest;
-pub const ManifestPrefetchMap = worker.ManifestPrefetchMap;
 pub const NodeState = worker.NodeState;
 pub const WorkerOptions = worker.Options;
 pub const RaftWait = worker.RaftWait;

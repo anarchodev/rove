@@ -16,13 +16,12 @@
 const std = @import("std");
 const root = @import("root.zig");
 const s3_mod = @import("s3.zig");
-const http_blob = @import("http_blob.zig");
 
 const Error = root.Error;
 
 /// Operator-supplied configuration. Read from env by `env.zig`,
-/// threaded through `WorkerConfig` / `ApplyConfig` / files-server /
-/// log-server, and resolved per-tenant via `TenantStorage.openBackend`.
+/// threaded through `WorkerConfig` / `ApplyConfig` / log-server, and
+/// resolved per-tenant via `TenantStorage.openBackend`.
 /// One bucket hosts the whole node; per-tenant scoping is the key
 /// prefix `{key_prefix_base}{instance_id}/{subdir}/`. `key_prefix_base`
 /// lets a single bucket host multiple deployments (staging + prod).
@@ -38,55 +37,32 @@ pub const BackendConfig = struct {
     use_tls: bool = true,
 };
 
-/// `BlobBackend` is the per-store handle held by every consumer
-/// that owns a per-tenant `BlobStore`. Two variants:
+/// `BlobBackend` is the per-store handle held by every consumer that
+/// owns a per-tenant `BlobStore`: content-addressed bytes shared
+/// across leader + followers via S3-shaped object storage, used for
+/// file-blobs (bytecode + static assets) and log-blobs.
 ///
-/// - `s3` — content-addressed bytes shared across leader +
-///   followers via S3-shaped object storage. Used for file-blobs
-///   (bytecode + static assets) and log-blobs.
-/// - `http` — read-only fetch against a colocated files-server
-///   over HTTP/2. Used by the worker for manifest reads
-///   (production.md #1.4 step 4 — manifests live in raft-replicated
-///   KV inside the files-server cluster, not S3).
-///
-/// Construction picks the variant; the `blobStore()` interface is
-/// uniform so consumers don't branch.
+/// One variant only — every node must read the same content-addressed
+/// store, so S3 is mandatory even single-node
+/// (`docs/architecture/deployment-and-logs.md`). The wrapper stays
+/// because consumers hold it by value and construct it through
+/// `TenantStorage.openBackend`, which owns the prefix rule.
 pub const BlobBackend = struct {
-    inner: union(enum) {
-        s3: s3_mod.S3BlobStore,
-        http: http_blob.HttpBlobStore,
-    },
+    s3: s3_mod.S3BlobStore,
 
     /// Open an S3 backend with `config`. The config's `key_prefix` scopes
     /// a shared bucket — e.g. each tenant passes
     /// `key_prefix = "{instance_id}/file-blobs/"`.
     pub fn openS3(allocator: std.mem.Allocator, config: s3_mod.Config) !BlobBackend {
-        return .{ .inner = .{ .s3 = try s3_mod.S3BlobStore.init(allocator, config) } };
-    }
-
-    /// Open an HTTP-backed backend for one tenant. Read-only: writes
-    /// flow through the files-server's raft cluster, never directly
-    /// from a client. See `http_blob.HttpBlobStore` for the URL
-    /// shape.
-    pub fn openHttp(
-        allocator: std.mem.Allocator,
-        cfg: http_blob.HttpBlobStore.Config,
-    ) !BlobBackend {
-        return .{ .inner = .{ .http = try http_blob.HttpBlobStore.init(allocator, cfg) } };
+        return .{ .s3 = try s3_mod.S3BlobStore.init(allocator, config) };
     }
 
     pub fn deinit(self: *BlobBackend) void {
-        switch (self.inner) {
-            .s3 => |*s| s.deinit(),
-            .http => |*h| h.deinit(),
-        }
+        self.s3.deinit();
     }
 
     pub fn blobStore(self: *BlobBackend) root.BlobStore {
-        return switch (self.inner) {
-            .s3 => |*s| s.blobStore(),
-            .http => |*h| h.blobStore(),
-        };
+        return self.s3.blobStore();
     }
 
     /// Delete every object under `sub_prefix` (relative to this backend's
@@ -95,19 +71,12 @@ pub const BlobBackend = struct {
     ///
     /// Not on the `BlobStore` vtable: enumeration is a storage-lifecycle
     /// operation (teardown, GC), not part of the hash-keyed read/write surface
-    /// that every caller shares. The read-only `http` variant has no delete
-    /// path at all.
+    /// that every caller shares.
     pub fn deletePrefix(self: *BlobBackend, sub_prefix: []const u8) !u64 {
-        return switch (self.inner) {
-            .s3 => |*s| try s.deletePrefix(sub_prefix),
-            .http => root.Error.Io,
-        };
+        return self.s3.deletePrefix(sub_prefix);
     }
 
-    /// Build a presigned GET URL for `key`. Returns null when the
-    /// backend variant can't presign — today only the `http` (read
-    /// through colocated files-server) variant; an S3 backend always
-    /// produces a URL. Caller frees on success.
+    /// Build a presigned GET URL for `key`. Caller frees.
     ///
     /// 302-redirects static asset requests directly to S3 (deployment
     /// snapshots — `docs/architecture/deployment-and-logs.md`). `expires_secs` caps the
@@ -121,11 +90,8 @@ pub const BlobBackend = struct {
         expires_secs: u32,
         response_content_type: ?[]const u8,
         body_allocator: std.mem.Allocator,
-    ) !?[]u8 {
-        return switch (self.inner) {
-            .s3 => |*s| try s.presignGet(key, expires_secs, response_content_type, body_allocator),
-            .http => null,
-        };
+    ) ![]u8 {
+        return self.s3.presignGet(key, expires_secs, response_content_type, body_allocator);
     }
 };
 
@@ -144,22 +110,6 @@ test "BlobBackend: s3 init through wrapper (no I/O)" {
     });
     defer be.deinit();
     _ = be.blobStore();
-    try testing.expect(be.inner == .s3);
-}
-
-fn testFakeMint(_: ?*anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
-    return allocator.dupe(u8, "fake.jwt");
-}
-
-test "BlobBackend: http variant (no I/O)" {
-    var be = try BlobBackend.openHttp(testing.allocator, .{
-        .base_url = "https://files.loop46.localhost:9090",
-        .instance_id = "acme",
-        .mint_jwt = testFakeMint,
-        .verify_tls = false,
-    });
-    defer be.deinit();
-    _ = be.blobStore();
-    try testing.expect(be.inner == .http);
+    try testing.expectEqualStrings("loop46", be.s3.config.bucket);
 }
 

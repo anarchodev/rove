@@ -568,9 +568,6 @@ pub const TenantSlot = struct {
     blob_backend: blob_mod.BlobBackend,
     /// Owned blob backend for per-deployment manifest JSON.
     manifest_backend: blob_mod.BlobBackend,
-    /// One-shot prefetched manifest from the cold-start batch fetch.
-    /// Drained on the first reload that matches its dep_id.
-    prefetched_manifest: ?PrefetchedManifest,
     /// Atomic pointer to the current snapshot. Null until first load.
     current: std.atomic.Value(?*TenantFilesSnapshot),
 
@@ -734,39 +731,6 @@ pub const TenantFiles = struct {
     }
 };
 
-/// One pre-fetched manifest from the cold-start bulk fetch.
-/// Owned bytes; freed by the worker after consumption (or at
-/// shutdown if never consumed).
-pub const PrefetchedManifest = struct {
-    dep_id: u64,
-    bytes: []u8,
-};
-
-/// Configuration for routing manifest reads through a files-server
-/// cluster over HTTP/2 instead of fetching from S3 directly. Set
-/// on `WorkerConfig.manifest_http` to opt in. See production.md
-/// #1.4 step 4.
-pub const ManifestHttpConfig = struct {
-    /// Origin like `https://files.loop46.localhost:9090`. Borrowed;
-    /// HttpBlobStore dupes internally so the caller can free
-    /// after `Worker.create` returns.
-    base_url: []const u8,
-    /// Per-fetch JWT minter. Loop46 typically wires this to a
-    /// closure over its `services_jwt_secret`. Borrowed.
-    mint_jwt: blob_mod.http_blob.MintJwtFn,
-    mint_ctx: ?*anyopaque = null,
-    /// Optional CA bundle path for self-signed dev certs. Borrowed.
-    ca_bundle_path: ?[]const u8 = null,
-    /// Production: true. Dev / smoke against self-signed cert: false.
-    verify_tls: bool = true,
-};
-
-/// Manifest-prefetch slot map. Keys + value bytes are allocator-owned;
-/// consumed at TenantFiles.open time (`fetchRemove` transfers ownership
-/// out). Lives on NodeState so cold-start prefetch persists across
-/// worker boot.
-pub const ManifestPrefetchMap = std.StringHashMapUnmanaged(PrefetchedManifest);
-
 /// Per-tenant deployment cache subsystem — the tenant-slot map, the
 /// node-wide content-addressed bytecode cache, the single
 /// deployment-loader thread, and the manifest-fetch config.
@@ -831,13 +795,6 @@ pub const DeploymentCache = struct {
     /// `deploymentLoadFnNode`.
     deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
 
-    /// Process-wide manifest-fetch config consumed by
-    /// `openTenantSlotNode`. Shared pointers (libcurl Easy, prefetch
-    /// map) live for the lifetime of the cache.
-    manifest_http: ?ManifestHttpConfig = null,
-    manifest_easy: ?*blob_mod.curl.Easy = null,
-    manifest_prefetch: ?ManifestPrefetchMap = null,
-
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
@@ -876,15 +833,6 @@ pub const DeploymentCache = struct {
         // already be drained by the worker shutdown path; any surviving
         // entry trips the assert in `BytecodeCache.deinit`.
         self.bytecode_cache.deinit();
-        if (self.manifest_prefetch) |*map| {
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*.bytes);
-            }
-            map.deinit(self.allocator);
-            self.manifest_prefetch = null;
-        }
     }
 
     /// Spawn the single deployment loader thread. Idempotent. Called
@@ -1095,32 +1043,15 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     );
     errdefer blob_backend.deinit();
 
-    // Production.md #1.4 step 4 — when manifest_http is wired, open
-    // an HTTP-backed manifest_backend that fetches manifests from a
-    // colocated files-server cluster (where they live in raft-
-    // replicated KV). Otherwise fall back to S3-direct, which still
-    // works as long as files-server's bootstrap path keeps the dual
-    // S3 PUT alive. The S3 PUT goes away once every loop46 worker
-    // in the deployment uses the HTTP backend.
-    var manifest_backend = if (dc.manifest_http) |mh|
-        try blob_mod.BlobBackend.openHttp(allocator, .{
-            .base_url = mh.base_url,
-            .instance_id = inst.id,
-            .mint_jwt = mh.mint_jwt,
-            .mint_ctx = mh.mint_ctx,
-            // Shared Easy across all per-tenant manifest backends
-            // on this node — see `DeploymentCache.manifest_easy`. Falls
-            // back to per-tenant Easy when shared init failed.
-            .easy = dc.manifest_easy,
-            .ca_bundle_path = mh.ca_bundle_path,
-            .verify_tls = mh.verify_tls,
-        })
-    else
-        try inst.storage.openBackend(
-            allocator,
-            dc.blob_backend_cfg,
-            "deployments",
-        );
+    // Per-tenant deployment manifests live in their own `deployments/`
+    // prefix in the same shared object store as the file-blobs
+    // (`docs/architecture/deployment-and-logs.md`), so leader and
+    // followers read identical keys.
+    var manifest_backend = try inst.storage.openBackend(
+        allocator,
+        dc.blob_backend_cfg,
+        "deployments",
+    );
     errdefer manifest_backend.deinit();
 
     const id_copy = try allocator.dupe(u8, inst.id);
@@ -1128,20 +1059,6 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
 
     const slot = try allocator.create(TenantSlot);
     errdefer allocator.destroy(slot);
-    // Pull this tenant's prefetched manifest (if any) — transfer
-    // ownership of the bytes from the worker's prefetch map to
-    // `slot`. fetchRemove returns the entry's key + value pair;
-    // we own the value bytes from here and free the key (the
-    // map's key was a copy of the tenant id, not the same alloc
-    // as `id_copy` above).
-    var prefetched: ?PrefetchedManifest = null;
-    if (dc.manifest_prefetch) |*map| {
-        if (map.fetchRemove(inst.id)) |kv| {
-            allocator.free(kv.key);
-            prefetched = kv.value;
-        }
-    }
-    errdefer if (prefetched) |p| allocator.free(p.bytes);
 
     slot.* = .{
         .allocator = allocator,
@@ -1152,7 +1069,6 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
         .router = dc.router,
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
-        .prefetched_manifest = prefetched,
         .current = .{ .raw = null },
     };
 
@@ -1195,7 +1111,6 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
     slot.plan_retired.deinit(allocator);
     slot.manifest_backend.deinit();
     slot.blob_backend.deinit();
-    if (slot.prefetched_manifest) |p| allocator.free(p.bytes);
     allocator.free(slot.instance_id);
     allocator.destroy(slot);
 }
@@ -1323,35 +1238,17 @@ fn fetchBlobRetry(
 /// background `DeploymentLoader` thread (a release landed).
 fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_mod.Detail) !void {
     const allocator = slot.allocator;
-    // Two-tier source for the manifest bytes:
-    //   1. One-shot prefetch from cold-start. Transfer ownership
-    //      out of the prefetch slot when the dep_id matches.
-    //   2. Per-tenant HTTP / S3 fetch via manifest_backend.
-    //
     // dep_ids are content-addressed (truncated sha-256, see
     // `files_mod.manifest_json.computeDeploymentId`), so reaching
     // this function with `dep_id == slot.currentDeploymentId()` is
     // already filtered out in `deploymentLoadFnNode`. No in-function
     // cached-bytes short-circuit needed.
-    var json_bytes: []u8 = undefined;
-    var owned_by_prefetch = false;
-    if (slot.prefetched_manifest) |p| {
-        slot.prefetched_manifest = null;
-        if (p.dep_id == dep_id) {
-            json_bytes = p.bytes;
-            owned_by_prefetch = true;
-        } else {
-            allocator.free(p.bytes);
-        }
-    }
-    if (!owned_by_prefetch) {
-        var key_buf: [25]u8 = undefined;
-        const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
-        json_bytes = slot.manifest_backend.blobStore().get(key, allocator) catch |err| switch (err) {
-            error.NotFound => return error.NoDeployment,
-            else => return err,
-        };
-    }
+    var key_buf: [25]u8 = undefined;
+    const manifest_key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+    const json_bytes = slot.manifest_backend.blobStore().get(manifest_key, allocator) catch |err| switch (err) {
+        error.NotFound => return error.NoDeployment,
+        else => return err,
+    };
     var json_bytes_consumed = false;
     errdefer if (!json_bytes_consumed) allocator.free(json_bytes);
 

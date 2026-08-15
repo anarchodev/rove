@@ -99,7 +99,6 @@ const WorkerCtx = struct {
     /// internal base). Null disables push; the log-server's LIST poll is the
     /// catch-up. Enables the worker's batch-pushed fast-path (off the main loop,
     /// on the dedicated push thread).
-    log_public_base: ?[]const u8,
     /// Worker→log-server push fan-out targets (`REWIND_LOG_PUSH_BASES`, a list;
     /// default the single `log_public_base`). Empty disables push. The push
     /// thread POSTs each flushed batch key to every base; per-target failure is
@@ -302,7 +301,6 @@ fn workerMain(args: *WorkerCtx) !void {
         .move_secret = args.move_secret,
         .cluster_id = args.cluster_id,
         .cp_urls = args.cp_urls,
-        .log_public_base = args.log_public_base,
         .log_push_bases = args.log_push_bases,
         .services_jwt_secret = args.services_jwt_secret,
     });
@@ -953,7 +951,6 @@ pub fn main() !void {
         .move_secret = move_secret,
         .cluster_id = cluster_id,
         .cp_urls = cp_urls,
-        .log_public_base = log_public_base,
         .log_push_bases = log_push_bases,
         .services_jwt_secret = services_jwt_secret,
         .peer_urls = peer_urls,

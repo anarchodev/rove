@@ -5,11 +5,11 @@
 //! request hot path (`dispatchOnce` / `finalizeBatch` / `resolveRequest`).
 //!
 //! `tryHandleSystem` is the single entry point (called from `dispatchOnce`):
-//! CORS preflight, the `services-token` mint, the Prometheus `metrics`
-//! render (`buildMetricsText`, re-exported from `root.zig`), raft snapshot
-//! bundling, the release POST (config-mirror), reset, and admin-kv. Every
-//! function takes `server`/`worker` as `anytype` — same structural-typing
-//! shape as the rest of the worker_*.zig family.
+//! CORS preflight, the Prometheus `metrics` render (`buildMetricsText`,
+//! re-exported from `root.zig`), raft snapshot bundling, the release POST
+//! (config-mirror), reset, and admin-kv. Every function takes
+//! `server`/`worker` as `anytype` — same structural-typing shape as the
+//! rest of the worker_*.zig family.
 
 const std = @import("std");
 const rove = @import("rove");
@@ -27,8 +27,8 @@ const worker_mod = @import("worker.zig");
 
 const RaftWait = worker_mod.RaftWait;
 
-/// `/_system/*` route handler — CORS preflight + `services-token`
-/// mint + `release` POST. Returns true iff the request matched and
+/// `/_system/*` route handler — CORS preflight + `release` POST +
+/// admin-kv + raft-snapshot. Returns true iff the request matched and
 /// was finalized (response stamped + moved to `response_in`).
 pub fn tryHandleSystem(
     server: anytype,
@@ -96,8 +96,8 @@ pub fn tryHandleSystem(
     // Per-endpoint auth. Most `/_system/*` endpoints require admin
     // auth (root bearer or session cookie); a small allow-list of
     // cluster-internal endpoints also accept a services-JWT carrying
-    // the matching capability so files-server can push deploys +
-    // config without holding the operator's root bearer. The cap
+    // the matching capability, so a peer service can push a release or
+    // pull a snapshot without holding the operator's root bearer. The cap
     // alternative is gated to the exact endpoint that needs it —
     // there is no global "admin or cap" pass.
     const required_cap: ?[]const u8 = if (std.mem.eql(u8, sys_rest, "release"))
@@ -113,24 +113,14 @@ pub fn tryHandleSystem(
         return true;
     }
 
-    // JWT minter for
-    // the standalone services (log-server + files-server). Caller is
-    // already admin-authenticated; we hand back a 5-minute HS256
-    // token + the public origins of both services so the dashboard
-    // can call them directly cross-origin.
-    if (std.mem.eql(u8, sys_rest, "services-token")) {
-        try handleServicesTokenMint(server, allocator, worker, ent, sid, sess, cors_origin);
-        return true;
-    }
-
-    // Platform-bootstrap-only release endpoint. files-server's
-    // bootstrap thread POSTs `{"tenant_id":"...","dep_id":N}` here
-    // for the platform tenants (`__admin__`, `__replay__`) at
-    // startup — that's a chicken-and-egg: __admin__'s own handler
-    // can't be the entry point until `_deploy/current` has been
-    // stamped to point at __admin__'s manifest. Customer release
-    // traffic goes through `__admin__`'s deployed
-    // `publishRelease` RPC instead.
+    // Operator/bootstrap release endpoint. The `rewind` CLI's
+    // root-token path and `rewind-ops release` POST
+    // `{"tenant_id":"...","dep_id":N}` here. It is the only way to
+    // publish the platform tenants (`__admin__`, `__replay__`):
+    // a chicken-and-egg, since __admin__'s own handler can't be the
+    // entry point until `_deploy/current` has been stamped to point
+    // at __admin__'s manifest. Customer release traffic goes through
+    // `__admin__`'s deployed `publishRelease` RPC instead.
     if (std.mem.eql(u8, sys_rest, "release")) {
         try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
         return true;
@@ -147,8 +137,8 @@ pub fn tryHandleSystem(
         return true;
     }
 
-    // Leader-status probe used by smokes + files-server bootstrap to
-    // discover which node will accept release / admin-kv POSTs. The
+    // Leader-status probe used by smokes and the operator publish path
+    // to discover which node will accept release / admin-kv POSTs. The
     // tenant-routing leader-skip in dispatchOnce doesn't apply here
     // (`/_system/*` short-circuits before tenant routing), so /_system
     // probes alone can't tell leader from follower. Returns 200 on the
@@ -192,10 +182,10 @@ pub fn tryHandleSystem(
         return true;
     }
 
-    // Cluster-wide admin config push. files-server-standalone POSTs
-    // `{"pairs":[{"key":"...","value":"..."},...]}` here at platform
-    // bootstrap time so operator-supplied --bootstrap-kv values land
-    // in `__admin__/app.db` via raft (envelope 0).
+    // Cluster-wide admin config push. The operator POSTs
+    // `{"pairs":[{"key":"...","value":"..."},...]}` here (root bearer)
+    // at platform bootstrap time so operator-supplied config lands in
+    // `__admin__/app.db` via raft (envelope 0).
     if (std.mem.eql(u8, sys_rest, "admin-kv")) {
         try handleAdminKv(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
         return true;
@@ -213,8 +203,8 @@ pub fn tryHandleSystem(
 ///     Bearer <root-token>`
 ///   - **only when `required_cap` is set**: a services-JWT signed by
 ///     `LOOP46_SERVICES_JWT_SECRET` whose `caps` claim contains the
-///     given cap. Used by files-server to push platform deploys +
-///     config without holding the operator's root bearer.
+///     given cap — how a peer service pushes a release or pulls a
+///     snapshot without holding the operator's root bearer.
 ///
 /// Returns true when the caller is allowed to proceed, false when
 /// the response (401 / 500) has already been stamped onto the entity.
@@ -254,50 +244,6 @@ fn authorizeSystemRequest(
 
     try respb.setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
     return false;
-}
-
-/// Mint an HS256 JWT for the standalone services. Body shape:
-///   `{"token":"<jwt>","log_url":"<base>","files_url":"<base>","exp_ms":<...>}`
-/// Token expires in 5 minutes; the dashboard refreshes by hitting
-/// this endpoint again. 503 when the server wasn't started with a
-/// JWT secret (operator skipped Step B / F1 wiring).
-fn handleServicesTokenMint(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    cors_origin: ?[]const u8,
-) !void {
-    const secret = worker.services_jwt_secret orelse {
-        try respb.setSystemResponse(server, ent, sid, sess, 503, "services jwt not configured\n", allocator, cors_origin, null);
-        return;
-    };
-    const log_base = worker.log.log_public_base orelse {
-        try respb.setSystemResponse(server, ent, sid, sess, 503, "log-server public base not configured\n", allocator, cors_origin, null);
-        return;
-    };
-    const files_base = worker.files_public_base orelse {
-        try respb.setSystemResponse(server, ent, sid, sess, 503, "files-server public base not configured\n", allocator, cors_origin, null);
-        return;
-    };
-
-    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    const exp_ms: i64 = now_ms + 5 * 60 * 1000;
-    const token = jwt.mint(allocator, secret, .{ .exp_ms = exp_ms }) catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "mint failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-    defer allocator.free(token);
-
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"token\":\"{s}\",\"log_url\":\"{s}\",\"files_url\":\"{s}\",\"exp_ms\":{d}}}\n",
-        .{ token, log_base, files_base, exp_ms },
-    );
-    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
 }
 
 /// Emit operator metrics in Prometheus text format. Scope is
@@ -957,11 +903,10 @@ fn handleRelease(
 
     // Idempotent fast path: matches `releasePublishTrampoline`. If
     // the target's `_deploy/current` is already exactly `dep_id`,
-    // skip the raft propose. The platform-bootstrap flow (files-server
-    // pushing __admin__ / __replay__ at start) retries on connection-
-    // refused; each retry can land here after the first commit, so
-    // without this short-circuit every retry re-proposes a no-op
-    // envelope.
+    // skip the raft propose. The platform-bootstrap flow (publishing
+    // __admin__ / __replay__) retries against each node in turn, so a
+    // retry can land here after the first commit; without this
+    // short-circuit every retry re-proposes a no-op envelope.
     //
     // With content-addressed dep_ids, "same id" genuinely means
     // "same content", so the snapshot already in place IS the right
@@ -1185,14 +1130,12 @@ fn handleReset(
 
 /// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes
 /// each pair into `__admin__/app.db` via a raft-replicated envelope
-/// 0 writeset, so every node sees the same admin config. Used by
-/// files-server-standalone at platform-bootstrap time to ship
-/// operator-supplied config (resend_key, platform_email_from, ...)
-/// without a per-node `--bootstrap-kv` flag.
+/// 0 writeset, so every node sees the same admin config. The operator
+/// runs this at platform-bootstrap time to ship config (resend_key,
+/// platform_email_from, ...) without a per-node flag.
 ///
-/// Idempotent: re-posting the same pairs re-stamps the kv rows. The
-/// caller (files-server) does this on every restart with the same
-/// values, which is fine.
+/// Idempotent: re-posting the same pairs re-stamps the kv rows, so
+/// re-running the seeding script with unchanged values is a no-op.
 fn handleAdminKv(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -1269,10 +1212,9 @@ fn handleAdminKv(
     };
 
     // Propose envelope-0 and PARK the request on raft commit — the
-    // 204 must not be released at accept (files-server-standalone
-    // proceeds assuming the bootstrap kv is durable; a pre-quorum
-    // fault would leave it acting on a write the cluster rolled
-    // back). Mirrors the Class-B-correct release handler above:
+    // 204 must not be released at accept (the caller proceeds
+    // assuming the bootstrap kv is durable; a pre-quorum fault would
+    // leave it acting on a write the cluster rolled back). Mirrors the Class-B-correct release handler above:
     // drainRaftPending delivers the staged 204 at committedSeq>=seq
     // / 503 on fault/timeout. The idiom-2 park-on-commit rule
     // (`docs/architecture/consensus-robustness.md`; effect gating in

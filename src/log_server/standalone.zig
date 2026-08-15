@@ -73,16 +73,19 @@ pub const Config = struct {
     /// h2 connection cap.
     max_connections: u32 = 64,
     /// Optional TLS — when set, the listener does TLS termination via
-    /// rove-h2's standard path (the `*TlsConfig` is shared with the
-    /// worker, both built once by `loop46/main.zig::resolveTls`).
-    /// Null = h2c (the standalone binary's smoke driver path).
+    /// rove-h2's standard path. The `rewind-logs` binary builds this
+    /// from its own `--tls-cert` / `--tls-key` flags (`main.zig`); it
+    /// is NOT shared with the worker, which serves h2c on the private
+    /// plane. Null = h2c (the deployed shape, and the smoke path).
     tls_config: ?*h2.TlsConfig = null,
     /// Required for `/v1/*` requests — HMAC-SHA256 secret used to
-    /// verify the JWT in `Authorization: Bearer <token>`. The worker
-    /// mints these tokens at `/_system/log-token` after a session /
-    /// bearer-auth check; the dashboard sends them with each
-    /// log-server call. When null, every `/v1/*` request returns 401
-    /// (lets a smoke spin up a standalone without auth wired).
+    /// verify the JWT in `Authorization: Bearer <token>`. The worker's
+    /// fetch engine mints these as tenant-scoped `logs-read` tokens
+    /// when it rewrites the privileged `rewind-logs.internal` host
+    /// (`docs/architecture/cli-and-deploy.md` §7), so a token can only
+    /// read the tenant it was minted for. When null, every `/v1/*`
+    /// request returns 401 (lets a smoke spin up a standalone without
+    /// auth wired).
     jwt_secret: ?[]const u8 = null,
     /// `Access-Control-Allow-Origin` value emitted on every `/v1/*`
     /// response. The dashboard at `https://app.{suffix}` calls the

@@ -741,14 +741,7 @@ pub fn serveAssetByHash(
     ) catch |err| {
         std.log.warn("rove-js: asset presign for {s} failed: {s}", .{ hash, @errorName(err) });
         return err;
-    }) orelse {
-        // Per-request fault, not an operator-actionable process fault:
-        // same event and same level as the `catch` above. `.err` here
-        // also made the path untestable — Zig's test runner counts an
-        // error-level log as a failure regardless of assertions.
-        std.log.warn("rove-js: asset presign for {s} returned null", .{hash});
-        return error.PresignNotSupported;
-    };
+    });
     defer allocator.free(url);
     try emitStaticRedirectWithEtag(server, allocator, ent, sid, sess, url, etag, presign_expires_secs);
     return 302;
