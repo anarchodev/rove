@@ -351,7 +351,13 @@ pub const IndexDb = struct {
     ///
     /// Shares parameter numbering with `LIST_SQL_TAGGED` (?1 tenant,
     /// ?2/?3 cursor, ?4 limit, ?5 floor) so both bind identically.
-    const LIST_SQL_UNTAGGED: [:0]const u8 =
+    ///
+    /// HEAD/TAIL split: optional list FILTERS (`ListFilter`) splice
+    /// their AND clauses between the two, each shape prepared as its
+    /// own exact statement — never a parameter-guarded conditional
+    /// clause, which is the un-plannable spelling LIST_SQL_TAGGED's
+    /// comment documents.
+    const LIST_SQL_UNTAGGED_HEAD =
         \\SELECT tenant_id, request_id, received_ns, duration_ns, method, path, host,
         \\       status, outcome, deployment_id, activation
         \\FROM log_index
@@ -360,9 +366,13 @@ pub const IndexDb = struct {
         \\       received_ns < ?2 OR
         \\       (received_ns = ?2 AND request_id < ?3))
         \\  AND (?5 = 0 OR received_ns >= ?5)
+    ;
+    const LIST_SQL_UNTAGGED_TAIL =
+        \\
         \\ORDER BY received_ns DESC, request_id DESC
         \\LIMIT ?4
     ;
+    const LIST_SQL_UNTAGGED: [:0]const u8 = LIST_SQL_UNTAGGED_HEAD ++ LIST_SQL_UNTAGGED_TAIL;
 
     /// The same list, restricted to records carrying a `log_tags` row.
     ///
@@ -383,20 +393,114 @@ pub const IndexDb = struct {
     /// (`bindTagRow`) precisely so the cursor and the retention clamp
     /// can be applied on the driving table; the plan-shape test below
     /// pins the resulting index use.
-    const LIST_SQL_TAGGED: [:0]const u8 =
+    /// `CROSS JOIN`, not `JOIN`: in SQLite that is the documented way to
+    /// PIN the join order, and the order is the whole point (see the
+    /// doc comment above). A plain JOIN lets the planner invert the
+    /// drive once a spliced column filter (e.g. `li.status BETWEEN`)
+    /// makes `log_idx_status` look attractive — landing on exactly the
+    /// materialize-then-sort shape this statement exists to avoid: a
+    /// TEMP B-TREE over every match instead of streaming the LIMIT off
+    /// `log_tags_lookup`'s time order.
+    const LIST_SQL_TAGGED_HEAD =
         \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
         \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id,
         \\       li.activation
         \\FROM log_tags t
-        \\JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
+        \\CROSS JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
         \\WHERE t.tenant_id = ?1 AND t.key = ?6 AND t.value = ?7
         \\  AND (?2 = 0 OR
         \\       t.received_ns < ?2 OR
         \\       (t.received_ns = ?2 AND t.request_id < ?3))
         \\  AND (?5 = 0 OR t.received_ns >= ?5)
+    ;
+    const LIST_SQL_TAGGED_TAIL =
+        \\
         \\ORDER BY t.received_ns DESC, t.request_id DESC
         \\LIMIT ?4
     ;
+    const LIST_SQL_TAGGED: [:0]const u8 = LIST_SQL_TAGGED_HEAD ++ LIST_SQL_TAGGED_TAIL;
+
+    /// Optional `/list` filters — every field ANDs onto the base shape.
+    /// The zero value means "no filter" throughout, so a default-inited
+    /// struct is the unfiltered list.
+    pub const ListFilter = struct {
+        /// Inclusive status range; `(0, 0)` = no status filter. An
+        /// exact match is `min == max`; a class ("5xx") is `500..599`.
+        status_min: u16 = 0,
+        status_max: u16 = 0,
+        /// `outcome != 'ok'` — the `log_idx_failure` partial-index
+        /// predicate, spelled as the same literal so the planner can
+        /// match it.
+        failures_only: bool = false,
+        /// Exact method match (as logged, e.g. "GET").
+        method: ?[]const u8 = null,
+        /// Exact activation-kind match (e.g. "inbound", "ws_message").
+        activation: ?[]const u8 = null,
+        /// Case-sensitive substring of the request path (`instr`) —
+        /// paths are case-sensitive, and `instr` sidesteps LIKE's
+        /// wildcard/ESCAPE surface entirely.
+        path_contains: ?[]const u8 = null,
+
+        pub fn any(self: *const ListFilter) bool {
+            return self.status_min != 0 or self.status_max != 0 or
+                self.failures_only or self.method != null or
+                self.activation != null or self.path_contains != null;
+        }
+    };
+
+    /// Parameter indices a built filter statement binds its values at —
+    /// 0 = the clause is absent. Filled by `buildListSql`.
+    const FilterParams = struct {
+        status: u8 = 0, // binds min at .status, max at .status + 1
+        method: u8 = 0,
+        activation: u8 = 0,
+        path: u8 = 0,
+    };
+
+    /// Compose the list statement for one exact filter shape:
+    /// HEAD ++ (one AND clause per present filter) ++ TAIL. Each shape
+    /// is its own SQL text, so SQLite plans it precisely — the
+    /// tenant-prefixed indices keep every shape a SEARCH (the plan
+    /// tests below pin that). Caller frees the returned SQL.
+    fn buildListSql(
+        allocator: std.mem.Allocator,
+        tagged: bool,
+        filter: *const ListFilter,
+        params: *FilterParams,
+    ) ![:0]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const col = if (tagged) "li." else "";
+        // ?1..?5 are shared; the tagged head also uses ?6/?7.
+        var p: u8 = if (tagged) 8 else 6;
+        try buf.appendSlice(allocator, if (tagged) LIST_SQL_TAGGED_HEAD else LIST_SQL_UNTAGGED_HEAD);
+        const w = buf.writer(allocator);
+        if (filter.status_min != 0 or filter.status_max != 0) {
+            params.status = p;
+            try w.print("\n  AND {s}status BETWEEN ?{d} AND ?{d}", .{ col, p, p + 1 });
+            p += 2;
+        }
+        if (filter.failures_only) {
+            try w.print("\n  AND {s}outcome != 'ok'", .{col});
+        }
+        if (filter.method != null) {
+            params.method = p;
+            try w.print("\n  AND {s}method = ?{d}", .{ col, p });
+            p += 1;
+        }
+        if (filter.activation != null) {
+            params.activation = p;
+            try w.print("\n  AND {s}activation = ?{d}", .{ col, p });
+            p += 1;
+        }
+        if (filter.path_contains != null) {
+            params.path = p;
+            try w.print("\n  AND instr({s}path, ?{d}) > 0", .{ col, p });
+            p += 1;
+        }
+        try buf.appendSlice(allocator, if (tagged) LIST_SQL_TAGGED_TAIL else LIST_SQL_UNTAGGED_TAIL);
+        return buf.toOwnedSliceSentinel(allocator, 0);
+    }
 
     /// Newest-first list of records for `tenant_id`. Pagination cursor:
     /// pass `(after_received_ns, after_request_id)` from the previous
@@ -416,14 +520,25 @@ pub const IndexDb = struct {
         /// sugar route (`tag_key = "session"`). Null → no tag filter.
         tag_key: ?[]const u8,
         tag_value: ?[]const u8,
+        /// Optional column filters (status/failures/method/activation/
+        /// path). `.{}` = unfiltered.
+        filter: ListFilter,
     ) Error!ListResult {
-        // Two statements, not one with a conditional tag clause — see
-        // LIST_SQL_TAGGED for why the conditional spelling can't be
-        // planned.
+        // Two base statements, not one with a conditional tag clause —
+        // see LIST_SQL_TAGGED for why the conditional spelling can't be
+        // planned. Column filters splice per-shape via buildListSql,
+        // same discipline: every shape is its own exact SQL text.
         const tagged = tag_key != null and tag_value != null;
-        const sql = if (tagged) LIST_SQL_TAGGED else LIST_SQL_UNTAGGED;
+        var fparams: FilterParams = .{};
+        const built: ?[:0]u8 = if (filter.any())
+            buildListSql(self.allocator, tagged, &filter, &fparams) catch return Error.OutOfMemory
+        else
+            null;
+        defer if (built) |b| self.allocator.free(b);
+        const sql: [:0]const u8 = built orelse
+            (if (tagged) LIST_SQL_TAGGED else LIST_SQL_UNTAGGED);
         var st: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &st, null) != c.SQLITE_OK)
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &st, null) != c.SQLITE_OK)
             return Error.Sqlite;
         defer _ = c.sqlite3_finalize(st);
         bindText(st.?, 1, tenant_id);
@@ -437,6 +552,13 @@ pub const IndexDb = struct {
             bindText(st.?, 6, tag_key.?);
             bindText(st.?, 7, tag_value.?);
         }
+        if (fparams.status != 0) {
+            _ = c.sqlite3_bind_int(st, fparams.status, filter.status_min);
+            _ = c.sqlite3_bind_int(st, fparams.status + 1, filter.status_max);
+        }
+        if (fparams.method != 0) bindText(st.?, fparams.method, filter.method.?);
+        if (fparams.activation != 0) bindText(st.?, fparams.activation, filter.activation.?);
+        if (fparams.path != 0) bindText(st.?, fparams.path, filter.path_contains.?);
 
         var rows: std.ArrayListUnmanaged(ListRow) = .empty;
         errdefer {
@@ -1068,7 +1190,7 @@ test "insertBatch + queryList round-trips, newest-first" {
     const ndjson_key = "_logs/00000001/00000000000000000100-1730764800000.ndjson";
     try idx.insertBatch(&batch, ndjson_key, 0);
 
-    var list = try idx.queryList("acme", 0, 0, 0, 10, null, null);
+    var list = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{});
     defer list.deinit();
     try testing.expectEqual(@as(usize, 2), list.rows.len);
     // Newest first.
@@ -1079,14 +1201,14 @@ test "insertBatch + queryList round-trips, newest-first" {
 
     // Pagination: cursor at (received_ns=2000, id=101) returns the
     // older row only.
-    var p2 = try idx.queryList("acme", 2_000, 101, 0, 10, null, null);
+    var p2 = try idx.queryList("acme", 2_000, 101, 0, 10, null, null, .{});
     defer p2.deinit();
     try testing.expectEqual(@as(usize, 1), p2.rows.len);
     try testing.expectEqual(@as(u64, 100), p2.rows[0].request_id);
 
     // Retention read-clamp (Lever 3): a floor of 1500 hides the
     // received_ns=1000 record, leaving only the 2000 one — in list AND count.
-    var clamped = try idx.queryList("acme", 0, 0, 1_500, 10, null, null);
+    var clamped = try idx.queryList("acme", 0, 0, 1_500, 10, null, null, .{});
     defer clamped.deinit();
     try testing.expectEqual(@as(usize, 1), clamped.rows.len);
     try testing.expectEqual(@as(u64, 101), clamped.rows[0].request_id);
@@ -1123,19 +1245,19 @@ test "queryList filters by tag (user session + reserved _saga)" {
     try idx.insertBatch(&batch, "_logs/00000001/tagbatch.ndjson", 0);
 
     // tag.session=S1 → only request 1.
-    var s1 = try idx.queryList("acme", 0, 0, 0, 10, "session", "S1");
+    var s1 = try idx.queryList("acme", 0, 0, 0, 10, "session", "S1", .{});
     defer s1.deinit();
     try testing.expectEqual(@as(usize, 1), s1.rows.len);
     try testing.expectEqual(@as(u64, 1), s1.rows[0].request_id);
 
     // Reserved _saga tag is auto-derived from saga_id → both rows
     // share C1, so the engine session key returns the whole connection.
-    var c1 = try idx.queryList("acme", 0, 0, 0, 10, "_saga", "C1");
+    var c1 = try idx.queryList("acme", 0, 0, 0, 10, "_saga", "C1", .{});
     defer c1.deinit();
     try testing.expectEqual(@as(usize, 2), c1.rows.len);
 
     // Unknown tag value → no rows (not an error).
-    var none = try idx.queryList("acme", 0, 0, 0, 10, "session", "nope");
+    var none = try idx.queryList("acme", 0, 0, 0, 10, "session", "nope", .{});
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.rows.len);
 }
@@ -1204,6 +1326,128 @@ test "the tag-filtered list drives from log_tags, never a tenant-window scan" {
     defer a.free(untagged);
     try testing.expect(std.mem.indexOf(u8, untagged, "log_idx_recv") != null);
     try testing.expect(std.mem.indexOf(u8, untagged, "log_tags") == null);
+}
+
+test "list filters narrow by status, failures, method, activation, and path" {
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "filters");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    var records = [_]sidecar.Record{
+        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/api/checkout", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "C1", .activation = "inbound", .offset = 0, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "POST", .path = "/api/checkout", .host = "h", .status = 500, .outcome = "fault", .deployment_id = 1, .saga_id = "C1", .activation = "inbound", .offset = 10, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 3, .received_ns = 3_000, .duration_ns = 1, .method = "GET", .path = "/static/logo.png", .host = "h", .status = 404, .outcome = "ok", .deployment_id = 1, .saga_id = "", .activation = "inbound", .offset = 20, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 4, .received_ns = 4_000, .duration_ns = 1, .method = "GET", .path = "/ws", .host = "h", .status = 0, .outcome = "ok", .deployment_id = 1, .saga_id = "", .activation = "ws_message", .offset = 30, .length = 10 },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "filterbatch",
+        .ndjson_size = 40,
+        .ndjson_sha256 = "d",
+        .first_received_ns = 1_000,
+        .last_received_ns = 4_000,
+        .records = &records,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/filterbatch.ndjson", 0);
+
+    // Status class 5xx → only the 500.
+    var fivexx = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{ .status_min = 500, .status_max = 599 });
+    defer fivexx.deinit();
+    try testing.expectEqual(@as(usize, 1), fivexx.rows.len);
+    try testing.expectEqual(@as(u64, 2), fivexx.rows[0].request_id);
+
+    // Exact status.
+    var exact = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{ .status_min = 404, .status_max = 404 });
+    defer exact.deinit();
+    try testing.expectEqual(@as(usize, 1), exact.rows.len);
+    try testing.expectEqual(@as(u64, 3), exact.rows[0].request_id);
+
+    // Failures = outcome != 'ok' — catches the fault regardless of status.
+    var fails = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{ .failures_only = true });
+    defer fails.deinit();
+    try testing.expectEqual(@as(usize, 1), fails.rows.len);
+    try testing.expectEqual(@as(u64, 2), fails.rows[0].request_id);
+
+    // Method + activation exact matches.
+    var post = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{ .method = "POST" });
+    defer post.deinit();
+    try testing.expectEqual(@as(usize, 1), post.rows.len);
+    var ws = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{ .activation = "ws_message" });
+    defer ws.deinit();
+    try testing.expectEqual(@as(usize, 1), ws.rows.len);
+    try testing.expectEqual(@as(u64, 4), ws.rows[0].request_id);
+
+    // Path substring, newest-first ordering preserved.
+    var checkout = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{ .path_contains = "checkout" });
+    defer checkout.deinit();
+    try testing.expectEqual(@as(usize, 2), checkout.rows.len);
+    try testing.expectEqual(@as(u64, 2), checkout.rows[0].request_id);
+    try testing.expectEqual(@as(u64, 1), checkout.rows[1].request_id);
+
+    // Filters compose (AND).
+    var combo = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{ .status_min = 200, .status_max = 299, .path_contains = "checkout" });
+    defer combo.deinit();
+    try testing.expectEqual(@as(usize, 1), combo.rows.len);
+    try testing.expectEqual(@as(u64, 1), combo.rows[0].request_id);
+
+    // Filters compose with the TAGGED shape (a saga narrowed to its failures).
+    var sagafail = try idx.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1", .{ .failures_only = true });
+    defer sagafail.deinit();
+    try testing.expectEqual(@as(usize, 1), sagafail.rows.len);
+    try testing.expectEqual(@as(u64, 2), sagafail.rows[0].request_id);
+}
+
+test "every filter shape stays a SEARCH — no tenant-window table scan" {
+    // Same discipline as the tag-plan test above: pin the plan shape,
+    // no ANALYZE (production has no sqlite_stat1). Every filtered shape
+    // must still enter log_index through a tenant-prefixed index — a
+    // filter that degrades the list to a table SCAN would make "find my
+    // request" cost the whole table, not the tenant's window.
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "filterplan");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path);
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    const shapes = [_]IndexDb.ListFilter{
+        .{ .status_min = 500, .status_max = 599 },
+        .{ .failures_only = true },
+        .{ .path_contains = "x" },
+        .{ .method = "GET", .activation = "inbound" },
+        .{ .status_min = 200, .status_max = 299, .failures_only = true, .method = "GET", .activation = "inbound", .path_contains = "x" },
+    };
+    for (shapes) |f| {
+        var params: IndexDb.FilterParams = .{};
+        const sql = try IndexDb.buildListSql(a, false, &f, &params);
+        defer a.free(sql);
+        const plan = try explainQueryPlan(a, idx.db, sql);
+        defer a.free(plan);
+        try testing.expect(std.mem.indexOf(u8, plan, "SCAN") == null);
+        try testing.expect(std.mem.indexOf(u8, plan, "SEARCH log_index") != null);
+    }
+
+    // The tagged shape keeps driving from log_tags with filters spliced in.
+    var params: IndexDb.FilterParams = .{};
+    const f: IndexDb.ListFilter = .{ .status_min = 500, .status_max = 599, .failures_only = true };
+    const sql = try IndexDb.buildListSql(a, true, &f, &params);
+    defer a.free(sql);
+    const plan = try explainQueryPlan(a, idx.db, sql);
+    defer a.free(plan);
+    try testing.expect(std.mem.indexOf(u8, plan, "log_tags_lookup") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "SCAN") == null);
+    try testing.expect(std.mem.indexOf(u8, plan, "CORRELATED") == null);
 }
 
 test "a tag row's received_ns equals its record's — the tagged cursor depends on it" {
@@ -1300,7 +1544,7 @@ test "the retired _corr tag is migrated to _saga, so old sagas stay queryable" {
         ) == c.SQLITE_OK);
 
         // Precondition: the new spelling finds nothing.
-        var pre = try idx0.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1");
+        var pre = try idx0.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1", .{});
         defer pre.deinit();
         try testing.expectEqual(@as(usize, 0), pre.rows.len);
     }
@@ -1309,24 +1553,24 @@ test "the retired _corr tag is migrated to _saga, so old sagas stay queryable" {
     var idx = try IndexDb.open(a, db_path);
     defer idx.close();
 
-    var post = try idx.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1");
+    var post = try idx.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1", .{});
     defer post.deinit();
     try testing.expectEqual(@as(usize, 2), post.rows.len);
 
     // The retired key is gone, not duplicated.
-    var stale = try idx.queryList("acme", 0, 0, 0, 10, RETIRED_CORR_TAG, "C1");
+    var stale = try idx.queryList("acme", 0, 0, 0, 10, RETIRED_CORR_TAG, "C1", .{});
     defer stale.deinit();
     try testing.expectEqual(@as(usize, 0), stale.rows.len);
 
     // A user tag is untouched — the migration is scoped to the engine key.
-    var user = try idx.queryList("acme", 0, 0, 0, 10, "session", "S1");
+    var user = try idx.queryList("acme", 0, 0, 0, 10, "session", "S1", .{});
     defer user.deinit();
     try testing.expectEqual(@as(usize, 1), user.rows.len);
 
     // Idempotent: a second open must not fail or double-write.
     var again = try IndexDb.open(a, db_path);
     defer again.close();
-    var post2 = try again.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1");
+    var post2 = try again.queryList("acme", 0, 0, 0, 10, RESERVED_SAGA_TAG, "C1", .{});
     defer post2.deinit();
     try testing.expectEqual(@as(usize, 2), post2.rows.len);
 }
@@ -1378,7 +1622,7 @@ test "an index_db created before the activation column is migrated in place" {
     // Opening migrated it, and the pre-existing row reads as UNKNOWN —
     // not backfilled to 'inbound', which would invent a fact the index
     // never recorded.
-    var pre = try idx.queryList("acme", 0, 0, 0, 10, null, null);
+    var pre = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{});
     defer pre.deinit();
     try testing.expectEqual(@as(usize, 1), pre.rows.len);
     try testing.expectEqualStrings("", pre.rows[0].activation);
@@ -1398,7 +1642,7 @@ test "an index_db created before the activation column is migrated in place" {
     };
     try idx.insertBatch(&batch, "_logs/00000001/migbatch.ndjson", 0);
 
-    var post = try idx.queryList("acme", 0, 0, 0, 10, null, null);
+    var post = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{});
     defer post.deinit();
     try testing.expectEqual(@as(usize, 2), post.rows.len);
     try testing.expectEqualStrings("disconnect", post.rows[0].activation);
@@ -1747,7 +1991,7 @@ test "the activation kind survives the tag-filtered path too" {
     try idx.insertBatch(&batch, "_logs/00000001/wsbatch.ndjson", 0);
 
     // The whole saga, newest-first: close, frame, open.
-    var saga = try idx.queryList("acme", 0, 0, 0, 10, "_saga", "C1");
+    var saga = try idx.queryList("acme", 0, 0, 0, 10, "_saga", "C1", .{});
     defer saga.deinit();
     try testing.expectEqual(@as(usize, 3), saga.rows.len);
     try testing.expectEqualStrings("disconnect", saga.rows[0].activation);
@@ -1824,7 +2068,7 @@ test "a re-index counts as re-index, a collision counts as a CONFLICT" {
     try testing.expectEqual(before_reindex + 2, metrics.global.index_reindexed.load(.monotonic));
 
     // And the loss is real: the FIRST record still owns the identity.
-    var list = try idx.queryList("acme", 0, 0, 0, 10, null, null);
+    var list = try idx.queryList("acme", 0, 0, 0, 10, null, null, .{});
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
     try testing.expectEqualStrings("/first", list.rows[0].path);
@@ -1942,7 +2186,7 @@ test "insertBatch is idempotent on the same sidecar key" {
     try idx.insertBatch(&batch, ndjson_key, 0);
     try idx.insertBatch(&batch, ndjson_key, 0);
 
-    var list = try idx.queryList("globex", 0, 0, 0, 10, null, null);
+    var list = try idx.queryList("globex", 0, 0, 0, 10, null, null, .{});
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
 }
@@ -2075,7 +2319,7 @@ test "openReader sees rows committed by the writer connection" {
     try writer.insertBatch(&batch, "_logs/00000001/b1.ndjson", 0);
 
     // The reader (own connection, WAL snapshot) sees the committed row.
-    var list = try reader.queryList("acme", 0, 0, 0, 10, null, null);
+    var list = try reader.queryList("acme", 0, 0, 0, 10, null, null, .{});
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
     try testing.expectEqual(@as(u64, 42), list.rows[0].request_id);

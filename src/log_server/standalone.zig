@@ -638,7 +638,41 @@ fn handleList(
     else
         0;
 
-    var list = db.queryList(tenant_id, after_received_ns, after_request_id, floor_received_ns, limit, tag_key, tag_value) catch |err| {
+    // Column filters. Unlike the cursor these do NOT degrade on a bad
+    // value: a mistyped filter silently ignored returns unfiltered rows
+    // PRESENTED as filtered — worse than an error for "find my request".
+    var filter: index_db_mod.IndexDb.ListFilter = .{};
+    if (queryStr(query, "status")) |s| {
+        const range = parseStatusFilter(s) orelse {
+            try setResponse(server, ent, sid, sess, 400, "invalid status filter (want NNN or Nxx)\n", cfg);
+            return;
+        };
+        filter.status_min = range[0];
+        filter.status_max = range[1];
+    }
+    if (queryStr(query, "failures")) |s| {
+        if (!std.mem.eql(u8, s, "1")) {
+            try setResponse(server, ent, sid, sess, 400, "invalid failures filter (want failures=1)\n", cfg);
+            return;
+        }
+        filter.failures_only = true;
+    }
+    // An empty value (`?method=`) is a cleared control, not a filter
+    // that matches nothing — treat it as absent.
+    filter.method = nonEmpty(queryStr(query, "method"));
+    filter.activation = nonEmpty(queryStr(query, "activation"));
+    // The path term arrives percent-encoded (the dashboard uses
+    // URLSearchParams, which encodes `/`); decode before matching
+    // against the stored raw path.
+    var path_buf: [MAX_PATH_FILTER]u8 = undefined;
+    if (nonEmpty(queryStr(query, "path"))) |s| {
+        filter.path_contains = percentDecode(&path_buf, s) orelse {
+            try setResponse(server, ent, sid, sess, 400, "invalid path filter (bad percent-encoding or > 256 bytes)\n", cfg);
+            return;
+        };
+    }
+
+    var list = db.queryList(tenant_id, after_received_ns, after_request_id, floor_received_ns, limit, tag_key, tag_value, filter) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "list failed: {s}\n", .{@errorName(err)});
         try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
@@ -1009,6 +1043,51 @@ fn parseUint(comptime T: type, query: []const u8, key: []const u8, default: T) T
 /// Raw string value of a query key, or null if absent. Used for the
 /// `after_request_id` cursor, which is the opaque `req_<16hex>` token we
 /// handed out in `next_cursor` (§7.5), not a bare integer.
+/// `NNN` (exact, 100–599) or `Nxx` (a class: `5xx` → 500..599).
+/// Null on anything else — the caller 400s rather than silently
+/// dropping the filter.
+fn parseStatusFilter(s: []const u8) ?struct { u16, u16 } {
+    if (s.len == 3 and s[1] == 'x' and s[2] == 'x') {
+        if (s[0] < '1' or s[0] > '5') return null;
+        const base: u16 = @as(u16, s[0] - '0') * 100;
+        return .{ base, base + 99 };
+    }
+    const exact = std.fmt.parseInt(u16, s, 10) catch return null;
+    if (exact < 100 or exact > 599) return null;
+    return .{ exact, exact };
+}
+
+fn nonEmpty(s: ?[]const u8) ?[]const u8 {
+    if (s) |v| if (v.len != 0) return v;
+    return null;
+}
+
+const MAX_PATH_FILTER = 256;
+
+/// Percent-decode `s` into `buf` (no `+`-as-space — the dashboard uses
+/// `URLSearchParams`/`encodeURIComponent`, which emit `%20`). Null on a
+/// malformed escape or a term longer than the buffer.
+fn percentDecode(buf: *[MAX_PATH_FILTER]u8, s: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (n >= buf.len) return null;
+        if (s[i] == '%') {
+            if (i + 2 >= s.len) return null;
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch return null;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch return null;
+            buf[n] = @intCast(hi * 16 + lo);
+            i += 3;
+        } else {
+            buf[n] = s[i];
+            i += 1;
+        }
+        n += 1;
+    }
+    if (n == 0) return null; // an empty term filters nothing — reject loudly
+    return buf[0..n];
+}
+
 fn queryStr(query: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -1032,6 +1111,32 @@ fn parseInt(comptime T: type, query: []const u8, key: []const u8, default: T) T 
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "parseStatusFilter accepts NNN and Nxx, rejects everything else" {
+    try std.testing.expectEqual(@as(u16, 404), parseStatusFilter("404").?[0]);
+    try std.testing.expectEqual(@as(u16, 404), parseStatusFilter("404").?[1]);
+    try std.testing.expectEqual(@as(u16, 500), parseStatusFilter("5xx").?[0]);
+    try std.testing.expectEqual(@as(u16, 599), parseStatusFilter("5xx").?[1]);
+    try std.testing.expectEqual(@as(u16, 200), parseStatusFilter("2xx").?[0]);
+    try std.testing.expect(parseStatusFilter("6xx") == null);
+    try std.testing.expect(parseStatusFilter("0xx") == null);
+    try std.testing.expect(parseStatusFilter("99") == null);
+    try std.testing.expect(parseStatusFilter("600") == null);
+    try std.testing.expect(parseStatusFilter("abc") == null);
+    try std.testing.expect(parseStatusFilter("") == null);
+}
+
+test "percentDecode round-trips an encoded path term and rejects malformed input" {
+    var buf: [MAX_PATH_FILTER]u8 = undefined;
+    try std.testing.expectEqualStrings("/api/checkout", percentDecode(&buf, "%2Fapi%2Fcheckout").?);
+    try std.testing.expectEqualStrings("plain", percentDecode(&buf, "plain").?);
+    try std.testing.expectEqualStrings("a b", percentDecode(&buf, "a%20b").?);
+    try std.testing.expect(percentDecode(&buf, "%2") == null); // truncated escape
+    try std.testing.expect(percentDecode(&buf, "%zz") == null); // non-hex
+    try std.testing.expect(percentDecode(&buf, "") == null); // empty term
+    const too_long = "a" ** (MAX_PATH_FILTER + 1);
+    try std.testing.expect(percentDecode(&buf, too_long) == null);
+}
 
 test "parseRoute matches /v1/{tenant}/list" {
     const r = parseRoute("/v1/acme/list?limit=10").?;
