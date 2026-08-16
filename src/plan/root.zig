@@ -204,8 +204,9 @@ pub const PlanLimits = struct {
 /// write path needs no sentinel special-case.
 pub const UNMETERED_BYTES: u64 = std.math.maxInt(u64);
 
-/// Every tier's `max_kv_bytes` — a uniform placeholder until the tier figures
-/// are a product call, NOT a limit the engine imposes.
+/// The engine posture behind `max_kv_bytes` — background for the per-tier
+/// figures below (decided 2026-08-16, rove#314; the product framing is
+/// `docs/strategy/billing-policy.md`, "The launch tiers").
 ///
 /// What the engine constrains is a per-NODE total, not a per-tenant file:
 /// every tenant's KV is a sibling store inside the one node-wide `cluster.kv`
@@ -224,7 +225,32 @@ pub const UNMETERED_BYTES: u64 = std.math.maxInt(u64);
 /// So selling more KV per tenant is a capacity + pricing decision, not blocked
 /// engine work. `CLUSTER_MAP_SIZE` (`src/kv/kvstore.zig`) carries the one hard
 /// bound: the map stays under free disk.
-pub const KV_BYTES_CEILING: u64 = 1 * 1024 * 1024 * 1024;
+///
+/// The per-tier figures are sized as RUNWAY over realistic transactional
+/// state, never as a storage headline: kv is OLTP (1 MiB value cap, 256 B
+/// keys, replicated 3x through raft — every sold GiB is three on disk), and
+/// bulk data belongs on the blob axis (`max_stored_bytes`). Density math:
+/// enterprise at 2 GiB means a node's 64 GiB map holds ~32 tenants even if
+/// every one maxes out — advertising bigger numbers would invite the dense
+/// usage the over-subscription design assumes away. Above enterprise the
+/// answer is not a bigger cap on shared infrastructure: a genuine outlier
+/// gets `Overrides` with a conversation, and the practical top end is a
+/// DEDICATED CLUSTER at a custom price (clusters are the capacity step, and
+/// the zero-downtime move makes onboarding one routine).
+pub const KV_FREE: u64 = 64 * 1024 * 1024;
+pub const KV_PRO: u64 = 512 * 1024 * 1024;
+pub const KV_ENTERPRISE: u64 = 2 * 1024 * 1024 * 1024;
+/// Platform tenants hold the account graph and the registry; a refusal here
+/// is an outage, so the ceiling is generous — but finite, because the map it
+/// opens against is (`CLUSTER_MAP_SIZE`), and a runaway platform app must
+/// fail loud rather than quietly filling a node.
+pub const KV_PLATFORM: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Customer object storage (`blob.*`) per tenant — the BULK axis, where large
+/// data belongs. Enforced at the write path: refuse, never evict (#349).
+pub const STORED_FREE: u64 = 1 * 1024 * 1024 * 1024;
+pub const STORED_PRO: u64 = 50 * 1024 * 1024 * 1024;
+pub const STORED_ENTERPRISE: u64 = 500 * 1024 * 1024 * 1024;
 
 /// Every tier's `max_receive_bytes` until the tier figures are set. 1 GiB
 /// matches what the `blob.write` / `seal` recipe path already permits for one
@@ -273,8 +299,8 @@ pub fn table(t: Tier) PlanLimits {
             .max_body_bytes = 4 * 1024 * 1024,
             .max_resident_html_bytes = 4 * 1024 * 1024,
             .retention_days = 7,
-            .max_kv_bytes = KV_BYTES_CEILING,
-            .max_stored_bytes = UNMETERED_BYTES,
+            .max_kv_bytes = KV_FREE,
+            .max_stored_bytes = STORED_FREE,
             .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
         .pro => .{
@@ -288,8 +314,8 @@ pub fn table(t: Tier) PlanLimits {
             .max_body_bytes = 32 * 1024 * 1024,
             .max_resident_html_bytes = 32 * 1024 * 1024,
             .retention_days = 30,
-            .max_kv_bytes = KV_BYTES_CEILING,
-            .max_stored_bytes = UNMETERED_BYTES,
+            .max_kv_bytes = KV_PRO,
+            .max_stored_bytes = STORED_PRO,
             .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
         .enterprise => .{
@@ -303,8 +329,8 @@ pub fn table(t: Tier) PlanLimits {
             .max_body_bytes = 256 * 1024 * 1024,
             .max_resident_html_bytes = 256 * 1024 * 1024,
             .retention_days = 365,
-            .max_kv_bytes = KV_BYTES_CEILING,
-            .max_stored_bytes = UNMETERED_BYTES,
+            .max_kv_bytes = KV_ENTERPRISE,
+            .max_stored_bytes = STORED_ENTERPRISE,
             .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
         // The platform's own tenants. The ceilings mirror enterprise —
@@ -325,7 +351,7 @@ pub fn table(t: Tier) PlanLimits {
             .max_body_bytes = 256 * 1024 * 1024,
             .max_resident_html_bytes = 256 * 1024 * 1024,
             .retention_days = 365,
-            .max_kv_bytes = KV_BYTES_CEILING,
+            .max_kv_bytes = KV_PLATFORM,
             .max_stored_bytes = UNMETERED_BYTES,
             .max_receive_bytes = RECEIVE_BYTES_DEFAULT,
         },
@@ -534,14 +560,27 @@ test "plan: parseBlob round-trips tier + overrides" {
     }
 }
 
-test "plan: every tier carries both byte ceilings" {
+test "plan: every tier carries both byte ceilings, under the node map" {
     for ([_]Tier{ .free, .pro, .enterprise, .platform }) |t| {
         const p = table(t);
-        // No tier may promise more KV than the map its `app.db` opens at.
-        try testing.expect(p.max_kv_bytes <= KV_BYTES_CEILING);
+        // No tier may promise more KV than the node-wide env could hold for a
+        // handful of maxed tenants: a single tenant's cap stays well under the
+        // 64 GiB `CLUSTER_MAP_SIZE`, so density never saturates a node with a
+        // couple of accounts (the rove#314 sizing argument).
+        try testing.expect(p.max_kv_bytes <= 4 * 1024 * 1024 * 1024);
         try testing.expect(p.max_kv_bytes > 0);
         try testing.expect(p.max_stored_bytes > 0);
     }
+}
+
+test "plan: the sellable tiers escalate kv and stored bytes" {
+    try testing.expect(table(.pro).max_kv_bytes > table(.free).max_kv_bytes);
+    try testing.expect(table(.enterprise).max_kv_bytes > table(.pro).max_kv_bytes);
+    try testing.expect(table(.pro).max_stored_bytes > table(.free).max_stored_bytes);
+    try testing.expect(table(.enterprise).max_stored_bytes > table(.pro).max_stored_bytes);
+    // The platform is not a sellable tier: its kv ceiling protects the node,
+    // and its own blobs are unmetered (it is us).
+    try testing.expectEqual(UNMETERED_BYTES, table(.platform).max_stored_bytes);
 }
 
 test "plan: effective folds the byte-ceiling overrides" {
