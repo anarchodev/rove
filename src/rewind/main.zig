@@ -323,8 +323,9 @@ fn workerMain(args: *WorkerCtx) !void {
 
     // Out-of-band snapshot catch-up driver: the pump's
     // `snapshotTriggerTick` queues a `(gid, peer)` for any peer in
-    // `StateSnapshot`; this thread dumps the leader's store + pushes
-    // `v2-load-replace` + `v2-apply-snapshot` to the peer, off the poll loop.
+    // `StateSnapshot`; this thread dumps the leader's store + streams it to
+    // the peer's `v2-snapshot-stream` (baseline + ConfState in headers),
+    // off the poll loop.
     const catchup = try rjs.SnapshotCatchupThread.init(
         allocator,
         args.node.tenant,

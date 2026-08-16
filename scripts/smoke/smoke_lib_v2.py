@@ -195,13 +195,14 @@ def _curl_run(args: list, data: bytes, timeout: float) -> HttpResponse:
     return HttpResponse(status=status, body=body, headers=headers_out)
 
 
-def attach_bundle(url: str, bundle_path: str, *, tenant: str,
-                  index=None, term=None, epoch=None,
-                  incarnation: str | None = "",
-                  as_learner=None, voters=None, learners=None,
-                  discard_body: bool = False) -> str:
-    """POST a snapshot bundle to a node's `/_system/v2-attach` and return the
-    HTTP status as a string.
+def attach_join(url: str, *, tenant: str,
+                epoch=None,
+                incarnation: str | None = "",
+                as_learner=None, voters=None, learners=None,
+                discard_body: bool = False) -> str:
+    """POST an EMPTY join attach to a node's `/_system/v2-attach` and return
+    the HTTP status as a string. Attach carries no body — state arrives via
+    the streamed snapshot (`v2-snapshot-stream`) or log replication.
 
     ONE implementation of the CP's attach contract (the Python mirror of
     `src/wire/root.zig`'s `encodeAttach`), because the smokes that hand-roll
@@ -225,21 +226,23 @@ def attach_bundle(url: str, bundle_path: str, *, tenant: str,
     args += ["-w", "%{http_code}", "-m", "20", "--http2-prior-knowledge",
              "-X", "POST", "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
              "-H", f"X-Rewind-Tenant: {tenant}"]
-    if index is not None:
-        args += ["-H", f"X-Rewind-Baseline-Index: {index}"]
-    if term is not None:
-        args += ["-H", f"X-Rewind-Baseline-Term: {term}"]
     if epoch is not None:
         args += ["-H", f"X-Rewind-Epoch: {epoch}"]
     if incarnation is not None:
         args += ["-H", f"X-Rewind-Incarnation: {incarnation or 'legacy'}"]
     if as_learner is not None:
         args += ["-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}"]
+    # An EMPTY list is an EXPLICIT empty set and must reach the wire: curl
+    # drops a header given as "Name: " (empty value), but "Name;" sends it
+    # with an empty value — which the receiver parses as zero ids, distinct
+    # from an absent header (the receiver-side default).
     if voters is not None:
-        args += ["-H", "X-Rewind-Voters: " + ",".join(str(v) for v in voters)]
+        args += ["-H", ("X-Rewind-Voters: " + ",".join(str(v) for v in voters))
+                 if voters else "X-Rewind-Voters;"]
     if learners is not None:
-        args += ["-H", "X-Rewind-Learners: " + ",".join(str(l) for l in learners)]
-    args += ["--data-binary", f"@{bundle_path}", url]
+        args += ["-H", ("X-Rewind-Learners: " + ",".join(str(l) for l in learners))
+                 if learners else "X-Rewind-Learners;"]
+    args += [url]
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 

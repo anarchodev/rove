@@ -89,7 +89,7 @@ def main() -> int:
         #    doors are served by admin/index.mjs — the production implementation.
         try:
             c.deploy_with_packages("__admin__", ADMIN_FILES, *c.firstparty_packages(
-                ["@rewind/oidc", "@rewind/email"]))
+                ["@rewind/oidc", "@rewind/email", "@rewind/stripe"]))
             check("publish the real dashboard onto __admin__", True)
         except RuntimeError as e:
             check("publish the real dashboard onto __admin__", False, str(e))

@@ -96,7 +96,7 @@ pub const EncodedAttach = struct {
 };
 
 /// THE attach encoder — every Zig sender goes through here (the Python
-/// smokes' mirror is `smoke_lib_v2.attach_bundle`).
+/// smokes' mirror is `smoke_lib_v2.attach_join`).
 pub fn encodeAttach(gpa: std.mem.Allocator, env: AttachEnvelope) !EncodedAttach {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();

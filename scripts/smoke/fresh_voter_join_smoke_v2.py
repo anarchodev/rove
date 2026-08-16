@@ -2,23 +2,26 @@
 """V2 fresh-voter join smoke — bring a node with NO group instance into an
 existing per-tenant group (the bhs-3 case), via the ensureMember sequence.
 
-Distinct from promote_back_smoke (which re-promotes a DEMOTED learner that still
-has a stale group): here node 3 stays a VOTER (conf_state voters:[1,2,3]) but its
-group instance is GONE (wiped data dir = a fresh node). This reproduces the
-"phantom voter" exactly: a configured voter that holds nothing and gets no
-replication, because the leader has no group instance on node 3 to replicate to.
+Reproduces the "phantom voter" exactly: a configured voter whose group
+instance is GONE (wiped data dir = a fresh node) — it holds nothing and gets
+no replication. The heal is the reconciler's raft-native re-add, driven BY
+HAND here (the manual compose gate before the reconciler runs it on real
+tenants — docs/architecture/cp-membership-reconciler.md):
 
-The ensureMember sequence (no conf_change — node 3 is already a voter):
-  GET  v2-applied-baseline (leader) → {index X, term T}
-  GET  v2-snapshot         (leader) → store bundle (⊇ X)
-  POST v2-attach           (node 3) → CREATE the group at epoch 1 + load the bundle
-  POST v2-apply-snapshot   (node 3, {index:X, term:T}) → data-free raft baseline at X
-Then the leader replicates the tail (> X) to node 3 automatically, and a FRESH
-write must reach it — proving attach+baseline made it a productive voter.
+  POST v2-confchange{remove}  (leader) → tear out the phantom (its stale-high
+       Progress.match is the commit_to-out-of-range hazard; a fresh add
+       starts at match=0)
+  GET  v2-applied-baseline    (leader) → {epoch, voters, learners, incarnation}
+  POST v2-attach              (node 3) → EMPTY: born learner at the leader's
+       epoch with the augmented ConfState — no bundle, no baseline
+  POST v2-confchange{add}     (leader) → the leader tracks it; the data then
+       arrives raft-natively (here: the auto-catchup streams it — the grace
+       is forced low so the log tail is compacted and replication alone
+       cannot cover it)
+  POST v2-confchange{promote} (leader) → back to a voter once caught up
 
-This is the Phase-3 hard gate for docs/architecture/cp-membership-reconciler.md: prove
-the compose is safe (epoch/membership) on a throwaway tenant BEFORE the reconciler
-drives it on real tenants.
+Then a FRESH write must reach it — proving the join made it a productive
+voter.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -26,14 +29,19 @@ Needs S3 env: `set -a; . ./.env; set +a` first.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
+# Compact past the seeded writes (floor = durabilized − grace), so the reborn
+# empty node CANNOT be covered by log replication — the heal must go through
+# the auto-catchup's streamed snapshot onto the group born empty.
+os.environ["REWIND_SNAPSHOT_GRACE"] = "20"
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_join  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -60,15 +68,6 @@ def _curl_json(url, *, method="GET", data=None):
     out = subprocess.run(args, capture_output=True, text=True).stdout
     nl = out.rfind("\n")
     return int(out[nl + 1:].strip() or 0), out[:nl]
-
-
-def _curl_to_file(url, path, *, data=None):
-    args = ["curl", "-s", "-o", path, "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET]
-    if data is not None:
-        args += ["-H", "Content-Type: application/json", "--data", data]
-    args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
 def main() -> int:
@@ -135,41 +134,75 @@ def main() -> int:
         cs = confstate(lead)
         check("cluster still lists it as a voter (phantom)", cs is not None and vnid in cs["voters"], f"cs={cs}")
 
-        print("step 3: ensureMember — pull baseline + bundle from the leader")
+        print(f"step 3: REMOVE the phantom voter {vnid} (stale-high match must never meet a fresh empty group)")
         lead = c.leader_node("acme")
+
+        def confchange(node, nid, op):
+            st, _ = _curl_json(url(node, "v2-confchange"), method="POST",
+                               data=json.dumps({"tenant": "acme", "node_id": nid, "op": op}))
+            return st
+
+        check("remove phantom → 204", confchange(lead, vnid, "remove") == 204)
+        removed = None
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            removed = confstate(lead)
+            if removed is not None and vnid not in removed.get("voters", []):
+                break
+            time.sleep(0.5)
+        check("phantom out of the config", removed is not None and vnid not in removed["voters"], f"cs={removed}")
+
+        print(f"step 4: attach node {vnid} EMPTY (born learner, augmented ConfState) + AddLearner")
         st, body = _curl_json(url(lead, "v2-applied-baseline?tenant=acme"))
         check("applied-baseline → 200", st == 200, f"got {st} {body!r}")
-        base = json.loads(body) if st == 200 else {"index": 0, "term": 0}
-        print(f"       baseline index={base['index']} term={base['term']}")
-        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
-            bpath = tf.name
-        check("snapshot bundle → 200",
-              _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
-
-        print(f"step 4: v2-attach the bundle on node {vnid} (CREATE group@epoch1 + load) + apply-snapshot")
+        base = json.loads(body) if st == 200 else {}
+        # Retired-protocol gate: an attach that still ships a bundle body is
+        # rejected BEFORE any instance side-effect.
+        bundle_rc = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "10",
+             "--http2-prior-knowledge", "-X", "POST", *SECRET,
+             "-H", "X-Rewind-Tenant: acme", "-H", "X-Rewind-Incarnation: legacy",
+             "--data-binary", "not-a-bundle", url(victim, "v2-attach")],
+            capture_output=True, text=True).stdout.strip()
+        check("attach with a bundle body → 400 (retired protocol)", bundle_rc == "400", f"got {bundle_rc}")
         # Envelope decode gate (rove#363 class 3): an attach that OMITS the
         # incarnation header is rejected loudly — absence means the sender
         # bypassed the shared encoder; it must never quietly read as legacy.
         check("attach without incarnation → 400",
-              attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
-                            incarnation=None, discard_body=True) == "400")
-        check("attach → 204", attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
-                                            incarnation=base.get("incarnation", "")) == "204")
-        st, body = _curl_json(url(victim, "v2-apply-snapshot"), method="POST",
-                              data=json.dumps({"tenant": "acme", "index": base["index"], "term": base["term"]}))
-        check("apply-snapshot → 204", st == 204, f"got {st} {body!r}")
+              attach_join(url(victim, "v2-attach"), tenant="acme",
+                          incarnation=None, discard_body=True) == "400")
+        # The reconciler's augmented ConfState: the leader's membership plus
+        # this node as a learner.
+        aug_learners = sorted(set(base.get("learners", [])) | {vnid})
+        check("attach EMPTY → 204",
+              attach_join(url(victim, "v2-attach"), tenant="acme",
+                          epoch=base.get("epoch"), as_learner=True,
+                          voters=base.get("voters"), learners=aug_learners,
+                          incarnation=base.get("incarnation", "")) == "204")
+        check("AddLearner → 204", confchange(lead, vnid, "add") == 204)
 
-        print(f"step 5: ⭐ node {vnid} catches up to the bundle/log state")
+        print(f"step 5: ⭐ the auto-catchup streams the store onto the empty-born node {vnid}")
         caught = False
-        for _ in range(40):  # ~20s
+        for _ in range(80):  # ~40s — trigger fires ≤100ms; dump+stream is the tail
             rg = c.admin_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and latest in rg.body:
                 caught = True
                 break
             time.sleep(0.5)
-        check(f"⭐ node {vnid} now holds the tenant data", caught, "attach+baseline brought the group up")
-        cs = confstate(lead)
-        check(f"node {vnid} still a voter (not demoted)", cs is not None and vnid in cs["voters"], f"cs={cs}")
+        check(f"⭐ node {vnid} now holds the tenant data", caught,
+              "the streamed catch-up brought the empty-born group up")
+
+        print(f"step 5b: promote node {vnid} back to a voter")
+        promoted = False
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            if confchange(lead, vnid, "promote") == 204:
+                cs = confstate(lead)
+                if cs is not None and vnid in cs.get("voters", []):
+                    promoted = True
+                    break
+            time.sleep(1.0)
+        check(f"node {vnid} a voter again", promoted, f"cs={confstate(lead)}")
 
         print(f"step 6: ⭐ a FRESH write replicates to node {vnid} (proves the raft handshake)")
         c.request_retry("acme", "/?fn=handler", method="POST",
@@ -201,9 +234,10 @@ def main() -> int:
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print("\nPASS fresh-voter join smoke (v2) — a wiped configured-voter with no group "
-          "instance was brought in via v2-attach (epoch-1) + apply-snapshot baseline, "
-          "caught up, took a fresh write, and the cluster survived a leader kill 3-of-3. ⭐")
+    print("\nPASS fresh-voter join smoke (v2) — a wiped configured-voter was removed, "
+          "re-attached EMPTY as a born learner, caught up via the streamed auto-catchup, "
+          "was promoted back, took a fresh write, and the cluster survived a leader "
+          "kill 3-of-3. ⭐")
     return 0
 
 

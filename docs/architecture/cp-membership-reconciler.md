@@ -113,12 +113,15 @@ fn reconcileMembership(self: *Router) void {
 // One (tenant,node): absent → learner(catching up) → voter. One step per call.
 fn advanceMember(self, tenant, node, cluster, leader_url, st) !void {
     if (!st.hosted) {
-        const bundle   = try self.snapshotFromLeader(leader_url, tenant);    // GET v2-snapshot          [built]
-        const baseline = try self.appliedBaseline(leader_url, tenant);       // GET v2-applied-baseline   [built]
-        try self.attach(node, tenant, bundle);                               // POST v2-attach            [built]
-        try self.applySnapshot(node, tenant, baseline.index, baseline.term); // POST v2-apply-snapshot    [built]
-        if (st.role == .none) try self.confChange(leader_url, tenant, node.id, .add); // AddLearner       [built]
-        return; // let raft replicate the tail; next pass promotes
+        // A configured member with NO local instance is REMOVED first (its
+        // stale-high Progress.match is the commit_to hazard); the next pass
+        // re-adds it fresh. A non-member bootstraps EMPTY:
+        const baseline = try self.appliedBaseline(leader_url, tenant);  // GET v2-applied-baseline [built]
+        try self.attachEmpty(node, tenant, baseline);   // POST v2-attach — epoch + incarnation +
+                                                        // augmented ConfState; NO data     [built]
+        try self.confChange(leader_url, tenant, node.id, .add); // AddLearner (fresh match=0) [built]
+        return; // data arrives raft-natively (log tail, or the streamed
+                // auto-catchup when compacted); next pass promotes
     }
     if (st.role == .learner) {
         if (st.caught_up) try self.confChange(leader_url, tenant, node.id, .promote); // AddNode          [built]
@@ -158,8 +161,8 @@ diagnostic even before the reconciler.
 
 ### Phase 3 — `ensureMember` primitive (compose) — riskiest
 The per-node state machine, composed in `cp/main.zig` from existing endpoints
-(`v2-snapshot`, `v2-applied-baseline`, `v2-attach`, `v2-apply-snapshot`,
-`v2-confchange`). **The risk:** `v2-attach`/`createGroupEpoch` was written for
+(`v2-applied-baseline`, `v2-attach` (EMPTY), `v2-confchange`; the data path is
+the engine's streamed auto-catchup). **The risk:** `v2-attach`/`createGroupEpoch` was written for
 *moving a tenant to a new cluster at a new epoch*, not *adding a replica to an
 existing same-cluster group* — epoch/membership semantics must be verified
 (wrong epoch → fenced → split-brain).

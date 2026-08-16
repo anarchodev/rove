@@ -42,7 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import (  # noqa: E402
-    MOVE_SECRET, PUBLIC_SUFFIX, V2Cluster, _curl, attach_bundle, rpc_wrap,
+    MOVE_SECRET, PUBLIC_SUFFIX, V2Cluster, _curl, attach_join, rpc_wrap,
 )
 
 TENANT = "tobedeleted"
@@ -165,10 +165,8 @@ def main() -> int:
         # forever. The attach door is how the CP creates instances, so it is
         # also the door that plants one.
         T2 = "reborn531"
-        empty_bundle = str(c.data_dirs[0].parent / "empty-bundle-531")
-        Path(empty_bundle).write_bytes(b"")
-        st = attach_bundle(f"{c.node_url(0)}/_system/v2-attach", empty_bundle,
-                           tenant=T2, incarnation="deadbeefdeadbeef")
+        st = attach_join(f"{c.node_url(0)}/_system/v2-attach",
+                         tenant=T2, incarnation="deadbeefdeadbeef")
         check("plant a stale-lifetime instance on node 1 → 204", st == "204",
               f"got {st}")
         r = cp("provision", {"tenant": T2})

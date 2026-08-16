@@ -175,11 +175,14 @@ Concretely:
   `ProgressState::Snapshot` that our model never produces (see the **CORRECTION**
   below).
 - **Auto-orchestrate a leader-push** on detection (pump `snapshotTriggerTick` →
-  worker `SnapshotCatchupThread`): the leader dumps its store (consistent
+  worker `SnapshotCatchupThread`): the leader streams its store (consistent
   read-txn cursor via a sibling handle, **direct peer→peer over
-  `REWIND_PEER_URLS` — no S3**) → `POST v2-load-replace` **on the peer (its worker,
-  off-pump)** → `POST v2-apply-snapshot {index, term}` **on the peer (its pump,
-  fast, data-free)**. The peer's `match` advances past `first_index` → it is no
+  `REWIND_PEER_URLS` — no S3**) to the peer's `POST v2-snapshot-stream` — the
+  pair stream applies in bounded txns **on the peer's worker (off-pump)**, and
+  the data-free baseline + the leader's ConfState (riding the headers) install
+  at END_STREAM **on the peer's pump (fast)**. The install's restore reply is
+  addressed from the leader, so the follower's new position flows back over
+  the transport, the peer's `match` advances past `first_index` → it is no
   longer below the floor → the leader replicates the tail.
 
 > **CORRECTION (2026-06-17) — the "native `StateSnapshot` trigger" was a mistake.**
@@ -198,9 +201,9 @@ Concretely:
 > async-generating, then returns a **metadata-only** snapshot; the bulk ships on a
 > side channel (TiKV's Snap Worker over gRPC streams; etcd's `snap.Message`
 > `ReadCloser`), and the receiver applies it **asynchronously, off the raft
-> thread** ("its large size would block the thread"). rove's split — heavy
-> `v2-load-replace` on the worker, fast data-free `apply_local_snapshot` on the
-> pump — is the same principle, so the data design is *validated*, not divergent.
+> thread** ("its large size would block the thread"). rove's split — the heavy
+> pair-stream apply on the worker, the fast data-free `apply_local_snapshot` on
+> the pump — is the same principle, so the data design is *validated*, not divergent.
 > The one **justified divergence**: TiKV eventually returns a real metadata
 > snapshot so the peer enters `Snapshot` and raft **pauses replication to it**
 > (flow control); we keep `Unavailable` and detect-and-push from the leader. Cost
@@ -264,11 +267,11 @@ applies onto an unloaded store).
 
 ## Phase 2 — membership SSOT (kill `REWIND_VOTERS`)
 
-Once the out-of-band baseline carries the real **ConfState** (the source's
-membership, passed through `v2-apply-snapshot` → `apply_local_snapshot`, instead
-of the membership-neutral "keep current prs" it does today), a joining node
-learns its membership **from the baseline + the replicated conf-change log** —
-not the static env. Then:
+The out-of-band baseline carries the real **ConfState** (the source's
+membership, read on the pump at trigger time and passed through the stream
+headers → `apply_local_snapshot`; the attach envelope carries the same lists
+at birth), so a joining node learns its membership **from the baseline + the
+replicated conf-change log** — not the static env. Then:
 
 - Retire `REWIND_VOTERS`; group ConfState is whatever the replicated state says.
 - Delete the `initWithLearners` born-learner hack (a joiner is a learner because
@@ -367,9 +370,13 @@ Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
 
 ## Phase 2.5 — chunked-streaming snapshot transfer (multi-GB) — BUILT 2026-06-18
 
-**Status: built + smoke-verified** (catch-up path; the move path's buffered
-endpoints are retained and un-regressed). The design below is as-built; a couple
-of choices diverged from the original plan and are flagged inline.
+**Status: built + smoke-verified**, and the stream is now THE only transfer
+form — the buffered bundle endpoints (`v2-snapshot`, attach-with-body,
+`v2-load-replace`, `v2-apply-snapshot`) and `KvStore.dumpTenantBundle` /
+`loadTenantBundle` are deleted; the reconciler bootstrap attaches EMPTY and
+the data arrives via log replication or this stream. The design below is
+as-built; a couple of choices diverged from the original plan and are flagged
+inline.
 
 **Why before Phase 3.** The out-of-band catch-up (Phase 1) and the cross-cluster
 move shared ONE primitive — the single-shot `dumpTenantBundle` — which does not
@@ -378,7 +385,8 @@ tenants until this lands.
 
 ### The wall (the retired single-shot path)
 
-`KvStore.dumpTenantBundle` → `kvexp.dumpTenantBundle`: `durabilize(0)`,
+`KvStore.dumpTenantBundle` → `kvexp.dumpTenantBundle` (both deleted):
+`durabilize(0)`,
 `openSnapshot`, write **every pair into one `ArrayList(u8)`**. That buffer was
 shipped as **one HTTP body** and loaded on the dest in **one atomic kvexp txn**.
 At multi-GB that's a multi-GB allocation on source AND dest, one unbounded HTTP
