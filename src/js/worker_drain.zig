@@ -602,14 +602,37 @@ fn resolveParked(
     status: u16,
     body: []const u8,
 ) !void {
+    try resolveParkedWithHeaders(worker, ent, sid, sess, status, body, .{ .fields = null, .count = 0 });
+}
+
+/// `resolveParked` with a packed handler response-header set. Ownership
+/// of `resp_hdrs` (its `_buf`) transfers onto the entity on success and
+/// is freed here on every non-success path (already-resolved, alloc
+/// failure) — the caller never frees it.
+fn resolveParkedWithHeaders(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status: u16,
+    body: []const u8,
+    resp_hdrs: h2.RespHeaders,
+) !void {
     const server = worker.h2;
     const allocator = worker.allocator;
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // already resolved
+    var hdrs = resp_hdrs;
+    var hdrs_taken = false;
+    errdefer if (!hdrs_taken) h2.RespHeaders.deinit(allocator, (&hdrs)[0..1]);
+    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) {
+        h2.RespHeaders.deinit(allocator, (&hdrs)[0..1]);
+        return; // already resolved
+    }
     const owned = try allocator.dupe(u8, body);
     var owned_taken = false;
     errdefer if (!owned_taken) allocator.free(owned);
     try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, hdrs);
+    hdrs_taken = true;
     try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = owned.ptr, .len = @intCast(owned.len) });
     owned_taken = true;
     try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
@@ -652,7 +675,12 @@ fn resolveParked(
 const ContResumeNext = union(enum) {
     /// Terminal flush. `body` is allocator-owned; ownership
     /// transferred into the entity's RespBody on success.
-    terminal: struct { status: u16, body: []u8 },
+    /// `resp_hdrs` is the packed handler response-header set (auto
+    /// content-type + handler headers + set-cookies — the same set the
+    /// inbound terminal path builds); its `_buf` ownership transfers
+    /// into the entity's RespHeaders on success, and stays with the
+    /// caller on failure (mirrors `body`).
+    terminal: struct { status: u16, body: []u8, resp_hdrs: h2.RespHeaders },
     /// Re-park with a new continuation. `new_cont` is owned
     /// (transferred onto the entity's ContDescriptor).
     /// `new_bound_sched_id` is allocator-owned if non-null (the
@@ -901,7 +929,7 @@ fn proposeAndParkContResume(
             // stale desc on an entity mid-commit-flow can't fire
             // spuriously.
             try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = t.status });
-            try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
+            try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, t.resp_hdrs);
             try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = t.body.ptr, .len = @intCast(t.body.len) });
             try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
             try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
@@ -1664,11 +1692,36 @@ fn finishContResume(
                 return;
             }
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            // Pack the handler response-header set (auto JSON content-type
+            // + handler headers + set-cookies) — the same set the inbound
+            // terminal path stamps. A held chain's terminal must be
+            // indistinguishable on the wire from a plain dispatch response;
+            // the offline harness compares bodies only, so a dropped header
+            // here is invisible to `rewind test` and surfaces as a browser
+            // parsing the JSON body as text.
+            const handler_ct: ?[]const u8 = if (r.body_is_json) "application/json" else null;
+            var resp_hdrs: h2.RespHeaders = respb.buildHandlerRespHeaders(
+                allocator,
+                null,
+                null,
+                r.set_cookies,
+                handler_ct,
+                r.headers,
+            ) catch {
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " alloc failed\n") catch {};
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.saga_id, r.tags, ctx.act, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            };
             if (ctx.wrote) {
                 // Terminal + writes — propose through raft, park the
                 // entity on `raft_pending_cont` with the response staged;
                 // its drainEntityArm ships the response at commit.
                 const body_dup = allocator.dupe(u8, r.body) catch {
+                    h2.RespHeaders.deinit(allocator, (&resp_hdrs)[0..1]);
                     ctx.txn.rollback() catch {};
                     ctx.txn_done.* = true;
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " alloc failed\n") catch {};
@@ -1696,7 +1749,7 @@ fn finishContResume(
                     ctx.ws,
                     ctx.txn,
                     ctx.tenant_id,
-                    .{ .terminal = .{ .status = st, .body = body_dup } },
+                    .{ .terminal = .{ .status = st, .body = body_dup, .resp_hdrs = resp_hdrs } },
                     ctx.pending_fetches,
                     ctx.readset,
                     lh,
@@ -1706,6 +1759,7 @@ fn finishContResume(
                     // back + destroyed the txn.
                     std.log.warn("rove-js " ++ spec.site ++ ": propose failed: {s}", .{@errorName(perr)});
                     allocator.free(body_dup);
+                    h2.RespHeaders.deinit(allocator, (&resp_hdrs)[0..1]);
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
@@ -1734,7 +1788,7 @@ fn finishContResume(
             // Terminal ⇒ the connection is closing: connection-scoped
             // fetches drop (scope rule), unbound ones still fire.
             worker_streaming.flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, false);
-            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st, r.body) catch {};
+            resolveParkedWithHeaders(worker, ctx.ent, ctx.sid, ctx.sess, st, r.body, resp_hdrs) catch {};
             captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.saga_id, r.tags, ctx.act, 0);
             r.console = &.{};
             r.exception = &.{};
