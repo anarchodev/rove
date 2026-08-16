@@ -55,6 +55,15 @@ pub const Box = struct {
     gid: u64,
     index: u64,
     term: u64,
+    /// The sender's ConfState (optional headers), installed WITH the baseline
+    /// so the receiver adopts the membership as of the snapshot (raft snapshot
+    /// semantics — a membership-neutral install strands any conf-change
+    /// compacted below the baseline). Null lens → headers absent →
+    /// membership-neutral install (keep the group's current membership).
+    conf_voters_buf: [16]u64 = undefined,
+    conf_voters_len: ?u8 = null,
+    conf_learners_buf: [16]u64 = undefined,
+    conf_learners_len: ?u8 = null,
 
     /// END_STREAM seen — ready to finalize (finish + durabilize + baseline).
     eof: bool = false,
@@ -74,10 +83,13 @@ pub const Box = struct {
         gid: u64,
         index: u64,
         term: u64,
-    ) error{OutOfMemory}!*Box {
+        conf_voters: ?[]const u64,
+        conf_learners: ?[]const u64,
+    ) error{ OutOfMemory, ConfStateTooLarge }!*Box {
         const t = try allocator.dupe(u8, tenant);
         errdefer allocator.free(t);
         const self = try allocator.create(Box);
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .loader = loader,
@@ -87,7 +99,28 @@ pub const Box = struct {
             .index = index,
             .term = term,
         };
+        if (conf_voters) |v| {
+            if (v.len > self.conf_voters_buf.len) return error.ConfStateTooLarge;
+            @memcpy(self.conf_voters_buf[0..v.len], v);
+            self.conf_voters_len = @intCast(v.len);
+        }
+        if (conf_learners) |l| {
+            if (l.len > self.conf_learners_buf.len) return error.ConfStateTooLarge;
+            @memcpy(self.conf_learners_buf[0..l.len], l);
+            self.conf_learners_len = @intCast(l.len);
+        }
         return self;
+    }
+
+    /// The ConfState the `.replace` install carries (null = headers absent →
+    /// membership-neutral).
+    pub fn confVoters(self: *const Box) ?[]const u64 {
+        const n = self.conf_voters_len orelse return null;
+        return self.conf_voters_buf[0..n];
+    }
+    pub fn confLearners(self: *const Box) ?[]const u64 {
+        const n = self.conf_learners_len orelse return null;
+        return self.conf_learners_buf[0..n];
     }
 
     pub fn unref(self: *Box) void {

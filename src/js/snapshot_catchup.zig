@@ -36,6 +36,7 @@ const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
 const bridge_mod = @import("bridge");
 const snapshot_sink_mod = @import("snapshot_sink.zig");
+const wire = @import("rove-wire");
 const curl = blob_mod.curl;
 
 const SNAP_MODE_HEADER = "x-rewind-snapshot-mode";
@@ -135,6 +136,15 @@ pub const SnapshotCatchupThread = struct {
         peer: u64 = 0,
         index: u64 = 0,
         term: u64 = 0,
+        /// Catchup only: the leader's ConfState at trigger time, carried as
+        /// `X-Rewind-Voters`/`X-Rewind-Learners` on the stream so the peer's
+        /// baseline install adopts the membership as of the snapshot (raft
+        /// snapshot semantics; see the bridge's `CatchupJob`). Empty lens on a
+        /// push job (merge mode carries no baseline at all).
+        voters_buf: [16]u64 = undefined,
+        voters_len: u8 = 0,
+        learners_buf: [16]u64 = undefined,
+        learners_len: u8 = 0,
         /// Owned dup of the tenant id (catchup: copied from the bridge's borrowed
         /// `GroupSig.id_str`; push: from the request header). Freed after run.
         id_str: []u8,
@@ -144,6 +154,13 @@ pub const SnapshotCatchupThread = struct {
         /// Owned dest base URL (push only); freed after run.
         dest_url: ?[]u8 = null,
         mode: snapshot_sink_mod.Mode = .replace,
+
+        pub fn voters(self: *const Job) []const u64 {
+            return self.voters_buf[0..self.voters_len];
+        }
+        pub fn learners(self: *const Job) []const u64 {
+            return self.learners_buf[0..self.learners_len];
+        }
     };
 
     const Self = @This();
@@ -322,7 +339,7 @@ pub const SnapshotCatchupThread = struct {
 
         const url = std.fmt.allocPrint(a, "{s}/_system/v2-snapshot-stream", .{base}) catch return;
         defer a.free(url);
-        const status = self.streamUpload(url, secret, job.id_str, .replace, job.index, job.term, &dumper) catch |e| {
+        const status = self.streamUpload(url, secret, job.id_str, .replace, job.index, job.term, job.voters(), job.learners(), &dumper) catch |e| {
             switch (e) {
                 // Fail loud: the page-pinning bound tripped — the tenant is too
                 // large/hot for REWIND_SNAPSHOT_XFER_MAX_MS; aborting keeps the
@@ -368,7 +385,7 @@ pub const SnapshotCatchupThread = struct {
             return;
         };
         defer a.free(url);
-        const status = self.streamUpload(url, secret, job.id_str, job.mode, job.index, job.term, &dumper) catch |e| {
+        const status = self.streamUpload(url, secret, job.id_str, job.mode, job.index, job.term, &.{}, &.{}, &dumper) catch |e| {
             std.log.warn("v2 snapshot-push tenant={s} dest={s}: {s}", .{ job.id_str, dest, @errorName(e) });
             self.postCompletion(job.entity, 0);
             return;
@@ -379,10 +396,11 @@ pub const SnapshotCatchupThread = struct {
 
     /// Stream the held snapshot to `url` (a peer/dest `/_system/v2-snapshot-stream`)
     /// as a chunked upload — the body IS the pair stream; the baseline / mode ride
-    /// in headers (`.replace` carries `{index,term}`; `.merge` carries the mode and
-    /// no baseline). One blocking call on this off-loop thread; libcurl pulls from
-    /// the dumper at the wire's drain rate. Returns the HTTP status; errors on
-    /// transport or a tripped page-pinning deadline.
+    /// in headers (`.replace` carries `{index,term}` + the ConfState the install
+    /// adopts; `.merge` carries the mode and no baseline). One blocking call on
+    /// this off-loop thread; libcurl pulls from the dumper at the wire's drain
+    /// rate. Returns the HTTP status; errors on transport or a tripped
+    /// page-pinning deadline.
     fn streamUpload(
         self: *Self,
         url: []const u8,
@@ -391,6 +409,8 @@ pub const SnapshotCatchupThread = struct {
         mode: snapshot_sink_mod.Mode,
         index: u64,
         term: u64,
+        voters: []const u64,
+        learners: []const u64,
         dumper: *kv_mod.StreamDumper,
     ) !u16 {
         const a = self.allocator;
@@ -398,6 +418,10 @@ pub const SnapshotCatchupThread = struct {
         defer a.free(idx_str);
         const term_str = try std.fmt.allocPrint(a, "{d}", .{term});
         defer a.free(term_str);
+        const voters_str = try wire.joinIds(a, voters);
+        defer a.free(voters_str);
+        const learners_str = try wire.joinIds(a, learners);
+        defer a.free(learners_str);
 
         var headers: std.ArrayListUnmanaged(curl.Header) = .empty;
         defer headers.deinit(a);
@@ -405,9 +429,19 @@ pub const SnapshotCatchupThread = struct {
         try headers.append(a, .{ .name = TENANT_HEADER, .value = tenant });
         switch (mode) {
             .replace => {
-                // Default mode on the dest — carries the data-free baseline.
+                // Default mode on the dest — carries the data-free baseline,
+                // plus the ConfState the install adopts (raft snapshot
+                // semantics: the membership rides the snapshot; a
+                // membership-neutral install would strand any conf-change
+                // compacted below the baseline). An empty voter set is never a
+                // real leader ConfState — omit the headers (the dest installs
+                // membership-neutral) rather than send an explicit empty set.
                 try headers.append(a, .{ .name = SNAP_INDEX_HEADER, .value = idx_str });
                 try headers.append(a, .{ .name = SNAP_TERM_HEADER, .value = term_str });
+                if (voters.len > 0) {
+                    try headers.append(a, .{ .name = wire.VOTERS, .value = voters_str });
+                    try headers.append(a, .{ .name = wire.LEARNERS, .value = learners_str });
+                }
             },
             .merge => try headers.append(a, .{ .name = SNAP_MODE_HEADER, .value = "merge" }),
         }

@@ -206,23 +206,36 @@ const AwaitAck = struct {
 /// One out-of-band snapshot catch-up job, handed pump thread → worker thread
 /// (the snapshot-trigger half of the raft-native alignment arc). The pump
 /// detects a peer in `ProgressState::Snapshot` (fell below the leader's
-/// compaction first_index) and enqueues the bundle's baseline {index, term}
-/// it computed on-thread (baselineIndex + logTerm are pump-only). The worker's
-/// `SnapshotCatchupThread` then dumps the leader's store + pushes
-/// `v2-load-replace` + `v2-apply-snapshot {index, term}` to the peer, so the
-/// peer's `match` advances past first_index and `StateSnapshot` clears. The
-/// `(gid, peer)` pair is deduped in `catchup_inflight` while a job is live so
-/// the same lagging peer isn't re-pushed every tick.
+/// compaction first_index) and enqueues the baseline {index, term} + the
+/// leader's ConfState it read on-thread (baselineIndex / logTerm / confState
+/// are pump-only). The worker's `SnapshotCatchupThread` then streams the
+/// leader's store to the peer's `v2-snapshot-stream` door with the baseline +
+/// ConfState in headers, so the peer's `match` advances past first_index and
+/// `StateSnapshot` clears. The `(gid, peer)` pair is deduped in
+/// `catchup_inflight` while a job is live so the same lagging peer isn't
+/// re-pushed every tick.
 const CatchupJob = struct {
     gid: u64,
     peer: u64,
-    /// Baseline the worker installs via `v2-apply-snapshot`, snapshotted on the
+    /// Baseline the peer installs at END_STREAM, snapshotted on the
     /// pump at enqueue time. The store dump the worker takes later reflects a
     /// LATER applied instant (⊇ this index), so the leader's tail above `index`
     /// re-applies idempotently — the same ordering CP's `bootstrapMember` uses
     /// (read baseline, THEN dump the bundle).
     index: u64,
     term: u64,
+    /// The leader's ConfState at trigger time, carried so the peer's baseline
+    /// install adopts the membership AS OF the snapshot (raft snapshot
+    /// semantics — etcd/TiKV always ship `metadata.conf_state`). Without it a
+    /// conf-change committed below the baseline would never replay on the
+    /// receiver: the tail starts above `index`, so a membership-neutral
+    /// install leaves the receiver's ConfState permanently stale. Read on the
+    /// pump AFTER the baseline index, so it covers every change ≤ `index`
+    /// (a later change rides the tail and re-applies idempotently).
+    voters_buf: [16]u64,
+    voters_len: u8,
+    learners_buf: [16]u64,
+    learners_len: u8,
 };
 
 /// One drained follower→leader promotion: the group's `gid` (for the
@@ -237,10 +250,24 @@ pub const SnapshotCatchup = struct {
     peer: u64,
     index: u64,
     term: u64,
+    /// The leader's ConfState at trigger time (see `CatchupJob`) — rides the
+    /// stream headers so the peer's install adopts the membership as of the
+    /// snapshot.
+    voters_buf: [16]u64,
+    voters_len: u8,
+    learners_buf: [16]u64,
+    learners_len: u8,
     /// Pointer-stable `GroupSig.id_str` — the tenant string for the store dump +
     /// the `X-Rewind-Tenant` header. Borrowed; valid until the group is destroyed
     /// (the worker dups it into the job before any await).
     id_str: []const u8,
+
+    pub fn voters(self: *const SnapshotCatchup) []const u64 {
+        return self.voters_buf[0..self.voters_len];
+    }
+    pub fn learners(self: *const SnapshotCatchup) []const u64 {
+        return self.learners_buf[0..self.learners_len];
+    }
 };
 
 /// One queued propose, handed worker thread → pump thread.
@@ -1087,13 +1114,31 @@ pub const Bridge = struct {
     /// Pump thread: enqueue an out-of-band snapshot catch-up for a `StateSnapshot`
     /// peer, unless one is already in flight for this `(gid, peer)`. Returns true
     /// iff a job was queued (so the caller can log only on a fresh trigger). The
-    /// baseline {index, term} was computed by the caller on the pump thread.
-    pub fn enqueueSnapshotCatchup(self: *Bridge, gid: u64, peer: u64, index: u64, term: u64) bool {
+    /// baseline {index, term} + the group's ConfState were read by the caller on
+    /// the pump thread (baseline first, so the ConfState covers every membership
+    /// change at or below it). Lists longer than the job's inline buffers refuse
+    /// the enqueue (retry next tick) rather than truncate a membership.
+    pub fn enqueueSnapshotCatchup(self: *Bridge, gid: u64, peer: u64, index: u64, term: u64, voters: []const u64, learners: []const u64) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const key = catchupKey(gid, peer);
         if (self.catchup_inflight.contains(key)) return false;
-        self.snapshot_catchup.append(self.allocator, .{ .gid = gid, .peer = peer, .index = index, .term = term }) catch return false;
+        var job: CatchupJob = .{
+            .gid = gid,
+            .peer = peer,
+            .index = index,
+            .term = term,
+            .voters_buf = undefined,
+            .voters_len = 0,
+            .learners_buf = undefined,
+            .learners_len = 0,
+        };
+        if (voters.len > job.voters_buf.len or learners.len > job.learners_buf.len) return false;
+        @memcpy(job.voters_buf[0..voters.len], voters);
+        job.voters_len = @intCast(voters.len);
+        @memcpy(job.learners_buf[0..learners.len], learners);
+        job.learners_len = @intCast(learners.len);
+        self.snapshot_catchup.append(self.allocator, job) catch return false;
         self.catchup_inflight.put(self.allocator, key, {}) catch {
             // Couldn't mark in-flight — drop the job we just queued rather than
             // leave it un-deduped (it would be re-pushed every tick).
@@ -1119,7 +1164,17 @@ pub const Bridge = struct {
                 _ = self.catchup_inflight.remove(catchupKey(job.gid, job.peer));
                 continue;
             };
-            out[n] = .{ .gid = job.gid, .peer = job.peer, .index = job.index, .term = job.term, .id_str = sig.id_str };
+            out[n] = .{
+                .gid = job.gid,
+                .peer = job.peer,
+                .index = job.index,
+                .term = job.term,
+                .voters_buf = job.voters_buf,
+                .voters_len = job.voters_len,
+                .learners_buf = job.learners_buf,
+                .learners_len = job.learners_len,
+                .id_str = sig.id_str,
+            };
             n += 1;
         }
         return n;

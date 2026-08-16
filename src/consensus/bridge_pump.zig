@@ -206,11 +206,21 @@ pub fn snapshotTriggerTick(self: anytype) void {
         const index = self.node.baselineIndex(gid);
         if (index == 0) continue; // nothing applied yet — nothing to snapshot
         const term = self.node.logTerm(gid, index) orelse continue;
+        // The group's ConfState, read AFTER the baseline index on this same
+        // pump thread so it covers every membership change ≤ index. It rides
+        // the stream and is installed WITH the baseline (raft snapshot
+        // semantics — etcd/TiKV always ship `metadata.conf_state`): a
+        // membership-neutral install would leave any conf-change compacted
+        // below the baseline permanently missing on the receiver. Unreadable
+        // ConfState → skip this tick and retry, like an unresolvable term.
+        var voters_buf: [16]u64 = undefined;
+        var learners_buf: [16]u64 = undefined;
+        const cs = self.node.confState(gid, &voters_buf, &learners_buf) orelse continue;
         for (peers) |peer| {
-            if (self.enqueueSnapshotCatchup(gid, peer, index, term)) {
+            if (self.enqueueSnapshotCatchup(gid, peer, index, term, cs.voters, cs.learners)) {
                 std.log.info(
-                    "v2 snapshot-trigger gid={d}: peer {d} in StateSnapshot — queued out-of-band catch-up to baseline {d}/{d}",
-                    .{ gid, peer, index, term },
+                    "v2 snapshot-trigger gid={d}: peer {d} in StateSnapshot — queued out-of-band catch-up to baseline {d}/{d} (voters={any} learners={any})",
+                    .{ gid, peer, index, term, cs.voters, cs.learners },
                 );
             }
         }

@@ -285,8 +285,10 @@ pub fn parseAppliedBaseline(
 }
 
 // ── id-list helpers (the one join/parse pair) ─────────────────────────
+// Public: every id-list that crosses a wire (attach ConfState, streamed-
+// snapshot ConfState) formats and parses through this ONE pair.
 
-fn joinIds(a: std.mem.Allocator, ids: []const u64) ![]u8 {
+pub fn joinIds(a: std.mem.Allocator, ids: []const u64) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(a);
     for (ids, 0..) |id, i| {
@@ -298,7 +300,7 @@ fn joinIds(a: std.mem.Allocator, ids: []const u64) ![]u8 {
 
 /// Parse `1,2,3` into `buf`; returns the count. An EMPTY string is zero
 /// ids (a present-but-empty header is an explicit empty set).
-fn parseIds(s: []const u8, buf: *[MAX_MEMBER_IDS]u64) !u8 {
+pub fn parseIds(s: []const u8, buf: *[MAX_MEMBER_IDS]u64) !u8 {
     var n: u8 = 0;
     var it = std.mem.tokenizeScalar(u8, s, ',');
     while (it.next()) |tok| {
