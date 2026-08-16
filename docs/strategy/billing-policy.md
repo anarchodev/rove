@@ -84,6 +84,65 @@ and DPA lean on — rove#324/#326.)
 | downgrade (paid → smaller paid) | → new tier at webhook | full | per new tier | over-cap kv/instances kept; creation/writes gated |
 | abuse suspension | untouched | stops (front 403) | — | untouched (reversible) |
 
+
+## The launch tiers (decided 2026-08-16, rove#314)
+
+| | free | pro | enterprise |
+|---|---|---|---|
+| **price** | $0 | **$25 / mo, flat per account** | **$250 / mo listed**; custom via `Overrides` |
+| instances | 1 | 5 | 25 |
+| team accounts | 2 | 5 | 20 |
+| outbound | off | on | on |
+| replay retention | 7 days | 30 days | 365 days |
+| KV per tenant | 64 MiB | 512 MiB | 2 GiB |
+| blobs per tenant | 1 GiB | 50 GiB | 500 GiB |
+| max request body | 4 MiB | 32 MiB | 256 MiB |
+
+**Why these numbers, against the field** (verified 2026-08-16): the platform
+price band is $20–25 (Deno Deploy 20, Vercel 20/seat, Convex 25/seat,
+Supabase 25); the durable-execution band is $50–100+ (Trigger.dev 50, Inngest
+75, Temporal Cloud 100 minimum). We bundle both categories and price at the
+top of the platform band — the durable/replay half is the reason to choose
+us, not a separate SKU. Flat per-account (members included) is a deliberate
+wedge against the per-seat pricers: a four-person team is $80–100 elsewhere.
+
+**Retention is the headline.** Our free tier's 7-day full-request replay
+equals Supabase *Pro*; our 30 days is what Vercel sells per-event as an
+add-on and Supabase gates behind its $599 Team tier — and theirs are logs,
+not deterministic replay. 365 days has no comparable at any price.
+
+**KV is transactional state, not storage — sized as runway, sold as OLTP.**
+1 MiB per value, 256 B keys, strongly consistent, replicated 3× (every sold
+GiB is three on disk), every write replayable. 512 MiB is ~half a million
+1 KB rows — real runway for a serious site's state. Bulk data belongs on the
+blob axis, where 50/500 GiB stands against Deno's 5 GiB and Supabase's
+100 GB. We do not chase the database-headline number (Supabase's 8 GB is a
+Postgres disk, a different product); density math also forbids it — at
+2 GiB/tenant a node's 64 GiB map holds ~32 maxed tenants, where 8 GiB/tenant
+would let two or three accounts saturate a cluster the over-subscription
+design assumes stays sparse.
+
+**The top of the range is the cluster, not a bigger cap.** A customer who
+outgrows enterprise buys a **dedicated three-node cluster at a custom
+price** — the architecture's own capacity step, onboarded with the
+zero-downtime move. `Overrides` handles small stretches; the cluster handles
+scale. Shared tiers are never stretched to hold a whale.
+
+**Marketing guardrails for the pricing page (rove#315):**
+
+- **No "encrypted at rest"** — Phase 9 is deferred, so today the claim is
+  false, and even once it ships the ceiling is "encrypted at rest", never
+  "we cannot read your logs" (customer-held keys are deliberately deferred).
+  This is the rove#322 false-claims class; check the page against it.
+- Advertised retention = enforced retention, in **days** (the derived byte
+  floor is a later revision, per the launch sequencing).
+- Requests are not priced and not advertised as a quota — the caps exist to
+  protect the node, not to meter.
+
+**Operational rider:** these numbers sell storage against a bound nothing
+monitors (rove#472 — no disk metrics). The disk gauge belongs in the go-live
+checklist ahead of the first enterprise deal.
+
 ## Stripe dashboard configuration this assumes
 
 Not code — recorded so going live doesn't miss them: Smart Retries
