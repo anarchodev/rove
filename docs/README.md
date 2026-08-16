@@ -95,6 +95,7 @@ commit when one opens or closes. Find them live:
 
 ## Product & strategy
 
+- [billing-policy.md](strategy/billing-policy.md) — the unhappy paths (dunning, downgrade, cancellation), decided together (rove#313)
 - [pricing-model.md](strategy/pricing-model.md) — pricing model (tier *enforcement* shipped — `architecture/control-plane.md` "Operational state")
 - [platform-accounts-model.md](strategy/platform-accounts-model.md) — accounts/orgs/users (product layer, not the engine)
 - [saas-in-a-box.md](strategy/saas-in-a-box.md) — the author-platform shape: per-end-customer tenants + the first-party library suite (users/billing/jobs/webhooks/flags/…)
