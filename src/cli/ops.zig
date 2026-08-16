@@ -472,7 +472,9 @@ const SeedPkg = struct {
 //
 // 1.0.1: the SPDX license headers (#343). No behavioural change to any package
 // — the sources diverged from the 1.0.0 seed by two comment lines each.
-const SEED_VERSION = "1.0.1";
+// 1.0.2: browser's saga-unit rename (#448), oidc's login-time operator
+// authority, and the first publish of @rewind/stripe (#307/#310).
+const SEED_VERSION = "1.0.2";
 const REGISTRY_TENANT = "registry";
 
 // LEAVES-FIRST: @rewind/jwt has no intra-set dependency and MUST publish before
