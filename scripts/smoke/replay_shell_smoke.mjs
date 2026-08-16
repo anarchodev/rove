@@ -166,7 +166,8 @@ function compute(items, taxRate) {
   return { [label]: subtotal, total: subtotal * (1 + taxRate) };
 }
 export default function handler() {
-  return compute([10, 20, 30], 0.0875);
+  const result = compute([10, 20, 30], 0.0875);
+  return result;
 }
 `,
         },
@@ -449,9 +450,15 @@ async function checkPopulatedState(ctx) {
     // single line is sub-pixel), so the end of the rail is the LAST
     // thing the handler executed — for this fixture, its `return` line.
     // The highlight must be there, not blank on the engine wind-down.
+    //
+    // The fixture returns a BARE LOCAL deliberately: that shape compiles
+    // to pure loads/stores, which contributed no pc2line entry before
+    // arenajs 0.3.5 emitted per-statement source positions (rove#578) —
+    // an engine regressing that emission fails this assertion, because
+    // the return line vanishes from the trace entirely.
     const returnLine = FIXTURE.modules[0].source.split("\n")
-        .findIndex((l) => l.includes("return compute")) + 1;
-    if (returnLine < 1) throw new Error("fixture lost its `return compute` line");
+        .findIndex((l) => l.trim() === "return result;") + 1;
+    if (returnLine < 1) throw new Error("fixture lost its `return result;` line");
     if (scrubberBox) {
         const y2 = scrubberBox.y + scrubberBox.height / 2;
         await popup.mouse.move(scrubberBox.x + scrubberBox.width * 0.5, y2);
