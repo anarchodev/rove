@@ -136,7 +136,7 @@ def main() -> int:
             "login_path": "/login"}, separators=(",", ":")))
         # web/admin's middleware imports `@rewind/oidc` + `@rewind/email`,
         # so the packages stage with the deploy.
-        adm_pkgs, adm_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+        adm_pkgs, adm_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email", "@rewind/stripe"])
         c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         c.admin_kv_put("__admin__", "_oidc/rp/default", json.dumps({
             "issuer": auth_base, "client_id": "admin-dashboard",

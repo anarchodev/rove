@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """V2 membership-reconciler smoke — a wiped node AUTO-HEALS, no manual ops.
 
-GREEN. Previously surfaced the attach→apply-snapshot WINDOW bug: the reconciler
-created the group (last_index 0) then installed the baseline in a SEPARATE op, and
-a leader heartbeat carrying commit > 0 could reach the empty group first → raft-rs
-commit_to fatal! ("to_commit out of range [last_index 0]"). Fixed by making attach
-install the baseline ATOMICALLY (X-Rewind-Baseline-* → createGroupAtBaseline, one
-pump op): the fresh group is never observable at last_index 0. The baseline = the
-leader's current applied index, which is ≥ the wiped node's stale Progress.match,
-so the leader's heartbeat commit = min(match, committed) can never exceed the
-node's new last_index. fresh_voter_join (manual, separate apply-snapshot) won the
-race by quiescent+fast pacing; the reconciler lost it deterministically.
-
-The end-to-end gate for docs/architecture/cp-membership-reconciler.md (Phases 3+4). With
+The end-to-end gate for docs/architecture/cp-membership-reconciler.md. With
 REWIND_CP_RECONCILE_MEMBERSHIP=1, the CP's additive, learner-first reconciler
 converges DP group membership to the cluster's node set on its own.
 
 Reproduces the bhs-3 phantom-voter, then does NOTHING but wait: provision a
-tenant on a 3-node cluster, seed data, then WIPE node 3's data dir + restart it
-(a configured voter with no group instance, matched=0). The reconciler must, with
-no operator action, walk it back to a caught-up voter via the learner-first path:
-  voter-but-stuck → DEMOTE to learner (so it can't disrupt elections)
-  learner, not hosted → bootstrap (snapshot + attach + apply-snapshot)
+tenant on a 3-node cluster, seed data, then WIPE a follower's data dir +
+restart it (a configured voter with no group instance, stale-high
+Progress.match). The reconciler must, with no operator action, walk it back to
+a caught-up voter via the raft-native member re-add:
+  voter/learner, confirmed-absent → REMOVE (drops the stale-high Progress —
+      the commit_to-out-of-range class needs a stale match, so tear it out)
+  absent from config, not hosted  → attach EMPTY (born learner, the leader's
+      augmented ConfState + epoch + incarnation; NO data through the CP),
+      then AddLearner (fresh match=0)
+  data arrives raft-natively: the log tail replicates, or — forced here via a
+      LOW REWIND_SNAPSHOT_GRACE, so the leader has compacted past the reborn
+      node's empty log — the auto-catchup STREAMS the store with the baseline
+      + ConfState in headers onto the group born empty
   learner, caught up → PROMOTE to voter
-Then a FRESH write must replicate to it — proving it's a productive voter again,
-entirely hands-off. (Contrast fresh_voter_join_smoke, which drives the same
-sequence BY HAND.)
+Then a FRESH write must replicate to it — proving it's a productive voter
+again, entirely hands-off. The grow phase (sole-voter birth → 3 voters) covers
+the young-log replication flavor of the same add; the wipe leg covers the
+compacted/streamed flavor.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -49,6 +47,11 @@ os.environ["REWIND_CP_RECONCILE_SECS"] = "2"
 # new "never demote on the first observation" property: the demote lands a pass
 # later, not on first sight.)
 os.environ["REWIND_CP_DEMOTE_GRACE_MS"] = "1000"
+# Force mechanism-A compaction PAST the seeded writes (floor = durabilized −
+# grace), so the wiped node's heal CANNOT replay the log from entry 1 and must
+# take the streamed snapshot catch-up onto the group born EMPTY — the
+# reconciler-bootstrap × auto-catchup composition this smoke gates.
+os.environ["REWIND_SNAPSHOT_GRACE"] = "20"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
@@ -96,9 +99,12 @@ def main() -> int:
         except RuntimeError as e:
             check("deploy", False, str(e)); return 1
         c.wait_for_handler("acme", "/?fn=handler", want_body="value:none")
-        for i in range(30):
+        # WELL past REWIND_SNAPSHOT_GRACE, so the leader's compaction floor
+        # (durabilized − grace) sits far above entry 1 by the wipe below — the
+        # heal is then forced through the streamed catch-up, never a log replay.
+        for i in range(120):
             c.request_retry("acme", "/?fn=handler", method="POST", data=f'{{"value":"v-{i}"}}', want_status=204, deadline_s=10)
-        latest = "v-29"
+        latest = "v-119"
 
         # With a reconciler present the CP births a tenant as the SOLE voter {1}
         # and the reconciler GROWS it to the full node set learner-first (the
