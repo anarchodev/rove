@@ -495,6 +495,28 @@ async function checkPopulatedState(ctx) {
     await popup.screenshot({ path: "/tmp/replay-shell-populated.png" });
     ok("screenshot → /tmp/replay-shell-populated.png");
 
+    // Browser refresh: the shell caches the received bundle in
+    // sessionStorage (keyed by the URL fragment), so a reload reboots
+    // the SAME record with no opener handshake — the dashboard's
+    // listener is long gone by now, so surviving this proves the cache
+    // path, not a re-handshake.
+    await popup.reload({ waitUntil: "domcontentloaded" });
+    try {
+        await popup.waitForFunction(() => {
+            const s = document.getElementById("source-state");
+            return s && /completed|exited/.test(s.textContent || "");
+        }, { timeout: 15_000 });
+        ok("reload reboots the same record from the cache");
+    } catch {
+        bad("reload did not reach terminal — bundle cache missing/broken");
+    }
+    const reloadErrBadge = await popup.locator("#appbar-meta .badge--error").count();
+    if (reloadErrBadge === 0) ok("no load-error badge after reload");
+    else bad("reload surfaced a load error");
+    const reloadEvCount = await popup.locator("#event-stream .ev").count();
+    if (reloadEvCount === evCount) ok(`reloaded event stream matches (${reloadEvCount} entries)`);
+    else bad(`reloaded event stream differs: ${reloadEvCount} vs ${evCount}`);
+
     await popup.close();
     await opener.close();
 }
