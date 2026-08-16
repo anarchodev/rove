@@ -26,7 +26,7 @@ pub fn ensureGroup(self: *Node, tenant_id: u64, id_str: []const u8) Error!*Tenan
     // Birth OR restart: recover any durable WAL records for this group
     // (a no-op on a never-seen group). On a restart this replays the
     // committed log back into the store.
-    return self.createGroupCore(tenant_id, id_str, 0, true, false, null);
+    return self.createGroupCore(tenant_id, id_str, 0, true, false, null, null);
 }
 
 /// Attach a tenant group at an explicit migration fence `epoch` (the
@@ -44,13 +44,18 @@ pub fn ensureGroup(self: *Node, tenant_id: u64, id_str: []const u8) Error!*Tenan
 /// (voters = the rest), for joining an existing group safely — see
 /// `createGroupCore`. The default (false) births a voter from the static
 /// voter set (a move destination / a configured voter rejoining).
-pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, as_learner: bool, voters_override: ?[]const u64) Error!*TenantSlot {
+/// `learners_override` non-null makes {voters_override, learners_override}
+/// the EXACT born ConfState (the attach envelope's augmented membership —
+/// raft semantics: a joiner is born with the group's real membership, self
+/// included, exactly as a snapshot's ConfState would install it). The
+/// supplied membership must contain this node (`Error.SelfNotInConfState`).
+pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, as_learner: bool, voters_override: ?[]const u64, learners_override: ?[]const u64) Error!*TenantSlot {
     if (self.groups.get(tenant_id) != null) return Error.GroupExists;
     self.mgr.clearTombstone(tenant_id) catch {};
     // A migration attach is a FRESH group — its state arrives via the
     // bundle, not the WAL — so do NOT replay any (stale) recovered records
     // for this gid.
-    return self.createGroupCore(tenant_id, id_str, epoch, false, as_learner, voters_override);
+    return self.createGroupCore(tenant_id, id_str, epoch, false, as_learner, voters_override, learners_override);
 }
 
 /// A group recorded in the node-local manifest (see `groups_manifest`):
@@ -68,7 +73,7 @@ pub const PersistedGroup = struct {
 /// single-threaded, like `ensureGroup`. Idempotent.
 pub fn recoverGroup(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
     if (self.groups.get(tenant_id)) |slot| return slot;
-    return self.createGroupCore(tenant_id, id_str, epoch, true, false, null);
+    return self.createGroupCore(tenant_id, id_str, epoch, true, false, null, null);
 }
 
 /// Record (or update) a group in the node-local recovery manifest, then
@@ -161,7 +166,11 @@ pub fn freePersistedGroups(allocator: std.mem.Allocator, groups: []PersistedGrou
 /// back to `self.voters`. Ignored on the `recover` path (a rejoining group
 /// restores its membership from the WAL) and immaterial under a baseline
 /// (the baseline's ConfState overwrites the born membership).
-pub fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool, as_learner: bool, voters_override: ?[]const u64) Error!*TenantSlot {
+/// `learners_override` non-null: {voters_override, learners_override} is the
+/// EXACT born ConfState — the sender's real membership, self included (raft
+/// snapshot semantics), superseding the `as_learner` self-split. Must contain
+/// this node in one of the lists (`Error.SelfNotInConfState`).
+pub fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool, as_learner: bool, voters_override: ?[]const u64, learners_override: ?[]const u64) Error!*TenantSlot {
     // {data_dir}/{tenant_id}/app.db
     const dir = std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ self.data_dir, tenant_id }) catch
         return Error.OutOfMemory;
@@ -203,7 +212,19 @@ pub fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u
     const learner_self = [_]u64{self.node_id};
     var voters_slice: []const u64 = base_voters;
     var learners_slice: []const u64 = &.{};
-    if (as_learner and !recover) {
+    if (learners_override != null and !recover) {
+        // Explicit ConfState birth: the caller (the attach envelope) supplies
+        // the group's REAL membership — self included, exactly as a snapshot's
+        // ConfState would install it — so no self-split synthesis. A membership
+        // that omits this node would birth a non-member group whose later
+        // snapshot install raft refuses (the restore recipient rule); reject
+        // it here, before the group half-forms.
+        learners_slice = learners_override.?;
+        var self_in = false;
+        for (voters_slice) |v| self_in = self_in or v == self.node_id;
+        for (learners_slice) |l| self_in = self_in or l == self.node_id;
+        if (!self_in) return Error.SelfNotInConfState;
+    } else if (as_learner and !recover) {
         var n: usize = 0;
         for (base_voters) |v| {
             if (v != self.node_id and n < voters_scratch.len) {
@@ -290,9 +311,12 @@ pub fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u
     // this membership — so it leads immediately. A born-MULTI group still
     // elects via ticks; campaigning here would race the peers that have not
     // yet created the group. (`as_learner` splits self out of `voters_slice`,
-    // so a learner is never sole-self and never campaigns.)
-    const born_sole_self = !recover and voters_slice.len == 1 and voters_slice[0] == self.node_id;
-    if (self.isSingleNode() or born_sole_self) {
+    // so a learner is never sole-self and never campaigns; an explicit-
+    // ConfState birth listing self in `learners` — or in a multi-member voter
+    // set — is likewise never sole-self, so it idles: raft refuses a learner
+    // campaign, and a multi-member group must elect via ticks.)
+    const sole_self_voter = voters_slice.len == 1 and voters_slice[0] == self.node_id;
+    if (sole_self_voter and (self.isSingleNode() or !recover)) {
         try self.mgr.campaign(tenant_id);
         var spins: u32 = 0;
         while (!self.mgr.isLeader(tenant_id) and spins < 100) : (spins += 1) {

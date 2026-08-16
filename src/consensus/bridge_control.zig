@@ -55,6 +55,11 @@ pub const ControlCmd = struct {
     /// node set) instead of the node's static `REWIND_VOTERS`. Null → `self.voters`.
     /// Borrowed from the caller stack for the blocking call.
     birth_voters: ?[]const u64 = null,
+    /// `create_group_epoch`: non-null makes {birth_voters, birth_learners} the
+    /// EXACT born ConfState (the attach envelope's membership, self included —
+    /// raft snapshot semantics) instead of the `as_learner` self-split. Borrowed
+    /// from the caller stack for the blocking call.
+    birth_learners: ?[]const u64 = null,
     /// `conf_state`: caller buffers to fill + the counts written back.
     cs_voters: []u64 = &.{},
     cs_learners: []u64 = &.{},
@@ -79,9 +84,17 @@ pub const ControlCmd = struct {
     done: std.Thread.ResetEvent = .{},
 };
 
-pub fn createGroupEpoch(self: anytype, gid: u64, epoch: u64, birth_voters: ?[]const u64) Error!void {
+/// Create `gid`'s group at `epoch` with no baseline (the plain / empty
+/// attach). `as_learner` births this node as a non-voting learner (joining an
+/// existing group — a born-voter would campaign past a high-term leader).
+/// `birth_voters`/`birth_learners`: the born ConfState — non-null
+/// `birth_learners` makes the pair the sender's EXACT membership (self
+/// included, raft snapshot semantics; `Error.SelfNotInConfState` when it
+/// omits this node); null falls back to the `as_learner` self-split over
+/// `birth_voters` (or the static env set).
+pub fn createGroupEpoch(self: anytype, gid: u64, epoch: u64, as_learner: bool, birth_voters: ?[]const u64, birth_learners: ?[]const u64) Error!void {
     const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-    var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .birth_voters = birth_voters };
+    var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .as_learner = as_learner, .birth_voters = birth_voters, .birth_learners = birth_learners };
     return runControl(self, &cmd);
 }
 
@@ -110,7 +123,7 @@ pub fn createGroupAtBaseline(self: anytype, gid: u64, epoch: u64, index: u64, te
     // errors → double-free crash) before the snapshot can fix it. Born with the
     // real membership directly, the fallback is never taken (matches the
     // no-baseline `createGroupEpoch` path, which already births with `voters`).
-    var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .birth_voters = voters, .snap_voters = voters, .snap_learners = learners };
+    var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .birth_voters = voters, .birth_learners = learners, .snap_voters = voters, .snap_learners = learners };
     return runControl(self, &cmd);
 }
 
@@ -317,7 +330,7 @@ pub fn drainControl(self: anytype) bool {
                     std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
                     break :blk Error.InvalidBaseline;
                 }
-                _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner, cmd.birth_voters) catch |e| break :blk e;
+                _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner, cmd.birth_voters, cmd.birth_learners) catch |e| break :blk e;
                 // Atomic baseline (createGroupAtBaseline): install the data-free
                 // snapshot in the SAME pump op as group creation so the fresh
                 // group is never observable at last_index 0 between creation and

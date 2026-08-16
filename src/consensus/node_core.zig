@@ -907,7 +907,7 @@ test "createGroupAtEpoch: a RawNode-rejected config errors cleanly (no gfs doubl
 
     // voters_override={1} + as_learner=true → self(1) split out → voters=[], learners=[1].
     const voters = [_]u64{1};
-    try testing.expectError(Error.CreateGroupFailed, node.createGroupAtEpoch(99, "x", 1, true, &voters));
+    try testing.expectError(Error.CreateGroupFailed, node.createGroupAtEpoch(99, "x", 1, true, &voters, null));
 
     // No double-free crash, no leak, and the node is still usable: a normal
     // single-node group still forms + commits.
@@ -916,6 +916,47 @@ test "createGroupAtEpoch: a RawNode-rejected config errors cleanly (no gfs doubl
     try ws.addPut("k", "v");
     const applied = try node.proposeWriteSet(7, "ok", &ws);
     try testing.expect(applied > 0);
+}
+
+test "createGroupAtEpoch: an explicit ConfState births the exact membership" {
+    // The attach-empty learner birth (reconciler bootstrap): the envelope's
+    // {voters, learners} IS the born ConfState — self included, exactly as a
+    // snapshot's ConfState would install it — never the as_learner self-split
+    // synthesis and never the static fallback.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    // Self (1) the sole VOTER plus a distinct learner: both lists reach
+    // raft-rs verbatim, and the sole-self voter still campaigns to leader.
+    _ = try node.createGroupAtEpoch(50, "explicit-voter", 1, false, &[_]u64{1}, &[_]u64{3});
+    try testing.expect(node.isLeader(50));
+    var vbuf: [8]u64 = undefined;
+    var lbuf: [8]u64 = undefined;
+    const cs = node.confState(50, &vbuf, &lbuf).?;
+    try testing.expectEqualSlices(u64, &[_]u64{1}, cs.voters);
+    try testing.expectEqualSlices(u64, &[_]u64{3}, cs.learners);
+
+    // Self (1) a LEARNER: the group is born idling — no campaign (raft
+    // refuses a learner campaign; the leader's AddLearner activates it).
+    _ = try node.createGroupAtEpoch(51, "explicit-learner", 1, true, &[_]u64{2}, &[_]u64{1});
+    try testing.expect(!node.isLeader(51));
+    const cs2 = node.confState(51, &vbuf, &lbuf).?;
+    try testing.expectEqualSlices(u64, &[_]u64{2}, cs2.voters);
+    try testing.expectEqualSlices(u64, &[_]u64{1}, cs2.learners);
+
+    // A supplied membership that OMITS this node is refused before the group
+    // half-forms — the birth-time twin of restore's recipient rule.
+    try testing.expectError(
+        Error.SelfNotInConfState,
+        node.createGroupAtEpoch(52, "omits-self", 1, true, &[_]u64{2}, &[_]u64{3}),
+    );
+    try testing.expect(node.groups.get(52) == null);
 }
 
 test "durabilize: the pump checkpoints the store + stamps the raft watermark" {
@@ -1342,12 +1383,12 @@ test "Phase 2: a group born {self} on a multi-node node auto-leads, then grows +
 
     // Node 1 births the group as {self=1}: it must lead IMMEDIATELY, with no
     // explicit campaign and no warm-up — the born-{self} auto-campaign.
-    _ = try nodes[0].createGroupAtEpoch(tenant, id, epoch, false, &[_]u64{1});
+    _ = try nodes[0].createGroupAtEpoch(tenant, id, epoch, false, &[_]u64{1}, null);
     try testing.expect(nodes[0].isLeader(tenant));
 
     // Node 2 joins as a learner of the {1}-led group (the reconciler bootstrap
     // shape): born voters={1}, learner={2}; it never campaigns.
-    _ = try nodes[1].createGroupAtEpoch(tenant, id, epoch, true, &[_]u64{1});
+    _ = try nodes[1].createGroupAtEpoch(tenant, id, epoch, true, &[_]u64{1}, null);
     try testing.expect(!nodes[1].isLeader(tenant));
 
     // Warm the mesh so the leader can reach the learner.
@@ -1457,11 +1498,11 @@ test "Phase 2: two genesis nodes (self-only, registry-only addressing) form + gr
 
     // Node 1 births the group {self} (a fresh creation — recover=false — as
     // provision does) and auto-leads: no static voter set, no campaign call.
-    _ = try nodes[0].createGroupAtEpoch(tenant, id, epoch, false, &[_]u64{1});
+    _ = try nodes[0].createGroupAtEpoch(tenant, id, epoch, false, &[_]u64{1}, null);
     try testing.expect(nodes[0].isLeader(tenant));
 
     // Node 2 joins as a learner of the {1}-led group.
-    _ = try nodes[1].createGroupAtEpoch(tenant, id, epoch, true, &[_]u64{1});
+    _ = try nodes[1].createGroupAtEpoch(tenant, id, epoch, true, &[_]u64{1}, null);
     try testing.expect(!nodes[1].isLeader(tenant));
 
     // Grow FIRST: until node 2 is a member, the leader's raft has no reason to

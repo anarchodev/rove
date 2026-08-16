@@ -1507,7 +1507,7 @@ test "bridge: move control — attach at epoch, destroy reclaims" {
     // Destination-attach shape: register the tenant, then stand up its
     // group at a migration epoch (epoch+1 over the source's birth epoch).
     const gid = try bridge.registerTenant("mover");
-    try bridge.createGroupEpoch(gid, 1, null);
+    try bridge.createGroupEpoch(gid, 1, false, null, null);
 
     // A post-attach write commits through the freshly-attached group.
     var ws = WriteSet.init(a);
@@ -2067,7 +2067,7 @@ test "bridge: createGroupEpoch requires a running pump thread" {
     defer bridge.deinit();
     const gid = try bridge.registerTenant("x");
     // No startPump → control ops have no executor.
-    try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1, null));
+    try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1, false, null, null));
 }
 
 test "a multi-node propose for a locally-unhosted group faults — no husk is born" {
