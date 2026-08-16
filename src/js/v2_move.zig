@@ -1526,6 +1526,10 @@ pub fn armSnapshotStream(
     var gid: u64 = 0;
     var index: u64 = 0;
     var term: u64 = 0;
+    var voters_buf: [wire.MAX_MEMBER_IDS]u64 = undefined;
+    var learners_buf: [wire.MAX_MEMBER_IDS]u64 = undefined;
+    var conf_voters: ?[]const u64 = null;
+    var conf_learners: ?[]const u64 = null;
     var loader_opts: kv_mod.StreamLoaderOptions = undefined;
     switch (mode) {
         .merge => {
@@ -1548,6 +1552,22 @@ pub fn armSnapshotStream(
                 return reply(server, allocator, ent, sid, sess, 400, "bad snapshot term\n");
             if (index == 0 or term == 0)
                 return reply(server, allocator, ent, sid, sess, 400, "index and term must be nonzero\n");
+            // Optional ConfState (`X-Rewind-Voters`/`X-Rewind-Learners`): when
+            // the sender ships its membership, the baseline install adopts it
+            // (raft snapshot semantics — the membership rides the snapshot, so
+            // a conf-change compacted below the baseline still reaches the
+            // receiver). Absent → membership-neutral install. Malformed is a
+            // 400, never silently collapsed to "absent".
+            if (respb.findHeader(rh, wire.VOTERS)) |vs| {
+                const n = wire.parseIds(vs, &voters_buf) catch
+                    return reply(server, allocator, ent, sid, sess, 400, "malformed x-rewind-voters\n");
+                conf_voters = voters_buf[0..n];
+            }
+            if (respb.findHeader(rh, wire.LEARNERS)) |ls| {
+                const n = wire.parseIds(ls, &learners_buf) catch
+                    return reply(server, allocator, ent, sid, sess, 400, "malformed x-rewind-learners\n");
+                conf_learners = learners_buf[0..n];
+            }
             gid = worker.raft.gidForTenant(tenant) orelse
                 return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
             if (worker.raft.isLeaderOf(gid))
@@ -1560,7 +1580,7 @@ pub fn armSnapshotStream(
         return reply(server, allocator, ent, sid, sess, 500, "loader init failed\n");
     // Box.create COPIES `loader` into the heap box (which then owns its
     // key/val buffers); on success the local must NOT be deinit'd.
-    const box = snapshot_sink_mod.Box.create(allocator, loader, mode, tenant, gid, index, term) catch {
+    const box = snapshot_sink_mod.Box.create(allocator, loader, mode, tenant, gid, index, term, conf_voters, conf_learners) catch {
         loader.deinit();
         return reply(server, allocator, ent, sid, sess, 500, "snapshot box alloc failed\n");
     };
@@ -1600,8 +1620,10 @@ pub fn drainSnapshotStreams(worker: anytype) !void {
             switch (box.mode) {
                 .replace => {
                     if (box.durabilize()) |_| {
-                        // Data durable → advance the raft baseline.
-                        worker.raft.applyLocalSnapshot(box.gid, box.index, box.term, null, null) catch |e| switch (e) {
+                        // Data durable → advance the raft baseline, adopting
+                        // the sender's ConfState when it rode the stream
+                        // (membership-as-of-the-snapshot; null = neutral).
+                        worker.raft.applyLocalSnapshot(box.gid, box.index, box.term, box.confVoters(), box.confLearners()) catch |e| switch (e) {
                             // Already advanced past `index` via replication during
                             // the stream, or now leads — benign (driver treats 409
                             // as success).

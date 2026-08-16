@@ -179,7 +179,17 @@ fn drainSnapshotCatchupJobs(worker: anytype, catchup: *rjs.SnapshotCatchupThread
             worker.raft.clearSnapshotCatchup(j.gid, j.peer);
             continue;
         };
-        catchup.enqueue(.{ .gid = j.gid, .peer = j.peer, .index = j.index, .term = j.term, .id_str = id_dup }) catch {
+        catchup.enqueue(.{
+            .gid = j.gid,
+            .peer = j.peer,
+            .index = j.index,
+            .term = j.term,
+            .voters_buf = j.voters_buf,
+            .voters_len = j.voters_len,
+            .learners_buf = j.learners_buf,
+            .learners_len = j.learners_len,
+            .id_str = id_dup,
+        }) catch {
             worker.allocator.free(id_dup);
             worker.raft.clearSnapshotCatchup(j.gid, j.peer);
         };
