@@ -53,6 +53,17 @@
 //!        identical; the quickjs.c delta is allocator + state-slot
 //!        plumbing only ("allocator/arena internals, perf, GC" — the
 //!        SOP's explicit do-not-bump list).
+//!        Still 1 at arenajs v0.3.5 (2026-08-16, #ff95371): per-statement
+//!        pc2line source positions (every statement anchors a loc, not
+//!        only throw-capable expressions — rove#578). Verified no-bump:
+//!        the executed op stream and all semantics are unchanged; the
+//!        only handler-observable delta is MORE-ACCURATE error line
+//!        attribution (`err.stack` / lineNumber) for throws inside
+//!        statements previously attributed to the preceding line. A
+//!        rare v1 record whose handler folded such a stack string into
+//!        its output diverges VISIBLY via the interaction digest — the
+//!        per-record check — where a bump would refuse every v1 record
+//!        wholesale for a delta that almost never manifests.
 
 /// Current JS engine version. Stamped into every request's `LogRecord`
 /// and replicated readset header. See the bump SOP above before changing.
