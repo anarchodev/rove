@@ -502,8 +502,15 @@ fn handleAttach(
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
         };
     } else {
-        worker.raft.createGroupEpoch(gid, dec.epoch, dec.voters()) catch |err| switch (err) {
+        // The no-baseline birth honors the SAME membership envelope as the
+        // baseline path: an EMPTY attach that carries `join_as_learner` + the
+        // sender's ConfState births a non-campaigning learner with the group's
+        // real membership (self included), ready for the leader's AddLearner —
+        // the raft-native member add, where the data then arrives via log
+        // replication or the streamed snapshot catch-up, never a bundle body.
+        worker.raft.createGroupEpoch(gid, dec.epoch, dec.join_as_learner, dec.voters(), dec.learners()) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
+            error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
         };
     }
