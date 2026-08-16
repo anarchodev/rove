@@ -381,7 +381,14 @@ async function checkPopulatedState(ctx) {
     // Drag the scrubber: mousedown near the left edge, move to the
     // middle, mouseup. The playhead should land on an event other
     // than where it started.
+    // The source header is a lossy signal of playhead motion now that
+    // it resolves through the innermost CUSTOMER frame (provenance): a
+    // drag that lands inside the epilogue tail can legitimately show
+    // the same customer line it started on. The transport chip
+    // (visible-scan grain) moves whenever the drag crosses a tick, so
+    // accept either signal.
     const headerPreDrag = (await popup.locator("#source-header").innerText()).trim();
+    const timePreDrag = (await popup.locator("#transport-time").innerText()).trim();
     const scrubberBox = await popup.locator(".scrubber").boundingBox();
     if (scrubberBox) {
         const y = scrubberBox.y + scrubberBox.height / 2;
@@ -390,18 +397,68 @@ async function checkPopulatedState(ctx) {
         await popup.mouse.move(scrubberBox.x + scrubberBox.width * 0.7, y, { steps: 8 });
         await popup.mouse.up();
         await popup.waitForFunction(
-            (prev) => {
+            ([prevHdr, prevTime]) => {
                 const h = document.getElementById("source-header");
-                return h && h.innerText.trim() !== prev;
+                const t = document.getElementById("transport-time");
+                return (h && h.innerText.trim() !== prevHdr)
+                    || (t && t.innerText.trim() !== prevTime);
             },
-            headerPreDrag,
+            [headerPreDrag, timePreDrag],
             { timeout: 2000 },
         ).then(
             () => ok("scrubber drag moves the playhead"),
-            () => bad("scrubber drag did not change source header"),
+            () => bad("scrubber drag moved neither source header nor transport time"),
         );
     } else {
         bad("scrubber not measurable");
+    }
+
+    // ── Frame provenance ─────────────────────────────────────────────
+    // Even this pure fixture's run ends in a tail of engine frames —
+    // the interaction-digest response fold + park machinery execute as
+    // base-arena JS (file "<arena-base>"). None of it is the
+    // customer's: the stream and ticks must not card it, and unnamed
+    // frames must not surface as raw "<atom:N>" ids.
+    const streamTxt = await popup.locator("#event-stream").innerText();
+    if (!streamTxt.includes("<arena-base>") && !streamTxt.includes("<atom:"))
+        ok("event stream carries no engine frames or raw atom names");
+    else
+        bad("engine noise leaked into the event stream");
+
+    // Single-step sweep from the end: every stop must show bundle code
+    // with a live line highlight — the playhead never rests inside an
+    // engine frame, and the source pane never goes blank on a file the
+    // bundle doesn't carry.
+    await popup.locator('button[aria-label="Jump to end"]').click();
+    let sweepOk = true, sweepWhy = "";
+    for (let s = 0; s < 8 && sweepOk; s++) {
+        await popup.locator('button[aria-label="Step back"]').click();
+        const hdr = (await popup.locator("#source-header").innerText()).trim();
+        const hl = await popup.locator(".code__body .line.is-current").count();
+        if (!/\.mjs/.test(hdr) || hdr.includes("<arena-base>")) {
+            sweepOk = false; sweepWhy = `step ${s + 1} header: ${JSON.stringify(hdr)}`;
+        } else if (hl !== 1) {
+            sweepOk = false; sweepWhy = `step ${s + 1}: ${hl} highlighted lines`;
+        }
+    }
+    if (sweepOk) ok("step-back sweep: every stop on bundle code with one highlighted line");
+    else         bad("step-back sweep left bundle code: " + sweepWhy);
+
+    // Drag into the run's tail — the close region, where only engine
+    // frames execute. The highlight stays on the innermost bundle
+    // frame instead of going blank.
+    if (scrubberBox) {
+        const y2 = scrubberBox.y + scrubberBox.height / 2;
+        await popup.mouse.move(scrubberBox.x + scrubberBox.width * 0.5, y2);
+        await popup.mouse.down();
+        await popup.mouse.move(scrubberBox.x + scrubberBox.width * 0.96, y2, { steps: 6 });
+        await popup.mouse.up();
+        const hdrTail = (await popup.locator("#source-header").innerText()).trim();
+        const hlTail = await popup.locator(".code__body .line.is-current").count();
+        if (/\.mjs/.test(hdrTail) && !hdrTail.includes("<arena-base>") && hlTail === 1)
+            ok("engine-tail drag keeps the source pane on bundle code: " + JSON.stringify(hdrTail));
+        else
+            bad(`engine-tail drag left bundle code: ${JSON.stringify(hdrTail)} (${hlTail} highlighted)`);
     }
 
     // Module-click navigation: clicking a non-current module in the
