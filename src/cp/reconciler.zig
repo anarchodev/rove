@@ -237,8 +237,18 @@ fn ensureMember(router: anytype, tenant: []const u8, node_url: []const u8, node_
         return if (reconcileConfChange(router, leader_url, tenant, node_id, "remove", raft_addr)) .progressed else .failed;
     }
     if (is_learner) {
+        // A CONFIRMED phantom learner (configured learner, reachable, NO local
+        // instance) is REMOVED, not bootstrapped in place — the same heal as a
+        // phantom voter, for the same reason: the leader's Progress.match for
+        // it is stale-HIGH from before the wipe, and an empty re-attach under
+        // a live Progress means the leader's heartbeat commit =
+        // min(match, committed) can exceed the reborn group's log → raft
+        // fatal!s (commit_to out of range). Removing drops the Progress; the
+        // next pass re-adds it fresh (match=0), so the leader can never send
+        // a commit beyond the node's log. (A learner remove never touches the
+        // voter quorum, so the ConfChangeQuorumGuard is indifferent.)
         if (host == .absent)
-            return if (bootstrapMember(router, leader_url, node_url, tenant, node_id, true, cluster_id)) .progressed else .failed;
+            return if (reconcileConfChange(router, leader_url, tenant, node_id, "remove", raft_addr)) .progressed else .failed;
         const last_idx = nodeLastIndex(router, node_url, tenant) orelse return .progressed;
         if (last_idx + RECONCILE_SLACK >= ms.leader_last)
             return if (reconcileConfChange(router, leader_url, tenant, node_id, "promote", raft_addr)) .progressed else .failed;
@@ -331,10 +341,6 @@ fn reconcileConfChange(router: anytype, leader_url: []const u8, tenant: []const 
     return true;
 }
 
-/// Out-of-band bootstrap of `tenant`'s group onto `node_url`: pull the
-/// leader's baseline {index,term} + snapshot bundle, attach (create group +
-/// load) on the node, then install the data-free raft baseline so the leader
-/// replicates the tail.
 /// Build the genesis §4d attach-carry header — `id@raft_addr,…` for every
 /// REGISTERED cluster node EXCEPT `skip_id` (the joiner itself) — so a
 /// genesis-booted joiner learns the existing members' transport addresses and
@@ -360,6 +366,22 @@ fn peerAddrsHeader(router: anytype, cluster_id: []const u8, skip_id: u64) ?[]u8 
     return out.toOwnedSlice(a) catch null;
 }
 
+/// Out-of-band bootstrap of `tenant`'s group onto `node_url` — the raft-native
+/// member add (how etcd/TiKV do it): attach the node EMPTY, carrying only the
+/// leader's epoch + storage incarnation + AUGMENTED ConfState (the leader's
+/// membership plus this node as a learner). No data ships through the CP: once
+/// the caller's AddLearner commits, the leader's own missing-entry detection
+/// replicates the log tail — or, when the tail is compacted, parks the peer in
+/// `ProgressState::Snapshot` and the auto-catchup streams the store with the
+/// baseline + ConfState in headers (`snapshot_catchup.zig`), bounded memory on
+/// every party.
+///
+/// Safety is by ORDER, not by an atomic bundle install: the leader holds NO
+/// Progress for the joiner until the AddLearner that FOLLOWS this attach, so
+/// no heartbeat can reach the empty group — and the fresh Progress starts at
+/// match=0, so commit = min(match, committed) = 0 until the node actually has
+/// a log (the `commit_to out of range` class needs a stale-high match, which
+/// the phantom-member remove→re-add heal above makes impossible).
 fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8, tenant: []const u8, node_id: u64, as_learner: bool, cluster_id: []const u8) bool {
     const a = router.allocator;
     const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
@@ -390,24 +412,16 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
         return false;
     }
 
-    const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
-    defer a.free(tbody);
-    const snap = bc.call(router, leader_url, "/_system/v2-snapshot", .POST, tbody, &.{}) catch return false;
-    defer a.free(snap.body);
-    if (snap.status != 200) return false;
-
-    // Membership SSOT, the AUGMENTED-ConfState approach: the
-    // baseline carries the leader's CURRENT ConfState PLUS this node as a
-    // learner, so the joiner learns its membership from the snapshot
-    // (raft.rs:2629) AND satisfies the recipient-must-be-in-the-ConfState rule
-    // (raft.rs:2581) WITHOUT requiring the leader's AddLearner to commit first.
-    // Crucially this keeps the panic-safe bootstrap-THEN-add ORDER: the leader
-    // does not track/commit-to this node until the AddLearner that FOLLOWS this
-    // bootstrap, so it can never send a commit past the node's just-installed
-    // baseline (the `to_commit out of range` abort the add-FIRST reorder hit).
-    // `add_self` augments only when the leader's view doesn't already list the
-    // node (the absent-from-config first touch); when it is already a learner
-    // (re-bootstrap) the set is the leader's as-is.
+    // Membership SSOT, the AUGMENTED-ConfState approach: the attach carries
+    // the leader's CURRENT ConfState PLUS this node as a learner, so the
+    // joiner is born with the group's real membership — never the static
+    // fallback (the rogue sole-router group) — AND satisfies the
+    // recipient-must-be-in-the-ConfState rule (raft.rs:2581) for the streamed
+    // snapshot that may later catch it up, WITHOUT requiring the leader's
+    // AddLearner to commit first. `add_self` augments only when the leader's
+    // view doesn't already list the node (the absent-from-config first touch);
+    // when it is already a learner (re-bootstrap) the set is the leader's
+    // as-is.
     const add_self = !idIn(bp.value.voters, node_id) and !idIn(bp.value.learners, node_id);
     var learners_buf: [wire.MAX_MEMBER_IDS + 1]u64 = undefined;
     if (bp.value.learners.len > wire.MAX_MEMBER_IDS) return false;
@@ -424,23 +438,17 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
     const peer_addrs = peerAddrsHeader(router, cluster_id, node_id);
     defer if (peer_addrs) |pa| a.free(pa);
 
-    // Attach AND install the baseline atomically (the wire envelope's
-    // baseline fields → createGroupAtBaseline on the worker). A separate
-    // v2-apply-snapshot POST would leave a window where the freshly-attached
-    // empty group (last_index 0) is reachable; a leader heartbeat carrying
-    // commit > 0 arriving in that window crashes raft (commit_to out of
-    // range). One atomic op closes it. The store bundle (snap.body) is
-    // loaded by attach before the group is created, so the baseline's data
-    // is already present. The epoch is the LEADER's, not a hard-coded 1, or
-    // its epoch-stamped messages are fenced out and the join stalls (the
-    // genesis `__admin__` group is epoch 0; a moved tenant is >1).
-    // `join_as_learner` seeds the pre-baseline born state — a learner
-    // doesn't campaign, so it follows the leader instead of deadlocking a
-    // high-term group; the baseline ConfState is authoritative after.
+    // Attach EMPTY — no bundle body, no baseline headers. The group is born
+    // at last_index 0 as a non-campaigning learner; that is SAFE here because
+    // the leader does not track this node yet (bootstrap-THEN-add order), so
+    // no heartbeat can reach the empty group. The epoch is the LEADER's, not
+    // a hard-coded 1, or its epoch-stamped messages are fenced out and the
+    // join stalls (the genesis `__admin__` group is epoch 0; a moved tenant
+    // is >1). `join_as_learner`: a learner doesn't campaign, so it follows
+    // the leader instead of deadlocking a high-term group.
     var enc = wire.encodeAttach(a, .{
         .tenant = tenant,
         .incarnation = bp.value.incarnation,
-        .baseline = .{ .index = bp.value.index, .term = bp.value.term },
         .epoch = bp.value.epoch,
         .join_as_learner = as_learner,
         .voters = bp.value.voters,
@@ -448,10 +456,10 @@ fn bootstrapMember(router: anytype, leader_url: []const u8, node_url: []const u8
         .peer_addrs = peer_addrs,
     }) catch return false;
     defer enc.deinit();
-    const ar = bc.call(router, node_url, "/_system/v2-attach", .POST, snap.body, enc.headers) catch return false;
+    const ar = bc.call(router, node_url, "/_system/v2-attach", .POST, "", enc.headers) catch return false;
     defer a.free(ar.body);
     if (ar.status != 204) return false;
-    std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={}, conf_state voters={any} learners={any})", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner, bp.value.voters, learners_buf[0..learners_len] });
+    std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} EMPTY (epoch {d}, learner={}, conf_state voters={any} learners={any}) — data arrives raft-natively (replication / streamed catch-up)", .{ tenant, node_url, bp.value.epoch, as_learner, bp.value.voters, learners_buf[0..learners_len] });
     return true;
 }
 
