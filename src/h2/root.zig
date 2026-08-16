@@ -2269,6 +2269,29 @@ pub fn H2(comptime opts: Options) type {
             }
         }
 
+        /// Every Server field `create` initializes by NAME (the collection
+        /// fields are covered by the `COLLECTIONS` inline-for instead). The
+        /// comptime check below walks the struct's real field list and
+        /// refuses to compile if any field is in neither set — because
+        /// `allocator.create` returns raw memory where field DEFAULTS never
+        /// apply, a field added to the struct but not to `create` would
+        /// otherwise ship uninitialized (silently correct under Debug's 0xAA
+        /// fill, garbage under ReleaseFast — the rove#574 KvStore class).
+        const CREATE_INITIALIZES = [_][]const u8{
+            "io",           "h2_opts",                        "reg",                  "allocator",
+            "recv_enobufs_total", "handshake_reaped_total",   "recv_enobufs_logged",  "recv_enobufs_last_logged_decade",
+            "recv_enobufs_low_outstanding_streak", "http_status_class", "http_status_notable", "body_sinks",
+        };
+        comptime {
+            @setEvalBranchQuota(100_000);
+            outer: for (@typeInfo(Self).@"struct".fields) |f| {
+                for (COLLECTIONS) |s| if (std.mem.eql(u8, s.name, f.name)) continue :outer;
+                for (CREATE_INITIALIZES) |n| if (std.mem.eql(u8, n, f.name)) continue :outer;
+                @compileError("h2 Server field '" ++ f.name ++ "' is not initialized by create() — " ++
+                    "assign it there AND add it to CREATE_INITIALIZES (create() memory takes no field defaults)");
+            }
+        }
+
         pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
             try ensureCallbacks();
 
