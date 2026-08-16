@@ -26,6 +26,12 @@ const curl = blob.curl;
 pub const TENANT = "x-rewind-tenant";
 pub const INCARNATION = "x-rewind-incarnation";
 pub const PLAN = "x-rewind-plan";
+/// RETIRED (with the buffered bundle path + the atomic baseline attach): a
+/// joiner is born EMPTY and its state arrives raft-natively — log
+/// replication, or the streamed catch-up whose END_STREAM install carries
+/// the baseline. The names are kept only so the decoder can REJECT a stale
+/// sender loudly instead of silently birthing a group it thinks is at a
+/// baseline it never installed.
 pub const BASELINE_INDEX = "x-rewind-baseline-index";
 pub const BASELINE_TERM = "x-rewind-baseline-term";
 pub const EPOCH = "x-rewind-epoch";
@@ -48,8 +54,6 @@ pub const INCARNATION_LEGACY = "legacy";
 /// fixed parse buffers. Clusters are small by construction (cold-multi).
 pub const MAX_MEMBER_IDS = 16;
 
-pub const Baseline = struct { index: u64, term: u64 };
-
 // ── v2-attach: envelope ───────────────────────────────────────────────
 
 /// Every field of the `/_system/v2-attach` envelope. The move secret is
@@ -65,9 +69,6 @@ pub const AttachEnvelope = struct {
     /// Opaque plan blob; rides provision/move attaches. Absent → receiver
     /// leaves the tenant on the free tier until a live push (non-fatal).
     plan: ?[]const u8 = null,
-    /// Reconciler bootstrap: create the group already AT this baseline
-    /// (atomic attach+install). Absent → plain attach (birth at 0).
-    baseline: ?Baseline = null,
     /// Birth epoch. Absent → receiver defaults to 1 (provision/move
     /// attaches don't send it).
     epoch: ?u64 = null,
@@ -75,8 +76,7 @@ pub const AttachEnvelope = struct {
     /// learner-first). Encoded only when true; absent → false.
     join_as_learner: bool = false,
     /// ConfState / birth-voter set (cluster node-set SSOT). Absent → the
-    /// receiver falls back to its env (`REWIND_VOTERS`) for a plain
-    /// attach, or membership-neutral for a baseline attach.
+    /// receiver falls back to its env (`REWIND_VOTERS`).
     voters: ?[]const u64 = null,
     learners: ?[]const u64 = null,
     /// Genesis §4d attach-carry: `id@addr,…` of the existing members so a
@@ -109,10 +109,6 @@ pub fn encodeAttach(gpa: std.mem.Allocator, env: AttachEnvelope) !EncodedAttach 
         .value = if (env.incarnation.len == 0) INCARNATION_LEGACY else env.incarnation,
     });
     if (env.plan) |p| try hs.append(a, .{ .name = PLAN, .value = p });
-    if (env.baseline) |b| {
-        try hs.append(a, .{ .name = BASELINE_INDEX, .value = try std.fmt.allocPrint(a, "{d}", .{b.index}) });
-        try hs.append(a, .{ .name = BASELINE_TERM, .value = try std.fmt.allocPrint(a, "{d}", .{b.term}) });
-    }
     if (env.epoch) |e|
         try hs.append(a, .{ .name = EPOCH, .value = try std.fmt.allocPrint(a, "{d}", .{e}) });
     if (env.join_as_learner)
@@ -130,14 +126,12 @@ pub fn encodeAttach(gpa: std.mem.Allocator, env: AttachEnvelope) !EncodedAttach 
 pub const AttachDecodeError = error{
     MissingTenant,
     MissingIncarnation,
-    MalformedBaselineIndex,
-    MalformedBaselineTerm,
-    /// index > 0 with term 0 — a term-0 baseline crashes raft's restore.
-    BaselineIndexWithoutTerm,
-    /// term > 0 with index 0/absent — no sender produces this; reject
-    /// rather than silently birth at last_index 0 (the crash window an
-    /// atomic baseline attach exists to close).
-    BaselineTermWithoutIndex,
+    /// A baseline header on an attach — the atomic baseline attach is
+    /// RETIRED (a joiner is born empty; the streamed catch-up installs the
+    /// baseline). A sender still sending one predates the retirement and
+    /// must fail loudly, not birth a group it believes is at a baseline
+    /// that was never installed.
+    BaselineRetired,
     MalformedEpoch,
     MalformedVoters,
     MalformedLearners,
@@ -152,7 +146,6 @@ pub const DecodedAttach = struct {
     /// `INCARNATION_LEGACY` is translated back here).
     incarnation: []const u8,
     plan: ?[]const u8,
-    baseline: ?Baseline,
     /// Header absent → 1 (provision/move attaches don't send it).
     epoch: u64,
     join_as_learner: bool,
@@ -178,24 +171,16 @@ pub const DecodedAttach = struct {
 /// THE attach decoder. `headers` is anything with
 /// `get(name: []const u8) ?[]const u8` (the worker wraps its h2 header
 /// lookup). Required fields error instead of defaulting; a malformed
-/// value NEVER collapses to "absent" — routing a reconciler bootstrap
-/// into the no-baseline birth path is the exact crash window the atomic
-/// baseline attach closes.
+/// value NEVER collapses to "absent" — and a RETIRED field (the baseline
+/// pair) is a loud decode error, never ignored: a sender still shipping it
+/// believes in an install that will not happen.
 pub fn decodeAttach(headers: anytype) AttachDecodeError!DecodedAttach {
     const tenant = headers.get(TENANT) orelse return error.MissingTenant;
     const inc_wire = headers.get(INCARNATION) orelse return error.MissingIncarnation;
     const incarnation = if (std.mem.eql(u8, inc_wire, INCARNATION_LEGACY)) "" else inc_wire;
 
-    const baseline_index: u64 = if (headers.get(BASELINE_INDEX)) |s|
-        std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch return error.MalformedBaselineIndex
-    else
-        0;
-    const baseline_term: u64 = if (headers.get(BASELINE_TERM)) |s|
-        std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch return error.MalformedBaselineTerm
-    else
-        0;
-    if (baseline_index > 0 and baseline_term == 0) return error.BaselineIndexWithoutTerm;
-    if (baseline_term > 0 and baseline_index == 0) return error.BaselineTermWithoutIndex;
+    if (headers.get(BASELINE_INDEX) != null or headers.get(BASELINE_TERM) != null)
+        return error.BaselineRetired;
 
     const epoch: u64 = if (headers.get(EPOCH)) |s|
         std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch return error.MalformedEpoch
@@ -211,7 +196,6 @@ pub fn decodeAttach(headers: anytype) AttachDecodeError!DecodedAttach {
         .tenant = tenant,
         .incarnation = incarnation,
         .plan = headers.get(PLAN),
-        .baseline = if (baseline_index > 0) .{ .index = baseline_index, .term = baseline_term } else null,
         .epoch = epoch,
         .join_as_learner = join_as_learner,
         .peer_addrs = headers.get(PEER_ADDRS),
@@ -234,10 +218,7 @@ pub fn attachDecodeMessage(e: AttachDecodeError) []const u8 {
     return switch (e) {
         error.MissingTenant => "missing " ++ TENANT ++ "\n",
         error.MissingIncarnation => "missing " ++ INCARNATION ++ " — required since rove#363; a legacy name-keyed tenant sends the value '" ++ INCARNATION_LEGACY ++ "', never an absent header\n",
-        error.MalformedBaselineIndex => "malformed " ++ BASELINE_INDEX ++ "\n",
-        error.MalformedBaselineTerm => "malformed " ++ BASELINE_TERM ++ "\n",
-        error.BaselineIndexWithoutTerm => "baseline index>0 requires a nonzero term\n",
-        error.BaselineTermWithoutIndex => "baseline term without an index\n",
+        error.BaselineRetired => "attach carries no baseline - a joiner is born empty and its state arrives raft-natively (v2-snapshot-stream / log replication)\n",
         error.MalformedEpoch => "malformed " ++ EPOCH ++ "\n",
         error.MalformedVoters => "malformed " ++ VOTERS ++ "\n",
         error.MalformedLearners => "malformed " ++ LEARNERS ++ "\n",
@@ -330,7 +311,6 @@ test "attach: encode→decode round-trips every field" {
         .tenant = "acme",
         .incarnation = "deadbeef01234567",
         .plan = "{\"tier\":\"pro\"}",
-        .baseline = .{ .index = 42, .term = 7 },
         .epoch = 3,
         .join_as_learner = true,
         .voters = &.{ 1, 2, 3 },
@@ -343,8 +323,6 @@ test "attach: encode→decode round-trips every field" {
     try testing.expectEqualStrings("acme", dec.tenant);
     try testing.expectEqualStrings("deadbeef01234567", dec.incarnation);
     try testing.expectEqualStrings("{\"tier\":\"pro\"}", dec.plan.?);
-    try testing.expectEqual(@as(u64, 42), dec.baseline.?.index);
-    try testing.expectEqual(@as(u64, 7), dec.baseline.?.term);
     try testing.expectEqual(@as(u64, 3), dec.epoch);
     try testing.expect(dec.join_as_learner);
     try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, dec.voters().?);
@@ -363,8 +341,26 @@ test "attach: legacy incarnation rides the wire as an explicit token" {
     const dec = try decodeAttach(fh);
     try testing.expectEqualStrings("", dec.incarnation);
     // Minimal attach carries nothing else.
-    try testing.expect(dec.plan == null and dec.baseline == null and dec.voters() == null);
+    try testing.expect(dec.plan == null and dec.voters() == null);
     try testing.expectEqual(@as(u64, 1), dec.epoch);
+}
+
+test "attach: a RETIRED baseline header is a loud decode error" {
+    // Either header alone suffices — a pre-retirement sender is refused
+    // before any instance/group side-effect, not silently birthed empty at a
+    // baseline it thinks was installed.
+    const base = [_]curl.Header{
+        .{ .name = TENANT, .value = "acme" },
+        .{ .name = INCARNATION, .value = INCARNATION_LEGACY },
+    };
+    {
+        const hdrs = base ++ [_]curl.Header{.{ .name = BASELINE_INDEX, .value = "42" }};
+        try testing.expectError(error.BaselineRetired, decodeAttach(FakeHeaders{ .entries = &hdrs }));
+    }
+    {
+        const hdrs = base ++ [_]curl.Header{.{ .name = BASELINE_TERM, .value = "7" }};
+        try testing.expectError(error.BaselineRetired, decodeAttach(FakeHeaders{ .entries = &hdrs }));
+    }
 }
 
 test "attach: an ABSENT incarnation header is a decode error, never legacy" {
@@ -380,17 +376,6 @@ test "attach: malformed values are errors, not absent-field fallbacks" {
         .{ .name = TENANT, .value = "acme" },
         .{ .name = INCARNATION, .value = INCARNATION_LEGACY },
     };
-    {
-        const hdrs = base ++ [_]curl.Header{.{ .name = BASELINE_INDEX, .value = "not-a-number" }};
-        try testing.expectError(error.MalformedBaselineIndex, decodeAttach(FakeHeaders{ .entries = &hdrs }));
-    }
-    {
-        const hdrs = base ++ [_]curl.Header{
-            .{ .name = BASELINE_INDEX, .value = "5" },
-            .{ .name = BASELINE_TERM, .value = "0" },
-        };
-        try testing.expectError(error.BaselineIndexWithoutTerm, decodeAttach(FakeHeaders{ .entries = &hdrs }));
-    }
     {
         const hdrs = base ++ [_]curl.Header{.{ .name = VOTERS, .value = "1,x" }};
         try testing.expectError(error.MalformedVoters, decodeAttach(FakeHeaders{ .entries = &hdrs }));
