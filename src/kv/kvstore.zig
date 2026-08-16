@@ -374,16 +374,26 @@ pub const KvStore = struct {
             };
         }
 
-        self.allocator = allocator;
-        self.manifest = manifest;
-        self.store_id = store_id;
-        self.owned = null;
-        self.active_txn = null;
-        self.usage_cached_bytes = .init(0);
-        self.usage_cached_at_ms = .init(0);
+        // Struct-LITERAL init, never field-by-field: `allocator.create` gives
+        // raw memory where field defaults do NOT apply, so a piecemeal init
+        // silently skips any field it doesn't name — the `storedBytesCached`
+        // TTL cache shipped uninitialized exactly that way, and ReleaseFast
+        // heap residue read as a "fresh" cache of garbage bytes the storage
+        // quota then enforced (Debug's 0xAA fill happens to read as a
+        // never-refreshed timestamp, hiding it). A literal makes an unnamed
+        // defaulted field take its default and an unnamed non-defaulted field
+        // a compile error. `counter` may point INTO `self`, so it is fixed up
+        // after the literal lands.
+        self.* = .{
+            .allocator = allocator,
+            .manifest = manifest,
+            .store_id = store_id,
+            .owned = null,
+            .counter = undefined,
+            .owned_counter = null,
+        };
         if (shared_counter) |sc| {
             self.counter = sc;
-            self.owned_counter = null;
         } else {
             self.owned_counter = SeqCounter.init(0);
             self.counter = &self.owned_counter.?;
@@ -452,16 +462,18 @@ pub const KvStore = struct {
             }
         }
 
-        self.allocator = allocator;
-        self.manifest = &stack.manifest;
-        self.store_id = store_id;
-        self.owned = stack;
-        self.active_txn = null;
-        self.usage_cached_bytes = .init(0);
-        self.usage_cached_at_ms = .init(0);
+        // Struct-literal init — see `attach` for why field-by-field init
+        // after `allocator.create` is the uninitialized-field trap.
+        self.* = .{
+            .allocator = allocator,
+            .manifest = &stack.manifest,
+            .store_id = store_id,
+            .owned = stack,
+            .counter = undefined,
+            .owned_counter = null,
+        };
         if (shared_counter) |sc| {
             self.counter = sc;
-            self.owned_counter = null;
         } else {
             self.owned_counter = SeqCounter.init(0);
             self.counter = &self.owned_counter.?;
@@ -1604,6 +1616,33 @@ test "attached vacuumInto round-trips data via standalone re-open" {
     const v2 = try dst.get("counter");
     defer a.free(v2);
     try testing.expectEqualStrings("42", v2);
+}
+
+test "every creation path leaves the TTL caches at their never-refreshed defaults" {
+    // Guards the init CLASS, not just these four fields: `allocator.create`
+    // returns raw memory (field defaults never apply), so an init that missed
+    // a field shipped an uninitialized TTL cache — Debug's 0xAA fill reads as
+    // a negative `at_ms` (cache miss → correct scan → invisible), while
+    // ReleaseFast heap residue reads as a FRESH cache of garbage bytes that
+    // the storage quota then enforced against real tenants. Under Debug this
+    // test sees the 0xAA fill directly: a skipped field is `!= 0` here.
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+    try testing.expectEqual(@as(u64, 0), kv.usage_cached_bytes.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), kv.usage_cached_at_ms.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), kv.stored_cached_bytes.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), kv.stored_cached_at_ms.load(.monotonic));
+
+    const att = try KvStore.attach(testing.allocator, kv.manifest, 7, null);
+    defer att.close();
+    try testing.expectEqual(@as(u64, 0), att.usage_cached_bytes.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), att.usage_cached_at_ms.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), att.stored_cached_bytes.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), att.stored_cached_at_ms.load(.monotonic));
 }
 
 test "lastAppliedRaftIdx round-trips through manifest" {
