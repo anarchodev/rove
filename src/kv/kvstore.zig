@@ -445,7 +445,10 @@ pub const KvStore = struct {
 
         const path_owned = allocator.dupeZ(u8, path) catch return Error.OutOfMemory;
         errdefer allocator.free(path_owned);
-        stack.path = path_owned;
+        // Struct-literal init (the rove#574 class — `create` memory takes no
+        // field defaults); `manifest` is `undefined` in the literal only
+        // because kvexp's member `init` fills it in place on the next line.
+        stack.* = .{ .path = path_owned, .manifest = undefined };
         stack.manifest.init(allocator, path_owned, .{
             .max_map_size = map_size,
         }) catch return Error.Sqlite;

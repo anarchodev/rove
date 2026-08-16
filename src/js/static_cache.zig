@@ -114,11 +114,16 @@ pub const StaticCache = struct {
 
         const e = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(e);
-        @memcpy(&e.hash_hex, hash_hex[0..HASH_HEX_LEN]);
-        e.bytes = try self.allocator.dupe(u8, bytes);
+        // Struct-literal init: `create` returns raw memory where field
+        // defaults never apply, so a piecemeal init silently skips any field
+        // it doesn't name (the KvStore TTL-cache class, rove#574). A literal
+        // makes a skipped defaulted field take its default and a skipped
+        // non-defaulted field a compile error.
+        e.* = .{
+            .hash_hex = hash_hex[0..HASH_HEX_LEN].*,
+            .bytes = try self.allocator.dupe(u8, bytes),
+        };
         errdefer self.allocator.free(e.bytes);
-        e.prev = null;
-        e.next = null;
 
         // Key is the entry's own hash_hex — stable for the entry's life,
         // and removed from the map before the entry is freed.

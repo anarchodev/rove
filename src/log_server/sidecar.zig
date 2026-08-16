@@ -148,16 +148,25 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
     };
     if (v != @as(i64, VERSION)) return ParseError.InvalidVersion;
 
-    var out: IdxFile = undefined;
-    out.node_id = try dupeStr(allocator, obj, "node_id");
-    errdefer allocator.free(out.node_id);
-    out.batch_id = try dupeStr(allocator, obj, "batch_id");
-    errdefer allocator.free(out.batch_id);
-    out.ndjson_size = try getInt(obj, "ndjson_size");
-    out.ndjson_sha256 = try dupeStr(allocator, obj, "ndjson_sha256");
-    errdefer allocator.free(out.ndjson_sha256);
-    out.first_received_ns = @intCast(try getInt(obj, "first_received_ns"));
-    out.last_received_ns = @intCast(try getInt(obj, "last_received_ns"));
+    // Struct-LITERAL init, never `undefined` + field-by-field (the rove#574
+    // class): with a literal, a field added to `IdxFile` that this parser
+    // doesn't fill is a compile error here, not garbage handed to the
+    // indexer. The owned strings are built first so each keeps its errdefer.
+    const node_id = try dupeStr(allocator, obj, "node_id");
+    errdefer allocator.free(node_id);
+    const batch_id = try dupeStr(allocator, obj, "batch_id");
+    errdefer allocator.free(batch_id);
+    const ndjson_sha256 = try dupeStr(allocator, obj, "ndjson_sha256");
+    errdefer allocator.free(ndjson_sha256);
+    var out: IdxFile = .{
+        .node_id = node_id,
+        .batch_id = batch_id,
+        .ndjson_size = try getInt(obj, "ndjson_size"),
+        .ndjson_sha256 = ndjson_sha256,
+        .first_received_ns = @intCast(try getInt(obj, "first_received_ns")),
+        .last_received_ns = @intCast(try getInt(obj, "last_received_ns")),
+        .records = &.{},
+    };
 
     const records_val = obj.get("records") orelse return ParseError.MissingField;
     const records_arr = switch (records_val) {
