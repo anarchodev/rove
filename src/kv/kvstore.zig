@@ -201,7 +201,17 @@ const STANDALONE_MAP_SIZE: usize = 1 * 1024 * 1024 * 1024;
 /// drive — a map larger than free disk trades `MDB_MAP_FULL` for `ENOSPC`,
 /// which takes the raft WAL and the log spool down with it rather than just
 /// refusing a write.
-pub const CLUSTER_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024;
+///
+/// 512 GiB is sized against the production nodes' ~878 GB drives so the map
+/// still binds FIRST, with ~330 GB of margin left for the env's disk
+/// neighbors (raft log segments, the sqlite log index, the OS) even through
+/// a compaction stall. At the launch tiers (2 GiB enterprise kv,
+/// `rove-plan`) this is ~250 maxed tenants per cluster — the map is no
+/// longer what ever binds in practice; per-tenant metering, disk gauges
+/// (rove#472), and the zero-downtime move are the operating controls. A
+/// dedicated-cluster deployment on bigger drives raises this with its
+/// hardware.
+pub const CLUSTER_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
 
 /// Reserved store_id for standalone-mode KvStores. The file holds
 /// exactly one store (this caller's data).
