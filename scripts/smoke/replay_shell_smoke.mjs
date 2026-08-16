@@ -444,21 +444,30 @@ async function checkPopulatedState(ctx) {
     if (sweepOk) ok("step-back sweep: every stop on bundle code with one highlighted line");
     else         bad("step-back sweep left bundle code: " + sweepWhy);
 
-    // Drag into the run's tail — the close region, where only engine
-    // frames execute. The highlight stays on the innermost bundle
-    // frame instead of going blank.
+    // Drag to the rail's far end. The rail is in customer-event space
+    // (raw space would compress the handler's run into a sliver where a
+    // single line is sub-pixel), so the end of the rail is the LAST
+    // thing the handler executed — for this fixture, its `return` line.
+    // The highlight must be there, not blank on the engine wind-down.
+    const returnLine = FIXTURE.modules[0].source.split("\n")
+        .findIndex((l) => l.includes("return compute")) + 1;
+    if (returnLine < 1) throw new Error("fixture lost its `return compute` line");
     if (scrubberBox) {
         const y2 = scrubberBox.y + scrubberBox.height / 2;
         await popup.mouse.move(scrubberBox.x + scrubberBox.width * 0.5, y2);
         await popup.mouse.down();
-        await popup.mouse.move(scrubberBox.x + scrubberBox.width * 0.96, y2, { steps: 6 });
+        await popup.mouse.move(scrubberBox.x + scrubberBox.width - 1, y2, { steps: 6 });
         await popup.mouse.up();
         const hdrTail = (await popup.locator("#source-header").innerText()).trim();
         const hlTail = await popup.locator(".code__body .line.is-current").count();
         if (/\.mjs/.test(hdrTail) && !hdrTail.includes("<arena-base>") && hlTail === 1)
-            ok("engine-tail drag keeps the source pane on bundle code: " + JSON.stringify(hdrTail));
+            ok("rail-end drag keeps the source pane on bundle code: " + JSON.stringify(hdrTail));
         else
-            bad(`engine-tail drag left bundle code: ${JSON.stringify(hdrTail)} (${hlTail} highlighted)`);
+            bad(`rail-end drag left bundle code: ${JSON.stringify(hdrTail)} (${hlTail} highlighted)`);
+        if (hdrTail.endsWith("line " + returnLine))
+            ok(`rail-end drag reaches the handler's return (line ${returnLine})`);
+        else
+            bad(`rail end is not the return line ${returnLine}: ${JSON.stringify(hdrTail)}`);
     }
 
     // Module-click navigation: clicking a non-current module in the
