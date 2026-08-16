@@ -50,7 +50,7 @@ nobody re-ran:
 | 2026-06-28 | `web/` extracted to the rewind-apps repo | smokes reading `web/…` in-repo |
 | 2026-07-05 | `name:` → `on:` resume-export key | smokes passing the retired spelling |
 | 2026-07-28 | 12 ambient libs became `@rewind/*` packages | fixtures using `oidc.` / `schedule.` / … as globals |
-| — | `v2-bundle` → `v2-snapshot`; pause/resume dropped when the dump went non-quiescing | a door that 404s |
+| — | `v2-bundle` → `v2-snapshot` → the streamed doors (`v2-snapshot-push`/`-stream`); the buffered bundle path deleted (rove#568) | a door that 404s |
 | — | plan tiers `email_*` → `outbound_*`; `email.send`'s `key` → `apiKey` | `None` where a number was expected |
 | — | the cert frame gained a leading version byte | an unpacker returning None, read as "certs are broken" |
 | — | `stream.write` became lossless (soft cap = back-pressure, hard cap throws) | a smoke that required drops, i.e. required data loss |
@@ -169,5 +169,5 @@ stripped, and a green summary must not paper over that.
   segment from the product; guessing the layout is how several of these smokes
   started 404ing.
 - Simulating the CP means sending what the CP sends. Use
-  `smoke_lib_v2.attach_bundle` rather than a private copy of the attach
+  `smoke_lib_v2.attach_join` rather than a private copy of the attach
   contract — four smokes each had their own, so a new header landed in none.

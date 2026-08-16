@@ -12,9 +12,9 @@ here; this is the cluster-to-cluster forwarding mechanism in isolation.
     dest    → rewind    (acquiring: holds the group + applies forwards)
 
 Legs:
-  A.  seed key1 on the source; snapshot it onto the dest (bundle→attach→
-      resume — the dest now holds the group + the snapshot; the source's
-      brief quiesce is lifted immediately and it serves again).
+  A.  seed key1 on the source; attach the dest EMPTY, then STREAM the
+      snapshot onto it (`v2-snapshot-push`, merge mode — the real move
+      mechanism; the source never stops serving).
   B.  open the overlap: `v2-forward-begin` on the source (dest = ).
   C.  write key2 + key3 on the SOURCE → each is committed locally AND
       forwarded → both appear on the DEST, while the source still serves
@@ -122,30 +122,29 @@ def post(port, suffix, payload):
     ])
 
 
-def bundle(port):
-    """v2-snapshot returns the raw snapshot bytes; capture to a temp file."""
-    path = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), f"fwd-bundle-{os.getpid()}.bin")
-    rc = subprocess.run(
-        ["curl", "-s", "-o", path, "-w", "%{http_code}", "-m", "15",
-         "--http2-prior-knowledge", "-X", "POST",
-         f"http://127.0.0.1:{port}/_system/v2-snapshot",
-         "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
-         "-H", "Content-Type: application/json",
-         "--data", f'{{"tenant":"{TENANT}"}}'],
-        capture_output=True, text=True,
-    )
-    return (rc.stdout.strip(), path)
-
-
-def attach(port, bundle_path):
+def attach_empty(port):
+    """EMPTY attach — forms the group + instance; the state arrives via the
+    streamed push (`v2-snapshot-push`, the real move mechanism)."""
     return subprocess.run(
         ["curl", "-s", "-w", "%{http_code}", "-m", "15", "--http2-prior-knowledge",
          "-X", "POST", f"http://127.0.0.1:{port}/_system/v2-attach",
          "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
          "-H", f"X-Rewind-Tenant: {TENANT}",
          # Required header (rove#363 class 3); name-keyed harness tenant.
-         "-H", "X-Rewind-Incarnation: legacy",
-         "--data-binary", f"@{bundle_path}"],
+         "-H", "X-Rewind-Incarnation: legacy"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def snapshot_push(src_port, dest_port):
+    """Source-side streamed push to the dest (merge mode — insert-if-absent)."""
+    return subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "60",
+         "--http2-prior-knowledge", "-X", "POST",
+         f"http://127.0.0.1:{src_port}/_system/v2-snapshot-push",
+         "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
+         "-H", f"X-Rewind-Tenant: {TENANT}",
+         "-H", f"X-Rewind-Dest: http://127.0.0.1:{dest_port}"],
         capture_output=True, text=True,
     ).stdout.strip()
 
@@ -194,20 +193,17 @@ def main():
         spawn("src", PSRC, dsrc)
         spawn("dst", PDST, ddst)
 
-        # ── A. seed + snapshot onto the dest ──────────────────────────
-        print("leg A: seed key1 on source, snapshot onto dest")
+        # ── A. seed + stream the snapshot onto the dest ───────────────
+        print("leg A: seed key1 on source; attach dest EMPTY; stream the snapshot")
         check("PUT src key1", kv_put(PSRC, "key1", "v1"), 204)
-        # Confirm the write is visible before snapshotting it — the bundle is
-        # a snapshot read, and dumping in the same instant as the commit can
+        # Confirm the write is visible before streaming it — the dump is a
+        # snapshot read, and dumping in the same instant as the commit can
         # race to an empty snapshot.
         check("source read-back key1", kv_get(PSRC, "key1"), (200, "v1"))
-        code, bpath = bundle(PSRC)
-        check("v2-snapshot src", code, "200")
-        check("v2-attach dst", attach(PDST, bpath), "204")
-        # No resume step: `v2-snapshot` is a NON-QUIESCING consistent dump, so
-        # the source never stopped serving and has nothing to resume.
+        check("v2-attach dst (EMPTY)", attach_empty(PDST), "204")
+        check("v2-snapshot-push src → dst (merge)", snapshot_push(PSRC, PDST), "204")
         st, body = kv_get(PDST, "key1")
-        check("dest has snapshot key1", (st, body), (200, "v1"))
+        check("dest has streamed key1", (st, body), (200, "v1"))
 
         # ── B. open the overlap ───────────────────────────────────────
         print("leg B: v2-forward-begin on source (dest = :%d)" % PDST)

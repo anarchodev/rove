@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
-"""V2 conf_change Phase-2 smoke — out-of-band PROMOTE-BACK of a below-floor learner.
+"""V2 promote-back smoke — a below-floor learner heals via the AUTO catch-up.
 
-The hard half of Phase 2. A voter demoted to a learner falls BELOW the
-voters-only WAL-compaction floor (the point of demoting — the floor advances
-past it so the leader compacts). When that node returns it can NOT catch up by
-replication (the leader truncated the entries it needs) and rove has no
-in-protocol snapshot transport — its leader-side Progress is stuck forever.
+A voter demoted to a learner falls BELOW the WAL-compaction floor (the point
+of demoting — the floor advances past it so the leader compacts; the grace is
+forced LOW here so the churn genuinely truncates past it). When that node
+returns it can NOT catch up by replication (the leader truncated the entries
+it needs). The recovery is the streamed snapshot catch-up, fully automatic:
+the leader's trigger detects the below-floor peer, streams its store to the
+peer's `v2-snapshot-stream` in REPLACE mode (every stale pair cleared — a key
+the cluster deleted while the learner was gone must NOT survive as a phantom)
+with the data-free baseline + ConfState in headers, and the peer installs at
+END_STREAM. Then `v2-confchange{promote}` brings it back to a voter and a
+FRESH write must replicate to it.
 
-Promote-back rejoins it out-of-band, leader never sending a snapshot:
-  GET  v2-applied-baseline (leader) → {index X, term T}
-  GET  v2-snapshot         (leader) → a store bundle (⊇ X), saved to a file
-  POST v2-load-replace     (learner) → overwrite-load the bundle (store ← fresh)
-  POST v2-apply-snapshot   (learner, {index:X, term:T}) → install a DATA-FREE raft
-       baseline at X locally → the leader can now replicate the tail (> X)
-  POST v2-confchange{promote} (leader) → back to a voter
-Then a FRESH write must replicate to the rejoined node — proving the raft
-handshake (not just the bundle) brought it back as a productive voter.
+The crash-in-window leg: the raft baseline is in the WAL and the streamed
+data is in LMDB, but the store watermark may lag. A crash right after the
+rejoin must recover cleanly (raft drives applied from the WAL compaction
+marker, not the store watermark) — no applied>committed panic, no
+compacted-gap, data intact.
 
-Setup forces the below-floor condition deterministically: demote node 3, STOP
-it, advance + compact the log well past its frozen match, then restart it.
+Setup forces the below-floor condition deterministically: demote a follower,
+STOP it, advance + compact the log well past its frozen match, restart it.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Build: `zig build rewind rewind-cp rewind-front files-server-v2`
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
+
+# Force mechanism-A compaction past the churned writes (floor = durabilized −
+# grace), so the returning learner is GENUINELY below the floor and only the
+# streamed catch-up can recover it.
+os.environ["REWIND_SNAPSHOT_GRACE"] = "20"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
@@ -67,21 +73,6 @@ def _curl_json(url, *, method="GET", data=None, tenant=None):
     nl = out.rfind("\n")
     return int(out[nl + 1:].strip() or 0), out[:nl]
 
-
-def _curl_to_file(url, path, *, data=None):
-    args = ["curl", "-s", "-o", path, "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET]
-    if data is not None:
-        args += ["-H", "Content-Type: application/json", "--data", data]
-    args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
-
-
-def _curl_from_file(url, path, *, tenant):
-    args = ["curl", "-s", "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET,
-            "-H", f"X-Rewind-Tenant: {tenant}", "--data-binary", f"@{path}", url]
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
 def main() -> int:
@@ -170,47 +161,37 @@ def main() -> int:
         c.start_node(victim)
         cs = wait_membership(victim, vnid, learner=True, deadline_s=30.0)
         check(f"node {vnid} back as a learner", cs is not None and vnid in cs["learners"], f"cs={cs}")
-        # ⭐ It must be STUCK: replication alone cannot fix a below-floor learner,
-        # so its store stays stale for a while.
-        stuck = True
-        for _ in range(12):  # ~6s
+
+        print(f"step 6: ⭐ the AUTO catch-up streams the store onto the below-floor learner")
+        healed = False
+        for _ in range(80):  # ~40s — trigger ≤100ms; dump+stream is the tail
+            # Keep the group AWAKE on the live nodes: the trigger scans only the
+            # active set, so a fully idle tenant's leader hibernates and the
+            # heal waits for the victim's leaderless escalation (~40s) instead.
+            # Production tenants have traffic; model it (a v2-kv GET nudges the
+            # group awake on the node it lands on).
+            for n in range(3):
+                if n != victim:
+                    c.admin_kv_get("acme", KEY, node=n)
             rg = c.admin_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and latest in rg.body:
-                stuck = False
+                healed = True
                 break
             time.sleep(0.5)
-        check("victim STUCK below floor (replication alone can't catch up)", stuck,
-              "would-be false positive if plain replication caught it up")
-
-        print("step 6: promote-back — pull baseline + bundle from the leader")
-        lead = c.leader_node("acme")
-        st, body = _curl_json(url(lead, "v2-applied-baseline?tenant=acme"))
-        check("applied-baseline → 200", st == 200, f"got {st} {body!r}")
-        base = json.loads(body) if st == 200 else {"index": 0, "term": 0}
-        print(f"       baseline index={base['index']} term={base['term']}")
-        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
-            bpath = tf.name
-        code = _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}')
-        check("snapshot bundle → 200", code == "200", f"got {code}")
-
-        print("step 7: load-replace into the victim + install the raft baseline")
-        code = _curl_from_file(url(victim, "v2-load-replace"), bpath, tenant="acme")
-        check("load-replace → 204", code == "204", f"got {code}")
-        st, body = _curl_json(url(victim, "v2-apply-snapshot"), method="POST",
-                              data=json.dumps({"tenant": "acme", "index": base["index"], "term": base["term"]}))
-        check("apply-snapshot → 204", st == 204, f"got {st} {body!r}")
+        check(f"⭐ node {vnid} auto-caught-up to the latest value (streamed replace)", healed)
 
         print("step 8: promote the victim back to a voter")
+        lead = c.leader_node("acme")
         check("promote → 204", confchange(lead, vnid, "promote") == 204)
         cs = wait_membership(lead, vnid, learner=False)
         check(f"node {vnid} is a voter again", cs is not None and vnid in cs["voters"], f"cs={cs}")
 
         print("step 8b: ⭐ CRASH the victim in the rejoin window (before any heal write)")
-        # The raft baseline is in the WAL, the bundle data is in LMDB, but the
+        # The raft baseline is in the WAL, the streamed data is in LMDB, but the
         # store watermark may still be stale. Recovery must reconcile (raft drives
         # applied from the WAL compaction marker, not the store watermark) — no
         # applied>committed panic, no compacted-gap. Restart and confirm it's
-        # back as a voter member that still holds the bundle data.
+        # back as a voter member that still holds the streamed data.
         # Confirm the victim itself persisted the promote first, so the crash
         # lands AFTER the rejoin completed but BEFORE any healing write.
         check("victim sees itself a voter pre-crash",
@@ -222,11 +203,11 @@ def main() -> int:
         check(f"node {vnid} recovered as a voter after a rejoin-window crash",
               cs is not None and vnid in cs["voters"], f"cs={cs}")
         rg = c.admin_kv_get("acme", KEY, node=victim)
-        check("recovered victim still holds the bundle data", rg.status == 200 and latest in rg.body,
+        check("recovered victim still holds the streamed data", rg.status == 200 and latest in rg.body,
               f"got {rg.status} {rg.body!r}")
 
         print("step 9: ⭐ a FRESH write replicates to the rejoined voter")
-        # Historical state came via the bundle; this proves the raft handshake —
+        # Historical state came via the streamed catch-up; this proves the raft handshake —
         # the leader replicates a NEW entry (> baseline) and the victim applies it.
         c.request_retry("acme", "/?fn=handler", method="POST",
                         data='{"value":"after-rejoin"}', want_status=204, deadline_s=15)
@@ -250,8 +231,8 @@ def main() -> int:
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print("\nPASS promote-back smoke (v2) — a below-floor learner rejoined out-of-band "
-          "(bundle + data-free local snapshot baseline), was promoted back to a voter, "
+    print("\nPASS promote-back smoke (v2) — a below-floor learner was healed by the AUTO "
+          "streamed catch-up (replace + data-free baseline), was promoted back to a voter, "
           "and a fresh write replicated to it from the leader's log. ⭐")
     return 0
 

@@ -24,13 +24,14 @@ pub fn clusterVoterIds(a: std.mem.Allocator, n: usize) ![]u64 {
     return ids;
 }
 
-/// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`, plus the tenant's
-/// `X-Rewind-Plan` blob when set) out to every destination node. The plan
-/// rides attach so the destination enforces the right limits from the first
-/// post-move request (CP operational-state model,
-/// docs/architecture/control-plane.md). True only if all returned 204
-/// (idempotent re-attach included). On the first failure returns false; the
-/// caller evicts the partially-attached set.
+/// Fan an EMPTY `/_system/v2-attach` (`X-Rewind-Tenant`, plus the tenant's
+/// `X-Rewind-Plan` blob when set) out to every destination node — attach
+/// forms the group + instance with no data; state arrives via the streamed
+/// snapshot push / log replication. The plan rides attach so the destination
+/// enforces the right limits from the first post-move request (CP
+/// operational-state model, docs/architecture/control-plane.md). True only if
+/// all returned 204 (idempotent re-attach included). On the first failure
+/// returns false; the caller evicts the partially-attached set.
 ///
 /// `incarnation` is the tenant's storage incarnation (#357) in MARKER
 /// spelling: every node must key the tenant's storage identically, so EVERY
@@ -43,7 +44,7 @@ pub fn clusterVoterIds(a: std.mem.Allocator, n: usize) ![]u64 {
 /// born group forms with — the SAME set for every node, so the group forms
 /// consistently without depending on each node's static `REWIND_VOTERS`.
 /// Null → the node falls back to its env.
-pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u64, incarnation: []const u8) bool {
+pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u64, incarnation: []const u8) bool {
     const a = router.allocator;
     var enc = wire.encodeAttach(a, .{
         .tenant = tenant,
@@ -53,7 +54,7 @@ pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, bundle: []co
     }) catch return false;
     defer enc.deinit();
     for (dest_nodes) |base| {
-        const resp = bc.call(router, base, "/_system/v2-attach", .POST, bundle, enc.headers) catch |err| {
+        const resp = bc.call(router, base, "/_system/v2-attach", .POST, "", enc.headers) catch |err| {
             std.log.warn("rewind-cp: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
             return false;
         };

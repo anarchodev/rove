@@ -20,7 +20,8 @@ Sequence:
   1. provision acme [1,2,3], deploy, seed; CHURN the term (kill/restart leaders).
   2. remove node 3 (-> [1,2]) + evict its instance: node 3 is now a clean non-member.
   3. AddLearner(3) on the leader (-> voters[1,2] learners[3]).
-  4. bootstrap node 3 with X-Rewind-Join-As-Learner: 1 (atomic baseline attach).
+  4. attach node 3 EMPTY with X-Rewind-Join-As-Learner: 1 (no bundle, no
+     baseline — the data arrives by replication once the leader reaches it).
   5. ⭐ ASSERT node 3's LOCAL confstate == voters[1,2] learners[3] (BORN LEARNER;
      a born-voter would be [1,2,3] and deadlock).
   6. node 3 catches up (no deadlock); promote(3) -> [1,2,3]; fresh write replicates.
@@ -33,12 +34,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_join  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -67,15 +67,6 @@ def _curl_json(url, *, method="GET", data=None, headers=()):
     out = subprocess.run(args, capture_output=True, text=True).stdout
     nl = out.rfind("\n")
     return int(out[nl + 1:].strip() or 0), out[:nl]
-
-
-def _curl_to_file(url, path, *, data=None):
-    args = ["curl", "-s", "-o", path, "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET]
-    if data is not None:
-        args += ["-H", "Content-Type: application/json", "--data", data]
-    args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
 def main() -> int:
@@ -150,19 +141,15 @@ def main() -> int:
         check(f"leader sees node {vnid} as a LEARNER", cs_lead is not None and vnid in cs_lead.get("learners", []),
               f"cs={cs_lead}")
 
-        print(f"step 4: bootstrap node {vnid} as a BORN LEARNER (atomic baseline attach)")
+        print(f"step 4: attach node {vnid} EMPTY as a BORN LEARNER")
         st, body = _curl_json(url(lead, "v2-applied-baseline?tenant=acme"))
         check("applied-baseline → 200", st == 200, f"got {st} {body!r}")
-        base = json.loads(body) if st == 200 else {"index": 0, "term": 0}
-        print(f"       baseline index={base['index']} term={base['term']}")
-        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
-            bpath = tf.name
-        check("snapshot bundle → 200", _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
+        base = json.loads(body) if st == 200 else {}
         check("attach (join-as-learner) → 204",
-              attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
-                            index=base["index"], term=base["term"],
-                            incarnation=base.get("incarnation", ""),
-                            as_learner=True) == "204")
+              attach_join(url(victim, "v2-attach"), tenant="acme",
+                          epoch=base.get("epoch"),
+                          incarnation=base.get("incarnation", ""),
+                          as_learner=True) == "204")
 
         print(f"step 5: ⭐ node {vnid}'s LOCAL confstate must NOT list it as a voter (BORN LEARNER, not [1,2,3])")
         # The anti-deadlock property is that the joining node is NOT born a VOTER:

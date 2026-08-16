@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """V2 membership-from-snapshot smoke — a joiner learns its membership from the
-baseline's ConfState, not the static REWIND_VOTERS (raft-native-alignment Phase 2d).
+join envelope's ConfState, not the static REWIND_VOTERS.
 
-raft-rs `restore` rebuilds a group's membership from the snapshot's ConfState
-(`raft.rs:2629`), and DISCARDS a snapshot whose ConfState omits the recipient
-(`raft.rs:2581`). Phase 2c/2d make `apply_local_snapshot` carry an optional
-caller-supplied ConfState (the source leader's, read consistently from the
-extended `v2-applied-baseline`) and `v2-attach` forward it as `X-Rewind-Voters` /
-`X-Rewind-Learners`, so a joining node adopts the real membership from the
-snapshot instead of a static env voter set.
+raft-rs `restore` rebuilds a group's membership from a snapshot's ConfState
+(`raft.rs:2629`), and DISCARDS one whose ConfState omits the recipient
+(`raft.rs:2581`). rove applies the same rule at both membership carriers: the
+EMPTY attach births the envelope's exact {voters, learners} (self included, or
+the birth is refused — the -6 guard), and the streamed catch-up's baseline
+install adopts the ConfState riding the stream headers. This smoke gates the
+attach half on a hand-rolled join.
 
 Sequence:
   1. provision acme [1,2,3], deploy, seed.
   2. remove a follower from the group + evict it → a clean non-member.
   3. AddLearner(victim) on the leader → its ConfState now lists victim as a learner.
-  4. ⭐ v2-applied-baseline returns {index, term, epoch, voters, learners} in ONE
+  4. ⭐ v2-applied-baseline returns {epoch, voters, learners, incarnation} in ONE
      read (closes the index-vs-confstate TOCTOU); victim is in learners.
-  5. ⭐ attach with a ConfState that OMITS victim → 409 (the -6 guard enforces
-     raft.rs:2581). This is the distinguisher: WITHOUT 2d the headers are ignored
-     and the attach 204s via the static born-learner path.
-  6. attach with the correct ConfState (from the baseline) → 204.
+  5. ⭐ attach EMPTY with a ConfState that OMITS victim → 409 (the -6 guard,
+     raft.rs:2581's rule enforced at birth, before the group half-forms).
+  6. attach EMPTY with the correct ConfState (from the baseline) → 204.
   7. ⭐ victim's LOCAL ConfState now equals the leader's — it learned membership
-     from the snapshot. Promote it; a fresh write replicates.
+     from the join envelope. Promote it; a fresh write replicates.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -31,12 +30,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_join  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -63,15 +61,6 @@ def _curl_json(url, *, method="GET", data=None):
     out = subprocess.run(args, capture_output=True, text=True).stdout
     nl = out.rfind("\n")
     return int(out[nl + 1:].strip() or 0), out[:nl]
-
-
-def _curl_to_file(url, path, *, data=None):
-    args = ["curl", "-s", "-o", path, "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET]
-    if data is not None:
-        args += ["-H", "Content-Type: application/json", "--data", data]
-    args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
 def main() -> int:
@@ -139,26 +128,22 @@ def main() -> int:
               "voters" in base and "learners" in base, f"base={base}")
         check(f"⭐ baseline learners include node {vnid} (consistent read)",
               vnid in base.get("learners", []), f"base={base}")
-        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
-            bpath = tf.name
-        check("snapshot bundle → 200",
-              _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
 
-        print(f"step 5: ⭐ attach with a ConfState OMITTING node {vnid} → 409 (the -6 guard)")
-        rc = attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
-                           index=base["index"], term=base["term"], epoch=base.get("epoch", 1),
-                           incarnation=base.get("incarnation", ""), as_learner=True,
-                           voters=base["voters"], learners=[],  # victim deliberately omitted
-                           discard_body=True)
-        check("⭐ attach with self-omitting ConfState → 409 (membership is read + enforced; "
-              "pre-2d this 204s via the static path)", rc == "409", f"got {rc}")
+        print(f"step 5: ⭐ attach EMPTY with a ConfState OMITTING node {vnid} → 409 (the -6 guard)")
+        rc = attach_join(url(victim, "v2-attach"), tenant="acme",
+                         epoch=base.get("epoch", 1),
+                         incarnation=base.get("incarnation", ""), as_learner=True,
+                         voters=base["voters"], learners=[],  # victim deliberately omitted
+                         discard_body=True)
+        check("⭐ attach with self-omitting ConfState → 409 (membership is read + enforced "
+              "at birth, before the group half-forms)", rc == "409", f"got {rc}")
 
-        print(f"step 6: attach with the correct ConfState (from the baseline) → 204")
-        rc = attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
-                           index=base["index"], term=base["term"], epoch=base.get("epoch", 1),
-                           incarnation=base.get("incarnation", ""), as_learner=True,
-                           voters=base["voters"], learners=base["learners"],
-                           discard_body=True)
+        print(f"step 6: attach EMPTY with the correct ConfState (from the baseline) → 204")
+        rc = attach_join(url(victim, "v2-attach"), tenant="acme",
+                         epoch=base.get("epoch", 1),
+                         incarnation=base.get("incarnation", ""), as_learner=True,
+                         voters=base["voters"], learners=base["learners"],
+                         discard_body=True)
         check("attach with baseline ConfState → 204", rc == "204", f"got {rc}")
 
         print(f"step 7: ⭐ node {vnid} adopted the leader's membership from the snapshot")
@@ -172,7 +157,7 @@ def main() -> int:
         ok = (cs_v is not None and cs_l is not None
               and sorted(cs_v.get("voters", [])) == sorted(cs_l.get("voters", []))
               and sorted(cs_v.get("learners", [])) == sorted(cs_l.get("learners", [])))
-        check(f"⭐ node {vnid} ConfState == leader's (learned from the snapshot, not REWIND_VOTERS)",
+        check(f"⭐ node {vnid} ConfState == leader's (learned from the join envelope, not REWIND_VOTERS)",
               ok, f"victim={cs_v} leader={cs_l}")
 
         print(f"step 8: promote node {vnid} → voter; a fresh write replicates")
@@ -195,7 +180,7 @@ def main() -> int:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
     print("\nPASS membership-from-snapshot smoke (v2) — a joiner adopted its membership "
-          "from the baseline's ConfState (the native raft-rs mechanism), the self-omitting "
+          "from the join envelope's ConfState (raft snapshot semantics at birth), the self-omitting "
           "ConfState was rejected (raft.rs:2581), and a fresh write replicated. ⭐")
     return 0
 

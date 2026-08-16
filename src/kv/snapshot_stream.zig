@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! snapshot_stream.zig — streaming snapshot-transfer codec.
 //!
-//! A streamed alternative to the single-shot `dumpTenantBundle` →
-//! buffered-POST → `loadTenantBundle` path (which materializes the whole
-//! store into one `ArrayList`, one HTTP body, one txn — the multi-GB wall).
-//! Resident memory here is bounded to ONE pair + one apply batch on each end:
+//! THE transfer form of a tenant store — the buffered single-shot bundle path
+//! (which materialized the whole store into one `ArrayList`, one HTTP body,
+//! one txn — the multi-GB wall) is retired; every store crosses the wire as
+//! this stream. Resident memory is bounded to ONE pair + one apply batch on
+//! each end:
 //!
 //!   SOURCE — `StreamDumper`: a PULL-model serializer over a held kvexp
 //!     `Snapshot` cursor. `pull(dst)` fills the caller's buffer (curl's

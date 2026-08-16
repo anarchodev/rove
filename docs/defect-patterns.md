@@ -146,7 +146,7 @@ lists.
   `encodeAttach` is the only Zig sender path (provision/move fan-out and the
   reconciler bootstrap both drive it; the positional header juggling in the
   reconciler is gone) and `decodeAttach` the only receiver path; the Python
-  smokes' mirror stays `smoke_lib_v2.attach_bundle`. `AppliedBaseline` gets
+  smokes' mirror stays `smoke_lib_v2.attach_join`. `AppliedBaseline` gets
   the same treatment: one JSON encoder at the worker, one parser at the
   reconciler with **every field required** — a field the leader stops
   sending is a parse error, not a zero (`ignore_unknown_fields` stays on, so
@@ -157,9 +157,9 @@ lists.
   an ABSENT header is a 400 naming the rule, because absence means the
   sender bypassed the encoder. Malformed values never collapse to
   "absent-field" behavior.
-- **Attach is the only instance-creating door.** `v2-load-replace` and
-  `v2-snapshot-stream` no longer carry (or guess) a storage identity — the
-  move/promote-back protocol attaches first, so those doors now 404 on a
+- **Attach is the only instance-creating door.** The streamed snapshot door
+  (`v2-snapshot-stream`) never carries (or guesses) a storage identity — the
+  move/catch-up protocol attaches first, so the door 404s on a
   never-attached tenant instead of minting an instance with a guessed
   incarnation.
 

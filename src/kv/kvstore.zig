@@ -881,61 +881,6 @@ pub const KvStore = struct {
         try writeManifestFile(self.allocator, target_path, buf.items);
     }
 
-    /// Serialize just this handle's tenant key-space into a migration
-    /// bundle (kvexp `dumpTenantBundle`), returning owned bytes the
-    /// caller frees. Unlike `vacuumInto`/`dumpManifestToFile` (whole-file
-    /// kvexp snapshots), a bundle is the minimal shippable form of one
-    /// store's committed pairs — what a tenant MOVE ships from the source
-    /// cluster's `cluster.kv` to the destination's (the tenant-move
-    /// mechanism, `docs/architecture/consensus-and-storage.md`). The bundle
-    /// stamps `self.store_id`, so the destination
-    /// reconstructs the same store id (both clusters hash the tenant id to
-    /// the same `store_id`). Durabilize first so the snapshot reflects
-    /// every in-memory write.
-    pub fn dumpTenantBundle(self: *KvStore, allocator: std.mem.Allocator) Error![]u8 {
-        self.manifest.durabilize(0) catch return Error.Io;
-
-        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
-        defer snap.close();
-
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(allocator);
-        var w = buf.writer(allocator);
-        kvexp.dumpTenantBundle(&snap, self.store_id, &w) catch return Error.Sqlite;
-        return buf.toOwnedSlice(allocator) catch return Error.OutOfMemory;
-    }
-
-    /// Load a migration bundle (produced by `dumpTenantBundle` on the
-    /// source) into this handle's manifest, creating the store the bundle
-    /// names if absent and committing every pair in one txn. The MOVE
-    /// destination calls this on the tenant's freshly-created instance
-    /// store before the directory flips traffic over. `kvexp.loadTenantBundle`
-    /// is hardened against malformed input (bundles cross the network) and
-    /// rolls back the txn on any error, leaving the store untouched.
-    pub fn loadTenantBundle(self: *KvStore, bundle: []const u8) Error!void {
-        return self.loadBundleImpl(bundle, .{});
-    }
-
-    /// True REPLACE load (raft conf-change promote-back): every existing pair
-    /// is deleted before the bundle's pairs are written — one atomic kvexp Txn
-    /// — so the store ends EXACTLY equal to the bundle. Re-seats a STALE store
-    /// from an authoritative snapshot: a key the source deleted after this node
-    /// last saw it is removed, not left behind as a phantom (which would make a
-    /// promoted-back voter diverge from the cluster). Unlike `loadTenantBundle`
-    /// (overwrite + add only). The zero-downtime move's insert-if-absent load
-    /// uses the streamed path (`snapshot_stream.StreamLoader`, `mode=merge`).
-    pub fn loadTenantBundleReplace(self: *KvStore, bundle: []const u8) Error!void {
-        return self.loadBundleImpl(bundle, .{ .clear_existing = true });
-    }
-
-    fn loadBundleImpl(self: *KvStore, bundle: []const u8, opts: kvexp.LoadBundleOptions) Error!void {
-        var stream = std.io.fixedBufferStream(bundle);
-        _ = kvexp.loadTenantBundle(self.manifest, stream.reader(), opts) catch return Error.Sqlite;
-        // Persist the loaded pairs; raft_idx=0 → don't disturb the
-        // watermark (the destination group starts a fresh index sequence).
-        self.manifest.durabilize(0) catch return Error.Io;
-    }
-
     // ── Tracked transactions (kvexp.Txn-backed) ────────────────────
     //
     // Wraps a top-level `*kvexp.Txn` plus a stack of open savepoint
@@ -1659,52 +1604,6 @@ test "attached vacuumInto round-trips data via standalone re-open" {
     const v2 = try dst.get("counter");
     defer a.free(v2);
     try testing.expectEqualStrings("42", v2);
-}
-
-test "tenant bundle ships one store between two manifests (the move shape)" {
-    // Two independent manifests stand in for two clusters' cluster.kv.
-    // The same tenant id hashes to the same store_id on both, so the
-    // bundle dumped from the source loads into the destination at the
-    // matching id and a fresh handle reads the data back.
-    const a = testing.allocator;
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-
-    var src_buf: [96]u8 = undefined;
-    const src_path = std.fmt.bufPrintZ(&src_buf, "/tmp/rove-kv-bnd-src-{x}.kv", .{seed}) catch unreachable;
-    defer cleanupDb(src_path);
-    var dst_buf: [96]u8 = undefined;
-    const dst_path = std.fmt.bufPrintZ(&dst_buf, "/tmp/rove-kv-bnd-dst-{x}.kv", .{seed}) catch unreachable;
-    defer cleanupDb(dst_path);
-    cleanupDb(src_path);
-    cleanupDb(dst_path);
-
-    var src_manifest: kvexp.Manifest = undefined;
-    try src_manifest.init(a, src_path, .{ .max_map_size = STANDALONE_MAP_SIZE });
-    defer src_manifest.deinit();
-    var dst_manifest: kvexp.Manifest = undefined;
-    try dst_manifest.init(a, dst_path, .{ .max_map_size = STANDALONE_MAP_SIZE });
-    defer dst_manifest.deinit();
-
-    const tenant_id = hashStoreId("movetenant");
-    const src = try KvStore.attach(a, &src_manifest, tenant_id, null);
-    defer src.close();
-    try src.put("greeting", "hello");
-    try src.put("counter", "42");
-
-    const bundle = try src.dumpTenantBundle(a);
-    defer a.free(bundle);
-
-    // Destination: create the instance store, then load the bundle into it.
-    const dst = try KvStore.attach(a, &dst_manifest, tenant_id, null);
-    defer dst.close();
-    try dst.loadTenantBundle(bundle);
-
-    const g = try dst.get("greeting");
-    defer a.free(g);
-    try testing.expectEqualStrings("hello", g);
-    const c = try dst.get("counter");
-    defer a.free(c);
-    try testing.expectEqualStrings("42", c);
 }
 
 test "lastAppliedRaftIdx round-trips through manifest" {

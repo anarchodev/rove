@@ -89,8 +89,8 @@ pub const SnapshotCatchupThread = struct {
     /// For `clearSnapshotCatchup` when a job finishes (re-arms the trigger).
     bridge: *bridge_mod.Bridge,
     /// Shared move secret (`REWIND_MOVE_SECRET`) presented to the peer's
-    /// move-secret-gated `v2-load-replace` / `v2-apply-snapshot`. Null → the
-    /// peer rejects the push; treat as a misconfiguration (logged per job).
+    /// move-secret-gated `v2-snapshot-stream`. Null → the peer rejects the
+    /// push; treat as a misconfiguration (logged per job).
     move_secret: ?[]const u8,
     /// Peer HTTP base URLs indexed by raft id − 1 (`REWIND_PEER_URLS`), the
     /// worker analog of CP's `REWIND_CP_PEER_URLS`. Empty / a missing index →

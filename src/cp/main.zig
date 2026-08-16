@@ -753,7 +753,7 @@ const Router = struct {
         const incarnation = std.fmt.bufPrint(&inc_buf, "{x:0>16}", .{std.mem.readInt(u64, &rnd, .big)}) catch
             return replyStatus(server, ent, sid, sess, 500);
 
-        if (!move.attachToAll(self, birth_nodes, "", tenant, null, birth_voters, incarnation)) {
+        if (!move.attachToAll(self, birth_nodes, tenant, null, birth_voters, incarnation)) {
             move.evictAll(self, tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -1515,7 +1515,7 @@ const Router = struct {
             return;
         };
         defer a.free(move_inc);
-        if (!move.attachToAll(self, dest_nodes, "", tenant, plan_blob, null, move_inc)) {
+        if (!move.attachToAll(self, dest_nodes, tenant, plan_blob, null, move_inc)) {
             move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;

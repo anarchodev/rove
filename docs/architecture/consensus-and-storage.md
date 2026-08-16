@@ -332,13 +332,17 @@ Three mechanisms keep the WAL bounded and a restart correct:
   Physical segment-file GC reclaims fully-compacted segments via `noteCompaction`.
 - **New-member catch-up is out-of-band, not in-raft.** rove does **not** use
   raft's in-protocol snapshot (`MsgSnapshot`) at all. A genuinely new group
-  member — a conf_change learner, or a tenant-move destination — bootstraps its
-  store out-of-band via the move bundle (`dumpTenantBundle` on a follower / the
-  worker request thread, off the leader's hot path → `loadTenantBundle` on the
-  destination → join raft already caught up, so raft replicates only the tail).
-  An earlier in-raft snapshot path (leader-generated `MsgSnapshot`, S3-staged
-  bundle) was built then removed: it put a store dump on the leader's serving
-  hot path, and lockstep compaction means existing voters never need it.
+  member — a reconciler-bootstrapped learner, or a tenant-move destination —
+  attaches EMPTY (group + instance, no data) and its state arrives
+  raft-natively: the leader replicates the log tail when it still holds it,
+  and a peer below the compaction floor is recovered by the streamed snapshot
+  catch-up (`v2-snapshot-stream` — bounded memory both ends; the data-free
+  baseline + the leader's ConfState ride the stream headers and install at
+  END_STREAM). An earlier in-raft snapshot path (leader-generated
+  `MsgSnapshot`, S3-staged bundle) was built then removed — it put a store
+  dump on the leader's serving hot path — and the buffered single-shot bundle
+  transfer (dump → one HTTP body → one txn) is retired too: it buffered whole
+  tenants in RAM on every party (the multi-GB wall).
 - **Crash recovery.** At boot the Node opens the WAL with `SharedWal.open` (not
   `init`): it CRC-scans the segments, physically truncates only a *torn tail*,
   and buckets recovered records by `group_id`. `Bridge.recoverGroups` reads the
@@ -381,27 +385,29 @@ SIGKILL escalation) fails loudly instead of vanishing into an unchecked
 
 ## Tenant move (mechanism)
 
-A tenant is movable because it is a whole group. The DP-level mechanism:
+A tenant is movable because it is a whole group. The DP-level mechanism (the
+zero-downtime move — the source serves throughout):
 
-- **detach** → `bundle`: quiesce, await `committedSeq` *and* the worker-overlay
-  drain (`workerAckedThrough` — raft commit alone only proves the apply was
-  *skipped*; the skipped writes live in parked worker txns until the drain
-  promotes them, and the drain runs between dispatches on the very thread the
-  bundle handler blocks; the source replies **423** until the overlay covers
-  the quiesce point and the CP retries the same node), then dump the tenant's
-  committed KV state to a self-describing byte blob (magic + version + tenant
-  + KV pairs + CRC32), `destroyGroup` on every node (which raft-rs
-  **tombstones**), free pending handles.
-- **attach**(`bundle`): load it, `clearTombstone` (migration is *intentional*
+- **attach** (destination, EMPTY): `clearTombstone` (migration is *intentional*
   id reuse — raft-rs tombstones a destroyed id to block zombie messages, so an
   explicit lift is required), `createGroupEpoch` a fresh incarnation at the
-  migration epoch on every destination node, drive to leader.
+  migration epoch on every destination node, drive to leader. No data rides
+  the attach.
+- **forward** (`v2-forward-begin`): the source dual-writes every committed
+  write to the destination while it keeps serving.
+- **stream** (`v2-snapshot-push`, merge mode): the source leader streams its
+  held snapshot to the destination's `v2-snapshot-stream`, which loads
+  insert-if-absent in bounded txns — a forwarded (newer) key is never
+  clobbered by the (older) snapshot, and no party buffers the store whole.
+- **evict** (source, after the directory flips): `destroyGroup` on every
+  source node (which raft-rs **tombstones**), drop the instance.
 
-The bundle ships **committed state only**; the destination starts a fresh group
-(term/commit-idx reset) at a new epoch, and the epoch fences stale messages to
-the old location. Quiesce (pause proposes, drain) and the directory flip that
-make this a *correct, no-downtime* move are the **control plane's** job — see
-[control-plane.md](control-plane.md). Blobs never move (shared backend, below).
+The stream ships **committed state only**; the destination starts a fresh
+group (term/commit-idx reset) at a new epoch, and the epoch fences stale
+messages to the old location. The overlap ordering and the directory flip
+that make this a *correct, no-downtime* move are the **control plane's**
+job — see [control-plane.md](control-plane.md). Blobs never move (shared
+backend, below).
 
 ## Blob replication (bytes don't ride raft)
 

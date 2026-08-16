@@ -5,9 +5,8 @@ catch-up driver (raft-native-alignment Phase 1).
 
 This is the replacement for `high_churn_learner_smoke_v2.py`, whose premise (the
 mechanism-B `recent_active` learner-floor) the native arc DELETES. Here there is
-NO manual bootstrap orchestration (no v2-applied-baseline / v2-attach /
-v2-load-replace / v2-apply-snapshot calls from the harness): the recovery is
-fully automatic, driven by the engine.
+NO manual bootstrap orchestration from the harness: the recovery is fully
+automatic, driven by the engine.
 
 The mechanism under test:
   - Compaction is mechanism A (a FIXED catch-up buffer, `REWIND_SNAPSHOT_GRACE`,
@@ -21,10 +20,11 @@ The mechanism under test:
     stays Unavailable because the bulk data goes out-of-band, so the peer would
     otherwise sit in `Probe` forever. See raft-native-alignment.md.)
   - the pump's `snapshotTriggerTick` detects it and queues a `(gid, peer)` job;
-    the worker's `SnapshotCatchupThread` dumps the leader's store and pushes
-    `v2-load-replace` + `v2-apply-snapshot {index, term}` to the peer over its
-    `REWIND_PEER_URLS` HTTP endpoint. The peer's `match` advances past the
-    leader's compacted first_index, StateSnapshot clears, and the tail replicates.
+    the worker's `SnapshotCatchupThread` dumps the leader's store and STREAMS it
+    to the peer's `v2-snapshot-stream` (data-free baseline + ConfState in
+    headers) over its `REWIND_PEER_URLS` HTTP endpoint. The peer's `match`
+    advances past the leader's compacted first_index, StateSnapshot clears, and
+    the tail replicates.
 
 The victim is FROZEN (SIGSTOP), not killed: this models a partitioned/slow peer
 whose raft group state stays live in RAM, so the recovery under test is purely

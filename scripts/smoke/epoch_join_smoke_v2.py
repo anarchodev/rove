@@ -28,12 +28,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_bundle  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_join  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler() {
@@ -62,14 +61,6 @@ def _curl_json(url, *, method="GET", data=None):
     nl = out.rfind("\n")
     return int(out[nl + 1:].strip() or 0), out[:nl]
 
-
-def _curl_to_file(url, path, *, data=None):
-    args = ["curl", "-s", "-o", path, "-w", "%{http_code}", "-m", "20",
-            "--http2-prior-knowledge", "-X", "POST", *SECRET]
-    if data is not None:
-        args += ["-H", "Content-Type: application/json", "--data", data]
-    args.append(url)
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
 def main() -> int:
@@ -128,17 +119,14 @@ def main() -> int:
 
         print(f"step 2: identify join target = node {vnid} (each attempt does its own clean reset)")
 
-        with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
-            bpath = tf.name
-
         # One self-contained join attempt at a given epoch, mirroring the
         # reconciler's heal-to-completion flow so the two legs are INDEPENDENT:
         #   reset  — remove the node from the leader's config (drops any stale
         #            Progress) + evict its local group → a clean non-member, then
         #            AddLearner (fresh Progress, matched=0);
-        #   attach — fetch a FRESH baseline + snapshot from the CURRENT leader (so
-        #            the baseline is always at/above the compaction floor, never a
-        #            stale below-floor index), born-learner attach at `epoch`;
+        #   attach — EMPTY born-learner attach at `epoch` carrying the leader's
+        #            membership + incarnation (no bundle, no baseline — the data
+        #            arrives raft-natively once the leader can reach the group);
         #   drive  — a burst of writes so there's a live tail to replicate.
         # The ONLY variable between the two attempts is the epoch, so a stall is
         # attributable to epoch fencing — not a stale baseline or stale Progress.
@@ -156,11 +144,11 @@ def main() -> int:
             if st2 != 200:
                 return None, False, 0, 0
             b = json.loads(body2)
-            if _curl_to_file(url(lead_now, "v2-snapshot"), bpath, data='{"tenant":"acme"}') != "200":
-                return None, False, 0, 0
-            ac = attach_bundle(url(victim, "v2-attach"), bpath, tenant="acme",
-                               index=b["index"], term=b["term"], epoch=epoch_to_use,
-                               incarnation=b.get("incarnation", ""), as_learner=True)
+            aug_learners = sorted(set(b.get("learners", [])) | {vnid})
+            ac = attach_join(url(victim, "v2-attach"), tenant="acme",
+                             epoch=epoch_to_use,
+                             incarnation=b.get("incarnation", ""), as_learner=True,
+                             voters=b.get("voters"), learners=aug_learners)
             # create a live gap AFTER the attach
             for i in range(12):
                 c.request_retry("acme", "/?fn=handler", method="POST", data=f'{{"value":"e{epoch_to_use}-{i}"}}', want_status=204, deadline_s=10)
