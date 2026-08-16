@@ -479,41 +479,24 @@ fn handleAttach(
 
     const gid = worker.raft.registerTenant(tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
-    // A reconciler bootstrap supplies the leader's baseline {index, term} so
-    // the group is created already at that baseline (atomic) rather than at
-    // an empty last_index 0 — eliminating the attach→apply-snapshot window
-    // where a leader heartbeat carrying commit > 0 would crash the fresh
-    // group. Plain attach (moves, empty-attach) carries no baseline and
-    // creates at epoch. The epoch is the leader's actual one (default 1):
+    // Every attach births the group EMPTY at the sender's epoch, carrying the
+    // envelope's membership: `join_as_learner` + an explicit ConfState birth a
+    // non-campaigning learner with the group's real membership (self
+    // included), ready for the leader's AddLearner — the raft-native member
+    // add, where the data then arrives via log replication or the streamed
+    // snapshot catch-up. The epoch is the sender's actual one (default 1):
     // joining a non-epoch-1 group (genesis `__admin__` at epoch 0, a moved
     // tenant at >1) at the wrong epoch gets the leader's messages FENCED and
-    // the join silently stalls. `join_as_learner`: the reconciler adds a
-    // node learner-first — a born-voter would campaign past a high-term
-    // leader and deadlock.
+    // the join silently stalls.
     //
     // The decoded id lists live in `dec`'s inline buffers on this frame —
-    // `createGroupAtBaseline` BLOCKS on the pump ControlCmd, so they outlive
-    // the install. Absent lists → null → membership-neutral (baseline) /
-    // this node's static `REWIND_VOTERS` (plain birth).
-    if (dec.baseline) |b| {
-        worker.raft.createGroupAtBaseline(gid, dec.epoch, b.index, b.term, dec.join_as_learner, dec.voters(), dec.learners()) catch |err| switch (err) {
-            error.GroupExists => {}, // idempotent re-attach
-            error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
-            else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
-        };
-    } else {
-        // The no-baseline birth honors the SAME membership envelope as the
-        // baseline path: an EMPTY attach that carries `join_as_learner` + the
-        // sender's ConfState births a non-campaigning learner with the group's
-        // real membership (self included), ready for the leader's AddLearner —
-        // the raft-native member add, where the data then arrives via log
-        // replication or the streamed snapshot catch-up, never a bundle body.
-        worker.raft.createGroupEpoch(gid, dec.epoch, dec.join_as_learner, dec.voters(), dec.learners()) catch |err| switch (err) {
-            error.GroupExists => {}, // idempotent re-attach
-            error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
-            else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
-        };
-    }
+    // `createGroupEpoch` BLOCKS on the pump ControlCmd, so they outlive the
+    // birth. Absent lists → null → this node's static `REWIND_VOTERS`.
+    worker.raft.createGroupEpoch(gid, dec.epoch, dec.join_as_learner, dec.voters(), dec.learners()) catch |err| switch (err) {
+        error.GroupExists => {}, // idempotent re-attach
+        error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
+        else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
+    };
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 

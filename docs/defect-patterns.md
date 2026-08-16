@@ -124,8 +124,8 @@ fail — the receiver defaults.
 
 **Instances.**
 
-- `/_system/v2-attach` reads **10** `X-Rewind-*` headers (tenant, plan,
-  baseline index/term, epoch, voters, learners, join-as-learner, peer-addrs,
+- `/_system/v2-attach` reads **8** `X-Rewind-*` headers (tenant, plan,
+  epoch, voters, learners, join-as-learner, peer-addrs,
   incarnation). When the incarnation was added it reached the provisioning
   sender and not the move sender, the reconciler sender, or any of the four
   smokes that simulate a CP join. Each smoke had its own private copy of the

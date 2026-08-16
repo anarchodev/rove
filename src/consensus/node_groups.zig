@@ -164,8 +164,7 @@ pub fn freePersistedGroups(allocator: std.mem.Allocator, groups: []PersistedGrou
 /// supplied by the control plane (the cluster's node set, the single source
 /// of truth) instead of this node's static `REWIND_VOTERS` env. Null → fall
 /// back to `self.voters`. Ignored on the `recover` path (a rejoining group
-/// restores its membership from the WAL) and immaterial under a baseline
-/// (the baseline's ConfState overwrites the born membership).
+/// restores its membership from the WAL).
 /// `learners_override` non-null: {voters_override, learners_override} is the
 /// EXACT born ConfState — the sender's real membership, self included (raft
 /// snapshot semantics), superseding the `as_learner` self-split. Must contain

@@ -988,7 +988,6 @@ pub const Bridge = struct {
     // bridge_control.zig. Re-exported here so `bridge.<op>(...)` still resolves
     // via method-call syntax and the view types keep their `Bridge.X` spelling.
     pub const createGroupEpoch = bridge_control.createGroupEpoch;
-    pub const createGroupAtBaseline = bridge_control.createGroupAtBaseline;
     pub const destroyGroup = bridge_control.destroyGroup;
     pub const transferAllLeadership = bridge_control.transferAllLeadership;
     pub const transferLeadership = bridge_control.transferLeadership;

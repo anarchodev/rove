@@ -84,7 +84,7 @@ pub const ControlCmd = struct {
     done: std.Thread.ResetEvent = .{},
 };
 
-/// Create `gid`'s group at `epoch` with no baseline (the plain / empty
+/// Create `gid`'s group at `epoch` — always EMPTY (the plain / empty
 /// attach). `as_learner` births this node as a non-voting learner (joining an
 /// existing group — a born-voter would campaign past a high-term leader).
 /// `birth_voters`/`birth_learners`: the born ConfState — non-null
@@ -95,35 +95,6 @@ pub const ControlCmd = struct {
 pub fn createGroupEpoch(self: anytype, gid: u64, epoch: u64, as_learner: bool, birth_voters: ?[]const u64, birth_learners: ?[]const u64) Error!void {
     const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
     var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .as_learner = as_learner, .birth_voters = birth_voters, .birth_learners = birth_learners };
-    return runControl(self, &cmd);
-}
-
-/// Create `gid`'s group at `epoch` AND install a data-free raft baseline at
-/// {index, term} in the SAME pump op — atomic, so the fresh group is never
-/// reachable at last_index 0 (where a leader heartbeat carrying commit > 0
-/// would trip raft's commit_to fatal!). The reconciler bootstrap path: the
-/// kvexp state for `index` must already be loaded into the store. `index` 0
-/// behaves exactly like `createGroupEpoch` (no baseline). `as_learner` births
-/// the group with this node as a non-voting learner (joining an existing
-/// group via the reconciler's learner-first path) — see node.createGroupCore.
-/// `voters`/`learners` (membership SSOT): the source leader's
-/// ConfState the installed baseline carries, so the joining node learns its
-/// real membership from the snapshot rather than the static voter set. Null →
-/// membership-neutral (the born/current prs). The supplied membership MUST
-/// contain this node (`Error.SelfNotInConfState` otherwise — the leader must
-/// have conf-change-added it first).
-pub fn createGroupAtBaseline(self: anytype, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool, voters: ?[]const u64, learners: ?[]const u64) Error!void {
-    const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-    // BIRTH the group with the baseline's membership (`birth_voters = voters`),
-    // not just the post-birth snapshot ConfState (`snap_voters`). Without this
-    // the group is born via the `self.voters` FALLBACK first and the snapshot
-    // only corrects it afterwards — benign on a static cluster (self.voters is
-    // the full set) but FATAL on a genesis node, whose self.voters is `{self}`:
-    // it births a rogue sole-self group (auto-campaign + a half-init group that
-    // errors → double-free crash) before the snapshot can fix it. Born with the
-    // real membership directly, the fallback is never taken (matches the
-    // no-baseline `createGroupEpoch` path, which already births with `voters`).
-    var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .birth_voters = voters, .birth_learners = learners, .snap_voters = voters, .snap_learners = learners };
     return runControl(self, &cmd);
 }
 
@@ -321,33 +292,13 @@ pub fn drainControl(self: anytype) bool {
     for (batch[0..n]) |cmd| {
         cmd.err = switch (cmd.kind) {
             .create_group_epoch => blk: {
-                // INVARIANT (enforced both ends): a baseline at index>0 MUST
-                // carry a real term. A term-0 baseline makes raft-rs's restore
-                // fast-forward commit_to past an empty log → fatal!. The producer
-                // (v2-applied-baseline) refuses to emit one (409); refuse to
-                // install one too rather than silently birthing a crash-prone group.
-                if (cmd.snap_index > 0 and cmd.snap_term == 0) {
-                    std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
-                    break :blk Error.InvalidBaseline;
-                }
+                // A group is always born EMPTY at its epoch. Safety against a
+                // leader heartbeat reaching a last_index-0 group is by ORDER
+                // (the leader holds no Progress until the AddLearner that
+                // follows the attach), and any baseline install happens later,
+                // on the streamed catch-up's END_STREAM — the retired atomic
+                // create+install (createGroupAtBaseline) has no callers.
                 _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner, cmd.birth_voters, cmd.birth_learners) catch |e| break :blk e;
-                // Atomic baseline (createGroupAtBaseline): install the data-free
-                // snapshot in the SAME pump op as group creation so the fresh
-                // group is never observable at last_index 0 between creation and
-                // baseline. Without this, a leader heartbeat carrying commit > 0
-                // can reach the empty group first and trip raft's commit_to
-                // fatal! (to_commit out of range [last_index 0]). If the install
-                // fails, TEAR THE HALF-BORN GROUP DOWN — leaving it live at
-                // last_index 0 is the exact window this path exists to close
-                // (a labeled break is not an error return, so errdefer won't
-                // fire here; roll back explicitly).
-                if (cmd.snap_index > 0) {
-                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term, cmd.snap_voters, cmd.snap_learners) catch |e| {
-                        self.node.destroyGroupAndReclaim(cmd.gid) catch |de|
-                            std.log.err("v2 bridge: rollback of half-born gid {d} failed: {s}", .{ cmd.gid, @errorName(de) });
-                        break :blk e;
-                    };
-                }
                 break :blk null;
             },
             .destroy_group => blk: {
