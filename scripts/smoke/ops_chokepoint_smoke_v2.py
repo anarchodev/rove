@@ -114,7 +114,7 @@ def main() -> int:
 
         print("step 2: deploy the real dashboard, which carries the chokepoint")
         try:
-            pkgs, imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            pkgs, imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email", "@rewind/stripe"])
             c.deploy_with_packages("__admin__", admin_files, pkgs, imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e))
