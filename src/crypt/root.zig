@@ -276,6 +276,17 @@ pub fn wipe(key: *Key) void {
     std.crypto.secureZero(u8, key);
 }
 
+/// The per-tenant keyring: the store whose *delete* is the erasure.
+/// Sealing is only half of shredding — the other half is somewhere to
+/// keep keys that a delete genuinely removes.
+pub const keyring = @import("keyring.zig");
+
+test {
+    // Pull the keyring's tests into this module's test binary — a test
+    // artifact nothing references is a regression nobody sees.
+    _ = keyring;
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
