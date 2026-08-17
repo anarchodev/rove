@@ -416,6 +416,50 @@ The wire shapes are unchanged — `GET /?fn=whoami` and
 just belongs to the app now (the `__admin__` dashboard handler,
 `web/admin/index.mjs`, is the dogfood example).
 
+### 3.2 The saga — the causal unit
+
+A **saga** is one external cause and everything it triggers: the
+causal unit your logs, replay, and billing all present. Every
+activation belongs to exactly one saga, and each activation of a saga
+is one of its **hops**.
+
+What roots a saga — the external causes:
+
+- **An inbound HTTP request.** Its chain — the buffered handler, or
+  `onHeaders` + chunks, plus every connection trigger it arms and
+  their resumes — is one saga.
+- **A WebSocket connection's lifetime.** The upgrade roots it; every
+  frame (`onMessage`), wake, bound-fetch event, and the final
+  `onDisconnect` are hops of the same saga. A held connection IS one
+  saga by construction.
+- **A connectionless fire.** A `cron`/`schedule` fire or a
+  subscription fire roots a **new** saga — durability is decoupling:
+  the wake is a fresh external cause (time arrived, the feed pushed),
+  not a continuation of whatever armed it. Thread your own linkage
+  through the schedule's `msg` when you want one. (`webhook.send`
+  results are the exception: the callback continues the saga that
+  sent.)
+
+`request.sagaId` is the saga's id, identical on every hop, and every
+record in your logs is tagged with it (the reserved `_saga` tag), so
+one saga's whole story is one query — and the saga viewer's unit of
+playback. An inbound request honors `X-Rove-Correlation-Id` (≤256
+bytes) as its saga id, so an upstream tracing id can join rove hops
+into an existing distributed trace.
+
+Hops are atomic and the world moves only between them — per-tenant
+execution is strictly serial, a saga is a (usually non-contiguous)
+subsequence of the tenant's one execution tape, and other sagas' hops
+interleave in its seams. The contract and its consequences (no
+cross-hop transactions; re-read at each hop; a chain reads its own
+committed writes) live in the execution-tape section of the effect
+algebra (`effect-algebra.md` §1.1).
+
+This is rove's native meaning of the word: a saga here is the observed
+causal unit, not the distributed-systems "saga pattern" of
+compensating transactions — there is nothing to compensate, because a
+hop's writes are atomic and everything else is a recorded Msg.
+
 ## 4. Buffered vs streaming inbound — the 1 MB ceiling
 
 **Any inbound HTTP request body ≤ 1 MB is delivered in a single

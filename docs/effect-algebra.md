@@ -34,6 +34,36 @@ simulator). The exact invariant:
 
 Everything below either obeys that or is consciously outside the handler.
 
+### 1.1 The execution tape — hops are atomic, the world moves between them
+
+Per-tenant execution is **strictly serial**: the tenant has one
+authoritative execution tape, the activation (a *hop*) is its atom, and
+hops never overlap. That single fact carries the whole concurrency
+story:
+
+- **Inside a hop the world is frozen.** Reads see the committed state
+  as-of dispatch plus the hop's own writes; the hop's writeset commits
+  atomically with the hop (one raft entry). There is nothing to lock
+  against — no other code runs for this tenant while a hop runs.
+- **Between hops the world moves.** Other sagas' hops interleave on the
+  tape and may change any state the next hop reads. State observed at
+  hop N is stale by hop N+1 — re-read, don't carry cached reads across
+  a `next()`.
+- **A saga is a subsequence of the tape**, usually non-contiguous: one
+  external cause and everything it triggers (handler-shape.md §3.2).
+  Sagas interleave; hops don't. Within one saga, ordering is stronger
+  than raw interleaving: a chain's next input activates only after its
+  previous hop's writes commit (the input gate,
+  `architecture/websockets.md`), so each hop reads its predecessors'
+  writes.
+
+So there are no cross-hop transactions and no isolation levels to pick:
+atomicity is the hop, and anything that must be atomic belongs in one
+hop's writeset. Anything that spans hops must tolerate the world moving
+in between — which is also exactly what the saga viewer shows: the
+quiet-gap counts and interference marks between a saga's hops are the
+foreign tape activity that ran in its seams.
+
 ## 2. The four primitives
 
 The whole engine, minus the handlers, is four primitives — **two
