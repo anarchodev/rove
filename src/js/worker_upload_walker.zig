@@ -217,6 +217,9 @@ fn buildLogRecord(
         .saga_id = saga_id,
         .activation = lh.activation,
         .raft_seq = raft_seq,
+        // From the header, so the rebuilt record keeps its place on the
+        // tenant's execution tape.
+        .exec_seq = lh.exec_seq,
     };
 }
 
@@ -237,6 +240,7 @@ const sample_lh: log_mod.LogHeader = .{
     .deployment_id = 42,
     .duration_ns = 1234,
     .received_ns = 1_700_000_000_000_000_000,
+    .exec_seq = (2 << 40) | 5,
     .status = 200,
     .outcome = .ok,
     .activation = .inbound,

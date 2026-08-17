@@ -139,6 +139,7 @@ pub fn writeBatch(
             .status = r.status,
             .outcome = outcomeName(r.outcome),
             .deployment_id = r.deployment_id,
+            .exec_seq = r.exec_seq,
             .saga_id = r.saga_id,
             // Same table that spells the kind into the ndjson line, so
             // the sidecar and the record body can never disagree about
@@ -285,6 +286,11 @@ fn encodeRecordJson(
     try writeJsonString(w, r.exception);
     try w.writeAll(",\"saga_id\":");
     try writeJsonString(w, r.saga_id);
+    // The execution-sequence stamp as a DECIMAL STRING: its values exceed
+    // 2^53 (`term << 40 | counter`), and this JSON is consumed verbatim by
+    // dashboard JS via `/show`, where a bare number would silently round
+    // and break stamp equality/ordering. "0" = unstamped.
+    try w.print(",\"exec_seq\":\"{d}\"", .{r.exec_seq});
     try w.writeAll(",\"tags\":");
     try writeTags(w, r.tags);
     try w.writeAll(",\"activation\":");

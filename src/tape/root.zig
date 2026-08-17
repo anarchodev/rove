@@ -134,7 +134,9 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// section so any node can rebuild the customer LogRecord from the raft
 /// entry alone — including the request's `received_ns`, so a rebuilt record
 /// keeps its place in time instead of landing at the epoch and being hidden by
-/// the retention read-clamp (v8, rove#280). (`log_header_len == 0` is the
+/// the retention read-clamp (v8, rove#280), and the execution-sequence
+/// stamp `exec_seq`, so a rebuilt record keeps its place on the tenant's
+/// execution tape (v9). (`log_header_len == 0` is the
 /// "no header" sentinel for
 /// non-handler producers and paths that don't stamp a header). The
 /// `js_engine_version: u16` scalar (`docs/architecture/format-versioning.md`
@@ -147,7 +149,7 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// raft log (type-0 envelopes carry the readset): when the format
 /// changes, bump this and delete the old shape in the same change (and
 /// wipe the data dir) — do not add a min-supported fallback.
-pub const READSET_VERSION: u16 = 8;
+pub const READSET_VERSION: u16 = 9;
 pub const READSET_CHANNEL_COUNT: usize = 5;
 
 /// Wire ids are contiguous and stable — the per-tape decoder rejects
@@ -1659,6 +1661,7 @@ test "readset: serialize + parseReadset roundtrip with LogHeader" {
         .deployment_id = 1_700_000_000,
         .duration_ns = 12345,
         .received_ns = 1_700_000_000_000_000_000,
+        .exec_seq = (3 << 40) | 9,
         .status = 200,
         .outcome = .ok,
         .activation = .inbound,
@@ -1677,6 +1680,7 @@ test "readset: serialize + parseReadset roundtrip with LogHeader" {
     try testing.expectEqual(lh.request_id, p_lh.request_id);
     try testing.expectEqual(lh.deployment_id, p_lh.deployment_id);
     try testing.expectEqual(lh.duration_ns, p_lh.duration_ns);
+    try testing.expectEqual(lh.exec_seq, p_lh.exec_seq);
     try testing.expectEqual(lh.status, p_lh.status);
     try testing.expectEqual(lh.outcome, p_lh.outcome);
     try testing.expectEqual(lh.activation, p_lh.activation);

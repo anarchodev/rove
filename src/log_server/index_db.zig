@@ -55,6 +55,7 @@ const SCHEMA: [:0]const u8 =
     \\    outcome        TEXT,
     \\    deployment_id  INTEGER,
     \\    activation     TEXT,
+    \\    exec_seq       INTEGER,
     \\    ndjson_key     TEXT NOT NULL,
     \\    offset         INTEGER NOT NULL,
     \\    length         INTEGER NOT NULL,
@@ -183,6 +184,19 @@ pub const IndexDb = struct {
             if (c.sqlite3_exec(db, "ALTER TABLE log_index ADD COLUMN activation TEXT", null, null, null) != c.SQLITE_OK)
                 return Error.Sqlite;
         }
+
+        if (!try hasColumn(db, "log_index", "exec_seq")) {
+            // NULL for every pre-existing row AND for unstamped records —
+            // the tape position was never recorded, and backfilling one
+            // would assert an order the index never saw.
+            if (c.sqlite3_exec(db, "ALTER TABLE log_index ADD COLUMN exec_seq INTEGER", null, null, null) != c.SQLITE_OK)
+                return Error.Sqlite;
+        }
+        // After the column exists on every path (fresh file via SCHEMA,
+        // old file via the ALTER above) — partial: unstamped rows have no
+        // place on the tape, so the seq-window scan never visits them.
+        if (c.sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS log_idx_exec ON log_index (tenant_id, exec_seq) WHERE exec_seq IS NOT NULL", null, null, null) != c.SQLITE_OK)
+            return Error.Sqlite;
 
         // The engine's reserved tag was `_saga` before the saga rename.
         // Rewrite the rows rather than aliasing on read: an alias would
@@ -324,6 +338,11 @@ pub const IndexDb = struct {
         /// row was indexed before the field existed (stored NULL) —
         /// "unknown", never `inbound`.
         activation: []u8,
+        /// The execution-sequence stamp — the record's position on its
+        /// tenant's execution tape. 0 when unstamped (stored NULL):
+        /// the activation never entered execution, or the row predates
+        /// the field. Ordered but NOT dense.
+        exec_seq: u64 = 0,
 
         pub fn deinit(self: *ListRow, a: std.mem.Allocator) void {
             a.free(self.tenant_id);
@@ -359,7 +378,7 @@ pub const IndexDb = struct {
     /// comment documents.
     const LIST_SQL_UNTAGGED_HEAD =
         \\SELECT tenant_id, request_id, received_ns, duration_ns, method, path, host,
-        \\       status, outcome, deployment_id, activation
+        \\       status, outcome, deployment_id, activation, exec_seq
         \\FROM log_index
         \\WHERE tenant_id = ?1
         \\  AND (?2 = 0 OR
@@ -404,7 +423,7 @@ pub const IndexDb = struct {
     const LIST_SQL_TAGGED_HEAD =
         \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
         \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id,
-        \\       li.activation
+        \\       li.activation, li.exec_seq
         \\FROM log_tags t
         \\CROSS JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
         \\WHERE t.tenant_id = ?1 AND t.key = ?6 AND t.value = ?7
@@ -587,6 +606,87 @@ pub const IndexDb = struct {
                 // NULL (pre-migration row) reads back as "" — the
                 // unknown-kind sentinel.
                 .activation = try dupeColumnText(self.allocator, st.?, 10),
+                // NULL (unstamped / pre-migration) reads back as 0.
+                .exec_seq = @intCast(c.sqlite3_column_int64(st, 11)),
+            };
+            rows.append(self.allocator, row) catch return Error.OutOfMemory;
+        }
+        return .{
+            .rows = rows.toOwnedSlice(self.allocator) catch return Error.OutOfMemory,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// The seq-window statement — the tape view. Ascending over
+    /// `exec_seq` (execution order), which `/list`'s time view cannot
+    /// provide: wall-clock ordering breaks across leader failover, and
+    /// the saga viewer's window/gap/blame questions all key on the
+    /// stamp. Same keyset-cursor discipline as the list statements;
+    /// `exec_seq` is unique per tenant, so the cursor is the single
+    /// `?2` bound (strictly-greater-than). Unstamped rows carry NULL
+    /// and are skipped by the `IS NOT NULL` predicate (which also
+    /// matches `log_idx_exec`'s partial-index predicate). ?5 is the
+    /// same retention read-clamp `/list` applies.
+    const WINDOW_SQL: [:0]const u8 =
+        \\SELECT tenant_id, request_id, received_ns, duration_ns, method, path, host,
+        \\       status, outcome, deployment_id, activation, exec_seq
+        \\FROM log_index
+        \\WHERE tenant_id = ?1
+        \\  AND exec_seq IS NOT NULL
+        \\  AND exec_seq > ?2
+        \\  AND (?3 = 0 OR exec_seq <= ?3)
+        \\  AND (?5 = 0 OR received_ns >= ?5)
+        \\ORDER BY exec_seq ASC
+        \\LIMIT ?4
+    ;
+
+    /// Execution-tape window for `tenant_id`: records with
+    /// `after_seq < exec_seq <= to_seq`, ascending. `to_seq = 0` means
+    /// unbounded above. Pagination: pass the previous page's last
+    /// `exec_seq` as `after_seq` (an inclusive `seq_from` is
+    /// `seq_from - 1` here — callers own that conversion).
+    /// `floor_received_ns` is the retention read-clamp, as in
+    /// `queryList`.
+    pub fn queryWindow(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        after_seq: u64,
+        to_seq: u64,
+        floor_received_ns: i64,
+        limit: u32,
+    ) Error!ListResult {
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, WINDOW_SQL.ptr, @intCast(WINDOW_SQL.len), &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        _ = c.sqlite3_bind_int64(st, 2, @intCast(after_seq));
+        _ = c.sqlite3_bind_int64(st, 3, @intCast(to_seq));
+        _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
+        _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
+
+        var rows: std.ArrayListUnmanaged(ListRow) = .empty;
+        errdefer {
+            for (rows.items) |*r| r.deinit(self.allocator);
+            rows.deinit(self.allocator);
+        }
+        while (true) {
+            const rc = c.sqlite3_step(st);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return Error.Sqlite;
+            const row: ListRow = .{
+                .tenant_id = try dupeColumnText(self.allocator, st.?, 0),
+                .request_id = @intCast(c.sqlite3_column_int64(st, 1)),
+                .received_ns = c.sqlite3_column_int64(st, 2),
+                .duration_ns = c.sqlite3_column_int64(st, 3),
+                .method = try dupeColumnText(self.allocator, st.?, 4),
+                .path = try dupeColumnText(self.allocator, st.?, 5),
+                .host = try dupeColumnText(self.allocator, st.?, 6),
+                .status = @intCast(c.sqlite3_column_int(st, 7)),
+                .outcome = try dupeColumnText(self.allocator, st.?, 8),
+                .deployment_id = @bitCast(c.sqlite3_column_int64(st, 9)),
+                .activation = try dupeColumnText(self.allocator, st.?, 10),
+                .exec_seq = @intCast(c.sqlite3_column_int64(st, 11)),
             };
             rows.append(self.allocator, row) catch return Error.OutOfMemory;
         }
@@ -818,8 +918,8 @@ fn execLogIndexInserts(
         \\INSERT OR IGNORE INTO log_index
         \\(tenant_id, request_id, received_ns, duration_ns,
         \\ method, path, host, status, outcome, deployment_id,
-        \\ activation, ndjson_key, offset, length)
-        \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        \\ activation, exec_seq, ndjson_key, offset, length)
+        \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ;
     var st: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, sql.ptr, -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
@@ -861,9 +961,14 @@ fn execLogIndexInserts(
         // '', so "this index predates the field" stays distinguishable
         // from a kind that was recorded — see `sidecar.Record`.
         if (r.activation.len > 0) bindText(st.?, 11, r.activation) else _ = c.sqlite3_bind_null(st, 11);
-        bindText(st.?, 12, ndjson_key);
-        _ = c.sqlite3_bind_int64(st, 13, @intCast(r.offset + header_size));
-        _ = c.sqlite3_bind_int(st, 14, @intCast(r.length));
+        // 0 = unstamped: store NULL so the record has no place on the
+        // tape (the partial seq index skips it) rather than a fake
+        // position 0. The publish guard keeps real stamps < 2^63, so the
+        // i64 cast can't flip sign and break the index order.
+        if (r.exec_seq != 0) _ = c.sqlite3_bind_int64(st, 12, @intCast(r.exec_seq)) else _ = c.sqlite3_bind_null(st, 12);
+        bindText(st.?, 13, ndjson_key);
+        _ = c.sqlite3_bind_int64(st, 14, @intCast(r.offset + header_size));
+        _ = c.sqlite3_bind_int(st, 15, @intCast(r.length));
         if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
 
         // `INSERT OR IGNORE` swallows a primary-key clash, and the two things
@@ -1214,6 +1319,69 @@ test "insertBatch + queryList round-trips, newest-first" {
     try testing.expectEqual(@as(u64, 101), clamped.rows[0].request_id);
     try testing.expectEqual(@as(u64, 2), try idx.queryCount("acme", 0)); // no clamp
     try testing.expectEqual(@as(u64, 1), try idx.queryCount("acme", 1_500)); // clamped
+}
+
+test "queryWindow walks the tape in exec_seq order, skipping unstamped rows" {
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "window");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    // Stamps deliberately DISAGREE with received_ns order (a failover
+    // reordering wall-clock is the whole reason the stamp exists): the
+    // record received last carries the middle stamp. Term 7 base.
+    const t7: u64 = 7 << 40;
+    var records = [_]sidecar.Record{
+        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 3_000, .duration_ns = 1, .method = "GET", .path = "/b", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .exec_seq = t7 + 2, .offset = 0, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .exec_seq = t7 + 1, .offset = 1, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 3, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/c", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .exec_seq = t7 + 3, .offset = 2, .length = 1 },
+        // Unstamped (a pre-dispatch reject): no place on the tape.
+        .{ .tenant_id = "acme", .request_id = 4, .received_ns = 2_500, .duration_ns = 1, .method = "GET", .path = "/r", .host = "h", .status = 429, .outcome = "handler_error", .deployment_id = 1, .exec_seq = 0, .offset = 3, .length = 1 },
+        // Another tenant's stamp in the same numeric range must not leak.
+        .{ .tenant_id = "other", .request_id = 5, .received_ns = 1_500, .duration_ns = 1, .method = "GET", .path = "/o", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .exec_seq = t7 + 2, .offset = 4, .length = 1 },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "00000000000000000200-1730764800000",
+        .ndjson_size = 5,
+        .ndjson_sha256 = "deadbeef",
+        .first_received_ns = 1_000,
+        .last_received_ns = 3_000,
+        .records = &records,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/w.ndjson", 0);
+
+    // Whole tape: execution order, not arrival order; unstamped skipped.
+    var w = try idx.queryWindow("acme", 0, 0, 0, 10);
+    defer w.deinit();
+    try testing.expectEqual(@as(usize, 3), w.rows.len);
+    try testing.expectEqual(@as(u64, 2), w.rows[0].request_id);
+    try testing.expectEqual(@as(u64, 1), w.rows[1].request_id);
+    try testing.expectEqual(@as(u64, 3), w.rows[2].request_id);
+    try testing.expectEqual(t7 + 1, w.rows[0].exec_seq);
+
+    // Keyset cursor: strictly after the first stamp.
+    var p2 = try idx.queryWindow("acme", t7 + 1, 0, 0, 10);
+    defer p2.deinit();
+    try testing.expectEqual(@as(usize, 2), p2.rows.len);
+    try testing.expectEqual(t7 + 2, p2.rows[0].exec_seq);
+
+    // Bounded window [t7+1, t7+2].
+    var bounded = try idx.queryWindow("acme", t7, t7 + 2, 0, 10);
+    defer bounded.deinit();
+    try testing.expectEqual(@as(usize, 2), bounded.rows.len);
+    try testing.expectEqual(t7 + 2, bounded.rows[1].exec_seq);
+
+    // The retention read-clamp applies to the tape view too.
+    var clamped = try idx.queryWindow("acme", 0, 0, 1_500, 10);
+    defer clamped.deinit();
+    try testing.expectEqual(@as(usize, 2), clamped.rows.len);
+    try testing.expectEqual(@as(u64, 1), clamped.rows[0].request_id);
 }
 
 test "queryList filters by tag (user session + reserved _saga)" {

@@ -212,6 +212,57 @@ records are lost without a bump, and kept with one.
   the customer-facing replay store (page-encrypted at rest); operator signals go
   to Grafana Cloud — the two-sink split is decisions.md §7.
 
+### The execution-sequence stamp (`exec_seq`)
+
+Per-tenant execution is strictly serial: the tenant has one authoritative
+execution tape, the activation is its atom, and a saga is a (non-contiguous)
+subsequence of it. The **execution-sequence stamp** is that tape's order made
+durable — a total order over a tenant's activations that survives leader
+failover, which wall-clock ordering does not (a new leader's clock can sit
+behind the old one's, so `received_ns` can interleave two leaderships'
+records out of execution order). Window queries, quiet-gap counts, and
+read-your-write blame in the saga viewer all key on it.
+
+- **Mint** (`Bridge.mintExecStamp`, `src/consensus/bridge.zig`): the group
+  holder is the tenant's serialization point, so the worker mints one stamp
+  per activation at **execution entry** (not at capture — commit-time
+  captures complete out of order). Every hop of a held chain is its own tape
+  atom and gets a fresh stamp; resumes never inherit one.
+- **Shape**: `raft term << 40 | per-term serial counter`, one atomic u64 per
+  group (`GroupSig.exec_stamp`). The pump's leadership refresh folds the
+  group's current term in via `fetchMax` — a new term's base exceeds every
+  old term's stamps, so the publish *is* the counter reset. Terms strictly
+  increase across leadership acquisitions and are raft-durable, so stamps
+  never repeat across failover or restart **with no persistence of their
+  own** — the failure class of a persisted node-local counter (the
+  request-id minter's rove#281 collision) cannot occur by construction.
+- **Ordered, NOT dense.** The counter resets each term and abandoned mints
+  leave holes — never subtract two stamps for a count; count records in a
+  window query instead.
+- **0 = unstamped**, everywhere in the pipeline: the activation never
+  entered execution (pre-dispatch rejects), the tenant had no published
+  term yet (the first activations after a leadership acquisition, bounded
+  by one pump refresh), or a saturation guard refused the mint (term-half
+  mismatch against the published fence — see `mintExecStamp`). Unstamped
+  records exist in `/list` but have **no place on the tape**: the index
+  stores NULL and the seq-window scan never visits them.
+- **Carriage**: `LogRecord.exec_seq` → the ndjson record JSON as a **decimal
+  string** (values exceed 2^53; a bare JSON number silently rounds in
+  dashboard JS) → the sidecar (additive integer field) → a nullable
+  `log_index.exec_seq` column with the partial index `log_idx_exec`. The
+  replicated `LogHeader` carries it too (readset v9), so a walker-rebuilt
+  record keeps its tape position. Real stamps stay below 2^63 (the publish
+  guard fences the term one bit under the 24-bit field), so SQLite's i64
+  INTEGER ordering is the u64 ordering.
+- **Query** (`/v1/{tenant}/window`): the tape view — ascending by
+  `exec_seq`, keyset-paged on the stamp itself (`after_seq`), bounded by
+  `seq_from`/`seq_to`, honoring the same retention read-clamp as `/list`.
+- **Known anomaly** (shared with every leader-serialized system): a deposed
+  leader that hasn't yet observed its deposition can stamp read-only
+  activations into the old term. Those stamps are unique and order
+  *before* the new leadership — consistent with the stale state those
+  reads actually observed.
+
 ### Promotion-time LogRecord recovery (the walker)
 
 The flush above is best-effort *early visibility*: it drains the RAM buffer to S3

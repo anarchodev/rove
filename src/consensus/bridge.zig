@@ -179,7 +179,33 @@ pub const GroupSig = struct {
     /// this so an already-acked entry never enters `awaiting_worker`.
     /// Guarded by `Bridge.mutex`.
     worker_acked_seq: u64 = 0,
+    /// The execution-sequence stamp source: `raft term << EXEC_SEQ_TERM_SHIFT
+    /// | per-term serial counter` in one atomic, so mint (worker `fetchAdd`)
+    /// and term publication (pump `fetchMax` of the shifted term on each
+    /// leadership refresh) never tear. A new term's base always exceeds
+    /// every stamp of the old term (`(T+1)<<40 > T<<40|ctr` for any 40-bit
+    /// ctr), so the `fetchMax` is simultaneously the counter reset — and
+    /// because terms strictly increase across leadership acquisitions,
+    /// stamps never repeat across failover or process restart even though
+    /// nothing here persists. 0 until the first term publication (mint
+    /// refuses to stamp from an unpublished base — see `mintExecStamp`).
+    exec_stamp: std.atomic.Value(u64) = .init(0),
+    /// The term the pump last folded into `exec_stamp`, published FIRST
+    /// (before the `fetchMax` on the base). `mintExecStamp` refuses any
+    /// stamp whose term half doesn't equal this fence: that shape occurs
+    /// only on 40-bit counter saturation (the term half would be forged —
+    /// and a forged term can collide with a future real election's stamps
+    /// on another node) or transiently mid-publish (the base momentarily
+    /// lags the fence). Refusing both keeps stamps unique unconditionally.
+    exec_term: std.atomic.Value(u64) = .init(0),
 };
+
+/// Bit split of an execution-sequence stamp (`GroupSig.exec_stamp`): upper
+/// 24 bits = raft term, lower 40 = per-term serial counter. Both halves
+/// are out of physical reach (2^24 leadership changes per group; 2^40
+/// activations under one unbroken leadership) — `mintExecStamp` still
+/// fails loud rather than wrapping if either saturates.
+pub const EXEC_SEQ_TERM_SHIFT = bridge_pump.EXEC_SEQ_TERM_SHIFT;
 
 /// A pump-thread-only control operation, handed worker thread → pump
 /// thread (the `Manager` is not thread-safe; group lifecycle must run on
@@ -852,6 +878,38 @@ pub const Bridge = struct {
         return sig.faulted_seq.load(.acquire);
     }
 
+    /// Mint the next execution-sequence stamp for `gid`'s tenant — the
+    /// total order over the tenant's activations that survives leader
+    /// failover (`GroupSig.exec_stamp`; the log pipeline carries it as
+    /// `LogRecord.exec_seq`). Called by the worker once per activation at
+    /// execution entry; the group holder is the tenant's serialization
+    /// point, so mint order IS tape order. Returns 0 — the "unstamped"
+    /// sentinel — rather than a stamp that could break the total order:
+    /// for an unknown group, before the first leadership refresh publishes
+    /// the group's term (a stamp under a zero term base could collide with
+    /// another leadership's zero-base stamps), or on 40-bit counter
+    /// saturation (wrapping into the term bits would forge a future term).
+    pub fn mintExecStamp(self: *Bridge, gid: u64) u64 {
+        const sig = self.sigFor(gid) orelse return 0;
+        const fence = sig.exec_term.load(.monotonic);
+        if (fence == 0) return 0;
+        const stamp = sig.exec_stamp.fetchAdd(1, .monotonic) + 1;
+        const stamp_term = stamp >> EXEC_SEQ_TERM_SHIFT;
+        if (stamp_term != fence) {
+            // Above the fence = 40-bit counter saturation (2^40 activations
+            // under one unbroken leadership — out of physical reach, but
+            // never forge a term silently). Below = a mid-publish race
+            // (base lags the fence for part of one pump cycle); benign,
+            // heals on the next mint.
+            if (stamp_term > fence) std.log.warn(
+                "v2 exec-stamp gid={d}: 40-bit counter saturated at term {d} — records go unstamped until an election outruns the overflow",
+                .{ gid, fence },
+            );
+            return 0;
+        }
+        return stamp;
+    }
+
     /// Node-wide leadership for OBSERVABILITY ONLY: true iff this node is the
     /// raft leader of at least one group it carries. Leadership is
     /// per-GROUP — there is no single node-wide leader — so this must NEVER
@@ -1451,6 +1509,64 @@ test "bridge: propose → pumpOnce commits → committedSeq advances, read sees 
     const got = try bridge.node.get(gid, "greeting");
     defer a.free(got);
     try testing.expectEqualStrings("hello-bridge", got);
+}
+
+test "bridge: exec stamps are term-fenced — refused before a published term, strictly increasing after" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    const gid = try bridge.registerTenant("tenant-1");
+
+    // No pump cycle has published a term yet: a stamp under a zero base
+    // could collide with another leadership's zero-base stamps, so the
+    // mint refuses rather than hand one out.
+    try testing.expectEqual(@as(u64, 0), bridge.mintExecStamp(gid));
+    // Unknown group: same refusal.
+    try testing.expectEqual(@as(u64, 0), bridge.mintExecStamp(0xDEAD));
+
+    // Drive a write through so the group forms, elects, and the
+    // leadership refresh folds the term into the stamp base.
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const env = try encodeWs(a, "tenant-1", &ws);
+    defer a.free(env);
+    const seq = try bridge.propose(gid, env);
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < seq and spins < 200) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+
+    const s1 = bridge.mintExecStamp(gid);
+    const s2 = bridge.mintExecStamp(gid);
+    try testing.expect(s1 != 0);
+    try testing.expectEqual(s1 + 1, s2);
+    const term = s1 >> EXEC_SEQ_TERM_SHIFT;
+    try testing.expect(term > 0);
+
+    // A new leadership publishes fence-then-base. In the gap between the
+    // two stores a mint's term half doesn't match the fence — refused,
+    // never stamped into the wrong term.
+    const sig = bridge.sigFor(gid).?;
+    sig.exec_term.store(term + 1, .monotonic);
+    try testing.expectEqual(@as(u64, 0), bridge.mintExecStamp(gid));
+    // Base lands: `fetchMax` puts the new term's base above every old
+    // stamp, so the first mint of the new term exceeds all of them.
+    _ = sig.exec_stamp.fetchMax((term + 1) << EXEC_SEQ_TERM_SHIFT, .monotonic);
+    const s3 = bridge.mintExecStamp(gid);
+    try testing.expect(s3 > s2);
+    try testing.expectEqual(term + 1, s3 >> EXEC_SEQ_TERM_SHIFT);
+
+    // 40-bit counter saturation: the next mint would wrap into a forged
+    // term (which a future real election on another node could collide
+    // with) — refused, not handed out.
+    sig.exec_stamp.store(((term + 1) << EXEC_SEQ_TERM_SHIFT) | ((@as(u64, 1) << EXEC_SEQ_TERM_SHIFT) - 1), .monotonic);
+    try testing.expectEqual(@as(u64, 0), bridge.mintExecStamp(gid));
 }
 
 test "bridge: two tenants' watermarks advance independently (no cross-tenant HOL)" {

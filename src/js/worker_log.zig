@@ -594,6 +594,10 @@ pub fn captureLog(
     /// (early-error / read-only). The promotion walker stamps it from the
     /// entry's frame when it rebuilds a record from the raft log.
     raft_seq: u64,
+    /// The activation's execution-sequence stamp (`Request.trace.exec_seq`,
+    /// minted at execution entry — `LogRecord.exec_seq`). Pass 0 for paths
+    /// that never entered execution (pre-dispatch rejects).
+    exec_seq: u64,
 ) void {
     captureLogWithId(
         worker,
@@ -613,6 +617,7 @@ pub fn captureLog(
         tags,
         activation,
         raft_seq,
+        exec_seq,
     );
 }
 
@@ -641,6 +646,7 @@ pub fn captureLogWithId(
     tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
     raft_seq: u64,
+    exec_seq: u64,
 ) void {
     l3AssertMsgRecorded(activation, outcome, tapes);
     captureLogInner(
@@ -661,6 +667,7 @@ pub fn captureLogWithId(
         tags,
         activation,
         raft_seq,
+        exec_seq,
     ) catch |err| {
         std.log.warn("rove-js: log capture failed for {s}: {s}", .{ instance_id, @errorName(err) });
         // The transferred buffers must still be freed.
@@ -689,6 +696,7 @@ fn captureLogInner(
     tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
     raft_seq: u64,
+    exec_seq: u64,
 ) !void {
     const tl = worker.tenant_logs.get(instance_id) orelse return error.NoTenantLog;
     const allocator = worker.allocator;
@@ -771,6 +779,7 @@ fn captureLogInner(
         .tags = a_tags,
         .activation = activation,
         .raft_seq = raft_seq,
+        .exec_seq = exec_seq,
     });
 }
 

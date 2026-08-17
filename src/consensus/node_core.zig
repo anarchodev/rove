@@ -818,6 +818,18 @@ pub const Node = struct {
         return self.groups.get(tenant_id) != null;
     }
 
+    /// The group's current raft term, or 0 when the group doesn't exist
+    /// here yet. Terms strictly increase across leadership acquisitions
+    /// (every election bumps the term, and leadership is never resumed
+    /// without an election), so the term fences leader-scoped volatile
+    /// counters — the bridge folds it into `GroupSig.exec_stamp` once per
+    /// leadership refresh so execution-sequence stamps never repeat across
+    /// failover or restart.
+    pub fn currentTerm(self: *const Node, tenant_id: u64) u64 {
+        if (self.groups.get(tenant_id) == null) return 0;
+        return self.mgr.currentTerm(tenant_id);
+    }
+
     /// Read a committed key from a tenant's store. Caller owns the
     /// returned bytes (`allocator.free`). `Error.NotFound` if absent.
     pub fn get(self: *Node, tenant_id: u64, key: []const u8) Error![]u8 {
