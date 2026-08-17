@@ -428,6 +428,70 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 - Wire: `READSET_VERSION` is `7` (`src/tape/root.zig`); channels are `kv` +
   `module` + `fetch_responses` + `trigger_payload` + `request_reads`.
 
+### 3.9a Out-of-line references: one discipline, and every reference has a reader
+
+**Decision (2026-08-17, tracker #550).** A recorded payload has exactly one
+fate, chosen by what the payload IS, and every fate a writer can choose is one
+some reader can resolve. Two rules, which only work as a pair:
+
+> **A record must never carry bytes recoverable another way** — and **a
+> reference is only worth writing if some reader can resolve it.**
+
+The first rule alone makes records cheap and unreplayable. The second alone
+leaves the duplication in place. Adopting either half without the other is
+what produced the state this decision closes: the write side shipped
+references, the read side resolved none of them, and the payload presented to
+a replay as an empty value rather than a refusal.
+
+**The fates**, in the order the predicate tests them (`worker_log.payloadFate`
+— one function, called by every site that records a Msg):
+
+| fate | when | the entry holds |
+|---|---|---|
+| `none` | no bytes | nothing; a terminal-only event |
+| `referenced` | content-addressed | `{content_hash, byte_offset, len}` |
+| `carried` | at or under the 16 KiB cap | the bytes |
+| `spill` | anything else | `BodyRef{batch_id, offset, len}` into `_pool/` |
+
+Content-addressed beats size in both directions: bytes already stored
+immutably under their own hash are never copied onto a tape, however small,
+because that writes a second permanent copy of an object the tenant already
+pays for. Which streamer produced them is not part of the rule — that was a
+proxy for "content-addressed" and it made a chunk's fate depend on the code
+path that recorded it rather than on the chunk.
+
+**Zero length means no payload, and nothing else.** A site that cannot honour
+`spill` — a resume hop owns no durability park, so it has nowhere to put the
+bytes — records the true LENGTH with neither bytes nor pointer. That is the
+*unretained* shape, and it is deliberately distinguishable from a terminal-only
+event. Collapsing the two (recording zero) is what let a lost payload replay as
+an empty body.
+
+**The reader** is `src/log_server/body_ref.zig`, reached at
+`GET /v1/{tenant}/body/{request_id}/{channel}/{index}`. It resolves all three
+carrying fates and reports the fourth rather than serving it.
+
+**Addressing is `(record, channel, entry index)`, never a raw
+`{batch_id, offset, len}`.** The body pool is cross-tenant by construction —
+one object packs many tenants' bodies so the S3 request cost amortises — so a
+door accepting a caller-supplied batch and offset would let anyone past the
+tenant gate read a neighbour's bytes by walking offsets. Deriving the reference
+server-side, from a record the caller is already entitled to read, makes that
+request unrepresentable rather than leaving it to an entitlement check to
+catch. The record lookup carries the same tenant scoping and retention clamp as
+`/show`: a body must not outlive the record that names it.
+
+**Rejected: presigned URLs straight to the pool object.** Same reason, and it
+is the reason §5's presign note gives — a cross-tenant object cannot be handed
+out whole, and a presigned range is still an offset the caller controls.
+
+**Consequence to keep in view.** Every reference written is a bet that the
+bytes outlive the record pointing at them. `_pool/` has no reaper (#304), so
+today the bet holds by accident rather than by design; when eviction lands, the
+retention window for a pool object must be at least the window for any record
+that references it. `log_query_body_unresolved_total` is the signal that the
+bet is being lost.
+
 ### 3.10 Wake resumes surface the fired prefix, never matched keys
 
 **Decision (2026-07-11, issue #8).** An `after.kv`/`after.ms` resume tells the
