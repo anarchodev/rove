@@ -339,6 +339,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── rove-crypt: the sealed-envelope primitive ───────────────────
+    //
+    // Crypto shredding's one cipher seam: erasure is key destruction,
+    // so every ciphertext carries the algorithm, key generation, and a
+    // ref naming the key that opens it — self-describing from the first
+    // byte persisted (the crypto algorithm-agility gate,
+    // docs/architecture/format-versioning.md). std-only leaf: AEAD and
+    // HKDF come from std.crypto, matching `js/bindings/crypto.zig`, so
+    // importing it adds no link requirement to any binary. The browser
+    // replay arena deliberately does NOT import it — replay is decrypted
+    // server-side and no key is ever distributed to a client.
+    const crypt_mod = b.addModule("rove-crypt", .{
+        .root_source_file = b.path("src/crypt/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── rove-origin: node origin parsing ────────────────────────────
     //
     // The one definition of what the fleet can dial. Shared so the CP
@@ -501,6 +518,10 @@ pub fn build(b: *std.Build) void {
     // rove-ssrf tests
     const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
     test_step.dependOn(&b.addRunArtifact(ssrf_tests).step);
+
+    // rove-crypt tests
+    const crypt_tests = b.addTest(.{ .root_module = crypt_mod });
+    test_step.dependOn(&b.addRunArtifact(crypt_tests).step);
 
     // rove-origin tests
     const origin_tests = b.addTest(.{ .root_module = origin_mod });
