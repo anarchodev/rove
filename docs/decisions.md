@@ -1368,11 +1368,12 @@ prototype before V2 wrote code.
   plan generation (no `O(N_tenants)` on dispatch). Rate buckets
   **generation-refresh** on a stale generation — stale-until-restart was
   rejected because the painful direction is a *paying* customer not getting
-  their raise until restart. Retention is a **server-side read-path clamp**,
-  not GC: upgrade reveals, downgrade hides-never-deletes (sidesteps the
-  "downgrade retroactively deletes data" hazard); unbounded S3 until real GC
-  is an accepted operator cost. Open product call: the concrete
-  free/pro/enterprise numbers.
+  their raise until restart. Retention ships as a **server-side read-path
+  clamp**, not GC: upgrade reveals, downgrade hides-never-deletes (sidesteps
+  the "downgrade retroactively deletes data" hazard); unbounded S3 until real
+  GC was an accepted operator cost. **§11.6 completes this lever** — the clamp
+  becomes its read half and gains a deleting sweep behind it, which narrows
+  "upgrade reveals" to what the sweep has not yet taken.
 
 ### 10.10 Cutover strategy: freeze V1, branch, no dual-mode
 - **Decision** (2026-05-29; executed, cutover complete 2026-06-10): freeze V1
@@ -1568,6 +1569,58 @@ storage decisions that section assumes. (The customer-logs-vs-operator-signals
 - **Costs, accepted**: the engine gains a public protocol it must version
   deliberately (§14), and a self-hosted door must be safe by default rather than
   incidentally shielded by the admin app in front of it.
+
+### 11.6 Replay retention is a sold time window; capacity is derived (2026-08-17)
+- **Decision**: axis 2 sells **days**, and records past the window are
+  **deleted**. The byte capacity is derived, internal, and never quoted:
+  `capacity = log_refill_bytes_per_sec × 86400 × retention_days + log_burst_bytes`.
+  This **supersedes the capacity-ring model** (`strategy/pricing-model.md` §3 as
+  written before this date; tracker rove#319), which sold bytes and derived a
+  retention *floor*. Same identity — the decision is which side is sold.
+- **Why (the legal half, which the ring model never weighed)**: replay records
+  hold the customer's end-users' personal data and we hold it as a processor, so
+  a retention **period** is a required term of the DPA (rove#326) and the privacy
+  policy (rove#324). "Until your bytes run out, which depends on your traffic" is
+  not a period; it is the absence of one. Bounded retention also shrinks what an
+  erasure request must sweep (rove#340), what legal process can compel, and what
+  one breach exposes. For the segment that pays most, "kept basically forever" is
+  a liability, not a feature — an absent maximum is a procurement defect.
+- **Why (the engineering half)**: the sold number becomes the COGS bound, so the
+  promise and the spend cap are the same fact and cannot drift. It also fixes the
+  ring's own sharp edge — under a ring a traffic spike contracts the window
+  exactly when the logs matter most; under a fixed window a spike costs *us*
+  bytes, bounded by the derived ceiling, and the customer's horizon is unchanged.
+- **Derive from the byte bucket, never from `rps`.** A request is not a fixed
+  quantity of log; `rps × max_body_bytes` at the free tier is 500 × 4 MiB =
+  2 GB/s, a meaningless bound. Both caps are enforced at once and the `log_bytes`
+  bucket always binds first. Request rate enters only via the `k·count` floor.
+- **Enables the deletion to be compactor-free — conditionally.** Every axis-2
+  object is cross-tenant (`_logs/{node}/{batch}.ndjson` per §11.4, plus the
+  `_pool/` body spill); an earlier claim that log records are per-tenant prefixed
+  at `{instance}/log-blobs/` is **retracted** — no such store exists. Per-*tenant*
+  byte eviction from a shared object needs a compacting rewrite, which was the
+  ring's true price. Deletion by *age* does not, provided each object is
+  **homogeneous in expiry** — so shard the flush by retention class
+  (`_logs/{node}/{class}/…`, class ∈ the tier windows) and a whole object dies at
+  once. Cost is one PUT per class per node per flush: bounded by tier count (3),
+  never by tenant count, so §11.4's O(active tenants) rationale survives.
+- **Retention ≠ erasure.** Making objects homogeneous in expiry solves the
+  window; it does nothing for erasing *one* tenant from a shared object, which
+  still needs compaction or per-tenant crypto-shred (rove#91). The deprovision
+  sweep (`src/cp/storage_sweep.zig`) only reaches per-tenant prefixes, so a closed
+  account's records survive in `_logs/`/`_pool/` today. The window is deliverable
+  without solving this; the account-closure promise is not.
+- **The read clamp stays** as the *read* half of the lever: a downgrade must hide
+  immediately but not destroy for 30 days (`strategy/billing-policy.md` rule 9),
+  so the sweep's horizon lags a plan drop and the clamp makes the lag invisible.
+  This narrows §10.9's "upgrade reveals" to "reveals whatever the sweep has not
+  yet taken" — a pricing-page sentence, not a support surprise.
+- **Costs, accepted**: the light customer loses the decade-long tail the ring
+  would have given them; `log_max_ingest_rate` becomes a *billed* per-tier number
+  rather than a uniform guardrail (it is uniform 64 KiB/s in the tree today —
+  rove#301); and a published window is a promise the storage layer does not keep
+  until the sweep (rove#333) ships, which is a policy exposure rather than merely
+  an unpaid cost line.
 
 ---
 
