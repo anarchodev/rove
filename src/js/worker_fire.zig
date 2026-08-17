@@ -677,13 +677,21 @@ pub fn fireFetchEventActivation(
     // capture a tape entry so the chain has the closing seq +
     // terminal status / ok / body_truncated for replay; both
     // body_ref and inline_bytes are empty.
-    const FETCH_INLINE_THRESHOLD: usize = 16 * 1024;
-    var body_ref: bodies_mod.BodyRef = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
+    // The length is recorded on every fate that had bytes, whether or not the
+    // bytes themselves ride along — a zero length is reserved for a chunk that
+    // genuinely had none. That distinction is what lets a reader tell a
+    // terminal-only event apart from a payload nothing kept.
+    var body_ref: bodies_mod.BodyRef = .{
+        .batch_id = bodies_mod.NO_BATCH,
+        .offset = 0,
+        .len = @intCast(event.bytes.len),
+    };
     var inline_bytes_for_tape: []const u8 = "";
     var content_hash_for_tape: []const u8 = "";
     // Only a chunk that actually carries bytes can be referenced; a
     // terminal-only event has nothing to name.
     const content_ref: ?[64]u8 = if (event.bytes.len > 0) event.content_hash else null;
+    const content_slice: []const u8 = if (content_ref) |*h| h[0..] else "";
     if (parked_body_ref) |saved| {
         // Resume from a previous park. The
         // body's batch was confirmed durable by
@@ -691,71 +699,67 @@ pub fn fireFetchEventActivation(
         // the saved ref directly + skip append. Re-appending
         // would mint a new batch and re-park.
         body_ref = saved;
-    } else if (content_ref) |h| {
-        // Content-addressed chunk (a `blob.get`): the bytes are ALREADY
-        // durable and immutable at this tenant's `app-blobs/{h}`, so
-        // recording them again would write a second permanent copy of an
-        // object we already store — inline on the tape below the threshold,
-        // and into the never-evicted body pool above it (rove#430, #304).
+    } else switch (worker_mod.payloadFate(event.bytes.len, content_slice)) {
+        // Terminal-only event: nothing to name, nothing to carry.
+        .none => {},
+        // Bytes ride on the entry. Raft entry fsync IS the durability
+        // substrate — no buffer append, no park, no S3 round trip.
+        .carried => inline_bytes_for_tape = event.bytes,
+        // Content-addressed chunk (a `blob.get`, a static serve): the bytes are
+        // ALREADY durable and immutable at this tenant's content-addressed
+        // home, so recording them again would write a second permanent copy of
+        // an object we already store — inline on the tape below the cap, and
+        // into the never-evicted body pool above it.
         //
-        // So: reference, don't copy. `body_ref.len` still reports the chunk
-        // size (the record stays a complete activation event); the payload is
-        // recoverable by hash. Skipping the coordinator ALSO skips the
+        // So: reference, don't copy. Skipping the coordinator ALSO skips the
         // durability park — there is nothing to make durable, which removes an
         // S3 round trip from every large blob read.
-        content_hash_for_tape = &h;
-        body_ref = .{
-            .batch_id = bodies_mod.NO_BATCH,
-            .offset = 0,
-            .len = @intCast(event.bytes.len),
-        };
-    } else if (event.bytes.len > 0 and event.bytes.len <= FETCH_INLINE_THRESHOLD) {
-        // Inline fast path — no buffer append, the chunk bytes
-        // ride on the tape entry directly. Raft entry fsync IS
-        // the durability substrate.
-        body_ref = .{
-            .batch_id = bodies_mod.NO_BATCH,
-            .offset = 0,
-            .len = @intCast(event.bytes.len),
-        };
-        inline_bytes_for_tape = event.bytes;
-    } else if (event.bytes.len > 0) {
-        // Larger-than-threshold chunk — coord submit + park.
-        // the streaming substrate (`docs/architecture/routing-and-ingress.md`):
-        // submit returns a
-        // seq; durability is observed via the coord's per-worker
-        // HWM. Always park (no fast-durable bypass — submit is
-        // strictly async, durable_seq can't have advanced past
-        // this seq before the executor lands the PUT).
-        if (worker.node.blob_coord.coordinator) |coord| {
-            const wid = worker.coord_queue_id;
-            const seq = coord.submit(wid, event.bytes) catch |err| blk: {
-                std.log.warn(
-                    "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
-                    .{ tenant_id, event.bytes.len, @errorName(err) },
-                );
-                break :blk @as(?u64, null);
-            };
-            if (seq) |s| {
-                worker.fetch_pending_durability.append(worker.allocator, .{
-                    .event = event.*,
-                    .worker_seq = s,
-                    .queue_id = wid,
-                    .tenant_id_view = p.dep.inst.id,
-                }) catch |err| {
+        .referenced => content_hash_for_tape = content_slice,
+        // No other home: spill to the body pool via the blob coordinator
+        // (the streaming substrate,
+        // `docs/architecture/routing-and-ingress.md`). Submit returns a seq
+        // and durability is observed through the coord's per-worker HWM.
+        // Always park — submit is strictly async, so `durable_seq` cannot
+        // have advanced past this seq before the executor lands the PUT.
+        .spill => {
+            if (worker.node.blob_coord.coordinator) |coord| {
+                const wid = worker.coord_queue_id;
+                const seq = coord.submit(wid, event.bytes) catch |err| blk: {
                     std.log.warn(
-                        "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
-                        .{ tenant_id, @errorName(err) },
+                        "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
+                        .{ tenant_id, event.bytes.len, @errorName(err) },
                     );
-                    return;
+                    break :blk @as(?u64, null);
                 };
-                parked_to_durability = true;
-                return;
+                if (seq) |s| {
+                    worker.fetch_pending_durability.append(worker.allocator, .{
+                        .event = event.*,
+                        .worker_seq = s,
+                        .queue_id = wid,
+                        .tenant_id_view = p.dep.inst.id,
+                    }) catch |err| {
+                        std.log.warn(
+                            "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
+                            .{ tenant_id, @errorName(err) },
+                        );
+                        return;
+                    };
+                    parked_to_durability = true;
+                    return;
+                }
             }
-            // submit failed — fall through with empty body_ref.
-            // The activation runs but the tape entry has no
-            // BodyRef.
-        }
+            // The spill did not happen — no coordinator, or a submit the
+            // backend refused. The activation still runs, but these bytes now
+            // have no home at all, so the entry keeps its LENGTH and gains
+            // neither pointer nor payload: an unretained Msg, which every
+            // reader reports rather than serving as an empty body. Loud here
+            // too, because a silent one is how a partial outage turns into a
+            // class of records that replay wrong forever.
+            std.log.warn(
+                "rove-js fetch-event: chunk unretained tenant={s} fetch_id={s} bytes={d} — recorded without payload",
+                .{ tenant_id, event.fetch_id, event.bytes.len },
+            );
+        },
     }
     // An engine-fired static chunk records no BYTES (rove#391). These chunks
     // are small, so one record per chunk rode the tape verbatim and S3 log
