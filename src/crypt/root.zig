@@ -281,10 +281,16 @@ pub fn wipe(key: *Key) void {
 /// keep keys that a delete genuinely removes.
 pub const keyring = @import("keyring.zig");
 
+/// Keyring replication: the wire format and the quorum rule. Key
+/// material must reach a majority before anything is sealed under it,
+/// because a key that exists on one node dies with it.
+pub const replicate = @import("replicate.zig");
+
 test {
-    // Pull the keyring's tests into this module's test binary — a test
+    // Pull the submodules' tests into this module's test binary — a test
     // artifact nothing references is a regression nobody sees.
     _ = keyring;
+    _ = replicate;
 }
 
 // ── tests ────────────────────────────────────────────────────────────
