@@ -279,6 +279,49 @@ def main() -> int:
         except RuntimeError as e:
             check("non-operator completed the OIDC RP handshake", False, str(e)[:240])
 
+        # ── One-submission entry (the marketing form shape): POST the IdP
+        #    /login directly with a cross-origin return_to on the registered
+        #    RP origin. The magic-link verify lands the browser at the RP's
+        #    /_rp/login, and the PKCE handshake rides the now-live IdP
+        #    session to a signed-in dashboard — the user typed exactly once.
+        r = c.tls_curl(auth_base + "/login", method="POST",
+                       headers={"content-type": "application/x-www-form-urlencoded"},
+                       data="email=oneshot%40example.com&return_to=" +
+                            urllib.parse.quote(app_origin + "/_rp/login"))
+        os_auth_cookie = _sid(r)
+        os_magic = json.loads(r.body).get("magic_link", "") if r.status == 200 else ""
+        check("one-shot: POST /login (cross-origin return_to) → magic link",
+              bool(os_magic) and bool(os_auth_cookie),
+              f"got {r.status} {r.body[:120]!r}")
+        r = c.tls_curl(os_magic, headers={"Cookie": os_auth_cookie or ""})
+        loc = r.headers.get("location", "")
+        check("one-shot: verify → 302 to the RP /_rp/login",
+              r.status == 302 and loc == app_origin + "/_rp/login",
+              f"got {r.status} loc={loc!r}")
+        os_authed = False
+        if r.status == 302 and loc:
+            r = c.tls_curl(loc)                        # fresh RP-side browser sid
+            os_app_cookie = _sid(r)
+            r = c.tls_curl(r.headers.get("location", ""),
+                           headers={"Cookie": os_auth_cookie or ""})
+            cb = r.headers.get("location", "")
+            check("one-shot: authorize rides the live IdP session (no re-login)",
+                  r.status == 302 and "/_rp/callback" in cb and "code=" in cb,
+                  f"got {r.status} loc={cb[:160]!r}")
+            if r.status == 302 and os_app_cookie:
+                c.tls_curl(cb, headers={"Cookie": os_app_cookie})
+                for _ in range(200):
+                    pr = c.tls_curl(app_origin + "/_rp/poll",
+                                    headers={"Cookie": os_app_cookie})
+                    try:
+                        if pr.status == 200 and json.loads(pr.body).get("authed"):
+                            os_authed = True
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+        check("one-shot: RP session lands (poll → authed)", os_authed)
+
         # ── A5: log query through the admin chokepoint (the door). ─────────
         # Operator reads acme's logs via /v1/logs/{tenant}/list — the admin
         # issues the rewind-logs.internal door fetch (no browser token). Empty

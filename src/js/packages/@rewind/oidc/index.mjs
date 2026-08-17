@@ -402,7 +402,7 @@ class OIDCProvider {
     if (sid) kv.delete(this.cfg.session_path + "/" + sid);
     const q = new URLSearchParams(request.query || "");
     const plru = q.get("post_logout_redirect_uri");
-    if (plru && this._isRegisteredLogoutTarget(plru)) {
+    if (plru && this.isRegisteredClientOrigin(plru)) {
       response.status = 302;
       response.headers = { location: plru };
       return null;
@@ -413,10 +413,22 @@ class OIDCProvider {
       "<p>You have been signed out.</p>";
   }
 
-  // True iff `uri`'s origin (scheme://host[:port]) matches a registered
-  // client redirect_uri's origin. Origin-only — the RP lands the user on its
-  // own post-logout path; we guard the destination host, not the path.
-  _isRegisteredLogoutTarget(uri) {
+  /**
+   * True iff `uri`'s origin (scheme://host[:port]) matches a registered
+   * client redirect_uri's origin — the "may this IdP send a browser
+   * there" question. Origin-only: the destination path is the caller's
+   * to choose; the destination host is governed by the client registry.
+   * Backs RP-Initiated Logout's `post_logout_redirect_uri` validation,
+   * and an IdP's own login UI can use it to accept a cross-origin
+   * `return_to` on a registered RP (the one-submission entry: a static
+   * page POSTs the login form directly and the magic-link verify lands
+   * the browser on the RP's login route) — every browser-bound exit
+   * from the IdP answers to the same allowlist.
+   *
+   * @param {string} uri - Absolute URI whose origin is checked.
+   * @returns {boolean}
+   */
+  isRegisteredClientOrigin(uri) {
     const origin = (u) => {
       const m = /^([a-z][a-z0-9+.\-]*:\/\/[^\/?#]+)/i.exec(u || "");
       return m ? m[1].toLowerCase() : null;
