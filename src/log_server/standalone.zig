@@ -936,14 +936,22 @@ fn handleSeam(
     };
     defer before_loc.deinit(db.allocator);
 
-    var before_sets, const before_no_tape = try hopKeySets(allocator, store, &before_loc);
+    var before_sets, const before_no_tape = hopKeySets(allocator, store, &before_loc) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "seam probe failed at before_seq: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
     defer before_sets.deinit();
 
     // The left hop (its WRITES are the mirror probe); absent when
-    // after_seq = 0 — the seam before the saga's first hop.
+    // after_seq = 0 — the seam before the saga's first hop. The empty
+    // default owns nothing, so it is never deinit'd: only a set the
+    // probe actually produced is (a probe failure must not leave a
+    // deinit aimed at an unassigned value).
     var after_no_tape = false;
     var after_sets: seam_mod.KeySets = .{ .allocator = allocator };
-    defer after_sets.deinit();
+    var after_sets_owned = false;
+    defer if (after_sets_owned) after_sets.deinit();
     if (after_seq != 0) {
         var after_loc = (db.querySeamLocAt(tenant_id, after_seq, floor_received_ns) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "seam failed: {s}\n", .{@errorName(err)});
@@ -954,8 +962,14 @@ fn handleSeam(
             return;
         };
         defer after_loc.deinit(db.allocator);
-        after_sets.deinit();
-        after_sets, after_no_tape = try hopKeySets(allocator, store, &after_loc);
+        const probed = hopKeySets(allocator, store, &after_loc) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "seam probe failed at after_seq: {s}\n", .{@errorName(err)});
+            try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+            return;
+        };
+        after_sets = probed[0];
+        after_sets_owned = true;
+        after_no_tape = probed[1];
     }
 
     var candidates = db.querySeamLocs(tenant_id, after_seq, before_seq, floor_received_ns, scan_cap + 1) catch |err| {
@@ -964,55 +978,88 @@ fn handleSeam(
         return;
     };
     defer candidates.deinit();
-    const scan_truncated = candidates.rows.len > scan_cap;
-    const scan_rows = candidates.rows[0..@min(candidates.rows.len, scan_cap)];
 
+    const json = renderSeamJson(allocator, store, .{
+        .after_seq = after_seq,
+        .before_seq = before_seq,
+        .before = &before_sets,
+        .after = &after_sets,
+        .before_no_tape = before_no_tape,
+        .after_no_tape = after_no_tape,
+        .scan_rows = candidates.rows[0..@min(candidates.rows.len, scan_cap)],
+        .scan_truncated = candidates.rows.len > scan_cap,
+    }) catch |err| {
+        // Every failure here is loud: a candidate we cannot probe must
+        // never render as a quiet seam, which would read as data.
+        const msg = try std.fmt.allocPrint(allocator, "seam scan failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
+}
+
+/// Everything `renderSeamJson` needs: the seam's bounds, both hops'
+/// probe sets (+ whether each was probeable), and the capped candidate
+/// page.
+const SeamRender = struct {
+    after_seq: u64,
+    before_seq: u64,
+    before: *const seam_mod.KeySets,
+    after: *const seam_mod.KeySets,
+    before_no_tape: bool,
+    after_no_tape: bool,
+    scan_rows: []index_db_mod.IndexDb.SeamLoc,
+    scan_truncated: bool,
+};
+
+/// Render the seam response, probing each candidate against the two
+/// hop key sets. Returns an error — never a partial body — if any
+/// candidate can't be read or decoded; the caller answers 500.
+fn renderSeamJson(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    r: SeamRender,
+) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
-    var wrote_any = false;
-    var skipped_no_tape: u32 = 0;
     {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+        // Runs on the error return too, handing the buffer back so the
+        // errdefer above owns exactly one free.
         defer buf = aw.toArrayList();
-        try aw.writer.print(
+        const w = &aw.writer;
+
+        try w.print(
             "{{\"after_seq\":\"{d}\",\"before_seq\":\"{d}\",\"probe\":{{\"reads\":{d},\"read_prefixes\":{d},\"writes\":{d},\"hop_tapes_truncated\":{},\"before_no_tape\":{},\"after_no_tape\":{}}},\"scanned\":{d},\"scan_truncated\":{},\"interacting\":[",
-            .{ after_seq, before_seq, before_sets.reads.len, before_sets.read_prefixes.len, after_sets.writes.len, before_sets.truncated or after_sets.truncated, before_no_tape, after_no_tape, scan_rows.len, scan_truncated },
+            .{ r.after_seq, r.before_seq, r.before.reads.len, r.before.read_prefixes.len, r.after.writes.len, r.before.truncated or r.after.truncated, r.before_no_tape, r.after_no_tape, r.scan_rows.len, r.scan_truncated },
         );
 
-        for (scan_rows) |*cand| {
+        var wrote_any = false;
+        var skipped_no_tape: u32 = 0;
+        for (r.scan_rows) |*cand| {
             const rec_json = fetchRecordJson(allocator, store, cand.ndjson_key, cand.offset, cand.length) catch |err| {
-                // A candidate whose frame can't be fetched must not
-                // fabricate a quiet seam — fail the whole scan loudly.
-                buf = aw.toArrayList();
-                buf.deinit(allocator);
-                const msg = try std.fmt.allocPrint(allocator, "seam candidate fetch failed for {s}: {s}\n", .{ cand.ndjson_key, @errorName(err) });
-                try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
-                return;
+                std.log.warn("seam: candidate frame unreadable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUnreadable;
             };
             defer allocator.free(rec_json);
-            var blobs = seam_mod.blobsFromRecordJson(allocator, rec_json) catch {
-                buf = aw.toArrayList();
-                buf.deinit(allocator);
-                try setResponse(server, ent, sid, sess, 500, "seam candidate record unparseable\n", cfg);
-                return;
+            var blobs = seam_mod.blobsFromRecordJson(allocator, rec_json) catch |err| {
+                std.log.warn("seam: candidate record undecodable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUndecodable;
             };
             defer blobs.deinit(allocator);
+            // Neither side captured ⇒ unprobeable, counted not guessed.
             if (blobs.kv_tape == null and blobs.write_keys_blob == null) {
                 skipped_no_tape += 1;
                 continue;
             }
-            const wkeys = seam_mod.decodeWriteKeys(allocator, blobs.write_keys_blob) catch {
-                buf = aw.toArrayList();
-                buf.deinit(allocator);
-                try setResponse(server, ent, sid, sess, 500, "seam candidate write keys unparseable\n", cfg);
-                return;
+            const wkeys = seam_mod.decodeWriteKeys(allocator, blobs.write_keys_blob) catch |err| {
+                std.log.warn("seam: candidate write keys undecodable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUndecodable;
             };
             defer allocator.free(wkeys);
-            var cand_sets = seam_mod.extractKeySets(allocator, blobs.kv_tape, wkeys) catch {
-                buf = aw.toArrayList();
-                buf.deinit(allocator);
-                try setResponse(server, ent, sid, sess, 500, "seam candidate tape unparseable\n", cfg);
-                return;
+            var cand_sets = seam_mod.extractKeySets(allocator, blobs.kv_tape, wkeys) catch |err| {
+                std.log.warn("seam: candidate tape undecodable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUndecodable;
             };
             defer cand_sets.deinit();
 
@@ -1021,46 +1068,45 @@ fn handleSeam(
             // its own reads participate (it did observe committed state).
             const cand_committed = std.mem.eql(u8, cand.outcome, "ok");
             var wrote: seam_mod.Matches = if (cand_committed)
-                try seam_mod.writesMatching(allocator, &cand_sets, &before_sets, MATCH_KEY_CAP)
+                try seam_mod.writesMatching(allocator, &cand_sets, r.before, MATCH_KEY_CAP)
             else
                 .{ .keys = &.{}, .truncated = false };
             defer if (cand_committed) wrote.deinit(allocator);
-            var read = try seam_mod.readsMatching(allocator, &cand_sets, &after_sets, MATCH_KEY_CAP);
+            var read = try seam_mod.readsMatching(allocator, &cand_sets, r.after, MATCH_KEY_CAP);
             defer read.deinit(allocator);
             if (wrote.keys.len == 0 and read.keys.len == 0) continue;
 
-            if (wrote_any) try aw.writer.writeAll(",");
+            if (wrote_any) try w.writeAll(",");
             wrote_any = true;
             var rid_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
             const rid = log_mod.formatPrefixedId(&rid_buf, log_mod.REQUEST_ID_PREFIX, cand.request_id);
-            try aw.writer.print(
+            try w.print(
                 "{{\"request_id\":\"{s}\",\"exec_seq\":\"{d}\",\"received_ns\":{d},\"status\":{d},\"method\":",
                 .{ rid, cand.exec_seq, cand.received_ns, cand.status },
             );
-            try writeJsonString(&aw.writer, cand.method);
-            try aw.writer.writeAll(",\"path\":");
-            try writeJsonString(&aw.writer, cand.path);
-            try aw.writer.writeAll(",\"outcome\":");
-            try writeJsonString(&aw.writer, cand.outcome);
-            try aw.writer.writeAll(",\"activation\":");
-            try writeJsonString(&aw.writer, cand.activation);
-            try aw.writer.writeAll(",\"wrote\":[");
+            try writeJsonString(w, cand.method);
+            try w.writeAll(",\"path\":");
+            try writeJsonString(w, cand.path);
+            try w.writeAll(",\"outcome\":");
+            try writeJsonString(w, cand.outcome);
+            try w.writeAll(",\"activation\":");
+            try writeJsonString(w, cand.activation);
+            try w.writeAll(",\"wrote\":[");
             for (wrote.keys, 0..) |k, i| {
-                if (i > 0) try aw.writer.writeAll(",");
-                try writeJsonString(&aw.writer, k);
+                if (i > 0) try w.writeAll(",");
+                try writeJsonString(w, k);
             }
-            try aw.writer.writeAll("],\"read\":[");
+            try w.writeAll("],\"read\":[");
             for (read.keys, 0..) |k, i| {
-                if (i > 0) try aw.writer.writeAll(",");
-                try writeJsonString(&aw.writer, k);
+                if (i > 0) try w.writeAll(",");
+                try writeJsonString(w, k);
             }
-            try aw.writer.print("],\"keys_truncated\":{}}}", .{wrote.truncated or read.truncated});
+            try w.print("],\"keys_truncated\":{}}}", .{wrote.truncated or read.truncated});
         }
 
-        try aw.writer.print("],\"skipped_no_tape\":{d}}}\n", .{skipped_no_tape});
+        try w.print("],\"skipped_no_tape\":{d}}}\n", .{skipped_no_tape});
     }
-    const out = try buf.toOwnedSlice(allocator);
-    try setResponseOwned(server, ent, sid, sess, 200, out, cfg);
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Fetch one hop's record and extract its key sets (reads from the kv
