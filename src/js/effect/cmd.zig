@@ -114,6 +114,24 @@ pub const Cmd = union(enum) {
     /// on).
     ws_send: WsSendOut,
 
+    /// Commit-gated durable-wake arm for a CROSS-TENANT
+    /// `_sched/by_time/` put — the target-envelope sibling of the
+    /// anchor writeset's `kv_wake_broadcast` walk in
+    /// `noteCommittedSchedWrites`. A `platform.scope(t).kv` schedule
+    /// write rides the batch's target envelope, which builds no
+    /// `kv_wake_broadcast` Cmds (those are anchor-only by design —
+    /// kv-react fan-out is anchor-tenant semantics), so without this
+    /// the TARGET tenant's `next_wake_ns` watermark never lowers on
+    /// the proposing node and the wake sleeps until the target's next
+    /// leadership transition. Consumed by `noteCommittedSchedWrites`
+    /// (which runs before `releaseAll`); `interpretCmd`'s arm only
+    /// frees. The cross-NODE half of the same fix is the
+    /// `_sched/by_time/` branch in the bridge apply observer
+    /// (`rewind/main.zig`). Producer:
+    /// `worker_dispatch.appendTargetSchedWakeCmds` (both finalize
+    /// paths).
+    target_sched_wake: TargetSchedWake,
+
     /// Discard-arm: free every owned resource. Called per-Cmd from
     /// `BufferedCmds.deinit` on the fault path.
     pub fn deinit(self: *Cmd, allocator: std.mem.Allocator) void {
@@ -124,7 +142,21 @@ pub const Cmd = union(enum) {
             .http_fetch => |*pf| pf.deinit(allocator),
             .respond => |*ro| ro.deinit(allocator),
             .ws_send => |wo| if (wo.bytes.len > 0) allocator.free(wo.bytes),
+            .target_sched_wake => |*tw| tw.deinit(allocator),
         }
+        self.* = undefined;
+    }
+};
+
+/// Cross-tenant durable-wake intent: lower `tenant_id`'s watermark to
+/// `when_ns` at commit (leadership-gated at the consume site — the
+/// watermark is leader-local state). Allocator-owned tenant id.
+pub const TargetSchedWake = struct {
+    tenant_id: []u8,
+    when_ns: i64,
+
+    pub fn deinit(self: *TargetSchedWake, allocator: std.mem.Allocator) void {
+        if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
         self.* = undefined;
     }
 };
@@ -310,6 +342,12 @@ pub fn interpretCmd(
             worker.node.router.broadcastKvWake(tenant_id, w.key, w.op, write_version);
             // Broadcast just reads the key; release it after.
             allocator.free(w.key);
+        },
+        .target_sched_wake => |tw| {
+            // Already consumed by `noteCommittedSchedWrites` (runs
+            // before releaseAll on the same unit); nothing to
+            // interpret — just release the owned id.
+            allocator.free(tw.tenant_id);
         },
         .stream_chunk => |sc| {
             const server = worker.h2;

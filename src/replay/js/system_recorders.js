@@ -446,12 +446,27 @@
     },
     blob: {
       // jsBlobPresign (bindings/blob.zig): hash = 64 lowercase hex; a
-      // present ttl must land in 1..604800 after ToInt32.
-      presign: function(hash, ttl, ct){
+      // present ttl must land in 1..604800 after ToInt32; pool (arg 4) is a
+      // closed set; target (arg 5, the `platform.scope(t).blob` shims) is
+      // admin-only — the sim mirrors the throw, keyed on the same platform
+      // grant the scope object itself uses.
+      presign: function(hash, ttl, ct, pool, target){
         if (typeof hash !== "string") throw new TypeError("blob.url requires a hash string");
         if (!/^[0-9a-f]{64}$/.test(hash)) throw new TypeError("blob.url: hash must be 64 lowercase hex chars");
         if (ttl !== undefined && ttl !== null) { var t = Number(ttl) | 0; if (t < 1 || t > 604800) throw new TypeError("blob.url: ttl must be 1..604800 seconds"); }
-        return "https://sim.invalid/blob/" + hash + (ttl != null ? "?ttl=" + ttl : "");
+        var subdir = "app-blobs";
+        if (pool !== undefined && pool !== null && typeof pool === "string") {
+          if (pool === "exports" || pool === "file-blobs") subdir = pool;
+          else if (pool !== "app-blobs") throw new TypeError("blob presign: unknown pool");
+        }
+        if (target !== undefined && target !== null && typeof target === "string") {
+          // Same admin predicate as the platform.* gate above: authored
+          // worlds opt in via `scenario({admin:true})`; a captured world is
+          // proof the call was admitted live.
+          if (!globalThis.__rove_captured && globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError("blob presign: scoped presign is admin-only");
+          return "https://sim.invalid/" + target + "/" + subdir + "/" + hash + (ttl != null ? "?ttl=" + ttl : "");
+        }
+        return "https://sim.invalid/" + (subdir === "app-blobs" ? "blob/" : subdir + "/") + hash + (ttl != null ? "?ttl=" + ttl : "");
       },
       write: function(){}, seal: function(){ return {}; },
       // `blob.receive(on)` (own-tenant) and `platform.scope(id).blob.receive`

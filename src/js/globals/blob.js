@@ -271,6 +271,33 @@ globalThis.blob = {
   },
 
   /**
+   * Presign a deployed file's bytes — the `file-blobs/` twin of
+   * {@link blob.url}. An export artifact's bundle part (the deployment
+   * manifest) references each handler source and static asset by its
+   * content hash in the tenant's own immutable `file-blobs/` store; this
+   * turns those hashes into download URLs, so the code slice of an export
+   * ships pointers rather than copies (rove#340).
+   *
+   * @param {string} hash - A source/static hash from a deployment manifest.
+   * @param {object} [opts]
+   * @param {number} [opts.ttl] - Validity in seconds (default 300,
+   *   max 604800 = 7 days).
+   * @param {string} [opts.contentType] - Signed response Content-Type
+   *   override (S3 returns exactly this).
+   * @returns {string} The presigned URL.
+   */
+  fileUrl(hash, opts) {
+    opts = opts || {};
+    assertHash(hash, "blob.fileUrl");
+    // No `_assertMaterialized`: file-blobs are written by the deploy path,
+    // not through `blob.put`, so there is no `_blob/pending/{hash}` marker
+    // to check (the same posture as `blob.exportUrl`).
+    return sysBlob.presign(hash, opts.ttl != null ? opts.ttl : null,
+                           opts.contentType != null ? opts.contentType : null,
+                           "file-blobs");
+  },
+
+  /**
    * Append bytes to this chain's open recipe (created on the first
    * write). The accumulation is kv rows + a sha256 midstate — nothing
    * lives in worker RAM, so it spans activations, replicates, and

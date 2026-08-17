@@ -1182,7 +1182,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{
         .path = &.{ "_system", "blob" },
         .fns = &.{
-            .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 4 },
+            .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 5 },
             // Upload sessions (`docs/architecture/routing-and-ingress.md`, customer blob storage).
             .{ .name = "write", .cfunc = blob_b.jsBlobWrite, .argc = 1 },
             .{ .name = "seal", .cfunc = blob_b.jsBlobSeal, .argc = 2 },

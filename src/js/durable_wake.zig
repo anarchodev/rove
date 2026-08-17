@@ -153,6 +153,23 @@ pub fn noteCommittedSchedWrites(worker: anytype, unit: anytype) void {
             if (slot == null) slot = worker.node.deploy.tenant_files_map.get(unit.tenant_id);
             if (slot) |s| s.lowerWake(when_ns);
         },
+        .target_sched_wake => |tw| {
+            // Cross-tenant (`platform.scope(t).kv`) sched put riding
+            // this batch's target envelope: the same commit-gated
+            // bootstrap as the anchor walk above, aimed at the TARGET
+            // tenant's watermark. Leadership-gated — the watermark is
+            // leader-local state (only commit arms and the promotion
+            // pass ever set it); lowering it on a non-leader would
+            // make the steady sweep busy-fire a tick that can never
+            // commit there. When this node does NOT lead the target's
+            // group, the arm happens on the node that does, via the
+            // `_sched/by_time/` branch of the bridge apply observer
+            // (the cross-node half of the same fix — rewind/main.zig).
+            const gid = worker.node.raft.gidForTenant(tw.tenant_id) orelse continue;
+            if (!worker.node.raft.isLeaderOf(gid)) continue;
+            if (worker.node.deploy.tenant_files_map.get(tw.tenant_id)) |ts|
+                ts.lowerWake(tw.when_ns);
+        },
         else => {},
     };
 }
@@ -160,8 +177,11 @@ pub fn noteCommittedSchedWrites(worker: anytype, unit: anytype) void {
 /// Parse `whenNs` out of a `_sched/by_time/{whenNs_padded}/{id}` key.
 /// Null when the key isn't a by_time index entry or the timestamp
 /// segment doesn't parse. Leading zero-padding is fine — `parseInt`
-/// ignores it.
-fn parseByTimeWhenNs(key: []const u8) ?i64 {
+/// ignores it. Pub: the batch finalize paths
+/// (`worker_dispatch.appendTargetSchedWakeCmds`) and the bridge apply
+/// observer (`rewind/main.zig`) key their sched-write detection on the
+/// same parse, so the three sites can't drift on the key shape.
+pub fn parseByTimeWhenNs(key: []const u8) ?i64 {
     if (!std.mem.startsWith(u8, key, SCHED_BY_TIME_PREFIX)) return null;
     const rest = key[SCHED_BY_TIME_PREFIX.len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;

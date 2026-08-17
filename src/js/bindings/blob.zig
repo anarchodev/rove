@@ -21,6 +21,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const c = qjs.c;
 const blob_mod = @import("rove-blob");
+const tenant_mod = @import("rove-tenant");
 const blob_sessions = @import("../blob_sessions.zig");
 const blob_receive = @import("../blob_receive.zig");
 const http_b = @import("http.zig");
@@ -36,17 +37,28 @@ const js_undefined = globals.js_undefined;
 const PRESIGN_DEFAULT_TTL_SECS: u32 = 300;
 const PRESIGN_MAX_TTL_SECS: u32 = 604_800;
 
-/// `_system.blob.presign(hash, ttl_secs?, content_type?, pool?)` → URL
-/// string. Presigned GET against the calling tenant's
+/// `_system.blob.presign(hash, ttl_secs?, content_type?, pool?, target?)` →
+/// URL string. Presigned GET against a tenant's
 /// `{key_prefix_base}{instance_id}/{pool}/{hash}` key, where `pool` is
-/// `app-blobs` (default) or `exports` — the unmetered pool the data-export
+/// `app-blobs` (default), `exports` — the unmetered pool the data-export
 /// job writes its parts into (rove#429), whose download links would
-/// otherwise have nothing to sign them.
+/// otherwise have nothing to sign them — or `file-blobs`, the
+/// content-addressed deployment store an export artifact's bundle manifest
+/// references (`blob.fileUrl`; the code slice ships pointers into the
+/// immutable store rather than copies — rove#340).
 ///
 /// The pool is a closed set resolved here, never a caller-supplied path
-/// fragment, so no argument can escape the tenant's own prefix. Both pools
-/// hold only this tenant's bytes (the prefix comes from `state.storage`), so
-/// naming either is not an escalation — a hash that isn't there simply 404s.
+/// fragment, so no argument can escape the tenant's own prefix. Every pool
+/// holds only that tenant's bytes (the prefix comes from the resolved
+/// storage handle), so naming any of them is not an escalation — a hash
+/// that isn't there simply 404s.
+///
+/// `target` (arg 5) presigns against ANOTHER tenant's pool — admin-only
+/// (`state.platform`, the same gate `blob.receive`'s scoped target uses),
+/// set by the `platform.scope(t).blob.{exportUrl,fileUrl}` shims so the
+/// dashboard can mint a customer's export links. The target resolves
+/// through the tenant registry to ITS storage handle (id + incarnation),
+/// so the signed path can never be assembled from the raw argument.
 pub fn jsBlobPresign(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -101,6 +113,8 @@ pub fn jsBlobPresign(
         const pool = @as([*]const u8, @ptrCast(pool_c))[0..pool_len];
         if (std.mem.eql(u8, pool, "exports")) {
             subdir = "exports";
+        } else if (std.mem.eql(u8, pool, "file-blobs")) {
+            subdir = "file-blobs";
         } else if (!std.mem.eql(u8, pool, "app-blobs")) {
             _ = c.JS_ThrowTypeError(ctx, "blob presign: unknown pool");
             return js_exception;
@@ -111,11 +125,39 @@ pub fn jsBlobPresign(
         _ = c.JS_ThrowTypeError(ctx, "blob.url: blob storage backend is not configured");
         return js_exception;
     };
-    const storage = state.storage orelse {
+    if (cfg.endpoint.len == 0) {
         _ = c.JS_ThrowTypeError(ctx, "blob.url: blob storage backend is not configured");
         return js_exception;
-    };
-    if (cfg.endpoint.len == 0) {
+    }
+
+    // Optional cross-tenant target (arg 5) — admin-only, resolved through
+    // the tenant registry so the signed prefix comes from THAT tenant's
+    // storage handle (id + incarnation), never from the argument.
+    var storage: *const tenant_mod.TenantStorage = undefined;
+    var target_c: ?[*:0]const u8 = null;
+    defer if (target_c) |p| c.JS_FreeCString(ctx, p);
+    if (argc >= 5 and c.JS_IsString(argv[4])) {
+        if (state.platform == null) {
+            _ = c.JS_ThrowTypeError(ctx, "blob presign: scoped presign is admin-only");
+            return js_exception;
+        }
+        var tl: usize = 0;
+        const tc = c.JS_ToCStringLen(ctx, &tl, argv[4]);
+        if (tc == null) return js_exception;
+        target_c = tc;
+        const target_id = @as([*]const u8, @ptrCast(tc))[0..tl];
+        const inst_opt = state.platform.?.getInstance(target_id) catch {
+            _ = c.JS_ThrowTypeError(ctx, "blob presign: instance not found");
+            return js_exception;
+        };
+        const inst = inst_opt orelse {
+            _ = c.JS_ThrowTypeError(ctx, "blob presign: instance not found");
+            return js_exception;
+        };
+        storage = &inst.storage;
+    } else if (state.storage) |*own| {
+        storage = own;
+    } else {
         _ = c.JS_ThrowTypeError(ctx, "blob.url: blob storage backend is not configured");
         return js_exception;
     }

@@ -66,6 +66,23 @@ export default function () {
     }
   });
 
+  check("blob.fileUrl", () => {
+    throws(() => blob.fileUrl("nope"), /hash must be 64 lowercase hex chars/);
+    throws(() => blob.fileUrl(SHA_HELLO, { ttl: 0 }), /ttl must be 1\.\.604800/);
+    // The code slice of an export ships POINTERS: a bundle manifest's file
+    // hashes sign into the tenant's own content-addressed `file-blobs/`
+    // (rove#340), the store the deploy path wrote them into.
+    const url = blob.fileUrl(SHA_HELLO, { ttl: 300, contentType: "text/css" });
+    ok(url.startsWith("https://s3.test.example/surface-bucket/sfx/surface/file-blobs/" + SHA_HELLO),
+      "file-blobs path, got " + url);
+    ok(url.includes("/sfx/surface/"), "tenant-prefixed, got " + url);
+    for (const param of ["X-Amz-Algorithm=AWS4-HMAC-SHA256", "X-Amz-Expires=300",
+                         "X-Amz-Signature=", "X-Amz-Date="]) {
+      ok(url.includes(param), "presigned URL carries " + param);
+    }
+    ok(url.includes("text%2Fcss") || url.includes("text/css"), "signed content-type present");
+  });
+
   check("blob.write", () => {
     throws(() => blob.write(42), /bytes must be a string or Uint8Array/);
     // The recipe substrate: appends are kv rows + a sha256 midstate —
