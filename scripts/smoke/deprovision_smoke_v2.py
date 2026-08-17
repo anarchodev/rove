@@ -57,7 +57,14 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    with V2Cluster.spawn("deprov", nodes=3) as c:
+    # Generation 1, not the default 0 (rove#606). At generation 0
+    # `namespace.apply` is a no-op, so a consumer that scopes to the
+    # generation and one that does not compose the SAME prefix — and the
+    # sweep assertion below cannot fail however wrong the CP is. Production
+    # runs at generation 1, where the two diverge, and that is where the CP
+    # was found sweeping `prod/{tenant}/…` while the bytes sat in
+    # `prod/1/{tenant}/…`.
+    with V2Cluster.spawn("deprov", nodes=3, storage_generation=1) as c:
         cp_url = c.front_url().replace(str(c.front_port), str(c.cp_port))
 
         def cp(op: str, body: dict):

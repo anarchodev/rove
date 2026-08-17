@@ -246,8 +246,19 @@ def attach_join(url: str, *, tenant: str,
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
-def claim_storage_namespace(prefix: str) -> None:
+def claim_storage_namespace(prefix: str, *, generation: int = 0) -> None:
     """Stamp `prefix` with a storage-namespace marker (rove#266).
+
+    `generation=N` bumps the marker N times after adopting, so the store runs
+    at a NON-ZERO generation. That matters more than it looks: generation 0 is
+    the un-segmented layout, and `namespace.apply` returns the base UNCHANGED
+    for it. So at the default a namespaced consumer and a non-namespaced one
+    compose byte-identical prefixes, and any disagreement about who applies
+    the generation is invisible — which is exactly how rove#606 (the CP
+    sweeping an un-namespaced prefix, deleting nothing, reporting success)
+    survived a smoke that already asserted the sweep removed objects.
+    Production runs at generation 1. A smoke that cares about prefix
+    composition must ask for one too.
 
     Every service refuses to start against an unmarked object store — without
     a generation it cannot tell its own keys from a previous cluster
@@ -268,12 +279,19 @@ def claim_storage_namespace(prefix: str) -> None:
              "--env", "/nonexistent-so-only-the-process-env-is-read"],
             env=env, capture_output=True, text=True, timeout=60)
 
-    if ops().returncode == 0:
-        return
-    r = ops("--adopt")
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"could not claim the storage namespace for {prefix}: {r.stdout}{r.stderr}")
+    already_claimed = ops().returncode == 0
+    if not already_claimed:
+        r = ops("--adopt")
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"could not claim the storage namespace for {prefix}: {r.stdout}{r.stderr}")
+    if already_claimed:
+        return  # a prefix someone else already staked; leave its generation alone
+    for _ in range(generation):
+        r = ops("--bump")
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"could not bump the storage namespace for {prefix}: {r.stdout}{r.stderr}")
 
 
 def _gen_self_signed(prefix: str) -> tuple[str, str]:
@@ -349,6 +367,7 @@ class V2Cluster:
               tls_idp: bool = False,
               tls_cert: str = "", tls_key: str = "",
               genesis: bool = False,
+              storage_generation: int = 0,
               worker_log_push: bool = True) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
@@ -393,16 +412,16 @@ class V2Cluster:
         )
         for d in (*c.data_dirs, c.cp_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
-        c._claim_storage_namespace()
+        c._claim_storage_namespace(storage_generation)
         if genesis:
             c._boot_genesis(nodes)
         else:
             c._boot(nodes)
         return c
 
-    def _claim_storage_namespace(self) -> None:
+    def _claim_storage_namespace(self, generation: int = 0) -> None:
         """Claim this run's prefix — see `claim_storage_namespace`."""
-        claim_storage_namespace(self.s3_prefix)
+        claim_storage_namespace(self.s3_prefix, generation=generation)
 
     def _boot(self, nodes: int) -> None:
         voters = ",".join(str(i + 1) for i in range(nodes))
