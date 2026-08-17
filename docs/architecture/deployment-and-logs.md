@@ -257,6 +257,17 @@ read-your-write blame in the saga viewer all key on it.
 - **Query** (`/v1/{tenant}/window`): the tape view — ascending by
   `exec_seq`, keyset-paged on the stamp itself (`after_seq`), bounded by
   `seq_from`/`seq_to`, honoring the same retention read-clamp as `/list`.
+- **The saga window** (`/v1/{tenant}/saga/{saga_id}`): one saga as the
+  viewer consumes it — the roll-up row, the saga's **hops** (its stamped
+  activations, ascending tape order, `after_seq` keyset), per-seam **gap
+  summaries** (a bounded count of foreign activations between consecutive
+  hops plus the quiet duration — counts cap at `GAP_COUNT_CAP` with an
+  explicit `truncated` flag, never a silent cap), and an **unplaced**
+  addendum (unstamped hops, first page only — they have no tape position
+  and are not given a fake one). Seams across a page boundary are the
+  client's to stitch; it holds both edge hops. The roll-up's
+  `closed_at_ns == 0` means "no close was seen", which is NOT a liveness
+  signal — the holder is the only authority on open connections.
 - **Known anomaly** (shared with every leader-serialized system): a deposed
   leader that hasn't yet observed its deposition can stamp read-only
   activations into the old term. Those stamps are unique and order

@@ -168,6 +168,68 @@ def main() -> int:
                   p2_seqs == win_seqs[1:],
                   f"page2={p2_seqs} want={win_seqs[1:]}")
 
+        # ── The saga window: a multi-hop saga via the correlation header,
+        # interleaved with foreign requests. Serial per-tenant execution
+        # makes the stamps consecutive, so the seam counts are exact:
+        # S f f S f S → gaps of 2 and 1.
+        saga_hdr = {"X-Rove-Correlation-Id": "saga-e2e"}
+        plan = [saga_hdr, None, None, saga_hdr, None, saga_hdr]
+        saga_ok = 0
+        for i, hdr in enumerate(plan):
+            rr = c.request("globex", f"/?fn=handler&s={i}", headers=hdr,
+                           timeout=30.0)
+            if rr.status == 200 and rr.body == "ready":
+                saga_ok += 1
+        check("generated the interleaved saga traffic", saga_ok == len(plan),
+              f"{saga_ok}/{len(plan)} returned 200 'ready'")
+
+        # Wait for the saga's hops to be indexed, then hold the response.
+        saga_body = ""
+        saga = {}
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            resp = c.log_get("globex/saga/saga-e2e", timeout=15.0)
+            saga_body = resp.body
+            if resp.status == 200:
+                try:
+                    saga = json.loads(resp.body)
+                except json.JSONDecodeError:
+                    saga = {}
+                if len(saga.get("hops", [])) >= 3:
+                    break
+            time.sleep(1.0)
+
+        hops = saga.get("hops", [])
+        hop_seqs = [int(h.get("exec_seq", "0")) for h in hops]
+        check("saga window returns 3 hops in ascending tape order",
+              len(hops) == 3 and hop_seqs == sorted(hop_seqs)
+              and all(s > 0 for s in hop_seqs),
+              f"hops={hop_seqs} body={saga_body[:200]!r}")
+        check("saga roll-up names the saga and counts its activations",
+              saga.get("saga", {}).get("saga_id") == "saga-e2e"
+              and saga.get("saga", {}).get("activation_count") == 3,
+              f"saga={saga.get('saga')!r}")
+        gaps = saga.get("gaps", [])
+        check("gap summaries count the interleaved foreign activations",
+              [g.get("count") for g in gaps] == [2, 1]
+              and not any(g.get("truncated") for g in gaps),
+              f"gaps={gaps!r}")
+        if len(hop_seqs) == 3:
+            p2 = c.log_get(f"globex/saga/saga-e2e?after_seq={hop_seqs[0]}",
+                           timeout=15.0)
+            p2_hops = []
+            if p2.status == 200:
+                try:
+                    p2_hops = [int(h.get("exec_seq", "0"))
+                               for h in json.loads(p2.body).get("hops", [])]
+                except json.JSONDecodeError:
+                    pass
+            check("saga cursor resumes strictly after a hop",
+                  p2_hops == hop_seqs[1:], f"page2={p2_hops}")
+        unknown = c.log_get("globex/saga/never-seen", timeout=15.0)
+        check("unknown saga is a 404", unknown.status == 404,
+              f"status={unknown.status}")
+
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
         return 1
