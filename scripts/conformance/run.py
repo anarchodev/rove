@@ -89,7 +89,21 @@ def augment_world(world: dict, source_dir: Path) -> dict:
 
     A world that declares its own `packages` is left alone — an explicit
     declaration beats an inferred one.
+
+    The saga id is pinned for the same same-inputs reason: prod
+    synthesizes one when the wire carries none, while the sim runs with
+    none — and the saga id is a recorded input that can reach written
+    bytes (`_sched/*.armed_by`, the durable-wake provenance). An
+    unpinned case would diverge on the first schedule() arm through no
+    fault of the engines. A world that declares its own `request.sagaId`
+    wins; the prod adapter sends whichever id the world ends up with as
+    `X-Rove-Correlation-Id`.
     """
+    req = dict(world.get("request") or {})
+    if not req.get("sagaId"):
+        world = dict(world)
+        req["sagaId"] = "conformance-saga"
+        world["request"] = req
     if world.get("packages") or world.get("app_imports"):
         return world
     manifest = source_dir / "manifest.json"

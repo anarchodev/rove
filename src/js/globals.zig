@@ -514,6 +514,14 @@ pub const DispatchState = struct {
     /// arena-OOM bump→GC retry (dispatcher.runOutcome) refuses to
     /// rerun an attempt that raised this.
     side_effects_flag: ?*bool = null,
+    /// The saga that ARMED this activation across the durability
+    /// boundary (`Trace.parent_saga`, a durable wake's provenance —
+    /// handler-shape.md §3.2). Consumed by `finishResponse`, which
+    /// stamps it as the reserved `_parent` record tag AFTER the handler
+    /// ran — so it never occupies the handler's `request.tag` quota and
+    /// never reaches the JS surface. Null everywhere but the durable-
+    /// wake fire path.
+    parent_saga: ?[]const u8 = null,
     /// `docs/architecture/websockets.md`: per-chunk RFC 6455 data opcode, pushed in
     /// lockstep with `pending_stream_chunks` (1 = text, the arg was a
     /// string; 2 = binary, an ArrayBuffer/TypedArray). Non-null only on

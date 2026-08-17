@@ -323,6 +323,15 @@ def run_prod(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
     if body is not None and not isinstance(body, str):
         body = json.dumps(body)
     headers = {str(k): str(v) for k, v in (req.get("headers") or {}).items()}
+    # Pin prod's saga id to the world's (augment_world guarantees one):
+    # unpinned, prod synthesizes an id the sim doesn't have, and the
+    # saga id reaches written bytes (`_sched/*.armed_by`) — a same-
+    # inputs violation, not an engine divergence.
+    pinned_saga = (world.get("request") or {}).get("sagaId")
+    if pinned_saga and not any(
+        k.lower() == "x-rove-correlation-id" for k in headers
+    ):
+        headers["X-Rove-Correlation-Id"] = str(pinned_saga)
 
     resp = cluster.request(
         tenant, path, method=method, data=body, headers=headers or None, timeout=45.0

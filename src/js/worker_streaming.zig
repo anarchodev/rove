@@ -1505,6 +1505,21 @@ pub const FirePrep = struct {
         p.readset.deinit();
         p.dep.tc.release();
     }
+
+    /// The `Request.trace` every fire site builds — ONE constructor so
+    /// a new Trace field cannot be silently forgotten at some sites
+    /// (the same failure mode `plan_rate`'s doc above records: a site
+    /// that forgets ships struct defaults, visible only from far away).
+    /// `parent_saga` is non-null only on the durable-wake path.
+    pub fn trace(p: *FirePrep, saga_id: ?[]const u8, parent_saga: ?[]const u8) dispatcher_mod.Trace {
+        return .{
+            .readset = &p.readset,
+            .request_id = p.request_id,
+            .saga_id = saga_id,
+            .exec_seq = p.exec_seq,
+            .parent_saga = parent_saga,
+        };
+    }
 };
 
 /// Build the shared prep. Returns null (after a warn) when the
@@ -1716,6 +1731,18 @@ pub fn runFire(
     const tenant_id = p.dep.inst.id;
     const dep_id = p.dep.tc.snap.deployment_id;
 
+    // Captures below that carry no handler tags must still carry the
+    // engine `_parent` provenance — a fire that FAULTS is exactly the
+    // record the armer's thread needs to find via `?tag._parent=`.
+    // Borrowed for the call; `captureLogWithId` dupes.
+    var parent_tag_buf: [1]log_mod.Tag = undefined;
+    const fallback_tags: []const log_mod.Tag = blk: {
+        const ps = req.trace.parent_saga orelse break :blk &.{};
+        if (!log_mod.validParentSagaValue(ps)) break :blk &.{};
+        parent_tag_buf[0] = .{ .key = log_mod.PARENT_SAGA_TAG, .value = ps };
+        break :blk parent_tag_buf[0..1];
+    };
+
     // Commit-gated fetch effects: every fire origin gets an `http.fetch`
     // accumulator so a fetch issued from a wake / subscription /
     // chained activation (`__system/webhook_fire`'s deferred fire, a
@@ -1741,7 +1768,7 @@ pub fn runFire(
         worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0, p.exec_seq);
+        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
         return;
     };
 
@@ -1886,17 +1913,17 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, spec.act, 0, p.exec_seq);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, fallback_tags, spec.act, 0, p.exec_seq);
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, &.{}, spec.act, fw_seq, p.exec_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, fallback_tags, spec.act, fw_seq, p.exec_seq);
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0, p.exec_seq);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; connectionless fires never dispatch as one.
@@ -1904,7 +1931,7 @@ pub fn runFire(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0, p.exec_seq);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
         },
     }
 }

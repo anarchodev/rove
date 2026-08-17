@@ -55,15 +55,30 @@ pub const Tag = struct {
 /// (`request.tag` throws), not a silent truncation.
 pub const MAX_TAGS: usize = 4;
 /// Max ENGINE-populated tags per record, on top of `MAX_TAGS` — the
-/// defensive cap downstream copies apply is the sum, so an engine tag
-/// can never silently evict a user's fourth tag.
+/// defensive cap downstream copies apply is `MAX_RECORD_TAGS`, so an
+/// engine tag can never silently evict a user's fourth tag.
 pub const MAX_ENGINE_TAGS: usize = 1;
+/// The record-level total: every consumer sizing or capping a record's
+/// tag list uses THIS, never `MAX_TAGS` alone (which bounds only what
+/// `request.tag` accepts).
+pub const MAX_RECORD_TAGS: usize = MAX_TAGS + MAX_ENGINE_TAGS;
 /// Reserved engine tag: the saga that ARMED an activation whose arm
 /// crossed the durability boundary and therefore rooted a new saga
 /// (handler-shape.md §3.2 — a durable wake's provenance). Stamped by
 /// the dispatcher from `Trace.parent_saga`; `_`-keys are rejected on
 /// the `request.tag` surface, so it cannot collide.
 pub const PARENT_SAGA_TAG = "_parent";
+
+/// Whether a candidate `_parent` value may be stamped. `armed_by`
+/// transits customer-writable `_sched/` state, so an oversized or
+/// control-char value is forged or garbage — dropped by every stamping
+/// site, never indexed. 256 is the correlation-header bound the saga id
+/// itself obeys.
+pub fn validParentSagaValue(v: []const u8) bool {
+    if (v.len == 0 or v.len > 256) return false;
+    for (v) |b| if (b < 0x20) return false;
+    return true;
+}
 /// Tag key length cap. Keys are `[a-z0-9_]`.
 pub const MAX_TAG_KEY_LEN: usize = 32;
 /// Tag value length cap. Values should be low-cardinality (a plan
@@ -386,8 +401,9 @@ pub const LogRecord = struct {
     /// JS exception message if the handler threw. Empty otherwise.
     exception: []const u8,
     tapes: TapePayloads = .{},
-    /// Low-cardinality user-defined index tags (≤`MAX_TAGS`), set by
-    /// the handler via `request.tag(k, v)`. Owned slice with owned
+    /// Low-cardinality index tags (≤`MAX_RECORD_TAGS`): the handler's
+    /// `request.tag(k, v)` set (≤`MAX_TAGS`) plus engine-stamped
+    /// `_`-tags (`_parent`). Owned slice with owned
     /// key/value bytes; `deinit` frees them. Empty (`&.{}`) when the
     /// handler set none. The log-server indexes these into `log_tags`
     /// for `?tag.k=v` filtering; the leader-captured record carries

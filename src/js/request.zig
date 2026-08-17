@@ -495,7 +495,9 @@ pub const Response = struct {
     /// handler set a content-type via `response.headers`.
     body_is_json: bool = false,
     /// User-defined index tags set via `request.tag(k,v)` during this
-    /// activation (≤`MAX_TAGS`). Owned slice + owned key/value; `deinit`
+    /// activation (≤`MAX_TAGS`; the record may add ≤`MAX_ENGINE_TAGS`
+    /// engine tags like `_parent` downstream). Owned slice + owned
+    /// key/value; `deinit`
     /// frees them. The capture site BORROWS these into the LogRecord
     /// (duped there), so this Response keeps ownership. Empty = none.
     tags: []log_mod.Tag = &.{},

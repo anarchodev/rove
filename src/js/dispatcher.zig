@@ -114,6 +114,7 @@ pub const SubscriptionFireSource = request_mod.SubscriptionFireSource;
 pub const Activation = request_mod.Activation;
 
 pub const Request = request_mod.Request;
+pub const Trace = request_mod.Trace;
 pub const ResponseHeader = request_mod.ResponseHeader;
 pub const Response = request_mod.Response;
 pub const RunOutcome = request_mod.RunOutcome;
@@ -246,27 +247,6 @@ pub const Dispatcher = struct {
         var tags_buf: std.ArrayList(log_mod.Tag) = .empty;
         errdefer freeTagsBuf(self.allocator, &tags_buf);
 
-        // Engine provenance: an activation whose arm crossed the
-        // durability boundary rooted a NEW saga (handler-shape.md §3.2),
-        // and the arming saga rides its record as the reserved `_parent`
-        // tag so the viewer can offer the cross-saga jump. Seeded before
-        // the handler's own `request.tag` calls; `_`-keys are rejected on
-        // the JS surface, so no collision is possible. Best-effort — a
-        // failed dupe drops the tag, never the activation.
-        if (request.trace.parent_saga) |ps| {
-            if (ps.len > 0) blk: {
-                const k = self.allocator.dupe(u8, log_mod.PARENT_SAGA_TAG) catch break :blk;
-                const v = self.allocator.dupe(u8, ps) catch {
-                    self.allocator.free(k);
-                    break :blk;
-                };
-                tags_buf.append(self.allocator, .{ .key = k, .value = v }) catch {
-                    self.allocator.free(k);
-                    self.allocator.free(v);
-                };
-            }
-        }
-
         var state = globals.DispatchState{
             .allocator = self.allocator,
             .kv = kv,
@@ -328,6 +308,7 @@ pub const Dispatcher = struct {
                 request.effects.pending_stream_chunk_opcodes != null,
             .is_system_module = request.is_system_module,
             .side_effects_flag = side_effects,
+            .parent_saga = request.trace.parent_saga,
         };
 
         // Reset the per-request arena and reseed time/random. The base
@@ -739,6 +720,30 @@ fn finishResponse(
         // the panic surfaces as a GPF inside @memset under
         // std.mem.Allocator.free.
         return DispatchError.KvFailed;
+    }
+
+    // Engine provenance: an activation whose arm crossed the durability
+    // boundary rooted a NEW saga (handler-shape.md §3.2); the arming
+    // saga rides its record as the reserved `_parent` tag — the
+    // viewer's cross-saga jump. Stamped AFTER the handler ran so it
+    // never occupies the `request.tag` quota (the surface guard counts
+    // the live buffer, and an engine tag consuming a customer slot
+    // would also be a prod-only, engine-divergent throw). Clamped to
+    // the tag-value contract: `armed_by` transits customer-writable
+    // `_sched/` state, so an oversized or control-char value is forged
+    // or garbage — dropped, never indexed. Best-effort: a failed dupe
+    // drops the tag, never the activation.
+    if (state.parent_saga) |ps| stamp: {
+        if (!log_mod.validParentSagaValue(ps)) break :stamp;
+        const k = d.allocator.dupe(u8, log_mod.PARENT_SAGA_TAG) catch break :stamp;
+        const v = d.allocator.dupe(u8, ps) catch {
+            d.allocator.free(k);
+            break :stamp;
+        };
+        tags_buf.append(d.allocator, .{ .key = k, .value = v }) catch {
+            d.allocator.free(k);
+            d.allocator.free(v);
+        };
     }
 
     // Handler `stream.*` effects (§2.2): a handler that called

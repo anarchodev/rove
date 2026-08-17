@@ -59,6 +59,10 @@ function schedArm(whenNs, target, msg, key) {
         } catch (_e) { /* corrupt prior record — overwrite below */ }
     }
     const rec = { when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
+    // Provenance: the arming saga rides to the fired record as the
+    // reserved `_parent` tag (handler-shape.md §3.2). A re-arm's armer
+    // is the CURRENT fire — the linked-list-through-fires shape.
+    if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) rec.armed_by = request.sagaId;
     if (key) rec.key = key;
     kv.set(byIdKey, JSON.stringify(rec));
     kv.set(schedByTimeKey(rounded, id), "");
