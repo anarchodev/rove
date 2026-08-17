@@ -40,6 +40,15 @@ READY_SRC = (
     '  schedule({ in: 1000 }, "wakes.mjs.fired", { note: "hi" }, { key: "smoke-parent" });\n'
     '  return "armed";\n'
     '}\n'
+    # kv-touching probe for the seam assertions: ?w= writes a key,
+    # ?r= reads one — the ops land on the record's kv tape / write-key
+    # list, which is what /seam intersects.
+    'export function touch() {\n'
+    '  const q = new URLSearchParams(request.query || "");\n'
+    '  const w = q.get("w"); if (w) kv.set(w, "1");\n'
+    '  const r = q.get("r"); kv.get(r || "never/set");\n'
+    '  return "touched";\n'
+    '}\n'
 )
 WAKES_SRC = 'export function fired() { return "fired"; }\n'
 FIXTURE = {"index.mjs": rpc_wrap(READY_SRC), "wakes.mjs": WAKES_SRC}
@@ -286,6 +295,67 @@ def main() -> int:
             check("the fired wake rooted its own saga (wake-*)",
                   wake_saga.startswith("wake-") and wake_saga != "parent-e2e",
                   f"saga_id={wake_saga!r}")
+        # ── Seam interference. Serial execution pins the tape order:
+        #   S: touch?w=cart/1      (hop 1 — writes cart/1)
+        #   F1: touch?w=shared/k   (foreign — writes what hop 2 reads)
+        #   F2: touch?r=cart/1     (foreign — reads what hop 1 wrote)
+        #   S: touch?r=shared/k    (hop 2 — reads shared/k)
+        # /seam over (hop1, hop2) must return F2 then F1 (newest-first)
+        # with the exact matched keys.
+        seam_hdr = {"X-Rove-Correlation-Id": "seam-e2e"}
+        plan2 = [("/?fn=touch&w=cart/1", seam_hdr),
+                 ("/?fn=touch&w=shared/k", None),
+                 ("/?fn=touch&r=cart/1", None),
+                 ("/?fn=touch&r=shared/k", seam_hdr)]
+        touched = 0
+        for path2, hdr in plan2:
+            rr = c.request("globex", path2, headers=hdr, timeout=30.0)
+            if rr.status == 200 and rr.body == "touched":
+                touched += 1
+        check("generated the seam traffic", touched == len(plan2),
+              f"{touched}/{len(plan2)} returned 200 'touched'")
+
+        seam_hops = []
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            resp = c.log_get("globex/saga/seam-e2e", timeout=15.0)
+            if resp.status == 200:
+                try:
+                    seam_hops = json.loads(resp.body).get("hops", [])
+                except json.JSONDecodeError:
+                    seam_hops = []
+                if len(seam_hops) >= 2:
+                    break
+            time.sleep(1.0)
+        check("seam saga indexed with 2 hops", len(seam_hops) == 2,
+              f"hops={len(seam_hops)}")
+
+        if len(seam_hops) == 2:
+            a_seq = seam_hops[0]["exec_seq"]
+            b_seq = seam_hops[1]["exec_seq"]
+            sresp = c.log_get(
+                f"globex/seam?after_seq={a_seq}&before_seq={b_seq}",
+                timeout=30.0)
+            seam = {}
+            if sresp.status == 200:
+                try:
+                    seam = json.loads(sresp.body)
+                except json.JSONDecodeError:
+                    pass
+            inter = seam.get("interacting", [])
+            check("seam scan finds both interacting foreigners, newest-first",
+                  len(inter) == 2
+                  and inter[0].get("read") == ["cart/1"] and inter[0].get("wrote") == []
+                  and inter[1].get("wrote") == ["shared/k"] and inter[1].get("read") == [],
+                  f"status={sresp.status} interacting={inter!r} body={sresp.body[:300]!r}")
+            # `skipped_no_tape` is REPORTED, not asserted at 0: an
+            # unrelated kv-free activation (a scheduler tick, a wake)
+            # can legitimately land in this seam and be unprobeable.
+            check("seam probe is honest about its inputs",
+                  seam.get("probe", {}).get("reads") == 1
+                  and seam.get("probe", {}).get("writes") == 1
+                  and not seam.get("scan_truncated"),
+                  f"probe={seam.get('probe')!r} skipped={seam.get('skipped_no_tape')!r}")
 
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")

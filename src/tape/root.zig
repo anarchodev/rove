@@ -802,6 +802,31 @@ pub const Readset = struct {
     /// request install (`request.ctx`), never a lazily-read body, so
     /// `body_read` stays false while the entry must survive.
     ctx_payload: bool = false,
+    /// The activation's kv WRITE KEYS — its writeset slice, keys only,
+    /// recorded by the dispatcher at end-of-activation. Writes are TEA
+    /// outputs and deliberately never enter the kv tape (replay
+    /// re-derives them); this list exists for the log-server's seam
+    /// scan, which intersects one activation's writes with another's
+    /// reads. IN-MEMORY only, the `interaction_digest` stance: it
+    /// rides `TapePayloads` (via `log.encodeKeyList`) onto the
+    /// LogRecord and is NOT part of the encoded readset — a
+    /// follower-rebuilt record carries none and its seams read as
+    /// unprobeable rather than write-free. Keys are duped with the
+    /// kv tape's allocator; freed in `deinit`, cleared per attempt.
+    kv_write_keys: std.ArrayListUnmanaged([]u8) = .empty,
+
+    /// Record one written key (dupe; dedup is the consumer's concern —
+    /// the writeset already folds same-key rewrites upstream of this).
+    pub fn appendWriteKey(self: *Readset, key: []const u8) !void {
+        const owned = try self.kv.allocator.dupe(u8, key);
+        errdefer self.kv.allocator.free(owned);
+        try self.kv_write_keys.append(self.kv.allocator, owned);
+    }
+
+    fn clearWriteKeys(self: *Readset) void {
+        for (self.kv_write_keys.items) |k| self.kv.allocator.free(k);
+        self.kv_write_keys.clearRetainingCapacity();
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -820,6 +845,8 @@ pub const Readset = struct {
     }
 
     pub fn deinit(self: *Readset) void {
+        self.clearWriteKeys();
+        self.kv_write_keys.deinit(self.kv.allocator);
         self.kv.deinit();
         self.module.deinit();
         self.fetch_responses.deinit();
@@ -839,6 +866,9 @@ pub const Readset = struct {
         self.module.reset();
         self.request_reads.reset();
         self.body_read = false;
+        // Per-attempt like the kv tape: the GC rerun re-records the
+        // retried attempt's writes.
+        self.clearWriteKeys();
     }
 
     /// Drop the body reference from the readset when the handler

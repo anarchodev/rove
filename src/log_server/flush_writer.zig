@@ -435,6 +435,9 @@ fn writeTapePayloads(
     else
         try w.print(",\"interaction_digest\":\"{x:0>16}\"", .{t.interaction_digest});
     try writeBytesField(allocator, w, "kv_tape_b64", t.kv_tape_bytes, false);
+    // The activation's write KEYS (`log.encodeKeyList` blob) — the seam
+    // scan's write side; reads live in the kv tape above.
+    try writeBytesField(allocator, w, "kv_write_keys_b64", t.kv_write_keys_bytes, false);
     try writeBytesField(allocator, w, "module_tree_b64", t.module_tree_bytes, false);
     try writeBytesField(allocator, w, "fetch_responses_tape_b64", t.fetch_responses_tape_bytes, false);
     try writeBytesField(allocator, w, "trigger_payload_tape_b64", t.trigger_payload_tape_bytes, false);

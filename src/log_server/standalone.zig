@@ -38,6 +38,7 @@ const h2 = @import("rove-h2");
 const log_mod = @import("rove-log");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
+const seam_mod = @import("seam.zig");
 const indexer_mod = @import("indexer.zig");
 const metrics_mod = @import("metrics.zig");
 const jwt = @import("rove-jwt");
@@ -509,6 +510,10 @@ fn handleOne(
             metrics_mod.Metrics.inc(&metrics_mod.global.query_list);
             try handleSaga(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.tail, route.query, floor_ns, rctx.cfg);
         },
+        .seam => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_show);
+            try handleSeam(server, allocator, rctx.store, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg);
+        },
     }
 }
 
@@ -563,7 +568,7 @@ fn handleBatchPushed(
     try setResponse(server, ent, sid, sess, 204, "", rctx.cfg);
 }
 
-const RouteKind = enum { list, show, count, session, window, saga };
+const RouteKind = enum { list, show, count, session, window, saga, seam };
 
 const ParsedRoute = struct {
     kind: RouteKind,
@@ -603,6 +608,9 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
     }
     if (std.mem.eql(u8, remainder, "window")) {
         return .{ .kind = .window, .tenant_id = tenant_id, .tail = "", .query = query };
+    }
+    if (std.mem.eql(u8, remainder, "seam")) {
+        return .{ .kind = .seam, .tenant_id = tenant_id, .tail = "", .query = query };
     }
     if (std.mem.startsWith(u8, remainder, "show/")) {
         const tail = remainder["show/".len..];
@@ -861,6 +869,265 @@ fn handleSaga(
     try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
 }
 
+/// Seam-scan bounds. Each scanned candidate costs one range-GET +
+/// inflate + tape parse, serial on this thread, so the default stays
+/// small and the clamp hard; `scan_truncated` announces the cap. The
+/// per-row key lists cap at MATCH_KEY_CAP with their own flag.
+const SEAM_SCAN_DEFAULT: u32 = 16;
+const SEAM_SCAN_MAX: u32 = 64;
+const MATCH_KEY_CAP: usize = 32;
+
+/// One seam's interference — the bounded per-gap scan
+/// (`docs/architecture/deployment-and-logs.md`, the saga window; a
+/// key→writer blame INDEX can come later without changing this
+/// surface). `GET /v1/{t}/seam?after_seq=A&before_seq=B[&limit=K]`:
+/// the hop at B supplies the read set (what the next hop observed),
+/// the hop at A the write set (what the previous hop left), both from
+/// their kv tapes; every stamped foreign record in the OPEN interval
+/// (A,B) is fetched NEWEST-first (blame wants the latest writer) and
+/// kept iff its writes hit B's reads (`wrote`) or its reads hit A's
+/// writes (`read`). A=0 means the seam before the first hop (no write
+/// side). Adjacent-hop key sets are a deliberate approximation of the
+/// saga's cumulative sets — the seam's own hops are what the marks
+/// point at.
+///
+/// Response:
+///   {"after_seq":"A","before_seq":"B",
+///    "probe":{"reads":N,"read_prefixes":N,"writes":N,
+///             "hop_tapes_truncated":bool,
+///             "before_no_tape":bool,"after_no_tape":bool},
+///    "scanned":N,"scan_truncated":bool,"skipped_no_tape":N,
+///    "interacting":[{<row>,"wrote":[..],"read":[..],
+///                    "keys_truncated":bool}]}
+///
+/// `*_no_tape` flags are load-bearing: a hop with no kv tape yields
+/// EMPTY probe sets, and "nothing interacted" must be distinguishable
+/// from "nothing was probeable".
+fn handleSeam(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    db: *index_db_mod.IndexDb,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tenant_id: []const u8,
+    query: []const u8,
+    floor_received_ns: i64,
+    cfg: *const Config,
+) !void {
+    const after_seq = parseUint(u64, query, "after_seq", 0);
+    const before_seq = parseUint(u64, query, "before_seq", 0);
+    if (before_seq == 0) {
+        try setResponse(server, ent, sid, sess, 400, "seam requires before_seq (the right hop's exec_seq)\n", cfg);
+        return;
+    }
+    const scan_cap = @min(parseUint(u32, query, "limit", SEAM_SCAN_DEFAULT), SEAM_SCAN_MAX);
+
+    // The right hop (its READS are the probe). Must exist — a seam is
+    // defined by its hops.
+    var before_loc = (db.querySeamLocAt(tenant_id, before_seq, floor_received_ns) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "seam failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    }) orelse {
+        try setResponse(server, ent, sid, sess, 404, "no record at before_seq\n", cfg);
+        return;
+    };
+    defer before_loc.deinit(db.allocator);
+
+    var before_sets, const before_no_tape = hopKeySets(allocator, store, &before_loc) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "seam probe failed at before_seq: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    defer before_sets.deinit();
+
+    // The left hop (its WRITES are the mirror probe); absent when
+    // after_seq = 0 — the seam before the saga's first hop. The empty
+    // default owns nothing, so it is never deinit'd: only a set the
+    // probe actually produced is (a probe failure must not leave a
+    // deinit aimed at an unassigned value).
+    var after_no_tape = false;
+    var after_sets: seam_mod.KeySets = .{ .allocator = allocator };
+    var after_sets_owned = false;
+    defer if (after_sets_owned) after_sets.deinit();
+    if (after_seq != 0) {
+        var after_loc = (db.querySeamLocAt(tenant_id, after_seq, floor_received_ns) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "seam failed: {s}\n", .{@errorName(err)});
+            try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+            return;
+        }) orelse {
+            try setResponse(server, ent, sid, sess, 404, "no record at after_seq\n", cfg);
+            return;
+        };
+        defer after_loc.deinit(db.allocator);
+        const probed = hopKeySets(allocator, store, &after_loc) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "seam probe failed at after_seq: {s}\n", .{@errorName(err)});
+            try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+            return;
+        };
+        after_sets = probed[0];
+        after_sets_owned = true;
+        after_no_tape = probed[1];
+    }
+
+    var candidates = db.querySeamLocs(tenant_id, after_seq, before_seq, floor_received_ns, scan_cap + 1) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "seam scan failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    defer candidates.deinit();
+
+    const json = renderSeamJson(allocator, store, .{
+        .after_seq = after_seq,
+        .before_seq = before_seq,
+        .before = &before_sets,
+        .after = &after_sets,
+        .before_no_tape = before_no_tape,
+        .after_no_tape = after_no_tape,
+        .scan_rows = candidates.rows[0..@min(candidates.rows.len, scan_cap)],
+        .scan_truncated = candidates.rows.len > scan_cap,
+    }) catch |err| {
+        // Every failure here is loud: a candidate we cannot probe must
+        // never render as a quiet seam, which would read as data.
+        const msg = try std.fmt.allocPrint(allocator, "seam scan failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
+}
+
+/// Everything `renderSeamJson` needs: the seam's bounds, both hops'
+/// probe sets (+ whether each was probeable), and the capped candidate
+/// page.
+const SeamRender = struct {
+    after_seq: u64,
+    before_seq: u64,
+    before: *const seam_mod.KeySets,
+    after: *const seam_mod.KeySets,
+    before_no_tape: bool,
+    after_no_tape: bool,
+    scan_rows: []index_db_mod.IndexDb.SeamLoc,
+    scan_truncated: bool,
+};
+
+/// Render the seam response, probing each candidate against the two
+/// hop key sets. Returns an error — never a partial body — if any
+/// candidate can't be read or decoded; the caller answers 500.
+fn renderSeamJson(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    r: SeamRender,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+        // Runs on the error return too, handing the buffer back so the
+        // errdefer above owns exactly one free.
+        defer buf = aw.toArrayList();
+        const w = &aw.writer;
+
+        try w.print(
+            "{{\"after_seq\":\"{d}\",\"before_seq\":\"{d}\",\"probe\":{{\"reads\":{d},\"read_prefixes\":{d},\"writes\":{d},\"hop_tapes_truncated\":{},\"before_no_tape\":{},\"after_no_tape\":{}}},\"scanned\":{d},\"scan_truncated\":{},\"interacting\":[",
+            .{ r.after_seq, r.before_seq, r.before.reads.len, r.before.read_prefixes.len, r.after.writes.len, r.before.truncated or r.after.truncated, r.before_no_tape, r.after_no_tape, r.scan_rows.len, r.scan_truncated },
+        );
+
+        var wrote_any = false;
+        var skipped_no_tape: u32 = 0;
+        for (r.scan_rows) |*cand| {
+            const rec_json = fetchRecordJson(allocator, store, cand.ndjson_key, cand.offset, cand.length) catch |err| {
+                std.log.warn("seam: candidate frame unreadable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUnreadable;
+            };
+            defer allocator.free(rec_json);
+            var blobs = seam_mod.blobsFromRecordJson(allocator, rec_json) catch |err| {
+                std.log.warn("seam: candidate record undecodable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUndecodable;
+            };
+            defer blobs.deinit(allocator);
+            // Neither side captured ⇒ unprobeable, counted not guessed.
+            if (blobs.kv_tape == null and blobs.write_keys_blob == null) {
+                skipped_no_tape += 1;
+                continue;
+            }
+            const wkeys = seam_mod.decodeWriteKeys(allocator, blobs.write_keys_blob) catch |err| {
+                std.log.warn("seam: candidate write keys undecodable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUndecodable;
+            };
+            defer allocator.free(wkeys);
+            var cand_sets = seam_mod.extractKeySets(allocator, blobs.kv_tape, wkeys) catch |err| {
+                std.log.warn("seam: candidate tape undecodable at {s}: {s}", .{ cand.ndjson_key, @errorName(err) });
+                return error.SeamCandidateUndecodable;
+            };
+            defer cand_sets.deinit();
+
+            // A candidate whose writes never committed (outcome != ok —
+            // rolled back) cannot have influenced anyone's reads; only
+            // its own reads participate (it did observe committed state).
+            const cand_committed = std.mem.eql(u8, cand.outcome, "ok");
+            var wrote: seam_mod.Matches = if (cand_committed)
+                try seam_mod.writesMatching(allocator, &cand_sets, r.before, MATCH_KEY_CAP)
+            else
+                .{ .keys = &.{}, .truncated = false };
+            defer if (cand_committed) wrote.deinit(allocator);
+            var read = try seam_mod.readsMatching(allocator, &cand_sets, r.after, MATCH_KEY_CAP);
+            defer read.deinit(allocator);
+            if (wrote.keys.len == 0 and read.keys.len == 0) continue;
+
+            if (wrote_any) try w.writeAll(",");
+            wrote_any = true;
+            var rid_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+            const rid = log_mod.formatPrefixedId(&rid_buf, log_mod.REQUEST_ID_PREFIX, cand.request_id);
+            try w.print(
+                "{{\"request_id\":\"{s}\",\"exec_seq\":\"{d}\",\"received_ns\":{d},\"status\":{d},\"method\":",
+                .{ rid, cand.exec_seq, cand.received_ns, cand.status },
+            );
+            try writeJsonString(w, cand.method);
+            try w.writeAll(",\"path\":");
+            try writeJsonString(w, cand.path);
+            try w.writeAll(",\"outcome\":");
+            try writeJsonString(w, cand.outcome);
+            try w.writeAll(",\"activation\":");
+            try writeJsonString(w, cand.activation);
+            try w.writeAll(",\"wrote\":[");
+            for (wrote.keys, 0..) |k, i| {
+                if (i > 0) try w.writeAll(",");
+                try writeJsonString(w, k);
+            }
+            try w.writeAll("],\"read\":[");
+            for (read.keys, 0..) |k, i| {
+                if (i > 0) try w.writeAll(",");
+                try writeJsonString(w, k);
+            }
+            try w.print("],\"keys_truncated\":{}}}", .{wrote.truncated or read.truncated});
+        }
+
+        try w.print("],\"skipped_no_tape\":{d}}}\n", .{skipped_no_tape});
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Fetch one hop's record and extract its key sets (reads from the kv
+/// tape, writes from the write-key list). `(sets, true)` with empty
+/// sets when the record carries neither — the caller surfaces the flag
+/// so an unprobeable hop is never read as "touched nothing".
+fn hopKeySets(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    loc: *const index_db_mod.IndexDb.SeamLoc,
+) !struct { seam_mod.KeySets, bool } {
+    const rec_json = try fetchRecordJson(allocator, store, loc.ndjson_key, loc.offset, loc.length);
+    defer allocator.free(rec_json);
+    var blobs = try seam_mod.blobsFromRecordJson(allocator, rec_json);
+    defer blobs.deinit(allocator);
+    const no_tape = blobs.kv_tape == null and blobs.write_keys_blob == null;
+    const wkeys = try seam_mod.decodeWriteKeys(allocator, blobs.write_keys_blob);
+    defer allocator.free(wkeys);
+    return .{ try seam_mod.extractKeySets(allocator, blobs.kv_tape, wkeys), no_tape };
+}
+
 fn renderSagaJson(
     allocator: std.mem.Allocator,
     roll: *const index_db_mod.IndexDb.SagaRow,
@@ -980,24 +1247,10 @@ fn handleShow(
         return;
     }
 
-    // Range-read the compressed frame out of the batch payload.
-    // Each record is its own raw-deflate stream; the sidecar's
-    // `(offset, length)` brackets exactly one frame.
-    const payload = store.getRange(row.ndjson_key, row.offset, row.length, allocator) catch |err| {
+    const decompressed = fetchRecordJson(allocator, store, row.ndjson_key, row.offset, row.length) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
             "payload fetch failed for {s}: {s}\n",
-            .{ row.ndjson_key, @errorName(err) },
-        );
-        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
-        return;
-    };
-    defer allocator.free(payload);
-
-    const decompressed = decompressRawDeflate(allocator, payload) catch |err| {
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            "frame decompress failed for {s}: {s}\n",
             .{ row.ndjson_key, @errorName(err) },
         );
         try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
@@ -1014,6 +1267,23 @@ fn handleShow(
     try buf.appendSlice(allocator, "}\n");
     const out = try buf.toOwnedSlice(allocator);
     try setResponseOwned(server, ent, sid, sess, 200, out, cfg);
+}
+
+/// Range-read + inflate one record's stored JSON: each record is its
+/// own raw-deflate stream, and the index's `(ndjson_key, offset,
+/// length)` brackets exactly one frame. Caller owns the returned
+/// bytes. Shared by `/show` (returns it verbatim) and the seam scan
+/// (parses it for the kv tape).
+fn fetchRecordJson(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    ndjson_key: []const u8,
+    offset: u64,
+    length: u32,
+) ![]u8 {
+    const payload = try store.getRange(ndjson_key, offset, length, allocator);
+    defer allocator.free(payload);
+    return try decompressRawDeflate(allocator, payload);
 }
 
 /// Decode one raw-deflate frame (the per-record framing the worker
@@ -1449,6 +1719,11 @@ test "parseRoute matches /v1/{tenant}/window and /v1/{tenant}/saga/{id}" {
     try testing.expectEqualStrings("after_seq=9", s.query);
     // Empty saga id is a 404 (no tail).
     try testing.expect(parseRoute("/v1/acme/saga/") == null);
+
+    const m = parseRoute("/v1/acme/seam?after_seq=4&before_seq=9").?;
+    try testing.expectEqual(RouteKind.seam, m.kind);
+    try testing.expectEqualStrings("acme", m.tenant_id);
+    try testing.expectEqualStrings("after_seq=4&before_seq=9", m.query);
 }
 
 test "parseRoute matches /v1/{tenant}/session/{id}" {
