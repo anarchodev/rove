@@ -34,12 +34,17 @@
 //!
 //! ## What a key_ref is
 //!
-//! A truncated HMAC of the identity name under a subkey derived for
-//! that purpose, never the name itself. The name is chosen by the
-//! customer and routinely identifies a person; the ref is what lands in
-//! the log sidecar and the SQLite index, so those stay free of plaintext
-//! identifiers while "every record for identity X" is still answerable
-//! by recomputing the ref.
+//! An opaque 8-byte name for a key, whose meaning belongs to the
+//! keystore. With the keyring's slot allocation it is the slot number,
+//! big-endian (`refForSlot`), so a reader can go straight from a
+//! ciphertext to the key that opens it with no lookup in between.
+//!
+//! Do not confuse it with `identityRef`, which is a different thing
+//! wearing the same shape: a pseudonym for a *customer identity*, used
+//! by the log index so queries can ask "every record for identity X"
+//! without a plaintext identifier ever landing. A key ref says which
+//! key; an identity ref says whose data. They are deliberately separate
+//! because keys are minted before any identity exists.
 //!
 //! ## Overhead
 //!
@@ -52,8 +57,8 @@
 //!
 //! Nonces are random. AES-GCM's 96-bit nonce gives roughly a 2^-32
 //! collision probability at 2^32 seals under ONE key, and a repeated
-//! (key, nonce) pair forfeits confidentiality for both messages. Per-
-//! identity keys never approach that. A tenant key sealing every record
+//! (key, nonce) pair forfeits confidentiality for both messages. A
+//! per-slot key never approaches that. A tenant key sealing every record
 //! for the life of a busy tenant can, which is what `key_version` is
 //! for: rotating the key resets the budget. `alg_id` reserves room for
 //! an extended-nonce AEAD if that bound ever becomes awkward to manage.
@@ -78,13 +83,39 @@ pub const HEADER_LEN: usize = 1 + 4 + KEY_REF_LEN + NONCE_LEN;
 pub const OVERHEAD: usize = HEADER_LEN + TAG_LEN;
 
 pub const Key = [KEY_LEN]u8;
+
+/// Names the key that opens a sealed blob. Opaque here — the keystore
+/// assigns the meaning. See the key-ref note in the file header.
 pub const KeyRef = [KEY_REF_LEN]u8;
 
-/// The tenant's own key — the outer (C1) level. Reserved so it can
-/// never collide with a real identity ref: `keyRef` rejects any input
-/// that would hash to it rather than letting one identity silently
-/// address the tenant key.
+/// Pseudonym for a customer identity, for the log index. Same shape as
+/// a `KeyRef` and NOT interchangeable with one: this says whose data,
+/// a `KeyRef` says which key.
+pub const IdentityRef = [KEY_REF_LEN]u8;
+
+/// The tenant's own key — the outer (C1) level, and slot 0.
+///
+/// Reserved rather than allocated, so a tenant-level seal and an
+/// identity-level one can never name the same key: allocation starts at
+/// `FIRST_SLOT`, and an all-zero ref cannot be produced by
+/// `refForSlot` for any allocatable slot.
 pub const TENANT_REF: KeyRef = [_]u8{0} ** KEY_REF_LEN;
+
+/// First allocatable slot. Slot 0 is `TENANT_REF`.
+pub const FIRST_SLOT: u64 = 1;
+
+/// The ref naming the key in `slot`. Big-endian so refs sort in slot
+/// order, which makes a hex dump of a sidecar readable in the order
+/// keys were minted.
+pub fn refForSlot(slot: u64) KeyRef {
+    var out: KeyRef = undefined;
+    std.mem.writeInt(u64, &out, slot, .big);
+    return out;
+}
+
+pub fn slotForRef(ref: KeyRef) u64 {
+    return std.mem.readInt(u64, &ref, .big);
+}
 
 pub const Error = error{
     /// Fewer bytes than a header plus tag.
@@ -246,27 +277,28 @@ pub fn deriveSubkey(root: []const u8, label: []const u8) Key {
 /// root secret.
 pub const DOMAIN = "rove-crypt/v1";
 
-/// The ref-key label. Refs are derived under their own label so a
-/// stolen ref key cannot decrypt anything.
-pub const REF_LABEL = "rove-crypt/key-ref/v1";
+/// Label for the identity-pseudonym key. Derived under its own label so
+/// a stolen pseudonym key cannot decrypt anything.
+pub const IDENTITY_LABEL = "rove-crypt/identity-ref/v1";
 
-/// Compute the `key_ref` naming `identity`.
+/// Compute the pseudonym for a customer identity.
 ///
 /// A truncated HMAC, never the identity itself, because the identity is
-/// customer-chosen and routinely identifies a person while the ref is
-/// what persists in the log sidecar and the SQLite index. Equality is
+/// customer-chosen and routinely identifies a person while the pseudonym
+/// is what persists in the log sidecar and the SQLite index. Equality is
 /// preserved, so "every record for identity X" stays answerable by
-/// recomputing the ref; nothing else about X is recoverable from it.
+/// recomputing it; nothing else about X is recoverable from it.
 ///
-/// A collision with `TENANT_REF` is remapped rather than returned: two
-/// levels addressing one key would let an identity shred read as a
-/// tenant shred.
-pub fn keyRef(ref_key: Key, identity: []const u8) KeyRef {
+/// This does NOT name a key. Keys are minted into slots before any
+/// identity exists, and the identity→slot binding lives in replicated
+/// KV — which is what keeps minting off the commit path. Using a
+/// pseudonym where a `KeyRef` belongs would reintroduce a keyring write
+/// per identity.
+pub fn identityRef(pseudonym_key: Key, identity: []const u8) IdentityRef {
     var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, identity, &ref_key);
-    var ref: KeyRef = undefined;
+    HmacSha256.create(&mac, identity, &pseudonym_key);
+    var ref: IdentityRef = undefined;
     @memcpy(&ref, mac[0..KEY_REF_LEN]);
-    if (std.mem.eql(u8, &ref, &TENANT_REF)) ref[KEY_REF_LEN - 1] = 1;
     return ref;
 }
 
@@ -424,20 +456,36 @@ test "deriveSubkey separates roots — the shred property" {
     try testing.expect(!std.mem.eql(u8, &one, &two));
 }
 
-test "keyRef is stable, distinguishing, and never the tenant ref" {
-    const ref_key = deriveSubkey("root", REF_LABEL);
-    const a1 = keyRef(ref_key, "u_7f3a9c");
-    const a2 = keyRef(ref_key, "u_7f3a9c");
-    const b = keyRef(ref_key, "u_0e11bd");
+test "identityRef is stable and distinguishing" {
+    const pk = deriveSubkey("root", IDENTITY_LABEL);
+    const a1 = identityRef(pk, "u_7f3a9c");
+    const a2 = identityRef(pk, "u_7f3a9c");
+    const b = identityRef(pk, "u_0e11bd");
 
     try testing.expectEqualSlices(u8, &a1, &a2);
     try testing.expect(!std.mem.eql(u8, &a1, &b));
-    try testing.expect(!std.mem.eql(u8, &a1, &TENANT_REF));
 
-    // A different ref key yields a different ref for the same identity,
-    // so refs cannot be correlated across tenants.
-    const other_key = deriveSubkey("other-root", REF_LABEL);
-    try testing.expect(!std.mem.eql(u8, &a1, &keyRef(other_key, "u_7f3a9c")));
+    // A different pseudonym key yields a different value for the same
+    // identity, so pseudonyms cannot be correlated across tenants.
+    const other = deriveSubkey("other-root", IDENTITY_LABEL);
+    try testing.expect(!std.mem.eql(u8, &a1, &identityRef(other, "u_7f3a9c")));
+}
+
+test "a slot round-trips through its ref, and slot 0 is the tenant key" {
+    try testing.expectEqualSlices(u8, &TENANT_REF, &refForSlot(0));
+    try testing.expectEqual(@as(u64, 0), slotForRef(TENANT_REF));
+
+    // Big-endian, so refs sort in slot order.
+    try testing.expect(std.mem.order(u8, &refForSlot(1), &refForSlot(2)) == .lt);
+    try testing.expect(std.mem.order(u8, &refForSlot(255), &refForSlot(256)) == .lt);
+
+    for ([_]u64{ FIRST_SLOT, 1, 42, 4095, 4096, 1 << 32, std.math.maxInt(u64) }) |slot| {
+        try testing.expectEqual(slot, slotForRef(refForSlot(slot)));
+    }
+
+    // No allocatable slot can produce the reserved tenant ref, so an
+    // identity-level seal can never be mistaken for a tenant-level one.
+    try testing.expect(!std.mem.eql(u8, &TENANT_REF, &refForSlot(FIRST_SLOT)));
 }
 
 test "a tenant-ref envelope round-trips like any other" {
