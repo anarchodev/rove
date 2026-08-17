@@ -687,7 +687,7 @@ fn handleList(
     };
     defer list.deinit();
 
-    const json = try renderListJson(allocator, list.rows);
+    const json = try renderRowsJson(allocator, list.rows, .time);
     try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
 }
 
@@ -727,7 +727,7 @@ fn handleWindow(
     };
     defer list.deinit();
 
-    const json = try renderWindowJson(allocator, list.rows);
+    const json = try renderRowsJson(allocator, list.rows, .seq);
     try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
 }
 
@@ -877,40 +877,17 @@ fn handleCount(
 
 // ── JSON rendering ─────────────────────────────────────────────────
 
-fn renderListJson(
-    allocator: std.mem.Allocator,
-    rows: []index_db_mod.IndexDb.ListRow,
-) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"records\":[");
-    for (rows, 0..) |r, i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try writeRowJson(allocator, &buf, &r);
-    }
-    if (rows.len == 0) {
-        try buf.appendSlice(allocator, "],\"next_cursor\":null}\n");
-    } else {
-        const last = &rows[rows.len - 1];
-        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
-        defer buf = aw.toArrayList();
-        // Hand back the cursor request_id as the opaque prefixed token the
-        // client passes verbatim to `?after_request_id=` (§7.5).
-        var cur_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
-        const cur_rid = log_mod.formatPrefixedId(&cur_buf, log_mod.REQUEST_ID_PREFIX, last.request_id);
-        try aw.writer.print(
-            "],\"next_cursor\":{{\"received_ns\":{d},\"request_id\":\"{s}\"}}}}\n",
-            .{ last.received_ns, cur_rid },
-        );
-    }
-    return buf.toOwnedSlice(allocator);
-}
+/// Which keyset the `next_cursor` object carries: the `/list` time
+/// cursor (`received_ns` + opaque `request_id` token) or the `/window`
+/// tape cursor (`exec_seq` decimal string). One renderer for both
+/// endpoints so an envelope change can never drift them apart — the
+/// dashboard parses the two responses with the same client.
+const CursorFlavor = enum { time, seq };
 
-/// Same rows as `renderListJson`, with the seq-keyset cursor: the last
-/// row's `exec_seq`, passed back verbatim as `?after_seq=`.
-fn renderWindowJson(
+fn renderRowsJson(
     allocator: std.mem.Allocator,
     rows: []index_db_mod.IndexDb.ListRow,
+    flavor: CursorFlavor,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -925,10 +902,24 @@ fn renderWindowJson(
         const last = &rows[rows.len - 1];
         var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
         defer buf = aw.toArrayList();
-        try aw.writer.print(
-            "],\"next_cursor\":{{\"exec_seq\":\"{d}\"}}}}\n",
-            .{last.exec_seq},
-        );
+        switch (flavor) {
+            // Hand back the cursor request_id as the opaque prefixed
+            // token the client passes verbatim to `?after_request_id=`
+            // (§7.5).
+            .time => {
+                var cur_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+                const cur_rid = log_mod.formatPrefixedId(&cur_buf, log_mod.REQUEST_ID_PREFIX, last.request_id);
+                try aw.writer.print(
+                    "],\"next_cursor\":{{\"received_ns\":{d},\"request_id\":\"{s}\"}}}}\n",
+                    .{ last.received_ns, cur_rid },
+                );
+            },
+            // The last row's stamp, passed back verbatim as `?after_seq=`.
+            .seq => try aw.writer.print(
+                "],\"next_cursor\":{{\"exec_seq\":\"{d}\"}}}}\n",
+                .{last.exec_seq},
+            ),
+        }
     }
     return buf.toOwnedSlice(allocator);
 }

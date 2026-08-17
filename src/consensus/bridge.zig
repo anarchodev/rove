@@ -891,23 +891,48 @@ pub const Bridge = struct {
     /// saturation (wrapping into the term bits would forge a future term).
     pub fn mintExecStamp(self: *Bridge, gid: u64) u64 {
         const sig = self.sigFor(gid) orelse return 0;
+        return mintExecStampFromSig(sig, gid);
+    }
+
+    /// `mintExecStamp` by tenant id — the worker's activation-entry form.
+    /// One lock acquisition for the id→gid→sig lookup (the two-step
+    /// `gidForTenant` + `sigFor` spelling takes the bridge mutex twice per
+    /// activation), then the lock-free mint. Every activation family calls
+    /// exactly this, so a new family can't half-adopt the stamp.
+    pub fn mintExecStampForTenant(self: *Bridge, id_str: []const u8) u64 {
+        const found: ?struct { sig: *GroupSig, gid: u64 } = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const gid = self.by_id.get(id_str) orelse break :blk null;
+            const sig = self.groups.get(gid) orelse break :blk null;
+            break :blk .{ .sig = sig, .gid = gid };
+        };
+        const f = found orelse return 0;
+        return mintExecStampFromSig(f.sig, f.gid);
+    }
+
+    fn mintExecStampFromSig(sig: *GroupSig, gid: u64) u64 {
         const fence = sig.exec_term.load(.monotonic);
         if (fence == 0) return 0;
         const stamp = sig.exec_stamp.fetchAdd(1, .monotonic) + 1;
         const stamp_term = stamp >> EXEC_SEQ_TERM_SHIFT;
-        if (stamp_term != fence) {
-            // Above the fence = 40-bit counter saturation (2^40 activations
-            // under one unbroken leadership — out of physical reach, but
-            // never forge a term silently). Below = a mid-publish race
-            // (base lags the fence for part of one pump cycle); benign,
-            // heals on the next mint.
-            if (stamp_term > fence) std.log.warn(
-                "v2 exec-stamp gid={d}: 40-bit counter saturated at term {d} — records go unstamped until an election outruns the overflow",
-                .{ gid, fence },
-            );
-            return 0;
-        }
-        return stamp;
+        if (stamp_term == fence) return stamp;
+        // Mismatch. Re-read the fence first: the pump's fence-then-base
+        // publish can land IN FULL between our fence load and the
+        // `fetchAdd` above, in which case the stamp legitimately belongs
+        // to the NEW term — a routine leadership change, not an anomaly.
+        const fence_now = sig.exec_term.load(.monotonic);
+        if (stamp_term == fence_now) return stamp;
+        // Still mismatched: above the fence = 40-bit counter saturation
+        // (2^40 activations under one unbroken leadership — out of
+        // physical reach, but never forge a term silently). Below = the
+        // base lagging a half-published fence; benign, heals within one
+        // pump cycle. Either way the record rides unstamped.
+        if (stamp_term > fence_now) std.log.warn(
+            "v2 exec-stamp gid={d}: 40-bit counter saturated at term {d} — records go unstamped until an election outruns the overflow",
+            .{ gid, fence_now },
+        );
+        return 0;
     }
 
     /// Node-wide leadership for OBSERVABILITY ONLY: true iff this node is the
@@ -1566,6 +1591,20 @@ test "bridge: exec stamps are term-fenced — refused before a published term, s
     // term (which a future real election on another node could collide
     // with) — refused, not handed out.
     sig.exec_stamp.store(((term + 1) << EXEC_SEQ_TERM_SHIFT) | ((@as(u64, 1) << EXEC_SEQ_TERM_SHIFT) - 1), .monotonic);
+    try testing.expectEqual(@as(u64, 0), bridge.mintExecStamp(gid));
+
+    // The worker-facing by-tenant form mints from the same source (its
+    // refusals included — the poisoned counter above still refuses).
+    try testing.expectEqual(@as(u64, 0), bridge.mintExecStampForTenant("tenant-1"));
+    try testing.expectEqual(@as(u64, 0), bridge.mintExecStampForTenant("never-registered"));
+
+    // A demotion edge withdraws the fence, so a deposed holder's mints
+    // refuse (unstamped) instead of stamping into the old term forever.
+    // Driven directly: a gid the node has no group for reads as
+    // not-leader, and was_leader=true makes that a demotion.
+    sig.was_leader = true;
+    bridge.refreshOneLocked(sig, 0xFEED, true);
+    try testing.expectEqual(@as(u64, 0), sig.exec_term.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), bridge.mintExecStamp(gid));
 }
 

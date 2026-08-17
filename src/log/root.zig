@@ -469,13 +469,13 @@ pub const LogHeader = struct {
     ///
     /// Required. The readset bundle that carries this header is versioned and
     /// its parser rejects any mismatch outright, so there is exactly one shape
-    /// per version — an entry either predates the field and is v7 (rejected
-    /// whole), or is v8 and carries it.
+    /// per version — an entry from an older shape is rejected whole, never
+    /// half-parsed into a record that lies about when it happened.
     received_ns: i64,
     /// The execution-sequence stamp (`LogRecord.exec_seq`), carried so a
     /// follower-rebuilt record keeps its place on the tenant's execution
     /// tape. Required — same one-shape-per-version stance as
-    /// `received_ns`; an entry without it is v8 and rejected whole.
+    /// `received_ns`.
     exec_seq: u64,
     status: u16,
     outcome: Outcome,

@@ -588,27 +588,7 @@ pub const IndexDb = struct {
             const rc = c.sqlite3_step(st);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return Error.Sqlite;
-            const row: ListRow = .{
-                .tenant_id = try dupeColumnText(self.allocator, st.?, 0),
-                .request_id = @intCast(c.sqlite3_column_int64(st, 1)),
-                .received_ns = c.sqlite3_column_int64(st, 2),
-                .duration_ns = c.sqlite3_column_int64(st, 3),
-                .method = try dupeColumnText(self.allocator, st.?, 4),
-                .path = try dupeColumnText(self.allocator, st.?, 5),
-                .host = try dupeColumnText(self.allocator, st.?, 6),
-                .status = @intCast(c.sqlite3_column_int(st, 7)),
-                .outcome = try dupeColumnText(self.allocator, st.?, 8),
-                // deployment_id is content-addressed u64 (sha-256
-                // truncated); the high bit can be set. SQLite
-                // INTEGER stores all 64 bits; reinterpret without
-                // a sign check.
-                .deployment_id = @bitCast(c.sqlite3_column_int64(st, 9)),
-                // NULL (pre-migration row) reads back as "" — the
-                // unknown-kind sentinel.
-                .activation = try dupeColumnText(self.allocator, st.?, 10),
-                // NULL (unstamped / pre-migration) reads back as 0.
-                .exec_seq = @intCast(c.sqlite3_column_int64(st, 11)),
-            };
+            const row = try listRowFromStmt(self.allocator, st.?);
             rows.append(self.allocator, row) catch return Error.OutOfMemory;
         }
         return .{
@@ -660,8 +640,15 @@ pub const IndexDb = struct {
             return Error.Sqlite;
         defer _ = c.sqlite3_finalize(st);
         bindText(st.?, 1, tenant_id);
-        _ = c.sqlite3_bind_int64(st, 2, @intCast(after_seq));
-        _ = c.sqlite3_bind_int64(st, 3, @intCast(to_seq));
+        // The bounds arrive from a CLIENT query string, so the full u64
+        // range is reachable; every real stamp is a positive i64 (the
+        // publish guard), so saturating an out-of-range bound to i64.max
+        // preserves its meaning ("after everything" / "no upper bound
+        // below the ceiling") where an @intCast would be illegal behavior
+        // and a @bitCast would go negative and match every row.
+        const i64_max: u64 = std.math.maxInt(i64);
+        _ = c.sqlite3_bind_int64(st, 2, @intCast(@min(after_seq, i64_max)));
+        _ = c.sqlite3_bind_int64(st, 3, @intCast(@min(to_seq, i64_max)));
         _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
         _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
 
@@ -674,25 +661,40 @@ pub const IndexDb = struct {
             const rc = c.sqlite3_step(st);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return Error.Sqlite;
-            const row: ListRow = .{
-                .tenant_id = try dupeColumnText(self.allocator, st.?, 0),
-                .request_id = @intCast(c.sqlite3_column_int64(st, 1)),
-                .received_ns = c.sqlite3_column_int64(st, 2),
-                .duration_ns = c.sqlite3_column_int64(st, 3),
-                .method = try dupeColumnText(self.allocator, st.?, 4),
-                .path = try dupeColumnText(self.allocator, st.?, 5),
-                .host = try dupeColumnText(self.allocator, st.?, 6),
-                .status = @intCast(c.sqlite3_column_int(st, 7)),
-                .outcome = try dupeColumnText(self.allocator, st.?, 8),
-                .deployment_id = @bitCast(c.sqlite3_column_int64(st, 9)),
-                .activation = try dupeColumnText(self.allocator, st.?, 10),
-                .exec_seq = @intCast(c.sqlite3_column_int64(st, 11)),
-            };
+            const row = try listRowFromStmt(self.allocator, st.?);
             rows.append(self.allocator, row) catch return Error.OutOfMemory;
         }
         return .{
             .rows = rows.toOwnedSlice(self.allocator) catch return Error.OutOfMemory,
             .allocator = self.allocator,
+        };
+    }
+
+    /// Materialize one `ListRow` from the shared 12-column SELECT shape
+    /// (`LIST_SQL_*` / `WINDOW_SQL` — all three list the same columns in
+    /// the same order, so there is exactly one ordinal map to keep
+    /// correct).
+    fn listRowFromStmt(allocator: std.mem.Allocator, st: *c.sqlite3_stmt) Error!ListRow {
+        return .{
+            .tenant_id = try dupeColumnText(allocator, st, 0),
+            .request_id = @intCast(c.sqlite3_column_int64(st, 1)),
+            .received_ns = c.sqlite3_column_int64(st, 2),
+            .duration_ns = c.sqlite3_column_int64(st, 3),
+            .method = try dupeColumnText(allocator, st, 4),
+            .path = try dupeColumnText(allocator, st, 5),
+            .host = try dupeColumnText(allocator, st, 6),
+            .status = @intCast(c.sqlite3_column_int(st, 7)),
+            // deployment_id is content-addressed u64 (sha-256 truncated);
+            // the high bit can be set. SQLite INTEGER stores all 64 bits;
+            // reinterpret without a sign check.
+            .deployment_id = @bitCast(c.sqlite3_column_int64(st, 9)),
+            .outcome = try dupeColumnText(allocator, st, 8),
+            // NULL (pre-migration row) reads back as "" — the
+            // unknown-kind sentinel.
+            .activation = try dupeColumnText(allocator, st, 10),
+            // NULL (unstamped / pre-migration) reads back as 0. Stored
+            // stamps are positive i64 by the insert-side guard.
+            .exec_seq = @intCast(c.sqlite3_column_int64(st, 11)),
         };
     }
 
@@ -963,9 +965,15 @@ fn execLogIndexInserts(
         if (r.activation.len > 0) bindText(st.?, 11, r.activation) else _ = c.sqlite3_bind_null(st, 11);
         // 0 = unstamped: store NULL so the record has no place on the
         // tape (the partial seq index skips it) rather than a fake
-        // position 0. The publish guard keeps real stamps < 2^63, so the
-        // i64 cast can't flip sign and break the index order.
-        if (r.exec_seq != 0) _ = c.sqlite3_bind_int64(st, 12, @intCast(r.exec_seq)) else _ = c.sqlite3_bind_null(st, 12);
+        // position 0. The mint-side publish guard keeps every real stamp
+        // a positive i64; a larger value can only come from a corrupt
+        // sidecar, and storing it (sign-flipped) would order the record
+        // BEFORE the whole tape — treat it as unstamped instead of
+        // inventing a position.
+        if (r.exec_seq != 0 and r.exec_seq <= std.math.maxInt(i64))
+            _ = c.sqlite3_bind_int64(st, 12, @intCast(r.exec_seq))
+        else
+            _ = c.sqlite3_bind_null(st, 12);
         bindText(st.?, 13, ndjson_key);
         _ = c.sqlite3_bind_int64(st, 14, @intCast(r.offset + header_size));
         _ = c.sqlite3_bind_int(st, 15, @intCast(r.length));

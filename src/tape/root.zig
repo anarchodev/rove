@@ -862,7 +862,7 @@ pub const Readset = struct {
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
     /// (readset replication, `docs/architecture/effects-and-handlers.md`). Wire format
-    /// (READSET_VERSION = 8):
+    /// (`READSET_VERSION`):
     ///
     /// ```
     /// [u32  magic = READSET_MAGIC ('RREA')]

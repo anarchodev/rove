@@ -2298,10 +2298,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // unstamped) when the tenant isn't registered with the bridge or
         // the group has no published term yet — the first activations
         // after a leadership acquisition, bounded by one pump refresh.
-        const exec_seq: u64 = if (worker.raft.gidForTenant(scope_inst.id)) |gid|
-            worker.raft.mintExecStamp(gid)
-        else
-            0;
+        const exec_seq: u64 = worker.raft.mintExecStampForTenant(scope_inst.id);
 
         // Admin-handler `platform.root.set/delete` writes accumulate
         // into the *batch* root writeset

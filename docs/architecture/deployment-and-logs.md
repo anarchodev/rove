@@ -223,11 +223,11 @@ behind the old one's, so `received_ns` can interleave two leaderships'
 records out of execution order). Window queries, quiet-gap counts, and
 read-your-write blame in the saga viewer all key on it.
 
-- **Mint** (`Bridge.mintExecStamp`, `src/consensus/bridge.zig`): the group
-  holder is the tenant's serialization point, so the worker mints one stamp
-  per activation at **execution entry** (not at capture — commit-time
-  captures complete out of order). Every hop of a held chain is its own tape
-  atom and gets a fresh stamp; resumes never inherit one.
+- **Mint** (`Bridge.mintExecStampForTenant`, `src/consensus/bridge.zig`):
+  the group holder is the tenant's serialization point, so the worker mints
+  one stamp per activation at **execution entry** (not at capture —
+  commit-time captures complete out of order). Every hop of a held chain is
+  its own tape atom and gets a fresh stamp; resumes never inherit one.
 - **Shape**: `raft term << 40 | per-term serial counter`, one atomic u64 per
   group (`GroupSig.exec_stamp`). The pump's leadership refresh folds the
   group's current term in via `fetchMax` — a new term's base exceeds every

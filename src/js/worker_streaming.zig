@@ -1070,10 +1070,7 @@ fn resumeStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    const exec_seq: u64 = if (worker.raft.gidForTenant(inst.id)) |gid|
-        worker.raft.mintExecStamp(gid)
-    else
-        0;
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
     // wake_batch activation: drain the fired arms (fired
     // PREFIXES, fire-time order) so nothing re-fires next sweep;
     // resumeStream owns the slice + each entry's `prefix` for the
@@ -1293,10 +1290,7 @@ pub fn resumeBoundFetchStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    const exec_seq: u64 = if (worker.raft.gidForTenant(inst.id)) |gid|
-        worker.raft.mintExecStamp(gid)
-    else
-        0;
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     // Snapshot fetchesPending — same shape as resumeBoundFetchChain.
     // Entity is in `stream_data_out` or `stream_response_in` at
@@ -1561,10 +1555,7 @@ pub fn firePrep(
             const tl = worker.tenant_logs.get(dep.inst.id) orelse break :blk 0;
             break :blk tl.id_minter.nextRequestId() catch 0;
         },
-        .exec_seq = if (worker.raft.gidForTenant(dep.inst.id)) |gid|
-            worker.raft.mintExecStamp(gid)
-        else
-            0,
+        .exec_seq = worker.raft.mintExecStampForTenant(dep.inst.id),
     };
 }
 

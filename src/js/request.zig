@@ -290,7 +290,7 @@ pub const Trace = struct {
     saga_id: ?[]const u8 = null,
     /// Per-ACTIVATION execution-sequence stamp (`LogRecord.exec_seq` — the
     /// tenant-tape total order, `docs/architecture/deployment-and-logs.md`).
-    /// Minted once per activation by the worker (`Bridge.mintExecStamp`)
+    /// Minted once per activation by the worker (`Bridge.mintExecStampForTenant`)
     /// when the activation enters execution — unlike `request_id` and
     /// `saga_id`, a resumed chain does NOT inherit it: every hop is its
     /// own tape atom and gets a fresh stamp. 0 on paths that never enter

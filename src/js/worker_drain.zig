@@ -2143,10 +2143,7 @@ fn resumeContinuation(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    const exec_seq: u64 = if (worker.raft.gidForTenant(inst.id)) |gid|
-        worker.raft.mintExecStamp(gid)
-    else
-        0;
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
     // durable-wake-plan P5(a): accumulate this resume hop's
     // `http.fetch`es (a `webhook.send` from an onResult handler —
     // heldsync recipe-1's retry hop — issues one inline). Write arms
@@ -2345,10 +2342,7 @@ pub fn resumeBoundFetchChain(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    const exec_seq: u64 = if (worker.raft.gidForTenant(inst.id)) |gid|
-        worker.raft.mintExecStamp(gid)
-    else
-        0;
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     // Snapshot the per-chain pending-bound-fetch count BEFORE the
     // activation runs. The component lives on the entity (still
@@ -3279,10 +3273,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    const exec_seq: u64 = if (worker.raft.gidForTenant(inst.id)) |gid|
-        worker.raft.mintExecStamp(gid)
-    else
-        0;
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     const fetches_pending: u32 = blk: {
         const cnt = server.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;

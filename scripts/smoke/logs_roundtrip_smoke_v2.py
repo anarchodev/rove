@@ -133,8 +133,11 @@ def main() -> int:
         check("exec_seq values are distinct", len(set(seqs)) == len(seqs),
               f"seqs={seqs}")
 
-        # The tape view: /window walks exactly the STAMPED records,
-        # ASCENDING by stamp; unstamped rows never appear on the tape.
+        # The tape view: /window walks stamped records ASCENDING by stamp;
+        # unstamped rows never appear. Set-INCLUSION against the /list
+        # snapshot, not equality — the two calls are separate reads of a
+        # continuously-indexing store, so a batch (e.g. the probe's) can
+        # land between them and legitimately appear only in the window.
         stamped = sorted(int(r.get("exec_seq", "0")) for r in records
                          if int(r.get("exec_seq", "0")) > 0)
         win_resp = c.log_get("globex/window?limit=50", timeout=15.0)
@@ -145,9 +148,11 @@ def main() -> int:
             except json.JSONDecodeError:
                 pass
         win_seqs = [int(r.get("exec_seq", "0")) for r in win_rows]
-        check("window returns the stamped records in ascending tape order",
-              win_seqs == stamped,
-              f"status={win_resp.status} win={win_seqs} want={stamped}")
+        check("window is strictly ascending, nonzero, and covers the listed stamps",
+              all(s > 0 for s in win_seqs)
+              and win_seqs == sorted(set(win_seqs))
+              and set(stamped) <= set(win_seqs),
+              f"status={win_resp.status} win={win_seqs} listed={stamped}")
         if win_seqs:
             after = win_seqs[0]
             page2 = c.log_get(f"globex/window?after_seq={after}&limit=50",
