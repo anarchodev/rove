@@ -36,6 +36,7 @@ const respb = @import("response_builder.zig");
 const response_building = @import("response_building.zig");
 const auth = @import("auth.zig");
 const raft_propose = @import("raft_propose.zig");
+const durable_wake = @import("durable_wake.zig");
 const v2_move = @import("v2_move.zig");
 const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
@@ -722,6 +723,43 @@ fn appendRespondCmds(
     }
 }
 
+/// Stage one `Cmd.target_sched_wake` per `_sched/by_time/` put in this
+/// batch's cross-tenant target envelopes (`platform.scope(t).kv`
+/// writes). The anchor writeset's sched puts arm the anchor tenant's
+/// durable-wake watermark through the `kv_wake_broadcast` walk in
+/// `noteCommittedSchedWrites`; target-envelope puts build no such Cmds
+/// (kv-react fan-out is anchor-tenant semantics), so without this a
+/// cross-tenant schedule is a silently-dead wake on the proposing node
+/// — the target's watermark stays high until its group's next
+/// leadership transition. `noteCommittedSchedWrites` consumes these on
+/// the commit arm, leadership-gated on the TARGET tenant's group; the
+/// cross-node half is the apply observer's `_sched/by_time/` branch
+/// (rewind/main.zig). Append-failure skips the entry (best-effort, the
+/// same posture as the sibling Cmd builders — the row itself is
+/// durable either way and the promotion pass recovers the wake).
+fn appendTargetSchedWakeCmds(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    cmds: *effect_mod.cmd.BufferedCmds,
+) void {
+    for (worker.batch_side.targets.items) |*t| {
+        for (t.ws.ops.items) |op| switch (op) {
+            .put => |p| {
+                const when_ns = durable_wake.parseByTimeWhenNs(p.key) orelse continue;
+                const id = allocator.dupe(u8, t.id) catch continue;
+                cmds.items.append(allocator, .{ .target_sched_wake = .{
+                    .tenant_id = id,
+                    .when_ns = when_ns,
+                } }) catch {
+                    allocator.free(id);
+                    continue;
+                };
+            },
+            .delete => {},
+        };
+    }
+}
+
 fn finalizeBatch(
     worker: anytype,
     anchor: *const tenant_mod.Instance,
@@ -864,6 +902,7 @@ fn finalizeBatch(
                 };
             }
             appendRespondCmds(allocator, &barrier_cmds, successes);
+            appendTargetSchedWakeCmds(worker, allocator, &barrier_cmds);
             // Items that successfully moved to barrier_cmds are
             // now owned by it; clear the source so the caller's
             // defer doesn't double-free.
@@ -1114,6 +1153,7 @@ fn finalizeBatch(
     // raft_pending_X also emits Cmd.respond, so `drainEntityArm`
     // unconditionally skips the move on commit.
     appendRespondCmds(allocator, &write_path_cmds, successes);
+    appendTargetSchedWakeCmds(worker, allocator, &write_path_cmds);
     worker_mod.parkKvWakes(worker, seq, anchor_id, writeset, write_path_cmds) catch |perr|
         std.log.warn("rove-js parkKvWakes (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
     // parkKvWakes consumed write_path_cmds unconditionally.

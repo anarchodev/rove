@@ -3,7 +3,11 @@
 // rove#340 — the durable data-export job.
 //
 // Walks a tenant's KV into content-addressed parts, one part per
-// activation, and records them under `_export/{id}`. Composed from the
+// activation, then (format 2, when the marker's `bundle_requested` is set
+// and a deployment exists) ships one final `kind:"bundle"` part — the raw
+// deployment manifest, whose per-file hashes `blob.fileUrl` presigns out of
+// the tenant's immutable file-blobs — and records everything under
+// `_export/{id}`. Composed from the
 // primitives the effect algebra already has — a durable kv marker, the
 // scheduler's durable wake, and the one outbound Cmd — so there is no new
 // envelope type, no sweep thread, and no per-feature recovery path.
@@ -171,17 +175,42 @@ export default function () {
             // Idempotent on the hash: at-least-once firing can re-issue a
             // part, and the re-issue produces the identical object.
             if (st.parts.length === 0 || st.parts[st.parts.length - 1].hash !== part.hash) {
-                st.parts.push({ hash: part.hash, bytes: part.bytes, entries: part.entries });
+                const rec = { hash: part.hash, bytes: part.bytes, entries: part.entries };
+                if (part.kind === "bundle") rec.kind = "bundle";
+                st.parts.push(rec);
                 st.bytes = (st.bytes || 0) + part.bytes;
                 st.entries = (st.entries || 0) + part.entries;
             }
-            st.cursor = part.next_cursor || "";
-            if (part.done) {
+            if (part.kind === "bundle") {
+                // The bundle is one part and always the last: record which
+                // deployment the code slice captured and finish. A redeploy
+                // between the kv walk and this part exported the NEWER
+                // manifest — dep_id is what makes that visible.
+                st.bundle = { manifest_hash: part.hash, dep_id: part.dep_id || "" };
                 st.state = "done";
                 st.finished_at = Date.now();
                 kv.set(key, JSON.stringify(st));
                 schedCancel(crypto.sha256b64url(key));
                 return { status: 200 };
+            }
+            st.cursor = part.next_cursor || "";
+            if (part.done) {
+                // KV walk finished. Format 2 continues into the code slice
+                // when the start requested it AND there is a deployment to
+                // export; a marker without `bundle_requested` (pre-format-2,
+                // or an explicit {bundle:false}) finishes kv-only, exactly
+                // as before.
+                if (st.bundle_requested && kv.get("_deploy/current") !== null) {
+                    st.phase = "bundle";
+                    // Fall through to the shared issue tail below.
+                } else {
+                    st.state = "done";
+                    st.bundle = null;
+                    st.finished_at = Date.now();
+                    kv.set(key, JSON.stringify(st));
+                    schedCancel(crypto.sha256b64url(key));
+                    return { status: 200 };
+                }
             }
         }
         // A failed upload deliberately does NOT advance the cursor: the
@@ -201,7 +230,11 @@ export default function () {
     __rove.fetch({
         url: "http://rove-kvexport.internal/",
         method: "POST",
-        body: JSON.stringify({ id: id, cursor: st.cursor || "" }),
+        // `phase` picks the builder at the door: the kv walk (cursor-chained)
+        // or the one-shot bundle part (the deployment manifest).
+        body: JSON.stringify(st.phase === "bundle"
+            ? { id: id, phase: "bundle" }
+            : { id: id, cursor: st.cursor || "" }),
         headers: {},
         on_chunk: "__system/export_run",
         ctx: { id: id },

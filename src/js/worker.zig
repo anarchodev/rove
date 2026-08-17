@@ -2861,7 +2861,38 @@ pub fn Worker(comptime opts: Options) type {
             const inst = (self.node.tenant.getInstance(pf.tenant_id) catch null) orelse
                 return failed(self, pf, "no such instance");
 
-            var rw = kv_export_mod.buildRewrite(a, inst.kv, pf.body, kv_export_mod.PART_MAX_BYTES) catch |err|
+            const req = kv_export_mod.parseReq(a, pf.body) catch |err|
+                return failed(self, pf, @errorName(err));
+            const is_bundle = std.mem.eql(u8, req.value.phase, "bundle");
+            const req_id = a.dupe(u8, req.value.id) catch {
+                req.deinit();
+                return failed(self, pf, "out of memory");
+            };
+            defer a.free(req_id);
+            req.deinit();
+
+            var rw = if (is_bundle) blk: {
+                // The code slice: the part is the deployment manifest the
+                // worker already holds in RAM — no S3 read on the worker
+                // thread. The snapshot stays pinned across the build (the
+                // manifest bytes are borrowed until the rewrite dupes them)
+                // and releases on block exit. Slot lookup under the lock so
+                // an `evictTenant` can't free the slot between get and pin.
+                const snap = pin: {
+                    self.node.deploy.tenant_files_lock.lock();
+                    defer self.node.deploy.tenant_files_lock.unlock();
+                    const slot = self.node.deploy.tenant_files_map.get(pf.tenant_id) orelse
+                        break :pin null;
+                    break :pin slot.pinCurrent();
+                } orelse return failed(self, pf, "no deployment snapshot");
+                defer snap.release();
+                break :blk kv_export_mod.buildBundleRewrite(
+                    a,
+                    req_id,
+                    snap.manifest_bytes,
+                    snap.deployment_id,
+                ) catch |err| return failed(self, pf, @errorName(err));
+            } else kv_export_mod.buildRewrite(a, inst.kv, pf.body, kv_export_mod.PART_MAX_BYTES) catch |err|
                 return failed(self, pf, @errorName(err));
             // NOT `errdefer`: this function returns a bool, so the failure
             // paths below are ordinary returns and an errdefer would never

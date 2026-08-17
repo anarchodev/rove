@@ -109,6 +109,11 @@ export function status() {
     }
     return JSON.stringify(st);
 }
+// The code slice's pointer half: a bundle manifest entry's hash presigns
+// out of the tenant's own file-blobs (rove#340).
+export function fileurl() {
+    return blob.fileUrl(_param("h"));
+}
 """
 
 HANDLERS = {
@@ -219,6 +224,45 @@ def main() -> int:
               f"missing={missing[:5]}")
         check("values round-trip byte-exact", seen.get("data/0007") == "value-7",
               f"got {seen.get('data/0007')!r}")
+
+        print("step 6b: ⭐ the code slice — the bundle part IS the deploy "
+              "manifest, and its hashes download (format 2)")
+        bundle_parts = [p for p in parts if p.get("kind") == "bundle"]
+        check("exactly one bundle part (this tenant HAS a deployment)",
+              len(bundle_parts) == 1, f"parts={parts}")
+        check("the marker records which deployment the slice captured",
+              isinstance((state.get("bundle") or {}).get("dep_id"), str)
+              and len(state["bundle"]["dep_id"]) == 16,
+              f"bundle={state.get('bundle')}")
+        if bundle_parts:
+            bi = parts.index(bundle_parts[0])
+            proc = subprocess.run(["curl", "-sS", "--fail-with-body", links[bi]],
+                                  capture_output=True, text=True, timeout=60)
+            check("GET the bundle part → 200", proc.returncode == 0,
+                  f"rc={proc.returncode} {proc.stderr[:120]}")
+            try:
+                manifest = json.loads(proc.stdout)
+            except ValueError:
+                manifest = {}
+            m_entries = manifest.get("entries") or []
+            check("the bundle part parses as the deploy manifest",
+                  any(e.get("path") == "seed/index.mjs" for e in m_entries),
+                  proc.stdout[:160])
+            seed_entry = next((e for e in m_entries
+                               if e.get("path") == "seed/index.mjs"), None)
+            if seed_entry:
+                rr = c.request(TENANT, f"/start?fn=fileurl&h={seed_entry['hash']}",
+                               method="POST", data=b"x")
+                check("blob.fileUrl mints a link for a manifest hash",
+                      rr.status == 200 and rr.body.strip().startswith("http"),
+                      f"got {rr.status} {rr.body[:100]!r}")
+                proc = subprocess.run(
+                    ["curl", "-sS", "--fail-with-body", rr.body.strip()],
+                    capture_output=True, text=True, timeout=60)
+                check("the fileUrl link returns the DEPLOYED SOURCE bytes",
+                      proc.returncode == 0
+                      and proc.stdout == HANDLERS["seed/index.mjs"],
+                      f"rc={proc.returncode} got={proc.stdout[:80]!r}")
 
         print("step 7: ⭐ a tenant AT its storage cap can still export (#429)")
         # Pin the quota below what this tenant already stores, so any metered

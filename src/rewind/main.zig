@@ -139,30 +139,63 @@ const WorkerCtx = struct {
 /// reload is per promoted tenant; the watermark sweeps are partition-wide +
 /// idempotent (the per-group propose gate inside each no-ops tenants this node
 /// does not lead), so they run once per tick whenever any promotion landed.
-/// DP apply observer (`bridge.setApplyObserver`): fired on the pump thread once
-/// per committed PUT on a FOLLOWER (the leader's apply is skipped). Detects the
-/// replicated `_deploy/current` marker and enqueues a load so the follower
-/// tracks the tenant's current deployment continuously — see
-/// `DeploymentCache.enqueueDeployment` for why. `ctx` is `*NodeState`.
+/// Apply observer (`bridge.setApplyObserver`): fired on the pump thread once
+/// per committed PUT on a non-proposing node (the proposing worker's apply is
+/// skipped — its effects run inline at propose/commit time). Two branches:
 ///
-/// `id_str` is the tenant the writeset TARGETED — for a release published
-/// through the admin batch (a `multi` cross-tenant inner) that is the
-/// release's target tenant, NOT the admin anchor whose group carried the
-/// entry, so it must come from the observer, not a `idStrForGid(gid)` lookup
-/// (which resolves the anchor, not the target tenant).
+/// 1. `_deploy/current` — enqueues a deployment load so a follower tracks the
+///    tenant's current deployment continuously (see
+///    `DeploymentCache.enqueueDeployment`).
+/// 2. `_sched/by_time/{when}/{id}` — arms the tenant's durable-wake watermark
+///    when THIS node leads the tenant's group. This is the cross-node half of
+///    the cross-tenant schedule fix: a `platform.scope(t).kv` sched write
+///    rides the admin batch's target envelope, whose commit arm runs on the
+///    ADMIN group's leader — a different node than the target's group leader
+///    whenever leaderships diverge. The proposing-node half is
+///    `Cmd.target_sched_wake` (`worker_dispatch.appendTargetSchedWakeCmds` →
+///    `noteCommittedSchedWrites`). Leadership-gated because the watermark is
+///    leader-local state — lowering it on a non-leader would make the steady
+///    sweep busy-fire a tick that can never commit there. Catch-up re-applies
+///    of old sched rows may lower spuriously; the resulting `scheduler_tick`
+///    re-derives the true min and re-raises (self-correcting, same posture as
+///    `noteCommittedSchedWrites`). The no-leader-anywhere case (hibernated
+///    group) is covered by `sweepDurableWakesOnPromotion` on the next
+///    election.
+///
+/// `id_str` is the tenant the writeset TARGETED — for a release or a
+/// cross-tenant sched write riding the admin batch (a `multi` cross-tenant
+/// inner) that is the TARGET tenant, NOT the admin anchor whose group carried
+/// the entry, so it must come from the observer, not a `idStrForGid(gid)`
+/// lookup (which resolves the anchor, not the target tenant).
 /// Borrowed for the call; the loader dups it. Empty for root writesets
-/// (no `_deploy/current` key there — the key check filters them).
+/// (no `_deploy/current` or `_sched/` keys there — the checks filter them).
 fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.ApplyOp, key: []const u8, value: []const u8) void {
     _ = gid;
-    // Only a written marker names a deployment to load. A DELETE of
-    // `_deploy/current` (a tenant being torn down) has no dep to enqueue —
-    // dropping the release pointer is the point.
+    // Only puts carry effects here. A DELETE of `_deploy/current` (a tenant
+    // being torn down) has no dep to enqueue — dropping the release pointer
+    // is the point; a `_sched/by_time` delete never needs to RAISE the
+    // watermark (the next tick re-derives the min from committed rows).
     if (op != .put) return;
-    if (!std.mem.eql(u8, key, "_deploy/current")) return;
     if (id_str.len == 0) return;
     const node: *rjs.NodeState = @ptrCast(@alignCast(ctx));
-    const dep_id = std.fmt.parseInt(u64, value, 16) catch return;
-    node.deploy.enqueueDeployment(id_str, dep_id);
+    if (std.mem.eql(u8, key, "_deploy/current")) {
+        const dep_id = std.fmt.parseInt(u64, value, 16) catch return;
+        node.deploy.enqueueDeployment(id_str, dep_id);
+        return;
+    }
+    if (rjs.durable_wake.parseByTimeWhenNs(key)) |when_ns| {
+        // The bridge mutex is NOT held during node.pump()'s apply (commit
+        // hooks re-acquire it — bridge_pump.zig), so these bridge queries
+        // are safe from the observer.
+        const tgid = node.raft.gidForTenant(id_str) orelse return;
+        if (!node.raft.isLeaderOf(tgid)) return;
+        // Hold the slot lock across get+lowerWake so a concurrent
+        // `evictTenant` can't free the slot between them.
+        node.deploy.tenant_files_lock.lock();
+        defer node.deploy.tenant_files_lock.unlock();
+        const slot = node.deploy.tenant_files_map.get(id_str) orelse return;
+        slot.lowerWake(when_ns);
+    }
 }
 
 /// Poll-loop hook: move the pump's queued snapshot catch-up jobs onto the

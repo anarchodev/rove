@@ -954,7 +954,10 @@ class V2Cluster:
     # missing one shows up as a resolve failure at deploy, not at edit time.
     FIRSTPARTY_PKG_DEPS = {
         "@rewind/cron": ["@rewind/schedule"],
-        "@rewind/export": ["@rewind/schedule"],
+        # `@rewind/export` inlines its `_sched/` row writes (the schedArm
+        # twin `__system/export_run` carries) so the same code path serves
+        # `forScope(platform.scope(t))` — no sibling import since rove#340's
+        # cross-tenant arc.
         "@rewind/oauth": ["@rewind/jwt"],
         "@rewind/oidc": ["@rewind/jwt"],
     }

@@ -31,6 +31,21 @@
 //! One JSON object per line (`{"key":…,"value":…}`), keys in store order.
 //! Line-delimited so a part is streamable and resumable, and so a truncated
 //! part is detectable at the line boundary rather than silently short.
+//!
+//! ## The bundle part (artifact format 2)
+//!
+//! The code slice of an export is ONE additional part whose bytes are the
+//! tenant's raw deployment manifest (`manifest_json.zig` v2 — `entries:
+//! [{path, kind, hash, content_type, …}]`), taken from the worker's resident
+//! `TenantFilesSnapshot.manifest_bytes` — local memory, never an S3 read on
+//! the worker thread. File BYTES are not copied into the export: every
+//! manifest entry's `hash` names an object in the tenant's own immutable,
+//! content-addressed `file-blobs/` pool, which `blob.fileUrl` presigns —
+//! pointers into a store that lives exactly as long as the tenant does (both
+//! pools are torn down together; there is no file-blobs GC). If file-blobs
+//! ever grows GC, revisit toward CopyObject-into-exports. Bytecode is
+//! deliberately absent — platform-internal and reproducible from the sources
+//! the manifest names.
 
 const std = @import("std");
 const kvstore = @import("raft-kv").kvstore;
@@ -244,11 +259,8 @@ pub fn buildRewrite(
     cmd_body: []const u8,
     max_bytes: usize,
 ) !Rewrite {
-    const Req = struct { id: []const u8 = "", cursor: []const u8 = "" };
-    const parsed = std.json.parseFromSlice(Req, a, cmd_body, .{ .ignore_unknown_fields = true }) catch
-        return error.BadExportRequest;
+    const parsed = try parseReq(a, cmd_body);
     defer parsed.deinit();
-    if (parsed.value.id.len == 0) return error.BadExportRequest;
 
     var part = try buildPart(a, store, parsed.value.cursor, max_bytes);
     defer part.deinit(a);
@@ -274,6 +286,74 @@ pub fn buildRewrite(
     return .{
         .hash = hash,
         .body = try a.dupe(u8, part.bytes),
+        .ctx_json = try ctx.toOwnedSlice(a),
+    };
+}
+
+/// The request an export Cmd's body carries. `phase` selects the slice:
+/// absent/`"kv"` walks the store (`buildRewrite`), `"bundle"` ships the
+/// deployment manifest (`buildBundleRewrite`) — parsed by the door
+/// (`worker.rewriteKvExport`) to pick the builder.
+pub const Req = struct {
+    id: []const u8 = "",
+    cursor: []const u8 = "",
+    phase: []const u8 = "kv",
+};
+
+pub fn parseReq(a: std.mem.Allocator, cmd_body: []const u8) !std.json.Parsed(Req) {
+    const parsed = std.json.parseFromSlice(Req, a, cmd_body, .{ .ignore_unknown_fields = true }) catch
+        return error.BadExportRequest;
+    errdefer parsed.deinit();
+    if (parsed.value.id.len == 0) return error.BadExportRequest;
+    if (!std.mem.eql(u8, parsed.value.phase, "kv") and
+        !std.mem.eql(u8, parsed.value.phase, "bundle"))
+        return error.BadExportRequest;
+    return parsed;
+}
+
+/// Build the bundle part: body = the raw deployment manifest bytes, ctx = a
+/// descriptor shaped like the kv parts' (`done` is always true — the bundle
+/// is one part) plus `kind:"bundle"` and the 16-hex `dep_id`, so the job and
+/// the artifact both record WHICH deployment the code slice captured (a
+/// redeploy between the kv walk and this part exports the newer manifest;
+/// the dep_id is what makes that visible rather than silent).
+///
+/// `entries` counts the manifest's file entries — the same "how much is in
+/// this part" scalar the kv parts carry. A manifest that doesn't parse is
+/// refused loudly: it is engine-written, so an unparseable one is corruption,
+/// not customer input.
+pub fn buildBundleRewrite(
+    a: std.mem.Allocator,
+    id: []const u8,
+    manifest_bytes: []const u8,
+    dep_id: u64,
+) !Rewrite {
+    const Manifest = struct { entries: []const struct {} = &.{} };
+    const parsed = std.json.parseFromSlice(Manifest, a, manifest_bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.BadManifest;
+    const entry_count = parsed.value.entries.len;
+    parsed.deinit();
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(manifest_bytes, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+
+    var ctx: std.ArrayList(u8) = .empty;
+    errdefer ctx.deinit(a);
+    try ctx.appendSlice(a, "{\"id\":");
+    try appendJsonString(a, &ctx, id);
+    try ctx.appendSlice(a, ",\"part\":{\"hash\":\"");
+    try ctx.appendSlice(a, &hash);
+    try ctx.writer(a).print(
+        "\",\"bytes\":{d},\"entries\":{d},\"done\":true,\"next_cursor\":\"\"," ++
+            "\"kind\":\"bundle\",\"dep_id\":\"{x:0>16}\"}}}}",
+        .{ manifest_bytes.len, entry_count, dep_id },
+    );
+
+    return .{
+        .hash = hash,
+        .body = try a.dupe(u8, manifest_bytes),
         .ctx_json = try ctx.toOwnedSlice(a),
     };
 }
@@ -441,6 +521,66 @@ test "kv export: the rewrite yields a self-describing part the job can chain on"
     const p2 = try std.json.parseFromSlice(Ctx, a, rw2.ctx_json, .{});
     defer p2.deinit();
     try testing.expect(p2.value.part.done);
+}
+
+test "kv export: the bundle rewrite ships the manifest verbatim with a self-describing descriptor" {
+    const a = testing.allocator;
+    const manifest =
+        \\{"version":2,"entries":[{"path":"index.mjs","kind":"handler","hash":"aa"},
+        \\{"path":"style.css","kind":"static","hash":"bb","content_type":"text/css"}]}
+    ;
+    var rw = try buildBundleRewrite(a, "exp-9", manifest, 0xdeadbeef12345678);
+    defer rw.deinit(a);
+
+    // The body IS the manifest — byte-identical, so the artifact's bundle
+    // part parses with the same reader the deploy path uses.
+    try testing.expectEqualStrings(manifest, rw.body);
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(manifest, &digest, .{});
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), &rw.hash);
+
+    const Ctx = struct {
+        id: []const u8,
+        part: struct {
+            hash: []const u8,
+            bytes: u64,
+            entries: u64,
+            done: bool,
+            next_cursor: []const u8,
+            kind: []const u8,
+            dep_id: []const u8,
+        },
+    };
+    const parsed = try std.json.parseFromSlice(Ctx, a, rw.ctx_json, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("exp-9", parsed.value.id);
+    try testing.expectEqualStrings(&rw.hash, parsed.value.part.hash);
+    try testing.expectEqual(@as(u64, manifest.len), parsed.value.part.bytes);
+    try testing.expectEqual(@as(u64, 2), parsed.value.part.entries);
+    try testing.expect(parsed.value.part.done);
+    try testing.expectEqualStrings("bundle", parsed.value.part.kind);
+    try testing.expectEqualStrings("deadbeef12345678", parsed.value.part.dep_id);
+}
+
+test "kv export: an unparseable manifest is refused loudly, not exported" {
+    const a = testing.allocator;
+    try testing.expectError(error.BadManifest, buildBundleRewrite(a, "exp-9", "not json", 1));
+}
+
+test "kv export: the request parse accepts both phases and refuses others" {
+    const a = testing.allocator;
+    {
+        const p = try parseReq(a, "{\"id\":\"x\"}");
+        defer p.deinit();
+        try testing.expectEqualStrings("kv", p.value.phase);
+    }
+    {
+        const p = try parseReq(a, "{\"id\":\"x\",\"phase\":\"bundle\"}");
+        defer p.deinit();
+        try testing.expectEqualStrings("bundle", p.value.phase);
+    }
+    try testing.expectError(error.BadExportRequest, parseReq(a, "{\"id\":\"x\",\"phase\":\"tapes\"}"));
 }
 
 test "kv export: a request with no export id is refused" {

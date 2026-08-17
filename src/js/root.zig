@@ -65,6 +65,7 @@ pub const reserved = @import("rove-reserved");
 pub const ssrf = @import("rove-ssrf");
 pub const session = @import("session.zig");
 pub const deployment_loader = @import("deployment_loader.zig");
+pub const durable_wake = @import("durable_wake.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
 pub const snapshot_catchup = @import("snapshot_catchup.zig");
 pub const SnapshotCatchupThread = snapshot_catchup.SnapshotCatchupThread;
