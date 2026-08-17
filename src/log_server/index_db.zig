@@ -578,23 +578,7 @@ pub const IndexDb = struct {
         if (fparams.method != 0) bindText(st.?, fparams.method, filter.method.?);
         if (fparams.activation != 0) bindText(st.?, fparams.activation, filter.activation.?);
         if (fparams.path != 0) bindText(st.?, fparams.path, filter.path_contains.?);
-
-        var rows: std.ArrayListUnmanaged(ListRow) = .empty;
-        errdefer {
-            for (rows.items) |*r| r.deinit(self.allocator);
-            rows.deinit(self.allocator);
-        }
-        while (true) {
-            const rc = c.sqlite3_step(st);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) return Error.Sqlite;
-            const row = try listRowFromStmt(self.allocator, st.?);
-            rows.append(self.allocator, row) catch return Error.OutOfMemory;
-        }
-        return .{
-            .rows = rows.toOwnedSlice(self.allocator) catch return Error.OutOfMemory,
-            .allocator = self.allocator,
-        };
+        return self.collectListRows(st.?);
     }
 
     /// The seq-window statement — the tape view. Ascending over
@@ -664,7 +648,10 @@ pub const IndexDb = struct {
     /// order all the same. Keyset cursor on the stamp (`?3`,
     /// strictly-greater-than). Unstamped hops are excluded here — they
     /// have no tape position; `querySagaUnplaced` returns them.
-    const SAGA_HOPS_SQL: [:0]const u8 =
+    /// The shared saga-join head: the 12-column list shape driven from
+    /// the reserved `_saga` tag. `?1` = tenant, `?2` = saga id; each
+    /// tail adds its own predicates + order + limit.
+    const SAGA_JOIN_HEAD =
         \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
         \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id,
         \\       li.activation, li.exec_seq
@@ -673,6 +660,10 @@ pub const IndexDb = struct {
         \\WHERE t.tenant_id = ?1 AND t.key = '
     ++ RESERVED_SAGA_TAG ++
         \\' AND t.value = ?2
+    ;
+
+    const SAGA_HOPS_SQL: [:0]const u8 = SAGA_JOIN_HEAD ++
+        \\
         \\  AND li.exec_seq IS NOT NULL AND li.exec_seq > ?3
         \\  AND (?5 = 0 OR li.received_ns >= ?5)
         \\ORDER BY li.exec_seq ASC
@@ -682,17 +673,11 @@ pub const IndexDb = struct {
     /// The unstamped remainder of a saga: hops captured without a tape
     /// position (an activation minted while the group had no published
     /// term, or a record indexed before the stamp existed). Ordered by
-    /// arrival because that is all they carry. Capped — callers show
-    /// them as an addendum, not a paged list.
-    const SAGA_UNPLACED_SQL: [:0]const u8 =
-        \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
-        \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id,
-        \\       li.activation, li.exec_seq
-        \\FROM log_tags t
-        \\CROSS JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
-        \\WHERE t.tenant_id = ?1 AND t.key = '
-    ++ RESERVED_SAGA_TAG ++
-        \\' AND t.value = ?2
+    /// arrival because that is all they carry. Capped by the caller's
+    /// limit — an addendum, not a paged list; ask for one more row than
+    /// you show so the cap is announced, never silent.
+    const SAGA_UNPLACED_SQL: [:0]const u8 = SAGA_JOIN_HEAD ++
+        \\
         \\  AND li.exec_seq IS NULL
         \\  AND (?4 = 0 OR li.received_ns >= ?4)
         \\ORDER BY li.received_ns ASC, li.request_id ASC
@@ -779,6 +764,16 @@ pub const IndexDb = struct {
     /// silent cap).
     pub const GapCount = struct { count: u32, truncated: bool };
 
+    const GAP_COUNT_SQL: [:0]const u8 =
+        \\SELECT COUNT(*) FROM (
+        \\  SELECT 1 FROM log_index
+        \\  WHERE tenant_id = ?1
+        \\    AND exec_seq IS NOT NULL AND exec_seq > ?2 AND exec_seq < ?3
+        \\    AND (?5 = 0 OR received_ns >= ?5)
+        \\  LIMIT ?4
+        \\)
+    ;
+
     pub fn countSeqRange(
         self: *IndexDb,
         tenant_id: []const u8,
@@ -787,20 +782,50 @@ pub const IndexDb = struct {
         floor_received_ns: i64,
         cap: u32,
     ) Error!GapCount {
-        const sql =
-            \\SELECT COUNT(*) FROM (
-            \\  SELECT 1 FROM log_index
-            \\  WHERE tenant_id = ?1
-            \\    AND exec_seq IS NOT NULL AND exec_seq > ?2 AND exec_seq < ?3
-            \\    AND (?5 = 0 OR received_ns >= ?5)
-            \\  LIMIT ?4
-            \\)
-        ;
         var st: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &st, null) != c.SQLITE_OK)
+        if (c.sqlite3_prepare_v2(self.db, GAP_COUNT_SQL.ptr, @intCast(GAP_COUNT_SQL.len), &st, null) != c.SQLITE_OK)
             return Error.Sqlite;
         defer _ = c.sqlite3_finalize(st);
-        bindText(st.?, 1, tenant_id);
+        return stepGapCount(st.?, tenant_id, after_seq, before_seq, floor_received_ns, cap);
+    }
+
+    /// One bounded count per seam between consecutive `hops` rows —
+    /// `hops.len - 1` results (empty for < 2 hops), one PREPARED
+    /// statement reset+rebound per seam (the amortization `insertBatch`
+    /// uses; a page of hops must not pay a parse per seam). Caller frees
+    /// the returned slice.
+    pub fn gapCounts(
+        self: *IndexDb,
+        allocator: std.mem.Allocator,
+        tenant_id: []const u8,
+        hops: []const ListRow,
+        floor_received_ns: i64,
+        cap: u32,
+    ) Error![]GapCount {
+        if (hops.len < 2) return allocator.alloc(GapCount, 0) catch Error.OutOfMemory;
+        const out = allocator.alloc(GapCount, hops.len - 1) catch return Error.OutOfMemory;
+        errdefer allocator.free(out);
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, GAP_COUNT_SQL.ptr, @intCast(GAP_COUNT_SQL.len), &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        for (hops[0 .. hops.len - 1], hops[1..], out) |prev, next, *slot| {
+            _ = c.sqlite3_reset(st);
+            _ = c.sqlite3_clear_bindings(st);
+            slot.* = try stepGapCount(st.?, tenant_id, prev.exec_seq, next.exec_seq, floor_received_ns, cap);
+        }
+        return out;
+    }
+
+    fn stepGapCount(
+        st: *c.sqlite3_stmt,
+        tenant_id: []const u8,
+        after_seq: u64,
+        before_seq: u64,
+        floor_received_ns: i64,
+        cap: u32,
+    ) Error!GapCount {
+        bindText(st, 1, tenant_id);
         const i64_max: u64 = std.math.maxInt(i64);
         _ = c.sqlite3_bind_int64(st, 2, @intCast(@min(after_seq, i64_max)));
         _ = c.sqlite3_bind_int64(st, 3, @intCast(@min(before_seq, i64_max)));
@@ -814,10 +839,11 @@ pub const IndexDb = struct {
         return .{ .count = @intCast(n), .truncated = false };
     }
 
-    /// Materialize one `ListRow` from the shared 12-column SELECT shape
-    /// (`LIST_SQL_*` / `WINDOW_SQL` — all three list the same columns in
-    /// the same order, so there is exactly one ordinal map to keep
-    /// correct).
+    /// Materialize one `ListRow` from the shared 12-column SELECT shape.
+    /// EVERY list-shaped statement (`LIST_SQL_*`, `WINDOW_SQL`, the
+    /// `SAGA_JOIN_HEAD` queries) lists the same columns in the same
+    /// order, so this is the one ordinal map to keep correct — a new
+    /// column edits every SELECT column list and this map together.
     fn listRowFromStmt(allocator: std.mem.Allocator, st: *c.sqlite3_stmt) Error!ListRow {
         return .{
             .tenant_id = try dupeColumnText(allocator, st, 0),
@@ -1639,6 +1665,13 @@ test "saga window: hops in tape order, gap counts, unplaced addendum, roll point
     const g2_capped = try idx.countSeqRange("acme", t3 + 5, t3 + 9, 0, 2);
     try testing.expectEqual(@as(u32, 2), g2_capped.count);
     try testing.expect(g2_capped.truncated);
+
+    // The batch form (one prepared statement, rebound per seam) agrees.
+    const gcs = try idx.gapCounts(a, "acme", hops.rows, 0, 1000);
+    defer a.free(gcs);
+    try testing.expectEqual(@as(usize, 2), gcs.len);
+    try testing.expectEqual(@as(u32, 2), gcs[0].count);
+    try testing.expectEqual(@as(u32, 3), gcs[1].count);
 
     // The unstamped hop is the addendum, never a tape position.
     var un = try idx.querySagaUnplaced("acme", "S", 0, 10);

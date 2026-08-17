@@ -472,7 +472,20 @@ fn handleOne(
         .list => {
             metrics_mod.Metrics.inc(&metrics_mod.global.query_list);
             const tf = parseTagFilter(route.query);
-            try handleList(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, if (tf) |t| t.key else null, if (tf) |t| t.value else null);
+            // Decode the tag VALUE so `?tag._saga={id}` and `/saga/{id}`
+            // resolve the same stored bytes — saga ids are arbitrary
+            // ≤256-byte header bytes and browser clients send them
+            // percent-encoded (URLSearchParams / encodeURIComponent).
+            // Conventional `[a-z0-9_]` tag values decode to themselves.
+            var tagv_buf: [MAX_PATH_FILTER]u8 = undefined;
+            const tag_value: ?[]const u8 = if (tf) |t|
+                (percentDecode(&tagv_buf, t.value) orelse {
+                    try setResponse(server, ent, sid, sess, 400, "invalid tag value (bad percent-encoding or > 256 bytes)\n", rctx.cfg);
+                    return;
+                })
+            else
+                null;
+            try handleList(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, if (tf) |t| t.key else null, tag_value);
         },
         // Replay sugar: list this session's activations, newest-first.
         // `/session/{id}` ≡ `/list?tag.session={id}`.
@@ -613,8 +626,9 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
 /// if present. Returns the (key, value) borrowing into `query`, or null
 /// when no `tag.` param is present. Only the first is honored — one tag
 /// filter per query keeps the index plan simple (multi-tag AND can be
-/// added when a customer needs it). The `<value>` is NOT percent-decoded
-/// here; low-cardinality tag values are `[a-z0-9_]`-shaped by convention.
+/// added when a customer needs it). The `<value>` is returned RAW; the
+/// route dispatch percent-decodes it before matching, so this filter
+/// and the `/saga/{id}` path segment resolve the same stored bytes.
 fn parseTagFilter(query: []const u8) ?struct { key: []const u8, value: []const u8 } {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -747,6 +761,10 @@ fn handleWindow(
 /// is an index-range scan proportional to the seam.
 const GAP_COUNT_CAP: u32 = 1000;
 
+/// The unplaced addendum's display cap — announced via
+/// `unplaced_truncated`, never silent.
+const UNPLACED_CAP: u32 = 100;
+
 /// One saga's window — the saga viewer's data source. Response:
 ///
 ///   {"saga":{...roll-up...},
@@ -754,6 +772,7 @@ const GAP_COUNT_CAP: u32 = 1000;
 ///    "gaps":[{"after_seq":"..","before_seq":"..","count":N,
 ///             "truncated":bool,"quiet_ns":N}],  // between in-page hops
 ///    "unplaced":[<row>...],        // unstamped hops, first page only
+///    "unplaced_truncated":bool,    // the addendum cap, announced
 ///    "next_cursor":{"exec_seq":".."} | null}
 ///
 /// `gaps[i]` sits between `hops[i]` and `hops[i+1]` — seams across a
@@ -774,11 +793,17 @@ fn handleSaga(
     floor_received_ns: i64,
     cfg: *const Config,
 ) !void {
-    const limit = parseUint(u32, query, "limit", 100);
+    // Clamped: each in-page seam below costs a bounded count scan, so
+    // the page size bounds the whole request's work — an unclamped
+    // client limit would be a cost amplifier /list doesn't have.
+    const limit = @min(parseUint(u32, query, "limit", 100), 500);
     const after_seq = parseUint(u64, query, "after_seq", 0);
 
     // The saga id may be client-supplied (`X-Rove-Correlation-Id`,
     // ≤256 bytes) and so arrives percent-encoded in the path segment.
+    // `parseTagFilter` decodes tag values the same way, so
+    // `/saga/{id}` and `/list?tag._saga={id}` resolve one saga
+    // identically.
     var corr_buf: [MAX_PATH_FILTER]u8 = undefined;
     const corr_id = percentDecode(&corr_buf, saga_tail) orelse {
         try setResponse(server, ent, sid, sess, 400, "invalid saga id (bad percent-encoding or > 256 bytes)\n", cfg);
@@ -805,25 +830,34 @@ fn handleSaga(
 
     // Unstamped hops ride the first page only — they have no tape
     // position, so paging them under a seq cursor would re-send them
-    // on every page.
+    // on every page. Fetch one past the cap so a cap hit is announced,
+    // never silent. A db error here 500s like every sibling query —
+    // an empty addendum on error would affirmatively claim the saga
+    // has no unstamped hops.
     var unplaced: ?index_db_mod.IndexDb.ListResult = null;
     defer if (unplaced) |*u| u.deinit();
+    var unplaced_truncated = false;
     if (after_seq == 0) {
-        unplaced = db.querySagaUnplaced(tenant_id, corr_id, floor_received_ns, 100) catch null;
+        unplaced = db.querySagaUnplaced(tenant_id, corr_id, floor_received_ns, UNPLACED_CAP + 1) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "saga unplaced failed: {s}\n", .{@errorName(err)});
+            try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+            return;
+        };
+        if (unplaced.?.rows.len > UNPLACED_CAP) unplaced_truncated = true;
     }
 
-    // One bounded count per in-page seam.
-    var gaps: std.ArrayListUnmanaged(index_db_mod.IndexDb.GapCount) = .empty;
-    defer gaps.deinit(allocator);
-    if (hops.rows.len > 1) {
-        for (hops.rows[0 .. hops.rows.len - 1], hops.rows[1..]) |prev, next| {
-            const gc = db.countSeqRange(tenant_id, prev.exec_seq, next.exec_seq, floor_received_ns, GAP_COUNT_CAP) catch
-                index_db_mod.IndexDb.GapCount{ .count = 0, .truncated = true };
-            gaps.append(allocator, gc) catch return;
-        }
-    }
+    // One bounded count per in-page seam (one prepared statement,
+    // rebound per seam). A count failure 500s — success can never
+    // produce fabricated gap data.
+    const gaps = db.gapCounts(allocator, tenant_id, hops.rows, floor_received_ns, GAP_COUNT_CAP) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "saga gaps failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    defer allocator.free(gaps);
 
-    const json = try renderSagaJson(allocator, &roll, hops.rows, gaps.items, if (unplaced) |*u| u.rows else &.{});
+    const unplaced_rows = if (unplaced) |*u| u.rows[0..@min(u.rows.len, UNPLACED_CAP)] else &.{};
+    const json = try renderSagaJson(allocator, &roll, hops.rows, gaps, unplaced_rows, unplaced_truncated);
     try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
 }
 
@@ -832,7 +866,8 @@ fn renderSagaJson(
     roll: *const index_db_mod.IndexDb.SagaRow,
     hops: []index_db_mod.IndexDb.ListRow,
     gaps: []const index_db_mod.IndexDb.GapCount,
-    unplaced: []index_db_mod.IndexDb.ListRow,
+    unplaced: []const index_db_mod.IndexDb.ListRow,
+    unplaced_truncated: bool,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -866,10 +901,17 @@ fn renderSagaJson(
         for (gaps, 0..) |g, i| {
             if (i > 0) try aw.writer.writeAll(",");
             // The seam's endpoints as decimal strings, same 2^53 stance
-            // as every stamp this surface emits.
+            // as every stamp this surface emits. `quiet_ns` is the
+            // END-to-start wall gap (the previous hop's own execution
+            // time is not "quiet"), clamped at zero: tape order is
+            // authoritative while received_ns is per-node wall clock,
+            // so a failover seam can legitimately measure negative —
+            // meaningless as a duration, so it floors.
+            const prev_end = hops[i].received_ns +| hops[i].duration_ns;
+            const quiet_ns = @max(hops[i + 1].received_ns -| prev_end, 0);
             try aw.writer.print(
                 "{{\"after_seq\":\"{d}\",\"before_seq\":\"{d}\",\"count\":{d},\"truncated\":{},\"quiet_ns\":{d}}}",
-                .{ hops[i].exec_seq, hops[i + 1].exec_seq, g.count, g.truncated, hops[i + 1].received_ns - hops[i].received_ns },
+                .{ hops[i].exec_seq, hops[i + 1].exec_seq, g.count, g.truncated, quiet_ns },
             );
         }
         try aw.writer.writeAll("],\"unplaced\":[");
@@ -881,16 +923,22 @@ fn renderSagaJson(
     aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
     {
         defer buf = aw.toArrayList();
-        if (hops.len == 0) {
-            try aw.writer.writeAll("],\"next_cursor\":null}\n");
-        } else {
-            try aw.writer.print(
-                "],\"next_cursor\":{{\"exec_seq\":\"{d}\"}}}}\n",
-                .{hops[hops.len - 1].exec_seq},
-            );
-        }
+        try aw.writer.print("],\"unplaced_truncated\":{}", .{unplaced_truncated});
+        try writeSeqCursorTail(&aw.writer, hops);
     }
     return buf.toOwnedSlice(allocator);
+}
+
+/// The seq-keyset cursor envelope tail: `,"next_cursor":{"exec_seq":".."}}`
+/// from the last row's stamp, or `null` when the page is empty. The ONE
+/// spelling for every stamp-cursored endpoint (`/window`, `/saga`) — the
+/// dashboard's cursor parser must never see two shapes.
+fn writeSeqCursorTail(w: *std.Io.Writer, rows: []const index_db_mod.IndexDb.ListRow) !void {
+    if (rows.len == 0) {
+        try w.writeAll(",\"next_cursor\":null}\n");
+    } else {
+        try w.print(",\"next_cursor\":{{\"exec_seq\":\"{d}\"}}}}\n", .{rows[rows.len - 1].exec_seq});
+    }
 }
 
 fn handleShow(
@@ -1058,29 +1106,26 @@ fn renderRowsJson(
         if (i > 0) try buf.append(allocator, ',');
         try writeRowJson(allocator, &buf, &r);
     }
-    if (rows.len == 0) {
-        try buf.appendSlice(allocator, "],\"next_cursor\":null}\n");
-    } else {
-        const last = &rows[rows.len - 1];
+    {
         var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
         defer buf = aw.toArrayList();
+        try aw.writer.writeAll("]");
         switch (flavor) {
             // Hand back the cursor request_id as the opaque prefixed
             // token the client passes verbatim to `?after_request_id=`
             // (§7.5).
-            .time => {
+            .time => if (rows.len == 0) {
+                try aw.writer.writeAll(",\"next_cursor\":null}\n");
+            } else {
+                const last = &rows[rows.len - 1];
                 var cur_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
                 const cur_rid = log_mod.formatPrefixedId(&cur_buf, log_mod.REQUEST_ID_PREFIX, last.request_id);
                 try aw.writer.print(
-                    "],\"next_cursor\":{{\"received_ns\":{d},\"request_id\":\"{s}\"}}}}\n",
+                    ",\"next_cursor\":{{\"received_ns\":{d},\"request_id\":\"{s}\"}}}}\n",
                     .{ last.received_ns, cur_rid },
                 );
             },
-            // The last row's stamp, passed back verbatim as `?after_seq=`.
-            .seq => try aw.writer.print(
-                "],\"next_cursor\":{{\"exec_seq\":\"{d}\"}}}}\n",
-                .{last.exec_seq},
-            ),
+            .seq => try writeSeqCursorTail(&aw.writer, rows),
         }
     }
     return buf.toOwnedSlice(allocator);
