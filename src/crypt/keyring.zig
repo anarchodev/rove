@@ -9,8 +9,8 @@
 //! level down. This file is the answer — per-tenant files that are
 //! **rewritten whole** on every change and never appended to.
 //!
-//!   destroy one identity  → rewrite its shard without that entry
-//!   destroy the tenant    → remove the tenant's directory
+//!   destroy one key   → rewrite its shard without that entry
+//!   destroy a tenant  → remove the tenant's directory
 //!
 //! ## Why a rewrite is a real delete, and what it is not
 //!
@@ -31,24 +31,56 @@
 //! the KEK, and the KEK is the one secret that never touches storage.
 //! It is not a claim about physical overwrite.
 //!
-//! ## Why sharded
+//! ## Keys are indexed by SLOT, not by identity
 //!
-//! One file per tenant makes a mint cost a rewrite of every key that
-//! tenant has — quadratic to fill, and a tenant with thousands of
-//! identities rewrites hundreds of KB to add 48 bytes. Splitting by the
-//! first byte of the key ref spreads entries over `SHARD_COUNT` files,
-//! so a mint rewrites `entries / SHARD_COUNT` of them. Refs are HMAC
-//! output, so the split is uniform without any balancing.
+//! Keys are minted into a pool **before any identity exists**, so there
+//! is nothing identity-shaped to index them by. A slot is just a
+//! number; the identity→slot binding lives in replicated KV, written by
+//! the request path inside the raft entry it was already sending.
 //!
-//! Each shard is still rewritten WHOLE, so the property above is
-//! untouched: sharding changes only how much a rewrite costs, never
-//! whether a destroyed key survives in a live file. `MAX_ENTRIES_PER_
-//! SHARD` is what bounds that cost; the per-tenant total is derived from
-//! it rather than chosen, so the two can never drift apart.
+//! That indirection is the whole point: it keeps minting — with its
+//! quorum round trip and its fsync — off the commit path, which is the
+//! most latency-sensitive path in the system. A keyring indexed by
+//! identity would force a keyring write the first time each identity
+//! appeared, which is exactly the cost the pool exists to avoid.
 //!
-//! A shard file exists only while it holds entries — an absent file is
-//! an empty shard — so a small tenant costs a handful of files and a
-//! fully-shredded one costs none.
+//! ## Sharding, and why the capacity bound is structural
+//!
+//! One file per tenant would make a mint rewrite every key that tenant
+//! has — quadratic to fill, and a tenant with thousands of identities
+//! rewriting hundreds of KB to add 48 bytes.
+//!
+//! Slots are allocated in ascending order, so shards are **contiguous
+//! ranges**: shard S holds exactly the slots `[S·SLOTS_PER_SHARD,
+//! (S+1)·SLOTS_PER_SHARD)`, and the number of shards grows with the
+//! tenant instead of being fixed.
+//!
+//! Every write rewrites the shard it touches, and only that one. For a
+//! refill that is the tail shard, since refills append; for a destroy it
+//! is whichever shard holds the slot, which may be any of them. Either
+//! way the cost is one shard, which is what the mapping bounds.
+//!
+//! **Slots are never reused.** A destroy leaves a hole, and the
+//! allocator keeps moving forward. That is deliberate: reuse would make
+//! a stale reference to a destroyed slot resolve to some *other*
+//! tenant's-identity key instead of failing, turning "this key was
+//! shredded" into "this ciphertext belongs to someone else" — a
+//! distinction worth keeping. The cost is that a heavily-churning
+//! tenant accumulates sparse shards, bounded by total-ever-minted
+//! rather than live keys. An emptied shard has no file at all, so the
+//! cost is one file per shard that still holds a survivor.
+//!
+//! A shard's capacity is then a property of the mapping rather than a
+//! limit anyone has to enforce: a shard cannot hold more slots than its
+//! range contains. There is no "shard full" error to handle and no
+//! bound that can quietly stop matching the rewrite cost it claims to
+//! cap.
+//!
+//! Each shard is still rewritten WHOLE, so the erasure property above is
+//! untouched — sharding changes only what a rewrite costs, never
+//! whether a destroyed key survives in a live file. A shard file exists
+//! only while it holds entries, so a small tenant costs a handful of
+//! files and a fully-shredded one costs none.
 //!
 //! ## Key loss is data loss
 //!
@@ -61,9 +93,10 @@
 //!
 //! ## Scope
 //!
-//! Node-local storage only. Minting the tenant secret, delivering it to
-//! every node, replicating keyrings, and invalidating caches on destroy
-//! are the surrounding work; this file is what they store into.
+//! Node-local storage only. Reserving slot ranges through raft,
+//! delivering the tenant secret to every node, and invalidating caches
+//! on destroy are the surrounding work; this file is what they store
+//! into.
 
 const std = @import("std");
 const crypt = @import("root.zig");
@@ -75,32 +108,31 @@ pub const SECRET_LEN: usize = 32;
 
 pub const Secret = [SECRET_LEN]u8;
 
-/// Shards per tenant, indexed by `key_ref[0]`. One per possible value of
-/// that byte, so the mapping is a byte read rather than a modulus and
-/// cannot be got wrong.
-pub const SHARD_COUNT: usize = 256;
+/// Slots per shard, as a power of two so the slot→shard mapping is a
+/// shift rather than a division.
+pub const SHARD_BITS: u6 = 12;
+pub const SLOTS_PER_SHARD: u64 = 1 << SHARD_BITS;
 
-/// Entries in ONE shard. This is the real bound: it caps how much a
-/// single mint or destroy rewrites, which is the cost that actually
-/// bites. 4096 × 48 B keeps a rewrite under 192 KiB even for a shard
-/// that has drifted well above its share.
-pub const MAX_ENTRIES_PER_SHARD: usize = 4096;
-
-/// Per-tenant capacity, DERIVED so it cannot drift from the bound that
-/// does the work. Refs distribute uniformly, so a tenant approaching
-/// this total is nowhere near a full shard.
-pub const MAX_ENTRIES: usize = SHARD_COUNT * MAX_ENTRIES_PER_SHARD;
+/// Largest addressable slot. Shard indices are `u32`, so this is where
+/// the mapping runs out — 2^44 slots per tenant, far past any real
+/// use, and checked rather than allowed to wrap into another shard.
+pub const MAX_SLOT: u64 = (@as(u64, std.math.maxInt(u32)) << SHARD_BITS) | (SLOTS_PER_SHARD - 1);
 
 const SHARD_MAGIC: u32 = 0x524B5231; // 'RKR1'
 const SECRET_MAGIC: u32 = 0x524B5331; // 'RKS1'
 const FORMAT_VERSION: u16 = 1;
 
-/// `[4B magic][2B version][1B shard][4B count]`
-const SHARD_HEADER_LEN: usize = 4 + 2 + 1 + 4;
+/// `[4B magic][2B version][4B shard][4B count]`
+const SHARD_HEADER_LEN: usize = 4 + 2 + 4 + 4;
 /// `[4B magic][2B version][32B secret]`
 const SECRET_FILE_LEN: usize = 4 + 2 + SECRET_LEN;
-/// `[8B key_ref][32B key][8B created_unix_ns]`
-const ENTRY_LEN: usize = crypt.KEY_REF_LEN + crypt.KEY_LEN + 8;
+/// `[8B slot][32B key][8B created_unix_ns]`
+const ENTRY_LEN: usize = 8 + crypt.KEY_LEN + 8;
+
+/// The most one rewrite can cost, which is what sharding exists to
+/// bound. Structural: a shard's range cannot hold more than this.
+pub const MAX_SHARD_BYTES: usize =
+    SHARD_HEADER_LEN + @as(usize, SLOTS_PER_SHARD) * ENTRY_LEN;
 
 const SECRET_FILE_NAME = "tenant.kr";
 
@@ -121,9 +153,8 @@ pub const Error = error{
     /// The KEK does not open this keyring, or a file was altered.
     AuthFailed,
     TenantIdTooLong,
-    /// One shard is full. Reported rather than silently spilling: a
-    /// spill would mean a mint rewriting more than the bound promises.
-    ShardFull,
+    /// A slot past `MAX_SLOT`, or a range that would wrap.
+    SlotOutOfRange,
     Io,
     OutOfMemory,
 };
@@ -135,15 +166,20 @@ const Entry = struct {
 
 /// One entry as an audit surface sees it — no key material.
 pub const AuditEntry = struct {
-    key_ref: crypt.KeyRef,
+    slot: u64,
     created_unix_ns: i64,
 };
 
-/// Which shard a ref belongs to. The single definition — every reader
-/// and writer routes through it, so a shard can never be written under
+/// Which shard a slot lives in. The single definition — every reader
+/// and writer routes through it, so a slot can never be written under
 /// one rule and looked for under another.
-pub fn shardOf(key_ref: crypt.KeyRef) u8 {
-    return key_ref[0];
+pub fn shardOf(slot: u64) u32 {
+    return @intCast(slot >> SHARD_BITS);
+}
+
+/// First slot of `shard`.
+pub fn shardBase(shard: u32) u64 {
+    return @as(u64, shard) << SHARD_BITS;
 }
 
 pub const Keyring = struct {
@@ -156,12 +192,12 @@ pub const Keyring = struct {
     /// the nonce-budget note in `crypt`).
     file_key: crypt.Key,
     secret: Secret,
-    /// Every entry, across all shards. Lookups stay one hash probe —
+    /// Every key, across all shards. Lookups stay one hash probe —
     /// sharding is a persistence concern, not a lookup one.
-    entries: std.AutoHashMapUnmanaged(crypt.KeyRef, Entry) = .empty,
+    keys: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
     /// Live count per shard, so a rewrite can size its buffer without
-    /// walking the whole map.
-    shard_counts: [SHARD_COUNT]u32 = [_]u32{0} ** SHARD_COUNT,
+    /// scanning. Only shards that hold entries appear.
+    shard_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Set by `destroyAll`. The secret is zeroed at that point, so a
     /// later mint would seal under a key derived from zeroes and write
     /// a keyring back for a tenant that no longer exists. Refuse.
@@ -218,9 +254,10 @@ pub const Keyring = struct {
     pub fn deinit(self: *Self) void {
         // Key material outlives the map's memory unless it is cleared —
         // a freed page is still readable by whatever allocates it next.
-        var it = self.entries.iterator();
+        var it = self.keys.iterator();
         while (it.next()) |e| std.crypto.secureZero(u8, &e.value_ptr.key);
-        self.entries.deinit(self.allocator);
+        self.keys.deinit(self.allocator);
+        self.shard_counts.deinit(self.allocator);
         std.crypto.secureZero(u8, &self.secret);
         std.crypto.secureZero(u8, &self.file_key);
         self.allocator.free(self.tenant_dir);
@@ -233,66 +270,112 @@ pub const Keyring = struct {
     }
 
     pub fn count(self: *const Self) usize {
-        return self.entries.count();
+        return self.keys.count();
     }
 
-    /// Look up an identity key. `null` means shredded (or never minted)
-    /// — callers surface that as not-found, never as an error, because
+    /// Look up a key by slot. `null` means shredded (or never minted) —
+    /// callers surface that as not-found, never as an error, because
     /// "erased" should read like "absent" to everything downstream.
-    pub fn get(self: *const Self, key_ref: crypt.KeyRef) ?crypt.Key {
-        return (self.entries.get(key_ref) orelse return null).key;
+    pub fn keyAt(self: *const Self, slot: u64) ?crypt.Key {
+        return (self.keys.get(slot) orelse return null).key;
     }
 
-    /// Mint an identity key, or return the existing one.
+    /// Convenience for callers holding a ciphertext header rather than a
+    /// slot. The envelope's key ref IS the slot (`crypt.refForSlot`).
+    pub fn keyForRef(self: *const Self, ref: crypt.KeyRef) ?crypt.Key {
+        return self.keyAt(crypt.slotForRef(ref));
+    }
+
+    /// Mint keys for `[from_slot, from_slot + n)` — the pool refill.
     ///
-    /// Idempotent by construction: a retried request that minted a
-    /// second key would strand everything the first key sealed, which
-    /// looks exactly like data loss and is unrecoverable.
+    /// Idempotent: a slot that already holds a key keeps it. A retried
+    /// refill that minted fresh keys over live ones would strand
+    /// everything they had sealed, which is unrecoverable and looks
+    /// exactly like data loss.
     ///
-    /// Rewrites one shard, not the whole keyring.
-    pub fn mint(self: *Self, key_ref: crypt.KeyRef, now_unix_ns: i64) Error!crypt.Key {
+    /// Rewrites only the shards the range touches, and a range that
+    /// stays inside one shard rewrites exactly one file — which is the
+    /// normal case, since refills are sized to a shard.
+    ///
+    /// On a mid-range failure the shards already written stay written.
+    /// They hold correctly-minted keys, so that is durable progress
+    /// rather than damage, and the caller retries the whole range.
+    pub fn mintRange(self: *Self, from_slot: u64, n: u64, now_unix_ns: i64) Error!void {
         if (self.destroyed) return Error.NoKeyring;
-        if (self.entries.get(key_ref)) |e| return e.key;
+        if (n == 0) return;
+        if (from_slot < crypt.FIRST_SLOT) return Error.SlotOutOfRange;
+        // Checked rather than allowed to wrap: a wrapped range would
+        // silently mint into shard 0 and overwrite live keys.
+        const last = std.math.add(u64, from_slot, n - 1) catch return Error.SlotOutOfRange;
+        if (last > MAX_SLOT) return Error.SlotOutOfRange;
 
-        const shard = shardOf(key_ref);
-        if (self.shard_counts[shard] >= MAX_ENTRIES_PER_SHARD) return Error.ShardFull;
+        var shard = shardOf(from_slot);
+        const last_shard = shardOf(last);
+        while (shard <= last_shard) : (shard += 1) {
+            const lo = @max(from_slot, shardBase(shard));
+            const hi = @min(last, shardBase(shard) + SLOTS_PER_SHARD - 1);
+            try self.mintWithinShard(shard, lo, hi, now_unix_ns);
+            if (shard == last_shard) break; // `shard + 1` could overflow u32
+        }
+    }
 
-        var key: crypt.Key = undefined;
-        std.crypto.random.bytes(&key);
-        self.entries.put(self.allocator, key_ref, .{
-            .key = key,
-            .created_unix_ns = now_unix_ns,
-        }) catch return Error.OutOfMemory;
-        self.shard_counts[shard] += 1;
+    fn mintWithinShard(self: *Self, shard: u32, lo: u64, hi: u64, now_unix_ns: i64) Error!void {
+        var added: u32 = 0;
+        errdefer self.rollbackMint(shard, lo, hi, added);
 
+        var slot = lo;
+        while (slot <= hi) : (slot += 1) {
+            if (self.keys.contains(slot)) continue;
+            var key: crypt.Key = undefined;
+            std.crypto.random.bytes(&key);
+            self.keys.put(self.allocator, slot, .{
+                .key = key,
+                .created_unix_ns = now_unix_ns,
+            }) catch return Error.OutOfMemory;
+            added += 1;
+        }
+        if (added == 0) return; // every slot already present; nothing to write
+
+        const gop = self.shard_counts.getOrPut(self.allocator, shard) catch
+            return Error.OutOfMemory;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += added;
+
+        // Roll memory back if the rewrite does not land, so no caller
+        // ever receives a key the disk will not have after a restart.
         self.flushShard(shard) catch |err| {
-            // Roll back so memory cannot claim a key the disk will not
-            // have after a restart. Handing out a key that does not
-            // survive is how data gets sealed under something
-            // unrecoverable.
-            _ = self.entries.remove(key_ref);
-            self.shard_counts[shard] -= 1;
+            gop.value_ptr.* -= added;
             return err;
         };
-        return key;
     }
 
-    /// Destroy an identity key. Returns whether it existed, so a caller
-    /// can distinguish "shredded now" from "already gone" for audit
-    /// without either being an error.
+    fn rollbackMint(self: *Self, shard: u32, lo: u64, hi: u64, added: u32) void {
+        _ = shard;
+        if (added == 0) return;
+        var slot = lo;
+        var removed: u32 = 0;
+        while (slot <= hi and removed < added) : (slot += 1) {
+            if (self.keys.remove(slot)) removed += 1;
+        }
+    }
+
+    /// Destroy one key. Returns whether it existed, so a caller can
+    /// distinguish "shredded now" from "already gone" for audit without
+    /// either being an error.
     ///
     /// On return the key is absent from the live shard. Everything it
     /// sealed — kv values, log frames, tapes, pooled bodies, and any
     /// copy in a backup — is unreadable from this point.
-    pub fn destroy(self: *Self, key_ref: crypt.KeyRef) Error!bool {
+    pub fn destroy(self: *Self, slot: u64) Error!bool {
         if (self.destroyed) return false;
-        var removed = self.entries.fetchRemove(key_ref) orelse return false;
+        var removed = self.keys.fetchRemove(slot) orelse return false;
         // Wiped only once the rewrite lands — the rollback below needs
         // these bytes if it does not.
         defer std.crypto.secureZero(u8, &removed.value.key);
 
-        const shard = shardOf(key_ref);
-        self.shard_counts[shard] -= 1;
+        const shard = shardOf(slot);
+        const cnt = self.shard_counts.getPtr(shard) orelse return Error.Corrupt;
+        cnt.* -= 1;
 
         self.flushShard(shard) catch |err| {
             // Put it back: reporting a shred that did not reach disk is
@@ -305,10 +388,11 @@ pub const Keyring = struct {
             // leave memory and disk disagreeing, and the next successful
             // flush would then quietly complete a destroy this call
             // reported as failed.
-            self.entries.putAssumeCapacity(key_ref, removed.value);
-            self.shard_counts[shard] += 1;
+            self.keys.putAssumeCapacity(slot, removed.value);
+            cnt.* += 1;
             return err;
         };
+        if (cnt.* == 0) _ = self.shard_counts.remove(shard);
         return true;
     }
 
@@ -321,23 +405,23 @@ pub const Keyring = struct {
         // with it — sync the parent, which is what recorded the removal.
         try syncPath(std.fs.path.dirname(self.tenant_dir) orelse ".");
 
-        var it = self.entries.iterator();
+        var it = self.keys.iterator();
         while (it.next()) |e| std.crypto.secureZero(u8, &e.value_ptr.key);
-        self.entries.clearRetainingCapacity();
-        self.shard_counts = [_]u32{0} ** SHARD_COUNT;
+        self.keys.clearRetainingCapacity();
+        self.shard_counts.clearRetainingCapacity();
         std.crypto.secureZero(u8, &self.secret);
         self.destroyed = true;
     }
 
-    /// Enumerate refs and mint times, never key material. Caller frees.
+    /// Enumerate slots and mint times, never key material. Caller frees.
     pub fn audit(self: *const Self, allocator: std.mem.Allocator) Error![]AuditEntry {
-        const out = allocator.alloc(AuditEntry, self.entries.count()) catch
+        const out = allocator.alloc(AuditEntry, self.keys.count()) catch
             return Error.OutOfMemory;
         var i: usize = 0;
-        var it = self.entries.iterator();
+        var it = self.keys.iterator();
         while (it.next()) |e| : (i += 1) {
             out[i] = .{
-                .key_ref = e.key_ptr.*,
+                .slot = e.key_ptr.*,
                 .created_unix_ns = e.value_ptr.created_unix_ns,
             };
         }
@@ -386,10 +470,10 @@ pub const Keyring = struct {
         ) catch Error.OutOfMemory;
     }
 
-    fn shardPath(self: *const Self, shard: u8) Error![]u8 {
+    fn shardPath(self: *const Self, shard: u32) Error![]u8 {
         return std.fmt.allocPrint(
             self.allocator,
-            "{s}/{x:0>2}.kr",
+            "{s}/{x:0>8}.kr",
             .{ self.tenant_dir, shard },
         ) catch Error.OutOfMemory;
     }
@@ -410,7 +494,7 @@ pub const Keyring = struct {
         const path = try self.secretPath();
         defer self.allocator.free(path);
 
-        const plain = self.readSealed(path) catch |err| switch (err) {
+        const plain = self.readSealed(path, SECRET_FILE_LEN) catch |err| switch (err) {
             Error.NoKeyring => return Error.NoKeyring,
             else => return err,
         };
@@ -426,8 +510,8 @@ pub const Keyring = struct {
     }
 
     /// Load every shard present. Absent shards are empty, so the
-    /// directory listing IS the shard set — no probing 256 paths for a
-    /// tenant that has three keys.
+    /// directory listing IS the shard set — no probing a shard space
+    /// that grows with the tenant.
     fn readShards(self: *Self) Error!void {
         var d = std.fs.cwd().openDir(self.tenant_dir, .{ .iterate = true }) catch
             return Error.NoKeyring;
@@ -441,19 +525,19 @@ pub const Keyring = struct {
         }
     }
 
-    /// `{NN}.kr` → shard NN. Anything else (the secret file, a leftover
-    /// `.tmp.*` from an interrupted rewrite) is not a shard.
-    fn parseShardName(name: []const u8) ?u8 {
-        if (name.len != 5) return null;
-        if (!std.mem.eql(u8, name[2..], ".kr")) return null;
-        return std.fmt.parseInt(u8, name[0..2], 16) catch null;
+    /// `{XXXXXXXX}.kr` → shard. Anything else (the secret file, a
+    /// leftover `.tmp.*` from an interrupted rewrite) is not a shard.
+    fn parseShardName(name: []const u8) ?u32 {
+        if (name.len != 11) return null;
+        if (!std.mem.eql(u8, name[8..], ".kr")) return null;
+        return std.fmt.parseInt(u32, name[0..8], 16) catch null;
     }
 
-    fn readShard(self: *Self, shard: u8) Error!void {
+    fn readShard(self: *Self, shard: u32) Error!void {
         const path = try self.shardPath(shard);
         defer self.allocator.free(path);
 
-        const plain = self.readSealed(path) catch |err| switch (err) {
+        const plain = self.readSealed(path, MAX_SHARD_BYTES) catch |err| switch (err) {
             // Raced with a destroy that emptied it; an absent shard is
             // an empty shard.
             Error.NoKeyring => return,
@@ -465,22 +549,22 @@ pub const Keyring = struct {
         }
 
         const n = try validateShardPlain(plain, shard);
+        self.keys.ensureUnusedCapacity(self.allocator, n) catch return Error.OutOfMemory;
 
-        self.entries.ensureUnusedCapacity(self.allocator, n) catch return Error.OutOfMemory;
         var pos: usize = SHARD_HEADER_LEN;
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            var ref: crypt.KeyRef = undefined;
-            @memcpy(&ref, plain[pos..][0..crypt.KEY_REF_LEN]);
-            pos += crypt.KEY_REF_LEN;
+            const slot = std.mem.readInt(u64, plain[pos..][0..8], .little);
+            pos += 8;
             var key: crypt.Key = undefined;
             @memcpy(&key, plain[pos..][0..crypt.KEY_LEN]);
             pos += crypt.KEY_LEN;
             const created = std.mem.readInt(i64, plain[pos..][0..8], .little);
             pos += 8;
-            self.entries.putAssumeCapacity(ref, .{ .key = key, .created_unix_ns = created });
+            self.keys.putAssumeCapacity(slot, .{ .key = key, .created_unix_ns = created });
         }
-        self.shard_counts[shard] = n;
+        if (n > 0) self.shard_counts.put(self.allocator, shard, n) catch
+            return Error.OutOfMemory;
     }
 
     /// Rewrite one shard whole. Never appends: an append-only keyring
@@ -489,11 +573,11 @@ pub const Keyring = struct {
     ///
     /// An emptied shard is removed rather than written as a zero-entry
     /// file, so a fully-shredded tenant leaves no shard behind.
-    fn flushShard(self: *Self, shard: u8) Error!void {
+    fn flushShard(self: *Self, shard: u32) Error!void {
         const path = try self.shardPath(shard);
         defer self.allocator.free(path);
 
-        const n = self.shard_counts[shard];
+        const n: u32 = if (self.shard_counts.get(shard)) |c| c else 0;
         if (n == 0) {
             std.fs.cwd().deleteFile(path) catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -511,22 +595,27 @@ pub const Keyring = struct {
 
         std.mem.writeInt(u32, plain[0..4], SHARD_MAGIC, .big);
         std.mem.writeInt(u16, plain[4..6], FORMAT_VERSION, .little);
-        plain[6] = shard;
-        std.mem.writeInt(u32, plain[7..11], n, .little);
+        std.mem.writeInt(u32, plain[6..10], shard, .little);
+        std.mem.writeInt(u32, plain[10..14], n, .little);
 
+        // Walk the shard's slot RANGE rather than the whole key map, so
+        // a rewrite costs the shard's size regardless of how many keys
+        // the tenant has. It also emits in slot order, which makes a
+        // shard's plaintext identical on every node holding it.
         var pos: usize = SHARD_HEADER_LEN;
-        var it = self.entries.iterator();
-        while (it.next()) |e| {
-            if (shardOf(e.key_ptr.*) != shard) continue;
-            @memcpy(plain[pos..][0..crypt.KEY_REF_LEN], e.key_ptr);
-            pos += crypt.KEY_REF_LEN;
-            @memcpy(plain[pos..][0..crypt.KEY_LEN], &e.value_ptr.key);
+        var slot = shardBase(shard);
+        const end = slot + SLOTS_PER_SHARD;
+        while (slot < end) : (slot += 1) {
+            const e = self.keys.get(slot) orelse continue;
+            std.mem.writeInt(u64, plain[pos..][0..8], slot, .little);
+            pos += 8;
+            @memcpy(plain[pos..][0..crypt.KEY_LEN], &e.key);
             pos += crypt.KEY_LEN;
-            std.mem.writeInt(i64, plain[pos..][0..8], e.value_ptr.created_unix_ns, .little);
+            std.mem.writeInt(i64, plain[pos..][0..8], e.created_unix_ns, .little);
             pos += 8;
         }
-        // `shard_counts` drives the buffer size, so a disagreement with
-        // what the map actually holds would truncate or leave a tail of
+        // `shard_counts` sized the buffer, so a disagreement with what
+        // the map actually holds would truncate or leave a tail of
         // uninitialised bytes — either way, keys silently lost.
         if (pos != plain.len) return Error.Corrupt;
 
@@ -588,9 +677,12 @@ pub const Keyring = struct {
         try syncPath(self.tenant_dir);
     }
 
-    fn readSealed(self: *Self, path: []const u8) Error![]u8 {
-        const max = crypt.OVERHEAD + SHARD_HEADER_LEN + MAX_ENTRIES_PER_SHARD * ENTRY_LEN;
-        const sealed = std.fs.cwd().readFileAlloc(self.allocator, path, max) catch |err| switch (err) {
+    fn readSealed(self: *Self, path: []const u8, max_plain: usize) Error![]u8 {
+        const sealed = std.fs.cwd().readFileAlloc(
+            self.allocator,
+            path,
+            crypt.OVERHEAD + max_plain,
+        ) catch |err| switch (err) {
             error.FileNotFound => return Error.NoKeyring,
             else => return Error.Io,
         };
@@ -613,17 +705,17 @@ pub const Keyring = struct {
 /// shard arriving from a peer is held to exactly the same standard as
 /// one read off local disk — a peer is not a more trusted source of key
 /// material than a file is.
-fn validateShardPlain(plain: []const u8, shard: u8) Error!u32 {
+fn validateShardPlain(plain: []const u8, shard: u32) Error!u32 {
     if (plain.len < SHARD_HEADER_LEN) return Error.Corrupt;
     if (std.mem.readInt(u32, plain[0..4], .big) != SHARD_MAGIC) return Error.Corrupt;
     if (std.mem.readInt(u16, plain[4..6], .little) != FORMAT_VERSION) return Error.Corrupt;
     // The shard records which shard it is, so a file moved, renamed, or
     // delivered under the wrong index is caught instead of silently
     // scattering entries into a rewrite set nothing will ever route to.
-    if (plain[6] != shard) return Error.Corrupt;
+    if (std.mem.readInt(u32, plain[6..10], .little) != shard) return Error.Corrupt;
 
-    const n = std.mem.readInt(u32, plain[7..11], .little);
-    if (n > MAX_ENTRIES_PER_SHARD) return Error.Corrupt;
+    const n = std.mem.readInt(u32, plain[10..14], .little);
+    if (n > SLOTS_PER_SHARD) return Error.Corrupt;
     // The count and the byte length must agree exactly. A trailing
     // remainder means the file is not what it claims, and a keyring is
     // the last place to be lenient about that.
@@ -631,10 +723,18 @@ fn validateShardPlain(plain: []const u8, shard: u8) Error!u32 {
 
     var pos: usize = SHARD_HEADER_LEN;
     var i: u32 = 0;
+    var prev: ?u64 = null;
     while (i < n) : (i += 1) {
-        // A ref filed under the wrong shard would be unreachable by
+        const slot = std.mem.readInt(u64, plain[pos..][0..8], .little);
+        // A slot outside this shard's range would be unreachable by
         // every later mint and destroy, which route by `shardOf`.
-        if (shardOf(plain[pos..][0..crypt.KEY_REF_LEN].*) != shard) return Error.Corrupt;
+        if (shardOf(slot) != shard) return Error.Corrupt;
+        // Ascending and distinct. Writers emit in slot order, so a
+        // repeat or an inversion means the file was tampered with or
+        // written by something that is not this codec — and a duplicate
+        // slot would silently drop one of the two keys on load.
+        if (prev) |p| if (slot <= p) return Error.Corrupt;
+        prev = slot;
         pos += ENTRY_LEN;
     }
     return n;
@@ -661,7 +761,7 @@ pub fn installSealedShard(
     base_dir: []const u8,
     tenant_id: []const u8,
     kek: []const u8,
-    shard: u8,
+    shard: u32,
     sealed: []const u8,
 ) Error!void {
     var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
@@ -703,7 +803,7 @@ pub fn readSealedShard(
     base_dir: []const u8,
     tenant_id: []const u8,
     kek: []const u8,
-    shard: u8,
+    shard: u32,
 ) Error!?[]u8 {
     var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
     defer kr.deinit();
@@ -711,8 +811,11 @@ pub fn readSealedShard(
     const path = try kr.shardPath(shard);
     defer allocator.free(path);
 
-    const max = crypt.OVERHEAD + SHARD_HEADER_LEN + MAX_ENTRIES_PER_SHARD * ENTRY_LEN;
-    return std.fs.cwd().readFileAlloc(allocator, path, max) catch |err| switch (err) {
+    return std.fs.cwd().readFileAlloc(
+        allocator,
+        path,
+        crypt.OVERHEAD + MAX_SHARD_BYTES,
+    ) catch |err| switch (err) {
         error.FileNotFound => null,
         else => Error.Io,
     };
@@ -751,18 +854,23 @@ fn cleanup(dir: []const u8) void {
     std.fs.cwd().deleteTree(dir) catch {};
 }
 
-/// Refs whose FIRST byte varies, so successive `refOf` values land in
-/// different shards — the property most of these tests depend on.
-fn refOf(n: u8) crypt.KeyRef {
-    return [_]u8{ n, 2, 3, 4, 5, 6, 7, 8 };
+test "slot to shard is a contiguous range mapping" {
+    try testing.expectEqual(@as(u32, 0), shardOf(crypt.FIRST_SLOT));
+    try testing.expectEqual(@as(u32, 0), shardOf(SLOTS_PER_SHARD - 1));
+    try testing.expectEqual(@as(u32, 1), shardOf(SLOTS_PER_SHARD));
+    try testing.expectEqual(@as(u64, 0), shardBase(0));
+    try testing.expectEqual(SLOTS_PER_SHARD, shardBase(1));
+
+    // Capacity is a property of the mapping, not a limit to enforce: a
+    // shard's range simply cannot hold more slots than it contains.
+    try testing.expectEqual(
+        SLOTS_PER_SHARD,
+        shardBase(1) - shardBase(0),
+    );
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), shardOf(MAX_SLOT));
 }
 
-/// Refs sharing a first byte, so they collide into ONE shard.
-fn sameShardRef(n: u8) crypt.KeyRef {
-    return [_]u8{ 0x7F, n, 3, 4, 5, 6, 7, 8 };
-}
-
-test "create then open round-trips the secret and its entries" {
+test "create then open round-trips the secret and its keys" {
     var buf: [64]u8 = undefined;
     const dir = tmpDirPath(&buf);
     defer cleanup(dir);
@@ -771,18 +879,20 @@ test "create then open round-trips the secret and its entries" {
     {
         var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
         defer kr.deinit();
-        minted = try kr.mint(refOf(1), 1234);
-        try testing.expectEqual(@as(usize, 1), kr.count());
+        try kr.mintRange(1, 4, 1234);
+        try testing.expectEqual(@as(usize, 4), kr.count());
+        minted = kr.keyAt(1).?;
     }
 
     var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
     defer kr.deinit();
     try testing.expectEqualSlices(u8, &TEST_SECRET, kr.tenantSecret());
-    try testing.expectEqual(@as(usize, 1), kr.count());
-    try testing.expectEqualSlices(u8, &minted, &kr.get(refOf(1)).?);
+    try testing.expectEqual(@as(usize, 4), kr.count());
+    try testing.expectEqualSlices(u8, &minted, &kr.keyAt(1).?);
+    try testing.expect(kr.keyAt(5) == null);
 }
 
-test "minting is idempotent — a retry never strands the first key" {
+test "minting is idempotent — a retry never strands a live key" {
     var buf: [64]u8 = undefined;
     const dir = tmpDirPath(&buf);
     defer cleanup(dir);
@@ -790,10 +900,53 @@ test "minting is idempotent — a retry never strands the first key" {
     var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
     defer kr.deinit();
 
-    const first = try kr.mint(refOf(1), 1);
-    const again = try kr.mint(refOf(1), 2);
-    try testing.expectEqualSlices(u8, &first, &again);
-    try testing.expectEqual(@as(usize, 1), kr.count());
+    try kr.mintRange(1, 4, 1);
+    const first = kr.keyAt(2).?;
+    // An overlapping retry must keep every key that already exists;
+    // minting fresh ones over them would strand everything they sealed.
+    try kr.mintRange(1, 8, 2);
+    try testing.expectEqualSlices(u8, &first, &kr.keyAt(2).?);
+    try testing.expectEqual(@as(usize, 8), kr.count());
+}
+
+test "a range spanning shards writes each of them" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    const from = SLOTS_PER_SHARD - 2;
+    {
+        var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+        defer kr.deinit();
+        try kr.mintRange(from, 4, 1);
+        try testing.expectEqual(@as(u32, 2), kr.shard_counts.get(0).?);
+        try testing.expectEqual(@as(u32, 2), kr.shard_counts.get(1).?);
+    }
+
+    var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
+    defer kr.deinit();
+    try testing.expectEqual(@as(usize, 4), kr.count());
+    try testing.expect(kr.keyAt(from) != null);
+    try testing.expect(kr.keyAt(from + 3) != null);
+}
+
+test "an out-of-range or wrapping mint is refused, never wrapped into shard 0" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    // Slot 0 is the reserved tenant ref, not an allocatable slot.
+    try testing.expectError(Error.SlotOutOfRange, kr.mintRange(0, 1, 1));
+    try testing.expectError(Error.SlotOutOfRange, kr.mintRange(MAX_SLOT, 2, 1));
+    // A wrapped range would silently mint into shard 0 over live keys.
+    try testing.expectError(
+        Error.SlotOutOfRange,
+        kr.mintRange(std.math.maxInt(u64) - 1, 4, 1),
+    );
+    try testing.expectEqual(@as(usize, 0), kr.count());
 }
 
 test "destroy removes the key from memory AND the live shard" {
@@ -801,21 +954,18 @@ test "destroy removes the key from memory AND the live shard" {
     const dir = tmpDirPath(&buf);
     defer cleanup(dir);
 
-    const doomed = refOf(1);
-    const kept = refOf(2);
-    var kept_key: crypt.Key = undefined;
-
+    var kept: crypt.Key = undefined;
     {
         var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
         defer kr.deinit();
-        _ = try kr.mint(doomed, 1);
-        kept_key = try kr.mint(kept, 2);
+        try kr.mintRange(1, 3, 1);
+        kept = kr.keyAt(3).?;
 
-        try testing.expect(try kr.destroy(doomed));
-        try testing.expect(kr.get(doomed) == null);
+        try testing.expect(try kr.destroy(2));
+        try testing.expect(kr.keyAt(2) == null);
         // Already-gone is not an error — an audit needs to tell the two
         // apart without either failing.
-        try testing.expect(!try kr.destroy(doomed));
+        try testing.expect(!try kr.destroy(2));
     }
 
     // The decisive assertion: after reopening from disk the destroyed
@@ -823,124 +973,9 @@ test "destroy removes the key from memory AND the live shard" {
     // every check above and fail this one.
     var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
     defer kr.deinit();
-    try testing.expect(kr.get(doomed) == null);
-    try testing.expectEqualSlices(u8, &kept_key, &kr.get(kept).?);
-    try testing.expectEqual(@as(usize, 1), kr.count());
-}
-
-test "destroy rewrites only the shard, leaving co-resident entries intact" {
-    var buf: [64]u8 = undefined;
-    const dir = tmpDirPath(&buf);
-    defer cleanup(dir);
-
-    // All three share a first byte, so all three live in one shard and
-    // the destroy forces a genuine re-encode rather than an unlink.
-    {
-        var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
-        defer kr.deinit();
-        _ = try kr.mint(sameShardRef(1), 1);
-        _ = try kr.mint(sameShardRef(2), 2);
-        _ = try kr.mint(sameShardRef(3), 3);
-        try testing.expectEqual(@as(u32, 3), kr.shard_counts[0x7F]);
-        try testing.expect(try kr.destroy(sameShardRef(2)));
-    }
-
-    var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
-    defer kr.deinit();
+    try testing.expect(kr.keyAt(2) == null);
+    try testing.expectEqualSlices(u8, &kept, &kr.keyAt(3).?);
     try testing.expectEqual(@as(usize, 2), kr.count());
-    try testing.expectEqual(@as(u32, 2), kr.shard_counts[0x7F]);
-    try testing.expect(kr.get(sameShardRef(1)) != null);
-    try testing.expect(kr.get(sameShardRef(2)) == null);
-    try testing.expect(kr.get(sameShardRef(3)) != null);
-}
-
-test "entries spread across shards, and an emptied shard leaves no file" {
-    var buf: [64]u8 = undefined;
-    const dir = tmpDirPath(&buf);
-    defer cleanup(dir);
-
-    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
-    defer kr.deinit();
-
-    _ = try kr.mint(refOf(0x11), 1);
-    _ = try kr.mint(refOf(0x22), 2);
-    try testing.expectEqual(@as(u32, 1), kr.shard_counts[0x11]);
-    try testing.expectEqual(@as(u32, 1), kr.shard_counts[0x22]);
-
-    const path = try kr.shardPath(0x11);
-    defer testing.allocator.free(path);
-    try std.fs.cwd().access(path, .{});
-
-    // Emptying a shard removes its file rather than leaving a
-    // zero-entry one, so a fully-shredded tenant leaves nothing behind.
-    _ = try kr.destroy(refOf(0x11));
-    try testing.expectError(error.FileNotFound, std.fs.cwd().access(path, .{}));
-    try testing.expectEqual(@as(usize, 1), kr.count());
-}
-
-test "a full shard is refused rather than rewriting past the bound" {
-    var buf: [64]u8 = undefined;
-    const dir = tmpDirPath(&buf);
-    defer cleanup(dir);
-
-    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
-    defer kr.deinit();
-
-    // Fill one shard to its cap without touching the filesystem for
-    // every entry — the bound is what is under test, not the rewrite.
-    kr.shard_counts[0x7F] = MAX_ENTRIES_PER_SHARD;
-    try testing.expectError(Error.ShardFull, kr.mint(sameShardRef(9), 1));
-
-    // A different shard is unaffected: the bound is per-shard, which is
-    // the whole point of it being the bound that matters.
-    kr.shard_counts[0x7F] = 0;
-    _ = try kr.mint(refOf(0x01), 1);
-}
-
-test "the derived total capacity cannot drift from the per-shard bound" {
-    try testing.expectEqual(SHARD_COUNT * MAX_ENTRIES_PER_SHARD, MAX_ENTRIES);
-    // A rewrite is bounded by one shard, not by the tenant's total. This
-    // is the invariant the sharding exists to provide.
-    try testing.expect(MAX_ENTRIES_PER_SHARD * ENTRY_LEN <= 256 * 1024);
-}
-
-test "a mint rewrites a fraction of the keyring, not all of it" {
-    var buf: [64]u8 = undefined;
-    const dir = tmpDirPath(&buf);
-    defer cleanup(dir);
-
-    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
-    defer kr.deinit();
-
-    const n: u16 = 1024;
-    var i: u16 = 0;
-    while (i < n) : (i += 1) {
-        // Vary the first byte (the shard) and a second byte, so entries
-        // spread over every shard rather than 256 of them colliding.
-        const ref = crypt.KeyRef{ @truncate(i), @truncate(i >> 8), 3, 4, 5, 6, 7, 8 };
-        _ = try kr.mint(ref, i);
-    }
-    try testing.expectEqual(@as(usize, n), kr.count());
-
-    // The cost that matters is the biggest single shard, because that is
-    // what one more mint rewrites. Unsharded it would be every entry.
-    var largest: u64 = 0;
-    var total: u64 = 0;
-    var s: usize = 0;
-    while (s < SHARD_COUNT) : (s += 1) {
-        const path = try kr.shardPath(@intCast(s));
-        defer testing.allocator.free(path);
-        const stat = std.fs.cwd().statFile(path) catch continue;
-        total += stat.size;
-        if (stat.size > largest) largest = stat.size;
-    }
-
-    // 1024 entries over 256 shards is 4 apiece, so a rewrite touches a
-    // small multiple of one entry rather than 1024 of them. Asserting a
-    // ratio rather than a byte count keeps this meaningful if ENTRY_LEN
-    // or the envelope overhead changes.
-    try testing.expect(total > 0);
-    try testing.expect(largest * 16 < total);
 }
 
 test "a destroyed key can no longer open what it sealed" {
@@ -951,22 +986,147 @@ test "a destroyed key can no longer open what it sealed" {
     var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
     defer kr.deinit();
 
-    const ref = refOf(1);
-    const key = try kr.mint(ref, 1);
-    const sealed = try crypt.sealAlloc(testing.allocator, "personal data", key, ref, 1);
+    const slot: u64 = 7;
+    try kr.mintRange(slot, 1, 1);
+    const ref = crypt.refForSlot(slot);
+    const sealed = try crypt.sealAlloc(
+        testing.allocator,
+        "personal data",
+        kr.keyAt(slot).?,
+        ref,
+        1,
+    );
     defer testing.allocator.free(sealed);
 
-    // Readable while the key lives...
-    const opened = try crypt.openAlloc(testing.allocator, sealed, kr.get(ref).?);
+    // Readable while the key lives, and reachable straight from the
+    // ciphertext header — the envelope's ref IS the slot, so no binding
+    // lookup stands between a reader and its key.
+    const h = try crypt.peek(sealed);
+    const opened = try crypt.openAlloc(testing.allocator, sealed, kr.keyForRef(h.key_ref).?);
     testing.allocator.free(opened);
 
-    _ = try kr.destroy(ref);
+    _ = try kr.destroy(slot);
 
-    // ...and afterwards the bytes still exist and simply cannot be read.
-    // That is the whole property, stated as a test.
-    try testing.expect(kr.get(ref) == null);
-    const h = try crypt.peek(sealed);
-    try testing.expectEqualSlices(u8, &ref, &h.key_ref);
+    // Afterwards the bytes still exist and simply cannot be read. That
+    // is the whole property, stated as a test.
+    try testing.expect(kr.keyForRef(h.key_ref) == null);
+    try testing.expectEqual(slot, crypt.slotForRef(h.key_ref));
+}
+
+test "emptying a shard leaves no file behind" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+    try kr.mintRange(1, 2, 1);
+
+    const path = try kr.shardPath(0);
+    defer testing.allocator.free(path);
+    try std.fs.cwd().access(path, .{});
+
+    _ = try kr.destroy(1);
+    try std.fs.cwd().access(path, .{}); // still one key left
+    _ = try kr.destroy(2);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(path, .{}));
+    try testing.expectEqual(@as(usize, 0), kr.count());
+}
+
+test "a destroy rewrites its OWN shard and leaves the others byte-identical" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    // Three shards. Refills append at the tail, but a destroy can land
+    // anywhere — it must rewrite the shard that holds the slot, not the
+    // shard that happens to be current.
+    try kr.mintRange(1, SLOTS_PER_SHARD * 2 + 5, 1);
+
+    const before_1 = (try readSealedShard(testing.allocator, dir, "acme", TEST_KEK, 1)).?;
+    defer testing.allocator.free(before_1);
+    const before_2 = (try readSealedShard(testing.allocator, dir, "acme", TEST_KEK, 2)).?;
+    defer testing.allocator.free(before_2);
+
+    // Destroy in shard 0 — the oldest, furthest from the tail.
+    try testing.expect(try kr.destroy(3));
+
+    const after_1 = (try readSealedShard(testing.allocator, dir, "acme", TEST_KEK, 1)).?;
+    defer testing.allocator.free(after_1);
+    const after_2 = (try readSealedShard(testing.allocator, dir, "acme", TEST_KEK, 2)).?;
+    defer testing.allocator.free(after_2);
+
+    // Untouched shards are byte-identical: not merely equivalent in
+    // content, but not rewritten at all. A fresh seal would differ in
+    // its nonce even for identical entries, so equality here proves no
+    // write happened.
+    try testing.expectEqualSlices(u8, before_1, after_1);
+    try testing.expectEqualSlices(u8, before_2, after_2);
+
+    var reopened = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
+    defer reopened.deinit();
+    try testing.expect(reopened.keyAt(3) == null);
+    try testing.expect(reopened.keyAt(2) != null);
+    try testing.expect(reopened.keyAt(SLOTS_PER_SHARD) != null);
+    try testing.expect(reopened.keyAt(SLOTS_PER_SHARD * 2) != null);
+}
+
+test "emptying a middle shard removes only its file" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    // One key in each of shards 0, 1, 2 — sparse, which is the shape a
+    // churning tenant ends up with since slots are never reused.
+    try kr.mintRange(1, 1, 1);
+    try kr.mintRange(SLOTS_PER_SHARD, 1, 1);
+    try kr.mintRange(SLOTS_PER_SHARD * 2, 1, 1);
+
+    const mid = try kr.shardPath(1);
+    defer testing.allocator.free(mid);
+    try std.fs.cwd().access(mid, .{});
+
+    try testing.expect(try kr.destroy(SLOTS_PER_SHARD));
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(mid, .{}));
+
+    var reopened = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
+    defer reopened.deinit();
+    try testing.expectEqual(@as(usize, 2), reopened.count());
+    try testing.expect(reopened.keyAt(1) != null);
+    try testing.expect(reopened.keyAt(SLOTS_PER_SHARD * 2) != null);
+}
+
+test "one rewrite is bounded by a shard, not by the tenant's total" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    // Four shards' worth of keys. A refill into the tail shard rewrites
+    // that shard alone, so cost is flat in the tenant's size — the
+    // property sharding exists to provide.
+    try kr.mintRange(1, SLOTS_PER_SHARD * 3 + 10, 1);
+    try testing.expectEqual(@as(usize, SLOTS_PER_SHARD * 3 + 10), kr.count());
+
+    var largest: u64 = 0;
+    var total: u64 = 0;
+    for ([_]u32{ 0, 1, 2, 3 }) |s| {
+        const p = try kr.shardPath(s);
+        defer testing.allocator.free(p);
+        const st = std.fs.cwd().statFile(p) catch continue;
+        total += st.size;
+        if (st.size > largest) largest = st.size;
+        try testing.expect(st.size <= crypt.OVERHEAD + MAX_SHARD_BYTES);
+    }
+    try testing.expect(total > largest);
 }
 
 test "destroyAll removes the tenant directory — the tenant-level shred" {
@@ -977,8 +1137,7 @@ test "destroyAll removes the tenant directory — the tenant-level shred" {
     {
         var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
         defer kr.deinit();
-        _ = try kr.mint(refOf(1), 1);
-        _ = try kr.mint(refOf(2), 2);
+        try kr.mintRange(1, 4, 1);
         try kr.destroyAll();
         try testing.expectEqual(@as(usize, 0), kr.count());
         try testing.expectError(error.FileNotFound, std.fs.cwd().access(kr.tenant_dir, .{}));
@@ -997,14 +1156,14 @@ test "a destroyed keyring refuses to mint rather than resurrect the tenant" {
 
     var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
     defer kr.deinit();
-    _ = try kr.mint(refOf(1), 1);
+    try kr.mintRange(1, 2, 1);
     try kr.destroyAll();
 
     // The secret is zeroed by destroyAll, so minting on this handle
     // would seal under a key derived from zeroes and write a keyring
     // back for a tenant that no longer exists.
-    try testing.expectError(Error.NoKeyring, kr.mint(refOf(2), 2));
-    try testing.expect(!try kr.destroy(refOf(1)));
+    try testing.expectError(Error.NoKeyring, kr.mintRange(3, 1, 2));
+    try testing.expect(!try kr.destroy(1));
 }
 
 test "a wrong KEK is refused" {
@@ -1015,7 +1174,7 @@ test "a wrong KEK is refused" {
     {
         var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
         defer kr.deinit();
-        _ = try kr.mint(refOf(1), 1);
+        try kr.mintRange(1, 1, 1);
     }
 
     try testing.expectError(
@@ -1035,14 +1194,13 @@ test "tenants are isolated — one KEK, different directories and file keys" {
     var b = try Keyring.create(testing.allocator, dir, "tenant-b", TEST_KEK, b_secret);
     defer b.deinit();
 
-    // Separate directories, separate file keys, separate nonce budgets.
     try testing.expect(!std.mem.eql(u8, a.tenant_dir, b.tenant_dir));
     try testing.expect(!std.mem.eql(u8, &a.file_key, &b.file_key));
 
-    // The same ref in two tenants names two unrelated keys, so one
+    // The same slot in two tenants names two unrelated keys, so one
     // tenant's shred can never reach into another's.
-    _ = try a.mint(refOf(1), 1);
-    try testing.expect(b.get(refOf(1)) == null);
+    try a.mintRange(1, 1, 1);
+    try testing.expect(b.keyAt(1) == null);
 }
 
 test "opening a missing keyring says NoKeyring, not corrupt" {
@@ -1078,14 +1236,14 @@ test "a garbage shard file is corrupt, never silently accepted" {
     defer cleanup(dir);
 
     var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
-    _ = try kr.mint(refOf(0x11), 1);
-    const path = try kr.shardPath(0x11);
-    defer testing.allocator.free(path);
-    const owned_path = testing.allocator.dupe(u8, path) catch unreachable;
-    defer testing.allocator.free(owned_path);
+    try kr.mintRange(1, 1, 1);
+    const path = try kr.shardPath(0);
+    const owned = testing.allocator.dupe(u8, path) catch unreachable;
+    testing.allocator.free(path);
+    defer testing.allocator.free(owned);
     kr.deinit();
 
-    const f = try std.fs.cwd().createFile(owned_path, .{ .truncate = true });
+    const f = try std.fs.cwd().createFile(owned, .{ .truncate = true });
     try f.writeAll("not an envelope");
     f.close();
 
@@ -1093,51 +1251,28 @@ test "a garbage shard file is corrupt, never silently accepted" {
     try testing.expect(err == Error.Corrupt or err == Error.AuthFailed);
 }
 
-test "a shard file holding the wrong shard's entries is refused" {
-    var buf: [64]u8 = undefined;
-    const dir = tmpDirPath(&buf);
-    defer cleanup(dir);
-
-    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
-    _ = try kr.mint(refOf(0x11), 1);
-    const src = try kr.shardPath(0x11);
-    defer testing.allocator.free(src);
-    const dst = try kr.shardPath(0x22);
-    defer testing.allocator.free(dst);
-    const owned_src = testing.allocator.dupe(u8, src) catch unreachable;
-    defer testing.allocator.free(owned_src);
-    const owned_dst = testing.allocator.dupe(u8, dst) catch unreachable;
-    defer testing.allocator.free(owned_dst);
-    kr.deinit();
-
-    // Renaming a shard would file its entries under an index no later
-    // mint or destroy would ever route to, leaving them unreachable.
-    // The self-describing shard byte catches it.
-    try std.fs.cwd().rename(owned_src, owned_dst);
-    try testing.expectError(
-        Error.Corrupt,
-        Keyring.open(testing.allocator, dir, "acme", TEST_KEK),
-    );
-}
-
-test "audit lists refs and mint times without exposing key material" {
+test "audit lists slots and mint times without exposing key material" {
     var buf: [64]u8 = undefined;
     const dir = tmpDirPath(&buf);
     defer cleanup(dir);
 
     var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
     defer kr.deinit();
-    _ = try kr.mint(refOf(1), 111);
-    _ = try kr.mint(refOf(2), 222);
+    try kr.mintRange(1, 3, 111);
 
     const rows = try kr.audit(testing.allocator);
     defer testing.allocator.free(rows);
-    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqual(@as(usize, 3), rows.len);
 
-    var seen: i64 = 0;
-    for (rows) |r| seen += r.created_unix_ns;
-    try testing.expectEqual(@as(i64, 333), seen);
+    var slot_sum: u64 = 0;
+    for (rows) |r| {
+        slot_sum += r.slot;
+        try testing.expectEqual(@as(i64, 111), r.created_unix_ns);
+    }
+    try testing.expectEqual(@as(u64, 6), slot_sum);
 }
+
+// ── replication seam ─────────────────────────────────────────────────
 
 test "replication: a shard sent from one node opens on another" {
     var buf_a: [64]u8 = undefined;
@@ -1147,15 +1282,12 @@ test "replication: a shard sent from one node opens on another" {
     const node_b = tmpDirPath(&buf_b);
     defer cleanup(node_b);
 
-    const ref = refOf(0x11);
     var minted: crypt.Key = undefined;
-
-    // Node A mints. Node B is attached with the SAME tenant secret —
-    // the CP delivers it at attach; only shards move over the wire.
     {
         var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
         defer a.deinit();
-        minted = try a.mint(ref, 1);
+        try a.mintRange(1, 3, 1);
+        minted = a.keyAt(2).?;
     }
     {
         var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
@@ -1163,22 +1295,17 @@ test "replication: a shard sent from one node opens on another" {
     }
 
     // The seam: ship the sealed bytes verbatim and install them.
-    const sealed = (try readSealedShard(
-        testing.allocator,
-        node_a,
-        "acme",
-        TEST_KEK,
-        shardOf(ref),
-    )).?;
+    const sealed = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)).?;
     defer testing.allocator.free(sealed);
-    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), sealed);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, sealed);
 
-    // Node B now holds the same key — the property the whole design
+    // Node B now holds the same keys — the property the whole design
     // rests on: a sealed shard is portable ciphertext, because the file
     // key derives from the cluster KEK and the tenant id alone.
     var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
     defer b.deinit();
-    try testing.expectEqualSlices(u8, &minted, &b.get(ref).?);
+    try testing.expectEqual(@as(usize, 3), b.count());
+    try testing.expectEqualSlices(u8, &minted, &b.keyAt(2).?);
 }
 
 test "replication: an empty install removes the shard, propagating a destroy" {
@@ -1189,12 +1316,11 @@ test "replication: an empty install removes the shard, propagating a destroy" {
     const node_b = tmpDirPath(&buf_b);
     defer cleanup(node_b);
 
-    const ref = refOf(0x11);
     {
         var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
         defer b.deinit();
-        _ = try b.mint(ref, 1);
-        try testing.expect(b.get(ref) != null);
+        try b.mintRange(1, 1, 1);
+        try testing.expect(b.keyAt(1) != null);
     }
 
     // A shard that emptied has no file, so `readSealedShard` yields
@@ -1202,18 +1328,12 @@ test "replication: an empty install removes the shard, propagating a destroy" {
     // remove the receiver's copy, not leave it stale.
     var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
     a.deinit();
-    try testing.expect((try readSealedShard(
-        testing.allocator,
-        node_a,
-        "acme",
-        TEST_KEK,
-        shardOf(ref),
-    )) == null);
-    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), "");
+    try testing.expect((try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)) == null);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, "");
 
     var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
     defer b.deinit();
-    try testing.expect(b.get(ref) == null);
+    try testing.expect(b.keyAt(1) == null);
 }
 
 test "replication: a peer under a different KEK is refused at install" {
@@ -1224,19 +1344,12 @@ test "replication: a peer under a different KEK is refused at install" {
     const node_b = tmpDirPath(&buf_b);
     defer cleanup(node_b);
 
-    const ref = refOf(0x11);
     {
         var a = try Keyring.create(testing.allocator, node_a, "acme", "kek-one", TEST_SECRET);
         defer a.deinit();
-        _ = try a.mint(ref, 1);
+        try a.mintRange(1, 1, 1);
     }
-    const sealed = (try readSealedShard(
-        testing.allocator,
-        node_a,
-        "acme",
-        "kek-one",
-        shardOf(ref),
-    )).?;
+    const sealed = (try readSealedShard(testing.allocator, node_a, "acme", "kek-one", 0)).?;
     defer testing.allocator.free(sealed);
 
     // Caught on receipt rather than at the next open. An unverified
@@ -1247,7 +1360,7 @@ test "replication: a peer under a different KEK is refused at install" {
         node_b,
         "acme",
         "kek-two",
-        shardOf(ref),
+        0,
         sealed,
     ));
 }
@@ -1260,19 +1373,12 @@ test "replication: corrupt bytes and a wrong shard index are refused at install"
     const node_b = tmpDirPath(&buf_b);
     defer cleanup(node_b);
 
-    const ref = refOf(0x11);
     {
         var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
         defer a.deinit();
-        _ = try a.mint(ref, 1);
+        try a.mintRange(1, 1, 1);
     }
-    const sealed = (try readSealedShard(
-        testing.allocator,
-        node_a,
-        "acme",
-        TEST_KEK,
-        shardOf(ref),
-    )).?;
+    const sealed = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)).?;
     defer testing.allocator.free(sealed);
 
     // Delivered under the wrong index: the shard is self-describing, so
@@ -1282,7 +1388,7 @@ test "replication: corrupt bytes and a wrong shard index are refused at install"
         node_b,
         "acme",
         TEST_KEK,
-        shardOf(ref) +% 1,
+        1,
         sealed,
     ));
 
@@ -1294,7 +1400,7 @@ test "replication: corrupt bytes and a wrong shard index are refused at install"
         node_b,
         "acme",
         TEST_KEK,
-        shardOf(ref),
+        0,
         tampered,
     ));
 
@@ -1313,57 +1419,28 @@ test "replication: installing is idempotent, so a retried push is safe" {
     const node_b = tmpDirPath(&buf_b);
     defer cleanup(node_b);
 
-    const ref = refOf(0x11);
     var minted: crypt.Key = undefined;
     {
         var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
         defer a.deinit();
-        minted = try a.mint(ref, 1);
+        try a.mintRange(1, 2, 1);
+        minted = a.keyAt(1).?;
     }
     {
         var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
         b.deinit();
     }
 
-    const sealed = (try readSealedShard(
-        testing.allocator,
-        node_a,
-        "acme",
-        TEST_KEK,
-        shardOf(ref),
-    )).?;
+    const sealed = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)).?;
     defer testing.allocator.free(sealed);
 
     // A push that times out but landed will be retried; the second
     // install must be a no-op rather than corrupting the first.
-    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), sealed);
-    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), sealed);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, sealed);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, sealed);
 
     var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
     defer b.deinit();
-    try testing.expectEqual(@as(usize, 1), b.count());
-    try testing.expectEqualSlices(u8, &minted, &b.get(ref).?);
-}
-
-test "many entries across many shards survive a reopen intact" {
-    var buf: [64]u8 = undefined;
-    const dir = tmpDirPath(&buf);
-    defer cleanup(dir);
-
-    const n: u16 = 256;
-    {
-        var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
-        defer kr.deinit();
-        var i: u16 = 0;
-        while (i < n) : (i += 1) _ = try kr.mint(refOf(@intCast(i)), i);
-        try testing.expectEqual(@as(usize, n), kr.count());
-        _ = try kr.destroy(refOf(128));
-    }
-
-    var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
-    defer kr.deinit();
-    try testing.expectEqual(@as(usize, n - 1), kr.count());
-    try testing.expect(kr.get(refOf(128)) == null);
-    try testing.expect(kr.get(refOf(0)) != null);
-    try testing.expect(kr.get(refOf(255)) != null);
+    try testing.expectEqual(@as(usize, 2), b.count());
+    try testing.expectEqualSlices(u8, &minted, &b.keyAt(1).?);
 }

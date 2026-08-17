@@ -45,14 +45,14 @@ const keyring = @import("keyring.zig");
 const MAGIC: u32 = 0x524B5831;
 pub const WIRE_VERSION: u16 = 1;
 
-/// `[4B magic][2B version][2B tenant_len][1B shard][4B sealed_len]`
-pub const HEADER_LEN: usize = 4 + 2 + 2 + 1 + 4;
+/// `[4B magic][2B version][2B tenant_len][4B shard][4B sealed_len]`
+pub const HEADER_LEN: usize = 4 + 2 + 2 + 4 + 4;
 
 /// Ceiling on one frame, so a malformed length cannot make a receiver
-/// allocate without bound. A shard is capped by construction
-/// (`MAX_ENTRIES_PER_SHARD`), and this leaves room for the envelope.
-pub const MAX_SEALED_LEN: usize =
-    crypt.OVERHEAD + 16 + keyring.MAX_ENTRIES_PER_SHARD * 48;
+/// allocate without bound. A shard's size is capped by construction —
+/// its slot range cannot hold more than it contains — so this is that
+/// bound plus the envelope.
+pub const MAX_SEALED_LEN: usize = crypt.OVERHEAD + keyring.MAX_SHARD_BYTES;
 
 pub const Error = error{
     Truncated,
@@ -65,7 +65,9 @@ pub const Error = error{
 /// One shard's worth of sealed bytes, addressed to a tenant.
 pub const Frame = struct {
     tenant_id: []const u8,
-    shard: u8,
+    /// Shard index. Shards are contiguous slot ranges, so the space
+    /// grows with the tenant rather than being fixed.
+    shard: u32,
     /// Sealed shard bytes, byte-identical to what the sender has on
     /// disk. Borrowed from the decoded buffer.
     sealed: []const u8,
@@ -82,8 +84,8 @@ pub fn encode(allocator: std.mem.Allocator, frame: Frame) Error![]u8 {
     std.mem.writeInt(u32, out[0..4], MAGIC, .big);
     std.mem.writeInt(u16, out[4..6], WIRE_VERSION, .little);
     std.mem.writeInt(u16, out[6..8], @intCast(frame.tenant_id.len), .little);
-    out[8] = frame.shard;
-    std.mem.writeInt(u32, out[9..13], @intCast(frame.sealed.len), .little);
+    std.mem.writeInt(u32, out[8..12], frame.shard, .little);
+    std.mem.writeInt(u32, out[12..16], @intCast(frame.sealed.len), .little);
     @memcpy(out[HEADER_LEN..][0..frame.tenant_id.len], frame.tenant_id);
     @memcpy(out[HEADER_LEN + frame.tenant_id.len ..], frame.sealed);
     return out;
@@ -102,8 +104,8 @@ pub fn decode(bytes: []const u8) Error!Frame {
         return Error.UnsupportedVersion;
 
     const id_len = std.mem.readInt(u16, bytes[6..8], .little);
-    const shard = bytes[8];
-    const sealed_len = std.mem.readInt(u32, bytes[9..13], .little);
+    const shard = std.mem.readInt(u32, bytes[8..12], .little);
+    const sealed_len = std.mem.readInt(u32, bytes[12..16], .little);
     if (id_len > keyring.MAX_TENANT_ID_LEN) return Error.TooLarge;
     if (sealed_len > MAX_SEALED_LEN) return Error.TooLarge;
 
@@ -190,7 +192,7 @@ test "a frame round-trips" {
 
     const f = try decode(buf);
     try testing.expectEqualStrings("acme", f.tenant_id);
-    try testing.expectEqual(@as(u8, 0x2A), f.shard);
+    try testing.expectEqual(@as(u32, 0x2A), f.shard);
     try testing.expectEqualStrings(sealed, f.sealed);
 }
 
@@ -232,7 +234,7 @@ test "a declared length beyond the cap is refused before allocating" {
     const a = testing.allocator;
     const buf = try encode(a, .{ .tenant_id = "acme", .shard = 1, .sealed = "xyz" });
     defer a.free(buf);
-    std.mem.writeInt(u32, buf[9..13], @intCast(MAX_SEALED_LEN + 1), .little);
+    std.mem.writeInt(u32, buf[12..16], @intCast(MAX_SEALED_LEN + 1), .little);
     try testing.expectError(Error.TooLarge, decode(buf));
 }
 
