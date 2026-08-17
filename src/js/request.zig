@@ -288,6 +288,14 @@ pub const Trace = struct {
     /// it (accepting an `X-Rove-Correlation-Id` header when present);
     /// resumes inherit. Null on test paths that don't care.
     saga_id: ?[]const u8 = null,
+    /// Per-ACTIVATION execution-sequence stamp (`LogRecord.exec_seq` — the
+    /// tenant-tape total order, `docs/architecture/deployment-and-logs.md`).
+    /// Minted once per activation by the worker (`Bridge.mintExecStampForTenant`)
+    /// when the activation enters execution — unlike `request_id` and
+    /// `saga_id`, a resumed chain does NOT inherit it: every hop is its
+    /// own tape atom and gets a fresh stamp. 0 on paths that never enter
+    /// execution and on test paths that don't care.
+    exec_seq: u64 = 0,
 };
 
 /// Admin-tenant platform surface. All-null for every non-admin request;

@@ -47,6 +47,14 @@ pub const Record = struct {
     /// Stored as a string in JSON so the sidecar is human-readable.
     outcome: []const u8,
     deployment_id: u64,
+    /// The execution-sequence stamp (`LogRecord.exec_seq`) — the record's
+    /// position on its tenant's execution tape. Carried so the indexer
+    /// can populate the seq-window index without decompressing the ndjson
+    /// frame. 0 = unstamped (the activation never entered execution, or
+    /// the record predates the field). Optional on parse (older sidecars
+    /// omit it). Ordered but NOT dense — never subtract two stamps for a
+    /// count.
+    exec_seq: u64 = 0,
     /// Per-saga id (stable across every activation of one saga).
     /// Carried in the sidecar so the indexer can populate the reserved
     /// `_saga` tag without decompressing the ndjson frame. Empty when
@@ -197,6 +205,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
             .status = @intCast(try getInt(ro, "status")),
             .outcome = try dupeStr(allocator, ro, "outcome"),
             .deployment_id = try getInt(ro, "deployment_id"),
+            .exec_seq = try getIntOpt(ro, "exec_seq"),
             // `saga_id` is the current key. `saga_id` is the
             // retired spelling, still read so sidecars already in
             // object storage keep their saga id — the same read-side
@@ -248,7 +257,7 @@ pub fn encode(allocator: std.mem.Allocator, idx: *const IdxFile) ![]u8 {
         try writeJsonString(w, r.host);
         try w.print(",\"status\":{d},\"outcome\":", .{r.status});
         try writeJsonString(w, r.outcome);
-        try w.print(",\"deployment_id\":{d},\"saga_id\":", .{r.deployment_id});
+        try w.print(",\"deployment_id\":{d},\"exec_seq\":{d},\"saga_id\":", .{ r.deployment_id, r.exec_seq });
         try writeJsonString(w, r.saga_id);
         try w.writeAll(",\"activation\":");
         try writeJsonString(w, r.activation);
@@ -359,6 +368,13 @@ fn getInt(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
         .number_string => |s| std.fmt.parseInt(u64, s, 10) catch return ParseError.InvalidJson,
         else => ParseError.InvalidJson,
     };
+}
+
+/// Like `getInt` but absent-tolerant: 0 when the key is missing. For
+/// additive fields whose zero value already means "absent" (`exec_seq`).
+fn getIntOpt(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
+    if (obj.get(name) == null) return 0;
+    return getInt(obj, name);
 }
 
 /// Emit tags as a JSON object `{"k":"v",...}` (`{}` when empty).

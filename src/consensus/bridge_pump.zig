@@ -13,6 +13,15 @@
 const std = @import("std");
 const Error = @import("bridge_error.zig").Error;
 
+/// Bit split of an execution-sequence stamp (`GroupSig.exec_stamp`; see
+/// `mintExecStamp` in bridge.zig, which re-exports this): upper 24 bits =
+/// raft term, lower 40 = per-term serial counter. Both halves are out of
+/// physical reach (2^24 leadership changes per group; 2^40 activations
+/// under one unbroken leadership) — mint and publish still fail loud
+/// rather than wrapping if either saturates. Defined here (not in
+/// bridge.zig) because this file cannot import its own root.
+pub const EXEC_SEQ_TERM_SHIFT = 40;
+
 pub fn pumpLoop(self: anytype) void {
     // Stall probes: a pump pause longer than the election timeout is a
     // spurious-election trigger (ticks, heartbeat sends, and inbound
@@ -293,6 +302,43 @@ pub fn refreshOneLocked(self: anytype, sig: anytype, gid: u64, single: bool) voi
     // loaded the deployment + armed watermarks inline at release).
     if (!single and promoted_edge) {
         self.promoted.append(self.allocator, sig.gid) catch {};
+    }
+    // Fold the group's term into the execution-stamp base while this node
+    // leads it. Fence first, then base (`mintExecStamp` refuses the
+    // transient mismatch), and both before the `is_leader` release-store
+    // below so a worker that observes leadership also observes a published
+    // stamp base. `fetchMax` because a new term's shifted base always
+    // exceeds every stamp of the old term — the publish IS the counter
+    // reset. Skipped when the published fence already equals the term (the
+    // common every-cycle case): the pump is the fence's only writer, so
+    // the load is exact, and skipping avoids a per-cycle FFI term read's
+    // sibling RMW ping-ponging the `exec_stamp` cacheline against
+    // concurrent worker mints.
+    if (now) {
+        const term = self.node.currentTerm(gid);
+        // Guarded one bit below the 24-bit field so every real stamp
+        // stays a positive i64 — the log index stores stamps in SQLite
+        // INTEGER columns, where a sign flip would corrupt tape order.
+        if (term > 0 and term < (@as(u64, 1) << (63 - EXEC_SEQ_TERM_SHIFT))) {
+            if (sig.exec_term.load(.monotonic) != term) {
+                sig.exec_term.store(term, .monotonic);
+                _ = sig.exec_stamp.fetchMax(term << EXEC_SEQ_TERM_SHIFT, .monotonic);
+            }
+        } else if (term != 0) {
+            // 2^23 elections on one group — out of physical reach; never
+            // shift a term into the counter bits or the sign bit.
+            std.log.warn("v2 exec-stamp gid={d}: term {d} exceeds the stamp's term field — records go unstamped", .{ gid, term });
+        }
+    } else if (sig.was_leader) {
+        // Demotion edge: withdraw the fence so this node's mints refuse
+        // (unstamped) instead of stamping into the OLD term indefinitely.
+        // The resume/connection-holder activation families mint without a
+        // leader gate, so without this a deposed holder would keep
+        // ordering activations before a failover they can already
+        // observe the effects of. Old-term stamps remain possible only in
+        // the pump-refresh-latency window, which is the bounded anomaly
+        // the exec-seq doc licenses.
+        sig.exec_term.store(0, .monotonic);
     }
     sig.was_leader = now;
     sig.is_leader.store(now, .release);

@@ -4020,6 +4020,7 @@ test "captureLog appends a record to the worker's node-wide buffer" {
         &.{},
         .inbound,
         12345,
+        (5 << 40) | 3,
     );
 
     try testing.expectEqual(@as(usize, 1), fake.log.log_buffer.buffer.items.len);
@@ -4031,8 +4032,9 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     // The tape fields make the round-trip.
     try testing.expectEqualStrings("test-correlation-id", buffered.saga_id);
     try testing.expectEqual(log_mod.ActivationSource.inbound, buffered.activation);
-    // raft_seq round-trips through the buffer.
+    // raft_seq + exec_seq round-trip through the buffer.
     try testing.expectEqual(@as(u64, 12345), buffered.raft_seq);
+    try testing.expectEqual(@as(u64, (5 << 40) | 3), buffered.exec_seq);
 }
 
 test "captureLog records saga_id + send_callback activation (Phase 1b)" {
@@ -4094,6 +4096,7 @@ test "captureLog records saga_id + send_callback activation (Phase 1b)" {
         "chain-abc-123",
         &.{},
         .send_callback,
+        0,
         0,
     );
 

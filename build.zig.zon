@@ -11,8 +11,8 @@
             .hash = "kvexp-0.1.0-1hj5RBTCBABiD5SF7XN0pimZ8cr8mJxbQeQ-aWG3vA7T",
         },
         .raft_rs_zig = .{
-            .url = "git+https://github.com/anarchodev/raft-rs-zig#4c6cfa313c3e7036dac47c997ac8c746805bd919",
-            .hash = "raft_rs_zig-0.0.1-SBgYX_TsBABenwe5iyq8vsQdVkBmp7__9u0qjR-wcKd3",
+            .url = "git+https://github.com/anarchodev/raft-rs-zig#aa3415bf706dfce7e848de637453bbb414bd55f9",
+            .hash = "raft_rs_zig-0.0.1-SBgYXwX0BAAlWgU8_MZqNB36L2xO_-ZRJoylIoL2WAx9",
         },
     },
     .fingerprint = 0xe74470b1aa30c66d,

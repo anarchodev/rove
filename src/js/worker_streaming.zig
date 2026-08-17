@@ -584,6 +584,7 @@ const StreamFinishCtx = struct {
     chunks_st: *components_mod.StreamChunks,
     wakes_st: *components_mod.StreamWakes,
     request_id: u64,
+    exec_seq: u64,
     now_ns: i64,
     deployment_id: u64,
     wrote: bool,
@@ -650,7 +651,7 @@ fn finishStreamResume(
                 ctx.txn.rollback() catch {};
                 ctx.txn_done.* = true;
                 markStreamDrainingAnywhere(server, ctx.ent);
-                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0);
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0, ctx.exec_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -684,13 +685,13 @@ fn finishStreamResume(
                         ctx.txn.rollback() catch {};
                         ctx.txn_done.* = true;
                         markStreamDrainingAnywhere(server, ctx.ent);
-                        captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0);
+                        captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0, ctx.exec_seq);
                         r.console = &.{};
                         r.exception = &.{};
                         return;
                     }
                 }
-                const lh_term = fireLogHeader(ctx.request_id, dep_id, @intCast(@max(@min(r.status, 599), 100)), ctx.act, "POST", mpath, "", corr, ctx.now_ns);
+                const lh_term = fireLogHeader(ctx.request_id, dep_id, @intCast(@max(@min(r.status, 599), 100)), ctx.act, "POST", mpath, "", corr, ctx.now_ns, ctx.exec_seq);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (`docs/architecture/deployment-and-logs.md`).
                 const tapes = streamTapes(worker, spec.tape, &ctx);
@@ -703,7 +704,7 @@ fn finishStreamResume(
                     // half-open stream. The helper already freed
                     // `stage.chunks`; the defer is a no-op.
                     markStreamDrainingAnywhere(server, ctx.ent);
-                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, r.console, r.exception, tapes, corr, r.tags, ctx.act, 0);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, r.console, r.exception, tapes, corr, r.tags, ctx.act, 0, ctx.exec_seq);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -718,7 +719,7 @@ fn finishStreamResume(
                 // is_draining).
                 ctx.chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, tapes, corr, r.tags, ctx.act, fw_seq);
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, tapes, corr, r.tags, ctx.act, fw_seq, ctx.exec_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -747,7 +748,7 @@ fn finishStreamResume(
             markStreamDrainingAnywhere(server, ctx.ent);
             ctx.chain_st.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0);
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0, ctx.exec_seq);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -767,7 +768,7 @@ fn finishStreamResume(
                 ctx.txn_done.* = true;
                 markStreamDrainingAnywhere(server, ctx.ent);
                 const msg = allocator.dupe(u8, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch @constCast("");
-                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0, ctx.exec_seq);
                 return;
             }
             // Park-time vigilance (docs/handler-shape.md §2.1): the
@@ -803,7 +804,7 @@ fn finishStreamResume(
                 markStreamDrainingAnywhere(server, ctx.ent);
                 std.log.warn("rove-js " ++ spec.site ++ ": held with no wake source tenant={s} module={s}", .{ tid, mpath });
                 const msg = allocator.dupe(u8, worker_mod.HELD_NO_WAKE_SOURCE_BODY) catch @constCast("");
-                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0, ctx.exec_seq);
                 return;
             }
             // Tapes before the propose so the input channels ride the raft
@@ -817,14 +818,14 @@ fn finishStreamResume(
                 // no chunks to stage.
                 var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = false };
                 defer stage.chunks.deinit(allocator);
-                const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns);
+                const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns, ctx.exec_seq);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (held + writes): propose failed: {s}", .{@errorName(perr)});
                     cval.deinit(allocator);
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     markStreamDrainingAnywhere(server, ctx.ent);
-                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0, ctx.exec_seq);
                     return;
                 };
                 ctx.txn_owned.* = false;
@@ -851,7 +852,7 @@ fn finishStreamResume(
             // Log with the module that RAN (pre-re-aim path), then
             // re-aim the chain for the NEXT activation — an explicit
             // cross-module target moves every later resume there.
-            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, cval.tags, ctx.act, fw_seq);
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, cval.tags, ctx.act, fw_seq, ctx.exec_seq);
             if (cval.path.len > 0 and !std.mem.eql(u8, cval.path, ctx.chain_st.module_path)) {
                 allocator.free(ctx.chain_st.module_path);
                 ctx.chain_st.module_path = cval.path;
@@ -876,7 +877,7 @@ fn finishStreamResume(
                 ctx.txn_done.* = true;
                 markStreamDrainingAnywhere(server, ctx.ent);
                 const msg = allocator.dupe(u8, worker_mod.NEXT_FN_UNSUPPORTED_BODY) catch @constCast("");
-                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, msg, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0, ctx.exec_seq);
                 return;
             }
             var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = false };
@@ -902,14 +903,14 @@ fn finishStreamResume(
                         ctx.txn.rollback() catch {};
                         ctx.txn_done.* = true;
                         markStreamDrainingAnywhere(server, ctx.ent);
-                        captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0);
+                        captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0, ctx.exec_seq);
                         return;
                     };
                     for (s2.chunks) |c| stage.chunks.appendAssumeCapacity(c);
                     allocator.free(s2.chunks);
                     s2.chunks = &.{};
                 }
-                const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns);
+                const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns, ctx.exec_seq);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the outer defer
@@ -920,7 +921,7 @@ fn finishStreamResume(
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     markStreamDrainingAnywhere(server, ctx.ent);
-                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0, ctx.exec_seq);
                     return;
                 };
                 ctx.txn_owned.* = false;
@@ -985,7 +986,7 @@ fn finishStreamResume(
             // the NEXT activation — the one `next()` semantic: an
             // explicit cross-module target moves every later resume
             // there.
-            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, &.{}, ctx.act, fw_seq);
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, &.{}, ctx.act, fw_seq, ctx.exec_seq);
             if (s2.path.len > 0 and !std.mem.eql(u8, s2.path, ctx.chain_st.module_path)) {
                 allocator.free(ctx.chain_st.module_path);
                 ctx.chain_st.module_path = s2.path;
@@ -1002,7 +1003,7 @@ fn finishStreamResume(
             ctx.txn.rollback() catch {};
             ctx.txn_done.* = true;
             markStreamDrainingAnywhere(server, ctx.ent);
-            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0, ctx.exec_seq);
         },
     }
 }
@@ -1069,6 +1070,7 @@ fn resumeStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
     // wake_batch activation: drain the fired arms (fired
     // PREFIXES, fire-time order) so nothing re-fires next sweep;
     // resumeStream owns the slice + each entry's `prefix` for the
@@ -1134,6 +1136,7 @@ fn resumeStream(
             .readset = &readset,
             .request_id = request_id,
             .saga_id = chain_ctx.saga_id,
+            .exec_seq = exec_seq,
         },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
@@ -1148,7 +1151,7 @@ fn resumeStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDraining(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, activation, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, activation, 0, exec_seq);
         return;
     };
 
@@ -1172,6 +1175,7 @@ fn resumeStream(
         .chunks_st = chunks_st,
         .wakes_st = wakes_st,
         .request_id = request_id,
+        .exec_seq = exec_seq,
         .now_ns = now_ns,
         .deployment_id = tc.snap.deployment_id,
         .wrote = wrote,
@@ -1286,6 +1290,7 @@ pub fn resumeBoundFetchStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     // Snapshot fetchesPending — same shape as resumeBoundFetchChain.
     // Entity is in `stream_data_out` or `stream_response_in` at
@@ -1363,6 +1368,7 @@ pub fn resumeBoundFetchStream(
             .readset = &readset,
             .request_id = request_id,
             .saga_id = chain_ctx.saga_id,
+            .exec_seq = exec_seq,
         },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
@@ -1387,7 +1393,7 @@ pub fn resumeBoundFetchStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDrainingAnywhere(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0, exec_seq);
         return;
     };
 
@@ -1407,6 +1413,7 @@ pub fn resumeBoundFetchStream(
         .chunks_st = chunks_st,
         .wakes_st = wakes_st,
         .request_id = request_id,
+        .exec_seq = exec_seq,
         .now_ns = now_ns,
         .deployment_id = tc.snap.deployment_id,
         .wrote = wrote,
@@ -1476,6 +1483,12 @@ pub const FirePrep = struct {
     readset: tape_mod.Readset,
     now_ns: i64,
     request_id: u64,
+    /// The activation's execution-sequence stamp (`LogRecord.exec_seq`),
+    /// minted per activation here in `firePrep` — every hop on a chain is
+    /// its own tape atom, so resumes never inherit it. 0 when the tenant
+    /// isn't registered with the bridge or the group has no published
+    /// term yet; the record then rides unstamped.
+    exec_seq: u64 = 0,
     /// The firing tenant's resolved rate caps + plan generation, for the
     /// `Request.plan` every fire site builds. Resolved HERE rather than at
     /// each site because a site that forgets them silently meters the
@@ -1542,6 +1555,7 @@ pub fn firePrep(
             const tl = worker.tenant_logs.get(dep.inst.id) orelse break :blk 0;
             break :blk tl.id_minter.nextRequestId() catch 0;
         },
+        .exec_seq = worker.raft.mintExecStampForTenant(dep.inst.id),
     };
 }
 
@@ -1616,6 +1630,7 @@ pub fn fireLogHeader(
     host: []const u8,
     corr: ?[]const u8,
     received_ns: i64,
+    exec_seq: u64,
 ) log_mod.LogHeader {
     return .{
         .request_id = request_id,
@@ -1624,6 +1639,9 @@ pub fn fireLogHeader(
         // The activation's own arrival time, so a record the promotion walker
         // rebuilds from the raft entry keeps its place in time (rove#280).
         .received_ns = received_ns,
+        // The activation's tape position, so a rebuilt record keeps its
+        // place on the tenant's execution tape too.
+        .exec_seq = exec_seq,
         .status = status,
         .outcome = .ok,
         .activation = act,
@@ -1723,7 +1741,7 @@ pub fn runFire(
         worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0);
+        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0, p.exec_seq);
         return;
     };
 
@@ -1742,7 +1760,7 @@ pub fn runFire(
                 );
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1763,7 +1781,7 @@ pub fn runFire(
                 );
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, "POST", log_path, "", corr, p.now_ns);
+                const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, "POST", log_path, "", corr, p.now_ns, p.exec_seq);
                 // Capture tapes BEFORE the propose so the input channels
                 // (ctx/Msg on `trigger_payload`, the fetch event on
                 // `fetch_responses`) ride the raft entry's readset — the
@@ -1775,21 +1793,21 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false; // helper rolled back + destroyed the txn
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, tapes, corr, r.tags, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, tapes, corr, r.tags, spec.act, 0, p.exec_seq);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, tapes, corr, r.tags, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, tapes, corr, r.tags, spec.act, fw_seq, p.exec_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1820,7 +1838,7 @@ pub fn runFire(
                 },
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns);
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns, p.exec_seq);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
@@ -1828,12 +1846,12 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): cont-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, cval.tags, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, cval.tags, spec.act, 0, p.exec_seq);
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, cval.tags, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, cval.tags, spec.act, fw_seq, p.exec_seq);
                 return;
             }
             if (comptime spec.readonly_cont_commits) {
@@ -1843,7 +1861,7 @@ pub fn runFire(
                 p.txn.rollback() catch {};
                 p.txn_done = true;
             }
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, cval.tags, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, cval.tags, spec.act, 0, p.exec_seq);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
@@ -1860,7 +1878,7 @@ pub fn runFire(
                 },
             }
             if (wrote) {
-                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns);
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns, p.exec_seq);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
@@ -1868,17 +1886,17 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, spec.act, 0, p.exec_seq);
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, &.{}, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, corr, &.{}, spec.act, fw_seq, p.exec_seq);
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0, p.exec_seq);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; connectionless fires never dispatch as one.
@@ -1886,7 +1904,7 @@ pub fn runFire(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, &.{}, spec.act, 0, p.exec_seq);
         },
     }
 }

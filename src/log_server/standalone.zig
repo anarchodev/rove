@@ -488,6 +488,10 @@ fn handleOne(
             metrics_mod.Metrics.inc(&metrics_mod.global.query_count);
             try handleCount(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, floor_ns, rctx.cfg);
         },
+        .window => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_list);
+            try handleWindow(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg);
+        },
     }
 }
 
@@ -542,7 +546,7 @@ fn handleBatchPushed(
     try setResponse(server, ent, sid, sess, 204, "", rctx.cfg);
 }
 
-const RouteKind = enum { list, show, count, session };
+const RouteKind = enum { list, show, count, session, window };
 
 const ParsedRoute = struct {
     kind: RouteKind,
@@ -555,9 +559,10 @@ const ParsedRoute = struct {
 };
 
 /// `/v1/{tenant_id}/list[?...]`, `/v1/{tenant_id}/show/{request_id}`,
-/// `/v1/{tenant_id}/count`, or `/v1/{tenant_id}/session/{session_id}`
-/// (replay sugar for `list?tag.session={session_id}`). Returns null on
-/// shape mismatch (caller responds 404).
+/// `/v1/{tenant_id}/count`, `/v1/{tenant_id}/session/{session_id}`
+/// (replay sugar for `list?tag.session={session_id}`), or
+/// `/v1/{tenant_id}/window[?...]` (the execution-tape view — ascending
+/// by `exec_seq`). Returns null on shape mismatch (caller responds 404).
 fn parseRoute(path: []const u8) ?ParsedRoute {
     const q_idx = std.mem.indexOfScalar(u8, path, '?');
     const path_no_query = if (q_idx) |i| path[0..i] else path;
@@ -576,6 +581,9 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
     }
     if (std.mem.eql(u8, remainder, "count")) {
         return .{ .kind = .count, .tenant_id = tenant_id, .tail = "", .query = query };
+    }
+    if (std.mem.eql(u8, remainder, "window")) {
+        return .{ .kind = .window, .tenant_id = tenant_id, .tail = "", .query = query };
     }
     if (std.mem.startsWith(u8, remainder, "show/")) {
         const tail = remainder["show/".len..];
@@ -679,7 +687,47 @@ fn handleList(
     };
     defer list.deinit();
 
-    const json = try renderListJson(allocator, list.rows);
+    const json = try renderRowsJson(allocator, list.rows, .time);
+    try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
+}
+
+/// The execution-tape window: records ordered ASCENDING by `exec_seq`
+/// (execution order — the order that survives leader failover, unlike
+/// `/list`'s wall-clock view). Params, all decimal integers:
+/// `seq_from` (inclusive lower bound), `seq_to` (inclusive upper bound,
+/// 0/absent = unbounded), `after_seq` (keyset cursor — strictly after;
+/// overrides `seq_from` when present), `limit`. Stamps exceed 2^53, so
+/// they travel as decimal strings in the response JSON and parse from
+/// the query string here; unstamped records have no place on the tape
+/// and never appear.
+fn handleWindow(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    db: *index_db_mod.IndexDb,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tenant_id: []const u8,
+    query: []const u8,
+    floor_received_ns: i64,
+    cfg: *const Config,
+) !void {
+    const limit = parseUint(u32, query, "limit", 100);
+    const seq_from = parseUint(u64, query, "seq_from", 0);
+    const seq_to = parseUint(u64, query, "seq_to", 0);
+    const after_seq = parseUint(u64, query, "after_seq", 0);
+    // The statement's lower bound is strictly-greater-than; an inclusive
+    // seq_from enters as its predecessor. The cursor wins when present.
+    const after = if (after_seq != 0) after_seq else (seq_from -| 1);
+
+    var list = db.queryWindow(tenant_id, after, seq_to, floor_received_ns, limit) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "window failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    defer list.deinit();
+
+    const json = try renderRowsJson(allocator, list.rows, .seq);
     try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
 }
 
@@ -829,9 +877,17 @@ fn handleCount(
 
 // ── JSON rendering ─────────────────────────────────────────────────
 
-fn renderListJson(
+/// Which keyset the `next_cursor` object carries: the `/list` time
+/// cursor (`received_ns` + opaque `request_id` token) or the `/window`
+/// tape cursor (`exec_seq` decimal string). One renderer for both
+/// endpoints so an envelope change can never drift them apart — the
+/// dashboard parses the two responses with the same client.
+const CursorFlavor = enum { time, seq };
+
+fn renderRowsJson(
     allocator: std.mem.Allocator,
     rows: []index_db_mod.IndexDb.ListRow,
+    flavor: CursorFlavor,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -846,14 +902,24 @@ fn renderListJson(
         const last = &rows[rows.len - 1];
         var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
         defer buf = aw.toArrayList();
-        // Hand back the cursor request_id as the opaque prefixed token the
-        // client passes verbatim to `?after_request_id=` (§7.5).
-        var cur_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
-        const cur_rid = log_mod.formatPrefixedId(&cur_buf, log_mod.REQUEST_ID_PREFIX, last.request_id);
-        try aw.writer.print(
-            "],\"next_cursor\":{{\"received_ns\":{d},\"request_id\":\"{s}\"}}}}\n",
-            .{ last.received_ns, cur_rid },
-        );
+        switch (flavor) {
+            // Hand back the cursor request_id as the opaque prefixed
+            // token the client passes verbatim to `?after_request_id=`
+            // (§7.5).
+            .time => {
+                var cur_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+                const cur_rid = log_mod.formatPrefixedId(&cur_buf, log_mod.REQUEST_ID_PREFIX, last.request_id);
+                try aw.writer.print(
+                    "],\"next_cursor\":{{\"received_ns\":{d},\"request_id\":\"{s}\"}}}}\n",
+                    .{ last.received_ns, cur_rid },
+                );
+            },
+            // The last row's stamp, passed back verbatim as `?after_seq=`.
+            .seq => try aw.writer.print(
+                "],\"next_cursor\":{{\"exec_seq\":\"{d}\"}}}}\n",
+                .{last.exec_seq},
+            ),
+        }
     }
     return buf.toOwnedSlice(allocator);
 }
@@ -886,6 +952,10 @@ fn writeRowJson(
     // before the field existed.
     try aw.writer.writeAll(",\"activation\":");
     try writeJsonString(&aw.writer, r.activation);
+    // The execution-sequence stamp as a DECIMAL STRING — its values
+    // exceed 2^53, and a bare JSON number would silently round in
+    // dashboard JS, breaking stamp equality/ordering. "0" = unstamped.
+    try aw.writer.print(",\"exec_seq\":\"{d}\"", .{r.exec_seq});
     try aw.writer.writeAll("}");
 }
 
