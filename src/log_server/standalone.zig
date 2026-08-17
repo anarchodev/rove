@@ -492,6 +492,10 @@ fn handleOne(
             metrics_mod.Metrics.inc(&metrics_mod.global.query_list);
             try handleWindow(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg);
         },
+        .saga => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_list);
+            try handleSaga(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.tail, route.query, floor_ns, rctx.cfg);
+        },
     }
 }
 
@@ -546,7 +550,7 @@ fn handleBatchPushed(
     try setResponse(server, ent, sid, sess, 204, "", rctx.cfg);
 }
 
-const RouteKind = enum { list, show, count, session, window };
+const RouteKind = enum { list, show, count, session, window, saga };
 
 const ParsedRoute = struct {
     kind: RouteKind,
@@ -560,9 +564,11 @@ const ParsedRoute = struct {
 
 /// `/v1/{tenant_id}/list[?...]`, `/v1/{tenant_id}/show/{request_id}`,
 /// `/v1/{tenant_id}/count`, `/v1/{tenant_id}/session/{session_id}`
-/// (replay sugar for `list?tag.session={session_id}`), or
+/// (replay sugar for `list?tag.session={session_id}`),
 /// `/v1/{tenant_id}/window[?...]` (the execution-tape view — ascending
-/// by `exec_seq`). Returns null on shape mismatch (caller responds 404).
+/// by `exec_seq`), or `/v1/{tenant_id}/saga/{saga_id}[?...]` (one
+/// saga's window: roll-up + hops + gap summaries). Returns null on
+/// shape mismatch (caller responds 404).
 fn parseRoute(path: []const u8) ?ParsedRoute {
     const q_idx = std.mem.indexOfScalar(u8, path, '?');
     const path_no_query = if (q_idx) |i| path[0..i] else path;
@@ -594,6 +600,11 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
         const tail = remainder["session/".len..];
         if (tail.len == 0) return null;
         return .{ .kind = .session, .tenant_id = tenant_id, .tail = tail, .query = query };
+    }
+    if (std.mem.startsWith(u8, remainder, "saga/")) {
+        const tail = remainder["saga/".len..];
+        if (tail.len == 0) return null;
+        return .{ .kind = .saga, .tenant_id = tenant_id, .tail = tail, .query = query };
     }
     return null;
 }
@@ -729,6 +740,157 @@ fn handleWindow(
 
     const json = try renderRowsJson(allocator, list.rows, .seq);
     try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
+}
+
+/// Gap counts stop scanning here — "1000+ quiet" is the honest
+/// rendering of a seam bigger than anyone reads, and an uncapped COUNT
+/// is an index-range scan proportional to the seam.
+const GAP_COUNT_CAP: u32 = 1000;
+
+/// One saga's window — the saga viewer's data source. Response:
+///
+///   {"saga":{...roll-up...},
+///    "hops":[<row>...],            // stamped, ascending tape order
+///    "gaps":[{"after_seq":"..","before_seq":"..","count":N,
+///             "truncated":bool,"quiet_ns":N}],  // between in-page hops
+///    "unplaced":[<row>...],        // unstamped hops, first page only
+///    "next_cursor":{"exec_seq":".."} | null}
+///
+/// `gaps[i]` sits between `hops[i]` and `hops[i+1]` — seams across a
+/// page boundary are the client's to stitch (it holds both edge hops).
+/// 404 when the index has never seen the saga. The roll-up's
+/// `closed_at_ns == 0` means "no close was seen" — NOT a liveness
+/// signal (the holder is the only authority on open connections).
+fn handleSaga(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    db: *index_db_mod.IndexDb,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tenant_id: []const u8,
+    saga_tail: []const u8,
+    query: []const u8,
+    floor_received_ns: i64,
+    cfg: *const Config,
+) !void {
+    const limit = parseUint(u32, query, "limit", 100);
+    const after_seq = parseUint(u64, query, "after_seq", 0);
+
+    // The saga id may be client-supplied (`X-Rove-Correlation-Id`,
+    // ≤256 bytes) and so arrives percent-encoded in the path segment.
+    var corr_buf: [MAX_PATH_FILTER]u8 = undefined;
+    const corr_id = percentDecode(&corr_buf, saga_tail) orelse {
+        try setResponse(server, ent, sid, sess, 400, "invalid saga id (bad percent-encoding or > 256 bytes)\n", cfg);
+        return;
+    };
+
+    var roll = (db.querySagaRoll(tenant_id, corr_id) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "saga failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    }) orelse {
+        try setResponse(server, ent, sid, sess, 404, "unknown saga\n", cfg);
+        return;
+    };
+    // The roll-up's strings were duped by the db's own allocator.
+    defer roll.deinit(db.allocator);
+
+    var hops = db.querySagaHops(tenant_id, corr_id, after_seq, floor_received_ns, limit) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "saga hops failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    defer hops.deinit();
+
+    // Unstamped hops ride the first page only — they have no tape
+    // position, so paging them under a seq cursor would re-send them
+    // on every page.
+    var unplaced: ?index_db_mod.IndexDb.ListResult = null;
+    defer if (unplaced) |*u| u.deinit();
+    if (after_seq == 0) {
+        unplaced = db.querySagaUnplaced(tenant_id, corr_id, floor_received_ns, 100) catch null;
+    }
+
+    // One bounded count per in-page seam.
+    var gaps: std.ArrayListUnmanaged(index_db_mod.IndexDb.GapCount) = .empty;
+    defer gaps.deinit(allocator);
+    if (hops.rows.len > 1) {
+        for (hops.rows[0 .. hops.rows.len - 1], hops.rows[1..]) |prev, next| {
+            const gc = db.countSeqRange(tenant_id, prev.exec_seq, next.exec_seq, floor_received_ns, GAP_COUNT_CAP) catch
+                index_db_mod.IndexDb.GapCount{ .count = 0, .truncated = true };
+            gaps.append(allocator, gc) catch return;
+        }
+    }
+
+    const json = try renderSagaJson(allocator, &roll, hops.rows, gaps.items, if (unplaced) |*u| u.rows else &.{});
+    try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
+}
+
+fn renderSagaJson(
+    allocator: std.mem.Allocator,
+    roll: *const index_db_mod.IndexDb.SagaRow,
+    hops: []index_db_mod.IndexDb.ListRow,
+    gaps: []const index_db_mod.IndexDb.GapCount,
+    unplaced: []index_db_mod.IndexDb.ListRow,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    {
+        defer buf = aw.toArrayList();
+        try aw.writer.writeAll("{\"saga\":{\"saga_id\":");
+        try writeJsonString(&aw.writer, roll.corr_id);
+        try aw.writer.print(
+            ",\"first_received_ns\":{d},\"last_received_ns\":{d},\"activation_count\":{d},\"error_count\":{d},\"last_status\":{d},\"closed_at_ns\":{d}",
+            .{ roll.first_received_ns, roll.last_received_ns, roll.activation_count, roll.error_count, roll.last_status, roll.closed_at_ns },
+        );
+        try aw.writer.writeAll(",\"last_outcome\":");
+        try writeJsonString(&aw.writer, roll.last_outcome);
+        try aw.writer.writeAll(",\"root_method\":");
+        try writeJsonString(&aw.writer, roll.root_method);
+        try aw.writer.writeAll(",\"root_path\":");
+        try writeJsonString(&aw.writer, roll.root_path);
+        try aw.writer.writeAll(",\"root_host\":");
+        try writeJsonString(&aw.writer, roll.root_host);
+        try aw.writer.writeAll("},\"hops\":[");
+    }
+    for (hops, 0..) |r, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try writeRowJson(allocator, &buf, &r);
+    }
+    aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    {
+        defer buf = aw.toArrayList();
+        try aw.writer.writeAll("],\"gaps\":[");
+        for (gaps, 0..) |g, i| {
+            if (i > 0) try aw.writer.writeAll(",");
+            // The seam's endpoints as decimal strings, same 2^53 stance
+            // as every stamp this surface emits.
+            try aw.writer.print(
+                "{{\"after_seq\":\"{d}\",\"before_seq\":\"{d}\",\"count\":{d},\"truncated\":{},\"quiet_ns\":{d}}}",
+                .{ hops[i].exec_seq, hops[i + 1].exec_seq, g.count, g.truncated, hops[i + 1].received_ns - hops[i].received_ns },
+            );
+        }
+        try aw.writer.writeAll("],\"unplaced\":[");
+    }
+    for (unplaced, 0..) |r, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try writeRowJson(allocator, &buf, &r);
+    }
+    aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    {
+        defer buf = aw.toArrayList();
+        if (hops.len == 0) {
+            try aw.writer.writeAll("],\"next_cursor\":null}\n");
+        } else {
+            try aw.writer.print(
+                "],\"next_cursor\":{{\"exec_seq\":\"{d}\"}}}}\n",
+                .{hops[hops.len - 1].exec_seq},
+            );
+        }
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 fn handleShow(
@@ -1227,6 +1389,21 @@ test "parseRoute matches /v1/{tenant}/count" {
     try testing.expectEqual(RouteKind.count, r.kind);
     try testing.expectEqualStrings("acme", r.tenant_id);
     try testing.expectEqualStrings("", r.tail);
+}
+
+test "parseRoute matches /v1/{tenant}/window and /v1/{tenant}/saga/{id}" {
+    const w = parseRoute("/v1/acme/window?seq_from=5&limit=20").?;
+    try testing.expectEqual(RouteKind.window, w.kind);
+    try testing.expectEqualStrings("acme", w.tenant_id);
+    try testing.expectEqualStrings("seq_from=5&limit=20", w.query);
+
+    const s = parseRoute("/v1/acme/saga/corr-7f1a?after_seq=9").?;
+    try testing.expectEqual(RouteKind.saga, s.kind);
+    try testing.expectEqualStrings("acme", s.tenant_id);
+    try testing.expectEqualStrings("corr-7f1a", s.tail);
+    try testing.expectEqualStrings("after_seq=9", s.query);
+    // Empty saga id is a 404 (no tail).
+    try testing.expect(parseRoute("/v1/acme/saga/") == null);
 }
 
 test "parseRoute matches /v1/{tenant}/session/{id}" {

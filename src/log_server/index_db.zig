@@ -651,7 +651,107 @@ pub const IndexDb = struct {
         _ = c.sqlite3_bind_int64(st, 3, @intCast(@min(to_seq, i64_max)));
         _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
         _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
+        return self.collectListRows(st.?);
+    }
 
+    /// One saga's hops — its STAMPED activations in tape order. Drives
+    /// from `log_tags_lookup` on the reserved `_saga` tag (the saga's
+    /// own rows, a bounded set), probes `log_index` by PK, and sorts by
+    /// stamp; the sort is over the saga's remaining rows only, not a
+    /// tenant window, so a temp b-tree here is proportional to the saga
+    /// — unlike the `/list` statements, where streaming off an index is
+    /// load-bearing (see LIST_SQL_TAGGED). `CROSS JOIN` pins that drive
+    /// order all the same. Keyset cursor on the stamp (`?3`,
+    /// strictly-greater-than). Unstamped hops are excluded here — they
+    /// have no tape position; `querySagaUnplaced` returns them.
+    const SAGA_HOPS_SQL: [:0]const u8 =
+        \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
+        \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id,
+        \\       li.activation, li.exec_seq
+        \\FROM log_tags t
+        \\CROSS JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
+        \\WHERE t.tenant_id = ?1 AND t.key = '
+    ++ RESERVED_SAGA_TAG ++
+        \\' AND t.value = ?2
+        \\  AND li.exec_seq IS NOT NULL AND li.exec_seq > ?3
+        \\  AND (?5 = 0 OR li.received_ns >= ?5)
+        \\ORDER BY li.exec_seq ASC
+        \\LIMIT ?4
+    ;
+
+    /// The unstamped remainder of a saga: hops captured without a tape
+    /// position (an activation minted while the group had no published
+    /// term, or a record indexed before the stamp existed). Ordered by
+    /// arrival because that is all they carry. Capped — callers show
+    /// them as an addendum, not a paged list.
+    const SAGA_UNPLACED_SQL: [:0]const u8 =
+        \\SELECT li.tenant_id, li.request_id, li.received_ns, li.duration_ns,
+        \\       li.method, li.path, li.host, li.status, li.outcome, li.deployment_id,
+        \\       li.activation, li.exec_seq
+        \\FROM log_tags t
+        \\CROSS JOIN log_index li ON li.tenant_id = t.tenant_id AND li.request_id = t.request_id
+        \\WHERE t.tenant_id = ?1 AND t.key = '
+    ++ RESERVED_SAGA_TAG ++
+        \\' AND t.value = ?2
+        \\  AND li.exec_seq IS NULL
+        \\  AND (?4 = 0 OR li.received_ns >= ?4)
+        \\ORDER BY li.received_ns ASC, li.request_id ASC
+        \\LIMIT ?3
+    ;
+
+    pub fn querySagaHops(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        corr_id: []const u8,
+        after_seq: u64,
+        floor_received_ns: i64,
+        limit: u32,
+    ) Error!ListResult {
+        return self.execSagaRowsQuery(SAGA_HOPS_SQL, tenant_id, corr_id, after_seq, floor_received_ns, limit);
+    }
+
+    pub fn querySagaUnplaced(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        corr_id: []const u8,
+        floor_received_ns: i64,
+        limit: u32,
+    ) Error!ListResult {
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, SAGA_UNPLACED_SQL.ptr, @intCast(SAGA_UNPLACED_SQL.len), &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        bindText(st.?, 2, corr_id);
+        _ = c.sqlite3_bind_int64(st, 3, @intCast(limit));
+        _ = c.sqlite3_bind_int64(st, 4, floor_received_ns);
+        return self.collectListRows(st.?);
+    }
+
+    fn execSagaRowsQuery(
+        self: *IndexDb,
+        sql: [:0]const u8,
+        tenant_id: []const u8,
+        corr_id: []const u8,
+        after_seq: u64,
+        floor_received_ns: i64,
+        limit: u32,
+    ) Error!ListResult {
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        bindText(st.?, 2, corr_id);
+        // Client-reachable u64 bound — saturate, same reasoning as
+        // `queryWindow`.
+        _ = c.sqlite3_bind_int64(st, 3, @intCast(@min(after_seq, std.math.maxInt(i64))));
+        _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
+        _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
+        return self.collectListRows(st.?);
+    }
+
+    fn collectListRows(self: *IndexDb, st: *c.sqlite3_stmt) Error!ListResult {
         var rows: std.ArrayListUnmanaged(ListRow) = .empty;
         errdefer {
             for (rows.items) |*r| r.deinit(self.allocator);
@@ -661,13 +761,57 @@ pub const IndexDb = struct {
             const rc = c.sqlite3_step(st);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return Error.Sqlite;
-            const row = try listRowFromStmt(self.allocator, st.?);
+            const row = try listRowFromStmt(self.allocator, st);
             rows.append(self.allocator, row) catch return Error.OutOfMemory;
         }
         return .{
             .rows = rows.toOwnedSlice(self.allocator) catch return Error.OutOfMemory,
             .allocator = self.allocator,
         };
+    }
+
+    /// A bounded gap count. `count` is the number of stamped records in
+    /// the OPEN interval `(after_seq, before_seq)` — capped at `cap`,
+    /// with `truncated` saying the cap was hit. Bounded because a count
+    /// is an index-range SCAN in SQLite: a seam holding a million
+    /// foreign activations must cost the reader `cap` index entries,
+    /// not a million ("1000+ quiet" is the honest rendering — never a
+    /// silent cap).
+    pub const GapCount = struct { count: u32, truncated: bool };
+
+    pub fn countSeqRange(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        after_seq: u64,
+        before_seq: u64,
+        floor_received_ns: i64,
+        cap: u32,
+    ) Error!GapCount {
+        const sql =
+            \\SELECT COUNT(*) FROM (
+            \\  SELECT 1 FROM log_index
+            \\  WHERE tenant_id = ?1
+            \\    AND exec_seq IS NOT NULL AND exec_seq > ?2 AND exec_seq < ?3
+            \\    AND (?5 = 0 OR received_ns >= ?5)
+            \\  LIMIT ?4
+            \\)
+        ;
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        const i64_max: u64 = std.math.maxInt(i64);
+        _ = c.sqlite3_bind_int64(st, 2, @intCast(@min(after_seq, i64_max)));
+        _ = c.sqlite3_bind_int64(st, 3, @intCast(@min(before_seq, i64_max)));
+        // LIMIT cap+1 so `truncated` distinguishes "exactly cap" from
+        // "more than cap".
+        _ = c.sqlite3_bind_int64(st, 4, @as(i64, cap) + 1);
+        _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
+        if (c.sqlite3_step(st) != c.SQLITE_ROW) return Error.Sqlite;
+        const n: u64 = @intCast(c.sqlite3_column_int64(st, 0));
+        if (n > cap) return .{ .count = cap, .truncated = true };
+        return .{ .count = @intCast(n), .truncated = false };
     }
 
     /// Materialize one `ListRow` from the shared 12-column SELECT shape
@@ -733,6 +877,54 @@ pub const IndexDb = struct {
         }
     };
 
+    /// The shared 11-column `log_sagas` SELECT column list — one ordinal
+    /// map for the saga list and the point fetch.
+    const SAGA_COLS =
+        \\SELECT corr_id, first_received_ns, last_received_ns, activation_count,
+        \\       root_method, root_path, root_host, last_status, last_outcome,
+        \\       error_count, closed_at_ns
+        \\FROM log_sagas
+    ;
+
+    fn sagaRowFromStmt(allocator: std.mem.Allocator, st: *c.sqlite3_stmt) Error!SagaRow {
+        return .{
+            .corr_id = try dupeColumnText(allocator, st, 0),
+            .first_received_ns = c.sqlite3_column_int64(st, 1),
+            .last_received_ns = c.sqlite3_column_int64(st, 2),
+            .activation_count = @intCast(c.sqlite3_column_int64(st, 3)),
+            .root_method = try dupeColumnText(allocator, st, 4),
+            .root_path = try dupeColumnText(allocator, st, 5),
+            .root_host = try dupeColumnText(allocator, st, 6),
+            .last_status = @intCast(c.sqlite3_column_int(st, 7)),
+            .last_outcome = try dupeColumnText(allocator, st, 8),
+            .error_count = @intCast(c.sqlite3_column_int64(st, 9)),
+            // NULL → 0, the "no close seen" sentinel.
+            .closed_at_ns = c.sqlite3_column_int64(st, 10),
+        };
+    }
+
+    /// One saga's roll-up row, or null when the index has never seen the
+    /// saga (the saga-viewer 404). `closed_at_ns == 0` means "no close
+    /// was seen", which is explicitly NOT a liveness signal — see
+    /// `execSagaUpsert`.
+    pub fn querySagaRoll(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        corr_id: []const u8,
+    ) Error!?SagaRow {
+        const sql: [:0]const u8 = SAGA_COLS ++ "\nWHERE tenant_id = ?1 AND corr_id = ?2";
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        bindText(st.?, 2, corr_id);
+        const rc = c.sqlite3_step(st);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return Error.Sqlite;
+        return try sagaRowFromStmt(self.allocator, st.?);
+    }
+
     /// Sagas for `tenant_id`, most-recently-active first. Cursor is
     /// `(after_last_received_ns, after_saga_id)` from the previous
     /// page's tail; `(0, "")` starts at the newest.
@@ -766,11 +958,8 @@ pub const IndexDb = struct {
         floor_received_ns: i64,
         limit: u32,
     ) Error!SagaListResult {
-        const sql =
-            \\SELECT corr_id, first_received_ns, last_received_ns, activation_count,
-            \\       root_method, root_path, root_host, last_status, last_outcome,
-            \\       error_count, closed_at_ns
-            \\FROM log_sagas
+        const sql = SAGA_COLS ++
+            \\
             \\WHERE tenant_id = ?1
             \\  AND (?2 = 0 OR
             \\       last_received_ns < ?2 OR
@@ -798,20 +987,7 @@ pub const IndexDb = struct {
             const rc = c.sqlite3_step(st);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return Error.Sqlite;
-            const row: SagaRow = .{
-                .corr_id = try dupeColumnText(self.allocator, st.?, 0),
-                .first_received_ns = c.sqlite3_column_int64(st, 1),
-                .last_received_ns = c.sqlite3_column_int64(st, 2),
-                .activation_count = @intCast(c.sqlite3_column_int64(st, 3)),
-                .root_method = try dupeColumnText(self.allocator, st.?, 4),
-                .root_path = try dupeColumnText(self.allocator, st.?, 5),
-                .root_host = try dupeColumnText(self.allocator, st.?, 6),
-                .last_status = @intCast(c.sqlite3_column_int(st, 7)),
-                .last_outcome = try dupeColumnText(self.allocator, st.?, 8),
-                .error_count = @intCast(c.sqlite3_column_int64(st, 9)),
-                // NULL → 0, the "no close seen" sentinel.
-                .closed_at_ns = c.sqlite3_column_int64(st, 10),
-            };
+            const row = try sagaRowFromStmt(self.allocator, st.?);
             rows.append(self.allocator, row) catch return Error.OutOfMemory;
         }
         return .{
@@ -1390,6 +1566,86 @@ test "queryWindow walks the tape in exec_seq order, skipping unstamped rows" {
     defer clamped.deinit();
     try testing.expectEqual(@as(usize, 2), clamped.rows.len);
     try testing.expectEqual(@as(u64, 1), clamped.rows[0].request_id);
+}
+
+test "saga window: hops in tape order, gap counts, unplaced addendum, roll point-fetch" {
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "sagawin");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    // Saga S's hops at stamps 1, 5, 9 (term 3); foreign records fill the
+    // seams: 2 foreign in (1,5), 3 foreign in (5,9). One of S's hops is
+    // unstamped (minted in a no-fence window) — an addendum, not a tape
+    // position. A second saga ("other") shares the tape.
+    const t3: u64 = 3 << 40;
+    var records = [_]sidecar.Record{
+        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/s0", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "S", .exec_seq = t3 + 1, .offset = 0, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/f1", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "F1", .exec_seq = t3 + 2, .offset = 1, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 3, .received_ns = 3_000, .duration_ns = 1, .method = "GET", .path = "/f2", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "F2", .exec_seq = t3 + 3, .offset = 2, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 4, .received_ns = 4_000, .duration_ns = 1, .method = "POST", .path = "/s1", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "S", .exec_seq = t3 + 5, .offset = 3, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 5, .received_ns = 5_000, .duration_ns = 1, .method = "GET", .path = "/f3", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "F3", .exec_seq = t3 + 6, .offset = 4, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 6, .received_ns = 6_000, .duration_ns = 1, .method = "GET", .path = "/f4", .host = "h", .status = 500, .outcome = "handler_error", .deployment_id = 1, .saga_id = "F4", .exec_seq = t3 + 7, .offset = 5, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 7, .received_ns = 7_000, .duration_ns = 1, .method = "GET", .path = "/f5", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "F5", .exec_seq = t3 + 8, .offset = 6, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 8, .received_ns = 8_000, .duration_ns = 1, .method = "POST", .path = "/s2", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "S", .exec_seq = t3 + 9, .offset = 7, .length = 1 },
+        .{ .tenant_id = "acme", .request_id = 9, .received_ns = 1_500, .duration_ns = 1, .method = "GET", .path = "/s-lost", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .saga_id = "S", .exec_seq = 0, .offset = 8, .length = 1 },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "00000000000000000300-1730764800000",
+        .ndjson_size = 9,
+        .ndjson_sha256 = "deadbeef",
+        .first_received_ns = 1_000,
+        .last_received_ns = 8_000,
+        .records = &records,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/s.ndjson", 0);
+
+    // Roll point-fetch: present for S, null for a saga never seen.
+    var roll = (try idx.querySagaRoll("acme", "S")).?;
+    defer roll.deinit(a);
+    try testing.expectEqual(@as(u64, 4), roll.activation_count);
+    try testing.expectEqualStrings("GET", roll.root_method);
+    try testing.expect((try idx.querySagaRoll("acme", "nope")) == null);
+    try testing.expect((try idx.querySagaRoll("other-tenant", "S")) == null);
+
+    // Hops: stamped only, tape order, the saga's rows only.
+    var hops = try idx.querySagaHops("acme", "S", 0, 0, 10);
+    defer hops.deinit();
+    try testing.expectEqual(@as(usize, 3), hops.rows.len);
+    try testing.expectEqual(t3 + 1, hops.rows[0].exec_seq);
+    try testing.expectEqual(t3 + 5, hops.rows[1].exec_seq);
+    try testing.expectEqual(t3 + 9, hops.rows[2].exec_seq);
+    try testing.expectEqualStrings("/s1", hops.rows[1].path);
+
+    // Keyset cursor resumes strictly after a stamp.
+    var p2 = try idx.querySagaHops("acme", "S", t3 + 1, 0, 10);
+    defer p2.deinit();
+    try testing.expectEqual(@as(usize, 2), p2.rows.len);
+    try testing.expectEqual(t3 + 5, p2.rows[0].exec_seq);
+
+    // Gap counts: 2 foreign in (1,5), 3 in (5,9); cap 2 truncates the
+    // second seam at 2 and says so.
+    const g1 = try idx.countSeqRange("acme", t3 + 1, t3 + 5, 0, 1000);
+    try testing.expectEqual(@as(u32, 2), g1.count);
+    try testing.expect(!g1.truncated);
+    const g2 = try idx.countSeqRange("acme", t3 + 5, t3 + 9, 0, 1000);
+    try testing.expectEqual(@as(u32, 3), g2.count);
+    const g2_capped = try idx.countSeqRange("acme", t3 + 5, t3 + 9, 0, 2);
+    try testing.expectEqual(@as(u32, 2), g2_capped.count);
+    try testing.expect(g2_capped.truncated);
+
+    // The unstamped hop is the addendum, never a tape position.
+    var un = try idx.querySagaUnplaced("acme", "S", 0, 10);
+    defer un.deinit();
+    try testing.expectEqual(@as(usize, 1), un.rows.len);
+    try testing.expectEqualStrings("/s-lost", un.rows[0].path);
+    try testing.expectEqual(@as(u64, 0), un.rows[0].exec_seq);
 }
 
 test "queryList filters by tag (user session + reserved _saga)" {
