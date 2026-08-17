@@ -58,6 +58,14 @@ pub const Metrics = struct {
     query_list: Counter = .init(0),
     query_show: Counter = .init(0),
     query_count: Counter = .init(0),
+    /// Out-of-line payload resolutions attempted (`/v1/{t}/body/...`).
+    query_body: Counter = .init(0),
+    /// …of which returned a verdict instead of bytes. This is the signal
+    /// that the reference discipline is leaking: a healthy system
+    /// resolves nearly every reference it wrote, so a rising ratio here
+    /// means references are outliving the bytes they name — the body
+    /// pool's eviction story overtaking the records that point into it.
+    query_body_unresolved: Counter = .init(0),
 
     pub inline fn inc(c: *Counter) void {
         _ = c.fetchAdd(1, .monotonic);
@@ -103,6 +111,8 @@ pub fn render(allocator: std.mem.Allocator) ![]u8 {
     try counter(w, "log_query_list_total", "list queries served.", m.query_list.load(.monotonic));
     try counter(w, "log_query_show_total", "show queries served.", m.query_show.load(.monotonic));
     try counter(w, "log_query_count_total", "count queries served.", m.query_count.load(.monotonic));
+    try counter(w, "log_query_body_total", "out-of-line payload resolutions attempted.", m.query_body.load(.monotonic));
+    try counter(w, "log_query_body_unresolved_total", "payload resolutions that returned a verdict instead of bytes.", m.query_body_unresolved.load(.monotonic));
     buf = aw.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
