@@ -156,6 +156,34 @@ def main() -> int:
                 headers={"Authorization": f"Bearer {tok(tenant='acme')}"}),
           expect_status=200, reject=False)
 
+    # List filters over the wire: each shape must prepare + execute
+    # (the built SQL runs against the real sqlite even on an empty
+    # index), and a malformed filter must 400 loudly — a silently
+    # dropped filter would present unfiltered rows as filtered.
+    auth = {"Authorization": f"Bearer {tok(tenant='acme')}"}
+    check("filter: status class", _curl(f"{base}/v1/acme/list?status=5xx", headers=auth),
+          expect_status=200, reject=False)
+    check("filter: exact status", _curl(f"{base}/v1/acme/list?status=404", headers=auth),
+          expect_status=200, reject=False)
+    check("filter: failures", _curl(f"{base}/v1/acme/list?failures=1", headers=auth),
+          expect_status=200, reject=False)
+    check("filter: everything at once",
+          _curl(f"{base}/v1/acme/list?status=2xx&failures=1&method=GET"
+                f"&activation=inbound&path=%2Fapi%2Fcheckout", headers=auth),
+          expect_status=200, reject=False)
+    check("filter: tag + columns compose",
+          _curl(f"{base}/v1/acme/list?tag.session=s1&status=5xx", headers=auth),
+          expect_status=200, reject=False)
+    check("filter: bad status is a loud 400",
+          _curl(f"{base}/v1/acme/list?status=banana", headers=auth),
+          expect_status=400, reject=False)
+    check("filter: bad failures is a loud 400",
+          _curl(f"{base}/v1/acme/list?failures=yes", headers=auth),
+          expect_status=400, reject=False)
+    check("filter: bad path encoding is a loud 400",
+          _curl(f"{base}/v1/acme/list?path=%2", headers=auth),
+          expect_status=400, reject=False)
+
     if failures:
         print(f"\nFAILED ({len(failures)}):")
         for f in failures:
