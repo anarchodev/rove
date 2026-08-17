@@ -346,8 +346,10 @@ pub fn wakesToJson(
 /// trigger_payload (→ `request.ctx`); `export_name` is the resolved wake
 /// export when the arm carried an `{on}` override (G3 — replay must
 /// invoke the same export), "" when the default `onWake` applies.
-/// Bounded input: the batch is one entry per armed watch, so the
-/// JSON is always far under `REQUEST_BODY_CAP`.
+/// Bounded input: the batch is one entry per armed watch, so the wakes
+/// JSON is always far under `REQUEST_BODY_CAP`. The threaded `ctx` is NOT
+/// bounded that way — it is whatever the arming handler passed — so it
+/// takes the same over-cap posture as every other Msg.
 pub fn captureWakeBatchTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
@@ -361,10 +363,17 @@ pub fn captureWakeBatchTapes(
     // (export_fixture's extractCtx reads it back). `ctx_payload` keeps it
     // past the read-taping elision: ctx is consumed unconditionally at
     // install, so `body_read` never flips for it.
-    if (ctx_body.len > 0 and ctx_body.len <= REQUEST_BODY_CAP) {
+    //
+    // The entry is written whenever an envelope EXISTED, and carries the bytes
+    // only when they fit — the same posture as `captureSendCallbackTapes`.
+    // Skipping the entry outright for an over-cap ctx recorded nothing at all,
+    // so a replay saw `request.ctx` undefined and could not tell that from a
+    // wake that threaded no ctx. The length alone is enough to tell those
+    // apart.
+    if (ctx_body.len > 0) {
         readset.trigger_payload.appendTriggerPayload(
             .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(ctx_body.len) },
-            ctx_body,
+            if (ctx_body.len <= REQUEST_BODY_CAP) ctx_body else "",
         ) catch |err| {
             std.log.warn("rove-js wake-ctx capture failed: {s}", .{@errorName(err)});
         };
