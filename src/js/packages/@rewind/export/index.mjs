@@ -77,6 +77,13 @@ function _schedArm(kvh, whenNs, target, msg, key) {
     } catch (_e) { /* corrupt prior record — overwrite below */ }
   }
   const rec = { when_ns: String(rounded), target: target, msg: msg, key: key };
+  // Provenance: the arming saga rides to the fired record as `armed_by`
+  // (handler-shape.md §3.2 — what the seam scan reads to link a fired job
+  // back to whoever started it). Every `_sched/` writer stamps it; a
+  // cross-tenant start stamps the ADMIN saga that armed it, which is
+  // exactly the link an operator wants when a customer's export misfires.
+  if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId)
+    rec.armed_by = request.sagaId;
   kvh.set(byIdKey, JSON.stringify(rec));
   kvh.set(_schedByTimeKey(rounded, id), "");
   return id;
