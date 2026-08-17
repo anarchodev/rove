@@ -476,7 +476,12 @@ const SeedPkg = struct {
 // authority, and the first publish of @rewind/stripe (#307/#310).
 // 1.0.3: oidc's public isRegisteredClientOrigin + login_hint threading
 // (#588) — the one-submission signup's IdP-side allowlist seam.
-const SEED_VERSION = "1.0.3";
+// 1.0.4: the first publish of @rewind/export (#340 — the dashboard's
+// cross-tenant data export imports it, so `^1.0.0` cannot resolve until the
+// registry has it), plus schedule's `armed_by` provenance stamp (#598), which
+// moved that package's bytes after the 1.0.3 seed and would 409 a re-seed at
+// the frozen version.
+const SEED_VERSION = "1.0.4";
 const REGISTRY_TENANT = "registry";
 
 // LEAVES-FIRST: @rewind/jwt has no intra-set dependency and MUST publish before
@@ -492,6 +497,7 @@ const SEED_PACKAGES = [_]SeedPkg{
     .{ .spec = "@rewind/users", .source = @embedFile("pkg_users") },
     .{ .spec = "@rewind/segments", .source = @embedFile("pkg_segments") },
     .{ .spec = "@rewind/schedule", .source = @embedFile("pkg_schedule") },
+    .{ .spec = "@rewind/export", .source = @embedFile("pkg_export") },
     .{ .spec = "@rewind/browser", .source = @embedFile("pkg_browser") },
     .{ .spec = "@rewind/stripe", .source = @embedFile("pkg_stripe") },
     .{ .spec = "@rewind/oauth", .source = @embedFile("pkg_oauth"), .dep_jwt = true },
