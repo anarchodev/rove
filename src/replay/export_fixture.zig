@@ -17,6 +17,16 @@
 //! key isn't in the map, so replay resolves it to not_found (a *new* read the
 //! original never made surfaces the same way, visible in the effect log).
 //!
+//! A payload over the inline cap is not on the tape: the entry keeps a POINTER
+//! (a body-pool slice, or a slice of one of the tenant's content-addressed
+//! objects) and the bytes stay in object storage. Nothing here can follow
+//! either pointer — the puller resolves them through the log-server's body door
+//! and inlines the bytes as `resolved_bodies` (`outOfLinePayloads` names what
+//! to fetch). When one is still unreachable the emitted world OMITS
+//! `request.body`, so a captured world's read-your-tape refusal fires on the
+//! first payload read instead of the handler running against `""`. A missing
+//! input must present as a refusal, never as a plausible empty value.
+//!
 //! Scope: faithful for `inbound` activations, `wake_batch` (
 //! the fired-watch batch rides `activation_bytes`, ctx rides
 //! `trigger_payload`, the resolved export rides `export`), and
@@ -91,16 +101,24 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         if (b64) |s| break :blk try b64decode(a, s);
         break :blk null;
     };
+    // A corrupt or version-mismatched channel is a decode ERROR, not zero
+    // entries: swallowing it turns an unreadable recording into a world that
+    // asserts the activation had no fetch result and no trigger payload — a
+    // fixture that passes while proving nothing.
     const fetch_resp: []const decode.FetchResponseEntry = blk: {
         const b64 = if (tapes) |t| jStr(t, "fetch_responses_b64") else null;
-        if (b64) |s| break :blk decode.decodeFetchResponses(a, try b64decode(a, s)) catch &.{};
+        if (b64) |s| break :blk try decode.decodeFetchResponses(a, try b64decode(a, s));
         break :blk &.{};
     };
     const trigger: []const decode.TriggerPayloadEntry = blk: {
         const b64 = if (tapes) |t| jStr(t, "trigger_payload_b64") else null;
-        if (b64) |s| break :blk decode.decodeTriggerPayload(a, try b64decode(a, s)) catch &.{};
+        if (b64) |s| break :blk try decode.decodeTriggerPayload(a, try b64decode(a, s));
         break :blk &.{};
     };
+    // Out-of-line payloads the puller already fetched through the log-server's
+    // body door, keyed by channel then RAW entry ordinal.
+    const resolved_fetch = resolvedChannel(obj, "fetch_responses");
+    const resolved_trigger = resolvedChannel(obj, "trigger_payload");
     const activation_bytes: ?[]const u8 = blk: {
         const b64 = if (tapes) |t| jStr(t, "activation_bytes_b64") else null;
         if (b64) |s| break :blk try b64decode(a, s);
@@ -183,23 +201,58 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     var fetch_id: ?[]const u8 = null;
     var fetch_body: ?[]const u8 = null;
     if (fetch_resp.len != 0) {
+        // Every chunk contributes or the body is a LIE: a partly-spilled
+        // multi-chunk fetch concatenated from the carried chunks alone is
+        // plausible-but-short, which replays as real data. One unreachable
+        // chunk sinks the whole body.
         var body = std.ArrayList(u8){};
-        for (fetch_resp) |e| try body.appendSlice(a, e.inline_bytes);
-        fetch_body = body.items;
+        var whole = true;
+        for (fetch_resp, 0..) |e, i| {
+            if (entryBytes(a, decode.fetchPayloadFate(e), resolved_fetch, i)) |b|
+                try body.appendSlice(a, b)
+            else
+                whole = false;
+        }
+        if (whole) fetch_body = body.items;
+        // The event metadata is recorded on the entry itself, so it stays
+        // true even when the payload is unreachable.
         const last = fetch_resp[fetch_resp.len - 1];
         fetch_id = last.fetch_id;
         fetch_done = last.final;
         if (last.final) fetch_status = last.terminal_status;
     }
+    // The trigger_payload entry: an inbound activation's request body, else a
+    // resume's `{"ctx":…}` envelope. Null when the entry names bytes that are
+    // not reachable from the record.
+    const trigger_env: ?[]const u8 = if (trigger.len != 0)
+        entryBytes(a, decode.triggerPayloadFate(trigger[0]), resolved_trigger, 0)
+    else
+        null;
+    const trigger_is_body = std.mem.eql(u8, activation, "inbound") or
+        std.mem.eql(u8, activation, "inbound_headers") or
+        std.mem.eql(u8, activation, "inbound_chunk");
+
     // request.body: the fetch result body (fetch_chunk) else the inbound body.
-    const eff_body: ?[]const u8 = fetch_body orelse body_bytes;
-    const eff_body_present = fetch_body != null or body_read;
+    // `null` here means the payload is UNREACHABLE, not empty — the world then
+    // omits `request.body` entirely, which leaves a captured world's payload
+    // accessors on their read-your-tape refusal (epilogue's `miss`) instead of
+    // serving `""` as if the handler had really read nothing.
+    const eff_body: ?[]const u8 = blk: {
+        if (fetch_resp.len != 0) break :blk fetch_body;
+        if (body_bytes) |b| break :blk b;
+        // A body over the inline cap is absent from `request_body_b64` and
+        // present only as the trigger entry's pointer, so THAT entry — not the
+        // missing inline field — decides between "empty" and "elsewhere".
+        if (trigger_is_body and trigger.len != 0) break :blk trigger_env;
+        // Nothing out of line: a read body with no recorded bytes was empty.
+        break :blk if (body_read) "" else null;
+    };
 
     // ── ctx (from the trigger_payload `{"ctx": …}` envelope) ──
     const ctx_json: ?[]const u8 = blk: {
-        if (trigger.len != 0 and trigger[0].batch_id == decode.NO_BATCH and trigger[0].inline_bytes.len != 0)
-            break :blk extractCtx(a, trigger[0].inline_bytes);
-        break :blk null;
+        const env = trigger_env orelse break :blk null;
+        if (env.len == 0) break :blk null;
+        break :blk extractCtx(a, env);
     };
 
     // ── send_callback: the trigger_payload envelope IS the Msg
@@ -213,10 +266,9 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     var scb_result: ?std.json.ObjectMap = null;
     var scb_ctx_json: ?[]const u8 = null;
     if (std.mem.eql(u8, activation, "send_callback") and
-        trigger.len != 0 and trigger[0].batch_id == decode.NO_BATCH and
-        trigger[0].inline_bytes.len != 0)
+        trigger_env != null and trigger_env.?.len != 0)
     scb: {
-        const env = std.json.parseFromSlice(std.json.Value, a, trigger[0].inline_bytes, .{}) catch break :scb;
+        const env = std.json.parseFromSlice(std.json.Value, a, trigger_env.?, .{}) catch break :scb;
         if (env.value != .object) break :scb;
         const cv = env.value.object.get("ctx") orelse break :scb;
         if (cv != .object) break :scb;
@@ -283,9 +335,11 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         }
         try w.writeAll(" }");
     }
-    if (eff_body_present) {
+    // Emitted only with bytes in hand. An absent `request.body` is what makes
+    // an unreachable payload REFUSE on replay rather than read as empty.
+    if (eff_body) |b| {
         try w.writeAll(",\n    \"body\": ");
-        try jsonStr(w, eff_body orelse "");
+        try jsonStr(w, b);
     }
     if (ip) |v| {
         try w.writeAll(",\n    \"ip\": ");
@@ -423,6 +477,92 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try std.json.Stringify.value(sv, .{}, w);
     }
     try w.writeAll("\n}\n");
+}
+
+/// The `resolved_bodies.<channel>` map a puller writes into the fixture:
+/// `{ "<raw entry ordinal>": "<standard base64>" }`, addressed exactly the way
+/// the log-server's body door is (channel + raw ordinal, never a raw
+/// `{batch_id, offset, len}` — see `outOfLinePayloads`).
+fn resolvedChannel(obj: std.json.ObjectMap, channel: []const u8) ?std.json.ObjectMap {
+    const rb = obj.get("resolved_bodies") orelse return null;
+    if (rb != .object) return null;
+    const ch = rb.object.get(channel) orelse return null;
+    return if (ch == .object) ch.object else null;
+}
+
+/// The bytes for one tape entry: carried on the entry, else the resolution the
+/// puller inlined, else null — "this payload is named by the record but is not
+/// reachable from it". Nothing offline can follow a pool or content pointer, so
+/// null is the honest answer, and every caller must express it as an absence
+/// rather than as empty bytes.
+fn entryBytes(
+    a: std.mem.Allocator,
+    fate: decode.PayloadFate,
+    resolved: ?std.json.ObjectMap,
+    index: usize,
+) ?[]const u8 {
+    switch (fate) {
+        .carried => |b| return b,
+        .empty => return "",
+        // `not_recorded` is unresolvable at the door too (the payload was
+        // recorded as nothing); it looks here only so a puller that somehow
+        // supplied bytes is still believed.
+        .pool, .content, .not_recorded => {
+            const m = resolved orelse return null;
+            var key_buf: [24]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{d}", .{index}) catch return null;
+            const v = m.get(key) orelse return null;
+            if (v != .string) return null;
+            return b64decode(a, v.string) catch null;
+        },
+    }
+}
+
+/// One payload the record names by POINTER instead of carrying — the address
+/// the log-server's body door takes
+/// (`GET /v1/{tenant}/body/{request_id}/{channel}/{index}`). `index` is the RAW
+/// entry ordinal within the channel, never a filtered one, because the door
+/// derives the reference server-side from the record: a caller-supplied
+/// `{batch_id, offset}` would address the cross-tenant body pool directly and
+/// let anyone past the tenant gate walk a neighbour's bytes.
+pub const OutOfLine = struct {
+    channel: []const u8,
+    index: u32,
+};
+
+/// Enumerate every out-of-line payload in a pulled bundle, so the puller can
+/// resolve each through the door and inline the bytes back as
+/// `resolved_bodies` before the transcode runs. Returns an empty slice when the
+/// whole recording rode inline (the common case) — and, deliberately, when a
+/// channel does not decode: an unreadable tape is the transcode's error to
+/// report, not a reason for the puller to fail first.
+pub fn outOfLinePayloads(a: std.mem.Allocator, fixture_json: []const u8) Error![]const OutOfLine {
+    const parsed = std.json.parseFromSlice(std.json.Value, a, fixture_json, .{}) catch
+        return Error.BadFixture;
+    if (parsed.value != .object) return Error.BadFixture;
+    const tapes = if (parsed.value.object.get("tapes")) |v|
+        (if (v == .object) v.object else return &.{})
+    else
+        return &.{};
+
+    var out = std.ArrayList(OutOfLine){};
+    if (jStr(tapes, "trigger_payload_b64")) |s| {
+        if (decode.decodeTriggerPayload(a, try b64decode(a, s))) |entries| {
+            for (entries, 0..) |e, i| switch (decode.triggerPayloadFate(e)) {
+                .pool => try out.append(a, .{ .channel = "trigger_payload", .index = @intCast(i) }),
+                else => {},
+            };
+        } else |_| {}
+    }
+    if (jStr(tapes, "fetch_responses_b64")) |s| {
+        if (decode.decodeFetchResponses(a, try b64decode(a, s))) |entries| {
+            for (entries, 0..) |e, i| switch (decode.fetchPayloadFate(e)) {
+                .pool, .content => try out.append(a, .{ .channel = "fetch_responses", .index = @intCast(i) }),
+                else => {},
+            };
+        } else |_| {}
+    }
+    return out.toOwnedSlice(a);
 }
 
 /// Extract the threaded ctx from a trigger_payload `{"ctx": <value>}` envelope —
@@ -589,35 +729,52 @@ test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue 
     try testing.expectEqualStrings("timer", w1.get("kind").?.string);
 }
 
-/// Build a base64 trigger_payload tape carrying one inline envelope
-/// (mirrors the encodeEntry format `decodeTriggerPayload` reads).
-fn b64TriggerTape(a: std.mem.Allocator, envelope: []const u8) ![]const u8 {
+/// One trigger_payload entry as the tape records it. `batch_id != NO_BATCH`
+/// with empty `inline_bytes` is the SPILLED shape — a body over the inline cap,
+/// whose bytes live in the body pool and never touch the tape. Test helpers
+/// that can only produce the inline shape make the spilled branches
+/// unreachable, so a test over them proves nothing.
+const TriggerRec = struct {
+    batch_id: u64 = decode.NO_BATCH,
+    ref_len: u32,
+    inline_bytes: []const u8 = "",
+};
+
+fn b64TriggerTapeRecs(a: std.mem.Allocator, recs: []const TriggerRec) ![]const u8 {
     var buf = std.ArrayList(u8){};
     defer buf.deinit(a);
     var hdr: [12]u8 = undefined;
     std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
     std.mem.writeInt(u16, hdr[4..6], decode.VERSION, .big);
     std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.trigger_payload), .big);
-    std.mem.writeInt(u32, hdr[8..12], 1, .big);
+    std.mem.writeInt(u32, hdr[8..12], @intCast(recs.len), .big);
     try buf.appendSlice(a, &hdr);
-    var ent = std.ArrayList(u8){};
-    defer ent.deinit(a);
-    var b8: [8]u8 = undefined;
-    std.mem.writeInt(u64, &b8, decode.NO_BATCH, .big); // batch_id
-    try ent.appendSlice(a, &b8);
-    std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
-    try ent.appendSlice(a, &b8);
-    var b4: [4]u8 = undefined;
-    std.mem.writeInt(u32, &b4, @intCast(envelope.len), .big); // body_ref.len
-    try ent.appendSlice(a, &b4);
-    try putLen(&ent, a, envelope);
-    std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
-    try buf.appendSlice(a, &b4);
-    try buf.appendSlice(a, ent.items);
+    for (recs) |r| {
+        var ent = std.ArrayList(u8){};
+        defer ent.deinit(a);
+        var b8: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b8, r.batch_id, .big); // batch_id
+        try ent.appendSlice(a, &b8);
+        std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
+        try ent.appendSlice(a, &b8);
+        var b4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b4, r.ref_len, .big); // body_ref.len
+        try ent.appendSlice(a, &b4);
+        try putLen(&ent, a, r.inline_bytes);
+        std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
+        try buf.appendSlice(a, &b4);
+        try buf.appendSlice(a, ent.items);
+    }
     const enc = std.base64.standard.Encoder;
     const out = try a.alloc(u8, enc.calcSize(buf.items.len));
     _ = enc.encode(out, buf.items);
     return out;
+}
+
+/// Build a base64 trigger_payload tape carrying one inline envelope
+/// (mirrors the encodeEntry format `decodeTriggerPayload` reads).
+fn b64TriggerTape(a: std.mem.Allocator, envelope: []const u8) ![]const u8 {
+    return b64TriggerTapeRecs(a, &.{.{ .ref_len = @intCast(envelope.len), .inline_bytes = envelope }});
 }
 
 test "transcode: send_callback envelope -> flattened result surface + bag + bare ctx (issue #67)" {
@@ -694,47 +851,77 @@ test "transcode: send_callback bare-ctx envelope (no result) lifts ctx whole (is
     try testing.expectEqual(@as(i64, 1), wo.get("ctx").?.object.get("step").?.integer);
 }
 
-/// Build a base64 fetch_responses tape with one terminal, inline-body entry
-/// (mirrors the encodeEntry format `decodeFetchResponses` reads).
-fn b64FetchTape(a: std.mem.Allocator, fid: []const u8, status: u16, body: []const u8) ![]const u8 {
+/// One fetch_responses chunk as the tape records it. The three pointer shapes
+/// are reachable from here — carried (`inline_bytes`), pool
+/// (`batch_id != NO_BATCH`), content (`content_hash` + `ref_len`, bytes left in
+/// content-addressed storage) — plus the metadata-only fate (`ref_len > 0` with
+/// no bytes and no pointer). A helper that could only write the carried shape
+/// left every other branch untestable.
+const FetchRec = struct {
+    fid: []const u8 = "ftch_1",
+    seq: u32 = 0,
+    byte_offset: u64 = 0,
+    batch_id: u64 = decode.NO_BATCH,
+    ref_len: u32,
+    final: bool = true,
+    status: u16 = 200,
+    body: []const u8 = "",
+    content_hash: []const u8 = "",
+};
+
+fn b64FetchTapeRecs(a: std.mem.Allocator, recs: []const FetchRec) ![]const u8 {
     var buf = std.ArrayList(u8){};
     defer buf.deinit(a);
     var hdr: [12]u8 = undefined;
     std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
     std.mem.writeInt(u16, hdr[4..6], decode.VERSION, .big);
     std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.fetch_responses), .big);
-    std.mem.writeInt(u32, hdr[8..12], 1, .big);
+    std.mem.writeInt(u32, hdr[8..12], @intCast(recs.len), .big);
     try buf.appendSlice(a, &hdr);
-    var ent = std.ArrayList(u8){};
-    defer ent.deinit(a);
-    var b8: [8]u8 = undefined;
-    var b4: [4]u8 = undefined;
-    var b2: [2]u8 = undefined;
-    try putLen(&ent, a, fid); // fetch_id
-    std.mem.writeInt(u32, &b4, 0, .big); // seq
-    try ent.appendSlice(a, &b4);
-    std.mem.writeInt(u64, &b8, 0, .big); // byte_offset
-    try ent.appendSlice(a, &b8);
-    std.mem.writeInt(u64, &b8, decode.NO_BATCH, .big); // batch_id (inline)
-    try ent.appendSlice(a, &b8);
-    std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
-    try ent.appendSlice(a, &b8);
-    std.mem.writeInt(u32, &b4, @intCast(body.len), .big); // body_ref.len
-    try ent.appendSlice(a, &b4);
-    try ent.append(a, 1); // final
-    std.mem.writeInt(u16, &b2, status, .big); // status
-    try ent.appendSlice(a, &b2);
-    try ent.append(a, 1); // ok (recorded on the tape, but NOT surfaced — status is the single signal, #7)
-    try ent.append(a, 0); // trunc
-    try putLen(&ent, a, "{}"); // headers
-    try putLen(&ent, a, body); // inline_bytes
-    std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
-    try buf.appendSlice(a, &b4);
-    try buf.appendSlice(a, ent.items);
+    for (recs) |r| {
+        var ent = std.ArrayList(u8){};
+        defer ent.deinit(a);
+        var b8: [8]u8 = undefined;
+        var b4: [4]u8 = undefined;
+        var b2: [2]u8 = undefined;
+        try putLen(&ent, a, r.fid); // fetch_id
+        std.mem.writeInt(u32, &b4, r.seq, .big); // seq
+        try ent.appendSlice(a, &b4);
+        std.mem.writeInt(u64, &b8, r.byte_offset, .big); // byte_offset
+        try ent.appendSlice(a, &b8);
+        std.mem.writeInt(u64, &b8, r.batch_id, .big); // batch_id
+        try ent.appendSlice(a, &b8);
+        std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
+        try ent.appendSlice(a, &b8);
+        std.mem.writeInt(u32, &b4, r.ref_len, .big); // body_ref.len
+        try ent.appendSlice(a, &b4);
+        try ent.append(a, if (r.final) 1 else 0); // final
+        std.mem.writeInt(u16, &b2, r.status, .big); // status
+        try ent.appendSlice(a, &b2);
+        try ent.append(a, 1); // ok (recorded on the tape, but NOT surfaced — status is the single signal, #7)
+        try ent.append(a, 0); // trunc
+        try putLen(&ent, a, "{}"); // headers
+        try putLen(&ent, a, r.body); // inline_bytes
+        try putLen(&ent, a, r.content_hash); // v6 trailing content hash
+        std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
+        try buf.appendSlice(a, &b4);
+        try buf.appendSlice(a, ent.items);
+    }
     const enc = std.base64.standard.Encoder;
     const out = try a.alloc(u8, enc.calcSize(buf.items.len));
     _ = enc.encode(out, buf.items);
     return out;
+}
+
+/// Build a base64 fetch_responses tape with one terminal, inline-body entry
+/// (mirrors the encodeEntry format `decodeFetchResponses` reads).
+fn b64FetchTape(a: std.mem.Allocator, fid: []const u8, status: u16, body: []const u8) ![]const u8 {
+    return b64FetchTapeRecs(a, &.{.{
+        .fid = fid,
+        .status = status,
+        .ref_len = @intCast(body.len),
+        .body = body,
+    }});
 }
 
 test "transcode: fetch_chunk emits a world world.zig accepts — no stray `ok` key (issue #214)" {
@@ -770,6 +957,318 @@ test "transcode: fetch_chunk emits a world world.zig accepts — no stray `ok` k
     try testing.expectEqualStrings("upstream-body", w.body.?); // → request.bytes on replay
     // And explicitly: no `ok` on the request surface.
     try testing.expect(wp.value.object.get("request").?.object.get("ok") == null);
+}
+
+/// A base64 request_reads tape carrying a single `body_read` entry — the
+/// recorded fact that the handler read its payload. It is what makes the
+/// spilled-body case sharp: `body_read` is TRUE while the bytes are absent.
+fn b64BodyReadTape(a: std.mem.Allocator) ![]const u8 {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(a);
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
+    std.mem.writeInt(u16, hdr[4..6], decode.VERSION, .big);
+    std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.request_reads), .big);
+    std.mem.writeInt(u32, hdr[8..12], 1, .big);
+    try buf.appendSlice(a, &hdr);
+    var ent = std.ArrayList(u8){};
+    defer ent.deinit(a);
+    try ent.append(a, @intFromEnum(decode.RequestReadKind.body_read));
+    try putLen(&ent, a, "");
+    try putLen(&ent, a, "");
+    var b4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
+    try buf.appendSlice(a, &b4);
+    try buf.appendSlice(a, ent.items);
+    const enc = std.base64.standard.Encoder;
+    const out = try a.alloc(u8, enc.calcSize(buf.items.len));
+    _ = enc.encode(out, buf.items);
+    return out;
+}
+
+/// Parse an emitted world and hand back its `request` object.
+fn reqOf(a: std.mem.Allocator, out: []const u8) !std.json.ObjectMap {
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    return wp.value.object.get("request").?.object;
+}
+
+test "transcode: a spilled inbound body REFUSES — it never becomes an empty body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The recording says the handler READ a body; the body was over the inline
+    // cap, so the record carries no `request_body_b64` and the trigger entry
+    // holds a body-pool pointer instead of the bytes.
+    const reads_b64 = try b64BodyReadTape(a);
+    const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .batch_id = 42, .ref_len = 65536 }});
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"inbound",
+        \\   "request": {{ "method":"POST", "path":"/upload", "host":"h" }},
+        \\   "seed":"1", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "request_reads_b64":"{s}", "trigger_payload_b64":"{s}" }}, "sources":[] }}
+    , .{ reads_b64, tp_b64 });
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    // THE regression: `"body": ""` here asserts an empty payload the handler
+    // would read as real. The world must carry no body at all, which leaves a
+    // captured world's payload accessors on their read-your-tape refusal.
+    const req = try reqOf(a, out.items);
+    try testing.expect(req.get("body") == null);
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const wv = try world.fromValue(a, wp.value);
+    try testing.expect(wv.body == null);
+    try testing.expect(wv.captured);
+
+    // And the address the puller needs to fix it, in the door's own terms.
+    const pending = try outOfLinePayloads(a, fixture);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings("trigger_payload", pending[0].channel);
+    try testing.expectEqual(@as(u32, 0), pending[0].index);
+}
+
+test "transcode: a resolved spilled body is inlined verbatim" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const reads_b64 = try b64BodyReadTape(a);
+    const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .batch_id = 42, .ref_len = 11 }});
+    var body_b64_buf: [32]u8 = undefined;
+    const body_b64 = std.base64.standard.Encoder.encode(&body_b64_buf, "spilled-BODY");
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"inbound",
+        \\   "request": {{ "method":"POST", "path":"/upload", "host":"h" }},
+        \\   "seed":"1", "timestamp_ns":"1700000000000000000",
+        \\   "resolved_bodies": {{ "trigger_payload": {{ "0": "{s}" }} }},
+        \\   "tapes": {{ "request_reads_b64":"{s}", "trigger_payload_b64":"{s}" }}, "sources":[] }}
+    , .{ body_b64, reads_b64, tp_b64 });
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const req = try reqOf(a, out.items);
+    try testing.expectEqualStrings("spilled-BODY", req.get("body").?.string);
+}
+
+test "transcode: an empty body that WAS read stays an empty body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No trigger entry is recorded for a zero-length body, so `body_read`
+    // with nothing out of line means the payload really was empty — the one
+    // case where `""` is the truth and not a fabrication.
+    const reads_b64 = try b64BodyReadTape(a);
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"inbound",
+        \\   "request": {{ "method":"POST", "path":"/x", "host":"h" }},
+        \\   "seed":"1", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "request_reads_b64":"{s}" }}, "sources":[] }}
+    , .{reads_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+    const req = try reqOf(a, out.items);
+    try testing.expectEqualStrings("", req.get("body").?.string);
+}
+
+test "transcode: one unreachable chunk sinks the whole fetch body — no silent truncation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A two-chunk fetch where the second spilled to the pool. Concatenating
+    // only the carried chunk yields "head" — plausible, short, and wrong.
+    const fr_b64 = try b64FetchTapeRecs(a, &.{
+        .{ .seq = 0, .final = false, .status = 0, .ref_len = 4, .body = "head" },
+        .{ .seq = 1, .final = true, .status = 200, .byte_offset = 4, .batch_id = 9, .ref_len = 40000 },
+    });
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk", "export":"onUpstream",
+        \\   "request": {{ "method":"POST", "path":"/x", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "fetch_responses_b64":"{s}" }}, "sources":[] }}
+    , .{fr_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const req = try reqOf(a, out.items);
+    try testing.expect(req.get("body") == null);
+    // The event metadata is recorded on the entry, so it survives intact.
+    try testing.expectEqual(@as(i64, 200), req.get("status").?.integer);
+    try testing.expect(req.get("done").?.bool);
+
+    // The door address is the RAW ordinal within the channel — index 1, not
+    // "the first out-of-line one".
+    const pending = try outOfLinePayloads(a, fixture);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings("fetch_responses", pending[0].channel);
+    try testing.expectEqual(@as(u32, 1), pending[0].index);
+
+    // Resolved, the body is whole.
+    var tail_buf: [32]u8 = undefined;
+    const tail_b64 = std.base64.standard.Encoder.encode(&tail_buf, "-tail");
+    const resolved_fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk", "export":"onUpstream",
+        \\   "request": {{ "method":"POST", "path":"/x", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "resolved_bodies": {{ "fetch_responses": {{ "1": "{s}" }} }},
+        \\   "tapes": {{ "fetch_responses_b64":"{s}" }}, "sources":[] }}
+    , .{ tail_b64, fr_b64 });
+    var out2 = std.ArrayList(u8){};
+    defer out2.deinit(a);
+    try transcode(a, resolved_fixture, &out2);
+    try testing.expectEqualStrings("head-tail", (try reqOf(a, out2.items)).get("body").?.string);
+}
+
+test "transcode: a content-referenced chunk is addressed, not dropped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A `blob.get` chunk leaves its bytes in content-addressed storage: the
+    // entry names the object and carries NO_BATCH, so a batch_id-only check
+    // reads it as inline-and-empty.
+    const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const fr_b64 = try b64FetchTapeRecs(a, &.{
+        .{ .seq = 0, .final = true, .status = 200, .ref_len = 4096, .content_hash = hash },
+    });
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk",
+        \\   "request": {{ "method":"GET", "path":"/x", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "fetch_responses_b64":"{s}" }}, "sources":[] }}
+    , .{fr_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+    try testing.expect((try reqOf(a, out.items)).get("body") == null);
+
+    const pending = try outOfLinePayloads(a, fixture);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings("fetch_responses", pending[0].channel);
+    try testing.expectEqual(@as(u32, 0), pending[0].index);
+}
+
+test "transcode: terminal-only chunk is empty; a claimed-but-unkept payload refuses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ref_len 0 — a transport failure closes the chain with a status and no
+    // bytes. That IS an empty body.
+    const empty_b64 = try b64FetchTapeRecs(a, &.{.{ .final = true, .status = 0, .ref_len = 0 }});
+    const empty_fx = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk",
+        \\   "request": {{ "method":"GET", "path":"/x", "host":"h" }},
+        \\   "seed":"1", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "fetch_responses_b64":"{s}" }}, "sources":[] }}
+    , .{empty_b64});
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, empty_fx, &out);
+    try testing.expectEqualStrings("", (try reqOf(a, out.items)).get("body").?.string);
+
+    // ref_len > 0 with no bytes and no pointer — the entry claims a payload it
+    // kept nowhere. Nothing can resolve it, so it must refuse rather than read
+    // as the empty body above.
+    const lost_b64 = try b64FetchTapeRecs(a, &.{.{ .final = true, .status = 200, .ref_len = 1024 }});
+    const lost_fx = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk",
+        \\   "request": {{ "method":"GET", "path":"/x", "host":"h" }},
+        \\   "seed":"1", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "fetch_responses_b64":"{s}" }}, "sources":[] }}
+    , .{lost_b64});
+    var out2 = std.ArrayList(u8){};
+    defer out2.deinit(a);
+    try transcode(a, lost_fx, &out2);
+    try testing.expect((try reqOf(a, out2.items)).get("body") == null);
+    // It is not a door address either — the door has nothing to fetch.
+    try testing.expectEqual(@as(usize, 0), (try outOfLinePayloads(a, lost_fx)).len);
+}
+
+test "transcode: a send_callback envelope over the cap loses its result surface, not silently" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An over-cap envelope records a metadata-only entry: the record says an
+    // envelope existed and kept none of it.
+    const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .ref_len = 20000 }});
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"hooks.mjs", "activation":"send_callback",
+        \\   "request": {{ "method":"POST", "path":"/hooks", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "trigger_payload_b64":"{s}" }}, "sources":[] }}
+    , .{tp_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const req = wp.value.object.get("request").?.object;
+    // No fabricated outcome: no flattened result, no bag, and no payload —
+    // so the first payload read on replay refuses.
+    try testing.expect(req.get("status") == null);
+    try testing.expect(req.get("activation") == null);
+    try testing.expect(req.get("body") == null);
+    try testing.expect(req.get("bodyB64") == null);
+    try testing.expect(wp.value.object.get("ctx") == null);
+}
+
+test "transcode: a corrupt tape channel fails loud, not as zero entries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Swallowing the decode error would emit a world asserting the activation
+    // had no fetch result — a green fixture over an unreadable recording.
+    var raw = std.ArrayList(u8){};
+    defer raw.deinit(a);
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
+    std.mem.writeInt(u16, hdr[4..6], decode.VERSION + 1, .big); // a version this reader cannot know
+    std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.fetch_responses), .big);
+    std.mem.writeInt(u32, hdr[8..12], 0, .big);
+    try raw.appendSlice(a, &hdr);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try a.alloc(u8, enc.calcSize(raw.items.len));
+    _ = enc.encode(b64, raw.items);
+
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk",
+        \\   "request": {{ "method":"GET", "path":"/x", "host":"h" }},
+        \\   "tapes": {{ "fetch_responses_b64":"{s}" }}, "sources":[] }}
+    , .{b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try testing.expectError(decode.Error.BadVersion, transcode(a, fixture, &out));
+}
+
+test "outOfLinePayloads: an all-inline recording needs no door" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fr_b64 = try b64FetchTape(a, "ftch_1", 200, "upstream-body");
+    const tp_b64 = try b64TriggerTape(a, "{\"ctx\":{\"x\":1}}");
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"fetch_chunk",
+        \\   "tapes": {{ "fetch_responses_b64":"{s}", "trigger_payload_b64":"{s}" }} }}
+    , .{ fr_b64, tp_b64 });
+    try testing.expectEqual(@as(usize, 0), (try outOfLinePayloads(a, fixture)).len);
+    // And a fixture with no tapes at all.
+    try testing.expectEqual(@as(usize, 0), (try outOfLinePayloads(a, "{}")).len);
 }
 
 test "isFaithfulTranscode" {
