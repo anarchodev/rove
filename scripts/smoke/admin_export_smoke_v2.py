@@ -171,8 +171,13 @@ def main() -> int:
         check("A: the kv part carries the seeded keys",
               '"data/0007"' in proc.stdout and '"value-7"' in proc.stdout,
               proc.stdout[:120])
+        # The job's own `_export/{id}` record is excluded from its own walk.
+        # Keyed on the parsed KEYS — the `_sched/by_id/` watchdog row's VALUE
+        # legitimately contains the marker key as its idempotency key.
+        marker_keys = [json.loads(ln)["key"] for ln in proc.stdout.splitlines()
+                       if ln.strip()]
         check("A: the job's own marker is not in the artifact",
-              '"_export/' not in proc.stdout, "")
+              not any(k.startswith("_export/") for k in marker_keys), "")
 
         # The bundle part IS the deployment manifest; a manifest entry's hash
         # downloads through the scoped fileUrl — the pointers are real.
@@ -207,6 +212,19 @@ def main() -> int:
           "target's group leader")
     with V2Cluster.spawn("adminexp3", nodes=3) as c:
         c._ensure_admin_app()
+        # Provision + deploy every candidate BEFORE the probe replaces
+        # __admin__'s standing deploy app — after that, no deploy path exists.
+        provisioned = []
+        for i in range(5):
+            t = f"expb-t{i}"
+            r = c.provision(t)
+            if r.status != 200:
+                continue
+            c.deploy_handlers(t, {"index.mjs": TARGET_SRC})
+            provisioned.append(t)
+        check("B: candidate targets provisioned", len(provisioned) >= 2,
+              f"provisioned={provisioned}")
+
         pkgs, imports = c.firstparty_packages(["@rewind/export"])
         dep = c.deploy_with_packages("__admin__", {"index.mjs": rpc_wrap(PROBE_SRC)}, pkgs, imports)
         check("B: deploy admin probe", bool(dep), f"dep_id={dep}")
@@ -221,12 +239,7 @@ def main() -> int:
         # the proposing node could arm the target's watermark).
         divergent = None
         candidates = []
-        for i in range(5):
-            t = f"expb-t{i}"
-            r = c.provision(t)
-            if r.status != 200:
-                continue
-            c.deploy_handlers(t, {"index.mjs": TARGET_SRC})
+        for t in provisioned:
             lt = c.leader_node(t)
             candidates.append((t, lt))
             if lt is not None and admin_leader is not None and lt != admin_leader:
