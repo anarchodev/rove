@@ -104,10 +104,19 @@ size there will usually be something red, and the question worth answering is
 a backlog item; a new one is a regression, and only the second should block you.
 
 `smoke-baseline.json` in this directory is the last recorded full run:
-**155/155 in 9m at `--jobs 8`**. Both former reds are green in it — rove#361
-(`tls_large_body`) and rove#377 (`raft_soak_v2`) are fixed, not waived.
-Refresh the baseline when you fix something, so the next person's diff is
-meaningful.
+**154/155 at `--jobs 8`**, 9–14m depending on box load. The one red is
+rove#361 (`tls_large_body`), recorded red **on purpose**: the bug is open and
+the smoke reproduces it intermittently (it passed two consecutive full runs
+and then hung at 420s in the third, and passes solo almost always). Recording
+its lucky greens would turn every hit of a live bug into a false
+"regression" — the failure mode this whole file warns about. rove#377
+(`raft_soak_v2`) has since gone quiet and is recorded green; if it starts
+flapping again, record it red for the same reason rather than re-litigating
+each run.
+
+Refresh the baseline when you FIX something. Do not refresh it to launder a
+known-flaky red into green — a baseline is a claim about what the suite
+proves, and an over-optimistic one is worse than a stale one.
 
 Running the suite from a **git worktree** needs `REWIND_APPS_DIR` pointed at a
 rewind-apps checkout: `APPS_DIR` defaults to `<repo>/web`, which only the main
