@@ -160,6 +160,22 @@ def main() -> int:
             "nonce": nonce,
         })
 
+        # 3a. login_hint threading (the static-marketing-form seam): an
+        #     unauthenticated /authorize forwards the hint into its /login
+        #     bounce, and the login form prefills it. A hint is prefill-only —
+        #     the form still requires the user's own submit.
+        hinted = authorize + "&login_hint=" + urllib.parse.quote(LOGIN_EMAIL)
+        r = idp(hinted)
+        loc = r.headers.get("location", "")
+        lq = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        check("/authorize (no session) forwards login_hint to /login",
+              r.status == 302 and lq.get("login_hint") == [LOGIN_EMAIL],
+              f"got {r.status} loc={loc!r}")
+        r = idp("/login?login_hint=" + urllib.parse.quote(LOGIN_EMAIL))
+        check("GET /login?login_hint → form prefilled",
+              r.status == 200 and 'value="' + LOGIN_EMAIL + '"' in r.body,
+              f"got {r.status} body={r.body[:160]!r}")
+
         # POST /login → magic link + the platform session cookie.
         r = idp("/login", method="POST",
                 headers={"content-type": "application/x-www-form-urlencoded"},
@@ -243,6 +259,35 @@ def main() -> int:
         else:
             check("refresh grant → fresh id_token verifies", False,
                   f"got {tr2.status} {tr2.body[:160]!r}")
+
+        # ── 4b. Cross-origin return_to (the one-submission marketing entry):
+        #     POST /login may name a return_to on a REGISTERED client origin
+        #     (the same allowlist RP-initiated logout uses) — the magic-link
+        #     verify lands the browser there. Any other origin still falls
+        #     back to the issuer root (open-redirect defense).
+        rp_origin_rt = "https://app.localhost/_rp/login"  # admin-dashboard's
+        # ${ISSUER_PARENT} template resolves to app.localhost for this host.
+        r = idp("/login", method="POST",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                data="email=oneshot%40example.com&return_to=" +
+                     urllib.parse.quote(rp_origin_rt))
+        os_link = json.loads(r.body).get("magic_link", "") if r.status == 200 else ""
+        os_sid = re.search(r"__Host-rove_sid=[^;]+", r.headers.get("set-cookie", ""))
+        check("POST /login accepts registered-origin return_to", bool(os_link),
+              f"got {r.status} {r.body[:120]!r}")
+        r = idp(path_of(os_link), headers={"Cookie": os_sid.group(0)} if os_sid else {})
+        check("one-shot verify → 302 to the registered RP origin",
+              r.status == 302 and r.headers.get("location", "") == rp_origin_rt,
+              f"got {r.status} loc={r.headers.get('location','')!r}")
+        r = idp("/login", method="POST",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                data="email=oneshot2%40example.com&return_to=" +
+                     urllib.parse.quote("https://evil.example.com/steal"))
+        ev_link = json.loads(r.body).get("magic_link", "") if r.status == 200 else ""
+        r = idp(path_of(ev_link)) if ev_link else r
+        check("off-registry return_to falls back to issuer root",
+              r.status == 302 and r.headers.get("location", "") == ISS + "/",
+              f"got {r.status} loc={r.headers.get('location','')!r}")
 
         # ── 5. Device authorization grant (RFC 8628 — the CLI flow). ──────
         # This block plays BOTH roles: the CLI (device_authorization + poll

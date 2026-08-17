@@ -402,7 +402,7 @@ class OIDCProvider {
     if (sid) kv.delete(this.cfg.session_path + "/" + sid);
     const q = new URLSearchParams(request.query || "");
     const plru = q.get("post_logout_redirect_uri");
-    if (plru && this._isRegisteredLogoutTarget(plru)) {
+    if (plru && this.isRegisteredClientOrigin(plru)) {
       response.status = 302;
       response.headers = { location: plru };
       return null;
@@ -413,10 +413,22 @@ class OIDCProvider {
       "<p>You have been signed out.</p>";
   }
 
-  // True iff `uri`'s origin (scheme://host[:port]) matches a registered
-  // client redirect_uri's origin. Origin-only — the RP lands the user on its
-  // own post-logout path; we guard the destination host, not the path.
-  _isRegisteredLogoutTarget(uri) {
+  /**
+   * True iff `uri`'s origin (scheme://host[:port]) matches a registered
+   * client redirect_uri's origin — the "may this IdP send a browser
+   * there" question. Origin-only: the destination path is the caller's
+   * to choose; the destination host is governed by the client registry.
+   * Backs RP-Initiated Logout's `post_logout_redirect_uri` validation,
+   * and an IdP's own login UI can use it to accept a cross-origin
+   * `return_to` on a registered RP (the one-submission entry: a static
+   * page POSTs the login form directly and the magic-link verify lands
+   * the browser on the RP's login route) — every browser-bound exit
+   * from the IdP answers to the same allowlist.
+   *
+   * @param {string} uri - Absolute URI whose origin is checked.
+   * @returns {boolean}
+   */
+  isRegisteredClientOrigin(uri) {
     const origin = (u) => {
       const m = /^([a-z][a-z0-9+.\-]*:\/\/[^\/?#]+)/i.exec(u || "");
       return m ? m[1].toLowerCase() : null;
@@ -483,13 +495,22 @@ class OIDCProvider {
     // The human must be authenticated TO THIS IdP (§4.7): the
     // magic-link step bound the per-request sid → user in kv. No
     // session ⇒ bounce to the IdP's own login UI, returning here.
+    // A `login_hint` (standard OIDC authorize parameter) rides along
+    // so the login UI can prefill the email the user already typed
+    // upstream (e.g. the marketing page's form → the RP's beginLogin).
+    // It is a HINT only: the login UI prefills, never auto-submits —
+    // authentication still requires the user's own click, and the
+    // magic-link verify binds whatever address the mint step confirmed,
+    // not the hint.
     const sid = request.session && request.session.id;
     const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
     if (sess_raw == null) {
       const here = this._iss() + "/authorize?" + q.toString();
+      const hint = q.get("login_hint");
       response.status = 302;
       response.headers = {
-        location: this.cfg.login_path + "?return_to=" + encodeURIComponent(here),
+        location: this.cfg.login_path + "?return_to=" + encodeURIComponent(here) +
+          (hint ? "&login_hint=" + encodeURIComponent(hint) : ""),
       };
       return null;
     }
@@ -868,7 +889,11 @@ class OIDCRelyingParty {
    * `GET /_rp/login` handler. Captures the platform sid (must be a
    * real browser request), stashes single-use PKCE state, and 302s
    * to the IdP `/authorize`. Honors a same-origin `?return_to=`
-   * path (open-redirect safe).
+   * path (open-redirect safe) and forwards an optional
+   * `?login_hint=` (standard OIDC parameter) so the IdP's login UI
+   * can prefill an email typed upstream — the seam that lets a
+   * static marketing form carry the address into the PKCE flow it
+   * cannot itself originate.
    *
    * @returns {null} (the redirect is set on `response`); 400 text
    *   when there is no session context.
@@ -884,6 +909,10 @@ class OIDCRelyingParty {
     }
     const q = new URLSearchParams(request.query || "");
     const return_to = this._safePath(q.get("return_to"));
+    // Bounded: a hint is display-prefill data, never authority — cap it
+    // so an attacker-crafted link can't smuggle an absurd query string
+    // through the whole redirect chain.
+    const login_hint = (q.get("login_hint") || "").slice(0, 320);
 
     const state = _b64urlRandom(32);
     const verifier = _b64urlRandom(32);
@@ -902,6 +931,7 @@ class OIDCRelyingParty {
       code_challenge: challenge,
       code_challenge_method: "S256",
     });
+    if (login_hint) p.set("login_hint", login_hint);
     response.status = 302;
     response.headers = {
       location: this.cfg.issuer + "/authorize?" + p.toString(),
