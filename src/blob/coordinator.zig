@@ -45,7 +45,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
-const reservation = @import("reservation.zig");
+const reservation = @import("rove-reserve");
 
 /// Pointer into the bytes a coordinator submission stored. `batch_id`
 /// is globally unique (raft-reserved); the full S3
@@ -74,8 +74,10 @@ pub const BodyRef = struct {
 /// back to a local atomic counter starting at 1 — used by unit tests
 /// and any caller that doesn't need cross-leader uniqueness.
 ///
-/// The reservation machine itself lives in `reservation.zig` (the
-/// `ReservationAllocator`); this is re-exported so `Config` and callers keep
+/// The reservation machine itself is `rove-reserve` (the
+/// `ReservationAllocator`), shared with the keyring's slot allocation —
+/// a reissued id corrupts whatever it names, and that concurrency is
+/// not worth writing twice. Re-exported so `Config` and callers keep
 /// naming `coordinator.ReservationProvider`.
 pub const ReservationProvider = reservation.ReservationProvider;
 
@@ -325,7 +327,7 @@ pub const BlobCoordinator = struct {
     /// The globally-unique `batch_id` source — the raft-reserved-block machine
     /// (or a local counter when `config.reservation` is null). Embedded in
     /// place: its refill thread captures `&self.reservations`, stable because
-    /// the coordinator is heap-allocated. See `reservation.zig`.
+    /// the coordinator is heap-allocated. See `rove-reserve`.
     reservations: reservation.ReservationAllocator = .{},
 
     shutdown_flag: std.atomic.Value(bool) = .init(false),
@@ -390,11 +392,14 @@ pub const BlobCoordinator = struct {
 
         // Configure + spawn the reservation allocator (its refill thread, in
         // production). In place — `self` is at its final heap address now.
-        try self.reservations.start(
-            config.reservation,
-            config.reservation_block_size,
-            config.reservation_low_watermark_pct,
-        );
+        try self.reservations.start(.{
+            .provider = config.reservation,
+            .block_size = config.reservation_block_size,
+            .low_watermark_pct = config.reservation_low_watermark_pct,
+            // 0 is `NO_BATCH`, the coordinator's inline-body sentinel.
+            .first_id = 1,
+            .label = "blob batch ids",
+        });
 
         return self;
     }
@@ -796,7 +801,7 @@ pub const BlobCoordinator = struct {
     ) !void {
         if (subs.len == 0) return;
 
-        const batch_id = try self.reservations.nextBatchId();
+        const batch_id = try self.reservations.next();
         var leaf_buf: [21]u8 = undefined;
         const leaf_str = std.fmt.bufPrint(&leaf_buf, "{d:0>20}", .{batch_id}) catch unreachable;
         const leaf_owned = try self.allocator.dupe(u8, leaf_str);
