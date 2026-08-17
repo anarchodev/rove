@@ -788,7 +788,11 @@ fn captureLogInner(
 /// in → `&.{}` (no alloc).
 fn dupeTags(allocator: std.mem.Allocator, tags: []const log_mod.Tag) ![]log_mod.Tag {
     if (tags.len == 0) return &.{};
-    const n = @min(tags.len, log_mod.MAX_TAGS);
+    // User tags + the engine's own (`_parent`) — the JS surface enforces
+    // the user cap, so the defensive cap here is the sum; capping at
+    // MAX_TAGS alone would silently evict a user's last tag whenever an
+    // engine tag is present.
+    const n = @min(tags.len, log_mod.MAX_TAGS + log_mod.MAX_ENGINE_TAGS);
     const out = try allocator.alloc(log_mod.Tag, n);
     var filled: usize = 0;
     errdefer {

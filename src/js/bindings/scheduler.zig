@@ -89,7 +89,7 @@ pub fn jsSetWake(
     return js_undefined;
 }
 
-// ── `__rove_fire_wake(target, id, key, scheduledAtNs, msg, cleanup)` ─
+// ── `__rove_fire_wake(target, id, key, scheduledAtNs, msg, cleanup, armedBy?)` ─
 
 /// Enqueue one `durable_wake` activation for THIS tenant. Called once
 /// per due `_sched/by_time` entry by `scheduler_tick`. Args:
@@ -102,6 +102,10 @@ pub fn jsSetWake(
 ///   4 msg           — customer payload, JSON-encoded string ("null" ok)
 ///   5 cleanupKeys   — array of `_sched/` keys to delete in the
 ///                     target activation's writeset
+///   6 armedBy       — OPTIONAL: the arming saga's id ("" = absent),
+///                     provenance for the fired record's `_parent` tag.
+///                     Tolerated absent so taped ticks from before the
+///                     field replay without divergence.
 /// Throws if no worker is registered (a fire is never silently lost).
 pub fn jsFireWake(
     ctx: ?*c.JSContext,
@@ -212,6 +216,12 @@ pub fn jsFireWake(
         return globals.js_false;
     }
 
+    // Optional arg 6: the arming saga (`_sched/*.armed_by`) for the
+    // fired record's `_parent` provenance tag. Tolerant — absent on
+    // entries (and taped `scheduler_tick` runs) that predate the field.
+    const armed_by_b: ?Borrowed = if (argc >= 7) borrowStr(ctx, argv[6]) else null;
+    defer if (armed_by_b) |ab| c.JS_FreeCString(ctx, ab.cstr);
+
     const input: globals.FireWakeInput = .{
         .tenant_id = state.instance_id,
         .target = target.slice,
@@ -220,6 +230,7 @@ pub fn jsFireWake(
         .scheduled_at_ns = scheduled_at_ns,
         .msg_json = msg_json.slice,
         .cleanup_keys = slices.items,
+        .armed_by = if (armed_by_b) |ab| (if (ab.slice.len > 0) ab.slice else null) else null,
     };
 
     if (state.side_effects_flag) |f| f.* = true;

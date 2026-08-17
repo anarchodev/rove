@@ -1648,6 +1648,39 @@ test "dispatch: request.tag captured into response.tags (update-in-place)" {
     try testing.expect(saw_session and saw_flow);
 }
 
+test "dispatch: Trace.parent_saga seeds the reserved _parent tag alongside user tags" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\request.tag("flow", "checkout");
+        \\return "x";
+    ,
+        .{ .method = "GET", .path = "/", .trace = .{ .parent_saga = "corr-armed-me" } },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), resp.tags.len);
+    var saw_parent = false;
+    var saw_flow = false;
+    for (resp.tags) |t| {
+        if (std.mem.eql(u8, t.key, "_parent")) {
+            try testing.expectEqualStrings("corr-armed-me", t.value);
+            saw_parent = true;
+        }
+        if (std.mem.eql(u8, t.key, "flow")) saw_flow = true;
+    }
+    try testing.expect(saw_parent and saw_flow);
+}
+
 test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

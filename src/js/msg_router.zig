@@ -575,6 +575,9 @@ pub const MsgRouter = struct {
             dup_count = i + 1;
         }
 
+        const armed_by: ?[]u8 = if (input.armed_by) |ab| try a.dupe(u8, ab) else null;
+        errdefer if (armed_by) |ab| a.free(ab);
+
         const payload: effect_mod.msg.DurableWake = .{
             .tenant_id = tid,
             .module_path = target,
@@ -583,6 +586,7 @@ pub const MsgRouter = struct {
             .msg_json = msg_json,
             .scheduled_at_ns = input.scheduled_at_ns,
             .cleanup_keys = cleanup,
+            .armed_by = armed_by,
         };
         try self.enqueueMsgForTenant(input.tenant_id, .{ .durable_wake = payload });
     }

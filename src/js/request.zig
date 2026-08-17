@@ -296,6 +296,13 @@ pub const Trace = struct {
     /// own tape atom and gets a fresh stamp. 0 on paths that never enter
     /// execution and on test paths that don't care.
     exec_seq: u64 = 0,
+    /// The saga that ARMED this activation, when the arm crossed the
+    /// durability boundary and therefore rooted a new saga (a durable
+    /// wake's `_sched/*.armed_by` — handler-shape.md §3.2). Provenance
+    /// only: the dispatcher stamps it onto the record as the reserved
+    /// `_parent` tag; it never reaches the JS surface. Null everywhere
+    /// else.
+    parent_saga: ?[]const u8 = null,
 };
 
 /// Admin-tenant platform surface. All-null for every non-admin request;

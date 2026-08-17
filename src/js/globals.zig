@@ -355,6 +355,10 @@ pub const FireWakeInput = struct {
     /// The entry's `_sched/` keys to delete in the target activation's
     /// writeset (the JS lib owns the exact key format).
     cleanup_keys: []const []const u8,
+    /// The saga that armed the entry (`_sched/*.armed_by`), or null
+    /// when absent. Provenance for the fired activation's `_parent`
+    /// record tag — the fire still roots its own saga.
+    armed_by: ?[]const u8 = null,
 };
 
 /// One `on.timer(ms)` / `on.kv(prefix,{to?})`
@@ -689,7 +693,7 @@ pub const DispatchState = struct {
     set_wake_ctx: ?*anyopaque = null,
 
     /// §2.6 durable-wake: trampoline backing
-    /// `__rove_fire_wake(target, id, key, scheduledAtNs, msg, cleanupKeys)`.
+    /// `__rove_fire_wake(target, id, key, scheduledAtNs, msg, cleanupKeys, armedBy?)`.
     /// Enqueues one `durable_wake` activation for THIS tenant (routed
     /// to its owning worker via `enqueueDurableWakeForTenant`). The
     /// dispatch path injects `cleanup_keys` as deletes into the target

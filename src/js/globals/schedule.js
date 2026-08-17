@@ -154,6 +154,14 @@
 
     const record = { when_ns: String(rounded), target: target, msg: payload };
     if (key !== null) record.key = key;
+    // Provenance: the saga arming this entry. The FIRE roots its own
+    // saga (crossing the durability boundary starts a new saga —
+    // handler-shape.md §3.2); this rides to the fired record as the
+    // reserved `_parent` tag so the viewer can offer the cross-saga
+    // jump. A re-arm overwrites it: the latest armer is the parent.
+    if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) {
+      record.armed_by = request.sagaId;
+    }
     kv.set(_byIdKey(id), JSON.stringify(record));
     kv.set(_byTimeKey(rounded, id), "");
     return id;

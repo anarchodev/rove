@@ -246,6 +246,27 @@ pub const Dispatcher = struct {
         var tags_buf: std.ArrayList(log_mod.Tag) = .empty;
         errdefer freeTagsBuf(self.allocator, &tags_buf);
 
+        // Engine provenance: an activation whose arm crossed the
+        // durability boundary rooted a NEW saga (handler-shape.md §3.2),
+        // and the arming saga rides its record as the reserved `_parent`
+        // tag so the viewer can offer the cross-saga jump. Seeded before
+        // the handler's own `request.tag` calls; `_`-keys are rejected on
+        // the JS surface, so no collision is possible. Best-effort — a
+        // failed dupe drops the tag, never the activation.
+        if (request.trace.parent_saga) |ps| {
+            if (ps.len > 0) blk: {
+                const k = self.allocator.dupe(u8, log_mod.PARENT_SAGA_TAG) catch break :blk;
+                const v = self.allocator.dupe(u8, ps) catch {
+                    self.allocator.free(k);
+                    break :blk;
+                };
+                tags_buf.append(self.allocator, .{ .key = k, .value = v }) catch {
+                    self.allocator.free(k);
+                    self.allocator.free(v);
+                };
+            }
+        }
+
         var state = globals.DispatchState{
             .allocator = self.allocator,
             .kv = kv,

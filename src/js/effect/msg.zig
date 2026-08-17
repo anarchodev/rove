@@ -176,6 +176,12 @@ pub const DurableWake = struct {
     /// engine never reconstructs the padded-timestamp shape. Owned
     /// slice of owned slices.
     cleanup_keys: [][]u8,
+    /// The saga that armed this entry (`_sched/*.armed_by`), or null
+    /// when the entry predates the field. Provenance only — the fired
+    /// activation ROOTS ITS OWN saga (crossing the durability boundary
+    /// starts a new saga; handler-shape.md §3.2) and this rides to its
+    /// record as the reserved `_parent` tag, never onto the JS surface.
+    armed_by: ?[]u8 = null,
 
     pub fn deinit(self: *DurableWake, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -185,6 +191,7 @@ pub const DurableWake = struct {
         allocator.free(self.msg_json);
         for (self.cleanup_keys) |k| allocator.free(k);
         allocator.free(self.cleanup_keys);
+        if (self.armed_by) |a| allocator.free(a);
         self.* = undefined;
     }
 };

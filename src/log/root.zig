@@ -54,6 +54,16 @@ pub const Tag = struct {
 /// payload — keep cardinality low. Over-cap is a handler bug
 /// (`request.tag` throws), not a silent truncation.
 pub const MAX_TAGS: usize = 4;
+/// Max ENGINE-populated tags per record, on top of `MAX_TAGS` — the
+/// defensive cap downstream copies apply is the sum, so an engine tag
+/// can never silently evict a user's fourth tag.
+pub const MAX_ENGINE_TAGS: usize = 1;
+/// Reserved engine tag: the saga that ARMED an activation whose arm
+/// crossed the durability boundary and therefore rooted a new saga
+/// (handler-shape.md §3.2 — a durable wake's provenance). Stamped by
+/// the dispatcher from `Trace.parent_saga`; `_`-keys are rejected on
+/// the `request.tag` surface, so it cannot collide.
+pub const PARENT_SAGA_TAG = "_parent";
 /// Tag key length cap. Keys are `[a-z0-9_]`.
 pub const MAX_TAG_KEY_LEN: usize = 32;
 /// Tag value length cap. Values should be low-cardinality (a plan

@@ -71,7 +71,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .body = body,
         .query = null,
         .activation = .disconnect,
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id, .exec_seq = p.exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -185,7 +185,7 @@ pub fn fireSubscriptionActivation(
         .body = body,
         .fn_override = subscriptionExport(source),
         .activation = .{ .subscription_fire = .{ .name = subscription_name, .source = source } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full, .exec_seq = p.exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -237,7 +237,7 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .query = null,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .{ .subscription_fire = .{ .name = "__scheduler_tick", .source = null } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full, .exec_seq = p.exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{
@@ -307,7 +307,7 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
             .scheduled_at_ns = 0,
             .msg_json = ctx_json,
         } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full, .exec_seq = p.exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -446,7 +446,7 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
             .scheduled_at_ns = dw.scheduled_at_ns,
             .msg_json = dw.msg_json,
         } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full, .exec_seq = p.exec_seq, .parent_saga = dw.armed_by },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -522,7 +522,7 @@ pub fn fireChainedActivation(
         .fn_override = sc.fn_name,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .send_callback,
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full, .exec_seq = p.exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
@@ -635,7 +635,7 @@ pub fn fireFetchEventActivation(
             .terminal_ok = if (event.final) event.terminal_ok else false,
             .body_truncated = if (event.final) event.body_truncated else false,
         } },
-        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = corr_full, .exec_seq = p.exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{

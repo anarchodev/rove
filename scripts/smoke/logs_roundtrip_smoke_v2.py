@@ -29,8 +29,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
-FIXTURE = {"index.mjs": rpc_wrap(READY_SRC)}
+READY_SRC = (
+    # `schedule` is the `@rewind/schedule` package, not an ambient global.
+    'import schedule from "@rewind/schedule";\n'
+    'export function handler() { return "ready"; }\n'
+    # Arms a durable wake targeting the second module's named export.
+    # The fired activation ROOTS ITS OWN saga (the durability boundary);
+    # the arming saga rides its record as the reserved `_parent` tag.
+    'export function arm() {\n'
+    '  schedule({ in: 1000 }, "wakes.mjs.fired", { note: "hi" }, { key: "smoke-parent" });\n'
+    '  return "armed";\n'
+    '}\n'
+)
+WAKES_SRC = 'export function fired() { return "fired"; }\n'
+FIXTURE = {"index.mjs": rpc_wrap(READY_SRC), "wakes.mjs": WAKES_SRC}
 
 N_REQUESTS = 8
 
@@ -51,7 +63,10 @@ def main() -> int:
         r = c.provision("globex")
         check("provision globex → 200/409", r.status in (200, 409),
               f"got {r.status} {r.body!r}")
-        c.deploy_handlers("globex", FIXTURE)
+        # `@rewind/schedule` rides as a first-party package (the saga
+        # provenance section arms a durable wake through it).
+        pkgs, imports = c.firstparty_packages(["@rewind/schedule"])
+        c.deploy_with_packages("globex", FIXTURE, pkgs, imports)
         c.wait_for_handler("globex", "/?fn=handler", want_body="ready", timeout_s=30.0)
 
         # Generate N logged activations.
@@ -229,6 +244,48 @@ def main() -> int:
         unknown = c.log_get("globex/saga/never-seen", timeout=15.0)
         check("unknown saga is a 404", unknown.status == 404,
               f"status={unknown.status}")
+
+        # ── Saga identity across the durability boundary: an armed wake
+        # fires as its OWN saga, carrying the arming saga as `_parent`.
+        arm = c.request("globex", "/?fn=arm",
+                        headers={"X-Rove-Correlation-Id": "parent-e2e"},
+                        timeout=30.0)
+        check("armed a durable wake from saga parent-e2e",
+              arm.status == 200 and arm.body == "armed",
+              f"status={arm.status} body={arm.body!r}")
+
+        # The wake fires ~1s later; poll for its record via the parent tag.
+        fired = []
+        deadline = time.time() + 45.0
+        last = ""
+        while time.time() < deadline:
+            resp = c.log_get("globex/list?tag._parent=parent-e2e", timeout=15.0)
+            last = resp.body
+            if resp.status == 200:
+                try:
+                    fired = json.loads(resp.body).get("records", [])
+                except json.JSONDecodeError:
+                    fired = []
+                if fired:
+                    break
+            time.sleep(1.0)
+        check("the fired wake's record carries _parent=parent-e2e",
+              len(fired) == 1 and fired[0].get("activation") == "durable_wake",
+              f"records={len(fired)} last={last[:200]!r}")
+
+        # The fired activation roots a FRESH saga — never the armer's.
+        if fired:
+            rid = fired[0].get("request_id")
+            shown = c.log_get(f"globex/show/{rid}", timeout=15.0)
+            wake_saga = ""
+            if shown.status == 200:
+                try:
+                    wake_saga = json.loads(shown.body).get("record", {}).get("saga_id", "")
+                except json.JSONDecodeError:
+                    pass
+            check("the fired wake rooted its own saga (wake-*)",
+                  wake_saga.startswith("wake-") and wake_saga != "parent-e2e",
+                  f"saga_id={wake_saga!r}")
 
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
