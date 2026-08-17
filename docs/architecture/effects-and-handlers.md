@@ -120,6 +120,25 @@ durable next-fire watermark per tenant; everything else is the baked
   `worker_drain.zig` commit arm lowers it when a committed batch touches
   `_sched/` — never set-on-call from the still-uncommitted handler (the
   marker-commit-race lesson).
+- **Cross-tenant schedules arm too** (the target-envelope sched arm). A
+  `platform.scope(t).kv` write of `_sched/` rows rides the batch's target
+  envelope, which builds no anchor Cmds — without its own arm the schedule is
+  silently dead until the target's next leadership transition. Two halves,
+  both leadership-gated on the TARGET's group (the watermark is leader-local
+  state; a non-leader's sweep would busy-fire a tick that can never commit):
+  `Cmd.target_sched_wake` staged per target-envelope `_sched/by_time/` put
+  (`worker_dispatch.appendTargetSchedWakeCmds`, consumed by
+  `noteCommittedSchedWrites`) covers the proposing node — the only half that
+  exists single-node; the `_sched/by_time/` branch of the bridge apply
+  observer (`rewind/main.zig`, the `onDeployApply` seam) covers whichever
+  OTHER node leads the target's group, since applies are skipped on the
+  proposing node. Catch-up re-applies lower spuriously and self-correct (the
+  fired tick re-derives the true min); the no-leader case falls to the
+  promotion pass. This is what lets `@rewind/export.forScope(scope)` start a
+  customer's export from `__admin__` with two ordinary kv writes (rove#340) —
+  and any future cross-tenant schedule compose the same way. Regression gate:
+  `scripts/smoke/admin_export_smoke_v2.py` (both leader placements, with a
+  start-to-done deadline that promotion-pass recovery cannot meet).
 - **Two capability-scoped builtins** (`is_system_module`-gated, survive
   `_harden.js`): `__rove_set_wake(when_ns)` / `__rove_fire_wake`
   (`src/js/bindings/scheduler.zig`). Baked modules can't reach `_system.http`,
