@@ -432,13 +432,22 @@ What roots a saga — the external causes:
   frame (`onMessage`), wake, bound-fetch event, and the final
   `onDisconnect` are hops of the same saga. A held connection IS one
   saga by construction.
-- **A connectionless fire.** A `cron`/`schedule` fire or a
-  subscription fire roots a **new** saga — durability is decoupling:
-  the wake is a fresh external cause (time arrived, the feed pushed),
-  not a continuation of whatever armed it. Thread your own linkage
-  through the schedule's `msg` when you want one. (`webhook.send`
-  results are the exception: the callback continues the saga that
-  sent.)
+- **A connectionless fire.** A `cron`/`schedule` fire, a subscription
+  fire, or a `webhook.send` delivery roots a **new** saga — durability
+  is decoupling: **crossing the durability boundary starts a new
+  saga.** Anything that parks intent in `kv` and fires later (a
+  `_sched/*` entry, an owed-send marker, a subscription's dirty
+  marker) is a fresh external cause when it fires, not a continuation
+  of whatever armed it. The saga follows the *live* continuation
+  structure only: a held connection's chain, or a connectionless
+  root's direct `next()` chain — so a `webhook.send` `{on}` callback
+  belongs to the *delivery's* saga, not the sender's. (The one
+  connection-shaped exception is exactly the rule again: a send bound
+  to a HELD caller resumes the held chain, so it stays in the
+  connection's saga.) The arming saga isn't lost — a durable wake's
+  record carries it as the reserved `_parent` tag, the viewer's
+  cross-saga jump; thread your own linkage through the schedule's
+  `msg` when you want it in-hand.
 
 `request.sagaId` is the saga's id, identical on every hop, and every
 record in your logs is tagged with it (the reserved `_saga` tag), so

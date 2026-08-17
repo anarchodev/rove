@@ -1648,6 +1648,78 @@ test "dispatch: request.tag captured into response.tags (update-in-place)" {
     try testing.expect(saw_session and saw_flow);
 }
 
+test "dispatch: Trace.parent_saga seeds the reserved _parent tag alongside user tags" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    // FOUR user tags — the full quota. The engine tag is stamped after
+    // the handler runs, so it must never consume a customer slot (a
+    // quota throw here would be prod-only AND engine-divergent: the
+    // sim never seeds a parent).
+    var resp = try runOne(
+        &d,
+        kv,
+        \\request.tag("flow", "checkout");
+        \\request.tag("a", "1");
+        \\request.tag("b", "2");
+        \\request.tag("c", "3");
+        \\return "x";
+    ,
+        .{ .method = "GET", .path = "/", .trace = .{ .parent_saga = "corr-armed-me" } },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 5), resp.tags.len);
+    var saw_parent = false;
+    var saw_flow = false;
+    for (resp.tags) |t| {
+        if (std.mem.eql(u8, t.key, "_parent")) {
+            try testing.expectEqualStrings("corr-armed-me", t.value);
+            saw_parent = true;
+        }
+        if (std.mem.eql(u8, t.key, "flow")) saw_flow = true;
+    }
+    try testing.expect(saw_parent and saw_flow);
+}
+
+test "dispatch: a forged/oversized parent_saga is dropped, never stamped" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    const big = "x" ** 300;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return "x";
+    ,
+        .{ .method = "GET", .path = "/", .trace = .{ .parent_saga = big } },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), resp.tags.len);
+
+    var resp2 = try runOne(
+        &d,
+        kv,
+        \\return "x";
+    ,
+        .{ .method = "GET", .path = "/", .trace = .{ .parent_saga = "bad\x01ctl" } },
+    );
+    defer resp2.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), resp2.tags.len);
+}
+
 test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

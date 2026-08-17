@@ -77,7 +77,8 @@ pub const Record = struct {
     /// mislabel every pre-existing WS frame as an inbound request.
     /// Optional on parse. Owned on parse.
     activation: []const u8 = "",
-    /// User-defined index tags (≤`MAX_TAGS`). Carried so the indexer
+    /// User + engine index tags (≤`MAX_RECORD_TAGS` — user tags plus
+    /// engine tags like `_parent`). Carried so the indexer
     /// inserts `log_tags` rows without decompressing. Optional on parse.
     /// Owned key/value on parse.
     tags: []Tag = &.{},

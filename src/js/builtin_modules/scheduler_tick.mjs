@@ -98,6 +98,9 @@ export default function () {
         const target = rec.target;
         const msg = rec.msg === undefined ? null : rec.msg;
         const wakeKey = rec.key === undefined || rec.key === null ? null : rec.key;
+        // Provenance for the fired record's `_parent` tag; "" = absent
+        // (entries written before the field, or armed outside a saga).
+        const armedBy = typeof rec.armed_by === "string" ? rec.armed_by : "";
 
         // Fan out. The two cleanup keys ride into the target's writeset
         // (see fireDurableWakeActivation) so the delete commits with the
@@ -115,6 +118,7 @@ export default function () {
             String(whenNs),
             JSON.stringify(msg),
             [byIdKey, key],
+            armedBy,
         );
         if (!ok) {
             kv.delete(byIdKey);

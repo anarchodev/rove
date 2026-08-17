@@ -1742,6 +1742,38 @@ WebSocket is unstarted; the fairness policy for the callback execution phase
 (a held-sync continuation is a user waiting synchronously — plain FIFO against
 fresh requests is not obviously right) is undecided.
 
+### 13.6 Saga identity: the durability boundary is the saga boundary
+- **Decision** (2026-08-17, locked in conversation): a saga follows the
+  **live continuation structure** — a held connection's chain, or a
+  connectionless root's direct `next()` chain. **Crossing the durability
+  boundary roots a new saga**: anything that parks intent in the Model
+  and fires later (`schedule`/`cron` `_sched/*` entries, `webhook.send`'s
+  owed markers, subscription dirty markers) is a fresh external cause at
+  fire time. Consequences: a `webhook.send` `{on}` callback belongs to the
+  *delivery's* saga (the durable wake that executed the send), never the
+  sender's; a send bound to a HELD caller resumes the held chain and so
+  stays in the connection's saga — the same rule, since nothing durable
+  was crossed on the resume path. This is L2's reconstruct-vs-abandon
+  distinction surfacing in identity: a Continuation that reconstructs
+  from the Model is connected to its armer only *through* the Model, and
+  an unbounded causal-closure saga (webhook retries fire hours later)
+  would never settle as a unit of playback.
+- **Provenance, not inheritance**: the arming saga rides the durable
+  entry (`_sched/*.armed_by`) and lands on the fired activation's record
+  as the reserved `_parent` tag — the saga viewer's cross-saga jump. A
+  coalesced subscription fire deliberately gets NO parent (N writes
+  coalesce into one fire; a single parent would be a lie). A cron
+  recurrence's re-arm records the previous fire as parent — a linked
+  list back through fires, which is what actually happened.
+- **Rejected**: full causal-closure inheritance (the pure reading of
+  "one external cause and everything it triggers") — it makes every
+  requesting saga unbounded through its durable effects, resurfaces
+  week-old sagas on retry activity, and erases the connection/
+  connectionless axis the whole verb surface teaches. Also rejected:
+  literal connection-only continuation (shattering a connectionless
+  root's `next()` chain into single-hop sagas) — those hops are one
+  RAM-enqueued execution, not decoupled work.
+
 ## 14. Format & protocol versioning (pre-launch freeze)
 
 The locked rules from the pre-launch versioning sweep. **Full as-built spec —
