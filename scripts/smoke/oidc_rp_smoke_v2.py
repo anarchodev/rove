@@ -61,21 +61,31 @@ def idp_login(c: V2Cluster, *, email: str, app_origin: str, auth_base: str) -> s
         return loc if loc.startswith("http") else base + loc
 
     # 1. app /_rp/login → 302 to the IdP /authorize (mints the app sid).
-    r = c.tls_curl(app_origin + "/_rp/login?return_to=" + urllib.parse.quote("/"))
+    #    Carry a login_hint (the static-marketing-form seam) and assert the
+    #    RP forwards it into the authorize URL.
+    r = c.tls_curl(app_origin + "/_rp/login?return_to=" + urllib.parse.quote("/") +
+                   "&login_hint=" + urllib.parse.quote(email))
     if r.status != 302:
         raise RuntimeError(f"/_rp/login {r.status}: {r.body[:200]}")
     app_cookie = _sid(r)
     authorize = r.headers.get("location", "")
     if not app_cookie:
         raise RuntimeError(f"/_rp/login minted no app sid: {r.headers}")
+    aq = urllib.parse.parse_qs(urllib.parse.urlparse(authorize).query)
+    if aq.get("login_hint") != [email]:
+        raise RuntimeError(f"authorize URL lost the login_hint: {authorize}")
 
-    # 2. IdP /authorize, no IdP session → 302 to /login (mints the auth sid).
+    # 2. IdP /authorize, no IdP session → 302 to /login (mints the auth sid);
+    #    the hint must survive into the login bounce for the form prefill.
     r = c.tls_curl(authorize)
     if r.status != 302:
         raise RuntimeError(f"/authorize#1 {r.status}: {r.body[:200]} (url={authorize})")
     auth_cookie = _sid(r)
     login_loc = absll(auth_base, r.headers.get("location", ""))
-    return_to = urllib.parse.parse_qs(urllib.parse.urlparse(login_loc).query)["return_to"][0]
+    lq = urllib.parse.parse_qs(urllib.parse.urlparse(login_loc).query)
+    return_to = lq["return_to"][0]
+    if lq.get("login_hint") != [email]:
+        raise RuntimeError(f"/login bounce lost the login_hint: {login_loc}")
 
     # 3. POST IdP /login (dev: no resend key → magic_link in JSON).
     r = c.tls_curl(auth_base + "/login", method="POST",

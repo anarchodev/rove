@@ -160,6 +160,22 @@ def main() -> int:
             "nonce": nonce,
         })
 
+        # 3a. login_hint threading (the static-marketing-form seam): an
+        #     unauthenticated /authorize forwards the hint into its /login
+        #     bounce, and the login form prefills it. A hint is prefill-only —
+        #     the form still requires the user's own submit.
+        hinted = authorize + "&login_hint=" + urllib.parse.quote(LOGIN_EMAIL)
+        r = idp(hinted)
+        loc = r.headers.get("location", "")
+        lq = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        check("/authorize (no session) forwards login_hint to /login",
+              r.status == 302 and lq.get("login_hint") == [LOGIN_EMAIL],
+              f"got {r.status} loc={loc!r}")
+        r = idp("/login?login_hint=" + urllib.parse.quote(LOGIN_EMAIL))
+        check("GET /login?login_hint → form prefilled",
+              r.status == 200 and 'value="' + LOGIN_EMAIL + '"' in r.body,
+              f"got {r.status} body={r.body[:160]!r}")
+
         # POST /login → magic link + the platform session cookie.
         r = idp("/login", method="POST",
                 headers={"content-type": "application/x-www-form-urlencoded"},
