@@ -297,6 +297,16 @@ pub const TapePayloads = struct {
     /// (`docs/architecture/replay-and-sim.md` §5 G3).
     /// Empty when the conventional export applies. Allocator-owned.
     export_name: []const u8 = &.{},
+    /// The activation's kv WRITE KEYS (its writeset slice, keys only),
+    /// encoded with `encodeKeyList` — the "who touched what" half the
+    /// kv tape deliberately lacks (`kv.set` is an output, never a
+    /// recorded input). The log-server's seam scan intersects these
+    /// against other activations' reads. Empty when the activation
+    /// wrote nothing, on non-handler producers, and on
+    /// follower-rebuilt records (in-memory only, the
+    /// `interaction_digest` stance — such records' seams read as
+    /// unprobeable, never as write-free). Allocator-owned.
+    kv_write_keys_bytes: []const u8 = &.{},
     // Response body is NOT captured — deterministic replay
     // re-produces it from (request body, tapes, source). Storing
     // it on every batch PUT would be pure duplication on the S3
@@ -311,9 +321,65 @@ pub const TapePayloads = struct {
         if (self.request_reads_tape_bytes.len != 0) allocator.free(self.request_reads_tape_bytes);
         if (self.request_body_bytes.len != 0) allocator.free(self.request_body_bytes);
         if (self.activation_bytes.len != 0) allocator.free(self.activation_bytes);
+        if (self.kv_write_keys_bytes.len != 0) allocator.free(self.kv_write_keys_bytes);
         self.* = .{};
     }
 };
+
+/// Length-prefixed key-list codec for `kv_write_keys_bytes`:
+/// `[u32 BE count]` then per key `[u32 BE len][bytes]`. Keys are raw
+/// bytes (kv keys are not guaranteed UTF-8, so a JSON array of strings
+/// cannot carry them). Versionless by design — the blob rides inside
+/// the tolerant record JSON, never a strict wire.
+pub fn encodeKeyList(allocator: std.mem.Allocator, keys: []const []const u8) ![]u8 {
+    var total: usize = 4;
+    for (keys) |k| total += 4 + k.len;
+    const out = try allocator.alloc(u8, total);
+    std.mem.writeInt(u32, out[0..4], @intCast(keys.len), .big);
+    var cur: usize = 4;
+    for (keys) |k| {
+        std.mem.writeInt(u32, out[cur..][0..4], @intCast(k.len), .big);
+        cur += 4;
+        @memcpy(out[cur..][0..k.len], k);
+        cur += k.len;
+    }
+    return out;
+}
+
+pub const KeyListError = error{Truncated};
+
+/// Decode a key-list blob; returned slices BORROW into `bytes`. Caller
+/// frees only the outer slice.
+pub fn decodeKeyList(allocator: std.mem.Allocator, bytes: []const u8) (KeyListError || std.mem.Allocator.Error)![][]const u8 {
+    if (bytes.len < 4) return KeyListError.Truncated;
+    const count = std.mem.readInt(u32, bytes[0..4], .big);
+    const out = try allocator.alloc([]const u8, count);
+    errdefer allocator.free(out);
+    var cur: usize = 4;
+    for (out) |*slot| {
+        if (cur + 4 > bytes.len) return KeyListError.Truncated;
+        const len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+        cur += 4;
+        if (cur + len > bytes.len) return KeyListError.Truncated;
+        slot.* = bytes[cur .. cur + len];
+        cur += len;
+    }
+    return out;
+}
+
+test "key-list codec round-trips, rejects truncation" {
+    const a = std.testing.allocator;
+    const enc = try encodeKeyList(a, &.{ "cart/1", "", "items/42" });
+    defer a.free(enc);
+    const dec = try decodeKeyList(a, enc);
+    defer a.free(dec);
+    try std.testing.expectEqual(@as(usize, 3), dec.len);
+    try std.testing.expectEqualStrings("cart/1", dec[0]);
+    try std.testing.expectEqualStrings("", dec[1]);
+    try std.testing.expectEqualStrings("items/42", dec[2]);
+    try std.testing.expectError(KeyListError.Truncated, decodeKeyList(a, enc[0 .. enc.len - 1]));
+    try std.testing.expectError(KeyListError.Truncated, decodeKeyList(a, ""));
+}
 
 // ── Customer-facing ID formatting (docs/architecture/format-versioning.md §7.5) ────
 //

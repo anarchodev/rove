@@ -164,6 +164,14 @@ pub fn captureTapes(
         .interaction_digest = readset.interaction_digest,
     };
 
+    // The activation's write keys (`Readset.kv_write_keys`, recorded by
+    // the dispatcher) ride the record for the log-server's seam scan.
+    // Best-effort like the channel serializations below.
+    if (readset.kv_write_keys.items.len > 0) {
+        const keys: []const []const u8 = @ptrCast(readset.kv_write_keys.items);
+        payloads.kv_write_keys_bytes = log_mod.encodeKeyList(allocator, keys) catch &.{};
+    }
+
     const channels = [_]struct {
         tape: *tape_mod.Tape,
         out: *[]const u8,

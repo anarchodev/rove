@@ -722,6 +722,7 @@ fn finishResponse(
         return DispatchError.KvFailed;
     }
 
+<<<<<<< HEAD
     // Engine provenance: an activation whose arm crossed the durability
     // boundary rooted a NEW saga (handler-shape.md §3.2); the arming
     // saga rides its record as the reserved `_parent` tag — the
@@ -744,6 +745,23 @@ fn finishResponse(
             d.allocator.free(k);
             d.allocator.free(v);
         };
+=======
+    // Record the activation's kv write KEYS onto the readset — its
+    // writeset slice, `ws_base..` (batch writesets are shared; the
+    // slice is this activation's). Reads ride the kv tape; writes are
+    // outputs and live only in this list (`Readset.kv_write_keys` —
+    // the log-server's seam scan is the consumer). After the kv-error
+    // gate: a failed attempt's writes roll back and must not be
+    // claimed. Best-effort: a failed append leaves the list short.
+    if (state.readset) |rs| {
+        for (state.writeset.ops.items[state.ws_base..]) |op| {
+            const key = switch (op) {
+                .put => |p| p.key,
+                .delete => |del| del.key,
+            };
+            rs.appendWriteKey(key) catch break;
+        }
+>>>>>>> 756c2ddc (log-server: the seam scan — interacting activations via write-key recording (#589))
     }
 
     // Handler `stream.*` effects (§2.2): a handler that called

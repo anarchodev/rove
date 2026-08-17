@@ -1044,6 +1044,138 @@ pub const IndexDb = struct {
         }
     };
 
+    /// One record's payload location + display columns for the seam
+    /// scan: enough to fetch the frame (`ndjson_key`/`offset`/`length`)
+    /// AND render the interacting row without a second query.
+    pub const SeamLoc = struct {
+        request_id: u64,
+        exec_seq: u64,
+        received_ns: i64,
+        method: []u8,
+        path: []u8,
+        status: u16,
+        outcome: []u8,
+        activation: []u8,
+        ndjson_key: []u8,
+        offset: u64,
+        length: u32,
+
+        pub fn deinit(self: *SeamLoc, a: std.mem.Allocator) void {
+            a.free(self.method);
+            a.free(self.path);
+            a.free(self.outcome);
+            a.free(self.activation);
+            a.free(self.ndjson_key);
+        }
+    };
+
+    pub const SeamLocList = struct {
+        rows: []SeamLoc,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *SeamLocList) void {
+            for (self.rows) |*r| r.deinit(self.allocator);
+            self.allocator.free(self.rows);
+        }
+    };
+
+    const SEAM_COLS =
+        \\SELECT request_id, exec_seq, received_ns, method, path, status, outcome,
+        \\       activation, ndjson_key, offset, length
+        \\FROM log_index
+    ;
+
+    fn seamLocFromStmt(allocator: std.mem.Allocator, st: *c.sqlite3_stmt) Error!SeamLoc {
+        return .{
+            .request_id = @intCast(c.sqlite3_column_int64(st, 0)),
+            .exec_seq = @intCast(c.sqlite3_column_int64(st, 1)),
+            .received_ns = c.sqlite3_column_int64(st, 2),
+            .method = try dupeColumnText(allocator, st, 3),
+            .path = try dupeColumnText(allocator, st, 4),
+            .status = @intCast(c.sqlite3_column_int(st, 5)),
+            .outcome = try dupeColumnText(allocator, st, 6),
+            .activation = try dupeColumnText(allocator, st, 7),
+            .ndjson_key = try dupeColumnText(allocator, st, 8),
+            .offset = @intCast(c.sqlite3_column_int64(st, 9)),
+            .length = @intCast(c.sqlite3_column_int(st, 10)),
+        };
+    }
+
+    /// The record AT a tape position, or null (no such stamp — 404, not
+    /// an empty probe). `floor_received_ns` is the retention read-clamp.
+    pub fn querySeamLocAt(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        exec_seq: u64,
+        floor_received_ns: i64,
+    ) Error!?SeamLoc {
+        const sql: [:0]const u8 = SEAM_COLS ++
+            \\
+            \\WHERE tenant_id = ?1 AND exec_seq = ?2
+            \\  AND (?3 = 0 OR received_ns >= ?3)
+        ;
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        _ = c.sqlite3_bind_int64(st, 2, @intCast(@min(exec_seq, std.math.maxInt(i64))));
+        _ = c.sqlite3_bind_int64(st, 3, floor_received_ns);
+        const rc = c.sqlite3_step(st);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return Error.Sqlite;
+        return try seamLocFromStmt(self.allocator, st.?);
+    }
+
+    /// Payload locations for stamped records in the OPEN interval
+    /// `(after_seq, before_seq)` — NEWEST-first, because blame wants the
+    /// latest writer of a key and the scan is capped: with the cap
+    /// biting, the most recent candidates are the ones that matter.
+    pub fn querySeamLocs(
+        self: *IndexDb,
+        tenant_id: []const u8,
+        after_seq: u64,
+        before_seq: u64,
+        floor_received_ns: i64,
+        limit: u32,
+    ) Error!SeamLocList {
+        const sql: [:0]const u8 = SEAM_COLS ++
+            \\
+            \\WHERE tenant_id = ?1
+            \\  AND exec_seq IS NOT NULL AND exec_seq > ?2 AND exec_seq < ?3
+            \\  AND (?5 = 0 OR received_ns >= ?5)
+            \\ORDER BY exec_seq DESC
+            \\LIMIT ?4
+        ;
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        const i64_max: u64 = std.math.maxInt(i64);
+        _ = c.sqlite3_bind_int64(st, 2, @intCast(@min(after_seq, i64_max)));
+        _ = c.sqlite3_bind_int64(st, 3, @intCast(@min(before_seq, i64_max)));
+        _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
+        _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
+
+        var rows: std.ArrayListUnmanaged(SeamLoc) = .empty;
+        errdefer {
+            for (rows.items) |*r| r.deinit(self.allocator);
+            rows.deinit(self.allocator);
+        }
+        while (true) {
+            const rc = c.sqlite3_step(st);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return Error.Sqlite;
+            const row = try seamLocFromStmt(self.allocator, st.?);
+            rows.append(self.allocator, row) catch return Error.OutOfMemory;
+        }
+        return .{
+            .rows = rows.toOwnedSlice(self.allocator) catch return Error.OutOfMemory,
+            .allocator = self.allocator,
+        };
+    }
+
     /// Look up a single record's payload location + index columns.
     /// Returns null if the record isn't indexed (yet, or ever).
     pub fn queryShow(
@@ -1679,6 +1811,24 @@ test "saga window: hops in tape order, gap counts, unplaced addendum, roll point
     try testing.expectEqual(@as(usize, 1), un.rows.len);
     try testing.expectEqualStrings("/s-lost", un.rows[0].path);
     try testing.expectEqual(@as(u64, 0), un.rows[0].exec_seq);
+
+    // Seam locators: the point fetch finds the hop at a stamp, and the
+    // interval scan lists foreign candidates NEWEST-first, capped.
+    var at = (try idx.querySeamLocAt("acme", t3 + 5, 0)).?;
+    defer at.deinit(a);
+    try testing.expectEqual(@as(u64, 4), at.request_id);
+    try testing.expectEqualStrings("/s1", at.path);
+    try testing.expect((try idx.querySeamLocAt("acme", t3 + 4, 0)) == null);
+
+    var locs = try idx.querySeamLocs("acme", t3 + 5, t3 + 9, 0, 10);
+    defer locs.deinit();
+    try testing.expectEqual(@as(usize, 3), locs.rows.len);
+    try testing.expectEqual(t3 + 8, locs.rows[0].exec_seq);
+    try testing.expectEqual(t3 + 6, locs.rows[2].exec_seq);
+    var capped = try idx.querySeamLocs("acme", t3 + 5, t3 + 9, 0, 2);
+    defer capped.deinit();
+    try testing.expectEqual(@as(usize, 2), capped.rows.len);
+    try testing.expectEqual(t3 + 8, capped.rows[0].exec_seq);
 }
 
 test "queryList filters by tag (user session + reserved _saga)" {

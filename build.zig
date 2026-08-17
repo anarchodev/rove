@@ -320,6 +320,10 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-log", log_mod);
     log_server_mod.addImport("rove-jwt", jwt_mod);
     log_server_mod.addImport("rove-plan", plan_mod);
+    // Seam interference (`seam.zig`) decodes candidate records' kv tapes
+    // server-side — the whole point is filtering N foreign records down
+    // to the interacting few without shipping N tapes to the client.
+    log_server_mod.addImport("rove-tape", tape_mod);
 
     // ── rove-ssrf: SSRF blocklist + dev-only test overrides ─────────
     //
@@ -483,6 +487,7 @@ pub fn build(b: *std.Build) void {
     log_server_test_mod.addImport("rove-log", log_mod);
     log_server_test_mod.addImport("rove-jwt", jwt_mod);
     log_server_test_mod.addImport("rove-plan", plan_mod);
+    log_server_test_mod.addImport("rove-tape", tape_mod);
     const log_server_tests = b.addTest(.{ .root_module = log_server_test_mod });
     const run_log_server_tests = b.addRunArtifact(log_server_tests);
     const log_server_test_step = b.step("log-server-test", "Run rove-log-server unit tests");
