@@ -250,6 +250,14 @@ async function checkPopulatedState(ctx) {
     await opener.goto(ORIGIN + "/", { waitUntil: "domcontentloaded" });
 
     await opener.evaluate((fixture) => {
+        // The u64 fields ride as BigInt, the way the dashboard may post
+        // them (postMessage clones BigInt; JSON.parse of a fixture never
+        // produces one). The shell's refresh cache must tolerate that —
+        // JSON.stringify throws on BigInt, and a bundle that silently
+        // fails to cache makes this function's reload check the only
+        // gate that notices.
+        fixture.seed = 4242424242424242424n;
+        fixture.timestamp_ns = 1786927011398000000n;
         window.__fixture__ = fixture;
         window.addEventListener("message", (e) => {
             if (e.data?.kind === "replay:ready") {
@@ -504,9 +512,14 @@ async function checkPopulatedState(ctx) {
 
     // Browser refresh: the shell caches the received bundle in
     // sessionStorage (keyed by the URL fragment), so a reload reboots
-    // the SAME record with no opener handshake — the dashboard's
-    // listener is long gone by now, so surviving this proves the cache
-    // path, not a re-handshake.
+    // the SAME record with no opener handshake. The opener must be
+    // CLOSED first — this harness's handshake listener is persistent,
+    // so with the opener alive a reload silently re-handshakes and the
+    // check passes even when the cache write failed (the real
+    // dashboard's listener is one-shot, so users get no such rescue).
+    // Closing the opener discards its browsing context, window.opener
+    // reads null in the popup, and the cache is the only boot path.
+    await opener.close();
     await popup.reload({ waitUntil: "domcontentloaded" });
     try {
         await popup.waitForFunction(() => {
@@ -525,7 +538,6 @@ async function checkPopulatedState(ctx) {
     else bad(`reloaded event stream differs: ${reloadEvCount} vs ${evCount}`);
 
     await popup.close();
-    await opener.close();
 }
 
 // ── Path 3: throw case ───────────────────────────────────────────────
