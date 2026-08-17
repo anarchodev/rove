@@ -134,8 +134,16 @@ scale. Shared tiers are never stretched to hold a whale.
   false, and even once it ships the ceiling is "encrypted at rest", never
   "we cannot read your logs" (customer-held keys are deliberately deferred).
   This is the rove#322 false-claims class; check the page against it.
-- Advertised retention = enforced retention, in **days** (the derived byte
-  floor is a later revision, per the launch sequencing).
+- Advertised retention = enforced retention, in **days**, permanently —
+  days are the sold axis and the byte capacity is derived and internal
+  (`pricing-model.md` §3; `decisions.md` §11.6). The capacity-ring
+  revision this line once anticipated is not coming.
+- **Say "deleted after N days", not "we keep N days"** — the deletion is
+  the half the DPA and privacy policy commit to. Two riders belong in the
+  same breath: records a customer explicitly **pins** outlive the window,
+  and a customer may set a **shorter** window than their tier's. Both are
+  exceptions to a published period, so both have to appear in the prose
+  or the claim is false the first time either is used.
 - Requests are not priced and not advertised as a quota — the caps exist to
   protect the node, not to meter.
 
