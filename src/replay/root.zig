@@ -40,6 +40,13 @@ const export_fixture = @import("export_fixture.zig");
 pub const exportFixture = export_fixture.transcode;
 pub const exportFixtureActivation = export_fixture.activationOf;
 pub const exportFixtureIsFaithful = export_fixture.isFaithfulTranscode;
+/// The `(channel, entry index)` addresses of every payload a pulled record
+/// names by POINTER rather than carries. `pull` resolves each through the
+/// log-server's body door and inlines the bytes as `resolved_bodies`; whatever
+/// stays unresolved makes the transcoded world REFUSE that input rather than
+/// replay it as empty.
+pub const exportFixtureOutOfLine = export_fixture.outOfLinePayloads;
+pub const OutOfLinePayload = export_fixture.OutOfLine;
 
 // ── the JS-authored test runner (harness reactor + saga library) ──
 const first_party = @import("first_party.zig");
