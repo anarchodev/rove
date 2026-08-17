@@ -370,6 +370,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The slot pool is `rove-reserve` with a provider that also mints and
+    // replicates — the same block allocator the blob coordinator uses,
+    // because a reissued slot would give two identities one key.
+    crypt_mod.addImport("rove-reserve", reserve_mod);
 
     // ── rove-origin: node origin parsing ────────────────────────────
     //

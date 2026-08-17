@@ -318,11 +318,16 @@ pub const keyring = @import("keyring.zig");
 /// because a key that exists on one node dies with it.
 pub const replicate = @import("replicate.zig");
 
+/// The slot pool: keys minted ahead of demand, so the request path only
+/// takes a slot that is already backed by a quorum-durable key.
+pub const pool = @import("pool.zig");
+
 test {
     // Pull the submodules' tests into this module's test binary — a test
     // artifact nothing references is a regression nobody sees.
     _ = keyring;
     _ = replicate;
+    _ = pool;
 }
 
 // ── tests ────────────────────────────────────────────────────────────
