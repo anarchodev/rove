@@ -464,20 +464,7 @@ pub const Keyring = struct {
             self.allocator.free(plain);
         }
 
-        if (plain.len < SHARD_HEADER_LEN) return Error.Corrupt;
-        if (std.mem.readInt(u32, plain[0..4], .big) != SHARD_MAGIC) return Error.Corrupt;
-        if (std.mem.readInt(u16, plain[4..6], .little) != FORMAT_VERSION) return Error.Corrupt;
-        // The shard says which shard it is, so a file moved or renamed
-        // under a different index is caught instead of silently
-        // scattering entries into the wrong rewrite set.
-        if (plain[6] != shard) return Error.Corrupt;
-
-        const n = std.mem.readInt(u32, plain[7..11], .little);
-        if (n > MAX_ENTRIES_PER_SHARD) return Error.Corrupt;
-        // The count and the byte length must agree exactly. A trailing
-        // remainder means the file is not what it claims, and a keyring
-        // is the last place to be lenient about that.
-        if (plain.len != SHARD_HEADER_LEN + @as(usize, n) * ENTRY_LEN) return Error.Corrupt;
+        const n = try validateShardPlain(plain, shard);
 
         self.entries.ensureUnusedCapacity(self.allocator, n) catch return Error.OutOfMemory;
         var pos: usize = SHARD_HEADER_LEN;
@@ -491,9 +478,6 @@ pub const Keyring = struct {
             pos += crypt.KEY_LEN;
             const created = std.mem.readInt(i64, plain[pos..][0..8], .little);
             pos += 8;
-            // A ref filed under the wrong shard would be unreachable by
-            // every later mint and destroy, which route by `shardOf`.
-            if (shardOf(ref) != shard) return Error.Corrupt;
             self.entries.putAssumeCapacity(ref, .{ .key = key, .created_unix_ns = created });
         }
         self.shard_counts[shard] = n;
@@ -551,11 +535,6 @@ pub const Keyring = struct {
 
     /// Seal `plain` and land it at `path` atomically and durably.
     fn writeSealed(self: *Self, path: []const u8, plain: []const u8) Error!void {
-        std.fs.cwd().makePath(self.tenant_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return Error.Io,
-        };
-
         const sealed = crypt.sealAlloc(
             self.allocator,
             plain,
@@ -564,6 +543,20 @@ pub const Keyring = struct {
             FORMAT_VERSION,
         ) catch return Error.OutOfMemory;
         defer self.allocator.free(sealed);
+        try self.writeRaw(path, sealed);
+    }
+
+    /// Land already-sealed bytes at `path` atomically and durably.
+    ///
+    /// Split out because replication installs a peer's shard **byte for
+    /// byte** — re-sealing it locally would produce different bytes for
+    /// the same content, so a shard could never be compared or repaired
+    /// by identity.
+    fn writeRaw(self: *Self, path: []const u8, sealed: []const u8) Error!void {
+        std.fs.cwd().makePath(self.tenant_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return Error.Io,
+        };
 
         const tmp = std.fmt.allocPrint(
             self.allocator,
@@ -613,6 +606,117 @@ pub const Keyring = struct {
         };
     }
 };
+
+/// Structural check on a decrypted shard, returning its entry count.
+///
+/// Shared by the local read path and the replication install path so a
+/// shard arriving from a peer is held to exactly the same standard as
+/// one read off local disk — a peer is not a more trusted source of key
+/// material than a file is.
+fn validateShardPlain(plain: []const u8, shard: u8) Error!u32 {
+    if (plain.len < SHARD_HEADER_LEN) return Error.Corrupt;
+    if (std.mem.readInt(u32, plain[0..4], .big) != SHARD_MAGIC) return Error.Corrupt;
+    if (std.mem.readInt(u16, plain[4..6], .little) != FORMAT_VERSION) return Error.Corrupt;
+    // The shard records which shard it is, so a file moved, renamed, or
+    // delivered under the wrong index is caught instead of silently
+    // scattering entries into a rewrite set nothing will ever route to.
+    if (plain[6] != shard) return Error.Corrupt;
+
+    const n = std.mem.readInt(u32, plain[7..11], .little);
+    if (n > MAX_ENTRIES_PER_SHARD) return Error.Corrupt;
+    // The count and the byte length must agree exactly. A trailing
+    // remainder means the file is not what it claims, and a keyring is
+    // the last place to be lenient about that.
+    if (plain.len != SHARD_HEADER_LEN + @as(usize, n) * ENTRY_LEN) return Error.Corrupt;
+
+    var pos: usize = SHARD_HEADER_LEN;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        // A ref filed under the wrong shard would be unreachable by
+        // every later mint and destroy, which route by `shardOf`.
+        if (shardOf(plain[pos..][0..crypt.KEY_REF_LEN].*) != shard) return Error.Corrupt;
+        pos += ENTRY_LEN;
+    }
+    return n;
+}
+
+/// Install a sealed shard received from a peer.
+///
+/// The bytes are written **verbatim**: a shard's file key is
+/// `HKDF(cluster KEK, tenant id)`, identical on every node, so a sealed
+/// shard is portable ciphertext and re-sealing it locally would only
+/// produce different bytes for the same content.
+///
+/// Verified before it lands, not at the next open. An unverified
+/// install poisons the receiver silently and surfaces at a failover —
+/// the worst possible moment, since that is exactly when the peer's
+/// copy becomes the only copy. Both failure modes are distinguished:
+/// `AuthFailed` means the sender's KEK differs from ours, `Corrupt`
+/// means the bytes are not a shard.
+///
+/// An empty `sealed` removes the shard, which is how a peer learns that
+/// a shard was emptied by destroys rather than merely not updated.
+pub fn installSealedShard(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+    kek: []const u8,
+    shard: u8,
+    sealed: []const u8,
+) Error!void {
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
+    defer kr.deinit();
+
+    const path = try kr.shardPath(shard);
+    defer allocator.free(path);
+
+    if (sealed.len == 0) {
+        std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return Error.Io,
+        };
+        return syncPath(kr.tenant_dir);
+    }
+
+    const plain = crypt.openAlloc(allocator, sealed, kr.file_key) catch |err| switch (err) {
+        crypt.Error.AuthFailed => return Error.AuthFailed,
+        crypt.Error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.Corrupt,
+    };
+    defer {
+        std.crypto.secureZero(u8, plain);
+        allocator.free(plain);
+    }
+    _ = try validateShardPlain(plain, shard);
+
+    try kr.writeRaw(path, sealed);
+}
+
+/// Read a shard's sealed bytes for sending to a peer, or null when the
+/// shard is empty. Caller frees.
+///
+/// Deliberately returns the bytes as stored rather than re-encoding
+/// from memory: what a peer installs is then exactly what this node
+/// has, with no chance of a divergence between the two representations.
+pub fn readSealedShard(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+    kek: []const u8,
+    shard: u8,
+) Error!?[]u8 {
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
+    defer kr.deinit();
+
+    const path = try kr.shardPath(shard);
+    defer allocator.free(path);
+
+    const max = crypt.OVERHEAD + SHARD_HEADER_LEN + MAX_ENTRIES_PER_SHARD * ENTRY_LEN;
+    return std.fs.cwd().readFileAlloc(allocator, path, max) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => Error.Io,
+    };
+}
 
 /// fsync a directory, so a rename or unlink cannot be the thing a power
 /// cut loses.
@@ -1033,6 +1137,212 @@ test "audit lists refs and mint times without exposing key material" {
     var seen: i64 = 0;
     for (rows) |r| seen += r.created_unix_ns;
     try testing.expectEqual(@as(i64, 333), seen);
+}
+
+test "replication: a shard sent from one node opens on another" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    const ref = refOf(0x11);
+    var minted: crypt.Key = undefined;
+
+    // Node A mints. Node B is attached with the SAME tenant secret —
+    // the CP delivers it at attach; only shards move over the wire.
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        minted = try a.mint(ref, 1);
+    }
+    {
+        var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
+        b.deinit();
+    }
+
+    // The seam: ship the sealed bytes verbatim and install them.
+    const sealed = (try readSealedShard(
+        testing.allocator,
+        node_a,
+        "acme",
+        TEST_KEK,
+        shardOf(ref),
+    )).?;
+    defer testing.allocator.free(sealed);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), sealed);
+
+    // Node B now holds the same key — the property the whole design
+    // rests on: a sealed shard is portable ciphertext, because the file
+    // key derives from the cluster KEK and the tenant id alone.
+    var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+    defer b.deinit();
+    try testing.expectEqualSlices(u8, &minted, &b.get(ref).?);
+}
+
+test "replication: an empty install removes the shard, propagating a destroy" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    const ref = refOf(0x11);
+    {
+        var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
+        defer b.deinit();
+        _ = try b.mint(ref, 1);
+        try testing.expect(b.get(ref) != null);
+    }
+
+    // A shard that emptied has no file, so `readSealedShard` yields
+    // null and the transfer carries zero bytes. Installing that must
+    // remove the receiver's copy, not leave it stale.
+    var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+    a.deinit();
+    try testing.expect((try readSealedShard(
+        testing.allocator,
+        node_a,
+        "acme",
+        TEST_KEK,
+        shardOf(ref),
+    )) == null);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), "");
+
+    var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+    defer b.deinit();
+    try testing.expect(b.get(ref) == null);
+}
+
+test "replication: a peer under a different KEK is refused at install" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    const ref = refOf(0x11);
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", "kek-one", TEST_SECRET);
+        defer a.deinit();
+        _ = try a.mint(ref, 1);
+    }
+    const sealed = (try readSealedShard(
+        testing.allocator,
+        node_a,
+        "acme",
+        "kek-one",
+        shardOf(ref),
+    )).?;
+    defer testing.allocator.free(sealed);
+
+    // Caught on receipt rather than at the next open. An unverified
+    // install surfaces at a failover — the moment the peer's copy
+    // becomes the only copy.
+    try testing.expectError(Error.AuthFailed, installSealedShard(
+        testing.allocator,
+        node_b,
+        "acme",
+        "kek-two",
+        shardOf(ref),
+        sealed,
+    ));
+}
+
+test "replication: corrupt bytes and a wrong shard index are refused at install" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    const ref = refOf(0x11);
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        _ = try a.mint(ref, 1);
+    }
+    const sealed = (try readSealedShard(
+        testing.allocator,
+        node_a,
+        "acme",
+        TEST_KEK,
+        shardOf(ref),
+    )).?;
+    defer testing.allocator.free(sealed);
+
+    // Delivered under the wrong index: the shard is self-describing, so
+    // this is caught rather than filed where nothing routes to it.
+    try testing.expectError(Error.Corrupt, installSealedShard(
+        testing.allocator,
+        node_b,
+        "acme",
+        TEST_KEK,
+        shardOf(ref) +% 1,
+        sealed,
+    ));
+
+    const tampered = try testing.allocator.dupe(u8, sealed);
+    defer testing.allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 0x01;
+    try testing.expectError(Error.AuthFailed, installSealedShard(
+        testing.allocator,
+        node_b,
+        "acme",
+        TEST_KEK,
+        shardOf(ref),
+        tampered,
+    ));
+
+    // Nothing was written by either rejected install.
+    try testing.expectError(
+        Error.NoKeyring,
+        Keyring.open(testing.allocator, node_b, "acme", TEST_KEK),
+    );
+}
+
+test "replication: installing is idempotent, so a retried push is safe" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    const ref = refOf(0x11);
+    var minted: crypt.Key = undefined;
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        minted = try a.mint(ref, 1);
+    }
+    {
+        var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
+        b.deinit();
+    }
+
+    const sealed = (try readSealedShard(
+        testing.allocator,
+        node_a,
+        "acme",
+        TEST_KEK,
+        shardOf(ref),
+    )).?;
+    defer testing.allocator.free(sealed);
+
+    // A push that times out but landed will be retried; the second
+    // install must be a no-op rather than corrupting the first.
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), sealed);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, shardOf(ref), sealed);
+
+    var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, 1), b.count());
+    try testing.expectEqualSlices(u8, &minted, &b.get(ref).?);
 }
 
 test "many entries across many shards survive a reopen intact" {
