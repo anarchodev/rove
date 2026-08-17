@@ -248,22 +248,20 @@ def from_sim_bundle(bundle: dict, *, compared_headers=DEFAULT_COMPARED_HEADERS) 
     return o
 
 
-def from_replay_result(res: dict, *, stderr: str = "") -> Outcome:
+def from_replay_result(
+    res: dict, *, stderr: str = "", compared_headers=DEFAULT_COMPARED_HEADERS
+) -> Outcome:
     """Normalize the WASM replay engine's parked outcome.
 
-    The epilogue parks `{status, result, effects, digest}` under
-    `__replay_output__` in the host kv overlay — the same side channel the
-    native driver's OUTPUT_KEY uses.
+    The epilogue parks the WIRE response — what production would have put on
+    the socket, not the handler's raw intent — under `__replay_output__` in the
+    host kv overlay, the same side channel the native driver's OUTPUT_KEY uses:
+    `{status, held, threw, error, headers, cookies, body, bodyB64, binary,
+    isJson, result, effects, digest, divergence}`.
 
-    What this engine can observe is narrower than the sim's, and the gaps are
-    left ABSENT rather than filled with a plausible value:
-
-    - **headers** — the parked outcome carries only a status, so response
-      headers cannot be read back (rove#437). Filling in `{}` would assert the handler set
-      none, which is a different claim from "this engine cannot see them".
-    - **error** — a throwing handler parks nothing at all, so the message is not
-      recoverable here. `ok` still compares, because a non-zero rc with no
-      parked output IS observable.
+    Gaps are left ABSENT rather than filled with a plausible value. Filling in
+    `{}` for headers an engine cannot see would assert the handler set none,
+    which is a different claim from "this engine cannot observe them".
     """
     o = Outcome(engine="replay")
     parked = res.get("parked")
@@ -287,36 +285,59 @@ def from_replay_result(res: dict, *, stderr: str = "") -> Outcome:
             )
         return o
 
-    o.ok = rc == 0
+    # Mirrors the sim's own `ok_run`: it ran, it did not diverge, and it did
+    # not throw. A caught throw completes the module, so `rc == 0` alone would
+    # call a 500 a success and disagree with both other engines about the one
+    # path this case exists to compare.
+    o.ok = (
+        rc == 0
+        and parked.get("divergence") is None
+        and not parked.get("threw", False)
+    )
     if "status" in parked:
         o.status = parked["status"]
+    if "headers" in parked:
+        o.headers = _pick_headers(parked["headers"], compared_headers)
 
-    # `result` is already the wire text (`__ser` of the return value), so it
-    # goes through the same wire→body route as every other engine.
-    if "result" in parked:
-        body = _body_from_wire(parked["result"])
-        o.body = body
-        # `result` is the engine's OWN wire text, so its hash is a genuine
-        # byte-exact check against prod's wire bytes — the equality `body`
-        # deliberately gives up by canonicalizing key order. The sim cannot
-        # join: its bundle body has already been through Zig's JSON
-        # re-serialization, so hashing it would test that round-trip rather
-        # than the engine.
-        if isinstance(parked["result"], str):
-            o.body_sha256 = hashlib.sha256(parked["result"].encode("utf-8")).hexdigest()
-        # Same rule the sim applies: a returned `next(...)` holds the
-        # connection. Derived identically on both sides so the comparison tests
-        # the engines rather than two different definitions of "held".
-        if isinstance(body, dict) and body.get("__rove_disposition") == "next":
-            o.disposition = "held"
-        else:
-            o.disposition = "terminal"
+    # The WIRE body — what prod would have put on the socket, which is also
+    # what the digest folds. It is NOT the return value: the two differ
+    # whenever prod transformed one into the other (JSON-stringified,
+    # byte-passed, stream-prefixed, or replaced wholesale by the thrown body).
+    if parked.get("binary") is True and parked.get("bodyB64") is not None:
+        raw = base64.b64decode(parked["bodyB64"])
+        o.body = {"kind": "bytes", "b64": base64.b64encode(raw).decode()}
+    elif "body" in parked:
+        o.body = _body_from_wire(parked["body"])
+        # This engine's own wire text, so its hash is a genuine byte-exact
+        # check against prod's wire bytes — the equality `body` deliberately
+        # gives up by canonicalizing key order. The sim cannot join: its bundle
+        # body has already been through Zig's JSON re-serialization, so hashing
+        # it would test that round-trip rather than the engine.
+        if isinstance(parked["body"], str):
+            o.body_sha256 = hashlib.sha256(parked["body"].encode("utf-8")).hexdigest()
+
+    # The epilogue decides held/terminal itself, with the same rule the sim
+    # applies, so the comparison tests the engines rather than two adapters'
+    # definitions of "held".
+    if "held" in parked:
+        o.disposition = "held" if parked["held"] else "terminal"
+
+    # A thrown handler parks its exception. Prod SERVES a throw (500 +
+    # `handler threw: …`), so it is an outcome to compare, not a run that
+    # stopped — and `error: None` on the success path is a produced value the
+    # sim reports too, not an engine that cannot see one.
+    if "threw" in parked:
+        o.error = _canon_error(parked["error"]) if parked.get("error") else None
 
     if "effects" in parked:
         o.effects = normalize_effects(parked["effects"])
         o.writes = writes_of(o.effects)
     if parked.get("digest") is not None:
         o.digest = parked["digest"]
+    # A diverged run is a failed run, surfaced by the adapter (and folded into
+    # `ok` above) — never a field to compare, since no other engine has one.
+    if parked.get("divergence") is not None:
+        o.notes["divergence"] = parked["divergence"]
     return o
 
 

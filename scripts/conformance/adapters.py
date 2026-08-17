@@ -487,7 +487,7 @@ def run_replay(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
     except json.JSONDecodeError as e:
         raise AdapterError(f"replay driver output is not JSON: {e}")
 
-    return from_replay_result(res, stderr=proc.stderr)
+    return from_replay_result(res, stderr=proc.stderr, compared_headers=compared_headers)
 
 
 ADAPTERS = {
