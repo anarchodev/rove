@@ -76,12 +76,27 @@ pub fn build(b: *std.Build) void {
     //
     // Leaf module — stdlib only. The fs backend lives in src/blob/fs.zig
     // and ships in Phase 1a. The s3 backend lands in Phase 6.
+    // ── rove-reserve: cluster-unique ids from raft-reserved blocks ──
+    //
+    // Shared because a reissued id corrupts whatever it names, and the
+    // double-buffered refill that avoids a consensus round trip per id
+    // is not concurrency worth writing twice. Used by the blob
+    // coordinator's `batch_id` and by the keyring's slot allocation,
+    // where a reissued slot would give two identities one key — so
+    // shredding either would shred both. std-only leaf.
+    const reserve_mod = b.addModule("rove-reserve", .{
+        .root_source_file = b.path("src/reserve/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const blob_mod = b.addModule("rove-blob", .{
         .root_source_file = b.path("src/blob/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     blob_mod.link_libc = true;
+    blob_mod.addImport("rove-reserve", reserve_mod);
     // libcurl backs the S3 outbound path. Replaces std.http.Client,
     // which has a string of bugs in 0.15.x (HEAD stalls / segfaults,
     // no application-level timeouts → 15-minute kernel TCP retry
@@ -522,6 +537,10 @@ pub fn build(b: *std.Build) void {
     // rove-crypt tests
     const crypt_tests = b.addTest(.{ .root_module = crypt_mod });
     test_step.dependOn(&b.addRunArtifact(crypt_tests).step);
+
+    // rove-reserve tests
+    const reserve_tests = b.addTest(.{ .root_module = reserve_mod });
+    test_step.dependOn(&b.addRunArtifact(reserve_tests).step);
 
     // rove-origin tests
     const origin_tests = b.addTest(.{ .root_module = origin_mod });
