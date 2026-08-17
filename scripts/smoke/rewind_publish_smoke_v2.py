@@ -167,7 +167,25 @@ def main() -> int:
             "post_login": "/", "operator_prefix": "_admin/operator/",
         }, separators=(",", ":")))
         # Seed the OPERATOR so their OIDC session resolves is_root.
-        c.admin_kv_put("__admin__", "_admin/operator/" + sha256_hex(OPERATOR), "")
+        #
+        # Then WAIT for the row to be readable before anyone logs in. Operator
+        # authority is resolved once, at login (auth-and-domains.md §4.6c:
+        # `is_root` is baked into the session record), so a login that races
+        # ahead of this write's replication mints a permanently non-root
+        # session — and every later assertion fails as "operator-only",
+        # pointing anywhere but here. That is a load-sensitive false
+        # regression on the deploy gate, not a product defect: the write is
+        # durable, the reader was just early.
+        op_key = "_admin/operator/" + sha256_hex(OPERATOR)
+        c.admin_kv_put("__admin__", op_key, "")
+        op_visible = False
+        for _ in range(60):
+            if c.admin_kv_get("__admin__", op_key).status == 200:
+                op_visible = True
+                break
+            time.sleep(0.25)
+        check("operator allowlist row is readable before login", op_visible,
+              "the row never became visible — a login now would be non-root")
         # Alias the valid hosts → the system tenants (front routing + worker alias).
         c._cp_post("/_control/host", {"host": admin_host, "tenant": "__admin__"})
         c._cp_post("/_control/host", {"host": auth_host, "tenant": "__auth__"})
