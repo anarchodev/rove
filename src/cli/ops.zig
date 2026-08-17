@@ -474,7 +474,9 @@ const SeedPkg = struct {
 // — the sources diverged from the 1.0.0 seed by two comment lines each.
 // 1.0.2: browser's saga-unit rename (#448), oidc's login-time operator
 // authority, and the first publish of @rewind/stripe (#307/#310).
-const SEED_VERSION = "1.0.2";
+// 1.0.3: oidc's public isRegisteredClientOrigin + login_hint threading
+// (#588) — the one-submission signup's IdP-side allowlist seam.
+const SEED_VERSION = "1.0.3";
 const REGISTRY_TENANT = "registry";
 
 // LEAVES-FIRST: @rewind/jwt has no intra-set dependency and MUST publish before
