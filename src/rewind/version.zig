@@ -12,6 +12,11 @@
 //! `src/cp/directory.zig`, a different binary) are listed with their
 //! value plus a pointer to where the canonical constant + its tests live.
 //!
+//! A format with NO version yet is listed as `(unversioned)` rather than
+//! left out. The registry's job is to make the whole surface auditable at a
+//! glance, and an omission reads as "nothing to see" — which is the opposite
+//! of what an unversioned load-bearing format deserves.
+//!
 //! ## Versioning idioms (audit §3), for reading the dump
 //!
 //!  - Where a format has a fail-loud MAGIC or type discriminant
@@ -85,6 +90,12 @@ pub fn dump(w: *std.Io.Writer) !void {
     try w.print("  cert_pack            v{d} (src/cp/directory.zig)\n", .{CERT_PACK_VERSION});
     try w.print("  service_jwt          v{d}\n", .{SERVICE_JWT_VERSION});
     try w.print("  deployment_manifest  v{d}\n", .{files.manifest_json.VERSION});
+    // The customer's `<bundle>/rewind.lock`, written and read by the `rewind`
+    // CLI (`src/cli/packages.zig` owns the shape; not in this binary's import
+    // graph, hence no constant to reference). An INPUT to a deploy since #630,
+    // so a shape change mis-pins rather than being ignored — versioning it is
+    // #244's pass.
+    try w.writeAll("  bundle_lockfile      (unversioned) — src/cli/packages.zig\n");
     try w.print("  log_sidecar          v{d}\n", .{log_server.sidecar.VERSION});
     try w.writeAll("  -- replay / tape (must lockstep with rtap.mjs / wasm-app.mjs) --\n");
     try w.print("  tape                 v{d} (magic 0x{X:0>8})\n", .{ rjs.tape.VERSION, rjs.tape.MAGIC });
@@ -105,4 +116,8 @@ test "registry dump renders all format lines without error" {
     try std.testing.expect(std.mem.indexOf(u8, out, "js_engine_version") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "readset              v9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "request_id           req_<16hex>") != null);
+    // An unversioned format still has to appear: the registry is an inventory
+    // of the whole surface, and dropping the entries with nothing to print is
+    // how a load-bearing format goes unnoticed.
+    try std.testing.expect(std.mem.indexOf(u8, out, "bundle_lockfile      (unversioned)") != null);
 }
