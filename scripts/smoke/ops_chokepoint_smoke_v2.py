@@ -114,7 +114,11 @@ def main() -> int:
 
         print("step 2: deploy the real dashboard, which carries the chokepoint")
         try:
-            pkgs, imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email", "@rewind/stripe"])
+            # Derived from admin/manifest.json, never hand-listed: a copy of
+            # the app's dependencies drifts in the direction that fails late
+            # — the app gains an import, this seeds the old set, and the
+            # deploy dies at compile with `could not load module`.
+            pkgs, imports = c.firstparty_packages_for_app(APPS_DIR / "admin")
             c.deploy_with_packages("__admin__", admin_files, pkgs, imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e))

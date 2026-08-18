@@ -156,10 +156,9 @@ def main() -> int:
         r = c.provision("__auth__")
         check("provision __auth__ → 200/409", r.status in (200, 409), f"got {r.status}")
         try:
-            # web/auth imports `@rewind/oidc` (which pulls `@rewind/jwt`) and
-            # `@rewind/email`, so
-            # the packages stage with the deploy.
-            auth_pkgs, auth_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            # Derived from auth/manifest.json, never hand-listed — see
+            # `firstparty_packages_for_app`.
+            auth_pkgs, auth_imports = c.firstparty_packages_for_app(APPS_DIR / "auth")
             c.deploy_with_packages(
                 "__auth__", {"index.mjs": auth_src}, auth_pkgs, auth_imports,
                 statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
@@ -176,7 +175,9 @@ def main() -> int:
         try:
             # web/admin's middleware imports `@rewind/oidc` + `@rewind/email`,
             # so the packages stage with the deploy.
-            adm_pkgs, adm_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email", "@rewind/stripe"])
+            # Derived from admin/manifest.json, never hand-listed — see
+            # `firstparty_packages_for_app`.
+            adm_pkgs, adm_imports = c.firstparty_packages_for_app(APPS_DIR / "admin")
             c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e))
