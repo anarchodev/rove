@@ -29,6 +29,18 @@
 //! fails publishes nothing, so a quorum outage stalls the pool instead
 //! of handing out slots it cannot stand behind.
 //!
+//! ## The hot path never waits
+//!
+//! `tryAcquire` is what a request calls, and it returns `null` rather
+//! than waiting for a refill. The worker is a poll loop, so a blocking
+//! acquire would not slow the one request that needed a slot — it would
+//! stop serving every tenant on the node. `null` means park and retry,
+//! which is what the hot path already does for a write awaiting raft.
+//!
+//! `acquire` keeps the waiting behaviour for background callers, and is
+//! documented as such so the distinction is not left to whoever wires it
+//! up next.
+//!
 //! ## Why this is mostly composition
 //!
 //! "Hand out cluster-unique ids from blocks reserved through consensus,
@@ -110,11 +122,30 @@ pub const SlotPool = struct {
         self.alloc.deinit();
     }
 
-    /// Take a slot whose key is minted and quorum-durable.
+    /// Take a slot whose key is minted and quorum-durable, or `null` if
+    /// the pool is momentarily empty. **Never waits** — this is the one
+    /// a request path calls.
     ///
-    /// Blocks only if the pool is empty and the next block has not
-    /// landed — the watermark refill exists to make that rare. Returns
-    /// `Shutdown` if `deinit` fired while parked.
+    /// `null` means park and retry, not fail: the caller has the same
+    /// options it already has for a write awaiting raft, and the poll
+    /// loop keeps serving every other tenant meanwhile.
+    ///
+    /// It should also be rare enough to alarm on. Only a *new* identity
+    /// reaches the pool — a returning one is a map lookup — so demand
+    /// tracks new-identity rate, not request rate, orders of magnitude
+    /// below what the refill sustains. A dry pool means the KMS is
+    /// degraded, not that the tenant is busy.
+    pub fn tryAcquire(self: *Self) ?u64 {
+        return self.alloc.tryNext();
+    }
+
+    /// Take a slot, **waiting** for a refill if the pool is empty.
+    ///
+    /// Background callers only. The wait is unbounded, so on the poll
+    /// loop it would stall every tenant on the node rather than the one
+    /// request that needed a slot — the hot path uses `tryAcquire`.
+    ///
+    /// Returns `Shutdown` if `deinit` fired while parked.
     pub fn acquire(self: *Self) Error!u64 {
         return self.alloc.next() catch |err| switch (err) {
             reserve.Error.Shutdown => Error.Shutdown,
@@ -321,6 +352,71 @@ test "a slot is NOT handed out when replication cannot reach a quorum" {
     t.join();
     // Stalled, never satisfied with an undurable slot.
     try testing.expectError(Error.Shutdown, result);
+}
+
+test "tryAcquire returns null instead of waiting when the pool cannot fill" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try keyring_mod.Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    var h = Harness{};
+    defer h.deinit();
+    // Replication never succeeds, so no block is ever published and the
+    // pool stays permanently dry.
+    h.fail_replicate.store(true, .monotonic);
+
+    var pool = SlotPool{};
+    try pool.start(&kr, h.deps(), 4);
+    defer pool.deinit();
+
+    // The whole point: this RETURNS. The worker is a poll loop, so a
+    // blocking acquire here would stop serving every tenant on the node
+    // rather than slowing the one request that wanted a slot.
+    try testing.expect(pool.tryAcquire() == null);
+    try testing.expect(pool.tryAcquire() == null);
+
+    // And it kicked a refill on the way out, so a caller that parks and
+    // retries is not waiting on nothing.
+    std.Thread.sleep(150 * std.time.ns_per_ms);
+    try testing.expect(h.replicate_calls.load(.monotonic) >= 1);
+}
+
+test "tryAcquire yields durable slots on the fast path" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try keyring_mod.Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    var h = Harness{};
+    defer h.deinit();
+    var pool = SlotPool{};
+    try pool.start(&kr, h.deps(), 8);
+    defer pool.deinit();
+
+    // The first block has to land; `tryAcquire` never waits for it.
+    var first: ?u64 = null;
+    var spins: usize = 0;
+    while (first == null and spins < 200) : (spins += 1) {
+        first = pool.tryAcquire();
+        if (first == null) std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try testing.expectEqual(crypt.FIRST_SLOT, first.?);
+
+    // The invariant holds on this path too: a slot handed out has a key
+    // locally and its shard has been replicated.
+    try testing.expect(pool.keyAt(first.?) != null);
+    try testing.expect(h.sawShard(keyring_mod.shardOf(first.?)));
+
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        const slot = pool.tryAcquire().?;
+        try testing.expect(pool.keyAt(slot) != null);
+    }
 }
 
 test "a reservation failure is retried without surfacing to the caller" {
