@@ -16,6 +16,20 @@
 //!   - `emitResolution` — the `resolution` JSON `/v1/deploy/cut` expects
 //!     (files omitted; the deploy app joins the staged rows server-side and
 //!     batch-compiles each package there).
+//!   - `appSurfacePins` — a resolved graph read back as exact-version pins,
+//!     which is what makes a deploy reproducible.
+//!
+//! ## The lockfile is a cached resolve response
+//!
+//! A bundle's `rewind.lock` is the registry's `/v1/resolve` body stored
+//! verbatim, so it parses with `parseResolveResponse` like any other
+//! response — there is no second format to keep in step.
+//!
+//! Pinning only the APP SURFACE is enough to pin the whole graph. The
+//! registry range-resolves exactly the specs the app declares; every
+//! transitive edge is already a frozen `pkg_hash` in the depending
+//! package's `imports`, and the closure walks hashes. So a pin per
+//! app-surface spec determines every package in the deployment.
 //!
 //! The wire shape is fixed by the engine and proven by
 //! `scripts/smoke/pm_deploy_smoke.py` / `V2Cluster.deploy_with_packages`:
@@ -386,6 +400,39 @@ fn dfsVisit(
 /// server-side (hashes stay server-authoritative) and batch-compiles each
 /// package there. No `capabilities`/`private` on the wire (the deploy app
 /// defaults them).
+/// The exact-version pins a resolved graph implies, as `overrides` for a
+/// later `buildResolveRequest` — the seam that turns a lockfile back into a
+/// reproducible resolve.
+///
+/// One entry per APP-SURFACE spec (see the module header for why that is
+/// sufficient). `Dependency.range` carries an exact version here rather than
+/// a range, which is what `overrides` means on the wire.
+///
+/// Matching is by `pkg_hash`, never by spec: the same spec can appear more
+/// than once in a resolution at different versions — an app-surface copy plus
+/// a nested private one — and picking by name would pin the app to whichever
+/// happened to be listed first.
+pub fn appSurfacePins(a: std.mem.Allocator, res: *const Resolution) Error![]Dependency {
+    var out: std.ArrayList(Dependency) = .empty;
+    errdefer out.deinit(a);
+    for (res.app_imports) |edge| {
+        const pkg = for (res.packages) |p| {
+            if (std.mem.eql(u8, p.pkg_hash, edge.pkg_hash)) break p;
+        } else {
+            // An app_imports edge naming no package in the same document is a
+            // lockfile that cannot describe a deployment. Refuse rather than
+            // silently dropping the pin, which would re-resolve that spec by
+            // range and look like it worked.
+            return Error.BadResolution;
+        };
+        try out.append(a, .{
+            .spec = try a.dupe(u8, edge.specifier),
+            .range = try a.dupe(u8, pkg.version),
+        });
+    }
+    return out.toOwnedSlice(a) catch Error.OutOfMemory;
+}
+
 pub fn emitResolution(
     a: std.mem.Allocator,
     res: *const Resolution,
@@ -526,6 +573,89 @@ test "readDependencies: malformed dependencies → BadResolution" {
     try testing.expectError(Error.BadResolution, readDependencies(a,
         \\{"dependencies":{"@rewind/jwt":42}}
     ));
+}
+
+/// A lockfile as the registry writes it: an app-surface `@rewind/oidc` that
+/// pulls `@rewind/jwt` at one version, plus a NESTED private copy of `jwt` at
+/// another. The nesting is the whole point — it is what makes "match by spec"
+/// wrong.
+const LOCK_WITH_NESTED_DUP =
+    \\{"packages":[
+    \\{"spec":"@rewind/oidc","version":"2.3.1","pkg_hash":"oidchash",
+    \\ "files":[{"path":"index.mjs","source_hash":"s1"}],
+    \\ "imports":{"@rewind/jwt":"jwt19"},"capabilities":[],"private":false},
+    \\{"spec":"@rewind/jwt","version":"1.9.0","pkg_hash":"jwt19",
+    \\ "files":[{"path":"index.mjs","source_hash":"s2"}],
+    \\ "imports":{},"capabilities":[],"private":true},
+    \\{"spec":"@rewind/jwt","version":"1.4.0","pkg_hash":"jwt14",
+    \\ "files":[{"path":"index.mjs","source_hash":"s3"}],
+    \\ "imports":{},"capabilities":[],"private":false}
+    \\],"app_imports":{"@rewind/oidc":"oidchash","@rewind/jwt":"jwt14"}}
+;
+
+test "appSurfacePins: pins the app surface, by hash and not by spec" {
+    var res = try parseResolveResponse(testing.allocator, LOCK_WITH_NESTED_DUP);
+    defer res.deinit();
+
+    const pins = try appSurfacePins(testing.allocator, &res);
+    defer testing.allocator.free(pins);
+
+    try testing.expectEqual(@as(usize, 2), pins.len);
+    var saw_oidc = false;
+    var saw_jwt = false;
+    for (pins) |pin| {
+        if (std.mem.eql(u8, pin.spec, "@rewind/oidc")) {
+            saw_oidc = true;
+            try testing.expectEqualStrings("2.3.1", pin.range);
+        }
+        if (std.mem.eql(u8, pin.spec, "@rewind/jwt")) {
+            saw_jwt = true;
+            // 1.4.0 is what the APP imports; 1.9.0 is oidc's private copy.
+            // Matching by spec would pin the app to whichever came first in
+            // the packages array, which is 1.9.0 here.
+            try testing.expectEqualStrings("1.4.0", pin.range);
+        }
+    }
+    try testing.expect(saw_oidc and saw_jwt);
+    testing.allocator.free(pins[0].spec);
+    testing.allocator.free(pins[0].range);
+    testing.allocator.free(pins[1].spec);
+    testing.allocator.free(pins[1].range);
+}
+
+test "appSurfacePins: a pin round-trips into the overrides that reproduce it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var res = try parseResolveResponse(a, LOCK_WITH_NESTED_DUP);
+    defer res.deinit();
+    const pins = try appSurfacePins(a, &res);
+
+    // The declared ranges are loose; the overrides are exact. That pairing is
+    // what makes the next resolve return this same graph instead of whatever
+    // the registry considers newest.
+    const deps = [_]Dependency{
+        .{ .spec = "@rewind/oidc", .range = "^2.0" },
+        .{ .spec = "@rewind/jwt", .range = "^1.0" },
+    };
+    const body = try buildResolveRequest(a, &deps, pins);
+    try testing.expect(std.mem.indexOf(u8, body, "\"overrides\":") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"@rewind/oidc\":\"2.3.1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"@rewind/jwt\":\"1.4.0\"") != null);
+}
+
+test "appSurfacePins: an app_imports edge naming no package is refused" {
+    const dangling =
+        \\{"packages":[{"spec":"@rewind/jwt","version":"1.0.0","pkg_hash":"jwt10",
+        \\ "files":[],"imports":{},"capabilities":[],"private":false}],
+        \\ "app_imports":{"@rewind/oidc":"nosuchhash"}}
+    ;
+    var res = try parseResolveResponse(testing.allocator, dangling);
+    defer res.deinit();
+    // Dropping the pin instead would silently re-resolve that spec by range
+    // and look like the lockfile had been honoured.
+    try testing.expectError(Error.BadResolution, appSurfacePins(testing.allocator, &res));
 }
 
 test "buildResolveRequest: deps only, then with overrides" {

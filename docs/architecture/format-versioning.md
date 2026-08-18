@@ -83,6 +83,13 @@ Legend — **Ver?**: explicit version field present today. **Tier**: see §2.
 | kvexp store (app.db / __root__.db) | kvexp (fetched, **not vendored**); `data_dir/{id}/app.db` | LMDB B+tree; applied-raft-idx watermark in kvexp meta | LMDB internal | C |
 | Group manifest (node-local) | `src/consensus/node.zig:703-789` (`{data_dir}/__groups__/app.db`) | kvexp; key=id_str, value=epoch decimal ASCII | none | C |
 | ACME account key | `src/cp/acme.zig:199-220` (`{data_dir}/acme/account.key`) | PKCS#8 PEM | none | C |
+| Bundle lockfile (`<bundle>/rewind.lock`) | written `src/cli/rewind.zig` `writeLockfile`, read `readLockfile`; shape `src/cli/packages.zig` `parseResolveResponse` | the registry's `/v1/resolve` body verbatim — JSON `{packages[{spec,version,pkg_hash,files,imports,capabilities,private}], app_imports{spec:pkg_hash}}` | **none** | C |
+
+> **`rewind.lock` became load-bearing** when `deploy` started resolving through
+> it (#630): it is now an INPUT to a deploy, not a record of one, so a shape
+> change silently mis-pins rather than being ignored. It carries no version
+> field yet — that lands with the versioning pass (#244), and the entry is
+> listed here so the inventory is complete in the meantime.
 
 > **Stale / dead (not live formats):** per-instance SQLite `files.db` / `log.db`
 > referenced in `src/files/root.zig`, `src/tenant/root.zig:146`, `src/log/root.zig`

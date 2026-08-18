@@ -346,6 +346,135 @@ fn uploadStep(a: std.mem.Allocator, cfg: *const Cfg, upath: []const u8, body: []
     c.fatal("upload {s}: no leader after retries", .{label});
 }
 
+/// How a deploy treats the bundle's `rewind.lock`.
+pub const LockMode = enum {
+    /// Pin what the lock pins; resolve anything it does not; rewrite it.
+    /// The default, and the reproducible one: an existing pin never moves
+    /// on its own, while adding a dependency still just works.
+    use,
+    /// Refuse unless the lock pins exactly the declared set. For CI, where a
+    /// deploy that quietly resolves a new range is the thing you are trying
+    /// to catch.
+    frozen,
+    /// Ignore the lock and re-resolve every range. The deliberate
+    /// "move the pins" path, same as `rewind lock`.
+    update,
+};
+
+/// Read `<bundle>/rewind.lock` as the resolve response it is. Null when the
+/// file is absent (a bundle that has never been deployed); fatal when it is
+/// present and unreadable, because silently re-resolving a corrupt lock is
+/// exactly the drift the lock exists to prevent.
+fn readLockfile(a: std.mem.Allocator, bundle: []const u8) ?packages.Resolution {
+    const path = std.fs.path.join(a, &.{ bundle, "rewind.lock" }) catch c.oom();
+    const bytes = std.fs.cwd().readFileAlloc(a, path, 4 << 20) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => c.fatal("read {s}: {s}", .{ path, @errorName(err) }),
+    };
+    return packages.parseResolveResponse(a, bytes) catch |err|
+        c.fatal("{s} is not a readable lockfile ({s}) — `rewind lock {s}` rewrites it", .{ path, @errorName(err), bundle });
+}
+
+/// How a bundle's lockfile and its `manifest.json` disagree, if they do.
+/// `no_lockfile` is kept distinct from "no drift": under `--frozen` there is
+/// nothing to be faithful TO, which is a different complaint than a lock that
+/// has fallen behind.
+const LockDrift = struct {
+    no_lockfile: bool = false,
+    /// Declared, and the lock pins nothing for it.
+    missing: []const []const u8 = &.{},
+    /// Pinned, and the bundle no longer declares it.
+    stale: []const []const u8 = &.{},
+    /// The pins that DO line up — the `overrides` a deploy sends.
+    pins: []const packages.Dependency = &.{},
+
+    fn diverged(self: LockDrift) bool {
+        return self.no_lockfile or self.missing.len != 0 or self.stale.len != 0;
+    }
+};
+
+/// Compare a bundle's lockfile against the dependencies it declares. Pure —
+/// no printing and no exit, so a caller publishing MANY bundles can ask about
+/// every one before it decides anything.
+fn lockDrift(
+    a: std.mem.Allocator,
+    bundle: []const u8,
+    deps: []const packages.Dependency,
+) LockDrift {
+    var lock = readLockfile(a, bundle) orelse return .{ .no_lockfile = true };
+    defer lock.deinit();
+
+    const pinned = packages.appSurfacePins(a, &lock) catch |err|
+        c.fatal("{s}/rewind.lock: {s}", .{ bundle, @errorName(err) });
+
+    var pins = std.ArrayList(packages.Dependency){};
+    var missing = std.ArrayList([]const u8){};
+    for (deps) |d| {
+        for (pinned) |pin| {
+            if (std.mem.eql(u8, pin.spec, d.spec)) {
+                pins.append(a, pin) catch c.oom();
+                break;
+            }
+        } else missing.append(a, d.spec) catch c.oom();
+    }
+    var stale = std.ArrayList([]const u8){};
+    for (pinned) |pin| {
+        for (deps) |d| {
+            if (std.mem.eql(u8, pin.spec, d.spec)) break;
+        } else stale.append(a, pin.spec) catch c.oom();
+    }
+    return .{
+        .missing = missing.items,
+        .stale = stale.items,
+        .pins = pins.items,
+    };
+}
+
+/// Print one bundle's drift, naming the bundle. Publish walks many bundles, so
+/// "the lockfile is out of date" without a name is not an actionable report.
+fn reportDrift(bundle: []const u8, drift: LockDrift) void {
+    if (drift.no_lockfile) {
+        std.debug.print("  {s}: no rewind.lock\n", .{bundle});
+        return;
+    }
+    if (drift.missing.len != 0) {
+        std.debug.print("  {s}: not pinned by the lockfile:\n", .{bundle});
+        for (drift.missing) |spec| std.debug.print("    + {s}\n", .{spec});
+    }
+    if (drift.stale.len != 0) {
+        std.debug.print("  {s}: pinned but no longer declared:\n", .{bundle});
+        for (drift.stale) |spec| std.debug.print("    - {s}\n", .{spec});
+    }
+}
+
+/// The `overrides` a deploy sends: the lock's exact-version pins, narrowed to
+/// the specs the bundle still declares.
+///
+/// Narrowing matters because a pin for a dropped dependency is not merely
+/// useless — under `--frozen` it is the signal that the lock and the manifest
+/// have diverged, and it must be reported rather than passed to a registry
+/// that would ignore it.
+fn lockPins(
+    a: std.mem.Allocator,
+    bundle: []const u8,
+    deps: []const packages.Dependency,
+    mode: LockMode,
+) []const packages.Dependency {
+    if (mode == .update) return &.{};
+    const drift = lockDrift(a, bundle, deps);
+    if (mode != .frozen) return drift.pins;
+    if (drift.no_lockfile) c.fatal(
+        "--frozen needs {s}/rewind.lock, and there is none — run `rewind lock {s}` first",
+        .{ bundle, bundle },
+    );
+    if (drift.diverged()) {
+        std.debug.print("rewind: the lockfile is out of date with manifest.json:\n", .{});
+        reportDrift(bundle, drift);
+        c.fatal("--frozen: `rewind lock {s}` to update it", .{bundle});
+    }
+    return drift.pins;
+}
+
 /// `rewind lock <bundle>` — resolve the bundle's package graph and write
 /// `rewind.lock`, without deploying anything.
 ///
@@ -367,7 +496,9 @@ fn cmdLock(a: std.mem.Allocator, cfg: *const Cfg, bundle: []const u8) void {
         std.debug.print("bundle {s} declares no packages — no lockfile to write\n", .{bundle});
         return;
     }
-    var rr = registryResolve(a, cfg, deps);
+    // No overrides: `lock` is the deliberate "move the pins to the newest
+    // matching version" verb, which is why `deploy` does not do this.
+    var rr = registryResolve(a, cfg, deps, &.{});
     packages.topoSort(&rr.res) catch c.fatal("resolved packages form a dependency cycle", .{});
     writeLockfile(bundle, rr.body);
     std.debug.print("{s}/rewind.lock: {d} package(s) pinned\n", .{ bundle, rr.res.packages.len });
@@ -376,10 +507,18 @@ fn cmdLock(a: std.mem.Allocator, cfg: *const Cfg, bundle: []const u8) void {
     }
 }
 
-/// `rewind deploy <tenant> <bundle> [--release]` — per-file workspace deploy.
-/// A bundle whose `manifest.json` declares `dependencies` resolves them
-/// against the `@rewind` registry and stages the resolved package graph
-/// (P-CLI, rove#122); a package-free bundle takes the plain path.
+/// `rewind deploy <tenant> <bundle> [--release] [--frozen|--update]` — per-file
+/// workspace deploy. A bundle whose `manifest.json` declares `dependencies`
+/// resolves them against the `@rewind` registry and stages the resolved
+/// package graph (P-CLI, rove#122); a package-free bundle takes the plain
+/// path.
+///
+/// Resolution is pinned by the bundle's `rewind.lock` (`LockMode`). Without
+/// that, a deploy re-resolves the loose ranges every time and the same commit
+/// ships different package code as the registry moves under it — which is
+/// incoherent on a platform that sells per-request deterministic replay, since
+/// a tape pins the handler's module hashes and nothing in the repo would show
+/// the change.
 /// Auth-requiring verbs (deploy/release/rollback/…) need EITHER a root token
 /// (headless / operator) or an interactive login session. With neither, the
 /// transport silently sends an empty cookie jar and the server bounces a bare
@@ -399,7 +538,14 @@ fn requireAuth(cfg: *const Cfg) void {
     , .{cfg.session_file});
 }
 
-fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: []const u8, release: bool) void {
+fn cmdDeploy(
+    a: std.mem.Allocator,
+    cfg: *const Cfg,
+    tenant: []const u8,
+    bundle: []const u8,
+    release: bool,
+    lock_mode: LockMode,
+) void {
     requireAuth(cfg);
     const b = c.classify(a, bundle);
     if (b.skipped.len != 0) {
@@ -431,21 +577,56 @@ fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: 
     const declared = readBundleDependencies(a, bundle);
     const deps = augmentDependencies(a, declared, b.handlers);
 
+    // Everything that can REFUSE happens before anything that MUTATES.
+    //
+    // `reset` clears the tenant's staged deployment, so a failure after it —
+    // an out-of-date lockfile under `--frozen`, an unresolvable pin, a
+    // registry outage — leaves the tenant emptied by a deploy that then
+    // declined to proceed. Reading the lock and resolving the graph are both
+    // pure reads, so they belong on this side of the line.
+    var resolved: ?packages.Resolution = null;
+    var pin_count: usize = 0;
+    var lock_body: []const u8 = "";
+    if (deps.len != 0) {
+        const pins = lockPins(a, bundle, deps, lock_mode);
+        pin_count = pins.len;
+        var rr = registryResolve(a, cfg, deps, pins);
+        packages.topoSort(&rr.res) catch c.fatal("resolved packages form a dependency cycle", .{});
+        resolved = rr.res;
+        lock_body = rr.body;
+        // Say which discipline actually applied. Reporting "0/N pinned"
+        // under `--update` would read as a stale lockfile rather than as the
+        // deliberate re-resolve the caller asked for.
+        if (lock_mode == .update) {
+            std.debug.print(
+                "resolved {d} package(s) — --update: every range re-resolved, rewind.lock rewritten\n",
+                .{rr.res.packages.len},
+            );
+        } else if (pins.len == deps.len) {
+            std.debug.print(
+                "resolved {d} package(s) — all {d} pinned by rewind.lock\n",
+                .{ rr.res.packages.len, pins.len },
+            );
+        } else {
+            std.debug.print(
+                "resolved {d} package(s) — {d}/{d} pinned by rewind.lock, {d} newly resolved\n",
+                .{ rr.res.packages.len, pins.len, deps.len, deps.len - pins.len },
+            );
+        }
+    }
+
     _ = deployStep(a, cfg, "reset", c.tenantBody(a, tenant), "reset");
 
-    // With packages: resolve → stage every package file (stage-only, order
-    // free) → cut carries the lockfile resolution; the deploy app compiles
-    // each package as a batch (dependency-ordered) and links the handlers
-    // against the pinned graph, all server-side at cut.
+    // With packages: stage every package file (stage-only, order free) → cut
+    // carries the lockfile resolution; the deploy app compiles each package as
+    // a batch (dependency-ordered) and links the handlers against the pinned
+    // graph, all server-side at cut.
     var cut_body: []const u8 = c.tenantBody(a, tenant);
-    if (deps.len != 0) {
-        var rr = registryResolve(a, cfg, deps);
-        packages.topoSort(&rr.res) catch c.fatal("resolved packages form a dependency cycle", .{});
-        stagePackages(a, cfg, tenant, &rr.res);
-        const lock = packages.emitResolution(a, &rr.res) catch c.oom();
+    if (resolved) |*res| {
+        stagePackages(a, cfg, tenant, res);
+        const lock = packages.emitResolution(a, res) catch c.oom();
         cut_body = cutBody(a, tenant, lock);
-        writeLockfile(bundle, rr.body);
-        std.debug.print("resolved {d} package(s) against the registry\n", .{rr.res.packages.len});
+        writeLockfile(bundle, lock_body);
     }
 
     for (b.handlers) |h| {
@@ -504,12 +685,17 @@ const ResolveResult = struct {
 /// (`POST {registry}/v1/resolve`, public — no session). Returns the parsed,
 /// arena-owned resolution + the raw body (for the lockfile). Fatals on a
 /// missing registry URL or an unresolvable/bad response.
-fn registryResolve(a: std.mem.Allocator, cfg: *const Cfg, deps: []const packages.Dependency) ResolveResult {
+fn registryResolve(
+    a: std.mem.Allocator,
+    cfg: *const Cfg,
+    deps: []const packages.Dependency,
+    overrides: []const packages.Dependency,
+) ResolveResult {
     const base = cfg.registry_url orelse c.fatal(
         "this bundle declares `dependencies` but REWIND_REGISTRY_URL is unset — point it at your @rewind registry origin",
         .{},
     );
-    const req = packages.buildResolveRequest(a, deps, &.{}) catch c.oom();
+    const req = packages.buildResolveRequest(a, deps, overrides) catch c.oom();
     const url = std.fmt.allocPrint(a, "{s}/v1/resolve", .{base}) catch c.oom();
     const r = httpCall(a, cfg, "POST", url, &.{JSON_CT}, req, false, 60);
     if (r.code == 422) c.fatal("registry could not resolve dependencies: {s}", .{c.trunc(r.body)});
@@ -1264,11 +1450,37 @@ fn inList(list: [][]const u8, s: []const u8) bool {
     return false;
 }
 
-/// `rewind publish [--apps-dir D] [--only ...] [--include-examples] [--no-release]`
-/// — read `{apps-dir}/manifest.json` and drive provision + host-map + deploy +
-/// release for each first-party tenant. The typed twin of
-/// `scripts/ops/publish_firstparty.py`, over the session cookie (no operator secret).
-fn cmdPublish(a: std.mem.Allocator, cfg: *const Cfg, apps_dir: []const u8, only: [][]const u8, include_examples: bool, no_release: bool) void {
+/// `rewind publish [--apps-dir D] [--only ...] [--include-examples]
+/// [--no-release] [--frozen|--update]` — read `{apps-dir}/manifest.json` and
+/// drive provision + host-map + deploy + release for each first-party tenant.
+/// The typed twin of `scripts/ops/publish_firstparty.py`, over the session
+/// cookie (no operator secret).
+///
+/// `lock_mode` reaches every bundle. Under `--frozen` the whole selection is
+/// judged first (`preflightFrozen`), so a stale lockfile on the last tenant
+/// cannot be discovered after the first four have already shipped.
+/// One selected tenant from the publish manifest, resolved to what the loop
+/// needs. Selection is worked out ONCE and reused, so the `--frozen`
+/// pre-flight and the publish itself can never disagree about which bundles
+/// are in scope — a pre-flight that judged a different set than it gated
+/// would be worse than none.
+const PublishTarget = struct {
+    id: []const u8,
+    dir: []const u8,
+    bundle: []const u8,
+    cluster: []const u8,
+    hosts: []const []const u8,
+    provision: bool,
+    release: bool,
+};
+
+/// Read the publish manifest and resolve the selected tenants.
+fn publishTargets(
+    a: std.mem.Allocator,
+    apps_dir: []const u8,
+    only: [][]const u8,
+    include_examples: bool,
+) []const PublishTarget {
     const mpath = std.fs.path.join(a, &.{ apps_dir, "manifest.json" }) catch c.oom();
     const bytes = std.fs.cwd().readFileAlloc(a, mpath, 4 << 20) catch |e|
         c.fatal("read {s}: {s}", .{ mpath, @errorName(e) });
@@ -1286,19 +1498,14 @@ fn cmdPublish(a: std.mem.Allocator, cfg: *const Cfg, apps_dir: []const u8, only:
     const tenants = root.object.get("tenants") orelse c.fatal("manifest.json: no `tenants` array", .{});
     if (tenants != .array) c.fatal("manifest.json: `tenants` is not an array", .{});
 
-    var published: usize = 0;
+    var out = std.ArrayList(PublishTarget){};
     for (tenants.array.items) |t| {
         if (t != .object) continue;
         const id = jStr(t, "tenant") orelse {
             std.debug.print("· skipping a tenant entry with no `tenant` id\n", .{});
             continue;
         };
-        const dir = jStr(t, "dir") orelse id;
         const kind = jStr(t, "kind") orelse "operator";
-        const cluster = jStr(t, "cluster") orelse def_cluster;
-        const do_provision = jBool(t, "provision", true);
-        const do_release = jBool(t, "release", def_release);
-
         const selected = if (only.len != 0)
             inList(only, id)
         else
@@ -1308,19 +1515,72 @@ fn cmdPublish(a: std.mem.Allocator, cfg: *const Cfg, apps_dir: []const u8, only:
             continue;
         }
 
+        const dir = jStr(t, "dir") orelse id;
         var hosts = std.ArrayList([]const u8){};
         if (t.object.get("hosts")) |h| if (h == .array) {
             for (h.array.items) |hv| if (hv == .string) hosts.append(a, hv.string) catch c.oom();
         };
-
-        const bundle = std.fs.path.join(a, &.{ apps_dir, dir }) catch c.oom();
-        std.debug.print("\n▶ {s}  (dir {s}, cluster {s})\n", .{ id, dir, cluster });
-        if (do_provision) cmdProvision(a, cfg, id, cluster, if (hosts.items.len > 0) hosts.items[0] else null);
-        if (hosts.items.len > 1) for (hosts.items[1..]) |hh| cmdHostAdd(a, cfg, hh, id);
-        cmdDeploy(a, cfg, id, bundle, do_release and !no_release);
-        published += 1;
+        out.append(a, .{
+            .id = id,
+            .dir = dir,
+            .bundle = std.fs.path.join(a, &.{ apps_dir, dir }) catch c.oom(),
+            .cluster = jStr(t, "cluster") orelse def_cluster,
+            .hosts = hosts.items,
+            .provision = jBool(t, "provision", true),
+            .release = jBool(t, "release", def_release),
+        }) catch c.oom();
     }
-    std.debug.print("\npublish complete — {d} tenant(s) processed\n", .{published});
+    return out.items;
+}
+
+/// `--frozen` across many bundles: judge EVERY selected bundle before any of
+/// them is touched, and report all the offenders at once.
+///
+/// Refusing on the first offender would be the multi-bundle version of the bug
+/// `cmdDeploy` just fixed — earlier tenants already provisioned and published,
+/// and the operator learns about the next stale lockfile only after fixing
+/// this one and re-running.
+fn preflightFrozen(a: std.mem.Allocator, targets: []const PublishTarget) void {
+    var offenders: usize = 0;
+    for (targets) |t| {
+        const b = c.classify(a, t.bundle);
+        const declared = readBundleDependencies(a, t.bundle);
+        const deps = augmentDependencies(a, declared, b.handlers);
+        if (deps.len == 0) continue; // no packages, nothing to pin
+        const drift = lockDrift(a, t.bundle, deps);
+        if (!drift.diverged()) continue;
+        if (offenders == 0)
+            std.debug.print("rewind: --frozen — lockfiles out of date with manifest.json:\n", .{});
+        reportDrift(t.bundle, drift);
+        offenders += 1;
+    }
+    if (offenders != 0) c.fatal(
+        "--frozen: {d} bundle(s) need `rewind lock <dir>` — nothing was published",
+        .{offenders},
+    );
+}
+
+fn cmdPublish(
+    a: std.mem.Allocator,
+    cfg: *const Cfg,
+    apps_dir: []const u8,
+    only: [][]const u8,
+    include_examples: bool,
+    no_release: bool,
+    lock_mode: LockMode,
+) void {
+    const targets = publishTargets(a, apps_dir, only, include_examples);
+
+    // Every bundle's lockfile is judged before the first tenant is touched.
+    if (lock_mode == .frozen) preflightFrozen(a, targets);
+
+    for (targets) |t| {
+        std.debug.print("\n▶ {s}  (dir {s}, cluster {s})\n", .{ t.id, t.dir, t.cluster });
+        if (t.provision) cmdProvision(a, cfg, t.id, t.cluster, if (t.hosts.len > 0) t.hosts[0] else null);
+        if (t.hosts.len > 1) for (t.hosts[1..]) |hh| cmdHostAdd(a, cfg, hh, t.id);
+        cmdDeploy(a, cfg, t.id, t.bundle, t.release and !no_release, lock_mode);
+    }
+    std.debug.print("\npublish complete — {d} tenant(s) processed\n", .{targets.len});
 }
 
 const USAGE =
@@ -1329,7 +1589,7 @@ const USAGE =
     \\Usage:
     \\  rewind [--env <file>] login
     \\  rewind [--env <file>] status
-    \\  rewind [--env <file>] deploy <tenant> <bundle-dir> [--release]
+    \\  rewind [--env <file>] deploy <tenant> <bundle-dir> [--release] [--frozen|--update]
     \\  rewind [--env <file>] lock <bundle-dir>
     \\  rewind [--env <file>] release <tenant> <dep_id-hex>
     \\  rewind [--env <file>] rollback <tenant> <dep_id-hex>
@@ -1340,12 +1600,19 @@ const USAGE =
     \\  rewind sim <world.json> [--source-dir DIR] [--update] [-o FILE]
     \\  rewind test [dir] [--source-dir DIR] [--update]
     \\  rewind export-fixture <base64-record.json> [-o world.json]
-    \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
+    \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release] [--frozen|--update]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
     \\  rewind [--env <file>] host add <host> <tenant>
     \\  rewind [--env <file>] plan set <tenant> <plan>
     \\  rewind [--env <file>] move <tenant> <cluster> [--live] --yes
     \\  rewind [--env <file>] route <host>
+    \\
+    \\Packages resolve through the bundle's `rewind.lock`: an existing pin never
+    \\moves on its own, a newly declared dependency resolves and is written back.
+    \\`--frozen` refuses when the lock and manifest.json disagree (use it in CI);
+    \\`--update` re-resolves every range, as `rewind lock` does. Both work on
+    \\`publish` too, where `--frozen` judges every selected bundle before it
+    \\touches the first one.
     \\
     \\Operator verbs (provision/host/plan/move/route, and publish/deployments for
     \\any tenant) need an operator (is_root) session; deploy/release/rollback work
@@ -1532,16 +1799,25 @@ pub fn main() void {
     } else if (std.mem.eql(u8, verb, "deploy")) {
         if (rest.len < 2) c.fatal("deploy needs <tenant> <bundle-dir>", .{});
         var release = false;
+        var lock_mode: LockMode = .use;
+        var saw_mode = false;
         for (rest[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--release")) {
                 release = true;
+            } else if (std.mem.eql(u8, arg, "--frozen") or std.mem.eql(u8, arg, "--update")) {
+                // Mutually exclusive by meaning: one refuses to move the pins,
+                // the other exists to move them. Taking the last one silently
+                // would pick a behaviour the author did not ask for.
+                if (saw_mode) c.fatal("deploy: --frozen and --update are mutually exclusive", .{});
+                saw_mode = true;
+                lock_mode = if (std.mem.eql(u8, arg, "--frozen")) .frozen else .update;
             } else if (std.mem.eql(u8, arg, "--env")) {
                 c.fatal("--env is a GLOBAL flag — put it BEFORE the command: rewind --env <file> deploy <tenant> <bundle>", .{});
             } else {
-                c.fatal("deploy: unknown option '{s}' (want [--release]; --env goes before the command)", .{arg});
+                c.fatal("deploy: unknown option '{s}' (want [--release] [--frozen|--update]; --env goes before the command)", .{arg});
             }
         }
-        cmdDeploy(a, &cfg, rest[0], rest[1], release);
+        cmdDeploy(a, &cfg, rest[0], rest[1], release, lock_mode);
     } else if (std.mem.eql(u8, verb, "release") or std.mem.eql(u8, verb, "rollback")) {
         if (rest.len < 2) c.fatal("{s} needs <tenant> <dep_id-hex>", .{verb});
         cmdRelease(a, &cfg, rest[0], rest[1]);
@@ -1552,6 +1828,8 @@ pub fn main() void {
         var apps_dir: []const u8 = ".";
         var include_examples = false;
         var no_release = false;
+        var lock_mode: LockMode = .use;
+        var saw_mode = false;
         var only = std.ArrayList([]const u8){};
         var j: usize = 0;
         while (j < rest.len) : (j += 1) {
@@ -1572,9 +1850,13 @@ pub fn main() void {
                 include_examples = true;
             } else if (std.mem.eql(u8, arg, "--no-release")) {
                 no_release = true;
+            } else if (std.mem.eql(u8, arg, "--frozen") or std.mem.eql(u8, arg, "--update")) {
+                if (saw_mode) c.fatal("publish: --frozen and --update are mutually exclusive", .{});
+                saw_mode = true;
+                lock_mode = if (std.mem.eql(u8, arg, "--frozen")) .frozen else .update;
             } else c.fatal("publish: unknown option '{s}'", .{arg});
         }
-        cmdPublish(a, &cfg, apps_dir, only.items, include_examples, no_release);
+        cmdPublish(a, &cfg, apps_dir, only.items, include_examples, no_release, lock_mode);
     } else if (std.mem.eql(u8, verb, "provision")) {
         if (rest.len < 1) c.fatal("provision needs <tenant> [--cluster C] [--host H]", .{});
         const tenant = rest[0];
