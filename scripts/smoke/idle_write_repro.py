@@ -41,11 +41,20 @@ export function handler() {
 }
 """
 
-# Default steps straddle the front/worker/raft timeouts. Pass seconds on the
-# command line to probe a longer gap (the field report was ~40 minutes, which
-# is far past every timeout in the tree — so a long run is about finding a
-# mechanism none of these explain).
-IDLE_STEPS = [3.0, 6.0, 12.0, 30.0, 60.0]
+# The default steps straddle every timeout the header names — 2s hibernation,
+# 5s front leg, 10s worker h2 — and nothing else. Each step sleeps TWICE (once
+# before the write, once before the read), so the list IS this smoke's runtime.
+#
+# It used to run [3, 6, 12, 30, 60]: 222s of sleeping, of which the 30 and 60
+# steps were 180s spent probing gaps far past every timeout in the tree. Those
+# were EXPLORATORY — rove#353's field report was a ~40-minute gap, so the long
+# steps were hunting a mechanism none of the known timeouts explained. #353 is
+# closed and the mechanism is known, and a 60s step never approached 40 minutes
+# anyway. What remains is the regression guard, and the guard only needs the
+# steps that cross the timeouts.
+#
+# Pass seconds on the command line to probe a longer gap by hand.
+IDLE_STEPS = [3.0, 6.0, 12.0]
 if len(sys.argv) > 1:
     IDLE_STEPS = [float(a) for a in sys.argv[1:]]
 
