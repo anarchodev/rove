@@ -163,7 +163,7 @@ pub const SlotPool = struct {
 
 const testing = std.testing;
 
-const TEST_KEK = "a node-local key-encryption key, never on disk";
+const TEST_KEK = "a node-local cluster key-encryption key";
 const TEST_SECRET: keyring_mod.Secret = [_]u8{0x5A} ** keyring_mod.SECRET_LEN;
 
 fn tmpDirPath(buf: []u8) []const u8 {

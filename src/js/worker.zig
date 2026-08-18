@@ -1172,6 +1172,18 @@ pub const WorkerConfig = struct {
     /// move endpoints are disabled (404/501). Borrowed; alive for the
     /// worker's lifetime.
     move_secret: ?[]const u8 = null,
+    /// Cluster key-encryption key for per-tenant keyrings — the one
+    /// secret that must never reach storage, because it is what makes a
+    /// decommissioned disk's keyring residue useless. Every node in a
+    /// cluster holds the SAME value: a sealed keyring shard is portable
+    /// ciphertext only because its file key derives from this plus the
+    /// tenant id, which is what lets replication ship bytes verbatim.
+    /// When null the keyring surface is disabled (404). Borrowed.
+    keyring_kek: ?[]const u8 = null,
+    /// Peer HTTP bases, indexed by raft node id minus one — the same
+    /// `REWIND_PEER_URLS` mapping snapshot catch-up resolves against, so
+    /// the two cannot disagree about where a node lives. Borrowed.
+    peer_urls: []const []const u8 = &.{},
     /// This cluster's logical id in the control-plane directory
     /// (serve-or-forward). When set together with `cp_urls`, a request for a
     /// tenant this cluster can't resolve locally is forwarded to the cluster
@@ -1694,6 +1706,12 @@ pub fn Worker(comptime opts: Options) type {
         /// Shared secret gating the `/_system/v2-*` tenant-move
         /// surface. See `WorkerConfig.move_secret`.
         move_secret: ?[]const u8,
+        /// Cluster KEK for per-tenant keyrings. See
+        /// `WorkerConfig.keyring_kek`.
+        keyring_kek: ?[]const u8,
+        /// Peer HTTP bases by node id minus one. See
+        /// `WorkerConfig.peer_urls`.
+        peer_urls: []const []const u8,
         /// Serve-or-forward. See `WorkerConfig.cluster_id` /
         /// `cp_urls`. cluster_id null or cp_urls empty → forwarding disabled.
         cluster_id: ?[]const u8,
@@ -1796,6 +1814,8 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_ctx = config.compile_ctx,
                 .services_jwt_secret = config.services_jwt_secret,
                 .move_secret = config.move_secret,
+                .keyring_kek = config.keyring_kek,
+                .peer_urls = config.peer_urls,
                 .cluster_id = config.cluster_id,
                 .cp_urls = config.cp_urls,
                 .internal_insecure_tls = config.internal_insecure_tls,

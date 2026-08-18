@@ -18,18 +18,27 @@
 //! old ones, and on flash nothing at this layer can. Effectiveness comes
 //! from two other things:
 //!
-//!  1. The files are **sealed under the KEK**, which lives only in node
-//!     configuration and never on disk. Whatever an old block still
-//!     holds is ciphertext — useless to anyone reading a decommissioned
-//!     disk, a backup, or an object store.
+//!  1. The files are **sealed under the KEK**, so whatever an old block
+//!     still holds is ciphertext — useless to anyone who has the bytes
+//!     but not the key: a backup, an object store, a disk pulled from a
+//!     decommissioned node.
 //!  2. The **live** file stops containing the key. That is the whole
 //!     difference from a log, where a destroyed key remains in the
 //!     current, in-use file forever, readable by every legitimate
 //!     reader.
 //!
-//! So the guarantee is: erasure is effective against everyone without
-//! the KEK, and the KEK is the one secret that never touches storage.
-//! It is not a claim about physical overwrite.
+//! So the guarantee is: **erasure is effective against everyone who
+//! does not hold the KEK.** It is not a claim about physical overwrite,
+//! and it is not a claim that the KEK is unobtainable.
+//!
+//! Be precise about that second limit, because it is easy to overstate.
+//! This code never writes the KEK anywhere; whether the *deployment*
+//! keeps it off persistent storage is a separate property and not one
+//! this file can assert. Where the KEK ships in the same on-disk
+//! environment file as every other node secret, a recovered disk yields
+//! both halves and residue here is readable — which is why destroying a
+//! node's copy is a **rotation** question (`key_version` exists for it)
+//! rather than something the seal alone settles.
 //!
 //! ## Keys are indexed by SLOT, not by identity
 //!
@@ -840,7 +849,7 @@ fn syncPath(dir_path: []const u8) Error!void {
 
 const testing = std.testing;
 
-const TEST_KEK = "a node-local key-encryption key, never on disk";
+const TEST_KEK = "a node-local cluster key-encryption key";
 const TEST_SECRET: Secret = [_]u8{0x5A} ** SECRET_LEN;
 
 fn tmpDirPath(buf: []u8) []const u8 {

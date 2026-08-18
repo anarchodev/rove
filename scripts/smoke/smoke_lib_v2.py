@@ -59,6 +59,10 @@ LOG_SERVER = BIN_DIR / "rewind-logs"
 # each worker (`REWIND_ROOT_TOKEN`) and uses it for admin-surface auth.
 ROOT_TOKEN = "smoke-nonprod-root-token-0123456789abcdef"
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
+# Cluster KEK for per-tenant keyrings. Cluster-wide, never per-node —
+# see `_spawn_node`. A smoke value only; production reads it from the
+# environment and it must never reach disk.
+KEYRING_KEK = "rewindkeyringkekpadding0123456789abcdef0"
 JWT_SECRET_HEX = "a" * 64  # LOOP46_SERVICES_JWT_SECRET
 PUBLIC_SUFFIX = "localhost"
 
@@ -577,6 +581,12 @@ class V2Cluster:
         env["REWIND_PUBLIC_SUFFIX"] = PUBLIC_SUFFIX
         env["REWIND_ROOT_TOKEN"] = self.root_token
         env["REWIND_MOVE_SECRET"] = MOVE_SECRET
+        # Cluster key-encryption key for per-tenant keyrings. The SAME
+        # value on every node by construction: a sealed keyring shard is
+        # portable ciphertext only because its file key derives from this
+        # plus the tenant id, so a per-node value would make replication
+        # ship bytes no peer could open.
+        env["REWIND_KEYRING_KEK"] = KEYRING_KEK
         env["REWIND_NODE_ID"] = str(i + 1)
         # Cold-multi: every node carries the full static voter/peer set, so each
         # raft group is born {1..N} and elects on its own (genesis and steady

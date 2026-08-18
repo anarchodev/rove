@@ -720,6 +720,9 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-wire", wire_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
     js_mod.addImport("rove-plan", plan_mod);
+    // Keyring shard transport: the worker installs peer-sent shards and
+    // pushes its own to a quorum (`keyring_shard.zig`).
+    js_mod.addImport("rove-crypt", crypt_mod);
     js_mod.addImport("rove-reserved", reserved_mod);
     js_mod.addImport("rove-guards", guards_mod);
     js_mod.addImport("rove-binding", binding_mod);
