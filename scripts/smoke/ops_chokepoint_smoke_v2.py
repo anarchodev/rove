@@ -38,7 +38,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, APPS_DIR, BIN_DIR, MOVE_SECRET, _curl  # noqa: E402
+from smoke_lib_v2 import V2Cluster, APPS_DIR, BIN_DIR, MOVE_SECRET, _curl, require_apps_dir  # noqa: E402
+
+# Fail here, naming the setup step, rather than on a missing fixture file
+# deep in main() — an unpopulated `web/` submodule is the default state of a
+# clone made without --recursive.
+require_apps_dir()
 
 TENANT = "chokepointed"
 

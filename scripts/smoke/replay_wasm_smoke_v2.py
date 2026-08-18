@@ -35,7 +35,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, _curl, rpc_wrap, APPS_DIR  # noqa: E402
+from smoke_lib_v2 import V2Cluster, _curl, rpc_wrap, APPS_DIR, require_apps_dir  # noqa: E402
+
+# Fail here, naming the setup step, rather than on a missing fixture file
+# deep in main() — an unpopulated `web/` submodule is the default state of a
+# clone made without --recursive.
+require_apps_dir()
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TENANT = "replay-demo"

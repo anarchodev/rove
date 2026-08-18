@@ -354,8 +354,8 @@ def _apps_dir() -> Path:
     if env and (Path(env) / "replay" / "_static" / "qjs_arena_wasm.js").exists():
         return Path(env)
     raise EngineUnavailable(
-        "REWIND_APPS_DIR is not set to a rewind-apps checkout — the replay "
-        "porcelain lives there (private repo)"
+        "no rewind-apps checkout with the replay porcelain — expected the `web` "
+        "submodule (`git submodule update --init`) or REWIND_APPS_DIR"
     )
 
 

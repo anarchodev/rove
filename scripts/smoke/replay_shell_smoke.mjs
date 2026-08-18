@@ -69,7 +69,7 @@ const { chromium } = pw;
 const SCRIPT_DIR  = dirname(fileURLToPath(import.meta.url));
 // scripts/smoke/ → the repo root is two levels up.
 const REPO_ROOT   = resolve(SCRIPT_DIR, "..", "..");
-// The replay porcelain moved to the private rewind-apps repo when `web/`
+// The replay porcelain lives in the rewind-apps repo, mounted at `web/`
 // was extracted (commit fecf07b) — resolve it from $REWIND_APPS_DIR (the
 // smoke harness convention), falling back to an in-repo ./web. The static
 // server serves the `_static/` dir so `/` resolves index.html, matching
