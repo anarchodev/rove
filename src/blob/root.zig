@@ -182,5 +182,4 @@ test {
     _ = @import("coordinator.zig");
     _ = @import("namespace.zig");
     _ = @import("namespace_store.zig");
-    _ = @import("reservation.zig");
 }

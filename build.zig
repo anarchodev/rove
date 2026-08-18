@@ -76,12 +76,27 @@ pub fn build(b: *std.Build) void {
     //
     // Leaf module — stdlib only. The fs backend lives in src/blob/fs.zig
     // and ships in Phase 1a. The s3 backend lands in Phase 6.
+    // ── rove-reserve: cluster-unique ids from raft-reserved blocks ──
+    //
+    // Shared because a reissued id corrupts whatever it names, and the
+    // double-buffered refill that avoids a consensus round trip per id
+    // is not concurrency worth writing twice. Used by the blob
+    // coordinator's `batch_id` and by the keyring's slot allocation,
+    // where a reissued slot would give two identities one key — so
+    // shredding either would shred both. std-only leaf.
+    const reserve_mod = b.addModule("rove-reserve", .{
+        .root_source_file = b.path("src/reserve/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const blob_mod = b.addModule("rove-blob", .{
         .root_source_file = b.path("src/blob/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     blob_mod.link_libc = true;
+    blob_mod.addImport("rove-reserve", reserve_mod);
     // libcurl backs the S3 outbound path. Replaces std.http.Client,
     // which has a string of bugs in 0.15.x (HEAD stalls / segfaults,
     // no application-level timeouts → 15-minute kernel TCP retry
@@ -343,6 +358,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── rove-crypt: the sealed-envelope primitive ───────────────────
+    //
+    // Crypto shredding's one cipher seam: erasure is key destruction,
+    // so every ciphertext carries the algorithm, key generation, and a
+    // ref naming the key that opens it — self-describing from the first
+    // byte persisted (the crypto algorithm-agility gate,
+    // docs/architecture/format-versioning.md). std-only leaf: AEAD and
+    // HKDF come from std.crypto, matching `js/bindings/crypto.zig`, so
+    // importing it adds no link requirement to any binary. The browser
+    // replay arena deliberately does NOT import it — replay is decrypted
+    // server-side and no key is ever distributed to a client.
+    const crypt_mod = b.addModule("rove-crypt", .{
+        .root_source_file = b.path("src/crypt/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The slot pool is `rove-reserve` with a provider that also mints and
+    // replicates — the same block allocator the blob coordinator uses,
+    // because a reissued slot would give two identities one key.
+    crypt_mod.addImport("rove-reserve", reserve_mod);
+
     // ── rove-origin: node origin parsing ────────────────────────────
     //
     // The one definition of what the fleet can dial. Shared so the CP
@@ -506,6 +542,14 @@ pub fn build(b: *std.Build) void {
     // rove-ssrf tests
     const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
     test_step.dependOn(&b.addRunArtifact(ssrf_tests).step);
+
+    // rove-crypt tests
+    const crypt_tests = b.addTest(.{ .root_module = crypt_mod });
+    test_step.dependOn(&b.addRunArtifact(crypt_tests).step);
+
+    // rove-reserve tests
+    const reserve_tests = b.addTest(.{ .root_module = reserve_mod });
+    test_step.dependOn(&b.addRunArtifact(reserve_tests).step);
 
     // rove-origin tests
     const origin_tests = b.addTest(.{ .root_module = origin_mod });
@@ -681,6 +725,9 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-wire", wire_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
     js_mod.addImport("rove-plan", plan_mod);
+    // Keyring shard transport: the worker installs peer-sent shards and
+    // pushes its own to a quorum (`keyring_shard.zig`).
+    js_mod.addImport("rove-crypt", crypt_mod);
     js_mod.addImport("rove-reserved", reserved_mod);
     js_mod.addImport("rove-guards", guards_mod);
     js_mod.addImport("rove-binding", binding_mod);

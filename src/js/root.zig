@@ -153,6 +153,7 @@ test {
     _ = @import("log_walker.zig");
     _ = @import("static_cache.zig");
     _ = @import("blob_usage.zig");
+    _ = @import("keyring_slots.zig");
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");
     _ = @import("surface_tests.zig");

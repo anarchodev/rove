@@ -93,6 +93,8 @@ const WorkerCtx = struct {
     data_dir: []const u8,
     admin_api_domain: []const u8,
     move_secret: ?[]const u8,
+    /// Cluster KEK for per-tenant keyrings (`REWIND_KEYRING_KEK`).
+    keyring_kek: ?[]const u8,
     cluster_id: ?[]const u8,
     cp_urls: []const []const u8,
     /// Worker→log-server batch-push base (`REWIND_LOG_PUBLIC_BASE`, default the
@@ -342,6 +344,8 @@ fn workerMain(args: *WorkerCtx) !void {
         .log_batch_store = args.log_batch_store,
         .data_dir = args.data_dir,
         .move_secret = args.move_secret,
+        .keyring_kek = args.keyring_kek,
+        .peer_urls = args.peer_urls,
         .cluster_id = args.cluster_id,
         .cp_urls = args.cp_urls,
         .log_push_bases = args.log_push_bases,
@@ -701,6 +705,46 @@ pub fn main() !void {
     // surface (`/_system/v2-*`). The front door presents it as
     // `X-Rewind-Move-Secret`. Unset → the move surface is disabled.
     const move_secret = std.posix.getenv("REWIND_MOVE_SECRET");
+    // Cluster key-encryption key for per-tenant keyrings. The SAME value
+    // on every node of a cluster: a sealed keyring shard is portable
+    // ciphertext only because its file key derives from this plus the
+    // tenant id, which is what lets replication ship bytes verbatim.
+    //
+    // Read from the environment and never written to disk by this
+    // process. It DOES reach disk by deployment, though: the fleet ships
+    // node secrets as a 0600 systemd `EnvironmentFile`, so this sits on
+    // the same disk as the keyring ciphertext it protects, alongside the
+    // root token and the move secret.
+    //
+    // So a recovered disk yields both halves, and destroying a departed
+    // node's copy is a KEK-rotation question — `key_version` in the
+    // ciphertext envelope exists for exactly that — rather than
+    // something the seal settles on its own. Protecting this key alone
+    // would be theatre while the root token sits beside it granting live
+    // cluster access; the layer that actually closes it is full-disk
+    // encryption, which covers the WAL and the LMDB stores too.
+    //
+    // Unset → the keyring surface is disabled (404), which is the
+    // pre-rollout state.
+    //
+    // EMPTY is treated as unset, not as a key. A rendered env file that
+    // failed to resolve the secret emits `REWIND_KEYRING_KEK=` rather
+    // than omitting the line, and an empty ikm is a key everyone knows —
+    // it would seal every keyring in the fleet under a value with no
+    // entropy while looking configured. Disabled-and-obvious beats
+    // enabled-and-worthless.
+    const keyring_kek = blk: {
+        const v = std.posix.getenv("REWIND_KEYRING_KEK") orelse break :blk null;
+        if (v.len == 0) {
+            std.log.warn(
+                "rewind: REWIND_KEYRING_KEK is set but EMPTY — keyring surface stays " ++
+                    "disabled; the env render probably could not resolve the secret",
+                .{},
+            );
+            break :blk null;
+        }
+        break :blk v;
+    };
     // Serve-or-forward: this cluster's id + the control-plane
     // base URL. Set together; either unset → a local tenant miss 404s (no
     // forwarding). A DP that can't serve a tenant locally asks the CP who
@@ -993,6 +1037,7 @@ pub fn main() !void {
         .data_dir = data_dir,
         .admin_api_domain = admin_api_domain,
         .move_secret = move_secret,
+        .keyring_kek = keyring_kek,
         .cluster_id = cluster_id,
         .cp_urls = cp_urls,
         .log_push_bases = log_push_bases,

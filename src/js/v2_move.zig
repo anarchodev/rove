@@ -57,6 +57,9 @@ const curl = blob.curl;
 /// (docs/defect-patterns.md class 3). The attach envelope's fields, header
 /// names, and absent-vs-malformed semantics all live there.
 const wire = @import("rove-wire");
+/// Keyring shard install — key material replication, gated by the same
+/// move secret as the rest of this family.
+const keyring_shard = @import("keyring_shard.zig");
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = wire.TENANT;
@@ -137,6 +140,8 @@ pub fn tryHandleV2(
         try handleForwardBegin(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-forward-end")) {
         try handleForwardEnd(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, keyring_shard.ROUTE)) {
+        try keyring_shard.handlePush(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-snapshot-push")) {
         try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {

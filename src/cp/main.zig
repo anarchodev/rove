@@ -139,11 +139,27 @@ const Router = struct {
     /// `REWIND_ACME_DIRECTORY` is unset. Serves `/_cp/acme-challenge?token=`
     /// from its in-memory challenge store.
     acme: ?*acme_issuer.Handle = null,
-    /// S3 connection params, for the object sweep a deprovision runs
-    /// (`storage_sweep.zig`). Null when the CP has no S3 configured — the
-    /// delete then reports loudly that the tenant's bytes were left behind
-    /// rather than silently claiming a clean teardown.
+    /// S3 connection params on the RAW `S3_KEY_PREFIX_BASE`, i.e. OUTSIDE the
+    /// storage-namespace generation. That is deliberate and belongs to the
+    /// certificate mirror only: certs must survive a cold re-genesis, which
+    /// is precisely a generation bump. Null when the CP has no S3 configured.
+    ///
+    /// NOT for the teardown sweep — tenant objects live INSIDE the
+    /// generation, so sweeping this prefix deletes nothing (rove#606). Use
+    /// `sweep_cfg`.
     blob_cfg: ?blob.BackendConfig = null,
+
+    /// S3 connection params scoped to the object store's resolved storage
+    /// generation — the key space workers and the log-server actually write
+    /// tenant objects into. THE config the deprovision sweep must use.
+    ///
+    /// Null when the CP could not resolve the generation (no S3 configured,
+    /// marker missing, store unreachable). A null here never degrades into
+    /// sweeping `blob_cfg` instead: a sweep of the wrong prefix deletes
+    /// nothing while reporting a clean teardown, which is strictly worse
+    /// than refusing, because it also drops the incarnation that was the
+    /// only way to name the orphans afterwards (rove#606).
+    sweep_cfg: ?blob.BackendConfig = null,
 
     /// Opt-in: run the additive membership reconciler each reconcile tick
     /// (`REWIND_CP_RECONCILE_MEMBERSHIP=1`). OFF by default — a continuous
@@ -978,7 +994,7 @@ const Router = struct {
         //    the incarnation row goes — that row names the prefix, so a failed
         //    sweep must leave it in place for the retry to find.
         var swept: u64 = 0;
-        if (self.blob_cfg) |cfg| {
+        if (self.sweep_cfg) |cfg| {
             const storage = tenant_mod.TenantStorage{
                 .id = tenant,
                 .incarnation = if (incarnation) |i| .{ .token = i } else .legacy,
@@ -987,15 +1003,34 @@ const Router = struct {
                 try self.replyProvisionError(server, ent, sid, sess, 502, "tenant is torn down, but its stored objects were not fully deleted — retry");
                 return;
             };
+        } else if (self.blob_cfg != null) {
+            // S3 IS configured but the generation never resolved, so we know
+            // objects exist and cannot name them. Refusing is the only honest
+            // answer: sweeping the un-namespaced prefix would delete nothing
+            // and report a clean teardown, and step 5 would then drop the
+            // incarnation — the only handle on the orphans (rove#606).
+            std.log.warn(
+                "rewind-cp: delete {s}: storage generation unresolved — REFUSING to sweep " ++
+                    "(a sweep off the raw prefix removes nothing and claims success); " ++
+                    "the tenant is torn down but its objects remain — fix the object store and retry",
+                .{tenant},
+            );
+            try self.replyProvisionError(server, ent, sid, sess, 502, "tenant is torn down, but its stored objects were not deleted (storage generation unresolved) — retry");
+            return;
         } else {
-            // No S3 configured: say so rather than reporting a clean delete —
-            // the bytes are still there and still billing.
+            // No object store at all (dev / a CP deliberately run without S3):
+            // there is nothing to delete, so proceeding is honest. Still said
+            // out loud, because a MISconfigured S3 looks identical from here.
             std.log.warn("rewind-cp: delete {s}: no S3 config — stored objects NOT deleted", .{tenant});
         }
 
         // 5. The incarnation is per-LIFETIME: the next tenant to take this
         //    name must mint a fresh one, never inherit this one. Safe to drop
-        //    now — the objects it named are gone.
+        //    now — the objects it named are gone, which every path reaching
+        //    here has established: swept, or there was no object store. A
+        //    path that could NOT sweep returns above rather than falling
+        //    through, because this row is the only thing that names the
+        //    prefix and dropping it strands the bytes unfindable (rove#606).
         self.directory.removeIncarnation(tenant) catch |err|
             std.log.warn("rewind-cp: delete {s}: removeIncarnation failed: {s}", .{ tenant, @errorName(err) });
 
@@ -1851,6 +1886,45 @@ pub fn main() !void {
     };
     defer if (blob_owned) |*b| b.deinit(allocator);
 
+    // The teardown sweep's key space (rove#606). Tenant objects live INSIDE
+    // the storage-namespace generation — `prod/1/{tenant}/…`, not `prod/…` —
+    // because the worker and the log-server both scope their stores with
+    // `applyNamespace` at startup. The CP did not, so every deprovision swept
+    // a prefix nothing had ever been written to, deleted nothing, and logged
+    // that as success.
+    //
+    // Resolved into its OWN config rather than by scoping `blob_owned` in
+    // place: the certificate mirror deliberately sits outside the generation
+    // so certs survive a cold re-genesis, and moving it inside would destroy
+    // exactly the property it exists for.
+    //
+    // DEGRADE, never refuse to start: the worker exits when the marker is
+    // missing, but a CP that will not boot over an object-store hiccup takes
+    // provisioning and moves down for the whole cluster. So an unresolved
+    // generation leaves `sweep_cfg` null, and `handleDelete` refuses that one
+    // operation loudly instead of the CP refusing every operation.
+    var sweep_cfg: ?blob.BackendConfig = null;
+    var sweep_prefix_owned: ?[]u8 = null;
+    defer if (sweep_prefix_owned) |p| allocator.free(p);
+    if (blob_owned) |b| {
+        if (blob.namespace_store.resolve(allocator, b.cfg)) |segment| {
+            defer allocator.free(segment);
+            const scoped = try blob.namespace.apply(allocator, b.cfg.key_prefix_base, segment);
+            sweep_prefix_owned = scoped;
+            var c2 = b.cfg;
+            c2.key_prefix_base = scoped;
+            sweep_cfg = c2;
+            std.log.info("rewind-cp: teardown sweep scoped to generation '{s}' ({s})", .{ segment, scoped });
+        } else |err| {
+            std.log.warn(
+                "rewind-cp: storage generation unresolved ({s}) — deprovision will REFUSE to " ++
+                    "sweep rather than delete nothing and report success (rove#606). " ++
+                    "Serving normally otherwise.",
+                .{@errorName(err)},
+            );
+        }
+    }
+
     var cert_mirror_store: ?cert_mirror.CertMirror = if (blob_owned) |b|
         cert_mirror.CertMirror.init(allocator, b.cfg) catch |err| blk: {
             std.log.warn("rewind-cp: certificate mirror unavailable: {s}", .{@errorName(err)});
@@ -2025,7 +2099,7 @@ pub fn main() !void {
         const ms = std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t"), 10) catch break :blk 60 * std.time.ns_per_s;
         break :blk @as(i128, ms) * std.time.ns_per_ms;
     };
-    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns, .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX"), .blob_cfg = if (blob_owned) |b| b.cfg else null };
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns, .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX"), .blob_cfg = if (blob_owned) |b| b.cfg else null, .sweep_cfg = sweep_cfg };
 
     // Periodic membership reconciliation on the directory leader (between
     // request batches). last=0 → the first iteration reconciles, so a CP
