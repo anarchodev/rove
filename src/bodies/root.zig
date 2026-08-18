@@ -19,6 +19,24 @@
 
 const std = @import("std");
 
+/// The content-addressed pool object — the replacement for the
+/// counter-named layout below.
+///
+/// A counter-named batch makes uniqueness a coordination problem across
+/// nodes, and an uncoordinated counter is silent cross-tenant
+/// corruption (#625). Naming an object by its content removes the
+/// problem instead of solving it, and the header it introduces carries
+/// what a sweep needs to age and attribute an object without reading
+/// bodies.
+///
+/// Landed alongside the existing shape so the format can be reviewed on
+/// its own; switching the readers over is a separate, mechanical change.
+pub const pool_object = @import("pool_object.zig");
+
+test {
+    _ = pool_object;
+}
+
 /// Sentinel batch_id meaning "no body" / inline path / unparked.
 /// The coordinator's reservation provider floors the first reserved
 /// id at 1 (`max(stored, prev_end, 1)`), and the local-mode counter
