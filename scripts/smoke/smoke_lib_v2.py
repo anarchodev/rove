@@ -1028,6 +1028,29 @@ class V2Cluster:
         # dep stays internal to the package importing it.
         return packages, {spec: hashes[spec] for spec in specs}
 
+    def firstparty_packages_for_app(self, app_dir) -> tuple[list[dict], dict]:
+        """`firstparty_packages`, with the spec list READ FROM the app's own
+        `manifest.json` instead of hand-listed at the call site.
+
+        A hardcoded list is a copy of the app's dependencies that nothing keeps
+        in sync, and it drifts silently in the direction that fails late: the
+        app gains a dependency, the smoke keeps seeding the old set, and the
+        deploy dies at compile with `could not load module` — naming the
+        package, but not the reason. Deriving it means adding a dependency to
+        the app is the whole change.
+
+        Unknown specs are dropped rather than raising: a first-party app may
+        depend on a package that is not first-party, and that is the deploy's
+        business to resolve, not this seeder's.
+        """
+        import json
+        manifest = Path(app_dir) / "manifest.json"
+        deps = json.loads(manifest.read_text()).get("dependencies", {})
+        root = Path(__file__).resolve().parent.parent.parent / "src/js/packages/@rewind"
+        specs = [s for s in deps
+                 if s.startswith("@rewind/") and (root / s.split("/", 1)[1] / "index.mjs").exists()]
+        return self.firstparty_packages(specs)
+
     def deploy_with_packages(self, tenant: str, handler_files: dict[str, str],
                              packages: list[dict], app_imports: dict[str, str],
                              *, statics: Optional[dict[str, tuple]] = None,

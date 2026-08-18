@@ -104,10 +104,10 @@ def main() -> int:
         c._ensure_admin_app()
         c.provision("__auth__")
         try:
-            # web/auth imports `@rewind/oidc` (which pulls `@rewind/jwt`) and
-            # `@rewind/email`, so
-            # the packages stage with the deploy.
-            pkgs, imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            # The packages stage with the deploy. The spec list comes from the
+            # app's own manifest, so a dependency the app adds is seeded
+            # without editing this smoke.
+            pkgs, imports = c.firstparty_packages_for_app(APPS_DIR / "auth")
             c.deploy_with_packages(
                 "__auth__", {"index.mjs": auth_src}, pkgs, imports,
                 statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
@@ -119,9 +119,8 @@ def main() -> int:
             "login_path": "/login",
         }, separators=(",", ":")))
         try:
-            # web/admin's middleware imports `@rewind/oidc` + `@rewind/email`,
-            # so the packages stage with the deploy.
-            adm_pkgs, adm_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email", "@rewind/stripe"])
+            # Same, for the dashboard's own manifest.
+            adm_pkgs, adm_imports = c.firstparty_packages_for_app(APPS_DIR / "admin")
             c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e)); return 1

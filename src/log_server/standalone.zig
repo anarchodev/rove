@@ -39,6 +39,7 @@ const log_mod = @import("rove-log");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const seam_mod = @import("seam.zig");
+const body_ref_mod = @import("body_ref.zig");
 const indexer_mod = @import("indexer.zig");
 const metrics_mod = @import("metrics.zig");
 const jwt = @import("rove-jwt");
@@ -73,6 +74,14 @@ pub const Config = struct {
     poll_interval_ms: u32 = 5_000,
     /// h2 connection cap.
     max_connections: u32 = 64,
+    /// Object store for out-of-line PAYLOAD bytes — the body pool and the
+    /// tenants' content-addressed blobs. A DIFFERENT store from `store`,
+    /// and deliberately so: log batches are prefixed by
+    /// `LOG_S3_KEY_PREFIX` while `_pool/` and `{tenant}/app-blobs/` sit
+    /// under `S3_KEY_PREFIX_BASE`, so one handle cannot reach both. Null
+    /// disables `/v1/{tenant}/body/...`, which then reports that the
+    /// payload is unreachable rather than serving an empty body.
+    content_store: ?batch_store_mod.BatchStore = null,
     /// Optional TLS — when set, the listener does TLS termination via
     /// rove-h2's standard path. The `rewind-logs` binary builds this
     /// from its own `--tls-cert` / `--tls-key` flags (`main.zig`); it
@@ -514,6 +523,10 @@ fn handleOne(
             metrics_mod.Metrics.inc(&metrics_mod.global.query_show);
             try handleSeam(server, allocator, rctx.store, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg);
         },
+        .body => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_body);
+            try handleBody(server, allocator, rctx.store, rctx.read_db, ent, sid, sess, route.tenant_id, route.tail, floor_ns, rctx.cfg);
+        },
     }
 }
 
@@ -568,7 +581,7 @@ fn handleBatchPushed(
     try setResponse(server, ent, sid, sess, 204, "", rctx.cfg);
 }
 
-const RouteKind = enum { list, show, count, session, window, saga, seam };
+const RouteKind = enum { list, show, count, session, window, saga, seam, body };
 
 const ParsedRoute = struct {
     kind: RouteKind,
@@ -627,7 +640,35 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
         if (tail.len == 0) return null;
         return .{ .kind = .saga, .tenant_id = tenant_id, .tail = tail, .query = query };
     }
+    if (std.mem.startsWith(u8, remainder, "body/")) {
+        const tail = remainder["body/".len..];
+        if (tail.len == 0) return null;
+        return .{ .kind = .body, .tenant_id = tenant_id, .tail = tail, .query = query };
+    }
     return null;
+}
+
+/// The three segments of a `/body/` tail: `{request_id}/{channel}/{index}`.
+/// Split here rather than in the handler so the shape is testable without
+/// an h2 server, and so a malformed address is one `null` rather than
+/// three scattered guards.
+const BodyAddr = struct {
+    request_id: u64,
+    channel: body_ref_mod.Channel,
+    index: u32,
+};
+
+fn parseBodyTail(tail: []const u8) ?BodyAddr {
+    var it = std.mem.splitScalar(u8, tail, '/');
+    const id_str = it.next() orelse return null;
+    const chan_str = it.next() orelse return null;
+    const idx_str = it.next() orelse return null;
+    if (it.next() != null) return null; // trailing junk — not our address
+    const request_id = log_mod.parsePrefixedId(log_mod.REQUEST_ID_PREFIX, id_str) orelse
+        return null;
+    const channel = body_ref_mod.Channel.fromPath(chan_str) orelse return null;
+    const index = std.fmt.parseInt(u32, idx_str, 10) catch return null;
+    return .{ .request_id = request_id, .channel = channel, .index = index };
 }
 
 /// Extract a single `tag.<key>=<value>` filter from the query string,
@@ -1269,6 +1310,141 @@ fn handleShow(
     try setResponseOwned(server, ent, sid, sess, 200, out, cfg);
 }
 
+/// `GET /v1/{tenant}/body/{request_id}/{channel}/{index}` — the bytes of
+/// one recorded payload, resolved out of line.
+///
+/// A payload over the inline cap is not in the record; the record holds a
+/// pointer and the bytes stay in object storage. This is the door that
+/// turns the pointer back into bytes, so that a large input is replayable
+/// rather than silently replayed as empty (the out-of-line reference
+/// discipline — a reference is only worth writing if some reader can
+/// resolve it).
+///
+/// The address is `(record, channel, entry index)` and never a raw
+/// `{batch_id, offset, len}`. The body pool is cross-tenant, so accepting
+/// a caller-supplied batch and offset would let anyone past the tenant
+/// gate walk offsets into a neighbour's bytes; deriving the reference
+/// here, from a record this token may already read, makes that
+/// unrepresentable. The record lookup carries the same tenant scoping and
+/// the same retention clamp as `/show` — a body must not outlive the
+/// record that names it.
+///
+/// Status codes are a resolution VERDICT, never a body:
+///   404 — no such record, or no such entry in that channel
+///   409 — the entry recorded the payload as nothing (`NotRecorded`)
+///   410 — the referenced object is no longer in storage
+///   503 — no content store configured, so the pointer is unreachable
+/// None of these is an empty 200, which is the outcome the whole arc
+/// exists to eliminate.
+fn handleBody(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    db: *index_db_mod.IndexDb,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tenant_id: []const u8,
+    tail: []const u8,
+    floor_received_ns: i64,
+    cfg: *const Config,
+) !void {
+    const addr = parseBodyTail(tail) orelse {
+        try setResponse(
+            server,
+            ent,
+            sid,
+            sess,
+            400,
+            "invalid body address (want req_<16hex>/{trigger_payload|fetch_responses}/<index>)\n",
+            cfg,
+        );
+        return;
+    };
+
+    const content_store = cfg.content_store orelse {
+        try setResponse(server, ent, sid, sess, 503, "content store not configured\n", cfg);
+        return;
+    };
+
+    var maybe = db.queryShow(tenant_id, addr.request_id) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "body lookup failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    if (maybe == null) {
+        try setResponse(server, ent, sid, sess, 404, "record not found\n", cfg);
+        return;
+    }
+    defer maybe.?.deinit(allocator);
+    const row = maybe.?;
+
+    // Same clamp as `/show`: a record outside the tenant's retention
+    // window is 404, and its payload must not be reachable by a route
+    // that skipped the check.
+    if (floor_received_ns != 0 and row.received_ns < floor_received_ns) {
+        try setResponse(server, ent, sid, sess, 404, "record not found\n", cfg);
+        return;
+    }
+
+    const record_json = fetchRecordJson(allocator, store, row.ndjson_key, row.offset, row.length) catch |err| {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "payload fetch failed for {s}: {s}\n",
+            .{ row.ndjson_key, @errorName(err) },
+        );
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    defer allocator.free(record_json);
+
+    var resolved = body_ref_mod.resolveFromRecord(
+        allocator,
+        content_store,
+        tenant_id,
+        record_json,
+        addr.channel,
+        addr.index,
+    ) catch |err| {
+        metrics_mod.Metrics.inc(&metrics_mod.global.query_body_unresolved);
+        const status: u16, const msg: []const u8 = switch (err) {
+            body_ref_mod.Error.ChannelNotCaptured => .{ 404, "no tape for that channel\n" },
+            body_ref_mod.Error.NoSuchEntry => .{ 404, "no such entry in that channel\n" },
+            body_ref_mod.Error.NotRecorded => .{ 409, "the payload was not recorded\n" },
+            body_ref_mod.Error.Gone => .{ 410, "the referenced bytes are no longer stored\n" },
+            body_ref_mod.Error.TooLarge => .{ 413, "the reference exceeds the resolution ceiling\n" },
+            body_ref_mod.Error.MalformedRef => .{ 422, "the recorded reference is malformed\n" },
+            body_ref_mod.Error.BadRecordJson => .{ 422, "the record could not be decoded\n" },
+            else => .{ 500, "body resolution failed\n" },
+        };
+        try setResponse(server, ent, sid, sess, status, msg, cfg);
+        return;
+    };
+    defer resolved.deinit(allocator);
+
+    // Base64-in-JSON, like every other byte field a record carries
+    // (`request_body_b64`, `activation_bytes_b64`, the tape blobs). The
+    // dashboard reaches this door through a same-origin chokepoint that
+    // relays door results as TEXT, so raw octets would be UTF-8 mangled
+    // in transit; and the caller needs the verdict alongside the bytes to
+    // distinguish "resolved out of the pool" from "rode along inline",
+    // which a bare body cannot carry.
+    const enc_len = std.base64.standard.Encoder.calcSize(resolved.bytes.len);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, enc_len + 96);
+    try out.appendSlice(allocator, "{\"source\":\"");
+    try out.appendSlice(allocator, resolved.source.name());
+    try out.appendSlice(allocator, "\",\"len\":");
+    try out.print(allocator, "{d}", .{resolved.bytes.len});
+    try out.appendSlice(allocator, ",\"bytes_b64\":\"");
+    const enc_at = out.items.len;
+    try out.resize(allocator, enc_at + enc_len);
+    _ = std.base64.standard.Encoder.encode(out.items[enc_at..], resolved.bytes);
+    try out.appendSlice(allocator, "\"}\n");
+    try setResponseOwned(server, ent, sid, sess, 200, try out.toOwnedSlice(allocator), cfg);
+}
+
 /// Range-read + inflate one record's stored JSON: each record is its
 /// own raw-deflate stream, and the index's `(ndjson_key, offset,
 /// length)` brackets exactly one frame. Caller owns the returned
@@ -1724,6 +1900,31 @@ test "parseRoute matches /v1/{tenant}/window and /v1/{tenant}/saga/{id}" {
     try testing.expectEqual(RouteKind.seam, m.kind);
     try testing.expectEqualStrings("acme", m.tenant_id);
     try testing.expectEqualStrings("after_seq=4&before_seq=9", m.query);
+}
+
+test "parseRoute matches /v1/{tenant}/body/{id}/{channel}/{index}" {
+    const r = parseRoute("/v1/acme/body/req_00000000000000ff/trigger_payload/0").?;
+    try testing.expectEqual(RouteKind.body, r.kind);
+    try testing.expectEqualStrings("acme", r.tenant_id);
+    try testing.expectEqualStrings("req_00000000000000ff/trigger_payload/0", r.tail);
+    try testing.expect(parseRoute("/v1/acme/body/") == null);
+}
+
+test "parseBodyTail: the address is a triple, and nothing looser" {
+    const a = parseBodyTail("req_00000000000000ff/fetch_responses/7").?;
+    try testing.expectEqual(@as(u64, 0xff), a.request_id);
+    try testing.expectEqual(body_ref_mod.Channel.fetch_responses, a.channel);
+    try testing.expectEqual(@as(u32, 7), a.index);
+
+    // Too few segments, too many segments, junk index, unknown channel,
+    // and a bare integer where the opaque request-id token belongs —
+    // each is an address we refuse rather than guess at.
+    try testing.expect(parseBodyTail("req_00000000000000ff/trigger_payload") == null);
+    try testing.expect(parseBodyTail("req_00000000000000ff/trigger_payload/0/extra") == null);
+    try testing.expect(parseBodyTail("req_00000000000000ff/trigger_payload/x") == null);
+    try testing.expect(parseBodyTail("req_00000000000000ff/kv/0") == null);
+    try testing.expect(parseBodyTail("255/trigger_payload/0") == null);
+    try testing.expect(parseBodyTail("") == null);
 }
 
 test "parseRoute matches /v1/{tenant}/session/{id}" {

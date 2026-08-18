@@ -223,6 +223,19 @@ streaming path. h1→h2c translation is **edge-only**.
   raft analog); `bodyRef`/`readBody` serve bytes once durable. `batch_id`s come
   from a raft-reserved block (cross-leader-unique). This is the durability ground
   truth for streamed bytes.
+- **Reading a spilled payload back** (`src/log_server/body_ref.zig`, reached at
+  `GET /v1/{tenant}/body/{request_id}/{channel}/{index}`): the coordinator's
+  `bodyRef`/`readBody` serve bytes from RAM only until the batch is released, so
+  everything after that is a range read against the pool object. The door is the
+  one reader, and it takes a `(record, channel, entry index)` address rather than
+  a `{batch_id, offset, len}` — the pool is CROSS-TENANT, so a caller-supplied
+  offset would walk into a neighbour's bytes. It derives the reference from a
+  record the caller is already entitled to read (the out-of-line reference
+  discipline, `decisions.md`).
+- The door reads through its own store handle prefixed at the CONTENT base.
+  `_pool/` and `{tenant}/app-blobs/` sit under `S3_KEY_PREFIX_BASE`, while log
+  batches sit under `LOG_S3_KEY_PREFIX`; one handle cannot reach both, and
+  pointing the door at the log store resolves every reference to a miss.
 - **Chunk spool** (`src/js/chunk_spool.zig`): a per-fetch FIFO RAM window (default
   K=4, `ROVE_BOUND_FETCH_SPOOL_DEPTH`) over the coordinator. It lets a fast
   upstream race ahead of the raft-commit cadence: chunks past the window evict to

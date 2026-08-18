@@ -90,6 +90,12 @@ pub const FetchResponseEntry = struct {
     body_truncated: bool,
     headers: []const u8,
     inline_bytes: []const u8,
+    /// The recorded payload length — `body_ref.len`. Set on EVERY shape,
+    /// including the two that carry no bytes here, so a reader can tell a
+    /// terminal-only event (0 — a transport error, a stream FIN) from an
+    /// entry that claims a payload it kept nowhere. Without it those two
+    /// are indistinguishable and the second reads as an empty body.
+    body_ref_len: u32 = 0,
     /// sha256 hex of the OBJECT this chunk is a slice of, when the bytes were
     /// LEFT in content-addressed storage rather than copied onto the tape — a
     /// `blob.get` (`app-blobs/`) or a static serve (`file-blobs/`). Identical
@@ -109,6 +115,66 @@ pub const TriggerPayloadEntry = struct {
     batch_id: u64,
     inline_bytes: []const u8,
 };
+
+/// Where one entry's payload actually lives. The three pointer shapes a tape
+/// entry can carry, plus the two fates that carry nothing — the same
+/// classification the log-server's body door resolves against
+/// (`src/log_server/body_ref.zig` `locate` is the authority; this is the
+/// offline reader's std-only twin, and the two must agree or a payload the
+/// door serves reads as absent here).
+///
+/// A payload over the inline cap is NOT copied onto the entry: the entry keeps
+/// a pointer and the bytes stay in object storage. Nothing offline can follow
+/// either pointer, so a transcode that ignores the distinction turns a missing
+/// input into a plausible empty one.
+pub const PayloadFate = union(enum) {
+    /// The bytes ride on the entry itself.
+    carried: []const u8,
+    /// A slice of the cross-tenant body-pool object named by this batch id.
+    pool: u64,
+    /// A slice of one of the tenant's content-addressed objects, named by
+    /// its 64-hex sha256. The slice is `(byte_offset, body_ref_len)`.
+    content: []const u8,
+    /// The event genuinely had no payload (a terminal-only fetch chunk).
+    empty,
+    /// The entry claims a payload and kept neither bytes nor a usable
+    /// pointer — the payload was recorded as nothing.
+    not_recorded,
+};
+
+/// Classify a `fetch_responses` entry's payload. Order matters: carried bytes
+/// win over any pointer, and the content reference is checked before the pool
+/// because a content-addressed chunk deliberately carries `NO_BATCH` — there
+/// is no pool object to name.
+pub fn fetchPayloadFate(e: FetchResponseEntry) PayloadFate {
+    if (e.inline_bytes.len > 0) return .{ .carried = e.inline_bytes };
+    if (e.content_hash.len > 0) {
+        if (e.content_hash.len != 64 or !isHex(e.content_hash)) return .not_recorded;
+        if (e.body_ref_len == 0) return .not_recorded;
+        return .{ .content = e.content_hash };
+    }
+    if (e.batch_id != NO_BATCH) return .{ .pool = e.batch_id };
+    if (e.body_ref_len == 0) return .empty;
+    return .not_recorded;
+}
+
+/// Classify a `trigger_payload` entry's payload. A trigger entry always had a
+/// payload — an inbound body or a `{"ctx":…}` envelope — so unlike a fetch
+/// chunk there is no legitimate empty case: no bytes and no pool reference is
+/// the metadata-only fate an over-cap envelope records.
+pub fn triggerPayloadFate(e: TriggerPayloadEntry) PayloadFate {
+    if (e.inline_bytes.len > 0) return .{ .carried = e.inline_bytes };
+    if (e.batch_id != NO_BATCH) return .{ .pool = e.batch_id };
+    return .not_recorded;
+}
+
+fn isHex(s: []const u8) bool {
+    for (s) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
 
 /// Sentinel batch_id meaning "bytes ride inline, not in a blob"
 /// (`src/bodies/root.zig` `NO_BATCH`). A BodyRef with this batch_id has its
@@ -251,8 +317,9 @@ pub fn decodeFetchResponses(a: std.mem.Allocator, bytes: []const u8) Error![]Fet
         cur += 8;
         const batch_id = std.mem.readInt(u64, e[cur..][0..8], .big);
         cur += 8;
-        cur += 8; // body_ref.offset (unused offline)
-        cur += 4; // body_ref.len (unused offline)
+        cur += 8; // body_ref.offset — the door addresses by entry, not by ref
+        const body_ref_len = std.mem.readInt(u32, e[cur..][0..4], .big);
+        cur += 4;
         const final = e[cur] != 0;
         cur += 1;
         const status = std.mem.readInt(u16, e[cur..][0..2], .big);
@@ -282,6 +349,7 @@ pub fn decodeFetchResponses(a: std.mem.Allocator, bytes: []const u8) Error![]Fet
             .body_truncated = trunc,
             .headers = headers,
             .inline_bytes = inline_bytes,
+            .body_ref_len = body_ref_len,
             .content_hash = content_hash,
         });
     }
@@ -530,6 +598,86 @@ test "decodeFetchResponses: a referenced chunk names its bytes instead of carryi
     // Referenced, never both — a copy alongside the reference would be the
     // duplication the reference exists to remove.
     try testing.expectEqualStrings("", out[0].inline_bytes);
+    // The slice length survives the decode: it is half the reconstruction
+    // key `(content_hash, byte_offset, len)`, and without it a referenced
+    // chunk is indistinguishable from a terminal-only event.
+    try testing.expectEqual(@as(u32, 4096), out[0].body_ref_len);
+    try testing.expectEqualStrings(hash, fetchPayloadFate(out[0]).content);
+}
+
+test "payload fate: the three pointer shapes, and the two that carry nothing" {
+    // carried — bytes on the entry win over any pointer.
+    try testing.expectEqualStrings("hi", fetchPayloadFate(.{
+        .fetch_id = "f",
+        .seq = 0,
+        .byte_offset = 0,
+        .batch_id = 7,
+        .final = true,
+        .terminal_status = 200,
+        .terminal_ok = true,
+        .body_truncated = false,
+        .headers = "",
+        .inline_bytes = "hi",
+        .body_ref_len = 2,
+    }).carried);
+    // pool — a spilled chunk names the cross-tenant pool object.
+    try testing.expectEqual(@as(u64, 7), fetchPayloadFate(.{
+        .fetch_id = "f",
+        .seq = 0,
+        .byte_offset = 0,
+        .batch_id = 7,
+        .final = false,
+        .terminal_status = 0,
+        .terminal_ok = false,
+        .body_truncated = false,
+        .headers = "",
+        .inline_bytes = "",
+        .body_ref_len = 65536,
+    }).pool);
+    // empty vs not_recorded — the discriminator is the recorded LENGTH. A
+    // terminal-only event legitimately has no bytes; a non-zero length with
+    // no home is a payload the record claims and kept nowhere.
+    const terminal_only = decodeFate(0);
+    try testing.expect(terminal_only == .empty);
+    const claimed = decodeFate(1024);
+    try testing.expect(claimed == .not_recorded);
+    // A content hash that is not 64 hex names no object — the reference is
+    // unusable, so it is the metadata-only fate, never a resolvable one.
+    try testing.expect(fetchPayloadFate(.{
+        .fetch_id = "f",
+        .seq = 0,
+        .byte_offset = 0,
+        .batch_id = NO_BATCH,
+        .final = true,
+        .terminal_status = 200,
+        .terminal_ok = true,
+        .body_truncated = false,
+        .headers = "",
+        .inline_bytes = "",
+        .body_ref_len = 8,
+        .content_hash = "zzz",
+    }) == .not_recorded);
+    // A trigger entry always had a payload, so no-bytes-no-pool is the
+    // metadata-only fate rather than an empty one.
+    try testing.expect(triggerPayloadFate(.{ .batch_id = NO_BATCH, .inline_bytes = "" }) == .not_recorded);
+    try testing.expectEqual(@as(u64, 9), triggerPayloadFate(.{ .batch_id = 9, .inline_bytes = "" }).pool);
+    try testing.expectEqualStrings("{}", triggerPayloadFate(.{ .batch_id = NO_BATCH, .inline_bytes = "{}" }).carried);
+}
+
+fn decodeFate(len: u32) PayloadFate {
+    return fetchPayloadFate(.{
+        .fetch_id = "f",
+        .seq = 0,
+        .byte_offset = 0,
+        .batch_id = NO_BATCH,
+        .final = true,
+        .terminal_status = 0,
+        .terminal_ok = false,
+        .body_truncated = false,
+        .headers = "",
+        .inline_bytes = "",
+        .body_ref_len = len,
+    });
 }
 
 test "version + channel guards fail loud" {

@@ -877,11 +877,18 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
     w.writeAll("}") catch c.oom();
     buf = aw.toArrayList();
 
+    // 4. Out-of-line payloads. A payload over the inline cap is not on the
+    // tape — the entry keeps a pointer and the bytes stay in object storage —
+    // so the bundle so far names them without carrying them. Resolve each
+    // through the log-server's body door and inline the bytes, or the world
+    // below has to refuse an input the record could have supplied.
+    const bundle = resolveBodies(a, cfg, tenant, jStr(rec_val, "request_id") orelse req_id, buf.items);
+
     // Transcode the captured record (base64 tapes) into the ONE editable format
     // — a declarative `world.json` that `rewind replay` (fail) and `rewind sim`
     // (resolve) both consume. The wire/tape form never reaches a human.
     var world = std.ArrayList(u8){};
-    replay.exportFixture(a, buf.items, &world) catch |e|
+    replay.exportFixture(a, bundle, &world) catch |e|
         c.fatal("pull: transcode to world failed: {s}", .{@errorName(e)});
 
     if (out_file) |path| {
@@ -891,6 +898,95 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
     } else {
         std.debug.print("{s}\n", .{world.items});
     }
+}
+
+/// Resolve a pulled bundle's out-of-line payloads and inline them back into it.
+///
+/// A recorded payload over the inline cap is not stored in the log record: the
+/// entry keeps a pointer — a slice of the cross-tenant body pool, or a slice of
+/// one of the tenant's content-addressed objects — and the bytes stay where
+/// they already are. Offline replay can follow neither, so without this step a
+/// large input replays as an EMPTY body: a missing input presenting as a
+/// plausible value rather than a refusal.
+///
+/// Each payload is addressed by `(record, channel, RAW entry index)`, never by
+/// a raw `{batch_id, offset, len}`: the pool is cross-tenant by construction,
+/// so a door taking a caller-supplied batch and offset would let anyone past
+/// the tenant gate read a neighbour's bytes by walking offsets. The server
+/// derives the reference from a record this session may already read.
+///
+/// Best-effort by design. A door that refuses (the bytes are gone, the payload
+/// was recorded as nothing, no door at all) leaves that payload out of
+/// `resolved_bodies`, and the transcode then emits a world that REFUSES the
+/// input instead of one that serves it empty. Returns the bundle to transcode —
+/// the original when there was nothing out of line.
+fn resolveBodies(
+    a: std.mem.Allocator,
+    cfg: *const Cfg,
+    tenant: []const u8,
+    request_id: []const u8,
+    bundle: []const u8,
+) []const u8 {
+    const pending = replay.exportFixtureOutOfLine(a, bundle) catch |e| {
+        std.debug.print("rewind: pull: could not scan for out-of-line payloads: {s}\n", .{@errorName(e)});
+        return bundle;
+    };
+    if (pending.len == 0) return bundle;
+    if (bundle.len == 0 or bundle[bundle.len - 1] != '}') return bundle;
+
+    var out = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &out);
+    const w = &aw.writer;
+    // Splice `resolved_bodies` in ahead of the bundle's closing brace.
+    w.writeAll(bundle[0 .. bundle.len - 1]) catch c.oom();
+    w.writeAll(",\"resolved_bodies\":{") catch c.oom();
+
+    // One object per channel, opened as the walk enters it — `pending` is
+    // grouped by channel, so a channel is never re-entered.
+    var channels_written: usize = 0;
+    var open_channel: []const u8 = "";
+    var unresolved: usize = 0;
+    for (pending) |p| {
+        const url = std.fmt.allocPrint(a, "{s}/v1/logs/{s}/body/{s}/{s}/{d}", .{
+            cfg.admin_url, tenant, request_id, p.channel, p.index,
+        }) catch c.oom();
+        const r = httpCall(a, cfg, "GET", url, &.{}, null, true, 60);
+        if (r.code != 200) {
+            unresolved += 1;
+            std.debug.print(
+                "rewind: pull: {s}[{d}] unresolved ({d}) — replay will refuse that input, not fake it\n",
+                .{ p.channel, p.index, r.code },
+            );
+            continue;
+        }
+        const dp = std.json.parseFromSlice(std.json.Value, a, r.body, .{}) catch {
+            unresolved += 1;
+            continue;
+        };
+        const b64 = jStr(dp.value, "bytes_b64") orelse {
+            unresolved += 1;
+            continue;
+        };
+        if (!std.mem.eql(u8, open_channel, p.channel)) {
+            if (open_channel.len != 0) w.writeByte('}') catch c.oom();
+            if (channels_written != 0) w.writeByte(',') catch c.oom();
+            emitStr(w, p.channel);
+            w.writeAll(":{") catch c.oom();
+            open_channel = p.channel;
+            channels_written += 1;
+        } else {
+            w.writeByte(',') catch c.oom();
+        }
+        w.print("\"{d}\":", .{p.index}) catch c.oom();
+        emitStr(w, b64);
+    }
+    if (open_channel.len != 0) w.writeByte('}') catch c.oom();
+    w.writeAll("}}") catch c.oom();
+    out = aw.toArrayList();
+
+    const resolved = pending.len - unresolved;
+    std.debug.print("rewind: pull: resolved {d}/{d} out-of-line payload(s)\n", .{ resolved, pending.len });
+    return out.items;
 }
 
 /// `rewind replay <world.json> [--source-dir DIR] [-o FILE]`

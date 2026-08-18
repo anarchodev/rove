@@ -242,6 +242,28 @@ pub fn main() !void {
         .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, s3_handle.config.key_prefix },
     );
 
+    // Second store handle, prefixed at the CONTENT base rather than the
+    // log base, for the out-of-line payload door
+    // (`/v1/{tenant}/body/...`). `_pool/` and `{tenant}/app-blobs/` live
+    // under `S3_KEY_PREFIX_BASE`; log batches live under
+    // `LOG_S3_KEY_PREFIX`. One handle cannot reach both, and pointing the
+    // door at the log store would resolve every reference to a miss.
+    //
+    // Its own handle also keeps its libcurl connection off the one the
+    // indexer thread drives.
+    var content_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+        .endpoint = s3cfg.endpoint,
+        .region = s3cfg.region,
+        .bucket = s3cfg.bucket,
+        .key_prefix = s3cfg.key_prefix_base,
+        .access_key = s3cfg.access_key,
+        .secret_key = s3cfg.secret_key,
+        .use_tls = s3cfg.use_tls,
+    });
+    defer content_handle.deinit();
+    const content_store: log_server.batch_store.BatchStore = content_handle.batchStore();
+    std.log.info("content backend: s3 key_prefix='{s}'", .{content_handle.config.key_prefix});
+
     var tls_config: ?*h2.TlsConfig = null;
     defer if (tls_config) |c| c.destroy();
     if (cli.tls_cert) |cert| {
@@ -276,6 +298,7 @@ pub fn main() !void {
     const handle = try log_server.standalone.spawn(.{
         .allocator = allocator,
         .store = batch_store,
+        .content_store = content_store,
         .db = db,
         .read_db = read_db,
         .bind_addr = listen_addr,

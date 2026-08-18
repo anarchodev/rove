@@ -109,6 +109,44 @@ pub fn getOrOpenTenantLog(
 /// replay fetches on demand.
 pub const REQUEST_BODY_CAP: usize = 16 * 1024;
 
+/// How a Msg's payload is carried on the tape. ONE rule, applied wherever a
+/// payload is recorded, so a chunk's fate follows from what the chunk IS and
+/// not from which code path happened to record it.
+///
+/// The rule reads top to bottom, and the first clause is the one that was
+/// previously spelled differently in two places: **content-addressed ⇒
+/// reference.** Bytes already stored immutably under their own hash are
+/// never copied onto a tape — recording them again writes a second permanent
+/// copy of an object the tenant already pays for, inline below the cap and
+/// into the never-evicted body pool above it. `blob.*` has no delete verb and
+/// the door refuses a PUT whose body does not hash to its key, so the hash
+/// provably names those bytes for the tenant's lifetime.
+pub const PayloadFate = union(enum) {
+    /// No bytes to record — a terminal-only event closing a chain.
+    none,
+    /// Small enough to ride on the entry. The raft entry's fsync is the
+    /// durability substrate.
+    carried,
+    /// Name the content-addressed object instead of copying it. The
+    /// reconstruction key is `(content_hash, byte_offset, len)`, so the
+    /// length is still recorded even though no bytes ride along.
+    referenced,
+    /// Over the cap and not content-addressed: the bytes have no other home
+    /// and must be spilled to the body pool, which the recording site can
+    /// only do if it owns a durability park.
+    spill,
+};
+
+/// Classify a payload by what it is. `content_hash` is the sha256 hex of the
+/// object the bytes are a slice of, or empty when they are not
+/// content-addressed.
+pub fn payloadFate(bytes_len: usize, content_hash: []const u8) PayloadFate {
+    if (bytes_len == 0) return .none;
+    if (content_hash.len == 64) return .referenced;
+    if (bytes_len <= REQUEST_BODY_CAP) return .carried;
+    return .spill;
+}
+
 /// Drop a partial interaction digest before capture.
 ///
 /// The rule: **a digest is closed on the run's real result, or it is null —
@@ -308,8 +346,10 @@ pub fn wakesToJson(
 /// trigger_payload (→ `request.ctx`); `export_name` is the resolved wake
 /// export when the arm carried an `{on}` override (G3 — replay must
 /// invoke the same export), "" when the default `onWake` applies.
-/// Bounded input: the batch is one entry per armed watch, so the
-/// JSON is always far under `REQUEST_BODY_CAP`.
+/// Bounded input: the batch is one entry per armed watch, so the wakes
+/// JSON is always far under `REQUEST_BODY_CAP`. The threaded `ctx` is NOT
+/// bounded that way — it is whatever the arming handler passed — so it
+/// takes the same over-cap posture as every other Msg.
 pub fn captureWakeBatchTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
@@ -323,10 +363,17 @@ pub fn captureWakeBatchTapes(
     // (export_fixture's extractCtx reads it back). `ctx_payload` keeps it
     // past the read-taping elision: ctx is consumed unconditionally at
     // install, so `body_read` never flips for it.
-    if (ctx_body.len > 0 and ctx_body.len <= REQUEST_BODY_CAP) {
+    //
+    // The entry is written whenever an envelope EXISTED, and carries the bytes
+    // only when they fit — the same posture as `captureSendCallbackTapes`.
+    // Skipping the entry outright for an over-cap ctx recorded nothing at all,
+    // so a replay saw `request.ctx` undefined and could not tell that from a
+    // wake that threaded no ctx. The length alone is enough to tell those
+    // apart.
+    if (ctx_body.len > 0) {
         readset.trigger_payload.appendTriggerPayload(
             .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(ctx_body.len) },
-            ctx_body,
+            if (ctx_body.len <= REQUEST_BODY_CAP) ctx_body else "",
         ) catch |err| {
             std.log.warn("rove-js wake-ctx capture failed: {s}", .{@errorName(err)});
         };
@@ -400,62 +447,72 @@ pub const FetchEvent = struct {
     /// — a `{on}` override, or onFetchResult/Chunk/Done). Recorded so replay
     /// invokes the same export (`docs/architecture/replay-and-sim.md` §5 G3).
     export_name: []const u8 = "",
-    /// This chunk belongs to the engine's own static streamer, so its Msg is
-    /// recorded by reference rather than by value (rove#391).
-    static_serve: bool = false,
     /// sha256 of the OBJECT this chunk is a slice of — identical on every
     /// chunk of the fetch. The slice is `(byte_offset, body_ref.len)`.
+    /// Non-empty means content-addressed, which is the whole condition for
+    /// recording the Msg by reference (`payloadFate`); the streamer that
+    /// produced the chunk is not part of the rule.
     content_hash: []const u8 = "",
 };
 
 /// Record a `fetch_chunk` activation's triggering event onto its readset's
 /// `fetch_responses` channel, then capture the log tapes. This is the recording
 /// half of non-inbound replay: the fetch result is the activation's Msg — an
-/// input (L3), so it must be taped or the activation can't be replayed. Small
-/// bodies (≤ `REQUEST_BODY_CAP`) ride **inline as raw bytes** → fully
-/// replayable offline; larger bodies record metadata only (the bytes would need
-/// a readset-blob `BodyRef` the offline driver can't fetch — the WASM/browser
-/// replay with S3 access is the path for those). `ctx_body` is the `{"ctx":…}`
-/// envelope → trigger_payload (→ `request.ctx`).
+/// input (L3), so it must be taped or the activation can't be replayed.
+/// `payloadFate` picks how: carried inline, referenced by content hash, or —
+/// on this path only — recorded as unretained, because a resume hop has no
+/// durability park to spill through. `ctx_body` is the `{"ctx":…}` envelope →
+/// trigger_payload (→ `request.ctx`).
 pub fn captureFetchChunkTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
     ctx_body: []const u8,
     ev: FetchEvent,
 ) log_mod.TapePayloads {
-    // An engine static chunk records its Msg BY REFERENCE, not by value.
-    // `__system/static` streams a non-resident asset as a BOUND fetch, so its
-    // chunks resume through here rather than through
-    // `fireFetchEventActivation` — one record per chunk, each carrying the
-    // payload verbatim, which made S3 log volume track static egress ~1:1.
+    // A content-addressed chunk records its Msg BY REFERENCE, not by value —
+    // `payloadFate`'s first clause, and the reason this site and
+    // `fireFetchEventActivation` now share one predicate instead of spelling
+    // it two ways. `__system/static` streams a non-resident asset as a BOUND
+    // fetch, so its chunks resume through here; one record per chunk carrying
+    // the payload verbatim made S3 log volume track static egress ~1:1.
     //
     // Dropping the entry outright is NOT an option: L3 requires every
     // `fetch_chunk` activation to record its Msg, and the guard below fails
     // loud if one does not. A `{hash, len}` entry satisfies that — the Msg IS
     // recorded, by a reference to immutable content-addressed bytes — while
     // costing a digest instead of the asset.
-    const ref_only = ev.static_serve and ev.content_hash.len == 64;
-    const inline_ok = ev.bytes.len <= REQUEST_BODY_CAP and !ref_only;
+    //
+    // `.spill` is the one fate this site cannot honour. A resume hop owns no
+    // durability park (unlike `fireFetchEventActivation`, which submits to the
+    // blob coordinator and re-fires once the batch lands), so an
+    // over-the-cap non-content-addressed chunk has nowhere to go. It is
+    // recorded as UNRETAINED — the true length with no bytes and no pointer —
+    // which every reader reports as a payload that was not kept. Recording a
+    // zero length instead would make it indistinguishable from a terminal-only
+    // event that legitimately had no bytes, and that is the shape a replay
+    // silently serves as an empty body.
+    const fate = payloadFate(ev.bytes.len, ev.content_hash);
     readset.fetch_responses.appendFetchResponse(
         ev.fetch_id,
         ev.seq,
         ev.byte_offset,
-        // A ref-only entry MUST carry the slice length: the reconstruction key
-        // is (content_hash, byte_offset, len), and a zero length would leave
-        // replay deriving it from the NEXT chunk's offset — which the last
-        // chunk does not have.
+        // The slice length is recorded on EVERY fate that had bytes. For a
+        // reference the reconstruction key is (content_hash, byte_offset,
+        // len), and a zero length would leave replay deriving it from the NEXT
+        // chunk's offset — which the last chunk does not have. For an
+        // unretained payload the length is the whole record of what was lost.
         .{
             .batch_id = bodies_mod.NO_BATCH,
             .offset = 0,
-            .len = @intCast(if (inline_ok or ref_only) ev.bytes.len else 0),
+            .len = @intCast(ev.bytes.len),
         },
         ev.final,
         ev.terminal_status,
         ev.terminal_ok,
         ev.body_truncated,
         ev.headers,
-        if (inline_ok) ev.bytes else "",
-        if (ref_only) ev.content_hash else "",
+        if (fate == .carried) ev.bytes else "",
+        if (fate == .referenced) ev.content_hash else "",
     ) catch |err| {
         std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
     };
@@ -1035,6 +1092,72 @@ fn sendPushChunk(
             );
         }
     }
+}
+
+test "payloadFate: content-addressed wins over size, both directions" {
+    const testing = std.testing;
+    const hash = "a" ** 64;
+
+    // The clause that used to be spelled two different ways. A
+    // content-addressed chunk is referenced whether it is small enough to
+    // ride inline or far over the cap — the rule is what the bytes ARE, not
+    // how many of them there are, and not which path recorded them.
+    try testing.expectEqual(PayloadFate.referenced, payloadFate(10, hash));
+    try testing.expectEqual(PayloadFate.referenced, payloadFate(10 * 1024 * 1024, hash));
+
+    // Without a hash, size decides.
+    try testing.expectEqual(PayloadFate.carried, payloadFate(10, ""));
+    try testing.expectEqual(PayloadFate.carried, payloadFate(REQUEST_BODY_CAP, ""));
+    try testing.expectEqual(PayloadFate.spill, payloadFate(REQUEST_BODY_CAP + 1, ""));
+
+    // No bytes is its own fate, and outranks everything: a terminal-only
+    // event has nothing to name and nothing to carry.
+    try testing.expectEqual(PayloadFate.none, payloadFate(0, ""));
+    try testing.expectEqual(PayloadFate.none, payloadFate(0, hash));
+
+    // A malformed hash is not a reference. Silently treating it as one would
+    // record a pointer no reader can resolve.
+    try testing.expectEqual(PayloadFate.carried, payloadFate(10, "abc"));
+}
+
+test "captureFetchChunkTapes: an unretained chunk keeps its length, not a zero" {
+    const testing = std.testing;
+    const a = testing.allocator;
+
+    // A resume hop owns no durability park, so an over-the-cap
+    // non-content-addressed chunk cannot spill. What it must NOT do is record
+    // a zero length: that is the spelling of "this event had no bytes", and a
+    // replay reading it serves an empty body as if it were the real payload.
+    var readset = tape_mod.Readset.init(a, 0, 0);
+    defer readset.deinit();
+
+    const big = try a.alloc(u8, REQUEST_BODY_CAP + 4096);
+    defer a.free(big);
+    @memset(big, 'x');
+
+    const fate = payloadFate(big.len, "");
+    try testing.expectEqual(PayloadFate.spill, fate);
+
+    try readset.fetch_responses.appendFetchResponse(
+        "ftch_1",
+        0,
+        0,
+        .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(big.len) },
+        false,
+        0,
+        false,
+        false,
+        "",
+        if (fate == .carried) big else "",
+        "",
+    );
+
+    const e = readset.fetch_responses.entries.items[0].fetch_responses;
+    try testing.expectEqual(@as(u32, @intCast(big.len)), e.body_ref.len);
+    try testing.expectEqual(@as(usize, 0), e.inline_bytes.len);
+    try testing.expectEqual(@as(usize, 0), e.content_hash.len);
+    // Distinguishable from a terminal-only event, which is the whole point.
+    try testing.expect(e.body_ref.len != 0);
 }
 
 test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + other kinds" {

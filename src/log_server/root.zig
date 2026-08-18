@@ -36,6 +36,7 @@ pub const standalone = @import("standalone.zig");
 pub const flush_writer = @import("flush_writer.zig");
 pub const metrics = @import("metrics.zig");
 pub const seam = @import("seam.zig");
+pub const body_ref = @import("body_ref.zig");
 
 test {
     _ = sidecar;
@@ -48,4 +49,5 @@ test {
     _ = flush_writer;
     _ = @import("metrics.zig");
     _ = seam;
+    _ = body_ref;
 }
