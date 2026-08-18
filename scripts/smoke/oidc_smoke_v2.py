@@ -102,10 +102,9 @@ def main() -> int:
         check("provision __auth__ → 200/409", r.status in (200, 409),
               f"got {r.status} {r.body!r}")
         try:
-            # web/auth imports `@rewind/oidc` (which pulls `@rewind/jwt`) and
-            # `@rewind/email`, so
-            # the packages stage with the deploy.
-            auth_pkgs, auth_imports = c.firstparty_packages(["@rewind/oidc", "@rewind/email"])
+            # Derived from auth/manifest.json, never hand-listed — see
+            # `firstparty_packages_for_app`.
+            auth_pkgs, auth_imports = c.firstparty_packages_for_app(APPS_DIR / "auth")
             c.deploy_with_packages(
                 "__auth__", {"index.mjs": auth_src}, auth_pkgs, auth_imports,
                 statics={"_config/oidc/default.json": (auth_cfg, "application/json")})

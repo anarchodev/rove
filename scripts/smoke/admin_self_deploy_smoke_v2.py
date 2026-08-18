@@ -88,8 +88,10 @@ def main() -> int:
         # 3. Publish the REAL dashboard onto __admin__. From here the deploy
         #    doors are served by admin/index.mjs — the production implementation.
         try:
-            c.deploy_with_packages("__admin__", ADMIN_FILES, *c.firstparty_packages(
-                ["@rewind/oidc", "@rewind/email", "@rewind/stripe"]))
+            # Derived from admin/manifest.json, never hand-listed — see
+            # `firstparty_packages_for_app`.
+            c.deploy_with_packages("__admin__", ADMIN_FILES,
+                                   *c.firstparty_packages_for_app(APPS_DIR / "admin"))
             check("publish the real dashboard onto __admin__", True)
         except RuntimeError as e:
             check("publish the real dashboard onto __admin__", False, str(e))

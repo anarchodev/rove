@@ -97,6 +97,37 @@ fn loadCfg(gpa: std.mem.Allocator, a: std.mem.Allocator, env_path: ?[]const u8) 
     };
 }
 
+/// The subset of config a REGISTRY-ONLY command needs: the registry origin
+/// plus the transport knobs curl takes. `loadCfg` fatals without
+/// `REWIND_ADMIN_URL` / `REWIND_IDP_URL`, which is right for anything that
+/// talks to the dashboard and wrong for `lock` — resolving a package graph is
+/// a public read against the registry, and demanding dashboard credentials for
+/// it is what kept the lockfile welded to `deploy`.
+fn loadRegistryCfg(gpa: std.mem.Allocator, a: std.mem.Allocator, env_path: ?[]const u8) Cfg {
+    const env = c.loadEnv(gpa, env_path);
+    var resolves = std.ArrayList([]const u8){};
+    if (cfgVar(&env, a, "REWIND_RESOLVE")) |csv| {
+        var it = std.mem.splitScalar(u8, csv, ',');
+        while (it.next()) |e| {
+            const t = std.mem.trim(u8, e, " \t");
+            if (t.len != 0) resolves.append(a, t) catch c.oom();
+        }
+    }
+    return .{
+        .env = env,
+        // Never dialled on this path: `registryResolve` passes `use_jar =
+        // false` and only ever builds a `{registry}/v1/resolve` URL.
+        .admin_url = "",
+        .idp_url = "",
+        .client_id = "",
+        .session_file = "",
+        .cacert = cfgVar(&env, a, "REWIND_CACERT"),
+        .resolves = resolves.items,
+        .registry_url = if (cfgVar(&env, a, "REWIND_REGISTRY_URL")) |u| std.mem.trimRight(u8, u, "/") else null,
+        .root_token = null,
+    };
+}
+
 fn defaultSessionPath(a: std.mem.Allocator) []const u8 {
     const home = std.process.getEnvVarOwned(a, "HOME") catch return "rewind.session";
     const dir = std.fs.path.join(a, &.{ home, ".config", "rewind" }) catch return "rewind.session";
@@ -313,6 +344,36 @@ fn uploadStep(a: std.mem.Allocator, cfg: *const Cfg, upath: []const u8, body: []
         std.Thread.sleep(2 * std.time.ns_per_s);
     }
     c.fatal("upload {s}: no leader after retries", .{label});
+}
+
+/// `rewind lock <bundle>` — resolve the bundle's package graph and write
+/// `rewind.lock`, without deploying anything.
+///
+/// The lockfile used to be a side effect of `deploy` alone, which meant it
+/// could only be refreshed by shipping. Adding an import without a deploy left
+/// the lockfile behind, and the drift surfaced far away and much later: a node
+/// compiling the bundle raises `could not load module '@rewind/x'`, in whatever
+/// suite happened to deploy it. Resolving is a public read with no session, so
+/// it has no business requiring one.
+///
+/// The resolution written here is the registry's response VERBATIM — the same
+/// bytes `deploy` persists — so a lockfile made by either route is the same
+/// lockfile.
+fn cmdLock(a: std.mem.Allocator, cfg: *const Cfg, bundle: []const u8) void {
+    const b = c.classify(a, bundle);
+    const declared = readBundleDependencies(a, bundle);
+    const deps = augmentDependencies(a, declared, b.handlers);
+    if (deps.len == 0) {
+        std.debug.print("bundle {s} declares no packages — no lockfile to write\n", .{bundle});
+        return;
+    }
+    var rr = registryResolve(a, cfg, deps);
+    packages.topoSort(&rr.res) catch c.fatal("resolved packages form a dependency cycle", .{});
+    writeLockfile(bundle, rr.body);
+    std.debug.print("{s}/rewind.lock: {d} package(s) pinned\n", .{ bundle, rr.res.packages.len });
+    for (rr.res.packages) |pkg| {
+        std.debug.print("  {s}@{s}\n", .{ pkg.spec, pkg.version });
+    }
 }
 
 /// `rewind deploy <tenant> <bundle> [--release]` — per-file workspace deploy.
@@ -910,7 +971,7 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
 /// plausible value rather than a refusal.
 ///
 /// Each payload is addressed by `(record, channel, RAW entry index)`, never by
-/// a raw `{batch_id, offset, len}`: the pool is cross-tenant by construction,
+/// a raw `BodyRef`: the pool is cross-tenant by construction,
 /// so a door taking a caller-supplied batch and offset would let anyone past
 /// the tenant gate read a neighbour's bytes by walking offsets. The server
 /// derives the reference from a record this session may already read.
@@ -1269,6 +1330,7 @@ const USAGE =
     \\  rewind [--env <file>] login
     \\  rewind [--env <file>] status
     \\  rewind [--env <file>] deploy <tenant> <bundle-dir> [--release]
+    \\  rewind [--env <file>] lock <bundle-dir>
     \\  rewind [--env <file>] release <tenant> <dep_id-hex>
     \\  rewind [--env <file>] rollback <tenant> <dep_id-hex>
     \\  rewind [--env <file>] deployments <tenant>
@@ -1345,7 +1407,8 @@ pub fn main() void {
         return;
     }
     const known = std.mem.eql(u8, verb, "login") or std.mem.eql(u8, verb, "status") or
-        std.mem.eql(u8, verb, "deploy") or std.mem.eql(u8, verb, "release") or
+        std.mem.eql(u8, verb, "deploy") or std.mem.eql(u8, verb, "lock") or
+        std.mem.eql(u8, verb, "release") or
         std.mem.eql(u8, verb, "rollback") or std.mem.eql(u8, verb, "deployments") or
         std.mem.eql(u8, verb, "publish") or std.mem.eql(u8, verb, "provision") or
         std.mem.eql(u8, verb, "host") or std.mem.eql(u8, verb, "plan") or
@@ -1359,6 +1422,16 @@ pub fn main() void {
     }
 
     const rest = argv[i..];
+
+    // `lock` talks only to the registry, so it takes the registry-only config
+    // for the same reason `replay` takes none: a command should not demand
+    // credentials for an origin it never dials.
+    if (std.mem.eql(u8, verb, "lock")) {
+        if (rest.len < 1) c.fatal("lock needs <bundle-dir>", .{});
+        var lock_cfg = loadRegistryCfg(gpa, a, env_path);
+        cmdLock(a, &lock_cfg, rest[0]);
+        return;
+    }
 
     // `replay` is fully offline (no dashboard / IdP) — handle it before
     // loadCfg so it never demands REWIND_ADMIN_URL / REWIND_IDP_URL.
