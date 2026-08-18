@@ -129,7 +129,7 @@ def main() -> int:
         c.deploy_with_packages(
             "__auth__", {"index.mjs": auth_src}, auth_pkgs, auth_imports,
             statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
-        c.admin_kv_put("__auth__", "_oidc/config/default", json.dumps({
+        c.admin_kv_seed("__auth__", "_oidc/config/default", json.dumps({
             "clients": [{"client_id": "admin-dashboard",
                          "redirect_uris": [app_origin + "/_rp/callback"]}],
             "login_path": "/login"}, separators=(",", ":")))
@@ -137,7 +137,7 @@ def main() -> int:
         # `firstparty_packages_for_app`.
         adm_pkgs, adm_imports = c.firstparty_packages_for_app(APPS_DIR / "admin")
         c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
-        c.admin_kv_put("__admin__", "_oidc/rp/default", json.dumps({
+        c.admin_kv_seed("__admin__", "_oidc/rp/default", json.dumps({
             "issuer": auth_base, "client_id": "admin-dashboard",
             "redirect_uri": app_origin + "/_rp/callback",
             "post_login": "/", "operator_prefix": "_admin/operator/"},

@@ -204,9 +204,9 @@ def main() -> int:
         # gate is armed by a scenario key no capture carries.
         print("step 5: a captured __admin__ world actually REPLAYS")
         probe_src = ADMIN_PROBE_SRC.replace("REPLACE_TARGET", TARGET)
-        c.admin_kv_put(TARGET, "probe/scoped", "S")
-        c.admin_kv_put(TARGET, "probe/p/1", "one")
-        c.admin_kv_put("__admin__", "_x", "")  # ensure the store exists
+        c.admin_kv_seed(TARGET, "probe/scoped", "S")
+        c.admin_kv_seed(TARGET, "probe/p/1", "one")
+        c.admin_kv_seed("__admin__", "_x", "")  # ensure the store exists
         # Our own bundle replaces the standing deploy app; nothing after this
         # step needs it.
         c.deploy_handlers("__admin__", {"index.mjs": probe_src})

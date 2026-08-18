@@ -206,8 +206,8 @@ def main() -> int:
         c.spawn_log_server(poll_interval_ms=200)
         r = c.provision("tgt")
         check("provision tgt → 200/409", r.status in (200, 409), f"got {r.status}")
-        c.admin_kv_put("tgt", "profile", "P")
-        c.admin_kv_put("tgt", "p/1", "one")
+        c.admin_kv_seed("tgt", "profile", "P")
+        c.admin_kv_seed("tgt", "p/1", "one")
 
         r = c.provision("__admin__")
         check("provision __admin__ → 200/409", r.status in (200, 409), f"got {r.status}")

@@ -1207,6 +1207,37 @@ class V2Cluster:
             f"{self.node_url(node)}/_system/v2-kv?tenant={tenant}&key={key}",
             headers={"X-Rewind-Move-Secret": MOVE_SECRET})
 
+    def admin_kv_seed(self, tenant: str, key: str, value: str, *,
+                      node: int = 0, retry_s: float = 20.0) -> HttpResponse:
+        """`admin_kv_put` for a row something LATER depends on: retries the
+        retryable refusals and RAISES if the row never lands.
+
+        The distinction is not stylistic. A seed written right after a deploy
+        contends with the deployment-load dispatch and gets a `503 write
+        failed`; a caller that discards the status carries on, and the failure
+        resurfaces far away as a wrong ANSWER — `is_root: false`, a 403 that
+        reads like an authorization bug, or a readiness poll that blames
+        replication for a write that was refused outright (rove#438).
+
+        `admin_kv_put` defaults to `retry_s=0` on purpose — the failover and
+        transfer smokes drive their own leader-re-resolution loops through
+        deliberately leaderless windows, and a helper that blocked in there
+        would fight them. But that default puts the burden on every caller to
+        remember two separate things: retry, and check. #438 fixed one call
+        site that way and the identical bug survived in three siblings for
+        months. This is the same operation with the burden removed: if you are
+        seeding a precondition, reach for this and there is nothing left to
+        forget.
+        """
+        r = self.admin_kv_put(tenant, key, value, node=node, retry_s=retry_s)
+        if r.status not in (200, 204):
+            raise RuntimeError(
+                f"seed {tenant}/{key} refused after {retry_s}s: "
+                f"{r.status} {r.body[:200]!r} — every later check that reads "
+                f"this row would fail somewhere else"
+            )
+        return r
+
     def admin_kv_put(self, tenant: str, key: str, value: str, *,
                      node: int = 0, retry_s: float = 0.0) -> HttpResponse:
         """Write a tenant KV key via the worker's `/_system/v2-kv` (move-secret

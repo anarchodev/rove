@@ -113,7 +113,7 @@ def main() -> int:
                 statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
         except RuntimeError as e:
             check("deploy web/auth → __auth__", False, str(e)); return 1
-        c.admin_kv_put("__auth__", "_oidc/config/default", json.dumps({
+        c.admin_kv_seed("__auth__", "_oidc/config/default", json.dumps({
             "clients": [{"client_id": CLIENT_ID,
                          "redirect_uris": [app_origin + "/_rp/callback"]}],
             "login_path": "/login",
@@ -124,7 +124,7 @@ def main() -> int:
             c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e)); return 1
-        c.admin_kv_put("__admin__", "_oidc/rp/default", json.dumps({
+        c.admin_kv_seed("__admin__", "_oidc/rp/default", json.dumps({
             "issuer": auth_base, "client_id": CLIENT_ID,
             "redirect_uri": app_origin + "/_rp/callback",
             "post_login": "/", "operator_prefix": "_admin/operator/",
@@ -136,8 +136,10 @@ def main() -> int:
         # own `other`.
         c.provision("custapp")
         c.provision("other")
-        c.admin_kv_put("__admin__",
-                       "account/" + sha256_hex(CUSTOMER) + "/instances/custapp", "")
+        # The ownership row the handler keys on: a precondition for every
+        # authz check below, so a refused write must not pass silently.
+        c.admin_kv_seed("__admin__",
+                        "account/" + sha256_hex(CUSTOMER) + "/instances/custapp", "")
 
         # Readiness.
         r = None
