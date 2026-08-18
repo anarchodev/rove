@@ -149,7 +149,7 @@ def main() -> int:
                 statics={"_config/oidc/default.json": (auth_cfg, "application/json")})
         except RuntimeError as e:
             check("deploy web/auth → __auth__", False, str(e)); return 1
-        c.admin_kv_put("__auth__", "_oidc/config/default", json.dumps({
+        c.admin_kv_seed("__auth__", "_oidc/config/default", json.dumps({
             "clients": [{"client_id": CLIENT_ID,
                          "redirect_uris": [app_origin + "/_rp/callback"]}],
             "login_path": "/login",
@@ -160,23 +160,26 @@ def main() -> int:
             c.deploy_with_packages("__admin__", admin_files, adm_pkgs, adm_imports)
         except RuntimeError as e:
             check("deploy web/admin → __admin__", False, str(e)); return 1
-        c.admin_kv_put("__admin__", "_oidc/rp/default", json.dumps({
+        c.admin_kv_seed("__admin__", "_oidc/rp/default", json.dumps({
             "issuer": auth_base, "client_id": CLIENT_ID,
             "redirect_uri": app_origin + "/_rp/callback",
             "post_login": "/", "operator_prefix": "_admin/operator/",
         }, separators=(",", ":")))
         # Seed the OPERATOR so their OIDC session resolves is_root.
         #
+        # `admin_kv_seed`, not `admin_kv_put`: this row is a PRECONDITION.
+        # Seeding it right after a deploy contends with the deployment-load
+        # dispatch and gets a `503 write failed`, and this call site used to
+        # discard that — the poll below then reported "the row never became
+        # visible", blaming replication for a write that was refused outright.
+        #
         # Then WAIT for the row to be readable before anyone logs in. Operator
         # authority is resolved once, at login (auth-and-domains.md §4.6c:
         # `is_root` is baked into the session record), so a login that races
-        # ahead of this write's replication mints a permanently non-root
-        # session — and every later assertion fails as "operator-only",
-        # pointing anywhere but here. That is a load-sensitive false
-        # regression on the deploy gate, not a product defect: the write is
-        # durable, the reader was just early.
+        # ahead of this write mints a permanently non-root session — and every
+        # later assertion fails as "operator-only", pointing anywhere but here.
         op_key = "_admin/operator/" + sha256_hex(OPERATOR)
-        c.admin_kv_put("__admin__", op_key, "")
+        c.admin_kv_seed("__admin__", op_key, "")
         op_visible = False
         for _ in range(60):
             if c.admin_kv_get("__admin__", op_key).status == 200:
