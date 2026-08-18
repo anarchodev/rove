@@ -112,9 +112,14 @@ pub const ReservationAllocator = struct {
         if (self.refill_thread) |t| t.join();
     }
 
-    /// Mint one id. In local mode returns from an atomic counter. With a
-    /// provider, draws from `current`, blocking on `id_avail` only if
-    /// the block is exhausted and the refill has not landed yet.
+    /// Mint one id, **waiting** if no block has one yet.
+    ///
+    /// Only for callers that may block — a background thread, a
+    /// low-rate control path. A caller on a poll loop must use
+    /// `tryNext`: the wait here is unbounded, so on a shared event loop
+    /// it stalls every tenant on the node, not just the request that
+    /// needed an id.
+    ///
     /// Returns `Shutdown` if `deinit` fired while parked.
     pub fn next(self: *Self) Error!u64 {
         if (self.cfg.provider == null) {
@@ -125,25 +130,61 @@ pub const ReservationAllocator = struct {
         defer self.mu.unlock();
         while (true) {
             if (self.shutdown_flag.load(.acquire)) return Error.Shutdown;
+            if (self.takeLocked()) |id| return id;
+            self.kickRefillLocked();
+            self.id_avail.wait(&self.mu);
+        }
+    }
+
+    /// Mint one id if a block already has one, else `null`. **Never
+    /// waits.**
+    ///
+    /// This is what a request path calls. `null` means "not right now"
+    /// — the caller parks its work and retries on a later cycle rather
+    /// than holding the loop. A refill is kicked on the way out, so the
+    /// retry has something to find.
+    ///
+    /// It does take the allocator's mutex, which is held for a handful
+    /// of field updates and never across I/O — bounded, unlike the
+    /// condvar wait `next` can enter.
+    ///
+    /// `null` is also the shutdown answer: a caller that cannot wait has
+    /// nothing useful to do with the distinction.
+    pub fn tryNext(self: *Self) ?u64 {
+        if (self.cfg.provider == null) {
+            return self.local_ctr.fetchAdd(1, .monotonic);
+        }
+
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.shutdown_flag.load(.acquire)) return null;
+        if (self.takeLocked()) |id| return id;
+        self.kickRefillLocked();
+        return null;
+    }
+
+    /// Take an id from `current`, promoting `upcoming` when `current` is
+    /// spent. Null when neither has one. Caller holds `mu`.
+    fn takeLocked(self: *Self) ?u64 {
+        while (true) {
             if (self.current.next < self.current.end) {
                 const id = self.current.next;
                 self.current.next += 1;
                 self.maybeKickRefillLocked();
                 return id;
             }
-            // Current exhausted; swap upcoming if available.
-            if (self.upcoming) |up| {
-                self.current = up;
-                self.upcoming = null;
-                continue;
-            }
-            // No block available; ensure refill is in flight + wait.
-            if (!self.refill_in_progress and !self.refill_needed) {
-                self.refill_needed = true;
-                self.refill_cond.signal();
-            }
-            self.id_avail.wait(&self.mu);
+            const up = self.upcoming orelse return null;
+            self.current = up;
+            self.upcoming = null;
         }
+    }
+
+    /// Ask the refill thread for a block if one is not already coming.
+    /// Caller holds `mu`.
+    fn kickRefillLocked(self: *Self) void {
+        if (self.refill_in_progress or self.refill_needed) return;
+        self.refill_needed = true;
+        self.refill_cond.signal();
     }
 
     fn maybeKickRefillLocked(self: *Self) void {
@@ -320,6 +361,60 @@ test "a provider that fails is retried rather than surfacing to the caller" {
     try testing.expectEqual(@as(u64, 1), try r.next());
     try testing.expectEqual(@as(u64, 2), try r.next());
     try testing.expect(f.fail_first.load(.monotonic) == 0);
+}
+
+test "tryNext yields ids from a live block, and null once it is dry" {
+    // A provider that serves exactly one block and then stalls, so the
+    // pool is guaranteed to run dry.
+    const OneBlock = struct {
+        served: std.atomic.Value(u32) = .init(0),
+        gate: std.Thread.ResetEvent = .{},
+        fn reserve(ctx: *anyopaque, prev_end: u64, count: u32) anyerror!u64 {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.served.fetchAdd(1, .monotonic) > 0) {
+                s.gate.wait();
+                return error.Cancelled;
+            }
+            _ = prev_end;
+            return 1 + count;
+        }
+    };
+    var p = OneBlock{};
+    var r = ReservationAllocator{};
+    try r.start(.{ .provider = .{ .ctx = &p, .reserveFn = OneBlock.reserve }, .block_size = 4 });
+
+    // The first block has to land before ids appear; `tryNext` never
+    // waits for it, so poll rather than assuming.
+    var first: ?u64 = null;
+    var spins: usize = 0;
+    while (first == null and spins < 200) : (spins += 1) {
+        first = r.tryNext();
+        if (first == null) std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u64, 1), first.?);
+    try testing.expectEqual(@as(u64, 2), r.tryNext().?);
+    try testing.expectEqual(@as(u64, 3), r.tryNext().?);
+    try testing.expectEqual(@as(u64, 4), r.tryNext().?);
+
+    // Dry, and the next block will never come. The point of the test is
+    // that this RETURNS — a blocking acquire here would hang the poll
+    // loop and with it every tenant on the node.
+    try testing.expect(r.tryNext() == null);
+    try testing.expect(r.tryNext() == null);
+
+    p.gate.set();
+    r.deinit();
+}
+
+test "tryNext returns null under shutdown rather than an error" {
+    // A caller that cannot wait has nothing useful to do with the
+    // distinction between "empty" and "shutting down" — both mean park.
+    var p = TestProvider{};
+    var r = ReservationAllocator{};
+    try r.start(.{ .provider = p.provider(), .block_size = 4 });
+    r.shutdown_flag.store(true, .release);
+    try testing.expect(r.tryNext() == null);
+    r.deinit();
 }
 
 test "deinit unparks a caller waiting on an exhausted block" {
