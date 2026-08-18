@@ -372,7 +372,7 @@ pub fn captureWakeBatchTapes(
     // apart.
     if (ctx_body.len > 0) {
         readset.trigger_payload.appendTriggerPayload(
-            .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(ctx_body.len) },
+            bodies_mod.BodyRef.carried(@intCast(ctx_body.len)),
             if (ctx_body.len <= REQUEST_BODY_CAP) ctx_body else "",
         ) catch |err| {
             std.log.warn("rove-js wake-ctx capture failed: {s}", .{@errorName(err)});
@@ -415,7 +415,7 @@ pub fn captureSendCallbackTapes(
     const allocator = worker.allocator;
     if (envelope.len > 0) {
         readset.trigger_payload.appendTriggerPayload(
-            .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(envelope.len) },
+            bodies_mod.BodyRef.carried(@intCast(envelope.len)),
             if (envelope.len <= REQUEST_BODY_CAP) envelope else "",
         ) catch |err| {
             std.log.warn("rove-js send-callback envelope capture failed: {s}", .{@errorName(err)});
@@ -501,11 +501,7 @@ pub fn captureFetchChunkTapes(
         // len), and a zero length would leave replay deriving it from the NEXT
         // chunk's offset — which the last chunk does not have. For an
         // unretained payload the length is the whole record of what was lost.
-        .{
-            .batch_id = bodies_mod.NO_BATCH,
-            .offset = 0,
-            .len = @intCast(ev.bytes.len),
-        },
+        bodies_mod.BodyRef.carried(@intCast(ev.bytes.len)),
         ev.final,
         ev.terminal_status,
         ev.terminal_ok,
@@ -1142,7 +1138,7 @@ test "captureFetchChunkTapes: an unretained chunk keeps its length, not a zero" 
         "ftch_1",
         0,
         0,
-        .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(big.len) },
+        bodies_mod.BodyRef.carried(@intCast(big.len)),
         false,
         0,
         false,

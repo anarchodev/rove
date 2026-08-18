@@ -73,7 +73,7 @@ Legend — **Ver?**: explicit version field present today. **Tier**: see §2.
 | Log batch object | `src/log_server/flush_writer.zig:6-18` | `[u32 LE sidecar_len][sidecar JSON][deflate frames…]` | sidecar **v1**; records none | B |
 | Log sidecar JSON | `src/log_server/sidecar.zig:26,36-103` | JSON `{v:1, node_id, batch_id, records[…]}` | **yes (v1)** | B |
 | Per-record JSON (+ inline tapes) | `src/log_server/flush_writer.zig:232-266` | deflate-wrapped JSON incl. base64 tape payloads | none | B |
-| Body-batch pool object | `src/bodies/` (`_pool/{batch_id}`) | concatenated bodies referenced by `BodyRef{batch_id,offset,len}` | none | B |
+| Body-batch pool object | `src/blob/pool_object.zig` (`_pool/{written_ms}-{digest}`) | header + entry table + concatenated bodies, referenced by `BodyRef{written_unix_ms,digest,offset,len}` | v1 (magic `RPL1`) | B |
 
 ### 1d. Local on-disk (opaque / pinned by dep)
 

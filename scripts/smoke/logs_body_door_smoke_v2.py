@@ -2,7 +2,7 @@
 """The out-of-line body door — a payload over the inline cap comes back whole.
 
 A request body over 16 KiB is NOT stored in the log record. The worker
-spills it to the cross-tenant body pool (`_pool/{batch_id}`) and the record
+spills it to the cross-tenant body pool (`_pool/{written_ms}-{digest}`) and the record
 keeps only a `BodyRef {batch_id, offset, len}` on its `trigger_payload`
 tape. Until this door existed nothing resolved that pointer, so every large
 input replayed as an EMPTY body — a missing input presenting as a plausible

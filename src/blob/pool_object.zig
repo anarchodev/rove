@@ -98,8 +98,12 @@ pub const ENTRY_LEN: usize = 8 + 4 + 4;
 /// allocates, and far above what a drain cycle collects.
 pub const MAX_ENTRIES: usize = 1 << 16;
 
+pub const PREFIX = "_pool/";
+
 /// `_pool/` + 13-digit ms + `-` + hex digest.
-pub const KEY_LEN: usize = "_pool/".len + 13 + 1 + DIGEST_LEN * 2;
+pub const KEY_LEN: usize = PREFIX.len + LEAF_LEN;
+/// The leaf alone: 13-digit ms + `-` + hex digest.
+pub const LEAF_LEN: usize = 13 + 1 + DIGEST_LEN * 2;
 
 pub const Error = error{
     Truncated,
@@ -132,14 +136,46 @@ pub const Ref = struct {
         .len = 0,
     };
 
+    /// Names no pool object, but keeps the payload's LENGTH.
+    ///
+    /// Used where the bytes ride on the tape entry itself, and where an
+    /// entry references content-addressed storage instead of the pool.
+    /// The length is what separates "this event had no payload" from
+    /// "this event had a payload and kept it nowhere" — collapsing the
+    /// two is how a dropped body reads back as an empty one
+    /// (`src/log_server/body_ref.zig` `locate`).
+    pub fn carried(len: u32) Ref {
+        return .{
+            .written_unix_ms = 0,
+            .digest = [_]u8{0} ** DIGEST_LEN,
+            .offset = 0,
+            .len = len,
+        };
+    }
+
+    /// True when this ref names no pool object. `carried` refs are
+    /// none-shaped: they answer "is there an object to fetch", and a
+    /// length alone is not one.
     pub fn isNone(self: Ref) bool {
         return self.written_unix_ms == 0 and std.mem.allEqual(u8, &self.digest, 0);
     }
 
     /// Format this ref's object key into `buf`, which must be at least
     /// `KEY_LEN`. Returns a slice of `buf`.
+    ///
+    /// This is the PREFIXED form, for a reader whose store handle sits at
+    /// the content base — the log server's body door. A writer whose
+    /// handle is already scoped to `_pool/` wants `leaf` instead; passing
+    /// this one there writes `_pool/_pool/…` and every reference to that
+    /// object resolves to a miss.
     pub fn key(self: Ref, buf: []u8) []u8 {
         return formatKey(self.written_unix_ms, self.digest, buf);
+    }
+
+    /// The key WITHOUT the `_pool/` prefix, for a store handle already
+    /// scoped to the pool. `buf` must be at least `LEAF_LEN`.
+    pub fn leaf(self: Ref, buf: []u8) []u8 {
+        return formatLeaf(self.written_unix_ms, self.digest, buf);
     }
 };
 
@@ -149,7 +185,16 @@ pub const Ref = struct {
 /// width, keeps lexical order equal to time order — which is what makes
 /// a cursored sweep possible.
 pub fn formatKey(written_unix_ms: u64, digest: Digest, buf: []u8) []u8 {
-    return std.fmt.bufPrint(buf, "_pool/{d:0>13}-{x}", .{ written_unix_ms, digest }) catch
+    return std.fmt.bufPrint(buf, PREFIX ++ "{d:0>13}-{x}", .{ written_unix_ms, digest }) catch
+        unreachable;
+}
+
+/// The same name without the `_pool/` prefix — what a store handle
+/// already scoped to the pool takes. The two forms exist because the
+/// pool has readers and writers at different prefix depths, and the
+/// difference is invisible to a store fixture that has no prefix at all.
+pub fn formatLeaf(written_unix_ms: u64, digest: Digest, buf: []u8) []u8 {
+    return std.fmt.bufPrint(buf, "{d:0>13}-{x}", .{ written_unix_ms, digest }) catch
         unreachable;
 }
 
@@ -157,10 +202,9 @@ pub fn formatKey(written_unix_ms: u64, digest: Digest, buf: []u8) []u8 {
 /// Null when the key is not one of ours — a foreign object under the
 /// prefix is skipped rather than aged.
 pub fn keyWrittenMs(key_str: []const u8) ?u64 {
-    const prefix = "_pool/";
-    if (!std.mem.startsWith(u8, key_str, prefix)) return null;
-    const rest = key_str[prefix.len..];
-    if (rest.len != 13 + 1 + DIGEST_LEN * 2) return null;
+    if (!std.mem.startsWith(u8, key_str, PREFIX)) return null;
+    const rest = key_str[PREFIX.len..];
+    if (rest.len != LEAF_LEN) return null;
     if (rest[13] != '-') return null;
     return std.fmt.parseInt(u64, rest[0..13], 10) catch null;
 }
@@ -233,6 +277,11 @@ pub const Sealed = struct {
 
     pub fn key(self: Sealed, buf: []u8) []u8 {
         return formatKey(self.written_unix_ms, self.digest, buf);
+    }
+
+    /// The key without the `_pool/` prefix — see `Ref.leaf`.
+    pub fn leaf(self: Sealed, buf: []u8) []u8 {
+        return formatLeaf(self.written_unix_ms, self.digest, buf);
     }
 };
 
@@ -538,6 +587,17 @@ test "the none sentinel is distinguishable and never minted" {
     // A real batch always carries a real wall-clock stamp, so a zero
     // stamp is what makes the sentinel unmintable.
     try testing.expect(!real.isNone());
+}
+
+test "a carried ref names no object but keeps the length" {
+    // The distinction a reader needs: no object to fetch either way,
+    // but a zero length means there were no bytes while a non-zero one
+    // means the bytes are somewhere other than the pool.
+    const c = Ref.carried(4096);
+    try testing.expect(c.isNone());
+    try testing.expectEqual(@as(u32, 4096), c.len);
+    try testing.expectEqual(@as(u32, 0), Ref.carried(0).len);
+    try testing.expect(std.meta.eql(Ref.none, Ref.carried(0)));
 }
 
 test "an empty batch seals and validates" {

@@ -39,6 +39,11 @@ pub const namespace = @import("namespace.zig");
 pub const namespace_store = @import("namespace_store.zig");
 pub const coordinator = @import("coordinator.zig");
 pub const BlobCoordinator = coordinator.BlobCoordinator;
+/// The cross-tenant body pool's object format — key, header, and the
+/// reference that points into it. Lives here because the coordinator is
+/// its producer and `rove-bodies` (its wire-format consumer) already
+/// depends on this module, so this is the only home both can reach.
+pub const pool_object = @import("pool_object.zig");
 
 pub const Error = error{
     /// The key contained characters that could escape the blob store's
@@ -180,6 +185,7 @@ test {
     _ = @import("backend.zig");
     _ = @import("curl_multi.zig");
     _ = @import("coordinator.zig");
+    _ = @import("pool_object.zig");
     _ = @import("namespace.zig");
     _ = @import("namespace_store.zig");
 }

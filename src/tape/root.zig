@@ -91,6 +91,14 @@ const tape_decode = @import("tape-decode");
 comptime {
     std.debug.assert(tape_decode.MAGIC == MAGIC);
     std.debug.assert(tape_decode.VERSION == VERSION);
+    // The `BodyRef` is the one variable-shaped scalar on this wire and it
+    // sits in the MIDDLE of two entry layouts, so a width change over
+    // there shifts every field after it. Pin the width, not just the
+    // version — a decoder reading the wrong width produces a plausible
+    // wrong answer rather than an error.
+    std.debug.assert(tape_decode.POOL_REF_WIRE_LEN == BODY_REF_WIRE_LEN);
+    std.debug.assert(tape_decode.POOL_DIGEST_LEN == bodies_mod.pool_object.DIGEST_LEN);
+    std.debug.assert(tape_decode.POOL_KEY_LEN == bodies_mod.POOL_KEY_LEN);
     const here = @typeInfo(Channel).@"enum".fields;
     const there = @typeInfo(tape_decode.Channel).@"enum".fields;
     std.debug.assert(here.len == there.len);
@@ -121,7 +129,55 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// outcome instead of re-deciding the rules; same entry width, new byte
 /// value, so the bump exists to make a stale reader reject loudly rather
 /// than misread (the engine-parity epic's outcome-replay model).
-pub const VERSION: u16 = 7;
+/// v7 → v8: the body pool became content-addressed, so the `BodyRef` on the
+/// `fetch_responses` and `trigger_payload` entries changed shape — a 20-byte
+/// `{batch_id, offset, len}` became a 32-byte
+/// `{written_unix_ms, digest, offset, len}`. Unlike the v5→v7 bumps this is
+/// NOT an appended field: it sits mid-entry, so everything after it shifts and
+/// an older tape read at the new width mis-slices instead of failing. The
+/// offline reader's floor moves with it (`tape_decode.MIN_VERSION`).
+pub const VERSION: u16 = 8;
+
+/// Wire width of a `BodyRef`: stamp(8) + digest(16) + offset(4) + len(4).
+/// Lockstep-asserted against the offline decoder above.
+pub const BODY_REF_WIRE_LEN: usize = 8 + bodies_mod.pool_object.DIGEST_LEN + 4 + 4;
+
+/// Append a `BodyRef` in wire order. Big-endian scalars, matching every
+/// other integer on this wire; the digest rides as opaque bytes.
+fn appendBodyRef(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    ref: bodies_mod.BodyRef,
+) !void {
+    var b8: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b8, ref.written_unix_ms, .big);
+    try buf.appendSlice(allocator, &b8);
+    try buf.appendSlice(allocator, &ref.digest);
+    var b4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b4, ref.offset, .big);
+    try buf.appendSlice(allocator, &b4);
+    std.mem.writeInt(u32, &b4, ref.len, .big);
+    try buf.appendSlice(allocator, &b4);
+}
+
+/// Read a `BodyRef` at `cur.*`, advancing it.
+fn readBodyRef(bytes: []const u8, cur: *usize) ParseError!bodies_mod.BodyRef {
+    if (cur.* + BODY_REF_WIRE_LEN > bytes.len) return ParseError.Truncated;
+    var ref: bodies_mod.BodyRef = .{
+        .written_unix_ms = std.mem.readInt(u64, bytes[cur.*..][0..8], .big),
+        .digest = undefined,
+        .offset = 0,
+        .len = 0,
+    };
+    cur.* += 8;
+    @memcpy(&ref.digest, bytes[cur.*..][0..bodies_mod.pool_object.DIGEST_LEN]);
+    cur.* += bodies_mod.pool_object.DIGEST_LEN;
+    ref.offset = std.mem.readInt(u32, bytes[cur.*..][0..4], .big);
+    cur.* += 4;
+    ref.len = std.mem.readInt(u32, bytes[cur.*..][0..4], .big);
+    cur.* += 4;
+    return ref;
+}
 
 /// Magic + version for the whole-Readset wire format used by
 /// `Readset.serialize` (readset replication, `docs/architecture/effects-and-handlers.md`).
@@ -142,14 +198,15 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// `js_engine_version: u16` scalar (`docs/architecture/format-versioning.md`
 /// §4) records which JS engine executed each replicated request, so a
 /// follower rebuilds the record against the same engine the leader ran.
-/// BodyRefs resolve through the one cross-tenant pool key template
-/// (`_pool/{batch_id:0>20}`). The parser accepts exactly this version
+/// BodyRefs name a content-addressed object in the one cross-tenant pool
+/// (`_pool/{written_unix_ms:0>13}-{digest_hex}`) — v10, which is a mid-entry
+/// shape change to the ref itself, not an appended field. The parser accepts exactly this version
 /// and rejects anything else loudly — the version byte is a format
 /// guard, not a compatibility band. This version rides in the durable
 /// raft log (type-0 envelopes carry the readset): when the format
 /// changes, bump this and delete the old shape in the same change (and
 /// wipe the data dir) — do not add a min-supported fallback.
-pub const READSET_VERSION: u16 = 9;
+pub const READSET_VERSION: u16 = 10;
 pub const READSET_CHANNEL_COUNT: usize = 5;
 
 /// Wire ids are contiguous and stable — the per-tape decoder rejects
@@ -166,7 +223,7 @@ pub const Channel = enum(u16) {
     /// Readset replication (`docs/architecture/effects-and-handlers.md`). One entry per
     /// `http.fetch` chunk activation; each entry records the
     /// `BodyRef` naming the bytes in the cross-tenant pool blob
-    /// (`_pool/{batch_id}`). Replay resolves the bytes via
+    /// (`_pool/{written_ms}-{digest}`). Replay resolves the bytes via
     /// `BlobStore.getRange` rather than reading them inline from the
     /// log blob.
     fetch_responses = 2,
@@ -313,17 +370,17 @@ pub const Entry = union(Channel) {
     /// One `http.fetch` chunk activation. Captures enough of the
     /// upstream event for replay to re-trigger the handler with
     /// the same payload. Two modes, discriminated by
-    /// `body_ref.batch_id`:
+    /// `body_ref`:
     ///
-    /// - `body_ref.batch_id != bodies_mod.NO_BATCH`: chunk bytes
-    ///   live in the per-tenant readset-blob; `inline_bytes` is
-    ///   empty. Used for chunks over the inline threshold.
-    /// - `body_ref.batch_id == bodies_mod.NO_BATCH` AND
+    /// - `!body_ref.isNone()`: chunk bytes live in the pool object
+    ///   the ref names; `inline_bytes` is empty. Used for chunks
+    ///   over the inline threshold.
+    /// - `body_ref.isNone()` AND
     ///   `inline_bytes.len > 0`: bytes ride inline in the entry.
     ///   Used for chunks under the inline threshold — handler runs
     ///   immediately, raft entry fsync IS the durability substrate,
     ///   same shape as the inbound `trigger_payload` inline path.
-    /// - `body_ref.batch_id == bodies_mod.NO_BATCH` AND
+    /// - `body_ref.isNone()` AND
     ///   `inline_bytes.len == 0`: a terminal-only event with no
     ///   body bytes (transport errors, stream-mode FINs, etc.).
     ///
@@ -365,7 +422,7 @@ pub const Entry = union(Channel) {
         /// later chunks reference the seq=0 entry for headers.
         headers: []const u8,
         /// Chunk payload when the inline fast path is selected
-        /// (`body_ref.batch_id == bodies_mod.NO_BATCH`,
+        /// (`body_ref.isNone()`,
         /// `body_ref.len == inline_bytes.len`). Empty for the
         /// BodyRef-to-S3 path and for terminal-only events.
         inline_bytes: []const u8,
@@ -394,15 +451,15 @@ pub const Entry = union(Channel) {
     /// cross-tenant pool blob OR carried inline in the entry
     /// itself (the inline small-body path; readset replication,
     /// `docs/architecture/effects-and-handlers.md`). The two modes are discriminated by
-    /// `body_ref.batch_id`:
+    /// `body_ref`:
     ///
-    /// - `body_ref.batch_id != bodies_mod.NO_BATCH`: bytes live
-    ///   at `_pool/{batch_id}` at the given
+    /// - `!body_ref.isNone()`: bytes live in the pool object the
+    ///   ref names, at the given
     ///   offset+len; `inline_bytes` is empty. Used for bodies
     ///   over the inline threshold (16 KB today); the dispatch
     ///   loop parks the request until the buffer's batch is
     ///   durable, then re-dispatches.
-    /// - `body_ref.batch_id == bodies_mod.NO_BATCH`: bytes ride
+    /// - `body_ref.isNone()`: bytes ride
     ///   inline as `inline_bytes`. `body_ref.offset == 0`,
     ///   `body_ref.len == inline_bytes.len`. The handler runs
     ///   immediately — no buffer append, no park, no S3 RTT —
@@ -570,7 +627,7 @@ pub const Tape = struct {
     /// buffers can go away. `headers` should be the parsed JSON
     /// (non-empty on seq=0 only); pass `""` for non-header
     /// chunks. `inline_bytes` is the chunk payload when the inline
-    /// fast path is selected (`body_ref.batch_id == NO_BATCH`,
+    /// fast path is selected (`body_ref.isNone()`,
     /// `body_ref.len == inline_bytes.len`); pass `""` for the
     /// BodyRef-to-S3 path and terminal-only events.
     pub fn appendFetchResponse(
@@ -623,10 +680,10 @@ pub const Tape = struct {
     /// nothing when the request had no body.
     ///
     /// `inline_bytes` carries the request body inline when the
-    /// caller chose the small-body inline path (`body_ref.batch_id
-    /// == bodies_mod.NO_BATCH`); empty for the by-reference path
-    /// (`body_ref.batch_id != NO_BATCH`, bytes live in
-    /// `_pool/{batch_id}`). The slice is dup'd into tape storage.
+    /// caller chose the small-body inline path
+    /// (`body_ref.isNone()`); empty for the by-reference path
+    /// (`!body_ref.isNone()`, bytes live in the pool object the ref
+    /// names). The slice is dup'd into tape storage.
     pub fn appendTriggerPayload(
         self: *Tape,
         body_ref: bodies_mod.BodyRef,
@@ -1329,16 +1386,7 @@ fn encodeEntry(
             var bo_be: [8]u8 = undefined;
             std.mem.writeInt(u64, &bo_be, f.byte_offset, .big);
             try buf.appendSlice(allocator, &bo_be);
-            // BodyRef: batch_id (u64), offset (u64), len (u32).
-            var br_bi: [8]u8 = undefined;
-            std.mem.writeInt(u64, &br_bi, f.body_ref.batch_id, .big);
-            try buf.appendSlice(allocator, &br_bi);
-            var br_off: [8]u8 = undefined;
-            std.mem.writeInt(u64, &br_off, f.body_ref.offset, .big);
-            try buf.appendSlice(allocator, &br_off);
-            var br_len: [4]u8 = undefined;
-            std.mem.writeInt(u32, &br_len, f.body_ref.len, .big);
-            try buf.appendSlice(allocator, &br_len);
+            try appendBodyRef(allocator, buf, f.body_ref);
             // Flags + terminal fields. Packed as 1-byte bools so the
             // wire layout stays bit-stable and the decoder can skip
             // ahead to `headers` deterministically.
@@ -1355,16 +1403,7 @@ fn encodeEntry(
             try appendLenPrefixed(allocator, buf, f.content_hash);
         },
         .trigger_payload => |t| {
-            // BodyRef: batch_id (u64), offset (u64), len (u32).
-            var br_bi: [8]u8 = undefined;
-            std.mem.writeInt(u64, &br_bi, t.body_ref.batch_id, .big);
-            try buf.appendSlice(allocator, &br_bi);
-            var br_off: [8]u8 = undefined;
-            std.mem.writeInt(u64, &br_off, t.body_ref.offset, .big);
-            try buf.appendSlice(allocator, &br_off);
-            var br_len: [4]u8 = undefined;
-            std.mem.writeInt(u32, &br_len, t.body_ref.len, .big);
-            try buf.appendSlice(allocator, &br_len);
+            try appendBodyRef(allocator, buf, t.body_ref);
             try appendLenPrefixed(allocator, buf, t.inline_bytes);
         },
         .request_reads => |r| {
@@ -1428,19 +1467,14 @@ fn decodeEntry(
         },
         .fetch_responses => {
             const fid = try readLenPrefixed(bytes, &cur);
-            if (cur + 4 + 8 + 8 + 8 + 4 + 1 + 2 + 1 + 1 > bytes.len) {
+            if (cur + 4 + 8 + BODY_REF_WIRE_LEN + 1 + 2 + 1 + 1 > bytes.len) {
                 return ParseError.Truncated;
             }
             const seq = std.mem.readInt(u32, bytes[cur..][0..4], .big);
             cur += 4;
             const byte_offset = std.mem.readInt(u64, bytes[cur..][0..8], .big);
             cur += 8;
-            const br_batch_id = std.mem.readInt(u64, bytes[cur..][0..8], .big);
-            cur += 8;
-            const br_offset = std.mem.readInt(u64, bytes[cur..][0..8], .big);
-            cur += 8;
-            const br_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
-            cur += 4;
+            const body_ref = try readBodyRef(bytes, &cur);
             const final = bytes[cur] != 0;
             cur += 1;
             const status = std.mem.readInt(u16, bytes[cur..][0..2], .big);
@@ -1463,11 +1497,7 @@ fn decodeEntry(
                 .fetch_id = fid,
                 .seq = seq,
                 .byte_offset = byte_offset,
-                .body_ref = .{
-                    .batch_id = br_batch_id,
-                    .offset = br_offset,
-                    .len = br_len,
-                },
+                .body_ref = body_ref,
                 .final = final,
                 .terminal_status = status,
                 .terminal_ok = ok,
@@ -1477,21 +1507,11 @@ fn decodeEntry(
             } };
         },
         .trigger_payload => {
-            if (cur + 8 + 8 + 4 > bytes.len) return ParseError.Truncated;
-            const br_batch_id = std.mem.readInt(u64, bytes[cur..][0..8], .big);
-            cur += 8;
-            const br_offset = std.mem.readInt(u64, bytes[cur..][0..8], .big);
-            cur += 8;
-            const br_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
-            cur += 4;
+            const body_ref = try readBodyRef(bytes, &cur);
             const inline_bytes = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .trigger_payload = .{
-                .body_ref = .{
-                    .batch_id = br_batch_id,
-                    .offset = br_offset,
-                    .len = br_len,
-                },
+                .body_ref = body_ref,
                 .inline_bytes = inline_bytes,
             } };
         },
@@ -1515,6 +1535,19 @@ fn decodeEntry(
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// A pool-backed `BodyRef` for tests, from a seed that stands in for a
+/// sealed object's identity. The digest is derived from the seed so two
+/// different seeds give two distinguishable refs — the only property the
+/// wire tests need.
+fn poolRef(seed: u8, offset: u32, len: u32) bodies_mod.BodyRef {
+    return .{
+        .written_unix_ms = 1_700_000_000_000 + @as(u64, seed),
+        .digest = [_]u8{seed} ** bodies_mod.pool_object.DIGEST_LEN,
+        .offset = offset,
+        .len = len,
+    };
+}
 
 test "kv tape: roundtrip with mixed ops and outcomes" {
     var tape = Tape.init(testing.allocator, .kv);
@@ -1642,7 +1675,7 @@ test "readset: serialize + parseReadset roundtrip" {
         "fetch-1",
         0,
         0,
-        .{ .batch_id = 5, .offset = 200, .len = 64 },
+        poolRef(5, 200, 64),
         true,
         200,
         true,
@@ -1652,7 +1685,7 @@ test "readset: serialize + parseReadset roundtrip" {
         "",
     );
     try rs.trigger_payload.appendTriggerPayload(
-        .{ .batch_id = 3, .offset = 0, .len = 128 },
+        poolRef(3, 0, 128),
         "",
     );
     try rs.request_reads.appendRequestReadOnce(.header_value, "user-agent", "smoke/1");
@@ -1872,7 +1905,7 @@ test "trigger_payload tape: BodyRef-only roundtrip (large body)" {
     var tape = Tape.init(testing.allocator, .trigger_payload);
     defer tape.deinit();
     try tape.appendTriggerPayload(
-        .{ .batch_id = 3, .offset = 4096, .len = 1024 },
+        poolRef(3, 4096, 1024),
         "",
     );
     const bytes = try tape.serialize(testing.allocator);
@@ -1883,7 +1916,7 @@ test "trigger_payload tape: BodyRef-only roundtrip (large body)" {
     try testing.expectEqual(Channel.trigger_payload, parsed.channel);
     try testing.expectEqual(@as(usize, 1), parsed.entries.len);
     const t = parsed.entries[0].trigger_payload;
-    try testing.expectEqual(@as(u64, 3), t.body_ref.batch_id);
+    try testing.expect(std.meta.eql(poolRef(3, 4096, 1024), t.body_ref));
     try testing.expectEqual(@as(u64, 4096), t.body_ref.offset);
     try testing.expectEqual(@as(u32, 1024), t.body_ref.len);
     try testing.expectEqualStrings("", t.inline_bytes);
@@ -1893,9 +1926,9 @@ test "trigger_payload tape: inline small-body roundtrip" {
     var tape = Tape.init(testing.allocator, .trigger_payload);
     defer tape.deinit();
     const body = "{\"hello\":\"world\"}";
-    // Inline path: sentinel batch_id, body rides as inline_bytes.
+    // Inline path: the ref names no object, body rides as inline_bytes.
     try tape.appendTriggerPayload(
-        .{ .batch_id = 0, .offset = 0, .len = @intCast(body.len) },
+        bodies_mod.BodyRef.carried(@intCast(body.len)),
         body,
     );
     const bytes = try tape.serialize(testing.allocator);
@@ -1904,7 +1937,7 @@ test "trigger_payload tape: inline small-body roundtrip" {
     var parsed = try parse(testing.allocator, bytes);
     defer parsed.deinit();
     const t = parsed.entries[0].trigger_payload;
-    try testing.expectEqual(@as(u64, 0), t.body_ref.batch_id);
+    try testing.expect(t.body_ref.isNone());
     try testing.expectEqualStrings(body, t.inline_bytes);
     try testing.expectEqual(@as(u32, body.len), t.body_ref.len);
 }
@@ -1971,7 +2004,7 @@ test "elideUnreadBody: drops trigger_payload entries unless body was read" {
     var rs = Readset.init(testing.allocator, 1, 1);
     defer rs.deinit();
     try rs.trigger_payload.appendTriggerPayload(
-        .{ .batch_id = 0, .offset = 0, .len = 5 },
+        bodies_mod.BodyRef.carried(5),
         "hello",
     );
     try testing.expectEqual(@as(usize, 1), rs.trigger_payload.entries.items.len);
@@ -1987,7 +2020,7 @@ test "elideUnreadBody: drops trigger_payload entries unless body was read" {
     var rs2 = Readset.init(testing.allocator, 1, 1);
     defer rs2.deinit();
     try rs2.trigger_payload.appendTriggerPayload(
-        .{ .batch_id = 0, .offset = 0, .len = 5 },
+        bodies_mod.BodyRef.carried(5),
         "hello",
     );
     rs2.body_read = true;
@@ -2015,7 +2048,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         "fetch-abc",
         0,
         0,
-        .{ .batch_id = 7, .offset = 100, .len = 256 },
+        poolRef(7, 100, 256),
         false,
         0,
         false,
@@ -2029,7 +2062,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         "fetch-abc",
         1,
         256,
-        .{ .batch_id = 7, .offset = 356, .len = 128 },
+        poolRef(7, 356, 128),
         false,
         0,
         false,
@@ -2043,7 +2076,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         "fetch-abc",
         2,
         384,
-        .{ .batch_id = 0, .offset = 0, .len = 0 },
+        bodies_mod.BodyRef.carried(0),
         true,
         200,
         true,
@@ -2065,7 +2098,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
     try testing.expectEqualStrings("fetch-abc", e0.fetch_id);
     try testing.expectEqual(@as(u32, 0), e0.seq);
     try testing.expectEqual(@as(u64, 0), e0.byte_offset);
-    try testing.expectEqual(@as(u64, 7), e0.body_ref.batch_id);
+    try testing.expect(std.meta.eql(poolRef(7, 100, 256), e0.body_ref));
     try testing.expectEqual(@as(u64, 100), e0.body_ref.offset);
     try testing.expectEqual(@as(u32, 256), e0.body_ref.len);
     try testing.expectEqual(false, e0.final);
@@ -2093,7 +2126,7 @@ test "fetch_responses tape: inline small-chunk roundtrip" {
         "fetch-xyz",
         0,
         0,
-        .{ .batch_id = 0, .offset = 0, .len = @intCast(chunk.len) },
+        bodies_mod.BodyRef.carried(@intCast(chunk.len)),
         true,
         200,
         true,
@@ -2107,7 +2140,7 @@ test "fetch_responses tape: inline small-chunk roundtrip" {
     var parsed = try parse(testing.allocator, bytes);
     defer parsed.deinit();
     const e = parsed.entries[0].fetch_responses;
-    try testing.expectEqual(@as(u64, 0), e.body_ref.batch_id); // sentinel
+    try testing.expect(e.body_ref.isNone()); // names no object
     try testing.expectEqual(@as(u32, chunk.len), e.body_ref.len);
     try testing.expectEqualStrings(chunk, e.inline_bytes);
     try testing.expectEqual(true, e.final);
@@ -2256,10 +2289,10 @@ test "cross-decoder: fetch_responses channel reads back via tape_decode" {
     var tape = Tape.init(a, .fetch_responses);
     defer tape.deinit();
     // Seq-0 inline chunk with headers; then a BodyRef terminal.
-    try tape.appendFetchResponse("ftch_1", 0, 0, .{ .batch_id = 0, .offset = 0, .len = 4 }, false, 0, false, false, "{\"content-type\":\"text/plain\"}", "body",
+    try tape.appendFetchResponse("ftch_1", 0, 0, bodies_mod.BodyRef.carried(4), false, 0, false, false, "{\"content-type\":\"text/plain\"}", "body",
         "",
 );
-    try tape.appendFetchResponse("ftch_1", 1, 4, .{ .batch_id = 7, .offset = 100, .len = 256 }, true, 200, true, false, "", "",
+    try tape.appendFetchResponse("ftch_1", 1, 4, poolRef(7, 100, 256), true, 200, true, false, "", "",
         "",
 );
     const bytes = try tape.serialize(a);
@@ -2269,12 +2302,14 @@ test "cross-decoder: fetch_responses channel reads back via tape_decode" {
     defer a.free(out);
     try testing.expectEqual(@as(usize, 2), out.len);
     try testing.expectEqualStrings("ftch_1", out[0].fetch_id);
-    try testing.expectEqual(tape_decode.NO_BATCH, out[0].batch_id);
+    try testing.expect(out[0].pool_ref.isNone());
     try testing.expectEqualStrings("{\"content-type\":\"text/plain\"}", out[0].headers);
     try testing.expectEqualStrings("body", out[0].inline_bytes);
     try testing.expectEqual(@as(u32, 1), out[1].seq);
     try testing.expectEqual(@as(u64, 4), out[1].byte_offset);
-    try testing.expectEqual(@as(u64, 7), out[1].batch_id);
+    try testing.expect(!out[1].pool_ref.isNone());
+    try testing.expectEqual(poolRef(7, 100, 256).written_unix_ms, out[1].pool_ref.written_unix_ms);
+    try testing.expectEqualSlices(u8, &poolRef(7, 100, 256).digest, &out[1].pool_ref.digest);
     try testing.expect(out[1].final);
     try testing.expectEqual(@as(u16, 200), out[1].terminal_status);
     try testing.expect(out[1].terminal_ok);
@@ -2285,17 +2320,18 @@ test "cross-decoder: trigger_payload channel reads back via tape_decode" {
     var tape = Tape.init(a, .trigger_payload);
     defer tape.deinit();
     const body = "{\"ctx\":{\"n\":1}}";
-    try tape.appendTriggerPayload(.{ .batch_id = 0, .offset = 0, .len = @intCast(body.len) }, body);
-    try tape.appendTriggerPayload(.{ .batch_id = 42, .offset = 4096, .len = 1024 }, "");
+    try tape.appendTriggerPayload(bodies_mod.BodyRef.carried(@intCast(body.len)), body);
+    try tape.appendTriggerPayload(poolRef(42, 4096, 1024), "");
     const bytes = try tape.serialize(a);
     defer a.free(bytes);
 
     const out = try tape_decode.decodeTriggerPayload(a, bytes);
     defer a.free(out);
     try testing.expectEqual(@as(usize, 2), out.len);
-    try testing.expectEqual(tape_decode.NO_BATCH, out[0].batch_id);
+    try testing.expect(out[0].pool_ref.isNone());
     try testing.expectEqualStrings(body, out[0].inline_bytes);
-    try testing.expectEqual(@as(u64, 42), out[1].batch_id);
+    try testing.expect(!out[1].pool_ref.isNone());
+    try testing.expectEqualSlices(u8, &poolRef(42, 4096, 1024).digest, &out[1].pool_ref.digest);
     try testing.expectEqualStrings("", out[1].inline_bytes);
 }
 

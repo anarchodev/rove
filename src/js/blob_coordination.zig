@@ -4,26 +4,20 @@
 //! for the rove-js worker node.
 //!
 //! Owns the singleton `BlobCoordinator` (one drainer + K=32 executor
-//! pool), the shared `_pool/` S3 backend it writes against, and the
-//! heap-owned raft-backed reservation context.
+//! pool) and the shared `_pool/` S3 backend it writes against.
 //! See the blob coordinator / chunk spool (`docs/architecture/routing-and-ingress.md`).
 //!
 //! All worker bodies > 16 KB (inbound + outbound fetch chunks) submit
-//! to `coordinator`; the coordinator demuxes them into the one `_pool/`
-//! backend by `BodyRef.(offset, len)`. `batch_id` reservation goes
-//! through raft when a cluster handle is wired (production), or a local
-//! atomic counter otherwise (single-process / test paths).
+//! to `coordinator`; the coordinator demuxes them out of the one
+//! `_pool/` backend by the extent a `BodyRef` names. Nothing here
+//! coordinates object names across nodes: a pool object is named by its
+//! own content, so two nodes writing at the same instant produce two
+//! distinct objects by construction.
 //!
-//! Dependencies: `allocator`, the process `blob_mod.BackendConfig`, and
-//! (optionally) the `kv.Cluster` handle for raft-backed reservation.
+//! Dependencies: `allocator` and the process `blob_mod.BackendConfig`.
 
 const std = @import("std");
 const blob_mod = @import("rove-blob");
-
-// Single-node uses the coordinator's local atomic counter for
-// cross-tenant `batch_id` reservation, which is correct for one node.
-// Cluster-wide reservation (multi-node) goes through the bridge's
-// `__root__` group — see the blob coordinator (`docs/architecture/routing-and-ingress.md`).
 
 pub const BlobCoordination = struct {
     allocator: std.mem.Allocator,
@@ -61,10 +55,7 @@ pub const BlobCoordination = struct {
     ///
     /// Opens a single shared S3 backend at the
     /// `{key_prefix_base}_pool/` prefix; submissions land in that one
-    /// pool, demuxed by `BodyRef.(offset, len)`. When `cluster` is
-    /// non-null the coord uses raft-backed `batch_id` reservation
-    /// (`_system/coord_next_pool_batch`); when null the coord falls
-    /// back to a local atomic counter (single-process / test paths).
+    /// pool, demuxed by the extent a `BodyRef` names.
     pub fn start(self: *BlobCoordination, worker_count: u8) !void {
         if (self.coordinator != null) return;
 
@@ -93,26 +84,19 @@ pub const BlobCoordination = struct {
         errdefer pool_backend.deinit();
         self.pool_backend = pool_backend;
 
-        // Single-node: local atomic-counter reservation
-        // (`reservation = null`). Cluster-wide raft-backed reservation
-        // is the multi-node path via the bridge's `__root__` group —
-        // see the file header.
         const coord = try blob_mod.BlobCoordinator.init(
             self.allocator,
             self.pool_backend.?.blobStore(),
-            .{
-                .worker_count = worker_count,
-                .reservation = null,
-            },
+            .{ .worker_count = worker_count },
         );
         self.coordinator = coord;
     }
 
     /// Tear down in reverse start order: stop + join the coordinator
-    /// (its refill thread reaches the reservation ctx + pool backend),
-    /// then the pool backend, then the reservation ctx. The caller
-    /// MUST have already shut down any producer (e.g. the FetchEngine)
-    /// that reads `coordinator` before invoking this.
+    /// (its executor threads reach the pool backend), then the pool
+    /// backend. The caller MUST have already shut down any producer
+    /// (e.g. the FetchEngine) that reads `coordinator` before invoking
+    /// this.
     pub fn deinit(self: *BlobCoordination) void {
         if (self.coordinator) |c| {
             c.deinit();

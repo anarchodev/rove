@@ -64,6 +64,7 @@ const globals = @import("globals.zig");
 const ssrf_mod = @import("rove-ssrf");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
+const kv_mod = @import("raft-kv");
 const files_mod = @import("rove-files");
 const static_cache = @import("static_cache.zig");
 
@@ -1425,7 +1426,7 @@ pub const FetchEngine = struct {
         const coord = self.node.blob_coord.coordinator orelse return;
         const owner_idx = self.node.router.lookupBoundFetchOwner(ev.fetch_id) orelse return;
         const wid = blob_mod.coordinator.QueueId.fromInboxIdx(owner_idx) orelse return;
-        const seq = coord.submit(wid, ev.bytes) catch |err| {
+        const seq = coord.submit(wid, kv_mod.hashStoreId(ev.tenant_id), ev.bytes) catch |err| {
             std.log.warn(
                 "rove-js chunk-spool: coord.submit fetch_id={s} seq={d} bytes={d}: {s}",
                 .{ ev.fetch_id, ev.seq, ev.bytes.len, @errorName(err) },

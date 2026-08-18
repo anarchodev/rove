@@ -29,6 +29,7 @@ const effect_mod = @import("effect/root.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
 const deployment_cache = @import("deployment_cache.zig");
 
+const kv_mod = @import("raft-kv");
 const worker_mod = @import("worker.zig");
 const worker_ws = @import("worker_ws.zig");
 const dispatch = @import("worker_dispatch.zig");
@@ -661,7 +662,7 @@ pub fn fireFetchEventActivation(
     // buffer append, no S3 PUT, handler runs immediately. The
     // raft entry's fsync IS the durability substrate (every
     // replica sees the bytes when the entry replicates).
-    // Discriminator: `body_ref.batch_id == NO_BATCH` ⇒ inline.
+    // Discriminator: `body_ref.isNone()` ⇒ no pool object.
     //
     // Larger chunks submit to the process-global blob coordinator
     // (`coord.submit` → seq) and park in `fetch_pending_durability`;
@@ -681,11 +682,7 @@ pub fn fireFetchEventActivation(
     // bytes themselves ride along — a zero length is reserved for a chunk that
     // genuinely had none. That distinction is what lets a reader tell a
     // terminal-only event apart from a payload nothing kept.
-    var body_ref: bodies_mod.BodyRef = .{
-        .batch_id = bodies_mod.NO_BATCH,
-        .offset = 0,
-        .len = @intCast(event.bytes.len),
-    };
+    var body_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(event.bytes.len));
     var inline_bytes_for_tape: []const u8 = "";
     var content_hash_for_tape: []const u8 = "";
     // Only a chunk that actually carries bytes can be referenced; a
@@ -724,7 +721,11 @@ pub fn fireFetchEventActivation(
         .spill => {
             if (worker.node.blob_coord.coordinator) |coord| {
                 const wid = worker.coord_queue_id;
-                const seq = coord.submit(wid, event.bytes) catch |err| blk: {
+                const seq = coord.submit(
+                    wid,
+                    kv_mod.hashStoreId(p.dep.inst.id),
+                    event.bytes,
+                ) catch |err| blk: {
                     std.log.warn(
                         "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
                         .{ tenant_id, event.bytes.len, @errorName(err) },

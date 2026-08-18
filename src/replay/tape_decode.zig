@@ -19,16 +19,23 @@
 const std = @import("std");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 7; // lockstep-asserted against src/tape/root.zig
-/// The oldest layout this reader still understands. Records already in S3 were
-/// written at v5, so a reader that demanded equality would make every tape
-/// predating the bump undecodable — the guard has to be a RANGE, and each
-/// decoder branches on `Reader.version` for the fields that differ.
+pub const VERSION: u16 = 8; // lockstep-asserted against src/tape/root.zig
+/// The oldest layout this reader still understands.
 ///
-/// v5 → v6: `fetch_responses` entries gained a trailing content-hash. A v5
-/// entry simply has no such field; nothing else moved, because the field was
-/// appended at the END of the entry rather than spliced into it.
-pub const MIN_VERSION: u16 = 5;
+/// A range is only sound while every version in it can be told apart by
+/// branching on `Reader.version` — which held for v5→v7, where each bump
+/// APPENDED a field at the end of an entry and left the fixed prefix in place.
+/// v8 moved the `BodyRef` itself: the pool is content-addressed, so the ref
+/// grew from a 20-byte `{batch_id, offset, len}` to a 32-byte
+/// `{written_unix_ms, digest, offset, len}` in the middle of both the
+/// `fetch_responses` and `trigger_payload` layouts. Everything after it shifts,
+/// so an older tape read at the new width mis-slices into a plausible-looking
+/// wrong answer rather than failing.
+///
+/// Hence equality, not a range: a tape written before the bump is rejected at
+/// `Reader.init` instead of decoded into fiction. Pre-customer, so there is no
+/// corpus to keep readable (`docs/decisions.md` — no pre-launch back-compat).
+pub const MIN_VERSION: u16 = VERSION;
 
 pub const Channel = enum(u16) {
     kv = 0,
@@ -75,7 +82,7 @@ pub const RequestReadEntry = struct {
 /// One `http.fetch` chunk activation's recorded event (`src/tape/root.zig`
 /// `FetchResponseEntry`). The fields a replay needs to rebuild the flattened
 /// `request` surface for a `fetch_chunk`: the bytes (`inline_bytes` for the
-/// inline path; `batch_id != NO_BATCH` means the bytes live in a readset blob,
+/// inline path; a non-`none` `pool_ref` means the bytes live in a readset blob,
 /// which the offline replay can't fetch), the terminal status/ok, and the
 /// shape discriminators (`final`/`seq`) that resolve onFetchResult vs Chunk vs
 /// Done. `headers` is the upstream response headers JSON (seq=0 only).
@@ -83,7 +90,8 @@ pub const FetchResponseEntry = struct {
     fetch_id: []const u8,
     seq: u32,
     byte_offset: u64,
-    batch_id: u64,
+    /// Pool pointer. Non-`none` means the bytes live in a readset blob.
+    pool_ref: PoolRef = .none,
     final: bool,
     terminal_status: u16,
     terminal_ok: bool,
@@ -109,10 +117,10 @@ pub const FetchResponseEntry = struct {
 
 /// One trigger-payload entry (`src/tape/root.zig` `TriggerPayloadEntry`). For an
 /// inbound activation `inline_bytes` is the request body; for a continuation
-/// resume it is the synthesized `{"ctx": …}` envelope. `batch_id != NO_BATCH`
+/// resume it is the synthesized `{"ctx": …}` envelope. A non-`none` `pool_ref`
 /// means the bytes live in a readset blob (not fetchable offline).
 pub const TriggerPayloadEntry = struct {
-    batch_id: u64,
+    pool_ref: PoolRef = .none,
     inline_bytes: []const u8,
 };
 
@@ -130,8 +138,8 @@ pub const TriggerPayloadEntry = struct {
 pub const PayloadFate = union(enum) {
     /// The bytes ride on the entry itself.
     carried: []const u8,
-    /// A slice of the cross-tenant body-pool object named by this batch id.
-    pool: u64,
+    /// A slice of the cross-tenant body-pool object this ref names.
+    pool: PoolRef,
     /// A slice of one of the tenant's content-addressed objects, named by
     /// its 64-hex sha256. The slice is `(byte_offset, body_ref_len)`.
     content: []const u8,
@@ -144,8 +152,8 @@ pub const PayloadFate = union(enum) {
 
 /// Classify a `fetch_responses` entry's payload. Order matters: carried bytes
 /// win over any pointer, and the content reference is checked before the pool
-/// because a content-addressed chunk deliberately carries `NO_BATCH` — there
-/// is no pool object to name.
+/// because a content-addressed chunk deliberately carries a `none` pool ref —
+/// there is no pool object to name.
 pub fn fetchPayloadFate(e: FetchResponseEntry) PayloadFate {
     if (e.inline_bytes.len > 0) return .{ .carried = e.inline_bytes };
     if (e.content_hash.len > 0) {
@@ -153,7 +161,7 @@ pub fn fetchPayloadFate(e: FetchResponseEntry) PayloadFate {
         if (e.body_ref_len == 0) return .not_recorded;
         return .{ .content = e.content_hash };
     }
-    if (e.batch_id != NO_BATCH) return .{ .pool = e.batch_id };
+    if (!e.pool_ref.isNone()) return .{ .pool = e.pool_ref };
     if (e.body_ref_len == 0) return .empty;
     return .not_recorded;
 }
@@ -164,7 +172,7 @@ pub fn fetchPayloadFate(e: FetchResponseEntry) PayloadFate {
 /// the metadata-only fate an over-cap envelope records.
 pub fn triggerPayloadFate(e: TriggerPayloadEntry) PayloadFate {
     if (e.inline_bytes.len > 0) return .{ .carried = e.inline_bytes };
-    if (e.batch_id != NO_BATCH) return .{ .pool = e.batch_id };
+    if (!e.pool_ref.isNone()) return .{ .pool = e.pool_ref };
     return .not_recorded;
 }
 
@@ -176,10 +184,62 @@ fn isHex(s: []const u8) bool {
     return true;
 }
 
-/// Sentinel batch_id meaning "bytes ride inline, not in a blob"
-/// (`src/bodies/root.zig` `NO_BATCH`). A BodyRef with this batch_id has its
-/// bytes in `inline_bytes`; any other value points into a readset blob.
-pub const NO_BATCH: u64 = 0;
+/// Digest bytes in a pool reference (`src/blob/pool_object.zig` `DIGEST_LEN`).
+pub const POOL_DIGEST_LEN: usize = 16;
+/// Wire width of a `PoolRef`: stamp(8) + digest(16) + offset(4) + len(4).
+/// Lockstep-asserted against `src/tape/root.zig`.
+pub const POOL_REF_WIRE_LEN: usize = 8 + POOL_DIGEST_LEN + 4 + 4;
+
+/// The offline twin of `rove-bodies`' `BodyRef` — a pointer into the
+/// cross-tenant body pool. Duplicated rather than imported because this file is
+/// deliberately std-only (linking `rove-bodies` would drag rove-blob + libcurl
+/// into the lean CLI); `src/tape/root.zig` comptime-asserts the wire width and
+/// round-trips its serializer through this decoder, so the copy cannot drift
+/// silently.
+///
+/// The object is CONTENT-ADDRESSED: `written_unix_ms` and `digest` are the two
+/// halves of its key, so a holder rebuilds the key without a lookup. A ref with
+/// a zero stamp and an all-zero digest names no object at all — the bytes rode
+/// inline, or live in content-addressed storage, or were never kept.
+pub const PoolRef = struct {
+    written_unix_ms: u64 = 0,
+    digest: [POOL_DIGEST_LEN]u8 = [_]u8{0} ** POOL_DIGEST_LEN,
+    offset: u32 = 0,
+    len: u32 = 0,
+
+    pub const none: PoolRef = .{};
+
+    pub fn isNone(self: PoolRef) bool {
+        return self.written_unix_ms == 0 and std.mem.allEqual(u8, &self.digest, 0);
+    }
+
+    /// `_pool/{written_unix_ms:0>13}-{digest_hex}` — mirrors
+    /// `pool_object.formatKey`. `buf` must be at least `POOL_KEY_LEN`.
+    pub fn key(self: PoolRef, buf: []u8) []u8 {
+        return std.fmt.bufPrint(buf, "_pool/{d:0>13}-{x}", .{ self.written_unix_ms, self.digest }) catch
+            unreachable;
+    }
+};
+
+/// Buffer size `PoolRef.key` needs.
+pub const POOL_KEY_LEN: usize = "_pool/".len + 13 + 1 + POOL_DIGEST_LEN * 2;
+
+/// Read a `PoolRef` at `cur.*`, advancing it. Big-endian throughout, matching
+/// every other scalar on this wire.
+fn readPoolRef(bytes: []const u8, cur: *usize) Error!PoolRef {
+    if (cur.* + POOL_REF_WIRE_LEN > bytes.len) return Error.Truncated;
+    var out: PoolRef = .{
+        .written_unix_ms = std.mem.readInt(u64, bytes[cur.*..][0..8], .big),
+    };
+    cur.* += 8;
+    @memcpy(&out.digest, bytes[cur.*..][0..POOL_DIGEST_LEN]);
+    cur.* += POOL_DIGEST_LEN;
+    out.offset = std.mem.readInt(u32, bytes[cur.*..][0..4], .big);
+    cur.* += 4;
+    out.len = std.mem.readInt(u32, bytes[cur.*..][0..4], .big);
+    cur.* += 4;
+    return out;
+}
 
 pub const Error = error{ BadMagic, BadVersion, ChannelMismatch, Truncated, BadEnum, OutOfMemory };
 
@@ -308,18 +368,14 @@ pub fn decodeFetchResponses(a: std.mem.Allocator, bytes: []const u8) Error![]Fet
     while (try r.nextRaw()) |e| {
         var cur: usize = 0;
         const fid = try readLenPrefixed(e, &cur);
-        // seq(4) + byte_offset(8) + BodyRef{batch_id(8),offset(8),len(4)} +
-        // final(1) + status(2) + ok(1) + trunc(1)
-        if (cur + 4 + 8 + 8 + 8 + 4 + 1 + 2 + 1 + 1 > e.len) return Error.Truncated;
+        // seq(4) + byte_offset(8) + PoolRef(32) + final(1) + status(2) +
+        // ok(1) + trunc(1)
+        if (cur + 4 + 8 + POOL_REF_WIRE_LEN + 1 + 2 + 1 + 1 > e.len) return Error.Truncated;
         const seq = std.mem.readInt(u32, e[cur..][0..4], .big);
         cur += 4;
         const byte_offset = std.mem.readInt(u64, e[cur..][0..8], .big);
         cur += 8;
-        const batch_id = std.mem.readInt(u64, e[cur..][0..8], .big);
-        cur += 8;
-        cur += 8; // body_ref.offset — the door addresses by entry, not by ref
-        const body_ref_len = std.mem.readInt(u32, e[cur..][0..4], .big);
-        cur += 4;
+        const pool_ref = try readPoolRef(e, &cur);
         const final = e[cur] != 0;
         cur += 1;
         const status = std.mem.readInt(u16, e[cur..][0..2], .big);
@@ -330,11 +386,10 @@ pub fn decodeFetchResponses(a: std.mem.Allocator, bytes: []const u8) Error![]Fet
         cur += 1;
         const headers = try readLenPrefixed(e, &cur);
         const inline_bytes = try readLenPrefixed(e, &cur);
-        // v6 appended a content hash: set when the chunk's bytes were left in
+        // The content hash: set when the chunk's bytes were left in
         // content-addressed storage instead of copied here (a `blob.get`
-        // result). Empty on a v5 tape, and on a v6 entry that carried its
-        // bytes the old way.
-        const content_hash: []const u8 = if (r.version >= 6 and cur < e.len)
+        // result). Empty on an entry that carried its bytes the other way.
+        const content_hash: []const u8 = if (cur < e.len)
             try readLenPrefixed(e, &cur)
         else
             "";
@@ -342,14 +397,14 @@ pub fn decodeFetchResponses(a: std.mem.Allocator, bytes: []const u8) Error![]Fet
             .fetch_id = fid,
             .seq = seq,
             .byte_offset = byte_offset,
-            .batch_id = batch_id,
+            .pool_ref = pool_ref,
             .final = final,
             .terminal_status = status,
             .terminal_ok = ok,
             .body_truncated = trunc,
             .headers = headers,
             .inline_bytes = inline_bytes,
-            .body_ref_len = body_ref_len,
+            .body_ref_len = pool_ref.len,
             .content_hash = content_hash,
         });
     }
@@ -364,13 +419,9 @@ pub fn decodeTriggerPayload(a: std.mem.Allocator, bytes: []const u8) Error![]Tri
     errdefer out.deinit(a);
     while (try r.nextRaw()) |e| {
         var cur: usize = 0;
-        if (cur + 8 + 8 + 4 > e.len) return Error.Truncated;
-        const batch_id = std.mem.readInt(u64, e[cur..][0..8], .big);
-        cur += 8;
-        cur += 8; // body_ref.offset
-        cur += 4; // body_ref.len
+        const pool_ref = try readPoolRef(e, &cur);
         const inline_bytes = try readLenPrefixed(e, &cur);
-        try out.append(a, .{ .batch_id = batch_id, .inline_bytes = inline_bytes });
+        try out.append(a, .{ .pool_ref = pool_ref, .inline_bytes = inline_bytes });
     }
     return out.toOwnedSlice(a);
 }
@@ -387,6 +438,23 @@ fn putHeader(buf: *std.ArrayList(u8), a: std.mem.Allocator, ch: Channel, count: 
     std.mem.writeInt(u32, h[8..12], count, .big);
     try buf.appendSlice(a, &h);
 }
+fn putPoolRef(l: *std.ArrayList(u8), a: std.mem.Allocator, ref: PoolRef) !void {
+    try putU64(l, a, ref.written_unix_ms);
+    try l.appendSlice(a, &ref.digest);
+    try putU32(l, a, ref.offset);
+    try putU32(l, a, ref.len);
+}
+
+/// A distinguishable pool ref for tests, seeded so two seeds differ.
+fn tPoolRef(seed: u8, offset: u32, len: u32) PoolRef {
+    return .{
+        .written_unix_ms = 1_700_000_000_000 + @as(u64, seed),
+        .digest = [_]u8{seed} ** POOL_DIGEST_LEN,
+        .offset = offset,
+        .len = len,
+    };
+}
+
 fn putLen(buf: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
     var l: [4]u8 = undefined;
     std.mem.writeInt(u32, &l, @intCast(s.len), .big);
@@ -479,9 +547,7 @@ test "decodeFetchResponses: terminal entry with inline body" {
     try putLen(&e, a, "ftch_1"); // fetch_id
     try putU32(&e, a, 0); // seq
     try putU64(&e, a, 0); // byte_offset
-    try putU64(&e, a, NO_BATCH); // batch_id (inline)
-    try putU64(&e, a, 0); // body_ref.offset
-    try putU32(&e, a, 4); // body_ref.len
+    try putPoolRef(&e, a, PoolRef{ .len = 4 }); // names no object: inline
     try e.append(a, 1); // final
     try putU16(&e, a, 502); // status
     try e.append(a, 1); // ok
@@ -497,7 +563,7 @@ test "decodeFetchResponses: terminal entry with inline body" {
     try testing.expect(out[0].final);
     try testing.expectEqual(@as(u16, 502), out[0].terminal_status);
     try testing.expect(out[0].terminal_ok);
-    try testing.expectEqual(NO_BATCH, out[0].batch_id);
+    try testing.expect(out[0].pool_ref.isNone());
     try testing.expectEqualStrings("boom", out[0].inline_bytes);
 }
 
@@ -508,64 +574,34 @@ test "decodeTriggerPayload: ctx envelope inline" {
     try putHeader(&buf, a, .trigger_payload, 1);
     var e = std.ArrayList(u8){};
     defer e.deinit(a);
-    try putU64(&e, a, NO_BATCH); // batch_id
-    try putU64(&e, a, 0); // offset
-    try putU32(&e, a, 0); // len
+    try putPoolRef(&e, a, PoolRef.none); // names no object
     try putLen(&e, a, "{\"ctx\":{\"x\":1}}"); // inline_bytes (the synthesized envelope)
     try putEntry(&buf, a, e.items);
 
     const out = try decodeTriggerPayload(a, buf.items);
     defer a.free(out);
     try testing.expectEqual(@as(usize, 1), out.len);
-    try testing.expectEqual(NO_BATCH, out[0].batch_id);
+    try testing.expect(out[0].pool_ref.isNone());
     try testing.expectEqualStrings("{\"ctx\":{\"x\":1}}", out[0].inline_bytes);
 }
 
-/// A v5 `fetch_responses` entry: everything up to `inline_bytes`, with no
-/// trailing content hash. Written by hand rather than by the encoder, because
-/// the encoder can only produce the CURRENT version — and the whole question
-/// is whether records already in S3 still read.
-fn putV5FetchEntry(buf: *std.ArrayList(u8), a: std.mem.Allocator, fid: []const u8, body: []const u8) !void {
-    var e = std.ArrayList(u8){};
-    defer e.deinit(a);
-    try putLen(&e, a, fid);
-    try putU32(&e, a, 0); // seq
-    try putU64(&e, a, 0); // byte_offset
-    try putU64(&e, a, NO_BATCH); // body_ref.batch_id
-    try putU64(&e, a, 0); // body_ref.offset
-    try putU32(&e, a, @intCast(body.len)); // body_ref.len
-    try e.append(a, 1); // final
-    try putU16(&e, a, 200); // terminal_status
-    try e.append(a, 1); // terminal_ok
-    try e.append(a, 0); // body_truncated
-    try putLen(&e, a, ""); // headers
-    try putLen(&e, a, body); // inline_bytes  (v5 ends here)
-    try putEntry(buf, a, e.items);
-}
-
-test "decodeFetchResponses: a v5 tape still reads after the v6 bump" {
-    // THE reason `MIN_VERSION` exists. Every record already in S3 was written
-    // at v5; a reader that demanded equality with the current version would
-    // make all of it undecodable the moment the writer moved.
+test "a tape written before the ref changed shape is refused, not mis-sliced" {
+    // The `MIN_VERSION` floor. v5-v7 could share a reader because each bump
+    // APPENDED a field; v8 moved the `BodyRef` mid-entry, so an older tape
+    // read at the new width would slice a plausible wrong answer out of the
+    // bytes that follow it. Refusing is the only honest outcome.
     const a = testing.allocator;
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(a);
-    var h: [12]u8 = undefined;
-    std.mem.writeInt(u32, h[0..4], MAGIC, .big);
-    std.mem.writeInt(u16, h[4..6], 5, .big); // the OLD version, on purpose
-    std.mem.writeInt(u16, h[6..8], @intFromEnum(Channel.fetch_responses), .big);
-    std.mem.writeInt(u32, h[8..12], 1, .big);
-    try buf.appendSlice(a, &h);
-    try putV5FetchEntry(&buf, a, "f-old", "hello");
-
-    const out = try decodeFetchResponses(a, buf.items);
-    defer a.free(out);
-    try testing.expectEqual(@as(usize, 1), out.len);
-    try testing.expectEqualStrings("f-old", out[0].fetch_id);
-    try testing.expectEqualStrings("hello", out[0].inline_bytes);
-    // The field the version added is simply absent, not garbage read off the
-    // end of the entry.
-    try testing.expectEqualStrings("", out[0].content_hash);
+    for ([_]u16{ 5, 6, 7 }) |old_version| {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(a);
+        var h: [12]u8 = undefined;
+        std.mem.writeInt(u32, h[0..4], MAGIC, .big);
+        std.mem.writeInt(u16, h[4..6], old_version, .big);
+        std.mem.writeInt(u16, h[6..8], @intFromEnum(Channel.fetch_responses), .big);
+        std.mem.writeInt(u32, h[8..12], 1, .big);
+        try buf.appendSlice(a, &h);
+        try testing.expectError(Error.BadVersion, decodeFetchResponses(a, buf.items));
+    }
 }
 
 test "decodeFetchResponses: a referenced chunk names its bytes instead of carrying them" {
@@ -579,9 +615,9 @@ test "decodeFetchResponses: a referenced chunk names its bytes instead of carryi
     try putLen(&e, a, "f-ref");
     try putU32(&e, a, 0);
     try putU64(&e, a, 0);
-    try putU64(&e, a, NO_BATCH);
-    try putU64(&e, a, 0);
-    try putU32(&e, a, 4096); // the chunk's real size — the record stays complete
+    // Names no pool object — the bytes are in content-addressed storage —
+    // but keeps the chunk's real size, so the record stays complete.
+    try putPoolRef(&e, a, PoolRef{ .len = 4096 });
     try e.append(a, 1);
     try putU16(&e, a, 200);
     try e.append(a, 1);
@@ -611,7 +647,7 @@ test "payload fate: the three pointer shapes, and the two that carry nothing" {
         .fetch_id = "f",
         .seq = 0,
         .byte_offset = 0,
-        .batch_id = 7,
+        .pool_ref = tPoolRef(7, 32, 2),
         .final = true,
         .terminal_status = 200,
         .terminal_ok = true,
@@ -621,11 +657,12 @@ test "payload fate: the three pointer shapes, and the two that carry nothing" {
         .body_ref_len = 2,
     }).carried);
     // pool — a spilled chunk names the cross-tenant pool object.
-    try testing.expectEqual(@as(u64, 7), fetchPayloadFate(.{
+    const spilled = tPoolRef(7, 32, 65536);
+    try testing.expect(std.meta.eql(spilled, fetchPayloadFate(.{
         .fetch_id = "f",
         .seq = 0,
         .byte_offset = 0,
-        .batch_id = 7,
+        .pool_ref = spilled,
         .final = false,
         .terminal_status = 0,
         .terminal_ok = false,
@@ -633,7 +670,7 @@ test "payload fate: the three pointer shapes, and the two that carry nothing" {
         .headers = "",
         .inline_bytes = "",
         .body_ref_len = 65536,
-    }).pool);
+    }).pool));
     // empty vs not_recorded — the discriminator is the recorded LENGTH. A
     // terminal-only event legitimately has no bytes; a non-zero length with
     // no home is a payload the record claims and kept nowhere.
@@ -647,7 +684,6 @@ test "payload fate: the three pointer shapes, and the two that carry nothing" {
         .fetch_id = "f",
         .seq = 0,
         .byte_offset = 0,
-        .batch_id = NO_BATCH,
         .final = true,
         .terminal_status = 200,
         .terminal_ok = true,
@@ -659,9 +695,10 @@ test "payload fate: the three pointer shapes, and the two that carry nothing" {
     }) == .not_recorded);
     // A trigger entry always had a payload, so no-bytes-no-pool is the
     // metadata-only fate rather than an empty one.
-    try testing.expect(triggerPayloadFate(.{ .batch_id = NO_BATCH, .inline_bytes = "" }) == .not_recorded);
-    try testing.expectEqual(@as(u64, 9), triggerPayloadFate(.{ .batch_id = 9, .inline_bytes = "" }).pool);
-    try testing.expectEqualStrings("{}", triggerPayloadFate(.{ .batch_id = NO_BATCH, .inline_bytes = "{}" }).carried);
+    try testing.expect(triggerPayloadFate(.{ .inline_bytes = "" }) == .not_recorded);
+    const parked = tPoolRef(9, 32, 4);
+    try testing.expect(std.meta.eql(parked, triggerPayloadFate(.{ .pool_ref = parked, .inline_bytes = "" }).pool));
+    try testing.expectEqualStrings("{}", triggerPayloadFate(.{ .inline_bytes = "{}" }).carried);
 }
 
 fn decodeFate(len: u32) PayloadFate {
@@ -669,7 +706,6 @@ fn decodeFate(len: u32) PayloadFate {
         .fetch_id = "f",
         .seq = 0,
         .byte_offset = 0,
-        .batch_id = NO_BATCH,
         .final = true,
         .terminal_status = 0,
         .terminal_ok = false,

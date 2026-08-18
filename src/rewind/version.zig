@@ -42,6 +42,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const kv = @import("raft-kv");
 const files = @import("rove-files");
+const blob = @import("rove-blob");
 const log_server = @import("rove-log-server");
 const rjs = @import("rove-js");
 const bridge = @import("bridge");
@@ -97,6 +98,10 @@ pub fn dump(w: *std.Io.Writer) !void {
     // #244's pass.
     try w.writeAll("  bundle_lockfile      (unversioned) — src/cli/packages.zig\n");
     try w.print("  log_sidecar          v{d}\n", .{log_server.sidecar.VERSION});
+    try w.print("  pool_object          v{d} (magic 0x{X:0>8})\n", .{
+        blob.pool_object.VERSION,
+        blob.pool_object.MAGIC,
+    });
     try w.writeAll("  -- replay / tape (must lockstep with rtap.mjs / wasm-app.mjs) --\n");
     try w.print("  tape                 v{d} (magic 0x{X:0>8})\n", .{ rjs.tape.VERSION, rjs.tape.MAGIC });
     try w.print("  readset              v{d} (magic 0x{X:0>8})\n", .{ rjs.tape.READSET_VERSION, rjs.tape.READSET_MAGIC });
@@ -114,7 +119,7 @@ test "registry dump renders all format lines without error" {
     const out = w.buffered();
     // A couple of anchors so a dropped line is caught.
     try std.testing.expect(std.mem.indexOf(u8, out, "js_engine_version") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "readset              v9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "readset              v10") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "request_id           req_<16hex>") != null);
     // An unversioned format still has to appear: the registry is an inventory
     // of the whole surface, and dropping the entries with nothing to print is

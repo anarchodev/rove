@@ -482,7 +482,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
 /// The `resolved_bodies.<channel>` map a puller writes into the fixture:
 /// `{ "<raw entry ordinal>": "<standard base64>" }`, addressed exactly the way
 /// the log-server's body door is (channel + raw ordinal, never a raw
-/// `{batch_id, offset, len}` — see `outOfLinePayloads`).
+/// a `BodyRef` — see `outOfLinePayloads`).
 fn resolvedChannel(obj: std.json.ObjectMap, channel: []const u8) ?std.json.ObjectMap {
     const rb = obj.get("resolved_bodies") orelse return null;
     if (rb != .object) return null;
@@ -523,8 +523,8 @@ fn entryBytes(
 /// (`GET /v1/{tenant}/body/{request_id}/{channel}/{index}`). `index` is the RAW
 /// entry ordinal within the channel, never a filtered one, because the door
 /// derives the reference server-side from the record: a caller-supplied
-/// `{batch_id, offset}` would address the cross-tenant body pool directly and
-/// let anyone past the tenant gate walk a neighbour's bytes.
+/// `BodyRef` would address the cross-tenant body pool directly and let anyone
+/// past the tenant gate walk a neighbour's bytes.
 pub const OutOfLine = struct {
     channel: []const u8,
     index: u32,
@@ -729,15 +729,47 @@ test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue 
     try testing.expectEqualStrings("timer", w1.get("kind").?.string);
 }
 
-/// One trigger_payload entry as the tape records it. `batch_id != NO_BATCH`
+/// A pool-backed ref for these hand-written tapes. The seed stands in for a
+/// sealed object's identity; only distinguishability matters here.
+fn poolRef(seed: u8, len: u32) decode.PoolRef {
+    return .{
+        .written_unix_ms = 1_700_000_000_000 + @as(u64, seed),
+        .digest = [_]u8{seed} ** decode.POOL_DIGEST_LEN,
+        .offset = 0,
+        .len = len,
+    };
+}
+
+/// Append a `PoolRef` in wire order (`src/tape/root.zig` `appendBodyRef`).
+fn putPoolRef(ent: *std.ArrayList(u8), a: std.mem.Allocator, ref: decode.PoolRef) !void {
+    var b8: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b8, ref.written_unix_ms, .big);
+    try ent.appendSlice(a, &b8);
+    try ent.appendSlice(a, &ref.digest);
+    var b4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b4, ref.offset, .big);
+    try ent.appendSlice(a, &b4);
+    std.mem.writeInt(u32, &b4, ref.len, .big);
+    try ent.appendSlice(a, &b4);
+}
+
+/// One trigger_payload entry as the tape records it. A non-`none` `pool_ref`
 /// with empty `inline_bytes` is the SPILLED shape — a body over the inline cap,
 /// whose bytes live in the body pool and never touch the tape. Test helpers
 /// that can only produce the inline shape make the spilled branches
 /// unreachable, so a test over them proves nothing.
 const TriggerRec = struct {
-    batch_id: u64 = decode.NO_BATCH,
+    /// Seed of the pool object this entry names; 0 means it names none.
+    pool_seed: u8 = 0,
     ref_len: u32,
     inline_bytes: []const u8 = "",
+
+    fn ref(self: TriggerRec) decode.PoolRef {
+        return if (self.pool_seed == 0)
+            .{ .len = self.ref_len }
+        else
+            poolRef(self.pool_seed, self.ref_len);
+    }
 };
 
 fn b64TriggerTapeRecs(a: std.mem.Allocator, recs: []const TriggerRec) ![]const u8 {
@@ -752,15 +784,9 @@ fn b64TriggerTapeRecs(a: std.mem.Allocator, recs: []const TriggerRec) ![]const u
     for (recs) |r| {
         var ent = std.ArrayList(u8){};
         defer ent.deinit(a);
-        var b8: [8]u8 = undefined;
-        std.mem.writeInt(u64, &b8, r.batch_id, .big); // batch_id
-        try ent.appendSlice(a, &b8);
-        std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
-        try ent.appendSlice(a, &b8);
-        var b4: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b4, r.ref_len, .big); // body_ref.len
-        try ent.appendSlice(a, &b4);
+        try putPoolRef(&ent, a, r.ref());
         try putLen(&ent, a, r.inline_bytes);
+        var b4: [4]u8 = undefined;
         std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
         try buf.appendSlice(a, &b4);
         try buf.appendSlice(a, ent.items);
@@ -852,21 +878,29 @@ test "transcode: send_callback bare-ctx envelope (no result) lifts ctx whole (is
 }
 
 /// One fetch_responses chunk as the tape records it. The three pointer shapes
-/// are reachable from here — carried (`inline_bytes`), pool
-/// (`batch_id != NO_BATCH`), content (`content_hash` + `ref_len`, bytes left in
-/// content-addressed storage) — plus the metadata-only fate (`ref_len > 0` with
-/// no bytes and no pointer). A helper that could only write the carried shape
-/// left every other branch untestable.
+/// are reachable from here — carried (`inline_bytes`), pool (`pool_seed`),
+/// content (`content_hash` + `ref_len`, bytes left in content-addressed
+/// storage) — plus the metadata-only fate (`ref_len > 0` with no bytes and no
+/// pointer). A helper that could only write the carried shape left every other
+/// branch untestable.
 const FetchRec = struct {
     fid: []const u8 = "ftch_1",
     seq: u32 = 0,
     byte_offset: u64 = 0,
-    batch_id: u64 = decode.NO_BATCH,
+    /// Seed of the pool object this chunk names; 0 means it names none.
+    pool_seed: u8 = 0,
     ref_len: u32,
     final: bool = true,
     status: u16 = 200,
     body: []const u8 = "",
     content_hash: []const u8 = "",
+
+    fn ref(self: FetchRec) decode.PoolRef {
+        return if (self.pool_seed == 0)
+            .{ .len = self.ref_len }
+        else
+            poolRef(self.pool_seed, self.ref_len);
+    }
 };
 
 fn b64FetchTapeRecs(a: std.mem.Allocator, recs: []const FetchRec) ![]const u8 {
@@ -889,12 +923,7 @@ fn b64FetchTapeRecs(a: std.mem.Allocator, recs: []const FetchRec) ![]const u8 {
         try ent.appendSlice(a, &b4);
         std.mem.writeInt(u64, &b8, r.byte_offset, .big); // byte_offset
         try ent.appendSlice(a, &b8);
-        std.mem.writeInt(u64, &b8, r.batch_id, .big); // batch_id
-        try ent.appendSlice(a, &b8);
-        std.mem.writeInt(u64, &b8, 0, .big); // body_ref.offset
-        try ent.appendSlice(a, &b8);
-        std.mem.writeInt(u32, &b4, r.ref_len, .big); // body_ref.len
-        try ent.appendSlice(a, &b4);
+        try putPoolRef(&ent, a, r.ref());
         try ent.append(a, if (r.final) 1 else 0); // final
         std.mem.writeInt(u16, &b2, r.status, .big); // status
         try ent.appendSlice(a, &b2);
@@ -1001,7 +1030,7 @@ test "transcode: a spilled inbound body REFUSES — it never becomes an empty bo
     // cap, so the record carries no `request_body_b64` and the trigger entry
     // holds a body-pool pointer instead of the bytes.
     const reads_b64 = try b64BodyReadTape(a);
-    const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .batch_id = 42, .ref_len = 65536 }});
+    const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .pool_seed = 42, .ref_len = 65536 }});
     const fixture = try std.fmt.allocPrint(a,
         \\{{ "entry":"index.mjs", "activation":"inbound",
         \\   "request": {{ "method":"POST", "path":"/upload", "host":"h" }},
@@ -1036,7 +1065,7 @@ test "transcode: a resolved spilled body is inlined verbatim" {
     const a = arena.allocator();
 
     const reads_b64 = try b64BodyReadTape(a);
-    const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .batch_id = 42, .ref_len = 11 }});
+    const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .pool_seed = 42, .ref_len = 11 }});
     var body_b64_buf: [32]u8 = undefined;
     const body_b64 = std.base64.standard.Encoder.encode(&body_b64_buf, "spilled-BODY");
     const fixture = try std.fmt.allocPrint(a,
@@ -1087,7 +1116,7 @@ test "transcode: one unreachable chunk sinks the whole fetch body — no silent 
     // only the carried chunk yields "head" — plausible, short, and wrong.
     const fr_b64 = try b64FetchTapeRecs(a, &.{
         .{ .seq = 0, .final = false, .status = 0, .ref_len = 4, .body = "head" },
-        .{ .seq = 1, .final = true, .status = 200, .byte_offset = 4, .batch_id = 9, .ref_len = 40000 },
+        .{ .seq = 1, .final = true, .status = 200, .byte_offset = 4, .pool_seed = 9, .ref_len = 40000 },
     });
     const fixture = try std.fmt.allocPrint(a,
         \\{{ "entry":"index.mjs", "activation":"fetch_chunk", "export":"onUpstream",
@@ -1135,8 +1164,8 @@ test "transcode: a content-referenced chunk is addressed, not dropped" {
     const a = arena.allocator();
 
     // A `blob.get` chunk leaves its bytes in content-addressed storage: the
-    // entry names the object and carries NO_BATCH, so a batch_id-only check
-    // reads it as inline-and-empty.
+    // entry names the object and carries no pool ref, so a check that looked
+    // only at the pool ref reads it as inline-and-empty.
     const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const fr_b64 = try b64FetchTapeRecs(a, &.{
         .{ .seq = 0, .final = true, .status = 200, .ref_len = 4096, .content_hash = hash },

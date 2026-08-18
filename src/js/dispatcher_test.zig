@@ -10,6 +10,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const tape_mod = @import("rove-tape");
+const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const rove = @import("rove");
@@ -3300,7 +3301,7 @@ test "dispatch: request_reads — body flag set on read (incl. empty body), abse
         var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
         defer readset.deinit();
         try readset.trigger_payload.appendTriggerPayload(
-            .{ .batch_id = 0, .offset = 0, .len = 5 },
+            bodies_mod.BodyRef.carried(5),
             "hello",
         );
         var txn = try kv.beginTrackedImmediate();

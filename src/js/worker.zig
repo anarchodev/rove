@@ -216,13 +216,13 @@ pub const ForwardWait = struct {
 /// via `node.blob_coordinator.durableSeq(worker_id) > worker_seq`.
 /// `drainBodyPending` polls that atomic and, on advance, looks up
 /// `coord.bodyRef(worker_id, worker_seq)` to materialize the wire
-/// `BodyRef` (batch_id + offset + len) into `body_ref`. Resume
+/// `BodyRef` into `body_ref`. Resume
 /// path in `dispatchPending`'s body-gate reads `body_ref` and
 /// stamps it on the readset.
 ///
 /// `status` is the lifecycle discriminator the dispatch body-gate
-/// reads on resume — NOT `body_ref.batch_id`. A failed park leaves
-/// `body_ref` at the `NO_BATCH` default, which is byte-identical to a
+/// reads on resume — NOT `body_ref`. A failed park leaves
+/// `body_ref` at the names-no-object default, which is byte-identical to a
 /// fresh (never-parked) request's default component; keying the resume
 /// off `body_ref` alone silently re-submits+re-parks a permanently-
 /// failing body instead of returning 503. The explicit `status` makes
@@ -241,7 +241,7 @@ pub const BodyDurabilityStatus = enum {
     resolved,
     /// Park failed: the submitted body never became durable
     /// (`coord.bodyRef` errored). The dispatch body-gate returns 503;
-    /// `body_ref` is meaningless (stays at the NO_BATCH default).
+    /// `body_ref` is meaningless (stays at the names-no-object default).
     failed,
 };
 
@@ -320,11 +320,7 @@ pub const BodyDurabilityWait = struct {
     /// coord seq to `.resolved` (with a real `body_ref`) or `.failed`.
     status: BodyDurabilityStatus = .fresh,
     /// Materialized BodyRef — meaningful only when `status == .resolved`.
-    body_ref: bodies_mod.BodyRef = .{
-        .batch_id = bodies_mod.NO_BATCH,
-        .offset = 0,
-        .len = 0,
-    },
+    body_ref: bodies_mod.BodyRef = .none,
     tenant_id: []const u8 = "",
 };
 
@@ -3245,8 +3241,10 @@ pub fn Worker(comptime opts: Options) type {
             conn_entity: rove.Entity,
             stream_id: u32,
             cap: u64,
+            tenant_hash: u64,
         ) ?*inbound_chunk_mod.Job {
-            const job = inbound_chunk_mod.Job.create(self.allocator, cap, REQUEST_BODY_CAP) catch return null;
+            const job = inbound_chunk_mod.Job.create(self.allocator, cap, REQUEST_BODY_CAP, tenant_hash) catch
+                return null;
             const s: h2.BodySink = .{
                 .ctx = job,
                 .push = &inbound_chunk_mod.Sink.push,

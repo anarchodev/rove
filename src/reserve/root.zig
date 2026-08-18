@@ -19,14 +19,19 @@
 //!
 //! ## Callers
 //!
-//! The blob coordinator's `batch_id`, which names a pooled object
-//! (`{key_prefix_base}_pool/{id:0>20}`), and the keyring's slot
-//! allocation, where a reissued slot would mean two identities sharing
-//! one key — so shredding one would shred the other.
+//! The keyring's slot allocation, where a reissued slot would mean two
+//! identities sharing one key — so shredding one would shred the other.
 //!
-//! Both reserve 0 as a sentinel, which is why `first_id` defaults to 1;
-//! it is configurable because that is a property of the caller's id
-//! space, not of this allocator.
+//! Note what is NOT a caller: the body pool. An object there is named by
+//! its own content, which removes the uniqueness problem rather than
+//! coordinating it — no block to reserve, no counter to replay after a
+//! restart, and nothing to get wrong at genesis. Reach for this
+//! allocator only when the id must be unique AND cannot be derived from
+//! what it names.
+//!
+//! Slot 0 is a sentinel, which is why `first_id` defaults to 1; it is
+//! configurable because that is a property of the caller's id space,
+//! not of this allocator.
 //!
 //! The double-buffered `current`/`upcoming` refill is the trickiest
 //! concurrency here, which is exactly why it lives in one place with a

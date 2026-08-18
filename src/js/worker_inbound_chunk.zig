@@ -64,11 +64,10 @@ pub const Prepared = struct {
     /// Coordinator durability key (valid from `.pending`).
     wid: blob_mod.coordinator.QueueId = @enumFromInt(0),
     seq: u64 = 0,
-    /// Materialized wire BodyRef (valid when `.resolved`); plain ints
-    /// so this file stays import-free.
-    batch_id: u64 = 0,
-    ref_offset: u64 = 0,
-    ref_len: u32 = 0,
+    /// Materialized wire BodyRef — valid when `.resolved`. Before that
+    /// it names no object, which is the same shape an inline fire has,
+    /// so the STATE is the discriminator here and never the ref.
+    ref: blob_mod.coordinator.BodyRef = .none,
 };
 
 pub const Job = struct {
@@ -83,6 +82,11 @@ pub const Job = struct {
     /// under it skip the durability park (the raft entry's fsync is
     /// the durability substrate, same as the classic inline path).
     inline_threshold: usize,
+
+    /// Owning tenant's `hashStoreId`, injected by the worker layer at
+    /// arm time. Rides into the pool object's header with every payload
+    /// this job spills, so a sweep can attribute those bytes.
+    tenant_hash: u64,
 
     chunks: std.ArrayListUnmanaged(Chunk) = .empty,
     /// Total bytes accepted from the wire.
@@ -122,9 +126,19 @@ pub const Job = struct {
     /// Accumulator `sinkDrained` hands to h2 (h2 repays exactly this).
     drained_pending: u32 = 0,
 
-    pub fn create(allocator: std.mem.Allocator, cap: u64, inline_threshold: usize) error{OutOfMemory}!*Job {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        cap: u64,
+        inline_threshold: usize,
+        tenant_hash: u64,
+    ) error{OutOfMemory}!*Job {
         const self = try allocator.create(Job);
-        self.* = .{ .allocator = allocator, .cap = cap, .inline_threshold = inline_threshold };
+        self.* = .{
+            .allocator = allocator,
+            .cap = cap,
+            .inline_threshold = inline_threshold,
+            .tenant_hash = tenant_hash,
+        };
         return self;
     }
 
@@ -355,9 +369,13 @@ pub const Sink = struct {
     }
 };
 
+/// Stand-in tenant hash for tests: it rides to the coordinator, which is
+/// not exercised here.
+const T_TENANT: u64 = 0xA11CE;
+
 test "job: accumulate → single-fire prepare" {
     const a = std.testing.allocator;
-    const j = try Job.create(a, 1024, 16 * 1024);
+    const j = try Job.create(a, 1024, 16 * 1024, T_TENANT);
     defer j.unref(); // worker ref
     defer j.unref(); // sink ref (test holds both)
     try std.testing.expect(j.sinkPush("hello "));
@@ -381,7 +399,7 @@ test "job: accumulate → single-fire prepare" {
 
 test "job: cap crossover pipelines prepared fires with repay-on-resolve" {
     const a = std.testing.allocator;
-    const j = try Job.create(a, 8, 4); // inline threshold 4 to exercise .unsubmitted
+    const j = try Job.create(a, 8, 4, T_TENANT); // inline threshold 4 to exercise .unsubmitted
     defer j.unref();
     defer j.unref();
     try std.testing.expect(j.sinkPush("12345678")); // == cap: accumulating
@@ -419,7 +437,7 @@ test "job: cap crossover pipelines prepared fires with repay-on-resolve" {
 
 test "job: kill drains everything" {
     const a = std.testing.allocator;
-    const j = try Job.create(a, 4, 16 * 1024);
+    const j = try Job.create(a, 4, 16 * 1024, T_TENANT);
     defer j.unref();
     defer j.unref();
     try std.testing.expect(j.sinkPush("123456")); // crosses cap (accumulate-accepted)

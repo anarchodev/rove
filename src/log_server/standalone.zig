@@ -1321,7 +1321,7 @@ fn handleShow(
 /// resolve it).
 ///
 /// The address is `(record, channel, entry index)` and never a raw
-/// `{batch_id, offset, len}`. The body pool is cross-tenant, so accepting
+/// a raw `BodyRef`. The body pool is cross-tenant, so accepting
 /// a caller-supplied batch and offset would let anyone past the tenant
 /// gate walk offsets into a neighbour's bytes; deriving the reference
 /// here, from a record this token may already read, makes that

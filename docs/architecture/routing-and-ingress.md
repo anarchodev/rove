@@ -218,17 +218,30 @@ streaming path. h1→h2c translation is **edge-only**.
 
 - **Coordinator** (`src/blob/coordinator.zig`): a worker `submit`s bytes to an
   MPSC queue and gets a monotonic `seq` with no allocation on the path; a K=32
-  executor pool PUTs each batch to `_pool/{batch_id}` with backoff on 503/429;
-  `durableSeq(worker_id)` is the contiguous-prefix durable high-water mark (a
-  raft analog); `bodyRef`/`readBody` serve bytes once durable. `batch_id`s come
-  from a raft-reserved block (cross-leader-unique). This is the durability ground
-  truth for streamed bytes.
+  executor pool PUTs each batch to `_pool/{written_unix_ms:0>13}-{digest_hex}`
+  with backoff on 503/429; `durableSeq(worker_id)` is the contiguous-prefix
+  durable high-water mark (a raft analog); `bodyRef`/`readBody` serve bytes once
+  durable. This is the durability ground truth for streamed bytes.
+- **The object is content-addressed** (`src/blob/pool_object.zig`), and that is
+  what makes the name safe across nodes rather than merely coordinated. A
+  counter would make uniqueness a consensus problem, and an uncounted counter is
+  silent cross-tenant corruption: two nodes mint the same id, the second PUT
+  overwrites the first, and the loser's `BodyRef` resolves to another tenant's
+  bytes with both writes having succeeded. Different content cannot collide;
+  identical content collides onto an identical object, so a retried PUT is
+  idempotent. The seal STAMP leads the key so a sweep's lexical LIST walks the
+  pool in write order and stops at its horizon. Each object carries a header —
+  `[magic][version][written_ms][count]` plus a `[tenant_hash][offset][len]` entry
+  per submission — so a GC range-GETs the head and learns age, tenant membership,
+  and extents without reading bodies; and `resolve` matches a ref against that
+  table instead of slicing at face value, so an overlapping table cannot
+  reproduce the cross-tenant read from inside one object.
 - **Reading a spilled payload back** (`src/log_server/body_ref.zig`, reached at
   `GET /v1/{tenant}/body/{request_id}/{channel}/{index}`): the coordinator's
   `bodyRef`/`readBody` serve bytes from RAM only until the batch is released, so
   everything after that is a range read against the pool object. The door is the
   one reader, and it takes a `(record, channel, entry index)` address rather than
-  a `{batch_id, offset, len}` — the pool is CROSS-TENANT, so a caller-supplied
+  a raw `BodyRef` — the pool is CROSS-TENANT, so a caller-supplied
   offset would walk into a neighbour's bytes. It derives the reference from a
   record the caller is already entitled to read (the out-of-line reference
   discipline, `decisions.md`).
