@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -31,9 +32,24 @@ def _lp(b: bytes) -> bytes:
     return struct.pack(">I", len(b)) + b
 
 
+def _rtap_version() -> int:
+    """The RTAP version this tree's decoder accepts, read from the decoder
+    itself (`src/replay/tape_decode.zig`).
+
+    Pinned as a literal this drifted silently: the guard is an equality check,
+    so a version bump anywhere turned every tape this smoke builds into a
+    `BadVersion` that looked like a replay bug. Reading the authority is the
+    only version of this that cannot go stale."""
+    src = (REPO_ROOT / "src" / "replay" / "tape_decode.zig").read_text()
+    m = re.search(r"pub const VERSION: u16 = (\d+);", src)
+    if not m:
+        raise SystemExit("could not read VERSION from src/replay/tape_decode.zig")
+    return int(m.group(1))
+
+
 def _kv_tape(entries) -> str:
     """Build a base64 RTAP kv tape. entries: [(key, value_or_None)] in order."""
-    hdr = struct.pack(">IHHI", 0x52544150, 5, 0, len(entries))  # MAGIC, VER=5, kv(0), count
+    hdr = struct.pack(">IHHI", 0x52544150, _rtap_version(), 0, len(entries))  # MAGIC, VER, kv(0), count
     body = b""
     for key, val in entries:
         outcome = 0 if val is not None else 1  # ok / not_found

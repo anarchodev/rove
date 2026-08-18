@@ -13,7 +13,7 @@
 //! that turns each into bytes (`resolve`).
 //!
 //! **Callers address a payload by `(record, channel, entry index)`, never
-//! by a raw `{batch_id, offset, len}`.** That is a confinement property,
+//! by a raw `BodyRef`.** That is a confinement property,
 //! not a convenience. The body pool is cross-tenant by construction — one
 //! object packs many tenants' bodies so the S3 request cost amortises
 //! (the blob coordinator / chunk spool,
@@ -29,8 +29,8 @@
 //!   - **carried** — the bytes ride on the tape entry. At or under the
 //!     inline cap the raft entry's own fsync is the durability substrate,
 //!     so there is nothing to point at.
-//!   - **pool** — a slice of `_pool/{batch_id:0>20}`. Bodies that came
-//!     from outside and have no other home.
+//!   - **pool** — a slice of a content-addressed `_pool/` object. Bodies
+//!     that came from outside and have no other home.
 //!   - **content** — a slice of one of the tenant's content-addressed
 //!     objects. Bytes that are already stored, immutably, under their own
 //!     hash; copying them onto the tape would write a second permanent
@@ -116,8 +116,10 @@ pub const Channel = enum {
 pub const Ref = union(enum) {
     /// The bytes are on the tape entry itself — nothing to fetch.
     carried: []const u8,
-    /// A slice of a cross-tenant body-pool object.
-    pool: struct { batch_id: u64, offset: u64, len: u32 },
+    /// A slice of a cross-tenant body-pool object. The ref names the
+    /// object (stamp + digest) as well as the extent, so the resolver
+    /// rebuilds the key without a lookup.
+    pool: bodies_mod.BodyRef,
     /// A slice of one of this tenant's content-addressed objects. `hash`
     /// is 64 hex chars; the slice is `(byte_offset, len)` INTO the named
     /// object, so the reconstruction key is the triple.
@@ -134,19 +136,15 @@ pub const Ref = union(enum) {
 /// Order matters. Carried bytes win over any pointer because an entry
 /// that has both is inline-with-a-length-stamp, not a reference; and the
 /// content reference is checked before the pool because a content-
-/// addressed chunk deliberately carries `NO_BATCH` (there is no pool
-/// object to name — that is the whole point of referencing it).
+/// addressed chunk deliberately names no pool object (that is the whole
+/// point of referencing it).
 pub fn locate(entry: tape_mod.Entry) Error!Ref {
     switch (entry) {
         .trigger_payload => |t| {
             if (t.inline_bytes.len > 0) return .{ .carried = t.inline_bytes };
-            if (t.body_ref.batch_id != bodies_mod.NO_BATCH) {
+            if (!t.body_ref.isNone()) {
                 if (t.body_ref.len > MAX_RESOLVE_BYTES) return Error.TooLarge;
-                return .{ .pool = .{
-                    .batch_id = t.body_ref.batch_id,
-                    .offset = t.body_ref.offset,
-                    .len = t.body_ref.len,
-                } };
+                return .{ .pool = t.body_ref };
             }
             // No bytes and no pointer. A trigger_payload entry always had
             // a payload — an inbound body or a ctx envelope — so unlike a
@@ -166,13 +164,9 @@ pub fn locate(entry: tape_mod.Entry) Error!Ref {
                     .len = f.body_ref.len,
                 } };
             }
-            if (f.body_ref.batch_id != bodies_mod.NO_BATCH) {
+            if (!f.body_ref.isNone()) {
                 if (f.body_ref.len > MAX_RESOLVE_BYTES) return Error.TooLarge;
-                return .{ .pool = .{
-                    .batch_id = f.body_ref.batch_id,
-                    .offset = f.body_ref.offset,
-                    .len = f.body_ref.len,
-                } };
+                return .{ .pool = f.body_ref };
             }
             // A terminal-only event legitimately has no bytes: it closes
             // the chain with a seq + status and nothing else. A non-zero
@@ -193,10 +187,11 @@ pub fn locate(entry: tape_mod.Entry) Error!Ref {
 // and the door needs a handle on the former; see `Config.content_store`
 // in `standalone.zig`.
 
-/// `_pool/{batch_id:0>20}`. Zero-padded so lexical S3 LIST order matches
-/// batch-id order (`bodies.poolKey` is the authority for the shape).
-pub fn poolKeyBuf(batch_id: u64, buf: *[26]u8) []const u8 {
-    return bodies_mod.poolKey(batch_id, buf);
+/// `_pool/{written_unix_ms:0>13}-{digest_hex}` — the object a `BodyRef`
+/// names. `bodies.pool_object` is the authority for the shape; the stamp
+/// leads so a sweep's lexical LIST walks the pool in write order.
+pub fn poolKeyBuf(ref: bodies_mod.BodyRef, buf: *[bodies_mod.POOL_KEY_LEN]u8) []const u8 {
+    return ref.key(buf);
 }
 
 /// The two content-addressed homes a hash can name, in the order the
@@ -240,8 +235,8 @@ pub fn resolve(
         .carried => |bytes| return allocator.dupe(u8, bytes),
         .empty => return allocator.alloc(u8, 0),
         .pool => |p| {
-            var key_buf: [26]u8 = undefined;
-            const key = poolKeyBuf(p.batch_id, &key_buf);
+            var key_buf: [bodies_mod.POOL_KEY_LEN]u8 = undefined;
+            const key = poolKeyBuf(p, &key_buf);
             const bytes = store.getRange(key, p.offset, p.len, allocator) catch |err| {
                 return mapStoreError(err);
             };
@@ -414,6 +409,22 @@ pub fn resolveFromRecord(
 
 const testing = std.testing;
 
+/// A pool-backed `BodyRef` for tests. The seed stands in for a sealed
+/// object's identity, so two seeds give two distinguishable objects.
+fn tPoolRef(seed: u16, offset: u32, len: u32) bodies_mod.BodyRef {
+    return .{
+        .written_unix_ms = 1_700_000_000_000 + @as(u64, seed),
+        .digest = [_]u8{@truncate(seed)} ** bodies_mod.pool_object.DIGEST_LEN,
+        .offset = offset,
+        .len = len,
+    };
+}
+
+/// The key `tPoolRef(seed, …)` resolves to, for seeding a store.
+fn tPoolKey(buf: *[bodies_mod.POOL_KEY_LEN]u8, seed: u16) []const u8 {
+    return tPoolRef(seed, 0, 0).key(buf);
+}
+
 test "Channel.fromPath: the two payload channels, and nothing else" {
     try testing.expectEqual(Channel.trigger_payload, Channel.fromPath("trigger_payload").?);
     try testing.expectEqual(Channel.fetch_responses, Channel.fromPath("fetch_responses").?);
@@ -428,7 +439,7 @@ test "Channel.fromPath: the two payload channels, and nothing else" {
 
 test "locate: carried bytes win over a length stamp" {
     const e: tape_mod.Entry = .{ .trigger_payload = .{
-        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 5 },
+        .body_ref = bodies_mod.BodyRef.carried(5),
         .inline_bytes = "hello",
     } };
     const ref = try locate(e);
@@ -437,20 +448,18 @@ test "locate: carried bytes win over a length stamp" {
 
 test "locate: a spilled trigger payload is a pool slice" {
     const e: tape_mod.Entry = .{ .trigger_payload = .{
-        .body_ref = .{ .batch_id = 42, .offset = 4096, .len = 100_000 },
+        .body_ref = tPoolRef(42, 4096, 100_000),
         .inline_bytes = "",
     } };
     const ref = try locate(e);
-    try testing.expectEqual(@as(u64, 42), ref.pool.batch_id);
-    try testing.expectEqual(@as(u64, 4096), ref.pool.offset);
-    try testing.expectEqual(@as(u32, 100_000), ref.pool.len);
+    try testing.expect(std.meta.eql(tPoolRef(42, 4096, 100_000), ref.pool));
 }
 
 test "locate: a trigger payload with neither bytes nor pointer is NotRecorded" {
     // Never legitimate: an inbound body / ctx envelope always had bytes,
     // so an entry with none is a payload we dropped, not an empty one.
     const e: tape_mod.Entry = .{ .trigger_payload = .{
-        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 },
+        .body_ref = bodies_mod.BodyRef.none,
         .inline_bytes = "",
     } };
     try testing.expectError(Error.NotRecorded, locate(e));
@@ -462,7 +471,7 @@ test "locate: a content-addressed chunk resolves by hash, not by pool" {
         .fetch_id = "f1",
         .seq = 2,
         .byte_offset = 8192,
-        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 4096 },
+        .body_ref = bodies_mod.BodyRef.carried(4096),
         .final = false,
         .terminal_status = 0,
         .terminal_ok = false,
@@ -485,7 +494,7 @@ test "locate: a terminal-only fetch entry is empty, not NotRecorded" {
         .fetch_id = "f1",
         .seq = 3,
         .byte_offset = 12288,
-        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 },
+        .body_ref = bodies_mod.BodyRef.none,
         .final = true,
         .terminal_status = 200,
         .terminal_ok = true,
@@ -506,7 +515,7 @@ test "locate: a length with no home is the metadata-only fate, reported not serv
         .fetch_id = "f1",
         .seq = 0,
         .byte_offset = 0,
-        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 65536 },
+        .body_ref = bodies_mod.BodyRef.carried(65536),
         .final = false,
         .terminal_status = 0,
         .terminal_ok = false,
@@ -523,7 +532,7 @@ test "locate: a malformed content hash is refused, not probed" {
         .fetch_id = "f1",
         .seq = 0,
         .byte_offset = 0,
-        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 16 },
+        .body_ref = bodies_mod.BodyRef.carried(16),
         .final = false,
         .terminal_status = 0,
         .terminal_ok = false,
@@ -538,7 +547,7 @@ test "locate: a malformed content hash is refused, not probed" {
         .fetch_id = "f1",
         .seq = 0,
         .byte_offset = 0,
-        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 16 },
+        .body_ref = bodies_mod.BodyRef.carried(16),
         .final = false,
         .terminal_status = 0,
         .terminal_ok = false,
@@ -552,15 +561,20 @@ test "locate: a malformed content hash is refused, not probed" {
 
 test "locate: a reference claiming more than the buffer ceiling is TooLarge" {
     const e: tape_mod.Entry = .{ .trigger_payload = .{
-        .body_ref = .{ .batch_id = 7, .offset = 0, .len = MAX_RESOLVE_BYTES + 1 },
+        .body_ref = tPoolRef(7, 0, MAX_RESOLVE_BYTES + 1),
         .inline_bytes = "",
     } };
     try testing.expectError(Error.TooLarge, locate(e));
 }
 
 test "poolKeyBuf: the cross-tenant pool leaf" {
-    var buf: [26]u8 = undefined;
-    try testing.expectEqualStrings("_pool/00000000000000000042", poolKeyBuf(42, &buf));
+    var buf: [bodies_mod.POOL_KEY_LEN]u8 = undefined;
+    // Stamp first, then the digest — the ordering that lets a sweep LIST
+    // lexically and stop at its horizon.
+    try testing.expectEqualStrings(
+        "_pool/1700000000042-2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+        poolKeyBuf(tPoolRef(42, 4096, 100_000), &buf),
+    );
 }
 
 test "contentKey: tenant-scoped, both homes" {
@@ -585,13 +599,10 @@ test "resolve: a pool slice is range-read out of the cross-tenant object" {
 
     // One pool object packing two tenants' bodies back to back — the
     // arrangement that makes caller-supplied offsets unsafe.
-    try store.put("_pool/00000000000000000009", "AAAAAAAAAABBBBBBBBBB");
+    var key_buf: [bodies_mod.POOL_KEY_LEN]u8 = undefined;
+    try store.put(tPoolKey(&key_buf, 9), "AAAAAAAAAABBBBBBBBBB");
 
-    const mine = try resolve(a, store, "acme", .{ .pool = .{
-        .batch_id = 9,
-        .offset = 10,
-        .len = 10,
-    } });
+    const mine = try resolve(a, store, "acme", .{ .pool = tPoolRef(9, 10, 10) });
     defer a.free(mine);
     try testing.expectEqualStrings("BBBBBBBBBB", mine);
 }
@@ -620,11 +631,10 @@ test "resolve: a missing pool object is Gone, not a fault" {
     const a = testing.allocator;
     var mem = try batch_store_mod.MemoryBatchStore.init(a);
     defer mem.deinit();
-    try testing.expectError(Error.Gone, resolve(a, mem.batchStore(), "acme", .{ .pool = .{
-        .batch_id = 404,
-        .offset = 0,
-        .len = 16,
-    } }));
+    try testing.expectError(
+        Error.Gone,
+        resolve(a, mem.batchStore(), "acme", .{ .pool = tPoolRef(404, 0, 16) }),
+    );
 }
 
 test "resolve: carried bytes are duped so callers have one ownership rule" {
@@ -654,7 +664,7 @@ test "tapeFromRecordJson: absent tapes, null field, and a real channel" {
     var t = tape_mod.Tape.init(a, .trigger_payload);
     defer t.deinit();
     try t.appendTriggerPayload(
-        .{ .batch_id = 3, .offset = 128, .len = 40_000 },
+        tPoolRef(3, 128, 40_000),
         "",
     );
     const raw = try t.serialize(a);
@@ -687,12 +697,13 @@ test "resolveFromRecord: end to end, a spilled body comes back whole" {
     for (body, 0..) |*b, i| b.* = @intCast('a' + (i % 26));
     const packed_obj = try std.mem.concat(a, u8, &.{ "NEIGHBOUR", body });
     defer a.free(packed_obj);
-    try store.put("_pool/00000000000000000011", packed_obj);
+    var key_buf: [bodies_mod.POOL_KEY_LEN]u8 = undefined;
+    try store.put(tPoolKey(&key_buf, 11), packed_obj);
 
     var t = tape_mod.Tape.init(a, .trigger_payload);
     defer t.deinit();
     try t.appendTriggerPayload(
-        .{ .batch_id = 11, .offset = "NEIGHBOUR".len, .len = @intCast(body.len) },
+        tPoolRef(11, "NEIGHBOUR".len, @intCast(body.len)),
         "",
     );
     const raw = try t.serialize(a);
@@ -723,7 +734,7 @@ test "resolveFromRecord: an index past the end is NoSuchEntry" {
     var t = tape_mod.Tape.init(a, .trigger_payload);
     defer t.deinit();
     try t.appendTriggerPayload(
-        .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 2 },
+        bodies_mod.BodyRef.carried(2),
         "hi",
     );
     const raw = try t.serialize(a);

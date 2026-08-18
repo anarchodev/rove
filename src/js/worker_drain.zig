@@ -2725,7 +2725,7 @@ const DurableBody = union(enum) {
 /// `.failed`) the coordinator's retained RAM copy is released here;
 /// `.not_yet` keeps it retained. `what` / `tenant` are log context for
 /// the failure path. The returned `BodyRef` is a plain value (the wire
-/// `batch_id`/`offset`/`len`), so releasing the coordinator copy before
+/// stamp/digest/offset/len), so releasing the coordinator copy before
 /// the caller consumes it is safe.
 fn pollDurableBodyRef(
     coord: anytype,
@@ -2746,7 +2746,7 @@ fn pollDurableBodyRef(
         return .failed;
     };
     _ = coord.release(queue_id, seq);
-    return .{ .ready = .{ .batch_id = ref.batch_id, .offset = ref.offset, .len = ref.len } };
+    return .{ .ready = ref };
 }
 
 pub fn drainBodyPending(worker: anytype) !void {
@@ -2774,12 +2774,12 @@ pub fn drainBodyPending(worker: anytype) !void {
             .not_yet => continue,
             // Body never became durable: mark failed. The dispatch
             // body-gate sees `.failed` and returns 503 (it does NOT
-            // re-submit, which keying off the NO_BATCH body_ref would).
+            // re-submit, which keying off an object-less body_ref would).
             .failed => wait.status = .failed,
-            // Stamp the wire BodyRef. `batch_id` is the
-            // coord's globally-unique pool batch_id; the S3 key is
-            // `{key_prefix_base}_pool/{batch_id:0>20}`. The dispatcher
-            // serializes it into the readset on resume.
+            // Stamp the wire BodyRef. It names a content-addressed pool
+            // object — the ref carries the seal stamp and digest, so the
+            // key needs no lookup. The dispatcher serializes it into the
+            // readset on resume.
             .ready => |ref| {
                 wait.body_ref = ref;
                 wait.status = .resolved;
@@ -3115,7 +3115,7 @@ fn advanceInboundChunkGate(worker: anytype, job: anytype) bool {
         switch (pf.coord) {
             .unsubmitted => {
                 const wid = worker.coord_queue_id;
-                if (coord.submit(wid, pf.bytes)) |seq| {
+                if (coord.submit(wid, job.tenant_hash, pf.bytes)) |seq| {
                     pf.wid = wid;
                     pf.seq = seq;
                     pf.coord = .pending;
@@ -3128,9 +3128,7 @@ fn advanceInboundChunkGate(worker: anytype, job: anytype) bool {
                 .not_yet => {},
                 .failed => pf.coord = .failed,
                 .ready => |ref| {
-                    pf.batch_id = ref.batch_id;
-                    pf.ref_offset = ref.offset;
-                    pf.ref_len = ref.len;
+                    pf.ref = ref;
                     pf.coord = .resolved;
                 },
             },
@@ -3284,7 +3282,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     // inbound body-gate. ≤ inline threshold: bytes ride inline (the
     // raft entry's fsync is durability). Larger: the pump already
     // parked the payload on the blob coordinator and materialized the
-    // wire BodyRef (head_fire.batch_id/...); record the pointer. The
+    // wire BodyRef (`head_fire.ref`); record the pointer. The
     // readset rides the raft entry (follower replay) AND serializes
     // into the LogRecord tapes below (dashboard replay).
     // The chunk payload IS this activation's Msg (L3) — its
@@ -3293,20 +3291,12 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     // the recording getter, so the flag is set structurally.
     if (chunk_bytes.len > 0) readset.body_read = true;
     if (chunk_bytes.len > 0 and chunk_bytes.len <= worker_mod.REQUEST_BODY_CAP) {
-        const inline_ref: bodies_mod.BodyRef = .{
-            .batch_id = bodies_mod.NO_BATCH,
-            .offset = 0,
-            .len = @intCast(chunk_bytes.len),
-        };
+        const inline_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(chunk_bytes.len));
         readset.trigger_payload.appendTriggerPayload(inline_ref, chunk_bytes) catch |err| {
             std.log.warn("rove-js inbound-chunk: trigger_payload append (inline): {s}", .{@errorName(err)});
         };
     } else if (chunk_bytes.len > 0) {
-        readset.trigger_payload.appendTriggerPayload(.{
-            .batch_id = head_fire.batch_id,
-            .offset = head_fire.ref_offset,
-            .len = head_fire.ref_len,
-        }, "") catch |err| {
+        readset.trigger_payload.appendTriggerPayload(head_fire.ref, "") catch |err| {
             std.log.warn("rove-js inbound-chunk: trigger_payload append (ref): {s}", .{@errorName(err)});
         };
     }

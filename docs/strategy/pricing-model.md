@@ -226,7 +226,7 @@ shipped layout and is retracted here:
   ride *inline* in the record. There is no per-tenant `log-blobs/` store;
   the log-server says so directly (`src/log_server/standalone.zig`).
 - **Bodies >16 KiB** spill to a second cross-tenant pool at
-  `_pool/{batch_id}` (`src/bodies/root.zig`, rove#304).
+  `_pool/{written_ms}-{digest}` (`src/blob/pool_object.zig`, rove#304).
 
 That layout is deliberate and worth keeping: per-tenant keys would cost
 `O(active tenants on node)` PUTs per flush, which is precisely what

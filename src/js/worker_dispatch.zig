@@ -2012,7 +2012,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // the normal dispatch block; `pumpInboundChunks` fires
                 // the rest off `parked_continuations` membership.
                 const job = worker.inbound_chunk_jobs.get(ent) orelse
-                    worker.armInboundChunkSink(ent, sess.entity, sid.id, body_cap) orelse
+                    worker.armInboundChunkSink(
+                        ent,
+                        sess.entity,
+                        sid.id,
+                        body_cap,
+                        kv_mod.hashStoreId(scope_inst.id),
+                    ) orelse
                     {
                         try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator);
                         processed += 1;
@@ -2218,20 +2224,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // getter) consistent with the captured record.
             readset.body_read = true;
             if (h.coord == .inline_ok) {
-                const inline_ref: bodies_mod.BodyRef = .{
-                    .batch_id = bodies_mod.NO_BATCH,
-                    .offset = 0,
-                    .len = @intCast(h.bytes.len),
-                };
+                const inline_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(h.bytes.len));
                 readset.trigger_payload.appendTriggerPayload(inline_ref, h.bytes) catch |err| {
                     std.log.warn("rove-js inbound-chunk: trigger_payload append (inline, first fire): {s}", .{@errorName(err)});
                 };
             } else {
-                readset.trigger_payload.appendTriggerPayload(.{
-                    .batch_id = h.batch_id,
-                    .offset = h.ref_offset,
-                    .len = h.ref_len,
-                }, "") catch |err| {
+                readset.trigger_payload.appendTriggerPayload(h.ref, "") catch |err| {
                     std.log.warn("rove-js inbound-chunk: trigger_payload append (ref, first fire): {s}", .{@errorName(err)});
                 };
             }
@@ -2260,11 +2258,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // Inline path — no buffer append, no park. Bytes
                     // ride inline in the readset; the raft entry's
                     // fsync IS durability. Handler runs immediately.
-                    const inline_ref: bodies_mod.BodyRef = .{
-                        .batch_id = bodies_mod.NO_BATCH,
-                        .offset = 0,
-                        .len = @intCast(body.len),
-                    };
+                    const inline_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(body.len));
                     readset.trigger_payload.appendTriggerPayload(inline_ref, body) catch |err| {
                         std.log.warn(
                             "rove-js inbound: readset.trigger_payload append (inline) tenant={s} bytes={d}: {s}",
@@ -2280,7 +2274,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // the BodyRef once the seq is durable.
                     if (worker.node.blob_coord.coordinator) |coord| {
                         const wid = worker.coord_queue_id;
-                        if (coord.submit(wid, body)) |seq| {
+                        if (coord.submit(wid, kv_mod.hashStoreId(scope_inst.id), body)) |seq| {
                             try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
                                 .worker_seq = seq,
                                 .queue_id = wid,

@@ -78,12 +78,13 @@ pub fn build(b: *std.Build) void {
     // and ships in Phase 1a. The s3 backend lands in Phase 6.
     // ── rove-reserve: cluster-unique ids from raft-reserved blocks ──
     //
-    // Shared because a reissued id corrupts whatever it names, and the
-    // double-buffered refill that avoids a consensus round trip per id
-    // is not concurrency worth writing twice. Used by the blob
-    // coordinator's `batch_id` and by the keyring's slot allocation,
-    // where a reissued slot would give two identities one key — so
-    // shredding either would shred both. std-only leaf.
+    // A reissued id corrupts whatever it names, and the double-buffered
+    // refill that avoids a consensus round trip per id is not
+    // concurrency worth writing twice. Used by the keyring's slot
+    // allocation, where a reissued slot would give two identities one
+    // key — so shredding either would shred both. The body pool does NOT
+    // use it: a pool object is named by its own content, which removes
+    // the uniqueness problem instead of coordinating it. std-only leaf.
     const reserve_mod = b.addModule("rove-reserve", .{
         .root_source_file = b.path("src/reserve/root.zig"),
         .target = target,
@@ -96,7 +97,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     blob_mod.link_libc = true;
-    blob_mod.addImport("rove-reserve", reserve_mod);
     // libcurl backs the S3 outbound path. Replaces std.http.Client,
     // which has a string of bugs in 0.15.x (HEAD stalls / segfaults,
     // no application-level timeouts → 15-minute kernel TCP retry
@@ -148,10 +148,10 @@ pub fn build(b: *std.Build) void {
     // Readset replication (docs/architecture/effects-and-handlers.md):
     // fetch-response bodies and inbound request bodies stream into a per-tenant
     // in-memory buffer that periodically flushes to S3 as one object
-    // per batch. The raft entry's readset carries a `BodyRef =
-    // (batch_id, offset, len)` pointer; the bytes never ride in the
-    // entry. Leaf module — depends only on rove-blob for the
-    // BlobStore interface.
+    // per batch. The raft entry's readset carries a `BodyRef` naming a
+    // content-addressed pool object and an extent inside it; the bytes
+    // never ride in the entry. Depends on rove-blob, which owns the pool
+    // object format this re-exports.
     const bodies_mod = b.addModule("rove-bodies", .{
         .root_source_file = b.path("src/bodies/root.zig"),
         .target = target,

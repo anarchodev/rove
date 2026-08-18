@@ -4,12 +4,17 @@
 //!
 //! See the blob coordinator / chunk spool in
 //! `docs/architecture/routing-and-ingress.md` for the full design.
-//! Submissions
-//! land in a single cross-tenant pool under
-//! `{key_prefix_base}_pool/{batch_id:0>20}` — there are no per-
-//! (tenant, worker) lanes; workers freely mix in one pool object.
-//! `batch_id` is globally unique by construction — minted from a
-//! raft-reserved block (`_system/coord_next_pool_batch`).
+//! Submissions land in a single cross-tenant pool under
+//! `{key_prefix_base}_pool/…` — there are no per-(tenant, worker)
+//! lanes; workers freely mix in one pool object.
+//!
+//! A batch's key is **derived from its own bytes** (`pool_object`), so
+//! uniqueness across nodes is a property of the name rather than a
+//! coordination problem: different content cannot collide, and identical
+//! content collides onto an identical object. There is no id to reserve,
+//! no counter to replay after a restart, and nothing to get wrong at
+//! genesis. The seal stamp is taken once, here, so a PUT that timed out
+//! after landing retries onto the same key instead of duplicating.
 //!
 //! Architecture:
 //!
@@ -45,41 +50,21 @@
 
 const std = @import("std");
 const root = @import("root.zig");
-const reservation = @import("rove-reserve");
+const pool_object = @import("pool_object.zig");
 
-/// Pointer into the bytes a coordinator submission stored. `batch_id`
-/// is globally unique (raft-reserved); the full S3
-/// key is `{key_prefix_base}_pool/{batch_id:0>20}` and the backend
-/// supplied to `init` already carries the `_pool/` prefix.
-pub const BodyRef = struct {
-    batch_id: u64,
-    offset: u64,
-    len: u32,
-};
+/// Pointer into the bytes a coordinator submission stored — the seal
+/// stamp and digest that name the object, plus the extent inside it.
+/// The backend supplied to `init` already carries the `_pool/` prefix,
+/// so `BodyRef.key` is the leaf a reader GETs.
+pub const BodyRef = pool_object.Ref;
 
-/// Provider of globally-unique `batch_id` blocks. Production wiring
-/// reads `_system/coord_next_pool_batch` from `__root__.db`, proposes
-/// an envelope-2 root_writeset advancing it by `count`, and blocks
-/// until commit. Returns the **new** end-of-range value; the caller
-/// owns `[returned - count, returned)`.
-///
-/// `prev_end` is the in-memory upper bound of the previously-issued
-/// block (0 on first call). The implementation must compute the new
-/// floor as `max(committed_value, prev_end, 1)` so a fresh leader
-/// after election reads the committed state authoritatively while a
-/// node that already reserved during this process lifetime never
-/// double-mints across its own blocks.
-///
-/// `null` in `Config.reservation` disables raft reservation and falls
-/// back to a local atomic counter starting at 1 — used by unit tests
-/// and any caller that doesn't need cross-leader uniqueness.
-///
-/// The reservation machine itself is `rove-reserve` (the
-/// `ReservationAllocator`), shared with the keyring's slot allocation —
-/// a reissued id corrupts whatever it names, and that concurrency is
-/// not worth writing twice. Re-exported so `Config` and callers keep
-/// naming `coordinator.ReservationProvider`.
-pub const ReservationProvider = reservation.ReservationProvider;
+/// Tenant hash for a submission whose owner is genuinely not known at
+/// the call site. The object still holds the bytes and still ages out at
+/// the sweep horizon; it just cannot be dropped early on the "every
+/// tenant in here is deprovisioned" rule. Never a stand-in for a tenant
+/// the caller could have looked up — an object mis-attributed to nobody
+/// outlives the tenant it actually belongs to.
+pub const TENANT_UNATTRIBUTED: u64 = 0;
 
 /// A worker's queue id in the coordinator — a DISTINCT TYPE, not a bare
 /// integer, so it cannot be confused with any other worker identity. The
@@ -133,19 +118,15 @@ pub const Config = struct {
     /// timing.
     retry_jitter_pct: u8 = 20,
 
-    /// Block size for batch_id reservation. Default
-    /// 10000. At sustained 100 batches/sec the prefetch fires every
-    /// ~80 s.
-    reservation_block_size: u32 = 10_000,
-    /// Low-watermark percentage (0..100). When
-    /// `consumed >= block_size * pct/100` the refill kicks off
-    /// asynchronously.
-    reservation_low_watermark_pct: u8 = 80,
-
-    /// Production: raft-backed reservation. `null` falls back to a
-    /// local atomic counter (tests, single-process deployments).
-    reservation: ?ReservationProvider = null,
+    /// Wall-clock source for the seal stamp, in milliseconds. Injectable
+    /// so a test can seal two batches at a known instant and assert that
+    /// only their CONTENT separates them.
+    now_unix_ms: *const fn () u64 = defaultNowUnixMs,
 };
+
+fn defaultNowUnixMs() u64 {
+    return @intCast(@max(0, std.time.milliTimestamp()));
+}
 
 pub const Error = error{
     SubmissionTooLarge,
@@ -202,6 +183,9 @@ const Submission = struct {
     seq: u64,
     /// Owned, transferred from caller at submit time.
     bytes: []u8,
+    /// Owning tenant, `hashStoreId`-shaped. Rides into the object's
+    /// header so a sweep learns membership without reading bodies.
+    tenant: u64,
 
     fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
         allocator.free(self.bytes);
@@ -210,7 +194,7 @@ const Submission = struct {
 
 const RefSlot = union(enum) {
     durable: DurableSlot,
-    /// Terminal PUT failure. Carries the owning `SealedBatch.batch_id`
+    /// Terminal PUT failure. Carries the owning `SealedBatch.retain_id`
     /// (or 0 for a `failCollected` submission that never reached a
     /// batch) so `release` can still find + refcount-free the batch.
     failed: u64,
@@ -226,19 +210,28 @@ const RefSlot = union(enum) {
 const DurableSlot = struct {
     ref: BodyRef,
     bytes: []const u8,
+    /// Owning `SealedBatch.retain_id`, so `release` finds the batch to
+    /// refcount. Carried beside the ref rather than read out of it: the
+    /// ref names an OBJECT, and two retained batches can legitimately
+    /// share one name.
+    retain_id: u64,
 };
 
 /// One drained-and-sealed batch handed from drainer to executor.
 /// Lives until coordinator deinit so worker `bodyRef(seq)` lookups
 /// stay valid for the request's lifetime.
 const SealedBatch = struct {
-    /// Globally-unique batch_id minted from the reservation block
-    /// (or local atomic counter in test mode). The S3 leaf key is
-    /// formatted from this — `{batch_id:0>20}`.
-    batch_id: u64,
-    /// Heap-allocated leaf key `{batch_id:0>20}` (21 bytes including
-    /// nul-terminator slack). Passed to `BlobStore.put`; the backend
-    /// supplies the `_pool/` prefix.
+    /// This batch's handle in the retained index — a PROCESS-LOCAL
+    /// counter, never an object name and never on any wire. It exists
+    /// only so `release` can find the batch a submission belongs to in
+    /// O(1). Two batches with identical content share a key by design
+    /// (that is what makes a retried PUT idempotent) but are still two
+    /// distinct in-RAM retentions, so the index cannot be keyed by the
+    /// digest.
+    retain_id: u64,
+    /// Heap-allocated leaf key `{written_unix_ms:0>13}-{digest_hex}` —
+    /// the name WITHOUT the `_pool/` prefix, because the store handed to
+    /// `init` already carries it.
     leaf_key: []u8,
     /// One submission's worker: a submission carries the
     /// originating worker so the executor can advance THAT worker's
@@ -272,7 +265,12 @@ const SealedBatch = struct {
 const SealedSubEntry = struct {
     worker_id: u8,
     seq: u64,
-    offset: u64,
+    /// The wire ref for this submission, computed at SEAL — the object
+    /// is content-addressed, so its name is not known until its bytes
+    /// are laid out. The offset is into the sealed object, past the
+    /// header, and is what `pool_object.resolve` matches against the
+    /// object's own entry table.
+    ref: BodyRef,
     /// Owned by the entry until coord deinit. Kept around so a
     /// recompute / re-PUT path (future) could rebuild the payload
     /// without re-asking workers. The parallel copy is retained
@@ -317,18 +315,18 @@ pub const BlobCoordinator = struct {
     /// (`docs/architecture/routing-and-ingress.md`): each
     /// batch is refcounted by its un-`release`d entries (`SealedBatch
     /// .live`) and freed when fully consumed.
-    /// `retained_by_batch` is the O(1) `batch_id → *SealedBatch` index
+    /// `retained_by_batch` is the O(1) `retain_id → *SealedBatch` index
     /// `release` uses (the `retained` list is the iteration/shutdown
     /// set). Both guarded by `retained_mu`.
     retained_mu: std.Thread.Mutex = .{},
     retained: std.ArrayListUnmanaged(*SealedBatch) = .empty,
     retained_by_batch: std.AutoHashMapUnmanaged(u64, *SealedBatch) = .empty,
 
-    /// The globally-unique `batch_id` source — the raft-reserved-block machine
-    /// (or a local counter when `config.reservation` is null). Embedded in
-    /// place: its refill thread captures `&self.reservations`, stable because
-    /// the coordinator is heap-allocated. See `rove-reserve`.
-    reservations: reservation.ReservationAllocator = .{},
+    /// Source of `SealedBatch.retain_id`. Process-local and never
+    /// durable — it names an in-RAM retention, not an object, so
+    /// restarting at 1 is correct rather than a collision. Starts at 1
+    /// so 0 stays the `RefSlot.failed` "never reached a batch" marker.
+    next_retain_id: std.atomic.Value(u64) = .init(1),
 
     shutdown_flag: std.atomic.Value(bool) = .init(false),
 
@@ -344,8 +342,6 @@ pub const BlobCoordinator = struct {
     ) !*Self {
         std.debug.assert(config.worker_count > 0);
         std.debug.assert(config.executor_size > 0);
-        std.debug.assert(config.reservation_block_size > 0);
-        std.debug.assert(config.reservation_low_watermark_pct <= 100);
 
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -390,17 +386,6 @@ pub const BlobCoordinator = struct {
             self.drainer_thread.join();
         }
 
-        // Configure + spawn the reservation allocator (its refill thread, in
-        // production). In place — `self` is at its final heap address now.
-        try self.reservations.start(.{
-            .provider = config.reservation,
-            .block_size = config.reservation_block_size,
-            .low_watermark_pct = config.reservation_low_watermark_pct,
-            // 0 is `NO_BATCH`, the coordinator's inline-body sentinel.
-            .first_id = 1,
-            .label = "blob batch ids",
-        });
-
         return self;
     }
 
@@ -418,10 +403,6 @@ pub const BlobCoordinator = struct {
         self.exec_cond.broadcast();
         self.exec_slack_cond.broadcast();
         self.exec_mu.unlock();
-
-        // Shut down the reservation allocator (wakes its refill thread + any
-        // submitter parked on id-avail, then joins the thread).
-        self.reservations.deinit();
 
         self.drainer_thread.join();
         for (self.executor_threads) |t| t.join();
@@ -453,11 +434,21 @@ pub const BlobCoordinator = struct {
     /// = handler activation boundary). Returns the submission's
     /// monotonic per-worker seq.
     ///
+    /// `tenant` is the owning tenant's `hashStoreId`. It is recorded in
+    /// the object's header — a HASH, never the name, because the pool is
+    /// cross-tenant by construction and a plaintext tenant list would put
+    /// customer identity in an object every tenant's bytes share. A
+    /// sweep reads it to decide whether every tenant in an object is
+    /// deprovisioned; a caller with genuinely no tenant to attribute
+    /// passes `TENANT_UNATTRIBUTED`, which only costs that object its
+    /// early-drop eligibility.
+    ///
     /// `bytes` is dup'd internally — caller retains ownership and
     /// remains free to read/mutate the original.
     pub fn submit(
         self: *Self,
         queue: QueueId,
+        tenant: u64,
         bytes: []const u8,
     ) Error!u64 {
         if (self.shutdown_flag.load(.acquire)) return Error.Shutdown;
@@ -491,6 +482,7 @@ pub const BlobCoordinator = struct {
         w.pending.append(self.allocator, .{
             .seq = seq,
             .bytes = bytes_copy,
+            .tenant = tenant,
         }) catch {
             w.mu.unlock();
             self.undoPendingCount();
@@ -617,7 +609,7 @@ pub const BlobCoordinator = struct {
         const w = &self.workers[queue.index()];
 
         // Drop the ref first (no future bodyRef/readBody can read the
-        // soon-to-be-freed bytes), capturing the owning batch_id.
+        // soon-to-be-freed bytes), capturing the owning retain_id.
         w.mu.lock();
         const removed = w.refs.fetchRemove(seq);
         w.mu.unlock();
@@ -628,11 +620,11 @@ pub const BlobCoordinator = struct {
         // a false forever is caught worker-side in `queueCoordRelease`,
         // not here, so this stays a pure value query.)
         const kv = removed orelse return false;
-        const batch_id: u64 = switch (kv.value) {
-            .durable => |d| d.ref.batch_id,
-            .failed => |bid| bid, // 0 ⇒ no batch (failCollected)
+        const retain_id: u64 = switch (kv.value) {
+            .durable => |d| d.retain_id,
+            .failed => |rid| rid, // 0 ⇒ no batch (failCollected)
         };
-        if (batch_id == 0) return true;
+        if (retain_id == 0) return true;
 
         // Free this submission's bytes; free the batch when fully
         // consumed.
@@ -640,7 +632,7 @@ pub const BlobCoordinator = struct {
         defer self.retained_mu.unlock();
         // Ref existed but batch already gone (shouldn't happen — the
         // ref is dropped only here) — treat as released.
-        const batch = self.retained_by_batch.get(batch_id) orelse return true;
+        const batch = self.retained_by_batch.get(retain_id) orelse return true;
         for (batch.entries.items) |*e| {
             if (e.worker_id == queue.index() and e.seq == seq) {
                 if (e.bytes.len > 0) self.allocator.free(e.bytes);
@@ -650,7 +642,7 @@ pub const BlobCoordinator = struct {
         }
         if (batch.live > 0) batch.live -= 1;
         if (batch.live == 0) {
-            _ = self.retained_by_batch.remove(batch_id);
+            _ = self.retained_by_batch.remove(retain_id);
             for (self.retained.items, 0..) |b, i| {
                 if (b == batch) {
                     _ = self.retained.swapRemove(i);
@@ -745,6 +737,7 @@ pub const BlobCoordinator = struct {
                     .worker_id = @intCast(i),
                     .seq = sub.seq,
                     .bytes = sub.bytes,
+                    .tenant = sub.tenant,
                 }) catch {
                     // OOM in the collected list: leave this worker's
                     // pending untouched and exit the drain pass; next
@@ -768,16 +761,20 @@ pub const BlobCoordinator = struct {
         self.drain_mu.unlock();
 
         // Slice into <= max_batch_bytes chunks (typically one chunk).
+        // The object's own framing counts against the cap: the header and
+        // one table entry per submission ride in the same PUT, so summing
+        // payload alone would let a full batch exceed the cap it is
+        // supposed to enforce by up to `MAX_ENTRIES * ENTRY_LEN`.
         var lo: usize = 0;
         while (lo < collected.items.len) {
             var hi: usize = lo;
-            var size: usize = 0;
+            var size: usize = pool_object.HEADER_LEN;
             while (hi < collected.items.len) : (hi += 1) {
-                const sz = collected.items[hi].bytes.len;
+                const sz = collected.items[hi].bytes.len + pool_object.ENTRY_LEN;
                 if (size + sz > self.config.max_batch_bytes and hi > lo) break;
                 size += sz;
             }
-            self.sealOneBatch(collected.items[lo..hi], size) catch |err| {
+            self.sealOneBatch(collected.items[lo..hi]) catch |err| {
                 std.log.warn(
                     "rove-blob coordinator: sealOneBatch failed: {s}",
                     .{@errorName(err)},
@@ -792,43 +789,62 @@ pub const BlobCoordinator = struct {
         worker_id: u8,
         seq: u64,
         bytes: []u8,
+        tenant: u64,
     };
 
-    fn sealOneBatch(
-        self: *Self,
-        subs: []const CollectedSubmission,
-        total_bytes: usize,
-    ) !void {
+    /// Lay `subs` out as one `pool_object`, name it from the result, and
+    /// hand it to an executor.
+    ///
+    /// The order here is forced by content addressing: the object's name
+    /// is a function of its bytes, so it cannot be minted before the
+    /// layout exists. The stamp is read ONCE, here, and the whole object
+    /// — header, entry table, and payload — is built from it, which is
+    /// what makes a retried PUT land on the same key rather than
+    /// producing a second object.
+    fn sealOneBatch(self: *Self, subs: []const CollectedSubmission) !void {
         if (subs.len == 0) return;
 
-        const batch_id = try self.reservations.next();
-        var leaf_buf: [21]u8 = undefined;
-        const leaf_str = std.fmt.bufPrint(&leaf_buf, "{d:0>20}", .{batch_id}) catch unreachable;
-        const leaf_owned = try self.allocator.dupe(u8, leaf_str);
-        errdefer self.allocator.free(leaf_owned);
+        const pool_subs = try self.allocator.alloc(pool_object.Submission, subs.len);
+        defer self.allocator.free(pool_subs);
+        for (subs, pool_subs) |sub, *ps| {
+            ps.* = .{ .tenant = sub.tenant, .bytes = sub.bytes };
+        }
 
-        const payload = try self.allocator.alloc(u8, total_bytes);
-        errdefer self.allocator.free(payload);
+        var sealed = try pool_object.sealWithRefs(
+            self.allocator,
+            pool_subs,
+            self.config.now_unix_ms(),
+        );
+        defer sealed.deinit(self.allocator);
+
+        // The LEAF, not the full key: this coordinator's store handle is
+        // already scoped to `{key_prefix_base}_pool/`, so the prefixed
+        // form would write `_pool/_pool/…` and every ref to that object
+        // would resolve to a miss at the door, which reads from the
+        // content base. `putsUnderPoolPrefix` pins this.
+        var leaf_buf: [pool_object.LEAF_LEN]u8 = undefined;
+        const leaf_owned = try self.allocator.dupe(u8, sealed.leaf(&leaf_buf));
+        errdefer self.allocator.free(leaf_owned);
 
         const batch = try self.allocator.create(SealedBatch);
         errdefer self.allocator.destroy(batch);
         batch.* = .{
-            .batch_id = batch_id,
+            .retain_id = self.next_retain_id.fetchAdd(1, .monotonic),
             .leaf_key = leaf_owned,
-            .payload = payload,
+            // Ownership moves off `sealed` — `deinit` above frees only
+            // what is left, and `refs` is copied into the entries below.
+            .payload = sealed.bytes,
         };
+        sealed.bytes = &.{};
         errdefer batch.entries.deinit(self.allocator);
 
-        var off: u64 = 0;
-        for (subs) |sub| {
-            @memcpy(payload[off .. off + sub.bytes.len], sub.bytes);
+        for (subs, sealed.refs) |sub, ref| {
             try batch.entries.append(self.allocator, .{
                 .worker_id = sub.worker_id,
                 .seq = sub.seq,
-                .offset = off,
+                .ref = ref,
                 .bytes = sub.bytes, // ownership transferred from worker pending list
             });
-            off += sub.bytes.len;
         }
 
         // Hand to executor.
@@ -848,7 +864,7 @@ pub const BlobCoordinator = struct {
         for (subs) |sub| {
             const w = &self.workers[sub.worker_id];
             w.mu.lock();
-            // batch_id 0: this submission never reached a SealedBatch
+            // retain_id 0: this submission never reached a SealedBatch
             // (failed at drain/seal), and its bytes are freed right
             // below — `release` finds no batch to refcount.
             w.refs.put(self.allocator, sub.seq, .{ .failed = 0 }) catch {};
@@ -902,7 +918,7 @@ pub const BlobCoordinator = struct {
         self.retained_mu.lock();
         self.retained.append(self.allocator, batch) catch
             std.log.warn("rove-blob coordinator: retained.append OOM", .{});
-        self.retained_by_batch.put(self.allocator, batch.batch_id, batch) catch
+        self.retained_by_batch.put(self.allocator, batch.retain_id, batch) catch
             std.log.warn("rove-blob coordinator: retained_by_batch.put OOM", .{});
         self.retained_mu.unlock();
 
@@ -914,20 +930,20 @@ pub const BlobCoordinator = struct {
             w.mu.lock();
             const slot: RefSlot = if (ok)
                 .{ .durable = .{
-                    .ref = .{
-                        .batch_id = batch.batch_id,
-                        .offset = entry.offset,
-                        .len = @intCast(entry.bytes.len),
-                    },
+                    // Minted at seal, not here: the object is named by
+                    // its content, so the ref exists as soon as the
+                    // layout does.
+                    .ref = entry.ref,
                     // Borrowed view of the retained submission bytes.
                     // The SealedSubEntry owns them until the entry is
                     // `release`d (or coord deinit); the batch was
                     // retained just above, so this slice is valid for
                     // every `readBody` until release.
                     .bytes = entry.bytes,
+                    .retain_id = batch.retain_id,
                 } }
             else
-                .{ .failed = batch.batch_id };
+                .{ .failed = batch.retain_id };
             w.refs.put(self.allocator, entry.seq, slot) catch {};
             if (ok) removeFromSorted(&w.unfinished, entry.seq);
             self.recomputeDurableSeqLocked(w);
@@ -1022,6 +1038,11 @@ const testing = std.testing;
 fn qid(n: u8) QueueId {
     return @enumFromInt(n);
 }
+
+/// Two tenant hashes, for tests where the pool's cross-tenant mixing is
+/// the thing under test rather than an incidental detail.
+const T_A: u64 = 0xA11CE;
+const T_B: u64 = 0xB0B;
 
 /// In-memory blob store fixture for tests. Mirrors the MemBlobStore
 /// pattern in `src/bodies/root.zig`. Optional per-key-prefix delay
@@ -1132,28 +1153,117 @@ test "coordinator: submit advances durable_seq when batch commits" {
     });
     defer coord.deinit();
 
-    const seq = try coord.submit(qid(0), "hello world");
+    const seq = try coord.submit(qid(0), T_A, "hello world");
     try testing.expectEqual(@as(u64, 0), seq);
 
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
     try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
 
     const ref = try coord.bodyRef(qid(0), 0);
-    try testing.expectEqual(@as(u64, 0), ref.offset);
     try testing.expectEqual(@as(u32, 11), ref.len);
-    // Local-mode counter starts at 1; first batch_id should be 1.
-    try testing.expectEqual(@as(u64, 1), ref.batch_id);
+    // Past the header + entry table — the payload does not start at 0.
+    try testing.expect(ref.offset >= pool_object.HEADER_LEN);
+    try testing.expect(!ref.isNone());
 
-    // The bytes actually landed under the expected leaf key.
-    var leaf_buf: [21]u8 = undefined;
-    const leaf = std.fmt.bufPrint(&leaf_buf, "{d:0>20}", .{ref.batch_id}) catch unreachable;
+    // The bytes landed under the key the REF names — the ref carries the
+    // stamp and digest, so a reader rebuilds the key with no lookup.
+    var leaf_buf: [pool_object.LEAF_LEN]u8 = undefined;
+    const leaf = ref.leaf(&leaf_buf);
     store.mu.lock();
     const stored = store.objects.get(leaf) orelse {
         store.mu.unlock();
         return error.NotStored;
     };
-    try testing.expectEqualStrings("hello world", stored);
     store.mu.unlock();
+
+    // The object names itself: its digest is the one the ref carries.
+    try testing.expectEqualSlices(u8, &ref.digest, &pool_object.digestOf(stored));
+    // And the ref resolves through the object's own entry table, not by
+    // slicing at face value.
+    try testing.expectEqualStrings("hello world", (try pool_object.resolve(stored, ref)).?);
+}
+
+test "coordinator: the key is content-derived, so two nodes cannot collide" {
+    // The failure this replaces: two coordinators on different nodes mint
+    // the same counter id, the second PUT overwrites the first, and the
+    // loser's ref resolves to the other's bytes. Same store, same seal
+    // instant, different content — the names must still differ.
+    const fixedStamp = struct {
+        fn f() u64 {
+            return 1_700_000_000_000;
+        }
+    }.f;
+
+    var store = TestStore.init(testing.allocator);
+    defer store.deinit();
+
+    const cfg: Config = .{ .worker_count = 1, .executor_size = 1, .now_unix_ms = fixedStamp };
+    const node_a = try BlobCoordinator.init(testing.allocator, store.blobStore(), cfg);
+    defer node_a.deinit();
+    const node_b = try BlobCoordinator.init(testing.allocator, store.blobStore(), cfg);
+    defer node_b.deinit();
+
+    _ = try node_a.submit(qid(0), T_A, "tenant a's body");
+    _ = try node_b.submit(qid(0), T_B, "tenant b's body");
+    try node_a.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+    try node_b.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+
+    const ref_a = try node_a.bodyRef(qid(0), 0);
+    const ref_b = try node_b.bodyRef(qid(0), 0);
+    try testing.expect(!std.mem.eql(u8, &ref_a.digest, &ref_b.digest));
+
+    // Both objects survive, and each ref reads back its OWN bytes.
+    store.mu.lock();
+    defer store.mu.unlock();
+    var buf_a: [pool_object.LEAF_LEN]u8 = undefined;
+    var buf_b: [pool_object.LEAF_LEN]u8 = undefined;
+    const obj_a = store.objects.get(ref_a.leaf(&buf_a)) orelse return error.NotStored;
+    const obj_b = store.objects.get(ref_b.leaf(&buf_b)) orelse return error.NotStored;
+    try testing.expectEqualStrings("tenant a's body", (try pool_object.resolve(obj_a, ref_a)).?);
+    try testing.expectEqualStrings("tenant b's body", (try pool_object.resolve(obj_b, ref_b)).?);
+}
+
+test "coordinator: the sealed object carries a valid GC header" {
+    var store = TestStore.init(testing.allocator);
+    defer store.deinit();
+    const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
+        .worker_count = 2,
+        // One executor: the drain pass coalesces both submissions into
+        // one object, which is the cross-tenant case the header exists
+        // to describe.
+        .executor_size = 1,
+    });
+    defer coord.deinit();
+
+    _ = try coord.submit(qid(0), T_A, "alpha");
+    _ = try coord.submit(qid(1), T_B, "bravo");
+    try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
+
+    const ref = try coord.bodyRef(qid(0), 0);
+    var leaf_buf: [pool_object.LEAF_LEN]u8 = undefined;
+    store.mu.lock();
+    defer store.mu.unlock();
+    const obj = store.objects.get(ref.leaf(&leaf_buf)) orelse return error.NotStored;
+
+    // Every object the coordinator writes is structurally sound: the
+    // entry table describes exactly the payload that follows it.
+    const h = try pool_object.validate(obj);
+    try testing.expectEqual(ref.written_unix_ms, h.written_unix_ms);
+    try testing.expect(h.count >= 1);
+
+    // A sweep learns membership from the head alone. When both landed in
+    // one object, both tenants are named there.
+    var saw_a = false;
+    var i: u32 = 0;
+    while (i < h.count) : (i += 1) {
+        const e = try pool_object.decodeEntry(obj, i);
+        if (e.tenant == T_A) saw_a = true;
+        // Tenants appear as the hash they were submitted under — never a
+        // name, in an object many tenants share.
+        try testing.expect(e.tenant == T_A or e.tenant == T_B);
+    }
+    try testing.expect(saw_a);
 }
 
 test "coordinator: HWM is monotonic across in-flight + queued seqs" {
@@ -1170,12 +1280,12 @@ test "coordinator: HWM is monotonic across in-flight + queued seqs" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(qid(0), "AAAA");
+    _ = try coord.submit(qid(0), T_A, "AAAA");
     // Sleep a tick so the first submission is sealed into its own
     // batch before the next two land.
     std.Thread.sleep(5 * std.time.ns_per_ms);
-    _ = try coord.submit(qid(0), "BBBB");
-    _ = try coord.submit(qid(0), "CCCC");
+    _ = try coord.submit(qid(0), T_A, "BBBB");
+    _ = try coord.submit(qid(0), T_A, "CCCC");
 
     // Mid-flight: HWM is still 0 (seq 0 not committed yet).
     try testing.expectEqual(@as(u64, 0), coord.durableSeq(qid(0)));
@@ -1197,7 +1307,7 @@ test "coordinator: rejects oversized submit" {
 
     const big = try testing.allocator.alloc(u8, 2048);
     defer testing.allocator.free(big);
-    try testing.expectError(Error.SubmissionTooLarge, coord.submit(qid(0), big));
+    try testing.expectError(Error.SubmissionTooLarge, coord.submit(qid(0), T_A, big));
 }
 
 test "coordinator: rejects invalid worker_id" {
@@ -1209,7 +1319,7 @@ test "coordinator: rejects invalid worker_id" {
     });
     defer coord.deinit();
 
-    try testing.expectError(Error.InvalidWorkerId, coord.submit(qid(7), "x"));
+    try testing.expectError(Error.InvalidWorkerId, coord.submit(qid(7), T_A, "x"));
 }
 
 test "coordinator: terminal failure stalls durable_seq + bodyRef returns PutFailed" {
@@ -1223,7 +1333,7 @@ test "coordinator: terminal failure stalls durable_seq + bodyRef returns PutFail
     });
     defer coord.deinit();
 
-    const seq = try coord.submit(qid(0), "doomed");
+    const seq = try coord.submit(qid(0), T_A, "doomed");
     try testing.expectEqual(@as(u64, 0), seq);
 
     // Poll until the executor has marked the seq as failed in refs.
@@ -1250,9 +1360,9 @@ test "coordinator: readBody returns submitted bytes from RAM" {
     });
     defer coord.deinit();
 
-    const s0 = try coord.submit(qid(0), "hello chunk zero");
-    const s1 = try coord.submit(qid(0), "second chunk!!");
-    const sw = try coord.submit(qid(1), "other worker");
+    const s0 = try coord.submit(qid(0), T_A, "hello chunk zero");
+    const s1 = try coord.submit(qid(0), T_A, "second chunk!!");
+    const sw = try coord.submit(qid(1), T_A, "other worker");
 
     try coord.waitForSeq(qid(0), 2, 5 * std.time.ns_per_s);
     try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
@@ -1282,9 +1392,9 @@ test "coordinator: release frees retained batch when fully consumed" {
     });
     defer coord.deinit();
 
-    const s0 = try coord.submit(qid(0), "alpha");
-    const s1 = try coord.submit(qid(0), "bravo");
-    const sw = try coord.submit(qid(1), "charlie");
+    const s0 = try coord.submit(qid(0), T_A, "alpha");
+    const s1 = try coord.submit(qid(0), T_A, "bravo");
+    const sw = try coord.submit(qid(1), T_A, "charlie");
     try coord.waitForSeq(qid(0), 2, 5 * std.time.ns_per_s);
     try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
 
@@ -1323,7 +1433,7 @@ test "coordinator: release frees retained batch when fully consumed" {
 
     // A never-durable seq: release returns false (retry later), and a
     // later retry after it becomes durable succeeds.
-    const s2 = try coord.submit(qid(0), "delta");
+    const s2 = try coord.submit(qid(0), T_A, "delta");
     // Before durability the ref isn't set → release defers.
     if (coord.durableSeq(qid(0)) <= s2) try testing.expect(!coord.release(qid(0), s2));
     try coord.waitForSeq(qid(0), s2 + 1, 5 * std.time.ns_per_s);
@@ -1339,9 +1449,9 @@ test "coordinator: per-worker HWMs are independent" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(qid(0), "a");
-    _ = try coord.submit(qid(1), "b");
-    _ = try coord.submit(qid(2), "c");
+    _ = try coord.submit(qid(0), T_A, "a");
+    _ = try coord.submit(qid(1), T_A, "b");
+    _ = try coord.submit(qid(2), T_A, "c");
 
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
     try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
@@ -1368,7 +1478,7 @@ test "coordinator: retries SlowDown then succeeds" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(qid(0), "persistent");
+    _ = try coord.submit(qid(0), T_A, "persistent");
 
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
     try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
@@ -1392,7 +1502,7 @@ test "coordinator: retry budget exhausted → terminal PutFailed" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(qid(0), "doomed");
+    _ = try coord.submit(qid(0), T_A, "doomed");
 
     const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
     while (std.time.nanoTimestamp() < deadline) {
@@ -1421,7 +1531,7 @@ test "coordinator: non-SlowDown error is terminal on first attempt" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(qid(0), "doomed");
+    _ = try coord.submit(qid(0), T_A, "doomed");
 
     const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
     while (std.time.nanoTimestamp() < deadline) {
@@ -1451,8 +1561,8 @@ test "coordinator: cross-tenant pool — different workers share one batch" {
     });
     defer coord.deinit();
 
-    _ = try coord.submit(qid(0), "AAAA");
-    _ = try coord.submit(qid(1), "BBBB");
+    _ = try coord.submit(qid(0), T_A, "AAAA");
+    _ = try coord.submit(qid(1), T_A, "BBBB");
 
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
     try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
@@ -1486,9 +1596,9 @@ test "coordinator: executor_size knob bounds concurrency" {
     defer coord.deinit();
 
     const t0 = std.time.nanoTimestamp();
-    _ = try coord.submit(qid(0), "1");
-    _ = try coord.submit(qid(0), "2");
-    _ = try coord.submit(qid(0), "3");
+    _ = try coord.submit(qid(0), T_A, "1");
+    _ = try coord.submit(qid(0), T_A, "2");
+    _ = try coord.submit(qid(0), T_A, "3");
 
     try coord.waitForSeq(qid(0), 3, 5 * std.time.ns_per_s);
     const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - t0);
@@ -1496,111 +1606,35 @@ test "coordinator: executor_size knob bounds concurrency" {
     try testing.expect(elapsed_ns >= 280 * std.time.ns_per_ms);
 }
 
-// ── Reservation provider tests ──────────────────────────────────────
-
-/// Fake reservation provider — backed by an atomic counter the test
-/// drives directly. Records every reservation request so tests can
-/// assert refill cadence + block sizes.
-const TestReservation = struct {
-    mu: std.Thread.Mutex = .{},
-    cur: u64 = 0,
-    /// History of (prev_end, count, returned new_end) triples.
-    calls: std.ArrayListUnmanaged(Call) = .empty,
-    allocator: std.mem.Allocator,
-    /// Inject errors on the next N calls.
-    fail_next: u32 = 0,
-
-    const Call = struct { prev_end: u64, count: u32, new_end: u64 };
-
-    fn init(allocator: std.mem.Allocator) TestReservation {
-        return .{ .allocator = allocator };
-    }
-
-    fn deinit(self: *TestReservation) void {
-        self.calls.deinit(self.allocator);
-    }
-
-    fn reserveFn(ctx: *anyopaque, prev_end: u64, count: u32) anyerror!u64 {
-        const self: *TestReservation = @ptrCast(@alignCast(ctx));
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.fail_next > 0) {
-            self.fail_next -= 1;
-            return error.SimulatedFailure;
-        }
-        const base = @max(self.cur, prev_end);
-        const new_end = base + count;
-        self.cur = new_end;
-        try self.calls.append(self.allocator, .{
-            .prev_end = prev_end,
-            .count = count,
-            .new_end = new_end,
-        });
-        return new_end;
-    }
-
-    fn provider(self: *TestReservation) ReservationProvider {
-        return .{ .ctx = self, .reserveFn = TestReservation.reserveFn };
-    }
-};
-
-test "coordinator: reservation mints unique batch_ids from raft block" {
+test "coordinator: PUTs the LEAF — its store is already scoped to the pool" {
+    // The seam a no-prefix fixture cannot see. In production this
+    // coordinator's `BlobStore` is opened at `{key_prefix_base}_pool/`,
+    // while the body door reads from the content base and rebuilds
+    // `_pool/{stamp}-{digest}` from the ref. If the writer PUT the
+    // prefixed form the object would land at `_pool/_pool/…` and every
+    // reference to it would resolve to a 410 — which is exactly what the
+    // door smokes reported when this was wrong.
     var store = TestStore.init(testing.allocator);
     defer store.deinit();
-    var res = TestReservation.init(testing.allocator);
-    defer res.deinit();
-
-    const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
-        .worker_count = 1,
-        .executor_size = 2,
-        .reservation = res.provider(),
-        .reservation_block_size = 100,
-    });
-    defer coord.deinit();
-
-    _ = try coord.submit(qid(0), "one");
-    _ = try coord.submit(qid(0), "two");
-    try coord.waitForSeq(qid(0), 2, 5 * std.time.ns_per_s);
-
-    const r0 = try coord.bodyRef(qid(0), 0);
-    const r1 = try coord.bodyRef(qid(0), 1);
-    // batch_ids come from the reservation block [0, 100). Both are
-    // strictly less than the new_end (100) and may equal each other
-    // when both submissions land in the same drainer pass + same
-    // SealedBatch.
-    try testing.expect(r0.batch_id < 100);
-    try testing.expect(r1.batch_id < 100);
-
-    // At least one reservation call happened.
-    res.mu.lock();
-    defer res.mu.unlock();
-    try testing.expect(res.calls.items.len >= 1);
-    try testing.expectEqual(@as(u32, 100), res.calls.items[0].count);
-}
-
-test "coordinator: reservation retries on provider failure" {
-    var store = TestStore.init(testing.allocator);
-    defer store.deinit();
-    var res = TestReservation.init(testing.allocator);
-    defer res.deinit();
-    res.fail_next = 1; // first call fails, then succeed
-
     const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
         .worker_count = 1,
         .executor_size = 1,
-        .reservation = res.provider(),
-        .reservation_block_size = 10,
     });
     defer coord.deinit();
 
-    _ = try coord.submit(qid(0), "x");
+    _ = try coord.submit(qid(0), T_A, "body");
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
-    const r = try coord.bodyRef(qid(0), 0);
-    try testing.expect(r.batch_id < 10);
+    const ref = try coord.bodyRef(qid(0), 0);
 
-    res.mu.lock();
-    defer res.mu.unlock();
-    // The provider was called at least twice: once failed + at
-    // least one success.
-    try testing.expect(res.calls.items.len >= 1);
+    store.mu.lock();
+    defer store.mu.unlock();
+    var it = store.objects.keyIterator();
+    const stored_key = it.next().?.*;
+    try testing.expect(!std.mem.startsWith(u8, stored_key, pool_object.PREFIX));
+
+    // And the two forms agree: the leaf is what the door's key is, minus
+    // the prefix its own handle does not supply.
+    var key_buf: [pool_object.KEY_LEN]u8 = undefined;
+    const door_key = ref.key(&key_buf);
+    try testing.expectEqualStrings(door_key[pool_object.PREFIX.len..], stored_key);
 }
