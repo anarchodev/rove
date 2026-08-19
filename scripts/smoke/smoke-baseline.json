@@ -744,6 +744,11 @@
     "seconds": 23.8,
     "status": "pass"
   },
+  "wake_walker_replay_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 10.3,
+    "status": "pass"
+  },
   "webhook_recovery_smoke_v2.py": {
     "rc": 0,
     "seconds": 8.9,

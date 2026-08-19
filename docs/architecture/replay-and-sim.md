@@ -155,7 +155,7 @@ payload-less kinds, identity is always pinned (`session` `null` / `tenant` /
 retired driver-only surfaces (`request.body`, the pre-rename `on.*` alias)
 exist only under `captured` so pinned old deployments still replay.
 
-## 4. The recorded input set — five channels (capture) vs what the driver decodes (replay)
+## 4. The recorded input set — six channels (capture) vs what the driver decodes (replay)
 
 > **On the word "tape."** The storage format is called RTAP and the code
 > says `tape` in many places; both are fine as *format* names and the
@@ -202,7 +202,7 @@ hashes the same set. Because all three fold the same sequence, two engines can
 be compared on *what they did* rather than only on the response they reached,
 which is what the behavior conformance suite (`scripts/conformance/`) asserts.
 
-Capture writes five channels (`src/tape/root.zig:127`):
+Capture writes six channels (`src/tape/root.zig`, `Channel`):
 
 | channel | carries |
 |---|---|
@@ -211,6 +211,15 @@ Capture writes five channels (`src/tape/root.zig:127`):
 | `fetch_responses` (2) | a fetch result's bytes + terminal `status`/`ok`/`body_truncated` (`worker_streaming.zig:3236`) |
 | `trigger_payload` (3) | the request **body** (inbound) **or** a synthesized `{"ctx": …}` envelope (continuation resume) — `worker_drain.zig:1448`, `liftThreadedCtx` `globals.zig:2253` |
 | `request_reads` (4) | the read-recorded `request` surface (header names/values, body-read flag, ip) |
+| `activation` (5) | the activation's own record: the **resolved export** it dispatched to, plus its Msg for the two kinds no other channel holds (`wake_batch`'s fired-watch bag, `ws_message`'s `[opcode][data]` frame) |
+
+The sixth is the only one the offline readers never see as a blob: the flushed
+record carries those two values as its own `export`/`activation_bytes` fields,
+which every reader already resolves. The channel exists so they ride the **raft
+entry** as well — that entry is all a promoted leader's walker has when the
+original leader died between propose and flush, and a record rebuilt without
+them replays with an empty wakes bag, through the conventional export
+(rove#199).
 
 ### Cross-store reads — the kv channel is tenant-implicit, so the store rides in the key
 

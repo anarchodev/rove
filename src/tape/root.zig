@@ -111,7 +111,8 @@ comptime {
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// Per-tape wire version. The channel set: `.kv`, `.module`,
-/// `.fetch_responses`, `.trigger_payload`, `.request_reads`. There
+/// `.fetch_responses`, `.trigger_payload`, `.request_reads`,
+/// `.activation`. There
 /// are no `.math_random` / `.crypto_random` / `.date` channels —
 /// `Math.random`, `crypto.*`, and `Date.now` are seeded from the two
 /// readset-header scalars (`seed`, `timestamp_ns`), not taped
@@ -200,14 +201,19 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// follower rebuilds the record against the same engine the leader ran.
 /// BodyRefs name a content-addressed object in the one cross-tenant pool
 /// (`_pool/{written_unix_ms:0>13}-{digest_hex}`) — v10, which is a mid-entry
-/// shape change to the ref itself, not an appended field. The parser accepts exactly this version
+/// shape change to the ref itself, not an appended field. The `activation`
+/// channel joins the fixed channel order as the sixth and last blob — v11 —
+/// so a `wake_batch` / `ws_message` hop's Msg and every kind's resolved
+/// export ride the raft entry instead of only the flushed record, which is
+/// what a promotion walker needs to rebuild the record faithfully.
+/// The parser accepts exactly this version
 /// and rejects anything else loudly — the version byte is a format
 /// guard, not a compatibility band. This version rides in the durable
 /// raft log (type-0 envelopes carry the readset): when the format
 /// changes, bump this and delete the old shape in the same change (and
 /// wipe the data dir) — do not add a min-supported fallback.
-pub const READSET_VERSION: u16 = 10;
-pub const READSET_CHANNEL_COUNT: usize = 5;
+pub const READSET_VERSION: u16 = 11;
+pub const READSET_CHANNEL_COUNT: usize = 6;
 
 /// Wire ids are contiguous and stable — the per-tape decoder rejects
 /// mismatched ids against the inner-blob channel header, so a wire id
@@ -248,6 +254,26 @@ pub const Channel = enum(u16) {
     /// `request.unmaskedIp()`. Replay reading anything NOT recorded
     /// here is a divergence error, never a silent undefined.
     request_reads = 4,
+    /// What the activation itself was: the export it dispatched to, and
+    /// its Msg when no other channel holds it (`wake_batch`'s drained
+    /// fired-watch bag — the wakes JSON the handler saw on
+    /// `request.activation.wakes`; `ws_message`'s `[opcode:u8][data]`
+    /// frame). Zero or one entry per activation — none at all for an
+    /// inbound hop, which dispatches conventionally and whose Msg is
+    /// the request body on `trigger_payload`.
+    ///
+    /// Every activation's Msg rides exactly one readset channel:
+    /// `fetch_chunk`'s is its `fetch_responses` entry, `send_callback`'s
+    /// envelope and the inbound body are `trigger_payload`, and the
+    /// other two are here. That completeness is the point — the raft
+    /// entry alone must be enough to rebuild the record, because it is
+    /// all a promotion walker has when a leader dies between propose
+    /// and flush (the promotion walker,
+    /// `docs/architecture/deployment-and-logs.md`). The resolved export
+    /// rides here for every kind for the same reason: a rebuilt record
+    /// that lost it replays through the CONVENTIONAL export, which is a
+    /// different handler run wearing the same request id.
+    activation = 5,
 };
 
 /// Outcome of a kv operation as captured on the tape. `NotFound` is
@@ -335,6 +361,7 @@ pub const Entry = union(Channel) {
     fetch_responses: FetchResponseEntry,
     trigger_payload: TriggerPayloadEntry,
     request_reads: RequestReadEntry,
+    activation: ActivationEntry,
 
     pub const KvEntry = struct {
         op: KvOp,
@@ -484,6 +511,35 @@ pub const Entry = union(Channel) {
         kind: RequestReadKind,
         name: []const u8,
         value: []const u8,
+    };
+
+    /// One activation's own record (see `Channel.activation`): the
+    /// export it dispatched to, plus its Msg when no other channel
+    /// holds it.
+    ///
+    /// `export_name` is the RESOLVED export — a `{on}` override, or
+    /// `onFetchResult`/`Chunk`/`Done` — and is empty when the
+    /// conventional export for the kind applies (export-name
+    /// resolution, `docs/architecture/replay-and-sim.md` G3).
+    ///
+    /// The Msg has two modes, as on `TriggerPayloadEntry`, except that
+    /// neither points into the body pool — a wake bag / WS frame is
+    /// synthesized at the dispatch site and never streams through the
+    /// durability park, so there is nothing to reference:
+    ///
+    /// - `inline_bytes.len > 0`: the bytes ride inline, and
+    ///   `body_ref.len == inline_bytes.len`.
+    /// - `inline_bytes.len == 0` with `body_ref.len > 0`: UNRETAINED —
+    ///   an over-the-cap frame nothing kept. The length is still the
+    ///   record of what was lost, which is what tells a reader this
+    ///   apart from an activation that carried no Msg here at all (a
+    ///   zero length replays as an empty body and looks like data).
+    /// - both zero: the entry exists for `export_name` alone, because
+    ///   this kind's Msg rides another channel.
+    pub const ActivationEntry = struct {
+        export_name: []const u8,
+        body_ref: bodies_mod.BodyRef,
+        inline_bytes: []const u8,
     };
 };
 
@@ -699,6 +755,32 @@ pub const Tape = struct {
         self.owned_bytes += inline_copy.len;
     }
 
+    /// Append the activation's own record (`Channel.activation`): the
+    /// resolved export, and the Msg when it lives here — the wakes bag
+    /// of a `wake_batch` hop, the `[opcode][data]` frame of a
+    /// `ws_message` one. `body_ref` carries the Msg's TRUE length
+    /// whether or not the bytes ride along, so an over-the-cap Msg is
+    /// recorded as unretained rather than as nothing. Both slices are
+    /// dup'd into tape storage.
+    pub fn appendActivation(
+        self: *Tape,
+        export_name: []const u8,
+        body_ref: bodies_mod.BodyRef,
+        inline_bytes: []const u8,
+    ) !void {
+        std.debug.assert(self.channel == .activation);
+        const export_copy = try self.allocator.dupe(u8, export_name);
+        errdefer self.allocator.free(export_copy);
+        const inline_copy = try self.allocator.dupe(u8, inline_bytes);
+        errdefer self.allocator.free(inline_copy);
+        try self.entries.append(self.allocator, .{ .activation = .{
+            .export_name = export_copy,
+            .body_ref = body_ref,
+            .inline_bytes = inline_copy,
+        } });
+        self.owned_bytes += export_copy.len + inline_copy.len;
+    }
+
     /// Record one request-surface read, once: if an entry with the
     /// same `(kind, name)` already exists the call is a no-op (a
     /// header's value can't change mid-request, so repeat reads add
@@ -777,8 +859,14 @@ pub const Tape = struct {
 /// bindings append to the relevant channel.
 ///
 /// Channel shape mirrors the WASM replay engine's `Module.tapes`
-/// 1:1 (rewind-apps repo `replay/replay-wasm-plan.md` §4) — same five
-/// channels, same names. No translation layer between capture and replay.
+/// 1:1 (rewind-apps repo `replay/replay-wasm-plan.md` §4) — same
+/// channels, same names, for the five that engine consumes. No
+/// translation layer between capture and replay. The sixth,
+/// `activation`, is raft-side only: the flushed record carries the same
+/// two values as `TapePayloads.activation_bytes` / `.export_name`,
+/// which every offline reader already resolves, so the channel exists
+/// to make the RAFT ENTRY self-sufficient, not to add a blob nobody
+/// reads.
 ///
 /// The readset is the single home for every per-request
 /// non-deterministic input the raft entry carries: the per-channel
@@ -842,6 +930,12 @@ pub const Readset = struct {
     /// resolves `request.body` via `BlobStore.getRange` instead of
     /// the inline `request_body_bytes` capture.
     trigger_payload: Tape,
+    /// The activation's own record — resolved export, plus the Msg of a
+    /// `wake_batch` / `ws_message` hop (see `Channel.activation`).
+    /// Written by the capture site just before the propose, so a
+    /// walker-recovered writing hop replays through the same export,
+    /// against the same wakes bag / frame the handler saw.
+    activation: Tape,
     /// The lazily-recorded request-surface reads (see
     /// `Channel.request_reads`). The JS getters in
     /// `globals.installRequest` append here on first access.
@@ -898,6 +992,7 @@ pub const Readset = struct {
             .fetch_responses = Tape.init(allocator, .fetch_responses),
             .trigger_payload = Tape.init(allocator, .trigger_payload),
             .request_reads = Tape.init(allocator, .request_reads),
+            .activation = Tape.init(allocator, .activation),
         };
     }
 
@@ -909,6 +1004,7 @@ pub const Readset = struct {
         self.fetch_responses.deinit();
         self.trigger_payload.deinit();
         self.request_reads.deinit();
+        self.activation.deinit();
     }
 
     /// Clear everything a dispatch ATTEMPT records — the arena-OOM
@@ -916,8 +1012,10 @@ pub const Readset = struct {
     /// flag are per-attempt (the GC rerun re-records them); the
     /// identity scalars (timestamp/seed/engine) and the WORKER-owned
     /// tapes (trigger_payload — the pre-dispatch body ref;
-    /// fetch_responses — the activation's chunk capture) survive, so
-    /// the retried attempt replays against the same inputs.
+    /// fetch_responses — the activation's chunk capture; activation —
+    /// the wake/WS Msg, written once at capture, after the last
+    /// attempt) survive, so the retried attempt replays against the
+    /// same inputs.
     pub fn resetAttempt(self: *Readset) void {
         self.kv.reset();
         self.module.reset();
@@ -957,14 +1055,14 @@ pub const Readset = struct {
     /// [i64  timestamp_ns       big-endian]
     /// [u64  seed               big-endian]
     /// [u16  js_engine_version  big-endian]   // docs/architecture/format-versioning.md §4
-    /// for each of the 5 channels in fixed order:
+    /// for each of the 6 channels in fixed order:
     ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
     /// [u32 log_header_len BE][log_header_bytes]
     /// ```
     ///
     /// Channels are emitted in fixed order: kv, module,
-    /// fetch_responses, trigger_payload, request_reads — the same
-    /// order `parseReadset` consumes them. An empty channel still emits a
+    /// fetch_responses, trigger_payload, request_reads, activation —
+    /// the same order `parseReadset` consumes them. An empty channel still emits a
     /// 12-byte header-only blob so the fixed layout stays alignable
     /// on the wire.
     ///
@@ -995,6 +1093,7 @@ pub const Readset = struct {
             &self.fetch_responses,
             &self.trigger_payload,
             &self.request_reads,
+            &self.activation,
         };
         for (channels) |t| {
             const blob = try t.serialize(allocator);
@@ -1040,7 +1139,7 @@ pub const ParsedReadset = struct {
     js_engine_version: u16,
     /// Borrowed slices into the input bytes, one per channel in
     /// fixed order (kv, module, fetch_responses, trigger_payload,
-    /// request_reads).
+    /// request_reads, activation).
     blobs: [READSET_CHANNEL_COUNT][]const u8,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`) — per-request
     /// LogRecord metadata. `null` when the producer didn't stamp a
@@ -1324,6 +1423,10 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
             allocator.free(r.name);
             allocator.free(r.value);
         },
+        .activation => |*a| {
+            allocator.free(a.export_name);
+            allocator.free(a.inline_bytes);
+        },
     }
 }
 
@@ -1410,6 +1513,11 @@ fn encodeEntry(
             try buf.append(allocator, @intFromEnum(r.kind));
             try appendLenPrefixed(allocator, buf, r.name);
             try appendLenPrefixed(allocator, buf, r.value);
+        },
+        .activation => |a| {
+            try appendLenPrefixed(allocator, buf, a.export_name);
+            try appendBodyRef(allocator, buf, a.body_ref);
+            try appendLenPrefixed(allocator, buf, a.inline_bytes);
         },
     }
 }
@@ -1527,6 +1635,17 @@ fn decodeEntry(
                 .kind = kind,
                 .name = name,
                 .value = value,
+            } };
+        },
+        .activation => {
+            const export_name = try readLenPrefixed(bytes, &cur);
+            const body_ref = try readBodyRef(bytes, &cur);
+            const inline_bytes = try readLenPrefixed(bytes, &cur);
+            if (cur != bytes.len) return ParseError.Truncated;
+            return .{ .activation = .{
+                .export_name = export_name,
+                .body_ref = body_ref,
+                .inline_bytes = inline_bytes,
             } };
         },
     }
@@ -1707,6 +1826,7 @@ test "readset: serialize + parseReadset roundtrip" {
         .fetch_responses,
         .trigger_payload,
         .request_reads,
+        .activation,
     };
     for (parsed.blobs, 0..) |blob, idx| {
         var p = try parse(testing.allocator, blob);
@@ -1940,6 +2060,59 @@ test "trigger_payload tape: inline small-body roundtrip" {
     try testing.expect(t.body_ref.isNone());
     try testing.expectEqualStrings(body, t.inline_bytes);
     try testing.expectEqual(@as(u32, body.len), t.body_ref.len);
+}
+
+test "activation tape: export + Msg roundtrip, and the unretained shape" {
+    var tape = Tape.init(testing.allocator, .activation);
+    defer tape.deinit();
+    const wakes = "[{\"kind\":\"kv\",\"prefix\":\"wk/\",\"firedAt\":1700000000000}]";
+    try tape.appendActivation("onFired", bodies_mod.BodyRef.carried(@intCast(wakes.len)), wakes);
+    // An over-the-cap frame nothing kept: LENGTH without bytes. Recording a
+    // zero here is the shape a replay serves as a real-looking empty frame.
+    try tape.appendActivation("", bodies_mod.BodyRef.carried(4_000_000), "");
+    // A kind whose Msg rides another channel: the entry is the export alone.
+    try tape.appendActivation("onUpstream", bodies_mod.BodyRef.carried(0), "");
+
+    const bytes = try tape.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    var parsed = try parse(testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try testing.expectEqual(Channel.activation, parsed.channel);
+    try testing.expectEqual(@as(usize, 3), parsed.entries.len);
+
+    const carried = parsed.entries[0].activation;
+    try testing.expectEqualStrings("onFired", carried.export_name);
+    try testing.expectEqualStrings(wakes, carried.inline_bytes);
+    try testing.expectEqual(@as(u32, wakes.len), carried.body_ref.len);
+
+    const unretained = parsed.entries[1].activation;
+    try testing.expectEqualStrings("", unretained.export_name);
+    try testing.expectEqualStrings("", unretained.inline_bytes);
+    try testing.expectEqual(@as(u32, 4_000_000), unretained.body_ref.len);
+
+    const export_only = parsed.entries[2].activation;
+    try testing.expectEqualStrings("onUpstream", export_only.export_name);
+    try testing.expectEqual(@as(u32, 0), export_only.body_ref.len);
+}
+
+test "readset: the activation channel rides the raft wire" {
+    // The whole point of the channel: what the leader captured is what a node
+    // holding only the raft entry can read back (rove#199).
+    var rs = Readset.init(testing.allocator, 1234, 0xAA);
+    defer rs.deinit();
+    try rs.activation.appendActivation("onFired", bodies_mod.BodyRef.carried(2), "[]");
+
+    const bytes = try rs.serialize(testing.allocator, null);
+    defer testing.allocator.free(bytes);
+    const parsed_rs = try parseReadset(bytes);
+
+    const idx: usize = @intFromEnum(Channel.activation);
+    var parsed = try parse(testing.allocator, parsed_rs.blobs[idx]);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.entries.len);
+    try testing.expectEqualStrings("onFired", parsed.entries[0].activation.export_name);
+    try testing.expectEqualStrings("[]", parsed.entries[0].activation.inline_bytes);
 }
 
 test "request_reads tape: all kinds roundtrip" {

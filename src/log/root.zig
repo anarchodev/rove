@@ -280,13 +280,22 @@ pub const TapePayloads = struct {
     /// still feeds the captured bytes — the handler's view is what
     /// was captured, even if that's less than the original.
     request_body_truncated: bool = false,
-    /// Captured activation input bytes (or its 256 KB prefix) for
-    /// activations whose Msg payload carries bytes the handler
-    /// reads — today only `fetch_chunk` (the upstream chunk
-    /// payload, surfaced as `request.activation.bytes`). Empty for
-    /// every other activation source. L3 (`docs/effect-algebra.md`):
-    /// every Msg is recorded, including its bytes — closes the
-    /// effect-audit's fetch-A untaped-chunk bug.
+    /// The activation's Msg bytes, for the kinds whose Msg is bytes the
+    /// handler reads: `fetch_chunk` (the upstream chunk payload,
+    /// surfaced as `request.activation.bytes`), `wake_batch` (the
+    /// drained fired-watch bag, `request.activation.wakes`), and
+    /// `ws_message` (the frame, `[opcode:u8][data]`). Empty for every
+    /// other activation source, and for a payload over the inline cap
+    /// that nothing retained — the readset's `activation` /
+    /// `fetch_responses` entry keeps that one's LENGTH, so absence here
+    /// is never silently an empty payload. L3
+    /// (`docs/effect-algebra.md`): every Msg is recorded, including its
+    /// bytes.
+    ///
+    /// Rebuilt from the raft entry's `activation` channel on a
+    /// walker-recovered record (`src/js/worker_upload_walker.zig`),
+    /// which is why that channel exists at all: this field never
+    /// reaches raft on its own.
     activation_bytes: []const u8 = &.{},
     /// True iff `activation_bytes` is a truncated prefix.
     activation_bytes_truncated: bool = false,
@@ -296,6 +305,9 @@ pub const TapePayloads = struct {
     /// export instead of the conventional one — export-name resolution
     /// (`docs/architecture/replay-and-sim.md` §5 G3).
     /// Empty when the conventional export applies. Allocator-owned.
+    /// Rides the raft entry on the readset's `activation` channel, so a
+    /// walker-rebuilt record replays through the same export instead of
+    /// the conventional one.
     export_name: []const u8 = &.{},
     /// The activation's kv WRITE KEYS (its writeset slice, keys only),
     /// encoded with `encodeKeyList` — the "who touched what" half the

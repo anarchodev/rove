@@ -500,8 +500,10 @@ recv buffer is what raises it. The snapshot stream stays WIDER
   re-execution, re-calling the API costs money and returns different tokens)
   is captured by this same `on_chunk` + `BodyRef` path; making it an explicit
   billed opt-in is deferred to a real LLM-stream customer.
-- Wire: `READSET_VERSION` is `7` (`src/tape/root.zig`); channels are `kv` +
-  `module` + `fetch_responses` + `trigger_payload` + `request_reads`.
+- Wire: the readset channels (`src/tape/root.zig` `Channel`) are `kv` +
+  `module` + `fetch_responses` + `trigger_payload` + `request_reads` +
+  `activation`; `READSET_VERSION` is the guard on that layout (`rewind version
+  --formats` prints the live number).
 
 ### 3.9a Out-of-line references: one discipline, and every reference has a reader
 
@@ -559,6 +561,19 @@ catch. The record lookup carries the same tenant scoping and retention clamp as
 **Rejected: presigned URLs straight to the pool object.** Same reason, and it
 is the reason §5's presign note gives — a cross-tenant object cannot be handed
 out whole, and a presigned range is still an offset the caller controls.
+
+**One Msg, one channel — including the copy that rides raft.** The same pair
+applies to the record a *follower* rebuilds. Every activation's Msg has exactly
+one readset channel (`trigger_payload` for an inbound body or a resume
+envelope, `fetch_responses` for a fetch event, `activation` for a wake bag or a
+WS frame), and the `activation` channel additionally carries the resolved
+export for every kind. Before that, a `wake_batch` / `ws_message` Msg and every
+kind's resolved export lived only on the flushed S3 record, so a promotion
+walker — which has nothing but the raft entry — rebuilt the record with an
+empty wakes bag and dispatched replay to the CONVENTIONAL export: a different
+handler run wearing the same request id, and the #214 shape again (rove#199).
+An over-the-cap WS frame stays unretained-with-length: too big for the entry,
+and a WS activation owns no durability park to spill through.
 
 **Consequence to keep in view.** Every reference written is a bet that the
 bytes outlive the record pointing at them. `_pool/` has no reaper (#304), so

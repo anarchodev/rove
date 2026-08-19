@@ -86,10 +86,10 @@ pub fn getOrOpenTenantLog(
 // ── Tape capture ──────────────────────────────────────────────────────
 //
 // `tape_mod.Readset` is the per-request structural holder for the
-// five channels (kv / module / fetch_responses / trigger_payload /
-// request_reads); the worker allocates one per dispatch, hands its
-// pointer to the dispatcher via `Request.readset`, then serializes +
-// flushes the non-empty channels via `captureTapes*` below.
+// six channels (kv / module / fetch_responses / trigger_payload /
+// request_reads / activation); the worker allocates one per dispatch,
+// hands its pointer to the dispatcher via `Request.readset`, then
+// serializes + flushes the non-empty channels via `captureTapes*` below.
 // `Math.random` / `crypto.*` / `Date.now` have no dedicated channels;
 // the readset's `seed` + `timestamp_ns` scalars are stamped onto
 // arenajs's per-context state by the dispatcher (`JS_SetRandomSeed` +
@@ -219,6 +219,11 @@ pub fn captureTapes(
         .{ .tape = &readset.fetch_responses, .out = &payloads.fetch_responses_tape_bytes },
         .{ .tape = &readset.trigger_payload, .out = &payloads.trigger_payload_tape_bytes },
         .{ .tape = &readset.request_reads, .out = &payloads.request_reads_tape_bytes },
+        // NOT `readset.activation`: its two values reach the flushed record as
+        // the record's own `activation_bytes` / `export_name` fields, which
+        // every offline reader already resolves. That channel exists to make
+        // the RAFT ENTRY self-sufficient for a rebuild — flushing a second
+        // encoding of the same values would add a blob nobody reads.
     };
 
     for (channels) |ch| {
@@ -288,6 +293,43 @@ pub fn captureTapesWithActivation(
         std.log.warn("rove-js activation-bytes capture failed: {s}", .{@errorName(err)});
     }
     return payloads;
+}
+
+/// Record the activation itself on the readset's `activation` channel: the
+/// resolved export, and the Msg for the kinds that keep it here (the wake
+/// batch's wakes JSON, the WS frame's `[opcode][data]`).
+///
+/// This is the half that rides the RAFT ENTRY. `TapePayloads.export_name` and
+/// `.activation_bytes` reach only the flushed S3 record, so a hop whose leader
+/// died between propose and flush was rebuilt with an empty wakes bag and
+/// dispatched to the CONVENTIONAL export — a different handler run wearing the
+/// same request id (the promotion walker,
+/// `docs/architecture/deployment-and-logs.md`).
+///
+/// `msg_len` is the Msg's TRUE length — 0 for the kinds whose Msg rides
+/// another channel — and `bytes` is the Msg itself when it was kept, empty
+/// when it was not. Over the cap the entry keeps the LENGTH and drops the
+/// bytes: the unretained shape (`payloadFate`'s `.spill` has no home here, as
+/// a resume hop owns no durability park to spill through). A zero length there
+/// would be indistinguishable from an activation that carried no Msg at all,
+/// which is the shape a replay serves as real-looking empty data.
+fn recordActivation(
+    readset: *tape_mod.Readset,
+    export_name: []const u8,
+    msg_len: usize,
+    bytes: []const u8,
+) void {
+    // Nothing resolved and nothing carried: the activation is fully described
+    // by its kind, so an entry would say nothing.
+    if (export_name.len == 0 and msg_len == 0) return;
+    std.debug.assert(bytes.len == 0 or bytes.len == msg_len);
+    readset.activation.appendActivation(
+        export_name,
+        bodies_mod.BodyRef.carried(@intCast(msg_len)),
+        bytes,
+    ) catch |err| {
+        std.log.warn("rove-js activation capture failed: {s}", .{@errorName(err)});
+    };
 }
 
 /// Serialize a drained wake batch to the EXACT JSON the handler saw on
@@ -384,6 +426,10 @@ pub fn captureWakeBatchTapes(
         return captureTapes(worker, readset, ctx_body);
     };
     defer allocator.free(json);
+    // The bag + the resolved export ride the raft entry, not just the flushed
+    // record: a writing wake hop whose leader dies before the flush is rebuilt
+    // from the entry alone, and both have to survive that.
+    recordActivation(readset, export_name, json.len, json);
     var payloads = captureTapesWithActivation(worker, readset, ctx_body, json);
     if (export_name.len > 0) {
         payloads.export_name = allocator.dupe(u8, export_name) catch &.{};
@@ -422,6 +468,10 @@ pub fn captureSendCallbackTapes(
         };
         readset.ctx_payload = true;
     }
+    // The Msg is the envelope on `trigger_payload` above, so this entry exists
+    // for the resolved export alone — which a rebuilt record needs just as
+    // much (G3).
+    recordActivation(readset, export_name, 0, "");
     var payloads = captureTapes(worker, readset, envelope);
     if (export_name.len > 0) {
         payloads.export_name = allocator.dupe(u8, export_name) catch &.{};
@@ -512,6 +562,9 @@ pub fn captureFetchChunkTapes(
     ) catch |err| {
         std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
     };
+    // The Msg rides `fetch_responses` above, so this entry exists for the
+    // resolved export alone — which a rebuilt record needs just as much (G3).
+    recordActivation(readset, ev.export_name, 0, "");
     var payloads = captureTapes(worker, readset, ctx_body);
     // Record the resolved export (G3) — owned, freed by TapePayloads.deinit.
     if (ev.export_name.len > 0) {
@@ -523,8 +576,9 @@ pub fn captureFetchChunkTapes(
 /// Record an inbound WS frame (`ws_message`'s Msg) so `onMessage` is
 /// replayable. The frame is `request.activation = {opcode, data}`; taped as
 /// `activation_bytes = [opcode:u8][data]` (inline ≤ `REQUEST_BODY_CAP`). `ctx`
-/// rides trigger_payload. Small frames replay offline; larger frames record
-/// metadata only (same inline rule as the rest).
+/// rides trigger_payload. Small frames replay offline; a frame over the cap has
+/// no home — too big for the raft entry, and a WS activation owns no durability
+/// park — so it records its LENGTH on the `activation` channel and no bytes.
 pub fn captureWsFrameTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
@@ -533,11 +587,24 @@ pub fn captureWsFrameTapes(
     data: []const u8,
 ) log_mod.TapePayloads {
     const allocator = worker.allocator;
-    if (data.len + 1 > REQUEST_BODY_CAP) return captureTapes(worker, readset, ctx_body);
+    if (data.len + 1 > REQUEST_BODY_CAP) {
+        // Nothing keeps an over-the-cap frame: it is too big for the raft
+        // entry and a WS activation owns no durability park to spill it
+        // through. Record the LENGTH alone so the record says a frame of this
+        // size arrived and was not retained — recording nothing would make it
+        // indistinguishable from an activation with no Msg, which replays as
+        // an empty frame that looks like real data.
+        recordActivation(readset, "", data.len + 1, "");
+        return captureTapes(worker, readset, ctx_body);
+    }
     const framed = allocator.alloc(u8, 1 + data.len) catch return captureTapes(worker, readset, ctx_body);
     defer allocator.free(framed);
     framed[0] = opcode;
     @memcpy(framed[1..], data);
+    // Both halves: the raft entry (for a walker-rebuilt record) and the
+    // flushed record's `activation_bytes`. `onMessage` is conventional, so
+    // there is no resolved export to carry.
+    recordActivation(readset, "", framed.len, framed);
     return captureTapesWithActivation(worker, readset, ctx_body, framed);
 }
 
@@ -1154,6 +1221,57 @@ test "captureFetchChunkTapes: an unretained chunk keeps its length, not a zero" 
     try testing.expectEqual(@as(usize, 0), e.content_hash.len);
     // Distinguishable from a terminal-only event, which is the whole point.
     try testing.expect(e.body_ref.len != 0);
+}
+
+test "captureWakeBatchTapes: the bag + resolved export ride the readset (rove#199)" {
+    const testing = std.testing;
+    const a = testing.allocator;
+
+    // The flushed record and the raft entry must carry the SAME Msg: a
+    // walker rebuild reads the readset, and a rebuild that disagreed with what
+    // the leader flushed would be a second version of one activation.
+    var readset = tape_mod.Readset.init(a, 0, 0);
+    defer readset.deinit();
+    const wakes = [_]components_mod.WakeEntry{
+        .{ .tag = .kv, .prefix = @constCast("wk/"), .fired_at_ns = 1_700_000_000_000_000_000 },
+    };
+    var tapes = captureWakeBatchTapes(
+        .{ .allocator = a },
+        &readset,
+        "{\"ctx\":{\"armed\":true}}",
+        &wakes,
+        "onFired",
+    );
+    defer tapes.deinit(a);
+
+    try testing.expectEqual(@as(usize, 1), readset.activation.entries.items.len);
+    const e = readset.activation.entries.items[0].activation;
+    try testing.expectEqualStrings("onFired", e.export_name);
+    try testing.expectEqualStrings(tapes.activation_bytes, e.inline_bytes);
+    try testing.expectEqual(@as(u32, @intCast(tapes.activation_bytes.len)), e.body_ref.len);
+}
+
+test "captureWsFrameTapes: an over-the-cap frame keeps its length, not a zero" {
+    const testing = std.testing;
+    const a = testing.allocator;
+
+    // Nothing retains a frame this size, and the record has to say so: a zero
+    // length is the spelling of "no Msg", which a replay serves as an empty
+    // frame that looks like the real one.
+    var readset = tape_mod.Readset.init(a, 0, 0);
+    defer readset.deinit();
+    const data = try a.alloc(u8, REQUEST_BODY_CAP + 1);
+    defer a.free(data);
+    @memset(data, 'x');
+
+    var tapes = captureWsFrameTapes(.{ .allocator = a }, &readset, "{\"ctx\":null}", 0x1, data);
+    defer tapes.deinit(a);
+
+    try testing.expectEqual(@as(usize, 0), tapes.activation_bytes.len);
+    try testing.expectEqual(@as(usize, 1), readset.activation.entries.items.len);
+    const e = readset.activation.entries.items[0].activation;
+    try testing.expectEqual(@as(u32, @intCast(data.len + 1)), e.body_ref.len);
+    try testing.expectEqual(@as(usize, 0), e.inline_bytes.len);
 }
 
 test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + other kinds" {

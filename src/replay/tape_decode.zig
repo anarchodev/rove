@@ -43,6 +43,14 @@ pub const Channel = enum(u16) {
     fetch_responses = 2,
     trigger_payload = 3,
     request_reads = 4,
+    /// The `wake_batch` / `ws_message` activation Msg. Carried here for
+    /// the wire-id lockstep only — that channel rides the raft entry so
+    /// the promotion walker can rebuild a record, and never reaches a
+    /// pulled bundle: the flushed record carries the same Msg as
+    /// `activation_bytes`, which is what `rewind replay` reads. Hence
+    /// no `decodeActivation` below; a decoder no caller reaches would
+    /// rot unnoticed.
+    activation = 5,
 };
 
 pub const KvOp = enum(u8) { get = 0, set = 1, delete = 2, prefix = 3 };
