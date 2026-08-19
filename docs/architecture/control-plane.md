@@ -71,11 +71,19 @@ source → attach the destination at a fresh epoch → flip → evict the source
 - **Keys** (kvexp): `cluster/{id}` → node origins; `placement/{tenant}` →
   `{state}:{cluster}`; `plan/{tenant}` → opaque tier+overrides; `host/{host}` →
   tenant; `cert/{host}` → packed cert+key.
-- **Hot-path reads are zero-alloc**: the in-memory projection (`clusters`,
-  `placements`, `plans`, `hosts`, `certs`) is rebuilt by the apply-observer on
-  every committed write, on leader and followers alike. `clusterFor(tenant)` and
-  `resolve(tenant)` are map lookups; `ClusterRef.nodes` slices are pointer-stable
-  past the directory lock.
+- **Hot-path reads go through the projection**: the in-memory projection
+  (`clusters`, `placements`, `plans`, `hosts`, `certs`) is rebuilt by the
+  apply-observer on every committed write, on leader and followers alike, so a
+  read is a map lookup rather than a store hit.
+- **A node set never leaves the directory lock.** A re-address replaces a
+  cluster's node array and frees the old one, from the pump thread, while HTTP
+  threads are reading — so there is no window in which a borrowed `nodes` slice
+  is sound, however briefly it is held. `resolve` / `clusterById` /
+  `soleCluster` deep-copy under the lock and hand back an `OwnedCluster` the
+  caller `deinit`s. Two reads stay allocation-free because they are safe:
+  `isPlaced` (existence) and `clusterIdFor` (a cluster id, which is never
+  freed — clusters are not removed and a re-address keeps the id slice in
+  place).
 
 ## CP directory replication
 

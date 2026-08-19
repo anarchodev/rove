@@ -1008,11 +1008,42 @@ fn testFrame(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     return buf;
 }
 
+/// Two adjacent loopback ports nothing on the box is using.
+///
+/// Chosen BELOW the kernel ephemeral range (32768+ on Linux) so an outbound
+/// connection's source port can never squat them — the same reasoning
+/// `scripts/smoke/smoke_ports.py` records for the smoke harness, which moved
+/// below the range for exactly this failure. These tests used fixed ports in
+/// the 393xx block, and a sibling process's TIME-WAIT socket at that number
+/// was enough to fail `bind` and redden the whole gate (rove#376).
+///
+/// Probed rather than merely relocated: several agent workspaces run
+/// `zig build test` on one box, so a fixed pair below the range would just
+/// trade an ephemeral squatter for a concurrent one. No `SO_REUSEADDR` — a
+/// port in TIME-WAIT must read as busy here, since that is the case being
+/// avoided.
+fn freeLoopbackPair(start: u16) ![2]u16 {
+    var p: u16 = start;
+    while (p < start + 200) : (p += 2) {
+        if (loopbackBindable(p) and loopbackBindable(p + 1)) return .{ p, p + 1 };
+    }
+    return error.NoFreePortPair;
+}
+
+fn loopbackBindable(port: u16) bool {
+    const addr = std.net.Address.parseIp("127.0.0.1", port) catch return false;
+    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
+    defer std.posix.close(sock);
+    std.posix.bind(sock, &addr.any, addr.getOsSockLen()) catch return false;
+    return true;
+}
+
 test "two RaftNets exchange a frame over loopback" {
     const allocator = testing.allocator;
 
-    const port_a: u16 = 39301;
-    const port_b: u16 = 39302;
+    const ports = try freeLoopbackPair(19300);
+    const port_a: u16 = ports[0];
+    const port_b: u16 = ports[1];
     const addr_a = try std.net.Address.parseIp("127.0.0.1", port_a);
     const addr_b = try std.net.Address.parseIp("127.0.0.1", port_b);
 
@@ -1090,8 +1121,9 @@ test "two RaftNets exchange a frame over loopback" {
 test "meshCounts: self excluded; configured counts non-self, connected tracks the dial" {
     const allocator = testing.allocator;
 
-    const port_a: u16 = 39311;
-    const port_b: u16 = 39312;
+    const ports = try freeLoopbackPair(19400);
+    const port_a: u16 = ports[0];
+    const port_b: u16 = ports[1];
     const addr_a = try std.net.Address.parseIp("127.0.0.1", port_a);
     const addr_b = try std.net.Address.parseIp("127.0.0.1", port_b);
 

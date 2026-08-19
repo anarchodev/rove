@@ -910,6 +910,67 @@ test "Phase 1 exit: propose a writeset, it commits + applies, a read sees it" {
     try testing.expectEqualStrings("1", got2);
 }
 
+test "persistedGroups: a corrupt manifest epoch is skipped loudly, never recovered as epoch 0 (rove#101)" {
+    // RC-5. The manifest value is a group's MIGRATION EPOCH, and epoch 0 is a
+    // legitimate value — a group that never moved — so `catch 0` turned an
+    // unreadable row into a plausible one. The group would come back stamping
+    // stale epochs, get fenced by its peers, and strand the tenant with
+    // nothing logged. This asserts the corrupt row does not come back AT ALL,
+    // which is the only outcome distinguishable from healthy state.
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    node.recordGroup("tenant-good", 7);
+    // A row the parser cannot read: a torn write, or bytes from a corrupted
+    // page. Written through the same store the recorder uses, so the read
+    // path sees exactly what recovery would see.
+    try node.groups_manifest.put("tenant-corrupt", "not-a-number");
+    try node.groups_manifest.checkpoint();
+
+    const manifest = try node.persistedGroups(a);
+    defer Node.freePersistedGroups(a, manifest.groups);
+
+    // Under `catch 0` this returned BOTH rows and the corrupt one carried a
+    // usable-looking epoch of 0.
+    try testing.expectEqual(@as(usize, 1), manifest.groups.len);
+    try testing.expectEqualStrings("tenant-good", manifest.groups[0].id_str);
+    try testing.expectEqual(@as(u64, 7), manifest.groups[0].epoch);
+    // And the refusal is REPORTED, not merely absent — the boot caller
+    // escalates on this count, so losing it would make the skip silent.
+    try testing.expectEqual(@as(usize, 1), manifest.refused);
+}
+
+test "persistedGroups: epoch 0 is a REAL epoch and survives the round trip (rove#101)" {
+    // The other half of the same property: skipping must key on the parse
+    // failing, not on the value being zero. A group that never moved records
+    // epoch 0 legitimately, and dropping those would strand every un-moved
+    // tenant on the node — a far bigger outage than the bug being fixed.
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    node.recordGroup("tenant-never-moved", 0);
+    const manifest = try node.persistedGroups(a);
+    defer Node.freePersistedGroups(a, manifest.groups);
+
+    try testing.expectEqual(@as(usize, 1), manifest.groups.len);
+    try testing.expectEqual(@as(u64, 0), manifest.groups[0].epoch);
+    try testing.expectEqual(@as(usize, 0), manifest.refused);
+}
+
 test "createGroupAtEpoch: a RawNode-rejected config errors cleanly (no gfs double-free)" {
     // Regression for the genesis SIGABRT. A born-{self} group attached as a
     // LEARNER splits self out of the voter set → ConfState{voters:[], learners:
