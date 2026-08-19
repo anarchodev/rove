@@ -269,6 +269,46 @@ the Model the rest of the activation reads. The trigger/output effects
 into *this* activation — their results arrive as future Msgs — which is
 why they're Cmd-builders, not Model mutations.
 
+**What one activation may write.** An activation's writes are replicated as
+one raft entry, so they are bounded, and the bounds are stated rather than
+discovered:
+
+| | limit | refusal code |
+|---|---|---|
+| key | 256 bytes | `key_too_large` |
+| value | 384 KiB | `value_too_large` |
+| writes per activation | 1000 | `too_many_writes` |
+| written bytes per activation | 400 KiB (keys + values) | `writes_too_large` |
+
+All four throw at the call site with a `code` you can branch on, so a handler
+never discovers a limit as a failed request. The per-activation pair is
+**yours alone** — other activations running in the same dispatch pass share
+the underlying batch, but never your allowance.
+
+More work than one activation's budget is not an error to design around; it is
+the signal to **continue in another activation**:
+
+```js
+export default function () {
+  return writeChunk(0);
+}
+export function onMore() {
+  return writeChunk(request.ctx.from);
+}
+function writeChunk(from) {
+  const rows = load(from, 200);           // a bounded slice
+  for (const r of rows) kv.set(`row/${r.id}`, JSON.stringify(r));
+  if (rows.length < 200) return "done";
+  after.ms(1, { on: "onMore" });          // the yield
+  return next({ from: from + rows.length });
+}
+```
+
+Each hop commits its own writes and hands the cursor on, so the work completes
+without any one entry growing. The hops are separate transactions — write the
+loop so a repeat of the last hop is harmless (a cursor in `ctx`, idempotent
+keys), because that is what makes it resumable across a leader change.
+
 ### 2.6 The rule, and why there are no scope flags
 
 > **All wakes registered through `after.*` are for the current connection.

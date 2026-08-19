@@ -298,6 +298,36 @@ pub const KV_KEY_MAX: usize = 256;
 /// cap is 256 KiB, which base64-encodes to ~342 KiB in one row.
 pub const KV_VAL_MAX: usize = 384 * 1024;
 
+/// What ONE ACTIVATION may write, in ops and in bytes (key + value summed
+/// across its `kv.set` / `kv.delete` calls).
+///
+/// The reason is the same ceiling the value cap derives from: an activation's
+/// writes ride one raft entry, together with its recorded reads. A per-VALUE
+/// cap does not bound that — a thousand legal values do not fit — so the
+/// budget is stated per activation, refused at the call site with a code, and
+/// sized so an activation that stays inside it can always be replicated:
+///
+///     writes (256 KiB) + reads (the kv tape budget) + framing < MAX_ENTRY_BYTES
+///
+/// The shape follows the transactional stores this competes with: Deno KV
+/// caps an atomic operation at 1000 mutations or 800 KiB, whichever comes
+/// first; DynamoDB at 100 items; Durable Objects at 128 pairs per `put()`.
+/// A handler with more work than one budget continues in a NEW activation
+/// (`next()` — `docs/handler-shape.md`), which keeps each activation a
+/// bounded, replayable unit instead of growing the entry.
+/// Held above `KV_VAL_MAX + KV_KEY_MAX` for now, because the two rules have to
+/// be satisfiable together: a value the guard calls legal must be writable —
+/// under its key — by a handler that has written nothing else. (The key is
+/// why this is not simply equal to the value cap: a max-size value under a
+/// max-size key spends both.) The balanced split this wants —
+/// value 128 KiB (what Durable Objects promises), writes 256 KiB, reads
+/// 128 KiB — needs `blob.write`'s inline append to stop putting up to 256 KiB
+/// (≈342 KiB base64) in a single kv row and spill to a `{ref}` row instead,
+/// which is what `docs/architecture/blob-write-recipes.md` says those rows are
+/// for. Until then the value cap is the floor under this number.
+pub const KV_WRITES_MAX: u32 = 1000;
+pub const KV_WRITE_BYTES_MAX: usize = 400 * 1024;
+
 /// `request.tag` limits — the low-cardinality index tags a handler may set.
 ///
 /// Same reason the kv caps are here: a handler author reads "at most 4 tags"

@@ -413,6 +413,14 @@ pub const DispatchState = struct {
     /// the batch wrote is a FOREIGN read for this one; eliding it leaves
     /// the record unreplayable (rove#532).
     ws_base: usize = 0,
+    /// What THIS activation has written so far — ops, and key+value bytes —
+    /// against `reserved.KV_WRITES_MAX` / `KV_WRITE_BYTES_MAX`. Counted here
+    /// rather than derived from the writeset because the writeset is
+    /// batch-scoped (see `ws_base`): the budget is one activation's, and a
+    /// neighbour in the same batch must not be able to spend it. Charged only
+    /// after a write succeeds, so a refusal costs nothing.
+    write_ops: u32 = 0,
+    write_bytes: usize = 0,
     /// Accumulated `console.log` output. Owned by the dispatcher; reset
     /// between requests.
     console: *std.ArrayList(u8),

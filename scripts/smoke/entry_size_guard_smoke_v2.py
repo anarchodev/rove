@@ -51,13 +51,41 @@ export default function () {
     catch (e) { return "refused:" + (e.code || "?"); }
   }
   if (op === "many") {
-    // Each value is legal; the ENTRY they build together is not.
+    // Each value is legal; the activation's TOTAL is not.
     const n = parseInt(p.get("n"), 10), each = parseInt(p.get("each"), 10);
-    for (let i = 0; i < n; i++) kv.set("many/" + i, "y".repeat(each));
-    return "wrote " + n;
+    try {
+      for (let i = 0; i < n; i++) kv.set("many/" + i, "y".repeat(each));
+      return "wrote " + n;
+    } catch (e) { return "refused:" + (e.code || "?"); }
+  }
+  if (op === "count") {
+    // The other half of the budget: ops, not bytes.
+    try { for (let i = 0; i < 1001; i++) kv.set("c/" + i, "v"); return "wrote 1001"; }
+    catch (e) { return "refused:" + (e.code || "?"); }
+  }
+  if (op === "chain") {
+    // The way past the budget: continue in a NEW activation. Each hop writes
+    // its share and hands the cursor on, so the work completes without any one
+    // entry growing. `next()` alone only PARKS — it needs a wake
+    // source. `after.ms(1)` is the nearest thing to a setTimeout(0) yield:
+    // `after.ms(0)` is refused ("ms must be > 0"), so a handler continuing
+    // itself has to ask for a delay it does not want.
+    const from = parseInt(p.get("from") || "0", 10);
+    for (let i = from; i < from + 3; i++) kv.set("chain/" + i, "z".repeat(100 * 1024));
+    if (from + 3 >= 9) return "chained " + (from + 3);
+    after.ms(1, { on: "onMore" });
+    return next({ from: from + 3 });
   }
   if (op === "small") { kv.set("s/" + p.get("k"), "ok"); return "s"; }
   return "ok";
+}
+
+export function onMore() {
+  const from = (request.ctx && request.ctx.from) || 0;
+  for (let i = from; i < from + 3; i++) kv.set("chain/" + i, "z".repeat(100 * 1024));
+  if (from + 3 >= 9) return "chained " + (from + 3);
+  after.ms(1, { on: "onMore" });
+  return next({ from: from + 3 });
 }
 """
 
@@ -87,14 +115,22 @@ def main() -> int:
         check("a value AT the cap still commits (the cap is reachable, not decorative)",
               r.status == 200 and r.body == "wrote", f"{r.status} {r.body[:60]!r}")
 
-        # ── 2. legal values, illegal entry: a defined 413 at propose ──
+        # ── 2. the per-activation write budget, at the call site ──
         r = c.request("victim", "/?op=many&n=8&each=200000", timeout=60.0)
-        check("an entry over the wire limit answers 413, not 421/503",
-              r.status == 413, f"{r.status} {r.body[:80]!r}")
-        check("…and says what to change",
-              "too large to replicate" in r.body, f"{r.body[:120]!r}")
+        check("an activation writing past its byte budget is refused at the call site",
+              r.status == 200 and r.body == "refused:writes_too_large",
+              f"{r.status} {r.body[:80]!r}")
+        r = c.request("victim", "/?op=count", timeout=60.0)
+        check("…and past its op budget too",
+              r.status == 200 and r.body == "refused:too_many_writes",
+              f"{r.status} {r.body[:80]!r}")
 
-        # ── 3. nothing reached the wire ──
+        # ── 3. the way past it: continue in a new activation ──
+        r = c.request("victim", "/?op=chain", timeout=60.0)
+        check("a chained handler writes 9×100 KiB across activations and commits",
+              r.status == 200 and r.body == "chained 9", f"{r.status} {r.body[:60]!r}")
+
+        # ── 4. nothing reached the wire ──
         logs = "".join(Path(p).read_text(errors="replace")
                        for p in c.log_paths.values() if Path(p).exists())
         oversize = "oversize frame" in logs
@@ -104,7 +140,7 @@ def main() -> int:
                       for i in range(len(c.node_ports)))
         check("the transport backstop never had to fire", dropped == 0, f"got {dropped}")
 
-        # ── 4. the co-tenant is untouched ──
+        # ── 5. the co-tenant is untouched ──
         ok, statuses = 0, []
         for i in range(40):
             rr = c.request("bystander", f"/?op=small&k={i}", timeout=30.0)

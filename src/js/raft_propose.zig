@@ -28,13 +28,25 @@ const bridge_mod = @import("bridge");
 const reserved = @import("rove-reserved");
 
 comptime {
-    // The rule the whole guard rests on: a value the kv guard ADMITS must be
-    // one a follower can receive. Anything else accepts a write at the call
-    // site and fails it during replication — a fault where a rule belongs.
-    // The slack covers the envelope header, the writeset framing around the
-    // pair, and the activation's readset riding the same entry.
-    const SLACK: usize = 64 * 1024;
-    std.debug.assert(reserved.KV_VAL_MAX + SLACK < bridge_mod.transport.MAX_ENTRY_BYTES);
+    // Two invariants, asserted rather than trusted.
+    //
+    // 1. The rules must be satisfiable together. A value the guard calls
+    //    legal has to be writable by a handler that has written nothing else,
+    //    or the platform states a cap it refuses to honour.
+    //    The KEY counts too, so the budget has to clear a max value under a
+    //    max key — equality here would make the stated value cap unreachable.
+    std.debug.assert(reserved.KV_VAL_MAX + reserved.KV_KEY_MAX <= reserved.KV_WRITE_BYTES_MAX);
+    // 2. An activation that stays inside its write budget always fits one
+    //    raft message, with room for the envelope and writeset framing.
+    const FRAMING: usize = 32 * 1024;
+    std.debug.assert(reserved.KV_WRITE_BYTES_MAX + FRAMING <
+        bridge_mod.transport.MAX_ENTRY_BYTES);
+    // The activation's READS ride the same entry, and their budget lives with
+    // the tape rather than here (rove#430 §3). The two together can still
+    // exceed an entry — that is what `Bridge.propose`'s `EntryTooLarge`
+    // backstop is for, answered as a retry rather than a refusal — and the
+    // balanced split that removes even that case (value 128 KiB / writes
+    // 256 KiB / reads 128 KiB) waits on `blob.write`'s inline-append size.
 }
 
 /// The result of a propose. `group_id` is the tenant's raft group (the

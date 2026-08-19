@@ -125,9 +125,30 @@ Derived, in the order a write meets them:
 | limit | where | what a customer sees |
 |---|---|---|
 | `KV_VAL_MAX` (384 KiB) | the kv guard, at `kv.set` | `value_too_large`, a code to branch on |
-| `MAX_ENTRY_BYTES` | `Bridge.propose` | a defined 413 — not 421 (every node refuses identically), not a 503 after the fact |
+| `KV_WRITES_MAX` (1000) / `KV_WRITE_BYTES_MAX` (400 KiB), **per activation** | the same guard | `too_many_writes` / `writes_too_large` |
+| `MAX_ENTRY_BYTES` | `Bridge.propose` | a defined 413 when the batch is this one request; otherwise the retry-safe 421, because an entry carries the whole batch and cannot say whose writes did not fit |
 | the same, by bytes | `proposeMulti`'s batching | nothing: the batch spills into another entry |
 | `MAX_MESSAGE_BYTES` | the transport, dropping unsent | nothing; `raft_oversize_dropped_total` should never leave zero |
+
+**The budget is per ACTIVATION, and that is the whole point.** Writes
+accumulate into a batch writeset shared by every request in a dispatch pass, so
+a per-batch rule would let a busy neighbour spend a handler's allowance and
+would refuse requests that did nothing wrong. The counters therefore live on
+the activation's `DispatchState` (and on the run host / arena module state
+offline), and the check runs in the ONE shared guard every engine calls, so the
+sim and the browser refuse exactly where prod does.
+
+The peers this competes with cap the same thing at the same altitude: Deno KV
+allows 1000 mutations or 800 KiB per atomic operation, whichever comes first;
+DynamoDB 100 items per transaction; Durable Objects 128 pairs per `put()`.
+
+**The way past the budget is another activation, not a bigger entry.** That
+keeps each activation a bounded, replayable unit — the property the whole
+product rests on — and it is the answer the refusal messages name. Today the
+spelling is `after.ms(1)` + `next()`, because `after.ms(0)` is refused ("ms
+must be > 0"): a handler continuing itself has to ask for a delay it does not
+want. A first-class self-continuation (the `setTimeout(0)` of this model) is
+the missing ergonomic and is tracked separately.
 
 **Rejected: fragmenting large raft messages in the transport.** It would make
 the ceiling disappear as a customer-visible rule and reappear as unbounded
