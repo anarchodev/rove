@@ -309,6 +309,11 @@
     "seconds": 0.9,
     "status": "pass"
   },
+  "keyring_shred_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 0.0,
+    "status": "pass"
+  },
   "kv_cap_smoke_v2.py": {
     "rc": 0,
     "seconds": 4.9,
