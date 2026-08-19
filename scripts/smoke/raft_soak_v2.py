@@ -52,6 +52,8 @@ import time
 os.environ.setdefault("V2_SMOKE_DATA_BASE", os.path.expanduser("~/.cache/rove-soak"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import smoke_quiet  # noqa: E402
+import smoke_lib_v2  # noqa: E402
 from smoke_lib_v2 import (  # noqa: E402
     V2Cluster, rpc_wrap, metric_counter, metric_hist_mean_us,
 )
@@ -216,6 +218,21 @@ def main() -> int:
             print(f"SOAK_HB_RTT_MEAN_US={hb[0]:.1f}")
             print(f"SOAK_HB_RTT_N={hb[1]}")
 
+        # Attribution, not just detection (rove#655). A spurious election says
+        # the election timeout lost a race with a pause-tail; it does NOT say
+        # whose fault the pause was. A box that cannot fsync produces exactly
+        # this signature with the code untouched — observed at io.full avg60 =
+        # 59% while cpu.full was 0.00 and load average was 1.1 on 32 cores, so
+        # every CPU-shaped indicator read idle. Without this the one smoke
+        # whose job is catching consensus-timing regressions has to be argued
+        # about every time it goes red, which is how a real one eventually
+        # gets waved through as "probably the box".
+        stall = smoke_quiet.io_stall()
+        contended = (not smoke_lib_v2.box_was_quiet()) or (
+            stall is not None and stall >= smoke_quiet.STALL_INCONCLUSIVE_PCT)
+        if stall is not None:
+            print(f"SOAK_IO_STALL_FULL_AVG60_PCT={stall:.1f}")
+
         ok = spurious <= 0 and (h["c2xx"] or 0) > 0
         verdict = "zero spurious elections" if spurious <= 0 else f"{spurious:.0f} SPURIOUS ELECTION(S)"
         print(f"\n{'PASS' if ok else 'FAIL'} — {verdict} under "
@@ -224,6 +241,12 @@ def main() -> int:
               ("Election timeout is comfortably above the load pause-tail."
                if spurious <= 0 else
                "Election timeout is BELOW the load pause-tail — widen REWIND_RAFT_TICK_MS."))
+        if not ok and contended:
+            print("\nINCONCLUSIVE — the assertion failed, but the box was not quiet"
+                  + (f" (I/O stall {stall:.0f}% of the last 60s)" if stall is not None else "")
+                  + ". Re-run on an idle machine before believing this; it is NOT"
+                    " recorded as a regression (rove#655).")
+            return 78  # run_all.INCONCLUSIVE_RC
         return 0 if ok else 1
 
 
