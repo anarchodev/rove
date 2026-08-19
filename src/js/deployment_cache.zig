@@ -599,6 +599,27 @@ pub const TenantSlot = struct {
     /// erasure, so nothing may report one.
     keyring_complete: std.atomic.Value(bool) = .init(false),
 
+    /// This tenant's slot pool — minted keys waiting ahead of demand, so
+    /// binding an identity never waits on consensus. Null until
+    /// `keyring_pool.ensurePool` runs, and only ever on the node that
+    /// leads the tenant (two nodes refilling would disagree about which
+    /// key sits in a slot).
+    pool: ?crypt_mod.pool.SlotPool = null,
+    /// Type-erased callback context owned by the pool, with its free
+    /// function beside it so teardown needs no knowledge of its type.
+    pool_ctx: ?*anyopaque = null,
+    pool_ctx_free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
+
+    /// Handoff between the shared refill driver and slot teardown.
+    ///
+    /// `evictTenant` removes a slot under `tenant_files_lock` and frees
+    /// it OUTSIDE that lock, so a driver holding a raw slot pointer could
+    /// be working on freed memory. A driver claims this WHILE holding the
+    /// map lock — the slot is provably alive at that moment — and
+    /// teardown takes it before touching the pool, so it waits out an
+    /// in-flight refill instead of pulling the ground from under it.
+    pool_busy: std.Thread.Mutex = .{},
+
     /// Resolved per-tenant plan limits (docs/architecture/control-plane.md —
     /// operational state). Null until the CP delivers a plan
     /// (via the attach handshake on a move, or a live single-target push);
@@ -1225,6 +1246,19 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
     if (slot.plan.load(.acquire)) |p| allocator.destroy(p);
     for (slot.plan_retired.items) |p| allocator.destroy(p);
     slot.plan_retired.deinit(allocator);
+    // Pool before keyring: the pool borrows the keyring it mints into,
+    // and its refill thread may be mid-`mintRange` right now. Taking
+    // `pool_busy` is what waits that out — see the note on the field.
+    {
+        slot.pool_busy.lock();
+        defer slot.pool_busy.unlock();
+        if (slot.pool) |*p| p.deinit();
+        slot.pool = null;
+        if (slot.pool_ctx) |c| {
+            if (slot.pool_ctx_free) |f| f(allocator, c);
+            slot.pool_ctx = null;
+        }
+    }
     if (slot.keyring) |*k| k.deinit();
     slot.manifest_backend.deinit();
     slot.blob_backend.deinit();

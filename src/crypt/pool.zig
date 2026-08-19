@@ -112,17 +112,23 @@ pub const SlotPool = struct {
     ///
     /// `block_slots` defaults to one shard, so preparing a block is one
     /// `mintRange` and one shard push.
+    /// `drive` chooses who runs the refill. A pool is PER TENANT, so a
+    /// node hosting many of them must not give each an owned thread —
+    /// `.external` lets a small shared worker set drive them all. The
+    /// owned thread stays available for tests and single-pool callers.
     pub fn start(
         self: *Self,
         kr: *keyring_mod.Keyring,
         deps: Deps,
         block_slots: u32,
+        drive: reserve.Drive,
     ) !void {
         self.keyring = kr;
         self.deps = deps;
         try self.alloc.start(.{
             .provider = .{ .ctx = self, .reserveFn = prepareBlock },
             .block_size = block_slots,
+            .drive = drive,
             // Slot 0 is `TENANT_REF`, the tenant's own key — never
             // allocatable to an identity.
             .first_id = crypt.FIRST_SLOT,
@@ -168,6 +174,18 @@ pub const SlotPool = struct {
     /// which callers surface as not-found.
     pub fn keyAt(self: *const Self, slot: u64) ?crypt.Key {
         return self.keyring.keyAt(slot);
+    }
+
+    /// Does this pool want a block? The shared driver's poll.
+    pub fn needsRefill(self: *Self) bool {
+        return self.alloc.needsRefill();
+    }
+
+    /// Reserve at most one block. The shared driver's unit of work —
+    /// blocking (raft round trip, fsync, quorum push), so never called
+    /// from the poll loop.
+    pub fn refillOnce(self: *Self) anyerror!bool {
+        return self.alloc.refillOnce();
     }
 
     /// Reserve → mint → replicate. Runs on the allocator's refill
@@ -314,7 +332,7 @@ test "no slot is published before the watermark that announces it" {
     defer kr.deinit();
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     const slot = try pool.acquire();
@@ -340,7 +358,7 @@ test "a watermark that will not commit withholds the block" {
     defer kr.deinit();
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     // Never satisfied while the watermark write keeps failing.
@@ -363,7 +381,7 @@ test "every slot handed out already has a durable key" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 8);
+    try pool.start(&kr, h.deps(), 8, .owned_thread);
     defer pool.deinit();
 
     // The invariant, checked on every slot rather than at the end: by
@@ -392,7 +410,7 @@ test "slots start after the reserved tenant key" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     // Slot 0 is TENANT_REF. Handing it to an identity would make a
@@ -415,7 +433,7 @@ test "a slot is NOT handed out when replication cannot reach a quorum" {
     h.fail_replicate.store(true, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
 
     // This is the property the whole ordering exists for. A leader that
     // sealed under a locally-minted but unreplicated key, committed the
@@ -454,7 +472,7 @@ test "tryAcquire returns null instead of waiting when the pool cannot fill" {
     h.fail_replicate.store(true, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     // The whole point: this RETURNS. The worker is a poll loop, so a
@@ -480,7 +498,7 @@ test "tryAcquire yields durable slots on the fast path" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 8);
+    try pool.start(&kr, h.deps(), 8, .owned_thread);
     defer pool.deinit();
 
     // The first block has to land; `tryAcquire` never waits for it.
@@ -519,7 +537,7 @@ test "a reservation failure is retried without surfacing to the caller" {
     h.fail_reserve.store(3, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     const slot = try pool.acquire();
@@ -543,7 +561,7 @@ test "a block straddling a shard boundary replicates both shards" {
     h.committed_end.store(keyring_mod.SLOTS_PER_SHARD - 2, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     const slot = try pool.acquire();
@@ -568,7 +586,7 @@ test "keys survive a restart, and slots are not reissued after one" {
         var kr = try keyring_mod.Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
         defer kr.deinit();
         var pool = SlotPool{};
-        try pool.start(&kr, h.deps(), 4);
+        try pool.start(&kr, h.deps(), 4, .owned_thread);
         for (&first_slots, 0..) |*s, i| {
             s.* = try pool.acquire();
             first_keys[i] = pool.keyAt(s.*).?;
@@ -582,7 +600,7 @@ test "keys survive a restart, and slots are not reissued after one" {
     var kr = try keyring_mod.Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
     defer kr.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4);
+    try pool.start(&kr, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     for (first_slots, first_keys) |slot, key| {
@@ -606,7 +624,7 @@ test "a shredded slot reads as absent without disturbing the pool" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 8);
+    try pool.start(&kr, h.deps(), 8, .owned_thread);
     defer pool.deinit();
 
     const doomed = try pool.acquire();
