@@ -1352,7 +1352,8 @@ pub fn build(b: *std.Build) void {
     // is the routing source of truth the front-door reads and a move flips.
     // Slice 1 makes it durable: it backs writes with the V2 `bridge`'s
     // directory raft group, so it now imports the bridge (and its test links
-    // the raft artifact). Reads stay on a pointer-stable in-memory projection.
+    // the raft artifact). Reads go through an in-memory projection, and a node
+    // set is deep-copied out of it under the lock (rove#100).
     const v2_cp_dir_mod = b.createModule(.{
         .root_source_file = b.path("src/cp/directory.zig"),
         .target = target,
