@@ -148,6 +148,7 @@ test {
     // call sites, which a test build never instantiates — so its tests
     // are collected only if the file is named here.
     _ = @import("worker_ws.zig");
+    _ = @import("worker_dispatch.zig");
     _ = @import("worker_inbound_chunk.zig");
     _ = @import("worker_upload_walker.zig");
     _ = @import("log_walker.zig");

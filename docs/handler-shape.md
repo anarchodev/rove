@@ -278,10 +278,14 @@ discovered:
 | key | 256 bytes | `key_too_large` |
 | value | 384 KiB | `value_too_large` |
 | writes per activation | 1000 | `too_many_writes` |
-| written bytes per activation | 400 KiB (keys + values) | `writes_too_large` |
+| written bytes per activation | 400 KiB (keys + values + 9 bytes framing per write) | `writes_too_large` |
 
 All four throw at the call site with a `code` you can branch on, so a handler
-never discovers a limit as a failed request. The per-activation pair is
+never discovers a limit as a failed request. The byte budget counts what each
+write puts on the entry rather than the string lengths alone, so a thousand
+tiny writes spend 9 KB of it on framing — stated here because a budget
+measured in anything but the bytes it protects is one the entry can still
+overflow. The per-activation pair is
 **yours alone** — other activations running in the same dispatch pass share
 the underlying batch, but never your allowance.
 

@@ -14,6 +14,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const raft_rpc = @import("raft_rpc.zig");
+const sizing = @import("rove-sizing");
 
 /// Re-export the frame codec so out-of-module callers (the V2 transport
 /// adapter, `src/consensus/transport.zig`) can build/parse the `[len:u32 BE]
@@ -25,7 +26,13 @@ const raft_rpc = @import("raft_rpc.zig");
 pub const rpc = raft_rpc;
 
 pub const RING_DEPTH: u16 = 256;
-pub const RECV_BUF_SIZE: u32 = 512 * 1024;
+/// The fixed per-connection recv buffer. THE head of the sizing chain: every
+/// producer-side budget — the kv value cap, an activation's write budget, the
+/// kv tape's read budget, the batch's admission reserve — is derived from it
+/// in `rove-sizing`, because nothing here fragments and a frame above this
+/// cannot be reassembled at all. Owned there so those derivations cannot
+/// drift from the buffer they are about.
+pub const RECV_BUF_SIZE: u32 = @intCast(sizing.RECV_BUF_SIZE);
 pub const MAX_SEND_QUEUE: u32 = 1024;
 pub const RECONNECT_INITIAL_NS: i64 = 100 * std.time.ns_per_ms;
 pub const RECONNECT_MAX_NS: i64 = 5 * std.time.ns_per_s;

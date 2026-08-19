@@ -22,31 +22,29 @@
 const std = @import("std");
 const kv_mod = @import("raft-kv");
 const apply_mod = @import("apply.zig");
-// The wire limit every batch has to fit inside — one authority, in the
-// transport that owns the receiver's buffer size.
 const bridge_mod = @import("bridge");
-const reserved = @import("rove-reserved");
+// The wire limit every batch has to fit inside, and the arithmetic for how
+// many bytes a thing puts on it — one authority, derived from the receiver's
+// buffer size.
+const sizing = @import("rove-sizing");
+const tenant_mod = @import("rove-tenant");
 
 comptime {
-    // Two invariants, asserted rather than trusted.
-    //
-    // 1. The rules must be satisfiable together. A value the guard calls
-    //    legal has to be writable by a handler that has written nothing else,
-    //    or the platform states a cap it refuses to honour.
-    //    The KEY counts too, so the budget has to clear a max value under a
-    //    max key — equality here would make the stated value cap unreachable.
-    std.debug.assert(reserved.KV_VAL_MAX + reserved.KV_KEY_MAX <= reserved.KV_WRITE_BYTES_MAX);
-    // 2. An activation that stays inside its write budget always fits one
-    //    raft message, with room for the envelope and writeset framing.
-    const FRAMING: usize = 32 * 1024;
-    std.debug.assert(reserved.KV_WRITE_BYTES_MAX + FRAMING <
-        bridge_mod.transport.MAX_ENTRY_BYTES);
-    // The activation's READS ride the same entry, and their budget lives with
-    // the tape rather than here (rove#430 §3). The two together can still
-    // exceed an entry — that is what `Bridge.propose`'s `EntryTooLarge`
-    // backstop is for, answered as a retry rather than a refusal — and the
-    // balanced split that removes even that case (value 128 KiB / writes
-    // 256 KiB / reads 128 KiB) waits on `blob.write`'s inline-append size.
+    // The budgets and their partition of the entry are derived and asserted
+    // once, in `rove-sizing`. What has to hold HERE is the one term that
+    // derivation could not see: the longest id an envelope actually carries.
+    // Under-reserving it would make the entry's fixed framing a guess again.
+    std.debug.assert(tenant_mod.MAX_INSTANCE_ID_LEN <= sizing.MAX_ENVELOPE_ID_BYTES);
+}
+
+/// What an entry has left for a readset once `writeset` is on it, for a
+/// producer that proposes ONE envelope alone (a cont-resume, a fire's
+/// forgetful writes). The batch path computes this from its running total
+/// instead; both hand it to `serializeForEntry`, so no producer can put a
+/// readset on an entry that has no room for it.
+pub fn entryRoomFor(writeset: *const kv_mod.WriteSet) usize {
+    const spent = sizing.ENTRY_FIXED_BYTES + writeset.encodedSize();
+    return sizing.MAX_ENTRY_BYTES -| spent -| sizing.RS_BLOB_HDR_BYTES;
 }
 
 /// The result of a propose. `group_id` is the tenant's raft group (the
@@ -203,14 +201,10 @@ pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8) !Propo
 /// be split here, and `Bridge.propose` refuses it with `EntryTooLarge` so the
 /// caller gets a defined error instead of a silent drop.
 fn chunkEnd(inner: []const []const u8, from: usize, max_count: usize) usize {
-    // `encodeMulti`'s framing: [1B type][2B id_len][1B count] then per inner
-    // [u32 len][inner].
-    const MULTI_HDR: usize = 1 + 2 + 1;
-    const PER_INNER: usize = 4;
-    var total: usize = MULTI_HDR;
+    var total: usize = sizing.MULTI_HDR_BYTES;
     var end = from;
     while (end < inner.len and end - from < max_count) {
-        const next = total + PER_INNER + inner[end].len;
+        const next = total + sizing.MULTI_INNER_HDR_BYTES + inner[end].len;
         if (end > from and next > bridge_mod.transport.MAX_ENTRY_BYTES) break;
         total = next;
         end += 1;

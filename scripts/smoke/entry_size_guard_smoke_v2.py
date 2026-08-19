@@ -13,9 +13,12 @@ The rule this pins: never send a message we know a priori is too large.
 
   1. A single value over `KV_VAL_MAX` is refused at the call site, by the
      kv guard, with a code the handler can branch on.
-  2. A batch of legal values whose ENTRY exceeds the wire limit is refused at
-     propose — a defined 413, not the retry-safe 421 (every node would refuse
-     it identically) and not a 503 after the links tear down.
+  2. A batch of legal values never BUILDS an entry over the limit: the
+     dispatch walk stops admitting once the entry no longer holds a worst-case
+     activation, so the skipped requests ride the next tick instead of being
+     refused for a neighbour's size. And an activation whose reads and writes
+     together want more than one entry replicates anyway — the readset's raft
+     copy is what yields, never the write.
   3. Nothing reaches the wire: no `oversize frame` in any node log, and
      `raft_oversize_dropped_total` stays 0 — the transport backstop never
      even has to fire.
@@ -78,12 +81,14 @@ export default function () {
   }
   if (op === "small") { kv.set("s/" + p.get("k"), "ok"); return "s"; }
   if (op === "unfittable") {
-    // Legal writes AND a large recorded readset: this activation's own share
-    // of a raft entry cannot fit even with the batch to itself. It must get a
-    // TERMINAL answer the first time — a retry would re-run the same handler
-    // and fail identically.
+    // Seed the rows the next op reads back, so its readset is large.
     for (let i = 0; i < 3; i++) kv.set("seed/" + i, "s".repeat(115 * 1024));
     return "seeded";
+  }
+  if (op === "readback") {
+    let n = 0;
+    for (let i = 0; i < 3; i++) if (kv.get("uf/" + i) !== null) n++;
+    return "uf:" + n;
   }
   if (op === "unfittable2") {
     for (let i = 0; i < 3; i++) kv.get("seed/" + i);      // ~345 KiB of readset
@@ -162,17 +167,27 @@ def main() -> int:
               all(r.status == 200 and r.body == "fat" for r in fat),
               f"statuses={[r.status for r in fat]}")
 
-        # ── 5. an activation that can never fit gets a TERMINAL answer ──
-        # Its own writes + its own recorded reads exceed one entry, so a retry
-        # would re-run the same handler and fail identically. 413, once.
+        # ── 5. reads and writes want more than one entry: the READS yield ──
+        # ~345 KiB of recorded reads and ~345 KiB of writes in one activation.
+        # Both halves passed every call-site guard, so replication must not
+        # then refuse them: the writes are the activation's output and the
+        # readset is the record's fidelity, so the raft copy of the readset is
+        # cut down to the room the entry has left and the write commits.
+        # Answering 413 here would punish a handler for obeying every stated
+        # rule, and no retry could ever succeed.
         r = c.request("victim", "/?op=unfittable", timeout=60.0)
-        check("seed for the unfittable case", r.status == 200, f"{r.status}")
+        check("seed for the reads-plus-writes case", r.status == 200, f"{r.status}")
         codes = []
         for _ in range(3):
             rr = c.request("victim", "/?op=unfittable2", timeout=60.0)
             codes.append(rr.status)
-        check("an activation whose own entry cannot fit answers 413 every time, never a retry-loop 421",
-              codes == [413, 413, 413], f"statuses={codes}")
+        check("an activation inside both budgets always replicates, never 413/421",
+              codes == [200, 200, 200], f"statuses={codes}")
+        # And the write really landed — a 200 that dropped the write would be
+        # the worse failure.
+        rr = c.request("victim", "/?op=readback", timeout=60.0)
+        check("its writes are durable, not traded away for the readset",
+              rr.status == 200 and rr.body == "uf:3", f"{rr.status} {rr.body[:60]!r}")
 
         # ── 6. nothing reached the wire ──
         logs = "".join(Path(p).read_text(errors="replace")

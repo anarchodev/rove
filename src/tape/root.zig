@@ -78,6 +78,7 @@ const std = @import("std");
 /// relative order of a read and a write across those two structures is lost.
 pub const interaction_digest = @import("interaction-digest");
 const bodies_mod = @import("rove-bodies");
+const sizing = @import("rove-sizing");
 const log_mod = @import("rove-log");
 // The lean CLI's std-only decoder for this same per-Tape wire format
 // (`src/replay/tape_decode.zig` — it can't link this module; that would
@@ -324,31 +325,29 @@ pub const KvOutcome = enum(u8) {
 /// This is a budget, not an accounting line, because the kv tape rides the
 /// RAFT ENTRY: the readset is serialized into the type-0 envelope, and the
 /// coalesced transport tears a peer connection down when one message exceeds
-/// the receiver's fixed recv buffer (`src/kv/raft_net.zig` `RECV_BUF_SIZE`,
-/// 512 KiB; the frame ceiling is ~524,280 bytes). Uncapped, a handler that
-/// read broadly and then wrote proposed an entry no follower could receive —
-/// three 300 KB values read in one writing activation is enough — and the
-/// write failed with a torn-down replication link rather than anything the
-/// handler could see. A single `kv.prefix` page (up to `KV_PREFIX_MAX` rows)
-/// can reach that on its own.
+/// the receiver's fixed recv buffer (`rove-sizing`'s `RECV_BUF_SIZE`, the
+/// head of the whole sizing chain). Uncapped, a handler that read broadly and
+/// then wrote proposed an entry no follower could receive — three 300 KB
+/// values read in one writing activation is enough. A single `kv.prefix` page
+/// (up to `KV_PREFIX_MAX` rows) can reach that on its own.
 ///
-/// Half the frame, leaving the other half for the same entry's writeset, the
-/// other readset channels, and the envelope framing. Set as high as that
-/// allows on purpose: everything above it becomes a record that cannot be
-/// replayed against those reads, so the budget should bite the activation
-/// that would otherwise break replication, not the one that merely reads a
-/// lot. An ordinary activation — hundreds of rows, or one document-sized
-/// value — is nowhere near it.
-///
-/// The ENTRY as a whole still has no guard: a writeset alone can exceed the
-/// frame (`kv.set` accepts values up to `reserved.KV_VAL_MAX`, 1 MiB, which
-/// is larger than a frame), which is the write-side half of the same ceiling
-/// and a separate fix.
+/// It is the EARLY, cheap control, not the thing that makes the entry fit.
+/// What makes the entry fit is `serializeForEntry`, which cuts the RAFT COPY
+/// of the readset down to the room the entry has left once the activation's
+/// writes are known — leaving this tape, and so the LogRecord a leader
+/// flushes, untouched. So this number is chosen for the tape's own sake — how
+/// much of one activation's reading is worth carrying in memory — and is
+/// deliberately generous: everything above it becomes a record that cannot be
+/// replayed against those reads, so it should bite the activation that reads
+/// pathologically, not the one that merely reads a lot. An ordinary
+/// activation — hundreds of rows, or one document-sized value — is nowhere
+/// near it.
 ///
 /// There is no cap on the NUMBER of entries: dropping a read outright would
 /// make it indistinguishable from a read that never happened, which replays
 /// as fiction. So the budget elides values and keeps keys, and the residual
-/// growth (one key per read) is bounded by the activation's CPU budget.
+/// growth (one key per read) is bounded by the activation's CPU budget — and,
+/// on the entry, by the trim's last resort.
 pub const KV_TAPE_BUDGET: usize = 256 * 1024;
 
 pub const KvOp = enum(u8) {
@@ -788,6 +787,106 @@ pub const Tape = struct {
         self.owned_bytes += prefix_copy.len + cursor_copy.len + lost_copy.len;
     }
 
+    /// Serialize this channel with a hard ceiling on the bytes it produces.
+    /// Past `budget`, a read's VALUE is written in its ELIDED form — outcome
+    /// `elided`, value = the lost byte count — while its key stays.
+    ///
+    /// NON-MUTATING, and that is the point: only the RAFT copy of a readset
+    /// has an entry to fit inside. The tape itself keeps its values for the
+    /// LogRecord copy, which is what a customer replays, so entry pressure
+    /// never costs the record a leader actually flushes. When a leader dies
+    /// before flushing, the follower rebuilds from the trimmed copy and the
+    /// record says so — one of the two becomes THE record, never both.
+    ///
+    /// Keeping the key is what separates the two failure modes: a record that
+    /// names a read it cannot serve the value for is UNREPLAYABLE, which
+    /// replay reports; a record MISSING a read replays as fiction, because
+    /// the read looks like one that never happened.
+    ///
+    /// `dropped` accumulates the value bytes left off, for the caller to
+    /// report. kv channel only.
+    pub fn serializeBounded(
+        self: *const Tape,
+        allocator: std.mem.Allocator,
+        budget: usize,
+        dropped: *usize,
+    ) ![]u8 {
+        std.debug.assert(self.channel == .kv);
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        var header: [12]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], MAGIC, .big);
+        std.mem.writeInt(u16, header[4..6], VERSION, .big);
+        std.mem.writeInt(u16, header[6..8], @intFromEnum(self.channel), .big);
+        std.mem.writeInt(u32, header[8..12], @intCast(self.entries.items.len), .big);
+        try buf.appendSlice(allocator, &header);
+
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(allocator);
+
+        for (self.entries.items) |*e| {
+            scratch.clearRetainingCapacity();
+            try encodeEntry(allocator, &scratch, e);
+            // Room for this entry as recorded? Then it rides as recorded.
+            if (buf.items.len + 4 + scratch.items.len <= budget) {
+                var len_be: [4]u8 = undefined;
+                std.mem.writeInt(u32, &len_be, @intCast(scratch.items.len), .big);
+                try buf.appendSlice(allocator, &len_be);
+                try buf.appendSlice(allocator, scratch.items);
+                continue;
+            }
+            // Otherwise write the elided shape of it, from a stack copy — the
+            // tape's own entry is untouched. Only a resolved read has a value
+            // to give up; anything else (a miss, an error, an already-elided
+            // or refused entry) rides as recorded, since it is small and
+            // dropping it would lose the fact that the read happened.
+            var len_buf: [20]u8 = undefined;
+            var lean = e.*;
+            if (lean.kv.outcome == .ok) {
+                const lost: usize = switch (lean.kv.op) {
+                    .prefix => blk: {
+                        var rows: usize = 0;
+                        for (lean.kv.results) |row| rows += row.key.len + row.value.len;
+                        break :blk rows;
+                    },
+                    else => lean.kv.value.len,
+                };
+                const marker = std.fmt.bufPrint(&len_buf, "{d}", .{lost}) catch "0";
+                // A page always elides whole (a partial page replays as a
+                // complete one with different contents); a value only when
+                // the marker is actually smaller than what it replaces.
+                if (lost > 0 and (lean.kv.op == .prefix or marker.len < lean.kv.value.len)) {
+                    lean.kv.outcome = .elided;
+                    lean.kv.value = marker;
+                    lean.kv.results = &.{};
+                    dropped.* += lost;
+                    scratch.clearRetainingCapacity();
+                    try encodeEntry(allocator, &scratch, &lean);
+                }
+            }
+            var len_be: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_be, @intCast(scratch.items.len), .big);
+            try buf.appendSlice(allocator, &len_be);
+            try buf.appendSlice(allocator, scratch.items);
+        }
+
+        return buf.toOwnedSlice(allocator);
+    }
+
+    /// The serialized form of this channel with NO entries — the shape a
+    /// reader sees for a channel that recorded nothing. Used by the readset's
+    /// last-resort trim, which has to leave a well-formed blob behind rather
+    /// than a truncated one.
+    fn emptyBlob(self: *const Tape, allocator: std.mem.Allocator) ![]u8 {
+        const buf = try allocator.alloc(u8, 12);
+        std.mem.writeInt(u32, buf[0..4], MAGIC, .big);
+        std.mem.writeInt(u16, buf[4..6], VERSION, .big);
+        std.mem.writeInt(u16, buf[6..8], @intFromEnum(self.channel), .big);
+        std.mem.writeInt(u32, buf[8..12], 0, .big);
+        return buf;
+    }
+
     pub fn appendModule(
         self: *Tape,
         specifier: []const u8,
@@ -1204,6 +1303,30 @@ pub const Readset = struct {
         allocator: std.mem.Allocator,
         log_header: ?log_mod.LogHeader,
     ) ![]u8 {
+        var dropped: usize = 0;
+        return self.serializeWith(allocator, log_header, null, &dropped);
+    }
+
+    /// How a readset's channels are cut down to fit a raft entry. `null` (the
+    /// LogRecord copy) keeps everything.
+    const EntryBound = union(enum) {
+        /// Every channel rides as recorded except kv, whose blob is capped at
+        /// this many bytes (values past it are written elided).
+        kv_capped: usize,
+        /// Last resort: every channel rides EMPTY. What survives is the
+        /// header scalars and the `LogHeader` — which is what a follower needs
+        /// to rebuild the customer's log record, and the reason this beats
+        /// refusing the write.
+        drop_all,
+    };
+
+    fn serializeWith(
+        self: *const Readset,
+        allocator: std.mem.Allocator,
+        log_header: ?log_mod.LogHeader,
+        bound: ?EntryBound,
+        dropped: *usize,
+    ) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
@@ -1224,7 +1347,13 @@ pub const Readset = struct {
             &self.activation,
         };
         for (channels) |t| {
-            const blob = try t.serialize(allocator);
+            const blob = if (bound) |b| switch (b) {
+                .drop_all => try t.emptyBlob(allocator),
+                .kv_capped => |cap| if (t.channel == .kv)
+                    try t.serializeBounded(allocator, cap, dropped)
+                else
+                    try t.serialize(allocator),
+            } else try t.serialize(allocator);
             defer allocator.free(blob);
             var len_be: [4]u8 = undefined;
             std.mem.writeInt(u32, &len_be, @intCast(blob.len), .big);
@@ -1376,8 +1505,87 @@ pub fn encodeReadsetList(
     return out;
 }
 
+/// What a `serializeForEntry` call had to leave off, for the caller to report.
+pub const TrimStats = struct {
+    /// Value bytes written in elided form instead of as recorded.
+    elided_bytes: usize = 0,
+    /// The readset degraded all the way to its header plus the `LogHeader`.
+    dropped_channels: bool = false,
+};
+
+/// Serialize one activation's readset for the RAFT ENTRY, cut down to the
+/// `room` the entry has left.
+///
+/// The readset and the writeset ride the same entry, and the entry has a hard
+/// ceiling: above it the message cannot reach a follower at all. The writes
+/// are not negotiable — they are the activation's output, guarded at the call
+/// site against a budget the batch reserved — so what gives is this copy's
+/// fidelity, never the write. Values are written elided (keys stay); if even
+/// that is not enough, the channels ride empty and what survives is the
+/// header plus the `LogHeader`, which is what a follower needs to rebuild the
+/// customer's log record.
+///
+/// NON-MUTATING. The tape keeps everything for the LogRecord copy, which has
+/// no entry to fit in, so a record the leader flushes is never degraded by
+/// entry pressure. Only a follower-rebuilt one is, and it says so: an elided
+/// read reports a divergence on replay rather than replaying as absent.
+///
+/// `room` comes from the batch's exact accounting; admission guarantees it is
+/// never below `sizing.READSET_RESERVE`, so an ordinary activation never
+/// reaches this path at all.
+pub fn serializeForEntry(
+    readset: *const Readset,
+    allocator: std.mem.Allocator,
+    log_header: ?log_mod.LogHeader,
+    room: usize,
+    stats: ?*TrimStats,
+) ![]u8 {
+    var dropped: usize = 0;
+    const full = try readset.serializeWith(allocator, log_header, null, &dropped);
+    if (full.len <= room) return full;
+    allocator.free(full);
+
+    // What the other five channels and the framing already spend tells us
+    // what is left for kv, which is the only channel with a budget to cut
+    // against.
+    const kv_full = try readset.kv.serialize(allocator);
+    const kv_len = kv_full.len;
+    allocator.free(kv_full);
+    const others = full.len - kv_len;
+    if (others < room) {
+        const capped = try readset.serializeWith(
+            allocator,
+            log_header,
+            .{ .kv_capped = room - others },
+            &dropped,
+        );
+        if (capped.len <= room) {
+            if (stats) |st| st.elided_bytes = dropped;
+            return capped;
+        }
+        allocator.free(capped);
+    }
+
+    // Last resort. The other channels have no budget of their own — a fetch
+    // chunk's inline bytes, the activation's Msg — and the alternative to
+    // dropping them is an entry no follower can receive, which costs the
+    // WRITE and the peer connection carrying every other group's traffic
+    // besides.
+    dropped = 0;
+    const bare = try readset.serializeWith(allocator, log_header, .drop_all, &dropped);
+    if (bare.len <= room) {
+        if (stats) |st| {
+            st.dropped_channels = true;
+            st.elided_bytes = full.len - bare.len;
+        }
+        return bare;
+    }
+    allocator.free(bare);
+    return error.ReadsetTooLarge;
+}
+
 /// Serialize ONE activation's readset (with `log_header` stamped in)
-/// directly into a `rs_bytes` payload — i.e. `serialize` followed by
+/// directly into a `rs_bytes` payload — i.e. `serializeForEntry` followed by
 /// `encodeReadsetList(&.{blob})`, with the intermediate blob freed
 /// internally. The single owner of the "wrap a lone readset as the
 /// 1-item list the wire expects" step that every single-readset
@@ -1385,12 +1593,17 @@ pub fn encodeReadsetList(
 /// `rs_bytes` is always a list. Returns freshly-allocated bytes the
 /// caller owns. On any failure the caller's convention is
 /// to log + fall back to empty `rs_bytes` (best-effort replication).
+///
+/// `room` is what the entry has left after this activation's writeset — the
+/// producers here propose one envelope alone, so it is nearly the whole
+/// entry.
 pub fn encodeSingleReadset(
     allocator: std.mem.Allocator,
     readset: *const Readset,
     log_header: ?log_mod.LogHeader,
+    room: usize,
 ) ![]u8 {
-    const blob = try readset.serialize(allocator, log_header);
+    const blob = try serializeForEntry(readset, allocator, log_header, room, null);
     defer allocator.free(blob);
     return encodeReadsetList(allocator, &.{blob});
 }
@@ -2740,4 +2953,105 @@ test {
     // reaches, and importing a file for its declarations does not reach it.
     // `scripts/ops/test_reachability_lint.py` fails when one is missing here.
     _ = interaction_digest;
+}
+
+test "the readset list is the sizing chain's arithmetic" {
+    // The batch charges each activation `RS_BLOB_HDR_BYTES + blob.len` and
+    // the entry has to agree, or admission reserves against a different
+    // number than the transport refuses on.
+    const a = testing.allocator;
+    const blobs = [_][]const u8{ "aaaa", "bbbbbb" };
+    const encoded = try encodeReadsetList(a, &blobs);
+    defer a.free(encoded);
+    try testing.expectEqual(sizing.readsetListBytes(2, 4 + 6), encoded.len);
+
+    const empty = try encodeReadsetList(a, &.{});
+    try testing.expectEqual(sizing.readsetListBytes(0, 0), empty.len);
+}
+
+test "serializeForEntry trims to the room the entry has, keeping every key" {
+    // An activation that read broadly AND wrote heavily cannot have both on
+    // one entry. What gives is this copy's fidelity, never the write: values
+    // ride elided, keys stay, and replay reports a divergence at the elided
+    // read rather than replaying it as a read that never happened.
+    const a = testing.allocator;
+    var rs = Readset.init(a, 42, 7);
+    defer rs.deinit();
+    try rs.kv.appendKv(.get, "small/one", "v", .ok);
+    const big = try a.alloc(u8, 40 * 1024);
+    defer a.free(big);
+    @memset(big, 'x');
+    try rs.kv.appendKv(.get, "big/a", big, .ok);
+    try rs.kv.appendKv(.get, "big/b", big, .ok);
+
+    const room: usize = 16 * 1024;
+    var stats: TrimStats = .{};
+    const blob = try serializeForEntry(&rs, a, null, room, &stats);
+    defer a.free(blob);
+    try testing.expect(blob.len <= room);
+    try testing.expect(stats.elided_bytes >= big.len);
+    try testing.expect(!stats.dropped_channels);
+
+    // The TAPE is untouched — the LogRecord copy has no entry to fit in, so
+    // entry pressure must not cost the record a leader actually flushes.
+    try testing.expectEqual(@as(usize, 3), rs.kv.entries.items.len);
+    try testing.expectEqual(@as(u32, 0), rs.kv.elided_reads);
+    for (rs.kv.entries.items) |e| try testing.expectEqual(KvOutcome.ok, e.kv.outcome);
+    const untrimmed = try rs.serialize(a, null);
+    defer a.free(untrimmed);
+    try testing.expect(untrimmed.len > room);
+
+    // Every read is still NAMED in the trimmed copy: parse it back and count.
+    const parsed = try parseReadset(blob);
+    var kv_tape = try parse(a, parsed.blobs[0]);
+    defer kv_tape.deinit();
+    try testing.expectEqual(@as(usize, 3), kv_tape.entries.len);
+    var elided: usize = 0;
+    for (kv_tape.entries) |e| {
+        try testing.expect(e.kv.key.len > 0);
+        if (e.kv.outcome == .elided) elided += 1;
+    }
+    try testing.expect(elided >= 1);
+}
+
+test "serializeForEntry leaves a readset that already fits untouched" {
+    const a = testing.allocator;
+    var rs = Readset.init(a, 42, 7);
+    defer rs.deinit();
+    try rs.kv.appendKv(.get, "k", "v", .ok);
+
+    const plain = try rs.serialize(a, null);
+    defer a.free(plain);
+    var stats: TrimStats = .{};
+    const bounded = try serializeForEntry(&rs, a, null, sizing.READSET_RESERVE, &stats);
+    defer a.free(bounded);
+    try testing.expectEqualSlices(u8, plain, bounded);
+    try testing.expectEqual(@as(usize, 0), stats.elided_bytes);
+}
+
+test "serializeForEntry drops the channels rather than build an entry nobody can receive" {
+    // The last resort. The other channels have no budget of their own — a
+    // fetch chunk's inline bytes, the activation's Msg — so when capping kv
+    // is not enough the readset degrades to its header plus the LogHeader,
+    // which is what a follower needs to rebuild the log record.
+    const a = testing.allocator;
+    var rs = Readset.init(a, 42, 7);
+    defer rs.deinit();
+    const chunk = try a.alloc(u8, 8 * 1024);
+    defer a.free(chunk);
+    @memset(chunk, 'z');
+    try rs.trigger_payload.appendTriggerPayload(bodies_mod.BodyRef.none, chunk);
+
+    const room: usize = 1024;
+    var stats: TrimStats = .{};
+    const blob = try serializeForEntry(&rs, a, null, room, &stats);
+    defer a.free(blob);
+    try testing.expect(blob.len <= room);
+    try testing.expect(stats.dropped_channels);
+    // Still well-formed, and still the activation's scalars.
+    const parsed = try parseReadset(blob);
+    try testing.expectEqual(@as(i64, 42), parsed.timestamp_ns);
+    try testing.expectEqual(@as(u64, 7), parsed.seed);
+    // And the tape kept its entry for the LogRecord copy.
+    try testing.expectEqual(@as(usize, 1), rs.trigger_payload.entries.items.len);
 }

@@ -20,6 +20,7 @@ const digest_mod = tape_mod.interaction_digest;
 const rove = @import("rove");
 const reserved = @import("rove-reserved");
 const guards = @import("rove-guards");
+const sizing = @import("rove-sizing");
 
 const c = qjs.c;
 
@@ -57,7 +58,10 @@ fn refusePlatformWrite(
 ) ?c.JSValue {
     const refusal = guards.checkKvWrite(key, value, true, .{
         .ops = state.write_ops,
-        .bytes = state.write_bytes,
+        // The side envelope this write lands on costs framing beyond the op
+        // itself, and `notePlatformWrite` charges it. Judge against the same
+        // figure, or the verdict and the charge disagree by that framing.
+        .bytes = state.write_bytes + SIDE_ENVELOPE_FRAMING,
     }) orelse return null;
     if (refusal.message.len > 0) return throwKvError(ctx, refusal.message, refusal.code);
     const msg = std.fmt.allocPrint(
@@ -69,12 +73,31 @@ fn refusePlatformWrite(
     return throwKvError(ctx, msg, guards.kv_reserved_code);
 }
 
+/// The framing one privileged write adds to the entry beyond its own op: the
+/// side envelope it lands on (the root writeset, or a cross-tenant target's)
+/// and that envelope's multi-inner header.
+///
+/// Charged per WRITE rather than per envelope, because this surface cannot
+/// see which write opened one — and uniformly, including on the self-scope
+/// branch that rides the anchor writeset, because the verdict is decided
+/// before that branch is chosen and the check and the charge have to be the
+/// same number. Both over-charge; over-charging a budget is the safe
+/// direction, since under-charging leaves a byte on the entry that batch
+/// admission never saw.
+const SIDE_ENVELOPE_FRAMING: usize =
+    sizing.sideEnvelopeFramingBytes(sizing.MAX_ENVELOPE_ID_BYTES);
+
 /// Charge the activation's write budget for a write that HAPPENED — a refused
 /// or failed one costs nothing, or a handler could be starved by writes that
 /// never reached the entry. Mirrors `WorkerKv.noteWrite`.
-fn notePlatformWrite(state: *DispatchState, bytes: usize) void {
+///
+/// The budget is in WIRE bytes, so the op's writeset framing counts, and so
+/// does the side envelope's (see `SIDE_ENVELOPE_FRAMING`): a platform write
+/// rides the same entry as the batch, and an entry is what this budget exists
+/// to keep deliverable.
+fn notePlatformWrite(state: *DispatchState, key_len: usize, value_len: usize) void {
     state.write_ops += 1;
-    state.write_bytes += bytes;
+    state.write_bytes += guards.kvWriteCost(key_len, value_len) + SIDE_ENVELOPE_FRAMING;
 }
 
 // ── cross-store read taping ───────────────────────────────────────
@@ -327,7 +350,7 @@ pub fn jsPlatformRootSet(
     tenant.root.put(key, val) catch |err| {
         state.pending_kv_error = err;
     };
-    notePlatformWrite(state, key.len + val.len);
+    notePlatformWrite(state, key.len, val.len);
     recordStoreWrite(state, "r", key, val);
     // Mirror the write into the root writeset so the worker can
     // propose it through raft. Admin handlers ALWAYS have this
@@ -374,7 +397,7 @@ pub fn jsPlatformRootDelete(
     };
     // A delete of a key missing LOCALLY still propagates (the NotFound arm
     // above), so it rides the entry and costs the budget like any other op.
-    notePlatformWrite(state, key.len);
+    notePlatformWrite(state, key.len, 0);
     if (state.root_writeset) |ws| {
         ws.addDelete(key) catch |err| {
             state.pending_kv_error = err;
@@ -951,7 +974,7 @@ fn scopeKvWrite(
                 state.writeset.addPut(key, val) catch |err| {
                     state.pending_kv_error = err;
                 };
-                notePlatformWrite(state, key.len + val.len);
+                notePlatformWrite(state, key.len, val.len);
             },
             .delete => {
                 state.txn.delete(key) catch |err| {
@@ -961,7 +984,7 @@ fn scopeKvWrite(
                 state.writeset.addDelete(key) catch |err| {
                     state.pending_kv_error = err;
                 };
-                notePlatformWrite(state, key.len);
+                notePlatformWrite(state, key.len, 0);
             },
         }
         return js_undefined;
@@ -975,8 +998,9 @@ fn scopeKvWrite(
         },
     };
     // The trampoline's writeset is a SIDE envelope on the same entry, so it
-    // costs this activation's budget exactly as a local write does.
-    notePlatformWrite(state, key.len + if (op == .put) val.len else 0);
+    // costs this activation's budget — its op's wire bytes and the envelope's
+    // framing — exactly as the self-scope branch above does.
+    notePlatformWrite(state, key.len, if (op == .put) val.len else 0);
     return js_undefined;
 }
 

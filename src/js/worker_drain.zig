@@ -816,7 +816,7 @@ fn proposeAndParkContResume(
     // anchor envelope expects, so the resumed activation is replayable
     // on any follower. Best-effort — any failure logs and we propose
     // with empty rs_bytes.
-    const rs_bytes: []u8 = tape_mod.encodeSingleReadset(allocator, readset, log_header_opt) catch |err| blk: {
+    const rs_bytes: []u8 = tape_mod.encodeSingleReadset(allocator, readset, log_header_opt, raft_propose.entryRoomFor(writeset)) catch |err| blk: {
         std.log.warn(
             "rove-js cont-resume: encodeSingleReadset tenant={s}: {s}",
             .{ tenant_id, @errorName(err) },

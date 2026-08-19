@@ -19,6 +19,7 @@
 const std = @import("std");
 const kvstore = @import("kvstore.zig");
 const usage = @import("usage.zig");
+const sizing = @import("rove-sizing");
 
 pub const OpType = enum(u8) {
     put = 1,
@@ -639,4 +640,28 @@ fn cleanupDb(path: [:0]const u8) void {
     const shm = std.fmt.bufPrint(&shm_buf, "{s}-shm", .{path}) catch return;
     std.fs.cwd().deleteFile(wal) catch {};
     std.fs.cwd().deleteFile(shm) catch {};
+}
+
+test "encodedSize is the sizing chain's arithmetic, op for op" {
+    // The budget an activation spends is denominated in `sizing.writeOpBytes`
+    // and the admission walk sums it; this file is what actually writes those
+    // bytes. Binding the two here is what stops a layout change from moving
+    // the encoder without moving every budget derived from it.
+    const a = testing.allocator;
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "value");
+    try ws.addDelete("gone");
+    try ws.addPut("longer/key/here", "y" ** 300);
+
+    var charged: usize = 0;
+    for (ws.ops.items) |op| charged += switch (op) {
+        .put => |p| sizing.writeOpBytes(p.key.len, p.value.len),
+        .delete => |d| sizing.writeOpBytes(d.key.len, 0),
+    };
+    try testing.expectEqual(ws.encodedSize(), sizing.writeSetBytes(charged));
+
+    const bytes = try ws.encode(a);
+    defer a.free(bytes);
+    try testing.expectEqual(ws.encodedSize(), bytes.len);
 }

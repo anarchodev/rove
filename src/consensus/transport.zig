@@ -74,6 +74,7 @@ fn nowNs() i64 {
 
 const RaftNet = raftnet.RaftNet;
 const rpc = raftnet.rpc;
+const sizing = @import("rove-sizing");
 const StepBatchEntry = raft.manager.StepBatchEntry;
 
 pub const PeerAddr = raftnet.PeerAddr;
@@ -95,19 +96,19 @@ const OutBuf = struct {
 /// Per-record header in the coalesced body: [group_id:u64][epoch:u64][len:u32].
 /// (There is no WAL-compaction `floor` field — mechanism-A compaction is
 /// per-node, so no cross-node floor is propagated.)
-const RECORD_HDR_SIZE: usize = 20;
+const RECORD_HDR_SIZE: usize = sizing.RECORD_HDR_BYTES;
 /// Coalesced-frame version byte (`docs/architecture/format-versioning.md` §3.2).
 /// Bump when the frame/record layout changes; the decoder rejects any
 /// other value loudly. Frozen v1 at the pre-launch format freeze.
 pub const FRAME_VERSION: u8 = 1;
 /// Bytes the frame prepends to the body before the records: `version:u8`
 /// + `count:u32`.
-const FRAME_PREFIX_SIZE: usize = 1 + 4;
+const FRAME_PREFIX_SIZE: usize = sizing.FRAME_PREFIX_BYTES;
 /// A coalesced frame is [HEADER_SIZE][version:u8][count:u32][body] and MUST fit
 /// the receiver's fixed recv buffer (raft_net's RECV_BUF_SIZE) — an oversize
 /// frame can't be reassembled and is torn down loudly on the recv side. Cap the
 /// body accordingly; queueOut flushes early when the next record would blow it.
-const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZE - FRAME_PREFIX_SIZE;
+const MAX_FRAME_BODY: usize = sizing.MAX_FRAME_BODY;
 
 /// The largest raft message this transport can put on the wire: one record,
 /// alone in its frame. Above it there is nowhere to put the bytes — the
@@ -116,7 +117,7 @@ const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZ
 /// receiver cannot buffer: doing so costs the whole peer connection, which
 /// carries every group's heartbeats and appends between those two nodes, not
 /// just the group that produced the message.
-pub const MAX_MESSAGE_BYTES: usize = MAX_FRAME_BODY - RECORD_HDR_SIZE;
+pub const MAX_MESSAGE_BYTES: usize = sizing.MAX_MESSAGE_BYTES;
 
 /// The largest ENVELOPE a propose may carry (`Bridge.propose` refuses above
 /// it). One entry per raft message (`max_size_per_msg = 0` is raft-rs for "at
@@ -125,20 +126,27 @@ pub const MAX_MESSAGE_BYTES: usize = MAX_FRAME_BODY - RECORD_HDR_SIZE;
 /// which `PROTO_HEADROOM` is a deliberately fat reserve.
 ///
 /// This is the number every producer-side budget derives from: a kv value
-/// (`reserved.KV_VAL_MAX`), a batched multi-propose chunk
-/// (`raft_propose.proposeMulti`), and the readset's kv tape all have to fit
-/// inside one of these, together.
-pub const MAX_ENTRY_BYTES: usize = MAX_MESSAGE_BYTES - PROTO_HEADROOM;
-const PROTO_HEADROOM: usize = 4096;
+/// (`reserved.KV_VAL_MAX`), an activation's write budget, the kv tape's read
+/// budget and the batch's admission reserve all have to fit inside one of
+/// these, together. The derivation is `rove-sizing`'s, stated once; these are
+/// re-exports so the transport's callers keep reading it from the transport.
+pub const MAX_ENTRY_BYTES: usize = sizing.MAX_ENTRY_BYTES;
+const PROTO_HEADROOM: usize = sizing.PROTO_HEADROOM;
 
 comptime {
-    // The chain that makes the guard real: entry ≤ message ≤ frame body ≤ the
-    // receiver's buffer. If a future change breaks a link here, the failure
-    // mode is a torn peer connection under load, which reads as an election
-    // storm and not as a size bug — so fail the build instead.
-    std.debug.assert(MAX_ENTRY_BYTES < MAX_MESSAGE_BYTES);
-    std.debug.assert(MAX_MESSAGE_BYTES + RECORD_HDR_SIZE <= MAX_FRAME_BODY);
-    std.debug.assert(MAX_FRAME_BODY + rpc.HEADER_SIZE + FRAME_PREFIX_SIZE <= raftnet.RECV_BUF_SIZE);
+    // The chain that makes the guard real (entry ≤ message ≤ frame body ≤ the
+    // receiver's buffer) is asserted where it is derived, in `rove-sizing`.
+    // What has to hold HERE is that this file's own layout still matches the
+    // terms that derivation was built from: the record header this file
+    // writes, and the frame prefix `flush` prepends. If a future change adds
+    // a field to either without moving the chain, the failure mode is a torn
+    // peer connection under load, which reads as an election storm and not as
+    // a size bug — so fail the build instead.
+    std.debug.assert(RECORD_HDR_SIZE == 8 + 8 + 4);
+    std.debug.assert(FRAME_PREFIX_SIZE == 1 + 4);
+    std.debug.assert(rpc.HEADER_SIZE == sizing.RPC_HEADER_BYTES);
+    std.debug.assert(MAX_FRAME_BODY ==
+        @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZE - FRAME_PREFIX_SIZE);
 }
 
 /// Peer-slot capacity: the largest cluster this node will ever address. The

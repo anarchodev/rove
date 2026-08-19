@@ -2188,7 +2188,7 @@ pub fn proposeForgetfulWrites(
     // propose with empty rs_bytes — the chain just doesn't get
     // readset-replicated for this entry.
     const rs_bytes: []u8 = if (readset_opt) |rs|
-        tape_mod.encodeSingleReadset(allocator, rs, log_header_opt) catch |err| blk: {
+        tape_mod.encodeSingleReadset(allocator, rs, log_header_opt, raft_propose.entryRoomFor(writeset)) catch |err| blk: {
             std.log.warn(
                 "rove-js proposeForgetfulWrites: encodeSingleReadset tenant={s}: {s}",
                 .{ tenant_id, @errorName(err) },

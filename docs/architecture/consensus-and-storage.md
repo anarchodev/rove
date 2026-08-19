@@ -100,20 +100,42 @@ heartbeats and appends of every other group hosted on the same node pair. One
 tenant's oversize write cost its neighbours an election storm.
 
 So the rule is **never put a message on the wire that we know a priori cannot
-be received**, enforced at three depths, all deriving from one constant
-(`transport.MAX_ENTRY_BYTES`):
+be received**, enforced at four depths, all deriving from one chain
+(`rove-sizing`: `RECV_BUF_SIZE` → frame → message → entry → the per-activation
+budgets, each computed from the one above and comptime-asserted):
 
 - **the value cap** (`reserved.KV_VAL_MAX`, 384 KiB) — a value the kv guard
   admits is always one a follower can receive, so an over-size write is a
   `value_too_large` refusal at `kv.set` rather than a fault during
   replication;
-- **the propose gate** (`Bridge.propose` → `EntryTooLarge`) — a batch of legal
-  values whose entry is nonetheless too big is refused before it enters the
-  leader's log, and the dispatcher answers a defined 413 (not the retry-safe
-  421: every node refuses identically);
+- **batch admission** (`worker_dispatch.batchAdmits`) — a dispatch pass stops
+  coalescing once the entry no longer holds a worst-case activation
+  (`sizing.ACTIVATION_RESERVE`), so a skipped request rides the next tick
+  rather than being refused for a neighbour's size;
+- **the propose gate** (`Bridge.propose` → `EntryTooLarge`) — the backstop for
+  producers that do not go through admission. From the dispatch path it is
+  unreachable by construction; when it does fire the dispatcher answers a
+  defined 413 for an activation whose own share could never fit (not the
+  retry-safe 421: every node refuses identically);
 - **the batcher** (`raft_propose.proposeMulti`) — the multi-envelope batch
   spills into another entry by BYTES, not only at 255 inners; count never
   bounded bytes.
+
+Every one of those measures **wire bytes**, through one arithmetic bound to
+each encoder by a round-trip test. That is deliberate: the write budget an
+activation spends and the limit the transport refuses on have to be the same
+quantity, or a reserve and a ceiling drift apart with every test green
+(decisions.md, "one accounting: four scopes, one unit, one derivation").
+
+**The activation's reads ride the same entry as its writes**, and the two
+budgets partition it by construction. When an activation wants more of both
+than one entry holds, what yields is fidelity and never the write: the raft
+COPY of the readset is cut down to the room the entry has left — values
+written elided, every key kept, degrading in the limit to the `LogHeader` a
+follower needs to rebuild the log record. The tape a leader flushes is
+untouched, so only a follower-rebuilt record is degraded, and it says so.
+`KV_TAPE_BUDGET` is the early control on how much reading is carried at all,
+not what makes the entry fit.
 
 The transport keeps a backstop that drops (never sends) an oversize message
 and counts it as `raft_oversize_dropped_total` — expected to stay zero, since
