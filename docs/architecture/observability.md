@@ -46,12 +46,14 @@ Tempo).
 auto-memory as `project_observability_split`): **customer request logs
 do not go to Grafana.** They live in the per-tenant replay store
 ([`deployment-and-logs.md`](deployment-and-logs.md) — S3-direct,
-page-encrypted at rest, addressable by request_id). Grafana Cloud holds
+addressable by request_id). Grafana Cloud holds
 operator-shaped signals only.
 `tenant_id` and `request_id` ride as **trace exemplars or low-cardinality
 structured-log fields**, never as Prometheus labels. The reasons:
 
-- Page-encrypted product data can't be sent to a third-party in plaintext.
+- Customer request content does not go to a third-party subprocessor. This
+  rests on it being customer content, not on it being ciphertext —
+  encryption at rest is unbuilt (PLAN §2.7, Phase 9).
 - The replay store already holds the bytes; double-shipping inflates the bill.
 - Per-tenant labels explode Grafana Cloud's active-series count
   (which is what they charge on).

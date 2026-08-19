@@ -372,16 +372,20 @@ const Router = struct {
             };
         };
         defer a.free(tenant);
-        const resolution = self.directory.resolve(tenant) orelse {
+        var resolution = (self.directory.resolve(a, tenant) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        }) orelse {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         };
+        defer resolution.deinit(a);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
         const w = buf.writer(a);
-        try w.print("{{\"cluster\":\"{s}\",\"tenant\":\"{s}\",\"nodes\":[", .{ resolution.cluster.id, tenant });
-        for (resolution.cluster.nodes, 0..) |n, i| {
+        try w.print("{{\"cluster\":\"{s}\",\"tenant\":\"{s}\",\"nodes\":[", .{ resolution.id, tenant });
+        for (resolution.nodes, 0..) |n, i| {
             if (i > 0) try w.writeByte(',');
             try w.print("\"{s}\"", .{n});
         }
@@ -701,7 +705,7 @@ const Router = struct {
 
         // Create-only — provisioning an already-placed tenant is a 409 (its
         // group already exists; relocate via `/_control/move`).
-        if (self.directory.resolve(tenant) != null) {
+        if (self.directory.isPlaced(tenant)) {
             try self.replyProvisionError(server, ent, sid, sess, 409, "that name is taken");
             return;
         }
@@ -715,18 +719,31 @@ const Router = struct {
             try self.replyProvisionError(server, ent, sid, sess, 429, "tenant creation is rate limited — retry in a minute");
             return;
         }
-        const cluster_ref = if (parsed.value.cluster.len > 0)
-            self.directory.clusterById(parsed.value.cluster) orelse {
-                try self.replyProvisionError(server, ent, sid, sess, 400, "unknown cluster");
-                return;
+        // OWNED (rove#100): `nodes` is held across attachToAll → awaitDestLeader
+        // → evictAll → pushDomainToNodes, every one of them a blocking HTTP
+        // fan-out. A projection-aliased slice would be freed under us by a
+        // concurrent `/_control/cluster` re-address on the pump thread.
+        var cluster_ref: directory_mod.Directory.OwnedCluster = blk: {
+            if (parsed.value.cluster.len > 0) {
+                break :blk (self.directory.clusterById(a, parsed.value.cluster) catch {
+                    try replyStatus(server, ent, sid, sess, 500);
+                    return;
+                }) orelse {
+                    try self.replyProvisionError(server, ent, sid, sess, 400, "unknown cluster");
+                    return;
+                };
             }
-        else
-            self.directory.soleCluster() orelse {
+            break :blk (self.directory.soleCluster(a) catch {
+                try replyStatus(server, ent, sid, sess, 500);
+                return;
+            }) orelse {
                 try self.replyProvisionError(server, ent, sid, sess, 400, "cluster is required (more than one is configured)");
                 return;
             };
+        };
+        defer cluster_ref.deinit(a);
         const cluster = cluster_ref.id;
-        const nodes = cluster_ref.nodes; // pointer-stable across the calls below
+        const nodes = cluster_ref.nodes;
 
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
             try replyStatus(server, ent, sid, sess, 500);
@@ -949,9 +966,9 @@ const Router = struct {
         // An unplaced tenant may still have a group on nodes from a previous
         // partial delete, so fall back to every configured cluster's nodes
         // rather than skipping eviction (that is what makes a retry converge).
-        var nodes_owned: ?directory_mod.Directory.OwnedResolution = null;
+        var nodes_owned: ?directory_mod.Directory.OwnedCluster = null;
         defer if (nodes_owned) |*r| r.deinit(a);
-        nodes_owned = (self.directory.resolveOwned(a, tenant) catch null) orelse null;
+        nodes_owned = (self.directory.resolve(a, tenant) catch null) orelse null;
 
         // The storage incarnation names the tenant's object prefix (#357), and
         // the sweep in step 4 needs it. Read it here alongside the other
@@ -1225,10 +1242,11 @@ const Router = struct {
     /// the state within one reconcile interval.
     fn pushSuspendToServingCluster(self: *Router, tenant: []const u8, suspended: bool) void {
         const a = self.allocator;
-        const res = self.directory.resolve(tenant) orelse return; // unplaced
+        var res = (self.directory.resolve(a, tenant) catch return) orelse return; // unplaced
+        defer res.deinit(a);
         const payload = std.json.Stringify.valueAlloc(a, .{ .tenant = tenant, .suspended = suspended }, .{}) catch return;
         defer a.free(payload);
-        for (res.cluster.nodes) |base| {
+        for (res.nodes) |base| {
             if (bc.call(self, base, "/_system/v2-suspend", .POST, payload, &.{})) |resp| {
                 var r = resp;
                 defer r.deinit(a);
@@ -1382,10 +1400,11 @@ const Router = struct {
     /// (the plan rides its first attach instead).
     fn pushPlanToServingCluster(self: *Router, tenant: []const u8, plan: []const u8) void {
         const a = self.allocator;
-        const res = self.directory.resolve(tenant) orelse return; // unplaced
+        var res = (self.directory.resolve(a, tenant) catch return) orelse return; // unplaced
+        defer res.deinit(a);
         const payload = std.json.Stringify.valueAlloc(a, .{ .tenant = tenant, .plan = plan }, .{}) catch return;
         defer a.free(payload);
-        for (res.cluster.nodes) |base| {
+        for (res.nodes) |base| {
             if (bc.call(self, base, "/_system/v2-plan", .POST, payload, &.{})) |resp| {
                 var r = resp;
                 defer r.deinit(a);
@@ -1405,8 +1424,10 @@ const Router = struct {
     /// caller surfaces that). Mirror of `pushPlanToServingCluster`, but GATED
     /// (a half-mapped host must not report success — docs/architecture/auth-consolidation.md B3).
     fn pushDomainToServingCluster(self: *Router, tenant: []const u8, host: []const u8) bool {
-        const res = self.directory.resolve(tenant) orelse return false; // unplaced
-        return self.pushDomainToNodes(res.cluster.nodes, tenant, host);
+        const a = self.allocator;
+        var res = (self.directory.resolve(a, tenant) catch return false) orelse return false; // unplaced
+        defer res.deinit(a);
+        return self.pushDomainToNodes(res.nodes, tenant, host);
     }
 
     /// Push the `host → tenant` worker alias to an EXPLICIT node set (the
@@ -1537,19 +1558,28 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 400);
             return;
         }
-        const resolution = self.directory.resolve(tenant) orelse {
+        // OWNED (rove#100): both node sets are held across the whole
+        // attach → await → forward → flip → evict sequence, all blocking HTTP.
+        var src = (self.directory.resolve(a, tenant) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        }) orelse {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         };
-        const src = resolution.cluster;
+        defer src.deinit(a);
         if (std.mem.eql(u8, src.id, dest)) {
             try replyStatus(server, ent, sid, sess, 400);
             return;
         }
-        const dest_ref = self.directory.clusterById(dest) orelse {
+        var dest_ref = (self.directory.clusterById(a, dest) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        }) orelse {
             try replyStatus(server, ent, sid, sess, 400);
             return;
         };
+        defer dest_ref.deinit(a);
         const src_nodes = src.nodes;
         const dest_nodes = dest_ref.nodes;
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {

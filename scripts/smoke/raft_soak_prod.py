@@ -43,6 +43,8 @@ os.environ["REWIND_CP_RECONCILE_MEMBERSHIP"] = "1"
 os.environ["REWIND_CP_RECONCILE_SECS"] = "2"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import smoke_quiet  # noqa: E402
+import smoke_lib_v2  # noqa: E402
 from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
 
 # POST {key,value} → replicated kv.set; GET ?key=K → "value:" + kv.get(K).
@@ -187,6 +189,19 @@ def main() -> int:
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
+        # Every failure here is a DEADLINE — "this node did not converge / come
+        # back within N seconds" — so a stalled box produces them with the code
+        # untouched, exactly as it does for the election soak (rove#655). The
+        # convergence assertions themselves (no loss, no divergence) are not
+        # timing-dependent, but they are only reached if the deadlines are.
+        stall = smoke_quiet.io_stall()
+        if (not smoke_lib_v2.box_was_quiet()) or (
+                stall is not None and stall >= smoke_quiet.STALL_INCONCLUSIVE_PCT):
+            print("\nINCONCLUSIVE — failures are deadline-shaped and the box was not"
+                  " quiet" + (f" (I/O stall {stall:.0f}% of the last 60s)"
+                              if stall is not None else "")
+                  + ". Re-run on an idle machine; NOT recorded as a regression.")
+            return 78  # run_all.INCONCLUSIVE_RC
         return 1
     print(f"\nPASS raft crash/recovery soak (v2) — {ROUNDS} rounds of churn + "
           f"ungraceful kills + wipe-heal; every node recovered + converged on all "

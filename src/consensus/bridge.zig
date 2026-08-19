@@ -696,6 +696,12 @@ pub const Bridge = struct {
     /// header). Returns the assigned seq (≥ 1).
     pub fn propose(self: *Bridge, gid: u64, payload: []const u8) Error!u64 {
         if (self.stop.load(.acquire)) return Error.ShuttingDown;
+        // A priori: an entry this size can never reach a follower. One entry
+        // per raft message and nothing fragments, so it would be dropped at
+        // the transport (or, before that guard existed, tear the connection
+        // down) and re-emitted forever. Refuse here, where the caller can
+        // still turn it into an answer for the customer.
+        if (payload.len > transport.MAX_ENTRY_BYTES) return Error.EntryTooLarge;
         self.mutex.lock();
         defer self.mutex.unlock();
         const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
@@ -1011,6 +1017,12 @@ pub const Bridge = struct {
         return self.node.meshSnapshot();
     }
 
+    /// See `Node.transportOversizeDropped` — the wire-limit backstop's count,
+    /// surfaced on `/_system/metrics`.
+    pub fn transportOversizeDropped(self: *Bridge) u64 {
+        return self.node.transportOversizeDropped();
+    }
+
     /// Per-group leadership. True when this node is the
     /// raft leader of `gid`'s group — used to leader-gate the move surface
     /// (`v2-bundle` / `v2-kv` PUT reject fast on a follower so the front
@@ -1283,11 +1295,22 @@ pub const Bridge = struct {
     /// Manager. A per-group failure is logged + skipped (one bad group must not
     /// block the rest). Returns the count recovered. No-op on a fresh data dir.
     pub fn recoverGroups(self: *Bridge) usize {
-        const groups = self.node.persistedGroups(self.allocator) catch |err| {
+        const manifest = self.node.persistedGroups(self.allocator) catch |err| {
             std.log.warn("v2 bridge: recoverGroups manifest read failed: {s}", .{@errorName(err)});
             return 0;
         };
+        const groups = manifest.groups;
         defer Node.freePersistedGroups(self.allocator, groups);
+        // The refusal escalates HERE rather than at the parse site (rove#101):
+        // a refused row means this node holds a group's state and will not
+        // stand it up, so the tenant does not serve here until the CP's
+        // membership reconciler re-attaches it. Silent recovery at epoch 0 —
+        // a valid epoch — would have looked healthy while the group stamped
+        // stale epochs and its peers fenced it.
+        if (manifest.refused > 0) std.log.err(
+            "v2 bridge: recoverGroups REFUSED {d} unreadable group manifest row(s) — those tenants will NOT serve on this node until re-attached",
+            .{manifest.refused},
+        );
         var n: usize = 0;
         for (groups) |g| {
             const gid = self.registerTenant(g.id_str) catch |err| {
@@ -1737,6 +1760,38 @@ test "bridge: move control — attach at epoch, destroy reclaims" {
     try testing.expectError(node_mod.Error.UnknownGroup, bridge.node.get(gid, "k"));
 
     bridge.stopPump();
+}
+
+test "bridge: an entry over the wire limit is refused, not proposed" {
+    // A priori: nothing fragments a raft message, so an entry above what one
+    // message can carry could only ever be dropped at the transport and
+    // re-emitted forever. Refusing it HERE is what turns an unserviceable
+    // write into an answer the customer can act on — and keeps the entry out
+    // of the leader's own log, where it would otherwise sit unreplicable.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    const gid = try bridge.registerTenant("tenant-big");
+
+    const too_big = try a.alloc(u8, transport.MAX_ENTRY_BYTES + 1);
+    defer a.free(too_big);
+    @memset(too_big, 'x');
+    try testing.expectError(Error.EntryTooLarge, bridge.propose(gid, too_big));
+
+    // The refusal is a size verdict, not a broken bridge: the same group takes
+    // an ordinary propose immediately after, at the first seq — proof the
+    // refused entry never consumed a ticket or entered the log.
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const env = try encodeWs(a, "tenant-big", &ws);
+    defer a.free(env);
+    try testing.expectEqual(@as(u64, 1), try bridge.propose(gid, env));
 }
 
 test "bridge: gid is a deterministic hash of the tenant id" {

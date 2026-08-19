@@ -413,6 +413,14 @@ pub const DispatchState = struct {
     /// the batch wrote is a FOREIGN read for this one; eliding it leaves
     /// the record unreplayable (rove#532).
     ws_base: usize = 0,
+    /// What THIS activation has written so far — ops, and key+value bytes —
+    /// against `reserved.KV_WRITES_MAX` / `KV_WRITE_BYTES_MAX`. Counted here
+    /// rather than derived from the writeset because the writeset is
+    /// batch-scoped (see `ws_base`): the budget is one activation's, and a
+    /// neighbour in the same batch must not be able to spend it. Charged only
+    /// after a write succeeds, so a refusal costs nothing.
+    write_ops: u32 = 0,
+    write_bytes: usize = 0,
     /// Accumulated `console.log` output. Owned by the dispatcher; reset
     /// between requests.
     console: *std.ArrayList(u8),
@@ -799,56 +807,10 @@ pub fn kvWriteArgToOwnedString(
 
 // ── kv.* ──────────────────────────────────────────────────────────────
 
-/// kv key / value size caps — THE canonical kvexp limits, referenced through
-/// `snapshot_stream` so they can never drift. A write that exceeds them
-/// succeeds in the local overlay but fails later at snapshot / tenant-move
-/// (`StreamKeyTooLarge` / `StreamValueTooLarge`), which would surface as an
-/// opaque replication failure, not a handler error. We reject it fail-fast
-/// here at write time with a clean, branchable JS error instead
-/// (docs/architecture/format-versioning.md §7.2). Conservative by design: these can
-/// be RAISED later without breaking anyone, never lowered.
-const KV_KEY_MAX: usize = reserved.KV_KEY_MAX;
-const KV_VAL_MAX: usize = reserved.KV_VAL_MAX;
-
-pub const KvSizeViolation = enum { key, value };
-
-/// Pure size check shared by `jsKvSet` (key + value) and `jsKvDelete` (key
-/// only — pass `null` for `val_len`). Returns which limit was exceeded, or
-/// null if the write is within bounds.
-pub fn kvSizeViolation(key_len: usize, val_len: ?usize) ?KvSizeViolation {
-    if (key_len > KV_KEY_MAX) return .key;
-    if (val_len) |vl| if (vl > KV_VAL_MAX) return .value;
-    return null;
-}
-
-/// Throw `Error{message, code}` for an oversized `kv.set` / `kv.delete`.
-/// `code` is `key_too_large` / `value_too_large` so customer JS can branch on
-/// `err.code` (same shape as the `reserved_key` error).
-pub fn throwKvTooLarge(ctx: ?*c.JSContext, which: KvSizeViolation) c.JSValue {
-    const state = getState(ctx);
-    const desc = switch (which) {
-        .key => .{ "key", "key_too_large", KV_KEY_MAX },
-        .value => .{ "value", "value_too_large", KV_VAL_MAX },
-    };
-    const msg = std.fmt.allocPrintSentinel(
-        state.allocator,
-        "kv: {s} exceeds the {d}-byte limit",
-        .{ desc[0], desc[2] },
-        0,
-    ) catch return c.JS_ThrowOutOfMemory(ctx);
-    defer state.allocator.free(msg);
-
-    const err = c.JS_NewError(ctx);
-    if (c.JS_IsException(err)) return err;
-    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, desc[1], desc[1].len));
-    return c.JS_Throw(ctx, err);
-}
-
-/// Throw `Error{message, code}` for a `rove-guards` verdict whose message is
-/// a constant. The size/namespace helpers above predate the guards module and
-/// stay as the formatting sites for their own messages; this is the generic
-/// one for a verdict that already carries its text.
+/// Throw `Error{message, code}` for a `rove-guards` verdict. Every kv rule's
+/// wording belongs to the guards module, so this raises the text it carries
+/// rather than composing its own — the reserved-key message is the one that
+/// names its key, and its caller formats it from `kvReservedMessageFmt`.
 pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c.JSValue {
     const err = c.JS_NewError(ctx);
     if (c.JS_IsException(err)) return err;
@@ -857,42 +819,7 @@ pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c
     return c.JS_Throw(ctx, err);
 }
 
-test "kvSizeViolation enforces canonical kv limits" {
-    // Drift guard: these must stay the kvexp caps (via snapshot_stream).
-    try std.testing.expectEqual(@as(usize, 256), KV_KEY_MAX);
-    try std.testing.expectEqual(@as(usize, 1 << 20), KV_VAL_MAX);
-    // Within bounds (boundary values inclusive).
-    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(256, 1 << 20));
-    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(0, 0));
-    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(10, null));
-    // Over a cap.
-    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(257, 0));
-    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(257, null));
-    try std.testing.expectEqual(@as(?KvSizeViolation, .value), kvSizeViolation(10, (1 << 20) + 1));
-    // Key is reported first when both exceed.
-    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(300, (1 << 20) + 1));
-}
 
-/// Throw `Error{message: "...", code: "reserved_key"}` for a customer
-/// `kv.set` / `kv.delete` against a platform-reserved namespace. Same
-/// shape as the `rate_limited` error from `email.send` so customer
-/// JS can branch on `err.code`.
-pub fn throwReservedKey(ctx: ?*c.JSContext, key: []const u8) c.JSValue {
-    const state = getState(ctx);
-    const msg = std.fmt.allocPrintSentinel(
-        state.allocator,
-        "kv: '{s}' is in a platform-reserved prefix",
-        .{key},
-        0,
-    ) catch return c.JS_ThrowOutOfMemory(ctx);
-    defer state.allocator.free(msg);
-
-    const err = c.JS_NewError(ctx);
-    if (c.JS_IsException(err)) return err;
-    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, "reserved_key", "reserved_key".len));
-    return c.JS_Throw(ctx, err);
-}
 
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
@@ -1611,5 +1538,9 @@ test "the kv write caps match the snapshot stream's frame bounds" {
     // engines start disagreeing about which writes are legal — the shape of
     // rove#502, one layer down.
     try std.testing.expectEqual(kv_mod.snapshot_stream.STREAM_KEY_MAX, reserved.KV_KEY_MAX);
-    try std.testing.expectEqual(kv_mod.snapshot_stream.STREAM_VAL_MAX, reserved.KV_VAL_MAX);
+    // Not equality: the write cap is bounded by what one raft message can
+    // carry, the stream by what a store may already hold. The stream must be
+    // able to move anything a write could ever have created — narrowing it
+    // under the write cap is what would strand a tenant mid-catch-up.
+    try std.testing.expect(reserved.KV_VAL_MAX <= kv_mod.snapshot_stream.STREAM_VAL_MAX);
 }

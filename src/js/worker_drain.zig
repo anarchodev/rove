@@ -1365,8 +1365,9 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
             std.log.warn("rove-js stream-resume: propose failed: {s}", .{@errorName(perr)});
             ctx.txn_owned.* = false;
             ctx.txn_done.* = true;
-            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume write replication failed\n") catch {};
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.saga_id, &.{}, ctx.activation, 0, ctx.exec_seq);
+            const st_fail = respb.proposeFailureStatus(perr, 500);
+            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st_fail, respb.proposeFailureBody(perr, "stream resume write replication failed\n")) catch {};
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, st_fail, .fault, &.{}, &.{}, .{}, ctx.saga_id, &.{}, ctx.activation, 0, ctx.exec_seq);
             return;
         };
         ctx.txn_owned.* = false;
@@ -1757,15 +1758,17 @@ fn finishContResume(
                     lh,
                 ) catch |perr| {
                     // Propose-fail / pre-park alloc failure: degrade to a
-                    // defined 500 over the held socket. The helper rolled
-                    // back + destroyed the txn.
+                    // defined status over the held socket — 413 when the entry
+                    // could never fit (a stated rule, terminal), 500 otherwise.
+                    // The helper rolled back + destroyed the txn.
                     std.log.warn("rove-js " ++ spec.site ++ ": propose failed: {s}", .{@errorName(perr)});
                     allocator.free(body_dup);
                     h2.RespHeaders.deinit(allocator, (&resp_hdrs)[0..1]);
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
-                    resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, console_owned, exception_owned, tapes, ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
+                    resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st_fail, respb.proposeFailureBody(perr, spec.noun ++ " write replication failed\n")) catch {};
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st_fail, .fault, console_owned, exception_owned, tapes, ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
                     return;
                 };
                 // Helper took ownership of txn (moved into pending_txns)
@@ -1918,8 +1921,9 @@ fn finishContResume(
                     std.log.warn("rove-js " ++ spec.site ++ " (repark): propose failed: {s}", .{@errorName(perr)});
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
-                    resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
+                    resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st_fail, respb.proposeFailureBody(perr, spec.noun ++ " write replication failed\n")) catch {};
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st_fail, .fault, &.{}, &.{}, tapes, ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
                     return;
                 };
                 ctx.txn_owned.* = false;

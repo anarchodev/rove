@@ -111,8 +111,9 @@ export default function () {
 
 `ensureKeypair()` is the only setup. It generates an RSA-2048 keypair
 (`crypto.oidcGenerateKey`) and stores it in kv. There is no special
-secrets primitive and no ceremony: the private key sits in kv and is
-**page-encrypted at rest by the platform** like every other value.
+secrets primitive and no ceremony: the private key sits in kv like every
+other value. Note that **kv is not encrypted at rest today** (PLAN §2.7),
+so the key carries the same at-rest exposure as anything else you store.
 Calling it from the actor route means the key is guaranteed to exist
 the moment anyone first looks you up — which is exactly when a follow
 begins.

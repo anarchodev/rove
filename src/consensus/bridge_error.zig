@@ -22,5 +22,12 @@ pub const Error = error{
     /// can safely re-aim at the leader (worker maps this to a 421; the
     /// front door / serve-or-forward retry on it).
     NotLeader,
+    /// The envelope is larger than one raft message can carry
+    /// (`transport.MAX_ENTRY_BYTES`). Refused BEFORE the propose, because the
+    /// alternative is not a slow write but a torn peer connection: nothing
+    /// fragments a raft message, so an entry over the wire limit is dropped
+    /// unsent and re-emitted forever. The caller owes the customer a defined
+    /// error — this write cannot be made durable at any size of patience.
+    EntryTooLarge,
     OutOfMemory,
 } || node_mod.Error;

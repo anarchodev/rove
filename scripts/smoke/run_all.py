@@ -38,6 +38,11 @@ import threading
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import smoke_quiet  # noqa: E402
+import smoke_reap  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(HERE))
@@ -45,7 +50,7 @@ from smoke_ports import acquire_slots  # noqa: E402
 
 # Not smokes: shared harness modules, and helpers imported by them.
 NOT_SMOKES = {"smoke_lib.py", "smoke_lib_v2.py", "v2_topology.py", "run_all.py",
-              "smoke_ports.py"}
+              "smoke_ports.py", "smoke_quiet.py", "smoke_reap.py"}
 
 # Scripts that are deliberately not part of the suite. Each needs a REASON —
 # "it fails" is not one; that is what the report is for. (A fixed repro
@@ -65,6 +70,11 @@ EXCLUDED = {
 # NOT as a pass: a baseline recorded in a stripped environment must not
 # silently bless members that never ran.
 SKIP_RC = 77
+# A timing-sensitive smoke that saw its failure while the box was stalled.
+# Distinct from a fail: the assertion did not hold, but the run cannot say
+# whether the code or the machine is responsible, so it must not be recorded
+# as a regression (rove#655).
+INCONCLUSIVE_RC = 78
 
 # Known-INTERMITTENT members that stay in the suite so the report keeps
 # counting them. All are genuine product defects, not stale fixtures — which
@@ -90,18 +100,13 @@ SKIP_RC = 77
 # like product bugs, and a flaky red trains people to ignore the report.
 # Membership is empirical: a member that proves load-tolerant should move to
 # the pool (the tail bounds the parallel suite's floor).
-SERIAL = {
-    "raft_soak_prod.py",        # 6 kill/wipe/heal rounds on election timing
-    "raft_soak_v2.py",          # same shape, shorter
-    "dispatch_gate_smoke_v2.py",  # rove#362: already intermittent serially —
-                                  # co-load noise would make the flip unreadable
-    "leader_failover_smoke_v2.py",  # asserts one acquisition per ORPHANED group
-                                    # after the kill — co-load can stretch
-                                    # heartbeats enough to fire a genuine extra
-                                    # election, which is the thing it measures
-    "tls_large_body_smoke.py",  # rove#361: red via ITS OWN download
-                                # concurrency — keep the repro conditions fixed
-}
+# The membership list itself lives in `smoke_quiet`, because it is now
+# consulted from two places: here, for the serial tail, and by `smoke_lib_v2`
+# so a HAND-RUN member takes the machine-wide exclusive lock too. The tail
+# alone only ever meant "alone within this run" — a sibling session's suite
+# was invisible to it, which is how a soak trips a spurious election on an
+# idle-looking box (rove#655).
+SERIAL = smoke_quiet.QUIET_EXCLUSIVE
 
 # Smokes that legitimately run longer than the default budget. Without an
 # entry here a slow-but-healthy smoke is reported HUNG, which reads as a
@@ -151,7 +156,8 @@ def run_one(p: Path, budget: int, log_dir: Path, slot: int | None) -> dict:
         try:
             rc = proc.wait(timeout=budget)
             status = ("pass" if rc == 0
-                      else "skip" if rc == SKIP_RC else "fail")
+                      else "skip" if rc == SKIP_RC
+                      else "inconclusive" if rc == INCONCLUSIVE_RC else "fail")
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -205,6 +211,14 @@ def main() -> int:
               "rewind-cp rewind-front rewind-logs rewind-ops` first", file=sys.stderr)
         return 2
 
+    # Clear what earlier runs left behind BEFORE allocating anything: an
+    # orphaned node holds a port block and adds I/O the timing-sensitive
+    # members will be measured against. Keyed on PPID==1, so a live sibling
+    # session's run can never be touched.
+    reaped = smoke_reap.reap_orphans()
+    if reaped:
+        print(f"smoke: reaped {reaped} orphaned node(s) from earlier runs\n", flush=True)
+
     jobs = max(1, args.jobs)
     log_dir = Path(args.logs) if args.logs else Path(f"/tmp/smoke-run-{os.getpid()}")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -232,7 +246,7 @@ def main() -> int:
             done_count += 1
             results[p.name] = res
             mark = {"pass": "ok  ", "fail": "FAIL", "timeout": "HUNG",
-                    "skip": "SKIP"}[res["status"]]
+                    "skip": "SKIP", "inconclusive": "INCO"}[res["status"]]
             print(f"  [{done_count:3d}/{len(smokes)}] {mark} {p.name}  "
                   f"({res['seconds']:.0f}s)", flush=True)
             if res["status"] == "skip":
@@ -323,13 +337,21 @@ def main() -> int:
     elapsed = time.time() - started
     passed = [n for n, r in results.items() if r["status"] in ("pass", "flaky")]
     skipped = [n for n, r in results.items() if r["status"] == "skip"]
+    # Held out of BOTH sides: not a pass, and not evidence of a regression.
+    inconclusive = [n for n, r in results.items() if r["status"] == "inconclusive"]
     failed = [n for n, r in results.items()
-              if r["status"] not in ("pass", "flaky", "skip")]
+              if r["status"] not in ("pass", "flaky", "skip", "inconclusive")]
     flaky = [n for n, r in results.items() if r["status"] == "flaky"]
     print(f"\n{'=' * 62}")
     print(f"{len(passed)}/{len(results) - len(skipped)} passed in {elapsed / 60:.0f}m"
           f"{f' ({len(flaky)} flaky)' if flaky else ''}"
-          f"{f' ({len(skipped)} skipped)' if skipped else ''}")
+          f"{f' ({len(skipped)} skipped)' if skipped else ''}"
+          f"{f' ({len(inconclusive)} inconclusive)' if inconclusive else ''}")
+    if inconclusive:
+        print("  INCONCLUSIVE (assertion failed while the box was stalled — "
+              "re-run on a quiet machine before believing it):")
+        for n in inconclusive:
+            print(f"    {n}")
 
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=2, sort_keys=True))

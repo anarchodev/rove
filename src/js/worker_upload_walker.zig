@@ -46,6 +46,7 @@ const std = @import("std");
 const apply_mod = @import("apply.zig");
 const tape_mod = @import("rove-tape");
 const log_mod = @import("rove-log");
+const bodies_mod = @import("rove-bodies");
 
 /// Max raft entries a promotion catch-up processes per driver tick.
 /// Bounds per-tick work so a fresh leader with a long backlog to
@@ -196,6 +197,39 @@ fn buildLogRecord(
     tapes.fetch_responses_tape_bytes = try allocator.dupe(u8, channel_blobs[fetch_idx]);
     tapes.trigger_payload_tape_bytes = try allocator.dupe(u8, channel_blobs[trigger_idx]);
     tapes.request_reads_tape_bytes = try allocator.dupe(u8, channel_blobs[request_reads_idx]);
+    // The activation channel is the reason a rebuilt resume hop replays as the
+    // same run: the record's `activation_bytes` (a `wake_batch`'s drained wakes
+    // bag, a `ws_message`'s frame) and `export_name` (the resolved `{on}`
+    // target) are raw fields with no tape blob behind them, so they reach a
+    // follower only through this channel. Decoded rather than copied through:
+    // the record's fields are the values themselves, not a serialized tape.
+    //
+    // An entry with no inline bytes is an over-the-cap frame nothing retained.
+    // It rebuilds with an empty `activation_bytes` — the same thing the leader
+    // flushed — and the entry's length is what says a Msg existed.
+    const activation_idx: usize = @intFromEnum(tape_mod.Channel.activation);
+    if (tape_mod.parse(allocator, channel_blobs[activation_idx])) |parsed_act| {
+        var pa = parsed_act;
+        defer pa.deinit();
+        if (pa.entries.len > 0) {
+            const act = pa.entries[0].activation;
+            if (act.inline_bytes.len > 0) {
+                tapes.activation_bytes = try allocator.dupe(u8, act.inline_bytes);
+            }
+            if (act.export_name.len > 0) {
+                tapes.export_name = try allocator.dupe(u8, act.export_name);
+            }
+        }
+    } else |err| {
+        // A record whose other channels parsed is still worth keeping; say
+        // what was lost rather than dropping the customer's log line.
+        std.log.warn(
+            "walker: unreadable activation channel for {s} at raft seq {d}: {s} — " ++
+                "this record replays without its wake batch / WS frame, and " ++
+                "through the conventional export",
+            .{ instance_id, raft_seq, @errorName(err) },
+        );
+    }
 
     return .{
         .tenant_id = tenant_id,
@@ -286,6 +320,66 @@ test "hydrate: single type-0 envelope → one LogRecord" {
     // kv + module channels carried through.
     try testing.expect(r.tapes.kv_tape_bytes.len > 0);
     try testing.expect(r.tapes.module_tree_bytes.len > 0);
+}
+
+test "hydrate: a wake hop's Msg + resolved export survive the rebuild (rove#199)" {
+    const a = testing.allocator;
+
+    // What a writing `wake_batch` hop captures just before its propose. If the
+    // leader dies here, this raft entry is the whole record: a rebuild that
+    // dropped either half would replay the hop with an EMPTY wakes bag, or
+    // through the conventional `onWake` instead of the arm's `{on}` target —
+    // a different handler run wearing the same request id.
+    const wakes = "[{\"kind\":\"kv\",\"prefix\":\"wk/\",\"firedAt\":1700000000000}]";
+    var rs = tape_mod.Readset.init(a, 1_700_000_000_000_000_000, 0xAB);
+    defer rs.deinit();
+    try rs.activation.appendActivation(
+        "onFired",
+        bodies_mod.BodyRef.carried(@intCast(wakes.len)),
+        wakes,
+    );
+    var lh = sample_lh;
+    lh.activation = .wake_batch;
+    const rs_blob = try rs.serialize(a, lh);
+    defer a.free(rs_blob);
+    const rs_list = try tape_mod.encodeReadsetList(a, &.{rs_blob});
+    defer a.free(rs_list);
+    const env = try apply_mod.encodeWriteSetEnvelope(a, "acme", "", rs_list);
+    defer a.free(env);
+
+    const records = try hydrateRecordsFromEnvelope(a, env, 21);
+    defer freeRecords(a, records);
+
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expectEqual(log_mod.ActivationSource.wake_batch, records[0].activation);
+    try testing.expectEqualStrings(wakes, records[0].tapes.activation_bytes);
+    try testing.expectEqualStrings("onFired", records[0].tapes.export_name);
+}
+
+test "hydrate: an unretained activation Msg rebuilds empty, not fabricated" {
+    const a = testing.allocator;
+
+    // An over-the-cap WS frame: the entry carries the LENGTH and no bytes, so
+    // the rebuilt record says the same thing the leader's flush said —
+    // nothing was kept. The walker must not invent bytes for it.
+    var rs = tape_mod.Readset.init(a, 1_700_000_000_000_000_000, 0xAB);
+    defer rs.deinit();
+    try rs.activation.appendActivation("", bodies_mod.BodyRef.carried(4_000_000), "");
+    var lh = sample_lh;
+    lh.activation = .ws_message;
+    const rs_blob = try rs.serialize(a, lh);
+    defer a.free(rs_blob);
+    const rs_list = try tape_mod.encodeReadsetList(a, &.{rs_blob});
+    defer a.free(rs_list);
+    const env = try apply_mod.encodeWriteSetEnvelope(a, "acme", "", rs_list);
+    defer a.free(env);
+
+    const records = try hydrateRecordsFromEnvelope(a, env, 22);
+    defer freeRecords(a, records);
+
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expectEqual(@as(usize, 0), records[0].tapes.activation_bytes.len);
+    try testing.expectEqual(@as(usize, 0), records[0].tapes.export_name.len);
 }
 
 test "hydrate: type-1 multi wrapping two writesets → two LogRecords" {

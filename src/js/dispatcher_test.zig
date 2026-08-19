@@ -4722,6 +4722,71 @@ test "dispatch: a root read-your-write stays off the tape (minimal readset)" {
     try testing.expect(tapedKv(&rs, "__rove_store/r/seen/by/nobody") != null);
 }
 
+test "dispatch: a platform write obeys the same kv rules a customer write does" {
+    // The privileged surface writes the root / target writeset directly rather
+    // than through `rove-binding`, so it has its own call into the one
+    // authority (`rove-guards`). Its bytes ride the SAME raft entry as the
+    // batch, which is why the size caps and the activation's write budget
+    // apply here unchanged — the only exemption the surface needs is WHICH
+    // keys it may name, never how much one entry may carry.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\// The exemption that survives: an admin handler names reserved keys.
+        \\let reserved_ok = "yes";
+        \\try { platform.root.set("_deploy/current", "rel-1"); }
+        \\catch (e) { reserved_ok = e.code; }
+        \\// The rules that now apply: the value cap, then the budget.
+        \\let oversize = "none";
+        \\try { platform.root.set("k", "x".repeat(400 * 1024)); }
+        \\catch (e) { oversize = e.code; }
+        \\let budget = "none";
+        \\try { for (let i = 0; i < 5; i++) platform.root.set("b/" + i, "y".repeat(100 * 1024)); }
+        \\catch (e) { budget = e.code; }
+        \\return [reserved_ok, oversize, budget].join("|");
+    ,
+        .{
+            .method = "GET",
+            .path = "/",
+            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("yes|value_too_large|writes_too_large", resp.body);
+
+    // A refused write never reaches the writeset — the entry carries only what
+    // the rules admitted, which is the whole point of refusing at the call
+    // site. The loop above spends the budget three times over before the
+    // fourth 100 KiB write is the one that cannot fit, so exactly three land.
+    var saw_reserved = false;
+    var budgeted_puts: usize = 0;
+    for (root_ws.ops.items) |op| switch (op) {
+        .put => |pp| {
+            try testing.expect(!std.mem.eql(u8, pp.key, "k"));
+            if (std.mem.startsWith(u8, pp.key, "b/")) budgeted_puts += 1;
+            if (std.mem.eql(u8, pp.key, "_deploy/current")) saw_reserved = true;
+        },
+        .delete => {},
+    };
+    try testing.expect(saw_reserved);
+    try testing.expectEqual(@as(usize, 3), budgeted_puts);
+}
+
 test "dispatch: a platform-bound handler cannot reach the root bearer, and the tape records only the verdict" {
     // The invariant behind the credential rule (docs/decisions.md §4.6b): on a
     // replay platform a handler-readable input is a RECORDED input, so the

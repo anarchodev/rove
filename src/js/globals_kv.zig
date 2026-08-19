@@ -174,6 +174,18 @@ pub const WorkerKv = struct {
         return false;
     }
 
+    /// This activation's slice of the batch writeset, as a budget. The
+    /// counters live on `DispatchState` (per activation); the writeset itself
+    /// is shared, which is exactly why the budget cannot be read off it.
+    pub fn writeBudget(self: WorkerKv) guards.WriteBudget {
+        return .{ .ops = self.state.write_ops, .bytes = self.state.write_bytes };
+    }
+
+    pub fn noteWrite(self: WorkerKv, bytes: usize) void {
+        self.state.write_ops += 1;
+        self.state.write_bytes += bytes;
+    }
+
     /// The worker always decides — it IS the rules' live authority.
     pub fn decides(_: WorkerKv) bool {
         return true;

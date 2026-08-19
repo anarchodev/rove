@@ -109,6 +109,38 @@ const FRAME_PREFIX_SIZE: usize = 1 + 4;
 /// body accordingly; queueOut flushes early when the next record would blow it.
 const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZE - FRAME_PREFIX_SIZE;
 
+/// The largest raft message this transport can put on the wire: one record,
+/// alone in its frame. Above it there is nowhere to put the bytes — the
+/// receiver's buffer is fixed and nothing fragments — so `queueOut` DROPS
+/// rather than sends. A sender must never emit a message it knows a priori the
+/// receiver cannot buffer: doing so costs the whole peer connection, which
+/// carries every group's heartbeats and appends between those two nodes, not
+/// just the group that produced the message.
+pub const MAX_MESSAGE_BYTES: usize = MAX_FRAME_BODY - RECORD_HDR_SIZE;
+
+/// The largest ENVELOPE a propose may carry (`Bridge.propose` refuses above
+/// it). One entry per raft message (`max_size_per_msg = 0` is raft-rs for "at
+/// most one entry per message"), so the message is this envelope plus the
+/// protobuf framing raft-rs wraps around it — a handful of varint fields, for
+/// which `PROTO_HEADROOM` is a deliberately fat reserve.
+///
+/// This is the number every producer-side budget derives from: a kv value
+/// (`reserved.KV_VAL_MAX`), a batched multi-propose chunk
+/// (`raft_propose.proposeMulti`), and the readset's kv tape all have to fit
+/// inside one of these, together.
+pub const MAX_ENTRY_BYTES: usize = MAX_MESSAGE_BYTES - PROTO_HEADROOM;
+const PROTO_HEADROOM: usize = 4096;
+
+comptime {
+    // The chain that makes the guard real: entry ≤ message ≤ frame body ≤ the
+    // receiver's buffer. If a future change breaks a link here, the failure
+    // mode is a torn peer connection under load, which reads as an election
+    // storm and not as a size bug — so fail the build instead.
+    std.debug.assert(MAX_ENTRY_BYTES < MAX_MESSAGE_BYTES);
+    std.debug.assert(MAX_MESSAGE_BYTES + RECORD_HDR_SIZE <= MAX_FRAME_BODY);
+    std.debug.assert(MAX_FRAME_BODY + rpc.HEADER_SIZE + FRAME_PREFIX_SIZE <= raftnet.RECV_BUF_SIZE);
+}
+
 /// Peer-slot capacity: the largest cluster this node will ever address. The
 /// per-destination buffers (`outbufs`, `hb_sent_ns`) and `raft_net`'s peer
 /// table are sized to this at init, so a node born in a small cluster can grow
@@ -173,6 +205,12 @@ pub const Transport = struct {
     /// atomic buckets let `/_system/metrics` snapshot it from the worker thread.
     hb_sent_ns: []i64,
     hb_rtt: MicrosHistogram = .{},
+    /// Messages dropped at `queueOut` for exceeding `MAX_MESSAGE_BYTES`.
+    /// Should stay at zero: the propose path refuses an oversize entry before
+    /// it is ever built, so a non-zero value means a producer got past that
+    /// guard and the group is now stuck re-emitting an entry it can never
+    /// deliver. Surfaced on `/_system/metrics`.
+    oversize_dropped: std.atomic.Value(u64) = .init(0),
 
     /// Per-group election forensics (docs/architecture/raft-best-practices.md,
     /// sizing the election timeout): wall-clock stamps of the last
@@ -415,14 +453,37 @@ pub const Transport = struct {
                 if (isHeartbeatReq(msg)) g.value_ptr.hb_ns = nowNs() else g.value_ptr.append_ns = nowNs();
             }
         }
+        // A message the receiver cannot buffer is not sent. It used to go out
+        // alone and be "surfaced loudly on the recv side" — but loudly there
+        // means the follower tears the CONNECTION down, and that connection
+        // carries every co-hosted group's heartbeats and appends, so one
+        // tenant's oversize entry cost its neighbours an election storm.
+        // Dropping is safe in raft's own terms (the link is assumed lossy and
+        // the leader re-emits); it is not a fix by itself, because the re-emit
+        // hits the same wall — `Bridge.propose` refusing the entry a priori is
+        // the fix, and this is the backstop that keeps a miss from reaching
+        // the wire. Counted, so a miss is visible rather than silent.
+        if (msg.len > MAX_MESSAGE_BYTES) {
+            _ = self.oversize_dropped.fetchAdd(1, .monotonic);
+            // `raft_oversize_dropped_total` is the alarm; this line carries the
+            // figures (the `kv_cap_refusals_total` convention). Warn, not err,
+            // so a test that provokes the backstop on purpose can silence it
+            // with the runner's log-level idiom — the metric is what an
+            // operator watches, and it should never leave zero.
+            std.log.warn(
+                "raft transport: message for node{d} group={d} is {d}B, over the {d}B " ++
+                    "wire limit — DROPPED unsent (a propose should have refused this; " ++
+                    "sending it would tear down every group's link to that node)",
+                .{ to, group_id, msg.len, MAX_MESSAGE_BYTES },
+            );
+            return;
+        }
         const ob = &self.outbufs[to - 1];
         const a = self.allocator;
         // Cap the coalesced frame so it never exceeds the receiver's fixed recv
         // buffer: if appending this record would blow MAX_FRAME_BODY, flush what's
         // buffered first and start a fresh frame (the recv side handles multiple
-        // frames per read). A single record larger than the cap still goes out
-        // alone — surfaced loudly on the recv side, not a silent wedge; keep
-        // raft's max_size_per_msg under RECV_BUF_SIZE so that can't happen.
+        // frames per read).
         if (ob.count > 0 and ob.body.items.len + RECORD_HDR_SIZE + msg.len > MAX_FRAME_BODY)
             self.flushPeer(to - 1, ob);
         // Roll back to this mark on a partial append: a header without
@@ -723,6 +784,59 @@ test "transport: queueOut resolves + registers a peer beyond the init set (growt
 
     // Beyond capacity is ignored at the guard (no out-of-bounds, no panic).
     t.queueOut(@as(u64, MAX_CLUSTER_NODES) + 1, 7, 0, "x");
+}
+
+test "transport: a message over the wire limit is dropped, never sent" {
+    // The rule: never put on the wire a message we know a priori the receiver
+    // cannot buffer. Sending it costs the whole peer CONNECTION — which
+    // carries every co-hosted group's heartbeats — so the one message becomes
+    // an election storm for tenants that did nothing.
+    //
+    // The drop warns by design (it means a producer got past the propose
+    // guard). The runner reports a logged warning as a failure, so this test —
+    // which provokes exactly that — silences the level it expects.
+    const prev_log = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log;
+
+    const a = testing.allocator;
+
+    var mgr = raft.Manager.init() catch return error.SkipZigTest;
+    defer mgr.deinit();
+    const listen = try std.net.Address.parseIp("127.0.0.1", 0);
+    var peers = [_]PeerAddr{
+        .{ .host = "127.0.0.1", .port = 18190 }, // node 1 (self slot)
+        .{ .host = "127.0.0.1", .port = 18191 }, // node 2
+    };
+    const t = Transport.init(a, .{
+        .node_id = 1,
+        .listen_addr = listen,
+        .peers = &peers,
+        .manager = &mgr,
+    }) catch |e| {
+        if (e == Error.TransportInit) return error.SkipZigTest;
+        return e;
+    };
+    defer t.deinit();
+
+    const ob = &t.outbufs[1]; // node 2
+
+    // At the limit: buffered like any other record.
+    const fits = try a.alloc(u8, MAX_MESSAGE_BYTES);
+    defer a.free(fits);
+    @memset(fits, 'a');
+    t.queueOut(2, 7, 0, fits);
+    try testing.expectEqual(@as(u32, 1), ob.count);
+    try testing.expectEqual(@as(u64, 0), t.oversize_dropped.load(.monotonic));
+
+    // One byte over: dropped, counted, and NOTHING added to the frame — the
+    // previously buffered record is still the only one.
+    const over = try a.alloc(u8, MAX_MESSAGE_BYTES + 1);
+    defer a.free(over);
+    @memset(over, 'b');
+    t.queueOut(2, 7, 0, over);
+    try testing.expectEqual(@as(u64, 1), t.oversize_dropped.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), ob.count);
 }
 
 test "transport: the default static resolver does not grow past the init set" {

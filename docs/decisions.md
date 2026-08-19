@@ -102,6 +102,81 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 - **Do not** re-propose dropping the read fast path for the sake of a total
   replay projection. Treat as a PLAN §7-style closed item.
 
+### 2.5a Never send a message we know a priori is too large
+
+**Decision (user, 2026-08-18, issue #646).** The raft transport reads a frame
+into a FIXED per-peer buffer (`raft_net.RECV_BUF_SIZE`, 512 KiB) and nothing
+fragments a raft message, so a message above that limit cannot be delivered at
+all. It must therefore never be sent — and every producer-side limit derives
+from that one number rather than being chosen independently.
+
+The reason it is a rule and not a tuning note is the blast radius. The
+connection is **per node-pair and shared by every group** (multi-raft over a
+coalesced transport), so an oversize frame does not fail one write: the
+receiver tears the connection down, and the heartbeats and appends of every
+co-hosted tenant go with it. Measured, before the guard: a handler retrying an
+oversize write for ten seconds produced 58 teardowns, 141 election-churn log
+lines, and cost an innocent co-tenant on the same three nodes ~6% of its
+writes. After: 413 to the writer, zero teardowns, zero churn, and the
+co-tenant untouched.
+
+Derived, in the order a write meets them:
+
+| limit | where | what a customer sees |
+|---|---|---|
+| `KV_VAL_MAX` (384 KiB) | the kv guard, at `kv.set` | `value_too_large`, a code to branch on |
+| `KV_WRITES_MAX` (1000) / `KV_WRITE_BYTES_MAX` (400 KiB), **per activation** | the same guard | `too_many_writes` / `writes_too_large` |
+| `MAX_ENTRY_BYTES` | `Bridge.propose` | a defined 413 for the activation whose OWN share cannot fit an entry (a retry would re-run the same handler and fail identically); the retry-safe 421 for its neighbours, who succeed in a smaller batch |
+| the same, by bytes | `proposeMulti`'s batching | nothing: the batch spills into another entry |
+| `MAX_MESSAGE_BYTES` | the transport, dropping unsent | nothing; `raft_oversize_dropped_total` should never leave zero |
+
+**Two scopes, and the batch is the one that had no rule.** The guard limits
+(key, value, writes, written bytes) are per ACTIVATION. The entry limit is per
+BATCH — a dispatch pass folds every same-tenant request into one writeset and
+one envelope. Nothing bounded the sum, so two activations each legally inside
+their budget built an entry no follower could receive, and the only answer left
+at propose was to refuse requests that had done nothing wrong.
+
+The walk now stops ADMITTING once the batch has less room left than the next
+activation could spend (`BATCH_ADMIT_RESERVE`). A skipped request has NOT run
+its handler — the check sits at the admission point, before dispatch — so
+nothing is executed twice and no side effect is repeated. A skipped request stays in
+`request_out` for the next dispatchOnce, exactly as a different-tenant request
+does, and rides its own entry. Spilling one batch into two entries was the
+alternative and is worse: it splits the batch's all-or-nothing apply while its
+speculative overlay commits on a single watermark.
+
+**The budget is per ACTIVATION, and that is the whole point.** Writes
+accumulate into a batch writeset shared by every request in a dispatch pass, so
+a per-batch rule would let a busy neighbour spend a handler's allowance and
+would refuse requests that did nothing wrong. The counters therefore live on
+the activation's `DispatchState` (and on the run host / arena module state
+offline), and the check runs in the ONE shared guard every engine calls, so the
+sim and the browser refuse exactly where prod does.
+
+The peers this competes with cap the same thing at the same altitude: Deno KV
+allows 1000 mutations or 800 KiB per atomic operation, whichever comes first;
+DynamoDB 100 items per transaction; Durable Objects 128 pairs per `put()`.
+
+**The way past the budget is another activation, not a bigger entry.** That
+keeps each activation a bounded, replayable unit — the property the whole
+product rests on — and it is the answer the refusal messages name. Today the
+spelling is `after.ms(1)` + `next()`, because `after.ms(0)` is refused ("ms
+must be > 0"): a handler continuing itself has to ask for a delay it does not
+want. A first-class self-continuation (the `setTimeout(0)` of this model) is
+the missing ergonomic and is tracked separately.
+
+**Rejected: fragmenting large raft messages in the transport.** It would make
+the ceiling disappear as a customer-visible rule and reappear as unbounded
+receive buffers and reassembly state per peer — paid on every node for a case
+that is a product mistake (`blob.*` is where bulk bytes belong). Revisit only
+if a real workload needs entries above the frame.
+
+**Consequence to keep in view.** `KV_VAL_MAX` is the one number here that is a
+product promise, and it is now bounded by a transport constant: raising the
+recv buffer is what raises it. The snapshot stream stays WIDER
+(`STREAM_VAL_MAX`, 1 MiB) so it can still move rows a store already holds.
+
 ### 2.6 Cluster / raft-KV library shape
 - **Decision** (V1 as-built, from the retired `raft-kv-design.md`; the V1
   `Cluster` itself was retired at the V2 cutover — V2 is the spine-free
@@ -425,8 +500,10 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   re-execution, re-calling the API costs money and returns different tokens)
   is captured by this same `on_chunk` + `BodyRef` path; making it an explicit
   billed opt-in is deferred to a real LLM-stream customer.
-- Wire: `READSET_VERSION` is `7` (`src/tape/root.zig`); channels are `kv` +
-  `module` + `fetch_responses` + `trigger_payload` + `request_reads`.
+- Wire: the readset channels (`src/tape/root.zig` `Channel`) are `kv` +
+  `module` + `fetch_responses` + `trigger_payload` + `request_reads` +
+  `activation`; `READSET_VERSION` is the guard on that layout (`rewind version
+  --formats` prints the live number).
 
 ### 3.9a Out-of-line references: one discipline, and every reference has a reader
 
@@ -485,6 +562,38 @@ catch. The record lookup carries the same tenant scoping and retention clamp as
 is the reason §5's presign note gives — a cross-tenant object cannot be handed
 out whole, and a presigned range is still an offset the caller controls.
 
+**One Msg, one channel — including the copy that rides raft.** The same pair
+applies to the record a *follower* rebuilds. Every activation's Msg has exactly
+one readset channel (`trigger_payload` for an inbound body or a resume
+envelope, `fetch_responses` for a fetch event, `activation` for a wake bag or a
+WS frame), and the `activation` channel additionally carries the resolved
+export for every kind. Before that, a `wake_batch` / `ws_message` Msg and every
+kind's resolved export lived only on the flushed S3 record, so a promotion
+walker — which has nothing but the raft entry — rebuilt the record with an
+empty wakes bag and dispatched replay to the CONVENTIONAL export: a different
+handler run wearing the same request id, and the #214 shape again (rove#199).
+An over-the-cap WS frame stays unretained-with-length: too big for the entry,
+and a WS activation owns no durability park to spill through.
+
+**kv values are the carve-out: a budget and a refusal, not a reference.**
+Values are not content-addressed, so there is no hash to point at — nothing to
+reference and nothing for a reader to resolve. They get the other half of the
+discipline instead: a per-activation ceiling (`tape.KV_TAPE_BUDGET`, half a
+raft frame) past which a read's VALUE is dropped and its key kept, recorded as
+`KvOutcome.elided` carrying the lost byte count. Every reader REFUSES such a
+read — the offline host records a divergence rather than answering — because
+the closed world's miss rule (absent ⇒ `not_found`) is precisely the wrong
+answer when the live run read real data. A `kv.prefix` page elides whole: a
+partial page would replay as a complete, shorter one.
+
+The ceiling is not a cost control. The kv tape rides the raft entry, and the
+coalesced transport tears a peer connection down above the receiver's fixed
+recv buffer (`raft_net.RECV_BUF_SIZE`, 512 KiB), so an uncapped broad read in a
+WRITING activation proposed an entry no follower could receive — three 300 KB
+values were enough, and the write returned `503 raft commit failed`. The write
+side of that same ceiling is guarded by the same number from the other
+direction: `KV_VAL_MAX` is 384 KiB — under one frame, not over it — and an
+activation's writes carry a budget of their own (rove#646).
 **Consequence to keep in view.** Every reference written is a bet that the
 bytes outlive the record pointing at them. `_pool/` has no reaper (#304), so
 today the bet holds by accident rather than by design; when eviction lands, the
@@ -1130,7 +1239,7 @@ under load is a footgun — the audit found exactly that).
 ## 7. Observability
 
 - **Decision** (2026-05-13): two separate sinks. **Customer request logs** stay
-  in the per-tenant replay store (S3-direct, page-encrypted) — a product feature
+  in the per-tenant replay store (S3-direct) — a product feature
   addressable by `request_id`. **Operator signals** (raft commit rate, follower
   lag, queue depth, snapshot-install duration, blob latency, elections, panics)
   go to Grafana Cloud.

@@ -209,7 +209,7 @@ records are lost without a bump, and kept with one.
   fallback for every node regardless.
 - **Query** (`standalone.zig`): `list` is answered from the SQLite index (no S3);
   `show/{request_id}` range-GETs the one record's frame and inflates it. Logs are
-  the customer-facing replay store (page-encrypted at rest); operator signals go
+  the customer-facing replay store; operator signals go
   to Grafana Cloud — the two-sink split is decisions.md §7.
 
 ### The execution-sequence stamp (`exec_seq`)
@@ -250,7 +250,7 @@ read-your-write blame in the saga viewer all key on it.
   string** (values exceed 2^53; a bare JSON number silently rounds in
   dashboard JS) → the sidecar (additive integer field) → a nullable
   `log_index.exec_seq` column with the partial index `log_idx_exec`. The
-  replicated `LogHeader` carries it too (readset v9), so a walker-rebuilt
+  replicated `LogHeader` carries it too, so a walker-rebuilt
   record keeps its tape position. Real stamps stay below 2^63 (the publish
   guard fences the term one bit under the 24-bit field), so SQLite's i64
   INTEGER ordering is the u64 ordering.
@@ -306,10 +306,17 @@ that window.
   → raft-rs `raft_manager_first_index`.
 - **Faithful replay needs the input in the raft copy.** A writing *resume* hop
   (`send_callback` / `wake` / `fetch_chunk` / `ws`) tapes its activation Msg into
-  the readset (`ctx`/Msg → `trigger_payload`, fetch event → `fetch_responses`)
-  **before** the propose serializes it, so the walker rebuilds a replay-faithful
-  record — not just the log line. (The stamp-before-propose ordering is the same
-  discipline `resumeIntoStream` already followed via `StreamResumeCtx.tapes`.)
+  the readset **before** the propose serializes it, so the walker rebuilds a
+  replay-faithful record — not just the log line. (The stamp-before-propose
+  ordering is the same discipline `resumeIntoStream` already followed via
+  `StreamResumeCtx.tapes`.) Every kind's Msg has exactly one channel:
+  `ctx`/envelope → `trigger_payload`, fetch event → `fetch_responses`, and the
+  wake bag / WS frame → `activation`, which also carries the **resolved export**
+  for every kind. That last one exists only because a rebuild has nothing else:
+  the flushed record holds those two as its own `activation_bytes` / `export`
+  fields, which never touch raft, so a record rebuilt without them replayed with
+  an empty wakes bag through the conventional export — the same handler id
+  running a different handler (rove#199).
 
 ## Known limitations (as-built)
 
@@ -322,9 +329,9 @@ that window.
 - **The log index is a single SQLite file** (cluster-scoped); sharding by
   `hash(tenant) % N` is a future lever, and the indexer full-scans each poll
   (a per-node `start-after` cursor is the obvious optimization).
-- **Walker fidelity gap for `wake_batch` / `ws_message`** — their activation Msg
-  (the `wakes[]` fired-watch bag; the WS frame) rides `activation_bytes`, which is
-  NOT one of the five readset channels, so it reaches only the flushed S3 copy, not
-  the raft entry. A walker-recovered writing wake/ws hop replays with its `ctx` but
-  without `request.activation.wakes` / `.data` (issue #199). Survival of the log
-  line is unaffected — the `LogHeader` rides raft regardless.
+- **An over-the-cap WS frame is recorded by length, not by value.** A frame
+  above the 16 KB inline cap has no home — too big for the raft entry, and a WS
+  activation owns no durability park to spill it through — so the `activation`
+  entry keeps its length and no bytes, in both the flushed and the rebuilt copy.
+  Such a hop's `request.activation.data` is not replayable; the record says so
+  rather than presenting an empty frame as the real one.

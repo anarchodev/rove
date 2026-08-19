@@ -249,6 +249,54 @@ pub fn stageResponse(
 /// and a blind retry double-executes the handler.
 /// Frees any body the handler wrote before stamping the new one.
 /// Does NOT move into response_in — caller orchestrates that.
+/// What a refused-a-priori write tells the customer. One wording, because a
+/// hop that cannot fit an entry breaks the SAME rule whether it arrived as an
+/// inbound request or as a resume (`send_callback`, `wake_batch`, `ws_message`,
+/// a streaming hop) — and a resume that says "replication failed" blames the
+/// platform for the handler's stated limit.
+pub const entry_too_large_body =
+    "this activation's writes are too large to replicate as one entry; " ++
+    "write fewer or smaller values, or use blob storage for bulk bytes\n";
+
+/// Map a failed propose to the status that describes it. `EntryTooLarge` is
+/// the one propose failure that is a broken RULE rather than a broken
+/// platform: it is terminal at any size of patience, so it is reported as such
+/// on every path. Everything else keeps the caller's own failure status —
+/// 500 on a resume (no retry loop to feed), 421 on the inbound path (the txn
+/// rolled back, so the front door may safely re-aim).
+pub fn proposeFailureStatus(perr: anyerror, otherwise: u16) u16 {
+    return if (perr == error.EntryTooLarge) 413 else otherwise;
+}
+
+/// The body that pairs with `proposeFailureStatus` on a resume path, where
+/// the caller's own noun ("continuation write replication failed") is the
+/// fallback.
+pub fn proposeFailureBody(perr: anyerror, otherwise: []const u8) []const u8 {
+    return if (perr == error.EntryTooLarge) entry_too_large_body else otherwise;
+}
+
+/// The propose-refused-a-priori sibling of `overwriteWith421`: this write can
+/// never be replicated at any size of patience, because the entry it would
+/// need exceeds what one raft message can carry
+/// (`consensus/transport.zig` `MAX_ENTRY_BYTES`). A 421 would be actively
+/// misleading — the front door re-aims on it, and every other node refuses
+/// identically — so answer 413 and say what the customer has to change.
+pub fn overwriteWith413(
+    server: anytype,
+    ent: rove.Entity,
+    allocator: std.mem.Allocator,
+    old_body_ptr: ?[*]u8,
+    old_body_len: u32,
+) !void {
+    if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+    const body = try allocator.dupe(u8, entry_too_large_body);
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 413 });
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body.ptr,
+        .len = @intCast(body.len),
+    });
+}
+
 pub fn overwriteWith421(
     server: anytype,
     ent: rove.Entity,
@@ -890,4 +938,31 @@ test "etagMatches: wildcard" {
 test "etagMatches: empty or whitespace only" {
     try std.testing.expect(!etagMatches("", "\"abc\""));
     try std.testing.expect(!etagMatches("   ", "\"abc\""));
+}
+
+test "a propose failure is reported as the rule it broke, on every path" {
+    // The inbound path already answered 413 for an activation that cannot fit
+    // an entry. The resume paths (send_callback / wake_batch / ws_message /
+    // a streaming hop) reported every propose failure as a 500 "write
+    // replication failed", which tells the customer the platform broke when
+    // in fact THEY broke a stated limit. Both now go through this mapping, so
+    // the two answers cannot drift apart again.
+    try std.testing.expectEqual(@as(u16, 413), proposeFailureStatus(error.EntryTooLarge, 500));
+    try std.testing.expectEqual(@as(u16, 413), proposeFailureStatus(error.EntryTooLarge, 421));
+    // Every other propose failure keeps the caller's own status: those ARE
+    // platform faults, and the inbound path's 421 is retry-safe in a way 413
+    // deliberately is not.
+    try std.testing.expectEqual(@as(u16, 500), proposeFailureStatus(error.NotLeader, 500));
+    try std.testing.expectEqual(@as(u16, 421), proposeFailureStatus(error.NoQuorum, 421));
+
+    // The body follows the status, and names what the handler must change —
+    // the same sentence `overwriteWith413` stamps on the inbound path.
+    try std.testing.expectEqualStrings(
+        entry_too_large_body,
+        proposeFailureBody(error.EntryTooLarge, "continuation write replication failed\n"),
+    );
+    try std.testing.expectEqualStrings(
+        "continuation write replication failed\n",
+        proposeFailureBody(error.NotLeader, "continuation write replication failed\n"),
+    );
 }

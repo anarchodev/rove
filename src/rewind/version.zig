@@ -119,7 +119,7 @@ test "registry dump renders all format lines without error" {
     const out = w.buffered();
     // A couple of anchors so a dropped line is caught.
     try std.testing.expect(std.mem.indexOf(u8, out, "js_engine_version") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "readset              v10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "readset              v11") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "request_id           req_<16hex>") != null);
     // An unversioned format still has to appear: the registry is an inventory
     // of the whole surface, and dropping the entries with nothing to print is
