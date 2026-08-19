@@ -87,6 +87,23 @@ const MODULES = [_]struct {
     /// or by a fetch a SYSTEM module issued. The three entries below are the
     /// result handlers the customer-context shims name.
     result_targetable: bool = false,
+    /// May a CONTINUATION HOP land in this module? (rove#643)
+    ///
+    /// `blob.put`'s `on` (and `webhook.send`'s `on_result`) is a module path
+    /// that rides the effect's ctx and is dispatched later by the baked result
+    /// handler's `next(on_result, …)`. The hop carries no record of who chose
+    /// the string — `@rewind/segments` names `__system/segments_onsealed` from
+    /// customer-context package JS, and `blob_compose` names
+    /// `__system/blob_compose_onresult` from system context, and by dispatch
+    /// time the two are the same anonymous hop. So the ISSUER cannot be the
+    /// test here (it is a baked module either way, which is exactly how a
+    /// laundered target defeats an issuer check — `decisions.md` §3.3); the
+    /// TARGET list is.
+    ///
+    /// Deliberately its own list rather than a reuse of `result_targetable`:
+    /// receiving a fetch result is not permission to be hopped into, and the
+    /// two sets differ.
+    continuation_targetable: bool = false,
 }{
     .{
         .path = "__system/webhook_onresult.mjs",
@@ -137,6 +154,7 @@ const MODULES = [_]struct {
         .path = "__system/blob_compose_onresult.mjs",
         .src = @embedFile("builtin_blob_compose_onresult_mjs"),
         .result_targetable = true,
+        .continuation_targetable = true,
     },
     .{
         // blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`: segments.seal's swap half
@@ -144,6 +162,7 @@ const MODULES = [_]struct {
         // confirmed).
         .path = "__system/segments_onsealed.mjs",
         .src = @embedFile("builtin_segments_onsealed_mjs"),
+        .continuation_targetable = true,
     },
     .{
         // Engine-fired deploy-static streamer ("onStatic"): on an LRU miss for
@@ -243,6 +262,20 @@ pub fn isWakeTargetable(target: []const u8) bool {
 pub fn isResultTargetable(target: []const u8) bool {
     for (MODULES) |m| {
         if (!m.result_targetable) continue;
+        if (std.mem.eql(u8, target, m.path)) return true;
+        const bare = m.path[0 .. m.path.len - ".mjs".len];
+        if (std.mem.eql(u8, target, bare)) return true;
+    }
+    return false;
+}
+
+/// True iff a continuation hop (`next(target, …)`, the third dispatch route)
+/// may land in `target` (rove#643). Same shape and exactness as its two
+/// siblings; the whole set is the two modules a `blob.put` `on` legitimately
+/// names.
+pub fn isContinuationTargetable(target: []const u8) bool {
+    for (MODULES) |m| {
+        if (!m.continuation_targetable) continue;
         if (std.mem.eql(u8, target, m.path)) return true;
         const bare = m.path[0 .. m.path.len - ".mjs".len];
         if (std.mem.eql(u8, target, bare)) return true;
@@ -353,15 +386,66 @@ test "isResultTargetable: only the shim-named result handlers, and only by exact
     try testing.expect(!isResultTargetable(""));
 }
 
-test "the two dispatch gates are independent lists" {
-    // A module opted into one route has NOT thereby opted into the other:
-    // `webhook_fire` is armed by wakes and must not be a result target,
-    // `webhook_onresult` receives results and must not be wake-armable.
-    // Collapsing these into one flag would silently widen both doors.
+test "isContinuationTargetable: only the two a blob.put `on` names" {
+    const testing = std.testing;
+
+    // `@rewind/segments` names segments_onsealed from customer-context package
+    // JS; `blob_compose` names blob_compose_onresult from system context. Both
+    // arrive as the same anonymous hop, so both are on the list.
+    for ([_][]const u8{ "segments_onsealed", "blob_compose_onresult" }) |name| {
+        var bare_buf: [64]u8 = undefined;
+        const bare = try std.fmt.bufPrint(&bare_buf, "__system/{s}", .{name});
+        try testing.expect(isContinuationTargetable(bare));
+        var mjs_buf: [64]u8 = undefined;
+        const mjs = try std.fmt.bufPrint(&mjs_buf, "__system/{s}.mjs", .{name});
+        try testing.expect(isContinuationTargetable(mjs));
+    }
+
+    // The rest stay unreachable by a hop a tenant can name — including the
+    // two that hold a privileged capability behind their kind guards.
+    for ([_][]const u8{
+        "__system/export_run",
+        "__system/webhook_fire",
+        "__system/scheduler_tick",
+        "__system/cron_tick",
+        "__system/blob_compose",
+        "__system/blob_onresult",
+        "__system/webhook_onresult",
+        "__system/static",
+    }) |path| {
+        try testing.expect(!isContinuationTargetable(path));
+    }
+
+    try testing.expect(!isContinuationTargetable("__system/segments_onsealed.mjs.someExport"));
+    try testing.expect(!isContinuationTargetable("__system/segments_onsealed_evil"));
+    try testing.expect(!isContinuationTargetable("__system/"));
+    try testing.expect(!isContinuationTargetable(""));
+}
+
+test "every continuation-targetable module is one a `blob.put` on names" {
+    var count: usize = 0;
+    for (MODULES) |m| {
+        if (m.continuation_targetable) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "the three dispatch gates are independent lists" {
+    // A module opted into one route has NOT thereby opted into another:
+    // `webhook_fire` is armed by wakes only, `webhook_onresult` receives
+    // results only, `segments_onsealed` is hopped into only. Collapsing any
+    // two of these into one flag would silently widen both doors.
     try std.testing.expect(isWakeTargetable("__system/webhook_fire"));
     try std.testing.expect(!isResultTargetable("__system/webhook_fire"));
+    try std.testing.expect(!isContinuationTargetable("__system/webhook_fire"));
+
     try std.testing.expect(isResultTargetable("__system/webhook_onresult"));
     try std.testing.expect(!isWakeTargetable("__system/webhook_onresult"));
+    try std.testing.expect(!isContinuationTargetable("__system/webhook_onresult"));
+
+    try std.testing.expect(isContinuationTargetable("__system/segments_onsealed"));
+    try std.testing.expect(!isWakeTargetable("__system/segments_onsealed"));
+    try std.testing.expect(!isResultTargetable("__system/segments_onsealed"));
 }
 
 test "every result-targetable module is one a customer-context shim names" {

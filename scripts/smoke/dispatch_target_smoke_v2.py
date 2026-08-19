@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""A fetch result may only land in a baked module that opted in (rove#639).
+"""Only an opted-in baked module is dispatchable by tenant-supplied data.
+
+Two of the three routes into the baked `__system/` registry (rove#639, #643);
+the third — a durable wake naming its target in a `_sched/` record — is
+`wake_target_smoke_v2.py`. All three grant `is_system_module` from the module
+PATH, so any target a tenant can name is a target a tenant can run privileged,
+on a ctx it chose.
 
 The `on_chunk` target of an outbound fetch is a module path, and the engine
 grants `is_system_module` from that PATH. `http.subscribe` passes its public
@@ -7,6 +13,8 @@ grants `is_system_module` from that PATH. `http.subscribe` passes its public
 name and validates it), so before this gate one `http.subscribe` call ran ANY
 baked module, as a system module, on a ctx the tenant chose — the wake route's
 hole (rove#495) reopened at the second door.
+
+## Route: a fetch result (`on_chunk`)
 
 The three things that have to hold together:
 
@@ -18,6 +26,15 @@ The three things that have to hold together:
   3. the shims still work — `webhook.send` and `blob.put` name baked result
      handlers from customer context on every call, so a gate that broke them
      would be worse than the hole.
+
+## Route: a continuation hop (`blob.put`'s `on`)
+
+The `on` rides the effect ctx and is dispatched later by the baked result
+handler's `next(on_result, …)`. The issuer at that point is itself a baked
+module, so only a TARGET list can gate it — `@rewind/segments` names
+`__system/segments_onsealed` there and must keep working, while
+`__system/webhook_onresult` must not become a lever a tenant can pull on its
+own `_send/owed/` state.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -44,6 +61,31 @@ TENANT = "acme"
 # deployment). `export_run` is the capability target.
 HANDLER_SRC = r'''
 export function handler() { return "ready"; }
+
+// (4) the continuation route. `on` is dispatched by `blob_onresult`'s next().
+export function putTo(target, log) {
+    const h = blob.put(new TextEncoder().encode("x-" + Date.now() + "-" + log), {
+        on: target,
+        ctx: { log: log, first_seq: 0, last_seq: 0, count: 1, id: "probe" },
+    });
+    return "put:" + h;
+}
+
+// A hop into `webhook_onresult` would advance this tenant's own send state
+// machine out of band: it reads `_send/owed/{ctx.id}` and either drops the
+// marker or re-arms a `_sched/` retry. Untouched ⇒ the hop never landed.
+export function armOwed() {
+    kv.set("_send/owed/probe", JSON.stringify({
+        url: "http://127.0.0.1:1/never", method: "POST", body: "", attempts: 0,
+    }));
+    return "armed";
+}
+
+export function owedRow() { return kv.get("_send/owed/probe") === null ? "gone" : "present"; }
+
+export function schedRows() {
+    return JSON.stringify((kv.prefix("_sched/", "", 20) || []).map(r => r.key));
+}
 
 // (1) the gate, at the issuing call.
 export function sub(url, target) {
@@ -192,7 +234,35 @@ def main() -> int:
         check("forged export job produced no parts", '"parts":[]' in row.replace(" ", ""),
               f"_export/probe-job: {row[:200]!r}")
 
-        print("\nstep 4: the shims that legitimately name baked result handlers")
+        print("\nstep 4: the continuation route — a hop target a tenant chose")
+        c.get(TENANT, "/?fn=armOwed")
+        r = c.get(TENANT, f"/?fn=putTo&args={_args('__system/webhook_onresult', 'probeE')}")
+        check("blob.put issued with a baked `on`", "put:" in r.body, f"got {r.body[:120]!r}")
+        time.sleep(4.0)
+        r = c.get(TENANT, "/?fn=owedRow")
+        check("hop refused — the send marker is untouched", "present" in r.body,
+              f"_send/owed/probe is {r.body[:40]!r}")
+        # THE discriminating assertion: without the gate the hop lands and
+        # `webhook_onresult` arms a `_sched/` retry against the marker above.
+        r = c.get(TENANT, "/?fn=schedRows")
+        check("hop refused — no retry armed", r.body.strip() in ('"[]"', "[]"),
+              f"_sched/ rows: {r.body[:160]!r}")
+
+        # And the hop that IS on the list still lands: `@rewind/segments` names
+        # segments_onsealed from customer-context package JS on every seal, so
+        # a gate that refused it would break sealing outright.
+        r = c.get(TENANT, f"/?fn=putTo&args={_args('__system/segments_onsealed', 'probeE')}")
+        check("allowed hop issued", "put:" in r.body, f"got {r.body[:120]!r}")
+        landed = False
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            if "probeE" in c.get(TENANT, "/?fn=seg").body:
+                landed = True
+                break
+            time.sleep(0.5)
+        check("segments_onsealed still reachable by a hop", landed)
+
+        print("\nstep 5: the shims that legitimately name baked result handlers")
         r = c.get(TENANT, f"/?fn=send&args={_args(sink)}")
         check("webhook.send issued", "sent" in r.body, f"got {r.body[:120]!r}")
         delivered = False
@@ -224,8 +294,9 @@ def main() -> int:
     if failures:
         print(f"FAILURES ({len(failures)}): {failures}")
         return 1
-    print("PASS — only opted-in baked modules receive a fetch result, the "
-          "export door stays shut, and the shims still work")
+    print("PASS — only opted-in baked modules are reachable by a fetch result "
+          "or a continuation hop, the export door stays shut, and the shims "
+          "still work")
     return 0
 
 

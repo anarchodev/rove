@@ -87,10 +87,10 @@ reaches the baked `__system/` modules: the engine grants `is_system_module`
 from the module **path**, so anything a tenant can name, a tenant can run
 privileged, with a ctx it chose.
 
-Two routes reach a baked module from tenant-supplied data, and each carries its
-own allowlist on the registry (`src/js/builtin_modules.zig`) — the target opts
-in, rather than each module being independently defensive about activations it
-never expected:
+Three routes reach a baked module from tenant-supplied data, and each carries
+its own allowlist on the registry (`src/js/builtin_modules.zig`) — the target
+opts in, rather than each module being independently defensive about
+activations it never expected:
 
 - **A durable wake** names its target in a `_sched/` record, which is customer
   data. `wake_targetable` is the set a wake may fire (`webhook_fire`,
@@ -101,9 +101,18 @@ never expected:
   (`webhook_onresult`, `blob_onresult`, `blob_compose_onresult` — the three the
   shims hand results to); the refusal is a JS exception at the issuing call, not
   a silent drop an activation later.
+- **A continuation hop** — `blob.put`'s `on` (and `webhook.send`'s
+  `on_result`) — rides the effect's ctx and is dispatched later by the baked
+  result handler's `next(on_result, …)`. `continuation_targetable` is that set
+  (`segments_onsealed`, `blob_compose_onresult`), checked at the router's
+  chained-dispatch funnel; a refused hop is dropped with a warning, as a
+  refused wake entry is.
 
 The lists are deliberately separate: receiving a result is not permission to be
-woken, and vice versa. A fetch issued from a baked module (`__rove.fetch`, which
+woken, or to be hopped into. Note what cannot be the test on the third route —
+by the time a hop dispatches, its issuer is a baked module whether the target
+came from `@rewind/segments` or from a handler, so an issuer check would pass
+for a laundered target and only a target list bounds it. A fetch issued from a baked module (`__rove.fetch`, which
 is itself `is_system_module`-gated) is engine-internal and exempt — that is how
 `webhook_fire` chains to `webhook_onresult` and `export_run` to itself.
 
