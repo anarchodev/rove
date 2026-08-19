@@ -171,7 +171,11 @@ pure function of its `(Msg, Model snapshot, bytecode)`) imply a stronger
 storage discipline than any single law states. *Inputs* must be recorded
 durably — L3 covers the Msg, the readset captures the Model snapshot
 (`architecture/effects-and-handlers.md` §4), the `.module` channel pins the
-bytecode by hash. *Outputs the handler synthesized* (writeset,
+bytecode by hash. The Model snapshot has one bound: the kv channel rides the
+raft entry, so an activation that reads past its kv budget records the read
+and drops the VALUE (`KvOutcome.elided`), and every replay engine refuses
+that read rather than resolving it — an input that cannot be carried is
+recorded as missing, never as absent. *Outputs the handler synthesized* (writeset,
 handler-generated Cmd-runtime bytes, wire-shipped bytes) are then a
 deterministic function of those inputs and therefore need not carry
 independent durability — they are derivable on demand.

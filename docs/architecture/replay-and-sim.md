@@ -206,7 +206,7 @@ Capture writes six channels (`src/tape/root.zig`, `Channel`):
 
 | channel | carries |
 |---|---|
-| `kv` (0) | kv **reads** (`get`/`prefix` + outcome), resolved by key on replay; `set`/`delete` are outputs, never recorded |
+| `kv` (0) | kv **reads** (`get`/`prefix` + outcome), resolved by key on replay; `set`/`delete` are outputs, never recorded. A read past the per-activation budget (`KV_TAPE_BUDGET`) records `elided` + the lost byte count, and replay REFUSES it — see below |
 | `module` (1) | resolved module specifier → source hash (bytecode pin) |
 | `fetch_responses` (2) | a fetch result's bytes + terminal `status`/`ok`/`body_truncated` (`worker_streaming.zig:3236`) |
 | `trigger_payload` (3) | the request **body** (inbound) **or** a synthesized `{"ctx": …}` envelope (continuation resume) — `worker_drain.zig:1448`, `liftThreadedCtx` `globals.zig:2253` |
@@ -220,6 +220,23 @@ entry** as well — that entry is all a promoted leader's walker has when the
 original leader died between propose and flush, and a record rebuilt without
 them replays with an empty wakes bag, through the conventional export
 (rove#199).
+
+### A read the budget dropped is refused, not answered
+
+The kv channel rides the raft entry, so it carries a per-activation ceiling
+(`tape.KV_TAPE_BUDGET`) — without one, a handler that reads broadly and then
+writes proposes an entry larger than the transport frame and its write fails
+outright. Past the ceiling the read's key is still recorded and its VALUE is
+not: the entry's outcome is `elided`, carrying the lost byte count.
+
+Replay must REFUSE such a read. The closed world's ordinary miss rule (a key
+not in the map resolves to `not_found`) is the one answer that is certainly
+wrong here — the live run read real data — and serving it would be the #214
+shape, a missing input arriving as a plausible value. The offline host records
+a divergence naming the key and the lost size, and the run reports `ok:false`.
+A `kv.prefix` page elides whole for the same reason: the map could rebuild a
+SHORT page and present it as complete, so every scan of an elided prefix
+refuses instead.
 
 ### Cross-store reads — the kv channel is tenant-implicit, so the store rides in the key
 

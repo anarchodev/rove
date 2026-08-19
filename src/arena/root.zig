@@ -239,6 +239,18 @@ pub const ArenaKv = struct {
                 if (!facade) FX.read(self.ctx, key, null);
                 return .absent;
             },
+            // `elided` (`src/tape/root.zig` `KvOutcome`): the capture resolved
+            // this read and dropped its value at the kv budget. There is
+            // nothing to serve and nothing to throw — a throw is catchable,
+            // and a handler that swallowed it would carry on as if the read
+            // had merely failed. Poison the run instead, the same verdict the
+            // off-tape read gets.
+            4 => {
+                if (val != null) std.c.free(val);
+                poison(key);
+                if (!facade) FX.read(self.ctx, key, null);
+                return .absent;
+            },
             else => {
                 // A recorded failure replays as the failure.
                 if (val != null) std.c.free(val);
@@ -308,6 +320,12 @@ pub const ArenaKv = struct {
             if (json != null) std.c.free(json);
             return null;
         }
+        // `elided` (`src/tape/root.zig` `KvOutcome`): the capture's kv budget
+        // dropped this page whole, so the host answers with no rows. Serving
+        // that as a scan result would present an EMPTY page as a complete one
+        // — the shape a partial page would have, and the reason the capture
+        // elides pages all-or-nothing. Poison, then let the run unwind.
+        if (outcome == 4) poison(p);
         const bytes: []const u8 = json[0..@intCast(json_len)];
         var parsed = std.json.parseFromSlice([]Row, std.heap.c_allocator, bytes, .{}) catch {
             std.c.free(json);

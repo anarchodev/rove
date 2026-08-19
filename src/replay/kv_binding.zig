@@ -316,6 +316,16 @@ pub const OfflineKv = struct {
                 _ = c.JS_ThrowInternalError(self.ctx, "kv.get: recorded failure");
                 return .thrown;
             },
+            // The capture resolved this read and dropped its value (over the
+            // activation's kv budget). The host has already recorded the
+            // divergence and the interrupt is braking the run; answer absent
+            // so the run unwinds instead of throwing something a handler
+            // could catch and turn into a plausible alternative path.
+            .elided => {
+                if (val != null) std.c.free(val);
+                if (!facade) FX.read(self.ctx, key, null);
+                return .absent;
+            },
             // `refused` exists only on write entries; a host answering a GET
             // with it is a protocol bug — loud, not absent.
             .refused => {
