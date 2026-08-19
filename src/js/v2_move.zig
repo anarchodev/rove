@@ -60,6 +60,7 @@ const wire = @import("rove-wire");
 /// Keyring shard install — key material replication, gated by the same
 /// move secret as the rest of this family.
 const keyring_shard = @import("keyring_shard.zig");
+const crypt = @import("rove-crypt");
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = wire.TENANT;
@@ -452,6 +453,23 @@ fn handleAttach(
     _ = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
 
+    // The keyring root secret rides a BIRTH attach only, and this is the
+    // one moment it exists outside a node: the CP mints it, fans the same
+    // bytes to every birth node, and keeps no copy (a key recorded in the
+    // directory would be key material in a raft log). A move or repair
+    // attach carries none — that node's keyring arrives from a peer as
+    // KEK-sealed ciphertext, the same operation as an ordinary shard
+    // update.
+    if (dec.secret) |sec| {
+        createKeyringAtBirth(worker, allocator, tenant, sec) catch |err| {
+            // Fail the attach. A tenant born without a shreddable root
+            // looks completely healthy until the first seal needs a key
+            // no node has, and by then the only fix is re-provisioning.
+            std.log.warn("v2-attach {s}: keyring create failed: {s}", .{ tenant, @errorName(err) });
+            return reply(server, allocator, ent, sid, sess, 500, "keyring create failed\n");
+        };
+    }
+
     // The tenant's plan rides the attach handshake (operational state,
     // docs/architecture/control-plane.md): cache the resolved limits on its slot so enforcement is local
     // from the first post-move request. Non-fatal — a bad/absent plan leaves
@@ -503,6 +521,36 @@ fn handleAttach(
         else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
     };
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+/// Create this tenant's keyring from the birth secret.
+///
+/// Idempotent: a re-delivered attach finds the keyring already there and
+/// succeeds, matching `createGroupEpoch`'s `GroupExists` posture — a
+/// retried birth must not fail on work that already landed.
+///
+/// A node with no `REWIND_KEYRING_KEK` has the keyring surface disabled
+/// and skips, so a cluster that has not turned crypto-shredding on still
+/// provisions. That stops being acceptable once values are sealed under
+/// these keys: a tenant born with no keyring would then be a tenant whose
+/// writes cannot be sealed at all.
+fn createKeyringAtBirth(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    tenant: []const u8,
+    secret: [32]u8,
+) !void {
+    const kek = worker.keyring_kek orelse return;
+    const data_dir = worker.data_dir orelse return;
+
+    const dir = try keyring_shard.keyringDir(allocator, data_dir);
+    defer allocator.free(dir);
+
+    var kr = crypt.keyring.Keyring.create(allocator, dir, tenant, kek, secret) catch |err| switch (err) {
+        error.KeyringExists => return,
+        else => return err,
+    };
+    kr.deinit();
 }
 
 // ── v2-evict: destroy the source group + drop the instance ────────────

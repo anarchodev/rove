@@ -64,6 +64,12 @@ const std = @import("std");
 ///                         in-memory Completions + `_send/proof/`, not
 ///                         `_callback/` rows). Stays reserved so customer
 ///                         JS can't spoof a receipt key.
+///   `_keys/`            → crypto-shredding: the slot counter
+///                         (`_keys/next_slot`), identity→slot bindings
+///                         (`_keys/bind/`) and destroy tombstones
+///                         (`_keys/dead/`). A tenant that could write
+///                         here could hand itself another identity's
+///                         key, or forge an erasure it never performed.
 ///   `_log/`             → per-tenant log metadata in app.db. Today
 ///                         only `_log/next_request_seq` lives here
 ///                         (in app.db, not log.db, so the worker opens
@@ -91,6 +97,7 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_config/",
     "_deploy/",
     "_callback/",
+    "_keys/",
     "_log/",
     "_magic/",
     "_triggers/",
@@ -219,6 +226,13 @@ test "isCustomerWriteReserved: known platform prefixes blocked" {
     try std.testing.expect(isCustomerWriteReserved("_magic/token"));
     try std.testing.expect(isCustomerWriteReserved("_triggers/users/index.mjs"));
     try std.testing.expect(isCustomerWriteReserved("_deploy/current"));
+    // Crypto-shredding state. A handler that could write these could
+    // rebind itself onto another identity's key (`_keys/bind/`), forge
+    // an erasure (`_keys/dead/`), or hand itself a slot range
+    // (`_keys/next_slot`).
+    try std.testing.expect(isCustomerWriteReserved("_keys/next_slot"));
+    try std.testing.expect(isCustomerWriteReserved("_keys/bind/0011223344556677"));
+    try std.testing.expect(isCustomerWriteReserved("_keys/dead/0000000000001001"));
     // `_admin/` is read-only from shims (is_root allowlist) → reserved.
     try std.testing.expect(isCustomerWriteReserved("_admin/operator/abc"));
 }

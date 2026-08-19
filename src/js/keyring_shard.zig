@@ -40,6 +40,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const crypt = @import("rove-crypt");
+const keyring_bind = @import("keyring_bind.zig");
 const blob = @import("rove-blob");
 const curl = blob.curl;
 const respb = @import("response_builder.zig");
@@ -56,11 +57,9 @@ const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 /// policy.
 const MAX_VOTERS = 16;
 
-/// Keyring root under the node's data dir. One directory per tenant
-/// beneath it.
-pub fn keyringDir(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/keyrings", .{data_dir});
-}
+/// Re-exported from `keyring_bind`, which owns the keyring's on-disk
+/// and keyspace facts. One name for the path, wherever it is needed.
+pub const keyringDir = keyring_bind.keyringDir;
 
 // ── receive ──────────────────────────────────────────────────────────
 
@@ -187,9 +186,25 @@ pub fn pushToQuorum(
     var q = crypt.replicate.Quorum.init(cs.voters.len);
     const self_id: u64 = worker.raft.config.node_id;
 
+    // EVERY voter is offered the shard, not just enough of them.
+    //
+    // A majority is the bar for calling the key durable; it is the wrong
+    // bar for stopping. Stopping there leaves a voter that is up and
+    // reachable without the shard, and nothing brings it one later:
+    // pushes are per-shard and refills append to the TAIL shard, so once
+    // minting moves past a shard — or the tenant simply stops taking new
+    // identities — that node's gap is permanent.
+    //
+    // It matters because raft elects on LOG up-to-dateness and the
+    // keyring deliberately sits outside the log, so those two majorities
+    // are unrelated. The node that missed a shard can win an election,
+    // and a node that answers reads while missing a key reports live
+    // data as erased — `keyAt` returns null and absence is authoritative.
+    //
+    // Cost is bounded: this runs on the refill path, ahead of demand,
+    // never on a request. A slow peer delays a future block, not a seal.
     for (cs.voters) |peer| {
         if (peer == self_id) continue; // already written locally
-        if (q.state() == .durable) break; // enough; the rest catch up on the next push
 
         const base = peerUrl(worker, peer) orelse {
             q.fail();
@@ -201,7 +216,9 @@ pub fn pushToQuorum(
             q.fail();
         }
         // A majority is unreachable — stop rather than time out against
-        // peers that cannot change the answer.
+        // peers that cannot change the answer. Unreachable only while
+        // NOT yet durable: `state` checks `acked >= needed` first, so a
+        // later peer failing after quorum cannot un-durable the push.
         if (q.state() == .impossible) break;
     }
 
