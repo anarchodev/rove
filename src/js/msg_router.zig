@@ -34,6 +34,7 @@ const components_mod = @import("components.zig");
 const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const globals = @import("globals.zig");
+const builtin_modules = @import("builtin_modules.zig");
 
 const KvWakeInbox = worker_mod.KvWakeInbox;
 
@@ -515,6 +516,24 @@ pub const MsgRouter = struct {
         fn_name: ?[]const u8,
         saga_id: ?[]const u8,
     ) !void {
+        // The hop's target is customer data on every route that reaches here
+        // (`blob.put`'s `on`, `webhook.send`'s `on_result`), and dispatch
+        // grants `is_system_module` from the module PATH — so a baked target
+        // is only dispatchable if it opted in (rove#643). Dropped rather than
+        // errored: a refused hop is not an enqueue failure, it is a target
+        // that was never dispatchable, and the same drop the wake route makes
+        // for a refused entry. Gated HERE, at the router's single funnel, so a
+        // future second producer of a chained dispatch inherits it.
+        if (builtin_modules.isBuiltinPath(module_path) and
+            !builtin_modules.isContinuationTargetable(module_path))
+        {
+            std.log.warn(
+                "rove-js chained dispatch: refusing baked target {s} for tenant={s} — not continuation-targetable",
+                .{ module_path, tenant_id },
+            );
+            return;
+        }
+
         const allocator = self.allocator;
         const tid = try allocator.dupe(u8, tenant_id);
         errdefer allocator.free(tid);
