@@ -769,7 +769,28 @@ const Router = struct {
         const incarnation = std.fmt.bufPrint(&inc_buf, "{x:0>16}", .{std.mem.readInt(u64, &rnd, .big)}) catch
             return replyStatus(server, ent, sid, sess, 500);
 
-        if (!move.attachToAll(self, birth_nodes, tenant, null, birth_voters, incarnation)) {
+        // Mint this tenant's keyring ROOT SECRET — the HKDF root whose
+        // destruction is the C1 shred. Same reasoning as the incarnation
+        // above, and one more besides: it is minted here rather than
+        // derived from anything, because a DERIVED key cannot be shredded
+        // (while its parent exists the child is re-derivable), so there
+        // would be nothing whose destruction constitutes erasure.
+        //
+        // It is never recorded. The directory is a raft group, and a key
+        // written to a log stays legible after it is "destroyed" — the
+        // exact recursion crypto-shredding exists to avoid. So this is the
+        // only moment the CP holds it: minted, delivered to the birth
+        // nodes, forgotten. A later joiner gets it from a peer as sealed
+        // ciphertext, never from here.
+        var secret_raw: [32]u8 = undefined;
+        std.crypto.random.bytes(&secret_raw);
+        var secret_hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&secret_hex, "{x}", .{&secret_raw}) catch
+            return replyStatus(server, ent, sid, sess, 500);
+        defer std.crypto.secureZero(u8, &secret_raw);
+        defer std.crypto.secureZero(u8, &secret_hex);
+
+        if (!move.attachToAll(self, birth_nodes, tenant, null, birth_voters, incarnation, &secret_hex)) {
             move.evictAll(self, tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -1550,7 +1571,12 @@ const Router = struct {
             return;
         };
         defer a.free(move_inc);
-        if (!move.attachToAll(self, dest_nodes, tenant, plan_blob, null, move_inc)) {
+        // No secret: a move re-homes an EXISTING tenant, whose keyring
+        // reaches the destination as KEK-sealed ciphertext from a peer.
+        // Minting a fresh one here would strand every byte the old key
+        // sealed, which is data loss wearing the shape of a provisioning
+        // step.
+        if (!move.attachToAll(self, dest_nodes, tenant, plan_blob, null, move_inc, null)) {
             move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;

@@ -224,6 +224,7 @@ def attach_join(url: str, *, tenant: str,
                 epoch=None,
                 incarnation: str | None = "",
                 as_learner=None, voters=None, learners=None,
+                keyring_secret: str | None = None,
                 discard_body: bool = False) -> str:
     """POST an EMPTY join attach to a node's `/_system/v2-attach` and return
     the HTTP status as a string. Attach carries no body — state arrives via
@@ -242,6 +243,12 @@ def attach_join(url: str, *, tenant: str,
     OMIT the header, which the server rejects with 400; that exists for
     negative tests only. Other omitted arguments send no header, which is
     what an attach that means to exercise the server's default needs.
+    `keyring_secret` is 64 hex characters and belongs on a BIRTH attach
+    only — the CP mints it once and fans the same bytes to every birth node,
+    because a per-node mint would key one tenant's data differently on each.
+    A move or repair attach omits it; that node's keyring arrives from a
+    peer as KEK-sealed ciphertext.
+
     `discard_body` drops the response body so an error message can't be
     concatenated ahead of the status code.
     """
@@ -267,6 +274,8 @@ def attach_join(url: str, *, tenant: str,
     if learners is not None:
         args += ["-H", ("X-Rewind-Learners: " + ",".join(str(l) for l in learners))
                  if learners else "X-Rewind-Learners;"]
+    if keyring_secret is not None:
+        args += ["-H", f"X-Rewind-Keyring-Secret: {keyring_secret}"]
     args += [url]
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 

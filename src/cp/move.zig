@@ -44,13 +44,20 @@ pub fn clusterVoterIds(a: std.mem.Allocator, n: usize) ![]u64 {
 /// born group forms with — the SAME set for every node, so the group forms
 /// consistently without depending on each node's static `REWIND_VOTERS`.
 /// Null → the node falls back to its env.
-pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u64, incarnation: []const u8) bool {
+/// `secret` is the tenant's keyring root, 64 hex, and is sent ONLY at
+/// birth — one minter fanning the same bytes to every birth node is what
+/// makes it agree cluster-wide. A move passes null: the destination is a
+/// new home for an existing tenant, so its keyring arrives from a peer as
+/// KEK-sealed ciphertext rather than being re-minted (re-minting would
+/// strand every byte the old key sealed).
+pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u64, incarnation: []const u8, secret: ?[]const u8) bool {
     const a = router.allocator;
     var enc = wire.encodeAttach(a, .{
         .tenant = tenant,
         .incarnation = incarnation,
         .plan = plan,
         .voters = birth_voters,
+        .secret = secret,
     }) catch return false;
     defer enc.deinit();
     for (dest_nodes) |base| {

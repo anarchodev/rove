@@ -25,6 +25,9 @@ const curl = blob.curl;
 
 pub const TENANT = "x-rewind-tenant";
 pub const INCARNATION = "x-rewind-incarnation";
+/// The tenant's keyring root secret, 64 lowercase hex, minted ONCE at
+/// birth. Present only on a birth attach; see `AttachEnvelope.secret`.
+pub const KEYRING_SECRET = "x-rewind-keyring-secret";
 pub const PLAN = "x-rewind-plan";
 /// RETIRED (with the buffered bundle path + the atomic baseline attach): a
 /// joiner is born EMPTY and its state arrives raft-natively — log
@@ -82,6 +85,23 @@ pub const AttachEnvelope = struct {
     /// Genesis §4d attach-carry: `id@addr,…` of the existing members so a
     /// joiner can ACK the leader. Absent/empty on static clusters.
     peer_addrs: ?[]const u8 = null,
+    /// The tenant's keyring root secret as 64 lowercase hex — the HKDF
+    /// root whose destruction is the tenant-level (C1) shred.
+    ///
+    /// Sent ONLY on a birth attach, where one minter fanning the same
+    /// bytes to every birth node is what makes the secret agree
+    /// cluster-wide; nodes minting independently would key one tenant's
+    /// data differently per node, which is a correctness fault rather
+    /// than a leak.
+    ///
+    /// A repair or move attach sends NOTHING here, and that is not an
+    /// omission. The CP has no durable copy to resend: storing a key in
+    /// the directory would put key material in a raft log, where a
+    /// destroyed key stays legible forever and shredding defeats itself
+    /// one level down. A late-joining node gets the keyring from a peer
+    /// as KEK-sealed ciphertext instead, which is the same operation as
+    /// an ordinary shard update (`js/keyring_shard.zig`).
+    secret: ?[]const u8 = null,
 };
 
 /// Encoded attach headers. `headers` (and every formatted value in it)
@@ -119,6 +139,7 @@ pub fn encodeAttach(gpa: std.mem.Allocator, env: AttachEnvelope) !EncodedAttach 
         try hs.append(a, .{ .name = LEARNERS, .value = try joinIds(a, l) });
     if (env.peer_addrs) |pa| if (pa.len != 0)
         try hs.append(a, .{ .name = PEER_ADDRS, .value = pa });
+    if (env.secret) |sec| try hs.append(a, .{ .name = KEYRING_SECRET, .value = sec });
 
     return .{ .arena = arena, .headers = try hs.toOwnedSlice(a) };
 }
@@ -135,6 +156,11 @@ pub const AttachDecodeError = error{
     MalformedEpoch,
     MalformedVoters,
     MalformedLearners,
+    /// Present but not 64 lowercase hex. Never treated as absent: a
+    /// birth that silently dropped the secret would stand the tenant up
+    /// with no keyring, and nothing downstream would notice until a
+    /// seal needed a key that no node had.
+    MalformedKeyringSecret,
 };
 
 /// Decoded attach envelope. Slices borrow the request's header storage
@@ -150,6 +176,8 @@ pub const DecodedAttach = struct {
     epoch: u64,
     join_as_learner: bool,
     peer_addrs: ?[]const u8,
+    /// Decoded keyring root secret, or null on a repair/move attach.
+    secret: ?[32]u8,
     voters_buf: [MAX_MEMBER_IDS]u64,
     voters_len: ?u8,
     learners_buf: [MAX_MEMBER_IDS]u64,
@@ -199,11 +227,18 @@ pub fn decodeAttach(headers: anytype) AttachDecodeError!DecodedAttach {
         .epoch = epoch,
         .join_as_learner = join_as_learner,
         .peer_addrs = headers.get(PEER_ADDRS),
+        .secret = null,
         .voters_buf = undefined,
         .voters_len = null,
         .learners_buf = undefined,
         .learners_len = null,
     };
+    if (headers.get(KEYRING_SECRET)) |hex| {
+        var raw: [32]u8 = undefined;
+        if (hex.len != 64) return error.MalformedKeyringSecret;
+        _ = std.fmt.hexToBytes(&raw, hex) catch return error.MalformedKeyringSecret;
+        out.secret = raw;
+    }
     if (headers.get(VOTERS)) |s|
         out.voters_len = parseIds(s, &out.voters_buf) catch return error.MalformedVoters;
     if (headers.get(LEARNERS)) |s|
@@ -217,6 +252,7 @@ pub fn decodeAttach(headers: anytype) AttachDecodeError!DecodedAttach {
 pub fn attachDecodeMessage(e: AttachDecodeError) []const u8 {
     return switch (e) {
         error.MissingTenant => "missing " ++ TENANT ++ "\n",
+        error.MalformedKeyringSecret => "malformed " ++ KEYRING_SECRET ++ " — must be exactly 64 lowercase hex characters\n",
         error.MissingIncarnation => "missing " ++ INCARNATION ++ " — required since rove#363; a legacy name-keyed tenant sends the value '" ++ INCARNATION_LEGACY ++ "', never an absent header\n",
         error.BaselineRetired => "attach carries no baseline - a joiner is born empty and its state arrives raft-natively (v2-snapshot-stream / log replication)\n",
         error.MalformedEpoch => "malformed " ++ EPOCH ++ "\n",
@@ -305,6 +341,60 @@ const FakeHeaders = struct {
         return null;
     }
 };
+
+test "attach: a birth secret round-trips as raw bytes" {
+    const hex = "00112233445566778899aabbccddeeff" ++ "ffeeddccbbaa99887766554433221100";
+    var enc = try encodeAttach(testing.allocator, .{
+        .tenant = "acme",
+        .incarnation = "deadbeef01234567",
+        .secret = hex,
+    });
+    defer enc.deinit();
+    const dec = try decodeAttach(FakeHeaders{ .entries = enc.headers });
+    const got = dec.secret orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 0x00), got[0]);
+    try testing.expectEqual(@as(u8, 0xff), got[15]);
+    try testing.expectEqual(@as(u8, 0x00), got[31]);
+}
+
+test "attach: no secret is the normal case, not a malformed one" {
+    // A move or repair attach carries none — the destination's keyring
+    // arrives from a peer as sealed ciphertext. Decoding must not invent
+    // one, and must not fail.
+    var enc = try encodeAttach(testing.allocator, .{
+        .tenant = "acme",
+        .incarnation = "deadbeef01234567",
+    });
+    defer enc.deinit();
+    const fh = FakeHeaders{ .entries = enc.headers };
+    const dec = try decodeAttach(fh);
+    try testing.expect(dec.secret == null);
+    try testing.expect(fh.get(KEYRING_SECRET) == null);
+}
+
+test "attach: a malformed secret is refused, never read as absent" {
+    // Silently dropping it would birth the tenant with no keyring, and
+    // nothing downstream would notice until a seal needed a key no node
+    // has — at which point the only repair is re-provisioning.
+    const cases = [_][]const u8{
+        "",
+        "abcd",
+        "0" ** 63,
+        "0" ** 65,
+        "g" ** 64,
+    };
+    for (cases) |bad| {
+        const hs = [_]curl.Header{
+            .{ .name = TENANT, .value = "acme" },
+            .{ .name = INCARNATION, .value = INCARNATION_LEGACY },
+            .{ .name = KEYRING_SECRET, .value = bad },
+        };
+        try testing.expectError(
+            error.MalformedKeyringSecret,
+            decodeAttach(FakeHeaders{ .entries = &hs }),
+        );
+    }
+}
 
 test "attach: encode→decode round-trips every field" {
     var enc = try encodeAttach(testing.allocator, .{
