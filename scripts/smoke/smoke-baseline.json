@@ -739,6 +739,11 @@
     "seconds": 2.2,
     "status": "pass"
   },
+  "truncation_after_fold_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.8,
+    "status": "pass"
+  },
   "ttfb_idle_reuse_smoke.py": {
     "rc": 0,
     "seconds": 58.5,
