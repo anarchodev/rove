@@ -126,7 +126,7 @@ Derived, in the order a write meets them:
 |---|---|---|
 | `KV_VAL_MAX` (384 KiB) | the kv guard, at `kv.set` | `value_too_large`, a code to branch on |
 | `KV_WRITES_MAX` (1000) / `KV_WRITE_BYTES_MAX` (400 KiB), **per activation** | the same guard | `too_many_writes` / `writes_too_large` |
-| `MAX_ENTRY_BYTES` | `Bridge.propose` | a defined 413 when the batch is this one request; otherwise the retry-safe 421, because an entry carries the whole batch and cannot say whose writes did not fit |
+| `MAX_ENTRY_BYTES` | `Bridge.propose` | a defined 413 for the activation whose OWN share cannot fit an entry (a retry would re-run the same handler and fail identically); the retry-safe 421 for its neighbours, who succeed in a smaller batch |
 | the same, by bytes | `proposeMulti`'s batching | nothing: the batch spills into another entry |
 | `MAX_MESSAGE_BYTES` | the transport, dropping unsent | nothing; `raft_oversize_dropped_total` should never leave zero |
 
@@ -138,7 +138,9 @@ their budget built an entry no follower could receive, and the only answer left
 at propose was to refuse requests that had done nothing wrong.
 
 The walk now stops ADMITTING once the batch has less room left than the next
-activation could spend (`BATCH_ADMIT_RESERVE`). A skipped request stays in
+activation could spend (`BATCH_ADMIT_RESERVE`). A skipped request has NOT run
+its handler — the check sits at the admission point, before dispatch — so
+nothing is executed twice and no side effect is repeated. A skipped request stays in
 `request_out` for the next dispatchOnce, exactly as a different-tenant request
 does, and rides its own entry. Spilling one batch into two entries was the
 alternative and is worse: it splits the batch's all-or-nothing apply while its

@@ -77,6 +77,19 @@ export default function () {
     return next({ from: from + 3 });
   }
   if (op === "small") { kv.set("s/" + p.get("k"), "ok"); return "s"; }
+  if (op === "unfittable") {
+    // Legal writes AND a large recorded readset: this activation's own share
+    // of a raft entry cannot fit even with the batch to itself. It must get a
+    // TERMINAL answer the first time — a retry would re-run the same handler
+    // and fail identically.
+    for (let i = 0; i < 3; i++) kv.set("seed/" + i, "s".repeat(115 * 1024));
+    return "seeded";
+  }
+  if (op === "unfittable2") {
+    for (let i = 0; i < 3; i++) kv.get("seed/" + i);      // ~345 KiB of readset
+    for (let i = 0; i < 3; i++) kv.set("uf/" + i, "u".repeat(115 * 1024));  // ~345 KiB of writes
+    return "wrote";
+  }
   if (op === "fat") {
     // One activation at ~350 KiB — legal on its own. Several of these
     // arriving together for the same tenant used to build ONE entry no
@@ -149,7 +162,19 @@ def main() -> int:
               all(r.status == 200 and r.body == "fat" for r in fat),
               f"statuses={[r.status for r in fat]}")
 
-        # ── 5. nothing reached the wire ──
+        # ── 5. an activation that can never fit gets a TERMINAL answer ──
+        # Its own writes + its own recorded reads exceed one entry, so a retry
+        # would re-run the same handler and fail identically. 413, once.
+        r = c.request("victim", "/?op=unfittable", timeout=60.0)
+        check("seed for the unfittable case", r.status == 200, f"{r.status}")
+        codes = []
+        for _ in range(3):
+            rr = c.request("victim", "/?op=unfittable2", timeout=60.0)
+            codes.append(rr.status)
+        check("an activation whose own entry cannot fit answers 413 every time, never a retry-loop 421",
+              codes == [413, 413, 413], f"statuses={codes}")
+
+        # ── 6. nothing reached the wire ──
         logs = "".join(Path(p).read_text(errors="replace")
                        for p in c.log_paths.values() if Path(p).exists())
         oversize = "oversize frame" in logs
@@ -159,7 +184,7 @@ def main() -> int:
                       for i in range(len(c.node_ports)))
         check("the transport backstop never had to fire", dropped == 0, f"got {dropped}")
 
-        # ── 6. the co-tenant is untouched ──
+        # ── 7. the co-tenant is untouched ──
         ok, statuses = 0, []
         for i in range(40):
             rr = c.request("bystander", f"/?op=small&k={i}", timeout=30.0)
