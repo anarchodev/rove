@@ -19,6 +19,7 @@ const tape_mod = @import("rove-tape");
 const digest_mod = tape_mod.interaction_digest;
 const rove = @import("rove");
 const reserved = @import("rove-reserved");
+const guards = @import("rove-guards");
 
 const c = qjs.c;
 
@@ -31,10 +32,50 @@ const js_undefined = globals_mod.js_undefined;
 const js_null = globals_mod.js_null;
 const valueToOwnedString = globals_mod.valueToOwnedString;
 const kvWriteArgToOwnedString = globals_mod.kvWriteArgToOwnedString;
-const kvSizeViolation = globals_mod.kvSizeViolation;
-const throwKvTooLarge = globals_mod.throwKvTooLarge;
-const throwReservedKey = globals_mod.throwReservedKey;
-const KvSizeViolation = globals_mod.KvSizeViolation;
+const throwKvError = globals_mod.throwKvError;
+
+// ── the kv rules, on the privileged path too ──────────────────────
+//
+// A platform write rides the SAME raft entry as the batch it dispatches in,
+// so it obeys the same rules a customer write does — and there is exactly one
+// authority for those (`rove-guards`, reached from the customer surface via
+// `rove-binding`). These bindings write the root / target writeset directly
+// rather than through the binding, so they call the guard here.
+
+/// Refuse a privileged write that breaks a kv rule, as the customer surface
+/// would. Returns the thrown exception, or null when the write may proceed.
+///
+/// `is_system_module` is TRUE here: the admin handler is allowed to write the
+/// platform-reserved prefixes, which is the whole point of the surface. It is
+/// not exempt from the size caps or from the activation's write budget —
+/// those bound what one entry may carry, never which namespace it names.
+fn refusePlatformWrite(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    key: []const u8,
+    value: ?[]const u8,
+) ?c.JSValue {
+    const refusal = guards.checkKvWrite(key, value, true, .{
+        .ops = state.write_ops,
+        .bytes = state.write_bytes,
+    }) orelse return null;
+    if (refusal.message.len > 0) return throwKvError(ctx, refusal.message, refusal.code);
+    const msg = std.fmt.allocPrint(
+        state.allocator,
+        comptime guards.kvReservedMessageFmt(),
+        .{key},
+    ) catch return c.JS_ThrowOutOfMemory(ctx);
+    defer state.allocator.free(msg);
+    return throwKvError(ctx, msg, guards.kv_reserved_code);
+}
+
+/// Charge the activation's write budget for a write that HAPPENED — a refused
+/// or failed one costs nothing, or a handler could be starved by writes that
+/// never reached the entry. Mirrors `WorkerKv.noteWrite`.
+fn notePlatformWrite(state: *DispatchState, bytes: usize) void {
+    state.write_ops += 1;
+    state.write_bytes += bytes;
+}
 
 // ── cross-store read taping ───────────────────────────────────────
 //
@@ -281,9 +322,12 @@ pub fn jsPlatformRootSet(
     const val = kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
     defer state.allocator.free(val);
 
+    if (refusePlatformWrite(state, ctx, key, val)) |thrown| return thrown;
+
     tenant.root.put(key, val) catch |err| {
         state.pending_kv_error = err;
     };
+    notePlatformWrite(state, key.len + val.len);
     recordStoreWrite(state, "r", key, val);
     // Mirror the write into the root writeset so the worker can
     // propose it through raft. Admin handlers ALWAYS have this
@@ -313,6 +357,8 @@ pub fn jsPlatformRootDelete(
     const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key);
 
+    if (refusePlatformWrite(state, ctx, key, null)) |thrown| return thrown;
+
     recordStoreWrite(state, "r", key, null);
     tenant.root.delete(key) catch |err| switch (err) {
         error.NotFound => {
@@ -326,6 +372,9 @@ pub fn jsPlatformRootDelete(
             return js_undefined;
         },
     };
+    // A delete of a key missing LOCALLY still propagates (the NotFound arm
+    // above), so it rides the entry and costs the budget like any other op.
+    notePlatformWrite(state, key.len);
     if (state.root_writeset) |ws| {
         ws.addDelete(key) catch |err| {
             state.pending_kv_error = err;
@@ -857,6 +906,12 @@ fn scopeKvWrite(
     } else state.allocator.dupe(u8, "") catch return js_exception;
     defer state.allocator.free(val);
 
+    // Before the fold and before either write path: a refused write must not
+    // reach the digest, and BOTH paths below (self-scope through this
+    // dispatch's writeset, cross-tenant through the trampoline) end up in the
+    // same proposed entry.
+    if (refusePlatformWrite(state, ctx, key, if (op == .put) val else null)) |thrown| return thrown;
+
     // Self-scope (the scope target IS the dispatching tenant, e.g. __admin__
     // deploying ITSELF via handleWsReset's `scope(__admin__).kv.delete`): route
     // through THIS dispatch's writeset like other platform writers, NOT the
@@ -896,6 +951,7 @@ fn scopeKvWrite(
                 state.writeset.addPut(key, val) catch |err| {
                     state.pending_kv_error = err;
                 };
+                notePlatformWrite(state, key.len + val.len);
             },
             .delete => {
                 state.txn.delete(key) catch |err| {
@@ -905,6 +961,7 @@ fn scopeKvWrite(
                 state.writeset.addDelete(key) catch |err| {
                     state.pending_kv_error = err;
                 };
+                notePlatformWrite(state, key.len);
             },
         }
         return js_undefined;
@@ -917,6 +974,9 @@ fn scopeKvWrite(
             return js_undefined;
         },
     };
+    // The trampoline's writeset is a SIDE envelope on the same entry, so it
+    // costs this activation's budget exactly as a local write does.
+    notePlatformWrite(state, key.len + if (op == .put) val.len else 0);
     return js_undefined;
 }
 

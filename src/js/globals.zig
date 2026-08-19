@@ -807,56 +807,10 @@ pub fn kvWriteArgToOwnedString(
 
 // ── kv.* ──────────────────────────────────────────────────────────────
 
-/// kv key / value size caps — THE canonical kvexp limits, referenced through
-/// `snapshot_stream` so they can never drift. A write that exceeds them
-/// succeeds in the local overlay but fails later at snapshot / tenant-move
-/// (`StreamKeyTooLarge` / `StreamValueTooLarge`), which would surface as an
-/// opaque replication failure, not a handler error. We reject it fail-fast
-/// here at write time with a clean, branchable JS error instead
-/// (docs/architecture/format-versioning.md §7.2). Conservative by design: these can
-/// be RAISED later without breaking anyone, never lowered.
-const KV_KEY_MAX: usize = reserved.KV_KEY_MAX;
-const KV_VAL_MAX: usize = reserved.KV_VAL_MAX;
-
-pub const KvSizeViolation = enum { key, value };
-
-/// Pure size check shared by `jsKvSet` (key + value) and `jsKvDelete` (key
-/// only — pass `null` for `val_len`). Returns which limit was exceeded, or
-/// null if the write is within bounds.
-pub fn kvSizeViolation(key_len: usize, val_len: ?usize) ?KvSizeViolation {
-    if (key_len > KV_KEY_MAX) return .key;
-    if (val_len) |vl| if (vl > KV_VAL_MAX) return .value;
-    return null;
-}
-
-/// Throw `Error{message, code}` for an oversized `kv.set` / `kv.delete`.
-/// `code` is `key_too_large` / `value_too_large` so customer JS can branch on
-/// `err.code` (same shape as the `reserved_key` error).
-pub fn throwKvTooLarge(ctx: ?*c.JSContext, which: KvSizeViolation) c.JSValue {
-    const state = getState(ctx);
-    const desc = switch (which) {
-        .key => .{ "key", "key_too_large", KV_KEY_MAX },
-        .value => .{ "value", "value_too_large", KV_VAL_MAX },
-    };
-    const msg = std.fmt.allocPrintSentinel(
-        state.allocator,
-        "kv: {s} exceeds the {d}-byte limit",
-        .{ desc[0], desc[2] },
-        0,
-    ) catch return c.JS_ThrowOutOfMemory(ctx);
-    defer state.allocator.free(msg);
-
-    const err = c.JS_NewError(ctx);
-    if (c.JS_IsException(err)) return err;
-    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, desc[1], desc[1].len));
-    return c.JS_Throw(ctx, err);
-}
-
-/// Throw `Error{message, code}` for a `rove-guards` verdict whose message is
-/// a constant. The size/namespace helpers above predate the guards module and
-/// stay as the formatting sites for their own messages; this is the generic
-/// one for a verdict that already carries its text.
+/// Throw `Error{message, code}` for a `rove-guards` verdict. Every kv rule's
+/// wording belongs to the guards module, so this raises the text it carries
+/// rather than composing its own — the reserved-key message is the one that
+/// names its key, and its caller formats it from `kvReservedMessageFmt`.
 pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c.JSValue {
     const err = c.JS_NewError(ctx);
     if (c.JS_IsException(err)) return err;
@@ -865,43 +819,7 @@ pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c
     return c.JS_Throw(ctx, err);
 }
 
-test "kvSizeViolation enforces canonical kv limits" {
-    // Drift guard: the key cap is kvexp's (via snapshot_stream); the value cap
-    // is what one raft message can carry (`transport.MAX_ENTRY_BYTES`).
-    try std.testing.expectEqual(@as(usize, 256), KV_KEY_MAX);
-    try std.testing.expectEqual(@as(usize, 384 * 1024), KV_VAL_MAX);
-    // Within bounds (boundary values inclusive).
-    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(256, KV_VAL_MAX));
-    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(0, 0));
-    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(10, null));
-    // Over a cap.
-    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(257, 0));
-    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(257, null));
-    try std.testing.expectEqual(@as(?KvSizeViolation, .value), kvSizeViolation(10, (1 << 20) + 1));
-    // Key is reported first when both exceed.
-    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(300, (1 << 20) + 1));
-}
 
-/// Throw `Error{message: "...", code: "reserved_key"}` for a customer
-/// `kv.set` / `kv.delete` against a platform-reserved namespace. Same
-/// shape as the `rate_limited` error from `email.send` so customer
-/// JS can branch on `err.code`.
-pub fn throwReservedKey(ctx: ?*c.JSContext, key: []const u8) c.JSValue {
-    const state = getState(ctx);
-    const msg = std.fmt.allocPrintSentinel(
-        state.allocator,
-        "kv: '{s}' is in a platform-reserved prefix",
-        .{key},
-        0,
-    ) catch return c.JS_ThrowOutOfMemory(ctx);
-    defer state.allocator.free(msg);
-
-    const err = c.JS_NewError(ctx);
-    if (c.JS_IsException(err)) return err;
-    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, "reserved_key", "reserved_key".len));
-    return c.JS_Throw(ctx, err);
-}
 
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
