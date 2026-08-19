@@ -858,11 +858,12 @@ pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c
 }
 
 test "kvSizeViolation enforces canonical kv limits" {
-    // Drift guard: these must stay the kvexp caps (via snapshot_stream).
+    // Drift guard: the key cap is kvexp's (via snapshot_stream); the value cap
+    // is what one raft message can carry (`transport.MAX_ENTRY_BYTES`).
     try std.testing.expectEqual(@as(usize, 256), KV_KEY_MAX);
-    try std.testing.expectEqual(@as(usize, 1 << 20), KV_VAL_MAX);
+    try std.testing.expectEqual(@as(usize, 384 * 1024), KV_VAL_MAX);
     // Within bounds (boundary values inclusive).
-    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(256, 1 << 20));
+    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(256, KV_VAL_MAX));
     try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(0, 0));
     try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(10, null));
     // Over a cap.
@@ -1611,5 +1612,9 @@ test "the kv write caps match the snapshot stream's frame bounds" {
     // engines start disagreeing about which writes are legal — the shape of
     // rove#502, one layer down.
     try std.testing.expectEqual(kv_mod.snapshot_stream.STREAM_KEY_MAX, reserved.KV_KEY_MAX);
-    try std.testing.expectEqual(kv_mod.snapshot_stream.STREAM_VAL_MAX, reserved.KV_VAL_MAX);
+    // Not equality: the write cap is bounded by what one raft message can
+    // carry, the stream by what a store may already hold. The stream must be
+    // able to move anything a write could ever have created — narrowing it
+    // under the write cap is what would strand a tenant mid-catch-up.
+    try std.testing.expect(reserved.KV_VAL_MAX <= kv_mod.snapshot_stream.STREAM_VAL_MAX);
 }

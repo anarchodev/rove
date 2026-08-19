@@ -89,6 +89,36 @@ disk. The writer is **never held across the raft round-trip** (decisions.md
 §2.2: holding the WAL writer for the RTT serializes a tenant to
 `batch_size / raft_latency`).
 
+**An entry has a hard size ceiling, and it is a delivery bound, not a policy
+one.** One entry rides one raft message (`max_size_per_msg = 0` is raft-rs for
+"at most one entry per message"), one message rides one frame, and a frame is
+read into the receiver's FIXED buffer (`raft_net.RECV_BUF_SIZE`, 512 KiB).
+Nothing fragments a raft message, so an entry above that is undeliverable —
+and the old failure mode was worse than undelivered: the frame went out, every
+follower tore the *connection* down, and that connection carries the
+heartbeats and appends of every other group hosted on the same node pair. One
+tenant's oversize write cost its neighbours an election storm.
+
+So the rule is **never put a message on the wire that we know a priori cannot
+be received**, enforced at three depths, all deriving from one constant
+(`transport.MAX_ENTRY_BYTES`):
+
+- **the value cap** (`reserved.KV_VAL_MAX`, 384 KiB) — a value the kv guard
+  admits is always one a follower can receive, so an over-size write is a
+  `value_too_large` refusal at `kv.set` rather than a fault during
+  replication;
+- **the propose gate** (`Bridge.propose` → `EntryTooLarge`) — a batch of legal
+  values whose entry is nonetheless too big is refused before it enters the
+  leader's log, and the dispatcher answers a defined 413 (not the retry-safe
+  421: every node refuses identically);
+- **the batcher** (`raft_propose.proposeMulti`) — the multi-envelope batch
+  spills into another entry by BYTES, not only at 255 inners; count never
+  bounded bytes.
+
+The transport keeps a backstop that drops (never sends) an oversize message
+and counts it as `raft_oversize_dropped_total` — expected to stay zero, since
+reaching it means a producer got past the gates above.
+
 Three ordering rules make "committed" mean **durable**:
 
 - **Quorum counts only fsynced entries.** raft-rs runs the async-append flow:

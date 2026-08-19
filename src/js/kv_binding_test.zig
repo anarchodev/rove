@@ -248,8 +248,8 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(257), 'v'))",
         "Error|key_too_large|kv: key exceeds the 256-byte limit");
     try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(256), 'v'))", "ok:null"); // boundary
-    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((1 << 20) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 1048576-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((384 * 1024) + 1)))",
+        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     // Order is contract: a key breaking the reserved rule AND the size cap
     // reports reserved_key.
     try expectEval(ctx, a, "__t(() => kv.set('_secret/' + 'k'.repeat(300), 'v'))",
@@ -258,8 +258,8 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     // ── the system-module exemption: namespace only, never the caps ──
     st.system_module = true;
     try expectEval(ctx, a, "__t(() => kv.set('_sched/by_id/x', 'v'))", "ok:null");
-    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((1 << 20) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 1048576-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((384 * 1024) + 1)))",
+        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     st.system_module = false;
 
     // ── the per-key exemption: NOT a customer write, EVERY check skipped ──

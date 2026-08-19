@@ -46,8 +46,15 @@ const kvexp = @import("kvexp");
 pub const STREAM_MAGIC: u32 = 0x3253474D;
 pub const STREAM_VERSION: u8 = 1;
 
-/// Matches kvexp's internal BUNDLE_KEY_MAX / BUNDLE_VAL_MAX — values written
-/// through rove are bundle-capped at 1 MiB, keys at 256 B.
+/// Matches kvexp's internal BUNDLE_KEY_MAX / BUNDLE_VAL_MAX — 1 MiB values,
+/// 256 B keys.
+///
+/// This is deliberately WIDER than what rove now accepts on a write
+/// (`reserved.KV_VAL_MAX`, 384 KiB — bounded by what one raft message can
+/// carry). The stream has to move what is ALREADY in a store, including rows
+/// written before that cap existed; narrowing it to match would turn a
+/// legacy value into a catch-up that cannot complete. The direction that must
+/// hold is `KV_VAL_MAX <= STREAM_VAL_MAX`, asserted in `src/js/globals.zig`.
 pub const STREAM_KEY_MAX: usize = 256;
 pub const STREAM_VAL_MAX: usize = 1 << 20;
 

@@ -793,6 +793,16 @@ pub const Node = struct {
         return t.meshSnapshot();
     }
 
+    /// Raft messages the transport DROPPED for exceeding the peer's frame
+    /// limit. Zero on a single-node node (nothing is sent) and expected to
+    /// stay zero everywhere: `Bridge.propose` refuses an oversize entry
+    /// before it exists, so a climbing count means a producer got past that
+    /// guard and a group is stuck re-emitting an undeliverable entry.
+    pub fn transportOversizeDropped(self: *Node) u64 {
+        const t = self.transport orelse return 0;
+        return t.oversize_dropped.load(.monotonic);
+    }
+
     /// Whether this node is the raft leader of `tenant_id`'s group. False
     /// for a group this node has not created yet (a tenant the bridge has
     /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not

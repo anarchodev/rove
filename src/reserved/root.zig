@@ -285,7 +285,18 @@ test "isCustomerWriteReserved: customer (non-_) keys allowed" {
 /// another accepted. Conservative by design: these can be RAISED later
 /// without breaking anyone, never lowered.
 pub const KV_KEY_MAX: usize = 256;
-pub const KV_VAL_MAX: usize = 1 << 20;
+/// 384 KiB, and the ceiling above it is not storage but REPLICATION: a write
+/// rides one raft entry, one entry rides one raft message, and a message above
+/// the receiver's fixed buffer cannot be delivered at all
+/// (`consensus/transport.zig` `MAX_ENTRY_BYTES`, asserted against this
+/// constant in `src/js/raft_propose.zig`). A value the guard admits must be
+/// one a follower can receive — otherwise the platform accepts a write at the
+/// call site and fails it during replication, which is a fault where a rule
+/// belongs.
+///
+/// Sized to leave the shipped `blob.write` recipe intact: its inline append
+/// cap is 256 KiB, which base64-encodes to ~342 KiB in one row.
+pub const KV_VAL_MAX: usize = 384 * 1024;
 
 /// `request.tag` limits — the low-cardinality index tags a handler may set.
 ///
