@@ -706,6 +706,17 @@ pub const Node = struct {
         // hard crash would lose all writes since the last graceful close.
         const wal = raft.SharedWal.open(allocator, wal_path) catch return Error.Io;
         errdefer wal.deinit();
+        // A CRC-valid record whose fixed-size payload is the wrong length. The
+        // engine's append path rejects these, so one on disk was written by an
+        // older build or is corruption that passed CRC. The scan cannot refuse
+        // (it covers every group's records), so it counts; the refusal is
+        // per-group, inside `initRecover`. Surfaced here because a WAL that
+        // holds one is a fact an operator needs before a group fails to
+        // recover and looks like a transient.
+        if (wal.malformed_records > 0) std.log.err(
+            "v2 node: WAL holds {d} malformed record(s) — group recovery will REFUSE any group whose compaction marker is among them (rove#101)",
+            .{wal.malformed_records},
+        );
 
         // Node-local group manifest store (see the `groups_manifest` field).
         const man_dir = std.fmt.allocPrint(allocator, "{s}/__groups__", .{data_dir}) catch
