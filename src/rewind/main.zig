@@ -990,6 +990,16 @@ pub fn main() !void {
     node_state.deploy.keyring_kek = keyring_kek;
     node_state.deploy.data_dir = data_dir;
     try node_state.deploy.startDeploymentLoader();
+
+    // The shared keyring-pool refill driver. A pool is per tenant, so an
+    // owned thread each would scale threads with tenants; this small
+    // worker set turns the crank for all of them, keeping minted slots
+    // ahead of demand so binding an identity never waits on consensus.
+    // Idle when no tenant has a pool, which is every cluster that has
+    // not turned crypto-shredding on.
+    var keyring_driver: rjs.keyring_pool.RefillDriver = undefined;
+    try keyring_driver.start(allocator, &node_state.deploy);
+    defer keyring_driver.deinit();
     // Continuous follower deployment loading: fire on every committed
     // `_deploy/current` write so a FOLLOWER loads each deployment as it
     // replicates (the loader is otherwise only enqueued inline at release time

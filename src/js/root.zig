@@ -66,6 +66,9 @@ pub const ssrf = @import("rove-ssrf");
 pub const session = @import("session.zig");
 pub const deployment_loader = @import("deployment_loader.zig");
 pub const durable_wake = @import("durable_wake.zig");
+/// Per-tenant slot pools and the shared refill driver that keeps them
+/// warm ahead of demand (`keyring_pool.zig`).
+pub const keyring_pool = @import("keyring_pool.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
 pub const snapshot_catchup = @import("snapshot_catchup.zig");
 pub const SnapshotCatchupThread = snapshot_catchup.SnapshotCatchupThread;
@@ -156,6 +159,7 @@ test {
     _ = @import("blob_usage.zig");
     _ = @import("keyring_slots.zig");
     _ = @import("keyring_bind.zig");
+    _ = @import("keyring_pool.zig");
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");
     _ = @import("surface_tests.zig");
