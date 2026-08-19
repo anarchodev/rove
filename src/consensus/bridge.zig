@@ -2080,6 +2080,58 @@ test "bridge: a hibernated group whose leader died re-elects on a requestWake nu
     try testing.expect(reelected != null);
 }
 
+test "bridge: proposePut is CP-shaped — in worker-overlay it never reaches the LOCAL store" {
+    // The trap this pins: `proposePut` / `proposeDelete` are convenience
+    // helpers for the CONTROL PLANE, which runs `apply_on_commit`. A
+    // worker runs `worker_overlay`, where the pump skips an entry this
+    // bridge proposed and is still awaiting — on the premise that a
+    // `TrackedTxn` is doing the store write.
+    //
+    // Call one from a worker with no such txn and the value lands on
+    // every FOLLOWER and on no leader: the one node that most needs it,
+    // and the one that will read it back. A platform write on a worker
+    // must therefore write locally AND propose (`js/blob_usage.zig` is
+    // the model, `js/keyring_slots.zig` the caller this was found from).
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    bridge.setWorkerOverlay();
+
+    const store_path = try std.fmt.allocPrintSentinel(a, "{s}/worker.db", .{dir}, 0);
+    defer a.free(store_path);
+    const worker_store = try node_mod.KvStore.open(a, store_path);
+    defer worker_store.close();
+    const Res = struct {
+        store: *node_mod.KvStore,
+        fn resolve(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*node_mod.KvStore {
+            _ = gid;
+            _ = id_str;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.store;
+        }
+    };
+    var res: Res = .{ .store = worker_store };
+    bridge.setStoreResolver(.{ .ctx = &res, .func = Res.resolve });
+
+    const gid = try bridge.registerTenant("ten");
+    const seq = try bridge.proposePut(gid, "_keys/next_slot", "whatever");
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < seq and spins < 400) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+
+    // Committed to the log...
+    try testing.expectEqual(seq, bridge.committedSeq(gid));
+    // ...and absent from this node's store. A caller that read it back
+    // to confirm its own write would never see one.
+    try testing.expectError(node_mod.Error.NotFound, worker_store.get("_keys/next_slot"));
+}
+
 test "bridge: identity binding — foreign + faulted entries write the store and never credit a waiter" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
