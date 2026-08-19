@@ -75,8 +75,16 @@ const TagPair = struct { key: []u8, value: []u8 };
 var tag_list: std.ArrayList(TagPair) = .empty;
 
 /// Called by arenajs at every run entry (arena_run / arena_run_module).
+/// This run's spent write budget — module-linear-memory state, reset per run
+/// like poison and the deadline. The arena has no batch: one run is one
+/// activation, so the counters ARE the activation's slice.
+var write_ops: u32 = 0;
+var write_bytes: usize = 0;
+
 export fn rove_arena_run_begin() void {
     poison_len = 0;
+    write_ops = 0;
+    write_bytes = 0;
     deadline_ms = if (budget_ms > 0) emscripten_get_now() + budget_ms else 0;
     for (tag_list.items) |t| {
         std.heap.c_allocator.free(t.key);
@@ -169,6 +177,18 @@ pub const ArenaKv = struct {
 
     pub fn isExempt(_: ArenaKv, key: []const u8) bool {
         return exempt(key);
+    }
+
+    /// The per-activation write budget, so the browser refuses exactly what
+    /// prod refuses — the engine-parity rule: one compiled check, every
+    /// engine (`reserved.KV_WRITES_MAX` / `KV_WRITE_BYTES_MAX`).
+    pub fn writeBudget(_: ArenaKv) binding.guards.WriteBudget {
+        return .{ .ops = write_ops, .bytes = write_bytes };
+    }
+
+    pub fn noteWrite(_: ArenaKv, bytes: usize) void {
+        write_ops += 1;
+        write_bytes += bytes;
     }
 
     pub fn decides(self: ArenaKv) bool {

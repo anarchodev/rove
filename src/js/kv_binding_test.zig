@@ -13,6 +13,7 @@
 const std = @import("std");
 const qjs = @import("rove-qjs");
 const binding = @import("rove-binding");
+const guards = binding.guards;
 
 const c = qjs.c;
 const testing = std.testing;
@@ -23,6 +24,9 @@ const MockState = struct {
     system_module: bool = false,
     exempt_prefix: []const u8 = "",
     fail_prefix: bool = false,
+    /// The activation's spent write budget, charged by the binding.
+    write_ops: u32 = 0,
+    write_bytes: usize = 0,
     /// Outcome-replay knobs: `decide` false = captured mode (rules skipped);
     /// a taped refusal replays for exactly this key ("set" op).
     decide: bool = true,
@@ -66,6 +70,18 @@ const MockKv = struct {
     pub fn isExempt(self: MockKv, key: []const u8) bool {
         return self.st.exempt_prefix.len > 0 and
             std.mem.startsWith(u8, key, self.st.exempt_prefix);
+    }
+
+    /// The activation's spent write budget, on the mock's own state — the
+    /// binding charges it through `noteWrite`, so these cases exercise the
+    /// same accounting the worker and the offline engines use.
+    pub fn writeBudget(self: MockKv) guards.WriteBudget {
+        return .{ .ops = self.st.write_ops, .bytes = self.st.write_bytes };
+    }
+
+    pub fn noteWrite(self: MockKv, bytes: usize) void {
+        self.st.write_ops += 1;
+        self.st.write_bytes += bytes;
     }
 
     pub fn decides(self: MockKv) bool {
@@ -248,8 +264,8 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(257), 'v'))",
         "Error|key_too_large|kv: key exceeds the 256-byte limit");
     try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(256), 'v'))", "ok:null"); // boundary
-    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((1 << 20) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 1048576-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((384 * 1024) + 1)))",
+        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     // Order is contract: a key breaking the reserved rule AND the size cap
     // reports reserved_key.
     try expectEval(ctx, a, "__t(() => kv.set('_secret/' + 'k'.repeat(300), 'v'))",
@@ -258,8 +274,8 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     // ── the system-module exemption: namespace only, never the caps ──
     st.system_module = true;
     try expectEval(ctx, a, "__t(() => kv.set('_sched/by_id/x', 'v'))", "ok:null");
-    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((1 << 20) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 1048576-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((384 * 1024) + 1)))",
+        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     st.system_module = false;
 
     // ── the per-key exemption: NOT a customer write, EVERY check skipped ──
@@ -281,6 +297,13 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.delete())", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.prefix())", "ok:null");
 
+    // A fresh activation's write budget. The sections above deliberately
+    // write past `KV_WRITE_BYTES_MAX` while probing the size caps — in
+    // production each of those would be its own activation, and the budget is
+    // per activation (`guards.WriteBudget`). Its own coverage is below.
+    st.write_ops = 0;
+    st.write_bytes = 0;
+
     // ── prefix: shape, defaulting, capping, cursor ──
     try expectEval(ctx, a, "__t(() => { kv.set('p/1','a'); kv.set('p/2','b'); kv.set('q/1','z'); return 0; })", "ok:0");
     try expectEval(ctx, a, "__t(() => kv.prefix('p/'))", "ok:[{\"key\":\"p/1\",\"value\":\"a\"},{\"key\":\"p/2\",\"value\":\"b\"}]");
@@ -299,6 +322,21 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     // ── delete round-trip ──
     try expectEval(ctx, a, "__t(() => kv.delete('p/1'))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.get('p/1'))", "ok:null");
+
+    // ── the per-activation write budget ──
+    // Both halves refuse with a code, and neither is the value cap: these say
+    // the ACTIVATION is full, and the way past them is `next()`.
+    st.write_ops = 0;
+    st.write_bytes = 0;
+    try expectEval(ctx, a, "__t(() => { for (let i = 0; i < 5; i++) kv.set('b/' + i, 'x'.repeat(100 * 1024)); return 0; })", "Error|writes_too_large|kv: this activation's writes exceed 409600 bytes — continue the work in a new activation (after.ms + next())");
+    // A refused write charges nothing, so a SMALL write after it still fits.
+    try expectEval(ctx, a, "__t(() => kv.set('b/small', 'v'))", "ok:null");
+    st.write_ops = 0;
+    st.write_bytes = 0;
+    // The count half, with tiny values so bytes stay nowhere near the cap.
+    try expectEval(ctx, a, "__t(() => { for (let i = 0; i < 1001; i++) kv.set('c/' + i, 'v'); return 0; })", "Error|too_many_writes|kv: this activation has made 1000 writes, its limit — continue the work in a new activation (after.ms + next())");
+    st.write_ops = 0;
+    st.write_bytes = 0;
 
     // ── outcome-replay (captured worlds) ──
     // A taped refusal replays verbatim, before any rule runs — even for a

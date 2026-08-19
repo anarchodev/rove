@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const binding = @import("rove-binding");
+const guards = binding.guards;
 const c = @import("qjs_c.zig").c;
 const host = @import("host.zig");
 const decode = @import("tape_decode.zig");
@@ -106,6 +107,18 @@ pub const OfflineKv = struct {
 
     pub fn isExempt(_: OfflineKv, key: []const u8) bool {
         return exempt(key);
+    }
+
+    /// The per-activation write budget (`reserved.KV_WRITES_MAX` /
+    /// `KV_WRITE_BYTES_MAX`), so a sim run refuses where prod would. Counters
+    /// live on the run host and reset with it — offline, one run is one
+    /// activation, so they are that activation's slice.
+    pub fn writeBudget(_: OfflineKv) guards.WriteBudget {
+        return host.activeWriteBudget();
+    }
+
+    pub fn noteWrite(_: OfflineKv, bytes: usize) void {
+        host.noteActiveWrite(bytes);
     }
 
     /// Authored worlds (and the harness) DECIDE — the same rules as the

@@ -159,6 +159,11 @@
     "seconds": 16.9,
     "status": "pass"
   },
+  "entry_size_guard_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 24.0,
+    "status": "pass"
+  },
   "epoch_join_smoke_v2.py": {
     "rc": 0,
     "seconds": 20.7,

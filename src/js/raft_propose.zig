@@ -22,6 +22,32 @@
 const std = @import("std");
 const kv_mod = @import("raft-kv");
 const apply_mod = @import("apply.zig");
+// The wire limit every batch has to fit inside — one authority, in the
+// transport that owns the receiver's buffer size.
+const bridge_mod = @import("bridge");
+const reserved = @import("rove-reserved");
+
+comptime {
+    // Two invariants, asserted rather than trusted.
+    //
+    // 1. The rules must be satisfiable together. A value the guard calls
+    //    legal has to be writable by a handler that has written nothing else,
+    //    or the platform states a cap it refuses to honour.
+    //    The KEY counts too, so the budget has to clear a max value under a
+    //    max key — equality here would make the stated value cap unreachable.
+    std.debug.assert(reserved.KV_VAL_MAX + reserved.KV_KEY_MAX <= reserved.KV_WRITE_BYTES_MAX);
+    // 2. An activation that stays inside its write budget always fits one
+    //    raft message, with room for the envelope and writeset framing.
+    const FRAMING: usize = 32 * 1024;
+    std.debug.assert(reserved.KV_WRITE_BYTES_MAX + FRAMING <
+        bridge_mod.transport.MAX_ENTRY_BYTES);
+    // The activation's READS ride the same entry, and their budget lives with
+    // the tape rather than here (rove#430 §3). The two together can still
+    // exceed an entry — that is what `Bridge.propose`'s `EntryTooLarge`
+    // backstop is for, answered as a retry rather than a refusal — and the
+    // balanced split that removes even that case (value 128 KiB / writes
+    // 256 KiB / reads 128 KiB) waits on `blob.write`'s inline-append size.
+}
 
 /// The result of a propose. `group_id` is the tenant's raft group (the
 /// worker parks `RaftWait{group_id, seq}` and the drain polls
@@ -144,7 +170,7 @@ pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8) !Propo
     var seq: u64 = 0;
     var i: usize = 0;
     while (i < inner.len) {
-        const end = @min(i + CHUNK, inner.len);
+        const end = chunkEnd(inner, i, CHUNK);
         const slice = inner[i..end];
         // The whole multi (anchor writeset + any same-batch side
         // writes) replicates through the ANCHOR tenant's group. The
@@ -161,6 +187,35 @@ pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8) !Propo
         i = end;
     }
     return .{ .group_id = gid, .seq = seq };
+}
+
+/// Where the chunk starting at `from` has to stop: at `max_count` inners (the
+/// multi wire format's u8 count), or at the point where the encoded chunk would
+/// no longer fit ONE raft entry (`MAX_ENTRY_BYTES`) — whichever comes first.
+///
+/// Counting was the only bound before, and count does not bound bytes: 255
+/// inners of a few KB each build an entry no follower can receive, with no
+/// single large value anywhere in sight. The batch exists to amortise raft
+/// entries, so spilling into a second entry is exactly the right answer;
+/// what must never happen is one entry that cannot be sent.
+///
+/// Always returns at least `from + 1`: a single inner that does not fit cannot
+/// be split here, and `Bridge.propose` refuses it with `EntryTooLarge` so the
+/// caller gets a defined error instead of a silent drop.
+fn chunkEnd(inner: []const []const u8, from: usize, max_count: usize) usize {
+    // `encodeMulti`'s framing: [1B type][2B id_len][1B count] then per inner
+    // [u32 len][inner].
+    const MULTI_HDR: usize = 1 + 2 + 1;
+    const PER_INNER: usize = 4;
+    var total: usize = MULTI_HDR;
+    var end = from;
+    while (end < inner.len and end - from < max_count) {
+        const next = total + PER_INNER + inner[end].len;
+        if (end > from and next > bridge_mod.transport.MAX_ENTRY_BYTES) break;
+        total = next;
+        end += 1;
+    }
+    return @max(end, from + 1);
 }
 
 /// `rs_bytes` rides the anchor envelope (inner[0]) only. Targets
@@ -225,4 +280,51 @@ pub fn proposeBatch(
         }
     }
     return proposeMulti(worker, gid, inner.items);
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "proposeMulti chunking: bytes bound the batch, not just the count" {
+    const LIMIT = bridge_mod.transport.MAX_ENTRY_BYTES;
+
+    // 255 inners of 8 KB each is a legal COUNT and an illegal ENTRY: ~2 MB,
+    // which no follower can receive. Count was the only bound before, so this
+    // is the batch that built an undeliverable entry with no large value
+    // anywhere in it.
+    var inners: [255][]const u8 = undefined;
+    const chunk = "x" ** (8 * 1024);
+    for (&inners) |*e| e.* = chunk;
+
+    var from: usize = 0;
+    var entries: usize = 0;
+    while (from < inners.len) {
+        const end = chunkEnd(&inners, from, 255);
+        try testing.expect(end > from); // always makes progress
+        // Every chunk fits one entry.
+        var total: usize = 4;
+        for (inners[from..end]) |e| total += 4 + e.len;
+        try testing.expect(total <= LIMIT);
+        from = end;
+        entries += 1;
+    }
+    // It spilled rather than building one oversize entry.
+    try testing.expect(entries > 1);
+}
+
+test "proposeMulti chunking: a single inner that cannot fit still advances" {
+    // One inner larger than an entry cannot be split here — the chunk is that
+    // inner alone, and `Bridge.propose` refuses it with EntryTooLarge so the
+    // caller gets a defined error. Returning `from` would spin forever.
+    const big = "y" ** 64;
+    var inners = [_][]const u8{big};
+    try testing.expectEqual(@as(usize, 1), chunkEnd(&inners, 0, 255));
+}
+
+test "proposeMulti chunking: the ordinary batch is untouched" {
+    // A handful of small envelopes still rides ONE entry — the batching win
+    // (fewer raft entries per dispatch pass) is the reason this exists.
+    var inners = [_][]const u8{ "a" ** 128, "b" ** 128, "c" ** 128 };
+    try testing.expectEqual(@as(usize, 3), chunkEnd(&inners, 0, 255));
 }

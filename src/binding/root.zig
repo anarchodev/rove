@@ -55,6 +55,18 @@
 //!                                         //   null. Checked before the
 //!                                         //   rules; a hit replays the
 //!                                         //   refusal verbatim.
+//! writeBudget(d) guards.WriteBudget      // what THIS ACTIVATION has already
+//!                                         //   written (ops + key/value
+//!                                         //   bytes). Per activation, never
+//!                                         //   per batch: writes accumulate
+//!                                         //   into a shared writeset, and a
+//!                                         //   busy neighbour must not spend
+//!                                         //   this handler's allowance.
+//! noteWrite(d, bytes) void                // a write HAPPENED — charge it.
+//!                                         //   Called only after the
+//!                                         //   delegate's put/del succeeds,
+//!                                         //   so a refused or failed write
+//!                                         //   costs nothing.
 //! recordRefusal(d, op, key, refusal) void // a live refusal happened — tape
 //!                                         //   it (the worker) or ignore it
 //!                                         //   (engines that produce no
@@ -77,7 +89,9 @@
 //! call returns undefined/null — a read must never throw).
 
 const std = @import("std");
-const guards = @import("rove-guards");
+/// Re-exported so a delegate in another module can name `guards.WriteBudget`
+/// without taking its own dependency on the guards module.
+pub const guards = @import("rove-guards");
 
 /// kv.prefix page bounds — prod's, and therefore everyone's: an omitted or
 /// non-positive limit defaults to 100, any request is capped at 1000. The
@@ -268,13 +282,17 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             // write at all and skips the table, exactly as the JS evaluator's
             // isExempt parameter does.
             if (d.decides() and !d.isExempt(key)) {
-                if (guards.checkKvWrite(key, value, d.isSystemModule())) |refusal| {
+                if (guards.checkKvWrite(key, value, d.isSystemModule(), d.writeBudget())) |refusal| {
                     d.recordRefusal(.set, key, refusal);
                     return throwRefusal(d, ctx, refusal, key);
                 }
             }
 
             if (!d.put(ctx, key, value)) return js_exception;
+            // Spend the activation's budget only on a write that HAPPENED: a
+            // refused or failed one costs nothing, or a handler could be
+            // starved by writes that never reached the entry.
+            d.noteWrite(key.len + value.len);
             return js_undefined;
         }
 
@@ -296,13 +314,16 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             // Same rules, same authority — null value: a delete has none to
             // size-check.
             if (d.decides() and !d.isExempt(key)) {
-                if (guards.checkKvWrite(key, null, d.isSystemModule())) |refusal| {
+                if (guards.checkKvWrite(key, null, d.isSystemModule(), d.writeBudget())) |refusal| {
                     d.recordRefusal(.delete, key, refusal);
                     return throwRefusal(d, ctx, refusal, key);
                 }
             }
 
             if (!d.del(ctx, key)) return js_exception;
+            // A delete is an op with a key and no value — it rides the entry
+            // like any other.
+            d.noteWrite(key.len);
             return js_undefined;
         }
 

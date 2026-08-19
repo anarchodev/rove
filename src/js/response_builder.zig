@@ -249,6 +249,32 @@ pub fn stageResponse(
 /// and a blind retry double-executes the handler.
 /// Frees any body the handler wrote before stamping the new one.
 /// Does NOT move into response_in — caller orchestrates that.
+/// The propose-refused-a-priori sibling of `overwriteWith421`: this write can
+/// never be replicated at any size of patience, because the entry it would
+/// need exceeds what one raft message can carry
+/// (`consensus/transport.zig` `MAX_ENTRY_BYTES`). A 421 would be actively
+/// misleading — the front door re-aims on it, and every other node refuses
+/// identically — so answer 413 and say what the customer has to change.
+pub fn overwriteWith413(
+    server: anytype,
+    ent: rove.Entity,
+    allocator: std.mem.Allocator,
+    old_body_ptr: ?[*]u8,
+    old_body_len: u32,
+) !void {
+    if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+    const body = try allocator.dupe(
+        u8,
+        "this activation's writes are too large to replicate as one entry; " ++
+            "write fewer or smaller values, or use blob storage for bulk bytes\n",
+    );
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 413 });
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body.ptr,
+        .len = @intCast(body.len),
+    });
+}
+
 pub fn overwriteWith421(
     server: anytype,
     ent: rove.Entity,

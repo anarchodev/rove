@@ -23,6 +23,7 @@
 const std = @import("std");
 const decode = @import("tape_decode.zig");
 const path_confine = @import("path_confine.zig");
+const guards = @import("rove-binding").guards;
 
 /// The C ABI struct (`arena_replay_host`). Field order + signatures mirror the
 /// header exactly; a NULL responder reports "tape not installed" (code 1).
@@ -97,6 +98,24 @@ pub fn activeTapedRefusal(op_ch: u8, key: []const u8) ?[]const u8 {
     return h.refusals.get(buf[0 .. 1 + key.len]);
 }
 
+/// The active run's spent write budget, and the charge for one write. Host
+/// state rather than delegate state because the delegate is constructed per
+/// call; offline, one run is one activation, so these ARE the activation's
+/// slice (`reserved.KV_WRITES_MAX` / `KV_WRITE_BYTES_MAX`, enforced by the
+/// shared guard so a sim refuses exactly where prod does).
+pub fn activeWriteBudget() guards.WriteBudget {
+    const h: *Host = @ptrCast(@alignCast(active_user orelse return .{}));
+    if (active_vtable != &HOST_VTABLE) return .{};
+    return .{ .ops = h.write_ops, .bytes = h.write_bytes };
+}
+
+pub fn noteActiveWrite(bytes: usize) void {
+    if (active_vtable != &HOST_VTABLE) return;
+    const h: *Host = @ptrCast(@alignCast(active_user orelse return));
+    h.write_ops += 1;
+    h.write_bytes += bytes;
+}
+
 /// Whether the active run host carries a divergence verdict — the interrupt
 /// handler's second trigger (`return poisoned || over_budget`).
 pub fn activePoisoned() bool {
@@ -146,6 +165,10 @@ pub const Host = struct {
     /// When set, `module_load` reads `{source_dir}/{spec}` from the working
     /// tree instead of `sources` — the what-if lever for local changes.
     source_dir: ?[]const u8 = null,
+    /// This run's spent write budget (see `activeWriteBudget`). Per Host, so
+    /// a fresh run starts with a fresh allowance.
+    write_ops: u32 = 0,
+    write_bytes: usize = 0,
     /// First divergence message, if any. Two producers: `module_load` (a
     /// module the source tree / fixture lacks) and the poison door
     /// (`poisonActive` — a captured-world request-surface read the tape

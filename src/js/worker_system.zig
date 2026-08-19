@@ -475,6 +475,19 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         , .{worker.node.kv_cap_refusals.load(.monotonic)});
     }
 
+    // ── the wire-limit backstop ─────────────────────────────────────────
+    // Should read zero forever: the propose path refuses an oversize entry
+    // before it exists. Non-zero means a producer got past that guard and a
+    // group is re-emitting an entry it can never deliver.
+    {
+        try w.print(
+            \\# HELP raft_oversize_dropped_total raft messages dropped unsent for exceeding the peer's frame limit (should be 0; a propose should have refused the entry first).
+            \\# TYPE raft_oversize_dropped_total counter
+            \\raft_oversize_dropped_total {d}
+            \\
+        , .{worker.raft.transportOversizeDropped()});
+    }
+
     // ── abuse-gate counters ───────────────────────────────────────────
     try w.print(
         \\# HELP log_ingest_limited_total admissions 429'd by the log-byte ingest guardrail (lagging log_bytes bucket).
