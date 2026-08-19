@@ -3,7 +3,7 @@
 // captured log record + deployment manifest), boots qjs_arena_wasm,
 // installs Module.tapes / Module.module_sources / Module.host_trace
 // the same way the replay shell's `wasm-app.mjs` does (resolved from
-// $REWIND_APPS_DIR — the porcelain moved to the private rewind-apps repo
+// $REWIND_APPS_DIR — the porcelain lives in rewind-apps, mounted at `web/`
 // when `web/` was extracted, commit fecf07b), runs the handler in SCAN
 // mode, and prints a one-line JSON summary on stdout.
 //
@@ -23,7 +23,7 @@ const __filename = fileURLToPath(import.meta.url);
 const repo_root = path.resolve(path.dirname(__filename), "..", "..");
 
 // The WASM replay porcelain (rtap / request-replay / qjs_arena_wasm) moved
-// out of this repo when `web/` was extracted into the private rewind-apps
+// out of this repo when `web/` was extracted into the rewind-apps
 // repo (commit fecf07b). Resolve it from $REWIND_APPS_DIR — the smoke
 // harness convention (smoke_lib_v2.APPS_DIR) — falling back to an in-repo
 // ./web for an operator who keeps apps in-tree. Dynamic import so the

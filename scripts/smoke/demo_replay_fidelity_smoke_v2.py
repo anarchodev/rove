@@ -18,7 +18,7 @@ compared to the one production folded. Digest agreement — not a matching statu
 would call a divergence a pass.
 
 Ports: the shared V2Cluster allocation (do not run two smokes at once). Needs a
-rewind-apps checkout (REWIND_APPS_DIR, default ~/src/rewind-apps) for the replay
+rewind-apps checkout (REWIND_APPS_DIR, default: the `web` submodule) for the replay
 shell, and S3 credentials: `set -a; . ./.env; set +a`.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ import tempfile
 import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, APPS_DIR  # noqa: E402
 
 TENANT = "shopdemo"
 
@@ -78,7 +78,7 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    apps = os.environ.get("REWIND_APPS_DIR", os.path.expanduser("~/src/rewind-apps"))
+    apps = str(APPS_DIR)
     checker = os.path.join(apps, "e2e", "replay-digest-check.mjs")
     if not os.path.exists(checker):
         print(f"SKIP — no rewind-apps checkout at {apps} (set REWIND_APPS_DIR)")

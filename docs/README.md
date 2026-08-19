@@ -91,7 +91,7 @@ commit when one opens or closes. Find them live:
 - `gh issue list --label design` — north-stars / unscheduled designs
 - `gh issue list` — everything, including single-item issues under no arc
 
-- _The operator deploy plan (this operator's topology, hardware spec, DNS/TLS distribution, rollout history) lives in the private `rewind-infra` repo. The operator-neutral binary/port/firewall/TLS reference is [architecture/configuration-and-network.md](architecture/configuration-and-network.md). The WASM replay UI plan lives in the private rewind-apps repo (`replay/replay-wasm-plan.md`), alongside the porcelain it describes._
+- _The operator deploy plan (this operator's topology, hardware spec, DNS/TLS distribution, rollout history) lives in the private `rewind-infra` repo. The operator-neutral binary/port/firewall/TLS reference is [architecture/configuration-and-network.md](architecture/configuration-and-network.md). The WASM replay UI plan lives in the rewind-apps repo (`replay/replay-wasm-plan.md`, mounted here as the `web` submodule), alongside the porcelain it describes._
 
 ## Product & strategy
 

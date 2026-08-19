@@ -44,10 +44,31 @@ from smoke_ports import alloc, alloc_port, free, CLUSTER_BLOCK  # noqa: E402,F40
 from v2_topology import spawn_cp, spawn_front, await_ready, CP_BIN, FRONT_BIN  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-# First-party app content (used as fixtures by some smokes). Moved out of the
-# engine repo for rewindjs (private rewind-apps); point via REWIND_APPS_DIR.
-# Falls back to ./web for an operator who keeps apps in-repo.
+# First-party app content the smokes deploy as fixtures. `web/` is the
+# `rewind-apps` submodule, pinned by this commit; `REWIND_APPS_DIR` overrides it
+# when you are editing a branch of that repo alongside this one.
 APPS_DIR = Path(os.environ.get("REWIND_APPS_DIR") or (REPO_ROOT / "web"))
+
+
+def require_apps_dir() -> Path:
+    """`APPS_DIR`, or exit naming the fix.
+
+    An unpopulated submodule is the default state of a fresh `git clone` without
+    `--recursive`, and the failure it produces is 15 smokes dying on missing
+    fixture files — which `--baseline` then reports as REGRESSIONS. That reads
+    like a product break and costs an afternoon. It is a setup step, so say so.
+    """
+    if (APPS_DIR / "manifest.json").exists():
+        return APPS_DIR
+    override = os.environ.get("REWIND_APPS_DIR")
+    where = f"REWIND_APPS_DIR={override}" if override else f"{APPS_DIR} (the web submodule)"
+    sys.exit(
+        f"rewind-apps content not found at {where}.\n"
+        "  • in a workspace:  git submodule update --init\n"
+        "  • fresh workspace: scripts/ops/workspace.py <topic>\n"
+        "  • or point REWIND_APPS_DIR at a rewind-apps checkout.\n"
+        "This is setup, not a product failure — 15 smokes read fixtures from there."
+    )
 BIN_DIR = REPO_ROOT / "zig-out" / "bin"
 REWIND = BIN_DIR / "rewind-worker"
 LOG_SERVER = BIN_DIR / "rewind-logs"

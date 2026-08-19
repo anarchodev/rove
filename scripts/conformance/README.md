@@ -60,9 +60,11 @@ and the sim. The runner now runs `gen_replay_prelude.py --check` before using
 the replay engine and fails with the regeneration command, rather than letting
 the staleness surface as a scatter of digest divergences (rove#474).
 
-The replay engine needs **`REWIND_APPS_DIR`** pointing at a rewind-apps
-checkout — the replay porcelain (`rtap.mjs`, `request-replay.mjs`,
-`qjs_arena_wasm`) lives in that private repo. Without it the engine reports
+The replay engine needs a rewind-apps checkout — the replay porcelain
+(`rtap.mjs`, `request-replay.mjs`, `qjs_arena_wasm`) lives there. The `web`
+submodule is that checkout, pinned by this commit, so `git submodule update
+--init` is enough; **`REWIND_APPS_DIR`** overrides it when you are editing a
+branch of rewind-apps alongside this one. Without either the engine reports
 itself unavailable and the run degrades to sim-only, which is reported as
 `unproven` rather than as a pass.
 

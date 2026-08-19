@@ -185,18 +185,23 @@ Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`
 - Write comments in the timeless present: explain the current code — keep rationale, invariants, and cross-references (including `docs/` pointers). Don't narrate the change that produced it (no "was X / now Y", issue-# tags, or bare Phase-N history — that belongs in git + the PR, where it stays accurate as the code moves on). When a past pitfall matters, encode it as a present-tense constraint, not a changelog line. The phased delivery plan itself lives in `docs/PLAN.md` (§3 for phase content, §10.16 for launch sequencing) — reference it by doc-pointer rather than tagging a comment with a phase number.
 - A doc-pointer comment must satisfy three conditions (so it doesn't rot into a dangling reference — the failure mode the plans→issues migration mass-produced): **(1)** the invariant is stated *inline* and the comment survives the doc's deletion — the `docs/` pointer is the *why*-expansion, never the load-bearing content; **(2)** it targets a durable reference doc only — `docs/architecture/…` or a customer contract (`effect-algebra.md`, `handler-shape.md`, `decisions.md`) — never a plan/audit doc, an issue number, or any temporal target; **(3)** it cites the *concept name* (`the fold-gate invariant (consensus-robustness.md)`), not a bare `§` number that rots silently on a doc restructure — a `§` is acceptable only as a supplement beside the concept. `scripts/ops/doc_pointer_lint.py` enforces condition 2's path half (every `docs/…` path cited in a comment must resolve); conditions 1 and 3 are the human's to keep.
 
-## Working with multiple agents (git worktrees)
+## Working with multiple agents (one clone per workspace)
 
-This repo is frequently worked on by several Claude sessions at once. To keep sessions from colliding in one working tree — where one window's uncommitted edits get swept into another's commit — **each session runs in its own git worktree on its own branch**, all sharing the one `.git` object store (no bare repo needed; worktrees attach to the regular checkout):
+This repo is frequently worked on by several Claude sessions at once. Each session gets its **own local clone** on its own branch, created by one script:
 
 ```bash
-git worktree add ../rove-<topic> -b <branch> <base>   # e.g. ../rove-docs -b docs/restructure v2
-git worktree list
-git worktree remove ../rove-<topic>                   # when merged/abandoned; `git worktree prune` clears dead entries
+scripts/ops/workspace.py <topic>            # → ../rove-<topic>, branched off origin/main
+scripts/ops/workspace.py <topic> --base v2  # start somewhere else
+rm -rf ../rove-<topic>                      # done; nothing to prune
 ```
 
-Rules for the shared repo:
-- The main checkout (`/home/user/src/rove`) is load-bearing — it holds the real `.git`; don't delete or move it.
-- A branch can be checked out in only one worktree (git enforces this) — one branch per session by construction.
-- Never switch the branch of, or run `git add -u` / `git commit` in, a checkout another session is using. Unexplained working-tree WIP is probably a sibling session's — examine it, stage only your own files, and never commit another window's work without confirmation.
+The script clones, points `origin` at GitHub, creates the branch, materialises the `web` submodule at its pinned commit, and copies `.env`. Run it rather than assembling a workspace by hand — an unenforced setup ritual works for a month and then quietly doesn't, and the symptom surfaces far away as confusing smoke failures.
+
+**`web/` is the `rewind-apps` submodule** — the first-party app bundles the smokes deploy, pinned by each rove commit. That pin is what makes a cross-repo change reviewable: a rove commit says which apps commit it expects, so a paired wire-format change (tape ↔ `rtap.mjs`) can't half-land. `git submodule update --init` populates it; `REWIND_APPS_DIR` overrides it when you are editing a branch of rewind-apps alongside this one — push that branch and bump the pin in the same PR (push-then-pin).
+
+Rules:
+- The main checkout (`/home/user/src/rove`) is load-bearing — it is what the script clones from; don't delete or move it.
+- Never run `git add -u` / `git commit` in a clone another session is using. Unexplained working-tree WIP is probably a sibling's — examine it, stage only your own files, and never commit another window's work without confirmation.
 - Smoke ports come from `scripts/smoke/smoke_ports.py` (each smoke process owns a disjoint slot), so concurrent smokes/suites don't collide on ports. The remaining reason not to run two full suites at once is CPU: a saturated box trips raft election timeouts, which reads as spurious failovers.
+
+**Why clones and not `git worktree`.** Worktrees share the object store — about 39 MB here — while a workspace's real cost is its Zig build cache at 1-5 GB, which worktrees do *not* share. So the saving is under a percent, and it buys three problems: `git worktree` plus submodules is disclaimed by git itself (*"It is NOT recommended to make multiple checkouts of a superproject"* — git-worktree(1) BUGS), the stash stack is shared so one session can pop another's, and a branch can live in only one worktree. A local clone hardlinks the object files, so it costs the ~12 MB working tree and has none of that.

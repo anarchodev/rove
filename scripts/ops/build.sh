@@ -66,7 +66,9 @@ if [ "$SKIP_TESTS" = 1 ] || [ "${ROVE_SKIP_SMOKES:-0}" = 1 ]; then
 else
     log "Smoke gate (full suite vs scripts/smoke/smoke-baseline.json)"
     [ -f "$REPO_ROOT/.env" ] || die "no $REPO_ROOT/.env — the smoke gate needs S3 credentials (ROVE_SKIP_SMOKES=1 to skip consciously)"
-    export REWIND_APPS_DIR="${REWIND_APPS_DIR:-$HOME/src/rewind-apps}"
+    # Default to the `web` submodule, pinned by this commit; $HOME/src was
+    # one developer's layout and silently wrong everywhere else.
+    export REWIND_APPS_DIR="${REWIND_APPS_DIR:-$REPO_ROOT/web}"
     # The default-install build below (the suite's helper binaries:
     # echo-server, ws-echo, …) MUST be ReleaseFast: a bare `zig build` here
     # installs DEBUG binaries over the shippable set in zig-out — the suite

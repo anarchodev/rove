@@ -246,7 +246,7 @@ output) with source view, variable panel, and stepping controls.
   re-running from start with a different stop predicate.
 
 **Still open** (design opportunities — see `replay-wasm-plan.md` §8, in
-the private rewind-apps repo at `replay/replay-wasm-plan.md`, for the
+the rewind-apps repo at `replay/replay-wasm-plan.md`, for the
 implementation-side roadmap):
 
 - **Breakpoints** — gutter clicks on source lines; the next replay

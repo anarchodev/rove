@@ -1,4 +1,5 @@
 /zig-out
+/.zig-cache
 /.claude
 scripts/__pycache__/
 examples/rust_ffi_smoke/target/
@@ -7,3 +8,17 @@ examples/rust_ffi_smoke/Cargo.lock
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Secrets. These MUST be TRACKED ignores rather than `.git/info/exclude`: that
+# file is local to one repository and does NOT survive `git clone`, so a
+# workspace made by cloning starts with no protection at all. This repo is
+# public and `.env` holds live S3 credentials — one `git add -A` in a fresh
+# clone is the whole distance between here and a credential leak.
+.env
+.env.*
+!.env.example
+/scripts/deploy.conf
+
+# Local developer artifacts (also exclude-only until now).
+scripts/_smoke_helpers.sh
+scripts/.raft_pending_perf_baseline.json
