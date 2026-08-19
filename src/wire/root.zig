@@ -98,9 +98,15 @@ pub const AttachEnvelope = struct {
     /// omission. The CP has no durable copy to resend: storing a key in
     /// the directory would put key material in a raft log, where a
     /// destroyed key stays legible forever and shredding defeats itself
-    /// one level down. A late-joining node gets the keyring from a peer
-    /// as KEK-sealed ciphertext instead, which is the same operation as
-    /// an ordinary shard update (`js/keyring_shard.zig`).
+    /// one level down. A late-joining node is meant to get the keyring
+    /// from a peer as KEK-sealed ciphertext instead, which is the same
+    /// operation as an ordinary shard update (`js/keyring_shard.zig`).
+    ///
+    /// That pull does not exist yet — the transport is push-only, so
+    /// today a node that missed pushes stays short. It is not silent:
+    /// such a node measures itself against the minted watermark, finds
+    /// itself incomplete, and answers `unverified` rather than reporting
+    /// erasure it cannot stand behind (`js/keyring_bind.zig`).
     secret: ?[]const u8 = null,
 };
 

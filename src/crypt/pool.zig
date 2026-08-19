@@ -74,10 +74,22 @@ pub const ReserveFn = *const fn (ctx: *anyopaque, prev_end: u64, count: u32) any
 /// hand out any slot from that block.
 pub const ReplicateFn = *const fn (ctx: *anyopaque, shard: u32) anyerror!void;
 
+/// Publish `end` as the tenant's minted watermark — the replicated
+/// statement that slots below it exist and every node should hold them.
+///
+/// It is what lets a node decide whether a missing key is an erasure or
+/// its own gap, so it MUST land before any slot from the block is handed
+/// out. Advancing it late is the dangerous direction: a node measuring
+/// against a stale watermark can believe itself complete while missing
+/// exactly the keys the block just minted, and then report live data as
+/// shredded. Returning an error withholds the block instead.
+pub const CommitMintedFn = *const fn (ctx: *anyopaque, end: u64) anyerror!void;
+
 pub const Deps = struct {
     ctx: *anyopaque,
     reserve: ReserveFn,
     replicate: ReplicateFn,
+    commit_minted: CommitMintedFn,
     /// Injected so tests are not at the mercy of the wall clock.
     now: *const fn () i64 = defaultNow,
 };
@@ -186,6 +198,13 @@ pub const SlotPool = struct {
             shard += 1;
         }
 
+        // Last, and before the caller publishes the block: every node
+        // must be able to learn that these slots exist before any
+        // ciphertext can name one. A failure here withholds the block —
+        // the allocator retries — rather than handing out slots that
+        // some node would later mistake for erased.
+        try self.deps.commit_minted(self.deps.ctx, new_end);
+
         return new_end;
     }
 };
@@ -219,6 +238,11 @@ const Harness = struct {
     replicated_mu: std.Thread.Mutex = .{},
     fail_reserve: std.atomic.Value(u32) = .init(0),
     fail_replicate: std.atomic.Value(bool) = .init(false),
+    fail_commit_minted: std.atomic.Value(bool) = .init(false),
+    /// Highest watermark published, and the shard count at that moment —
+    /// enough to assert the watermark never leads replication.
+    minted_watermark: std.atomic.Value(u64) = .init(0),
+    replicated_at_mint: std.atomic.Value(u32) = .init(0),
 
     fn reserve(ctx: *anyopaque, prev_end: u64, count: u32) anyerror!u64 {
         const s: *Harness = @ptrCast(@alignCast(ctx));
@@ -242,11 +266,19 @@ const Harness = struct {
         s.replicated.append(testing.allocator, shard) catch unreachable;
     }
 
+    fn commitMinted(ctx: *anyopaque, end: u64) anyerror!void {
+        const s: *Harness = @ptrCast(@alignCast(ctx));
+        if (s.fail_commit_minted.load(.monotonic)) return error.NotCommitted;
+        s.replicated_at_mint.store(s.replicate_calls.load(.monotonic), .monotonic);
+        s.minted_watermark.store(end, .monotonic);
+    }
+
     fn deps(self: *Harness) Deps {
         return .{
             .ctx = self,
             .reserve = Harness.reserve,
             .replicate = Harness.replicate,
+            .commit_minted = Harness.commitMinted,
             .now = fixedNow,
         };
     }
@@ -265,6 +297,59 @@ const Harness = struct {
 
 fn fixedNow() i64 {
     return 1_700_000_000_000_000_000;
+}
+
+test "no slot is published before the watermark that announces it" {
+    // The ordering the completeness check depends on. If a slot could be
+    // handed out while the watermark still trails it, a node missing that
+    // block would measure itself against the old watermark, call itself
+    // complete, and report the block's ciphertext as ERASED.
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var h = Harness{};
+    defer h.deinit();
+    var kr = try keyring_mod.Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    var pool = SlotPool{};
+    try pool.start(&kr, h.deps(), 4);
+    defer pool.deinit();
+
+    const slot = try pool.acquire();
+    // Every slot handed out sits strictly below a published watermark.
+    try testing.expect(slot < h.minted_watermark.load(.monotonic));
+    // And the shards were pushed before the watermark went out, never
+    // after — the watermark is a claim the pushes have to have earned.
+    try testing.expect(h.replicated_at_mint.load(.monotonic) > 0);
+}
+
+test "a watermark that will not commit withholds the block" {
+    // Publishing anyway would hand out slots that some node could later
+    // mistake for erased. Stalling the pool is the safe direction: the
+    // hot path parks and retries, which is what `tryAcquire` is for.
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var h = Harness{};
+    defer h.deinit();
+    h.fail_commit_minted.store(true, .monotonic);
+    var kr = try keyring_mod.Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    var pool = SlotPool{};
+    try pool.start(&kr, h.deps(), 4);
+    defer pool.deinit();
+
+    // Never satisfied while the watermark write keeps failing.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try testing.expect(pool.tryAcquire() == null);
+        std.Thread.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u64, 0), h.minted_watermark.load(.monotonic));
 }
 
 test "every slot handed out already has a durable key" {

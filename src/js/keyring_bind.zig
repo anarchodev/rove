@@ -56,6 +56,41 @@
 //! a reserved key, observed at apply, exactly like the `_deploy/current`
 //! release pointer.
 //!
+//! ## Absence means shredded only where completeness is CHECKED
+//!
+//! The scheme's cheapest property is that a missing key means *erased*,
+//! never *not loaded* — that is what removes the entire cache
+//! invalidation class. It holds only while a node's keyring really does
+//! hold every key it should, and nothing about raft delivers that: raft
+//! elects on LOG up-to-dateness, and key material deliberately travels
+//! outside the log, so a node can carry every committed entry and still
+//! be missing shards. Left unchecked, a routine leader change onto such
+//! a node reports live customer data as erased.
+//!
+//! So completeness is derived rather than assumed, from state raft has
+//! already replicated:
+//!
+//!   live keys + destroyed slots  must cover  [FIRST_SLOT, minted)
+//!
+//! `_keys/minted` is the watermark, and it is deliberately NOT the
+//! reservation counter. A leader that dies between reserving a block and
+//! minting it leaves `_keys/next_slot` ahead of anything that ever
+//! existed, and a node measuring against that would declare itself
+//! permanently incomplete through no fault of its own — one crash would
+//! take the tenant down. The watermark therefore advances only after a
+//! block is minted AND quorum-durable, which is exactly the point the
+//! pool already reaches before it publishes a block.
+//!
+//! The two sets are disjoint (a destroy removes the key and writes the
+//! tombstone in one apply) and both sit inside the range, so covering it
+//! is a counting question and needs no per-slot walk. Holding MORE than
+//! the range requires is complete too: a node can have applied a shard
+//! push before the watermark write reaches it.
+//!
+//! A node that comes up short does not get to answer. It reports
+//! `unverified`, which is not-found's opposite — the whole point is that
+//! it must never be mistaken for erasure.
+//!
 //! ## Both halves of a node, not just the follower half
 //!
 //! The apply observer does NOT fire on the node that proposed the entry
@@ -81,6 +116,15 @@ pub const BIND_PREFIX = "_keys/bind/";
 /// erasure to every node through the log.
 pub const DEAD_PREFIX = "_keys/dead/";
 
+/// Slots minted AND made quorum-durable, as an exclusive end — the
+/// denominator of the completeness check.
+///
+/// Distinct from `_keys/next_slot`, which counts slots RESERVED. See the
+/// watermark note in the file header: measuring against reservations
+/// would let one badly-timed leader crash mark every node incomplete
+/// forever.
+pub const MINTED_KEY = "_keys/minted";
+
 /// Label for the subkey that pseudonymises identities. Distinct from
 /// every sealing key: this one names data, it never opens it.
 const PSEUDONYM_LABEL = "rewind-identity-ref/v1";
@@ -94,6 +138,29 @@ const BIND_VALUE_LEN: usize = 8 + std.crypto.auth.hmac.sha2.HmacSha256.mac_lengt
 const DEAD_VALUE_LEN: usize = 8;
 
 const HEX_REF_LEN: usize = crypt.KEY_REF_LEN * 2;
+
+/// What this node can say about a slot it does not hold.
+pub const Completeness = enum {
+    /// Every key this tenant should have is here, so a miss is an
+    /// erasure and may be reported as one.
+    complete,
+    /// This node is missing key material. A miss here says nothing about
+    /// whether the data was erased, and must never be reported as if it
+    /// did.
+    incomplete,
+};
+
+/// The answer to "open the ciphertext at this slot".
+pub const Lookup = union(enum) {
+    key: crypt.Key,
+    /// Destroyed. Callers surface not-found — "erased" should read like
+    /// "absent" to everything downstream.
+    shredded,
+    /// This node cannot tell, and says so instead of guessing. Reporting
+    /// erasure from here would be a lie about the one thing customers
+    /// are promised.
+    unverified,
+};
 
 pub const Error = error{
     /// Stored bytes this codec did not write.
@@ -201,6 +268,64 @@ pub fn bindingFor(pk: crypt.Key, identity: []const u8, slot: u64) [BIND_VALUE_LE
     return encodeBinding(slot, fullMac(pk, identity));
 }
 
+pub fn encodeMinted(end: u64) [8]u8 {
+    var out: [8]u8 = undefined;
+    std.mem.writeInt(u64, &out, end, .little);
+    return out;
+}
+
+pub fn decodeMinted(bytes: []const u8) Error!u64 {
+    if (bytes.len != 8) return Error.Corrupt;
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+/// Does this node hold everything the tenant has minted?
+///
+/// `live` is the keyring's key count, `destroyed` the tombstone count,
+/// `minted` the watermark. Holding more than the range requires is
+/// complete: a shard push can land before the watermark write that
+/// announces it.
+pub fn completeness(live: u64, destroyed: u64, minted: u64) Completeness {
+    const required = if (minted <= crypt.FIRST_SLOT) 0 else minted - crypt.FIRST_SLOT;
+    const held = live +| destroyed;
+    return if (held >= required) .complete else .incomplete;
+}
+
+/// Resolve a slot against this node's keyring, refusing to call a miss
+/// an erasure unless the keyring is known complete.
+pub fn lookup(kr: *const crypt.keyring.Keyring, slot: u64, c: Completeness) Lookup {
+    if (kr.keyAt(slot)) |k| return .{ .key = k };
+    return switch (c) {
+        .complete => .shredded,
+        .incomplete => .unverified,
+    };
+}
+
+/// Count this tenant's destroy tombstones. Paginated, because the count
+/// grows with total-ever-destroyed rather than with live keys.
+///
+/// Off the hot path by construction — completeness is settled when a
+/// node takes up a tenant, not per request.
+pub fn countTombstones(kv: anytype, allocator: std.mem.Allocator) !u64 {
+    var total: u64 = 0;
+    var cursor: []const u8 = "";
+    var cursor_owned: ?[]u8 = null;
+    defer if (cursor_owned) |c| allocator.free(c);
+    while (true) {
+        var res = try kv.prefix(DEAD_PREFIX, cursor, 512);
+        defer res.deinit();
+        if (res.entries.len == 0) break;
+        total += res.entries.len;
+        if (res.entries.len < 512) break;
+        const last = res.entries[res.entries.len - 1].key;
+        const next = try allocator.dupe(u8, last);
+        if (cursor_owned) |c| allocator.free(c);
+        cursor_owned = next;
+        cursor = next;
+    }
+    return total;
+}
+
 pub fn encodeDead(destroyed_unix_ns: i64) [DEAD_VALUE_LEN]u8 {
     var out: [DEAD_VALUE_LEN]u8 = undefined;
     std.mem.writeInt(i64, out[0..8], destroyed_unix_ns, .little);
@@ -304,6 +429,84 @@ test "slot 0 is never bindable — it is the tenant's own key" {
     // of slot 0 would be a C1 shred wearing the wrong name.
     try testing.expect(crypt.FIRST_SLOT > 0);
     try testing.expectEqualSlices(u8, &crypt.TENANT_REF, &[_]u8{0} ** crypt.KEY_REF_LEN);
+}
+
+test "completeness: a node holding the whole range may report erasure" {
+    // 4096 minted from slot 1 ⇒ 4095 slots to account for.
+    try testing.expectEqual(Completeness.complete, completeness(4095, 0, 4096));
+    try testing.expectEqual(Completeness.complete, completeness(4090, 5, 4096));
+    try testing.expectEqual(Completeness.complete, completeness(0, 4095, 4096));
+}
+
+test "completeness: a node short of the range may NOT report erasure" {
+    // The failover case. One missing shard is the difference between
+    // "this was erased" and "I never received it", and only this check
+    // can tell them apart.
+    try testing.expectEqual(Completeness.incomplete, completeness(4094, 0, 4096));
+    try testing.expectEqual(Completeness.incomplete, completeness(0, 0, 4096));
+    try testing.expectEqual(Completeness.incomplete, completeness(2048, 1, 4096));
+}
+
+test "completeness: a fresh tenant is complete, not incomplete" {
+    // Nothing minted ⇒ nothing to be missing. Reporting incomplete here
+    // would make every new tenant unserveable.
+    try testing.expectEqual(Completeness.complete, completeness(0, 0, 0));
+    try testing.expectEqual(Completeness.complete, completeness(0, 0, crypt.FIRST_SLOT));
+}
+
+test "completeness: holding more than the watermark requires is complete" {
+    // A shard push can land before the watermark write that announces
+    // it. Calling that node incomplete would take a HEALTHY node out of
+    // service on ordinary message ordering.
+    try testing.expectEqual(Completeness.complete, completeness(8191, 0, 4096));
+}
+
+test "completeness measures MINTED, never RESERVED" {
+    // A leader that dies between reserving a block and minting it leaves
+    // the reservation counter ahead of anything that ever existed. If
+    // the check measured that, one crash would mark every node in the
+    // cluster incomplete forever — the tenant goes down and no repair
+    // helps, because the missing keys were never minted.
+    const reserved: u64 = 8192; // `_keys/next_slot` after the dead leader
+    const minted: u64 = 4096; // what actually reached a quorum
+    const live: u64 = 4095;
+    try testing.expectEqual(Completeness.complete, completeness(live, 0, minted));
+    try testing.expectEqual(Completeness.incomplete, completeness(live, 0, reserved));
+}
+
+test "an incomplete node answers unverified, never shredded" {
+    // The failure this whole check exists to prevent: a node that is
+    // merely missing key material telling a customer their data was
+    // erased.
+    var buf: [64]u8 = undefined;
+    const dir = std.fmt.bufPrint(&buf, "/tmp/rove-kb-test-{x}", .{std.crypto.random.int(u64)}) catch unreachable;
+    std.fs.cwd().makePath(dir) catch unreachable;
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    var kr = try crypt.keyring.Keyring.create(testing.allocator, dir, "acme", "test-kek", TEST_SECRET);
+    defer kr.deinit();
+    try kr.mintRange(1, 4, 1);
+
+    // A slot this node holds resolves the same either way.
+    try testing.expect(lookup(&kr, 2, .complete) == .key);
+    try testing.expect(lookup(&kr, 2, .incomplete) == .key);
+
+    // A slot it does not hold is an erasure ONLY when it can stand
+    // behind the claim.
+    try testing.expect(lookup(&kr, 9, .complete) == .shredded);
+    try testing.expect(lookup(&kr, 9, .incomplete) == .unverified);
+}
+
+test "a minted watermark round-trips" {
+    try testing.expectEqual(@as(u64, 12288), try decodeMinted(&encodeMinted(12288)));
+    try testing.expectError(Error.Corrupt, decodeMinted(""));
+    try testing.expectError(Error.Corrupt, decodeMinted(&[_]u8{0} ** 7));
+}
+
+test "the watermark key is closed to customer writes" {
+    // A handler that could write it could declare itself complete and
+    // turn every missing key into a reported erasure.
+    try testing.expect(std.mem.startsWith(u8, MINTED_KEY, "_"));
 }
 
 test "a dead marker round-trips its timestamp" {

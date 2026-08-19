@@ -45,6 +45,7 @@
 
 const std = @import("std");
 const crypt = @import("rove-crypt");
+const keyring_bind = @import("keyring_bind.zig");
 
 /// Platform-reserved counter key. Leading `_` is closed to customer
 /// writes (`architecture/format-versioning.md`, the reserved-keyspace
@@ -146,9 +147,47 @@ pub fn reserve(
     return new_end;
 }
 
+/// Publish the tenant's minted watermark — the replicated statement
+/// that every slot below `end` exists and every node should hold its key.
+///
+/// This is what makes a missing key readable as *erased* rather than
+/// *not mine yet*: a node compares its own keyring against this number
+/// and the destroy tombstones, and refuses to answer if it comes up
+/// short. Without it, absence is an assumption the transport does not
+/// back — raft elects on log up-to-dateness and key material travels
+/// outside the log, so a node can be fully caught up and still missing
+/// shards.
+///
+/// Called by the pool AFTER mint and quorum replication and BEFORE the
+/// block is published, so no ciphertext can ever name a slot that some
+/// node has no way to learn about. A failure here withholds the block
+/// rather than handing out slots on a claim nobody replicated.
+///
+/// No read-modify-write and so no nonce guard, unlike the reservation
+/// counter: this value is derived from a block the caller already owns,
+/// and leadership serializes the writes. A stale leader cannot commit
+/// one at all.
+pub fn commitMinted(worker: anytype, tenant: []const u8, end: u64) Error!void {
+    const gid = worker.raft.gidForTenant(tenant) orelse return Error.NotHosted;
+    const value = keyring_bind.encodeMinted(end);
+    const seq = worker.raft.proposePut(gid, keyring_bind.MINTED_KEY, &value) catch
+        return Error.NotCommitted;
+    worker.raft.awaitCommit(gid, seq, COMMIT_TIMEOUT_NS) catch
+        return Error.NotCommitted;
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "the watermark and the reservation counter are different keys" {
+    // Conflating them is the failure mode the split exists to prevent: a
+    // leader that dies between reserving a block and minting it leaves
+    // the RESERVATION ahead of anything that ever existed, and a node
+    // measuring completeness against that declares itself permanently
+    // incomplete through no fault of its own.
+    try testing.expect(!std.mem.eql(u8, COUNTER_KEY, keyring_bind.MINTED_KEY));
+}
 
 test "the counter key is closed to customer writes" {
     // A handler that could write `_keys/next_slot` could hand itself an

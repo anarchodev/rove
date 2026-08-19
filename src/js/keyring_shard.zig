@@ -187,9 +187,25 @@ pub fn pushToQuorum(
     var q = crypt.replicate.Quorum.init(cs.voters.len);
     const self_id: u64 = worker.raft.config.node_id;
 
+    // EVERY voter is offered the shard, not just enough of them.
+    //
+    // A majority is the bar for calling the key durable; it is the wrong
+    // bar for stopping. Stopping there leaves a voter that is up and
+    // reachable without the shard, and nothing brings it one later:
+    // pushes are per-shard and refills append to the TAIL shard, so once
+    // minting moves past a shard — or the tenant simply stops taking new
+    // identities — that node's gap is permanent.
+    //
+    // It matters because raft elects on LOG up-to-dateness and the
+    // keyring deliberately sits outside the log, so those two majorities
+    // are unrelated. The node that missed a shard can win an election,
+    // and a node that answers reads while missing a key reports live
+    // data as erased — `keyAt` returns null and absence is authoritative.
+    //
+    // Cost is bounded: this runs on the refill path, ahead of demand,
+    // never on a request. A slow peer delays a future block, not a seal.
     for (cs.voters) |peer| {
         if (peer == self_id) continue; // already written locally
-        if (q.state() == .durable) break; // enough; the rest catch up on the next push
 
         const base = peerUrl(worker, peer) orelse {
             q.fail();
@@ -201,7 +217,9 @@ pub fn pushToQuorum(
             q.fail();
         }
         // A majority is unreachable — stop rather than time out against
-        // peers that cannot change the answer.
+        // peers that cannot change the answer. Unreachable only while
+        // NOT yet durable: `state` checks `acked >= needed` first, so a
+        // later peer failing after quorum cannot un-durable the push.
         if (q.state() == .impossible) break;
     }
 
