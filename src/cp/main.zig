@@ -745,7 +745,12 @@ const Router = struct {
         const cluster = cluster_ref.id;
         const nodes = cluster_ref.nodes;
 
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
+        // A failed provision ENDS this tenant lifetime, so the rollback
+        // shreds too. Leaving the keyring behind would be worse than
+        // untidy: the name is free again, and a later tenant taking it
+        // would find a keyring from the previous lifetime on some nodes
+        // and not others.
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"shred\":true}}", .{tenant}) catch {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
@@ -1013,7 +1018,16 @@ const Router = struct {
         //    destroys the raft group AND the instance (its store, its
         //    `instance/{id}` root marker — which is what frees the name — and
         //    its domain aliases).
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
+        // `shred` marks this as the END of the tenant's lifetime, not a
+        // change of address: the node destroys its keyring, so every byte
+        // it ever sealed goes permanently unreadable. A move's source
+        // eviction sends the same request WITHOUT it, because the tenant
+        // carries on serving the same data elsewhere.
+        //
+        // It rides here rather than being inferred at the node, because
+        // only the caller knows which of the two this is — and guessing
+        // wrong in one direction destroys a live tenant's keys.
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"shred\":true}}", .{tenant}) catch {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
