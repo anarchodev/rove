@@ -80,9 +80,10 @@ pub const Channel = enum {
 
     /// Parse the channel name as it appears in a request path. Returns
     /// null on anything else — including a channel that exists on the tape
-    /// but carries no payload (`kv`, `module`, `request_reads`), which the
-    /// door reports as a malformed ADDRESS (400) rather than a missing
-    /// resource (404). The split is worth keeping: 400 means the caller
+    /// but carries no payload the door can serve (`kv`, `module`,
+    /// `request_reads`, and `activation`, whose blob rides the raft entry
+    /// and is never flushed), which the door reports as a malformed
+    /// ADDRESS (400) rather than a missing resource (404). The split is worth keeping: 400 means the caller
     /// asked the wrong question, 404 means the question was well formed
     /// and the answer is nothing. Never a silent fallback to a default
     /// channel.
