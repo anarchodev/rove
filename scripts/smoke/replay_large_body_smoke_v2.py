@@ -43,7 +43,7 @@ import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, APPS_DIR  # noqa: E402
 
 # The response IS a function of the whole body, and the digest folds the
 # response (`interaction_digest.response`). A replay that runs on "" therefore
@@ -77,7 +77,7 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    apps = os.environ.get("REWIND_APPS_DIR", os.path.expanduser("~/src/rewind-apps"))
+    apps = str(APPS_DIR)
     checker = os.path.join(apps, "e2e", "replay-digest-check.mjs")
     if not os.path.exists(checker):
         # A cross-engine smoke that silently degrades to single-engine reports a

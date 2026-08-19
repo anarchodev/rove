@@ -33,7 +33,7 @@ import tempfile
 import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, APPS_DIR  # noqa: E402
 
 # `mode` picks what the handler writes, so runs can be identical or not while
 # the RESPONSE stays the same in both cases.
@@ -161,7 +161,7 @@ def main() -> int:
         # Needs a rewind-apps checkout for the shell modules; skipped with a
         # message rather than silently passing when absent, because a check
         # that quietly does not run is worse than one that is missing.
-        apps = os.environ.get("REWIND_APPS_DIR", os.path.expanduser("~/src/rewind-apps"))
+        apps = str(APPS_DIR)
         checker = os.path.join(apps, "e2e", "replay-digest-check.mjs")
         if not os.path.exists(checker):
             print(f"  SKIP cross-engine replay check — no rewind-apps checkout at {apps}")
@@ -260,7 +260,7 @@ def main() -> int:
               p1 is not None and p3 is not None and p1 != p3,
               f"{p1} vs {p3} — the digest is still blind to the privileged surface")
 
-        apps = os.environ.get("REWIND_APPS_DIR", os.path.expanduser("~/src/rewind-apps"))
+        apps = str(APPS_DIR)
         checker = os.path.join(apps, "e2e", "replay-digest-check.mjs")
         if not os.path.exists(checker):
             print(f"  SKIP cross-engine privileged replay check — no rewind-apps checkout at {apps}")

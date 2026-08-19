@@ -350,9 +350,19 @@ def _apps_dir() -> Path:
     """The rewind-apps checkout holding the replay porcelain (rtap /
     request-replay / qjs_arena_wasm). `$REWIND_APPS_DIR` is the smoke harness's
     convention; honour it rather than inventing a second one."""
+    def has_porcelain(d: Path) -> bool:
+        return (d / "replay" / "_static" / "qjs_arena_wasm.js").exists()
+
     env = os.environ.get("REWIND_APPS_DIR")
-    if env and (Path(env) / "replay" / "_static" / "qjs_arena_wasm.js").exists():
+    if env and has_porcelain(Path(env)):
         return Path(env)
+    # The `web` submodule, pinned by this commit. Without this fallback the
+    # replay engine is unavailable whenever REWIND_APPS_DIR is unset, and the
+    # run reports "PASS (PROVED NOTHING)" while exiting 0 — honest text that a
+    # `&& echo PASS` wrapper still reads as success.
+    submodule = Path(__file__).resolve().parent.parent.parent / "web"
+    if has_porcelain(submodule):
+        return submodule
     raise EngineUnavailable(
         "no rewind-apps checkout with the replay porcelain — expected the `web` "
         "submodule (`git submodule update --init`) or REWIND_APPS_DIR"

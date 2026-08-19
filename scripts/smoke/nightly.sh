@@ -22,7 +22,7 @@
 # Environment (all defaulted for the dev box):
 #   ROVE_NIGHTLY_DIR    dedicated checkout      (~/src/rove-nightly)
 #   ROVE_SMOKE_ENV      S3 credentials file     (~/src/rove/.env)
-#   REWIND_APPS_DIR     first-party app sources (~/src/rewind-apps)
+#   REWIND_APPS_DIR     first-party app sources (default: the web submodule)
 #   SMOKE_JOBS          run_all --jobs          (8)
 #   SMOKE_ISSUE         standing GH issue       (373)
 #   SMOKE_FILTER        run_all --filter        (unset = full suite; used by
@@ -38,7 +38,9 @@ NIGHTLY_DIR="${ROVE_NIGHTLY_DIR:-$HOME/src/rove-nightly}"
 # stay clonable-from-empty and hard-resettable without excludes.
 RUNS_DIR="$NIGHTLY_DIR-runs"
 ENV_FILE="${ROVE_SMOKE_ENV:-$HOME/src/rove/.env}"
-export REWIND_APPS_DIR="${REWIND_APPS_DIR:-$HOME/src/rewind-apps}"
+# The `web` submodule inside the nightly checkout, pinned by the commit under
+# test — not a sibling checkout that drifts on its own schedule.
+export REWIND_APPS_DIR="${REWIND_APPS_DIR:-$NIGHTLY_DIR/web}"
 JOBS="${SMOKE_JOBS:-8}"
 ISSUE="${SMOKE_ISSUE:-373}"
 # HTTPS, not SSH: the timer fires with no login session, so there is no
@@ -82,8 +84,13 @@ cd "$NIGHTLY_DIR"
 git remote set-url origin "$REMOTE_URL"
 git fetch origin main >"$RUN_DIR/git.log" 2>&1 \
     && git reset --hard origin/main >>"$RUN_DIR/git.log" 2>&1 \
-    && git clean -fd --exclude=.env >>"$RUN_DIR/git.log" 2>&1 \
+    && git clean -fd --exclude=.env --exclude=web >>"$RUN_DIR/git.log" 2>&1 \
     || die "checkout update failed" "$(tail -20 "$RUN_DIR/git.log")"
+# The `web` submodule carries the first-party bundles 15 smokes deploy. Without
+# this the nightly runs against an empty `web/` and reports those smokes as
+# regressions — a red that is entirely its own setup.
+git submodule update --init --recursive >>"$RUN_DIR/git.log" 2>&1 \
+    || die "web submodule update failed" "$(tail -20 "$RUN_DIR/git.log")"
 SHA="$(git rev-parse --short HEAD)"
 log "at origin/main ($SHA)"
 
