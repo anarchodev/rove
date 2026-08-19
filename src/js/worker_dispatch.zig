@@ -844,7 +844,15 @@ fn finalizeBatch(
                 // `EntryTooLarge` is refused a priori and identically on every
                 // node, so the retry-safe 421 would send the front door
                 // re-aiming after an answer that will never change.
-                const too_large = perr == error.EntryTooLarge;
+                //
+                // Only when this request is ALONE in the batch, though. An
+                // entry carries every request in the dispatch pass, so with
+                // more than one we cannot say whose writes blew it — and 413
+                // tells a small request "never" when a retry, landing in a
+                // different batch, would have committed. Batched, everyone
+                // keeps the retry-safe 421; the offender collects its 413 the
+                // first time it proposes alone.
+                const too_large = perr == error.EntryTooLarge and successes.items.len == 1;
                 for (successes.items) |*s| {
                     contDiscardIfAny(allocator, s); // open hop didn't commit → 421, not held
                     streamDiscardIfAny(allocator, s); // stream-first-hop never reached the wire → drop chain meta
@@ -1085,8 +1093,10 @@ fn finalizeBatch(
         allocator.destroy(txn);
         // See the barrier path: an entry over the wire limit is refused the
         // same way everywhere, so it gets a defined 413 instead of the
-        // retry-safe 421.
-        const too_large = err == error.EntryTooLarge;
+        // retry-safe 421 — but only when the batch is this one request, since
+        // an entry carries the whole pass and a batch cannot say whose writes
+        // were the ones that did not fit.
+        const too_large = err == error.EntryTooLarge and successes.items.len == 1;
         for (successes.items) |*s| {
             contDiscardIfAny(allocator, s); // open hop didn't commit → 421, not held
             // 421 not 503: the propose never entered the log and the txn
