@@ -42,10 +42,35 @@
 //! Within one process `rove-reserve` also floors each request at the
 //! highest block it has ever issued, so back-to-back refills cannot
 //! overlap even while a propose is still in flight.
+//!
+//! ## Why these writes go through a txn AND a propose
+//!
+//! A worker runs the pump in `worker_overlay` mode, where the skip
+//! decision is keyed on PROVENANCE: an entry this bridge proposed and is
+//! still awaiting is skipped, because a worker `TrackedTxn` is presumed
+//! to be doing the store write. Proposing without one therefore lands
+//! the value on every FOLLOWER and on no leader — the node that most
+//! needs it. `bridge.zig`'s worker-overlay test pins exactly that
+//! behaviour.
+//!
+//! So each write here does what every other standalone platform write
+//! does (`blob_usage.zig` is the model): write it through a txn locally,
+//! then propose the same op to replicate it. The txn is the leader's
+//! copy; the propose is everyone else's.
+//!
+//! That also keeps the read-back honest, which is easy to talk yourself
+//! out of. Writing locally does not make the check see only its own
+//! value: a competing proposer's entry arrives with a FOREIGN origin, so
+//! the pump writes it here too. The read-back therefore still
+//! discriminates exactly when it must — both racers see a nonce that is
+//! not theirs and both back off, which is conservative rather than
+//! lossy.
 
 const std = @import("std");
 const crypt = @import("rove-crypt");
 const keyring_bind = @import("keyring_bind.zig");
+const kv_mod = @import("raft-kv");
+const raft_propose = @import("raft_propose.zig");
 
 /// Platform-reserved counter key. Leading `_` is closed to customer
 /// writes (`architecture/format-versioning.md`, the reserved-keyspace
@@ -115,7 +140,9 @@ pub fn reserve(
     prev_end: u64,
     count: u32,
 ) Error!u64 {
-    const gid = worker.raft.gidForTenant(tenant) orelse return Error.NotHosted;
+    // Reserving for a tenant this node does not host would hand out
+    // slots nobody else agrees to.
+    _ = worker.raft.gidForTenant(tenant) orelse return Error.NotHosted;
 
     const committed = try readEnd(worker, tenant);
     const floor = @max(@max(committed, prev_end), crypt.FIRST_SLOT);
@@ -129,10 +156,7 @@ pub fn reserve(
     std.mem.writeInt(u64, value[0..8], new_end, .little);
     std.mem.writeInt(u64, value[8..16], nonce, .little);
 
-    const seq = worker.raft.proposePut(gid, COUNTER_KEY, &value) catch
-        return Error.NotCommitted;
-    worker.raft.awaitCommit(gid, seq, COMMIT_TIMEOUT_NS) catch
-        return Error.NotCommitted;
+    try writeReplicated(worker, tenant, COUNTER_KEY, &value);
 
     // Read back and check the nonce. A commit is not proof the range is
     // ours: a concurrent proposer that computed the same `end` would
@@ -168,11 +192,47 @@ pub fn reserve(
 /// and leadership serializes the writes. A stale leader cannot commit
 /// one at all.
 pub fn commitMinted(worker: anytype, tenant: []const u8, end: u64) Error!void {
-    const gid = worker.raft.gidForTenant(tenant) orelse return Error.NotHosted;
+    // Not hosted here ⇒ nothing to write and nobody to replicate to.
+    _ = worker.raft.gidForTenant(tenant) orelse return Error.NotHosted;
     const value = keyring_bind.encodeMinted(end);
-    const seq = worker.raft.proposePut(gid, keyring_bind.MINTED_KEY, &value) catch
+    try writeReplicated(worker, tenant, keyring_bind.MINTED_KEY, &value);
+}
+
+/// Put `key = value` in the tenant's store on THIS node and on every
+/// other, then wait for the replication to commit.
+///
+/// The local txn is not an optimisation — see the provenance note in the
+/// file header. Without it the leader is the one node that never gets
+/// the value.
+///
+/// Local first, so a propose that never commits leaves the counter only
+/// AHEAD here. That direction is safe: the floor rule only ever moves
+/// forward, so a stale local value costs a skipped range and never
+/// reissues one.
+fn writeReplicated(
+    worker: anytype,
+    tenant: []const u8,
+    key: []const u8,
+    value: []const u8,
+) Error!void {
+    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+        return Error.NotHosted;
+
+    var txn = inst.kv.beginTrackedImmediate() catch return Error.NotCommitted;
+    txn.put(key, value) catch {
+        txn.rollback() catch {};
         return Error.NotCommitted;
-    worker.raft.awaitCommit(gid, seq, COMMIT_TIMEOUT_NS) catch
+    };
+    txn.commit() catch return Error.NotCommitted;
+
+    // No dispatched handler here, so no readset rides the envelope — the
+    // stance every non-handler producer takes.
+    var ws = kv_mod.WriteSet.init(worker.allocator);
+    defer ws.deinit();
+    ws.addPut(key, value) catch return Error.OutOfMemory;
+    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch
+        return Error.NotCommitted;
+    worker.raft.awaitCommit(proposed.group_id, proposed.seq, COMMIT_TIMEOUT_NS) catch
         return Error.NotCommitted;
 }
 
