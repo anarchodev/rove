@@ -131,8 +131,16 @@ pub const MsgRouter = struct {
     /// `enqueueMsgForTenant`; the typed wrappers
     /// `enqueueFetchEventForTenant` build the matching `effect.Msg`
     /// variant and route through it.
+    /// A worker's slot index is its routing identity for the life of
+    /// the process: `bound_fetch_owners` / `bound_send_owners` store
+    /// it, `relay_inboxes` is keyed by it, and `sweepDurableWakes`
+    /// partitions tenants by matching `hash(tenant_id) % N` against
+    /// it. So slots are TOMBSTONED on unregister, never compacted —
+    /// removing one by swapping the tail down would silently re-point
+    /// every registration naming the moved worker, and shrink the `N`
+    /// that both sides of the sweep's equality test divide by.
     msg_inboxes_mutex: std.Thread.Mutex = .{},
-    msg_inboxes: std.ArrayListUnmanaged(*effect_mod.MsgInbox) = .empty,
+    msg_inboxes: std.ArrayListUnmanaged(?*effect_mod.MsgInbox) = .empty,
 
     /// Per-worker relay inboxes (the CAS→connection relay,
     /// `docs/architecture/routing-and-ingress.md`), keyed by the SAME
@@ -249,13 +257,16 @@ pub const MsgRouter = struct {
         return idx;
     }
 
+    /// Tombstone a worker's slot. The slot stays, so every other
+    /// worker keeps the index it was handed; a message routed to a
+    /// departed worker gets `error.NoWorkers`, which every producer
+    /// already handles.
     pub fn unregisterMsgInbox(self: *MsgRouter, inbox: *effect_mod.MsgInbox) void {
         self.msg_inboxes_mutex.lock();
         defer self.msg_inboxes_mutex.unlock();
-        var i: usize = 0;
-        while (i < self.msg_inboxes.items.len) : (i += 1) {
-            if (self.msg_inboxes.items[i] == inbox) {
-                _ = self.msg_inboxes.swapRemove(i);
+        for (self.msg_inboxes.items) |*slot| {
+            if (slot.* == inbox) {
+                slot.* = null;
                 return;
             }
         }
@@ -315,7 +326,10 @@ pub const MsgRouter = struct {
             return error.NoWorkers;
         }
         const inbox_idx = std.hash.Wyhash.hash(0, tenant_id) % n;
-        const inbox = self.msg_inboxes.items[inbox_idx];
+        const inbox = self.msg_inboxes.items[inbox_idx] orelse {
+            self.msg_inboxes_mutex.unlock();
+            return error.NoWorkers;
+        };
         self.msg_inboxes_mutex.unlock();
         std.log.debug(
             "rove-js msg-route: kind={s} tenant={s} -> worker {d}/{d}",
@@ -495,7 +509,10 @@ pub const MsgRouter = struct {
             self.msg_inboxes_mutex.unlock();
             return error.NoWorkers;
         }
-        const inbox = self.msg_inboxes.items[worker_idx];
+        const inbox = self.msg_inboxes.items[worker_idx] orelse {
+            self.msg_inboxes_mutex.unlock();
+            return error.NoWorkers;
+        };
         self.msg_inboxes_mutex.unlock();
         try inbox.push(msg);
     }
@@ -639,3 +656,131 @@ pub const MsgRouter = struct {
         }
     }
 };
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// First tenant id (of the form `t<N>`) that hash-routes to `want`
+/// under a registry of `n` slots.
+fn tenantHashingTo(buf: []u8, want: usize, n: usize) []const u8 {
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) {
+        const id = std.fmt.bufPrint(buf, "t{d}", .{i}) catch unreachable;
+        if (std.hash.Wyhash.hash(0, id) % n == want) return id;
+    }
+    unreachable;
+}
+
+test "a bound fetch routes to its held-state owner, not to hash(tenant)" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [4]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes) |*ib| _ = try router.registerMsgInbox(ib);
+
+    var buf: [32]u8 = undefined;
+    const tenant = tenantHashingTo(&buf, 0, 4);
+    const owner = 2; // deliberately not the hash slot
+
+    try testing.expect(router.registerBoundFetchOwner("f1", owner));
+    try router.enqueueFetchEventForTenant(tenant, .{
+        .fetch_id = try a.dupe(u8, "f1"),
+        .tenant_id = try a.dupe(u8, tenant),
+        .bind = true,
+    });
+
+    // The whole point of the registry: inbound HTTP lands on a
+    // kernel-chosen worker, so the worker holding the bound fetch's
+    // parked continuation is not the one `hash(tenant_id)` names.
+    try testing.expectEqual(@as(usize, 1), inboxes[owner].items.items.len);
+    try testing.expectEqual(@as(usize, 0), inboxes[0].items.items.len);
+    try testing.expectEqual(@as(u64, 1), router.bound_fetch_cross_worker_routes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), router.bound_fetch_same_worker_routes.load(.monotonic));
+}
+
+test "an owner that happens to sit on the hash slot counts as same-worker" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [4]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes) |*ib| _ = try router.registerMsgInbox(ib);
+
+    var buf: [32]u8 = undefined;
+    const tenant = tenantHashingTo(&buf, 3, 4);
+
+    try testing.expect(router.registerBoundFetchOwner("f1", 3));
+    try router.enqueueFetchEventForTenant(tenant, .{
+        .fetch_id = try a.dupe(u8, "f1"),
+        .tenant_id = try a.dupe(u8, tenant),
+        .bind = true,
+    });
+
+    try testing.expectEqual(@as(usize, 1), inboxes[3].items.items.len);
+    try testing.expectEqual(@as(u64, 0), router.bound_fetch_cross_worker_routes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), router.bound_fetch_same_worker_routes.load(.monotonic));
+}
+
+test "an unbound fetch hash-routes and moves neither owner counter" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [4]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes) |*ib| _ = try router.registerMsgInbox(ib);
+
+    var buf: [32]u8 = undefined;
+    const tenant = tenantHashingTo(&buf, 1, 4);
+
+    try router.enqueueFetchEventForTenant(tenant, .{
+        .fetch_id = try a.dupe(u8, "f1"),
+        .tenant_id = try a.dupe(u8, tenant),
+        .bind = false,
+    });
+
+    try testing.expectEqual(@as(usize, 1), inboxes[1].items.items.len);
+    try testing.expectEqual(@as(u64, 0), router.bound_fetch_cross_worker_routes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), router.bound_fetch_same_worker_routes.load(.monotonic));
+}
+
+test "a departed worker's slot is tombstoned, so its siblings keep their index" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [3]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes, 0..) |*ib, i| try testing.expectEqual(i, try router.registerMsgInbox(ib));
+
+    var buf: [32]u8 = undefined;
+    const to_two = tenantHashingTo(&buf, 2, 3);
+
+    // Worker 1 tears down mid-shutdown. Compacting the registry here
+    // would slide worker 2 into slot 1, silently re-pointing every
+    // `bound_*_owners` entry that names 2 and changing the `% N` both
+    // sides of `sweepDurableWakes`'s ownership test divide by.
+    router.unregisterMsgInbox(&inboxes[1]);
+
+    try router.enqueueMsgForTenant(to_two, .{ .timer = .{} });
+    try testing.expectEqual(@as(usize, 1), inboxes[2].items.items.len);
+    try testing.expectEqual(@as(usize, 0), inboxes[0].items.items.len);
+
+    // Owner routing to the departed worker is refused, not misdelivered.
+    try testing.expectError(error.NoWorkers, router.enqueueMsgToWorker(1, .{ .timer = .{} }));
+
+    // And a fresh registration takes a NEW slot rather than reusing the
+    // tombstone — reuse would hand a new worker a departed one's
+    // identity, and with it that worker's held-state registrations.
+    var late = effect_mod.MsgInbox.init(a);
+    defer late.deinit();
+    try testing.expectEqual(@as(usize, 3), try router.registerMsgInbox(&late));
+}

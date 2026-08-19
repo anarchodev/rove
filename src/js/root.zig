@@ -170,6 +170,7 @@ test {
     _ = @import("bindings/http.zig");
     _ = @import("bindings/stream.zig");
     _ = @import("bindings/textcodec.zig");
+    _ = @import("blob_receive.zig");
     _ = @import("blob_sessions.zig");
     _ = @import("kv_export.zig");
     _ = @import("builtin_modules.zig");
@@ -177,15 +178,19 @@ test {
     _ = @import("deployment_cache.zig");
     _ = @import("durable_wake.zig");
     _ = @import("fetch_engine.zig");
+    _ = @import("globals_request.zig");
     _ = @import("gzip.zig");
     _ = @import("ip_mask.zig");
     _ = @import("module_execution.zig");
+    _ = @import("msg_router.zig");
     _ = @import("owed_retry.zig");
     _ = @import("package_resolver.zig");
+    _ = @import("raft_propose.zig");
     _ = @import("reserved_headers.zig");
     _ = @import("response_builder.zig");
     _ = @import("response_building.zig");
     _ = @import("rpc_dispatch.zig");
+    _ = @import("spool_registry.zig");
     _ = @import("worker_fire.zig");
     _ = @import("worker_log.zig");
     _ = @import("worker_system.zig");
