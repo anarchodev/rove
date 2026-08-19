@@ -26,6 +26,7 @@ Generalizes the proven flow in `v2_handler_smoke.py`. Reuses `smoke_lib`'s
 from __future__ import annotations
 
 import re
+import atexit
 import json
 import os
 import signal
@@ -42,6 +43,51 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib import mint_jwt, HttpResponse  # noqa: E402
 from smoke_ports import alloc, alloc_port, free, CLUSTER_BLOCK  # noqa: E402,F401
 from v2_topology import spawn_cp, spawn_front, await_ready, CP_BIN, FRONT_BIN  # noqa: E402
+import smoke_quiet  # noqa: E402
+import smoke_reap  # noqa: E402
+
+# Arm the child-survival nets for every smoke that imports this harness. The
+# V2 port kept `smoke_lib`'s spawn/teardown shape but dropped its `atexit` +
+# signal traps, which is why orphaned nodes accumulate on a shared box for
+# hours (rove#637).
+smoke_reap.install()
+
+# ── the box, taken for this smoke's lifetime ──────────────────────────────
+#
+# Ports are already partitioned across sessions (`smoke_ports`); TIME is not.
+# A timing-sensitive smoke needs the box quiet, and "quiet" has to mean quiet
+# across every clone on the machine — `run_all`'s serial tail only ever meant
+# quiet within one run, so a sibling session's suite was invisible to it.
+#
+# Taken at import so it covers the whole smoke, and held to process exit:
+# nothing here upgrades shared→exclusive, which is the one flock pattern that
+# can deadlock.
+_QUIET = None
+_QUIET_UNCONTENDED = True
+
+
+def _take_box() -> None:
+    global _QUIET, _QUIET_UNCONTENDED
+    if _QUIET is not None:
+        return
+    name = os.path.basename(sys.argv[0] or "")
+    ctx = (smoke_quiet.exclusive if name in smoke_quiet.QUIET_EXCLUSIVE
+           else smoke_quiet.shared)
+    _QUIET = ctx(name or "smoke")
+    _QUIET_UNCONTENDED = bool(_QUIET.__enter__())
+    atexit.register(lambda: _QUIET.__exit__(None, None, None))
+
+
+def box_was_quiet() -> bool:
+    """False if this smoke gave up waiting for the box, or the kernel reports
+    heavy I/O stall. A timing-sensitive assertion should report INCONCLUSIVE
+    rather than FAIL when this is false (rove#655)."""
+    stall = smoke_quiet.io_stall()
+    return _QUIET_UNCONTENDED and not (
+        stall is not None and stall >= smoke_quiet.STALL_INCONCLUSIVE_PCT)
+
+
+_take_box()
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # First-party app content the smokes deploy as fixtures. `web/` is the
@@ -438,10 +484,18 @@ class V2Cluster:
         for d in (*c.data_dirs, c.cp_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
         c._claim_storage_namespace(storage_generation)
-        if genesis:
-            c._boot_genesis(nodes)
-        else:
-            c._boot(nodes)
+        # A failure DURING boot must still tear down the nodes already up. The
+        # caller only enters `with` once spawn RETURNS, so without this an
+        # exception here — a flaky `await_ready` is the common one — leaks the
+        # whole partial cluster, which is where hours-old orphans come from.
+        try:
+            if genesis:
+                c._boot_genesis(nodes)
+            else:
+                c._boot(nodes)
+        except BaseException:
+            c.shutdown()
+            raise
         return c
 
     def _claim_storage_namespace(self, generation: int = 0) -> None:
@@ -663,7 +717,7 @@ class V2Cluster:
         log = f"/tmp/v2smoke-{self.tag}-n{i + 1}-{os.getpid()}.log"
         self.log_paths[f"n{i + 1}"] = log
         logf = open(log, "w+")
-        p = subprocess.Popen([str(REWIND), str(self.data_dirs[i]), str(self.node_ports[i])],
+        p = smoke_reap.popen([str(REWIND), str(self.data_dirs[i]), str(self.node_ports[i])],
                              stdout=logf, stderr=subprocess.STDOUT, env=env)
         p._name = f"n{i + 1}"
         p._logf = logf
@@ -741,7 +795,7 @@ class V2Cluster:
         log = f"/tmp/v2smoke-{self.tag}-logsrv-{os.getpid()}.log"
         self.log_paths["logsrv"] = log
         logf = open(log, "w+")
-        p = subprocess.Popen(
+        p = smoke_reap.popen(
             [str(LOG_SERVER),
              "--data-dir", str(self.log_data_dir),
              "--listen", f"127.0.0.1:{self.log_port}",

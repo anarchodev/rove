@@ -19,7 +19,7 @@
 const std = @import("std");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 8; // lockstep-asserted against src/tape/root.zig
+pub const VERSION: u16 = 9; // lockstep-asserted against src/tape/root.zig
 /// The oldest layout this reader still understands.
 ///
 /// A range is only sound while every version in it can be told apart by
@@ -43,10 +43,23 @@ pub const Channel = enum(u16) {
     fetch_responses = 2,
     trigger_payload = 3,
     request_reads = 4,
+    /// The `wake_batch` / `ws_message` activation Msg. Carried here for
+    /// the wire-id lockstep only — that channel rides the raft entry so
+    /// the promotion walker can rebuild a record, and never reaches a
+    /// pulled bundle: the flushed record carries the same Msg as
+    /// `activation_bytes`, which is what `rewind replay` reads. Hence
+    /// no `decodeActivation` below; a decoder no caller reaches would
+    /// rot unnoticed.
+    activation = 5,
 };
 
 pub const KvOp = enum(u8) { get = 0, set = 1, delete = 2, prefix = 3 };
-pub const KvOutcome = enum(u8) { ok = 0, not_found = 1, err = 2, refused = 3 };
+/// `elided` (4) is a read the capture RESOLVED but did not keep: the
+/// activation's kv budget was spent, so `value` carries the lost byte count
+/// instead of the bytes (`src/tape/root.zig` `KvOutcome`). A reader must
+/// refuse such a read — resolving it as absent or empty hands the handler a
+/// plausible value where the live run saw real data.
+pub const KvOutcome = enum(u8) { ok = 0, not_found = 1, err = 2, refused = 3, elided = 4 };
 
 /// One kv tape entry. For `prefix`, `value` is empty and `results` holds the
 /// returned pairs; otherwise `results` is empty and `value` is the read/written
@@ -322,7 +335,19 @@ pub fn decodeKv(a: std.mem.Allocator, bytes: []const u8) Error![]KvEntry {
                 p.key = try readLenPrefixed(e, &cur);
                 p.value = try readLenPrefixed(e, &cur);
             }
-            try out.append(a, .{ .op = .prefix, .outcome = outcome, .key = key, .results = slab });
+            // v9 trailing field: the lost row bytes of an ELIDED page (the
+            // budget dropped it whole), empty on an ordinary page.
+            const page_value: []const u8 = if (cur < e.len)
+                try readLenPrefixed(e, &cur)
+            else
+                "";
+            try out.append(a, .{
+                .op = .prefix,
+                .outcome = outcome,
+                .key = key,
+                .value = page_value,
+                .results = slab,
+            });
         } else {
             const value = try readLenPrefixed(e, &cur);
             try out.append(a, .{ .op = op, .outcome = outcome, .key = key, .value = value });

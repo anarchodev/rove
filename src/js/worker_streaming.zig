@@ -67,6 +67,7 @@ const worker_mod = @import("worker.zig");
 // bound-fetch resume through the worker hub (worker.resumeHeldBoundFetch),
 // so this base layer no longer calls up into worker_ws / worker_drain.
 const worker_drain = @import("worker_drain.zig");
+const respb = @import("response_builder.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_fire = @import("worker_fire.zig");
 const bodies_mod = @import("rove-bodies");
@@ -697,14 +698,17 @@ fn finishStreamResume(
                 const tapes = streamTapes(worker, spec.tape, &ctx);
                 const fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh_term) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (terminal + writes): propose failed: {s}", .{@errorName(perr)});
+                    // EntryTooLarge is a stated rule, not a platform fault — the record
+                    // says which (`response_builder.proposeFailureStatus`).
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     // No commit gate to wait for — close the stream now so
-                    // the customer sees a defined 500 rather than a
+                    // the customer sees a defined outcome rather than a
                     // half-open stream. The helper already freed
                     // `stage.chunks`; the defer is a no-op.
                     markStreamDrainingAnywhere(server, ctx.ent);
-                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, r.console, r.exception, tapes, corr, r.tags, ctx.act, 0, ctx.exec_seq);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st_fail, .fault, r.console, r.exception, tapes, corr, r.tags, ctx.act, 0, ctx.exec_seq);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -821,11 +825,14 @@ fn finishStreamResume(
                 const lh = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns, ctx.exec_seq);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (held + writes): propose failed: {s}", .{@errorName(perr)});
+                    // EntryTooLarge is a stated rule, not a platform fault — the record
+                    // says which (`response_builder.proposeFailureStatus`).
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
                     cval.deinit(allocator);
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     markStreamDrainingAnywhere(server, ctx.ent);
-                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0, ctx.exec_seq);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st_fail, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0, ctx.exec_seq);
                     return;
                 };
                 ctx.txn_owned.* = false;
@@ -913,6 +920,9 @@ fn finishStreamResume(
                 const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, "POST", mpath, "", corr, ctx.now_ns, ctx.exec_seq);
                 fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " (stream + writes): propose failed: {s}", .{@errorName(perr)});
+                    // EntryTooLarge is a stated rule, not a platform fault — the record
+                    // says which (`response_builder.proposeFailureStatus`).
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
                     // Helper already freed `stage.chunks` (the outer defer
                     // is now a no-op). Free what's left on the outcome
                     // struct (headers / ctx_json / kv_prefixes — the
@@ -921,7 +931,7 @@ fn finishStreamResume(
                     ctx.txn_owned.* = false;
                     ctx.txn_done.* = true;
                     markStreamDrainingAnywhere(server, ctx.ent);
-                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0, ctx.exec_seq);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st_fail, .fault, &.{}, &.{}, tapes, corr, &.{}, ctx.act, 0, ctx.exec_seq);
                     return;
                 };
                 ctx.txn_owned.* = false;
@@ -1817,9 +1827,12 @@ pub fn runFire(
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
                 const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): propose failed: {s}", .{ label, @errorName(perr) });
+                    // EntryTooLarge is a stated rule, not a platform fault — the record
+                    // says which (`response_builder.proposeFailureStatus`).
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
                     p.txn_owned = false; // helper rolled back + destroyed the txn
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, tapes, corr, r.tags, spec.act, 0, p.exec_seq);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st_fail, .fault, r.console, r.exception, tapes, corr, r.tags, spec.act, 0, p.exec_seq);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -1870,9 +1883,12 @@ pub fn runFire(
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
                 const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): cont-return propose failed: {s}", .{ label, @errorName(perr) });
+                    // EntryTooLarge is a stated rule, not a platform fault — the record
+                    // says which (`response_builder.proposeFailureStatus`).
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, cval.tags, spec.act, 0, p.exec_seq);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st_fail, .fault, &.{}, &.{}, tapes, corr, cval.tags, spec.act, 0, p.exec_seq);
                     return;
                 };
                 p.txn_owned = false;
@@ -1910,9 +1926,12 @@ pub fn runFire(
                 const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
                 const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
+                    // EntryTooLarge is a stated rule, not a platform fault — the record
+                    // says which (`response_builder.proposeFailureStatus`).
+                    const st_fail = respb.proposeFailureStatus(perr, 500);
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, corr, fallback_tags, spec.act, 0, p.exec_seq);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st_fail, .fault, &.{}, &.{}, tapes, corr, fallback_tags, spec.act, 0, p.exec_seq);
                     return;
                 };
                 p.txn_owned = false;

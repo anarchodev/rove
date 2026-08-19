@@ -75,8 +75,16 @@ const TagPair = struct { key: []u8, value: []u8 };
 var tag_list: std.ArrayList(TagPair) = .empty;
 
 /// Called by arenajs at every run entry (arena_run / arena_run_module).
+/// This run's spent write budget — module-linear-memory state, reset per run
+/// like poison and the deadline. The arena has no batch: one run is one
+/// activation, so the counters ARE the activation's slice.
+var write_ops: u32 = 0;
+var write_bytes: usize = 0;
+
 export fn rove_arena_run_begin() void {
     poison_len = 0;
+    write_ops = 0;
+    write_bytes = 0;
     deadline_ms = if (budget_ms > 0) emscripten_get_now() + budget_ms else 0;
     for (tag_list.items) |t| {
         std.heap.c_allocator.free(t.key);
@@ -171,6 +179,18 @@ pub const ArenaKv = struct {
         return exempt(key);
     }
 
+    /// The per-activation write budget, so the browser refuses exactly what
+    /// prod refuses — the engine-parity rule: one compiled check, every
+    /// engine (`reserved.KV_WRITES_MAX` / `KV_WRITE_BYTES_MAX`).
+    pub fn writeBudget(_: ArenaKv) binding.guards.WriteBudget {
+        return .{ .ops = write_ops, .bytes = write_bytes };
+    }
+
+    pub fn noteWrite(_: ArenaKv, bytes: usize) void {
+        write_ops += 1;
+        write_bytes += bytes;
+    }
+
     pub fn decides(self: ArenaKv) bool {
         return !isCaptured(self.ctx);
     }
@@ -216,6 +236,18 @@ pub const ArenaKv = struct {
             },
             1 => {
                 if (val != null) std.c.free(val);
+                if (!facade) FX.read(self.ctx, key, null);
+                return .absent;
+            },
+            // `elided` (`src/tape/root.zig` `KvOutcome`): the capture resolved
+            // this read and dropped its value at the kv budget. There is
+            // nothing to serve and nothing to throw — a throw is catchable,
+            // and a handler that swallowed it would carry on as if the read
+            // had merely failed. Poison the run instead, the same verdict the
+            // off-tape read gets.
+            4 => {
+                if (val != null) std.c.free(val);
+                poison(key);
                 if (!facade) FX.read(self.ctx, key, null);
                 return .absent;
             },
@@ -288,6 +320,12 @@ pub const ArenaKv = struct {
             if (json != null) std.c.free(json);
             return null;
         }
+        // `elided` (`src/tape/root.zig` `KvOutcome`): the capture's kv budget
+        // dropped this page whole, so the host answers with no rows. Serving
+        // that as a scan result would present an EMPTY page as a complete one
+        // — the shape a partial page would have, and the reason the capture
+        // elides pages all-or-nothing. Poison, then let the run unwind.
+        if (outcome == 4) poison(p);
         const bytes: []const u8 = json[0..@intCast(json_len)];
         var parsed = std.json.parseFromSlice([]Row, std.heap.c_allocator, bytes, .{}) catch {
             std.c.free(json);

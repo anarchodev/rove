@@ -159,6 +159,11 @@
     "seconds": 16.9,
     "status": "pass"
   },
+  "entry_size_guard_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 24.0,
+    "status": "pass"
+  },
   "epoch_join_smoke_v2.py": {
     "rc": 0,
     "seconds": 20.7,
@@ -312,6 +317,11 @@
   "kv_export_smoke_v2.py": {
     "rc": 0,
     "seconds": 7.2,
+    "status": "pass"
+  },
+  "kv_tape_budget_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.0,
     "status": "pass"
   },
   "leader_failover_smoke_v2.py": {
@@ -737,6 +747,11 @@
   "wake_target_smoke_v2.py": {
     "rc": 0,
     "seconds": 23.8,
+    "status": "pass"
+  },
+  "wake_walker_replay_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 10.3,
     "status": "pass"
   },
   "webhook_recovery_smoke_v2.py": {

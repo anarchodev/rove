@@ -906,6 +906,14 @@ pub const NodeState = struct {
     /// figures are in the paired warn log line.
     kv_cap_refusals: std.atomic.Value(u64) = .init(0),
 
+    /// Reads whose values the activation's kv-tape budget dropped
+    /// (`tape.KV_TAPE_BUDGET`). Non-zero means some records on this node
+    /// cannot be replayed against those reads — and, before the budget
+    /// existed, that the same activations were proposing raft entries too
+    /// large for a follower to receive. The tenant and figures are in the
+    /// paired warn log line.
+    tape_kv_elided: std.atomic.Value(u64) = .init(0),
+
     /// Admissions 429'd by the log-byte ingest guardrail (the lagging
     /// `log_bytes` bucket — the runaway-S3-volume guard,
     /// docs/strategy/pricing-model.md ingest-rate guardrail).

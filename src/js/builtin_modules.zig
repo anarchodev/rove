@@ -69,10 +69,46 @@ const MODULES = [_]struct {
     /// result (`on_chunk` targets) or directly by the engine are not wake
     /// targets and stay false.
     wake_targetable: bool = false,
+    /// May a FETCH RESULT land in this module? (rove#639)
+    ///
+    /// The `on_chunk` target of an outbound fetch is a module path, and the
+    /// customer-context shims (`globals/webhook.js`, `globals/blob.js`) must
+    /// name baked modules there — so `on_chunk` cannot simply refuse
+    /// `__system/` paths from handler context, the way the durability shims
+    /// are indistinguishable from customer code everywhere else
+    /// (`decisions.md` §3.3). The engine grants `is_system_module` from the
+    /// module PATH, so a target a tenant may name is a target a tenant may run
+    /// privileged, on a ctx it chose. This list is what bounds that set — the
+    /// result route's half of the pair, `wake_targetable` being the wake
+    /// route's (see "Who may dispatch a baked `__system/` module",
+    /// docs/architecture/effects-and-handlers.md).
+    ///
+    /// Default false: reachable only by the engine, by a wake it opted into,
+    /// or by a fetch a SYSTEM module issued. The three entries below are the
+    /// result handlers the customer-context shims name.
+    result_targetable: bool = false,
+    /// May a CONTINUATION HOP land in this module? (rove#643)
+    ///
+    /// `blob.put`'s `on` (and `webhook.send`'s `on_result`) is a module path
+    /// that rides the effect's ctx and is dispatched later by the baked result
+    /// handler's `next(on_result, …)`. The hop carries no record of who chose
+    /// the string — `@rewind/segments` names `__system/segments_onsealed` from
+    /// customer-context package JS, and `blob_compose` names
+    /// `__system/blob_compose_onresult` from system context, and by dispatch
+    /// time the two are the same anonymous hop. So the ISSUER cannot be the
+    /// test here (it is a baked module either way, which is exactly how a
+    /// laundered target defeats an issuer check — `decisions.md` §3.3); the
+    /// TARGET list is.
+    ///
+    /// Deliberately its own list rather than a reuse of `result_targetable`:
+    /// receiving a fetch result is not permission to be hopped into, and the
+    /// two sets differ.
+    continuation_targetable: bool = false,
 }{
     .{
         .path = "__system/webhook_onresult.mjs",
         .src = @embedFile("builtin_webhook_onresult_mjs"),
+        .result_targetable = true,
     },
     .{
         // durable-wake-plan P5(a): the wake-fired half of webhook.send
@@ -104,6 +140,7 @@ const MODULES = [_]struct {
         // result handler.
         .path = "__system/blob_onresult.mjs",
         .src = @embedFile("builtin_blob_onresult_mjs"),
+        .result_targetable = true,
     },
     .{
         // blob-write-recipes.md §4: the seal-time prompt compose —
@@ -116,6 +153,8 @@ const MODULES = [_]struct {
         // pending row) and the customer {on} handoff.
         .path = "__system/blob_compose_onresult.mjs",
         .src = @embedFile("builtin_blob_compose_onresult_mjs"),
+        .result_targetable = true,
+        .continuation_targetable = true,
     },
     .{
         // blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`: segments.seal's swap half
@@ -123,6 +162,7 @@ const MODULES = [_]struct {
         // confirmed).
         .path = "__system/segments_onsealed.mjs",
         .src = @embedFile("builtin_segments_onsealed_mjs"),
+        .continuation_targetable = true,
     },
     .{
         // Engine-fired deploy-static streamer ("onStatic"): on an LRU miss for
@@ -212,6 +252,37 @@ pub fn isWakeTargetable(target: []const u8) bool {
     return false;
 }
 
+/// True iff a fetch issued from CUSTOMER context may land its result in
+/// `target` (rove#639). Same shape and same exactness as `isWakeTargetable`,
+/// for the second dispatch route into the baked registry.
+///
+/// A fetch issued from a baked module (`__rove.fetch`, itself
+/// `is_system_module`-gated) is engine-internal and not subject to this — the
+/// question here is only what a TENANT may point a result at.
+pub fn isResultTargetable(target: []const u8) bool {
+    for (MODULES) |m| {
+        if (!m.result_targetable) continue;
+        if (std.mem.eql(u8, target, m.path)) return true;
+        const bare = m.path[0 .. m.path.len - ".mjs".len];
+        if (std.mem.eql(u8, target, bare)) return true;
+    }
+    return false;
+}
+
+/// True iff a continuation hop (`next(target, …)`, the third dispatch route)
+/// may land in `target` (rove#643). Same shape and exactness as its two
+/// siblings; the whole set is the two modules a `blob.put` `on` legitimately
+/// names.
+pub fn isContinuationTargetable(target: []const u8) bool {
+    for (MODULES) |m| {
+        if (!m.continuation_targetable) continue;
+        if (std.mem.eql(u8, target, m.path)) return true;
+        const bare = m.path[0 .. m.path.len - ".mjs".len];
+        if (std.mem.eql(u8, target, bare)) return true;
+    }
+    return false;
+}
+
 test "init compiles every built-in to non-empty bytecode" {
     const testing = std.testing;
     var map = try init(testing.allocator);
@@ -273,6 +344,120 @@ test "isWakeTargetable: only the three wake-driven jobs, and only by exact name"
     // when `isBuiltinPath`, and it is false for these.
     try testing.expect(!isBuiltinPath("jobs/reminder"));
     try testing.expect(!isBuiltinPath("reports.mjs.weekly"));
+}
+
+test "isResultTargetable: only the shim-named result handlers, and only by exact name" {
+    const testing = std.testing;
+
+    // The three a customer-context shim names as its `on_chunk`:
+    // `globals/webhook.js` → webhook_onresult, `globals/blob.js` →
+    // blob_onresult (put) and blob_compose_onresult (seal). Both spellings.
+    for ([_][]const u8{ "webhook_onresult", "blob_onresult", "blob_compose_onresult" }) |name| {
+        var bare_buf: [64]u8 = undefined;
+        const bare = try std.fmt.bufPrint(&bare_buf, "__system/{s}", .{name});
+        try testing.expect(isResultTargetable(bare));
+        var mjs_buf: [64]u8 = undefined;
+        const mjs = try std.fmt.bufPrint(&mjs_buf, "__system/{s}.mjs", .{name});
+        try testing.expect(isResultTargetable(mjs));
+    }
+
+    // Everything else is reachable only by the engine, by a wake it opted
+    // into, or by a fetch a system module issued. A tenant naming one of
+    // these as its `on_chunk` is what rove#639 was: `segments_onsealed`,
+    // `blob_compose`, `scheduler_tick` and `static` have no activation-kind
+    // guard at all, and `export_run` reaches the export door that
+    // `exportDoorRefused` denies to handler code.
+    for ([_][]const u8{
+        "__system/export_run",
+        "__system/segments_onsealed",
+        "__system/blob_compose",
+        "__system/scheduler_tick",
+        "__system/cron_tick",
+        "__system/webhook_fire",
+        "__system/static",
+    }) |path| {
+        try testing.expect(!isResultTargetable(path));
+    }
+
+    // Exactness, as for wakes: no named-export smuggling, no look-alikes.
+    try testing.expect(!isResultTargetable("__system/webhook_onresult.mjs.someExport"));
+    try testing.expect(!isResultTargetable("__system/blob_onresult_evil"));
+    try testing.expect(!isResultTargetable("__system/"));
+    try testing.expect(!isResultTargetable(""));
+}
+
+test "isContinuationTargetable: only the two a blob.put `on` names" {
+    const testing = std.testing;
+
+    // `@rewind/segments` names segments_onsealed from customer-context package
+    // JS; `blob_compose` names blob_compose_onresult from system context. Both
+    // arrive as the same anonymous hop, so both are on the list.
+    for ([_][]const u8{ "segments_onsealed", "blob_compose_onresult" }) |name| {
+        var bare_buf: [64]u8 = undefined;
+        const bare = try std.fmt.bufPrint(&bare_buf, "__system/{s}", .{name});
+        try testing.expect(isContinuationTargetable(bare));
+        var mjs_buf: [64]u8 = undefined;
+        const mjs = try std.fmt.bufPrint(&mjs_buf, "__system/{s}.mjs", .{name});
+        try testing.expect(isContinuationTargetable(mjs));
+    }
+
+    // The rest stay unreachable by a hop a tenant can name — including the
+    // two that hold a privileged capability behind their kind guards.
+    for ([_][]const u8{
+        "__system/export_run",
+        "__system/webhook_fire",
+        "__system/scheduler_tick",
+        "__system/cron_tick",
+        "__system/blob_compose",
+        "__system/blob_onresult",
+        "__system/webhook_onresult",
+        "__system/static",
+    }) |path| {
+        try testing.expect(!isContinuationTargetable(path));
+    }
+
+    try testing.expect(!isContinuationTargetable("__system/segments_onsealed.mjs.someExport"));
+    try testing.expect(!isContinuationTargetable("__system/segments_onsealed_evil"));
+    try testing.expect(!isContinuationTargetable("__system/"));
+    try testing.expect(!isContinuationTargetable(""));
+}
+
+test "every continuation-targetable module is one a `blob.put` on names" {
+    var count: usize = 0;
+    for (MODULES) |m| {
+        if (m.continuation_targetable) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "the three dispatch gates are independent lists" {
+    // A module opted into one route has NOT thereby opted into another:
+    // `webhook_fire` is armed by wakes only, `webhook_onresult` receives
+    // results only, `segments_onsealed` is hopped into only. Collapsing any
+    // two of these into one flag would silently widen both doors.
+    try std.testing.expect(isWakeTargetable("__system/webhook_fire"));
+    try std.testing.expect(!isResultTargetable("__system/webhook_fire"));
+    try std.testing.expect(!isContinuationTargetable("__system/webhook_fire"));
+
+    try std.testing.expect(isResultTargetable("__system/webhook_onresult"));
+    try std.testing.expect(!isWakeTargetable("__system/webhook_onresult"));
+    try std.testing.expect(!isContinuationTargetable("__system/webhook_onresult"));
+
+    try std.testing.expect(isContinuationTargetable("__system/segments_onsealed"));
+    try std.testing.expect(!isWakeTargetable("__system/segments_onsealed"));
+    try std.testing.expect(!isResultTargetable("__system/segments_onsealed"));
+}
+
+test "every result-targetable module is one a customer-context shim names" {
+    // The list is a grant, so it stays justified rather than inherited: each
+    // entry is named as an `on_chunk` by a shim that runs as customer JS
+    // (webhook.js; blob.js twice). A handler that stops being named should
+    // lose the flag rather than keep a standing invitation.
+    var count: usize = 0;
+    for (MODULES) |m| {
+        if (m.result_targetable) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
 }
 
 test "every wake-targetable module is one the platform actually arms" {

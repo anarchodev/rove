@@ -35,12 +35,12 @@ pub fn reconcileMembership(router: anytype) void {
         a.free(tenants);
     }
     for (tenants) |tenant| {
-        // resolveOwned (not resolve): the node set is held across the blocking
-        // backendCalls below, and a concurrent re-address (applyClusterLocal on
-        // the pump thread — exactly the /_control/cluster grow that adds a
-        // node) frees `resolve`'s projection-aliased slice → use-after-free.
-        // The owned copy is taken under the directory lock.
-        var res = (router.directory.resolveOwned(a, tenant) catch continue) orelse continue;
+        // The node set is held across the blocking backendCalls below, so it
+        // must be the owned copy `resolve` takes under the directory lock — a
+        // concurrent re-address (applyClusterLocal on the pump thread, exactly
+        // the /_control/cluster grow that adds a node) frees the projection's
+        // array (rove#100).
+        var res = (router.directory.resolve(a, tenant) catch continue) orelse continue;
         defer res.deinit(a);
         const nodes = res.nodes;
         if (nodes.len == 0) continue;

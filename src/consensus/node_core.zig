@@ -706,6 +706,17 @@ pub const Node = struct {
         // hard crash would lose all writes since the last graceful close.
         const wal = raft.SharedWal.open(allocator, wal_path) catch return Error.Io;
         errdefer wal.deinit();
+        // A CRC-valid record whose fixed-size payload is the wrong length. The
+        // engine's append path rejects these, so one on disk was written by an
+        // older build or is corruption that passed CRC. The scan cannot refuse
+        // (it covers every group's records), so it counts; the refusal is
+        // per-group, inside `initRecover`. Surfaced here because a WAL that
+        // holds one is a fact an operator needs before a group fails to
+        // recover and looks like a transient.
+        if (wal.malformed_records > 0) std.log.err(
+            "v2 node: WAL holds {d} malformed record(s) — group recovery will REFUSE any group whose compaction marker is among them (rove#101)",
+            .{wal.malformed_records},
+        );
 
         // Node-local group manifest store (see the `groups_manifest` field).
         const man_dir = std.fmt.allocPrint(allocator, "{s}/__groups__", .{data_dir}) catch
@@ -791,6 +802,16 @@ pub const Node = struct {
     pub fn meshSnapshot(self: *Node) ?transport_mod.Transport.MeshSnapshot {
         const t = self.transport orelse return null;
         return t.meshSnapshot();
+    }
+
+    /// Raft messages the transport DROPPED for exceeding the peer's frame
+    /// limit. Zero on a single-node node (nothing is sent) and expected to
+    /// stay zero everywhere: `Bridge.propose` refuses an oversize entry
+    /// before it exists, so a climbing count means a producer got past that
+    /// guard and a group is stuck re-emitting an undeliverable entry.
+    pub fn transportOversizeDropped(self: *Node) u64 {
+        const t = self.transport orelse return 0;
+        return t.oversize_dropped.load(.monotonic);
     }
 
     /// Whether this node is the raft leader of `tenant_id`'s group. False
@@ -897,6 +918,67 @@ test "Phase 1 exit: propose a writeset, it commits + applies, a read sees it" {
     const got2 = try node.get(tenant, "count");
     defer a.free(got2);
     try testing.expectEqualStrings("1", got2);
+}
+
+test "persistedGroups: a corrupt manifest epoch is skipped loudly, never recovered as epoch 0 (rove#101)" {
+    // RC-5. The manifest value is a group's MIGRATION EPOCH, and epoch 0 is a
+    // legitimate value — a group that never moved — so `catch 0` turned an
+    // unreadable row into a plausible one. The group would come back stamping
+    // stale epochs, get fenced by its peers, and strand the tenant with
+    // nothing logged. This asserts the corrupt row does not come back AT ALL,
+    // which is the only outcome distinguishable from healthy state.
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    node.recordGroup("tenant-good", 7);
+    // A row the parser cannot read: a torn write, or bytes from a corrupted
+    // page. Written through the same store the recorder uses, so the read
+    // path sees exactly what recovery would see.
+    try node.groups_manifest.put("tenant-corrupt", "not-a-number");
+    try node.groups_manifest.checkpoint();
+
+    const manifest = try node.persistedGroups(a);
+    defer Node.freePersistedGroups(a, manifest.groups);
+
+    // Under `catch 0` this returned BOTH rows and the corrupt one carried a
+    // usable-looking epoch of 0.
+    try testing.expectEqual(@as(usize, 1), manifest.groups.len);
+    try testing.expectEqualStrings("tenant-good", manifest.groups[0].id_str);
+    try testing.expectEqual(@as(u64, 7), manifest.groups[0].epoch);
+    // And the refusal is REPORTED, not merely absent — the boot caller
+    // escalates on this count, so losing it would make the skip silent.
+    try testing.expectEqual(@as(usize, 1), manifest.refused);
+}
+
+test "persistedGroups: epoch 0 is a REAL epoch and survives the round trip (rove#101)" {
+    // The other half of the same property: skipping must key on the parse
+    // failing, not on the value being zero. A group that never moved records
+    // epoch 0 legitimately, and dropping those would strand every un-moved
+    // tenant on the node — a far bigger outage than the bug being fixed.
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    node.recordGroup("tenant-never-moved", 0);
+    const manifest = try node.persistedGroups(a);
+    defer Node.freePersistedGroups(a, manifest.groups);
+
+    try testing.expectEqual(@as(usize, 1), manifest.groups.len);
+    try testing.expectEqual(@as(u64, 0), manifest.groups[0].epoch);
+    try testing.expectEqual(@as(usize, 0), manifest.refused);
 }
 
 test "createGroupAtEpoch: a RawNode-rejected config errors cleanly (no gfs double-free)" {

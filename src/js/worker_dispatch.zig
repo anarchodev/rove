@@ -22,6 +22,27 @@ const kv_mod = @import("raft-kv");
 const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
 const bodies_mod = @import("rove-bodies");
+const bridge_mod = @import("bridge");
+const reserved = @import("rove-reserved");
+
+/// What the batch reserves for the NEXT activation before admitting it: its
+/// whole write budget, an allowance for the readset it will contribute, and
+/// framing. Keeping one entry per batch is what preserves the batch's
+/// all-or-nothing apply; spilling into a second entry would split that
+/// atomicity, and refusing at propose would punish requests that did nothing
+/// wrong. So the walk simply stops early and the rest ride the next tick.
+/// Whether an activation's own contribution could not fit a raft entry even
+/// with the batch to itself. That is the only case where a propose refusal is
+/// PERMANENT: a retry re-runs the same handler, produces the same bytes, and
+/// fails again. Everything else is a batch-composition problem and retries
+/// successfully, so it must not be answered with a terminal status.
+fn cannotFitAlone(entry_bytes: usize) bool {
+    const FRAMING: usize = 32 * 1024;
+    return entry_bytes + FRAMING > bridge_mod.transport.MAX_ENTRY_BYTES;
+}
+
+const BATCH_ADMIT_RESERVE: usize =
+    reserved.KV_WRITE_BYTES_MAX + (128 * 1024) + (32 * 1024);
 const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
 const effect_mod = @import("effect/root.zig");
@@ -108,6 +129,13 @@ const SuccessRec = struct {
     deployment_id: u64,
     received_ns: i64,
     tapes: log_mod.TapePayloads,
+    /// What THIS activation contributes to the batch's raft entry: its own
+    /// writeset ops plus its serialized readset. Attribution, so a refused
+    /// batch can tell the activation that could never fit (a terminal 413)
+    /// from its neighbours (a retry-safe 421 that will succeed in a smaller
+    /// batch). Without it every propose refusal is a retry, and a handler
+    /// whose own entry is too large retries forever.
+    entry_bytes: usize = 0,
     /// User-defined index tags for the TERMINAL case (moved out of
     /// `resp.tags`; owned here, freed in `captureSuccess` after the
     /// borrow-capture, or by the teardown on an early-error drop). For
@@ -841,13 +869,23 @@ fn finalizeBatch(
                     .{ anchor_id, @errorName(rb_err) },
                 );
                 allocator.destroy(txn);
+                const entry_too_large = perr == error.EntryTooLarge;
                 for (successes.items) |*s| {
                     contDiscardIfAny(allocator, s); // open hop didn't commit → 421, not held
                     streamDiscardIfAny(allocator, s); // stream-first-hop never reached the wire → drop chain meta
                     // 421 not 503: the barrier never entered the log and the
                     // txn rolled back — retry-safe (the front door re-aims).
-                    respb.overwriteWith421(server, s.ent, allocator, s.body_ptr, s.body_len) catch |e2| panic_mod.invariantViolated(
-                        "finalizeBatch.respb.overwriteWith421(idiom0_barrier_fail)",
+                    // 413 only for an activation that could not fit an entry
+                    // ALONE — that answer will never change, so a retry is a
+                    // guaranteed second failure. Its neighbours get the
+                    // retry-safe 421 and succeed in a smaller batch, which
+                    // admission control now arranges.
+                    const too_large = entry_too_large and cannotFitAlone(s.entry_bytes);
+                    (if (too_large)
+                        respb.overwriteWith413(server, s.ent, allocator, s.body_ptr, s.body_len)
+                    else
+                        respb.overwriteWith421(server, s.ent, allocator, s.body_ptr, s.body_len)) catch |e2| panic_mod.invariantViolated(
+                        "finalizeBatch.respb.overwrite(idiom0_barrier_fail)",
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
                     );
@@ -856,7 +894,7 @@ fn finalizeBatch(
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
                     );
-                    captureSuccess(worker, anchor_id, s, 421, .fault, 0);
+                    captureSuccess(worker, anchor_id, s, if (too_large) 413 else 421, .fault, 0);
                     processed += 1;
                 }
                 successes.clearRetainingCapacity();
@@ -1076,14 +1114,21 @@ fn finalizeBatch(
             .{ anchor_id, batch_seq, @errorName(rb_err) },
         );
         allocator.destroy(txn);
+        // See the barrier path: 413 goes to the activation whose OWN share
+        // cannot fit an entry, 421 to the rest.
+        const entry_too_large = err == error.EntryTooLarge;
         for (successes.items) |*s| {
             contDiscardIfAny(allocator, s); // open hop didn't commit → 421, not held
             // 421 not 503: the propose never entered the log and the txn
             // rolled back — retry-safe. This is the follower "not the
             // leader" response the front door's leader discovery keys on;
             // the ambiguous post-propose 503s are never auto-retried.
-            respb.overwriteWith421(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
-                "finalizeBatch.respb.overwriteWith421(propose_fail)",
+            const too_large = entry_too_large and cannotFitAlone(s.entry_bytes);
+            (if (too_large)
+                respb.overwriteWith413(server, s.ent, allocator, s.body_ptr, s.body_len)
+            else
+                respb.overwriteWith421(server, s.ent, allocator, s.body_ptr, s.body_len)) catch |err2| panic_mod.invariantViolated(
+                "finalizeBatch.respb.overwrite(propose_fail)",
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err2) },
             );
@@ -1094,7 +1139,7 @@ fn finalizeBatch(
             );
             // Propose failed — no raft seq to stamp; the entry never
             // made it to the log.
-            captureSuccess(worker, anchor_id, s, 421, .fault, 0);
+            captureSuccess(worker, anchor_id, s, if (too_large) 413 else 421, .fault, 0);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -1604,6 +1649,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var batch_readset_bytes: []u8 = &.{};
     defer if (batch_readset_bytes.len > 0) allocator.free(batch_readset_bytes);
 
+    // What this batch has accumulated toward its ONE raft entry: every
+    // admitted activation's writes plus its serialized readset. The
+    // per-activation budget (`reserved.KV_WRITE_BYTES_MAX`) bounds one
+    // handler; nothing bounded the SUM, so a second fat activation joining
+    // the same walk built an entry no follower could receive and the whole
+    // batch was refused. The walk stops admitting instead — a skipped request
+    // stays in `request_out` for the next dispatchOnce, exactly as a
+    // different-tenant request does, and rides its own entry.
+    var batch_bytes: usize = 0;
+    var batch_ws_marked: usize = 0;
+
     // Batch-level `http.fetch`
     // accumulator. Each handler appends its successful fetches
     // here (transferred from the per-request `pending_fetches`
@@ -2106,6 +2162,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // leaving it in request_out for a future dispatchOnce call.
         if (anchor) |a| {
             if (a != scope_inst) continue;
+            // Room for one more? The next activation may spend its whole
+            // budget, so the batch stops admitting once what is already
+            // accumulated leaves less than that plus its readset. Conservative
+            // on purpose: the alternative is discovering the overflow at
+            // propose, where the only answer is to refuse requests that did
+            // nothing wrong.
+            if (batch_bytes + BATCH_ADMIT_RESERVE > bridge_mod.transport.MAX_ENTRY_BYTES) continue;
         } else {
             // Already proven BUSY earlier this tick? Skip.
             var skip_blocked = false;
@@ -3015,7 +3078,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // tenant's execution tape.
             .exec_seq = exec_seq,
         };
+        // Charge this activation to the batch: the writeset ops it added since
+        // the last mark, plus the readset blob it is about to contribute. The
+        // same figure is kept per activation (`own_entry_bytes`) so a refused
+        // batch can name the one that could never fit, instead of telling
+        // every request in it to retry something that will fail again.
+        var own_entry_bytes: usize = 0;
+        for (writeset.ops.items[batch_ws_marked..]) |op| own_entry_bytes += switch (op) {
+            .put => |pu| pu.key.len + pu.value.len,
+            .delete => |d| d.key.len,
+        };
+        batch_ws_marked = writeset.ops.items.len;
         if (readset.serialize(allocator, log_header)) |rs_bytes| {
+            own_entry_bytes += rs_bytes.len;
             batch_readset_blobs.append(allocator, rs_bytes) catch |err| {
                 allocator.free(rs_bytes);
                 std.log.warn(
@@ -3029,6 +3104,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .{ scope_inst.id, @errorName(err) },
             );
         }
+        batch_bytes += own_entry_bytes;
 
         // Transfer this handler's
         // successful `http.fetch` accumulator to the batch-level
@@ -3140,6 +3216,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .deployment_id = dep_id,
             .received_ns = received_ns,
             .tapes = tape_payloads,
+            .entry_bytes = own_entry_bytes,
             .request_id = request_id,
             .exec_seq = exec_seq,
             .cont = cont_opt,

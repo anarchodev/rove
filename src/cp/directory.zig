@@ -20,14 +20,23 @@
 //! awaiting commit** before it takes effect; the directory flip is
 //! therefore one committed raft write.
 //!
-//! Reads, however, stay on a pointer-stable **in-memory projection** (the
-//! `clusters` / `cluster_idx` / `placements` maps) — a materialized view
-//! of the committed log. This keeps the front-door hot path zero-alloc and
-//! lock-short (one hash lookup, return a `ClusterRef` by value whose slices
-//! outlive the lock), and keeps request-path reads OFF the pump thread's
-//! store entirely (the store is read only once, at boot, single-threaded,
-//! to rebuild the projection). The projection is updated under the mutex by
-//! the writer after its write commits.
+//! Reads, however, stay on an **in-memory projection** (the `clusters` /
+//! `cluster_idx` / `placements` maps) — a materialized view of the committed
+//! log, so request-path reads stay OFF the pump thread's store entirely (the
+//! store is read only once, at boot, single-threaded, to rebuild the
+//! projection). The projection is updated under the mutex by the writer after
+//! its write commits.
+//!
+//! **The projection is not pointer-stable, and a node set never leaves the
+//! lock.** `applyClusterLocal` frees a cluster's node array on a re-address,
+//! on the pump thread, while HTTP threads are reading — so a borrowed
+//! `nodes` slice has no safe window at all, not merely a short one. Reads
+//! that need a node set (`resolve`, `clusterById`, `soleCluster`) deep-copy
+//! UNDER the lock and hand the caller owned storage to `deinit`. A cluster
+//! `id` is exempt: ids are never freed, so `clusterIdFor` hands one back
+//! borrowed. This is rove#100 (RC-4), whose original spelling — one caller
+//! deep-copying while five others aliased — is the failure mode the
+//! asymmetry above exists to prevent.
 //!
 //! ## Boot / replay
 //!
@@ -132,34 +141,13 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Where a cluster lives, from the front door's point of view. `nodes` is
-/// the cluster's member node origins (e.g. `http://127.0.0.1:18092`) — one
-/// for a single-node cluster, N for a multi-node cluster. The
-/// front door forwards a tenant's request to whichever node currently
-/// leads its group (it discovers the leader by trying nodes; a follower
-/// 503s a write so the front door retries the next), and fans a move's
-/// attach/evict out to every node. `id` is the logical name used in
-/// placement config and move commands. All slices (and the `nodes` backing
-/// array) point into the `Directory`'s owned storage and are stable for
-/// its lifetime, so a `ClusterRef` returned by value is safe past the lock.
-pub const ClusterRef = struct {
-    id: []const u8,
-    nodes: []const []const u8,
-};
-
 /// A tenant's placement. Kept as a struct (not a bare cluster id) so added
-/// state can ride alongside the cluster without touching `clusterFor`'s callers.
+/// state can ride alongside the cluster without touching `resolve`'s callers.
 /// The move is one zero-downtime path that keeps the source serving until the
 /// atomic `move` flip, so there is no mid-move hold state.
 pub const Placement = struct {
     /// Index into `clusters` (the cluster currently serving this tenant).
     cluster_idx: usize,
-};
-
-/// What `resolve` hands the router: the cluster currently responsible for
-/// a tenant.
-pub const Resolution = struct {
-    cluster: ClusterRef,
 };
 
 /// Where a written certificate is copied so it survives a cold bring-up. A hook
@@ -199,7 +187,7 @@ pub const Directory = struct {
     /// Pointer-stable cluster storage. Appended to by `addCluster`, never
     /// reordered or removed (a cluster outlives the process), so an index
     /// into it is a stable handle and the owned id/url slices never move.
-    clusters: std.ArrayListUnmanaged(OwnedCluster) = .empty,
+    clusters: std.ArrayListUnmanaged(ProjectedCluster) = .empty,
     /// cluster id → index into `clusters`.
     cluster_idx: std.StringHashMapUnmanaged(usize) = .empty,
     /// tenant store id → placement.
@@ -251,13 +239,34 @@ pub const Directory = struct {
     /// other axes; placement-independent. Owned key + value.
     node_addrs: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    const OwnedCluster = struct {
+    /// One cluster as the projection holds it: the member node origins (e.g.
+    /// `http://127.0.0.1:18092`) — one for a single-node cluster, N for a
+    /// multi-node cluster — under the logical `id` used in placement config
+    /// and move commands. The front door forwards a tenant's request to
+    /// whichever node currently leads its group (it discovers the leader by
+    /// trying nodes; a follower 503s a write so the front door retries the
+    /// next), and a move fans attach/evict out to every node.
+    ///
+    /// LIFETIMES ARE NOT UNIFORM, and the difference is load-bearing:
+    ///
+    ///   - `id` lives as long as the `Directory`. Clusters are never removed
+    ///     and a re-address keeps the id slice in place, so `clusterIdFor`
+    ///     can hand one out borrowed.
+    ///   - `nodes` is replaced wholesale by a re-address, so it never leaves
+    ///     a locked section. Callers get `OwnedCluster`, a deep copy taken
+    ///     under the lock.
+    const ProjectedCluster = struct {
         id: []u8,
-        /// Owned array of owned node-origin URLs. Allocated once per
-        /// `addCluster`; never appended to, so the backing array address is
-        /// stable and a `ClusterRef.nodes` slice held past the lock stays
-        /// valid even when `clusters` reallocs (the slice header is copied
-        /// by value; the array it points at does not move).
+        /// Owned array of owned node-origin URLs, replaced wholesale by a
+        /// re-address (`applyClusterLocal` frees the old array).
+        ///
+        /// The array does not move when `clusters` reallocs — the slice
+        /// header is copied by value and the array it points at stays put —
+        /// which is true and was once read as "so a borrowed `nodes` slice
+        /// survives past the lock". It does not: surviving a realloc of the
+        /// OUTER list says nothing about the INNER array being freed, which
+        /// is exactly what a re-address does, on the pump thread, while HTTP
+        /// threads read. Hence `OwnedCluster` (rove#100).
         nodes: [][]u8,
     };
 
@@ -996,75 +1005,81 @@ pub const Directory = struct {
         return out.toOwnedSlice(a) catch return Error.OutOfMemory;
     }
 
-    /// Resolve a tenant to the cluster currently serving it, or null if the
-    /// tenant has no placement (the front door 404s / 421-misdirects). The
-    /// hot-path read. Returns the `ClusterRef` by value; its slices are
-    /// pointer-stable, so the caller may hold them past the lock.
-    pub fn clusterFor(self: *Directory, tenant_id: []const u8) ?ClusterRef {
-        return if (self.resolve(tenant_id)) |r| r.cluster else null;
-    }
-
-    /// Hot-path read: the serving cluster for a tenant. Slices are
-    /// pointer-stable; safe to hold past the lock.
-    pub fn resolve(self: *Directory, tenant_id: []const u8) ?Resolution {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const p = self.placements.get(tenant_id) orelse return null;
-        const c = self.clusters.items[p.cluster_idx];
-        return .{ .cluster = .{ .id = c.id, .nodes = c.nodes } };
-    }
-
-    /// A tenant's placement with the cluster id + node set DEEP-COPIED into
+    /// A cluster id + node set DEEP-COPIED out of the projection into
     /// caller-owned storage. Caller calls `deinit`.
-    pub const OwnedResolution = struct {
+    ///
+    /// The copy happens UNDER THE LOCK, and that is the whole point: copying
+    /// after a borrowed read returns is not enough, because the array can be
+    /// freed in the window between unlock and the copy.
+    pub const OwnedCluster = struct {
         id: []u8,
         nodes: [][]u8,
-        pub fn deinit(self: *OwnedResolution, a: std.mem.Allocator) void {
+        pub fn deinit(self: *OwnedCluster, a: std.mem.Allocator) void {
             freeNodes(a, self.nodes);
             a.free(self.id);
         }
     };
 
-    /// Like `resolve`, but the cluster id + node set are copied UNDER THE LOCK
-    /// into owned storage — safe to hold across blocking I/O. `resolve`'s
-    /// `ClusterRef.nodes` aliases the projection, which a concurrent re-address
-    /// (`applyClusterLocal` on the pump thread — e.g. a `/_control/cluster` grow)
-    /// frees out from under a held ref. Any caller that keeps the result past the
-    /// lock while doing blocking work (the membership reconciler) MUST use this.
-    /// Copying after `resolve` returns is NOT enough — the array can be freed in
-    /// the window between unlock and the copy; the copy has to happen under the lock.
-    pub fn resolveOwned(self: *Directory, a: std.mem.Allocator, tenant_id: []const u8) Error!?OwnedResolution {
+    /// Is this tenant placed? The existence check, allocation-free — for a
+    /// caller that wants the question and not the answer (provision's
+    /// create-only 409).
+    pub fn isPlaced(self: *Directory, tenant_id: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.placements.contains(tenant_id);
+    }
+
+    /// The id of the cluster serving a tenant, or null if unplaced.
+    /// Allocation-free, and safe to hold: ids are never freed (see
+    /// `ProjectedCluster`). Use this when the node set is not needed — most reads
+    /// that only name a cluster.
+    pub fn clusterIdFor(self: *Directory, tenant_id: []const u8) ?[]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         const p = self.placements.get(tenant_id) orelse return null;
-        const c = self.clusters.items[p.cluster_idx];
-        const nodes = try dupeNodes(a, c.nodes);
-        errdefer freeNodes(a, nodes);
-        const id = a.dupe(u8, c.id) catch return Error.OutOfMemory;
-        return OwnedResolution{ .id = id, .nodes = nodes };
+        return self.clusters.items[p.cluster_idx].id;
     }
 
-    /// Resolve a cluster id to its `ClusterRef` (the move orchestrator
-    /// needs the destination cluster's node set). Null if unknown.
-    pub fn clusterById(self: *Directory, cluster_id: []const u8) ?ClusterRef {
+    /// The cluster currently serving a tenant, or null if the tenant has no
+    /// placement (the front door 404s / 421-misdirects). Owned — caller
+    /// `deinit`s.
+    pub fn resolve(self: *Directory, a: std.mem.Allocator, tenant_id: []const u8) Error!?OwnedCluster {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const p = self.placements.get(tenant_id) orelse return null;
+        return try self.ownUnderLock(a, self.clusters.items[p.cluster_idx]);
+    }
+
+    /// A cluster by id (the move orchestrator needs the destination's node
+    /// set). Null if unknown. Owned — caller `deinit`s.
+    pub fn clusterById(self: *Directory, a: std.mem.Allocator, cluster_id: []const u8) Error!?OwnedCluster {
         self.mutex.lock();
         defer self.mutex.unlock();
         const idx = self.cluster_idx.get(cluster_id) orelse return null;
-        const c = self.clusters.items[idx];
-        return .{ .id = c.id, .nodes = c.nodes };
+        return try self.ownUnderLock(a, self.clusters.items[idx]);
     }
 
     /// The one configured cluster, or null when there are zero or several.
     /// Lets a caller that has no basis to choose — self-serve provisioning —
     /// omit the cluster in the single-cluster deployment that is the norm,
     /// while a multi-cluster deployment still has to say which, because
-    /// picking one IS a placement policy.
-    pub fn soleCluster(self: *Directory) ?ClusterRef {
+    /// picking one IS a placement policy. Owned — caller `deinit`s.
+    pub fn soleCluster(self: *Directory, a: std.mem.Allocator) Error!?OwnedCluster {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.clusters.items.len != 1) return null;
-        const c = self.clusters.items[0];
-        return .{ .id = c.id, .nodes = c.nodes };
+        return try self.ownUnderLock(a, self.clusters.items[0]);
+    }
+
+    /// Deep-copy one projection entry. Call with the mutex HELD — every
+    /// owned read funnels through here so there is one place the copy can be
+    /// checked to happen inside the critical section.
+    fn ownUnderLock(self: *Directory, a: std.mem.Allocator, c: ProjectedCluster) Error!OwnedCluster {
+        _ = self;
+        const nodes = try dupeNodes(a, c.nodes);
+        errdefer freeNodes(a, nodes);
+        const id = a.dupe(u8, c.id) catch return Error.OutOfMemory;
+        return OwnedCluster{ .id = id, .nodes = nodes };
     }
 
     // ── Plan / limits (admin-plane writes, DP reads) ─────────────────
@@ -1222,11 +1237,11 @@ pub const Directory = struct {
     }
 
     /// The tenant a host maps to, as an OWNED copy (caller frees), or null if
-    /// the host is unmapped. Copies under the lock because — like a plan value
-    /// and unlike a pointer-stable cluster slice — a host's tenant can be
-    /// replaced (freed) by a concurrent apply, so a borrowed slice held past
-    /// the lock would be unsafe. (Also: `resolve` takes the same mutex, so the
-    /// route handler must release before resolving the tenant → cluster.)
+    /// the host is unmapped. Copies under the lock because a host's tenant can
+    /// be replaced (freed) by a concurrent apply, so a borrowed slice held past
+    /// the lock would be unsafe — the same reason a cluster's node set is
+    /// copied. (Also: `resolve` takes the same mutex, so the route handler must
+    /// release before resolving the tenant → cluster.)
     pub fn hostTenantForOwned(self: *Directory, a: std.mem.Allocator, host: []const u8) Error!?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1692,7 +1707,19 @@ fn addNode1(dir: *Directory, id: []const u8, url: []const u8) !void {
     try dir.addCluster(id, &.{url});
 }
 
-test "directory: addCluster + assign + clusterFor round-trips" {
+/// Test helper: `resolve` unwrapped. Tests are single-threaded, so the deep
+/// copy is ceremony here — going through the real accessor anyway is the
+/// point, since it is the one production uses.
+fn tResolve(dir: *Directory, tenant: []const u8) !Directory.OwnedCluster {
+    return (try dir.resolve(testing.allocator, tenant)) orelse error.TestUnexpectedResult;
+}
+
+/// Test helper: `clusterById` unwrapped.
+fn tCluster(dir: *Directory, cluster_id: []const u8) !Directory.OwnedCluster {
+    return (try dir.clusterById(testing.allocator, cluster_id)) orelse error.TestUnexpectedResult;
+}
+
+test "directory: addCluster + assign + resolve round-trips" {
     var dir = Directory.init(testing.allocator);
     defer dir.deinit();
 
@@ -1701,14 +1728,15 @@ test "directory: addCluster + assign + clusterFor round-trips" {
     try dir.assign("alice", "cluster-1");
     try dir.assign("bob", "cluster-2");
 
-    const a = dir.clusterFor("alice").?;
+    var a = try tResolve(&dir, "alice");
+    defer a.deinit(testing.allocator);
     try testing.expectEqualStrings("cluster-1", a.id);
     try testing.expectEqual(@as(usize, 1), a.nodes.len);
     try testing.expectEqualStrings("http://127.0.0.1:18091", a.nodes[0]);
-    const b = dir.clusterFor("bob").?;
-    try testing.expectEqualStrings("cluster-2", b.id);
+    try testing.expectEqualStrings("cluster-2", dir.clusterIdFor("bob").?);
 
-    try testing.expect(dir.clusterFor("nobody") == null);
+    try testing.expect(dir.clusterIdFor("nobody") == null);
+    try testing.expect((try dir.resolve(testing.allocator, "nobody")) == null);
 }
 
 test "directory: move flips placement (the Phase-4 seam)" {
@@ -1718,11 +1746,13 @@ test "directory: move flips placement (the Phase-4 seam)" {
     try addNode1(&dir, "c2", "http://h:2");
     try dir.assign("t", "c1");
 
-    try testing.expectEqualStrings("c1", dir.clusterFor("t").?.id);
+    try testing.expectEqualStrings("c1", dir.clusterIdFor("t").?);
     try dir.move("t", "c2");
-    try testing.expectEqualStrings("c2", dir.clusterFor("t").?.id);
+    try testing.expectEqualStrings("c2", dir.clusterIdFor("t").?);
     // node origin follows the new cluster.
-    try testing.expectEqualStrings("http://h:2", dir.clusterFor("t").?.nodes[0]);
+    var moved = try tResolve(&dir, "t");
+    defer moved.deinit(testing.allocator);
+    try testing.expectEqualStrings("http://h:2", moved.nodes[0]);
 }
 
 test "directory: setPlan + planForOwned round-trip, update, unset→null" {
@@ -2010,14 +2040,68 @@ test "directory: multi-node cluster carries every node origin" {
     defer dir.deinit();
     try dir.addCluster("c3", &.{ "http://h:1", "http://h:2", "http://h:3" });
     try dir.assign("t", "c3");
-    const c = dir.clusterFor("t").?;
+    var c = try tResolve(&dir, "t");
+    defer c.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 3), c.nodes.len);
     try testing.expectEqualStrings("http://h:1", c.nodes[0]);
     try testing.expectEqualStrings("http://h:3", c.nodes[2]);
     // Re-address replaces the whole node set.
     try dir.addCluster("c3", &.{"http://h:9"});
-    try testing.expectEqual(@as(usize, 1), dir.clusterFor("t").?.nodes.len);
-    try testing.expectEqualStrings("http://h:9", dir.clusterFor("t").?.nodes[0]);
+    var re = try tResolve(&dir, "t");
+    defer re.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), re.nodes.len);
+    try testing.expectEqualStrings("http://h:9", re.nodes[0]);
+}
+
+test "directory: an owned read survives the re-address that frees the projection (rove#100)" {
+    // The RC-4 failure mode, made deterministic. In production the free comes
+    // from `applyClusterLocal` on the PUMP thread while an HTTP thread is
+    // mid-provision; the ordering below is that race with the interleaving
+    // pinned, which is what makes it a test rather than a soak.
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    try dir.addCluster("c1", &.{ "http://old:1", "http://old:2" });
+    try dir.assign("t", "c1");
+
+    // What a caller does before it blocks: take the node set it will fan out
+    // to (attach → await-leader → evict → domain push, seconds of HTTP).
+    var held = try tResolve(&dir, "t");
+    defer held.deinit(testing.allocator);
+
+    // What lands underneath it: a `/_control/cluster` grow, which replaces the
+    // node array and FREES the old one. A borrowed slice would be dangling
+    // from here on — the testing allocator poisons freed bytes, so the reads
+    // below would return garbage or fault.
+    try dir.addCluster("c1", &.{"http://new:9"});
+
+    try testing.expectEqualStrings("c1", held.id);
+    try testing.expectEqual(@as(usize, 2), held.nodes.len);
+    try testing.expectEqualStrings("http://old:1", held.nodes[0]);
+    try testing.expectEqualStrings("http://old:2", held.nodes[1]);
+
+    // The held copy is a SNAPSHOT, not a subscription: a fresh read sees the
+    // new address. A caller mid-fan-out finishing against the old node set is
+    // correct — the move/provision it is running is the thing that will fail
+    // or be retried, not memory it must not touch.
+    var fresh = try tResolve(&dir, "t");
+    defer fresh.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), fresh.nodes.len);
+    try testing.expectEqualStrings("http://new:9", fresh.nodes[0]);
+}
+
+test "directory: a cluster id IS safe to hold across a re-address (rove#100)" {
+    // The asymmetry `clusterIdFor` depends on: a re-address swaps the node
+    // array but keeps the id slice in place, and clusters are never removed,
+    // so an id outlives any read. Without this the id would need copying too
+    // and every caller that only names a cluster would pay for a node set.
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    try dir.addCluster("c1", &.{"http://old:1"});
+    try dir.assign("t", "c1");
+
+    const id_held = dir.clusterIdFor("t").?;
+    try dir.addCluster("c1", &.{ "http://new:1", "http://new:2" });
+    try testing.expectEqualStrings("c1", id_held);
 }
 
 test "directory: assign places, move flips the directory" {
@@ -2028,17 +2112,17 @@ test "directory: assign places, move flips the directory" {
     try dir.assign("t", "c1");
 
     // Placed on c1.
-    var r = dir.resolve("t").?;
-    try testing.expectEqualStrings("c1", r.cluster.id);
+    try testing.expectEqualStrings("c1", dir.clusterIdFor("t").?);
 
     // The directory flip commits the move: now served by c2.
     try dir.move("t", "c2");
-    r = dir.resolve("t").?;
-    try testing.expectEqualStrings("c2", r.cluster.id);
+    try testing.expectEqualStrings("c2", dir.clusterIdFor("t").?);
 
     // clusterById resolves the destination's node set for the orchestrator.
-    try testing.expectEqualStrings("http://h:1", dir.clusterById("c1").?.nodes[0]);
-    try testing.expect(dir.clusterById("nope") == null);
+    var c1 = try tCluster(&dir, "c1");
+    defer c1.deinit(testing.allocator);
+    try testing.expectEqualStrings("http://h:1", c1.nodes[0]);
+    try testing.expect((try dir.clusterById(testing.allocator, "nope")) == null);
 }
 
 test "directory: error surfaces — unknown cluster / unknown tenant" {
@@ -2060,14 +2144,16 @@ test "directory: assign is idempotent / re-placeable; addCluster re-addresses" {
 
     try dir.assign("t", "c1");
     try dir.assign("t", "c1"); // idempotent
-    try testing.expectEqualStrings("c1", dir.clusterFor("t").?.id);
+    try testing.expectEqualStrings("c1", dir.clusterIdFor("t").?);
     try dir.assign("t", "c2"); // re-place via assign
-    try testing.expectEqualStrings("c2", dir.clusterFor("t").?.id);
+    try testing.expectEqualStrings("c2", dir.clusterIdFor("t").?);
 
     // Re-address c1 in place; existing placements pointing at it follow.
     try dir.assign("u", "c1");
     try addNode1(&dir, "c1", "http://newhost:9");
-    try testing.expectEqualStrings("http://newhost:9", dir.clusterFor("u").?.nodes[0]);
+    var u = try tResolve(&dir, "u");
+    defer u.deinit(testing.allocator);
+    try testing.expectEqualStrings("http://newhost:9", u.nodes[0]);
 }
 
 test "directory: seedClusters + seedPlacements parse static config" {
@@ -2077,13 +2163,16 @@ test "directory: seedClusters + seedPlacements parse static config" {
     try dir.seedClusters("cluster-1=http://127.0.0.1:18091; cluster-2=http://127.0.0.1:18092 ;");
     try dir.seedPlacements("alice=cluster-1; bob=cluster-2");
 
-    try testing.expectEqualStrings("http://127.0.0.1:18091", dir.clusterFor("alice").?.nodes[0]);
-    try testing.expectEqualStrings("cluster-2", dir.clusterFor("bob").?.id);
+    var alice = try tResolve(&dir, "alice");
+    defer alice.deinit(testing.allocator);
+    try testing.expectEqualStrings("http://127.0.0.1:18091", alice.nodes[0]);
+    try testing.expectEqualStrings("cluster-2", dir.clusterIdFor("bob").?);
 
     // A multi-node cluster: comma-separated node origins.
     try dir.seedClusters("cluster-3=http://127.0.0.1:18093,http://127.0.0.1:18094,http://127.0.0.1:18095");
     try dir.seedPlacements("carol=cluster-3");
-    const c3 = dir.clusterFor("carol").?;
+    var c3 = try tResolve(&dir, "carol");
+    defer c3.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 3), c3.nodes.len);
     try testing.expectEqualStrings("http://127.0.0.1:18095", c3.nodes[2]);
 
@@ -2102,7 +2191,7 @@ test "directory: removal withdraws each axis and is idempotent" {
     try dir.setHost("acme.test", "acme");
     try dir.setPlan("acme", "{\"tier\":\"pro\"}");
 
-    try testing.expect(dir.resolve("acme") != null);
+    try testing.expect(dir.isPlaced("acme"));
     {
         const t = (try dir.hostTenantForOwned(a, "acme.test")).?;
         defer a.free(t);
@@ -2111,7 +2200,7 @@ test "directory: removal withdraws each axis and is idempotent" {
 
     // Withdrawing a placement makes the tenant unroutable and frees the name.
     try dir.unassign("acme");
-    try testing.expect(dir.resolve("acme") == null);
+    try testing.expect(!dir.isPlaced("acme"));
 
     try dir.removeHost("acme.test");
     try testing.expect((try dir.hostTenantForOwned(a, "acme.test")) == null);
@@ -2127,7 +2216,7 @@ test "directory: removal withdraws each axis and is idempotent" {
 
     // And the name is genuinely reusable afterwards.
     try dir.assign("acme", "c1");
-    try testing.expectEqualStrings("c1", dir.resolve("acme").?.cluster.id);
+    try testing.expectEqualStrings("c1", dir.clusterIdFor("acme").?);
 }
 
 test "directory: a removed row does not resurrect on replay" {
@@ -2147,8 +2236,8 @@ test "directory: a removed row does not resurrect on replay" {
     // Re-derive the projection the way `replayFromStore` would: drop the
     // in-memory state and re-apply what the axes hold.
     dir.removePlacementLocal("gone");
-    try testing.expect(dir.resolve("gone") == null);
-    try testing.expect(dir.resolve("stays") != null);
+    try testing.expect(!dir.isPlaced("gone"));
+    try testing.expect(dir.isPlaced("stays"));
 }
 
 test "directory: hostsForOwned finds the rows a deprovision must withdraw" {
@@ -2184,15 +2273,17 @@ test "directory: soleCluster answers only when there is no choice to make" {
     defer dir.deinit();
 
     // Nothing configured — a provisioner has nowhere to place a tenant.
-    try testing.expect(dir.soleCluster() == null);
+    try testing.expect((try dir.soleCluster(testing.allocator)) == null);
 
     try dir.seedClusters("only=http://127.0.0.1:18091");
-    try testing.expectEqualStrings("only", dir.soleCluster().?.id);
+    var only = (try dir.soleCluster(testing.allocator)).?;
+    defer only.deinit(testing.allocator);
+    try testing.expectEqualStrings("only", only.id);
 
     // A second cluster makes placement a policy decision, so the default
     // disappears rather than silently favouring the first-seeded one.
     try dir.seedClusters("only=http://127.0.0.1:18091; other=http://127.0.0.1:18092");
-    try testing.expect(dir.soleCluster() == null);
+    try testing.expect((try dir.soleCluster(testing.allocator)) == null);
 }
 
 test "directory: every seed parse failure is a distinct error naming its entry" {
@@ -2241,7 +2332,7 @@ test "directory: seedClusters rejects origins the front door cannot dial" {
     try testing.expectError(error.SeedOriginBadPort, dir.seedClusters("c1=http://10.0.0.1:https"));
 
     // Rejected BEFORE the cluster is added — nothing replicates.
-    try testing.expect(dir.clusterById("c1") == null);
+    try testing.expect((try dir.clusterById(testing.allocator, "c1")) == null);
 
     // The bad origin is what gets recorded, not the whole entry: with 16
     // origins allowed per cluster, naming the entry would not locate it.
@@ -2253,7 +2344,9 @@ test "directory: seedClusters rejects origins the front door cannot dial" {
 
     // And the valid forms still pass.
     try dir.seedClusters("c3=http://10.0.0.1:8443,10.0.0.2:8443,https://10.0.0.3:8443");
-    try testing.expectEqual(@as(usize, 3), dir.clusterById("c3").?.nodes.len);
+    var c3b = try tCluster(&dir, "c3");
+    defer c3b.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), c3b.nodes.len);
 }
 
 // ── Replicated (durable) directory ──────────────────────────────────────
@@ -2280,9 +2373,9 @@ test "directory: replicated placement survives a CP restart (Slice 1 exit)" {
         try d.addCluster("c1", &.{"http://h:1"});
         try d.addCluster("c2", &.{"http://h:2"});
         try d.assign("t", "c1");
-        try testing.expectEqualStrings("c1", d.clusterFor("t").?.id);
+        try testing.expectEqualStrings("c1", d.clusterIdFor("t").?);
         try d.move("t", "c2");
-        try testing.expectEqualStrings("c2", d.clusterFor("t").?.id);
+        try testing.expectEqualStrings("c2", d.clusterIdFor("t").?);
     }
 
     // Second incarnation over the SAME data_dir: the store/WAL replays, so
@@ -2297,11 +2390,14 @@ test "directory: replicated placement survives a CP restart (Slice 1 exit)" {
         defer bridge.deinit();
 
         try testing.expect(!d.isEmpty());
-        const r = d.clusterFor("t") orelse return error.TestUnexpectedResult;
+        var r = try tResolve(d, "t");
+        defer r.deinit(a);
         try testing.expectEqualStrings("c2", r.id);
         try testing.expectEqualStrings("http://h:2", r.nodes[0]);
         // The cluster registry replayed too.
-        try testing.expectEqualStrings("http://h:1", d.clusterById("c1").?.nodes[0]);
+        var c1 = try tCluster(d, "c1");
+        defer c1.deinit(a);
+        try testing.expectEqualStrings("http://h:1", c1.nodes[0]);
     }
 }
 
@@ -2421,12 +2517,13 @@ test "directory: a leader's write replicates to FOLLOWER projections (Slice 2A)"
     // EVERY node — leader and both followers — resolves acme → west via its
     // OWN projection, materialized from the replicated applies.
     for (directories, 0..) |d, i| {
-        const r = d.resolve("acme") orelse {
+        var r = (try d.resolve(a, "acme")) orelse {
             std.debug.print("node {d} has no placement for acme\n", .{i});
             return error.TestUnexpectedResult;
         };
-        try testing.expectEqualStrings("west", r.cluster.id);
-        try testing.expectEqual(@as(usize, 2), r.cluster.nodes.len);
-        try testing.expectEqualStrings("http://w:2", r.cluster.nodes[1]);
+        defer r.deinit(a);
+        try testing.expectEqualStrings("west", r.id);
+        try testing.expectEqual(@as(usize, 2), r.nodes.len);
+        try testing.expectEqualStrings("http://w:2", r.nodes[1]);
     }
 }

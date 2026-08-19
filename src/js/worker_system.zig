@@ -471,8 +471,27 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
             \\# HELP kv_cap_refusals_total write batches refused at the plan KV cap (tenant/figures in the paired kv-cap log line).
             \\# TYPE kv_cap_refusals_total counter
             \\kv_cap_refusals_total {d}
+            \\# HELP tape_kv_elided_total kv reads whose value the per-activation tape budget dropped; those records cannot be replayed against those reads (figures in the paired warn log line).
+            \\# TYPE tape_kv_elided_total counter
+            \\tape_kv_elided_total {d}
             \\
-        , .{worker.node.kv_cap_refusals.load(.monotonic)});
+        , .{
+            worker.node.kv_cap_refusals.load(.monotonic),
+            worker.node.tape_kv_elided.load(.monotonic),
+        });
+    }
+
+    // ── the wire-limit backstop ─────────────────────────────────────────
+    // Should read zero forever: the propose path refuses an oversize entry
+    // before it exists. Non-zero means a producer got past that guard and a
+    // group is re-emitting an entry it can never deliver.
+    {
+        try w.print(
+            \\# HELP raft_oversize_dropped_total raft messages dropped unsent for exceeding the peer's frame limit (should be 0; a propose should have refused the entry first).
+            \\# TYPE raft_oversize_dropped_total counter
+            \\raft_oversize_dropped_total {d}
+            \\
+        , .{worker.raft.transportOversizeDropped()});
     }
 
     // ── abuse-gate counters ───────────────────────────────────────────

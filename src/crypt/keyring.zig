@@ -40,6 +40,29 @@
 //! node's copy is a **rotation** question (`key_version` exists for it)
 //! rather than something the seal alone settles.
 //!
+//! ## Temporaries are part of the erasure, not an aside
+//!
+//! A rewrite lands through `{path}.tmp.{process}.{unique}`, and every
+//! rewrite emits the shard WHOLE. So a temporary that outlives its
+//! writer holds a full snapshot of that shard — including keys that are
+//! live at that moment and destroyed later. Left in place it is a live,
+//! named, readable file that a legitimate reader can open long after a
+//! destroy reported success: precisely the log-shaped failure above,
+//! reachable with no disk forensics at all.
+//!
+//! Only a crash can strand one, because every error path unlinks. That
+//! is what the process field in the name is for: a temporary carrying
+//! another process's nonce cannot be in flight, so `sweepStaleTemps`
+//! can run from any caller without racing a rewrite in progress.
+//!
+//! They are unlinked rather than scrubbed. Overwriting the bytes would
+//! assert a physical-destruction property no layer here controls — an
+//! SSD's translation layer, a copy-on-write filesystem and a
+//! thin-provisioned volume all place the write somewhere else — while
+//! the contents are already sealed under the KEK. Unlinking delivers
+//! exactly the guarantee stated above, and claiming more than that is
+//! the failure mode this file is careful about elsewhere.
+//!
 //! ## Keys are indexed by SLOT, not by identity
 //!
 //! Keys are minted into a pool **before any identity exists**, so there
@@ -230,6 +253,10 @@ pub const Keyring = struct {
     ) Error!Self {
         var self = try init(allocator, base_dir, tenant_id, kek);
         errdefer self.deinit();
+        // A create that crashed before its secret file landed leaves a
+        // temporary but no keyring, so this runs before the exists
+        // check rather than after it.
+        try sweepStaleTemps(allocator, self.tenant_dir);
         self.secret = secret;
 
         const secret_path = try self.secretPath();
@@ -255,6 +282,10 @@ pub const Keyring = struct {
     ) Error!Self {
         var self = try init(allocator, base_dir, tenant_id, kek);
         errdefer self.deinit();
+        // Before anything is read, and before this process can write:
+        // a crash mid-rewrite strands a whole shard as it was, which
+        // would keep a later-destroyed key legible in a live file.
+        try sweepStaleTemps(allocator, self.tenant_dir);
         try self.readSecretFile();
         try self.readShards();
         return self;
@@ -656,10 +687,16 @@ pub const Keyring = struct {
             else => return Error.Io,
         };
 
+        // `.tmp.{process}.{unique}`. The process field is what makes a
+        // sweep safe from any caller: a temporary carrying a different
+        // nonce cannot be in flight, since only a crash strands one.
+        // The unique field keeps two rewrites of one path from sharing
+        // a file, so a single-writer violation still loses a whole
+        // write rather than tearing the survivor.
         const tmp = std.fmt.allocPrint(
             self.allocator,
-            "{s}.tmp.{x}",
-            .{ path, std.crypto.random.int(u64) },
+            "{s}.tmp.{x}.{x}",
+            .{ path, processNonce(), std.crypto.random.int(u64) },
         ) catch return Error.OutOfMemory;
         defer self.allocator.free(tmp);
 
@@ -775,6 +812,11 @@ pub fn installSealedShard(
 ) Error!void {
     var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
     defer kr.deinit();
+    // A node that only ever receives shards never calls `open`, so
+    // without this its temporaries would survive every destroy until
+    // something else opened the keyring. Safe here despite a possible
+    // concurrent local rewrite: the sweep skips this process's own.
+    try sweepStaleTemps(allocator, kr.tenant_dir);
 
     const path = try kr.shardPath(shard);
     defer allocator.free(path);
@@ -830,6 +872,83 @@ pub fn readSealedShard(
     };
 }
 
+/// Identifies THIS process's temporaries, so a sweep can tell one that
+/// may be in flight from one that is provably abandoned.
+///
+/// A random draw rather than the pid: pids are reused, and a reused pid
+/// would make a dead process's temporary look like ours and survive the
+/// sweep that exists to remove it. Never zero, so the unset sentinel
+/// cannot collide with a real value.
+var process_nonce = std.atomic.Value(u64).init(0);
+
+fn processNonce() u64 {
+    const cached = process_nonce.load(.monotonic);
+    if (cached != 0) return cached;
+    const drawn = std.crypto.random.int(u64) | 1;
+    // Whoever wins sets it for the life of the process; a loser adopts
+    // the winner's value, so every thread agrees on one nonce.
+    if (process_nonce.cmpxchgStrong(0, drawn, .monotonic, .monotonic)) |won| return won;
+    return drawn;
+}
+
+/// True for a temporary that some other process left behind.
+///
+/// A name without the `.tmp.` marker is a real file and never matches —
+/// shards are `{8 hex}.kr` and the secret is `tenant.kr`. A marker
+/// followed by a field this codec did not write counts as stale rather
+/// than being skipped: an unrecognised temporary is still a temporary,
+/// and leaving it is the failure being fixed.
+fn isStaleTemp(name: []const u8) bool {
+    const marker = ".tmp.";
+    const at = std.mem.indexOf(u8, name, marker) orelse return false;
+    const rest = name[at + marker.len ..];
+    const sep = std.mem.indexOfScalar(u8, rest, '.') orelse return true;
+    const nonce = std.fmt.parseInt(u64, rest[0..sep], 16) catch return true;
+    return nonce != processNonce();
+}
+
+/// Remove every temporary stranded by a process that is no longer
+/// running. Absent directory is the first-write case, not a failure.
+///
+/// Names are collected before any unlink: deleting during a directory
+/// iteration can make the iterator skip entries, and a skipped entry
+/// here is a surviving key.
+fn sweepStaleTemps(allocator: std.mem.Allocator, tenant_dir: []const u8) Error!void {
+    var d = std.fs.cwd().openDir(tenant_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return Error.Io,
+    };
+    defer d.close();
+
+    var stale: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stale.items) |n| allocator.free(n);
+        stale.deinit(allocator);
+    }
+
+    var it = d.iterate();
+    while (it.next() catch return Error.Io) |ent| {
+        if (ent.kind != .file) continue;
+        if (!isStaleTemp(ent.name)) continue;
+        const owned = allocator.dupe(u8, ent.name) catch return Error.OutOfMemory;
+        stale.append(allocator, owned) catch {
+            allocator.free(owned);
+            return Error.OutOfMemory;
+        };
+    }
+    if (stale.items.len == 0) return;
+
+    for (stale.items) |n| {
+        d.deleteFile(n) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return Error.Io,
+        };
+    }
+    // The unlinks must survive a power cut, or the sweep is a no-op
+    // across exactly the restart that needed it.
+    try syncPath(tenant_dir);
+}
+
 /// fsync a directory, so a rename or unlink cannot be the thing a power
 /// cut loses.
 ///
@@ -861,6 +980,131 @@ fn tmpDirPath(buf: []u8) []const u8 {
 
 fn cleanup(dir: []const u8) void {
     std.fs.cwd().deleteTree(dir) catch {};
+}
+
+test "a crashed rewrite cannot keep a destroyed key legible" {
+    // The regression the sweep exists for. Every rewrite emits the
+    // shard WHOLE, so a temporary stranded by a crash carries keys that
+    // are live at that moment and destroyed later — and unlike block
+    // residue it is a named file any legitimate reader can just open.
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    const file_key = crypt.deriveSubkey(TEST_KEK, "rove-keyring/v1/acme");
+    var doomed: crypt.Key = undefined;
+    var tenant_buf: [256]u8 = undefined;
+    var tenant_dir: []const u8 = undefined;
+    {
+        var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+        defer kr.deinit();
+        try kr.mintRange(1, 4, 1);
+        doomed = kr.keyAt(2).?;
+        tenant_dir = try std.fmt.bufPrint(&tenant_buf, "{s}", .{kr.tenant_dir});
+    }
+
+    const shard_path = try std.fmt.allocPrint(testing.allocator, "{s}/00000000.kr", .{tenant_dir});
+    defer testing.allocator.free(shard_path);
+    // Stand in for the crash: the shard as it is now, under a nonce no
+    // live process holds — exactly what an interrupted rewrite leaves.
+    const stranded = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}.tmp.{x}.{x}",
+        .{ shard_path, processNonce() ^ 0xF0F0, @as(u64, 0xABCD) },
+    );
+    defer testing.allocator.free(stranded);
+    try std.fs.cwd().copyFile(shard_path, std.fs.cwd(), stranded, .{});
+
+    // Premise check. Without it this test could pass for the wrong
+    // reason — a stranded copy that never held the key proves nothing.
+    {
+        const raw = try std.fs.cwd().readFileAlloc(testing.allocator, stranded, 1 << 20);
+        defer testing.allocator.free(raw);
+        const plain = try crypt.openAlloc(testing.allocator, raw, file_key);
+        defer testing.allocator.free(plain);
+        try testing.expect(std.mem.indexOf(u8, plain, &doomed) != null);
+    }
+
+    {
+        var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
+        defer kr.deinit();
+        try testing.expect(try kr.destroy(2));
+    }
+
+    // Nothing left in the directory yields the destroyed key.
+    var d = try std.fs.cwd().openDir(tenant_dir, .{ .iterate = true });
+    defer d.close();
+    var it = d.iterate();
+    while (try it.next()) |ent| {
+        if (ent.kind != .file) continue;
+        try testing.expect(std.mem.indexOf(u8, ent.name, ".tmp.") == null);
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ tenant_dir, ent.name });
+        defer testing.allocator.free(path);
+        const raw = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 20);
+        defer testing.allocator.free(raw);
+        const plain = crypt.openAlloc(testing.allocator, raw, file_key) catch continue;
+        defer testing.allocator.free(plain);
+        try testing.expect(std.mem.indexOf(u8, plain, &doomed) == null);
+    }
+}
+
+test "the sweep leaves a rewrite this process still has in flight" {
+    // It runs from the install path, where another thread may be
+    // mid-rewrite. Deleting that temporary would turn an ordinary write
+    // into an Io failure — and for a mint, a lost key.
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var tenant_buf: [256]u8 = undefined;
+    var tenant_dir: []const u8 = undefined;
+    {
+        var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+        defer kr.deinit();
+        try kr.mintRange(1, 2, 1);
+        tenant_dir = try std.fmt.bufPrint(&tenant_buf, "{s}", .{kr.tenant_dir});
+    }
+
+    const mine = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/00000000.kr.tmp.{x}.{x}",
+        .{ tenant_dir, processNonce(), @as(u64, 7) },
+    );
+    defer testing.allocator.free(mine);
+    const theirs = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/00000000.kr.tmp.{x}.{x}",
+        .{ tenant_dir, processNonce() ^ 0xF0F0, @as(u64, 7) },
+    );
+    defer testing.allocator.free(theirs);
+    for ([_][]const u8{ mine, theirs }) |p| {
+        const f = try std.fs.cwd().createFile(p, .{});
+        f.close();
+    }
+
+    try sweepStaleTemps(testing.allocator, tenant_dir);
+
+    try std.fs.cwd().access(mine, .{});
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(theirs, .{}));
+}
+
+test "temp classification never matches a real keyring file" {
+    // A false positive here deletes a live shard, which is key loss —
+    // strictly worse than the residue the sweep removes.
+    try testing.expect(!isStaleTemp("00000000.kr"));
+    try testing.expect(!isStaleTemp("deadbeef.kr"));
+    try testing.expect(!isStaleTemp(SECRET_FILE_NAME));
+
+    // Ours is skipped; anyone else's goes.
+    var name_buf: [64]u8 = undefined;
+    const ours = try std.fmt.bufPrint(&name_buf, "00000000.kr.tmp.{x}.5", .{processNonce()});
+    try testing.expect(!isStaleTemp(ours));
+    try testing.expect(isStaleTemp("00000000.kr.tmp.1.5"));
+
+    // A temporary whose nonce field this codec did not write is still a
+    // temporary — treating it as a real file is the bug being fixed.
+    try testing.expect(isStaleTemp("00000000.kr.tmp.deadbeef"));
+    try testing.expect(isStaleTemp("00000000.kr.tmp.zzzz.5"));
 }
 
 test "slot to shard is a contiguous range mapping" {
