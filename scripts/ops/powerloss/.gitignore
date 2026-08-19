@@ -1,0 +1,6 @@
+# Build artifacts: the initramfs is assembled from the cache plus this
+# checkout's binaries on every run, the disk images are per-round scratch, and
+# the fail logs are diagnostics for a round that did not hold.
+initramfs-pl.gz
+pl-disk-*.img
+pl-fail-*.log
