@@ -130,6 +130,20 @@ Derived, in the order a write meets them:
 | the same, by bytes | `proposeMulti`'s batching | nothing: the batch spills into another entry |
 | `MAX_MESSAGE_BYTES` | the transport, dropping unsent | nothing; `raft_oversize_dropped_total` should never leave zero |
 
+**Two scopes, and the batch is the one that had no rule.** The guard limits
+(key, value, writes, written bytes) are per ACTIVATION. The entry limit is per
+BATCH — a dispatch pass folds every same-tenant request into one writeset and
+one envelope. Nothing bounded the sum, so two activations each legally inside
+their budget built an entry no follower could receive, and the only answer left
+at propose was to refuse requests that had done nothing wrong.
+
+The walk now stops ADMITTING once the batch has less room left than the next
+activation could spend (`BATCH_ADMIT_RESERVE`). A skipped request stays in
+`request_out` for the next dispatchOnce, exactly as a different-tenant request
+does, and rides its own entry. Spilling one batch into two entries was the
+alternative and is worse: it splits the batch's all-or-nothing apply while its
+speculative overlay commits on a single watermark.
+
 **The budget is per ACTIVATION, and that is the whole point.** Writes
 accumulate into a batch writeset shared by every request in a dispatch pass, so
 a per-batch rule would let a busy neighbour spend a handler's allowance and

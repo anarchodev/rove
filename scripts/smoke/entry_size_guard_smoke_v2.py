@@ -77,6 +77,13 @@ export default function () {
     return next({ from: from + 3 });
   }
   if (op === "small") { kv.set("s/" + p.get("k"), "ok"); return "s"; }
+  if (op === "fat") {
+    // One activation at ~350 KiB — legal on its own. Several of these
+    // arriving together for the same tenant used to build ONE entry no
+    // follower could receive; the batch now stops admitting instead.
+    for (let i = 0; i < 3; i++) kv.set("fat/" + p.get("k") + "/" + i, "f".repeat(115 * 1024));
+    return "fat";
+  }
   return "ok";
 }
 
@@ -130,7 +137,19 @@ def main() -> int:
         check("a chained handler writes 9×100 KiB across activations and commits",
               r.status == 200 and r.body == "chained 9", f"{r.status} {r.body[:60]!r}")
 
-        # ── 4. nothing reached the wire ──
+        # ── 4. concurrent fat activations for ONE tenant: all commit ──
+        # Each is inside its own budget; together they exceed one entry. The
+        # walk must spread them across batches rather than refuse the batch.
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+            futs = [pool.submit(c.request, "victim", f"/?op=fat&k={i}", timeout=60.0)
+                    for i in range(6)]
+            fat = [f.result() for f in futs]
+        check("6 concurrent 345 KiB activations on one tenant all commit",
+              all(r.status == 200 and r.body == "fat" for r in fat),
+              f"statuses={[r.status for r in fat]}")
+
+        # ── 5. nothing reached the wire ──
         logs = "".join(Path(p).read_text(errors="replace")
                        for p in c.log_paths.values() if Path(p).exists())
         oversize = "oversize frame" in logs
@@ -140,7 +159,7 @@ def main() -> int:
                       for i in range(len(c.node_ports)))
         check("the transport backstop never had to fire", dropped == 0, f"got {dropped}")
 
-        # ── 5. the co-tenant is untouched ──
+        # ── 6. the co-tenant is untouched ──
         ok, statuses = 0, []
         for i in range(40):
             rr = c.request("bystander", f"/?op=small&k={i}", timeout=30.0)
