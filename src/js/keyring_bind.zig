@@ -125,6 +125,13 @@ pub const DEAD_PREFIX = "_keys/dead/";
 /// forever.
 pub const MINTED_KEY = "_keys/minted";
 
+/// Keyring root under the node's data dir — one directory per tenant
+/// beneath it. Lives here, with the other keyring facts, so a consumer
+/// that only needs the path does not pull in the HTTP transport.
+pub fn keyringDir(allocator: std.mem.Allocator, data_dir: []const u8) Error![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/keyrings", .{data_dir}) catch Error.OutOfMemory;
+}
+
 /// Label for the subkey that pseudonymises identities. Distinct from
 /// every sealing key: this one names data, it never opens it.
 const PSEUDONYM_LABEL = "rewind-identity-ref/v1";

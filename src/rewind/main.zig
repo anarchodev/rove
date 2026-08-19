@@ -983,6 +983,12 @@ pub fn main() !void {
     node_state.move_secret = move_secret;
     node_state.cp_internal_base = if (cp_urls.len > 0) cp_urls[0] else null;
     node_state.wireInternal();
+    // Per-tenant keyrings need the cluster KEK and the node's data dir.
+    // Both null on a cluster that has not turned crypto-shredding on,
+    // which leaves every slot without a keyring — and therefore
+    // answering `unverified` for any key, never inventing an erasure.
+    node_state.deploy.keyring_kek = keyring_kek;
+    node_state.deploy.data_dir = data_dir;
     try node_state.deploy.startDeploymentLoader();
     // Continuous follower deployment loading: fire on every committed
     // `_deploy/current` write so a FOLLOWER loads each deployment as it

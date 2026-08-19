@@ -25,6 +25,8 @@ const bytecode_cache_mod = @import("bytecode_cache.zig");
 const module_execution = @import("module_execution.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const msg_router_mod = @import("msg_router.zig");
+const crypt_mod = @import("rove-crypt");
+const keyring_bind = @import("keyring_bind.zig");
 const plan_mod = @import("rove-plan");
 const static_cache = @import("static_cache.zig");
 
@@ -571,6 +573,32 @@ pub const TenantSlot = struct {
     /// Atomic pointer to the current snapshot. Null until first load.
     current: std.atomic.Value(?*TenantFilesSnapshot),
 
+    /// This tenant's keyring — the shreddable key material, and the one
+    /// store whose *delete* is the erasure.
+    ///
+    /// Opened with the slot rather than on demand, because absence is
+    /// authoritative: a node has to know what it holds before it answers
+    /// anything about a missing key. Opening is file reads — no thread,
+    /// no network — so it costs what the blob backends beside it already
+    /// cost.
+    ///
+    /// Null when this node has no `REWIND_KEYRING_KEK` (surface off), or
+    /// when the tenant predates crypto-shredding and has no keyring on
+    /// disk. Neither is an error, and neither may be read as "everything
+    /// was erased" — a lookup against a null keyring is `unverified`.
+    keyring: ?crypt_mod.keyring.Keyring = null,
+
+    /// Guards `keyring` against a destroy racing a read. Held only for
+    /// the map probe or the evict, never across the shard rewrite's
+    /// fsync — that runs on the destroy queue.
+    keyring_lock: std.Thread.Mutex = .{},
+
+    /// Does this node hold every key the tenant has minted? Recomputed
+    /// when the slot opens and after a destroy applies; read on the
+    /// lookup path. `incomplete` means a miss says nothing about
+    /// erasure, so nothing may report one.
+    keyring_complete: std.atomic.Value(bool) = .init(false),
+
     /// Resolved per-tenant plan limits (docs/architecture/control-plane.md —
     /// operational state). Null until the CP delivers a plan
     /// (via the attach handshake on a move, or a live single-target push);
@@ -794,6 +822,13 @@ pub const DeploymentCache = struct {
     /// `startDeploymentLoader`; the load function thunk is
     /// `deploymentLoadFnNode`.
     deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
+
+    /// Cluster KEK and node data dir, for opening per-tenant keyrings.
+    /// Set after `init` by the node wiring (like `router`); null leaves
+    /// the keyring surface off, which is what a cluster that has not
+    /// turned crypto-shredding on runs with.
+    keyring_kek: ?[]const u8 = null,
+    data_dir: ?[]const u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1057,6 +1092,24 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     const id_copy = try allocator.dupe(u8, inst.id);
     errdefer allocator.free(id_copy);
 
+    // The tenant's keyring. `NoKeyring` is the ordinary case for a
+    // tenant born before shredding was switched on, or on a node whose
+    // birth attach carried no secret — it leaves the slot with none,
+    // and every lookup then answers `unverified` rather than inventing
+    // an erasure it cannot stand behind.
+    var keyring: ?crypt_mod.keyring.Keyring = null;
+    if (dc.keyring_kek) |kek| {
+        if (dc.data_dir) |dd| {
+            const kdir = try keyring_bind.keyringDir(allocator, dd);
+            defer allocator.free(kdir);
+            keyring = crypt_mod.keyring.Keyring.open(allocator, kdir, inst.id, kek) catch |err| switch (err) {
+                error.NoKeyring => null,
+                else => return err,
+            };
+        }
+    }
+    errdefer if (keyring) |*k| k.deinit();
+
     const slot = try allocator.create(TenantSlot);
     errdefer allocator.destroy(slot);
 
@@ -1070,7 +1123,13 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
         .current = .{ .raw = null },
+        .keyring = keyring,
     };
+
+    // Settle completeness before the slot is reachable, so no lookup can
+    // read the default. A tenant with no keyring stays `false` — it
+    // cannot vouch for anything.
+    if (slot.keyring != null) refreshKeyringCompleteness(slot);
 
     // Best-effort initial load. Read `_deploy/current` from the
     // tenant's app.db (set by release POST + replicated via raft);
@@ -1095,6 +1154,63 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     return slot;
 }
 
+/// Recompute whether this node holds every key the tenant has minted.
+///
+/// One kv read for the watermark plus a paginated scan of the destroy
+/// tombstones — whose count grows with total-ever-destroyed rather than
+/// with live keys. Runs when a slot opens and after a destroy applies,
+/// never per request; the request path reads the cached answer.
+///
+/// Every failure path stores `false`. Claiming completeness while unsure
+/// is the one direction that turns a missing key into a reported
+/// erasure, so uncertainty must always cost availability rather than
+/// truthfulness.
+pub fn refreshKeyringCompleteness(slot: *TenantSlot) void {
+    const kr: *const crypt_mod.keyring.Keyring = if (slot.keyring) |*k| k else {
+        slot.keyring_complete.store(false, .release);
+        return;
+    };
+    const a = slot.allocator;
+
+    const minted: u64 = blk: {
+        const raw = slot.app_kv.get(keyring_bind.MINTED_KEY) catch |err| switch (err) {
+            // Never minted: nothing to be missing.
+            error.NotFound => break :blk 0,
+            else => {
+                slot.keyring_complete.store(false, .release);
+                return;
+            },
+        };
+        defer a.free(raw);
+        break :blk keyring_bind.decodeMinted(raw) catch {
+            slot.keyring_complete.store(false, .release);
+            return;
+        };
+    };
+
+    const dead = keyring_bind.countTombstones(slot.app_kv, a) catch {
+        slot.keyring_complete.store(false, .release);
+        return;
+    };
+
+    const c = keyring_bind.completeness(@intCast(kr.count()), dead, minted);
+    slot.keyring_complete.store(c == .complete, .release);
+}
+
+/// Resolve a slot to its key, or to why there isn't one.
+///
+/// The lock is held for a hash probe and nothing else — a destroy's
+/// shard rewrite runs off this path, so a reader never waits on an
+/// fsync.
+pub fn keyringLookup(slot: *TenantSlot, key_slot: u64) keyring_bind.Lookup {
+    slot.keyring_lock.lock();
+    defer slot.keyring_lock.unlock();
+    const kr: *const crypt_mod.keyring.Keyring = if (slot.keyring) |*k| k else return .unverified;
+    const c: keyring_bind.Completeness =
+        if (slot.keyring_complete.load(.acquire)) .complete else .incomplete;
+    return keyring_bind.lookup(kr, key_slot, c);
+}
+
 fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
     // Drop the slot's reference to the current snapshot (if any).
     // In-flight pinned references keep the old snapshot alive until
@@ -1109,6 +1225,7 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
     if (slot.plan.load(.acquire)) |p| allocator.destroy(p);
     for (slot.plan_retired.items) |p| allocator.destroy(p);
     slot.plan_retired.deinit(allocator);
+    if (slot.keyring) |*k| k.deinit();
     slot.manifest_backend.deinit();
     slot.blob_backend.deinit();
     allocator.free(slot.instance_id);

@@ -40,6 +40,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const crypt = @import("rove-crypt");
+const keyring_bind = @import("keyring_bind.zig");
 const blob = @import("rove-blob");
 const curl = blob.curl;
 const respb = @import("response_builder.zig");
@@ -56,11 +57,9 @@ const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 /// policy.
 const MAX_VOTERS = 16;
 
-/// Keyring root under the node's data dir. One directory per tenant
-/// beneath it.
-pub fn keyringDir(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/keyrings", .{data_dir});
-}
+/// Re-exported from `keyring_bind`, which owns the keyring's on-disk
+/// and keyspace facts. One name for the path, wherever it is needed.
+pub const keyringDir = keyring_bind.keyringDir;
 
 // ── receive ──────────────────────────────────────────────────────────
 
