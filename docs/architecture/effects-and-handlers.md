@@ -77,6 +77,36 @@ durable-wake promotion pass — no `_send/owed/`-specific scan remains.
 The rule: small bounded payload (a webhook body) → bytes-in-marker; arbitrary
 size (blob bytes) → pointer-in-marker + re-execution.
 
+### Who may dispatch a baked `__system/` module
+
+The shims run as ordinary customer JS, so the platform cannot tell a shim's
+call from a handler's — that is the cost of composing durability in JavaScript,
+and it is why the shim-written key prefixes are customer-writable
+(`reserved.zig`'s `SHIM_WRITABLE_PREFIXES`). The same indistinguishability
+reaches the baked `__system/` modules: the engine grants `is_system_module`
+from the module **path**, so anything a tenant can name, a tenant can run
+privileged, with a ctx it chose.
+
+Two routes reach a baked module from tenant-supplied data, and each carries its
+own allowlist on the registry (`src/js/builtin_modules.zig`) — the target opts
+in, rather than each module being independently defensive about activations it
+never expected:
+
+- **A durable wake** names its target in a `_sched/` record, which is customer
+  data. `wake_targetable` is the set a wake may fire (`webhook_fire`,
+  `export_run`, `cron_tick`); `scheduler_tick` drops a refused entry rather
+  than re-offering it every tick.
+- **A fetch result** lands in the fetch's `on_chunk` module. `result_targetable`
+  is the set a fetch issued from customer context may name
+  (`webhook_onresult`, `blob_onresult`, `blob_compose_onresult` — the three the
+  shims hand results to); the refusal is a JS exception at the issuing call, not
+  a silent drop an activation later.
+
+The lists are deliberately separate: receiving a result is not permission to be
+woken, and vice versa. A fetch issued from a baked module (`__rove.fetch`, which
+is itself `is_system_module`-gated) is engine-internal and exempt — that is how
+`webhook_fire` chains to `webhook_onresult` and `export_run` to itself.
+
 ### The tenant door (inter-tenant fast path)
 
 When the worker is started with `REWIND_INTERNAL_FRONT=<ip>[,<ip>…]` (the

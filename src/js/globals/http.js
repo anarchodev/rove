@@ -55,7 +55,10 @@
      * @param {string} [opts.body] - Request body.
      * @param {string} opts.on - Module path each upstream writeback
      *   wakes (REQUIRED — the universal callback key). Same
-     *   activation shape as a streamed `after.fetch`.
+     *   activation shape as a streamed `after.fetch`. One of YOUR
+     *   modules: a platform `__system/…` path is refused, because a
+     *   result lands in its target as a system module and the target
+     *   would then run privileged on a ctx you chose.
      * @param {number} [opts.maxChunkBytes=262144] - Per-chunk cap.
      * @param {number} [opts.maxTotalBytes=52428800] - Cumulative
      *   response cap; exceeding sets `bodyTruncated` on the terminal

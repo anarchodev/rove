@@ -46,6 +46,7 @@ const c = qjs.c;
 const globals = @import("../globals.zig");
 const limiter = @import("../limiter.zig");
 const kv_export = @import("../kv_export.zig");
+const builtin_modules = @import("../builtin_modules.zig");
 const log_mod = @import("rove-log");
 
 const js_undefined = globals.js_undefined;
@@ -778,6 +779,27 @@ fn buildFetchRow(
 
     if (fetched.on_chunk_module.?.len == 0) {
         _ = c.JS_ThrowTypeError(ctx, "http.fetch: `on_chunk` (module path) is required");
+        return error.JsException;
+    }
+
+    // A fetch result dispatches its `on_chunk` module with `is_system_module`
+    // set from the module PATH, so a tenant that can name a baked module here
+    // runs it privileged with a ctx it chose — the result-route twin of the
+    // wake gate (rove#639; `isResultTargetable`). Refused at the ISSUE site, so
+    // the caller gets a JS exception on the line that named the target, rather
+    // than a silent drop when the result lands an activation later.
+    //
+    // System-issued fetches are exempt: `__rove.fetch` is already
+    // `is_system_module`-gated, and the baked modules chain among themselves
+    // (`webhook_fire` → `webhook_onresult`, `export_run` → itself).
+    if (!state.is_system_module and
+        builtin_modules.isBuiltinPath(fetched.on_chunk_module.?) and
+        !builtin_modules.isResultTargetable(fetched.on_chunk_module.?))
+    {
+        _ = c.JS_ThrowTypeError(
+            ctx,
+            "http.fetch: `on_chunk` may not name a platform `__system/` module",
+        );
         return error.JsException;
     }
 
