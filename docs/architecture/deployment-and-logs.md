@@ -209,7 +209,7 @@ records are lost without a bump, and kept with one.
   fallback for every node regardless.
 - **Query** (`standalone.zig`): `list` is answered from the SQLite index (no S3);
   `show/{request_id}` range-GETs the one record's frame and inflates it. Logs are
-  the customer-facing replay store (page-encrypted at rest); operator signals go
+  the customer-facing replay store; operator signals go
   to Grafana Cloud — the two-sink split is decisions.md §7.
 
 ### The execution-sequence stamp (`exec_seq`)

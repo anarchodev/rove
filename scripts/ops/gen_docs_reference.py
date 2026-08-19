@@ -65,7 +65,12 @@ GROUPS = [
      ["users", "sessions", "oauth", "oidc", "activitypub"]),
     ("Admin (the __admin__ tenant only)", None, ["platform"]),
 ]
-SKIPPED = {"request"}  # the request surface is the Handlers page / contract
+# `request` is contract territory — the Handlers page documents it.
+# `export` and `stripe` are held back deliberately: the reference page is a
+# claim about live surface, and advertising one that is merged but not
+# switched on is the same false-claim class this page is audited for
+# (rove#322). Promote each into a GROUPS entry when it goes live.
+SKIPPED = {"request", "export", "stripe"}
 
 # Files whose surface has no @namespace block: section name + one-line
 # description fallback (the file header covers the rest in-repo).

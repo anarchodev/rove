@@ -64,7 +64,7 @@ fast-follow, not a launch requirement.
 **9. Retention downgrade hides immediately, destroys after 30 days.**
 The read clamp follows the plan live, so history beyond the new tier's
 retention becomes unreadable at once — but physical erasure (when it
-exists: rove#91's crypto-erasure, rove#333's sweep) must lag a plan
+exists: rove#592's crypto-shredding, rove#333's sweep) must lag a plan
 drop by **30 days**, so an accidental downgrade or a support case can
 recover. This is the one destructive path in the system, and it gets
 the one warning window.

@@ -1239,7 +1239,7 @@ under load is a footgun — the audit found exactly that).
 ## 7. Observability
 
 - **Decision** (2026-05-13): two separate sinks. **Customer request logs** stay
-  in the per-tenant replay store (S3-direct, page-encrypted) — a product feature
+  in the per-tenant replay store (S3-direct) — a product feature
   addressable by `request_id`. **Operator signals** (raft commit rate, follower
   lag, queue depth, snapshot-install duration, blob latency, elections, panics)
   go to Grafana Cloud.

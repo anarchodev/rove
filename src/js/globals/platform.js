@@ -163,6 +163,40 @@
     },
 
     /**
+     * Content-address handler sources into `scope`'s blobs WITHOUT
+     * compiling them, resuming with `{ok, results:[{path, source_hex}]}`.
+     *
+     * The staging half of a deploy. Compilation resolves every import
+     * eagerly, so a module can only be compiled once everything it imports
+     * exists — which, for a deploy that uploads files one at a time, is not
+     * true until the last file lands. Stage each file as it arrives, then
+     * {@link platform.compile} the finished bundle, where a sibling import
+     * resolves.
+     *
+     * **Bound, like {@link platform.compile}:** `return next()` after it.
+     *
+     * @param {Array<{path:string, source:string}>} files - Handler sources.
+     * @param {object} opts
+     * @param {string} opts.scope - Target instance id (where blobs land).
+     * @param {string} [opts.on="onFetchResult"] - Resume export.
+     * @param {*} [opts.ctx] - Threaded to the resume as `request.ctx.app`.
+     * @returns {string} The bound fetch id (`ftch_…`).
+     *
+     * @example
+     * platform.stage([{ path, source }], { scope: tenant, on: "onStaged" });
+     * return next();
+     */
+    stage(files, opts) {
+      opts = opts || {};
+      _rejectRenamed("platform.stage", opts, { name: "on", to: "on" });
+      const body = JSON.stringify({ scope: opts.scope, files, stage: true });
+      return sysOn.fetch(
+        "http://rove-compile.internal/",
+        { method: "POST", body, ctx: opts.ctx, on: opts.on || "onFetchResult" },
+      );
+    },
+
+    /**
      * Compile handler sources to bytecode + content-address them into
      * `scope`'s blobs, off the hot path (`docs/architecture/cli-and-deploy.md` §4.1).
      * Admin-only (the issuing tenant is checked natively). Source →
@@ -198,40 +232,6 @@
      * //   const { results } = request.ctx; ...stamp manifest...
      * // }
      */
-    /**
-     * Content-address handler sources into `scope`'s blobs WITHOUT
-     * compiling them, resuming with `{ok, results:[{path, source_hex}]}`.
-     *
-     * The staging half of a deploy. Compilation resolves every import
-     * eagerly, so a module can only be compiled once everything it imports
-     * exists — which, for a deploy that uploads files one at a time, is not
-     * true until the last file lands. Stage each file as it arrives, then
-     * {@link platform.compile} the finished bundle, where a sibling import
-     * resolves.
-     *
-     * **Bound, like {@link platform.compile}:** `return next()` after it.
-     *
-     * @param {Array<{path:string, source:string}>} files - Handler sources.
-     * @param {object} opts
-     * @param {string} opts.scope - Target instance id (where blobs land).
-     * @param {string} [opts.on="onFetchResult"] - Resume export.
-     * @param {*} [opts.ctx] - Threaded to the resume as `request.ctx.app`.
-     * @returns {string} The bound fetch id (`ftch_…`).
-     *
-     * @example
-     * platform.stage([{ path, source }], { scope: tenant, on: "onStaged" });
-     * return next();
-     */
-    stage(files, opts) {
-      opts = opts || {};
-      _rejectRenamed("platform.stage", opts, { name: "on", to: "on" });
-      const body = JSON.stringify({ scope: opts.scope, files, stage: true });
-      return sysOn.fetch(
-        "http://rove-compile.internal/",
-        { method: "POST", body, ctx: opts.ctx, on: opts.on || "onFetchResult" },
-      );
-    },
-
     compile(files, opts) {
       opts = opts || {};
       // The resume export is `on` everywhere. A retired spelling used to be
