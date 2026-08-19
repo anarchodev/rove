@@ -246,9 +246,11 @@ class ActivityPubActor {
   /**
    * Idempotently create and store this actor's RSA-2048 keypair.
    * Safe to call on every request; generates only on first call.
-   * The private key is stored in kv (page-encrypted at rest by the
-   * platform — no extra ceremony). Call once before serving the
-   * actor document, e.g. from your setup route or lazily.
+   * The private key is stored in kv — no extra ceremony and no
+   * separate secrets primitive. Note that kv is not encrypted at
+   * rest today, so the key carries the same at-rest exposure as any
+   * other value you store. Call once before serving the actor
+   * document, e.g. from your setup route or lazily.
    *
    * @returns {void}
    * @example

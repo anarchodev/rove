@@ -22,9 +22,10 @@
 //! same model the per-tenant SQLite handles use elsewhere in rove.
 //!
 //! What's deliberately NOT here:
-//! - Server-side encryption headers (S3 SSE / SSE-KMS). Loop46's
-//!   own page-encryption (PLAN Phase 9) handles this client-side;
-//!   no need for S3-side enc on top.
+//! - Server-side encryption headers (S3 SSE / SSE-KMS). Not sent, and
+//!   the client-side page encryption meant to cover this is unbuilt
+//!   (PLAN §2.7) — so blob bytes are stored with neither. Enabling SSE
+//!   is the cheap interim measure if that gap has to close first.
 //! - Listing on the read/write path. The blob store is keyed by hash, so
 //!   serving never enumerates — enumeration is expensive at scale, and a
 //!   reader that needed it would be reaching for a name the store does not

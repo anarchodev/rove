@@ -119,13 +119,34 @@ retired native generations — `webhooks.db`, `http.send`+`schedules.db`,
 
 ### 2.7 Encryption at rest
 
-Page-level AES-256-GCM on all per-tenant storage (not per-value), keyed by
-`HKDF(master, label‖instance_id)` with the master key held **outside** rove's
-persisted state and distinct labels per subsystem. Tapes encrypted the same;
-browser replay is server-side-decrypted over TLS (no client-side key
-distribution). SQLCipher vs a vendored AES-GCM VFS is the open Phase-9 call (§5).
-Why page-level (and the rejected write-only `env` / value-level encryption):
-decisions.md §7 + §7 here.
+**Not built.** Nothing in the tree encrypts customer data at rest today —
+not KV, not tapes, not blobs. Any doc, comment or product string claiming
+otherwise is a bug, not a lagging description. See Phase 9.
+
+Page-level AES-256-GCM on all per-tenant storage (not per-value), keyed from
+a per-tenant root held **outside** rove's persisted state, with distinct
+labels per subsystem. Tapes encrypted the same; browser replay is
+server-side-decrypted over TLS (no client-side key distribution). SQLCipher
+vs a vendored AES-GCM VFS is the open Phase-9 call (§5). Why page-level (and
+the rejected write-only `env` / value-level encryption): decisions.md §7 +
+§7 here.
+
+**Amendment (2026-08-18, rove#592 leaf #612): the root key is stored, not
+derived.** This section originally locked `HKDF(master, label‖instance_id)`.
+A *derived* key cannot be shredded: while the master exists, every tenant's
+key is re-derivable, so there is nothing whose destruction constitutes
+erasure. That defeats crypto-shredding, which is the mechanism both the
+account-closure promise and per-identity erasure rest on — and erasure is
+not a property that can be added on top of a derivation later, because the
+keys are already embedded in every ciphertext ever written.
+
+So the HKDF **root** is a per-tenant **stored secret**, and destroying it is
+the erasure. Derivation still happens below that root (subsystem labels,
+per-slot keys); what changed is where the chain starts. The rest of the
+section stands unaltered — page-level over per-value, distinct labels per
+subsystem, and especially *server-side-decrypted browser replay with no
+client-side key distribution*, which is what keeps the wasm replay arena out
+of the blast radius.
 
 ### 2.8 Cache invalidation via the apply hook
 
@@ -495,7 +516,7 @@ The uniqueness isn't any single feature — it's the coherence of the set:
 - **Purely functional handlers** (no async IO, no fetch, all effects are Cmds).
 - **Cmd-pattern outbound path: one native door to the outside world (`http.fetch`)**, commit-gated and atomic with the writeset; durability (`webhook.send` / `email.send` / `retry.*`) composes in JS on top.
 - **Deterministic triggers in the same KV transaction as the write.**
-- **Tape capture on every request, encrypted at rest.**
+- **Tape capture on every request.**
 - **Browser-based replay with DevTools breakpoints on production bugs.**
 - **One URL for the whole app (static + API + admin-of-admin).**
 - **Magic-link signup → live API in under a minute.**
