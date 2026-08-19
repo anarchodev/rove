@@ -62,7 +62,9 @@
 //!                                         //   into a shared writeset, and a
 //!                                         //   busy neighbour must not spend
 //!                                         //   this handler's allowance.
-//! noteWrite(d, bytes) void                // a write HAPPENED — charge it.
+//! noteWrite(d, bytes) void                // a write HAPPENED — charge it
+//!                                          (`guards.kvWriteCost` bytes, the
+//!                                          same figure the check judged).
 //!                                         //   Called only after the
 //!                                         //   delegate's put/del succeeds,
 //!                                         //   so a refused or failed write
@@ -292,7 +294,7 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             // Spend the activation's budget only on a write that HAPPENED: a
             // refused or failed one costs nothing, or a handler could be
             // starved by writes that never reached the entry.
-            d.noteWrite(key.len + value.len);
+            d.noteWrite(guards.kvWriteCost(key.len, value.len));
             return js_undefined;
         }
 
@@ -323,7 +325,7 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             if (!d.del(ctx, key)) return js_exception;
             // A delete is an op with a key and no value — it rides the entry
             // like any other.
-            d.noteWrite(key.len);
+            d.noteWrite(guards.kvWriteCost(key.len, 0));
             return js_undefined;
         }
 

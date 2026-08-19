@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const reserved = @import("rove-reserved");
+const sizing = @import("rove-sizing");
 
 /// Which JS constructor an engine throws. The distinction is customer-visible
 /// (`e instanceof TypeError`), so it belongs to the rule, not to the caller.
@@ -85,14 +86,35 @@ pub const kv_writes_too_large_message = std.fmt.comptimePrint(
 );
 
 /// What one activation has written so far: its own `kv.set` / `kv.delete`
-/// calls, keys and values summed. "Its own" is the point — writes are
-/// accumulated into a batch writeset shared with other activations, so the
-/// budget is measured from this activation's slice of it and a busy neighbour
-/// can never spend someone else's allowance.
+/// calls, measured in the bytes they put on the raft entry — key, value and
+/// the writeset framing every op carries (`sizing.writeOpBytes`). Measuring
+/// the wire is the point twice over:
+///
+///   - "Its own" — writes are accumulated into a batch writeset shared with
+///     other activations, so the budget is measured from this activation's
+///     slice of it and a busy neighbour can never spend someone else's
+///     allowance.
+///   - "Wire bytes" — the budget exists to keep the entry deliverable, so it
+///     has to count what the entry carries. A side envelope's framing is
+///     charged here too (`sizing.sideEnvelopeFramingBytes`), which is what
+///     lets batch admission see bytes that are only appended at propose.
 pub const WriteBudget = struct {
     ops: u32 = 0,
     bytes: usize = 0,
 };
+
+/// What one `kv.set` / `kv.delete` costs the activation's write budget: the
+/// bytes it puts on the raft entry — key, value, and the writeset framing
+/// every op carries.
+///
+/// THE single answer, because two layers ask it: `checkKvWrite` judging
+/// `spent + this write`, and the binding charging the write that happened. A
+/// check and a charge that compute it separately drift by exactly the term
+/// one of them forgets, and the drift shows up as a budget that admits more
+/// than the entry holds.
+pub fn kvWriteCost(key_len: usize, value_len: usize) usize {
+    return sizing.writeOpBytes(key_len, value_len);
+}
 
 fn kvTooLargeMessage(comptime which: []const u8, comptime limit: usize) []const u8 {
     return std.fmt.comptimePrint("kv: {s} exceeds the {d}-byte limit", .{ which, limit });
@@ -146,7 +168,7 @@ pub fn checkKvWrite(
             .message = kv_too_many_writes_message,
         };
     }
-    const this_write = utf8Len(key) + if (value) |v| utf8Len(v) else 0;
+    const this_write = kvWriteCost(utf8Len(key), if (value) |v| utf8Len(v) else 0);
     if (spent.bytes + this_write > reserved.KV_WRITE_BYTES_MAX) {
         return .{
             .throw = .err,
@@ -252,17 +274,26 @@ test "kv: the write budget refuses on ops and on bytes, and a fresh activation i
 
     // The byte half judges `spent + this write`, so the boundary is exact:
     // the write that lands ON the cap is allowed, the one that crosses it is
-    // not.
+    // not. The write costs what it puts on the wire — key, value AND the
+    // op's framing — so a budget stated in key+value alone would admit this
+    // one and overflow the entry.
     const v = "y" ** 1024;
-    const at = reserved.KV_WRITE_BYTES_MAX - v.len - 1;
+    const cost = sizing.writeOpBytes(1, v.len);
+    try testing.expectEqual(@as(usize, 1 + v.len + sizing.WS_OP_BYTES), cost);
+    const at = reserved.KV_WRITE_BYTES_MAX - cost;
     try testing.expect(checkKvWrite("k", v, false, .{ .bytes = at }) == null);
     try testing.expectEqualStrings(
         kv_writes_too_large_code,
         checkKvWrite("k", v, false, .{ .bytes = at + 1 }).?.code,
     );
 
-    // A delete costs its key, not a value.
-    try testing.expect(checkKvWrite("k", null, false, .{ .bytes = reserved.KV_WRITE_BYTES_MAX - 2 }) == null);
+    // A delete costs its key and its framing, not a value.
+    try testing.expect(checkKvWrite("k", null, false, .{
+        .bytes = reserved.KV_WRITE_BYTES_MAX - sizing.writeOpBytes(1, 0),
+    }) == null);
+    try testing.expectEqualStrings(kv_writes_too_large_code, checkKvWrite("k", null, false, .{
+        .bytes = reserved.KV_WRITE_BYTES_MAX - sizing.writeOpBytes(1, 0) + 1,
+    }).?.code);
 
     // And a system module is exempt from the NAMESPACE rule, never from this:
     // it rides the same entry as anything else.
@@ -309,3 +340,28 @@ test "tag: capacity refuses only at the cap" {
 }
 
 
+
+test "kv: a legal value under a legal key is writable by a fresh activation" {
+    // The two rules have to be satisfiable together, framing included — a
+    // value the guard calls legal that no handler can actually write is a cap
+    // the platform states and refuses to honour. `rove-sizing` asserts the
+    // arithmetic; this is the same claim through the surface that enforces it.
+    const k = "k" ** reserved.KV_KEY_MAX;
+    const v = "v" ** reserved.KV_VAL_MAX;
+    try testing.expect(checkKvWrite(k, v, false, .{}) == null);
+}
+
+test "kv: the check and the charge are the same function" {
+    // The budget is judged in one place and spent in another (`rove-binding`'s
+    // `noteWrite`, the privileged path's `notePlatformWrite`). If they compute
+    // the cost separately they drift by whatever one of them forgets, and the
+    // drift is invisible until an entry the budget admitted cannot be
+    // replicated. Both call this.
+    try testing.expectEqual(@as(usize, 9 + 3 + 5), kvWriteCost(3, 5));
+    const at = reserved.KV_WRITE_BYTES_MAX - kvWriteCost(3, 5);
+    try testing.expect(checkKvWrite("abc", "defgh", false, .{ .bytes = at }) == null);
+    try testing.expectEqualStrings(
+        kv_writes_too_large_code,
+        checkKvWrite("abc", "defgh", false, .{ .bytes = at + 1 }).?.code,
+    );
+}

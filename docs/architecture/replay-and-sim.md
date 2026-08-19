@@ -229,6 +229,13 @@ writes proposes an entry larger than the transport frame and its write fails
 outright. Past the ceiling the read's key is still recorded and its VALUE is
 not: the entry's outcome is `elided`, carrying the lost byte count.
 
+The same elision can appear in a FOLLOWER-rebuilt record, for the same reason.
+The readset also rides the raft entry, and that copy is cut down to the room
+the activation's own writes leave (`tape.serializeForEntry`): reads and writes
+share one entry and the write is what must survive. The tape a leader flushes
+is untouched — only the rebuild path sees the trimmed copy — and either way the
+record says so, so replay reads it the same way.
+
 Replay must REFUSE such a read. The closed world's ordinary miss rule (a key
 not in the map resolves to `not_found`) is the one answer that is certainly
 wrong here — the live run read real data — and serving it would be the #214

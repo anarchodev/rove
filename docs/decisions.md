@@ -138,7 +138,7 @@ their budget built an entry no follower could receive, and the only answer left
 at propose was to refuse requests that had done nothing wrong.
 
 The walk now stops ADMITTING once the batch has less room left than the next
-activation could spend (`BATCH_ADMIT_RESERVE`). A skipped request has NOT run
+activation could spend (`sizing.ACTIVATION_RESERVE`). A skipped request has NOT run
 its handler — the check sits at the admission point, before dispatch — so
 nothing is executed twice and no side effect is repeated. A skipped request stays in
 `request_out` for the next dispatchOnce, exactly as a different-tenant request
@@ -176,6 +176,65 @@ if a real workload needs entries above the frame.
 product promise, and it is now bounded by a transport constant: raising the
 recv buffer is what raises it. The snapshot stream stays WIDER
 (`STREAM_VAL_MAX`, 1 MiB) so it can still move rows a store already holds.
+
+#### 2.5a.1 One accounting: four scopes, one unit, one derivation
+
+**Decision (user, 2026-08-19).** The guards above were added a PR at a time and
+their arithmetic did not compose. Batch admission summed raw `key + value`
+bytes; `Bridge.propose` compared the ENCODED envelope; `WriteSet.encodedSize`
+computed the exact figure and nobody called it; and three separately chosen
+`FRAMING` constants stood in for the difference. The result was not untidiness
+but defects: an admission reserve LARGER than a whole entry (so every
+same-tenant batch silently collapsed to one request, with the gate, the
+conformance corpus and the smoke suite green), and a write budget and a read
+budget that could not both be spent by the same activation without the propose
+refusing what every call-site guard had allowed.
+
+The model, stated once and asserted in `rove-sizing`:
+
+- **Four named scopes.** *message* ≤ the receiver's buffer; *entry* = message −
+  raft-rs framing; *batch* = exactly one entry (its activations share a
+  `TrackedTxn` that commits all-or-nothing, so unlike an inner list it cannot
+  spill); *activation* = one handler run, contributing its writes and its
+  readset to the batch's entry.
+- **One unit.** Every layer measures the bytes that will actually be on the
+  wire, through `rove-sizing`'s arithmetic, bound to each encoder by a
+  round-trip test. The write budget is therefore denominated in wire bytes —
+  an op costs its framing too, and a side envelope costs its own — so the
+  layer that DECIDES and the layer that REFUSES compare the same number.
+- **One derivation.** `RECV_BUF_SIZE` → frame → message → entry → the
+  per-activation reserve, each computed from the one above and
+  comptime-asserted. A change anywhere fails the build instead of surfacing as
+  a co-tenant's election storm.
+- **The budgets partition the entry.** `ACTIVATION_RESERVE` (a whole write
+  budget plus the readset room every activation is guaranteed) plus
+  `BATCH_ROOM_MIN` plus framing is exactly one entry, by construction. So
+  `EntryTooLarge` at propose is unreachable from the dispatch path — it stays
+  as a backstop for producers that do not go through it.
+- **Batching is a stated policy.** A batch admits another activation while the
+  entry still holds a worst-case one. That makes coalescing available to the
+  ordinary small-write activation and unavailable to one already near its own
+  budget, which would need its own entry anyway. It also means the room cannot
+  be wide while the write budget is 400 KiB of a 520 KiB entry — the room
+  widens on its own when the value cap is renumbered down.
+
+**What gives when both cannot fit: fidelity, never the write.** Reads and
+writes ride the same entry and an activation can want more of both than one
+entry holds. The writes are the activation's output, already guarded and
+already reserved for, so the readset is what yields: the RAFT COPY is cut down
+to the room the entry actually has — values written elided, every key kept —
+and, if that is still not enough, degraded to its header plus the `LogHeader` a
+follower needs to rebuild the log record. An elided read reports a divergence
+on replay; a MISSING read would replay as fiction, which is why keys stay.
+
+The cut is **non-mutating**, and that placement is the decision. Only the raft
+copy has an entry to fit inside; the tape the leader flushes to the log has
+none, so it keeps everything. Entry pressure therefore costs nothing on the
+path a customer actually replays, and degrades only the rebuild a follower
+falls back to when the leader dies before flushing — where one of the two
+becomes THE record, never both. `KV_TAPE_BUDGET` remains the early, cheap
+control on how much reading is worth carrying at all; it is no longer what
+makes the entry fit.
 
 ### 2.6 Cluster / raft-KV library shape
 - **Decision** (V1 as-built, from the retired `raft-kv-design.md`; the V1

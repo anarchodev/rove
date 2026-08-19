@@ -24,25 +24,41 @@ const tape_mod = @import("rove-tape");
 const bodies_mod = @import("rove-bodies");
 const bridge_mod = @import("bridge");
 const reserved = @import("rove-reserved");
+// The one arithmetic for "how many bytes will this put on the wire", and the
+// partition of an entry the admission walk below enforces.
+const sizing = @import("rove-sizing");
 
-/// What the batch reserves for the NEXT activation before admitting it: its
-/// whole write budget, an allowance for the readset it will contribute, and
-/// framing. Keeping one entry per batch is what preserves the batch's
-/// all-or-nothing apply; spilling into a second entry would split that
-/// atomicity, and refusing at propose would punish requests that did nothing
-/// wrong. So the walk simply stops early and the rest ride the next tick.
 /// Whether an activation's own contribution could not fit a raft entry even
 /// with the batch to itself. That is the only case where a propose refusal is
 /// PERMANENT: a retry re-runs the same handler, produces the same bytes, and
 /// fails again. Everything else is a batch-composition problem and retries
 /// successfully, so it must not be answered with a terminal status.
+///
+/// `entry_bytes` is the activation's exact wire contribution, so this is an
+/// exact question — no framing fudge stands between the number the batch
+/// decided on and the number the transport refuses.
 fn cannotFitAlone(entry_bytes: usize) bool {
-    const FRAMING: usize = 32 * 1024;
-    return entry_bytes + FRAMING > bridge_mod.transport.MAX_ENTRY_BYTES;
+    return sizing.ENTRY_FIXED_BYTES + entry_bytes > sizing.MAX_ENTRY_BYTES;
 }
 
-const BATCH_ADMIT_RESERVE: usize =
-    reserved.KV_WRITE_BYTES_MAX + (128 * 1024) + (32 * 1024);
+/// Whether a batch already holding `batch_bytes` of exact wire bytes can
+/// admit another activation.
+///
+/// The batch is ONE raft entry — its activations share a `TrackedTxn` whose
+/// writeset commits all-or-nothing, so it cannot spill the way an inner list
+/// can — and the next activation may spend its whole budget. So the walk
+/// stops admitting once the entry no longer holds a worst-case one, and the
+/// skipped requests stay in `request_out` to ride the next tick.
+///
+/// Stated as a predicate, and tested, because the alternative is what this
+/// replaced: a reserve that happened to exceed a whole entry, which made this
+/// false at zero accumulated bytes and silently collapsed every batch to one
+/// request with the gate, the conformance corpus and the smoke suite green.
+fn batchAdmits(batch_bytes: usize) bool {
+    return sizing.ENTRY_FIXED_BYTES + batch_bytes + sizing.ACTIVATION_RESERVE <=
+        sizing.MAX_ENTRY_BYTES;
+}
+
 const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
 const effect_mod = @import("effect/root.zig");
@@ -879,7 +895,10 @@ fn finalizeBatch(
                     // ALONE — that answer will never change, so a retry is a
                     // guaranteed second failure. Its neighbours get the
                     // retry-safe 421 and succeed in a smaller batch, which
-                    // admission control now arranges.
+                    // admission control arranges. A BACKSTOP: admission
+                    // reserves a worst-case activation and the readset is cut
+                    // to what is left, so nothing that came through the
+                    // dispatch walk can reach it.
                     const too_large = entry_too_large and cannotFitAlone(s.entry_bytes);
                     (if (too_large)
                         respb.overwriteWith413(server, s.ent, allocator, s.body_ptr, s.body_len)
@@ -1659,6 +1678,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // different-tenant request does, and rides its own entry.
     var batch_bytes: usize = 0;
     var batch_ws_marked: usize = 0;
+    // `batch_side.wireBytes()` as of the last activation's attribution, so
+    // each activation is charged only the side envelopes it opened or grew.
+    var batch_side_marked: usize = 0;
 
     // Batch-level `http.fetch`
     // accumulator. Each handler appends its successful fetches
@@ -2163,12 +2185,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (anchor) |a| {
             if (a != scope_inst) continue;
             // Room for one more? The next activation may spend its whole
-            // budget, so the batch stops admitting once what is already
-            // accumulated leaves less than that plus its readset. Conservative
-            // on purpose: the alternative is discovering the overflow at
-            // propose, where the only answer is to refuse requests that did
-            // nothing wrong.
-            if (batch_bytes + BATCH_ADMIT_RESERVE > bridge_mod.transport.MAX_ENTRY_BYTES) continue;
+            // budget, so the batch stops admitting once the entry no longer
+            // holds a worst-case one (`sizing.ACTIVATION_RESERVE`).
+            // Conservative on purpose: the alternative is discovering the
+            // overflow at propose, where the only answer is to refuse requests
+            // that did nothing wrong. `batch_bytes` is exact wire bytes, so
+            // this compares the same quantity the transport will.
+            if (!batchAdmits(batch_bytes)) continue;
         } else {
             // Already proven BUSY earlier this tick? Skip.
             var skip_blocked = false;
@@ -3078,19 +3101,41 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // tenant's execution tape.
             .exec_seq = exec_seq,
         };
-        // Charge this activation to the batch: the writeset ops it added since
-        // the last mark, plus the readset blob it is about to contribute. The
-        // same figure is kept per activation (`own_entry_bytes`) so a refused
-        // batch can name the one that could never fit, instead of telling
-        // every request in it to retry something that will fail again.
+        // Charge this activation to the batch, in the bytes the entry will
+        // actually carry: the writeset ops it added since the last mark, the
+        // side envelopes it opened or grew, and the readset blob it is about
+        // to contribute. The same figure is kept per activation
+        // (`own_entry_bytes`) so a refused batch can name the one that could
+        // never fit, instead of telling every request in it to retry
+        // something that will fail again.
         var own_entry_bytes: usize = 0;
         for (writeset.ops.items[batch_ws_marked..]) |op| own_entry_bytes += switch (op) {
-            .put => |pu| pu.key.len + pu.value.len,
-            .delete => |d| d.key.len,
+            .put => |pu| sizing.writeOpBytes(pu.key.len, pu.value.len),
+            .delete => |d| sizing.writeOpBytes(d.key.len, 0),
         };
         batch_ws_marked = writeset.ops.items.len;
-        if (readset.serialize(allocator, log_header)) |rs_bytes| {
-            own_entry_bytes += rs_bytes.len;
+        // The activation's side envelopes (an admin handler's cross-tenant
+        // trampolines, `platform.root.*`) are appended at propose time, so
+        // charge them HERE — admission is otherwise blind to bytes it is
+        // about to add, and attribution can name the wrong activation when an
+        // entry is refused. They are disjoint from the anchor writeset walked
+        // above, so `wireBytes` (their framing AND their ops) is charged
+        // whole; the delta is what THIS activation added.
+        const side_wire_now = worker.batch_side.wireBytes();
+        own_entry_bytes += side_wire_now - batch_side_marked;
+        batch_side_marked = side_wire_now;
+        // The readset rides the same entry, so the RAFT COPY of it is cut down
+        // to the room the entry actually has left (the tape itself is
+        // untouched — the LogRecord copy has no entry to fit in). Admission
+        // guaranteed at least `sizing.READSET_RESERVE` of room, so an ordinary
+        // activation is never cut; a heavy reader that also writes heavily
+        // gives up a follower-rebuild's fidelity rather than the write.
+        var trim: tape_mod.TrimStats = .{};
+        const rs_room = sizing.MAX_ENTRY_BYTES -|
+            (sizing.ENTRY_FIXED_BYTES + batch_bytes + own_entry_bytes) -|
+            sizing.RS_BLOB_HDR_BYTES;
+        if (tape_mod.serializeForEntry(&readset, allocator, log_header, rs_room, &trim)) |rs_bytes| {
+            own_entry_bytes += sizing.RS_BLOB_HDR_BYTES + rs_bytes.len;
             batch_readset_blobs.append(allocator, rs_bytes) catch |err| {
                 allocator.free(rs_bytes);
                 std.log.warn(
@@ -3100,8 +3145,20 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             };
         } else |err| {
             std.log.warn(
-                "rove-js readset.serialize tenant={s}: {s}",
+                "rove-js readset serialize tenant={s}: {s}",
                 .{ scope_inst.id, @errorName(err) },
+            );
+        }
+        if (trim.elided_bytes > 0) {
+            // The activation's reads did not fit its share of the entry. The
+            // LogRecord copy is untouched, so this only degrades a
+            // follower-rebuilt record — say so, since it is invisible until
+            // the leader that could have flushed the full one dies.
+            std.log.warn(
+                "rove-js readset trimmed for the raft entry: tenant={s} " ++
+                    "elided={d} bytes channels_dropped={} — a follower-rebuilt " ++
+                    "record for this request cannot be replayed against those reads",
+                .{ scope_inst.id, trim.elided_bytes, trim.dropped_channels },
             );
         }
         batch_bytes += own_entry_bytes;
@@ -3267,4 +3324,57 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         batch_readset_bytes,
     );
     return processed;
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "batch admission: an empty batch admits a second activation" {
+    // THE regression. The reserve is what an activation may spend; if it ever
+    // reaches or exceeds a whole entry, this is false before anything has
+    // been accumulated and every same-tenant batch collapses to exactly one
+    // request — invisibly, because the skipped requests simply ride the next
+    // tick and nothing fails.
+    try testing.expect(batchAdmits(0));
+}
+
+test "batch admission: ordinary activations coalesce, a fat one ends the batch" {
+    // The batching win is amortising raft entries across many small writes,
+    // so the ordinary case has to admit many. 1 KiB is a generous stand-in
+    // for a handler that writes a row or two.
+    var bytes: usize = 0;
+    var admitted: usize = 0;
+    while (batchAdmits(bytes)) : (admitted += 1) bytes += 1024;
+    try testing.expect(admitted >= 16);
+
+    // And an activation that spent most of its budget leaves no room, so the
+    // next one rides its own entry rather than being refused at propose.
+    try testing.expect(!batchAdmits(reserved.KV_WRITE_BYTES_MAX));
+}
+
+test "an activation inside both budgets always fits one entry" {
+    // The claim the whole partition exists to make: satisfy every call-site
+    // guard — the write budget at `kv.set`, the readset trimmed to the room
+    // admission reserved — and replication cannot then refuse you. If this
+    // fails, `EntryTooLarge` is reachable from a guarded path and the
+    // handler is told "platform fault" for obeying every stated rule.
+    const worst = reserved.KV_WRITE_BYTES_MAX +
+        sizing.RS_BLOB_HDR_BYTES + sizing.READSET_RESERVE;
+    try testing.expect(!cannotFitAlone(worst));
+    try testing.expectEqual(sizing.ACTIVATION_RESERVE, worst);
+}
+
+test "attribution and admission measure the same unit" {
+    // A batch charged in raw key+value bytes while the transport refuses on
+    // ENCODED bytes hides 9 bytes per op — 9 KB at the op cap — from the
+    // layer that decides. Both sides call the same function.
+    const key = "users/alice";
+    const value = "x" ** 128;
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    try ws.addPut(key, value);
+    try ws.addDelete(key);
+    const charged = sizing.writeOpBytes(key.len, value.len) + sizing.writeOpBytes(key.len, 0);
+    try testing.expectEqual(ws.encodedSize(), sizing.writeSetBytes(charged));
 }

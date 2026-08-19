@@ -239,6 +239,8 @@ pub fn captureTapes(
     // figures: the record's `elided` entries are the durable half, but an
     // operator watching `tape_kv_elided_total` climb needs the tenant-facing
     // shape (a handler reading broadly) and this is where it is visible.
+    // (The raft copy's entry trim is reported separately at the propose site —
+    // it never touches this tape, so it never reaches these counters.)
     if (readset.kv.elided_reads > 0) {
         std.log.warn(
             "rove-js kv tape budget: {d} read(s) elided ({d} bytes) — this record " ++

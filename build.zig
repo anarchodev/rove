@@ -602,6 +602,34 @@ pub fn build(b: *std.Build) void {
     const reserved_tests = b.addTest(.{ .root_module = reserved_mod });
     test_step.dependOn(&b.addRunArtifact(reserved_tests).step);
 
+    // ── rove-sizing: the sizing chain, one derivation ──
+    //
+    // `RECV_BUF_SIZE` → frame → message → entry → per-activation budgets →
+    // the batch's admission reserve, plus the encoders' own byte arithmetic
+    // so admission, attribution and propose measure the same quantity in the
+    // same unit. Five layers used to hold four approximations of it and a
+    // reserve larger than a whole entry went unseen (rove#671).
+    //
+    // Imports the CONTRACT numbers (the kv write budget) and derives the
+    // replication ones from them — one direction, so `rove-reserved` stays
+    // the std-only leaf the offline engines read.
+    const sizing_mod = b.addModule("rove-sizing", .{
+        .root_source_file = b.path("src/sizing/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sizing_mod.addImport("rove-reserved", reserved_mod);
+    const sizing_tests = b.addTest(.{ .root_module = sizing_mod });
+    test_step.dependOn(&b.addRunArtifact(sizing_tests).step);
+
+    // Every layer that measures bytes against the entry limit reads them
+    // here: the transport that owns the receiver's buffer, the codecs whose
+    // framing the arithmetic describes, the tape that trims a readset to the
+    // room an entry has left, the guards that spend the write budget, and
+    // the worker's admission walk.
+    kv_mod.addImport("rove-sizing", sizing_mod);
+    tape_mod.addImport("rove-sizing", sizing_mod);
+
     // The tier table resolves a tenant with no plan blob from its ID (the
     // reserved platform singletons default to the platform tier), so it needs
     // the one reserved-id list. Both are leaves, so this adds no cycle.
@@ -621,6 +649,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     guards_mod.addImport("rove-reserved", reserved_mod);
+    // The write budget is denominated in WIRE bytes — an op costs its
+    // framing too — so the one evaluator of the rule needs the one
+    // arithmetic for it.
+    guards_mod.addImport("rove-sizing", sizing_mod);
 
     const guards_tests = b.addTest(.{ .root_module = guards_mod });
     test_step.dependOn(&b.addRunArtifact(guards_tests).step);
@@ -729,6 +761,7 @@ pub fn build(b: *std.Build) void {
     // pushes its own to a quorum (`keyring_shard.zig`).
     js_mod.addImport("rove-crypt", crypt_mod);
     js_mod.addImport("rove-reserved", reserved_mod);
+    js_mod.addImport("rove-sizing", sizing_mod);
     js_mod.addImport("rove-guards", guards_mod);
     js_mod.addImport("rove-binding", binding_mod);
     js_mod.addImport("metrics-server", metrics_server_mod);
@@ -1219,6 +1252,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     raftnet_mod.link_libc = true;
+    // RECV_BUF_SIZE is the head of the sizing chain, not a local knob: every
+    // producer-side budget is derived from it (`rove-sizing`).
+    raftnet_mod.addImport("rove-sizing", sizing_mod);
 
     const v2_smoke_mod = b.createModule(.{
         .root_source_file = b.path("src/consensus/v2_raft_smoke.zig"),
@@ -1272,6 +1308,7 @@ pub fn build(b: *std.Build) void {
     // requirement for the Phase-2 seam.
     v2_node_mod.addImport("kvlimbs", kv_mod);
     v2_node_mod.addImport("raft-net", raftnet_mod);
+    v2_node_mod.addImport("rove-sizing", sizing_mod);
     const v2_node_test = b.addTest(.{ .root_module = v2_node_mod });
 
     // ── V2 Phase 6 — hibernation / active-set pump-cost microbench ─────
@@ -1318,6 +1355,7 @@ pub fn build(b: *std.Build) void {
     // transport.zig pulls MicrosHistogram from the kvlimbs facade; needed once
     // a test instantiates the Transport struct (not just the wire codec).
     v2_transport_mod.addImport("kvlimbs", kv_mod);
+    v2_transport_mod.addImport("rove-sizing", sizing_mod);
     const v2_transport_test = b.addTest(.{ .root_module = v2_transport_mod });
     const run_v2_transport_test = b.addRunArtifact(v2_transport_test);
     v2_test_step.dependOn(&run_v2_transport_test.step);
@@ -1341,6 +1379,7 @@ pub fn build(b: *std.Build) void {
     v2_bridge_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     v2_bridge_mod.addImport("kvlimbs", kv_mod);
     v2_bridge_mod.addImport("raft-net", raftnet_mod);
+    v2_bridge_mod.addImport("rove-sizing", sizing_mod);
     const v2_bridge_test = b.addTest(.{ .root_module = v2_bridge_mod });
     const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
     v2_test_step.dependOn(&run_v2_bridge_test.step);

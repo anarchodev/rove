@@ -103,6 +103,7 @@ const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("rove-reserved");
+const sizing = @import("rove-sizing");
 const fetch_engine_mod = @import("fetch_engine.zig");
 const proxy_engine_mod = @import("proxy_engine.zig");
 pub const ProxyResultInbox = proxy_engine_mod.ProxyResultInbox;
@@ -638,6 +639,29 @@ pub const BatchSideEffects = struct {
             .ws = kv_mod.WriteSet.init(allocator),
         });
         return &self.targets.items[self.targets.items.len - 1].ws;
+    }
+
+    /// The bytes these side envelopes will put on the batch's raft entry:
+    /// each present envelope's own framing plus its encoded writeset, exactly
+    /// as `proposeBatch` will encode them.
+    ///
+    /// They are appended at PROPOSE time, so without this the batch's
+    /// accounting is blind to bytes it is about to add — admission cannot
+    /// reserve for them and attribution can name the wrong activation when an
+    /// entry is refused. The dispatch walk charges the delta to whichever
+    /// activation produced it.
+    pub fn wireBytes(self: *const BatchSideEffects) usize {
+        var n: usize = 0;
+        if (self.root_ws) |*rw| {
+            if (rw.ops.items.len > 0)
+                n += sizing.MULTI_INNER_HDR_BYTES + sizing.rootEnvelopeBytes(rw.encodedSize());
+        }
+        for (self.targets.items) |*t| {
+            if (t.ws.ops.items.len == 0) continue;
+            n += sizing.MULTI_INNER_HDR_BYTES +
+                sizing.writeSetEnvelopeBytes(t.id.len, t.ws.encodedSize(), 0);
+        }
+        return n;
     }
 
     /// True iff nothing was accumulated this tick (so `finalizeBatch`

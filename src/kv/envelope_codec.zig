@@ -19,6 +19,7 @@
 //! under the same caps by construction.
 
 const std = @import("std");
+const sizing = @import("rove-sizing");
 
 /// Max length of an envelope `id` (the tenant store id string). The
 /// 2-byte big-endian length field caps it at 65535 regardless; this is
@@ -226,4 +227,33 @@ test "multi wrapper round-trips inner envelopes in order" {
     const d0 = try decodeEnvelope(inner[0]);
     try std.testing.expectEqualStrings("t0", d0.id);
     try std.testing.expectEqualStrings("first", d0.payload);
+}
+
+test "the envelope shapes are the sizing chain's arithmetic" {
+    // Batch admission, attribution and `Bridge.propose` all measure "bytes on
+    // the wire" through `rove-sizing`; this file is what writes them. A
+    // header field added here without moving that arithmetic is a byte the
+    // deciding layer cannot see, which is how a reserve and a limit drift
+    // apart without any test noticing.
+    const a = std.testing.allocator;
+
+    const payload = try encodeWriteSetPayload(a, "WSBYTES", "RS");
+    defer a.free(payload);
+    try std.testing.expectEqual(sizing.WS_PAYLOAD_HDR_BYTES + 7 + 2, payload.len);
+
+    const env = try encodeEnvelope(a, ENVELOPE_TYPE_WRITESET, "tenant-1", payload);
+    defer a.free(env);
+    try std.testing.expectEqual(
+        sizing.writeSetEnvelopeBytes("tenant-1".len, 7, 2),
+        env.len,
+    );
+
+    const root = try encodeEnvelope(a, 2, "", "WSBYTES"); // type-2: root writeset
+    defer a.free(root);
+    try std.testing.expectEqual(sizing.rootEnvelopeBytes(7), root.len);
+
+    const inners = [_][]const u8{ env, root };
+    const multi = try encodeMulti(a, &inners);
+    defer a.free(multi);
+    try std.testing.expectEqual(sizing.entryBytes(2, env.len + root.len), multi.len);
 }
