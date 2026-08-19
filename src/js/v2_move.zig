@@ -61,6 +61,7 @@ const wire = @import("rove-wire");
 /// move secret as the rest of this family.
 const keyring_shard = @import("keyring_shard.zig");
 const crypt = @import("rove-crypt");
+const keyring_bind = @import("keyring_bind.zig");
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = wire.TENANT;
@@ -523,6 +524,33 @@ fn handleAttach(
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 
+/// Destroy this tenant's keyring — the C1 shred.
+///
+/// Removes the tenant's whole keyring directory, so every key at both
+/// levels goes at once and every byte sealed under any of them becomes
+/// permanently unreadable. That is the point: it is what turns "we
+/// deleted your account" into an erasure that survives the copies the
+/// object sweep cannot reach, and the backups it never sees.
+///
+/// A node with no keyring for this tenant is not an error — it may never
+/// have had one, or a retry may already have done this. Deprovision is
+/// idempotent everywhere else and this is no exception.
+fn shredTenantKeyring(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8) !void {
+    const kek = worker.keyring_kek orelse return;
+    const data_dir = worker.data_dir orelse return;
+
+    const dir = try keyring_bind.keyringDir(allocator, data_dir);
+    defer allocator.free(dir);
+
+    var kr = crypt.keyring.Keyring.open(allocator, dir, tenant, kek) catch |err| switch (err) {
+        error.NoKeyring => return,
+        else => return err,
+    };
+    defer kr.deinit();
+    try kr.destroyAll();
+    std.log.info("v2-evict {s}: keyring destroyed (C1 shred)", .{tenant});
+}
+
 /// Create this tenant's keyring from the birth secret.
 ///
 /// Idempotent: a re-delivered attach finds the keyring already there and
@@ -547,10 +575,33 @@ fn createKeyringAtBirth(
     defer allocator.free(dir);
 
     var kr = crypt.keyring.Keyring.create(allocator, dir, tenant, kek, secret) catch |err| switch (err) {
-        error.KeyringExists => return,
+        // Already there. Idempotent ONLY if it is the same keyring: a
+        // redelivered attach carries the same secret, but a keyring left
+        // behind by a previous tenant of this NAME carries a different
+        // one. Adopting that silently is the worst outcome available —
+        // nodes that kept the leftover would key the tenant one way and
+        // nodes that did not would key it another, so a binding written
+        // on one node would not resolve on the next. That is a
+        // correctness fault, not a leak, and it surfaces long after the
+        // provision that caused it.
+        error.KeyringExists => return verifySecretMatches(allocator, dir, tenant, kek, secret),
         else => return err,
     };
     kr.deinit();
+}
+
+/// Confirm an existing keyring belongs to THIS tenant lifetime.
+fn verifySecretMatches(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    tenant: []const u8,
+    kek: []const u8,
+    secret: [32]u8,
+) !void {
+    var kr = try crypt.keyring.Keyring.open(allocator, dir, tenant, kek);
+    defer kr.deinit();
+    if (!std.crypto.timing_safe.eql([32]u8, kr.tenantSecret().*, secret))
+        return error.KeyringSecretMismatch;
 }
 
 // ── v2-evict: destroy the source group + drop the instance ────────────
@@ -575,6 +626,25 @@ fn handleEvict(
         worker.raft.destroyGroup(gid) catch
             return reply(server, allocator, ent, sid, sess, 500, "group destroy failed\n");
     }
+    // The tenant-level (C1) shred, and ONLY when this eviction ends the
+    // tenant's lifetime. A move's source cleanup evicts the very same way
+    // while the tenant carries on serving elsewhere, so destroying its
+    // keys here would strand every byte they sealed — on the cluster that
+    // is about to take over.
+    //
+    // Before the slot is dropped, because the keyring lives on the slot.
+    // Before the CP's object sweep too (that runs after eviction), which
+    // is the useful order: anything the sweep cannot reach is already
+    // unreadable rather than merely scheduled for deletion.
+    if (parseShred(body)) shredTenantKeyring(worker, allocator, tenant) catch |err|
+        // Loud, and NOT fatal to the eviction. The tenant still has to
+        // come down; a keyring that outlives it is a bounded, fixable
+        // problem, while refusing the teardown leaves it routable.
+        std.log.err(
+            "v2-evict {s}: keyring shred FAILED: {s} — key material may survive this tenant",
+            .{ tenant, @errorName(err) },
+        );
+
     // Drop the cached bundle BEFORE the instance goes: the slot is keyed by
     // tenant name, so a name reused later would otherwise be served the
     // previous tenant's code from memory, never reaching storage (#357).
@@ -958,6 +1028,29 @@ fn parseTenant(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
     defer parsed.deinit();
     if (parsed.value.tenant.len == 0) return null;
     return allocator.dupe(u8, parsed.value.tenant) catch null;
+}
+
+/// Does this eviction end the tenant's LIFETIME, or just its residence
+/// on this cluster?
+///
+/// `v2-evict` serves both: a deprovision tears the tenant down for good,
+/// and a move's source cleanup hands it to another cluster that is about
+/// to serve the same data. Only the first may destroy key material.
+///
+/// Absent defaults to FALSE, and the asymmetry is the whole point. A
+/// caller that forgets the flag leaves a keyring behind — untidy, and
+/// removable later. A default of true would shred a live tenant's keys
+/// on a routine move, which is unrecoverable and looks exactly like data
+/// loss because it is.
+fn parseShred(body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(
+        struct { shred: bool = false },
+        std.heap.page_allocator,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return false;
+    defer parsed.deinit();
+    return parsed.value.shred;
 }
 
 /// Read a single query-string value (`?a=b&c=d`) by key. Values are
