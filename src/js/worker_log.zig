@@ -235,6 +235,26 @@ pub fn captureTapes(
         ch.out.* = bytes;
     }
 
+    // The kv budget dropped some values on this activation. Say so once, with
+    // figures: the record's `elided` entries are the durable half, but an
+    // operator watching `tape_kv_elided_total` climb needs the tenant-facing
+    // shape (a handler reading broadly) and this is where it is visible.
+    if (readset.kv.elided_reads > 0) {
+        std.log.warn(
+            "rove-js kv tape budget: {d} read(s) elided ({d} bytes) — this record " ++
+                "cannot be replayed against them; the activation read past the " ++
+                "per-activation kv budget ({d} bytes)",
+            .{ readset.kv.elided_reads, readset.kv.elided_bytes, tape_mod.KV_TAPE_BUDGET },
+        );
+        // The counter lives on the worker's Node; test harnesses pass a minimal
+        // `.{ .allocator }` stand-in, so reach for it only when it is there.
+        const W = @TypeOf(worker);
+        const T = if (@typeInfo(W) == .pointer) @typeInfo(W).pointer.child else W;
+        if (@hasField(T, "node")) {
+            _ = worker.node.tape_kv_elided.fetchAdd(readset.kv.elided_reads, .monotonic);
+        }
+    }
+
     // Request body — captured into the log record so the replay
     // shell's `request.body` is non-empty for POST / PUT requests.
     // Bodies ≤ `REQUEST_BODY_CAP` (16 KB) ride inline; larger bodies

@@ -575,6 +575,25 @@ handler run wearing the same request id, and the #214 shape again (rove#199).
 An over-the-cap WS frame stays unretained-with-length: too big for the entry,
 and a WS activation owns no durability park to spill through.
 
+**kv values are the carve-out: a budget and a refusal, not a reference.**
+Values are not content-addressed, so there is no hash to point at — nothing to
+reference and nothing for a reader to resolve. They get the other half of the
+discipline instead: a per-activation ceiling (`tape.KV_TAPE_BUDGET`, half a
+raft frame) past which a read's VALUE is dropped and its key kept, recorded as
+`KvOutcome.elided` carrying the lost byte count. Every reader REFUSES such a
+read — the offline host records a divergence rather than answering — because
+the closed world's miss rule (absent ⇒ `not_found`) is precisely the wrong
+answer when the live run read real data. A `kv.prefix` page elides whole: a
+partial page would replay as a complete, shorter one.
+
+The ceiling is not a cost control. The kv tape rides the raft entry, and the
+coalesced transport tears a peer connection down above the receiver's fixed
+recv buffer (`raft_net.RECV_BUF_SIZE`, 512 KiB), so an uncapped broad read in a
+WRITING activation proposed an entry no follower could receive — three 300 KB
+values were enough, and the write returned `503 raft commit failed`. The write
+side of that same ceiling is guarded by the same number from the other
+direction: `KV_VAL_MAX` is 384 KiB — under one frame, not over it — and an
+activation's writes carry a budget of their own (rove#646).
 **Consequence to keep in view.** Every reference written is a bet that the
 bytes outlive the record pointing at them. `_pool/` has no reaper (#304), so
 today the bet holds by accident rather than by design; when eviction lands, the

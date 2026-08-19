@@ -147,16 +147,36 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // code) → the world's `kv_refusals`, so replay throws the recorded
     // verdict instead of re-deciding the rules (outcome-replay).
     var refusals = std.ArrayList(struct { op: []const u8, key: []const u8, code: []const u8 }){};
+    // Reads the capture's kv budget dropped (`KvOutcome.elided`) → the world's
+    // `kv_elided`, which replay REFUSES. Omitting them instead would leave the
+    // key absent from the map, and a closed-world miss answers `not_found` —
+    // a plausible value where the live run read real data.
+    var elided = std.ArrayList(struct { op: []const u8, key: []const u8, bytes: u64 }){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
             if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
             try seen.put(a, e.key, {});
             switch (e.outcome) {
                 .ok => try kv.append(a, .{ .key = e.key, .value = e.value }),
+                .elided => try elided.append(a, .{
+                    .op = "get",
+                    .key = e.key,
+                    .bytes = std.fmt.parseInt(u64, e.value, 10) catch 0,
+                }),
                 .not_found, .err, .refused => {}, // omit — closed world resolves to not_found
             }
         },
         .prefix => {
+            // An elided page carries no rows by construction (all-or-nothing:
+            // a partial page would replay as a complete, shorter one).
+            if (e.outcome == .elided) {
+                try elided.append(a, .{
+                    .op = "prefix",
+                    .key = e.key,
+                    .bytes = std.fmt.parseInt(u64, e.value, 10) catch 0,
+                });
+                continue;
+            }
             for (e.results) |row| {
                 if (seen.contains(row.key)) continue;
                 try seen.put(a, row.key, {});
@@ -450,6 +470,18 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         }
         try w.writeAll("\n  ]");
     }
+    if (elided.items.len != 0) {
+        try w.writeAll(",\n  \"kv_elided\": [");
+        for (elided.items, 0..) |e, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.writeAll("\n    { \"op\": ");
+            try jsonStr(w, e.op);
+            try w.writeAll(", \"key\": ");
+            try jsonStr(w, e.key);
+            try w.print(", \"bytes\": {d} }}", .{e.bytes});
+        }
+        try w.writeAll("\n  ]");
+    }
     // The recorded status becomes an `expected` assertion — replay verifies the
     // re-run reproduces it.
     if (recorded) |r| {
@@ -633,6 +665,27 @@ fn b64KvTape(a: std.mem.Allocator, entries: []const decode.KvEntry) ![]const u8 
         try ent.append(a, @intFromEnum(e.op));
         try ent.append(a, @intFromEnum(e.outcome));
         try putLen(&ent, a, e.key);
+        if (e.op == .prefix) {
+            // [cursor][limit u32][count u32][rows…][value] — `value` trails
+            // the rows on a prefix entry (v9), carrying an elided page's lost
+            // row bytes.
+            try putLen(&ent, a, "");
+            var n: [4]u8 = undefined;
+            std.mem.writeInt(u32, &n, 0, .big); // limit
+            try ent.appendSlice(a, &n);
+            std.mem.writeInt(u32, &n, @intCast(e.results.len), .big);
+            try ent.appendSlice(a, &n);
+            for (e.results) |row| {
+                try putLen(&ent, a, row.key);
+                try putLen(&ent, a, row.value);
+            }
+            try putLen(&ent, a, e.value);
+            var l2: [4]u8 = undefined;
+            std.mem.writeInt(u32, &l2, @intCast(ent.items.len), .big);
+            try buf.appendSlice(a, &l2);
+            try buf.appendSlice(a, ent.items);
+            continue;
+        }
         try putLen(&ent, a, e.value);
         var l: [4]u8 = undefined;
         std.mem.writeInt(u32, &l, @intCast(ent.items.len), .big);
@@ -649,6 +702,49 @@ fn putLen(buf: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
     std.mem.writeInt(u32, &l, @intCast(s.len), .big);
     try buf.appendSlice(a, &l);
     try buf.appendSlice(a, s);
+}
+
+test "transcode: an elided read becomes a refusal, not an absent key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The capture resolved both reads; the budget dropped their values. If the
+    // transcode simply omitted them, the closed world would answer `not_found`
+    // — a plausible absence where the live run read 900 KB of real data.
+    const kv_b64 = try b64KvTape(a, &.{
+        .{ .op = .get, .outcome = .ok, .key = "user/jess", .value = "{\"n\":1}" },
+        .{ .op = .get, .outcome = .elided, .key = "big/blob", .value = "900000" },
+        .{ .op = .prefix, .outcome = .elided, .key = "feed/", .value = "400000" },
+    });
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"inbound",
+        \\   "request": {{ "method":"GET", "path":"/x", "host":"h" }},
+        \\   "seed":"42", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "kv_b64":"{s}" }}, "sources":[] }}
+    , .{kv_b64});
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try transcode(a, fixture, &out);
+
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const wo = wp.value.object;
+    // The kept read still lands in the map…
+    try testing.expectEqualStrings("{\"n\":1}", wo.get("kv").?.object.get("user/jess").?.string);
+    // …and neither elided read does.
+    try testing.expect(wo.get("kv").?.object.get("big/blob") == null);
+    const el = wo.get("kv_elided").?.array.items;
+    try testing.expectEqual(@as(usize, 2), el.len);
+    try testing.expectEqualStrings("get", el[0].object.get("op").?.string);
+    try testing.expectEqualStrings("big/blob", el[0].object.get("key").?.string);
+    try testing.expectEqual(@as(i64, 900000), el[0].object.get("bytes").?.integer);
+    try testing.expectEqualStrings("prefix", el[1].object.get("op").?.string);
+    try testing.expectEqualStrings("feed/", el[1].object.get("key").?.string);
+
+    // And the world parses back with the refusals attached.
+    const w = try world.fromValue(a, wp.value);
+    try testing.expectEqual(@as(usize, 2), w.kv_elided.len);
 }
 
 test "transcode: kv reads → closed-world map; not-found is omitted" {

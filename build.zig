@@ -1679,6 +1679,18 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_refusals = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_refusals.addArg("refusals");
     driver_smoke_step.dependOn(&driver_smoke_refusals.step);
+    // `elided`: the kv budget's read side (rove#430 §3) — a record whose read
+    // the budget dropped REFUSES the run instead of answering `not_found`.
+    const driver_smoke_elided = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_elided.addArg("elided");
+    driver_smoke_step.dependOn(&driver_smoke_elided.step);
+    // This ONE scenario hangs off the gate. The rest of `replay-driver-smoke`
+    // cannot yet: its `cronpkg` scenario is red on main (`@rewind/schedule`
+    // does not resolve in the fixture sources), which is itself the cost of a
+    // test artifact no gate runs — rove#647 fixes that and wires the whole
+    // step in. Wiring this one in now keeps the budget's refusal from rotting
+    // the same way.
+    test_step.dependOn(&driver_smoke_elided.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session

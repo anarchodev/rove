@@ -137,7 +137,12 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// NOT an appended field: it sits mid-entry, so everything after it shifts and
 /// an older tape read at the new width mis-slices instead of failing. The
 /// offline reader's floor moves with it (`tape_decode.MIN_VERSION`).
-pub const VERSION: u16 = 8;
+/// v8 → v9: `KvOutcome` gained `elided` — a read whose value the activation's
+/// kv budget (`KV_TAPE_BUDGET`) dropped, `value` = the lost byte count. Same
+/// entry width, new byte value, so the bump exists to make a stale reader
+/// reject loudly rather than misread an elided read as an ordinary one (the
+/// same posture as the v6 → v7 `refused` bump).
+pub const VERSION: u16 = 9;
 
 /// Wire width of a `BodyRef`: stamp(8) + digest(16) + offset(4) + len(4).
 /// Lockstep-asserted against the offline decoder above.
@@ -186,7 +191,7 @@ fn readBodyRef(bytes: []const u8, cur: *usize) ParseError!bodies_mod.BodyRef {
 /// the wrong-magic check at the decoder.
 pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// Whole-Readset wire version. The header carries the `timestamp_ns`
-/// + `seed` + `js_engine_version` scalars, then the 5 channel blobs in
+/// + `seed` + `js_engine_version` scalars, then the 6 channel blobs in
 /// fixed order, then a trailing `[u32 log_header_len][log_header_bytes]`
 /// section so any node can rebuild the customer LogRecord from the raft
 /// entry alone — including the request's `received_ns`, so a rebuilt record
@@ -295,7 +300,56 @@ pub const KvOutcome = enum(u8) {
     /// manufacture a false divergence. Refusals fold nothing into the
     /// interaction digest, in any engine: a refused write never happened.
     refused = 3,
+    /// The read SUCCEEDED live, and its value was left off the tape because
+    /// the activation's kv budget (`KV_TAPE_BUDGET`) was already spent. The
+    /// entry's `value` carries the elided byte count in decimal ASCII — the
+    /// same "carry a scalar in `value`" shape `refused` uses for its code —
+    /// so the record says how much was lost rather than implying nothing was
+    /// read.
+    ///
+    /// Every reader must REFUSE such a read rather than resolve it. An elided
+    /// `get` is not `not_found`, and an elided `prefix` page is not an empty
+    /// page: serving either would hand the handler a plausible value where the
+    /// live run saw real data, which is the failure this whole discipline
+    /// exists to prevent (`docs/decisions.md`, out-of-line references — every
+    /// fate a writer can choose is one some reader can resolve, and this one
+    /// resolves to a refusal).
+    elided = 4,
 };
+
+/// Per-activation ceiling on the kv channel's owned bytes. Past it a read's
+/// VALUE is dropped from the tape (`KvOutcome.elided`) while its key stays,
+/// so the record still names every read the handler made.
+///
+/// This is a budget, not an accounting line, because the kv tape rides the
+/// RAFT ENTRY: the readset is serialized into the type-0 envelope, and the
+/// coalesced transport tears a peer connection down when one message exceeds
+/// the receiver's fixed recv buffer (`src/kv/raft_net.zig` `RECV_BUF_SIZE`,
+/// 512 KiB; the frame ceiling is ~524,280 bytes). Uncapped, a handler that
+/// read broadly and then wrote proposed an entry no follower could receive —
+/// three 300 KB values read in one writing activation is enough — and the
+/// write failed with a torn-down replication link rather than anything the
+/// handler could see. A single `kv.prefix` page (up to `KV_PREFIX_MAX` rows)
+/// can reach that on its own.
+///
+/// Half the frame, leaving the other half for the same entry's writeset, the
+/// other readset channels, and the envelope framing. Set as high as that
+/// allows on purpose: everything above it becomes a record that cannot be
+/// replayed against those reads, so the budget should bite the activation
+/// that would otherwise break replication, not the one that merely reads a
+/// lot. An ordinary activation — hundreds of rows, or one document-sized
+/// value — is nowhere near it.
+///
+/// The ENTRY as a whole still has no guard: a writeset alone can exceed the
+/// frame (`kv.set` accepts values up to `reserved.KV_VAL_MAX`, 1 MiB, which
+/// is larger than a frame), which is the write-side half of the same ceiling
+/// and a separate fix.
+///
+/// There is no cap on the NUMBER of entries: dropping a read outright would
+/// make it indistinguishable from a read that never happened, which replays
+/// as fiction. So the budget elides values and keeps keys, and the residual
+/// growth (one key per read) is bounded by the activation's CPU budget.
+pub const KV_TAPE_BUDGET: usize = 256 * 1024;
 
 pub const KvOp = enum(u8) {
     get = 0,
@@ -371,8 +425,9 @@ pub const Entry = union(Channel) {
         key: []const u8,
         /// For `.get .ok` this is the value read; for `.set` it is the
         /// value written; for `.delete` + `.not_found` + `.err` it is
-        /// empty. For `.prefix`: empty (the input cursor is in `cursor`,
-        /// the rows are in `results`).
+        /// empty. On any `.elided` entry it is the LOST byte count in
+        /// decimal ASCII. For an ordinary `.prefix`: empty (the input
+        /// cursor is in `cursor`, the rows are in `results`).
         value: []const u8,
         /// `.prefix` only: the input cursor (empty for the first page).
         cursor: []const u8 = "",
@@ -553,10 +608,17 @@ pub const Tape = struct {
     channel: Channel,
     entries: std.ArrayList(Entry),
     /// Running total of heap bytes the tape has allocated for owned
-    /// slices inside entries. Lets the worker enforce a per-request
-    /// tape budget so a pathological handler can't OOM the process by
-    /// doing `kv.get(hugekey)` in a loop.
+    /// slices inside entries. On the kv channel this is a BUDGET, not
+    /// just accounting: `KV_TAPE_BUDGET` is what stops a broad read from
+    /// proposing a raft entry no follower can receive.
     owned_bytes: usize = 0,
+    /// Reads whose value the budget dropped (`KvOutcome.elided`), and the
+    /// bytes they would have added. In-memory only — the per-entry
+    /// `elided` outcome is the durable record; these exist so the capture
+    /// site can say, once per activation, that a record is not fully
+    /// replayable.
+    elided_reads: u32 = 0,
+    elided_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, channel: Channel) Tape {
         return .{
@@ -574,6 +636,8 @@ pub const Tape = struct {
         for (self.entries.items) |*e| freeEntry(self.allocator, e);
         self.entries.clearRetainingCapacity();
         self.owned_bytes = 0;
+        self.elided_reads = 0;
+        self.elided_bytes = 0;
     }
 
     pub fn deinit(self: *Tape) void {
@@ -594,17 +658,33 @@ pub const Tape = struct {
     ) !void {
         std.debug.assert(self.channel == .kv);
         std.debug.assert(op != .prefix);
+        // Over the budget the VALUE goes, the key stays: the record must keep
+        // naming every read the handler made (a dropped entry is a read that
+        // replays as never-happened), and only the value is unbounded.
+        var len_buf: [20]u8 = undefined;
+        var eff_value = value;
+        var eff_outcome = outcome;
+        if (op == .get and outcome == .ok and value.len > 0 and
+            self.owned_bytes + key.len + value.len > KV_TAPE_BUDGET)
+        {
+            eff_outcome = .elided;
+            eff_value = std.fmt.bufPrint(&len_buf, "{d}", .{value.len}) catch "0";
+        }
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
-        const val_copy = try self.allocator.dupe(u8, value);
+        const val_copy = try self.allocator.dupe(u8, eff_value);
         errdefer self.allocator.free(val_copy);
         try self.entries.append(self.allocator, .{ .kv = .{
             .op = op,
             .key = key_copy,
             .value = val_copy,
-            .outcome = outcome,
+            .outcome = eff_outcome,
         } });
         self.owned_bytes += key_copy.len + val_copy.len;
+        if (eff_outcome == .elided) {
+            self.elided_reads += 1;
+            self.elided_bytes += value.len;
+        }
     }
 
     /// Append a `kv.prefix(prefix, cursor, limit)` scan capture. Dups
@@ -619,6 +699,24 @@ pub const Tape = struct {
         outcome: KvOutcome,
     ) !void {
         std.debug.assert(self.channel == .kv);
+
+        // A page is all-or-nothing. Keeping the rows that fit would record a
+        // SHORTER page than the handler saw, and replay reconstructs a scan
+        // from the rows it has — so a partial page replays as a complete one
+        // with different contents, which is worse than refusing.
+        var page_bytes: usize = prefix.len + cursor.len;
+        for (results) |row| page_bytes += row.key.len + row.value.len;
+        if (outcome == .ok and results.len > 0 and
+            self.owned_bytes + page_bytes > KV_TAPE_BUDGET)
+        {
+            var lost_buf: [20]u8 = undefined;
+            const row_bytes = page_bytes - prefix.len - cursor.len;
+            const lost = std.fmt.bufPrint(&lost_buf, "{d}", .{row_bytes}) catch "0";
+            try self.appendKvPrefixElided(prefix, cursor, limit, lost);
+            self.elided_reads += 1;
+            self.elided_bytes += row_bytes;
+            return;
+        }
 
         const prefix_copy = try self.allocator.dupe(u8, prefix);
         errdefer self.allocator.free(prefix_copy);
@@ -658,6 +756,36 @@ pub const Tape = struct {
             .results = results_slab,
         } });
         self.owned_bytes += owned_added;
+    }
+
+    /// Record a scan whose rows the budget dropped: the inputs
+    /// (prefix/cursor/limit) survive so a reader knows exactly which scan it
+    /// must refuse, `value` carries the lost row bytes, and `results` is
+    /// empty — which is why the outcome must be `.elided` and never `.ok`
+    /// (an `.ok` page with no rows is a scan that legitimately found nothing).
+    fn appendKvPrefixElided(
+        self: *Tape,
+        prefix: []const u8,
+        cursor: []const u8,
+        limit: u32,
+        lost_bytes_decimal: []const u8,
+    ) !void {
+        const prefix_copy = try self.allocator.dupe(u8, prefix);
+        errdefer self.allocator.free(prefix_copy);
+        const cursor_copy = try self.allocator.dupe(u8, cursor);
+        errdefer self.allocator.free(cursor_copy);
+        const lost_copy = try self.allocator.dupe(u8, lost_bytes_decimal);
+        errdefer self.allocator.free(lost_copy);
+        try self.entries.append(self.allocator, .{ .kv = .{
+            .op = .prefix,
+            .outcome = .elided,
+            .key = prefix_copy,
+            .value = lost_copy,
+            .cursor = cursor_copy,
+            .limit = limit,
+            .results = &.{},
+        } });
+        self.owned_bytes += prefix_copy.len + cursor_copy.len + lost_copy.len;
     }
 
     pub fn appendModule(
@@ -1473,6 +1601,11 @@ fn encodeEntry(
                     try appendLenPrefixed(allocator, buf, p.key);
                     try appendLenPrefixed(allocator, buf, p.value);
                 }
+                // v9 trailing field: `value` on a prefix entry, which carries
+                // the lost row bytes of an ELIDED page and is empty otherwise.
+                // Appended LAST so the older layout is a strict prefix of this
+                // one, the same shape the v6 content-hash bump used.
+                try appendLenPrefixed(allocator, buf, k.value);
             } else {
                 try appendLenPrefixed(allocator, buf, k.value);
             }
@@ -1554,11 +1687,16 @@ fn decodeEntry(
                     p.key = try readLenPrefixed(bytes, &cur);
                     p.value = try readLenPrefixed(bytes, &cur);
                 }
+                // v9 trailing field — the elided page's lost row bytes.
+                const page_value: []const u8 = if (cur < bytes.len)
+                    try readLenPrefixed(bytes, &cur)
+                else
+                    "";
                 return .{ .kv = .{
                     .op = .prefix,
                     .outcome = outcome,
                     .key = key,
-                    .value = "",
+                    .value = page_value,
                     .cursor = cursor,
                     .limit = limit,
                     .results = slab,
@@ -2113,6 +2251,95 @@ test "readset: the activation channel rides the raft wire" {
     try testing.expectEqual(@as(usize, 1), parsed.entries.len);
     try testing.expectEqualStrings("onFired", parsed.entries[0].activation.export_name);
     try testing.expectEqualStrings("[]", parsed.entries[0].activation.inline_bytes);
+}
+
+test "kv budget: a value over the ceiling elides, and the key survives" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .kv);
+    defer tape.deinit();
+
+    const big = try a.alloc(u8, KV_TAPE_BUDGET + 1);
+    defer a.free(big);
+    @memset(big, 'v');
+
+    // Under the budget: the value rides.
+    try tape.appendKv(.get, "small", "hello", .ok);
+    // Over it: the read is still NAMED — dropping the entry would make it
+    // indistinguishable from a read that never happened — but the value is
+    // replaced by its length.
+    try tape.appendKv(.get, "huge", big, .ok);
+
+    try testing.expectEqual(@as(usize, 2), tape.entries.items.len);
+    const kept = tape.entries.items[0].kv;
+    try testing.expectEqual(KvOutcome.ok, kept.outcome);
+    try testing.expectEqualStrings("hello", kept.value);
+
+    const cut = tape.entries.items[1].kv;
+    try testing.expectEqual(KvOutcome.elided, cut.outcome);
+    try testing.expectEqualStrings("huge", cut.key);
+    // The value carries the LOST LENGTH, so a reader can say what it lost.
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d}", .{big.len}), cut.value);
+    try testing.expectEqual(@as(u32, 1), tape.elided_reads);
+    try testing.expectEqual(big.len, tape.elided_bytes);
+
+    // The whole point: the channel stays small enough to ride a raft entry.
+    try testing.expect(tape.owned_bytes < KV_TAPE_BUDGET);
+}
+
+test "kv budget: a prefix page is all-or-nothing" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .kv);
+    defer tape.deinit();
+
+    const row_value = try a.alloc(u8, KV_TAPE_BUDGET / 3);
+    defer a.free(row_value);
+    @memset(row_value, 'r');
+    const rows = [_]KvPair{
+        .{ .key = "p/1", .value = row_value },
+        .{ .key = "p/2", .value = row_value },
+        .{ .key = "p/3", .value = row_value },
+        .{ .key = "p/4", .value = row_value },
+    };
+
+    try tape.appendKvPrefix("p/", "", 100, &rows, .ok);
+
+    // Keeping the rows that fit would record a SHORTER page than the handler
+    // saw, and replay rebuilds a scan from the rows it has — so the short page
+    // would replay as a complete one.
+    try testing.expectEqual(@as(usize, 1), tape.entries.items.len);
+    const e = tape.entries.items[0].kv;
+    try testing.expectEqual(KvOp.prefix, e.op);
+    try testing.expectEqual(KvOutcome.elided, e.outcome);
+    try testing.expectEqual(@as(usize, 0), e.results.len);
+    // The inputs survive, so a reader knows exactly which scan to refuse.
+    try testing.expectEqualStrings("p/", e.key);
+    try testing.expectEqual(@as(u32, 100), e.limit);
+    try testing.expectEqual(@as(u32, 1), tape.elided_reads);
+
+    // And it round-trips as an elided page rather than an empty scan.
+    const bytes = try tape.serialize(a);
+    defer a.free(bytes);
+    var parsed = try parse(a, bytes);
+    defer parsed.deinit();
+    try testing.expectEqual(KvOutcome.elided, parsed.entries[0].kv.outcome);
+    try testing.expectEqual(@as(usize, 0), parsed.entries[0].kv.results.len);
+}
+
+test "kv budget: an ordinary activation is untouched" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .kv);
+    defer tape.deinit();
+
+    // 200 rows of 256 bytes — a busy handler, nowhere near the ceiling.
+    const value = "v" ** 256;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        try tape.appendKv(.get, try std.fmt.bufPrint(&kb, "row/{d}", .{i}), value, .ok);
+    }
+    try testing.expectEqual(@as(u32, 0), tape.elided_reads);
+    for (tape.entries.items) |e| try testing.expectEqual(KvOutcome.ok, e.kv.outcome);
 }
 
 test "request_reads tape: all kinds roundtrip" {

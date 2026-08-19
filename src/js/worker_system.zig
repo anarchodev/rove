@@ -471,8 +471,14 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
             \\# HELP kv_cap_refusals_total write batches refused at the plan KV cap (tenant/figures in the paired kv-cap log line).
             \\# TYPE kv_cap_refusals_total counter
             \\kv_cap_refusals_total {d}
+            \\# HELP tape_kv_elided_total kv reads whose value the per-activation tape budget dropped; those records cannot be replayed against those reads (figures in the paired warn log line).
+            \\# TYPE tape_kv_elided_total counter
+            \\tape_kv_elided_total {d}
             \\
-        , .{worker.node.kv_cap_refusals.load(.monotonic)});
+        , .{
+            worker.node.kv_cap_refusals.load(.monotonic),
+            worker.node.tape_kv_elided.load(.monotonic),
+        });
     }
 
     // ── the wire-limit backstop ─────────────────────────────────────────

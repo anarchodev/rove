@@ -248,6 +248,47 @@ fn runRefusals(a: std.mem.Allocator) !void {
     std.debug.print("REFUSALS OK — captured replay throws the tape's verdicts and re-decides nothing\n", .{});
 }
 
+/// The kv budget's read side (rove#430 §3): a captured world whose record
+/// says a read's value was ELIDED must refuse the run, not answer it. The
+/// closed world's miss rule would say `not_found` — a plausible absence where
+/// the live handler read real data, and exactly the shape (#214) that makes a
+/// replay lie. Both spellings are probed: a `get` and a `prefix` page.
+const ELIDED_HANDLER =
+    \\export default function () {
+    \\  const v = kv.get("big/blob");
+    \\  const page = kv.prefix("feed/", null, 100);
+    \\  return { got: v === null ? "absent" : "value", rows: page.length };
+    \\}
+;
+
+fn runElided(a: std.mem.Allocator) !void {
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"captured\":true,");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    // A row the map DOES hold under the elided prefix: proof that refusing
+    // beats serving the short page the map could reconstruct.
+    try w.writeAll("\"kv\":{\"feed/1\":\"kept\"},");
+    try w.writeAll("\"kv_elided\":[{\"op\":\"get\",\"key\":\"big/blob\",\"bytes\":900000},");
+    try w.writeAll("{\"op\":\"prefix\",\"key\":\"feed/\",\"bytes\":400000}],");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(ELIDED_HANDLER, .{}, w);
+    try w.writeAll("}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("ELIDED: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    check(out.items, &.{
+        "\"divergence\":", "big/blob", "elided", "\"ok\":false",
+    }, &.{"exceeded cpu budget"}, "ELIDED READ (a dropped value refuses the run, never answers it)");
+    std.debug.print("ELIDED OK — an elided read refuses instead of replaying as absent\n", .{});
+}
+
 /// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
 /// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
 /// complete because the GC arena reclaims the dead strings mid-run. Same shape
@@ -329,6 +370,10 @@ pub fn main() !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "refusals")) {
         try runRefusals(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "elided")) {
+        try runElided(a);
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "packages")) {

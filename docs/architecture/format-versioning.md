@@ -101,9 +101,9 @@ Legend — **Ver?**: explicit version field present today. **Tier**: see §2.
 
 | Format | File | Layout | Ver? | Tier |
 |---|---|---|---|---|
-| Per-channel tape | `src/tape/root.zig` `VERSION` | `[u32 MAGIC "RTAP"][u16 ver=7][u16 channel][u32 count][entries…]` (v6: fetch content-hash; v7: kv outcome `refused` — outcome-replay) | **yes (v7, MIN 5)** | A* |
+| Per-channel tape | `src/tape/root.zig` `VERSION` | `[u32 MAGIC "RTAP"][u16 ver=9][u16 channel][u32 count][entries…]` (v6: fetch content-hash; v7: kv outcome `refused` — outcome-replay; v8: content-addressed `BodyRef`; v9: kv outcome `elided` + a trailing `value` on prefix entries — the read budget) | **yes (v9, MIN = v9)** | A* |
 | Readset bundle (whole request) | `src/tape/root.zig` (`READSET_MAGIC`, `Readset.serialize`) | `[u32 "RREA"][u16 ver=11][i64 ts_ns][u64 seed][u16 js_engine_version]·6 channel blobs·LogHeader (carries `received_ns` + `exec_seq`)` | **yes (v11)** | A* |
-| WASM parser mirror | rewind-apps `replay/_static/rtap.mjs` | mirrors **per-tape** blobs only (NOT RREA — see §4 step 3) | tracks tape v7 (`RTAP_VERSION`) | A* |
+| WASM parser mirror | rewind-apps `replay/_static/rtap.mjs` | mirrors **per-tape** blobs only (NOT RREA — see §4 step 3) | tracks the tape version (`RTAP_VERSION`), rejecting any other | A* |
 
 `A*` = log-persisted (tapes ride inline in `LogRecord`) **and** must stay
 in lockstep with the JS-side `rtap.mjs` parser.

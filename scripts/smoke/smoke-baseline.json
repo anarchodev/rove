@@ -319,6 +319,11 @@
     "seconds": 7.2,
     "status": "pass"
   },
+  "kv_tape_budget_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.0,
+    "status": "pass"
+  },
   "leader_failover_smoke_v2.py": {
     "rc": 0,
     "seconds": 2.8,

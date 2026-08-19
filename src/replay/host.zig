@@ -116,6 +116,33 @@ pub fn noteActiveWrite(bytes: usize) void {
     h.write_bytes += bytes;
 }
 
+/// `Host`-side twin of `activeElidedRead` for the responders, which already
+/// hold the host pointer.
+fn elidedFor(h: *Host, op_ch: u8, key: []const u8) ?u64 {
+    if (h.elided.count() == 0) return null;
+    var buf: [300]u8 = undefined;
+    if (key.len + 1 > buf.len) return null;
+    buf[0] = op_ch;
+    @memcpy(buf[1 .. 1 + key.len], key);
+    return h.elided.get(buf[0 .. 1 + key.len]);
+}
+
+/// The byte count the capture elided for this read, if any. `op_ch` is 'g'
+/// (get) / 'p' (prefix). A `prefix` hit matches the whole prefix, not one
+/// page: a scan whose recorded page was dropped cannot be reconstructed from
+/// the map at any cursor, so every scan of it must refuse. Over-broad on
+/// purpose — the wrong direction here is answering, not refusing.
+pub fn activeElidedRead(op_ch: u8, key: []const u8) ?u64 {
+    if (active_vtable != &HOST_VTABLE) return null;
+    const h: *Host = @ptrCast(@alignCast(active_user orelse return null));
+    if (h.elided.count() == 0) return null;
+    var buf: [300]u8 = undefined;
+    if (key.len + 1 > buf.len) return null; // keys are ≤256 by the capture's own rules
+    buf[0] = op_ch;
+    @memcpy(buf[1 .. 1 + key.len], key);
+    return h.elided.get(buf[0 .. 1 + key.len]);
+}
+
 /// Whether the active run host carries a divergence verdict — the interrupt
 /// handler's second trigger (`return poisoned || over_budget`).
 pub fn activePoisoned() bool {
@@ -181,6 +208,12 @@ pub const Host = struct {
     /// refusal CODE. A hit replays the refusal; on a captured world a write
     /// with NO entry succeeded at capture and proceeds unguarded.
     refusals: std.StringHashMapUnmanaged([]const u8) = .{},
+    /// Reads whose values the capture's kv budget dropped
+    /// (`world.KvElided`), keyed `"g"/"p" ++ key` → the lost byte count.
+    /// A hit is a REFUSAL, not an answer: the closed world's miss rule
+    /// (absent ⇒ `not_found`) is exactly the wrong answer here, because the
+    /// live run read real data. The kv binding poisons the run instead.
+    elided: std.StringHashMapUnmanaged(u64) = .{},
 
     pub fn install(self: *Host) void {
         setHost(&HOST_VTABLE, self);
@@ -214,6 +247,22 @@ fn kvGet(
 ) callconv(.c) c_int {
     const h = hostOf(user);
     const k = key[0..@intCast(key_len)];
+    // A read the capture resolved but did not keep. The closed world's miss
+    // rule would answer `not_found`, which is the one answer that is certainly
+    // wrong: the live run read real data here. Record the divergence and let
+    // the interrupt brake the run — the value is unrecoverable, so there is
+    // nothing to serve.
+    if (elidedFor(h, 'g', k)) |lost| {
+        h.setDiv(
+            "kv.get(\"{s}\") — the capture elided this value ({d} bytes over the " ++
+                "activation's kv budget), so this run cannot be replayed against it",
+            .{ k, lost },
+        );
+        out_outcome.* = @intFromEnum(decode.KvOutcome.elided);
+        out_val.* = null;
+        out_val_len.* = 0;
+        return 0;
+    }
     if (h.kv_map.get(k)) |v| {
         out_outcome.* = @intFromEnum(decode.KvOutcome.ok);
         out_val.* = dupC(v, false) orelse return -1;
@@ -284,6 +333,17 @@ fn kvPrefix(
     const h = hostOf(user);
     const p = prefix[0..@intCast(prefix_len)];
     const cur = cursor[0..@intCast(cursor_len)]; // "" = from start; else strictly-greater
+    // A scan whose recorded page the capture's kv budget dropped. The rows are
+    // simply not in the map, so reconstructing the scan would produce a SHORT
+    // page and present it as complete. Refuse the run instead; the empty array
+    // below is only what the braking run unwinds through.
+    if (elidedFor(h, 'p', p)) |lost| {
+        h.setDiv(
+            "kv.prefix(\"{s}\") — the capture elided this page ({d} row bytes over " ++
+                "the activation's kv budget), so this run cannot be replayed against it",
+            .{ p, lost },
+        );
+    }
     // Reconstruct the scan from the closed-world map: keys under the prefix,
     // sorted, strictly after `cursor`, capped at `limit`. The map holds the
     // foreign matches; the handler's own writes are refilled by re-execution
@@ -436,6 +496,54 @@ test "map mode: closed world — a missing key is not_found, never a divergence"
     try testing.expectEqual(@as(c_int, 0), kvGet("absent", 6, &outcome, &val, &vlen, &h));
     try testing.expectEqual(@intFromEnum(decode.KvOutcome.not_found), outcome);
     try testing.expect(h.diverged == null);
+}
+
+test "elided read: refused, never answered as absent" {
+    const a = testing.allocator;
+    var map = std.StringHashMapUnmanaged([]const u8){};
+    defer map.deinit(a);
+    var elided = std.StringHashMapUnmanaged(u64){};
+    defer elided.deinit(a);
+    // "g" ++ key — the capture recorded this read and dropped its value.
+    try elided.put(a, "gbig/blob", 900_000);
+    var h = Host{ .a = a, .kv_map = map, .elided = elided };
+    defer if (h.diverged) |d| a.free(d);
+
+    var outcome: c_int = -1;
+    var val: [*c]u8 = null;
+    var vlen: c_int = -1;
+    try testing.expectEqual(@as(c_int, 0), kvGet("big/blob", 8, &outcome, &val, &vlen, &h));
+
+    // The closed world's miss rule (`not_found`) is the one answer that is
+    // certainly wrong here: the live run read 900 KB of real data.
+    try testing.expectEqual(@intFromEnum(decode.KvOutcome.elided), outcome);
+    try testing.expect(h.diverged != null);
+    try testing.expect(std.mem.indexOf(u8, h.diverged.?, "big/blob") != null);
+    try testing.expect(std.mem.indexOf(u8, h.diverged.?, "900000") != null);
+}
+
+test "elided page: every scan of that prefix refuses" {
+    const a = testing.allocator;
+    var map = std.StringHashMapUnmanaged([]const u8){};
+    defer map.deinit(a);
+    // A row the map DOES hold — a short page would look like a complete scan.
+    try map.put(a, "p/1", "kept");
+    var elided = std.StringHashMapUnmanaged(u64){};
+    defer elided.deinit(a);
+    try elided.put(a, "pp/", 400_000);
+    var h = Host{ .a = a, .kv_map = map, .elided = elided };
+    defer if (h.diverged) |d| a.free(d);
+
+    var outcome: c_int = -1;
+    var json: [*c]u8 = null;
+    var jlen: c_int = -1;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        kvPrefix("p/", 2, "", 0, 100, &outcome, &json, &jlen, &h),
+    );
+    if (json != null) std.c.free(json);
+    try testing.expect(h.diverged != null);
+    try testing.expect(std.mem.indexOf(u8, h.diverged.?, "kv.prefix") != null);
 }
 
 test "map mode: prefix scans the declared map, sorted (cursor + limit honored)" {

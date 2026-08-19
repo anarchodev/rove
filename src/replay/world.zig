@@ -46,6 +46,13 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
 /// One captured guard refusal (outcome-replay): `op` is "set"/"delete".
 pub const KvRefusal = struct { op: []const u8, key: []const u8, code: []const u8 };
+/// A read the capture RESOLVED but did not keep — the activation's kv budget
+/// was spent (`src/tape/root.zig` `KV_TAPE_BUDGET`). `op` is `get` or
+/// `prefix`, `key` the key or the scanned prefix, `bytes` what was lost.
+/// Replay REFUSES such a read (the poison door) instead of resolving it: a
+/// closed-world miss answers `not_found`, and serving that here would hand
+/// the handler a plausible absence where the live run read real data.
+pub const KvElided = struct { op: []const u8, key: []const u8, bytes: u64 = 0 };
 pub const Source = struct { path: []const u8, kind: []const u8, source: []const u8 };
 /// A registered kv trigger (issue #38): watched key `prefix` + the `module`
 /// specifier of its `_triggers/<prefix>/index` handler.
@@ -84,6 +91,9 @@ pub const World = struct {
     /// write with no entry succeeded at capture and proceeds unguarded.
     /// Meaningful only with `captured`; an authored world decides live.
     kv_refusals: []const KvRefusal = &.{},
+    /// Reads whose values the capture's kv budget dropped. Replay refuses
+    /// them rather than resolving them (see `KvElided`).
+    kv_elided: []const KvElided = &.{},
     /// Optional `expected` output — a PARTIAL, order-independent assertion over
     /// the produced bundle (response.status / writes / cmds / disposition). When
     /// present, `runWorld` appends a `verify` result. Stored as JSON text.
@@ -177,6 +187,7 @@ const TOP_KEYS = [_][]const u8{
     "entry",   "activation", "export",  "source_dir", "ctx",     "seed",
     "now_ms",  "arena_gc",   "captured", "request",   "kv",      "expected",
     "sources", "app_imports", "packages", "triggers", "kv_refusals",
+    "kv_elided",
 };
 /// The full set of `request.*` keys (same strictness rationale).
 const REQ_KEYS = [_][]const u8{
@@ -366,6 +377,26 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             try rs.append(a, .{ .op = op.string, .key = key.string, .code = code.string });
         }
         w.kv_refusals = try rs.toOwnedSlice(a);
+    }
+
+    // ── reads the capture's kv budget elided (refused on replay) ──
+    if (obj.get("kv_elided")) |ev| {
+        if (ev != .array) return Error.BadWorld;
+        var es = std.ArrayList(KvElided){};
+        for (ev.array.items) |item| {
+            if (item != .object) return Error.BadWorld;
+            const op = item.object.get("op") orelse return Error.BadWorld;
+            const key = item.object.get("key") orelse return Error.BadWorld;
+            if (op != .string or key != .string) return Error.BadWorld;
+            if (!std.mem.eql(u8, op.string, "get") and !std.mem.eql(u8, op.string, "prefix"))
+                return Error.BadWorld;
+            const bytes: u64 = if (item.object.get("bytes")) |b|
+                (if (b == .integer and b.integer >= 0) @intCast(b.integer) else return Error.BadWorld)
+            else
+                0;
+            try es.append(a, .{ .op = op.string, .key = key.string, .bytes = bytes });
+        }
+        w.kv_elided = try es.toOwnedSlice(a);
     }
 
     // ── expected output — a partial assertion over the produced bundle ──
