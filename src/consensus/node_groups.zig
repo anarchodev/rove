@@ -115,10 +115,30 @@ pub fn forgetGroup(self: *Node, id_str: []const u8) void {
     );
 }
 
-/// Read the recovery manifest into a freshly-allocated slice (caller owns:
+/// The manifest as recovery reads it: the rows it can use, plus a count of the
+/// rows it REFUSED.
+///
+/// The count is returned rather than logged at the refusal site, for two
+/// reasons that point the same way. A refused row is not an absence — the
+/// group's state is on this node and simply will not be recovered — so it is a
+/// FACT recovery should carry, not a side effect. And a `std.log.err` inside a
+/// unit-testable function makes the refusal path untestable: Zig's test runner
+/// fails any test that logs at error level, so the one path most worth a
+/// regression test could not have one. Escalation happens at the boot caller
+/// (`Bridge.recoverGroups`), which no unit test drives with a corrupt row.
+pub const PersistedManifest = struct {
+    groups: []PersistedGroup,
+    /// Rows whose epoch could not be parsed. Never zero-filled: epoch 0 is a
+    /// real epoch (a group that never moved), so a defaulted row would be
+    /// indistinguishable from a healthy one.
+    refused: usize = 0,
+};
+
+/// Read the recovery manifest into freshly-allocated storage (caller owns:
 /// free each `id_str`, then the slice via `freePersistedGroups`). Read once
 /// at boot by `Bridge.recoverGroups`. Empty on a fresh data dir.
-pub fn persistedGroups(self: *Node, allocator: std.mem.Allocator) Error![]PersistedGroup {
+pub fn persistedGroups(self: *Node, allocator: std.mem.Allocator) Error!PersistedManifest {
+    var refused: usize = 0;
     var out: std.ArrayListUnmanaged(PersistedGroup) = .empty;
     errdefer {
         for (out.items) |g| allocator.free(g.id_str);
@@ -132,7 +152,25 @@ pub fn persistedGroups(self: *Node, allocator: std.mem.Allocator) Error![]Persis
         defer page.deinit();
         if (page.entries.len == 0) break;
         for (page.entries) |e| {
-            const epoch = std.fmt.parseInt(u64, e.value, 10) catch 0;
+            // A corrupt row is SKIPPED LOUDLY, never defaulted. `catch 0`
+            // would recover a moved group at epoch 0 — and 0 is a VALID
+            // epoch (a group that never moved), so the corruption becomes
+            // indistinguishable from normal state. The group then stamps its
+            // messages with a stale epoch, peers fence it, and the tenant is
+            // stranded with nothing in the log to say why. A group that is
+            // absent instead is diagnosable at boot and recoverable: the CP's
+            // membership reconciler re-attaches it. Per the four-way error
+            // classification, a silent default is the one disposition that is
+            // never correct (consensus-robustness.md).
+            const epoch = std.fmt.parseInt(u64, e.value, 10) catch {
+                refused += 1;
+                std.log.warn(
+                    "v2 node: group manifest row '{s}' has an unparseable epoch ('{s}') — " ++
+                        "refusing recovery of this group (see the boot summary)",
+                    .{ e.key, e.value[0..@min(e.value.len, 32)] },
+                );
+                continue;
+            };
             const id_dup = allocator.dupe(u8, e.key) catch return Error.OutOfMemory;
             out.append(allocator, .{ .id_str = id_dup, .epoch = epoch }) catch {
                 allocator.free(id_dup);
@@ -145,10 +183,13 @@ pub fn persistedGroups(self: *Node, allocator: std.mem.Allocator) Error![]Persis
         cursor_buf = new_cursor;
         if (page.entries.len < 256) break;
     }
-    return out.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+    return .{
+        .groups = out.toOwnedSlice(allocator) catch return Error.OutOfMemory,
+        .refused = refused,
+    };
 }
 
-/// Free a `persistedGroups` result.
+/// Free a `persistedGroups` result's group slice.
 pub fn freePersistedGroups(allocator: std.mem.Allocator, groups: []PersistedGroup) void {
     for (groups) |g| allocator.free(g.id_str);
     allocator.free(groups);
@@ -184,7 +225,15 @@ pub fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u
     // Whatever was already durabilized into LMDB (a prior incarnation's
     // checkpoint) is the starting watermark — don't re-durabilize or
     // re-compact below it.
-    const durable_idx = store.lastAppliedRaftIdx() catch 0;
+    //
+    // PROPAGATED, not defaulted. A fresh store already answers 0 through the
+    // normal path (kvexp returns 0 when the watermark key is absent), so the
+    // only way this errors is a real read failure — and answering 0 to that
+    // claims "nothing was ever durabilized" for a store that may hold a high
+    // watermark, which invites re-durabilizing and re-compacting beneath live
+    // state. Failing the group is per-group and loud: `recoverGroups` logs and
+    // skips it, and `ensureGroup`'s caller sees the error.
+    const durable_idx = try store.lastAppliedRaftIdx();
 
     // GroupedFileStorage over the shared WAL. raft-rs takes ownership
     // via the vtable userdata slot and frees it when the group is

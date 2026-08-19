@@ -1283,11 +1283,22 @@ pub const Bridge = struct {
     /// Manager. A per-group failure is logged + skipped (one bad group must not
     /// block the rest). Returns the count recovered. No-op on a fresh data dir.
     pub fn recoverGroups(self: *Bridge) usize {
-        const groups = self.node.persistedGroups(self.allocator) catch |err| {
+        const manifest = self.node.persistedGroups(self.allocator) catch |err| {
             std.log.warn("v2 bridge: recoverGroups manifest read failed: {s}", .{@errorName(err)});
             return 0;
         };
+        const groups = manifest.groups;
         defer Node.freePersistedGroups(self.allocator, groups);
+        // The refusal escalates HERE rather than at the parse site (rove#101):
+        // a refused row means this node holds a group's state and will not
+        // stand it up, so the tenant does not serve here until the CP's
+        // membership reconciler re-attaches it. Silent recovery at epoch 0 —
+        // a valid epoch — would have looked healthy while the group stamped
+        // stale epochs and its peers fenced it.
+        if (manifest.refused > 0) std.log.err(
+            "v2 bridge: recoverGroups REFUSED {d} unreadable group manifest row(s) — those tenants will NOT serve on this node until re-attached",
+            .{manifest.refused},
+        );
         var n: usize = 0;
         for (groups) |g| {
             const gid = self.registerTenant(g.id_str) catch |err| {
