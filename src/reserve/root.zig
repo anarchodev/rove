@@ -12,10 +12,27 @@
 //! reserves a fresh block, so overlap is impossible by construction.
 //!
 //! The allocator hands out from `current` and keeps an `upcoming` block
-//! warm — a background thread reserves the next block once the current
-//! one crosses a low watermark, so `next()` almost never blocks on
-//! consensus. With no provider (tests, single process) it falls back to
-//! a local atomic counter.
+//! warm — the next block is reserved once the current one crosses a low
+//! watermark, so `next()` almost never blocks on consensus. With no
+//! provider (tests, single process) it falls back to a local atomic
+//! counter.
+//!
+//! ## Who runs the refill
+//!
+//! Two drives, same work. `owned_thread` gives the allocator its own
+//! thread and suits ONE allocator per process — the blob coordinator's
+//! `batch_id`, where a dedicated thread is self-contained and costs
+//! nothing to reason about.
+//!
+//! `external` hands the steps to a caller through `needsRefill` /
+//! `refillOnce`, for PER-TENANT allocators: the keyring's slot pool is
+//! one allocator per tenant, and an owned thread there would be a thread
+//! per tenant on a node built to host many of them. A small shared worker
+//! set can then keep every tenant's pool warm.
+//!
+//! What must not diverge is the double-buffered handoff, which is the
+//! trickiest concurrency here — so both drives run the same claim /
+//! reserve / install steps rather than each carrying a copy.
 //!
 //! ## Callers
 //!
@@ -54,6 +71,23 @@ pub const ReservationProvider = struct {
 /// refill loop retries them internally.
 pub const Error = error{Shutdown};
 
+/// Who runs the refill.
+pub const Drive = enum {
+    /// The allocator owns a thread. Right when there is ONE allocator
+    /// per process — the blob coordinator's `batch_id` — where a
+    /// dedicated thread is self-contained and costs nothing to reason
+    /// about.
+    owned_thread,
+    /// A caller drives refills through `needsRefill` / `refillOnce`.
+    ///
+    /// For PER-TENANT allocators, where an owned thread would mean a
+    /// thread per tenant on a node built to host many of them. The work
+    /// is unchanged — the same reserve, the same double buffering — only
+    /// who executes it moves, so a small shared worker set can keep
+    /// every tenant's pool warm.
+    external,
+};
+
 pub const Config = struct {
     /// `null` selects local mode: a process-local counter, no consensus.
     provider: ?ReservationProvider = null,
@@ -66,6 +100,8 @@ pub const Config = struct {
     /// Used only in the refill-failure log line, so an operator can tell
     /// which id space is starving.
     label: []const u8 = "reservation",
+    /// Defaults to the owned thread, so existing callers are unchanged.
+    drive: Drive = .owned_thread,
 };
 
 /// One reserved half-open block `[base, end)`; `next` is the cursor.
@@ -101,9 +137,47 @@ pub const ReservationAllocator = struct {
     pub fn start(self: *Self, cfg: Config) !void {
         self.cfg = cfg;
         self.local_ctr = .init(cfg.first_id);
-        if (cfg.provider != null) {
+        if (cfg.provider != null and cfg.drive == .owned_thread) {
             self.refill_thread = try std.Thread.spawn(.{}, refillLoop, .{self});
         }
+    }
+
+    /// Is a block wanted right now? The driver's poll in external mode.
+    ///
+    /// False while one is already being reserved, so two drivers cannot
+    /// both take the same pending refill.
+    pub fn needsRefill(self: *Self) bool {
+        if (self.cfg.provider == null) return false;
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.refill_needed and !self.refill_in_progress;
+    }
+
+    /// Reserve at most one block. True when one was installed, false
+    /// when nothing was pending. Errors are the provider's, surfaced so
+    /// the driver owns the backoff — it is the piece that knows how many
+    /// other tenants are waiting on the same worker.
+    ///
+    /// External mode only, and safe to call from several drivers: the
+    /// in-progress flag admits exactly one.
+    pub fn refillOnce(self: *Self) anyerror!bool {
+        std.debug.assert(self.cfg.drive == .external);
+        const provider = self.cfg.provider orelse return false;
+
+        self.mu.lock();
+        if (self.shutdown_flag.load(.acquire) or !self.beginRefillLocked()) {
+            self.mu.unlock();
+            return false;
+        }
+        const prev_end = self.prevEndLocked();
+        self.mu.unlock();
+
+        const new_end = provider.reserveFn(provider.ctx, prev_end, self.cfg.block_size) catch |err| {
+            self.abandonRefill();
+            return err;
+        };
+        self.installBlock(new_end);
+        return true;
     }
 
     /// Signal shutdown, wake the refill thread and any parked caller,
@@ -204,6 +278,58 @@ pub const ReservationAllocator = struct {
         }
     }
 
+    /// Claim the pending refill. Caller holds `mu`. False when there is
+    /// nothing to do or someone else already has it.
+    fn beginRefillLocked(self: *Self) bool {
+        if (!self.refill_needed or self.refill_in_progress) return false;
+        self.refill_needed = false;
+        self.refill_in_progress = true;
+        return true;
+    }
+
+    /// Floor for the next reservation. Caller holds `mu`.
+    fn prevEndLocked(self: *Self) u64 {
+        if (self.upcoming) |up| return up.end;
+        if (self.current.end > self.prev_committed_end) return self.current.end;
+        return self.prev_committed_end;
+    }
+
+    /// Give the claim back so the refill is retried.
+    fn abandonRefill(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.refill_in_progress = false;
+        self.refill_needed = true;
+        self.refill_cond.signal();
+    }
+
+    /// Install a freshly reserved block and wake anyone parked.
+    fn installBlock(self: *Self, new_end: u64) void {
+        const block_size: u64 = self.cfg.block_size;
+        std.debug.assert(new_end >= block_size);
+        const base = new_end - block_size;
+        const block: Reservation = .{ .base = base, .next = base, .end = new_end };
+
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (new_end > self.prev_committed_end) self.prev_committed_end = new_end;
+        if (self.current.next >= self.current.end) {
+            self.current = block;
+        } else {
+            // Current still has ids — stash as upcoming. If upcoming
+            // already exists (shouldn't normally — refill only kicks
+            // one at a time), drop the new block (its ids end up
+            // unused, harmless).
+            if (self.upcoming == null) self.upcoming = block;
+        }
+        self.refill_in_progress = false;
+        self.id_avail.broadcast();
+    }
+
+    /// Owned-thread drive. The same claim / reserve / install steps
+    /// `refillOnce` runs — deliberately one implementation, because the
+    /// double-buffered handoff is the trickiest concurrency here and a
+    /// second copy would drift from it.
     fn refillLoop(self: *Self) void {
         while (true) {
             self.mu.lock();
@@ -214,49 +340,22 @@ pub const ReservationAllocator = struct {
                 self.mu.unlock();
                 return;
             }
-            self.refill_needed = false;
-            self.refill_in_progress = true;
-            const prev_end: u64 = if (self.upcoming) |up|
-                up.end
-            else if (self.current.end > self.prev_committed_end)
-                self.current.end
-            else
-                self.prev_committed_end;
+            _ = self.beginRefillLocked();
+            const prev_end = self.prevEndLocked();
             self.mu.unlock();
 
             const provider = self.cfg.provider.?;
-            const block_size: u32 = self.cfg.block_size;
-            const new_end = provider.reserveFn(provider.ctx, prev_end, block_size) catch |err| {
+            const new_end = provider.reserveFn(provider.ctx, prev_end, self.cfg.block_size) catch |err| {
                 std.log.warn(
                     "rove-reserve: {s} refill failed: {s}; retrying in 100ms",
                     .{ self.cfg.label, @errorName(err) },
                 );
                 std.Thread.sleep(100 * std.time.ns_per_ms);
-                self.mu.lock();
-                self.refill_in_progress = false;
-                self.refill_needed = true;
-                self.refill_cond.signal();
-                self.mu.unlock();
+                self.abandonRefill();
                 continue;
             };
-            std.debug.assert(new_end >= prev_end + block_size);
-            const base = new_end - block_size;
-            const block: Reservation = .{ .base = base, .next = base, .end = new_end };
-
-            self.mu.lock();
-            if (new_end > self.prev_committed_end) self.prev_committed_end = new_end;
-            if (self.current.next >= self.current.end) {
-                self.current = block;
-            } else {
-                // Current still has ids — stash as upcoming. If upcoming
-                // already exists (shouldn't normally — refill only kicks
-                // one at a time), drop the new block (its ids end up
-                // unused, harmless).
-                if (self.upcoming == null) self.upcoming = block;
-            }
-            self.refill_in_progress = false;
-            self.id_avail.broadcast();
-            self.mu.unlock();
+            std.debug.assert(new_end >= prev_end + self.cfg.block_size);
+            self.installBlock(new_end);
         }
     }
 };
@@ -313,6 +412,127 @@ test "provider mode mints contiguous ids across block refills" {
     while (i <= 20) : (i += 1) {
         try testing.expectEqual(i, try r.next());
     }
+}
+
+test "external drive owns no thread" {
+    // The whole point: a per-tenant allocator must not cost a thread per
+    // tenant on a node built to host many of them.
+    var p = TestProvider{};
+    var r = ReservationAllocator{};
+    try r.start(.{ .provider = p.provider(), .block_size = 4, .drive = .external });
+    defer r.deinit();
+    try testing.expect(r.refill_thread == null);
+}
+
+test "external drive: nothing is reserved until a driver runs" {
+    var p = TestProvider{};
+    var r = ReservationAllocator{};
+    try r.start(.{ .provider = p.provider(), .block_size = 4, .drive = .external });
+    defer r.deinit();
+
+    // Nothing wanted yet, so a driver poll costs nothing.
+    try testing.expect(!r.needsRefill());
+    try testing.expectEqual(@as(u32, 0), p.calls.load(.monotonic));
+
+    // A hot-path miss asks for a block and does NOT wait for one.
+    try testing.expect(r.tryNext() == null);
+    try testing.expect(r.needsRefill());
+    try testing.expectEqual(@as(u32, 0), p.calls.load(.monotonic));
+
+    // The driver supplies it.
+    try testing.expect(try r.refillOnce());
+    try testing.expectEqual(@as(u32, 1), p.calls.load(.monotonic));
+    try testing.expect(!r.needsRefill());
+    try testing.expectEqual(@as(?u64, 1), r.tryNext());
+}
+
+test "external drive: refillOnce is a no-op when nothing is pending" {
+    // A driver sweeping many tenants calls this on every one of them, so
+    // the idle case must cost nothing and must not reserve a block that
+    // nobody asked for — slots are never reused, so a wasted block is
+    // permanently wasted.
+    var p = TestProvider{};
+    var r = ReservationAllocator{};
+    try r.start(.{ .provider = p.provider(), .block_size = 4, .drive = .external });
+    defer r.deinit();
+
+    try testing.expect(!try r.refillOnce());
+    try testing.expectEqual(@as(u32, 0), p.calls.load(.monotonic));
+}
+
+test "external drive: a provider failure surfaces and leaves the refill pending" {
+    // The driver owns the backoff, because it is the piece that knows how
+    // many other tenants are waiting on the same worker. Swallowing the
+    // error here would strand the pool with nobody aware it is starving.
+    const Failing = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+        fn reserve(ctx: *anyopaque, prev_end: u64, count: u32) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = prev_end;
+            _ = count;
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return error.NotLeader;
+        }
+    };
+    var f = Failing{};
+    var r = ReservationAllocator{};
+    try r.start(.{
+        .provider = .{ .ctx = &f, .reserveFn = Failing.reserve },
+        .block_size = 4,
+        .drive = .external,
+    });
+    defer r.deinit();
+
+    try testing.expect(r.tryNext() == null);
+    try testing.expectError(error.NotLeader, r.refillOnce());
+    // Still wanted, so the driver comes back to it.
+    try testing.expect(r.needsRefill());
+    try testing.expectError(error.NotLeader, r.refillOnce());
+    try testing.expectEqual(@as(u32, 2), f.calls.load(.monotonic));
+}
+
+test "external drive mints the same ids the owned thread would" {
+    // Moving WHO runs the refill must not change WHAT comes out — same
+    // double buffering, same contiguity, same no-reissue guarantee.
+    var p = TestProvider{};
+    var r = ReservationAllocator{};
+    try r.start(.{ .provider = p.provider(), .block_size = 4, .drive = .external });
+    defer r.deinit();
+
+    var got: [20]u64 = undefined;
+    var n: usize = 0;
+    var guard: usize = 0;
+    while (n < got.len) {
+        if (r.tryNext()) |id| {
+            got[n] = id;
+            n += 1;
+        } else {
+            _ = try r.refillOnce();
+        }
+        guard += 1;
+        try testing.expect(guard < 200);
+    }
+    var i: usize = 0;
+    while (i < got.len) : (i += 1) try testing.expectEqual(@as(u64, i + 1), got[i]);
+}
+
+test "external drive: a claimed refill is not handed to a second driver" {
+    // Two workers sweeping the same tenant must not both reserve — the
+    // loser's block would be dead ids, and slots are never reused.
+    var p = TestProvider{};
+    var r = ReservationAllocator{};
+    try r.start(.{ .provider = p.provider(), .block_size = 4, .drive = .external });
+    defer r.deinit();
+
+    try testing.expect(r.tryNext() == null);
+    try testing.expect(r.needsRefill());
+
+    r.mu.lock();
+    try testing.expect(r.beginRefillLocked()); // stands in for driver A
+    try testing.expect(!r.beginRefillLocked()); // driver B finds nothing
+    r.mu.unlock();
+    try testing.expect(!r.needsRefill());
+    try testing.expect(!try r.refillOnce());
 }
 
 test "ids are never reissued across a simulated leader change" {
