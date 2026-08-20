@@ -1076,10 +1076,7 @@ fn resumeStream(
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
     const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
     // wake_batch activation: drain the fired arms (fired
     // PREFIXES, fire-time order) so nothing re-fires next sweep;
@@ -1296,10 +1293,7 @@ pub fn resumeBoundFetchStream(
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
     const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     // Snapshot fetchesPending — same shape as resumeBoundFetchChain.
@@ -1575,10 +1569,7 @@ pub fn firePrep(
         // generation.
         .plan_rate = dep.tc.slot.effectivePlan().rate,
         .plan_gen = dep.tc.slot.plan_gen.load(.acquire),
-        .request_id = blk: {
-            const tl = worker.tenant_logs.get(dep.inst.id) orelse break :blk 0;
-            break :blk tl.id_minter.nextRequestId() catch 0;
-        },
+        .request_id = worker_mod.mintRequestId(worker, dep.inst),
         .exec_seq = worker.raft.mintExecStampForTenant(dep.inst.id),
     };
 }

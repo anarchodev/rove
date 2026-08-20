@@ -2143,10 +2143,7 @@ fn resumeContinuation(
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
     const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
     // durable-wake-plan P5(a): accumulate this resume hop's
     // `http.fetch`es (a `webhook.send` from an onResult handler —
@@ -2342,10 +2339,7 @@ pub fn resumeBoundFetchChain(
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
     const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     // Snapshot the per-chain pending-bound-fetch count BEFORE the
@@ -3270,10 +3264,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
     const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     const fetches_pending: u32 = blk: {
