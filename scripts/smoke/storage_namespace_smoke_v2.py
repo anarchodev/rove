@@ -109,6 +109,22 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
+    # One worker per node, whatever the ambient `REWIND_WORKERS` says.
+    #
+    # The collision this smoke reproduces needs lifetime B to re-issue the
+    # ids lifetime A already owns, and a `request_id`'s top 16 bits are its
+    # minter identity — `(node_id << 8) | worker_idx` (`log.MinterId`). At N
+    # workers the kernel hashes each lifetime's handful of connections
+    # across N minters independently, so B lands on a different mix of
+    # worker indices than A did and mints ids A never used. The negative
+    # control then reports "the collision did not happen here", which is
+    # true, and every positive result after it proves nothing.
+    #
+    # Pinning the identity set is the only way to make the control
+    # deterministic. It costs no coverage: the storage namespace is a key
+    # prefix, orthogonal to how many threads mint under it.
+    os.environ["REWIND_WORKERS"] = "1"
+
     print("=== a second cluster lifetime keeps its records (rove#266) ===")
 
     # ── lifetime A ────────────────────────────────────────────────────
