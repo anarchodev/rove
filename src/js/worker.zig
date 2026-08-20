@@ -3807,6 +3807,7 @@ pub fn writesetGrowsStore(writeset: *const kv_mod.WriteSet) bool {
 // in this file use `worker_log.X` directly.
 pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
 pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
+pub const mintRequestId = worker_log.mintRequestId;
 pub const captureTapes = worker_log.captureTapes;
 pub const dropPartialDigest = worker_log.dropPartialDigest;
 pub const captureTapesWithActivation = worker_log.captureTapesWithActivation;
@@ -4334,4 +4335,61 @@ test "receive ceiling: the binding limit decides what the customer is told" {
     const full = receiveCeiling(1024, 0);
     try std.testing.expectEqual(@as(u64, 0), full.cap);
     try std.testing.expectEqual(@as(u16, 507), full.status);
+}
+
+test "mintRequestId: a worker that never served the tenant opens its log instead of minting 0" {
+    // `tenant_logs` is per-worker and only the inbound dispatch walk
+    // opens one, but every routed activation (`send_callback`, durable
+    // wake, bound fetch chunk) reaches the worker `hash(tenant_id) % N`
+    // picks — not the one the tenant's inbound traffic landed on. A cold
+    // lookup there used to mint id 0 and the record was then dropped by
+    // `captureLogInner` as `NoTenantLog`: the activation ran, and was
+    // never recorded or replayable. This is that worker.
+    const allocator = testing.allocator;
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-mintreq-{x}", .{seed});
+    defer allocator.free(tmp_dir);
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
+    defer allocator.free(root_path);
+    const root_kv = try kv_mod.KvStore.open(allocator, root_path);
+    defer root_kv.close();
+
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
+    defer tenant.destroy();
+    try tenant.createInstance("acme");
+    const inst = tenant.instances.get("acme").?;
+
+    const FakeWorker = struct {
+        allocator: std.mem.Allocator,
+        tenant_logs: TenantMap(TenantLog),
+        log: struct { minter_id: log_mod.MinterId },
+    };
+    var fake = FakeWorker{
+        .allocator = allocator,
+        .tenant_logs = .empty,
+        // Worker 3 of node 1 — the identity a routed activation mints
+        // under, and the reason each worker needs its OWN minter.
+        .log = .{ .minter_id = try log_mod.MinterId.init(1, 3) },
+    };
+    defer fake.tenant_logs.deinit(allocator);
+
+    try testing.expect(fake.tenant_logs.get("acme") == null);
+
+    const first = mintRequestId(&fake, inst);
+    try testing.expect(first != 0);
+    try testing.expect(fake.tenant_logs.get("acme") != null);
+    // The id carries this worker's identity in its top 16 bits, which is
+    // what keeps two workers' counters from colliding (rove#281).
+    try testing.expectEqual(
+        @as(u64, (try log_mod.MinterId.init(1, 3)).raw()),
+        first >> 48,
+    );
+
+    // The open is cached, so the next activation on this worker draws
+    // from the same minter and ids stay monotone within it.
+    try testing.expect(mintRequestId(&fake, inst) > first);
 }

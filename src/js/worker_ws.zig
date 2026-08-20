@@ -205,10 +205,7 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
 
     // Per-connection correlation id (16-hex of a fresh request_id), stable
     // across the connection's frames — mirrors the inbound mint.
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
     var saga_buf: [16]u8 = undefined;
     const corr = std.fmt.bufPrint(&saga_buf, "{x:0>16}", .{request_id}) catch unreachable;
 

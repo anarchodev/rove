@@ -83,6 +83,38 @@ pub fn getOrOpenTenantLog(
     return worker.tenant_logs.getOrOpen(worker, inst);
 }
 
+/// Mint `inst`'s next `request_id` on this worker, lazy-opening its
+/// tenant log first.
+///
+/// The open is the load-bearing half. `tenant_logs` is per-worker
+/// (`RequestIdMinter` bakes the worker index into every id it hands
+/// out), and the inbound dispatch walk is the only path that opens one
+/// — so a worker that has never served an inbound request for a tenant
+/// has no log for it. Every routed activation reaches a worker chosen by
+/// `hash(tenant_id) % N` (`msg_router.enqueueMsgForTenant`), which is
+/// not the worker the tenant's inbound traffic landed on, so without the
+/// open here a `send_callback` / durable wake / bound-fetch chunk mints
+/// id 0 and its record is then dropped outright by `captureLogInner`
+/// (`error.NoTenantLog`) — the activation runs correctly and is simply
+/// never recorded, which also makes it unreplayable.
+///
+/// Returns 0 when the log cannot be opened, matching the callers'
+/// previous fallback: an unstamped record is worse than no request, but
+/// it is not worth failing the activation over.
+pub fn mintRequestId(
+    worker: anytype,
+    inst: *const tenant_mod.Instance,
+) u64 {
+    const tl = getOrOpenTenantLog(worker, inst) catch |err| {
+        std.log.warn(
+            "rove-js: getOrOpenTenantLog({s}) failed at request-id mint: {s}",
+            .{ inst.id, @errorName(err) },
+        );
+        return 0;
+    };
+    return tl.id_minter.nextRequestId() catch 0;
+}
+
 // ── Tape capture ──────────────────────────────────────────────────────
 //
 // `tape_mod.Readset` is the per-request structural holder for the
