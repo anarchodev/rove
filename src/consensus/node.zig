@@ -60,4 +60,5 @@ pub const DEFAULT_TICK_NS = core.DEFAULT_TICK_NS;
 test {
     _ = core;
     _ = @import("envelope.zig");
+    _ = @import("wal_flusher.zig");
 }
