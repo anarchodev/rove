@@ -192,10 +192,16 @@ This repo is frequently worked on by several Claude sessions at once. Each sessi
 ```bash
 scripts/ops/workspace.py <topic>            # → ../rove-<topic>, branched off origin/main
 scripts/ops/workspace.py <topic> --base v2  # start somewhere else
-rm -rf ../rove-<topic>                      # done; nothing to prune
+scripts/ops/workspace.py --list             # what exists, and what is reclaimable
+scripts/ops/workspace.py --gc --yes         # delete every workspace that holds nothing
+scripts/ops/workspace.py --trim --yes       # keep every clone, drop the idle ones' build caches
 ```
 
 The script clones, points `origin` at GitHub, creates the branch, materialises the `web` submodule at its pinned commit, and copies `.env`. Run it rather than assembling a workspace by hand — an unenforced setup ritual works for a month and then quietly doesn't, and the symptom surfaces far away as confusing smoke failures.
+
+**Retire workspaces with `--gc`, not `rm -rf`.** The same argument applies at the other end: teardown used to be a remembered `rm -rf`, so it never happened, and merged workspaces piled up tens of gigabytes — a working tree is ~12 MB, but its Zig build cache is 1-5 GB. `--gc` deletes only what git can prove holds nothing unique: clean tree, no stash, no untracked files, and every branch tip already on `origin/main` **by patch**, not by sha, since branches are routinely rebased before they merge. Everything else is kept with the reason printed. `--trim` is the separate lever: it drops the build cache of any workspace nothing is running in, keeping the clone and the work — a cache is not the work, and a rebuild costs minutes. `--except NAME` means leave this one alone, and governs both. Both report and do nothing until passed `--yes`.
+
+Deliberately absent from that proof is any check of who is "using" a workspace, because no signal for that is trustworthy — a session working in a clone still reports the main checkout as its cwd. The git proof stands alone: if it holds, the worst a delete costs a live session is a rebuilt cache; if it does not hold, the workspace is kept regardless.
 
 **`web/` is the `rewind-apps` submodule** — the first-party app bundles the smokes deploy, pinned by each rove commit. That pin is what makes a cross-repo change reviewable: a rove commit says which apps commit it expects, so a paired wire-format change (tape ↔ `rtap.mjs`) can't half-land. `git submodule update --init` populates it; `REWIND_APPS_DIR` overrides it when you are editing a branch of rewind-apps alongside this one — push that branch and bump the pin in the same PR (push-then-pin).
 
