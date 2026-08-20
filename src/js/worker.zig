@@ -3840,6 +3840,69 @@ pub fn writesetGrowsStore(writeset: *const kv_mod.WriteSet) bool {
 // keep working without touching their import lines. Internal callers
 // in this file use `worker_log.X` directly.
 pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
+/// What a kv-layer failure costs the request, named per condition.
+///
+/// Several conditions share a status today. They are still listed
+/// individually, because the reason each one is a 503 is not the same
+/// reason, and an `else` arm would erase that — the next person to ask
+/// "should a full store really answer like a lease conflict?" would have
+/// to re-derive the taxonomy instead of editing one arm.
+///
+/// Retriable (`503`) means the condition clears without the caller
+/// changing anything. `507` means it does not: the tenant must delete
+/// data or raise its cap, matching the `kvCapRefusal` gate's answer for
+/// the same wall (billing axis 1). `500` means nobody should retry.
+pub fn kvErrorStatus(err: anyerror) u16 {
+    return switch (err) {
+        // Clears on its own; the caller changed nothing wrong.
+        error.Conflict => 503, // lease / chain-head contention: drain and retry
+        error.TxnInvalidated => 503, // predecessor faulted; speculative basis gone
+        error.EngineBusy => 503, // reader/txn/cursor slots exhausted, transient
+        error.OverlayFull => 503, // back-pressure: a durabilize drains it
+        error.DiskFull => 503, // node-wide; no tenant action helps, but it can clear
+        error.Truncated => 503, // a short transfer: ask the sender again
+
+        // A wall the tenant owns. Retrying writes the same bytes into the
+        // same full store, so say so instead of implying "try again".
+        error.StoreFull => 507,
+
+        // Nobody should retry these.
+        error.Corrupt => 500, // needs an operator and a restore
+        error.IncompatibleFormat => 500, // needs the right binary
+        error.BadUsage => 500, // a bug on our side
+        error.StoreMissing, error.StoreExists => 500, // lifecycle mistake
+        error.OutOfMemory, error.Io, error.Engine => 500,
+
+        else => 500,
+    };
+}
+
+/// What to tell the caller, per condition. A bodyless 5xx is
+/// undiagnosable in production, and "storage error" is barely better —
+/// these say which wall was hit and whether waiting helps.
+pub fn kvErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Conflict => "storage contended; retry\n",
+        error.TxnInvalidated => "speculative dependency rolled back; retry\n",
+        error.EngineBusy => "storage engine at capacity; retry\n",
+        error.OverlayFull => "tenant write buffer full; retry\n",
+        error.DiskFull => "node out of disk; retry\n",
+        error.StoreFull => "kv store full: delete data or raise the cap\n",
+        error.Corrupt => "storage damaged; operator action required\n",
+        error.IncompatibleFormat => "on-disk format not readable by this build\n",
+        error.Truncated => "transfer ended early; retry\n",
+        error.BadUsage, error.StoreMissing, error.StoreExists => "storage error\n",
+        else => "storage error\n",
+    };
+}
+
+/// True when `kvErrorStatus` treats the condition as transient — the
+/// record is a `.fault` (the platform's problem, retriable) rather than a
+/// `.handler_error` (the handler's).
+pub fn kvErrorIsTransient(err: anyerror) bool {
+    return kvErrorStatus(err) == 503;
+}
+
 pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
 pub const getOrOpenTenantLogNoWait = worker_log.getOrOpenTenantLogNoWait;
 pub const mintRequestId = worker_log.mintRequestId;
@@ -4116,6 +4179,38 @@ test "promotionSweepDue: one worker drains the edge, every worker sweeps exactly
     var w3: u64 = gen.load(.acquire);
     try testing.expect(!promotionSweepDue(&gen, 0, &w3));
     try testing.expect(promotionSweepDue(&gen, 1, &w3));
+}
+
+test "kvErrorStatus: retriable, tenant-wall and never-retry are three different answers" {
+    // The three groups the customer can actually tell apart. Sharing a
+    // number is fine; sharing it by accident is not, which is why every
+    // condition is named rather than falling into an `else`.
+    for ([_]anyerror{
+        error.Conflict,      error.TxnInvalidated, error.EngineBusy,
+        error.OverlayFull,   error.DiskFull,       error.Truncated,
+    }) |e| {
+        try testing.expectEqual(@as(u16, 503), kvErrorStatus(e));
+        try testing.expect(kvErrorIsTransient(e));
+    }
+
+    // A full store is the one kv wall a retry cannot clear — same answer
+    // the `kvCapRefusal` gate gives for the same wall (billing axis 1).
+    try testing.expectEqual(@as(u16, 507), kvErrorStatus(error.StoreFull));
+    try testing.expect(!kvErrorIsTransient(error.StoreFull));
+
+    for ([_]anyerror{
+        error.Corrupt,      error.IncompatibleFormat, error.BadUsage,
+        error.StoreMissing, error.StoreExists,        error.Engine,
+    }) |e| {
+        try testing.expectEqual(@as(u16, 500), kvErrorStatus(e));
+        try testing.expect(!kvErrorIsTransient(e));
+    }
+
+    // Every condition says which wall was hit; a bodyless 5xx is
+    // undiagnosable and "storage error" is barely better.
+    try testing.expect(std.mem.indexOf(u8, kvErrorMessage(error.StoreFull), "full") != null);
+    try testing.expect(std.mem.indexOf(u8, kvErrorMessage(error.DiskFull), "disk") != null);
+    try testing.expect(std.mem.indexOf(u8, kvErrorMessage(error.Corrupt), "operator") != null);
 }
 
 test "BlockedTenants: defers past its cap, and the list is tick-local" {

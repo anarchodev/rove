@@ -37,22 +37,183 @@
 const std = @import("std");
 const kvexp = @import("kvexp");
 
+/// What went wrong underneath, grouped by **what the caller should do**
+/// rather than by which kvexp/LMDB code produced it.
+///
+/// The members exist separately even where today's callers funnel several
+/// of them to one status. Naming each at the call site is what makes the
+/// decision reviewable — an `else` arm hides the fact that "the tenant
+/// filled its store" and "the page cache is corrupt" were ever different
+/// questions — and it means separating one later is an edit to a switch,
+/// not an investigation.
+///
+/// `engineError` is the single translation from kvexp to this set.
 pub const Error = error{
+    /// Key absent. Not a failure.
     NotFound,
     OutOfMemory,
+
+    // ── Retry the same operation ──────────────────────────────────
+    /// Someone else holds the tenant's dispatch lease, or this txn is
+    /// not the kvexp chain head (`NotChainHead`). The work is fine; the
+    /// timing is not. Drain and retry.
     Conflict,
-    /// Generic underlying storage-engine (kvexp) error. The `Sqlite`
-    /// spelling is a historical name for the generic engine error.
-    Sqlite,
-    Io,
-    /// This txn's chain predecessor faulted while it was open, so a
-    /// rollback cascade invalidated it (kvexp `error.TxnInvalidated`,
-    /// active-writer cascade protection). The batch must self-abort:
-    /// roll back and return a retriable 5xx — its speculative basis is
-    /// gone. Distinct from `Conflict` (which means "retry the same txn
-    /// later"); an invalidated txn must NOT be retried.
+    /// A chain predecessor faulted while this txn was open, so a
+    /// rollback cascade invalidated it (kvexp `TxnInvalidated`). The
+    /// batch must self-abort: roll back and return a retriable 5xx, its
+    /// speculative basis is gone. **Not** `Conflict` — an invalidated
+    /// txn must never be retried as-is.
     TxnInvalidated,
+    /// A transient engine resource ran out — reader slots, txn slots,
+    /// cursors — or the map was resized underneath us. Retriable, and an
+    /// operator-tunable ceiling rather than a fault.
+    EngineBusy,
+
+    // ── Capacity: refuse, do not retry into the same wall ──────────
+    /// This tenant's in-memory overlay would pass
+    /// `max_overlay_bytes_per_store` (kvexp `OverlayCapExceeded`). The
+    /// contract is rollback + durabilize + retry, or shed the request —
+    /// it is BACK-PRESSURE, not a fault, and answering it as a storage
+    /// error tells the tenant to give up on a condition that clears.
+    OverlayFull,
+    /// The tenant's store hit its own ceiling — LMDB map/page/dbi full.
+    /// A per-tenant capacity refusal (the `max_kv_bytes` axis), not a
+    /// node fault: no other tenant is affected and no retry helps until
+    /// the tenant deletes something or its cap is raised.
+    StoreFull,
+    /// The DEVICE is out of space. Node-wide, every tenant, operator
+    /// action required. Deliberately not `StoreFull`: the blast radius
+    /// and the remedy are different.
+    DiskFull,
+
+    // ── Do not retry, ever ────────────────────────────────────────
+    /// The store or manifest is damaged (`Corrupted`, `Panic`,
+    /// `PageNotFound`, `ManifestPoisoned`). Retrying re-reads the same
+    /// damage; this needs an operator and a restore.
+    Corrupt,
+    /// On-disk or snapshot format this build cannot read
+    /// (`VersionMismatch`, `Incompatible`, `InvalidSnapshotFormat`,
+    /// `UnsupportedSnapshotVersion`). A version problem, not damage —
+    /// the remedy is the right binary, not a restore
+    /// (`docs/architecture/format-versioning.md`).
+    IncompatibleFormat,
+    /// The input stream ended early — a snapshot transfer delivered
+    /// fewer bytes than its own framing promised. Distinct from
+    /// `Corrupt`: nothing on this node is damaged, the SENDER was short,
+    /// and the remedy is to re-request the transfer rather than restore.
+    Truncated,
+    /// A caller broke the API contract — committing out of LIFO order
+    /// with a savepoint still open, an oversized key. A bug here, not a
+    /// condition out there.
+    BadUsage,
+
+    // ── Store lifecycle ───────────────────────────────────────────
+    /// No such store in the manifest.
+    StoreMissing,
+    /// A store with this id already exists.
+    StoreExists,
+
+    // ── Everything else ───────────────────────────────────────────
+    /// Filesystem-level failure outside LMDB's own reporting (path
+    /// creation, permissions, a failed durabilize).
+    Io,
+    /// Underlying engine error with no distinct handling YET. Reaching
+    /// this is a prompt to give the condition its own member above:
+    /// `engineError` logs the kvexp name it could not place, because an
+    /// unmapped error that arrives silently is how `Sqlite` came to mean
+    /// eleven different things.
+    Engine,
 };
+
+/// Every kvexp / LMDB error, paired with the `Error` whose *operational*
+/// meaning matches it. The single place that mapping is decided.
+///
+/// A table rather than a switch so `engineError` can check it for
+/// COMPLETENESS at comptime — see there.
+const ENGINE_ERRORS = .{
+    .{ "OutOfMemory", Error.OutOfMemory },
+    .{ "NotFound", Error.NotFound },
+
+    .{ "NotChainHead", Error.Conflict },
+    .{ "TxnInvalidated", Error.TxnInvalidated },
+
+    .{ "ReadersFull", Error.EngineBusy },
+    .{ "TxnFull", Error.EngineBusy },
+    .{ "TlsFull", Error.EngineBusy },
+    .{ "CursorFull", Error.EngineBusy },
+    .{ "MapResized", Error.EngineBusy },
+    .{ "BadRslot", Error.EngineBusy },
+    .{ "BadTxn", Error.EngineBusy },
+
+    .{ "OverlayCapExceeded", Error.OverlayFull },
+    .{ "MapFull", Error.StoreFull },
+    .{ "DbsFull", Error.StoreFull },
+    .{ "PageFull", Error.StoreFull },
+    .{ "NoSpaceOnDevice", Error.DiskFull },
+
+    .{ "Corrupted", Error.Corrupt },
+    .{ "Panic", Error.Corrupt },
+    .{ "PageNotFound", Error.Corrupt },
+    .{ "ManifestPoisoned", Error.Corrupt },
+    .{ "BadDbi", Error.Corrupt },
+    .{ "Invalid", Error.Corrupt },
+
+    .{ "VersionMismatch", Error.IncompatibleFormat },
+    .{ "Incompatible", Error.IncompatibleFormat },
+    .{ "InvalidSnapshotFormat", Error.IncompatibleFormat },
+    .{ "UnsupportedSnapshotVersion", Error.IncompatibleFormat },
+
+    .{ "SavepointStillOpen", Error.BadUsage },
+    .{ "BadValSize", Error.BadUsage },
+    .{ "KeyExist", Error.BadUsage },
+
+    .{ "StoreNotFound", Error.StoreMissing },
+    .{ "StoreAlreadyExists", Error.StoreExists },
+
+    .{ "EndOfStream", Error.Truncated },
+
+    .{ "Io", Error.Io },
+    .{ "PermissionDenied", Error.Io },
+    .{ "LmdbError", Error.Engine },
+};
+
+/// Translate a kvexp / LMDB error into the `Error` whose operational
+/// meaning matches, and **fail the build** if the caller's error set
+/// contains anything `ENGINE_ERRORS` does not place.
+///
+/// kvexp infers its error sets rather than declaring them, so there is no
+/// upstream type to switch over exhaustively. `@typeInfo` resolves the
+/// inferred set at the call site instead, which gets the same guarantee
+/// from the other end: bump the dep, gain an error, and the build stops
+/// with that error's name in the message. It cannot be swallowed, because
+/// swallowing it is what the comptime block refuses to compile.
+///
+/// This is the mechanism that keeps `Error.Engine` from drifting back
+/// into meaning everything, the way `Sqlite` did.
+pub fn engineError(err: anytype) Error {
+    comptime {
+        // set-size × table-size string compares, per call site.
+        @setEvalBranchQuota(100_000);
+        const info = @typeInfo(@TypeOf(err));
+        const set = info.error_set orelse @compileError(
+            "engineError needs a concrete error set to check; `anyerror` erases it",
+        );
+        outer: for (set) |e| {
+            for (ENGINE_ERRORS) |row| {
+                if (std.mem.eql(u8, row[0], e.name)) continue :outer;
+            }
+            @compileError(
+                "kvstore.engineError: kvexp error '" ++ e.name ++
+                    "' has no mapping. Add it to ENGINE_ERRORS — and give it its " ++
+                    "own Error member if callers should treat it differently.",
+            );
+        }
+    }
+    inline for (ENGINE_ERRORS) |row| {
+        if (err == @field(anyerror, row[0])) return row[1];
+    }
+    unreachable;
+}
 
 pub const Entry = struct {
     key: []u8,
@@ -380,14 +541,14 @@ pub const KvStore = struct {
         const self = allocator.create(KvStore) catch return Error.OutOfMemory;
         errdefer allocator.destroy(self);
 
-        const exists = manifest.hasStore(store_id) catch return Error.Sqlite;
+        const exists = manifest.hasStore(store_id) catch |e| return engineError(e);
         if (!exists) {
             // Tolerate the TOCTOU race when multiple threads attach
             // the same store concurrently — one wins createStore,
             // the others observe StoreAlreadyExists and proceed.
             manifest.createStore(store_id) catch |err| switch (err) {
                 error.StoreAlreadyExists => {},
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
         }
 
@@ -468,13 +629,13 @@ pub const KvStore = struct {
         stack.* = .{ .path = path_owned, .manifest = undefined };
         stack.manifest.init(allocator, path_owned, .{
             .max_map_size = map_size,
-        }) catch return Error.Sqlite;
+        }) catch |e| return engineError(e);
         errdefer stack.manifest.deinit();
 
         if (mode == .read_write) {
-            const exists = stack.manifest.hasStore(store_id) catch return Error.Sqlite;
+            const exists = stack.manifest.hasStore(store_id) catch |e| return engineError(e);
             if (!exists) {
-                stack.manifest.createStore(store_id) catch return Error.Sqlite;
+                stack.manifest.createStore(store_id) catch |e| return engineError(e);
                 // durabilize so the store DBI exists on disk;
                 // subsequent attach/open across processes can see it.
                 // raft_idx=0 → don't touch the watermark on bootstrap.
@@ -630,18 +791,18 @@ pub const KvStore = struct {
                 // invalidated this active txn (kvexp self-abort gate). Surface
                 // it distinctly so the dispatcher emits a retriable 503.
                 error.TxnInvalidated => return Error.TxnInvalidated,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
             return v orelse return Error.NotFound;
         }
         // No active txn: read through a brief lease against main_overlay
         // + LMDB. In-flight chain Txns are invisible — intentional, since
         // those writes are still speculative until raft commits.
-        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        var lease = self.manifest.acquire(self.store_id) catch |e| return engineError(e);
         defer lease.release();
         const v = lease.get(self.allocator, key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
-            else => return Error.Sqlite,
+            else => return engineError(err),
         };
         return v orelse return Error.NotFound;
     }
@@ -694,16 +855,16 @@ pub const KvStore = struct {
                 // Collapsing it into `Sqlite` would cost the caller the
                 // retriable 503 it is owed.
                 error.TxnInvalidated => return Error.TxnInvalidated,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
             return v orelse return Error.NotFound;
         }
-        const lease_opt = self.manifest.tryAcquire(self.store_id) catch return Error.Sqlite;
+        const lease_opt = self.manifest.tryAcquire(self.store_id) catch |e| return engineError(e);
         var lease = lease_opt orelse return Error.Conflict;
         defer lease.release();
         const v = lease.get(self.allocator, key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
-            else => return Error.Sqlite,
+            else => return engineError(err),
         };
         return v orelse return Error.NotFound;
     }
@@ -718,7 +879,7 @@ pub const KvStore = struct {
             const leaf = t.activeLeaf();
             leaf.put(key, value) catch |err| switch (err) {
                 error.TxnInvalidated => return Error.TxnInvalidated,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
             return;
         }
@@ -728,17 +889,17 @@ pub const KvStore = struct {
         // bare `Sqlite` (e.g. a follower-apply failure).
         var lease = self.manifest.acquire(self.store_id) catch |err| {
             std.log.warn("kvstore.put acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
         defer lease.release();
         var txn = lease.beginTxn() catch |err| {
             std.log.warn("kvstore.put beginTxn store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
         errdefer txn.rollback();
         txn.put(key, value) catch |err| {
             std.log.warn("kvstore.put put store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
         txn.commit() catch |err| {
             std.log.warn("kvstore.put commit store={x}: {s}", .{ self.store_id, @errorName(err) });
@@ -749,7 +910,7 @@ pub const KvStore = struct {
             // caller can tell the two apart (retryable must be reachable
             // as retryable).
             if (err == error.NotChainHead) return Error.Conflict;
-            return Error.Sqlite;
+            return engineError(err);
         };
     }
 
@@ -766,32 +927,32 @@ pub const KvStore = struct {
             _ = leaf.delete(key) catch |err| switch (err) {
                 error.OutOfMemory => return Error.OutOfMemory,
                 error.TxnInvalidated => return Error.TxnInvalidated,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
             return;
         }
         var lease = self.manifest.acquire(self.store_id) catch |err| {
             std.log.warn("kvstore.delete acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
         defer lease.release();
         var txn = lease.beginTxn() catch |err| {
             std.log.warn("kvstore.delete beginTxn store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
         errdefer txn.rollback();
         _ = txn.delete(key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
             else => {
                 std.log.warn("kvstore.delete delete store={x}: {s}", .{ self.store_id, @errorName(err) });
-                return Error.Sqlite;
+                return engineError(err);
             },
         };
         txn.commit() catch |err| {
             std.log.warn("kvstore.delete commit store={x}: {s}", .{ self.store_id, @errorName(err) });
             // See `put`: not-head is a drain-and-retry, not a fault.
             if (err == error.NotChainHead) return Error.Conflict;
-            return Error.Sqlite;
+            return engineError(err);
         };
     }
 
@@ -800,14 +961,14 @@ pub const KvStore = struct {
     /// past this is in the main_overlay / open Txns and isn't
     /// covered until the next durabilize.
     pub fn lastAppliedRaftIdx(self: *KvStore) Error!u64 {
-        return self.manifest.durableRaftIdx() catch return Error.Sqlite;
+        return self.manifest.durableRaftIdx() catch |e| return engineError(e);
     }
 
     /// Stamp the manifest's last applied raft idx by durabilizing
     /// at `idx`. Folds main_overlay into LMDB and writes the
     /// watermark atomically — the stamp and the durabilize are one call.
     pub fn setLastAppliedRaftIdx(self: *KvStore, idx: u64) Error!void {
-        self.manifest.durabilize(idx) catch return Error.Sqlite;
+        self.manifest.durabilize(idx) catch |e| return engineError(e);
     }
 
     /// Chain-BYPASSING authoritative put — the replicated-apply seam
@@ -823,12 +984,12 @@ pub const KvStore = struct {
     pub fn applyPut(self: *KvStore, key: []const u8, value: []const u8) Error!void {
         var lease = self.manifest.acquire(self.store_id) catch |err| {
             std.log.warn("kvstore.applyPut acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
         defer lease.release();
         lease.applyPut(key, value) catch |err| {
             std.log.warn("kvstore.applyPut store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
     }
 
@@ -836,12 +997,12 @@ pub const KvStore = struct {
     pub fn applyDelete(self: *KvStore, key: []const u8) Error!void {
         var lease = self.manifest.acquire(self.store_id) catch |err| {
             std.log.warn("kvstore.applyDelete acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
         defer lease.release();
         lease.applyDelete(key) catch |err| {
             std.log.warn("kvstore.applyDelete store={x}: {s}", .{ self.store_id, @errorName(err) });
-            return Error.Sqlite;
+            return engineError(err);
         };
     }
 
@@ -873,14 +1034,14 @@ pub const KvStore = struct {
             const leaf = t.activeLeaf();
             var pc = leaf.scanPrefix(prefix_bytes) catch |err| switch (err) {
                 error.TxnInvalidated => return Error.TxnInvalidated,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
             defer pc.deinit();
             try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
         } else {
-            var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+            var lease = self.manifest.acquire(self.store_id) catch |e| return engineError(e);
             defer lease.release();
-            var pc = lease.scanPrefix(prefix_bytes) catch return Error.Sqlite;
+            var pc = lease.scanPrefix(prefix_bytes) catch |e| return engineError(e);
             defer pc.deinit();
             try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
         }
@@ -929,7 +1090,7 @@ pub const KvStore = struct {
     /// bytes awaiting durabilize. O(1) — an `mdb_stat` of the store's
     /// DBI plus an in-memory counter read; nothing is scanned.
     pub fn usage(self: *KvStore) Error!kvexp.StoreUsage {
-        return self.manifest.storeUsage(self.store_id) catch Error.Sqlite;
+        return self.manifest.storeUsage(self.store_id) catch |e| engineError(e);
     }
 
     /// Conservative total bytes this store occupies (durable +
@@ -958,7 +1119,7 @@ pub const KvStore = struct {
     /// should route through the cluster's tick.
     pub fn checkpoint(self: *KvStore) Error!void {
         if (self.owned) |stack| {
-            stack.manifest.durabilize(0) catch return Error.Sqlite;
+            stack.manifest.durabilize(0) catch |e| return engineError(e);
         }
     }
 
@@ -997,13 +1158,13 @@ pub const KvStore = struct {
         // watermark.
         self.manifest.durabilize(0) catch return Error.Io;
 
-        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
+        var snap = self.manifest.openSnapshot() catch |e| return engineError(e);
         defer snap.close();
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         var w = buf.writer(self.allocator);
-        kvexp.dumpSnapshot(&snap, &w) catch return Error.Sqlite;
+        kvexp.dumpSnapshot(&snap, &w) catch |e| return engineError(e);
 
         try writeManifestFile(self.allocator, target_path, buf.items);
     }
@@ -1013,7 +1174,7 @@ pub const KvStore = struct {
         // in-memory write. raft_idx=0 → don't disturb the watermark.
         self.manifest.durabilize(0) catch return Error.Io;
 
-        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
+        var snap = self.manifest.openSnapshot() catch |e| return engineError(e);
         defer snap.close();
 
         // Dump just this store's records, remapped to
@@ -1026,7 +1187,7 @@ pub const KvStore = struct {
             self.store_id,
             STANDALONE_STORE_ID,
             &buf,
-        ) catch return Error.Sqlite;
+        ) catch |e| return engineError(e);
 
         try writeManifestFile(self.allocator, target_path, buf.items);
     }
@@ -1098,14 +1259,14 @@ pub const KvStore = struct {
             // dispatcher's skip-this-tick machinery picks a different
             // anchor instead of blocking on the dispatch lock.
             const lease_opt = self.store.manifest.tryAcquire(self.store.store_id) catch
-                return Error.Sqlite;
+                |e| return engineError(e);
             self.lease = lease_opt orelse return Error.Conflict;
             std.debug.assert(self.store.active_txn == null);
             self.txn_seq = self.store.counter.next();
-            self.top = self.lease.?.beginTxn() catch {
+            self.top = self.lease.?.beginTxn() catch |e| {
                 self.lease.?.release();
                 self.lease = null;
-                return Error.Sqlite;
+                return engineError(e);
             };
             self.store.setActiveTxn(self);
             self.opened = true;
@@ -1139,7 +1300,7 @@ pub const KvStore = struct {
             try self.ensureOpen();
             self.activeLeaf().put(key, value) catch |err| switch (err) {
                 error.TxnInvalidated => return Error.TxnInvalidated,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
         }
 
@@ -1147,13 +1308,13 @@ pub const KvStore = struct {
             try self.ensureOpen();
             _ = self.activeLeaf().delete(key) catch |err| switch (err) {
                 error.TxnInvalidated => return Error.TxnInvalidated,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
         }
 
         pub fn savepoint(self: *TrackedTxn) Error!void {
             try self.ensureOpen();
-            const child = self.activeLeaf().savepoint() catch return Error.Sqlite;
+            const child = self.activeLeaf().savepoint() catch |e| return engineError(e);
             self.savepoints.append(self.store.allocator, child) catch
                 return Error.OutOfMemory;
         }
@@ -1164,7 +1325,7 @@ pub const KvStore = struct {
             if (!self.opened) return;
             if (self.savepoints.items.len == 0) return;
             const leaf = self.savepoints.pop().?;
-            leaf.commit() catch return Error.Sqlite;
+            leaf.commit() catch |e| return engineError(e);
         }
 
         /// Rollback the innermost savepoint: drops its writes.
@@ -1245,10 +1406,13 @@ pub const KvStore = struct {
             while (self.savepoints.pop()) |sp| {
                 sp.commit() catch |err| switch (err) {
                     error.TxnInvalidated => return Error.TxnInvalidated,
-                    else => return Error.Sqlite,
+                    else => return engineError(err),
                 };
             }
-            const top = self.top orelse return Error.Sqlite;
+            // No top txn to park: `park` is only reachable from the
+            // active/immediate arm, so a null here is a caller-sequencing
+            // bug, not an engine condition.
+            const top = self.top orelse return Error.BadUsage;
             self.parked_handle = top.park(seq) catch return Error.TxnInvalidated;
         }
 
@@ -1277,7 +1441,7 @@ pub const KvStore = struct {
             // for a later-tick retry (predecessor not committed yet);
             // `.absent` means it's already gone (treat as done).
             if (self.parked_handle) |h| {
-                switch (self.store.manifest.commit(h) catch return Error.Sqlite) {
+                switch (self.store.manifest.commit(h) catch |e| return engineError(e)) {
                     .committed, .absent => {},
                     .not_head => return Error.Conflict,
                 }
@@ -1290,12 +1454,12 @@ pub const KvStore = struct {
             // (still in the chain) and the caller can retry on a later
             // tick once the predecessor worker commits its own head.
             while (self.savepoints.pop()) |sp| {
-                sp.commit() catch return Error.Sqlite;
+                sp.commit() catch |e| return engineError(e);
             }
             const top = self.top.?;
             top.commit() catch |err| switch (err) {
                 error.NotChainHead => return Error.Conflict,
-                else => return Error.Sqlite,
+                else => return engineError(err),
             };
             // Commit succeeded — kvexp freed the Txn; tear down
             // local state and drop the lease if still held.
@@ -1385,7 +1549,7 @@ fn collectPrefix(
 ) Error!void {
     var collected: u32 = 0;
     while (collected < count) {
-        const has = pc.next() catch return Error.Sqlite;
+        const has = pc.next() catch |e| return engineError(e);
         if (!has) break;
         const k_slice = pc.key();
         if (cursor.len > 0 and !std.mem.lessThan(u8, cursor, prefix_bytes)) {
@@ -1430,12 +1594,12 @@ fn writeManifestFile(
     var target_manifest: kvexp.Manifest = undefined;
     target_manifest.init(allocator, target_path, .{
         .max_map_size = CLUSTER_MAP_SIZE,
-    }) catch return Error.Sqlite;
+    }) catch |e| return engineError(e);
     defer target_manifest.deinit();
 
     var stream = std.io.fixedBufferStream(dump_bytes);
     const restored_idx = kvexp.loadSnapshot(&target_manifest, stream.reader()) catch
-        return Error.Sqlite;
+        |e| return engineError(e);
     target_manifest.durabilize(restored_idx) catch return Error.Io;
 }
 
@@ -1498,6 +1662,55 @@ fn cleanupDb(path: [:0]const u8) void {
     const lock_path = std.fmt.bufPrint(&lock_buf, "{s}-lock", .{path}) catch return;
     std.fs.cwd().deleteFile(path) catch {};
     std.fs.cwd().deleteFile(lock_path) catch {};
+}
+
+test "engineError places every kvexp condition by what the caller must do" {
+    // The distinctions that earn their own member: a full store is not a
+    // damaged one, back-pressure is not a fault, and a short transfer is
+    // neither. `Sqlite` used to answer all of these with one word.
+    const cases = .{
+        .{ error.OverlayCapExceeded, Error.OverlayFull },
+        .{ error.MapFull, Error.StoreFull },
+        .{ error.NoSpaceOnDevice, Error.DiskFull },
+        .{ error.Corrupted, Error.Corrupt },
+        .{ error.ManifestPoisoned, Error.Corrupt },
+        .{ error.UnsupportedSnapshotVersion, Error.IncompatibleFormat },
+        .{ error.EndOfStream, Error.Truncated },
+        .{ error.ReadersFull, Error.EngineBusy },
+        .{ error.NotChainHead, Error.Conflict },
+        .{ error.TxnInvalidated, Error.TxnInvalidated },
+        .{ error.SavepointStillOpen, Error.BadUsage },
+        .{ error.StoreNotFound, Error.StoreMissing },
+    };
+    inline for (cases) |c| {
+        const got: anyerror = engineError(@as(error{
+            OverlayCapExceeded,
+            MapFull,
+            NoSpaceOnDevice,
+            Corrupted,
+            ManifestPoisoned,
+            UnsupportedSnapshotVersion,
+            EndOfStream,
+            ReadersFull,
+            NotChainHead,
+            TxnInvalidated,
+            SavepointStillOpen,
+            StoreNotFound,
+        }, c[0]));
+        try testing.expectEqual(@as(anyerror, c[1]), got);
+    }
+}
+
+test "ENGINE_ERRORS has no duplicate mappings" {
+    // A name listed twice means the second row is dead and the first is
+    // load-bearing by accident — the comptime completeness check cannot
+    // see that, because it only asks whether a name is present at all.
+    @setEvalBranchQuota(100_000);
+    inline for (ENGINE_ERRORS, 0..) |a, i| {
+        inline for (ENGINE_ERRORS, 0..) |b, j| {
+            if (i < j) try testing.expect(!std.mem.eql(u8, a[0], b[0]));
+        }
+    }
 }
 
 test "open, put, get, delete" {

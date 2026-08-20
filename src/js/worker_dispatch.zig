@@ -2663,8 +2663,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // activation at runOutcome entry, so this read is this
             // activation's error.
             const interrupted = err == dispatcher_mod.DispatchError.Interrupted;
-            const invalidated = err == dispatcher_mod.DispatchError.KvFailed and
-                (if (worker.dispatcher.last_kv_error) |lke| lke == error.TxnInvalidated else false);
+            // The kv condition a KvFailed wraps, and what it costs the
+            // request. Each condition is named in `worker.kvErrorStatus`
+            // even where several share a status, so changing one later is
+            // an edit to a switch arm rather than a re-derivation.
+            const kv_err: ?anyerror = if (err == dispatcher_mod.DispatchError.KvFailed)
+                worker.dispatcher.last_kv_error
+            else
+                null;
+            const kv_status: ?u16 = if (kv_err) |ke| worker_mod.kvErrorStatus(ke) else null;
+            // Transient means the platform's problem and retriable — a
+            // `.fault` record. A full store is the tenant's own wall, so
+            // it stays a `.handler_error`.
+            const invalidated = if (kv_status) |st| st == 503 else false;
             // Diagnostic: surface the kvexp error KvFailed WRAPS. The tape only
             // records a `.kv_error` outcome and replay can't reproduce a
             // write-layer failure (its kv writes hit a never-failing overlay), so
@@ -2675,7 +2686,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .{ scope_inst.id, path, saga_id, if (worker.dispatcher.last_kv_error) |lke| @errorName(lke) else "(null)" },
             );
             const outcome: log_mod.Outcome = if (interrupted) .timeout else if (invalidated) .fault else .handler_error;
-            const status: u16 = if (interrupted) 504 else if (invalidated) 503 else 500;
+            const status: u16 = if (interrupted) 504 else kv_status orelse 500;
             if (interrupted) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 504, "handler exceeded cpu budget\n", allocator);
                 worker.penalty_box.recordKill(
@@ -2683,8 +2694,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     dep_id,
                     received_ns,
                 ) catch |pe| std.log.warn("rove-js penalty recordKill failed: {s}", .{@errorName(pe)});
-            } else if (invalidated) {
-                try respb.setSimpleResponse(server, ent, sid, sess, 503, "speculative dependency rolled back; retry\n", allocator);
+            } else if (kv_err) |ke| {
+                try respb.setSimpleResponse(server, ent, sid, sess, status, worker_mod.kvErrorMessage(ke), allocator);
             } else {
                 // Surface the actual DispatchError in BOTH the response body
                 // and journald, tagged with the saga id so it ties to
