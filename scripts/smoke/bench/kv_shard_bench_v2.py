@@ -5,13 +5,19 @@ The V2 successor to `scripts/bench/kv_bench_cluster.sh`'s third leg (and the
 deleted `kv_shard_wide_bench.py`), both of which spawn the retired `loop46`
 binary and have had no runnable replacement since the cutover.
 
-**The V1 "8 workers" number does not port.** V1 ran N worker THREADS in one
-process and scaled by raising N; `rewind-worker` runs exactly one worker
-thread per process (`src/rewind/main.zig` — one `Thread.spawn`, an event-loop
-node), and V2 scales horizontally by adding nodes. So the ~158k req/s 8w/8t
-V1 baseline has no apples-to-apples V2 counterpart, and this script does not
-pretend otherwise: it prints no ratio against it. What it establishes is a
-V2 baseline of its own, on the production 3-node shape.
+`REWIND_WORKERS` sets the worker-thread count and is echoed in the header,
+because a throughput number that does not say how many threads produced it
+is not comparable to anything.
+
+**Two drive modes, and the difference is not cosmetic.** By default the load
+goes through the FRONT door, which is the production path — and the front
+pools at most `proxy.MAX_LEGS` (4) upstream connections per node. Those
+connections are what `SO_REUSEPORT` hashes across workers, so a front-driven
+run can never occupy more than 4 workers per node no matter how high
+`REWIND_WORKERS` goes. `DIRECT=1` points h2load at the node port instead,
+one connection per client, which is what isolates the worker-count variable.
+Read a front-mode number as "what the current edge delivers" and a direct
+number as "what the node can do".
 
 What it measures, and why the second number matters as much as the first:
 
@@ -35,8 +41,11 @@ Run:
     python3 scripts/smoke/bench/kv_shard_bench_v2.py [requests] [clients] [streams]
 
 Env:
-    TENANTS=8     parallel tenants (each its own raft group)
-    NODES=3       cluster size; 3 is the production shape
+    TENANTS=8         parallel tenants (each its own raft group)
+    NODES=3           cluster size; 3 is the production shape
+    REWIND_WORKERS=1  worker threads per node (read by the worker itself)
+    DIRECT=0          1 = drive the node port directly, bypassing the front's
+                      4-leg upstream pool (see above)
 """
 from __future__ import annotations
 
@@ -54,6 +63,8 @@ from smoke_lib_v2 import V2Cluster, metric_counter  # noqa: E402
 
 TENANTS = int(os.environ.get("TENANTS", "8"))
 NODES = int(os.environ.get("NODES", "3"))
+WORKERS = int(os.environ.get("REWIND_WORKERS", "1"))
+DIRECT = os.environ.get("DIRECT", "0") not in ("", "0")
 REQUESTS = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
 CLIENTS = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 STREAMS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
@@ -105,8 +116,11 @@ def batch_occupancy(c: V2Cluster) -> tuple[float, float]:
 
 
 def main() -> int:
-    print(f"=== sharded write throughput: {TENANTS} tenants × {NODES} nodes ===")
-    print(f"    n={REQUESTS} c={CLIENTS} m={STREAMS} per tenant, through the front door")
+    print(f"=== sharded write throughput: {TENANTS} tenants × {NODES} nodes "
+          f"× {WORKERS} worker(s) ===")
+    print(f"    n={REQUESTS} c={CLIENTS} m={STREAMS} per tenant, "
+          + ("DIRECT to the node port (front's 4-leg pool bypassed)"
+             if DIRECT else "through the front door (≤4 upstream legs per node)"))
     tenants = [f"write{i}" for i in range(TENANTS)]
 
     with V2Cluster.spawn("kvshard", nodes=NODES) as c:
@@ -119,7 +133,10 @@ def main() -> int:
             c.wait_for_handler(t, "/", want_body="w", timeout_s=60.0)
         print(f"ok  {TENANTS} tenants provisioned, deployed and warm")
 
-        url = f"{c.front_url()}/"
+        # Direct mode addresses node 0 only, so keep it to NODES=1 when the
+        # question is worker scaling — otherwise the run measures
+        # serve-or-forward as much as it measures workers.
+        url = f"{c.node_url(0)}/" if DIRECT else f"{c.front_url()}/"
         before_n, _ = batch_occupancy(c)
 
         procs = []
@@ -156,6 +173,14 @@ def main() -> int:
         print()
         print(f"  raft batches observed:      {after_n - before_n:.0f}")
         print(f"  mean requests per batch:    {mean_occ:.2f}")
+        # Occupancy is the number to read against the worker count. The
+        # dispatch walk coalesces the requests ONE worker sees in one tick
+        # into one raft entry, so splitting a fixed arrival rate across N
+        # workers divides occupancy by roughly N and multiplies the entry
+        # count by roughly N. If throughput is flat while occupancy falls
+        # like 1/N, the binding layer is the entry pipeline, not worker CPU,
+        # and adding workers is moving the same work into more, smaller
+        # entries.
         print("  (1.00 means the dispatch walk never coalesced — the state "
               "before the admission-reserve fix)")
 
