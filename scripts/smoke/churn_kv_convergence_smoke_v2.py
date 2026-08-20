@@ -52,6 +52,8 @@ N_WRITERS = 6
 FLIP_INTERVAL = 1.5     # ONE controlled leadership flip this often — writes commit between
 WRITE_TIMEOUT = 2
 CONVERGE_TIMEOUT = 20.0  # per-round: how long to wait for all nodes to agree
+QUIESCE_SECS = 2.0       # writers paused this long before the check, so the
+                         # cluster is asked about a value that has stopped moving
 
 
 def main() -> int:
@@ -95,6 +97,10 @@ def main() -> int:
                     # round then "converges" on a value nothing is writing,
                     # which is how this soak reported PASS while measuring
                     # nothing (rove#373's lesson, same shape).
+                    # Quiesced for a convergence check — see `check_converge`.
+                    if pause.is_set():
+                        time.sleep(0.02)
+                        continue
                     try:
                         r = c.request("acme", "/?fn=handler", method="POST",
                                       data='{"v":"v-%d"}' % n, timeout=WRITE_TIMEOUT)
@@ -132,6 +138,12 @@ def main() -> int:
         # all three replicas agree on KEY (a transient orphan would be caught here
         # before later writes heal it).
         stop = threading.Event()
+        # Writers observe this while a round asserts convergence. Without it
+        # the check compares a MOVING TARGET: `converged_now` reads the three
+        # nodes through three sequential HTTP calls while thousands of writes
+        # per second are still landing, so the values differ by construction
+        # and "converged" only ever meant the reads got lucky.
+        pause = threading.Event()
         stats = [0]
         ts = burst(stop, stats)
 
@@ -145,13 +157,24 @@ def main() -> int:
 
         def check_converge(label):
             nonlocal diverged_round
-            ok, vals = False, {}
-            deadline = time.time() + CONVERGE_TIMEOUT
-            while time.time() < deadline:
-                ok, vals = converged_now()
-                if ok:
-                    break
-                time.sleep(0.4)
+            # QUIESCE FIRST. A replica set under a live write storm has no
+            # single "current value" to agree on — the question only means
+            # something once writing stops and the cluster is given time to
+            # settle. Stopping is what makes a remaining disagreement a FORK
+            # rather than lag, which is the whole claim this soak exists to
+            # make (and what its docstring already promised).
+            pause.set()
+            try:
+                time.sleep(QUIESCE_SECS)  # let in-flight writes land
+                ok, vals = False, {}
+                deadline = time.time() + CONVERGE_TIMEOUT
+                while time.time() < deadline:
+                    ok, vals = converged_now()
+                    if ok:
+                        break
+                    time.sleep(0.4)
+            finally:
+                pause.clear()
             if ok:
                 # A round that acked no NEW write proves nothing: three
                 # replicas agreeing on a value none of them was asked to
