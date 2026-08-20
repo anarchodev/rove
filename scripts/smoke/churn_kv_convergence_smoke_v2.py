@@ -76,6 +76,7 @@ def main() -> int:
 
         ctr = [0]
         highest_acked = [0]
+        write_errors = [0]
         lock = threading.Lock()
 
         def burst(stop, stats):
@@ -84,13 +85,31 @@ def main() -> int:
                     with lock:
                         ctr[0] += 1
                         n = ctr[0]
-                    r = c.request("acme", "/?fn=handler", method="POST",
-                                  data='{"v":"v-%d"}' % n, timeout=WRITE_TIMEOUT)
+                    # A write that times out or errors is EXPECTED here — the
+                    # soak restarts nodes and forces leadership flips under
+                    # load, so 503s and curl timeouts are the weather. What is
+                    # not acceptable is letting one of them kill the thread:
+                    # `c.request` raises on timeout, and an unguarded raise
+                    # silently removes a writer for the rest of the run. Six
+                    # such raises and the write storm is over — every later
+                    # round then "converges" on a value nothing is writing,
+                    # which is how this soak reported PASS while measuring
+                    # nothing (rove#373's lesson, same shape).
+                    try:
+                        r = c.request("acme", "/?fn=handler", method="POST",
+                                      data='{"v":"v-%d"}' % n, timeout=WRITE_TIMEOUT)
+                    except Exception:
+                        with lock:
+                            write_errors[0] += 1
+                        continue
                     if r.status == 204:
                         with lock:
                             stats[0] += 1
                             if n > highest_acked[0]:
                                 highest_acked[0] = n
+                    else:
+                        with lock:
+                            write_errors[0] += 1
 
             def churner():
                 while not stop.is_set():
@@ -106,6 +125,7 @@ def main() -> int:
             return ts
 
         diverged_round = None
+        vacuous_rounds: list[str] = []
         # Continuous writers run for the whole soak; churn = rolling restarts of one
         # node at a time (quorum held → writes keep committing), with an occasional
         # forced leadership flip. After each churn action we pause writes and assert
@@ -133,7 +153,23 @@ def main() -> int:
                     break
                 time.sleep(0.4)
             if ok:
-                print(f"  {label}: ok   converged={vals[0]!r} acked={stats[0]}")
+                # A round that acked no NEW write proves nothing: three
+                # replicas agreeing on a value none of them was asked to
+                # change is not convergence, it is quiescence. Say so and
+                # fail — a soak that stops writing must not report a pass.
+                with lock:
+                    acked_now = stats[0]
+                    errs = write_errors[0]
+                progressed = acked_now > check_converge.last_acked
+                check_converge.last_acked = acked_now
+                if not progressed:
+                    print(f"  {label}: NO-WRITE ROUND acked={acked_now} "
+                          f"(unchanged) write_errors={errs} — the storm stopped, "
+                          f"so this round tested nothing")
+                    vacuous_rounds.append(label)
+                    return False
+                print(f"  {label}: ok   converged={vals[0]!r} acked={acked_now} "
+                      f"write_errors={errs}")
             else:
                 print(f"  {label}: FAIL DIVERGED n1={vals.get(0)!r} n2={vals.get(1)!r} n3={vals.get(2)!r}")
                 diverged_round = label
@@ -141,6 +177,8 @@ def main() -> int:
                     c.dump_node_log(node=i, grep=["fold", "skip-detail", "transfer",
                                                   "became leader", "apply", "warn", "error"])
             return ok
+
+        check_converge.last_acked = 0
 
         for rnd in range(1, ROUNDS + 1):
             ld = c.leader_node("acme", deadline_s=8.0)
@@ -165,6 +203,14 @@ def main() -> int:
         for t in ts:
             t.join(timeout=10)
 
+        if vacuous_rounds:
+            print(f"\n*** {len(vacuous_rounds)} round(s) acked no new write: "
+                  f"{vacuous_rounds} ***\n"
+                  "The write storm stopped, so those rounds asserted convergence on a\n"
+                  "value nothing was writing. That is quiescence, not convergence — the\n"
+                  "soak cannot claim it tested anything. Fix the writers (or the cluster's\n"
+                  "ability to accept writes under churn) before believing a pass.")
+            return 1
         if diverged_round is not None:
             print(f"\n*** DIVERGENCE REPRODUCED in round {diverged_round} — the prod bug. ***")
             return 1
