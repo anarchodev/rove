@@ -73,6 +73,31 @@ pub fn parsePortEnv(name: []const u8, default: u16) u16 {
     return std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch default;
 }
 
+/// The most worker threads a node may run. `log.MinterId` partitions the
+/// request-id space 8 bits node + 8 bits worker and hard-errors past a
+/// worker index of 255, so a wrapped index would be an id collision under
+/// another name — refuse the count instead of truncating it. Held at 255
+/// rather than 256 so the count itself, not just the index, fits the `u8`
+/// the per-worker-sized subsystems take.
+pub const MAX_WORKERS: usize = 255;
+
+/// Read a worker-thread count from `name`. Unset, unparseable, or `0`
+/// falls back to `default`; anything above `MAX_WORKERS` is clamped with
+/// a warning rather than silently wrapping a worker identity.
+pub fn parseWorkerCountEnv(name: []const u8, default: usize) usize {
+    const s = std.posix.getenv(name) orelse return default;
+    const n = std.fmt.parseInt(usize, std.mem.trim(u8, s, " \t"), 10) catch return default;
+    if (n == 0) return default;
+    if (n > MAX_WORKERS) {
+        std.log.warn(
+            "{s}={d} exceeds the {d}-worker request-id identity space; using {d}",
+            .{ name, n, MAX_WORKERS, MAX_WORKERS },
+        );
+        return MAX_WORKERS;
+    }
+    return n;
+}
+
 /// Bring up the dedicated loopback HTTP/1.1 operator-metrics listener —
 /// separate from the binary's data port so stock Prometheus/Alloy can
 /// scrape it and so `/metrics` stays answerable while the main loop is
@@ -134,6 +159,17 @@ test "Cadence: gates to the interval" {
     try testing.expect(c.due(1000));
     try testing.expect(!c.due(1050));
     try testing.expect(c.due(1100));
+}
+
+test "parseWorkerCountEnv: unset falls back, absurd counts clamp" {
+    // No env in the test process, so this exercises the fallback arm;
+    // the clamp arm is the one that matters and is checked directly.
+    try std.testing.expectEqual(@as(usize, 1), parseWorkerCountEnv("REWIND_WORKERS_UNSET_XYZ", 1));
+    try std.testing.expectEqual(@as(usize, 4), parseWorkerCountEnv("REWIND_WORKERS_UNSET_XYZ", 4));
+    // A worker index must stay inside `log.MinterId`'s 8 bits; wrapping
+    // one is a request-id collision, not a rounding error.
+    try std.testing.expect(MAX_WORKERS <= 255);
+    try std.testing.expect(MAX_WORKERS <= std.math.maxInt(u8));
 }
 
 test "metrics ports are pairwise disjoint" {

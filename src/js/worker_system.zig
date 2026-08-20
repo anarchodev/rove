@@ -545,10 +545,18 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         \\# HELP bound_fetch_same_worker_routes_total bound fetch chunks where owner worker == hash(tenant_id) % N (correct but doesn't exercise the bug fix).
         \\# TYPE bound_fetch_same_worker_routes_total counter
         \\bound_fetch_same_worker_routes_total {d}
+        \\# HELP dispatch_lease_conflicts_total anchor selections that found the tenant's dispatch lease held by a sibling worker and served a different tenant this tick.
+        \\# TYPE dispatch_lease_conflicts_total counter
+        \\dispatch_lease_conflicts_total {d}
+        \\# HELP dispatch_blocked_overflows_total ticks stopped early because more than 32 tenants were contending (requests deferred to the next tick, never dropped).
+        \\# TYPE dispatch_blocked_overflows_total counter
+        \\dispatch_blocked_overflows_total {d}
         \\
     , .{
         worker.node.router.bound_fetch_cross_worker_routes.load(.monotonic),
         worker.node.router.bound_fetch_same_worker_routes.load(.monotonic),
+        worker.node.dispatch_lease_conflicts.load(.monotonic),
+        worker.node.dispatch_blocked_overflows.load(.monotonic),
     });
 
     // blob coordinator / chunk spool (`docs/architecture/routing-and-ingress.md`): peak inline RAM held by this
