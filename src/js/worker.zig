@@ -4116,9 +4116,13 @@ test "BlockedTenants: defers past its cap, and the list is tick-local" {
     try testing.expectEqual(@as(usize, 32), blocked.slice().len);
     try testing.expectEqual(&insts[31], blocked.slice()[31]);
 
-    // Tick-local: the worker clears at the top of every tick, so a tenant
-    // skipped for lease contention is a candidate again on the next one.
-    // A list that outlived its tick would starve a busy tenant silently.
+    // Tick-local: `dispatchOnce` clears at the top of every tick, so a
+    // tenant skipped for lease contention is a candidate again on the next
+    // one. A list that outlived its tick starves that tenant on that worker
+    // for the life of the process — its requests are re-walked and
+    // re-skipped forever while the worker idles, and nothing logs. The
+    // clear lives in `dispatchOnce` rather than its caller for that reason;
+    // `lease_contention_smoke_v2` is what proves the caller is served.
     blocked.clear();
     try testing.expectEqual(@as(usize, 0), blocked.slice().len);
     try blocked.append(&insts[7]);

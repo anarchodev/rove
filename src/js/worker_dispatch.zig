@@ -1609,6 +1609,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // an error return before finalize would otherwise carry it).
     worker.batch_side.reset(allocator);
 
+    // The contended-lease skip list is TICK-LOCAL, and this is the tick.
+    // A tenant marked busy is skipped for the rest of this walk only; it
+    // must be a candidate again on the next one, or the first conflict
+    // starves it on this worker for the life of the process — its
+    // requests sit in `request_out` being re-walked and re-skipped
+    // forever, answering nothing. Cleared HERE rather than by the caller
+    // because the caller cannot see the invariant, and a caller that
+    // forgets produces exactly that silent hang.
+    blocked.clear();
+
     const entities = server.request_out.entitySlice();
     const sids = server.request_out.column(h2.StreamId);
     const sessions = server.request_out.column(h2.Session);
