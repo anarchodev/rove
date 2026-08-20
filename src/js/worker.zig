@@ -60,8 +60,10 @@
 //! `parked_units`, `blob_sessions`, `spools`, `ws_conns`,
 //! `tenant_logs`, `log` (including `log_buffer`, which is per-worker
 //! despite the `NodeLogBuffer` spelling — the "node" in the name means
-//! "not per tenant"), `limiter`, `penalty_box`, `dispatcher`, and the
-//! route/handler caches. The allocator is `std.heap.c_allocator`,
+//! "not per tenant"; its flush thresholds are therefore per-worker too,
+//! so a node needs N times the records to trip the count-based one and
+//! the time-based one is what bounds visibility), `limiter`,
+//! `penalty_box`, `dispatcher`, and the route/handler caches. The allocator is `std.heap.c_allocator`,
 //! shared and thread-safe.
 //!
 //! Three of those per-worker fields are written by OTHER threads and
@@ -99,6 +101,13 @@
 //! for a tenant it is not anchoring (`platform.scope(x).kv.*`, a
 //! `_deploy/current` probe) blocks for at most one sibling's handler
 //! walk, and never observes writes that raft has not committed.
+//!
+//! A cross-tenant admin write can therefore answer with a retryable
+//! conflict when a sibling is mid-batch on the target. That is the
+//! accepted behaviour, not a gap to close here: the resolution is the
+//! tenant-scope activation model, which removes the cross-tenant
+//! `TrackedTxn` entirely — see "Cross-tenant writes at N worker threads"
+//! in `docs/architecture/consensus-and-storage.md`. Retry at the shim.
 
 const std = @import("std");
 const rove = @import("rove");
