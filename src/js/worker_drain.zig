@@ -1452,16 +1452,14 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.saga_id, &.{}, ctx.activation, 0, ctx.exec_seq);
 }
 
-/// 503 (retriable) when this activation's failure was an invalidated txn
-/// — a chain predecessor faulted and the cascade self-aborted it
-/// (`Error.TxnInvalidated` via `pending_kv_error`); else 500. Lets a
-/// resume hop's held caller retry rather than treat a transient
-/// speculative-basis loss as a hard handler error. `last_kv_error` is
-/// reset per activation at `runOutcome` entry.
+/// The status this activation's kv failure earns, per condition
+/// (`worker.kvErrorStatus`): retriable conditions let a resume hop's held
+/// caller retry instead of reading a transient storage state as a hard
+/// handler error, and a full store says so rather than implying a retry
+/// would help. Non-kv failures stay 500. `last_kv_error` is reset per
+/// activation at `runOutcome` entry, so this is this activation's.
 fn resumeErrStatus(worker: anytype) u16 {
-    if (worker.dispatcher.last_kv_error) |lke| {
-        if (lke == error.TxnInvalidated) return 503;
-    }
+    if (worker.dispatcher.last_kv_error) |lke| return worker_mod.kvErrorStatus(lke);
     return 500;
 }
 
