@@ -30,6 +30,10 @@ const kv_mod = @import("raft-kv");
 pub const Error = error{
     Kv,
     OutOfMemory,
+    /// Another thread holds the tenant's dispatch lease. Only the
+    /// `NoWait` openers raise it; the caller retries rather than joining
+    /// a wait it could deadlock in (`KvStore.getNoWait`).
+    Conflict,
 };
 
 /// A low-cardinality, user-defined index tag attached to a request's
@@ -801,7 +805,39 @@ pub const RequestIdMinter = struct {
             .next_request_seq = 0,
             .reserved_until = 0,
         };
-        const loaded = self.loadNextSeq() catch 0;
+        const loaded = self.loadNextSeq(.wait) catch 0;
+        self.next_request_seq = loaded;
+        self.reserved_until = loaded;
+        return self;
+    }
+
+    /// `init`, but refuses rather than waits when another thread holds
+    /// the tenant's dispatch lease (`Error.Conflict`). For openers that
+    /// already hold a DIFFERENT tenant's lease — see `KvStore.getNoWait`.
+    ///
+    /// The resume read is not optional here the way it is in `init`:
+    /// `init` treats a failed read as "start at 0", which is safe for a
+    /// genuine absent key but would RE-ISSUE ids if it swallowed
+    /// contention. So contention propagates and the caller retries.
+    pub fn initNoWait(
+        allocator: std.mem.Allocator,
+        identity: MinterId,
+        opts: Options,
+    ) Error!RequestIdMinter {
+        const seq_key = allocator.dupe(u8, opts.seq_key) catch return Error.OutOfMemory;
+        errdefer allocator.free(seq_key);
+        var self: RequestIdMinter = .{
+            .allocator = allocator,
+            .identity = identity,
+            .seq_kv = opts.seq_kv,
+            .seq_key = seq_key,
+            .next_request_seq = 0,
+            .reserved_until = 0,
+        };
+        const loaded = self.loadNextSeq(.no_wait) catch |err| switch (err) {
+            Error.Conflict => return Error.Conflict,
+            else => 0,
+        };
         self.next_request_seq = loaded;
         self.reserved_until = loaded;
         return self;
@@ -834,9 +870,14 @@ pub const RequestIdMinter = struct {
         return (@as(u64, self.identity.raw()) << 48) | @as(u64, seq);
     }
 
-    fn loadNextSeq(self: *RequestIdMinter) Error!u48 {
-        const bytes = self.seq_kv.get(self.seq_key) catch |err| switch (err) {
+    fn loadNextSeq(self: *RequestIdMinter, wait: enum { wait, no_wait }) Error!u48 {
+        const read = switch (wait) {
+            .wait => self.seq_kv.get(self.seq_key),
+            .no_wait => self.seq_kv.getNoWait(self.seq_key),
+        };
+        const bytes = read catch |err| switch (err) {
             error.NotFound => return 0,
+            error.Conflict => return Error.Conflict,
             else => return Error.Kv,
         };
         defer self.allocator.free(bytes);

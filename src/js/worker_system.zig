@@ -545,6 +545,9 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         \\# HELP bound_fetch_same_worker_routes_total bound fetch chunks where owner worker == hash(tenant_id) % N (correct but doesn't exercise the bug fix).
         \\# TYPE bound_fetch_same_worker_routes_total counter
         \\bound_fetch_same_worker_routes_total {d}
+        \\# HELP dispatch_log_open_deferrals_total entities deferred because the tenant's cold log could not be opened without waiting on a sibling worker's lease.
+        \\# TYPE dispatch_log_open_deferrals_total counter
+        \\dispatch_log_open_deferrals_total {d}
         \\# HELP dispatch_lease_conflicts_total anchor selections that found the tenant's dispatch lease held by a sibling worker and served a different tenant this tick.
         \\# TYPE dispatch_lease_conflicts_total counter
         \\dispatch_lease_conflicts_total {d}
@@ -555,6 +558,7 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
     , .{
         worker.node.router.bound_fetch_cross_worker_routes.load(.monotonic),
         worker.node.router.bound_fetch_same_worker_routes.load(.monotonic),
+        worker.node.dispatch_log_open_deferrals.load(.monotonic),
         worker.node.dispatch_lease_conflicts.load(.monotonic),
         worker.node.dispatch_blocked_overflows.load(.monotonic),
     });
