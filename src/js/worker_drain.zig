@@ -1997,6 +1997,24 @@ fn finishContResume(
     }
 }
 
+/// The export a hold-deadline expiry may resume, or null when the chain
+/// named none.
+///
+/// A continuation's `fn_name` is the target the handler asked for with
+/// `next({fn})`. Null means "resume me when my arms fire", and the arms
+/// name their own export per event (`onFetchChunk` / `onWake` / …) — so
+/// on a deadline, with no event, there is nothing the chain ever asked
+/// to run. See the caller for why running `"default"` instead is worse
+/// than a 504.
+fn deadlineResumeExport(worker: anytype, ent: rove.Entity) ?[]const u8 {
+    const server = worker.h2;
+    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return null;
+    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return null;
+    const c = desc.cont orelse return null;
+    const fname = c.fn_name orelse return null;
+    return if (fname.len > 0) fname else null;
+}
+
 fn resumeContinuation(
     worker: anytype,
     ent: rove.Entity,
@@ -2659,6 +2677,25 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     }
 
     for (expired.items) |e| {
+        // Only resume a handler when the chain NAMED one to resume
+        // (`next({fn})`). A chain parked on a bare `next()` — waiting on
+        // bound fetches, a streaming body, an owed send — has no resume
+        // target of its own: its resumes are supplied per-event by the
+        // fetch/stream path. Resuming it anyway falls through
+        // `defaultExportForKind` to `"default"` and re-invokes the
+        // customer's ENTRY handler against a synthetic request with no
+        // query and no body — whose return then becomes the client's
+        // answer. A timeout would silently re-run the entry point, and
+        // whatever it did on the way (a kv write, a send) would stand.
+        //
+        // `handler-shape.md` §2.1 already says what a hold deadline is:
+        // "the generic hold-deadline 504 (which remains the backstop for
+        // armed-but-never-fires)". Give it that.
+        const named = deadlineResumeExport(worker, e.ent);
+        if (named == null) {
+            resolveParked(worker, e.ent, e.sid, e.sess, 504, "hold deadline exceeded\n") catch {};
+            continue;
+        }
         resumeContinuation(worker, e.ent, e.sid, e.sess, "{\"ok\":false,\"error\":\"deadline\"}", false, false) catch |err| {
             std.log.warn(
                 "rove-js continuation: deadline resume failed ({s}); hard 504",
