@@ -49,6 +49,56 @@
 //! `worker.poll(...)` and `reg.flush()`. Keeping systems outside the
 //! Worker type mirrors shift-js's linear dispatch-is-a-phase pattern
 //! and matches the rove-library "systems are pure" principle.
+//!
+//! ## What N worker threads share
+//!
+//! A node runs one `Worker` per thread, shared-nothing: each has its
+//! own io_uring ring and its own `SO_REUSEPORT` listen socket, and the
+//! kernel spreads inbound connections across them. Everything a
+//! `Worker` holds by value is therefore per-worker, touched only by
+//! its own thread — the `rove.Registry` and h2 server, `pending_txns`,
+//! `parked_units`, `blob_sessions`, `spools`, `ws_conns`,
+//! `tenant_logs`, `log` (including `log_buffer`, which is per-worker
+//! despite the `NodeLogBuffer` spelling — the "node" in the name means
+//! "not per tenant"), `limiter`, `penalty_box`, `dispatcher`, and the
+//! route/handler caches. The allocator is `std.heap.c_allocator`,
+//! shared and thread-safe.
+//!
+//! Three of those per-worker fields are written by OTHER threads and
+//! carry their own mutex for it: `msg_inbox`, `wake_inbox` and
+//! `relay_inbox`, which register on `node.router` so the fetch, apply
+//! and pump threads can push activations in. The owning worker drains
+//! them once per tick.
+//!
+//! What a worker borrows is `node: *NodeState` and `raft: *Bridge`,
+//! plus read-only config slices owned by `main.zig`. Every piece of
+//! that is shared and synchronised:
+//!
+//!   - `raft` (`Bridge`) — one mutex covers seq assignment together
+//!     with inbox append, so per-tenant propose order is commit order;
+//!     the watermarks a worker polls on the drain path
+//!     (`committedSeq` / `faultedSeq` / `is_leader`) are lock-free
+//!     atomics.
+//!   - `node.tenant` (`Tenant`) — `maps_mutex` guards the instance map
+//!     and the check-then-open that populates it.
+//!   - `node.router` (`MsgRouter`) — a mutex per registry; routing is
+//!     by `msg_inbox_idx`, the slot `registerMsgInbox` handed back.
+//!   - `node.deploy` (`DeploymentCache`) — the live snapshot is an
+//!     atomic pointer with a refcount; plan, keyring and pin state
+//!     each have their own lock.
+//!   - `node.proxy_result_inboxes` — one slot per worker, indexed by
+//!     `msg_inbox_idx`, so workers never touch each other's.
+//!   - the NodeState counters and histograms — atomics throughout.
+//!
+//! The one shared thing that does NOT look shared is a tenant's
+//! `KvStore`: `node.tenant` hands every worker the SAME `*Instance`,
+//! so `KvStore.active_txn` is node-wide state, not this worker's. That
+//! is why the leaseless `KvStore` paths read it through `ownTxn()` and
+//! a non-owner falls through to the tenant lease instead — see
+//! "Leaseless paths and who waits" in `kvstore.zig`. A worker reaching
+//! for a tenant it is not anchoring (`platform.scope(x).kv.*`, a
+//! `_deploy/current` probe) blocks for at most one sibling's handler
+//! walk, and never observes writes that raft has not committed.
 
 const std = @import("std");
 const rove = @import("rove");

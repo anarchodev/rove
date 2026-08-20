@@ -233,6 +233,12 @@ pub fn hashStoreId(id_str: []const u8) u64 {
 
 // ── KvStore ────────────────────────────────────────────────────────
 
+/// `KvStore.active_txn_owner`'s "nobody" sentinel. No platform we build
+/// for hands out thread id 0 (Linux `gettid` and Windows
+/// `GetCurrentThreadId` both start above it), so it can never collide
+/// with a live owner.
+const NO_OWNER: std.Thread.Id = 0;
+
 pub const KvStore = struct {
     allocator: std.mem.Allocator,
     /// Pointer to the manifest backing this handle. In attached mode
@@ -245,14 +251,25 @@ pub const KvStore = struct {
     counter: *SeqCounter,
     owned_counter: ?SeqCounter,
     owned: ?*StandaloneStack,
-    /// In-flight TrackedTxn whose kvexp.Txn this thread should read
-    /// from. Set by `TrackedTxn.ensureOpen` (registers self) and
-    /// cleared by `releaseLease` / `commit` / `rollback`. Read by
-    /// `KvStore.get`/`prefix` to route through the in-flight Txn
-    /// (so handler reads see their own writes). Thread-local in
-    /// effect: the kvexp dispatch lease guarantees one active txn
-    /// per tenant at a time.
+    /// In-flight TrackedTxn whose kvexp.Txn its **opening thread**
+    /// reads and writes through, so a handler sees its own pending
+    /// writes. Set by `TrackedTxn.ensureOpen` (registers self) and
+    /// cleared by `releaseLease` / `commit` / `rollback`; only the
+    /// lease-holding thread ever writes it, so the pointer is
+    /// thread-confined.
+    ///
+    /// Read ONLY through `ownTxn()`, never directly: one `KvStore`
+    /// handle is shared by every worker thread on the node (see the
+    /// `usage_cached_*` note below), and the registration means
+    /// nothing to a sibling. `ownTxn` is what makes "thread-local in
+    /// effect" true rather than aspirational.
     active_txn: ?*TrackedTxn = null,
+    /// Thread that owns `active_txn`, as `std.Thread.getCurrentId()`;
+    /// `NO_OWNER` when no txn is registered. Published with release
+    /// ordering AFTER `active_txn` is set and cleared BEFORE it is
+    /// unset, so a thread that observes its own id also observes a
+    /// pointer only it can have written.
+    active_txn_owner: std.atomic.Value(std.Thread.Id) = .init(NO_OWNER),
     /// `usageBytesCached` TTL cache. Atomics because sibling worker
     /// threads share one handle per instance; a racing refresh is
     /// benign (both write a fresh figure). `at_ms == 0` = never
@@ -522,6 +539,77 @@ pub const KvStore = struct {
         _ = self;
     }
 
+    // ── Leaseless paths and who waits ───────────────────────────
+    //
+    // One `KvStore` handle per tenant is shared by every worker thread
+    // on the node. Two mechanisms keep them off each other, and they
+    // are not interchangeable:
+    //
+    //   - `TrackedTxn.ensureOpen` takes the tenant's dispatch lease
+    //     with `tryAcquire`, so a losing worker gets `Conflict` and the
+    //     dispatcher picks a different anchor for this tick. That skip
+    //     machinery lives at anchor selection, one level ABOVE this
+    //     type — a request that has already been admitted has nowhere
+    //     to defer to.
+    //   - `writeVersion` also uses `tryAcquire`: it runs per write
+    //     batch on the commit arm and must never stall; a contended
+    //     read stamps the fire-always sentinel and over-fires.
+    //
+    // Every other leaseless path below (`get`, `put`, `delete`,
+    // `prefix`, `applyPut`, `applyDelete`) takes the BLOCKING
+    // `acquire`, deliberately:
+    //
+    //   - It is the only correct answer at this depth. These callers
+    //     are synchronous reads and writes inside a handler
+    //     (`platform.scope(x).kv.*` against a tenant this worker is not
+    //     anchoring), on the deployment-loader thread (`_deploy/current`),
+    //     or on the apply/pump thread (`applyPut`/`applyDelete`, the
+    //     authoritative replicated-write seam, which must not skip).
+    //     None of them has a "come back next tick" continuation to
+    //     defer into, so `tryAcquire` would only convert a bounded wait
+    //     into a spurious error on a path with no retry.
+    //   - The wait is bounded by ONE handler walk, not by raft: the
+    //     dispatch lease drops at `finalizeBatch` (`releaseLease`),
+    //     well before the propose.
+    //
+    // What does change with worker count is the second failure mode on
+    // the write pair. A one-shot txn has to be the kvexp chain head, so
+    // `put`/`delete` fail while ANY worker holds an unresolved txn for
+    // the tenant — a window that widens with N. That is reported as
+    // `Conflict` (drain and retry), never `Sqlite`.
+
+    /// The in-flight `TrackedTxn` **this thread** may route through.
+    ///
+    /// The kvexp dispatch lease admits one open `TrackedTxn` per
+    /// tenant, but a `KvStore` handle is shared node-wide across
+    /// worker threads, so `active_txn` alone does not say the txn is
+    /// ours. Routing a sibling worker's read or write through it
+    /// would (a) mutate that txn's savepoint stack and lazy read view
+    /// from a second thread with no lock, and (b) expose writes that
+    /// are still speculative until raft commits — precisely what the
+    /// leaseless paths below are specified to hide ("In-flight chain
+    /// Txns are invisible"). A non-owner therefore falls through to
+    /// the lease, which serialises it behind the owner's handler walk
+    /// (released at `finalizeBatch`, well before the propose).
+    fn ownTxn(self: *KvStore) ?*TrackedTxn {
+        if (self.active_txn_owner.load(.acquire) != std.Thread.getCurrentId()) return null;
+        return self.active_txn;
+    }
+
+    /// Register `t` as this thread's active txn. Caller holds the
+    /// tenant's dispatch lease.
+    fn setActiveTxn(self: *KvStore, t: *TrackedTxn) void {
+        self.active_txn = t;
+        self.active_txn_owner.store(std.Thread.getCurrentId(), .release);
+    }
+
+    /// Drop the registration. Owner-clear first: once no thread can
+    /// match the owner id, nothing can observe the stale pointer.
+    fn clearActiveTxn(self: *KvStore) void {
+        self.active_txn_owner.store(NO_OWNER, .release);
+        self.active_txn = null;
+    }
+
     // ── Core ops ────────────────────────────────────────────────
 
     pub fn get(self: *KvStore, key: []const u8) Error![]u8 {
@@ -529,7 +617,7 @@ pub const KvStore = struct {
         // sees its own pending writes. kvexp.Txn.get walks the
         // savepoint chain, then chain backward, then main_overlay,
         // then LMDB.
-        if (self.active_txn) |t| {
+        if (self.ownTxn()) |t| {
             // Lazy batch-scoped read view: pay the LMDB read-txn
             // begin once on this batch's first kv.get, amortizing
             // across every subsequent read. Write-only batches
@@ -587,7 +675,7 @@ pub const KvStore = struct {
     /// if the current thread already owns it via a TrackedTxn, we
     /// route through that txn instead.
     pub fn put(self: *KvStore, key: []const u8, value: []const u8) Error!void {
-        if (self.active_txn) |t| {
+        if (self.ownTxn()) |t| {
             const leaf = t.activeLeaf();
             leaf.put(key, value) catch |err| switch (err) {
                 error.TxnInvalidated => return Error.TxnInvalidated,
@@ -595,11 +683,10 @@ pub const KvStore = struct {
             };
             return;
         }
-        // Blocking acquire — direct KvStore.put is used by test/admin
-        // paths where contention is rare; we don't surface Conflict.
-        // Each collapse-to-Sqlite site logs the underlying kvexp error
-        // first, so the real cause isn't swallowed behind a bare `Sqlite`
-        // (e.g. a follower-apply failure).
+        // Blocking acquire — deliberate; see "Leaseless paths and who
+        // waits" above. Each collapse-to-Sqlite site logs the underlying
+        // kvexp error first, so the real cause isn't swallowed behind a
+        // bare `Sqlite` (e.g. a follower-apply failure).
         var lease = self.manifest.acquire(self.store_id) catch |err| {
             std.log.warn("kvstore.put acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
             return Error.Sqlite;
@@ -616,6 +703,13 @@ pub const KvStore = struct {
         };
         txn.commit() catch |err| {
             std.log.warn("kvstore.put commit store={x}: {s}", .{ self.store_id, @errorName(err) });
+            // A one-shot txn must be the chain head. Any worker holding
+            // an unresolved (parked, awaiting raft) txn for this tenant
+            // makes it not-head, so this is a "retry once the chain
+            // drains", not a storage fault — surfaced as `Conflict` so a
+            // caller can tell the two apart (retryable must be reachable
+            // as retryable).
+            if (err == error.NotChainHead) return Error.Conflict;
             return Error.Sqlite;
         };
     }
@@ -628,7 +722,7 @@ pub const KvStore = struct {
     }
 
     pub fn delete(self: *KvStore, key: []const u8) Error!void {
-        if (self.active_txn) |t| {
+        if (self.ownTxn()) |t| {
             const leaf = t.activeLeaf();
             _ = leaf.delete(key) catch |err| switch (err) {
                 error.OutOfMemory => return Error.OutOfMemory,
@@ -656,6 +750,8 @@ pub const KvStore = struct {
         };
         txn.commit() catch |err| {
             std.log.warn("kvstore.delete commit store={x}: {s}", .{ self.store_id, @errorName(err) });
+            // See `put`: not-head is a drain-and-retry, not a fault.
+            if (err == error.NotChainHead) return Error.Conflict;
             return Error.Sqlite;
         };
     }
@@ -732,7 +828,7 @@ pub const KvStore = struct {
             list.deinit(self.allocator);
         }
 
-        if (self.active_txn) |t| {
+        if (self.ownTxn()) |t| {
             // Lazy batch-scoped read view (see KvStore.get).
             t.beginReadView();
             const leaf = t.activeLeaf();
@@ -972,7 +1068,7 @@ pub const KvStore = struct {
                 self.lease = null;
                 return Error.Sqlite;
             };
-            self.store.active_txn = self;
+            self.store.setActiveTxn(self);
             self.opened = true;
             self.read_view_opened = false;
         }
@@ -986,7 +1082,7 @@ pub const KvStore = struct {
         pub fn releaseLease(self: *TrackedTxn) void {
             if (self.lease == null) return;
             std.debug.assert(self.store.active_txn == self);
-            self.store.active_txn = null;
+            self.store.clearActiveTxn();
             self.lease.?.release();
             self.lease = null;
         }
@@ -1128,7 +1224,7 @@ pub const KvStore = struct {
             self.savepoints.deinit(self.store.allocator);
             self.savepoints = .empty;
             if (self.lease != null) {
-                self.store.active_txn = null;
+                self.store.clearActiveTxn();
                 self.lease.?.release();
                 self.lease = null;
             }
@@ -1169,7 +1265,7 @@ pub const KvStore = struct {
             self.savepoints.deinit(self.store.allocator);
             self.savepoints = .empty;
             if (self.lease != null) {
-                self.store.active_txn = null;
+                self.store.clearActiveTxn();
                 self.lease.?.release();
                 self.lease = null;
             }
@@ -1194,7 +1290,7 @@ pub const KvStore = struct {
             self.savepoints.deinit(self.store.allocator);
             self.savepoints = .empty;
             if (self.lease != null) {
-                self.store.active_txn = null;
+                self.store.clearActiveTxn();
                 self.lease.?.release();
                 self.lease = null;
             }
@@ -1531,6 +1627,118 @@ test "tracked txn savepoint + rollbackTo" {
         try testing.expectEqualStrings("first", v);
     }
     try txn.commit();
+}
+
+test "a sibling thread reads committed state, never the owner's tracked txn" {
+    // One `KvStore` handle per tenant is shared by every worker thread on
+    // the node, so `active_txn` is only meaningful to the thread that
+    // opened it. A sibling must fall through to the lease — which
+    // serialises it behind the owner's handler walk — instead of routing
+    // through a txn whose savepoint stack and read view the owner is
+    // mutating unlocked, and whose writes are speculative until raft
+    // commits.
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    try kv.put("k", "committed");
+
+    var txn = try kv.beginTracked();
+    try txn.put("k", "speculative"); // opens the txn and takes the lease
+
+    const Sibling = struct {
+        kv: *KvStore,
+        entered: std.Thread.ResetEvent = .{},
+        done: std.atomic.Value(bool) = .init(false),
+        value: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.entered.set();
+            if (self.kv.get("k")) |v| {
+                self.value = v;
+            } else |e| {
+                self.err = e;
+            }
+            self.done.store(true, .release);
+        }
+    };
+    var sib = Sibling{ .kv = kv };
+    const th = try std.Thread.spawn(.{}, Sibling.run, .{&sib});
+
+    // The discriminator: while the owner holds the lease the sibling
+    // cannot complete. Routing through `active_txn` would return
+    // "speculative" immediately instead. Asserting *not done* is safe
+    // under a loaded box — a slow sibling only strengthens it.
+    sib.entered.wait();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try testing.expect(!sib.done.load(.acquire));
+
+    txn.releaseLease();
+    th.join();
+
+    try testing.expectEqual(@as(?anyerror, null), sib.err);
+    const v = sib.value.?;
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("committed", v);
+
+    try txn.rollback();
+}
+
+test "a sibling thread's put never lands in the owner's tracked txn" {
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    var txn = try kv.beginTracked();
+    try txn.put("owner", "spec");
+
+    const Sibling = struct {
+        kv: *KvStore,
+        entered: std.Thread.ResetEvent = .{},
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.entered.set();
+            self.kv.put("sibling", "own") catch |e| {
+                self.err = e;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var sib = Sibling{ .kv = kv };
+    const th = try std.Thread.spawn(.{}, Sibling.run, .{&sib});
+
+    sib.entered.wait();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    // Two readings of the same fact. The sibling is still blocked on the
+    // lease, and — the direct one — the owner, reading through its own
+    // txn, cannot see the sibling's key. Routing the sibling's put
+    // through `active_txn` would satisfy neither: it would complete at
+    // once and its write would be sitting in the owner's writeset,
+    // riding the owner's raft entry and dying with the owner's rollback.
+    try testing.expect(!sib.done.load(.acquire));
+    try testing.expectError(Error.NotFound, kv.get("sibling"));
+
+    // Commit mutates the chain BEFORE dropping the lease, so the sibling
+    // wakes to an empty chain and its one-shot txn is the head.
+    try txn.commit();
+    th.join();
+    try testing.expectEqual(@as(?anyerror, null), sib.err);
+
+    const own = try kv.get("owner");
+    defer testing.allocator.free(own);
+    try testing.expectEqualStrings("spec", own);
+    const v = try kv.get("sibling");
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("own", v);
 }
 
 test "usage: bytes move overlay → durable across a checkpoint; cache honors TTL" {
