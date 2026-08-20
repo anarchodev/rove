@@ -1822,7 +1822,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // request-id mint just below the per-handler section), but
         // that runs AFTER these early exits — so the early-exit
         // captures need their own seed.
-        _ = worker_mod.getOrOpenTenantLog(worker, scope_inst) catch |err| {
+        //
+        // NO-WAIT, and that is load-bearing. This runs per ENTITY,
+        // hundreds of lines before the anchor filter, so `scope_inst`
+        // is routinely a tenant this walk is NOT anchored on while the
+        // walk already holds the anchor tenant's lease. Opening a cold
+        // log reads that tenant's `_log/next_request_seq` and so wants
+        // ITS lease: the blocking form parks this worker behind a
+        // sibling that may in turn be parked behind this one, and N
+        // workers over N busy tenants close the cycle. A contended
+        // tenant is deferred instead — the entity stays in
+        // `request_out` for a later tick, exactly as a
+        // different-tenant entity does — because a worker that cannot
+        // read this tenant's store cannot serve it this tick anyway.
+        _ = worker_mod.getOrOpenTenantLogNoWait(worker, scope_inst) catch |err| {
+            // Zig error values are global, so this is the one `Conflict`
+            // that `KvStore.getNoWait` raises and the minter forwards.
+            if (err == error.Conflict) {
+                _ = worker.node.dispatch_log_open_deferrals.fetchAdd(1, .monotonic);
+                continue;
+            }
             std.log.warn(
                 "rove-js: getOrOpenTenantLog({s}) failed before captureLog: {s}",
                 .{ scope_inst.id, @errorName(err) },

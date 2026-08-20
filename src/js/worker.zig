@@ -991,6 +991,16 @@ pub const NodeState = struct {
     /// the kernel is spreading one tenant's connections across workers.
     dispatch_lease_conflicts: std.atomic.Value(u64) = .init(0),
 
+    /// Entities deferred because the tenant's cold log could not be
+    /// opened without waiting on a lease a sibling worker held.
+    ///
+    /// Structurally zero at one worker, and near-zero after warmup at
+    /// any count: a log is opened once per (worker, tenant), so this
+    /// counts first-contact contention only. A count that keeps rising
+    /// under steady traffic means tenants are being evicted and
+    /// re-opened, not that dispatch is contended.
+    dispatch_log_open_deferrals: std.atomic.Value(u64) = .init(0),
+
     /// Bumped once by whichever worker drains a follower→leader promotion
     /// edge off the bridge, and read by every worker as its cue to run the
     /// on-promotion sweeps.
@@ -3831,6 +3841,7 @@ pub fn writesetGrowsStore(writeset: *const kv_mod.WriteSet) bool {
 // in this file use `worker_log.X` directly.
 pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
 pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
+pub const getOrOpenTenantLogNoWait = worker_log.getOrOpenTenantLogNoWait;
 pub const mintRequestId = worker_log.mintRequestId;
 pub const captureTapes = worker_log.captureTapes;
 pub const dropPartialDigest = worker_log.dropPartialDigest;

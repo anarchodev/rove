@@ -67,6 +67,37 @@ pub fn openTenantLog(
     return tl;
 }
 
+/// `openTenantLog`, but refuses rather than waits when another thread
+/// holds the tenant's dispatch lease (`error.Conflict`). See
+/// `getOrOpenTenantLogNoWait`.
+pub fn openTenantLogNoWait(
+    worker: anytype,
+    inst: *const tenant_mod.Instance,
+    minter_id: log_mod.MinterId,
+) !*TenantLog {
+    const allocator = worker.allocator;
+
+    const id_copy = try allocator.dupe(u8, inst.id);
+    errdefer allocator.free(id_copy);
+
+    const tl = try allocator.create(TenantLog);
+    errdefer allocator.destroy(tl);
+    tl.* = .{
+        .allocator = allocator,
+        .instance_id = id_copy,
+        .id_minter = undefined,
+    };
+    tl.id_minter = try log_mod.RequestIdMinter.initNoWait(
+        allocator,
+        minter_id,
+        .{
+            .seq_kv = inst.kv,
+            .seq_key = "_log/next_request_seq",
+        },
+    );
+    return tl;
+}
+
 pub fn freeTenantLog(allocator: std.mem.Allocator, tl: *TenantLog) void {
     tl.id_minter.deinit();
     allocator.free(tl.instance_id);
@@ -81,6 +112,28 @@ pub fn getOrOpenTenantLog(
     inst: *const tenant_mod.Instance,
 ) !*TenantLog {
     return worker.tenant_logs.getOrOpen(worker, inst);
+}
+
+/// `getOrOpenTenantLog` for a caller that may already hold a DIFFERENT
+/// tenant's dispatch lease: raises `error.Conflict` instead of waiting.
+///
+/// Opening a cold log reads the tenant's `_log/next_request_seq`, which
+/// takes that tenant's lease. The blocking form is bounded by one
+/// handler walk only while the holder can finish it — and a holder
+/// waiting on a lease THIS thread holds never can. The dispatch walk
+/// opens a log per entity while it may already be anchored elsewhere,
+/// so it uses this form and defers the entity for a later tick.
+pub fn getOrOpenTenantLogNoWait(
+    worker: anytype,
+    inst: *const tenant_mod.Instance,
+) !*TenantLog {
+    if (worker.tenant_logs.get(inst.id)) |e| return e;
+    const opened = try openTenantLogNoWait(worker, inst, worker.log.minter_id);
+    worker.tenant_logs.put(worker.allocator, opened) catch |err| {
+        TenantLog.free(worker.allocator, opened);
+        return err;
+    };
+    return opened;
 }
 
 /// Mint `inst`'s next `request_id` on this worker, lazy-opening its

@@ -669,6 +669,40 @@ pub const KvStore = struct {
         return lease.writeVersion();
     }
 
+    /// `get`, but never waits for the tenant's dispatch lease: returns
+    /// `Error.Conflict` when another thread holds it.
+    ///
+    /// For callers that hold ANOTHER tenant's lease while reading this
+    /// one. The blocking `get` is bounded by one handler walk only while
+    /// the holder can finish it — and a holder that is itself waiting on
+    /// a lease this thread holds never can. The dispatch walk opens a
+    /// tenant log per entity while it may already be anchored on a
+    /// different tenant, which is exactly that shape, so it uses this
+    /// and defers the entity rather than joining the cycle.
+    ///
+    /// An owned in-flight txn still short-circuits, same as `get`: a
+    /// thread reading through its own txn takes no lease and cannot
+    /// contend with itself.
+    pub fn getNoWait(self: *KvStore, key: []const u8) Error![]u8 {
+        if (self.ownTxn()) |t| {
+            t.beginReadView();
+            const leaf = t.activeLeaf();
+            const v = leaf.get(self.allocator, key) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            return v orelse return Error.NotFound;
+        }
+        const lease_opt = self.manifest.tryAcquire(self.store_id) catch return Error.Sqlite;
+        var lease = lease_opt orelse return Error.Conflict;
+        defer lease.release();
+        const v = lease.get(self.allocator, key) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return Error.Sqlite,
+        };
+        return v orelse return Error.NotFound;
+    }
+
     /// Direct put. Acquires the per-tenant lock so the one-shot Txn
     /// is the only entry in the kvexp chain for the duration — same
     /// guarantee TrackedTxn relies on. The lock is reentrant-ish:
@@ -1684,6 +1718,72 @@ test "a sibling thread reads committed state, never the owner's tracked txn" {
     const v = sib.value.?;
     defer testing.allocator.free(v);
     try testing.expectEqualStrings("committed", v);
+
+    try txn.rollback();
+}
+
+test "getNoWait refuses a sibling's held lease instead of waiting on it" {
+    // The blocking `get` is bounded by one handler walk only while the
+    // holder can finish it. A holder that is itself waiting on a lease
+    // THIS thread holds never can, and the dispatch walk creates exactly
+    // that shape: it opens a tenant log per entity while already anchored
+    // on a different tenant. `getNoWait` is how that caller declines to
+    // join the cycle.
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+    try kv.put("k", "committed");
+
+    // Uncontended: it reads committed state like `get`.
+    {
+        const v = try kv.getNoWait("k");
+        defer testing.allocator.free(v);
+        try testing.expectEqualStrings("committed", v);
+    }
+
+    // The owner's OWN txn short-circuits — a thread reading through its
+    // own txn takes no lease, so it can never contend with itself, and it
+    // sees its own speculative write.
+    var txn = try kv.beginTracked();
+    try txn.put("k", "speculative"); // opens the txn and takes the lease
+    {
+        const v = try kv.getNoWait("k");
+        defer testing.allocator.free(v);
+        try testing.expectEqualStrings("speculative", v);
+    }
+
+    // A sibling gets `Conflict` — and gets it PROMPTLY. `get` would park
+    // here until `releaseLease`; the whole point is that this one returns
+    // while the lease is still held.
+    const Sibling = struct {
+        kv: *KvStore,
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            if (self.kv.getNoWait("k")) |v| {
+                testing.allocator.free(v);
+            } else |e| {
+                self.err = e;
+            }
+            self.done.store(true, .release);
+        }
+    };
+    var sib = Sibling{ .kv = kv };
+    const th = try std.Thread.spawn(.{}, Sibling.run, .{&sib});
+    th.join();
+    try testing.expect(sib.done.load(.acquire));
+    try testing.expectEqual(@as(?anyerror, Error.Conflict), sib.err);
+
+    // Released: the sibling path succeeds again, on committed state.
+    txn.releaseLease();
+    var sib2 = Sibling{ .kv = kv };
+    const th2 = try std.Thread.spawn(.{}, Sibling.run, .{&sib2});
+    th2.join();
+    try testing.expectEqual(@as(?anyerror, null), sib2.err);
 
     try txn.rollback();
 }
