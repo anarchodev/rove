@@ -974,6 +974,21 @@ pub const NodeState = struct {
     /// many customer requests ride one raft log entry".
     dispatch_writeset_size: kv_mod.CountHistogram = .{},
 
+    /// Anchor selections that found a tenant's dispatch lease held by a
+    /// sibling worker, and served a different tenant this tick instead.
+    /// Structurally zero at one worker per process — a non-zero count is
+    /// the contended-lease skip actually running, which is the only way
+    /// to know that path works. Rising alongside flat throughput means
+    /// the kernel is spreading one tenant's connections across workers.
+    dispatch_lease_conflicts: std.atomic.Value(u64) = .init(0),
+
+    /// Ticks that stopped early because `BlockedTenants` filled its 32
+    /// slots. Degrading to "stop for now" is correct — the requests stay
+    /// in `request_out` for the next tick — but a persistently non-zero
+    /// count means more than 32 tenants are contending per tick and the
+    /// cap, not the work, is setting the pace.
+    dispatch_blocked_overflows: std.atomic.Value(u64) = .init(0),
+
     /// Write batches refused at the plan KV cap (billing axis 1 —
     /// the `kvCapRefusal` gate). The count says "a tenant on this
     /// node is bouncing off its ceiling"; the tenant, used and cap
@@ -4003,6 +4018,33 @@ pub fn findBytecode(
         cur_owned = new_cur;
         cur = new_cur;
     }
+}
+
+test "BlockedTenants: defers past its cap, and the list is tick-local" {
+    // Pointer identity only — the anchor scan asks "is this instance in
+    // here" and never dereferences, so undefined instances are enough.
+    var insts: [40]tenant_mod.Instance = undefined;
+    var blocked: BlockedTenants = .{};
+
+    try testing.expectEqual(@as(usize, 0), blocked.slice().len);
+    for (insts[0..32]) |*inst| try blocked.append(inst);
+    try testing.expectEqual(@as(usize, 32), blocked.slice().len);
+    try testing.expectEqual(&insts[7], blocked.slice()[7]);
+
+    // Past the cap `append` refuses rather than overwriting. `dispatchOnce`
+    // turns that into "stop this tick": every unserved entity stays in
+    // `request_out`, so a full list defers requests and never drops one.
+    try testing.expectError(error.Overflow, blocked.append(&insts[32]));
+    try testing.expectEqual(@as(usize, 32), blocked.slice().len);
+    try testing.expectEqual(&insts[31], blocked.slice()[31]);
+
+    // Tick-local: the worker clears at the top of every tick, so a tenant
+    // skipped for lease contention is a candidate again on the next one.
+    // A list that outlived its tick would starve a busy tenant silently.
+    blocked.clear();
+    try testing.expectEqual(@as(usize, 0), blocked.slice().len);
+    try blocked.append(&insts[7]);
+    try testing.expectEqual(@as(usize, 1), blocked.slice().len);
 }
 
 test "findBytecode: exact full-path key resolves before extension-append + walk-up" {

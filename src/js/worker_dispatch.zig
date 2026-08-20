@@ -2229,7 +2229,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             new_txn.open() catch |err| {
                 allocator.destroy(new_txn);
                 if (err == kv_mod.KvError.Conflict) {
+                    _ = worker.node.dispatch_lease_conflicts.fetchAdd(1, .monotonic);
                     blocked.append(scope_inst) catch {
+                        // The 32-slot list is full: stop the tick here.
+                        // Every unserved entity stays in `request_out`
+                        // and the list clears at the next tick's top, so
+                        // this defers requests, never drops them.
+                        _ = worker.node.dispatch_blocked_overflows.fetchAdd(1, .monotonic);
                         return processed;
                     };
                     continue;

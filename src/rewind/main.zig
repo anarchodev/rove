@@ -9,7 +9,14 @@
 //!
 //!   bridge.initSingleNode → setWorkerOverlay → startPump   (the pump thread)
 //!   NodeState.init(tenant, blob_cfg, bridge)             (shared node state)
-//!   Worker.create(.{ .raft = bridge, … })                (one worker thread)
+//!   Worker.create(.{ .raft = bridge, … })                (per worker thread)
+//!
+//! `REWIND_WORKERS` sets the thread count (default 1). The model is
+//! shared-nothing: each worker opens its own io_uring ring and its own
+//! `SO_REUSEPORT` listen socket, and the kernel hashes inbound
+//! connections across them — there is no shared ring. What the workers
+//! borrow, and what guarantees each piece under N threads, is the
+//! "What N worker threads share" section of `src/js/worker.zig`.
 //!
 //! Single node: the bridge is leader of every tenant group, leader-skip
 //! apply means the worker's `TrackedTxn.commit` is the durable write, and
@@ -1026,11 +1033,18 @@ pub fn main() !void {
     };
     if (eager > 0) std.log.info("rewind: cold-start opened {d} tenant(s) for deployment load", .{eager});
     try node_state.startFetchEngine();
-    // Async serve-or-forward engine. rewind runs a single worker (idx 0).
-    try node_state.startProxyEngine(1);
-    try node_state.blob_coord.start(1);
 
-    // One worker thread bound to the listen port (SO_REUSEPORT-ready).
+    // Worker threads, shared-nothing: each opens its own io_uring ring and
+    // its own `SO_REUSEPORT` listen socket on `addr`, and the kernel hashes
+    // inbound connections across them. Sized once here because the
+    // per-worker-indexed subsystems below (proxy result inboxes, blob
+    // coordinator queues) allocate one slot per worker and a worker's slot
+    // index is its routing identity for the life of the process
+    // (`msg_router.zig`).
+    const worker_count = boot.parseWorkerCountEnv("REWIND_WORKERS", 1);
+    try node_state.startProxyEngine(worker_count);
+    try node_state.blob_coord.start(@intCast(worker_count));
+
     const addr = try std.net.Address.parseIp("0.0.0.0", port);
 
     // Dedicated loopback HTTP/1.1 operator-metrics listener — separate from the
@@ -1042,32 +1056,53 @@ pub fn main() !void {
         boot.metricsFromEnv(allocator, "REWIND_METRICS_PORT", boot.METRICS_PORT_WORKER, "rewind");
     defer if (metrics_srv) |m| m.deinit();
 
-    var ready = std.Thread.ResetEvent{};
-    var ctx = WorkerCtx{
-        .allocator = allocator,
-        .worker_idx = 0,
-        .http_addr = addr,
-        .raft = bridge,
-        .node = &node_state,
-        .log_batch_store = log_batch_store,
-        .data_dir = data_dir,
-        .admin_api_domain = admin_api_domain,
-        .move_secret = move_secret,
-        .keyring_kek = keyring_kek,
-        .cluster_id = cluster_id,
-        .cp_urls = cp_urls,
-        .log_push_bases = log_push_bases,
-        .services_jwt_secret = services_jwt_secret,
-        .peer_urls = peer_urls,
-        .ready = &ready,
-        .metrics = metrics_srv,
-    };
-    var th = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctx});
-    ready.wait();
-    std.log.info("rewind: listening on 0.0.0.0:{d} (data_dir={s}, admin_domain={s})", .{ port, data_dir, admin_api_domain });
+    const readies = try allocator.alloc(std.Thread.ResetEvent, worker_count);
+    defer allocator.free(readies);
+    for (readies) |*ev| ev.* = .{};
+    const ctxs = try allocator.alloc(WorkerCtx, worker_count);
+    defer allocator.free(ctxs);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    for (ctxs, threads, readies, 0..) |*ctx, *th, *ready, i| {
+        ctx.* = .{
+            .allocator = allocator,
+            .worker_idx = @intCast(i),
+            .http_addr = addr,
+            .raft = bridge,
+            .node = &node_state,
+            .log_batch_store = log_batch_store,
+            .data_dir = data_dir,
+            .admin_api_domain = admin_api_domain,
+            .move_secret = move_secret,
+            .keyring_kek = keyring_kek,
+            .cluster_id = cluster_id,
+            .cp_urls = cp_urls,
+            .log_push_bases = log_push_bases,
+            .services_jwt_secret = services_jwt_secret,
+            .peer_urls = peer_urls,
+            .ready = ready,
+            // The metrics render reads live h2 + dispatch state only its
+            // own thread may touch, so exactly one worker publishes. The
+            // figures it cannot see from there are already node-wide
+            // atomics on `NodeState` / `Bridge`.
+            .metrics = if (i == 0) metrics_srv else null,
+        };
+        th.* = try std.Thread.spawn(.{}, workerThreadEntry, .{ctx});
+    }
+    // Every worker, not just the first: a partially-ready start would
+    // accept connections into a worker that has not opened its stores.
+    for (readies) |*ev| ev.wait();
+    std.log.info(
+        "rewind: listening on 0.0.0.0:{d} with {d} worker(s) (data_dir={s}, admin_domain={s})",
+        .{ port, worker_count, data_dir, admin_api_domain },
+    );
 
     while (!stop_flag.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
-    th.join();
+    // Join ALL workers before the leadership handoff below — a group
+    // handed off while a worker is still dispatching for it would serve
+    // the tail of a batch it no longer leads.
+    for (threads) |th| th.join();
     // Graceful leadership handoff: BEFORE tearing the pump down, hand every
     // group this node leads to a caught-up follower so a rolling restart (the
     // `/deploy` path) costs ~one heartbeat per group instead of a full
