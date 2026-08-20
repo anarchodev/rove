@@ -958,15 +958,44 @@ pub const BlobCoordinator = struct {
         self.exec_mu.unlock();
     }
 
-    /// Bounded exponential backoff on `Error.SlowDown`. Returns
-    /// true on commit, false on terminal fail (any non-SlowDown
-    /// error OR SlowDown after `retry_max_attempts`).
+    /// Bounded exponential backoff on the transient errors. Returns
+    /// true on commit, false on terminal fail (a non-transient error, or
+    /// transience that outlasted `retry_max_attempts`).
+    ///
+    /// `Conflict` (S3 409) is transient here for a reason specific to
+    /// this store: the pool's leaf key is
+    /// `{written_unix_ms}-{digest_hex}`, so **two writers racing on one
+    /// key are storing byte-identical bytes** — that is the same
+    /// property that makes a retried PUT idempotent. The racing writer
+    /// is therefore producing exactly the object this one wants, and the
+    /// answer is to confirm it landed rather than to fail.
+    ///
+    /// Confirm, not assume. The winner can still fail, and claiming
+    /// durability for bytes that never landed is the one thing this path
+    /// must never do — so a conflict checks `exists` and only counts as
+    /// committed when the object is actually there, otherwise it backs
+    /// off and tries again like any other transient.
+    ///
+    /// Losing this cost a customer request: a spilled chunk 409'd
+    /// against its own twin, went terminal after one attempt, and the
+    /// bound fetch waiting on it stalled until the 25s hold deadline
+    /// (rove#702).
     fn putWithRetry(self: *Self, store: root.BlobStore, key: []const u8, bytes: []const u8) bool {
         var attempt: u8 = 0;
         var backoff_ns: u64 = self.config.retry_initial_backoff_ns;
         while (true) : (attempt += 1) {
             store.put(key, bytes) catch |err| {
-                if (err != root.Error.SlowDown or attempt + 1 >= self.config.retry_max_attempts) {
+                if (err == root.Error.Conflict) {
+                    if (store.exists(key) catch false) {
+                        std.log.info(
+                            "rove-blob coordinator: put {s} raced a writer of the same content; object present",
+                            .{key},
+                        );
+                        return true;
+                    }
+                }
+                const transient = err == root.Error.SlowDown or err == root.Error.Conflict;
+                if (!transient or attempt + 1 >= self.config.retry_max_attempts) {
                     std.log.warn(
                         "rove-blob coordinator: put {s} terminal after {d} attempt(s): {s}",
                         .{ key, attempt + 1, @errorName(err) },
@@ -975,8 +1004,8 @@ pub const BlobCoordinator = struct {
                 }
                 const sleep_ns = jitter(backoff_ns, self.config.retry_jitter_pct);
                 std.log.warn(
-                    "rove-blob coordinator: put {s} SlowDown (attempt {d}/{d}), sleeping {d}ms",
-                    .{ key, attempt + 1, self.config.retry_max_attempts, sleep_ns / std.time.ns_per_ms },
+                    "rove-blob coordinator: put {s} {s} (attempt {d}/{d}), sleeping {d}ms",
+                    .{ key, @errorName(err), attempt + 1, self.config.retry_max_attempts, sleep_ns / std.time.ns_per_ms },
                 );
                 if (self.shutdown_flag.load(.acquire)) return false;
                 std.Thread.sleep(sleep_ns);
@@ -1062,6 +1091,13 @@ const TestStore = struct {
     /// decrements. Subsequent PUTs succeed normally (unless
     /// `always_fail` is set).
     slowdown_count: u32 = 0,
+    /// When > 0, the next PUT returns Error.Conflict (S3 409) and this
+    /// counter decrements — the racing-twin case.
+    conflict_count: u32 = 0,
+    /// With `conflict_count`, whether the twin's object is already in
+    /// the store when the conflict is raised: true models the winner
+    /// having landed it, false models a race still in flight.
+    conflict_lands_object: bool = false,
     /// Total PUT attempts observed (including those that errored).
     /// Used by retry tests to confirm the executor actually retried.
     put_attempts: std.atomic.Value(u32) = .init(0),
@@ -1092,6 +1128,26 @@ const TestStore = struct {
             self.slowdown_count -= 1;
             self.mu.unlock();
             return root.Error.SlowDown;
+        }
+        if (self.conflict_count > 0) {
+            self.conflict_count -= 1;
+            const land = self.conflict_lands_object;
+            self.mu.unlock();
+            if (land) {
+                // The twin won and its bytes are identical by
+                // construction — store them under the same key.
+                const k = try self.allocator.dupe(u8, key);
+                const v = try self.allocator.dupe(u8, bytes);
+                self.mu.lock();
+                defer self.mu.unlock();
+                const g = try self.objects.getOrPut(self.allocator, k);
+                if (g.found_existing) {
+                    self.allocator.free(k);
+                    self.allocator.free(g.value_ptr.*);
+                }
+                g.value_ptr.* = v;
+            }
+            return root.Error.Conflict;
         }
         defer self.mu.unlock();
         const key_copy = try self.allocator.dupe(u8, key);
@@ -1544,6 +1600,74 @@ test "coordinator: non-SlowDown error is terminal on first attempt" {
 
     // Exactly one PUT attempt — no retries for non-SlowDown errors.
     try testing.expectEqual(@as(u32, 1), store.put_attempts.load(.monotonic));
+}
+
+test "coordinator: a conflict whose twin already landed commits without re-uploading" {
+    // The pool's leaf key is `{ms}-{digest}`, so two writers racing on
+    // one key are storing byte-identical bytes. When the twin has
+    // landed, the object this writer wanted already exists — confirm and
+    // commit rather than re-upload or fail.
+    var store = TestStore.init(testing.allocator);
+    defer store.deinit();
+    store.conflict_count = 1;
+    store.conflict_lands_object = true;
+
+    const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
+        .worker_count = 1,
+        .executor_size = 1,
+        .retry_max_attempts = 5,
+        .retry_initial_backoff_ns = 1 * std.time.ns_per_ms,
+        .retry_jitter_pct = 0,
+    });
+    defer coord.deinit();
+
+    _ = try coord.submit(qid(0), T_A, "raced");
+
+    const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (std.time.nanoTimestamp() < deadline) {
+        if (coord.bodyRef(qid(0), 0)) |_| break else |err| {
+            if (err == Error.PutFailed) return error.ConflictWasTreatedAsTerminal;
+            if (err != Error.UnknownSeq) return err;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    } else return error.TestTimeout;
+
+    // One attempt: the conflict resolved by confirming the object, not
+    // by pushing the same bytes again.
+    try testing.expectEqual(@as(u32, 1), store.put_attempts.load(.monotonic));
+}
+
+test "coordinator: a conflict with nothing landed retries instead of claiming durability" {
+    // The losing writer must never report a body durable because someone
+    // else *might* be writing it. If the twin has not landed, this is an
+    // ordinary transient: back off and try again.
+    var store = TestStore.init(testing.allocator);
+    defer store.deinit();
+    store.conflict_count = 2;
+    store.conflict_lands_object = false;
+
+    const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
+        .worker_count = 1,
+        .executor_size = 1,
+        .retry_max_attempts = 5,
+        .retry_initial_backoff_ns = 1 * std.time.ns_per_ms,
+        .retry_jitter_pct = 0,
+    });
+    defer coord.deinit();
+
+    _ = try coord.submit(qid(0), T_A, "raced-twice");
+
+    const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (std.time.nanoTimestamp() < deadline) {
+        if (coord.bodyRef(qid(0), 0)) |_| break else |err| {
+            if (err == Error.PutFailed) return error.ConflictWasTreatedAsTerminal;
+            if (err != Error.UnknownSeq) return err;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    } else return error.TestTimeout;
+
+    // Two conflicts absorbed, third attempt stored it.
+    try testing.expectEqual(@as(u32, 3), store.put_attempts.load(.monotonic));
 }
 
 test "coordinator: cross-tenant pool — different workers share one batch" {

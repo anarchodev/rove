@@ -194,6 +194,11 @@ pub const S3BlobStore = struct {
             // the blob coordinator's retry path can distinguish them
             // from terminal failures. Everything else stays Error.Io.
             if (resp.status == 503 or resp.status == 429) return Error.SlowDown;
+            // 409 `OperationAborted` — a concurrent write to this exact
+            // key. Transient, and for a content-addressed key it means
+            // the other writer is storing the same bytes. Whether that
+            // is benign is the caller's call, not ours.
+            if (resp.status == 409) return Error.Conflict;
             return Error.Io;
         }
     }

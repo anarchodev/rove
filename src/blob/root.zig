@@ -61,6 +61,19 @@ pub const Error = error{
     /// these from terminal failures; callers without retry semantics
     /// can treat this the same as `Io`.
     SlowDown,
+    /// Another writer holds this key right now — S3 409
+    /// `OperationAborted` ("a conflicting conditional operation is
+    /// currently in progress against this resource. Please try again").
+    ///
+    /// Transient like `SlowDown`, but it means something different and
+    /// the difference matters to the caller: for a CONTENT-ADDRESSED key
+    /// the racing writer is storing byte-identical bytes, so the object
+    /// is about to exist and the right answer is to confirm rather than
+    /// re-upload. For any other key it is a genuine race between
+    /// different payloads. The store cannot tell which it is — only the
+    /// caller knows how its keys are named — so this stays a distinct
+    /// error rather than being resolved here.
+    Conflict,
     OutOfMemory,
 };
 
