@@ -330,11 +330,36 @@ def main() -> int:
                           f" — failed twice", flush=True)
 
         # Serial tail: timing-sensitive members, alone on a quiet box.
+        #
+        # Return the slot. The pool worker does this in a `finally` and the
+        # retry loop does it explicitly; leaking it here costs one slot per
+        # member, and `slots` only ever holds `--jobs` of them. With five
+        # exclusive members and `--jobs 4` the fifth `get()` blocks on an
+        # empty queue FOREVER — after the last member the runner sits in a
+        # futex with no children, so the summary and the `--baseline` diff
+        # never print and the member itself never runs. A suite that cannot
+        # reach its own verdict reports nothing while looking almost done.
         for p in serial_members:
-            report(p, run_one(p, TIMEOUTS.get(p.name, args.timeout), log_dir,
-                              slots.get()))
+            slot = slots.get()
+            try:
+                report(p, run_one(p, TIMEOUTS.get(p.name, args.timeout),
+                                  log_dir, slot))
+            finally:
+                slots.put(slot)
 
     elapsed = time.time() - started
+
+    # Every discovered member must have a result. A member that never ran is
+    # not a pass and not a failure — it is absent coverage, and absent
+    # coverage that says nothing is how a suite reports "162 ok" while one
+    # member sat unstarted. The slot leak above made this reachable; the
+    # check is what makes it VISIBLE if anything else ever does.
+    missing = [p.name for p in smokes if p.name not in results]
+    if missing:
+        print(f"\n*** {len(missing)} member(s) discovered but never ran: {missing} ***\n"
+              "The suite cannot speak for them. Treat this run as incomplete, not green.",
+              flush=True)
+
     passed = [n for n, r in results.items() if r["status"] in ("pass", "flaky")]
     skipped = [n for n, r in results.items() if r["status"] == "skip"]
     # Held out of BOTH sides: not a pass, and not evidence of a regression.
@@ -379,14 +404,16 @@ def main() -> int:
         for n in newly_skipped:
             print(f"  SKIPPED    {n} — passed in the baseline but did not run; "
                   f"this run proves less than the baseline did")
-        # A regression fails the run even if the absolute count improved.
-        return 1 if newly_broken else 0
+        # A regression fails the run even if the absolute count improved, and
+        # so does a member that never ran — an incomplete suite must not
+        # certify a baseline it did not exercise.
+        return 1 if (newly_broken or missing) else 0
 
     if failed:
         print(f"\nfailing ({len(failed)}):")
         for n in failed:
             print(f"  {results[n]['status']:7s} {n}")
-    return 1 if failed else 0
+    return 1 if (failed or missing) else 0
 
 
 if __name__ == "__main__":
