@@ -48,6 +48,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # and don't hit the record threshold with setup + the single target write.
 # The post-failover burst (RECORD_THRESHOLD writes) is what trips the flush.
 RECORD_THRESHOLD = 25
+# One worker per node, whatever the ambient `REWIND_WORKERS` says.
+#
+# `NodeLogBuffer` is per-WORKER (the "node" in the name means "not per
+# tenant"), and this smoke deliberately disables the time-based flush so
+# that only the walker's own records can surface. That leaves the
+# record-COUNT threshold as the sole flush trigger — and at N workers the
+# kernel spreads the burst across N buffers, so each holds burst/N and no
+# buffer ever reaches the threshold. Nothing flushes, and the assertion
+# reads as "the walker did not recover the record" when the walker did its
+# job and the record is sitting in a buffer.
+#
+# Not a product defect: production leaves the 1s time flush on, which
+# fires per worker regardless of count. It is this smoke's isolation
+# technique that needs one buffer.
+os.environ["REWIND_WORKERS"] = "1"
 os.environ["REWIND_LOG_FLUSH_INTERVAL_MS"] = str(3_600_000)  # 1h — effectively never
 os.environ["REWIND_LOG_FLUSH_RECORDS"] = str(RECORD_THRESHOLD)
 

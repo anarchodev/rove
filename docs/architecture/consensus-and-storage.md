@@ -169,6 +169,33 @@ Three ordering rules make "committed" mean **durable**:
   pump serializes against its own skip/commit decisions, and the next sweep
   resolves to commit (committed-beats-faulted) or a normal-fault rollback.
 
+## Cross-tenant writes at N worker threads
+
+A node runs `REWIND_WORKERS` worker threads, and a tenant's `KvStore` is
+shared between all of them (`node.tenant` hands every worker the same
+`*Instance`). One worker at a time holds a tenant's dispatch lease; a
+leaseless path that reaches a tenant it is not anchoring — `platform.scope(x).kv.*`,
+a `_deploy/current` probe, the move path — goes through `ownTxn()` and, as a
+non-owner, falls through to the lease rather than through the sibling's open
+`TrackedTxn`. So it waits for at most one handler walk and never observes
+writes raft has not committed.
+
+**The consequence at more than one worker: a cross-tenant admin write can
+answer with a retryable conflict under contention.** `TrackedTxn.open()` on a
+tenant a sibling is mid-batch on returns `Conflict`, which the admin surface
+reports as a retryable failure. It is never a wrong answer — the write did
+not happen and says so. A cross-tenant *read* is unaffected: it blocks for
+that one handler walk and then reads committed state.
+
+**This is deliberately not hardened in place.** The resolution is the
+tenant-scope activation model — admin dispatches its own code as an
+activation in the target tenant's scope, so the write is proposed by the
+worker that already anchors that tenant and into that tenant's own group,
+and there is no cross-tenant `TrackedTxn` to contend for. Hardening the
+current cross-tenant paths (the trampoline, `batch_side.targets`,
+multi-envelope inners) buys a retry that the scope model removes outright.
+Retry at the shim, not in the engine.
+
 ## Multi-node: replication, roles, and failover
 
 A tenant's group spans the cluster's nodes (a cluster is a *set* of node
