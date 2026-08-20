@@ -79,6 +79,9 @@ def main() -> int:
         ctr = [0]
         highest_acked = [0]
         write_errors = [0]
+        write_timeouts = [0]
+        status_counts: dict[int, int] = {}
+        reason_counts: dict[str, int] = {}
         lock = threading.Lock()
 
         def burst(stop, stats):
@@ -105,8 +108,15 @@ def main() -> int:
                         r = c.request("acme", "/?fn=handler", method="POST",
                                       data='{"v":"v-%d"}' % n, timeout=WRITE_TIMEOUT)
                     except Exception:
+                        # A client-side timeout is a LATENCY answer, not a
+                        # refusal: the cluster never said no. Counted apart
+                        # from status failures because they have opposite
+                        # causes and opposite fixes — one says the write
+                        # queued too long behind something, the other says a
+                        # node declined it outright.
                         with lock:
                             write_errors[0] += 1
+                            write_timeouts[0] += 1
                         continue
                     if r.status == 204:
                         with lock:
@@ -114,8 +124,18 @@ def main() -> int:
                             if n > highest_acked[0]:
                                 highest_acked[0] = n
                     else:
+                        # The BODY is the diagnosis. Since #704 a 5xx from the
+                        # kv layer names its condition ("storage contended;
+                        # retry" for a lease/chain-head Conflict, "kv store
+                        # full", "speculative dependency rolled back", …), so
+                        # a status alone under-reports what the cluster was
+                        # actually refusing.
+                        why = (r.body or "").strip()[:48]
                         with lock:
                             write_errors[0] += 1
+                            status_counts[r.status] = status_counts.get(r.status, 0) + 1
+                            k = f"{r.status}:{why}"
+                            reason_counts[k] = reason_counts.get(k, 0) + 1
 
             def churner():
                 while not stop.is_set():
@@ -191,8 +211,15 @@ def main() -> int:
                           f"so this round tested nothing")
                     vacuous_rounds.append(label)
                     return False
+                with lock:
+                    tmo = write_timeouts[0]
+                    codes = dict(status_counts)
                 print(f"  {label}: ok   converged={vals[0]!r} acked={acked_now} "
-                      f"write_errors={errs}")
+                      f"errors={errs} (timeouts={tmo} statuses={codes})")
+                if rnd == ROUNDS:
+                    with lock:
+                        top = sorted(reason_counts.items(), key=lambda kv: -kv[1])[:6]
+                    print("    refusal reasons: " + "; ".join(f"{k!r} x{v}" for k, v in top))
             else:
                 print(f"  {label}: FAIL DIVERGED n1={vals.get(0)!r} n2={vals.get(1)!r} n3={vals.get(2)!r}")
                 diverged_round = label
