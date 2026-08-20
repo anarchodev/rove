@@ -689,6 +689,11 @@ pub const KvStore = struct {
             const leaf = t.activeLeaf();
             const v = leaf.get(self.allocator, key) catch |err| switch (err) {
                 error.OutOfMemory => return Error.OutOfMemory,
+                // Same cascade case `get` distinguishes: a chain
+                // predecessor faulted and invalidated this active txn.
+                // Collapsing it into `Sqlite` would cost the caller the
+                // retriable 503 it is owed.
+                error.TxnInvalidated => return Error.TxnInvalidated,
                 else => return Error.Sqlite,
             };
             return v orelse return Error.NotFound;
