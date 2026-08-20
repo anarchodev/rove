@@ -238,7 +238,10 @@ fn drainSnapshotCatchupJobs(worker: anytype, catchup: *rjs.SnapshotCatchupThread
     }
 }
 
-fn runPromotionHook(worker: anytype) void {
+/// `last_sweep_gen` is this worker's own view of
+/// `NodeState.promotion_sweep_gen`, hence the pointer — see the relay note
+/// below.
+fn runPromotionHook(worker: anytype, last_sweep_gen: *u64) void {
     var buf: [64]bridge_mod.Promotion = undefined;
     const n = worker.raft.drainPromotions(&buf);
     for (buf[0..n]) |promo| {
@@ -249,9 +252,11 @@ fn runPromotionHook(worker: anytype) void {
         // docs/architecture/deployment-and-logs.md).
         worker.log_walker.seed(worker.allocator, worker.raft, promo.gid);
     }
-    if (n > 0) {
-        // The wake sweep is partitioned by `hash(tenant) % N_inboxes`, so every
-        // worker covers its own slice exactly once.
+    // Relay the edge to every worker: `drainPromotions` is single-consumer,
+    // so one worker takes every promotion, while the sweeps below cover
+    // only that worker's `hash(tenant) % N_inboxes` slice. `promotionSweepDue`
+    // carries the reasoning.
+    if (rjs.promotionSweepDue(&worker.node.promotion_sweep_gen, n, last_sweep_gen)) {
         rjs.sweepDurableWakesOnPromotion(worker);
         rjs.sweepDirtySubscriptionsOnPromotion(worker);
     }
@@ -388,6 +393,10 @@ fn workerMain(args: *WorkerCtx) !void {
     args.ready.set();
 
     var blocked_tenants: rjs.BlockedTenants = .{};
+    // This worker's view of `NodeState.promotion_sweep_gen`. Seeded from
+    // the live value so a worker that starts late doesn't replay every
+    // promotion the node has already swept.
+    var last_sweep_gen: u64 = worker.node.promotion_sweep_gen.load(.acquire);
     // Render + publish the operator-metrics snapshot to the loopback HTTP/1.1
     // listener every ~2s (cheap; the listener serves the latest — a few seconds
     // stale is nothing for a 60s scrape). `last_metrics_ns = 0` makes the first
@@ -410,7 +419,7 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainFetchPendingDurability(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
         try rjs.drainRaftPending(worker);
-        runPromotionHook(worker);
+        runPromotionHook(worker, &last_sweep_gen);
         drainSnapshotCatchupJobs(worker, catchup);
         try rjs.drainForwardPending(worker);
         // Finalize completed streamed-snapshot transfers
