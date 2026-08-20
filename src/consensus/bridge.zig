@@ -1794,6 +1794,38 @@ test "bridge: an entry over the wire limit is refused, not proposed" {
     try testing.expectEqual(@as(u64, 1), try bridge.propose(gid, env));
 }
 
+test "bridge: promotions are a single-consumer drain — a second reader sees nothing" {
+    // The premise `NodeState.promotion_sweep_gen` exists for. At N worker
+    // threads every worker polls this queue, but the first to arrive takes
+    // every edge — so a drained promotion cannot be the per-worker cue for
+    // the partitioned on-promotion sweeps (`promotionSweepDue`). If this
+    // test ever has to change, that relay has to change with it.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    const gid = try bridge.registerTenant("tenant-1");
+
+    // Stand in for the pump's follower→leader edge
+    // (`bridge_pump.refreshOneLocked`), which is multi-node-only and needs
+    // a real election to reach.
+    bridge.mutex.lock();
+    try bridge.promoted.append(a, gid);
+    bridge.mutex.unlock();
+
+    var buf: [4]Promotion = undefined;
+    try testing.expectEqual(@as(usize, 1), bridge.drainPromotions(&buf));
+    try testing.expectEqualStrings("tenant-1", buf[0].id_str);
+    try testing.expectEqual(gid, buf[0].gid);
+
+    // The next worker to poll — same edge, same tick — gets nothing.
+    try testing.expectEqual(@as(usize, 0), bridge.drainPromotions(&buf));
+}
+
 test "bridge: gid is a deterministic hash of the tenant id" {
     // The cross-node agreement property multi-node replication needs: the
     // same tenant id maps to the same raft group id everywhere, distinct

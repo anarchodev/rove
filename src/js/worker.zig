@@ -982,6 +982,21 @@ pub const NodeState = struct {
     /// the kernel is spreading one tenant's connections across workers.
     dispatch_lease_conflicts: std.atomic.Value(u64) = .init(0),
 
+    /// Bumped once by whichever worker drains a follower→leader promotion
+    /// edge off the bridge, and read by every worker as its cue to run the
+    /// on-promotion sweeps.
+    ///
+    /// The bridge's promotion queue is a single-consumer drain — the first
+    /// worker to poll takes every edge — but the sweeps it triggers cover
+    /// only the draining worker's `hash(tenant) % N_inboxes` slice. Without
+    /// this relay the other slices are never reconstructed after a
+    /// failover, and a scheduled wake on a tenant outside the draining
+    /// worker's slice simply never fires (`next_wake_ns` is volatile, so a
+    /// promoted leader's watermarks are all zero). Monotone and
+    /// never-reset: a worker compares it against its own last-seen value,
+    /// so a wrap would need 2^64 promotions.
+    promotion_sweep_gen: std.atomic.Value(u64) = .init(0),
+
     /// Ticks that stopped early because `BlockedTenants` filled its 32
     /// slots. Degrading to "stop for now" is correct — the requests stay
     /// in `request_out` for the next tick — but a persistently non-zero
@@ -4019,6 +4034,68 @@ pub fn findBytecode(
         cur_owned = new_cur;
         cur = new_cur;
     }
+}
+
+/// Decide whether THIS worker should run the on-promotion sweeps this
+/// tick, relaying one worker's drained promotion edge to all of them.
+///
+/// `drained` is what `Bridge.drainPromotions` just returned for this
+/// worker, `gen` is the node-wide `promotion_sweep_gen`, and `last` is
+/// this worker's own view of it (seeded from the live value at thread
+/// start, so a late starter doesn't replay edges the node already swept).
+///
+/// The drain is single-consumer: whichever worker polls first takes every
+/// edge, so `drained > 0` is true on exactly one worker. The sweeps it
+/// gates cover only that worker's `hash(tenant) % N_inboxes` slice — so
+/// gating on `drained` alone leaves every other slice unreconstructed
+/// after a failover, and a wake scheduled on a tenant in one of them never
+/// fires (`next_wake_ns` is volatile, so a promoted leader's watermarks
+/// are all zero and the steady sweep skips the tenant forever).
+pub fn promotionSweepDue(
+    gen: *std.atomic.Value(u64),
+    drained: usize,
+    last: *u64,
+) bool {
+    if (drained > 0) _ = gen.fetchAdd(1, .monotonic);
+    const now = gen.load(.acquire);
+    if (now == last.*) return false;
+    last.* = now;
+    return true;
+}
+
+test "promotionSweepDue: one worker drains the edge, every worker sweeps exactly once" {
+    var gen: std.atomic.Value(u64) = .init(0);
+    var w0: u64 = 0;
+    var w1: u64 = 0;
+    var w2: u64 = 0;
+
+    // Steady state: no edge, nobody sweeps.
+    try testing.expect(!promotionSweepDue(&gen, 0, &w0));
+    try testing.expect(!promotionSweepDue(&gen, 0, &w1));
+
+    // Worker 0 wins the single-consumer drain. Workers 1 and 2 see
+    // `drained == 0` and MUST still sweep — their partitions are the ones
+    // worker 0's sweep cannot reach.
+    try testing.expect(promotionSweepDue(&gen, 1, &w0));
+    try testing.expect(promotionSweepDue(&gen, 0, &w1));
+    try testing.expect(promotionSweepDue(&gen, 0, &w2));
+
+    // Exactly once: the next tick is quiet for all of them.
+    try testing.expect(!promotionSweepDue(&gen, 0, &w0));
+    try testing.expect(!promotionSweepDue(&gen, 0, &w1));
+    try testing.expect(!promotionSweepDue(&gen, 0, &w2));
+
+    // A second edge, drained by a different worker this time, still
+    // reaches everyone.
+    try testing.expect(promotionSweepDue(&gen, 2, &w2));
+    try testing.expect(promotionSweepDue(&gen, 0, &w0));
+    try testing.expect(promotionSweepDue(&gen, 0, &w1));
+
+    // A worker that starts late seeds from the live value, so it sweeps on
+    // the NEXT edge rather than replaying every one the node has served.
+    var w3: u64 = gen.load(.acquire);
+    try testing.expect(!promotionSweepDue(&gen, 0, &w3));
+    try testing.expect(promotionSweepDue(&gen, 1, &w3));
 }
 
 test "BlockedTenants: defers past its cap, and the list is tick-local" {
