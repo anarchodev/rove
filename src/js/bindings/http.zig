@@ -579,7 +579,7 @@ pub fn jsHttpCancelFetch(
     }
     if (state.side_effects_flag) |f| f.* = true;
     if (state.cancel_fetch) |fn_ptr| {
-        const fn_ctx = state.cancel_fetch_ctx orelse return js_undefined;
+        const fn_ctx = state.worker_ctx orelse return js_undefined;
         fn_ptr(fn_ctx, id_slice);
     }
     // Engine null (test paths / non-worker dispatch) → silent

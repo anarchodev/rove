@@ -114,6 +114,8 @@ pub const SubscriptionFireSource = request_mod.SubscriptionFireSource;
 pub const Activation = request_mod.Activation;
 
 pub const Request = request_mod.Request;
+/// Re-exported beside `Request` so a worker can name the cluster it builds.
+pub const Trampolines = request_mod.Trampolines;
 pub const Trace = request_mod.Trace;
 pub const ResponseHeader = request_mod.ResponseHeader;
 pub const Response = request_mod.Response;
@@ -295,16 +297,13 @@ pub const Dispatcher = struct {
             .saga_id = request.trace.saga_id orelse "",
             .platform_caps = request.admin.platform_caps,
             .resume_if_bound = request.trampolines.resume_if_bound,
-            .resume_if_bound_ctx = request.trampolines.resume_if_bound_ctx,
             .cancel_fetch = request.trampolines.cancel_fetch,
-            .cancel_fetch_ctx = request.trampolines.cancel_fetch_ctx,
             .set_wake = request.trampolines.set_wake,
+            .worker_ctx = request.trampolines.worker_ctx,
             .set_wake_ctx = request.trampolines.set_wake_ctx,
             .fire_wake = request.trampolines.fire_wake,
-            .fire_wake_ctx = request.trampolines.fire_wake_ctx,
             .blob_write = request.trampolines.blob_write,
             .blob_seal = request.trampolines.blob_seal,
-            .blob_session_ctx = request.trampolines.blob_session_ctx,
             .activation_entity = request.activation_entity,
             .activation_fetches_pending = request.activation_fetches_pending,
             .allow_blob_receive = request.activation == .inbound_headers,

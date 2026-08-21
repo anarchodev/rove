@@ -2444,15 +2444,7 @@ pub fn resumeBoundFetchChain(
         .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id, .exec_seq = exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
-        .trampolines = .{
-            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-            .resume_if_bound_ctx = @ptrCast(worker),
-            .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
-            .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
-            .blob_session_ctx = @ptrCast(worker),
-            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-            .cancel_fetch_ctx = @ptrCast(worker),
-        },
+        .trampolines = worker.trampolines(null),
         .effects = .{
             .pending_wakes = &pending_wakes,
             .pending_stream_chunks = &stream_chunks,
@@ -3380,15 +3372,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id, .exec_seq = exec_seq },
         .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
-        .trampolines = .{
-            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-            .resume_if_bound_ctx = @ptrCast(worker),
-            .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
-            .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
-            .blob_session_ctx = @ptrCast(worker),
-            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-            .cancel_fetch_ctx = @ptrCast(worker),
-        },
+        .trampolines = worker.trampolines(null),
         .effects = .{
             .pending_wakes = &pending_wakes,
             .pending_stream_chunks = &stream_chunks,

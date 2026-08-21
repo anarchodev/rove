@@ -2599,19 +2599,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // direct in globals.zig (no trampoline).
                 .platform_caps = worker.adminPlatformCaps(handler_inst),
             },
-            .trampolines = .{
-                // §6.4 held-sync resume hook trampoline.
-                // Available to every dispatch (the JS-shim
-                // `__system/webhook_onresult` calls it on terminal);
-                // returns false when nothing's bound.
-                .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-                .resume_if_bound_ctx = @ptrCast(worker),
-                .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-                .cancel_fetch_ctx = @ptrCast(worker),
-                .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
-                .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
-                .blob_session_ctx = @ptrCast(worker),
-            },
+            .trampolines = worker.trampolines(null),
             .effects = .{
                 .pending_fetches = &pending_fetches,
                 .pending_wakes = &pending_wakes,

@@ -355,17 +355,21 @@ pub const Trampolines = struct {
     /// `_system.continuation.resumeIfBound(send_id, event_json)` — the
     /// §6.4 held-sync resume hook. Wired to
     /// `worker.resumeBoundContinuation`.
+    /// The worker every hook below runs against. ONE pointer, not one per
+    /// hook: all four used to be separate `*anyopaque` fields that every
+    /// construction site set to the same `@ptrCast(worker)`, so the only
+    /// thing four fields bought was four chances to disagree. `set_wake_ctx`
+    /// stays separate because it genuinely differs — it is the tenant slot.
+    worker_ctx: ?*anyopaque = null,
     resume_if_bound: ?*const fn (
         ctx: *anyopaque,
         tenant_id: []const u8,
         send_id: []const u8,
         event_json: []const u8,
     ) bool = null,
-    resume_if_bound_ctx: ?*anyopaque = null,
     /// Cancel-fetch trampoline (outbound fetch / libcurl multi, `docs/architecture/configuration-and-network.md`). Wired to
     /// `FetchEngine.cancel`.
     cancel_fetch: ?*const fn (ctx: *anyopaque, id: []const u8) void = null,
-    cancel_fetch_ctx: ?*anyopaque = null,
     /// §2.6 durable-wake trampolines. `set_wake` stores this tenant's
     /// next-fire watermark; `fire_wake` enqueues a `durable_wake`
     /// activation per due entry. Non-null only on the baked
@@ -373,7 +377,6 @@ pub const Trampolines = struct {
     set_wake: ?*const fn (ctx: *anyopaque, tenant_id: []const u8, when_ns: i64) void = null,
     set_wake_ctx: ?*anyopaque = null,
     fire_wake: ?*const fn (ctx: *anyopaque, input: globals.FireWakeInput) bool = null,
-    fire_wake_ctx: ?*anyopaque = null,
     /// `docs/architecture/routing-and-ingress.md`: blob upload sessions.
     /// `blob_write` appends to (creating on first write) the chain's
     /// session; `blob_seal` finalizes it and hands back hash + bytes
@@ -391,7 +394,6 @@ pub const Trampolines = struct {
         tenant_id: []const u8,
         corr: []const u8,
     ) blob_sessions_mod.Error!blob_sessions_mod.Sealed = null,
-    blob_session_ctx: ?*anyopaque = null,
 };
 
 /// Caller-owned accumulators the bindings append to during the dispatch;
@@ -584,3 +586,24 @@ pub const RunOutcome = union(enum) {
     /// by any other activation kind.
     no_onchunk,
 };
+
+test "Trampolines: one worker context, not one per hook" {
+    // Four fields — `resume_if_bound_ctx`, `cancel_fetch_ctx`,
+    // `fire_wake_ctx`, `blob_session_ctx` — each held the same
+    // `@ptrCast(worker)` at every construction site, so the only thing four
+    // fields bought was four chances to disagree. A fifth would buy a fifth.
+    //
+    // `set_wake_ctx` is the one that genuinely differs: it is the tenant
+    // slot, and it is non-null only on the scheduler-tick path.
+    inline for (@typeInfo(Trampolines).@"struct".fields) |f| {
+        if (comptime std.mem.endsWith(u8, f.name, "_ctx")) {
+            const ok = comptime (std.mem.eql(u8, f.name, "worker_ctx") or
+                std.mem.eql(u8, f.name, "set_wake_ctx"));
+            if (!ok) {
+                @compileError("Trampolines." ++ f.name ++
+                    ": per-hook contexts are consolidated — use `worker_ctx`, " ++
+                    "or `set_wake_ctx` if this genuinely runs against the tenant slot");
+            }
+        }
+    }
+}

@@ -241,12 +241,9 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .trace = p.trace(corr_full, null),
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
-        .trampolines = .{
-            .set_wake = &deployment_cache.TenantSlot.setWakeTrampoline,
-            .set_wake_ctx = @ptrCast(p.dep.tc.slot),
-            .fire_wake = &@TypeOf(worker.*).fireWakeTrampoline,
-            .fire_wake_ctx = @ptrCast(worker),
-        },
+        // The one path that arms the tenant's next-fire watermark, so the
+        // one caller that names a wake slot.
+        .trampolines = worker.trampolines(p.dep.tc.slot),
     };
     // `scheduler_tick` is our own module and always returns terminal;
     // a continuation/stream return is a bug (`.rollback_silent`).
@@ -699,22 +696,7 @@ pub fn fireFetchEventActivation(
         .trace = p.trace(corr_full, null),
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
-        .trampolines = .{
-            // §6.4 held-sync resume hook. The baked
-            // `__system/webhook_onresult` shim calls `__rove_resume_if_bound`
-            // on terminal to wake any parked cont bound to this send-id.
-            // Set on every fetch-event activation (the H2 path sets it
-            // too, in `worker_dispatch.zig`); without this the JS builtin
-            // sees a null trampoline + returns false, leaving the cont
-            // parked until its 25s deadline.
-            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-            .resume_if_bound_ctx = @ptrCast(worker),
-            .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
-            .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
-            .blob_session_ctx = @ptrCast(worker),
-            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-            .cancel_fetch_ctx = @ptrCast(worker),
-        },
+        .trampolines = worker.trampolines(null),
     };
 
     // Small fetch chunks ride inline in
