@@ -1,15 +1,22 @@
 {
   "name": "kvprefixes",
-  "description": "The reserved-prefix write rule, per shim-writable prefix. Carried because the shim-writable allowlist is the one guard each engine enforces from its own copy of a list — the worker from `rove-reserved`, the replay prelude from a fragment generated off it — and those copies drifted once (rove#499: `_export/` was writable in prod and refused in replay). This case is what executes the pairing at runtime; the build-time assert in epilogue.zig only proves the two lists agree, not that a handler writing one of those prefixes actually replays.",
+  "description": "The reserved-prefix write rule, per shim-writable prefix. Carried because the shim-writable allowlist is the one guard each engine enforces from its own copy of a list — the worker from `rove-reserved`, the replay prelude from a fragment generated off it — and those copies drifted once (rove#499: `_export/` was writable in prod and refused in replay). This case is what executes the pairing at runtime; the build-time assert in epilogue.zig only proves the two lists agree, not that a handler writing one of those prefixes actually replays. The `hidden` world carries the read half of the same question: the engine-only namespaces (`_usage/`, `_keys/`, …) are INVISIBLE to a handler, not refused — the rule that lets their writers stay engine writes with no activation and no log record. It also pins the refill: a page-sized run of hidden rows must not truncate a customer's scan.",
   "source_dir": "src/replay/testdata/kvguardrails",
-  "engines": ["sim", "prod", "replay"],
+  "engines": [
+    "sim",
+    "prod",
+    "replay"
+  ],
   "worlds": [
     {
       "label": "prefixes",
       "world": {
         "entry": "index.mjs",
         "activation": "inbound",
-        "request": { "method": "GET", "path": "/prefixes" }
+        "request": {
+          "method": "GET",
+          "path": "/prefixes"
+        }
       }
     },
     {
@@ -17,7 +24,29 @@
       "world": {
         "entry": "index.mjs",
         "activation": "inbound",
-        "request": { "method": "GET", "path": "/page-rw" }
+        "request": {
+          "method": "GET",
+          "path": "/page-rw"
+        }
+      }
+    },
+    {
+      "label": "hidden",
+      "world": {
+        "entry": "index.mjs",
+        "activation": "inbound",
+        "request": {
+          "method": "GET",
+          "path": "/hidden"
+        },
+        "kv": {
+          "_usage/blob/aaa": "1",
+          "_usage/blob/bbb": "2",
+          "_usage/blob/ccc": "3",
+          "_keys/next_slot": "9",
+          "_config/mail.json": "cfg",
+          "users/1": "alice"
+        }
       }
     }
   ]

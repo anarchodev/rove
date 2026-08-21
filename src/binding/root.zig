@@ -246,6 +246,14 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             const key = coerce(d, ctx, argv[0]) catch return js_exception;
             defer d.allocator().free(key);
 
+            // The engine-only keyspace is INVISIBLE, not refused
+            // (`guards.kvReadHidden`) — so the read answers absent without
+            // reaching storage, and nothing about it enters the readset or
+            // the digest. Gated on `decides()` like the write table: a
+            // captured world replays the read that happened, not the read
+            // today's rules would allow.
+            if (d.decides() and guards.kvReadHidden(key, d.isSystemModule())) return js_null;
+
             switch (d.get(key)) {
                 .value => |v| {
                     defer d.release(v);
@@ -357,6 +365,20 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 break :blk @min(@as(u32, @intCast(n)), KV_PREFIX_MAX);
             } else KV_PREFIX_DEFAULT;
 
+            // Two hidden-aware paths before the plain one. A scan wholly
+            // inside an engine-only namespace has nothing visible to return
+            // and must not touch storage; a scan that merely SPANS one has to
+            // filter AND refill (`reserved.scanSpansEngineOnly`). Every other
+            // scan — the overwhelming majority, any prefix that is not an
+            // ancestor of a platform namespace — takes the plain path below
+            // and pays nothing.
+            if (d.decides() and guards.kvScanAllHidden(prefix, d.isSystemModule())) {
+                return q.JS_NewArray(ctx);
+            }
+            if (d.decides() and guards.kvScanFilters(prefix, d.isSystemModule())) {
+                return kvPrefixFiltered(d, ctx, prefix, cursor, limit);
+            }
+
             var page = d.prefix(prefix, cursor, limit) orelse return js_null;
             defer page.deinit();
 
@@ -366,6 +388,71 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 _ = q.JS_SetPropertyStr(ctx, obj, "key", q.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
                 _ = q.JS_SetPropertyStr(ctx, obj, "value", q.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
                 _ = q.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
+            }
+            return arr;
+        }
+
+        /// `kv.prefix` over a range that contains engine-only keys: skip them,
+        /// and keep scanning until the page is full or storage runs out.
+        ///
+        /// Refilling is the whole point. Filtering a single page would let a
+        /// run of hidden rows longer than one page come back EMPTY, and the
+        /// documented paging idiom stops on an empty page
+        /// (`handler-shape.md` §5.7) — so a tenant with a few hundred meter
+        /// rows would see its own scan end early and silently lose everything
+        /// sorted after them.
+        ///
+        /// Each iteration is a separate delegate scan, so it is a separate
+        /// taped read; the loop lives in the shared binding precisely so every
+        /// engine performs the identical sequence and replay reconstructs it.
+        fn kvPrefixFiltered(
+            d: D,
+            ctx: ?*q.JSContext,
+            prefix: []const u8,
+            cursor: []const u8,
+            limit: u32,
+        ) q.JSValue {
+            const arr = q.JS_NewArray(ctx);
+            var n: u32 = 0;
+            // Advances past the last row EXAMINED, hidden rows included, so
+            // each pass starts strictly later than the one before and the
+            // loop terminates.
+            var cur: []u8 = d.allocator().dupe(u8, cursor) catch return js_exception;
+            defer d.allocator().free(cur);
+
+            while (n < limit) {
+                var page = d.prefix(prefix, cur, limit) orelse return js_null;
+                const fetched = page.entries.len;
+                var last: ?[]const u8 = null;
+                for (page.entries) |e| {
+                    if (n >= limit) break;
+                    last = e.key;
+                    if (guards.kvRowHidden(e.key)) continue;
+                    const obj = q.JS_NewObject(ctx);
+                    _ = q.JS_SetPropertyStr(ctx, obj, "key", q.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
+                    _ = q.JS_SetPropertyStr(ctx, obj, "value", q.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
+                    _ = q.JS_SetPropertyUint32(ctx, arr, n, obj);
+                    n += 1;
+                }
+                // Dup before the page's storage goes away.
+                const advanced: ?[]u8 = if (last) |l|
+                    (d.allocator().dupe(u8, l) catch {
+                        page.deinit();
+                        return js_exception;
+                    })
+                else
+                    null;
+                page.deinit();
+                // A short page means storage is exhausted — there is nothing
+                // left to refill from, however many rows were filtered.
+                if (fetched < limit) {
+                    if (advanced) |a| d.allocator().free(a);
+                    break;
+                }
+                if (advanced) |a| {
+                    d.allocator().free(cur);
+                    cur = a;
+                } else break;
             }
             return arr;
         }

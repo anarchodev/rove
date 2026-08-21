@@ -147,7 +147,7 @@ fn exportDoorAllowed(ctx: ?*c.JSContext, state: *globals.DispatchState, url: []c
 /// path (`worker_fire.zig`'s `isBuiltinPath`), so it is equally true of a
 /// FIRST fire the tenant armed itself. Both `webhook.send({at})` and a
 /// hand-written `_send/`+`_sched/` row pair (both prefixes are
-/// customer-writable by design — `reserved.zig`'s `SHIM_WRITABLE_PREFIXES`)
+/// customer-writable by design — `src/reserved/root.zig`'s `SHIM_WRITABLE_PREFIXES`)
 /// arrive here as platform delivery, so the exemption made the whole quota
 /// opt-in: a tenant bypassed it by deferring. Nothing at this seam can tell
 /// an admitted send from an invented one, because the marker is customer
