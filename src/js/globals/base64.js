@@ -12,248 +12,260 @@
 // base64url surface — `base64url.encode(hex.decode(crypto.sha256(x)))`
 // is the PKCE code_challenge in two lines.
 
-const STD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-// Build via an array + join, NOT `out += `. In the per-request bump
-// arena every `+=` allocates a fresh (never-freed-until-reset) string,
-// so `+=`-building an n-char string costs O(n²) arena volume and
-// exhausts the arena for large inputs (a big base64/hex of a chunk or
-// payload then silently yields an empty response). Array push + join
-// is O(n). Same reason `_decodeBase`, `_bytesToString`, `hex.encode`
-// avoid `+=` below.
-function _encodeBase(bytes, alphabet, padding) {
-  const out = [];
-  let i = 0;
-  while (i + 2 < bytes.length) {
-    const b0 = bytes[i++], b1 = bytes[i++], b2 = bytes[i++];
-    out.push(alphabet[b0 >> 2]);
-    out.push(alphabet[((b0 & 0x03) << 4) | (b1 >> 4)]);
-    out.push(alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)]);
-    out.push(alphabet[b2 & 0x3f]);
-  }
-  const remaining = bytes.length - i;
-  if (remaining === 1) {
-    const b0 = bytes[i];
-    out.push(alphabet[b0 >> 2]);
-    out.push(alphabet[(b0 & 0x03) << 4]);
-    if (padding) out.push("==");
-  } else if (remaining === 2) {
-    const b0 = bytes[i], b1 = bytes[i + 1];
-    out.push(alphabet[b0 >> 2]);
-    out.push(alphabet[((b0 & 0x03) << 4) | (b1 >> 4)]);
-    out.push(alphabet[(b1 & 0x0f) << 2]);
-    if (padding) out.push("=");
-  }
-  return out.join("");
-}
+// IIFE-wrapped like every other shim. Its top-level `const`s include the
+// three `Int8Array` decode tables, and unwrapped they land in the base
+// context's GLOBAL LEXICAL scope where customer handler modules resolve
+// them by name — measured: a handler read `STD_LOOKUP.length` and wrote
+// `STD_LOOKUP[0] = 42`. The base arena is shared by every request on the
+// worker, whatever tenant it serves, so that is a cross-tenant channel
+// (rove#748). Enclosing them removes the reach; the engine separately
+// refuses the write, and defence on a cross-tenant path is worth having
+// twice.
+(function () {
+  const STD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-function _decodeBase(str, lookup) {
-  // Decode symbol-at-a-time over the ORIGINAL string, skipping padding
-  // + whitespace in place — no stripped copy. The earlier `+=` strip
-  // (O(n²) arena) and its array+join replacement (a per-char array,
-  // still heavy enough to exhaust the arena when many values are
-  // decoded in one activation) both allocated O(n) scratch per call;
-  // this allocates only the output Uint8Array.
-  const out = new Uint8Array((str.length * 3) >> 2); // upper bound
-  let oi = 0;
-  const quad = [0, 0, 0, 0];
-  let q = 0;
-  for (let i = 0; i < str.length; i++) {
-    const code = str.charCodeAt(i);
-    // Skip '=' padding and ASCII whitespace (space/\t/\n/\v/\f/\r).
-    if (code === 0x3d || code === 0x20 || (code >= 0x09 && code <= 0x0d)) continue;
-    const v = code < 128 ? lookup[code] : -1;
-    if (v < 0) throw new Error("invalid base64 input");
-    quad[q++] = v;
-    if (q === 4) {
-      out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
-      out[oi++] = ((quad[1] & 0x0f) << 4) | (quad[2] >> 2);
-      out[oi++] = ((quad[2] & 0x03) << 6) | quad[3];
-      q = 0;
+  // Build via an array + join, NOT `out += `. In the per-request bump
+  // arena every `+=` allocates a fresh (never-freed-until-reset) string,
+  // so `+=`-building an n-char string costs O(n²) arena volume and
+  // exhausts the arena for large inputs (a big base64/hex of a chunk or
+  // payload then silently yields an empty response). Array push + join
+  // is O(n). Same reason `_decodeBase`, `_bytesToString`, `hex.encode`
+  // avoid `+=` below.
+  function _encodeBase(bytes, alphabet, padding) {
+    const out = [];
+    let i = 0;
+    while (i + 2 < bytes.length) {
+      const b0 = bytes[i++], b1 = bytes[i++], b2 = bytes[i++];
+      out.push(alphabet[b0 >> 2]);
+      out.push(alphabet[((b0 & 0x03) << 4) | (b1 >> 4)]);
+      out.push(alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)]);
+      out.push(alphabet[b2 & 0x3f]);
     }
-  }
-  // Trailing 2 or 3 symbols (an unpadded or padded final group).
-  if (q === 2) {
-    out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
-  } else if (q === 3) {
-    out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
-    out[oi++] = ((quad[1] & 0x0f) << 4) | (quad[2] >> 2);
-  }
-  return out.subarray(0, oi);
-}
-
-function _buildLookup(alphabet) {
-  const arr = new Int8Array(128).fill(-1);
-  for (let i = 0; i < alphabet.length; i++) arr[alphabet.charCodeAt(i)] = i;
-  return arr;
-}
-const STD_LOOKUP = _buildLookup(STD_ALPHABET);
-const URL_LOOKUP = _buildLookup(URL_ALPHABET);
-// Cross-tolerant decoder: accept either alphabet on input. Useful
-// because code in the wild emits both styles and parsers should be
-// liberal in what they accept.
-const ANY_LOOKUP = (() => {
-  const arr = new Int8Array(STD_LOOKUP);
-  for (let i = 0; i < arr.length; i++) {
-    if (URL_LOOKUP[i] >= 0) arr[i] = URL_LOOKUP[i];
-  }
-  return arr;
-})();
-
-function _stringToBytes(s) {
-  // Treat string as binary (each char = byte 0-255). Matches btoa
-  // semantics. Throws on out-of-range chars to surface bugs early.
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) {
-    const code = s.charCodeAt(i);
-    if (code > 0xff) throw new Error("btoa: input contains non-Latin-1 character");
-    out[i] = code;
-  }
-  return out;
-}
-
-function _bytesToString(bytes) {
-  // Inverse of _stringToBytes — binary string out. Use TextDecoder
-  // if you want UTF-8 interpretation. Chunked fromCharCode.apply,
-  // not `+=` (O(n²) arena volume — see _encodeBase).
-  const parts = [];
-  const CH = 8192; // stay under the argument-count limit
-  for (let i = 0; i < bytes.length; i += CH) {
-    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CH)));
-  }
-  return parts.join("");
-}
-
-/**
- * Encode a binary string to padded standard base64 (browser `btoa`).
- *
- * @function btoa
- * @param {string} s - Binary string; each char is one byte
- *   (0–255). Non-Latin-1 chars throw.
- * @returns {string} Standard-alphabet base64 with `=` padding.
- * @example
- * btoa("hello"); // "aGVsbG8="
- */
-globalThis.btoa = function (s) {
-  if (typeof s !== "string") s = String(s);
-  return _encodeBase(_stringToBytes(s), STD_ALPHABET, true);
-};
-
-/**
- * Decode standard base64 to a binary string (browser `atob`).
- * Tolerates padding and whitespace.
- *
- * @function atob
- * @param {string} s - Standard-alphabet base64.
- * @returns {string} Binary string (one char per byte). Use
- *   `TextDecoder` for UTF-8 interpretation. Invalid input throws.
- * @example
- * atob("aGVsbG8="); // "hello"
- */
-globalThis.atob = function (s) {
-  if (typeof s !== "string") s = String(s);
-  return _bytesToString(_decodeBase(s, STD_LOOKUP));
-};
-
-/**
- * URL-safe base64 (no padding) over bytes — the shape PKCE / JWT
- * verification needs.
- *
- * @namespace base64url
- */
-globalThis.base64url = {
-  /**
-   * Encode bytes as URL-safe base64, no padding.
-   *
-   * @param {Uint8Array|string|number[]} input - Bytes; a string is
-   *   first UTF-8 encoded.
-   * @returns {string} URL-safe base64 (`-`/`_`, no `=`).
-   * @example
-   * base64url.encode(crypto.randomBytes(32)); // PKCE verifier
-   */
-  encode(input) {
-    let bytes;
-    if (typeof input === "string") {
-      bytes = new TextEncoder().encode(input);
-    } else if (input instanceof Uint8Array) {
-      bytes = input;
-    } else {
-      bytes = new Uint8Array(input);
-    }
-    return _encodeBase(bytes, URL_ALPHABET, false);
-  },
-
-  /**
-   * Decode URL-safe base64 to bytes. Tolerates padding and the
-   * standard (`+`/`/`) alphabet too (liberal in what it accepts).
-   *
-   * @param {string} s - base64url (or standard) text.
-   * @returns {Uint8Array} Decoded bytes. Invalid input throws.
-   * @example
-   * const token = "aGVhZA.cGF5bG9hZA.c2ln";
-   * const sig = base64url.decode(token.split(".")[2]);
-   */
-  decode(s) {
-    if (typeof s !== "string") s = String(s);
-    return _decodeBase(s, ANY_LOOKUP);
-  },
-};
-
-/**
- * Hex string ⇄ bytes. Bridges the platform's hex-returning crypto
- * APIs to the byte-oriented base64url surface — e.g.
- * `base64url.encode(hex.decode(crypto.sha256(x)))` is a PKCE
- * code_challenge in two calls.
- *
- * @namespace hex
- */
-globalThis.hex = {
-  /**
-   * Encode bytes as a lowercase hex string.
-   *
-   * @param {Uint8Array|number[]} bytes - Bytes to encode.
-   * @returns {string} Lowercase hex, 2 chars per byte.
-   * @example
-   * hex.encode(new Uint8Array([255, 0])); // "ff00"
-   */
-  encode(bytes) {
-    if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
-    const tab = "0123456789abcdef";
-    const out = [];  // array+join, not `+=` (O(n²) arena — see base64 _encodeBase)
-    for (let i = 0; i < bytes.length; i++) {
-      out.push(tab[bytes[i] >> 4]);
-      out.push(tab[bytes[i] & 0x0f]);
+    const remaining = bytes.length - i;
+    if (remaining === 1) {
+      const b0 = bytes[i];
+      out.push(alphabet[b0 >> 2]);
+      out.push(alphabet[(b0 & 0x03) << 4]);
+      if (padding) out.push("==");
+    } else if (remaining === 2) {
+      const b0 = bytes[i], b1 = bytes[i + 1];
+      out.push(alphabet[b0 >> 2]);
+      out.push(alphabet[((b0 & 0x03) << 4) | (b1 >> 4)]);
+      out.push(alphabet[(b1 & 0x0f) << 2]);
+      if (padding) out.push("=");
     }
     return out.join("");
-  },
+  }
 
-  /**
-   * Decode a hex string to bytes. Accepts upper or lower case.
-   *
-   * @param {string} s - Even-length hex string.
-   * @returns {Uint8Array} Decoded bytes. Odd length or non-hex
-   *   chars throw.
-   * @example
-   * hex.decode("ff00"); // Uint8Array([255, 0])
-   */
-  decode(s) {
-    if (typeof s !== "string") throw new TypeError("hex.decode: input must be a string");
-    if ((s.length & 1) !== 0) throw new Error("hex.decode: odd-length input");
-    const out = new Uint8Array(s.length >> 1);
-    for (let i = 0; i < out.length; i++) {
-      const hi = _hexNibble(s.charCodeAt(i * 2));
-      const lo = _hexNibble(s.charCodeAt(i * 2 + 1));
-      if (hi < 0 || lo < 0) throw new Error("hex.decode: non-hex character");
-      out[i] = (hi << 4) | lo;
+  function _decodeBase(str, lookup) {
+    // Decode symbol-at-a-time over the ORIGINAL string, skipping padding
+    // + whitespace in place — no stripped copy. The earlier `+=` strip
+    // (O(n²) arena) and its array+join replacement (a per-char array,
+    // still heavy enough to exhaust the arena when many values are
+    // decoded in one activation) both allocated O(n) scratch per call;
+    // this allocates only the output Uint8Array.
+    const out = new Uint8Array((str.length * 3) >> 2); // upper bound
+    let oi = 0;
+    const quad = [0, 0, 0, 0];
+    let q = 0;
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      // Skip '=' padding and ASCII whitespace (space/\t/\n/\v/\f/\r).
+      if (code === 0x3d || code === 0x20 || (code >= 0x09 && code <= 0x0d)) continue;
+      const v = code < 128 ? lookup[code] : -1;
+      if (v < 0) throw new Error("invalid base64 input");
+      quad[q++] = v;
+      if (q === 4) {
+        out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
+        out[oi++] = ((quad[1] & 0x0f) << 4) | (quad[2] >> 2);
+        out[oi++] = ((quad[2] & 0x03) << 6) | quad[3];
+        q = 0;
+      }
+    }
+    // Trailing 2 or 3 symbols (an unpadded or padded final group).
+    if (q === 2) {
+      out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
+    } else if (q === 3) {
+      out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
+      out[oi++] = ((quad[1] & 0x0f) << 4) | (quad[2] >> 2);
+    }
+    return out.subarray(0, oi);
+  }
+
+  function _buildLookup(alphabet) {
+    const arr = new Int8Array(128).fill(-1);
+    for (let i = 0; i < alphabet.length; i++) arr[alphabet.charCodeAt(i)] = i;
+    return arr;
+  }
+  const STD_LOOKUP = _buildLookup(STD_ALPHABET);
+  const URL_LOOKUP = _buildLookup(URL_ALPHABET);
+  // Cross-tolerant decoder: accept either alphabet on input. Useful
+  // because code in the wild emits both styles and parsers should be
+  // liberal in what they accept.
+  const ANY_LOOKUP = (() => {
+    const arr = new Int8Array(STD_LOOKUP);
+    for (let i = 0; i < arr.length; i++) {
+      if (URL_LOOKUP[i] >= 0) arr[i] = URL_LOOKUP[i];
+    }
+    return arr;
+  })();
+
+  function _stringToBytes(s) {
+    // Treat string as binary (each char = byte 0-255). Matches btoa
+    // semantics. Throws on out-of-range chars to surface bugs early.
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      if (code > 0xff) throw new Error("btoa: input contains non-Latin-1 character");
+      out[i] = code;
     }
     return out;
-  },
-};
+  }
 
-function _hexNibble(code) {
-  if (code >= 0x30 && code <= 0x39) return code - 0x30;
-  if (code >= 0x61 && code <= 0x66) return code - 0x61 + 10;
-  if (code >= 0x41 && code <= 0x46) return code - 0x41 + 10;
-  return -1;
-}
+  function _bytesToString(bytes) {
+    // Inverse of _stringToBytes — binary string out. Use TextDecoder
+    // if you want UTF-8 interpretation. Chunked fromCharCode.apply,
+    // not `+=` (O(n²) arena volume — see _encodeBase).
+    const parts = [];
+    const CH = 8192; // stay under the argument-count limit
+    for (let i = 0; i < bytes.length; i += CH) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CH)));
+    }
+    return parts.join("");
+  }
+
+  /**
+   * Encode a binary string to padded standard base64 (browser `btoa`).
+   *
+   * @function btoa
+   * @param {string} s - Binary string; each char is one byte
+   *   (0–255). Non-Latin-1 chars throw.
+   * @returns {string} Standard-alphabet base64 with `=` padding.
+   * @example
+   * btoa("hello"); // "aGVsbG8="
+   */
+  globalThis.btoa = function (s) {
+    if (typeof s !== "string") s = String(s);
+    return _encodeBase(_stringToBytes(s), STD_ALPHABET, true);
+  };
+
+  /**
+   * Decode standard base64 to a binary string (browser `atob`).
+   * Tolerates padding and whitespace.
+   *
+   * @function atob
+   * @param {string} s - Standard-alphabet base64.
+   * @returns {string} Binary string (one char per byte). Use
+   *   `TextDecoder` for UTF-8 interpretation. Invalid input throws.
+   * @example
+   * atob("aGVsbG8="); // "hello"
+   */
+  globalThis.atob = function (s) {
+    if (typeof s !== "string") s = String(s);
+    return _bytesToString(_decodeBase(s, STD_LOOKUP));
+  };
+
+  /**
+   * URL-safe base64 (no padding) over bytes — the shape PKCE / JWT
+   * verification needs.
+   *
+   * @namespace base64url
+   */
+  globalThis.base64url = {
+    /**
+     * Encode bytes as URL-safe base64, no padding.
+     *
+     * @param {Uint8Array|string|number[]} input - Bytes; a string is
+     *   first UTF-8 encoded.
+     * @returns {string} URL-safe base64 (`-`/`_`, no `=`).
+     * @example
+     * base64url.encode(crypto.randomBytes(32)); // PKCE verifier
+     */
+    encode(input) {
+      let bytes;
+      if (typeof input === "string") {
+        bytes = new TextEncoder().encode(input);
+      } else if (input instanceof Uint8Array) {
+        bytes = input;
+      } else {
+        bytes = new Uint8Array(input);
+      }
+      return _encodeBase(bytes, URL_ALPHABET, false);
+    },
+
+    /**
+     * Decode URL-safe base64 to bytes. Tolerates padding and the
+     * standard (`+`/`/`) alphabet too (liberal in what it accepts).
+     *
+     * @param {string} s - base64url (or standard) text.
+     * @returns {Uint8Array} Decoded bytes. Invalid input throws.
+     * @example
+     * const token = "aGVhZA.cGF5bG9hZA.c2ln";
+     * const sig = base64url.decode(token.split(".")[2]);
+     */
+    decode(s) {
+      if (typeof s !== "string") s = String(s);
+      return _decodeBase(s, ANY_LOOKUP);
+    },
+  };
+
+  /**
+   * Hex string ⇄ bytes. Bridges the platform's hex-returning crypto
+   * APIs to the byte-oriented base64url surface — e.g.
+   * `base64url.encode(hex.decode(crypto.sha256(x)))` is a PKCE
+   * code_challenge in two calls.
+   *
+   * @namespace hex
+   */
+  globalThis.hex = {
+    /**
+     * Encode bytes as a lowercase hex string.
+     *
+     * @param {Uint8Array|number[]} bytes - Bytes to encode.
+     * @returns {string} Lowercase hex, 2 chars per byte.
+     * @example
+     * hex.encode(new Uint8Array([255, 0])); // "ff00"
+     */
+    encode(bytes) {
+      if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
+      const tab = "0123456789abcdef";
+      const out = [];  // array+join, not `+=` (O(n²) arena — see base64 _encodeBase)
+      for (let i = 0; i < bytes.length; i++) {
+        out.push(tab[bytes[i] >> 4]);
+        out.push(tab[bytes[i] & 0x0f]);
+      }
+      return out.join("");
+    },
+
+    /**
+     * Decode a hex string to bytes. Accepts upper or lower case.
+     *
+     * @param {string} s - Even-length hex string.
+     * @returns {Uint8Array} Decoded bytes. Odd length or non-hex
+     *   chars throw.
+     * @example
+     * hex.decode("ff00"); // Uint8Array([255, 0])
+     */
+    decode(s) {
+      if (typeof s !== "string") throw new TypeError("hex.decode: input must be a string");
+      if ((s.length & 1) !== 0) throw new Error("hex.decode: odd-length input");
+      const out = new Uint8Array(s.length >> 1);
+      for (let i = 0; i < out.length; i++) {
+        const hi = _hexNibble(s.charCodeAt(i * 2));
+        const lo = _hexNibble(s.charCodeAt(i * 2 + 1));
+        if (hi < 0 || lo < 0) throw new Error("hex.decode: non-hex character");
+        out[i] = (hi << 4) | lo;
+      }
+      return out;
+    },
+  };
+
+  function _hexNibble(code) {
+    if (code >= 0x30 && code <= 0x39) return code - 0x30;
+    if (code >= 0x61 && code <= 0x66) return code - 0x61 + 10;
+    if (code >= 0x41 && code <= 0x46) return code - 0x41 + 10;
+    return -1;
+  }
+})();

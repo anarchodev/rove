@@ -1781,3 +1781,41 @@ test "the kv write caps match the snapshot stream's frame bounds" {
     // under the write cap is what would strand a tenant mid-catch-up.
     try std.testing.expect(reserved.KV_VAL_MAX <= kv_mod.snapshot_stream.STREAM_VAL_MAX);
 }
+
+test "every global shim is IIFE-wrapped, so its top level stays out of handler scope" {
+    // A shim's top-level `const`s land in the BASE context's global lexical
+    // scope, and customer handler modules resolve against it — so an
+    // unwrapped shim publishes its internals under names a handler can read
+    // and, for anything mutable, write. Measured before this test existed: a
+    // handler read `STD_LOOKUP.length` and wrote `STD_LOOKUP[0] = 42`
+    // (base64.js), and saw `sysHttp` as an object while `_system` was
+    // correctly undefined (webhook.js) — so `_harden.js`'s delete was hiding
+    // the property while the captures taken pre-harden stayed nameable.
+    //
+    // The base arena is shared by every request the worker serves, whatever
+    // tenant, which makes a writable one a cross-tenant channel (rove#748).
+    //
+    // The rule already existed and three shims had drifted off it, which is
+    // the argument for checking it here rather than in review.
+    for (GLOBALS_FILES) |g| {
+        var i: usize = 0;
+        // Skip the licence header and any leading comment/blank lines.
+        while (i < g.src.len) {
+            const nl = std.mem.indexOfScalarPos(u8, g.src, i, '\n') orelse g.src.len;
+            const line = std.mem.trim(u8, g.src[i..nl], " \t\r");
+            if (line.len != 0 and !std.mem.startsWith(u8, line, "//")) break;
+            i = nl + 1;
+        }
+        const rest = g.src[@min(i, g.src.len)..];
+        const wrapped = std.mem.startsWith(u8, rest, "(function () {") or
+            std.mem.startsWith(u8, rest, "(() => {");
+        if (!wrapped) {
+            std.debug.print(
+                "\nglobals/{s}.js is not IIFE-wrapped: its top-level bindings are " ++
+                    "reachable by name from customer handler code\n",
+                .{g.name},
+            );
+            return error.ShimNotEnclosed;
+        }
+    }
+}
