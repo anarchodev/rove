@@ -1467,7 +1467,30 @@ fn attachFn(ctx: *c.JSContext, target: c.JSValue, fb: FnBinding) void {
 
 fn evalSnippet(ctx: *c.JSContext, name: [*:0]const u8, source: []const u8) void {
     const result = c.JS_Eval(ctx, source.ptr, source.len, name, c.JS_EVAL_TYPE_GLOBAL);
-    c.JS_FreeValue(ctx, result);
+    defer c.JS_FreeValue(ctx, result);
+    if (!c.JS_IsException(result)) return;
+
+    // A shim that fails to install is an infallibility violation, not an
+    // expected failure: these are compiled into the binary and every one is
+    // covered by the gate, so reaching here means the build shipped JS that
+    // cannot evaluate. Continuing is the bad option — the context comes up
+    // missing a global, and the first customer to touch it gets a
+    // TypeError from a surface that is supposed to always exist, with
+    // nothing connecting it back to install.
+    //
+    // Swallowing this cost real time once: a base-context corruption
+    // (rove#735) had to be hand-instrumented here before eval failure could
+    // even be ruled out, because a failed install and a successful one
+    // looked identical from the outside.
+    const exc = c.JS_GetException(ctx);
+    defer c.JS_FreeValue(ctx, exc);
+    const msg = c.JS_ToCString(ctx, exc);
+    defer if (msg != null) c.JS_FreeCString(ctx, msg);
+    const detail: []const u8 = if (msg != null) std.mem.span(msg) else "<no message>";
+    std.debug.panic(
+        "rove-js: global shim {s} failed to evaluate: {s}",
+        .{ name, detail },
+    );
 }
 
 /// Convenience wrapper: install everything at once. Used by tests and
