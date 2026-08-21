@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
+const reserved = @import("rove-reserved");
 const world = @import("world.zig"); // test-only: round-trip the emitted world
 
 pub const Error = error{
@@ -151,13 +152,37 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // `kv_elided`, which replay REFUSES. Omitting them instead would leave the
     // key absent from the map, and a closed-world miss answers `not_found` —
     // a plausible value where the live run read real data.
-    var elided = std.ArrayList(struct { op: []const u8, key: []const u8, bytes: u64 }){};
+    // `sealed` distinguishes a value that is STILL THERE and merely
+    // unopenable from one the budget dropped. Both refuse, and must —
+    // serving a plausible value where the live run saw real data is the
+    // failure the discipline exists to prevent — but a reader told the
+    // wrong one either reports an erasure that did not happen or hides one
+    // that did.
+    var elided = std.ArrayList(struct {
+        op: []const u8,
+        key: []const u8,
+        bytes: u64,
+        sealed: bool = false,
+    }){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
             if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
             try seen.put(a, e.key, {});
             switch (e.outcome) {
-                .ok => try kv.append(a, .{ .key = e.key, .value = e.value }),
+                // A SEALED value cannot travel into the world at all: the
+                // world is JSON, and JSON strings are Unicode text, so the
+                // `0xFF` marker has no representation there — the same
+                // property that makes the marker unambiguous makes it
+                // unencodable. Classifying here, where the tape's raw bytes
+                // still exist, is therefore the only place this decision
+                // can be made; passing the value through would silently
+                // transcode it into different bytes.
+                .ok => if (reserved.isSealedValue(e.value)) try elided.append(a, .{
+                    .op = "get",
+                    .key = e.key,
+                    .bytes = e.value.len,
+                    .sealed = true,
+                }) else try kv.append(a, .{ .key = e.key, .value = e.value }),
                 .elided => try elided.append(a, .{
                     .op = "get",
                     .key = e.key,
@@ -180,6 +205,19 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
             for (e.results) |row| {
                 if (seen.contains(row.key)) continue;
                 try seen.put(a, row.key, {});
+                // One sealed row refuses the whole PAGE, not just itself: a
+                // page short by a row replays as a complete, shorter one,
+                // which is the all-or-nothing rule the elided page above
+                // already follows.
+                if (reserved.isSealedValue(row.value)) {
+                    try elided.append(a, .{
+                        .op = "prefix",
+                        .key = e.key,
+                        .bytes = row.value.len,
+                        .sealed = true,
+                    });
+                    break;
+                }
                 try kv.append(a, .{ .key = row.key, .value = row.value });
             }
         },
@@ -478,7 +516,9 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
             try jsonStr(w, e.op);
             try w.writeAll(", \"key\": ");
             try jsonStr(w, e.key);
-            try w.print(", \"bytes\": {d} }}", .{e.bytes});
+            try w.print(", \"bytes\": {d}", .{e.bytes});
+            if (e.sealed) try w.writeAll(", \"sealed\": true");
+            try w.writeAll(" }");
         }
         try w.writeAll("\n  ]");
     }

@@ -52,7 +52,16 @@ pub const KvRefusal = struct { op: []const u8, key: []const u8, code: []const u8
 /// Replay REFUSES such a read (the poison door) instead of resolving it: a
 /// closed-world miss answers `not_found`, and serving that here would hand
 /// the handler a plausible absence where the live run read real data.
-pub const KvElided = struct { op: []const u8, key: []const u8, bytes: u64 = 0 };
+/// A read replay must REFUSE. `sealed` says why: the value is still there
+/// and merely unopenable (a per-identity key was destroyed), rather than
+/// dropped by the activation's kv budget. Both refuse; a reader told the
+/// wrong one reports an erasure that did not happen, or hides one that did.
+pub const KvElided = struct {
+    op: []const u8,
+    key: []const u8,
+    bytes: u64 = 0,
+    sealed: bool = false,
+};
 pub const Source = struct { path: []const u8, kind: []const u8, source: []const u8 };
 /// A registered kv trigger (issue #38): watched key `prefix` + the `module`
 /// specifier of its `_triggers/<prefix>/index` handler.
@@ -394,7 +403,16 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
                 (if (b == .integer and b.integer >= 0) @intCast(b.integer) else return Error.BadWorld)
             else
                 0;
-            try es.append(a, .{ .op = op.string, .key = key.string, .bytes = bytes });
+            const sealed: bool = if (item.object.get("sealed")) |sv|
+                (if (sv == .bool) sv.bool else return Error.BadWorld)
+            else
+                false;
+            try es.append(a, .{
+                .op = op.string,
+                .key = key.string,
+                .bytes = bytes,
+                .sealed = sealed,
+            });
         }
         w.kv_elided = try es.toOwnedSlice(a);
     }

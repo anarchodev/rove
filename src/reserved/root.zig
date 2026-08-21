@@ -364,6 +364,42 @@ pub const KV_KEY_MAX: usize = 256;
 /// Conservative on purpose: raising it later breaks nobody, lowering it
 /// breaks handlers that already shipped.
 pub const SHRED_KEY_MAX: usize = 128;
+
+/// Marks a kv value that is SEALED under a per-identity key.
+///
+/// A CONTRACT, and it lives here for the same reason the kv caps do:
+/// every engine must agree on it, and the offline engines must be able to
+/// recognise a sealed value WITHOUT linking the crypto primitive. The
+/// browser arena deliberately does not link `rove-crypt` at all — PLAN
+/// §2.7 locks no client-side key distribution — so it can recognise one
+/// and refuse, but never open it.
+///
+/// `0xFF` specifically because it is not a legal byte in UTF-8, nor in
+/// the WTF-8 a lone surrogate produces. Customer values reach the engine
+/// through `JS_ToCStringLen` and so are UTF-8, which makes the test exact
+/// rather than probabilistic — and means no value already stored can
+/// collide with it.
+///
+/// Platform values are NOT UTF-8 and may legitimately begin with this
+/// byte. They are never sealed and never tested: every one lives under a
+/// reserved `_` prefix, which customer keys cannot use.
+pub const SEAL_MARKER: u8 = 0xFF;
+
+/// Is this a sealed customer value? Only meaningful for customer keys.
+///
+/// Ask this where the value's RAW BYTES are still in hand — the store, or
+/// a tape being transcoded. Do not ask it downstream of any text decode:
+/// the property that makes the marker unambiguous is that it is not legal
+/// UTF-8, and every offline path decodes tape values as text, so the byte
+/// does not survive. JSON turns it into a different code point and
+/// `TextDecoder` turns it into U+FFFD, both silently.
+///
+/// That is not a limitation to work around — it is why the decision about
+/// a sealed value is made once, by whoever serves the record, and never
+/// re-derived by a reader further down.
+pub fn isSealedValue(value: []const u8) bool {
+    return value.len > 0 and value[0] == SEAL_MARKER;
+}
 /// 384 KiB, and the ceiling above it is not storage but REPLICATION: a write
 /// rides one raft entry, one entry rides one raft message, and a message above
 /// the receiver's fixed buffer cannot be delivered at all

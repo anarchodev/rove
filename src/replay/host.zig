@@ -118,7 +118,16 @@ pub fn noteActiveWrite(bytes: usize) void {
 
 /// `Host`-side twin of `activeElidedRead` for the responders, which already
 /// hold the host pointer.
-fn elidedFor(h: *Host, op_ch: u8, key: []const u8) ?u64 {
+/// Why a read must be refused rather than resolved.
+///
+/// `sealed` means the value is still there and merely unopenable — a
+/// per-identity key was destroyed — as against dropped by the
+/// activation's kv budget. Both refuse; only the message differs, and it
+/// has to, because one says "your data was erased" and the other says
+/// "this run kept too much to hold".
+pub const Refusal = struct { bytes: u64, sealed: bool = false };
+
+fn elidedFor(h: *Host, op_ch: u8, key: []const u8) ?Refusal {
     if (h.elided.count() == 0) return null;
     var buf: [300]u8 = undefined;
     if (key.len + 1 > buf.len) return null;
@@ -132,7 +141,7 @@ fn elidedFor(h: *Host, op_ch: u8, key: []const u8) ?u64 {
 /// page: a scan whose recorded page was dropped cannot be reconstructed from
 /// the map at any cursor, so every scan of it must refuse. Over-broad on
 /// purpose — the wrong direction here is answering, not refusing.
-pub fn activeElidedRead(op_ch: u8, key: []const u8) ?u64 {
+pub fn activeElidedRead(op_ch: u8, key: []const u8) ?Refusal {
     if (active_vtable != &HOST_VTABLE) return null;
     const h: *Host = @ptrCast(@alignCast(active_user orelse return null));
     if (h.elided.count() == 0) return null;
@@ -213,7 +222,7 @@ pub const Host = struct {
     /// A hit is a REFUSAL, not an answer: the closed world's miss rule
     /// (absent ⇒ `not_found`) is exactly the wrong answer here, because the
     /// live run read real data. The kv binding poisons the run instead.
-    elided: std.StringHashMapUnmanaged(u64) = .{},
+    elided: std.StringHashMapUnmanaged(Refusal) = .{},
 
     pub fn install(self: *Host) void {
         setHost(&HOST_VTABLE, self);
@@ -253,10 +262,22 @@ fn kvGet(
     // the interrupt brake the run — the value is unrecoverable, so there is
     // nothing to serve.
     if (elidedFor(h, 'g', k)) |lost| {
-        h.setDiv(
+        if (lost.sealed) {
+            // A record reaches replay already OPENED — PLAN §2.7 locks no
+            // client-side key distribution, so the server opens it and
+            // serves plaintext. A value still sealed by the time it is
+            // transcoded therefore means the server could not open it
+            // either: that identity's key is gone.
+            h.setDiv(
+                "kv.get(\"{s}\") — sealed under a per-identity key " ++
+                    "(request.shredKey) that has been destroyed, so this value is " ++
+                    "permanently unreadable and this run cannot be replayed against it",
+                .{k},
+            );
+        } else h.setDiv(
             "kv.get(\"{s}\") — the capture elided this value ({d} bytes over the " ++
                 "activation's kv budget), so this run cannot be replayed against it",
-            .{ k, lost },
+            .{ k, lost.bytes },
         );
         out_outcome.* = @intFromEnum(decode.KvOutcome.elided);
         out_val.* = null;
@@ -338,10 +359,18 @@ fn kvPrefix(
     // page and present it as complete. Refuse the run instead; the empty array
     // below is only what the braking run unwinds through.
     if (elidedFor(h, 'p', p)) |lost| {
-        h.setDiv(
+        if (lost.sealed) {
+            h.setDiv(
+                "kv.prefix(\"{s}\") — a row on this page is sealed under a " ++
+                    "per-identity key (request.shredKey) that has been destroyed, so " ++
+                    "the page is permanently incomplete and this run cannot be " ++
+                    "replayed against it",
+                .{p},
+            );
+        } else h.setDiv(
             "kv.prefix(\"{s}\") — the capture elided this page ({d} row bytes over " ++
                 "the activation's kv budget), so this run cannot be replayed against it",
-            .{ p, lost },
+            .{ p, lost.bytes },
         );
     }
     // Reconstruct the scan from the closed-world map: keys under the prefix,
@@ -502,10 +531,10 @@ test "elided read: refused, never answered as absent" {
     const a = testing.allocator;
     var map = std.StringHashMapUnmanaged([]const u8){};
     defer map.deinit(a);
-    var elided = std.StringHashMapUnmanaged(u64){};
+    var elided = std.StringHashMapUnmanaged(Refusal){};
     defer elided.deinit(a);
     // "g" ++ key — the capture recorded this read and dropped its value.
-    try elided.put(a, "gbig/blob", 900_000);
+    try elided.put(a, "gbig/blob", .{ .bytes = 900_000 });
     var h = Host{ .a = a, .kv_map = map, .elided = elided };
     defer if (h.diverged) |d| a.free(d);
 
@@ -528,9 +557,9 @@ test "elided page: every scan of that prefix refuses" {
     defer map.deinit(a);
     // A row the map DOES hold — a short page would look like a complete scan.
     try map.put(a, "p/1", "kept");
-    var elided = std.StringHashMapUnmanaged(u64){};
+    var elided = std.StringHashMapUnmanaged(Refusal){};
     defer elided.deinit(a);
-    try elided.put(a, "pp/", 400_000);
+    try elided.put(a, "pp/", .{ .bytes = 400_000 });
     var h = Host{ .a = a, .kv_map = map, .elided = elided };
     defer if (h.diverged) |d| a.free(d);
 

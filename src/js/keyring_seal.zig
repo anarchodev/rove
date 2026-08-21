@@ -44,10 +44,13 @@
 
 const std = @import("std");
 const crypt = @import("rove-crypt");
+const reserved = @import("rove-reserved");
 
-/// Marks a sealed value. Not a legal UTF-8 byte, so no plaintext
-/// customer value can begin with it — see the header.
-pub const SEAL_MARKER: u8 = 0xFF;
+/// Marks a sealed value. Defined in `rove-reserved` with the other
+/// cross-engine contracts, so the offline engines can recognise a sealed
+/// value without linking the crypto primitive — the browser arena does
+/// not link it at all.
+pub const SEAL_MARKER: u8 = reserved.SEAL_MARKER;
 
 /// Bytes a seal adds: the marker plus the envelope's own overhead.
 pub const OVERHEAD: usize = 1 + crypt.OVERHEAD;
@@ -57,7 +60,7 @@ pub const OVERHEAD: usize = 1 + crypt.OVERHEAD;
 /// Only meaningful for CUSTOMER keys. A platform value is raw bytes and
 /// may legitimately begin with `0xFF`; callers must not ask about one.
 pub fn isSealed(value: []const u8) bool {
-    return value.len > 0 and value[0] == SEAL_MARKER;
+    return reserved.isSealedValue(value);
 }
 
 /// Seal `plaintext` under `key`, naming `slot` so a reader can find the

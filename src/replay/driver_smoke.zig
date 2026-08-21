@@ -289,6 +289,54 @@ fn runElided(a: std.mem.Allocator) !void {
     std.debug.print("ELIDED OK — an elided read refuses instead of replaying as absent\n", .{});
 }
 
+const SEALED_HANDLER =
+    \\export default function () {
+    \\  const v = kv.get("card");
+    \\  return { got: v === null ? "absent" : v };
+    \\}
+;
+
+/// A value still SEALED when replay meets it must refuse the run, never be
+/// served.
+///
+/// Serving it would hand the handler ciphertext — a plausible string where
+/// the live run saw plaintext — and the divergence would surface as a
+/// mismatched output rather than as what it is.
+///
+/// The world holds the value with its `0xFF` marker, which is what every
+/// engine recognises: the marker is not a legal UTF-8 byte, so no plaintext
+/// customer value can carry it, and the offline engines can spot one without
+/// linking the crypto primitive at all (the browser arena does not link it).
+fn runSealed(a: std.mem.Allocator) !void {
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"captured\":true,");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    // A sealed value CANNOT be carried in the world itself: the world is
+    // JSON, JSON strings are Unicode text, and the `0xFF` marker has no
+    // representation there — the same property that makes the marker
+    // unambiguous makes it unencodable. So the transcode classifies it,
+    // and what reaches the world is the refusal, flagged `sealed` to
+    // distinguish "the key was destroyed" from "the budget dropped it".
+    try w.writeAll("\"kv_elided\":[{\"op\":\"get\",\"key\":\"card\",\"bytes\":41,\"sealed\":true}],");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(SEALED_HANDLER, .{}, w);
+    try w.writeAll("}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("SEALED: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    check(out.items, &.{
+        "\"divergence\":", "card", "shredKey", "\"ok\":false",
+    }, &.{"exceeded cpu budget"}, "SEALED READ (a sealed value refuses the run, never serves ciphertext)");
+    std.debug.print("SEALED OK — a sealed value refuses instead of replaying as ciphertext\n", .{});
+}
+
 /// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
 /// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
 /// complete because the GC arena reclaims the dead strings mid-run. Same shape
@@ -374,6 +422,7 @@ pub fn main() !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "elided")) {
         try runElided(a);
+        try runSealed(a);
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "packages")) {
