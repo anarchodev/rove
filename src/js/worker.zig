@@ -4100,6 +4100,7 @@ pub fn runResume(
         &tc.snap.source_hashes,
         if (tc.snap.resolver) |*r| r else null,
         &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
+        tc.snap.deployment_id,
         request,
         budget,
     );

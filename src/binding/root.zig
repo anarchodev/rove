@@ -73,6 +73,10 @@
 //!                                         //   it (the worker) or ignore it
 //!                                         //   (engines that produce no
 //!                                         //   tapes). Best-effort.
+//! configScope(d) u64                      // the deployment this activation
+//!                                         //   runs under, for resolving the
+//!                                         //   `_config/` namespace; 0 = an
+//!                                         //   authored world with no release
 //! get(d, key) GetResult                   // value (owned) | absent | thrown
 //!                                         //   — the delegate records/tapes/
 //!                                         //   folds internally
@@ -254,7 +258,11 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             // today's rules would allow.
             if (d.decides() and guards.kvReadHidden(key, d.isSystemModule())) return js_null;
 
-            switch (d.get(key)) {
+            // `_config/` resolves under the asking activation's deployment.
+            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const skey = storageKey(d, &skey_buf, key) orelse return js_null;
+
+            switch (d.get(skey)) {
                 .value => |v| {
                     defer d.release(v);
                     return q.JS_NewStringLen(ctx, v.ptr, v.len);
@@ -298,11 +306,20 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 }
             }
 
-            if (!d.put(ctx, key, value)) return js_exception;
+            // Rules judge the key a handler NAMED; storage takes the key it
+            // resolves to, so a write and a read of the same name reach the
+            // same row. Only the mirror writes `_config/` in production, but
+            // an asymmetry here is the kind that surfaces years later as a
+            // config write nobody can find.
+            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const skey = storageKey(d, &skey_buf, key) orelse return js_exception;
+
+            if (!d.put(ctx, skey, value)) return js_exception;
             // Spend the activation's budget only on a write that HAPPENED: a
             // refused or failed one costs nothing, or a handler could be
-            // starved by writes that never reached the entry.
-            d.noteWrite(guards.kvWriteCost(key.len, value.len));
+            // starved by writes that never reached the entry. Charged on the
+            // key that rides the entry, which is the resolved one.
+            d.noteWrite(guards.kvWriteCost(skey.len, value.len));
             return js_undefined;
         }
 
@@ -330,11 +347,30 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 }
             }
 
-            if (!d.del(ctx, key)) return js_exception;
+            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const skey = storageKey(d, &skey_buf, key) orelse return js_exception;
+
+            if (!d.del(ctx, skey)) return js_exception;
             // A delete is an op with a key and no value — it rides the entry
             // like any other.
-            d.noteWrite(guards.kvWriteCost(key.len, 0));
+            d.noteWrite(guards.kvWriteCost(skey.len, 0));
             return js_undefined;
+        }
+
+        /// Where a `_config/` key LIVES for the activation doing the asking.
+        ///
+        /// A handler names config by its deployed path; storage holds it under
+        /// the deployment that shipped it, so code and config switch at the
+        /// same instant (`reserved.configStorageKey`). The rule is shared and
+        /// the deployment id is the engine's, which is why this sits in the
+        /// binding rather than in four delegates: the spelling a handler uses
+        /// must not depend on which engine is running it.
+        ///
+        /// Returns the key unchanged for everything that is not config, and
+        /// for an authored world with no release (`configScope() == 0`).
+        fn storageKey(d: D, buf: []u8, key: []const u8) ?[]const u8 {
+            if (!guards.reserved.isConfigKey(key)) return key;
+            return guards.reserved.configStorageKey(buf, d.configScope(), key);
         }
 
         /// `kv.prefix(prefix, cursor?, limit?)` → `[ { key, value }, ... ]`
@@ -379,7 +415,13 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 return kvPrefixFiltered(d, ctx, prefix, cursor, limit);
             }
 
-            var page = d.prefix(prefix, cursor, limit) orelse return js_null;
+            // A scan of the config namespace resolves the same way a get
+            // does, so `kv.prefix("_config/")` sees this deployment's rows and
+            // not every deployment's.
+            var spfx_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const spfx = storageKey(d, &spfx_buf, prefix) orelse return js_null;
+
+            var page = d.prefix(spfx, cursor, limit) orelse return js_null;
             defer page.deinit();
 
             const arr = q.JS_NewArray(ctx);

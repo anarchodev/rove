@@ -30,6 +30,8 @@ const MockState = struct {
     /// Outcome-replay knobs: `decide` false = captured mode (rules skipped);
     /// a taped refusal replays for exactly this key ("set" op).
     decide: bool = true,
+    /// The deployment the mock activation runs under (0 = an authored world).
+    config_scope: u64 = 0,
     taped_refusal_key: []const u8 = "",
     taped_refusal_code: []const u8 = "",
     /// The last refusal the binding asked to record (op char + code).
@@ -82,6 +84,10 @@ const MockKv = struct {
     pub fn noteWrite(self: MockKv, bytes: usize) void {
         self.st.write_ops += 1;
         self.st.write_bytes += bytes;
+    }
+
+    pub fn configScope(self: MockKv) u64 {
+        return self.st.config_scope;
     }
 
     pub fn decides(self: MockKv) bool {
@@ -436,4 +442,76 @@ test "kv binding: the engine-only keyspace is invisible to a handler" {
     try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:\"9\"");
     st.decide = true;
     try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:null");
+}
+
+test "kv binding: _config/ resolves under the asking activation's deployment" {
+    const a = testing.allocator;
+
+    var st = MockState{ .a = a };
+    defer st.deinit();
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    c.JS_SetContextOpaque(ctx.raw, &st);
+    installKv(ctx);
+    {
+        const ready = try evalStr(ctx, a, PROBE);
+        defer a.free(ready);
+    }
+
+    // Two deployments ship the same config path with different content —
+    // the ordinary case of editing `_config/oauth/google.json`. Seeded as
+    // the mirror writes them: under the deployment, not over each other.
+    st.system_module = true;
+    try expectEval(ctx, a, "__t(() => kv.set('_config/0000000000000001/oauth/google', 'one'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.set('_config/0000000000000002/oauth/google', 'two'))", "ok:null");
+    st.system_module = false;
+
+    // The handler names the deployed path. Which deployment it is running
+    // under decides what it reads — so code and config move together, and a
+    // rollback to 1 is a pointer flip rather than a race.
+    st.config_scope = 1;
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"one\"");
+    st.config_scope = 2;
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"two\"");
+
+    // A scan of the namespace resolves the same way, or a handler would see
+    // every deployment's rows at once.
+    try expectEval(ctx, a, "__t(() => kv.prefix('_config/').map((r) => r.value))", "ok:[\"two\"]");
+
+    // A deployment that shipped no such config reads absent — the honest
+    // answer, and what makes `fromConfig` throw its own message rather than
+    // silently serving another deployment's value.
+    st.config_scope = 3;
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:null");
+
+    // An authored world has no release to scope by, so a seeded key reads
+    // back exactly as written — the offline sim and the replay arena.
+    st.config_scope = 0;
+    st.system_module = true;
+    try expectEval(ctx, a, "__t(() => kv.set('_config/oauth/google', 'flat'))", "ok:null");
+    st.system_module = false;
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"flat\"");
+
+    // A write resolves the same way a read does, so a config write and a
+    // config read of one name reach one row. Only the mirror writes this
+    // namespace in production; the symmetry is what stops a future writer
+    // landing somewhere no reader looks.
+    st.config_scope = 5;
+    st.system_module = true;
+    try expectEval(ctx, a, "__t(() => kv.set('_config/oauth/google', 'five'))", "ok:null");
+    st.system_module = false;
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"five\"");
+    // …and it landed under deployment 5, not over anyone else's row.
+    st.config_scope = 0;
+    try expectEval(ctx, a, "__t(() => kv.get('_config/0000000000000005/oauth/google'))", "ok:\"five\"");
+    st.config_scope = 1;
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"one\"");
+
+    // Nothing outside the namespace is touched at any deployment.
+    st.config_scope = 2;
+    try expectEval(ctx, a, "__t(() => kv.set('users/1', 'alice'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.get('users/1'))", "ok:\"alice\"");
 }

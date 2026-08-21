@@ -478,7 +478,7 @@ test "doc examples: retired spellings (Gate B) + compile (Gate A) + execute (Gat
             .fn_override = if (has_default) null else "go",
             .trace = .{ .request_id = 1 },
         };
-        var outcome = d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, null, request, &budget) catch |err| {
+        var outcome = d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, null, 0, request, &budget) catch |err| {
             std.debug.print(
                 "\ndoc-examples GATE C [{s}]: dispatch failed: {s}\n--- example ---\n{s}\n",
                 .{ ex.origin, @errorName(err), ex.src },

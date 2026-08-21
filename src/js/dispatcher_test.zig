@@ -146,7 +146,7 @@ fn runOneOutcome(
     if (request.fn_override == null) request.fn_override = "go";
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    const outcome = try d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, null, request, &budget);
+    const outcome = try d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, null, 0, request, &budget);
     try txn.commit();
     return outcome;
 }
@@ -1031,7 +1031,7 @@ test "kv subscriptions: the fire activation surfaces name + source {kind:kv, pre
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, null, 0, .{
         .method = "POST",
         .path = "/_subscriptions/orders-react/index",
         .fn_override = "onSubscription",
@@ -1091,7 +1091,7 @@ test "kv subscriptions: watched-prefix writes inject ONE durable dirty marker (c
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, &.{ .subscriptions = &subs }, .{
+    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, &.{ .subscriptions = &subs }, 0, .{
         .method = "POST",
         .path = "/",
         .fn_override = "go",
@@ -1254,7 +1254,7 @@ test "static onChunk: a failed upstream read fails loud (502), never a silent 20
 
     // A missing blob: the single terminal event is ok:false, status 404,
     // seq 0 — the head hasn't been committed, so a clean 502 is possible.
-    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .fn_override = "onChunk",
@@ -1871,6 +1871,7 @@ test "dispatch: malformed bytecode surfaces in exception field" {
         null,
         null,
         null,
+        0,
         .{ .method = "GET", .path = "/" },
         &budget,
     );
@@ -1991,7 +1992,7 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     defer ws.deinit();
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "POST",
         .path = "/",
         .fn_override = "go",
@@ -2066,7 +2067,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     defer ws.deinit();
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "POST",
         .path = "/",
         .fn_override = "go",
@@ -2120,7 +2121,7 @@ test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (
     var rs1 = tape_mod.Readset.init(testing.allocator, 0, 0);
     defer rs1.deinit();
     var budget1 = Budget.fromNow(Budget.default_duration_ns);
-    var r1 = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var r1 = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "POST",
         .path = "/",
         .fn_override = "first",
@@ -2131,7 +2132,7 @@ test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (
     var rs2 = tape_mod.Readset.init(testing.allocator, 0, 0);
     defer rs2.deinit();
     var budget2 = Budget.fromNow(Budget.default_duration_ns);
-    var r2 = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var r2 = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "POST",
         .path = "/",
         .fn_override = "second",
@@ -2214,7 +2215,7 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         defer ws.deinit();
 
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/",
             .fn_override = "go",
@@ -2257,7 +2258,7 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         var ws2 = kv_mod.WriteSet.init(testing.allocator);
         defer ws2.deinit();
         var budget2 = Budget.fromNow(Budget.default_duration_ns);
-        var resp2 = try d.run(kv, &txn2, &ws2, bytecode, null, null, null, null, .{
+        var resp2 = try d.run(kv, &txn2, &ws2, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/",
             .fn_override = "go",
@@ -2310,6 +2311,7 @@ test "dispatch: tight loop hits budget and returns Interrupted" {
         null,
         null,
         null,
+        0,
         .{ .method = "GET", .path = "/", .fn_override = "go" },
         &budget,
     );
@@ -2384,7 +2386,7 @@ test "dispatch: .mjs module + internal fn_override dispatch" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/hello",
             .fn_override = "greet",
@@ -2401,7 +2403,7 @@ test "dispatch: .mjs module + internal fn_override dispatch" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/hello",
             .fn_override = "shout",
@@ -2418,7 +2420,7 @@ test "dispatch: .mjs module + internal fn_override dispatch" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/hello",
             .fn_override = "nope",
@@ -2436,7 +2438,7 @@ test "dispatch: .mjs module + internal fn_override dispatch" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "POST",
             .path = "/hello",
             .query = "fn=shout&args=%5B%22x%22%5D",
@@ -2485,7 +2487,7 @@ fn runWithMiddleware(
     if (request.fn_override == null) request.fn_override = "go";
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    const resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, null, request, &budget);
+    const resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, null, 0, request, &budget);
     try txn.commit();
     return resp;
 }
@@ -2685,7 +2687,7 @@ test "dispatch: missing fn defaults to `default` export, called with no args" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/landing",
         }, &budget);
@@ -2701,7 +2703,7 @@ test "dispatch: missing fn defaults to `default` export, called with no args" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/x",
             .query = "page=2&sort=desc",
@@ -2741,7 +2743,7 @@ test "dispatch: no fn and no default export → 404" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -2782,7 +2784,7 @@ test "dispatch: POST with non-envelope JSON body invokes default, body in reques
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "POST",
         .path = "/",
         .body = "{\"name\":\"alice\"}",
@@ -2828,7 +2830,7 @@ test "dispatch: a {fn,args} POST body is opaque payload — default export runs"
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "POST",
         .path = "/",
         .body = "{\"fn\":\"greet\",\"args\":[\"world\"]}",
@@ -2900,7 +2902,7 @@ test "dispatch: request.headers exposes named headers, filters pseudo-headers" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -2951,7 +2953,7 @@ test "dispatch: request.headers missing → empty object, missing key → undefi
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
     // No headers field — exercises the null path.
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -3030,7 +3032,7 @@ test "dispatch: request_reads — values recorded only on read, repeat reads ded
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -3095,7 +3097,7 @@ test "dispatch: request_reads — Object.keys records no values, JSON.stringify 
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/",
             .headers = hdrs,
@@ -3130,7 +3132,7 @@ test "dispatch: request_reads — Object.keys records no values, JSON.stringify 
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/",
             .headers = hdrs,
@@ -3187,7 +3189,7 @@ test "dispatch: request_reads — cookies access records the whole cookie header
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -3243,7 +3245,7 @@ test "dispatch: request_reads — body flag set on read (incl. empty body), abse
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "POST",
             .path = "/",
             .body = "hello",
@@ -3275,7 +3277,7 @@ test "dispatch: request_reads — body flag set on read (incl. empty body), abse
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/",
             .trace = .{ .readset = &readset },
@@ -3309,7 +3311,7 @@ test "dispatch: request_reads — body flag set on read (incl. empty body), abse
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "POST",
             .path = "/",
             .body = "hello",
@@ -3372,7 +3374,7 @@ test "dispatch: request.ip masked, unmaskedIp() raw, IP transport headers stripp
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -3432,7 +3434,7 @@ test "dispatch: request.ip prefers cf-connecting-ip; IPv6 masks to /48; absent �
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/",
             .headers = hdrs,
@@ -3471,7 +3473,7 @@ test "dispatch: request.ip prefers cf-connecting-ip; IPv6 masks to /48; absent �
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "GET",
             .path = "/",
             .headers = hdrs,
@@ -3525,7 +3527,7 @@ test "dispatch: duplicate header names — last value wins through the getters" 
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -3581,7 +3583,7 @@ test "dispatch: request.cookies parses RFC 6265 cookie header" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -3636,7 +3638,7 @@ test "dispatch: request.cookies empty when no cookie header" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -3681,7 +3683,7 @@ test "dispatch: async module handler gets unwrapped" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
         .method = "GET",
         .path = "/x",
         .fn_override = "fetchLike",
@@ -5242,7 +5244,7 @@ test "trigger: afterPut fires after a kv.set inside the handler" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5305,7 +5307,7 @@ test "trigger: afterDelete fires with previousValue" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5377,7 +5379,7 @@ test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5438,7 +5440,7 @@ test "trigger: cascade depth limit halts runaway recursion" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5496,7 +5498,7 @@ test "trigger: platform-key writes do not fire customer triggers" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5559,7 +5561,7 @@ test "trigger: beforePut throw is catchable in handler with code='trigger_reject
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5620,7 +5622,7 @@ test "trigger: beforePut return-value mutates the written value" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5683,7 +5685,7 @@ test "trigger: beforePut throw rolls back trigger-internal writes (the audit got
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5748,7 +5750,7 @@ test "trigger: afterPut throw is catchable AND rolls back the originating write"
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5819,7 +5821,7 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5883,7 +5885,7 @@ test "trigger: default export is the catchall when no named export matches" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -5950,7 +5952,7 @@ test "trigger: BEFORE sees previousValue on update" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6023,7 +6025,7 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, &.{ .triggers = &triggers }, 0, .{
         .method = "GET",
         .path = "/",
     }, &budget);

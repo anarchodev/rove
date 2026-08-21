@@ -130,6 +130,14 @@ pub const OfflineKv = struct {
         return !host.activeReplaysOutcomes();
     }
 
+    /// Authored worlds have no release to scope `_config/` by, so a seeded
+    /// key reads back exactly as the world wrote it. A captured world does
+    /// not need one either: its reads come from the tape, which recorded the
+    /// key the handler named.
+    pub fn configScope(_: OfflineKv) u64 {
+        return 0;
+    }
+
     pub fn tapedRefusal(_: OfflineKv, op: binding.WriteOp, key: []const u8) ?[]const u8 {
         return host.activeTapedRefusal(switch (op) {
             .set => 's',

@@ -22,7 +22,10 @@
 //! JSContext. Its MESSAGE is here, because the message is contract.
 
 const std = @import("std");
-const reserved = @import("rove-reserved");
+/// Re-exported so the binding can name the shared keyspace rules without
+/// taking its own dependency on the module, the same way it names
+/// `guards.WriteBudget`.
+pub const reserved = @import("rove-reserved");
 const sizing = @import("rove-sizing");
 
 /// Which JS constructor an engine throws. The distinction is customer-visible

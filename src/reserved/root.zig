@@ -143,6 +143,44 @@ pub const SHIM_WRITABLE_PREFIXES = [_][]const u8{
     "_rp/",
 };
 
+/// The config namespace, as a HANDLER names it: `_config/oauth/default`.
+pub const CONFIG_PREFIX = "_config/";
+
+/// Longest storage key `configStorageKey` can produce for a legal config key —
+/// the visible key plus `{dep_id:016x}/`.
+pub const CONFIG_STORAGE_KEY_MAX = KV_KEY_MAX + 17;
+
+/// `key` is one a handler names in the config namespace.
+pub fn isConfigKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, CONFIG_PREFIX);
+}
+
+/// Where a config key LIVES, given the deployment whose activation is asking.
+///
+/// A handler names config by its deployed path (`_config/oauth/default`);
+/// storage holds it under the deployment that shipped it
+/// (`_config/{dep_id:016x}/oauth/default`). The indirection exists so code and
+/// config switch at the same instant: `dep_id` is a content hash, so those rows
+/// are immutable and write-once, the mirror that produces them is order-free
+/// and idempotent, and the single-key `_deploy/current` flip is what makes a
+/// deployment's config visible — atomically, and in both directions, including
+/// a rollback and a deploy that REMOVES a key.
+///
+/// Flattening config into one shared mutable namespace is what made those three
+/// cases race, and the failure was asymmetric: new code against old config
+/// throws out of `fromConfig` ("config not found … Did you deploy the file?"),
+/// while old code against new config ignores the keys it does not know.
+///
+/// `dep_id == 0` means "no deployment" — an authored world in the offline sim
+/// or the replay arena, which has no release to scope by. Those read and write
+/// the visible key unchanged, so a seeded world behaves as the handler wrote
+/// it. Returns null if the result would not fit `buf`.
+pub fn configStorageKey(buf: []u8, dep_id: u64, visible: []const u8) ?[]const u8 {
+    if (dep_id == 0 or !isConfigKey(visible)) return visible;
+    const rest = visible[CONFIG_PREFIX.len..];
+    return std.fmt.bufPrint(buf, "{s}{x:0>16}/{s}", .{ CONFIG_PREFIX, dep_id, rest }) catch null;
+}
+
 /// The platform namespaces a handler cannot SEE — not merely cannot write.
 ///
 /// A key here is engine bookkeeping that no handler has business observing:
@@ -462,4 +500,33 @@ test "scanSpansEngineOnly: only an ancestor of a hidden namespace spans it" {
     // wholly hidden and the binding answers empty without touching storage.
     try std.testing.expect(!scanSpansEngineOnly("_usage/blob/"));
     try std.testing.expect(isEngineOnly("_usage/blob/"));
+}
+
+test "configStorageKey: a handler's name resolves under its own deployment" {
+    var buf: [CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "_config/000000000000002a/oauth/default",
+        configStorageKey(&buf, 42, "_config/oauth/default").?,
+    );
+    // Two deployments name the same config path and do not collide — which is
+    // what lets the pointer flip be the transaction.
+    try std.testing.expectEqualStrings(
+        "_config/00000000000000ff/oauth/default",
+        configStorageKey(&buf, 255, "_config/oauth/default").?,
+    );
+}
+
+test "configStorageKey: no deployment, or not config, passes through" {
+    var buf: [CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+    // An authored world in the sim or the replay arena has no release to scope
+    // by, so a seeded key reads back exactly as it was written.
+    try std.testing.expectEqualStrings("_config/oauth/default", configStorageKey(&buf, 0, "_config/oauth/default").?);
+    // Everything outside the namespace is untouched at any deployment.
+    try std.testing.expectEqualStrings("users/1", configStorageKey(&buf, 42, "users/1").?);
+    try std.testing.expectEqualStrings("_send/owed/x", configStorageKey(&buf, 42, "_send/owed/x").?);
+}
+
+test "configStorageKey: a key too long for the buffer is refused, not truncated" {
+    var small: [8]u8 = undefined;
+    try std.testing.expect(configStorageKey(&small, 42, "_config/oauth/default") == null);
 }

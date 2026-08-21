@@ -199,6 +199,14 @@ pub const ArenaKv = struct {
         return !isCaptured(self.ctx);
     }
 
+    /// Authored worlds have no release to scope `_config/` by, so a seeded
+    /// key reads back exactly as the world wrote it. A captured world does
+    /// not need one either: its reads come from the tape, which recorded the
+    /// key the handler named.
+    pub fn configScope(_: ArenaKv) u64 {
+        return 0;
+    }
+
     /// NOTE the binding treats the returned slice as borrowed for the
     /// duration of the throw — it is an owned dupe leaked to c_allocator
     /// per hit; refusal replays are rare and runs are short-lived.
