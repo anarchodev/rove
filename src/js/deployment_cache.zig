@@ -908,6 +908,34 @@ pub const DeploymentCache = struct {
         return opened;
     }
 
+    /// Open one sealed value for `tenant_id`, from a thread that holds no
+    /// activation.
+    ///
+    /// The map lock is held ACROSS the open, not just around the lookup.
+    /// `evictTenant` frees a slot the moment it leaves the map, so a
+    /// `*TenantSlot` taken and then released is a pointer that can die
+    /// before it is used. The worker's own trampolines may look it up
+    /// unlocked because a live activation pins the slot; the fetch
+    /// engine thread — which is where the logs door opens records — has
+    /// no such pin.
+    ///
+    /// A tenant with no slot here, or a slot with no keyring, answers
+    /// `.unverified`. That is not "erased": this node simply has nothing
+    /// to say, and saying "erased" from here would report an erasure
+    /// that never happened.
+    pub fn openSealedValue(
+        self: *DeploymentCache,
+        allocator: std.mem.Allocator,
+        tenant_id: []const u8,
+        value: []const u8,
+    ) !keyring_mod.keyspace.Opened {
+        self.tenant_files_lock.lock();
+        defer self.tenant_files_lock.unlock();
+        const slot = self.tenant_files_map.get(tenant_id) orelse return .unverified;
+        const keys = slot.keys orelse return .unverified;
+        return keys.openValue(allocator, value);
+    }
+
     /// Drop a tenant's cached slot — its loaded bundle, bytecode map and
     /// resolved plan. Called when the tenant is torn down (`v2-evict`).
     ///

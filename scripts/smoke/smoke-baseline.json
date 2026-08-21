@@ -604,6 +604,11 @@
     "seconds": 0.0,
     "status": "pass"
   },
+  "shred_serve_gate_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.5,
+    "status": "pass"
+  },
   "snap_catchup_smoke_v2.py": {
     "rc": 0,
     "seconds": 3.8,
