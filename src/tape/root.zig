@@ -1043,29 +1043,7 @@ pub const Tape = struct {
     /// must be able to distinguish "channel was empty" from "no tape
     /// at all" and a header-only blob does that cheaply.
     pub fn serialize(self: *const Tape, allocator: std.mem.Allocator) ![]u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(allocator);
-
-        var header: [12]u8 = undefined;
-        std.mem.writeInt(u32, header[0..4], MAGIC, .big);
-        std.mem.writeInt(u16, header[4..6], VERSION, .big);
-        std.mem.writeInt(u16, header[6..8], @intFromEnum(self.channel), .big);
-        std.mem.writeInt(u32, header[8..12], @intCast(self.entries.items.len), .big);
-        try buf.appendSlice(allocator, &header);
-
-        var scratch: std.ArrayList(u8) = .empty;
-        defer scratch.deinit(allocator);
-
-        for (self.entries.items) |*e| {
-            scratch.clearRetainingCapacity();
-            try encodeEntry(allocator, &scratch, e);
-            var len_be: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len_be, @intCast(scratch.items.len), .big);
-            try buf.appendSlice(allocator, &len_be);
-            try buf.appendSlice(allocator, scratch.items);
-        }
-
-        return buf.toOwnedSlice(allocator);
+        return serializeEntries(allocator, self.channel, self.entries.items);
     }
 
     /// SHA-256 of the serialized form, hex-encoded (64 chars, lowercase).
@@ -1077,6 +1055,43 @@ pub const Tape = struct {
         return hashHexBytes(bytes);
     }
 };
+
+/// Serialize a channel's entries to the tape wire format, independent of
+/// the `Tape` that captured them. `Tape.serialize` is this; `parse`'s
+/// inverse is this. A rewriter that opens sealed values on the way out
+/// (`src/js/logs_door_shred.zig`) needs the encode half without the
+/// capture half — the append methods enforce the kv budget, which is a
+/// capture-time rule and would silently ELIDE a value on a re-encode.
+pub fn serializeEntries(
+    allocator: std.mem.Allocator,
+    channel: Channel,
+    entries: []const Entry,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var header: [12]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], MAGIC, .big);
+    std.mem.writeInt(u16, header[4..6], VERSION, .big);
+    std.mem.writeInt(u16, header[6..8], @intFromEnum(channel), .big);
+    std.mem.writeInt(u32, header[8..12], @intCast(entries.len), .big);
+    try buf.appendSlice(allocator, &header);
+
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+
+    for (entries) |*e| {
+        scratch.clearRetainingCapacity();
+        try encodeEntry(allocator, &scratch, e);
+        var len_be: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_be, @intCast(scratch.items.len), .big);
+        try buf.appendSlice(allocator, &len_be);
+        try buf.appendSlice(allocator, scratch.items);
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
 
 /// Per-request captured readset — the set of non-deterministic
 /// inputs the handler observed, channeled by source. Structural
