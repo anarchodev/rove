@@ -375,3 +375,36 @@ test "Snapshot.restore preserves complex JS behavior" {
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("sum=55", str);
 }
+
+/// `minimalInit` plus an install-time script that allocates far more than the
+/// base budget — what a shim outgrowing the arena does, without needing to
+/// grow a real shim to reach it. Reports what `JS_Eval` did through
+/// `user_data` so the test can assert on it.
+fn hungryInit(rt: *c.JSRuntime, ctx: *c.JSContext, user_data: ?*anyopaque) Error!void {
+    try minimalInit(rt, ctx, null);
+    const src = "globalThis.__hog = []; for (let i = 0; i < 200000; i++) __hog.push({ i: i, s: 'x'.repeat(64) });";
+    const v = c.JS_Eval(ctx, src.ptr, src.len, "hungry.js", c.JS_EVAL_TYPE_GLOBAL);
+    defer c.JS_FreeValue(ctx, v);
+    if (user_data) |ud| {
+        const threw: *bool = @ptrCast(@alignCast(ud));
+        threw.* = c.JS_IsException(v);
+    }
+}
+
+test "base-arena exhaustion during install surfaces as a JS exception, not silence" {
+    // This pins the MECHANISM the loud-install guard depends on. rove's
+    // `evalSnippet` panics with the JS exception text when a global shim
+    // fails to evaluate; that guard is only worth having if an arena that
+    // runs out during install actually raises one, rather than failing the
+    // allocation quietly and letting `JS_FreezeRuntime` page-protect a
+    // half-built object graph.
+    //
+    // Checked rather than assumed: `js_dual_arena_oom_hit()` does NOT report
+    // base-arena misses — it stayed false through this exact scenario, which
+    // is why there is no OOM check in `create`. A guard that cannot trip is
+    // worse than no guard, because it reads like coverage.
+    var threw = false;
+    var snap = try Snapshot.create(.{ .base_size = 2 * 1024 * 1024 }, hungryInit, &threw);
+    defer snap.deinit();
+    try std.testing.expect(threw);
+}
