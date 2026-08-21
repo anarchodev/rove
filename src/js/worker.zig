@@ -2860,6 +2860,8 @@ pub fn Worker(comptime opts: Options) type {
                 input.ctx_json,
                 input.fn_name,
                 input.actor,
+                input.origin_tenant,
+                input.dispatch_id,
                 input.dispatcher_is_platform,
             ) catch |err| {
                 std.log.warn(

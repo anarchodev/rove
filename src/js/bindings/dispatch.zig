@@ -66,7 +66,13 @@ fn actorFromName(name: []const u8) ?log_mod.PlatformActor {
     return null;
 }
 
-/// `__rove.dispatch(targetTenant, modulePath, ctxJson, fnName|null, actor)`
+/// `__rove.dispatch(targetTenant, modulePath, ctxJson, fnName|null, actor, dispatchId|null)`
+///
+/// `dispatchId` names the caller's own `_dispatch/owed/{id}` marker, so the
+/// target's completion can be reported back and the marker resolved. The
+/// ORIGIN tenant is NOT an argument — it is stamped from `state.instance_id`
+/// below, because a caller able to name its own origin could aim another
+/// tenant's marker at itself.
 ///
 /// Returns true when the activation was enqueued. Throws — rather than
 /// returning false — when the op is unavailable or the arguments are wrong,
@@ -85,7 +91,7 @@ pub fn jsPlatformDispatch(
         return js_exception;
     }
     if (argc < 5) {
-        _ = c.JS_ThrowTypeError(ctx, "__rove.dispatch(targetTenant, modulePath, ctxJson, fnName, actor) requires 5 args");
+        _ = c.JS_ThrowTypeError(ctx, "__rove.dispatch(targetTenant, modulePath, ctxJson, fnName, actor, dispatchId) requires 5 args");
         return js_exception;
     }
 
@@ -132,6 +138,17 @@ pub fn jsPlatformDispatch(
         return js_exception;
     };
 
+    var did: []const u8 = "";
+    var did_borrow: ?Borrowed = null;
+    if (argc >= 6 and !c.JS_IsNull(argv[5]) and !c.JS_IsUndefined(argv[5])) {
+        did_borrow = borrowStr(ctx, argv[5]) orelse {
+            _ = c.JS_ThrowTypeError(ctx, "__rove.dispatch: dispatchId must be a string or null");
+            return js_exception;
+        };
+        did = did_borrow.?.slice;
+    }
+    defer if (did_borrow) |b| c.JS_FreeCString(ctx, b.cstr);
+
     const dispatch_fn = state.platform_dispatch orelse {
         _ = c.JS_ThrowTypeError(ctx, "__rove.dispatch is not available on this path");
         return js_exception;
@@ -149,6 +166,10 @@ pub fn jsPlatformDispatch(
         .ctx_json = ctx_json.slice,
         .fn_name = fn_name,
         .actor = actor,
+        // Report back to the tenant this activation is running IN, not to a
+        // tenant the caller named. Empty `did` ⇒ no marker ⇒ no report.
+        .origin_tenant = if (did.len > 0) state.instance_id else "",
+        .dispatch_id = did,
         .dispatcher_is_platform = state.platform != null,
     });
     return if (ok) js_true else js_false;

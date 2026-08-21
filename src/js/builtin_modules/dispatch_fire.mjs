@@ -105,6 +105,11 @@ export default function () {
         JSON.stringify(marker.ctx === undefined ? null : marker.ctx),
         typeof marker.fn === "string" && marker.fn ? marker.fn : null,
         marker.actor,
+        // The marker this dispatch resolves: the target's completion reports
+        // back here and clears it. Without this the watchdog would re-fire
+        // forever, since nothing else can tell this tenant the work landed —
+        // the target cannot write into this store, which is the point.
+        id,
     );
 
     return { status: 200 };

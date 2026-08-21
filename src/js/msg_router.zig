@@ -613,6 +613,12 @@ pub const MsgRouter = struct {
         ctx_json: []const u8,
         fn_name: ?[]const u8,
         actor: log_mod.PlatformActor,
+        /// Report completion HERE — the dispatching tenant's own scope — by
+        /// resolving `dispatch_id`'s owed marker. Both empty for a dispatch
+        /// with no marker, and for the result hop itself, which must not
+        /// produce a result of its own or two tenants would volley forever.
+        origin_tenant: []const u8,
+        dispatch_id: []const u8,
         dispatcher_is_platform: bool,
     ) !void {
         if (!dispatcher_is_platform) {
@@ -639,6 +645,10 @@ pub const MsgRouter = struct {
         errdefer allocator.free(ctx);
         const fn_dup: ?[]u8 = if (fn_name) |f| try allocator.dupe(u8, f) else null;
         errdefer if (fn_dup) |f| allocator.free(f);
+        const origin_dup = try allocator.dupe(u8, origin_tenant);
+        errdefer allocator.free(origin_dup);
+        const did_dup = try allocator.dupe(u8, dispatch_id);
+        errdefer allocator.free(did_dup);
 
         const payload: effect_mod.msg.PlatformDispatch = .{
             .tenant_id = tid,
@@ -646,6 +656,8 @@ pub const MsgRouter = struct {
             .ctx_json = ctx,
             .fn_name = fn_dup,
             .actor = actor,
+            .origin_tenant = origin_dup,
+            .dispatch_id = did_dup,
         };
         try self.enqueueMsgForTenant(tenant_id, .{ .platform_dispatch = payload });
     }
@@ -894,13 +906,13 @@ test "platform dispatch: only a platform-bound dispatcher may target another sco
     // comes from the DISPATCHER's identity, never from the target path — so
     // this is refused even though the path is one the platform itself uses.
     try router.enqueuePlatformDispatchForTenant(
-        tenant, "__system/static.mjs", "null", null, .system, false,
+        tenant, "__system/static.mjs", "null", null, .system, "", "", false,
     );
     try testing.expectEqual(@as(usize, 0), inboxes[1].items.items.len);
 
     // Same call, platform-bound dispatcher: admitted.
     try router.enqueuePlatformDispatchForTenant(
-        tenant, "__system/static.mjs", "null", null, .system, true,
+        tenant, "__system/static.mjs", "null", null, .system, "", "", true,
     );
     try testing.expectEqual(@as(usize, 1), inboxes[1].items.items.len);
     try testing.expectEqual(effect_mod.msg.ActivationSource.platform_dispatch, inboxes[1].items.items[0].kind());
@@ -926,7 +938,7 @@ test "platform dispatch: the target must be baked, never customer code" {
     // dep_id out of the wrong tenant's namespace.
     for ([_][]const u8{ "index.mjs", "handlers/admin.mjs", "" }) |path| {
         try router.enqueuePlatformDispatchForTenant(
-            tenant, path, "null", null, .operator, true,
+            tenant, path, "null", null, .operator, "", "", true,
         );
     }
     try testing.expectEqual(@as(usize, 0), inboxes[2].items.items.len);
@@ -950,7 +962,7 @@ test "platform dispatch: the actor rides the message, and there is no saga to in
     // to one value is what the vocabulary exists to prevent.
     for ([_]log_mod.PlatformActor{ .tenant_user, .operator, .system }) |actor| {
         try router.enqueuePlatformDispatchForTenant(
-            tenant, "__system/static.mjs", "{\"a\":1}", "onThing", actor, true,
+            tenant, "__system/static.mjs", "{\"a\":1}", "onThing", actor, "", "", true,
         );
     }
     try testing.expectEqual(@as(usize, 3), inboxes[0].items.items.len);
@@ -968,4 +980,39 @@ test "platform dispatch: the actor rides the message, and there is no saga to in
     // DEFAULT elsewhere — so absence by construction is what keeps a later
     // caller from threading one through.
     try testing.expect(!@hasField(effect_mod.msg.PlatformDispatch, "saga_id"));
+}
+
+test "platform dispatch: the result hop carries no origin, so results cannot volley" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [2]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes) |*ib| _ = try router.registerMsgInbox(ib);
+
+    var buf: [32]u8 = undefined;
+    const tenant = tenantHashingTo(&buf, 0, 2);
+
+    // A dispatch that names a marker: the target's completion has somewhere
+    // to report, so the origin can stop retrying.
+    try router.enqueuePlatformDispatchForTenant(
+        tenant, "__system/static.mjs", "null", null, .system, "acme", "d-1", true,
+    );
+    // The result hop itself: no origin, no marker. A result that produced a
+    // result would bounce between two tenants forever, so absence here is
+    // structural rather than a caller remembering to pass empties.
+    try router.enqueuePlatformDispatchForTenant(
+        tenant, "__system/dispatch_result.mjs", "{\"id\":\"d-1\"}", null, .system, "", "", true,
+    );
+
+    try testing.expectEqual(@as(usize, 2), inboxes[0].items.items.len);
+    const first = inboxes[0].items.items[0].platform_dispatch;
+    try testing.expectEqualStrings("acme", first.origin_tenant);
+    try testing.expectEqualStrings("d-1", first.dispatch_id);
+    const second = inboxes[0].items.items[1].platform_dispatch;
+    try testing.expectEqual(@as(usize, 0), second.origin_tenant.len);
+    try testing.expectEqual(@as(usize, 0), second.dispatch_id.len);
+    _ = drainAndFree(a, &inboxes[0]);
 }

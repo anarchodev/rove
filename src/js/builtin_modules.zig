@@ -126,6 +126,14 @@ const MODULES = [_]struct {
         .wake_targetable = true,
     },
     .{
+        // rove#691: the return half — resolves the owed marker in the ORIGIN
+        // tenant's scope once the target's activation has committed. Enqueued
+        // by the engine, not named by any shim, so it needs no targetable
+        // grant.
+        .path = "__system/dispatch_result.mjs",
+        .src = @embedFile("builtin_dispatch_result_mjs"),
+    },
+    .{
         // §2.6 durable scheduled wake (durable-wake P1; docs/architecture/effects-and-handlers.md).
         .path = "__system/scheduler_tick.mjs",
         .src = @embedFile("builtin_scheduler_tick_mjs"),

@@ -475,6 +475,15 @@ pub const PlatformDispatchInput = struct {
     /// Which KIND of principal caused this — the attribution the target's
     /// log carries. Never the individual operator.
     actor: log_mod.PlatformActor,
+    /// The owed marker this dispatch resolves, from the caller. Empty ⇒ no
+    /// marker, so no completion report. The ORIGIN tenant is deliberately not
+    /// here: the binding stamps it from `state.instance_id`, because a caller
+    /// that could name its own origin could aim another tenant's marker at
+    /// itself.
+    dispatch_id: []const u8 = "",
+    /// The dispatching activation's own tenant, stamped by the binding from
+    /// `state.instance_id`. See `dispatch_id`.
+    origin_tenant: []const u8 = "",
     /// Whether the DISPATCHING activation is platform-bound. Read from the
     /// dispatching tenant's identity at the binding and carried here, never
     /// inferred from the module path: a path says what code will run, only

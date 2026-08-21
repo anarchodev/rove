@@ -831,6 +831,7 @@ pub fn build(b: *std.Build) void {
         // webhook.send's wake-fired half (durable-wake; docs/architecture/effects-and-handlers.md).
         .{ .name = "builtin_webhook_fire_mjs", .path = "src/js/builtin_modules/webhook_fire.mjs" },
         .{ .name = "builtin_dispatch_fire_mjs", .path = "src/js/builtin_modules/dispatch_fire.mjs" },
+        .{ .name = "builtin_dispatch_result_mjs", .path = "src/js/builtin_modules/dispatch_result.mjs" },
         // §2.6 durable scheduled wake — the `scheduler_tick` baked
         // module (durable-wake P1; docs/architecture/effects-and-handlers.md). Add an entry here AND
         // in `src/js/builtin_modules.zig`'s `MODULES` table.
