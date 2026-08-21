@@ -300,6 +300,7 @@ pub const Dispatcher = struct {
             .cancel_fetch = request.trampolines.cancel_fetch,
             .set_wake = request.trampolines.set_wake,
             .worker_ctx = request.trampolines.worker_ctx,
+            .platform_dispatch = request.trampolines.platform_dispatch,
             .set_wake_ctx = request.trampolines.set_wake_ctx,
             .fire_wake = request.trampolines.fire_wake,
             .blob_write = request.trampolines.blob_write,

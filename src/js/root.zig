@@ -166,6 +166,7 @@ test {
     _ = @import("doc_examples.zig");
     _ = @import("surface_tests.zig");
     _ = @import("bindings/continuation.zig");
+    _ = @import("bindings/dispatch.zig");
     _ = @import("bindings/crypto.zig");
     _ = @import("bindings/crypto_ecdsa.zig");
     _ = @import("bindings/crypto_jose.zig");

@@ -2533,6 +2533,7 @@ pub fn Worker(comptime opts: Options) type {
                 .cancel_fetch = &Self.cancelFetchTrampoline,
                 .blob_write = &Self.blobWriteTrampoline,
                 .blob_seal = &Self.blobSealTrampoline,
+                .platform_dispatch = &Self.platformDispatchTrampoline,
                 .fire_wake = if (wake_slot != null) &Self.fireWakeTrampoline else null,
                 .set_wake = if (wake_slot != null) &deployment_cache.TenantSlot.setWakeTrampoline else null,
                 .set_wake_ctx = if (wake_slot) |sl| @ptrCast(sl) else null,
@@ -2843,6 +2844,32 @@ pub fn Worker(comptime opts: Options) type {
         /// builtin surfaces that as a thrown error so a fire is never
         /// silently dropped). All borrowed slices in `input` are dup'd
         /// by `enqueueDurableWakeForTenant`.
+        /// rove#691: place a platform action in `input.target_tenant`'s scope.
+        ///
+        /// Everything that decides whether this is ALLOWED lives at the
+        /// router funnel, not here — the dispatching tenant's platform grant
+        /// and the baked-target rule, both beside `isContinuationTargetable`
+        /// so a future producer inherits them. This trampoline only carries
+        /// the call across the binding boundary.
+        pub fn platformDispatchTrampoline(ctx: *anyopaque, input: globals.PlatformDispatchInput) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.node.router.enqueuePlatformDispatchForTenant(
+                input.target_tenant,
+                input.module_path,
+                input.ctx_json,
+                input.fn_name,
+                input.actor,
+                input.dispatcher_is_platform,
+            ) catch |err| {
+                std.log.warn(
+                    "rove-js platform dispatch: enqueue ({s} → {s}): {s}",
+                    .{ input.target_tenant, input.module_path, @errorName(err) },
+                );
+                return false;
+            };
+            return true;
+        }
+
         pub fn fireWakeTrampoline(ctx: *anyopaque, input: globals.FireWakeInput) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             self.node.router.enqueueDurableWakeForTenant(input) catch |err| {
