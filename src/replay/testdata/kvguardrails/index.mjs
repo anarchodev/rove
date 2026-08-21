@@ -117,6 +117,18 @@ export default function () {
       span: kv.prefix("", "", 2).map((r) => r.key),
     };
   }
+  // Config is addressed by the deployment that shipped it, so a handler
+  // reads the config that came WITH its code. In an authored world there is
+  // no release to scope by, so the seeded key reads back as written — every
+  // engine has to agree on both halves of that, or a case that seeds config
+  // passes in the sim and fails in prod for reasons no assertion names.
+  if (p === "/config") {
+    return {
+      get: kv.get("_config/oauth/google"),
+      missing: kv.get("_config/oauth/nope"),
+      scan: kv.prefix("_config/").map((r) => r.key),
+    };
+  }
   if (p === "/page-default") return { n: kv.prefix("orders/").length };
   if (p === "/page-explicit") return { n: kv.prefix("orders/", null, 5).length };
   if (p === "/page-over") return { n: kv.prefix("orders/", null, 5000).length };

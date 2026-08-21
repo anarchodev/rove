@@ -306,11 +306,20 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 }
             }
 
-            if (!d.put(ctx, key, value)) return js_exception;
+            // Rules judge the key a handler NAMED; storage takes the key it
+            // resolves to, so a write and a read of the same name reach the
+            // same row. Only the mirror writes `_config/` in production, but
+            // an asymmetry here is the kind that surfaces years later as a
+            // config write nobody can find.
+            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const skey = storageKey(d, &skey_buf, key) orelse return js_exception;
+
+            if (!d.put(ctx, skey, value)) return js_exception;
             // Spend the activation's budget only on a write that HAPPENED: a
             // refused or failed one costs nothing, or a handler could be
-            // starved by writes that never reached the entry.
-            d.noteWrite(guards.kvWriteCost(key.len, value.len));
+            // starved by writes that never reached the entry. Charged on the
+            // key that rides the entry, which is the resolved one.
+            d.noteWrite(guards.kvWriteCost(skey.len, value.len));
             return js_undefined;
         }
 
@@ -338,10 +347,13 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 }
             }
 
-            if (!d.del(ctx, key)) return js_exception;
+            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const skey = storageKey(d, &skey_buf, key) orelse return js_exception;
+
+            if (!d.del(ctx, skey)) return js_exception;
             // A delete is an op with a key and no value — it rides the entry
             // like any other.
-            d.noteWrite(guards.kvWriteCost(key.len, 0));
+            d.noteWrite(guards.kvWriteCost(skey.len, 0));
             return js_undefined;
         }
 
