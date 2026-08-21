@@ -161,6 +161,7 @@ test {
     _ = @import("keyring_slots.zig");
     _ = @import("keyring_bind.zig");
     _ = @import("keyring_pool.zig");
+    _ = @import("keyring_seal.zig");
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");
     _ = @import("surface_tests.zig");

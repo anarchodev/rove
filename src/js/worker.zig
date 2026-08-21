@@ -2849,6 +2849,37 @@ pub fn Worker(comptime opts: Options) type {
             );
         }
 
+        /// `ShredCaps.seal_writes` — seal this activation's customer
+        /// values under the slot its identity resolved to.
+        pub fn sealShredWritesTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            instance_id: []const u8,
+            key_slot: u64,
+            txn: *kv_mod.KvStore.TrackedTxn,
+            writeset: *kv_mod.WriteSet,
+            ws_base: usize,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
+                return error.KeyringUnavailable;
+            return keyring_pool.sealWrites(allocator, slot, key_slot, txn, writeset, ws_base);
+        }
+
+        /// `ShredCaps.open_value` — decide what a stored value is, and
+        /// open it when this node holds the key.
+        pub fn openShredValueTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            instance_id: []const u8,
+            value: []const u8,
+        ) anyerror!globals.OpenedValue {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
+                return error.KeyringUnavailable;
+            return keyring_pool.openValue(allocator, slot, value);
+        }
+
         pub fn blobWriteTrampoline(
             ctx: *anyopaque,
             tenant_id: []const u8,

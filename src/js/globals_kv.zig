@@ -243,9 +243,82 @@ pub const WorkerKv = struct {
             },
         };
 
+        // TAPE FIRST, and taped as it was STORED. The ordering is the
+        // whole scheme: if the value were opened before this, the tape
+        // would hold plaintext and destroying the key would erase
+        // everything except the copy replay keeps.
         if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key, value, .ok) catch {};
-        foldRead(state, key, true, value);
-        return .{ .value = value };
+
+        // Then open it, and fold + return the PLAINTEXT. The digest must
+        // be over the same bytes in every engine, and the offline engines
+        // are served records already opened (PLAN §2.7 — no client-side
+        // key distribution), so folding ciphertext here would diverge
+        // from them on every sealed read.
+        const opened = openStored(state, key, value) orelse return .absent;
+        foldRead(state, key, true, opened);
+        return .{ .value = opened };
+    }
+
+    /// What to do with one stored value on a read path.
+    const ValueOutcome = union(enum) {
+        /// Not sealed (or no keyring surface): use it as it is.
+        keep,
+        /// Sealed and opened; caller owns the replacement.
+        replaced: []u8,
+        /// The key is gone. Absent for a `get`, gone from the page for a
+        /// scan.
+        drop,
+        /// This node cannot tell. Fault rather than answer.
+        fault: anyerror,
+    };
+
+    fn openStoredValue(state: *DispatchState, stored: []const u8) ValueOutcome {
+        const caps = state.shred orelse return .keep;
+        const open_fn = caps.open_value orelse return .keep;
+        const outcome = open_fn(
+            caps.ctx,
+            state.allocator,
+            state.shred_instance_id,
+            stored,
+        ) catch |err| return .{ .fault = err };
+        return switch (outcome) {
+            .plaintext => .keep,
+            .opened => |plain| .{ .replaced = plain },
+            .shredded => .drop,
+            // A node short of key material must not report an erasure it
+            // cannot stand behind.
+            .unverified => .{ .fault = error.KeyringIncomplete },
+        };
+    }
+
+    /// Resolve a stored value to the bytes the handler should see, or
+    /// null when the read must answer absent.
+    ///
+    /// Frees `stored` and returns an owned replacement when it was
+    /// sealed, so the caller's `release` frees exactly one buffer either
+    /// way.
+    fn openStored(state: *DispatchState, key: []const u8, stored: []u8) ?[]u8 {
+        _ = key;
+        switch (openStoredValue(state, stored)) {
+            .keep => return stored,
+            .replaced => |plain| {
+                state.allocator.free(stored);
+                return plain;
+            },
+            // The erasure, seen by a reader: "erased" reads like
+            // "absent" to everything downstream.
+            .drop => {
+                state.allocator.free(stored);
+                return null;
+            },
+            // The handler still sees absent, but the request faults
+            // rather than being served a false negative.
+            .fault => |err| {
+                state.pending_kv_error = err;
+                state.allocator.free(stored);
+                return null;
+            },
+        }
     }
 
     pub fn release(self: WorkerKv, bytes: []const u8) void {
@@ -429,7 +502,7 @@ pub const WorkerKv = struct {
     pub fn prefix(self: WorkerKv, prefix_bytes: []const u8, cursor: []const u8, limit: u32) ?Page {
         const state = self.state;
 
-        const scan = state.kv.prefix(prefix_bytes, cursor, limit) catch |err| {
+        var scan = state.kv.prefix(prefix_bytes, cursor, limit) catch |err| {
             state.pending_kv_error = err;
             // Capture the failure path too — replay needs to surface the
             // same null return, otherwise a defensive `if (page === null)`
@@ -467,13 +540,49 @@ pub const WorkerKv = struct {
             rs.kv.appendKvPrefix(prefix_bytes, cursor, limit, pairs[0..np], .ok) catch {};
         }
 
+        // Opened AFTER the tape, for the reason `get` states: the tape
+        // must hold what was STORED, or destroying a key erases
+        // everything except the copy replay keeps.
+        //
+        // A shredded row leaves the page rather than appearing empty. An
+        // elided page and an empty one must never be confused, and the
+        // same holds here: a row whose key is gone is a row that is no
+        // longer there, not one whose value is "".
+        var live: usize = scan.entries.len;
+        var i: usize = 0;
+        while (i < live) {
+            const e = &scan.entries[i];
+            switch (openStoredValue(state, e.value)) {
+                .keep => i += 1,
+                .replaced => |plain| {
+                    state.allocator.free(e.value);
+                    e.value = plain;
+                    i += 1;
+                },
+                // Swapped to the tail rather than overwritten, so `scan`
+                // still owns every buffer exactly once and frees them all
+                // — the page just stops looking at this one.
+                .drop => {
+                    live -= 1;
+                    const tmp = scan.entries[i];
+                    scan.entries[i] = scan.entries[live];
+                    scan.entries[live] = tmp;
+                },
+                .fault => |err| {
+                    state.pending_kv_error = err;
+                    scan.deinit();
+                    return null;
+                },
+            }
+        }
+
         // Folded outside the tape's read-your-write filtering, like `foldRead`
         // sits outside `skip_tape`: the digest hashes the scan the handler
         // observed. The error path above folds nothing, matching `get`'s —
         // the offline engines have no storage-error path to agree with.
-        foldPrefix(state, prefix_bytes, scan.entries);
+        foldPrefix(state, prefix_bytes, scan.entries[0..live]);
 
-        return .{ .scan = scan, .entries = scan.entries };
+        return .{ .scan = scan, .entries = scan.entries[0..live] };
     }
 };
 

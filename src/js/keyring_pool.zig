@@ -48,6 +48,9 @@ const keyring_shard = @import("keyring_shard.zig");
 const deployment_cache = @import("deployment_cache.zig");
 const keyring_bind = @import("keyring_bind.zig");
 const kv_mod = @import("raft-kv");
+const keyring_seal = @import("keyring_seal.zig");
+const reserved = @import("rove-reserved");
+const globals = @import("globals.zig");
 
 /// Slots per reserved block — one shard's worth, so preparing a block is
 /// a single `mintRange` and a single shard push. Smaller blocks would
@@ -320,3 +323,72 @@ pub fn resolveSlot(
     try writeset.addPut(bind_key, &value);
     return got;
 }
+
+// ── sealing and opening values ───────────────────────────────────────
+
+/// Seal every customer value this activation wrote, under `slot`.
+///
+/// Runs after the handler returns, which is what makes late binding
+/// work: the identity in force at that moment is the one the writes seal
+/// under, wherever in the handler it was named.
+///
+/// Reserved keys are skipped. They are platform state — the binding row
+/// this activation may have just written among them — and sealing them
+/// would make the platform unable to read its own bookkeeping.
+pub fn sealWrites(
+    allocator: std.mem.Allocator,
+    slot_state: *deployment_cache.TenantSlot,
+    key_slot: u64,
+    txn: anytype,
+    writeset: *kv_mod.WriteSet,
+    ws_base: usize,
+) !void {
+    const kr: *const crypt.keyring.Keyring = if (slot_state.keyring) |*k| k else
+        return error.KeyringUnavailable;
+    const key = kr.keyAt(key_slot) orelse return error.KeyDestroyed;
+
+    for (writeset.ops.items[ws_base..]) |*op| {
+        const p = switch (op.*) {
+            .put => |put_op| put_op,
+            .delete => continue,
+        };
+        // Reserved keys are platform state — the binding row this
+        // activation may have just written is among them — and sealing
+        // one would leave the platform unable to read its own
+        // bookkeeping.
+        if (reserved.isCustomerWriteReserved(p.key)) continue;
+
+        const sealed = try keyring_seal.seal(allocator, p.value, key, key_slot, KEY_VERSION);
+        defer allocator.free(sealed);
+        // Both, inseparably: the txn is this node's write, the writeset
+        // is what every other node applies. One without the other leaves
+        // the leader holding plaintext where its followers hold
+        // ciphertext.
+        try txn.put(p.key, sealed);
+        try writeset.replacePutValue(op, sealed);
+    }
+}
+
+/// Decide what a stored value is, and open it if this node can.
+pub fn openValue(
+    allocator: std.mem.Allocator,
+    slot_state: *deployment_cache.TenantSlot,
+    value: []const u8,
+) !globals.OpenedValue {
+    if (!keyring_seal.isSealed(value)) return .plaintext;
+    const key_slot = keyring_seal.slotOf(value) orelse return .unverified;
+
+    return switch (deployment_cache.keyringLookup(slot_state, key_slot)) {
+        .key => |k| .{ .opened = try keyring_seal.open(allocator, value, k) },
+        // The erasure, seen from a reader: the key is gone and this node
+        // holds everything it should, so absence is authoritative.
+        .shredded => .shredded,
+        // This node is short of key material. Saying "erased" here would
+        // be a claim it cannot stand behind.
+        .unverified => .unverified,
+    };
+}
+
+/// Key generation stamped into every seal. One today; `key_version`
+/// exists so a KEK rotation can roll it without stranding stored bytes.
+const KEY_VERSION: u32 = 1;

@@ -758,6 +758,38 @@ fn finishResponse(
         };
     }
 
+    // Seal this activation's customer values, now that the handler has
+    // returned and its ops are final. THIS is what makes late binding
+    // work: the identity in force at this moment is the one the writes
+    // seal under, wherever in the handler it was named.
+    //
+    // After the kv-error gate above, so a failed attempt's writes — which
+    // roll back — are never sealed, and before the write KEYS are taped
+    // below, which record keys only and are unaffected either way.
+    if (state.shred_slot) |sc| {
+        if (sc.*) |key_slot| {
+            if (state.shred) |caps| {
+                if (caps.seal_writes) |seal| {
+                    seal(
+                        caps.ctx,
+                        d.allocator,
+                        state.shred_instance_id,
+                        key_slot,
+                        state.txn,
+                        state.writeset,
+                        state.ws_base,
+                    ) catch |err| {
+                        // Never commit plaintext an identity was promised
+                        // would be sealed. Failing the activation is the
+                        // only honest outcome: the handler asked for
+                        // per-identity erasure and cannot have it.
+                        state.pending_kv_error = err;
+                    };
+                }
+            }
+        }
+    }
+
     // Record the activation's kv write KEYS onto the readset — its
     // writeset slice, `ws_base..` (batch writesets are shared; the
     // slice is this activation's). Reads ride the kv tape; writes are
