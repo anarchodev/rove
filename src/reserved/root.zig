@@ -299,6 +299,19 @@ test "isCustomerWriteReserved: customer (non-_) keys allowed" {
 /// another accepted. Conservative by design: these can be RAISED later
 /// without breaking anyone, never lowered.
 pub const KV_KEY_MAX: usize = 256;
+
+/// Longest `request.shredKey(id)` identity, in bytes.
+///
+/// A CONTRACT like the kv caps beside it: every engine must agree on what
+/// a handler may pass, or a handler is refused by one and accepted by
+/// another. Sized so the identity plus its `_keys/bind/` prefix fits
+/// `KV_KEY_MAX` with room to spare — though what actually lands in the
+/// key is a fixed-width HMAC of the identity, never the identity itself,
+/// so this bounds what a handler may HOLD rather than what is stored.
+///
+/// Conservative on purpose: raising it later breaks nobody, lowering it
+/// breaks handlers that already shipped.
+pub const SHRED_KEY_MAX: usize = 128;
 /// 384 KiB, and the ceiling above it is not storage but REPLICATION: a write
 /// rides one raft entry, one entry rides one raft message, and a message above
 /// the receiver's fixed buffer cannot be delivered at all

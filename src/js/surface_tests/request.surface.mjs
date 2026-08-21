@@ -46,6 +46,26 @@ export default function () {
     throws(() => request.tag("k2", ""), /value length/);
   });
 
+  check("request.shredKey", () => {
+    // Scopes the activation to an opaque identity. Returns undefined and
+    // re-scopes on a second call — an activation has exactly one identity.
+    eq(request.shredKey("u_7f3a9c"), undefined);
+    eq(request.shredKey("u_0e11bd"), undefined);
+    // The id's CONTENT is the tenant's business: the engine never learns
+    // that an identity is a person, so anything printable is accepted.
+    eq(request.shredKey("customer@example.com"), undefined);
+    eq(request.shredKey("order:1234/line:7"), undefined);
+    throws(() => request.shredKey(), /requires a string argument/);
+    throws(() => request.shredKey(7), /requires a string argument/);
+    // Empty is refused rather than read as "no identity" — a handler that
+    // computed one from a missing cookie meant to scope and got nothing,
+    // and falling back to the tenant key would silently downgrade
+    // erasure from per-identity to per-tenant.
+    throws(() => request.shredKey(""), /id length/);
+    throws(() => request.shredKey("u_1\n"), /control characters/);
+    throws(() => request.shredKey("x".repeat(129)), /id length/);
+  });
+
   // No chain context in this dispatch → empty string (documented).
   check("request.sagaId", () => {
     eq(typeof request.sagaId, "string");

@@ -430,6 +430,21 @@ pub const DispatchState = struct {
     /// they reach the log record even across a `next()`. Each key/value
     /// is an owned dupe; capped at `log_mod.MAX_TAGS`.
     tags: *std.ArrayList(log_mod.Tag),
+    /// The activation's shred identity from `request.shredKey(id)` — the
+    /// opaque name every value this activation writes seals under, so a
+    /// later destroy of that name takes all of them together.
+    ///
+    /// A cell rather than a value because the identity is usually LATE:
+    /// it is unknown until a cookie is parsed or a token verified, and kv
+    /// writes stage in the request transaction and commit when the
+    /// handler returns — so what matters is the id in force at commit,
+    /// not at the moment of any particular write.
+    ///
+    /// Null means this site does not track one, which is the same
+    /// null-default stance `readset` takes: production worker sites
+    /// always set it, and the default exists for unit tests that
+    /// exercise binding behaviour without the surrounding buffers.
+    shred_key: ?*?[]u8 = null,
     /// Set if a kv-level error needs to bubble back to the caller after
     /// the JS runs. We can't throw from inside the C callback cleanly in
     /// all cases, so we record the first error and let the dispatcher

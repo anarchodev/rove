@@ -232,6 +232,74 @@ pub fn checkTagCapacity(count: usize) Verdict {
     return null;
 }
 
+pub const shred_key_args_message = "request.shredKey(id) requires a string argument";
+pub const shred_key_control_message = "request.shredKey: id must not contain control characters";
+
+fn shredKeyLenMessage() []const u8 {
+    return std.fmt.comptimePrint(
+        "request.shredKey: id length must be 1..{d} bytes",
+        .{reserved.SHRED_KEY_MAX},
+    );
+}
+
+/// One `request.shredKey(id)` identity.
+///
+/// Deliberately permissive about CONTENT: the engine never learns that an
+/// identity is a person, and the id is an opaque name the tenant chooses.
+/// Constraining its shape beyond length and control characters would be
+/// the engine modelling data subjects, which is exactly what this design
+/// avoids having to do.
+///
+/// Empty is refused rather than treated as "no identity". A handler that
+/// computed an empty id — a missing cookie, an unparsed token — means to
+/// scope the activation and got nothing; silently falling back to the
+/// tenant key would downgrade erasure from per-identity to per-tenant at
+/// the moment the customer is least able to notice.
+pub fn checkShredKey(id: []const u8) Verdict {
+    if (id.len < 1 or id.len > reserved.SHRED_KEY_MAX) {
+        return .{ .throw = .type_error, .code = "", .message = shredKeyLenMessage() };
+    }
+    for (id) |ch| {
+        if (ch < 0x20 or ch == 0x7f) {
+            return .{ .throw = .type_error, .code = "", .message = shred_key_control_message };
+        }
+    }
+    return null;
+}
+
+test "shredKey: an empty id is refused, never read as 'no identity'" {
+    // A handler that computed an empty id — a missing cookie, an unparsed
+    // token — meant to scope the activation and got nothing. Falling back
+    // to the tenant key would silently downgrade erasure from
+    // per-identity to per-tenant at the worst possible moment.
+    try std.testing.expect(checkShredKey("") != null);
+}
+
+test "shredKey: length is bounded, and the bound is the shared contract" {
+    const max = reserved.SHRED_KEY_MAX;
+    const ok = [_]u8{'a'} ** max;
+    try std.testing.expect(checkShredKey(&ok) == null);
+    const too_long = [_]u8{'a'} ** (max + 1);
+    try std.testing.expect(checkShredKey(&too_long) != null);
+}
+
+test "shredKey: control characters are refused" {
+    try std.testing.expect(checkShredKey("u_1\n") != null);
+    try std.testing.expect(checkShredKey("u_1\x00") != null);
+    try std.testing.expect(checkShredKey("u_1\x7f") != null);
+}
+
+test "shredKey: the id's CONTENT is the tenant's business, not the engine's" {
+    // The engine never learns that an identity is a person — it is an
+    // opaque name the tenant chooses and can destroy. Constraining its
+    // shape further would be the engine modelling data subjects, which
+    // is precisely what this design exists to avoid.
+    try std.testing.expect(checkShredKey("u_7f3a9c") == null);
+    try std.testing.expect(checkShredKey("customer@example.com") == null);
+    try std.testing.expect(checkShredKey("order:1234/line:7") == null);
+    try std.testing.expect(checkShredKey("日本語") == null);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

@@ -190,6 +190,9 @@ pub fn installRequest(
     // request.tag(key, value): attach a low-cardinality index tag to
     // this request's log record (see `jsRequestTag`).
     _ = c.JS_SetPropertyStr(ctx, req_obj, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
+    // Scopes this activation's writes to one opaque identity, so
+    // destroying that identity's key erases them wherever they landed.
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "shredKey", c.JS_NewCFunction2(ctx, jsRequestShredKey, "shredKey", 1, c.JS_CFUNC_generic, 0));
     // request.sagaId: the engine's per-saga id, stable across every
     // activation of one saga (a held connection's frames, a callback
     // chain's hops). The reserved `_saga` index tag is derived from it;
@@ -1171,6 +1174,19 @@ pub const WorkerTag = struct {
         return false;
     }
 
+    /// Replace the activation's shred identity. Calling `shredKey` twice
+    /// re-scopes rather than accumulating: an activation has exactly one
+    /// identity, and a write that needs a different one passes it per
+    /// call instead.
+    pub fn setShredKey(self: WorkerTag, id: []const u8) bool {
+        const state = self.state;
+        const cell = state.shred_key orelse return true;
+        const dup = state.allocator.dupe(u8, id) catch return false;
+        if (cell.*) |old_id| state.allocator.free(old_id);
+        cell.* = dup;
+        return true;
+    }
+
     pub fn tagAppend(self: WorkerTag, key: []const u8, val: []const u8) bool {
         const state = self.state;
         const k = state.allocator.dupe(u8, key) catch return false;
@@ -1188,6 +1204,7 @@ pub const WorkerTag = struct {
 };
 
 const jsRequestTag = binding.Tag(c, WorkerTag).jsRequestTag;
+const jsRequestShredKey = binding.ShredKey(c, WorkerTag).jsRequestShredKey;
 
 test "the request.tag limits match the log record's own bounds" {
     // The limits are a CONTRACT and live in `rove-reserved`, where the offline
