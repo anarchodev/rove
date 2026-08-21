@@ -375,6 +375,12 @@ pub const Trampolines = struct {
     /// activation per due entry. Non-null only on the baked
     /// `__system/scheduler_tick` fire path.
     set_wake: ?*const fn (ctx: *anyopaque, tenant_id: []const u8, when_ns: i64) void = null,
+    /// rove#691: `__rove.dispatch(...)` — place a platform action in another
+    /// tenant's scope. Wired to the worker's `platformDispatchTrampoline`.
+    platform_dispatch: ?*const fn (
+        ctx: *anyopaque,
+        input: globals.PlatformDispatchInput,
+    ) bool = null,
     set_wake_ctx: ?*anyopaque = null,
     fire_wake: ?*const fn (ctx: *anyopaque, input: globals.FireWakeInput) bool = null,
     /// `docs/architecture/routing-and-ingress.md`: blob upload sessions.

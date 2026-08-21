@@ -34,6 +34,7 @@ const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
 const scheduler_b = @import("bindings/scheduler.zig");
+const dispatch_b = @import("bindings/dispatch.zig");
 const on_b = @import("bindings/on.zig");
 const blob_b = @import("bindings/blob.zig");
 const blob_mod = @import("rove-blob");
@@ -453,6 +454,30 @@ pub const FireWakeInput = struct {
     armed_by: ?[]const u8 = null,
 };
 
+/// One `__rove.dispatch(...)` — a platform action placed into ANOTHER
+/// tenant's scope (rove#691). The activation runs the platform's own baked
+/// code against that tenant's data, under that tenant's lease, proposing
+/// into that tenant's own raft group.
+pub const PlatformDispatchInput = struct {
+    /// The SCOPE — whose data this runs against, and whose worker runs it.
+    target_tenant: []const u8,
+    /// Baked module path (`__system/…`). The router refuses anything else,
+    /// so this can never name customer code.
+    module_path: []const u8,
+    /// Argument JSON ("null" when omitted).
+    ctx_json: []const u8,
+    /// Optional named-export selector; null = default export.
+    fn_name: ?[]const u8,
+    /// Which KIND of principal caused this — the attribution the target's
+    /// log carries. Never the individual operator.
+    actor: log_mod.PlatformActor,
+    /// Whether the DISPATCHING activation is platform-bound. Read from the
+    /// dispatching tenant's identity at the binding and carried here, never
+    /// inferred from the module path: a path says what code will run, only
+    /// the caller says who may run it somewhere else (rove#643).
+    dispatcher_is_platform: bool,
+};
+
 /// One `on.timer(ms)` / `on.kv(prefix,{to?})`
 /// registration accumulated during the body. Mirrors the
 /// `pending_fetches` accumulator shape — the binding appends, the
@@ -830,6 +855,16 @@ pub const DispatchState = struct {
     /// The worker the hooks above run against — see
     /// `Request.Trampolines.worker_ctx`.
     worker_ctx: ?*anyopaque = null,
+    /// rove#691: trampoline backing `__rove.dispatch(...)`. Enqueues one
+    /// `platform_dispatch` activation into the TARGET tenant's scope, routed
+    /// to the worker anchoring it. Returns false when the router refuses
+    /// (not platform-bound, non-baked target, or no worker registered) —
+    /// the builtin surfaces that as a throw so a dispatch is never silently
+    /// dropped.
+    platform_dispatch: ?*const fn (
+        ctx: *anyopaque,
+        input: PlatformDispatchInput,
+    ) bool = null,
     set_wake_ctx: ?*anyopaque = null,
 
     /// §2.6 durable-wake: trampoline backing
@@ -1305,6 +1340,10 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
             // (`__system/webhook_fire`); delegates to `_system.http.fetch`
             // internals so staging/commit-gating/limits are identical.
             .{ .name = "fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
+            // rove#691: place a platform action in another tenant's scope.
+            // The engine op is only the enqueue — durability composes over
+            // it in JS, the way `webhook.send` composes over one fetch.
+            .{ .name = "dispatch", .cfunc = dispatch_b.jsPlatformDispatch, .argc = 5 },
         },
     },
     // §2.6 durable-wake tick ops — only `__system/scheduler_tick` calls
