@@ -109,12 +109,23 @@ pub const PlatformDispatch = struct {
     /// Which kind of principal caused this — the attribution the tenant's
     /// log carries. Never the individual operator.
     actor: log_mod.PlatformActor = .system,
+    /// Who to report completion to, and which owed marker it resolves.
+    ///
+    /// The origin tenant is stamped by the ENGINE from the dispatching
+    /// activation's own scope, never passed in by JS: a caller that could
+    /// name its own origin could aim another tenant's marker at itself.
+    /// Empty ⇒ nothing to report — an engine-originated result hop, which
+    /// must not produce a result of its own, or a dispatch with no marker.
+    origin_tenant: []u8 = &.{},
+    dispatch_id: []u8 = &.{},
 
     pub fn deinit(self: *PlatformDispatch, allocator: std.mem.Allocator) void {
         if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
         if (self.module_path.len > 0) allocator.free(self.module_path);
         if (self.ctx_json.len > 0) allocator.free(self.ctx_json);
         if (self.fn_name) |fn_n| allocator.free(fn_n);
+        if (self.origin_tenant.len > 0) allocator.free(self.origin_tenant);
+        if (self.dispatch_id.len > 0) allocator.free(self.dispatch_id);
         self.* = undefined;
     }
 };

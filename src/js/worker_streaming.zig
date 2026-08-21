@@ -1484,6 +1484,14 @@ pub const FirePrep = struct {
     /// isn't registered with the bridge or the group has no published
     /// term yet; the record then rides unstamped.
     exec_seq: u64 = 0,
+    /// Did this activation reach a committed terminal outcome?
+    ///
+    /// Set only where `runFire` records an `.ok` log — the write path after
+    /// its propose succeeds, and the read-only path after its commit. Every
+    /// other exit (propose fault, handler throw, continuation, stream) leaves
+    /// it false, which is the safe direction: a caller that reports
+    /// completion is telling another tenant it may stop retrying.
+    completed_ok: bool = false,
     /// The firing tenant's resolved rate caps + plan generation, for the
     /// `Request.plan` every fire site builds. Resolved HERE rather than at
     /// each site because a site that forgets them silently meters the
@@ -1823,6 +1831,7 @@ pub fn runFire(
                 p.txn_owned = false;
                 p.txn_done = true;
                 captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, tapes, corr, r.tags, spec.act, fw_seq, p.exec_seq);
+                p.completed_ok = true;
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1830,6 +1839,7 @@ pub fn runFire(
             commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
             flushFireFetches(worker, &pending_fetches);
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
+            p.completed_ok = true;
             r.console = &.{};
             r.exception = &.{};
         },
