@@ -18,6 +18,7 @@ Writes <apps-dir>/docs/_static/{handler-contract,effect-algebra}.html.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import pathlib
 import re
@@ -192,18 +193,105 @@ def page_html(slug: str, title: str, description: str, body: str, toc, lede: str
     )
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--apps-dir", type=pathlib.Path, required=True)
-    ap.add_argument("--check", action="store_true")
-    args = ap.parse_args()
+# Digest of the composed pages, committed HERE in rove.
+#
+# The freshness problem is cross-repo: the artifact lives in rewind-apps, so a
+# rove-side check would need that checkout to compare against — and a gate that
+# depends on a sibling clone either does not run or is not a gate. But `build()`
+# composes the expected pages from rove sources ALONE, so recording their digest
+# here makes the contract checkable without leaving the repo: edit
+# `docs/handler-shape.md` or `docs/effect-algebra.md` and the digest moves, and
+# the gate says so at the moment of the change rather than whenever someone next
+# happens to publish.
+#
+# That timing is the whole point. These pages are GENERATED at publish time, so
+# a stale mirror is invisible: the docs site gets correct HTML from the publish
+# run while the committed copy rots, and the drift surfaces only as a customer
+# reading a contract the engine does not implement.
+#
+# The two halves catch different drift and both are needed:
+#   - this digest  — a rove source doc moved and rewind-apps has not been told.
+#                    Runs on every `zig build test`.
+#   - `--check`    — the committed page does not match the rove commit
+#                    rewind-apps pins. Runs against an apps checkout.
+DIGEST_FILE = ROVE / "scripts" / "ops" / "docs-contract.sha256"
 
+
+def build() -> list[tuple[str, str]]:
+    """(slug, rendered page) for every contract page, from rove sources alone."""
+    pages = []
     for src_name, slug, title, desc in PAGES:
         md = (ROVE / "docs" / src_name).read_text()
         body, toc, lede = render_md(md)
         if len(toc) < 5:
             sys.exit(f"gen_docs_contract: {src_name}: only {len(toc)} headings — renderer regression?")
-        page = page_html(slug, title, desc, body, toc, lede)
+        pages.append((slug, page_html(slug, title, desc, body, toc, lede)))
+    return pages
+
+
+def digest(pages: list[tuple[str, str]]) -> str:
+    h = hashlib.sha256()
+    for slug, page in pages:
+        h.update(slug.encode("utf-8"))
+        h.update(b"\0")
+        h.update(page.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apps-dir", type=pathlib.Path)
+    ap.add_argument("--check", action="store_true",
+                    help="fail (exit 1) if the committed output is stale instead of writing")
+    ap.add_argument("--verify", action="store_true",
+                    help="fail (exit 1) if the source docs no longer match the "
+                         "recorded digest — the rove-side gate; needs no apps checkout")
+    ap.add_argument("--record", action="store_true",
+                    help="rewrite the recorded digest; run this WITH regenerating "
+                         "the pages in rewind-apps, never instead of it")
+    args = ap.parse_args()
+
+    pages = build()
+
+    if args.verify:
+        want = DIGEST_FILE.read_text(encoding="utf-8").split()[0] if DIGEST_FILE.exists() else ""
+        have = digest(pages)
+        if want != have:
+            print(
+                f"STALE: the contract source docs changed.\n"
+                f"  recorded {want or '(none)'}\n"
+                f"  current  {have}\n"
+                f"\n"
+                f"`docs/_static/handler-contract.html` and `effect-algebra.html` in\n"
+                f"rewind-apps are GENERATED from docs/handler-shape.md and\n"
+                f"docs/effect-algebra.md. They do not update themselves, and nothing\n"
+                f"downstream notices — a publish regenerates them in flight, so the\n"
+                f"site looks right while the committed copies rot and the repo stops\n"
+                f"being the record of what customers are told. Propagate the change:\n"
+                f"\n"
+                f"  python3 scripts/ops/gen_docs_contract.py --apps-dir <rewind-apps>\n"
+                f"  python3 scripts/ops/gen_docs_contract.py --record\n"
+                f"\n"
+                f"then commit the regenerated pages in rewind-apps AND the digest\n"
+                f"here, and bump the `web` pin. Recording without regenerating\n"
+                f"defeats the check.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"fresh: contract sources match the recorded digest ({have[:16]}…)")
+        return 0
+
+    if args.record:
+        DIGEST_FILE.write_text(digest(pages) + "  handler-contract.html effect-algebra.html\n",
+                               encoding="utf-8")
+        print(f"recorded {digest(pages)} → {DIGEST_FILE}")
+        return 0
+
+    if not args.apps_dir:
+        sys.exit("gen_docs_contract: --apps-dir is required to write or --check")
+
+    for slug, page in pages:
         dest = args.apps_dir / "docs" / "_static" / f"{slug}.html"
         if args.check:
             if not dest.exists() or dest.read_text() != page:
@@ -211,9 +299,8 @@ def main() -> int:
             print(f"gen_docs_contract: {dest} is current")
         else:
             dest.write_text(page)
-            print(f"gen_docs_contract: wrote {dest} ({len(toc)} headings)")
+            print(f"gen_docs_contract: wrote {dest}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

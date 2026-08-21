@@ -18,6 +18,7 @@ manifest `generate` hook.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import pathlib
 import re
@@ -286,13 +287,17 @@ def render(all_groups) -> str:
     return "\n".join(out)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--apps-dir", type=pathlib.Path, required=True)
-    ap.add_argument("--check", action="store_true",
-                    help="verify the generated page is current (no write)")
-    args = ap.parse_args()
+# Digest of the composed page, committed HERE in rove. Same cross-repo
+# freshness problem, same two halves, as the contract pages
+# (`gen_docs_contract.py`): the artifact lives in rewind-apps, but `build()`
+# composes it from rove sources alone, so its digest is checkable without a
+# sibling checkout. The source here is the shim JSDoc rather than an authored
+# doc — edit a shim's docblock and this moves.
+DIGEST_FILE = ROVE / "scripts" / "ops" / "docs-reference.sha256"
 
+
+def build() -> str:
+    """The rendered reference page, from rove sources alone."""
     grouped = set(SKIPPED)
     for _h, _d, stems in GROUPS:
         grouped.update(stems)
@@ -326,7 +331,62 @@ def main() -> int:
         sys.exit(f"gen_docs_reference: only {n_members} members extracted — "
                  f"parser regression?")
 
-    page = render(all_groups)
+    return render(all_groups)
+
+
+def digest(page: str) -> str:
+    return hashlib.sha256(page.encode("utf-8")).hexdigest()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apps-dir", type=pathlib.Path)
+    ap.add_argument("--check", action="store_true",
+                    help="verify the generated page is current (no write)")
+    ap.add_argument("--verify", action="store_true",
+                    help="fail (exit 1) if the shim JSDoc no longer matches the "
+                         "recorded digest — the rove-side gate; needs no apps checkout")
+    ap.add_argument("--record", action="store_true",
+                    help="rewrite the recorded digest; run this WITH regenerating "
+                         "the page in rewind-apps, never instead of it")
+    args = ap.parse_args()
+
+    page = build()
+
+    if args.verify:
+        want = DIGEST_FILE.read_text(encoding="utf-8").split()[0] if DIGEST_FILE.exists() else ""
+        have = digest(page)
+        if want != have:
+            print(
+                f"STALE: the shim JSDoc behind the reference page changed.\n"
+                f"  recorded {want or '(none)'}\n"
+                f"  current  {have}\n"
+                f"\n"
+                f"`docs/_static/reference.html` in rewind-apps is GENERATED from the\n"
+                f"shim docblocks. It does not update itself, and a publish regenerates\n"
+                f"it in flight — so the site looks right while the committed copy rots.\n"
+                f"Propagate the change:\n"
+                f"\n"
+                f"  python3 scripts/ops/gen_docs_reference.py --apps-dir <rewind-apps>\n"
+                f"  python3 scripts/ops/gen_docs_reference.py --record\n"
+                f"\n"
+                f"then commit the regenerated page in rewind-apps AND the digest here,\n"
+                f"and bump the `web` pin. Recording without regenerating defeats the\n"
+                f"check.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"fresh: shim JSDoc matches the recorded digest ({have[:16]}…)")
+        return 0
+
+    if args.record:
+        DIGEST_FILE.write_text(digest(page) + "  reference.html\n", encoding="utf-8")
+        print(f"recorded {digest(page)} → {DIGEST_FILE}")
+        return 0
+
+    if not args.apps_dir:
+        sys.exit("gen_docs_reference: --apps-dir is required to write or --check")
+
     dest = args.apps_dir / "docs" / "_static" / "reference.html"
     if args.check:
         if not dest.exists() or dest.read_text() != page:
@@ -334,10 +394,8 @@ def main() -> int:
         print(f"gen_docs_reference: {dest} is current")
         return 0
     dest.write_text(page)
-    print(f"gen_docs_reference: wrote {dest} "
-          f"({sum(len(ss) for _h, _d, ss in all_groups)} sections, {n_members} members)")
+    print(f"gen_docs_reference: wrote {dest}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
