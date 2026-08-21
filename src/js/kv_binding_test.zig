@@ -204,6 +204,18 @@ const PROBE =
     \\"ready"
 ;
 
+/// Register the binding as the global `kv`, the way an engine does.
+fn installKv(ctx: qjs.Context) void {
+    const g = c.JS_GetGlobalObject(ctx.raw);
+    defer c.JS_FreeValue(ctx.raw, g);
+    const obj = c.JS_NewObject(ctx.raw);
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "get", c.JS_NewCFunction2(ctx.raw, B.jsKvGet, "get", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "set", c.JS_NewCFunction2(ctx.raw, B.jsKvSet, "set", 2, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "delete", c.JS_NewCFunction2(ctx.raw, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "prefix", c.JS_NewCFunction2(ctx.raw, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, g, "kv", obj);
+}
+
 test "kv binding: coercion, guards, shaping, paging — the common contract" {
     const a = testing.allocator;
 
@@ -216,16 +228,7 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     defer ctx.deinit();
     c.JS_SetContextOpaque(ctx.raw, &st);
 
-    {
-        const g = c.JS_GetGlobalObject(ctx.raw);
-        defer c.JS_FreeValue(ctx.raw, g);
-        const obj = c.JS_NewObject(ctx.raw);
-        _ = c.JS_SetPropertyStr(ctx.raw, obj, "get", c.JS_NewCFunction2(ctx.raw, B.jsKvGet, "get", 1, c.JS_CFUNC_generic, 0));
-        _ = c.JS_SetPropertyStr(ctx.raw, obj, "set", c.JS_NewCFunction2(ctx.raw, B.jsKvSet, "set", 2, c.JS_CFUNC_generic, 0));
-        _ = c.JS_SetPropertyStr(ctx.raw, obj, "delete", c.JS_NewCFunction2(ctx.raw, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
-        _ = c.JS_SetPropertyStr(ctx.raw, obj, "prefix", c.JS_NewCFunction2(ctx.raw, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
-        _ = c.JS_SetPropertyStr(ctx.raw, g, "kv", obj);
-    }
+    installKv(ctx);
     {
         const ready = try evalStr(ctx, a, PROBE);
         defer a.free(ready);
@@ -363,4 +366,74 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     // …and a LIVE refusal is offered to the delegate for taping.
     try testing.expectEqualStrings("_secret/captured-ok", st.recorded_refusal_key[0..st.recorded_refusal_key_len]);
     try testing.expectEqualStrings("reserved_key", st.recorded_refusal_code);
+}
+
+test "kv binding: the engine-only keyspace is invisible to a handler" {
+    const a = testing.allocator;
+
+    var st = MockState{ .a = a };
+    defer st.deinit();
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    c.JS_SetContextOpaque(ctx.raw, &st);
+    installKv(ctx);
+    {
+        const ready = try evalStr(ctx, a, PROBE);
+        defer a.free(ready);
+    }
+
+    // Seed the way the platform does — engine Zig bypasses these bindings, so
+    // the test wears the system-module badge to plant the same rows.
+    st.system_module = true;
+    for ([_][]const u8{
+        "__t(() => kv.set('_usage/blob/aaa', '1'))",
+        "__t(() => kv.set('_usage/blob/bbb', '2'))",
+        "__t(() => kv.set('_usage/blob/ccc', '3'))",
+        "__t(() => kv.set('_keys/next_slot', '9'))",
+        "__t(() => kv.set('_config/mail.json', 'cfg'))",
+        "__t(() => kv.set('users/1', 'alice'))",
+    }) |src| try expectEval(ctx, a, src, "ok:null");
+    st.system_module = false;
+
+    // ── get: hidden is ABSENT, not refused ──
+    // A refusal would disclose the namespace it is protecting, and a write
+    // that silently did nothing is a bug while a read of someone else's
+    // keyspace is honestly empty.
+    try expectEval(ctx, a, "__t(() => kv.get('_usage/blob/aaa'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:null");
+    // Handler-readable platform namespaces are untouched.
+    try expectEval(ctx, a, "__t(() => kv.get('_config/mail.json'))", "ok:\"cfg\"");
+    try expectEval(ctx, a, "__t(() => kv.get('users/1'))", "ok:\"alice\"");
+
+    // ── a scan wholly inside a hidden namespace never reaches storage ──
+    st.last_limit = 0;
+    try expectEval(ctx, a, "__t(() => kv.prefix('_usage/'))", "ok:[]");
+    try testing.expectEqual(@as(u32, 0), st.last_limit); // the delegate was never called
+
+    // ── a spanning scan filters AND REFILLS ──
+    // This is the case a naive filter gets wrong. At limit 2 the first two
+    // pages are entirely hidden rows; filtering alone would hand the handler
+    // an empty array, and the documented idiom stops on an empty page — so a
+    // tenant with a few hundred meter rows would silently lose everything
+    // sorted after them. The scan must keep going until the page is full.
+    try expectEval(ctx, a, "__t(() => kv.prefix('', '', 2))",
+        "ok:[{\"key\":\"_config/mail.json\",\"value\":\"cfg\"},{\"key\":\"users/1\",\"value\":\"alice\"}]");
+
+    // ── the system-module exemption: the platform's own modules still see ──
+    st.system_module = true;
+    try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:\"9\"");
+    try expectEval(ctx, a, "__t(() => kv.prefix('_usage/').length)", "ok:3");
+    st.system_module = false;
+
+    // ── a captured world replays the read that happened ──
+    // `decides()` false means the rules are not consulted, exactly as on the
+    // write path: a tape recorded before the namespace was hidden must replay
+    // as captured rather than as today's table would answer.
+    st.decide = false;
+    try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:\"9\"");
+    st.decide = true;
+    try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:null");
 }

@@ -96,6 +96,27 @@ export default function () {
     const rows = kv.prefix("pagerw/");
     return { n: rows.length, keys: rows.map((r) => r.key) };
   }
+  // The engine-only keyspace: a handler cannot SEE it, which is what lets
+  // its writers stay engine writes with no activation behind them. Hidden
+  // rather than refused — a refusal would disclose the namespace it protects,
+  // and a read of a keyspace that is not the tenant's is honestly empty.
+  //
+  // `span` is the probe that matters. The world seeds three hidden rows ahead
+  // of the visible ones, so at a page size of 2 the first two pages are
+  // ENTIRELY hidden. An engine that filters a single page hands back an empty
+  // array, and the documented paging idiom stops on an empty page — so a
+  // tenant with a few hundred meter rows would silently lose everything
+  // sorted after them. Every engine must refill instead.
+  if (p === "/hidden") {
+    return {
+      usageGet: kv.get("_usage/blob/aaa"),
+      keysGet: kv.get("_keys/next_slot"),
+      configGet: kv.get("_config/mail.json"),
+      custGet: kv.get("users/1"),
+      hiddenScan: kv.prefix("_usage/").length,
+      span: kv.prefix("", "", 2).map((r) => r.key),
+    };
+  }
   if (p === "/page-default") return { n: kv.prefix("orders/").length };
   if (p === "/page-explicit") return { n: kv.prefix("orders/", null, 5).length };
   if (p === "/page-over") return { n: kv.prefix("orders/", null, 5000).length };

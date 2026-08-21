@@ -143,6 +143,58 @@ pub const SHIM_WRITABLE_PREFIXES = [_][]const u8{
     "_rp/",
 };
 
+/// The platform namespaces a handler cannot SEE — not merely cannot write.
+///
+/// A key here is engine bookkeeping that no handler has business observing:
+/// the storage meter the quota is enforced against, the crypto slot counter,
+/// receipt and token prefixes reserved so customer JS cannot forge one. They
+/// are invisible rather than refused, because that is the honest description
+/// of what they are: engine state that happens to live in the same store, not
+/// keys of the tenant's that are locked.
+///
+/// The invariant this buys: **an engine write to a key no handler can observe
+/// needs no activation and no log record**, because nothing a handler sees
+/// ever moved. That is what lets `_usage/` and `_keys/next_slot` stay engine
+/// writes while every handler-visible namespace gets an activation behind it.
+/// Reads are recorded, so the converse matters too — a readable meter would
+/// put a platform billing number in the customer's own tape, which redaction
+/// cannot fix (a redacted input replays differently).
+///
+/// NOT here, deliberately: `_config/` and `_deploy/` (documented
+/// customer-readable — their writers owe an activation instead), and every
+/// `SHIM_WRITABLE_PREFIXES` entry (the tenant's own durability markers).
+pub const ENGINE_ONLY_PREFIXES = [_][]const u8{
+    "_usage/",
+    "_keys/",
+    "_callback/",
+    "_magic/",
+    "_triggers/",
+    "_sessions/",
+    "_log/",
+};
+
+/// `key` is engine-only: a handler read must behave as though it is absent.
+pub fn isEngineOnly(key: []const u8) bool {
+    if (key.len == 0 or key[0] != '_') return false;
+    for (ENGINE_ONLY_PREFIXES) |p| {
+        if (std.mem.startsWith(u8, key, p)) return true;
+    }
+    return false;
+}
+
+/// A scan at `prefix` can reach engine-only keys without being inside one —
+/// `""`, `"_"`, `"_u"`. Such a scan has to skip them AND keep filling its
+/// page, or a run of hidden rows longer than the page truncates the
+/// customer's scan: the documented idiom pages until a page comes back empty
+/// (`handler-shape.md` §5.7), so an all-hidden page reads as "end of data"
+/// and everything after it is silently lost.
+pub fn scanSpansEngineOnly(prefix: []const u8) bool {
+    for (ENGINE_ONLY_PREFIXES) |p| {
+        if (std.mem.startsWith(u8, p, prefix)) return true;
+    }
+    return false;
+}
+
 /// Customer trigger registration prefix collides with a platform
 /// namespace (either direction). See `PLATFORM_KV_PREFIXES`.
 pub fn isReservedTriggerPrefix(prefix: []const u8) bool {
@@ -375,3 +427,39 @@ pub const KV_WRITE_BYTES_MAX: usize = 400 * 1024;
 pub const TAG_MAX: usize = 4;
 pub const TAG_KEY_MAX: usize = 32;
 pub const TAG_VAL_MAX: usize = 64;
+
+test "isEngineOnly: engine namespaces are hidden, customer keys are not" {
+    try std.testing.expect(isEngineOnly("_usage/blob/deadbeef"));
+    try std.testing.expect(isEngineOnly("_keys/next_slot"));
+    try std.testing.expect(isEngineOnly("_callback/abc"));
+    try std.testing.expect(isEngineOnly("_log/next_request_seq"));
+    try std.testing.expect(!isEngineOnly("users/1"));
+    try std.testing.expect(!isEngineOnly(""));
+    // A customer key that merely LOOKS like one: the match is on the
+    // namespace, not on the substring.
+    try std.testing.expect(!isEngineOnly("my_usage/x"));
+}
+
+test "isEngineOnly: handler-readable platform namespaces stay visible" {
+    // `_config/` is documented customer-readable and `_deploy/` is read by
+    // the tenant — their writers owe an activation instead of hiding.
+    try std.testing.expect(!isEngineOnly("_config/mail/default.json"));
+    try std.testing.expect(!isEngineOnly("_deploy/current"));
+    // Shim-writable durability markers are the tenant's own.
+    for (SHIM_WRITABLE_PREFIXES) |sp| try std.testing.expect(!isEngineOnly(sp));
+}
+
+test "scanSpansEngineOnly: only an ancestor of a hidden namespace spans it" {
+    try std.testing.expect(scanSpansEngineOnly("")); // the full scan
+    try std.testing.expect(scanSpansEngineOnly("_"));
+    try std.testing.expect(scanSpansEngineOnly("_u"));
+    try std.testing.expect(scanSpansEngineOnly("_usage/")); // itself
+    // The common case: an ordinary customer prefix pays nothing.
+    try std.testing.expect(!scanSpansEngineOnly("users/"));
+    try std.testing.expect(!scanSpansEngineOnly("_send/"));
+    try std.testing.expect(!scanSpansEngineOnly("_config/"));
+    // Deeper than the namespace is inside it, not spanning it — the scan is
+    // wholly hidden and the binding answers empty without touching storage.
+    try std.testing.expect(!scanSpansEngineOnly("_usage/blob/"));
+    try std.testing.expect(isEngineOnly("_usage/blob/"));
+}

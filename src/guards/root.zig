@@ -179,6 +179,37 @@ pub fn checkKvWrite(
     return null;
 }
 
+/// The read half of the reserved-keyspace rule: `true` when a handler read of
+/// `key` must behave as though the key is absent.
+///
+/// A read is HIDDEN, not refused, where a write is refused, not ignored. The
+/// asymmetry is deliberate. A write that silently did nothing is a bug the
+/// handler cannot see, so it must throw; a read of a namespace that is not the
+/// tenant's is honestly empty, and answering "absent" is the only answer that
+/// does not itself disclose the namespace. `is_system_module` exempts the
+/// platform's baked modules, which read these by design.
+pub fn kvReadHidden(key: []const u8, is_system_module: bool) bool {
+    return !is_system_module and reserved.isEngineOnly(key);
+}
+
+/// A scan at `prefix` is entirely inside an engine-only namespace, so it has
+/// nothing visible to return and must not touch storage at all.
+pub fn kvScanAllHidden(prefix: []const u8, is_system_module: bool) bool {
+    return !is_system_module and reserved.isEngineOnly(prefix);
+}
+
+/// A scan at `prefix` can reach engine-only keys, so it must filter them out
+/// and keep refilling its page. See `reserved.scanSpansEngineOnly` for why
+/// filtering alone is not enough.
+pub fn kvScanFilters(prefix: []const u8, is_system_module: bool) bool {
+    return !is_system_module and reserved.scanSpansEngineOnly(prefix);
+}
+
+/// One row of a filtered scan: skip it, or hand it to the handler.
+pub fn kvRowHidden(key: []const u8) bool {
+    return reserved.isEngineOnly(key);
+}
+
 /// The reserved-key message names the offending key, so it is formatted by
 /// the caller rather than carried on the verdict. Kept here so the wording
 /// has one home.
