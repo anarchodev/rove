@@ -69,8 +69,8 @@ pub const durable_wake = @import("durable_wake.zig");
 /// Per-tenant slot pools and the shared refill driver that keeps them
 /// warm ahead of demand (`keyring_pool.zig`).
 pub const keyring_pool = @import("keyring_pool.zig");
-/// The `_keys/` keyspace + codecs (`keyring_bind.zig`).
-pub const keyring_bind = @import("keyring_bind.zig");
+/// One tenant's key state and the `_keys/` keyspace (`rove-keyring`).
+pub const keyring = @import("rove-keyring");
 /// Per-tenant slot state, including the keyring (`deployment_cache.zig`).
 pub const deployment_cache = @import("deployment_cache.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
@@ -163,9 +163,7 @@ test {
     _ = @import("static_cache.zig");
     _ = @import("blob_usage.zig");
     _ = @import("keyring_slots.zig");
-    _ = @import("keyring_bind.zig");
     _ = @import("keyring_pool.zig");
-    _ = @import("keyring_seal.zig");
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");
     _ = @import("surface_tests.zig");

@@ -55,6 +55,10 @@ pub const SEAL_MARKER: u8 = reserved.SEAL_MARKER;
 /// Bytes a seal adds: the marker plus the envelope's own overhead.
 pub const OVERHEAD: usize = 1 + crypt.OVERHEAD;
 
+/// Key generation stamped into every seal. One today; `key_version`
+/// exists so a KEK rotation can roll it without stranding stored bytes.
+pub const KEY_VERSION: u32 = 1;
+
 /// Does this value carry a seal?
 ///
 /// Only meaningful for CUSTOMER keys. A platform value is raw bytes and

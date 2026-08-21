@@ -200,9 +200,9 @@ fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.A
     // The proposing node did this inline at the destroy (the observer does
     // not fire there — the leader-skip returns before `notifyApply`), so
     // between the two halves every node acts exactly once.
-    if (rjs.keyring_bind.parseDeadSlot(key)) |key_slot| {
+    if (rjs.keyring.keyspace.parseDeadSlot(key)) |key_slot| {
         if (node.deploy.tenant_files_map.get(id_str)) |slot| {
-            rjs.deployment_cache.evictAndQueueDestroy(slot, key_slot);
+            if (slot.keys) |keys| keys.evictAndQueue(key_slot);
         }
         return;
     }

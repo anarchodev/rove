@@ -61,7 +61,7 @@ const wire = @import("rove-wire");
 /// move secret as the rest of this family.
 const keyring_shard = @import("keyring_shard.zig");
 const crypt = @import("rove-crypt");
-const keyring_bind = @import("keyring_bind.zig");
+const keyring_mod = @import("rove-keyring");
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = wire.TENANT;
@@ -539,7 +539,7 @@ fn shredTenantKeyring(worker: anytype, allocator: std.mem.Allocator, tenant: []c
     const kek = worker.keyring_kek orelse return;
     const data_dir = worker.data_dir orelse return;
 
-    const dir = try keyring_bind.keyringDir(allocator, data_dir);
+    const dir = try keyring_mod.keyspace.keyringDir(allocator, data_dir);
     defer allocator.free(dir);
 
     var kr = crypt.keyring.Keyring.open(allocator, dir, tenant, kek) catch |err| switch (err) {

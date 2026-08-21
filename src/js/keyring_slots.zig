@@ -68,7 +68,7 @@
 
 const std = @import("std");
 const crypt = @import("rove-crypt");
-const keyring_bind = @import("keyring_bind.zig");
+const keyring_mod = @import("rove-keyring");
 const kv_mod = @import("raft-kv");
 const raft_propose = @import("raft_propose.zig");
 
@@ -194,8 +194,8 @@ pub fn reserve(
 pub fn commitMinted(worker: anytype, tenant: []const u8, end: u64) Error!void {
     // Not hosted here ⇒ nothing to write and nobody to replicate to.
     _ = worker.raft.gidForTenant(tenant) orelse return Error.NotHosted;
-    const value = keyring_bind.encodeMinted(end);
-    try writeReplicated(worker, tenant, keyring_bind.MINTED_KEY, &value);
+    const value = keyring_mod.keyspace.encodeMinted(end);
+    try writeReplicated(worker, tenant, keyring_mod.keyspace.MINTED_KEY, &value);
 }
 
 /// Put `key = value` in the tenant's store on THIS node and on every
@@ -246,7 +246,7 @@ test "the watermark and the reservation counter are different keys" {
     // the RESERVATION ahead of anything that ever existed, and a node
     // measuring completeness against that declares itself permanently
     // incomplete through no fault of its own.
-    try testing.expect(!std.mem.eql(u8, COUNTER_KEY, keyring_bind.MINTED_KEY));
+    try testing.expect(!std.mem.eql(u8, COUNTER_KEY, keyring_mod.keyspace.MINTED_KEY));
 }
 
 test "the counter key is closed to customer writes" {
