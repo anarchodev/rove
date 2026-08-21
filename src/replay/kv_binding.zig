@@ -523,16 +523,14 @@ pub const OfflineKv = struct {
 const TagPair = struct { key: []u8, value: []u8 };
 var tag_gen: u64 = 0;
 var tag_list: std.ArrayList(TagPair) = .empty;
-/// The activation's shred identity, if the handler named one. Process
-/// state like `tag_list` beside it — these engines run one activation at
-/// a time.
-var shred_key: ?[]u8 = null;
-/// Destroys attempted this activation — the cap is engine state.
-var shred_destroys: usize = 0;
 
 fn tagsReset() void {
     if (tag_gen == host.generation) return;
     tag_gen = host.generation;
+    // Same lifetime, same reset: the destroy cap is per ACTIVATION, and
+    // a count carried across runs would refuse in replay what production
+    // allowed.
+    binding.OfflineShred.reset();
     for (tag_list.items) |t| {
         std.heap.c_allocator.free(t.key);
         std.heap.c_allocator.free(t.value);
@@ -579,14 +577,13 @@ pub const OfflineTag = struct {
     /// same shape on every engine — a handler calling `shredKey` must
     /// behave identically in the sim, the arena and the worker.
     pub fn setShredKey(_: OfflineTag, id: []const u8) bool {
-        const dup = std.heap.c_allocator.dupe(u8, id) catch return false;
-        if (shred_key) |old_id| std.heap.c_allocator.free(old_id);
-        shred_key = dup;
-        return true;
+        tagsReset();
+        return binding.OfflineShred.set(id);
     }
 
     pub fn destroyCount(_: OfflineTag) usize {
-        return shred_destroys;
+        tagsReset();
+        return binding.OfflineShred.destroyCount();
     }
 
     /// Counted and validated, never performed: these engines hold no key
@@ -594,8 +591,8 @@ pub const OfflineTag = struct {
     /// including the cap, so a handler that trips it offline trips it in
     /// production too.
     pub fn destroyShredKey(_: OfflineTag, _: []const u8) bool {
-        shred_destroys += 1;
-        return true;
+        tagsReset();
+        return binding.OfflineShred.destroy();
     }
 
     pub fn tagAppend(self: OfflineTag, key: []const u8, val: []const u8) bool {

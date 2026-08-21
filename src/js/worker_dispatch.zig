@@ -2609,10 +2609,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // is what owns the tenant's slot pool and keyring.
             .shred = .{
                 .ctx = @ptrCast(worker),
+                .keys_for = &@TypeOf(worker.*).shredKeysForTrampoline,
                 .resolve_slot = &@TypeOf(worker.*).resolveShredSlotTrampoline,
-                .seal_writes = &@TypeOf(worker.*).sealShredWritesTrampoline,
-                .open_value = &@TypeOf(worker.*).openShredValueTrampoline,
-                .destroy_identity = &@TypeOf(worker.*).destroyShredIdentityTrampoline,
             },
             .shred_instance_id = scope_inst.id,
         };

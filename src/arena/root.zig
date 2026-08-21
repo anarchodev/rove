@@ -73,12 +73,6 @@ var budget_ms: f64 = 30_000; // generous default: a browser step-debug run is in
 
 const TagPair = struct { key: []u8, value: []u8 };
 var tag_list: std.ArrayList(TagPair) = .empty;
-/// The activation's shred identity, if the handler named one. Process
-/// state like `tag_list` beside it — these engines run one activation at
-/// a time.
-var shred_key: ?[]u8 = null;
-/// Destroys attempted this activation — the cap is engine state.
-var shred_destroys: usize = 0;
 
 /// Called by arenajs at every run entry (arena_run / arena_run_module).
 /// This run's spent write budget — module-linear-memory state, reset per run
@@ -88,6 +82,10 @@ var write_ops: u32 = 0;
 var write_bytes: usize = 0;
 
 export fn rove_arena_run_begin() void {
+    // Per-ACTIVATION, like everything else here. The worker keeps the
+    // destroy count on the activation's own cell; carrying it across
+    // runs would make the cap refuse in replay what production allowed.
+    binding.OfflineShred.reset();
     poison_len = 0;
     write_ops = 0;
     write_bytes = 0;
@@ -396,14 +394,11 @@ pub const ArenaTag = struct {
     /// surface must behave identically on every engine: a handler that
     /// calls `shredKey` must not die in the arena and live in the worker.
     pub fn setShredKey(_: ArenaTag, id: []const u8) bool {
-        const dup = std.heap.c_allocator.dupe(u8, id) catch return false;
-        if (shred_key) |old_id| std.heap.c_allocator.free(old_id);
-        shred_key = dup;
-        return true;
+        return binding.OfflineShred.set(id);
     }
 
     pub fn destroyCount(_: ArenaTag) usize {
-        return shred_destroys;
+        return binding.OfflineShred.destroyCount();
     }
 
     /// Counted and validated, never performed: these engines hold no key
@@ -411,8 +406,7 @@ pub const ArenaTag = struct {
     /// including the cap, so a handler that trips it offline trips it in
     /// production too.
     pub fn destroyShredKey(_: ArenaTag, _: []const u8) bool {
-        shred_destroys += 1;
-        return true;
+        return binding.OfflineShred.destroy();
     }
 
     pub fn tagAppend(self: ArenaTag, key: []const u8, val: []const u8) bool {

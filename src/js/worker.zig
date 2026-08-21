@@ -2890,6 +2890,22 @@ pub fn Worker(comptime opts: Options) type {
         /// `_system.blob.write` / `.seal` bindings reach this
         /// worker's `blob_sessions` collection through the same
         /// type-erased seam as the other worker re-entries.
+        /// `ShredCaps.keys_for` — this tenant's key state, or null when
+        /// the node holds no keyring for it.
+        ///
+        /// One lookup replacing three trampolines: sealing, opening and
+        /// destroying all turned out to need nothing but the keys, so
+        /// they are methods on `TenantKeys` and this is the only thing
+        /// the worker has to supply for them.
+        pub fn shredKeysForTrampoline(
+            ctx: *anyopaque,
+            instance_id: []const u8,
+        ) ?*keyring_mod.TenantKeys {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse return null;
+            return slot.keys;
+        }
+
         /// `ShredCaps.resolve_slot` — turn the identity a handler named
         /// into the slot whose key this activation's writes seal under.
         ///
@@ -2916,52 +2932,6 @@ pub fn Worker(comptime opts: Options) type {
                 txn,
                 writeset,
             );
-        }
-
-        /// `ShredCaps.seal_writes` — seal this activation's customer
-        /// values under the slot its identity resolved to.
-        pub fn sealShredWritesTrampoline(
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            instance_id: []const u8,
-            key_slot: u64,
-            txn: *kv_mod.KvStore.TrackedTxn,
-            writeset: *kv_mod.WriteSet,
-            ws_base: usize,
-        ) anyerror!void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
-                return error.KeyringUnavailable;
-            return keyring_pool.sealWrites(allocator, slot, key_slot, txn, writeset, ws_base);
-        }
-
-        /// `ShredCaps.open_value` — decide what a stored value is, and
-        /// open it when this node holds the key.
-        pub fn openShredValueTrampoline(
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            instance_id: []const u8,
-            value: []const u8,
-        ) anyerror!keyring_mod.keyspace.Opened {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
-                return error.KeyringUnavailable;
-            return keyring_pool.openValue(allocator, slot, value);
-        }
-
-        /// `ShredCaps.destroy_identity` — erase an identity's key.
-        pub fn destroyShredIdentityTrampoline(
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            instance_id: []const u8,
-            identity: []const u8,
-            txn: *kv_mod.KvStore.TrackedTxn,
-            writeset: *kv_mod.WriteSet,
-        ) anyerror!void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
-                return error.KeyringUnavailable;
-            return keyring_pool.destroyIdentity(self, allocator, slot, identity, txn, writeset);
         }
 
         pub fn blobWriteTrampoline(

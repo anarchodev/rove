@@ -1204,8 +1204,8 @@ pub const WorkerTag = struct {
         // `shredKey` failed — at commit the writes are already done.
         var slot: ?u64 = null;
         if (state.shred) |caps| {
-            if (caps.resolve_slot) |resolve| {
-                slot = resolve(
+            {
+                slot = caps.resolve_slot(
                     caps.ctx,
                     state.allocator,
                     state.shred_instance_id,
@@ -1244,11 +1244,9 @@ pub const WorkerTag = struct {
     pub fn destroyShredKey(self: WorkerTag, id: []const u8) bool {
         const state = self.state;
         const caps = state.shred orelse return true;
-        const destroy = caps.destroy_identity orelse return true;
-        destroy(
-            caps.ctx,
+        const keys = caps.keys_for(caps.ctx, state.shred_instance_id) orelse return true;
+        keys.destroyIdentity(
             state.allocator,
-            state.shred_instance_id,
             id,
             state.txn,
             state.writeset,

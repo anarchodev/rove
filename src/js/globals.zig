@@ -300,99 +300,46 @@ pub const PendingFetch = struct {
 /// are always set together from the same worker. Each fn stays
 /// optional so the JS callable can throw a precise "not configured"
 /// error on test/misconfigured paths (and so a test can wire just one).
-/// How an activation turns the identity a handler named into the slot
-/// whose key its writes seal under.
+/// How an activation reaches its tenant's key state.
 ///
-/// A capability the WORKER supplies, for the same reason `PlatformCaps`
-/// is: resolving needs the tenant's slot pool, its keyring and its raft
-/// group, none of which the dispatcher knows about — and threading the
-/// worker's generic type through here would drag it into every engine
-/// that shares this file.
+/// TWO capabilities, not four. Three of the originals — sealing an
+/// activation's writes, opening a stored value, destroying an identity —
+/// turned out to need nothing but the keys themselves, so they are
+/// methods on `TenantKeys` now and this only has to hand it over.
+/// `resolve_slot` stays separate because it genuinely needs the worker:
+/// it starts the slot pool (leader-gated, through the bridge) and spends
+/// the tenant's new-identity budget.
 ///
-/// Absent on the offline engines and in unit tests, where there is no
-/// key material and nothing to seal. `request.shredKey` still validates
-/// and still records the identity there, so the surface behaves the same
-/// everywhere; only the slot is missing.
+/// The fields are NOT optional. They are installed together or not at
+/// all, so per-field optionality bought nothing but a second null-check
+/// at every call site and a way to be silently half-configured.
 pub const ShredCaps = struct {
     ctx: *anyopaque,
-    /// Resolve `identity` to its slot for `instance_id`, binding it to a
-    /// fresh one if this is the first time the tenant has named it.
+
+    /// This tenant's key state, or null when the node has no keyring for
+    /// it (surface off, or a tenant predating crypto-shredding). Null is
+    /// never "everything was erased" — a lookup against no keyring is
+    /// `unverified`.
+    keys_for: *const fn (ctx: *anyopaque, instance_id: []const u8) ?*keyring_mod.TenantKeys,
+
+    /// Resolve `identity` to the slot its writes seal under, binding a
+    /// fresh one the first time this tenant names it.
     ///
     /// A new binding is APPENDED TO `writeset` rather than proposed on
     /// its own: it rides the raft entry the activation was already
     /// sending, so naming an identity costs no extra round trip and no
-    /// extra fsync on the request path.
-    ///
-    /// It goes through `txn` as well, and the two are inseparable. The
-    /// writeset is what followers apply; the txn is what this node
-    /// writes. A binding that reached only one of them would leave the
-    /// leader and its followers disagreeing about which slot an identity
-    /// holds — and the disagreement would surface as a value that opens
-    /// on one node and reads as erased on another.
-    ///
-    /// `error.PoolEmpty` means no minted slot is available right now —
-    /// the caller surfaces it rather than sealing under something else,
-    /// because every fallback available at that moment is a silent
-    /// downgrade of the erasure the handler asked for.
-    resolve_slot: ?*const fn (
+    /// extra fsync on the request path. It goes through `txn` as well,
+    /// inseparably — the writeset is what followers apply, the txn is
+    /// what this node writes, and a binding reaching only one would leave
+    /// them disagreeing about which slot an identity holds.
+    resolve_slot: *const fn (
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
         instance_id: []const u8,
         identity: []const u8,
         txn: *kv_mod.TrackedTxn,
         writeset: *kv_mod.WriteSet,
-    ) anyerror!u64 = null,
-
-    /// Seal every customer value this activation wrote, under `slot`.
-    ///
-    /// Runs once the handler has returned and the activation's ops are
-    /// final — which is what makes LATE binding work: the identity in
-    /// force at that moment is the one the writes seal under, no matter
-    /// where in the handler it was named.
-    ///
-    /// Rewrites the ops in place from `ws_base` (the writeset is
-    /// batch-scoped; that slice is this activation's) AND re-puts each
-    /// through the txn, for the same reason the binding does both — one
-    /// without the other leaves the leader holding plaintext where its
-    /// followers hold ciphertext.
-    seal_writes: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        instance_id: []const u8,
-        slot: u64,
-        txn: *kv_mod.TrackedTxn,
-        writeset: *kv_mod.WriteSet,
-        ws_base: usize,
-    ) anyerror!void = null,
-
-    /// Open a value read back from the store.
-    ///
-    /// The caller passes whatever the store held; this decides whether it
-    /// was sealed at all, and if so whether this node can still open it.
-    open_value: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        instance_id: []const u8,
-        value: []const u8,
-    ) anyerror!keyring_mod.keyspace.Opened = null,
-
-    /// Erase `identity`'s key — permanently, everywhere.
-    ///
-    /// Rides the activation's own raft entry like the binding does: the
-    /// binding row is deleted and a `_keys/dead/{slot}` tombstone written
-    /// in the SAME writeset, so the two cannot land apart. That tombstone
-    /// is the durable intent — the local shard rewrite may fail, a node
-    /// may be down, a leader may change — and the reconciliation sweep
-    /// re-derives the work from a tombstone whose slot the local keyring
-    /// still holds.
-    destroy_identity: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        instance_id: []const u8,
-        identity: []const u8,
-        txn: *kv_mod.TrackedTxn,
-        writeset: *kv_mod.WriteSet,
-    ) anyerror!void = null,
+    ) anyerror!u64,
 };
 
 pub const PlatformCaps = struct {

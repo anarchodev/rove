@@ -781,11 +781,9 @@ fn finishResponse(
     if (state.shred_slot) |sc| {
         if (sc.*) |key_slot| {
             if (state.shred) |caps| {
-                if (caps.seal_writes) |seal| {
-                    seal(
-                        caps.ctx,
+                if (caps.keys_for(caps.ctx, state.shred_instance_id)) |keys| {
+                    keys.sealWrites(
                         d.allocator,
-                        state.shred_instance_id,
                         key_slot,
                         state.txn,
                         state.writeset,

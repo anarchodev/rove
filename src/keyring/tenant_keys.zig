@@ -29,6 +29,7 @@ const crypt = @import("rove-crypt");
 const kv_mod = @import("raft-kv");
 const keyspace = @import("keyspace.zig");
 const seal_mod = @import("seal.zig");
+const reserved = @import("rove-reserved");
 
 /// Reserve → mint → replicate → publish, supplied by whoever owns the
 /// cluster. See the module header: none of this is knowable here.
@@ -290,6 +291,109 @@ pub const TenantKeys = struct {
             cursor = next;
         }
         return out;
+    }
+
+
+    // ── writes ───────────────────────────────────────────────────────
+
+    /// Seal every customer value this activation wrote, under `key_slot`.
+    ///
+    /// Runs after the handler returns, which is what makes late binding
+    /// work: the identity in force at that moment is the one the writes
+    /// seal under, wherever in the handler it was named.
+    pub fn sealWrites(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        key_slot: u64,
+        txn: anytype,
+        writeset: *kv_mod.WriteSet,
+        ws_base: usize,
+    ) !void {
+        const key = switch (self.lookup(key_slot)) {
+            .key => |k| k,
+            // Sealing under a key that is gone, or one this node cannot
+            // vouch for, would write bytes nobody can ever open.
+            .shredded, .unverified => return error.KeyDestroyed,
+        };
+
+        for (writeset.ops.items[ws_base..]) |*op| {
+            const p = switch (op.*) {
+                .put => |put_op| put_op,
+                .delete => continue,
+            };
+            // Reserved keys are platform state — the binding row this
+            // activation may have just written is among them — and
+            // sealing one would leave the platform unable to read its own
+            // bookkeeping.
+            if (reserved.isCustomerWriteReserved(p.key)) continue;
+
+            const sealed = try seal_mod.seal(allocator, p.value, key, key_slot, seal_mod.KEY_VERSION);
+            defer allocator.free(sealed);
+            // Both, inseparably: the txn is this node's write, the
+            // writeset is what every other node applies. One without the
+            // other leaves the leader holding plaintext where its
+            // followers hold ciphertext.
+            try txn.put(p.key, sealed);
+            try writeset.replacePutValue(op, sealed);
+        }
+    }
+
+    /// Erase `identity`'s key — permanently, and everywhere.
+    ///
+    /// The binding row is deleted and `_keys/dead/{slot}` written in the
+    /// SAME writeset, so they cannot land apart: a binding removed
+    /// without a tombstone leaves a live key nothing names, and a
+    /// tombstone without the removal leaves an identity pointing at a
+    /// slot being erased.
+    ///
+    /// The tombstone is the DURABLE INTENT — committed through the
+    /// tenant's raft group before any node acts — and it is never
+    /// removed, because the completeness check counts it. What each node
+    /// still owes is derived from the disagreement between a tombstone
+    /// and a keyring that still holds its slot (`reconcile`).
+    pub fn destroyIdentity(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        identity: []const u8,
+        txn: anytype,
+        writeset: *kv_mod.WriteSet,
+    ) !void {
+        const pk = keyspace.pseudonymKey(self.tenantSecret());
+        const bind_key = try keyspace.bindKey(allocator, pk, identity);
+        defer allocator.free(bind_key);
+
+        // An identity this tenant never named has nothing to erase. Not
+        // an error: a delete-account flow run twice must not fail the
+        // second time.
+        const raw = self.app_kv.get(bind_key) catch |err| switch (err) {
+            error.NotFound => {
+                std.log.info(
+                    "keyring {s}: destroy names an identity this tenant never bound — nothing to erase",
+                    .{self.instance_id},
+                );
+                return;
+            },
+            else => return err,
+        };
+        defer allocator.free(raw);
+        const key_slot = try keyspace.resolveBinding(raw, pk, identity);
+
+        const dead_key = try keyspace.deadKey(allocator, key_slot);
+        defer allocator.free(dead_key);
+        const dead_val = keyspace.encodeDead(@intCast(std.time.nanoTimestamp()));
+
+        try txn.delete(bind_key);
+        try txn.put(dead_key, &dead_val);
+        try writeset.addDelete(bind_key);
+        try writeset.addPut(dead_key, &dead_val);
+
+        // The local half. Every OTHER node does the same when the
+        // tombstone applies there.
+        std.log.info(
+            "keyring {s}: destroying slot {d} — identity erased",
+            .{ self.instance_id, key_slot },
+        );
+        self.evictAndQueue(key_slot);
     }
 
     // ── the pool ─────────────────────────────────────────────────────

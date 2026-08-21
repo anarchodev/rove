@@ -564,6 +564,75 @@ pub fn Tag(comptime q: type, comptime D: type) type {
     };
 }
 
+/// The offline engines' shred state, shared because it was identical.
+///
+/// The sim and the browser arena both need `request.shredKey` and its
+/// `destroy` to behave exactly as they do in the worker — validate, count
+/// against the cap, return the same refusals — while performing no
+/// sealing at all: they run against a recorded tape, and the arena holds
+/// no key material by design (PLAN §2.7 locks no client-side key
+/// distribution).
+///
+/// That made two byte-identical delegates in two engines. Divergence
+/// between them would be invisible until a handler behaved differently
+/// under replay than in production, which is the whole failure this
+/// binding layer exists to prevent — so there is one copy.
+///
+/// Container-level state, like the engines' own tag lists beside it: each
+/// runs a single activation at a time, and the two never link together
+/// (one is native, the other wasm).
+pub const OfflineShred = struct {
+    var identity: ?[]u8 = null;
+    var destroys: usize = 0;
+
+    pub fn set(id: []const u8) bool {
+        const dup = std.heap.c_allocator.dupe(u8, id) catch return false;
+        if (identity) |old| std.heap.c_allocator.free(old);
+        identity = dup;
+        return true;
+    }
+
+    pub fn destroyCount() usize {
+        return destroys;
+    }
+
+    /// Counted and validated, never performed — see the type's doc.
+    pub fn destroy() bool {
+        destroys += 1;
+        return true;
+    }
+
+    /// Per-activation state, cleared where the engines clear their tags.
+    pub fn reset() void {
+        if (identity) |old| std.heap.c_allocator.free(old);
+        identity = null;
+        destroys = 0;
+    }
+};
+
+test "the offline shred state resets per activation, not per process" {
+    // A destroy count carried across runs would make the cap refuse in
+    // replay what production allowed — the exact cross-engine divergence
+    // this binding layer exists to prevent. The worker keeps the count on
+    // the activation's own cell; the offline engines reset here.
+    OfflineShred.reset();
+    try std.testing.expectEqual(@as(usize, 0), OfflineShred.destroyCount());
+    _ = OfflineShred.destroy();
+    _ = OfflineShred.destroy();
+    try std.testing.expectEqual(@as(usize, 2), OfflineShred.destroyCount());
+    OfflineShred.reset();
+    try std.testing.expectEqual(@as(usize, 0), OfflineShred.destroyCount());
+}
+
+test "the offline shred state re-scopes rather than accumulating" {
+    // An activation has exactly one identity: naming a second replaces
+    // the first, matching the worker's cell.
+    OfflineShred.reset();
+    try std.testing.expect(OfflineShred.set("u_first"));
+    try std.testing.expect(OfflineShred.set("u_second"));
+    OfflineShred.reset();
+}
+
 /// `request.shredKey(id)` — the common binding for the per-identity
 /// erasure surface.
 ///
