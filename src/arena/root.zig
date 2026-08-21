@@ -73,6 +73,10 @@ var budget_ms: f64 = 30_000; // generous default: a browser step-debug run is in
 
 const TagPair = struct { key: []u8, value: []u8 };
 var tag_list: std.ArrayList(TagPair) = .empty;
+/// The activation's shred identity, if the handler named one. Process
+/// state like `tag_list` beside it — these engines run one activation at
+/// a time.
+var shred_key: ?[]u8 = null;
 
 /// Called by arenajs at every run entry (arena_run / arena_run_module).
 /// This run's spent write budget — module-linear-memory state, reset per run
@@ -376,6 +380,18 @@ pub const ArenaTag = struct {
         return false;
     }
 
+    /// The arena never seals — PLAN §2.7 locks no client-side key
+    /// distribution, so replay is served plaintext over TLS and the
+    /// identity is scope, not a key here. It is still STORED, because the
+    /// surface must behave identically on every engine: a handler that
+    /// calls `shredKey` must not die in the arena and live in the worker.
+    pub fn setShredKey(_: ArenaTag, id: []const u8) bool {
+        const dup = std.heap.c_allocator.dupe(u8, id) catch return false;
+        if (shred_key) |old_id| std.heap.c_allocator.free(old_id);
+        shred_key = dup;
+        return true;
+    }
+
     pub fn tagAppend(self: ArenaTag, key: []const u8, val: []const u8) bool {
         const k = std.heap.c_allocator.dupe(u8, key) catch return false;
         const v = std.heap.c_allocator.dupe(u8, val) catch {
@@ -458,6 +474,8 @@ export fn rove_arena_install(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_tag", c.JS_NewCFunction2(ctx, T.jsRequestTag, "__rove_request_tag", 2, c.JS_CFUNC_generic, 0));
+    const SK = binding.ShredKey(c, ArenaTag);
+    _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_shred_key", c.JS_NewCFunction2(ctx, SK.jsRequestShredKey, "__rove_request_shred_key", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_divergence", c.JS_NewCFunction2(ctx, jsDivergence, "__rove_divergence", 0, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_park_output", c.JS_NewCFunction2(ctx, jsParkOutput, "__rove_park_output", 1, c.JS_CFUNC_generic, 0));

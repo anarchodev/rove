@@ -515,6 +515,10 @@ pub const OfflineKv = struct {
 const TagPair = struct { key: []u8, value: []u8 };
 var tag_gen: u64 = 0;
 var tag_list: std.ArrayList(TagPair) = .empty;
+/// The activation's shred identity, if the handler named one. Process
+/// state like `tag_list` beside it — these engines run one activation at
+/// a time.
+var shred_key: ?[]u8 = null;
 
 fn tagsReset() void {
     if (tag_gen == host.generation) return;
@@ -558,6 +562,17 @@ pub const OfflineTag = struct {
             }
         }
         return false;
+    }
+
+    /// Stored, not sealed: the offline engines run against a recorded
+    /// tape, not live key material. It exists here so the surface is the
+    /// same shape on every engine — a handler calling `shredKey` must
+    /// behave identically in the sim, the arena and the worker.
+    pub fn setShredKey(_: OfflineTag, id: []const u8) bool {
+        const dup = std.heap.c_allocator.dupe(u8, id) catch return false;
+        if (shred_key) |old_id| std.heap.c_allocator.free(old_id);
+        shred_key = dup;
+        return true;
     }
 
     pub fn tagAppend(self: OfflineTag, key: []const u8, val: []const u8) bool {
@@ -657,6 +672,8 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     // The common request.tag binding — the epilogue assigns it onto the
     // per-request `request` object (`request.tag = __rove_request_tag`).
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_tag", c.JS_NewCFunction2(ctx, T.jsRequestTag, "__rove_request_tag", 2, c.JS_CFUNC_generic, 0));
+    const SK = binding.ShredKey(c, OfflineTag);
+    _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_shred_key", c.JS_NewCFunction2(ctx, SK.jsRequestShredKey, "__rove_request_shred_key", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_park_output", c.JS_NewCFunction2(ctx, jsParkOutput, "__rove_park_output", 1, c.JS_CFUNC_generic, 0));
     return 0;
 }

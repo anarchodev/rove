@@ -686,6 +686,10 @@ const EPILOGUE_BODY_TAIL =
     \\  // lands in the effect log as {kind:"tag"} (the delegate pushes it) so
     \\  // tests can assert what would index the record.
     \\  request.tag = __rove_request_tag;
+    \\  // request.shredKey — the same common binding (rove-binding.ShredKey).
+    \\  // A FUNCTION on every engine, so a handler that scopes its
+    \\  // activation to an identity behaves the same offline as in prod.
+    \\  request.shredKey = __rove_request_shred_key;
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  let __result = null, __err = null, __short = false;

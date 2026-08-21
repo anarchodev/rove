@@ -435,6 +435,70 @@ pub fn Tag(comptime q: type, comptime D: type) type {
     };
 }
 
+/// `request.shredKey(id)` — the common binding for the per-identity
+/// erasure surface.
+///
+/// Scopes the whole ACTIVATION: every kv value the handler writes, the
+/// readset it rides, the tape and the log record all seal under the key
+/// this names, so a later `shredKey` destroy takes all of them together.
+/// Calling it again replaces the scope rather than adding one — an
+/// activation has exactly one identity, and the per-call override is a
+/// separate argument on the write itself, not a second scope here.
+///
+/// **Late binding is the normal case, and works.** The identity is
+/// usually unknown until a cookie is parsed or a token verified, and kv
+/// writes stage in the request transaction and commit when the handler
+/// returns — so the seal applies at commit under whatever identity was
+/// set by then. There is no headers callback and none is needed: the
+/// response reaches the wire only after the activation's writes commit.
+///
+/// The delegate carries the engine's activation state:
+///
+/// ```
+/// fromCtx(ctx) D
+/// allocator(d) std.mem.Allocator
+/// setShredKey(d, id) bool                 // false = engine failure, a JS
+///                                         //   exception is pending
+/// ```
+pub fn ShredKey(comptime q: type, comptime D: type) type {
+    return struct {
+        const js_undefined = Vals(q).js_undefined;
+        const js_exception = Vals(q).js_exception;
+
+        pub fn jsRequestShredKey(
+            ctx: ?*q.JSContext,
+            _: q.JSValue,
+            argc: c_int,
+            argv: [*c]q.JSValue,
+        ) callconv(.c) q.JSValue {
+            const d = D.fromCtx(ctx);
+            if (argc < 1 or !q.JS_IsString(argv[0])) {
+                _ = q.JS_ThrowTypeError(ctx, std.fmt.comptimePrint("{s}", .{guards.shred_key_args_message}));
+                return js_exception;
+            }
+            const id = coerceId(d, ctx, argv[0]) catch return js_exception;
+            defer d.allocator().free(id);
+
+            if (guards.checkShredKey(id)) |refusal| {
+                _ = q.JS_ThrowTypeError(ctx, refusal.message.ptr);
+                return js_exception;
+            }
+            if (!d.setShredKey(id)) return js_exception;
+            return js_undefined;
+        }
+
+        fn coerceId(d: D, ctx: ?*q.JSContext, val: q.JSValue) ![]u8 {
+            var len: usize = 0;
+            const cstr = q.JS_ToCStringLen(ctx, &len, val);
+            if (cstr == null) return error.JsException;
+            defer q.JS_FreeCString(ctx, cstr);
+            const out = try d.allocator().alloc(u8, len);
+            if (len > 0) @memcpy(out, @as([*]const u8, @ptrCast(cstr))[0..len]);
+            return out;
+        }
+    };
+}
+
 /// The offline engines' effect-log helpers, shared by every delegate that
 /// records into the epilogue's `globalThis.__rove_effects` (the native
 /// sim/replay delegate and the wasm arena's): entries are pushed through the

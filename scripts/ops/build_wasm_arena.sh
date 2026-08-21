@@ -38,8 +38,9 @@ zig build-lib -target wasm32-emscripten -O ReleaseSmall -lc \
     -femit-bin="$ARCHIVE" \
     --dep rove-binding -Mroot="$ROVE_ROOT/src/arena/root.zig" \
     --dep rove-guards --dep interaction-digest -Mrove-binding="$ROVE_ROOT/src/binding/root.zig" \
-    --dep rove-reserved -Mrove-guards="$ROVE_ROOT/src/guards/root.zig" \
+    --dep rove-reserved --dep rove-sizing -Mrove-guards="$ROVE_ROOT/src/guards/root.zig" \
     -Minteraction-digest="$ROVE_ROOT/src/tape/interaction_digest.zig" \
+    --dep rove-reserved -Mrove-sizing="$ROVE_ROOT/src/sizing/root.zig" \
     -Mrove-reserved="$ROVE_ROOT/src/reserved/root.zig"
 
 echo "== qjs_arena_wasm (emcc, arenajs C + the archive) =="
