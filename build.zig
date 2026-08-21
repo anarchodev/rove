@@ -1944,6 +1944,35 @@ pub fn build(b: *std.Build) void {
     prelude_fresh.has_side_effects = true;
     prelude_fresh.expectExitCode(0);
 
+    // The docs site's contract pages (`handler-contract.html`,
+    // `effect-algebra.html`) and API reference (`reference.html`) are
+    // GENERATED into rewind-apps — the first two from `docs/handler-shape.md`
+    // + `docs/effect-algebra.md`, the third from the shim JSDoc. The publish
+    // driver runs the generators, so a stale mirror is INVISIBLE: the site
+    // gets correct HTML from the publish run while the committed copy rots,
+    // and the drift surfaces only as a customer reading a contract the engine
+    // does not implement. It reached prod that way once — the mirrors were
+    // missing the per-activation kv write budget and described retention as
+    // deletion, which it is not.
+    //
+    // Same split as the prelude gate above: the artifact is cross-repo, so
+    // this checks the half that is local — that the rove sources still match
+    // the digest recorded beside each generator. Always run, for the reason
+    // given above: declaring inputs would mirror each generator's source list
+    // here, and a doc or shim added there but not here would leave the gate
+    // cached-green on the very change it exists to catch.
+    const docs_contract_fresh = b.addSystemCommand(&.{"python3"});
+    docs_contract_fresh.addFileArg(b.path("scripts/ops/gen_docs_contract.py"));
+    docs_contract_fresh.addArg("--verify");
+    docs_contract_fresh.has_side_effects = true;
+    docs_contract_fresh.expectExitCode(0);
+
+    const docs_reference_fresh = b.addSystemCommand(&.{"python3"});
+    docs_reference_fresh.addFileArg(b.path("scripts/ops/gen_docs_reference.py"));
+    docs_reference_fresh.addArg("--verify");
+    docs_reference_fresh.has_side_effects = true;
+    docs_reference_fresh.expectExitCode(0);
+
     // The guard-parity lint is GONE, on purpose: every engine — the worker,
     // the sim/replay driver, and the browser arena (via the in-tree wasm) —
     // now executes the ONE compiled implementation of the handler-facing
@@ -1986,4 +2015,6 @@ pub fn build(b: *std.Build) void {
     conf_step.dependOn(&conf_run.step);
     test_step.dependOn(&conf_run.step);
     test_step.dependOn(&prelude_fresh.step);
+    test_step.dependOn(&docs_contract_fresh.step);
+    test_step.dependOn(&docs_reference_fresh.step);
 }
