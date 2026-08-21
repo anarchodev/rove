@@ -342,14 +342,14 @@ pub const Engine = struct {
             try refusals.put(a, keyed, r.code);
         }
 
-        // ── reads the capture elided → the refusal map ("g"/"p" ++ key)
-        var elided = std.StringHashMapUnmanaged(u64){};
+        // ── reads replay must refuse → the refusal map ("g"/"p" ++ key)
+        var elided = std.StringHashMapUnmanaged(hostmod.Refusal){};
         for (wv.kv_elided) |e| {
             const keyed = try std.mem.concat(a, u8, &.{
                 if (std.mem.eql(u8, e.op, "prefix")) "p" else "g",
                 e.key,
             });
-            try elided.put(a, keyed, e.bytes);
+            try elided.put(a, keyed, .{ .bytes = e.bytes, .sealed = e.sealed });
         }
 
         // ── module sources (inline) ──
