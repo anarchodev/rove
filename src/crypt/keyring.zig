@@ -406,6 +406,115 @@ pub const Keyring = struct {
     /// On return the key is absent from the live shard. Everything it
     /// sealed — kv values, log frames, tapes, pooled bodies, and any
     /// copy in a backup — is unreadable from this point.
+    /// Destroy many slots, rewriting each affected shard ONCE.
+    ///
+    /// A shard is ~192 KiB and every rewrite costs two fsyncs, so
+    /// destroying N slots one at a time rewrites the same file N times —
+    /// the quadratic shape sharding already removed from minting, which
+    /// gets it for free because mints append to the tail shard. Destroys
+    /// are scattered, so they have to ask for it.
+    ///
+    /// Returns how many of `slots` are now durably gone — counting both
+    /// those removed here and those `evict` already took out of memory,
+    /// because for the latter the shard rewrite IS the remaining work.
+    /// A slot that was never minted counts too: nothing to erase is a
+    /// satisfied destroy, which keeps a retry idempotent.
+    ///
+    /// Rollback is per SHARD and all-or-nothing: if a shard's rewrite
+    /// fails, every slot in that shard goes back, because reporting a
+    /// shred that did not reach disk is worse than reporting a failure.
+    /// Other shards still commit — their rewrites really did land, and
+    /// the caller's reconciliation retries whatever did not. The first
+    /// error surfaces once every shard has been attempted.
+    /// Drop a key from MEMORY only, leaving the shard on disk untouched.
+    ///
+    /// The first half of a destroy, split out because the two halves must
+    /// happen on different threads: eviction is a hash-map removal that
+    /// can run wherever the apply runs, while the rewrite fsyncs twice
+    /// and must not. Splitting them is also what puts the observable
+    /// change FIRST — a read stops resolving here, and the irreversible
+    /// part follows.
+    ///
+    /// The key survives on disk until the rewrite lands, so a crash in
+    /// between resurrects it. That is what the caller's durable tombstone
+    /// and its reconciliation are for; this function is deliberately not
+    /// the durability story.
+    pub fn evict(self: *Self, slot: u64) void {
+        var removed = self.keys.fetchRemove(slot) orelse return;
+        std.crypto.secureZero(u8, &removed.value.key);
+        if (self.shard_counts.getPtr(shardOf(slot))) |cnt| {
+            if (cnt.* > 0) cnt.* -= 1;
+        }
+    }
+
+    pub fn destroyMany(self: *Self, slots: []const u64) Error!usize {
+        if (self.destroyed) return 0;
+        if (slots.len == 0) return 0;
+
+        const ordered = self.allocator.dupe(u64, slots) catch return Error.OutOfMemory;
+        defer self.allocator.free(ordered);
+        std.mem.sort(u64, ordered, {}, std.sort.asc(u64));
+
+        var pulled: std.ArrayListUnmanaged(struct { slot: u64, entry: Entry }) = .empty;
+        defer {
+            for (pulled.items) |*pl| std.crypto.secureZero(u8, &pl.entry.key);
+            pulled.deinit(self.allocator);
+        }
+
+        var settled: usize = 0;
+        var first_err: ?Error = null;
+        var i: usize = 0;
+        while (i < ordered.len) {
+            const shard = shardOf(ordered[i]);
+            const group_start = pulled.items.len;
+            var in_shard: usize = 0;
+
+            // Pull whatever this shard still holds. A slot that is ALREADY
+            // gone from the map is not skipped: `evict` removed it when the
+            // destroy applied, and the shard on disk still contains it — so
+            // the flush below is exactly the work left to do, and skipping
+            // it would leave the key on disk forever.
+            while (i < ordered.len and shardOf(ordered[i]) == shard) : (i += 1) {
+                if (i > 0 and ordered[i] == ordered[i - 1]) continue; // duplicate
+                in_shard += 1;
+                const removed = self.keys.fetchRemove(ordered[i]) orelse continue;
+                pulled.append(self.allocator, .{
+                    .slot = ordered[i],
+                    .entry = removed.value,
+                }) catch {
+                    // An entry we cannot track is an entry we cannot roll
+                    // back, so put it straight back.
+                    self.keys.putAssumeCapacity(ordered[i], removed.value);
+                    if (first_err == null) first_err = Error.OutOfMemory;
+                    break;
+                };
+            }
+            const group = pulled.items[group_start..];
+
+            const cnt: ?*u32 = self.shard_counts.getPtr(shard);
+            if (cnt) |c| c.* -= @intCast(group.len);
+
+            // Rewrite the shard from the map as it now stands — once,
+            // whatever the group size. That is the whole reason for
+            // batching: N destroys in one shard are one ~192 KiB rewrite
+            // and two fsyncs, not N of each.
+            self.flushShard(shard) catch |err| {
+                for (group) |g| self.keys.putAssumeCapacity(g.slot, g.entry);
+                if (cnt) |c| c.* += @intCast(group.len);
+                pulled.shrinkRetainingCapacity(group_start);
+                if (first_err == null) first_err = err;
+                continue;
+            };
+            if (cnt) |c| if (c.* == 0) {
+                _ = self.shard_counts.remove(shard);
+            };
+            settled += in_shard;
+        }
+
+        if (first_err) |e| return e;
+        return settled;
+    }
+
     pub fn destroy(self: *Self, slot: u64) Error!bool {
         if (self.destroyed) return false;
         var removed = self.keys.fetchRemove(slot) orelse return false;
@@ -1105,6 +1214,146 @@ test "temp classification never matches a real keyring file" {
     // temporary — treating it as a real file is the bug being fixed.
     try testing.expect(isStaleTemp("00000000.kr.tmp.deadbeef"));
     try testing.expect(isStaleTemp("00000000.kr.tmp.zzzz.5"));
+}
+
+test "destroyMany rewrites each shard ONCE, not once per slot" {
+    // The whole point. A shard is ~192 KiB and every rewrite costs two
+    // fsyncs, so N destroys in one shard must not be N rewrites — that is
+    // the quadratic shape sharding already removed from minting.
+    //
+    // Measured by mtime-independent means: the file is written once, so
+    // its content after the batch reflects ALL the removals, and the
+    // survivors are exactly the ones not asked for.
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+    try kr.mintRange(1, 64, 1);
+
+    var doomed: [32]u64 = undefined;
+    for (&doomed, 0..) |*d, i| d.* = 1 + i * 2; // every other slot, all shard 0
+    try testing.expectEqual(@as(usize, 32), try kr.destroyMany(&doomed));
+
+    try testing.expectEqual(@as(usize, 32), kr.count());
+    for (doomed) |d| try testing.expect(kr.keyAt(d) == null);
+    // And a survivor between two destroyed neighbours is untouched.
+    try testing.expect(kr.keyAt(2) != null);
+    try testing.expect(kr.keyAt(64) != null);
+}
+
+test "destroyMany survives a restart — the rewrite really landed" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    {
+        var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+        defer kr.deinit();
+        try kr.mintRange(1, 8, 1);
+        _ = try kr.destroyMany(&[_]u64{ 2, 4, 6 });
+    }
+
+    var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
+    defer kr.deinit();
+    try testing.expectEqual(@as(usize, 5), kr.count());
+    for ([_]u64{ 2, 4, 6 }) |d| try testing.expect(kr.keyAt(d) == null);
+    for ([_]u64{ 1, 3, 5, 7, 8 }) |k| try testing.expect(kr.keyAt(k) != null);
+}
+
+test "destroyMany spans shards, and each is rewritten independently" {
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+    // Straddle the boundary: shard 0 ends at SLOTS_PER_SHARD - 1.
+    const across = [_]u64{ 5, SLOTS_PER_SHARD - 1, SLOTS_PER_SHARD, SLOTS_PER_SHARD + 3 };
+    try kr.mintRange(1, SLOTS_PER_SHARD + 8, 1);
+    try testing.expectEqual(@as(usize, 4), try kr.destroyMany(&across));
+    for (across) |d| try testing.expect(kr.keyAt(d) == null);
+    try testing.expect(kr.keyAt(6) != null);
+    try testing.expect(kr.keyAt(SLOTS_PER_SHARD + 4) != null);
+}
+
+test "destroyMany is idempotent — the reconciliation sweep re-runs it constantly" {
+    // A destroy is re-driven whenever a tombstone and the local keyring
+    // disagree, so a second run over the same slots is the NORMAL case.
+    // It reports what is SETTLED, not what it newly removed, so a caller
+    // cannot mistake "already gone" for "did not happen".
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+    try kr.mintRange(1, 8, 1);
+
+    try testing.expectEqual(@as(usize, 2), try kr.destroyMany(&[_]u64{ 3, 5 }));
+    try testing.expectEqual(@as(usize, 2), try kr.destroyMany(&[_]u64{ 3, 5 }));
+    // A slot never minted is a satisfied destroy: nothing to erase.
+    // A duplicate within one call counts once.
+    try testing.expectEqual(@as(usize, 2), try kr.destroyMany(&[_]u64{ 7, 7, 9999 }));
+    try testing.expectEqual(@as(usize, 5), kr.count());
+    try testing.expect(kr.keyAt(7) == null);
+}
+
+test "a slot EVICTED from memory is still rewritten out of its shard" {
+    // The production sequence, and the one that is easy to get wrong.
+    // `evict` runs at apply so reads stop immediately; the shard rewrite
+    // follows on the queue. If `destroyMany` skipped slots it no longer
+    // finds in the map, it would flush nothing and the key would sit on
+    // disk forever — erased in memory, intact where it matters.
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    {
+        var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+        defer kr.deinit();
+        try kr.mintRange(1, 8, 1);
+
+        kr.evict(4); // apply-time: memory only, disk untouched
+        try testing.expect(kr.keyAt(4) == null);
+
+        _ = try kr.destroyMany(&[_]u64{4}); // queue: the durable half
+    }
+
+    // The proof is on disk, after a reopen: memory-only eviction would
+    // have been undone by reading the shard back.
+    var kr = try Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
+    defer kr.deinit();
+    try testing.expect(kr.keyAt(4) == null);
+    try testing.expectEqual(@as(usize, 7), kr.count());
+}
+
+test "destroyMany reports nothing it did not actually erase" {
+    // A shred reported but not written to disk is the one outcome that
+    // must never happen: the caller tells a customer their data is gone
+    // and a restart brings it back.
+    var buf: [64]u8 = undefined;
+    const dir = tmpDirPath(&buf);
+    defer cleanup(dir);
+
+    var kr = try Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+    try kr.mintRange(1, 8, 1);
+
+    // Make the rewrite fail. Deleting the directory is NOT enough —
+    // `writeRaw` calls `makePath` and would simply recreate it — so put a
+    // FILE where the directory has to be.
+    std.fs.cwd().deleteTree(kr.tenant_dir) catch {};
+    {
+        const blocker = try std.fs.cwd().createFile(kr.tenant_dir, .{});
+        blocker.close();
+    }
+    try testing.expectError(Error.Io, kr.destroyMany(&[_]u64{ 2, 3 }));
+    // Rolled back in memory, so the next attempt still finds them to destroy.
+    try testing.expect(kr.keyAt(2) != null);
+    try testing.expect(kr.keyAt(3) != null);
+    try testing.expectEqual(@as(usize, 8), kr.count());
 }
 
 test "slot to shard is a contiguous range mapping" {
