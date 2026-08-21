@@ -147,6 +147,80 @@ fn mapPathToKey(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemor
     return try allocator.dupe(u8, trimmed);
 }
 
+/// One config row as the deploy path hands it to a tenant: the storage key
+/// (already deployment-scoped) and its bytes.
+pub const Pair = struct {
+    key: []u8,
+    value: []u8,
+
+    pub fn deinit(self: *Pair, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.value);
+        self.* = undefined;
+    }
+};
+
+pub fn freePairs(allocator: std.mem.Allocator, pairs: []Pair) void {
+    for (pairs) |*pr| pr.deinit(allocator);
+    allocator.free(pairs);
+}
+
+/// Collect a deployment's config rows WITHOUT writing them.
+///
+/// Same selection, same cap and same deployment-scoped key as
+/// `mirrorConfigToKv` — one rule, because two places now need these rows and
+/// a second copy of "which entries are config" is how the two would drift.
+/// This one exists for the deploy path, which reads the blobs off the poll
+/// loop and then hands the rows to the tenant to write in its own scope.
+///
+/// Caller frees with `freePairs`.
+pub fn collectConfigPairs(
+    allocator: std.mem.Allocator,
+    dep_id: u64,
+    manifest: manifest_json.Manifest,
+    file_blobs: blob_mod.BlobStore,
+) Error![]Pair {
+    var out: std.ArrayListUnmanaged(Pair) = .empty;
+    errdefer {
+        for (out.items) |*pr| pr.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    for (manifest.entries) |entry| {
+        const kv_key_opt = mapPathToKey(allocator, entry.path) catch return Error.OutOfMemory;
+        const kv_key = kv_key_opt orelse continue;
+        defer allocator.free(kv_key);
+        if (entry.kind != .static) continue;
+
+        const bytes = file_blobs.get(&entry.source_hex, allocator) catch return Error.Blob;
+        errdefer allocator.free(bytes);
+        if (bytes.len > MAX_CONFIG_BYTES) {
+            allocator.free(bytes);
+            std.log.warn(
+                "config_mirror: {s} is {d} bytes, exceeds {d}-byte cap",
+                .{ entry.path, bytes.len, MAX_CONFIG_BYTES },
+            );
+            return Error.ConfigTooLarge;
+        }
+
+        var skey_buf: [reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+        const skey = reserved.configStorageKey(&skey_buf, dep_id, kv_key) orelse {
+            allocator.free(bytes);
+            return Error.ConfigTooLarge;
+        };
+        const skey_owned = allocator.dupe(u8, skey) catch {
+            allocator.free(bytes);
+            return Error.OutOfMemory;
+        };
+        out.append(allocator, .{ .key = skey_owned, .value = bytes }) catch {
+            allocator.free(skey_owned);
+            allocator.free(bytes);
+            return Error.OutOfMemory;
+        };
+    }
+    return out.toOwnedSlice(allocator) catch Error.OutOfMemory;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -551,4 +625,54 @@ fn writeBlob(fake: *FakeBlobStore, bytes: []const u8, hex_out: *[64]u8) !void {
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     hex_out.* = std.fmt.bytesToHex(hash, .lower);
     try fake.put(hex_out, bytes);
+}
+
+test "collectConfigPairs: the rows a deploy hands the tenant, deployment-scoped" {
+    const allocator = testing.allocator;
+    var fake = FakeBlobStore{ .allocator = allocator };
+    defer fake.deinit();
+    const blobs = fake.store();
+
+    const body = "{\"client_id\":\"g\"}";
+    var hex: [64]u8 = undefined;
+    try writeBlob(&fake, body, &hex);
+
+    var entries = [_]files_mod.Entry{
+        .{
+            .path = try allocator.dupe(u8, "_config/oauth/google.json"),
+            .kind = .static,
+            .content_type = try allocator.dupe(u8, "application/json"),
+            .source_hex = hex,
+            .bytecode_hex = std.mem.zeroes([64]u8),
+        },
+        // Not config: a handler, and a static outside the namespace. Both are
+        // skipped by the SAME rule the loader-side mirror uses, which is why
+        // the selection lives in one function.
+        .{
+            .path = try allocator.dupe(u8, "index.mjs"),
+            .kind = .handler,
+            .content_type = try allocator.dupe(u8, "text/javascript"),
+            .source_hex = hex,
+            .bytecode_hex = std.mem.zeroes([64]u8),
+        },
+        .{
+            .path = try allocator.dupe(u8, "_static/logo.svg"),
+            .kind = .static,
+            .content_type = try allocator.dupe(u8, "image/svg+xml"),
+            .source_hex = hex,
+            .bytecode_hex = std.mem.zeroes([64]u8),
+        },
+    };
+    defer for (entries) |e| {
+        allocator.free(e.path);
+        allocator.free(e.content_type);
+    };
+    const manifest: manifest_json.Manifest = .{ .id = 9, .entries = &entries, .allocator = allocator };
+
+    const pairs = try collectConfigPairs(allocator, 9, manifest, blobs);
+    defer freePairs(allocator, pairs);
+
+    try testing.expectEqual(@as(usize, 1), pairs.len);
+    try testing.expectEqualStrings("_config/0000000000000009/oauth/google", pairs[0].key);
+    try testing.expectEqualStrings(body, pairs[0].value);
 }
