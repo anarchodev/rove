@@ -212,6 +212,35 @@ records are lost without a bump, and kept with one.
   the customer-facing replay store; operator signals go
   to Grafana Cloud — the two-sink split is decisions.md §7.
 
+### The serve-side shred gate
+
+A kv value written by an activation that named an identity
+(`request.shredKey`) is sealed at the **write boundary**, so the ciphertext
+propagates by itself into the writeset, the raft entry, the LMDB page, the
+readset and the **tape**. That is the mechanism, not a side effect — opening
+before the tape append would put plaintext on the tape and defeat it.
+
+So a record's kv tape holds ciphertext, and the **worker's
+`rewind-logs.internal` door opens it on the way out**
+(`src/js/logs_door_shred.zig`). Every consumer of a record — the dashboard,
+the replay viewer, the `rewind` CLI, the `@rewind/browser` shim — reaches it
+through that door, and the worker is the only process holding both the
+tenant's keys and the completeness watermark that says whether a missing key
+means anything.
+
+Three answers, and the third is why this is a gate rather than a transform:
+
+| resolution | served as |
+|---|---|
+| the key is here | plaintext — which is also what makes the interaction digest recomputable, since the digest folds the value the handler READ |
+| the key is destroyed, keyring complete | **still sealed**, so the transcode turns it into a refusal that names the erasure |
+| this node is short of key material | the whole response is refused (503, `key_material_unverified`) |
+
+Reporting an erasure that did not happen is the worst failure available here,
+so a node that cannot tell those apart says nothing rather than guessing.
+A **streamed** read of the door is refused for the same reason: the gate
+rewrites a whole response body, which a streamed transfer never has in hand.
+
 ### The execution-sequence stamp (`exec_seq`)
 
 Per-tenant execution is strictly serial: the tenant has one authoritative
