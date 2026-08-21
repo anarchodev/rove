@@ -69,6 +69,10 @@ pub const durable_wake = @import("durable_wake.zig");
 /// Per-tenant slot pools and the shared refill driver that keeps them
 /// warm ahead of demand (`keyring_pool.zig`).
 pub const keyring_pool = @import("keyring_pool.zig");
+/// The `_keys/` keyspace + codecs (`keyring_bind.zig`).
+pub const keyring_bind = @import("keyring_bind.zig");
+/// Per-tenant slot state, including the keyring (`deployment_cache.zig`).
+pub const deployment_cache = @import("deployment_cache.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
 pub const snapshot_catchup = @import("snapshot_catchup.zig");
 pub const SnapshotCatchupThread = snapshot_catchup.SnapshotCatchupThread;

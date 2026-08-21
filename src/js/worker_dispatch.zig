@@ -2612,6 +2612,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .resolve_slot = &@TypeOf(worker.*).resolveShredSlotTrampoline,
                 .seal_writes = &@TypeOf(worker.*).sealShredWritesTrampoline,
                 .open_value = &@TypeOf(worker.*).openShredValueTrampoline,
+                .destroy_identity = &@TypeOf(worker.*).destroyShredIdentityTrampoline,
             },
             .shred_instance_id = scope_inst.id,
         };

@@ -2946,6 +2946,21 @@ pub fn Worker(comptime opts: Options) type {
             return keyring_pool.openValue(allocator, slot, value);
         }
 
+        /// `ShredCaps.destroy_identity` — erase an identity's key.
+        pub fn destroyShredIdentityTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            instance_id: []const u8,
+            identity: []const u8,
+            txn: *kv_mod.KvStore.TrackedTxn,
+            writeset: *kv_mod.WriteSet,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
+                return error.KeyringUnavailable;
+            return keyring_pool.destroyIdentity(self, allocator, slot, identity, txn, writeset);
+        }
+
         pub fn blobWriteTrampoline(
             ctx: *anyopaque,
             tenant_id: []const u8,

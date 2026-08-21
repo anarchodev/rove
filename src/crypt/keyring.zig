@@ -469,6 +469,29 @@ pub const Keyring = struct {
             const group_start = pulled.items.len;
             var in_shard: usize = 0;
 
+            // Re-read the shard from disk FIRST. A rewrite serialises this
+            // instance's in-memory map, and that map can be behind the
+            // file: `installSealedShard` lands a peer's shard by writing
+            // the bytes directly, without going through any open Keyring.
+            // A follower that opened its keyring before a push therefore
+            // holds a map with none of those keys — and flushing it would
+            // write an almost-empty shard over the real one, erasing every
+            // key the push delivered rather than the one slot asked for.
+            //
+            // Reload, then remove exactly what was asked for, then write.
+            // The reload briefly restores keys `evict` had already taken
+            // out of memory, which is safe only because the caller holds
+            // the keyring lock across this whole call.
+            self.readShard(shard) catch |err| switch (err) {
+                // No file yet: nothing on disk to be behind.
+                Error.NoKeyring => {},
+                else => {
+                    if (first_err == null) first_err = err;
+                    while (i < ordered.len and shardOf(ordered[i]) == shard) : (i += 1) {}
+                    continue;
+                },
+            };
+
             // Pull whatever this shard still holds. A slot that is ALREADY
             // gone from the map is not skipped: `evict` removed it when the
             // destroy applied, and the shard on disk still contains it — so

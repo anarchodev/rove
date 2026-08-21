@@ -301,6 +301,25 @@ pub fn checkShredKey(id: []const u8) Verdict {
     return null;
 }
 
+test "the destroy cap refuses at the limit, never truncates" {
+    // A handler that asked to erase more than the cap must not be left
+    // guessing which of its calls took effect — none of them can be
+    // undone.
+    const max = reserved.SHRED_DESTROY_MAX_PER_ACTIVATION;
+    try std.testing.expect(checkShredDestroyCap(0) == null);
+    try std.testing.expect(checkShredDestroyCap(max - 1) == null);
+    try std.testing.expect(checkShredDestroyCap(max) != null);
+    try std.testing.expect(checkShredDestroyCap(max + 99) != null);
+}
+
+test "the destroy cap is a SAFETY bound, and small" {
+    // Not a resource bound — erasure reclaims rather than commits. It is
+    // small because the failure it guards against is a handler looping
+    // over a list it should not have, and every iteration is permanent.
+    try std.testing.expect(reserved.SHRED_DESTROY_MAX_PER_ACTIVATION >= 1);
+    try std.testing.expect(reserved.SHRED_DESTROY_MAX_PER_ACTIVATION <= 32);
+}
+
 test "shredKey: an empty id is refused, never read as 'no identity'" {
     // A handler that computed an empty id — a missing cookie, an unparsed
     // token — meant to scope the activation and got nothing. Falling back
@@ -332,6 +351,27 @@ test "shredKey: the id's CONTENT is the tenant's business, not the engine's" {
     try std.testing.expect(checkShredKey("customer@example.com") == null);
     try std.testing.expect(checkShredKey("order:1234/line:7") == null);
     try std.testing.expect(checkShredKey("日本語") == null);
+}
+
+pub const shred_destroy_args_message = "request.shredKey.destroy(id) requires a string argument";
+
+fn shredDestroyCapMessage() []const u8 {
+    return std.fmt.comptimePrint(
+        "request.shredKey.destroy: too many identities destroyed in one activation (max {d})",
+        .{reserved.SHRED_DESTROY_MAX_PER_ACTIVATION},
+    );
+}
+
+/// The per-activation destroy cap.
+///
+/// Checked BEFORE the destroy, and refused loudly rather than truncated:
+/// a handler that asked to erase more than this must not be left guessing
+/// which of its calls took effect, because none of them can be undone.
+pub fn checkShredDestroyCap(count: usize) Verdict {
+    if (count >= reserved.SHRED_DESTROY_MAX_PER_ACTIVATION) {
+        return .{ .throw = .type_error, .code = "", .message = shredDestroyCapMessage() };
+    }
+    return null;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

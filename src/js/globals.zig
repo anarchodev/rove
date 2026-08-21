@@ -374,6 +374,24 @@ pub const ShredCaps = struct {
         instance_id: []const u8,
         value: []const u8,
     ) anyerror!OpenedValue = null,
+
+    /// Erase `identity`'s key — permanently, everywhere.
+    ///
+    /// Rides the activation's own raft entry like the binding does: the
+    /// binding row is deleted and a `_keys/dead/{slot}` tombstone written
+    /// in the SAME writeset, so the two cannot land apart. That tombstone
+    /// is the durable intent — the local shard rewrite may fail, a node
+    /// may be down, a leader may change — and the reconciliation sweep
+    /// re-derives the work from a tombstone whose slot the local keyring
+    /// still holds.
+    destroy_identity: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        instance_id: []const u8,
+        identity: []const u8,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+    ) anyerror!void = null,
 };
 
 /// What a stored value turned out to be.
@@ -573,6 +591,10 @@ pub const DispatchState = struct {
     /// activation writes seals under. Set alongside `shred_key`, so the
     /// two never disagree about which identity is in force.
     shred_slot: ?*?u64 = null,
+    /// Identities destroyed this activation, against the per-activation
+    /// cap. A cell for the same reason `shred_key` is — the count belongs
+    /// to one activation, and a batch's siblings have their own.
+    shred_destroys: ?*usize = null,
     /// How to resolve an identity to a slot. Null on the offline
     /// engines and in unit tests; see `ShredCaps`.
     shred: ?ShredCaps = null,

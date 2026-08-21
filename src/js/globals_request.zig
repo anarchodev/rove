@@ -192,7 +192,14 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, req_obj, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
     // Scopes this activation's writes to one opaque identity, so
     // destroying that identity's key erases them wherever they landed.
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "shredKey", c.JS_NewCFunction2(ctx, jsRequestShredKey, "shredKey", 1, c.JS_CFUNC_generic, 0));
+    {
+        // `destroy` hangs off the scoping function rather than taking a
+        // name of its own: one concept, two verbs, and a call site that
+        // reads as what it does.
+        const shred_fn = c.JS_NewCFunction2(ctx, jsRequestShredKey, "shredKey", 1, c.JS_CFUNC_generic, 0);
+        _ = c.JS_SetPropertyStr(ctx, shred_fn, "destroy", c.JS_NewCFunction2(ctx, jsShredKeyDestroy, "destroy", 1, c.JS_CFUNC_generic, 0));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "shredKey", shred_fn);
+    }
     // request.sagaId: the engine's per-saga id, stable across every
     // activation of one saga (a held connection's frames, a callback
     // chain's hops). The reserved `_saga` index tag is derived from it;
@@ -1228,6 +1235,35 @@ pub const WorkerTag = struct {
         return true;
     }
 
+    pub fn destroyCount(self: WorkerTag) usize {
+        const cell = self.state.shred_destroys orelse return 0;
+        return cell.*;
+    }
+
+    /// Erase this identity's key. Permanent everywhere at once.
+    pub fn destroyShredKey(self: WorkerTag, id: []const u8) bool {
+        const state = self.state;
+        const caps = state.shred orelse return true;
+        const destroy = caps.destroy_identity orelse return true;
+        destroy(
+            caps.ctx,
+            state.allocator,
+            state.shred_instance_id,
+            id,
+            state.txn,
+            state.writeset,
+        ) catch |err| {
+            _ = c.JS_ThrowInternalError(
+                self.ctx,
+                "request.shredKey.destroy: could not erase this identity (%s)",
+                @errorName(err).ptr,
+            );
+            return false;
+        };
+        if (state.shred_destroys) |cell| cell.* += 1;
+        return true;
+    }
+
     pub fn tagAppend(self: WorkerTag, key: []const u8, val: []const u8) bool {
         const state = self.state;
         const k = state.allocator.dupe(u8, key) catch return false;
@@ -1246,6 +1282,7 @@ pub const WorkerTag = struct {
 
 const jsRequestTag = binding.Tag(c, WorkerTag).jsRequestTag;
 const jsRequestShredKey = binding.ShredKey(c, WorkerTag).jsRequestShredKey;
+const jsShredKeyDestroy = binding.ShredKey(c, WorkerTag).jsShredKeyDestroy;
 
 test "the request.tag limits match the log record's own bounds" {
     // The limits are a CONTRACT and live in `rove-reserved`, where the offline

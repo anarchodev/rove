@@ -178,6 +178,10 @@ pub const RefillDriver = struct {
         allocator: std.mem.Allocator,
         dc: *deployment_cache.DeploymentCache,
     ) !void {
+        // Hand the cache its reconciliation, which it calls at slot open
+        // but cannot import (this file needs `TenantSlot`, so the edge
+        // only goes one way).
+        deployment_cache.keyring_pool_hook.reconcile = reconcileDestroys;
         self.* = .{ .allocator = allocator, .dc = dc };
         const ts = try allocator.alloc(std.Thread, WORKERS);
         errdefer allocator.free(ts);
@@ -213,8 +217,12 @@ pub const RefillDriver = struct {
         var it = self.dc.tenant_files_map.iterator();
         while (it.next()) |entry| {
             const slot = entry.value_ptr.*;
-            if (slot.pool == null) continue;
-            if (!slot.pool.?.needsRefill()) continue;
+            // Either kind of work claims the slot. A destroy is owed even
+            // by a tenant with no pool — a node can hold keys for a tenant
+            // it does not lead, and it still has to erase them.
+            const wants_destroy = slot.pending_destroys.items.len != 0;
+            const wants_refill = if (slot.pool) |*p| p.needsRefill() else false;
+            if (!wants_destroy and !wants_refill) continue;
             if (!slot.pool_busy.tryLock()) continue;
             return slot;
         }
@@ -227,8 +235,17 @@ pub const RefillDriver = struct {
                 std.Thread.sleep(IDLE_SLEEP_NS);
                 continue;
             };
-            const pool = &slot.pool.?;
-            const res = pool.refillOnce();
+            // Destroys first: an erasure this node owes outranks keeping
+            // its pool warm, and the queue is usually empty so this costs
+            // a length check.
+            _ = deployment_cache.drainDestroys(slot, self.allocator) catch |err| blk: {
+                std.log.warn(
+                    "keyring {s}: destroy rewrite failed: {s} — reconciliation will retry",
+                    .{ slot.instance_id, @errorName(err) },
+                );
+                break :blk 0;
+            };
+            const res = if (slot.pool) |*pool| pool.refillOnce() else @as(anyerror!bool, false);
             slot.pool_busy.unlock();
             if (res) |_| {} else |err| {
                 std.log.warn(
@@ -392,3 +409,123 @@ pub fn openValue(
 /// Key generation stamped into every seal. One today; `key_version`
 /// exists so a KEK rotation can roll it without stranding stored bytes.
 const KEY_VERSION: u32 = 1;
+
+// ── destroying an identity ───────────────────────────────────────────
+
+/// Erase `identity`'s key — permanently, and everywhere.
+///
+/// The binding row is deleted and `_keys/dead/{slot}` written in the SAME
+/// writeset, so they cannot land apart. That matters in both directions:
+/// a binding removed without a tombstone would leave a live key nothing
+/// names, and a tombstone without the removal would leave an identity
+/// pointing at a slot that is being erased.
+///
+/// The tombstone is the DURABLE INTENT. A local shard rewrite can fail, a
+/// node can be down, a leader can change mid-destroy — and none of that
+/// loses the instruction, because it is committed through the tenant's
+/// raft group before any node acts on it. What each node owes is then
+/// derivable: a tombstone whose slot its keyring still holds is work
+/// outstanding, which is what `reconcileDestroys` sweeps for.
+///
+/// The tombstone is never removed. It is not a todo marker — it is the
+/// erasure record, and the completeness check counts it: `live keys +
+/// destroyed slots` must cover `[FIRST_SLOT, minted)`, so deleting one
+/// would make every node in the cluster read as permanently incomplete.
+pub fn destroyIdentity(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    slot_state: *deployment_cache.TenantSlot,
+    identity: []const u8,
+    txn: anytype,
+    writeset: *kv_mod.WriteSet,
+) !void {
+    const kr: *const crypt.keyring.Keyring = if (slot_state.keyring) |*k| k else
+        return error.KeyringUnavailable;
+    const pk = keyring_bind.pseudonymKey(kr.tenantSecret());
+
+    const bind_key = try keyring_bind.bindKey(allocator, pk, identity);
+    defer allocator.free(bind_key);
+
+    // An identity this tenant never named has nothing to erase. Not an
+    // error: a retried destroy, or a delete-account flow run twice, must
+    // not fail the second time.
+    const raw = slot_state.app_kv.get(bind_key) catch |err| switch (err) {
+        // Nothing to erase. Logged because a destroy that quietly does
+        // nothing is indistinguishable from one that worked, and the
+        // difference is whether a customer's data is gone.
+        error.NotFound => {
+            std.log.info(
+                "keyring {s}: destroy names an identity this tenant never bound — nothing to erase",
+                .{slot_state.instance_id},
+            );
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(raw);
+    const key_slot = try keyring_bind.resolveBinding(raw, pk, identity);
+
+    const dead_key = try keyring_bind.deadKey(allocator, key_slot);
+    defer allocator.free(dead_key);
+    const dead_val = keyring_bind.encodeDead(@intCast(std.time.nanoTimestamp()));
+
+    // Both ops, in one writeset and one txn — the atomicity above.
+    try txn.delete(bind_key);
+    try txn.put(dead_key, &dead_val);
+    try writeset.addDelete(bind_key);
+    try writeset.addPut(dead_key, &dead_val);
+
+    // The local half. Eviction is synchronous so a read stops resolving
+    // now; the shard rewrite is queued because neither the pump thread
+    // nor the poll loop may fsync. Every OTHER node does the same when
+    // the tombstone applies there.
+    std.log.info(
+        "keyring {s}: destroying slot {d} — identity erased",
+        .{ slot_state.instance_id, key_slot },
+    );
+    deployment_cache.evictAndQueueDestroy(slot_state, key_slot);
+    _ = worker;
+}
+
+/// Re-derive the destroys this node still owes, and queue them.
+///
+/// The tombstone says a slot is destroyed; the keyring still holding it
+/// says this node has not finished. That disagreement IS the todo list,
+/// which is why no separate marker is written and why nothing has to be
+/// cleaned up afterwards — the work disappears when the keyring agrees.
+///
+/// Per node by construction, which is the point: node A finishing must
+/// not clear node B's outstanding work, and a replicated marker removed
+/// on completion would do exactly that.
+///
+/// Runs when a node takes up a tenant, BEFORE the slot serves reads — a
+/// node that answered first could hand out a key it was already told to
+/// destroy — and again on the background sweep.
+pub fn reconcileDestroys(
+    allocator: std.mem.Allocator,
+    slot_state: *deployment_cache.TenantSlot,
+) !usize {
+    const kr: *const crypt.keyring.Keyring = if (slot_state.keyring) |*k| k else return 0;
+
+    var owed: usize = 0;
+    var cursor: []const u8 = "";
+    var cursor_owned: ?[]u8 = null;
+    defer if (cursor_owned) |c| allocator.free(c);
+    while (true) {
+        var res = try slot_state.app_kv.prefix(keyring_bind.DEAD_PREFIX, cursor, 512);
+        defer res.deinit();
+        if (res.entries.len == 0) break;
+        for (res.entries) |e| {
+            const key_slot = keyring_bind.parseDeadSlot(e.key) orelse continue;
+            if (kr.keyAt(key_slot) == null) continue; // already settled here
+            deployment_cache.evictAndQueueDestroy(slot_state, key_slot);
+            owed += 1;
+        }
+        if (res.entries.len < 512) break;
+        const next = try allocator.dupe(u8, res.entries[res.entries.len - 1].key);
+        if (cursor_owned) |c| allocator.free(c);
+        cursor_owned = next;
+        cursor = next;
+    }
+    return owed;
+}

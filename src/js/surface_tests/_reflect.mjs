@@ -37,7 +37,19 @@ export default function () {
           !Array.isArray(v) && !(v instanceof Uint8Array);
       } catch (_) { /* a throwing getter is still a public name — leaf */ }
       if (isPlainObj && depth > 0) addObj(label + "." + k, v, depth - 1);
-      else out.push(label + "." + k);
+      else {
+        out.push(label + "." + k);
+        // A FUNCTION carrying its own methods is public surface too
+        // (`request.shredKey.destroy`). Without this the sub-verb is
+        // invisible to the inventory, so removing one would go unnoticed
+        // — the exact drift this gate exists to catch.
+        if (typeof v === "function") {
+          for (const sub of Object.keys(v)) {
+            if (skip(sub)) continue;
+            out.push(label + "." + k + "." + sub);
+          }
+        }
+      }
     }
   }
 

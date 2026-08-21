@@ -616,6 +616,55 @@ pub fn ShredKey(comptime q: type, comptime D: type) type {
             return js_undefined;
         }
 
+        /// `request.shredKey.destroy(id)` — erase this identity's key.
+        ///
+        /// Permanent, and unrecoverable by construction: every byte
+        /// sealed under it becomes unreadable everywhere at once,
+        /// including in backups. That is the point, and it is why this is
+        /// a sub-verb of `shredKey` rather than a separate name — a
+        /// reader at the call site should see which noun is being
+        /// destroyed.
+        ///
+        /// Capped per activation. Not for resource reasons — erasure
+        /// reclaims rather than commits — but because a handler-facing
+        /// destroy means a loop with a bug erases customer data nothing
+        /// can restore. Refused loudly at the cap rather than truncated:
+        /// a handler that asked for more must not be left guessing which
+        /// of its calls took effect.
+        ///
+        /// ```
+        /// destroyCount(d) usize                   // destroys so far this activation
+        /// destroyShredKey(d, id) bool             // false = engine failure, JS exception pending
+        /// ```
+        pub fn jsShredKeyDestroy(
+            ctx: ?*q.JSContext,
+            _: q.JSValue,
+            argc: c_int,
+            argv: [*c]q.JSValue,
+        ) callconv(.c) q.JSValue {
+            const d = D.fromCtx(ctx);
+            if (argc < 1 or !q.JS_IsString(argv[0])) {
+                _ = q.JS_ThrowTypeError(ctx, std.fmt.comptimePrint("{s}", .{guards.shred_destroy_args_message}));
+                return js_exception;
+            }
+            const id = coerceId(d, ctx, argv[0]) catch return js_exception;
+            defer d.allocator().free(id);
+
+            // Same identity rules as scoping: one name, one set of rules.
+            if (guards.checkShredKey(id)) |refusal| {
+                _ = q.JS_ThrowTypeError(ctx, refusal.message.ptr);
+                return js_exception;
+            }
+            // Checked BEFORE the destroy — a refusal after the fact would
+            // be a refusal of something that already happened.
+            if (guards.checkShredDestroyCap(d.destroyCount())) |refusal| {
+                _ = q.JS_ThrowTypeError(ctx, refusal.message.ptr);
+                return js_exception;
+            }
+            if (!d.destroyShredKey(id)) return js_exception;
+            return js_undefined;
+        }
+
         fn coerceId(d: D, ctx: ?*q.JSContext, val: q.JSValue) ![]u8 {
             var len: usize = 0;
             const cstr = q.JS_ToCStringLen(ctx, &len, val);

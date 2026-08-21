@@ -27,6 +27,18 @@ const deployment_loader_mod = @import("deployment_loader.zig");
 const msg_router_mod = @import("msg_router.zig");
 const crypt_mod = @import("rove-crypt");
 const keyring_bind = @import("keyring_bind.zig");
+
+/// Set once at startup by `keyring_pool`, which owns the reconciliation
+/// but sits ABOVE this file in the import graph — it needs `TenantSlot`.
+/// A function pointer breaks the cycle without either side holding a
+/// back-pointer to the other.
+pub const keyring_pool_hook = struct {
+    pub var reconcile: *const fn (std.mem.Allocator, *TenantSlot) anyerror!usize = noReconcile;
+
+    fn noReconcile(_: std.mem.Allocator, _: *TenantSlot) anyerror!usize {
+        return 0;
+    }
+};
 const plan_mod = @import("rove-plan");
 const static_cache = @import("static_cache.zig");
 
@@ -620,6 +632,19 @@ pub const TenantSlot = struct {
     /// in-flight refill instead of pulling the ground from under it.
     pool_busy: std.Thread.Mutex = .{},
 
+    /// Slots whose keys this node has been told to destroy and has not
+    /// yet rewritten out of their shard.
+    ///
+    /// The eviction is already done by the time a slot lands here — that
+    /// happens synchronously at apply, so reads stop immediately — and
+    /// this is the durable half catching up. Batched because a shard is
+    /// ~192 KiB and every rewrite costs two fsyncs.
+    ///
+    /// Losing this list costs nothing: the tombstones commit through raft
+    /// before anything reaches here, so `reconcileDestroys` re-derives
+    /// the work from a tombstone whose slot the keyring still holds.
+    pending_destroys: std.ArrayListUnmanaged(u64) = .empty,
+
     /// Resolved per-tenant plan limits (docs/architecture/control-plane.md —
     /// operational state). Null until the CP delivers a plan
     /// (via the attach handshake on a move, or a live single-target push);
@@ -1150,7 +1175,24 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     // Settle completeness before the slot is reachable, so no lookup can
     // read the default. A tenant with no keyring stays `false` — it
     // cannot vouch for anything.
-    if (slot.keyring != null) refreshKeyringCompleteness(slot);
+    if (slot.keyring != null) {
+        refreshKeyringCompleteness(slot);
+        // Re-derive destroys this node still owes, BEFORE the slot is
+        // reachable. A node that served first could hand out a key it had
+        // already been told to destroy — the tombstone is committed, so
+        // the instruction predates this node's readiness to honour it.
+        const owed = keyring_pool_hook.reconcile(allocator, slot) catch |err| blk: {
+            std.log.warn(
+                "keyring {s}: destroy reconciliation failed at open: {s}",
+                .{ slot.instance_id, @errorName(err) },
+            );
+            break :blk 0;
+        };
+        if (owed != 0) std.log.info(
+            "keyring {s}: {d} destroy(s) outstanding on this node, queued",
+            .{ slot.instance_id, owed },
+        );
+    }
 
     // Best-effort initial load. Read `_deploy/current` from the
     // tenant's app.db (set by release POST + replicated via raft);
@@ -1223,6 +1265,58 @@ pub fn refreshKeyringCompleteness(slot: *TenantSlot) void {
 /// The lock is held for a hash probe and nothing else — a destroy's
 /// shard rewrite runs off this path, so a reader never waits on an
 /// fsync.
+/// Evict a slot's key from memory and queue its durable removal.
+///
+/// Eviction is synchronous and the rewrite is not, deliberately: the
+/// observable change must lead the irreversible one, so a read stops
+/// resolving before the shard is rewritten rather than after. Neither the
+/// pump thread nor the poll loop may fsync, which is why the rewrite is
+/// queued at all.
+///
+/// A failed append is survivable and not worth failing an apply over —
+/// the tombstone is already committed, so reconciliation finds the work
+/// again from the tombstone-versus-keyring disagreement.
+pub fn evictAndQueueDestroy(slot: *TenantSlot, key_slot: u64) void {
+    slot.keyring_lock.lock();
+    defer slot.keyring_lock.unlock();
+    if (slot.keyring) |*kr| kr.evict(key_slot);
+    for (slot.pending_destroys.items) |q| if (q == key_slot) return; // already queued
+    slot.pending_destroys.append(slot.allocator, key_slot) catch |err| std.log.warn(
+        "keyring {s}: could not queue destroy of slot {d}: {s} — reconciliation will retry",
+        .{ slot.instance_id, key_slot, @errorName(err) },
+    );
+}
+
+/// Take everything queued, leaving the list empty. Caller owns the slice.
+pub fn takePendingDestroys(slot: *TenantSlot, allocator: std.mem.Allocator) ?[]u64 {
+    slot.keyring_lock.lock();
+    defer slot.keyring_lock.unlock();
+    if (slot.pending_destroys.items.len == 0) return null;
+    const out = allocator.dupe(u64, slot.pending_destroys.items) catch return null;
+    slot.pending_destroys.clearRetainingCapacity();
+    return out;
+}
+
+/// Rewrite the shards of everything queued. Runs on the shared driver —
+/// it fsyncs, so never on the pump thread or the poll loop.
+///
+/// KNOWN COST: `keyring_lock` is held across the rewrite, so a reader
+/// resolving a sealed value for this tenant waits out one shard rewrite
+/// (~192 KiB and two fsyncs). Bounded and rare — it needs a tenant using
+/// per-identity keys to read a sealed value at the moment a destroy is
+/// being written — but it is a wait on the poll loop, which is the one
+/// place waits are expensive. Splitting the map lock from the disk lock
+/// removes it and is deliberately left as its own change rather than
+/// folded in here.
+pub fn drainDestroys(slot: *TenantSlot, allocator: std.mem.Allocator) !usize {
+    const slots = takePendingDestroys(slot, allocator) orelse return 0;
+    defer allocator.free(slots);
+    slot.keyring_lock.lock();
+    defer slot.keyring_lock.unlock();
+    const kr: *crypt_mod.keyring.Keyring = if (slot.keyring) |*k| k else return 0;
+    return kr.destroyMany(slots);
+}
+
 pub fn keyringLookup(slot: *TenantSlot, key_slot: u64) keyring_bind.Lookup {
     slot.keyring_lock.lock();
     defer slot.keyring_lock.unlock();
@@ -1254,6 +1348,7 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
         defer slot.pool_busy.unlock();
         if (slot.pool) |*p| p.deinit();
         slot.pool = null;
+        slot.pending_destroys.deinit(allocator);
         if (slot.pool_ctx) |c| {
             if (slot.pool_ctx_free) |f| f(allocator, c);
             slot.pool_ctx = null;
