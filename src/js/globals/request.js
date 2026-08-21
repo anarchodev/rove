@@ -25,7 +25,7 @@
 // pre-retirement deployments replay their pinned code.)
 (function () {
   "use strict";
-  var proto = {};
+  const proto = {};
   Object.defineProperty(proto, "text", {
     configurable: true,
     get: function () {
