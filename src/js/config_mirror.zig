@@ -24,8 +24,9 @@ const kv_mod = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const manifest_json = files_mod.manifest_json;
+const reserved = @import("rove-reserved");
 
-const CONFIG_PREFIX = "_config/";
+const CONFIG_PREFIX = reserved.CONFIG_PREFIX;
 const JSON_SUFFIX = ".json";
 
 /// Maximum bytes for a single `_config/*.json` file. The mirror rides
@@ -57,6 +58,7 @@ pub const Stats = struct {
 /// then `blobStore()`).
 pub fn mirrorConfigToKv(
     allocator: std.mem.Allocator,
+    dep_id: u64,
     manifest: manifest_json.Manifest,
     file_blobs: blob_mod.BlobStore,
     kv: *kv_mod.KvStore,
@@ -65,16 +67,14 @@ pub fn mirrorConfigToKv(
 ) Error!Stats {
     var stats: Stats = .{};
 
-    // Build the set of kv keys this manifest WILL produce so we can
-    // diff against existing rows.
-    var wanted: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = wanted.keyIterator();
-        while (it.next()) |k| allocator.free(k.*);
-        wanted.deinit(allocator);
-    }
-
-    // Pass 1 — PUT every config file from the manifest.
+    // PUT every config file from the manifest, under THIS deployment.
+    //
+    // There is no stale-row pass, and its absence is the point. Rows are
+    // keyed by `dep_id`, which is a content hash, so a row is immutable and
+    // another deployment's rows are not stale — they belong to that
+    // deployment. Deleting rows the new manifest did not claim is what made a
+    // key REMOVAL race: the delete landed while the previous deployment's code
+    // was still live and still reading the key.
     for (manifest.entries) |entry| {
         const kv_key_opt = mapPathToKey(allocator, entry.path) catch return Error.OutOfMemory;
         const kv_key = kv_key_opt orelse continue;
@@ -101,60 +101,35 @@ pub fn mirrorConfigToKv(
             return Error.ConfigTooLarge;
         }
 
-        txn.put(kv_key, bytes) catch {
+        var skey_buf: [reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+        const skey = reserved.configStorageKey(&skey_buf, dep_id, kv_key) orelse {
+            allocator.free(kv_key);
+            return Error.ConfigTooLarge;
+        };
+
+        // Already there with these bytes: skip. The row is immutable, so a
+        // re-mirror of the same deployment has nothing to say — and that is
+        // what makes running this twice, out of order, or on a follower cost
+        // nothing. Without the skip every reload re-proposes an identical
+        // entry for any tenant that ships config.
+        if (kv.get(skey)) |existing| {
+            defer allocator.free(existing);
+            if (std.mem.eql(u8, existing, bytes)) {
+                allocator.free(kv_key);
+                continue;
+            }
+        } else |_| {}
+
+        txn.put(skey, bytes) catch {
             allocator.free(kv_key);
             return Error.Kv;
         };
-        writeset.addPut(kv_key, bytes) catch {
+        writeset.addPut(skey, bytes) catch {
             allocator.free(kv_key);
             return Error.OutOfMemory;
         };
-        wanted.put(allocator, kv_key, {}) catch {
-            allocator.free(kv_key);
-            return Error.OutOfMemory;
-        };
+        allocator.free(kv_key);
         stats.put_count += 1;
-    }
-
-    // Pass 2 — DELETE existing `_config/` rows the new manifest
-    // doesn't claim. Snapshot the keys first (rather than delete
-    // during iteration) so we don't fight the cursor.
-    var stale: std.ArrayList([]u8) = .empty;
-    defer {
-        for (stale.items) |k| allocator.free(k);
-        stale.deinit(allocator);
-    }
-
-    var cursor: []const u8 = "";
-    var cursor_buf: ?[]u8 = null;
-    defer if (cursor_buf) |b| allocator.free(b);
-
-    while (true) {
-        var range = kv.prefix(CONFIG_PREFIX, cursor, 256) catch return Error.Kv;
-        defer range.deinit();
-        if (range.entries.len == 0) break;
-
-        for (range.entries) |row| {
-            if (!wanted.contains(row.key)) {
-                const owned = allocator.dupe(u8, row.key) catch return Error.OutOfMemory;
-                stale.append(allocator, owned) catch {
-                    allocator.free(owned);
-                    return Error.OutOfMemory;
-                };
-            }
-        }
-
-        if (range.entries.len < 256) break;
-        const last_key = range.entries[range.entries.len - 1].key;
-        if (cursor_buf) |b| allocator.free(b);
-        cursor_buf = allocator.dupe(u8, last_key) catch return Error.OutOfMemory;
-        cursor = cursor_buf.?;
-    }
-
-    for (stale.items) |key| {
-        txn.delete(key) catch return Error.Kv;
-        writeset.addDelete(key) catch return Error.OutOfMemory;
-        stats.delete_count += 1;
     }
 
     return stats;
@@ -273,11 +248,14 @@ test "mirrorConfigToKv: writes new rows + drops stale rows" {
     defer fake.deinit();
     const blobs = fake.store();
 
-    // Pre-existing _config row that the new deploy will REMOVE.
+    // A row from a PREVIOUS deployment. It must survive: that deployment's
+    // code may still be serving until the pointer flips, and deleting rows the
+    // new manifest does not claim is exactly what made a config-key removal
+    // race the release.
     {
         var seed_txn = try kv.beginTrackedImmediate();
         errdefer seed_txn.rollback() catch {};
-        try seed_txn.put("_config/oauth/old_provider", "{\"stale\":true}");
+        try seed_txn.put("_config/0000000000000006/oauth/old_provider", "{\"stale\":true}");
         try seed_txn.commit();
     }
 
@@ -321,22 +299,85 @@ test "mirrorConfigToKv: writes new rows + drops stale rows" {
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
 
-    const stats = try mirrorConfigToKv(allocator, manifest, blobs, kv, &txn, &ws);
+    const stats = try mirrorConfigToKv(allocator, 7, manifest, blobs, kv, &txn, &ws);
     try testing.expectEqual(@as(usize, 2), stats.put_count);
-    try testing.expectEqual(@as(usize, 1), stats.delete_count);
+    try testing.expectEqual(@as(usize, 0), stats.delete_count);
 
     try txn.commit();
 
-    // Verify the new rows landed and the stale row is gone.
-    const got_google = try kv.get("_config/oauth/google");
+    // The new rows land under THIS deployment.
+    const got_google = try kv.get("_config/0000000000000007/oauth/google");
     defer allocator.free(got_google);
     try testing.expectEqualStrings(google_json, got_google);
 
-    const got_sessions = try kv.get("_config/sessions/default");
+    const got_sessions = try kv.get("_config/0000000000000007/sessions/default");
     defer allocator.free(got_sessions);
     try testing.expectEqualStrings(sessions_json, got_sessions);
 
-    try testing.expectError(error.NotFound, kv.get("_config/oauth/old_provider"));
+    // …and the previous deployment's row is untouched. Its code may still be
+    // running; only the `_deploy/current` flip decides which set is visible.
+    const got_old = try kv.get("_config/0000000000000006/oauth/old_provider");
+    defer allocator.free(got_old);
+    try testing.expectEqualStrings("{\"stale\":true}", got_old);
+}
+
+test "mirrorConfigToKv: two deployments of the same config path coexist" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir_path);
+    const db_path = try std.fs.path.joinZ(allocator, &.{ data_dir_path, "app.db" });
+    defer allocator.free(db_path);
+    var kv = try kv_mod.KvStore.open(allocator, db_path);
+    defer kv.close();
+
+    var fake = FakeBlobStore{ .allocator = allocator };
+    defer fake.deinit();
+    const blobs = fake.store();
+
+    // Same path, different content — which is the realistic deploy: an edit
+    // to `_config/oauth/google.json`. Under one shared namespace the second
+    // overwrites the first and the switch is not atomic with the code's.
+    const v1 = "{\"client_id\":\"one\"}";
+    const v2 = "{\"client_id\":\"two\"}";
+    for ([_]struct { dep: u64, body: []const u8 }{
+        .{ .dep = 1, .body = v1 },
+        .{ .dep = 2, .body = v2 },
+    }) |step| {
+        var hex: [64]u8 = undefined;
+        try writeBlob(&fake, step.body, &hex);
+        var entries = [_]files_mod.Entry{.{
+            .path = try allocator.dupe(u8, "_config/oauth/google.json"),
+            .kind = .static,
+            .content_type = try allocator.dupe(u8, "application/json"),
+            .source_hex = hex,
+            .bytecode_hex = std.mem.zeroes([64]u8),
+        }};
+        defer for (entries) |e| {
+            allocator.free(e.path);
+            allocator.free(e.content_type);
+        };
+        const manifest: manifest_json.Manifest = .{ .id = step.dep, .entries = &entries, .allocator = allocator };
+
+        var txn = try kv.beginTrackedImmediate();
+        errdefer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(allocator);
+        defer ws.deinit();
+        _ = try mirrorConfigToKv(allocator, step.dep, manifest, blobs, kv, &txn, &ws);
+        try txn.commit();
+    }
+
+    // Both readable at once. `_deploy/current` alone decides which a handler
+    // sees, so code and config switch in the same instant — including on a
+    // rollback to deployment 1.
+    const got1 = try kv.get("_config/0000000000000001/oauth/google");
+    defer allocator.free(got1);
+    try testing.expectEqualStrings(v1, got1);
+    const got2 = try kv.get("_config/0000000000000002/oauth/google");
+    defer allocator.free(got2);
+    try testing.expectEqualStrings(v2, got2);
 }
 
 test "mirrorConfigToKv: re-running with same manifest is idempotent" {
@@ -385,7 +426,7 @@ test "mirrorConfigToKv: re-running with same manifest is idempotent" {
         errdefer txn.rollback() catch {};
         var ws = kv_mod.WriteSet.init(allocator);
         defer ws.deinit();
-        _ = try mirrorConfigToKv(allocator, manifest, blobs, kv, &txn, &ws);
+        _ = try mirrorConfigToKv(allocator, 1, manifest, blobs, kv, &txn, &ws);
         try txn.commit();
     }
 
@@ -393,10 +434,14 @@ test "mirrorConfigToKv: re-running with same manifest is idempotent" {
     errdefer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    const stats = try mirrorConfigToKv(allocator, manifest, blobs, kv, &txn, &ws);
+    const stats = try mirrorConfigToKv(allocator, 1, manifest, blobs, kv, &txn, &ws);
     try txn.commit();
 
-    try testing.expectEqual(@as(usize, 1), stats.put_count);
+    // Nothing to say: the row is immutable and already present, so a re-mirror
+    // writes NOTHING and its caller burns no raft entry. That is what makes
+    // running this twice, out of order, or on a follower cost nothing — and it
+    // is why the mirror needs no atomicity with the release.
+    try testing.expectEqual(@as(usize, 0), stats.put_count);
     try testing.expectEqual(@as(usize, 0), stats.delete_count);
 }
 
@@ -450,7 +495,7 @@ test "mirrorConfigToKv: rejects oversized config file" {
     defer ws.deinit();
     try testing.expectError(
         Error.ConfigTooLarge,
-        mirrorConfigToKv(allocator, manifest, blobs, kv, &txn, &ws),
+        mirrorConfigToKv(allocator, 1, manifest, blobs, kv, &txn, &ws),
     );
 }
 
@@ -495,7 +540,7 @@ test "mirrorConfigToKv: ignores handler files even under _config/" {
     errdefer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    const stats = try mirrorConfigToKv(allocator, manifest, blobs, kv, &txn, &ws);
+    const stats = try mirrorConfigToKv(allocator, 1, manifest, blobs, kv, &txn, &ws);
     try txn.commit();
 
     try testing.expectEqual(@as(usize, 0), stats.put_count);

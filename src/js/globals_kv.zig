@@ -418,6 +418,12 @@ pub const WorkerKv = struct {
         }
     };
 
+    /// The deployment this activation runs under — see
+    /// `DispatchState.deployment_id`.
+    pub fn configScope(self: WorkerKv) u64 {
+        return self.state.deployment_id;
+    }
+
     /// Reads go directly through `state.kv`; writes from the same handler
     /// are visible because the underlying store routes through the active
     /// txn's read view.

@@ -30,6 +30,8 @@ const MockState = struct {
     /// Outcome-replay knobs: `decide` false = captured mode (rules skipped);
     /// a taped refusal replays for exactly this key ("set" op).
     decide: bool = true,
+    /// The deployment the mock activation runs under (0 = an authored world).
+    config_scope: u64 = 0,
     taped_refusal_key: []const u8 = "",
     taped_refusal_code: []const u8 = "",
     /// The last refusal the binding asked to record (op char + code).
@@ -82,6 +84,10 @@ const MockKv = struct {
     pub fn noteWrite(self: MockKv, bytes: usize) void {
         self.st.write_ops += 1;
         self.st.write_bytes += bytes;
+    }
+
+    pub fn configScope(self: MockKv) u64 {
+        return self.st.config_scope;
     }
 
     pub fn decides(self: MockKv) bool {

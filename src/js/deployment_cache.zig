@@ -1295,6 +1295,7 @@ fn mirrorDeployConfig(
     allocator: std.mem.Allocator,
     slot: *TenantSlot,
     raft: *Bridge,
+    dep_id: u64,
     manifest: files_mod.manifest_json.Manifest,
     file_blobs: blob_mod.BlobStore,
 ) !void {
@@ -1304,6 +1305,7 @@ fn mirrorDeployConfig(
     defer ws.deinit();
     const stats = try config_mirror.mirrorConfigToKv(
         allocator,
+        dep_id,
         manifest,
         file_blobs,
         slot.app_kv,
@@ -1427,7 +1429,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_
         // idempotent and makes the gid resolvable.
         const mirror_gid = raft.registerTenant(slot.instance_id) catch 0;
         if (mirror_gid != 0 and raft.isLeaderOf(mirror_gid)) {
-            mirrorDeployConfig(allocator, slot, raft, manifest, bs) catch |err|
+            mirrorDeployConfig(allocator, slot, raft, dep_id, manifest, bs) catch |err|
                 std.log.warn(
                     "reloadDeployment: config mirror {s}/{d} failed: {s}",
                     .{ slot.instance_id, dep_id, @errorName(err) },
