@@ -247,6 +247,14 @@ pub const Dispatcher = struct {
         var tags_buf: std.ArrayList(log_mod.Tag) = .empty;
         errdefer freeTagsBuf(self.allocator, &tags_buf);
 
+        // The activation's shred identity and the slot it resolved to.
+        // Owned here for the same reason `tags_buf` is: they belong to
+        // one activation, and a batch's other activations may name
+        // different identities (or none).
+        var shred_key_cell: ?[]u8 = null;
+        defer if (shred_key_cell) |k| self.allocator.free(k);
+        var shred_slot_cell: ?u64 = null;
+
         var state = globals.DispatchState{
             .allocator = self.allocator,
             .kv = kv,
@@ -260,6 +268,10 @@ pub const Dispatcher = struct {
             .root_ws_base = if (request.admin.root_writeset) |rws| rws.ops.items.len else 0,
             .console = &console_buf,
             .tags = &tags_buf,
+            .shred_key = &shred_key_cell,
+            .shred_slot = &shred_slot_cell,
+            .shred = request.shred,
+            .shred_instance_id = request.shred_instance_id,
             .readset = request.trace.readset,
             // Deterministic replay (`docs/architecture/replay-and-sim.md`): arenajs's per-request
             // xorshift64star state is the single PRNG (no Zig-side

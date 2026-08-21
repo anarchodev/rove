@@ -44,7 +44,6 @@ const keyring_bind = @import("keyring_bind.zig");
 const blob = @import("rove-blob");
 const curl = blob.curl;
 const respb = @import("response_builder.zig");
-const bridge_control = @import("bridge").control;
 
 /// `/_system/` suffix this handles. Registered in the `v2-*` family, so
 /// it inherits that family's move-secret gate.
@@ -160,7 +159,7 @@ pub fn pushToQuorum(
 
     var voters_buf: [MAX_VOTERS]u64 = undefined;
     var learners_buf: [MAX_VOTERS]u64 = undefined;
-    const cs = bridge_control.confState(worker.raft, gid, &voters_buf, &learners_buf) orelse
+    const cs = worker.raft.confState(gid, &voters_buf, &learners_buf) orelse
         return PushError.UnknownMembership;
     if (cs.voters.len == 0) return PushError.UnknownMembership;
 

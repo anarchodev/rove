@@ -298,6 +298,50 @@ pub const PendingFetch = struct {
 /// are always set together from the same worker. Each fn stays
 /// optional so the JS callable can throw a precise "not configured"
 /// error on test/misconfigured paths (and so a test can wire just one).
+/// How an activation turns the identity a handler named into the slot
+/// whose key its writes seal under.
+///
+/// A capability the WORKER supplies, for the same reason `PlatformCaps`
+/// is: resolving needs the tenant's slot pool, its keyring and its raft
+/// group, none of which the dispatcher knows about — and threading the
+/// worker's generic type through here would drag it into every engine
+/// that shares this file.
+///
+/// Absent on the offline engines and in unit tests, where there is no
+/// key material and nothing to seal. `request.shredKey` still validates
+/// and still records the identity there, so the surface behaves the same
+/// everywhere; only the slot is missing.
+pub const ShredCaps = struct {
+    ctx: *anyopaque,
+    /// Resolve `identity` to its slot for `instance_id`, binding it to a
+    /// fresh one if this is the first time the tenant has named it.
+    ///
+    /// A new binding is APPENDED TO `writeset` rather than proposed on
+    /// its own: it rides the raft entry the activation was already
+    /// sending, so naming an identity costs no extra round trip and no
+    /// extra fsync on the request path.
+    ///
+    /// It goes through `txn` as well, and the two are inseparable. The
+    /// writeset is what followers apply; the txn is what this node
+    /// writes. A binding that reached only one of them would leave the
+    /// leader and its followers disagreeing about which slot an identity
+    /// holds — and the disagreement would surface as a value that opens
+    /// on one node and reads as erased on another.
+    ///
+    /// `error.PoolEmpty` means no minted slot is available right now —
+    /// the caller surfaces it rather than sealing under something else,
+    /// because every fallback available at that moment is a silent
+    /// downgrade of the erasure the handler asked for.
+    resolve_slot: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        instance_id: []const u8,
+        identity: []const u8,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+    ) anyerror!u64 = null,
+};
+
 pub const PlatformCaps = struct {
     ctx: *anyopaque,
     /// `platform.instances.deployStarter(name)`: deploy the embedded
@@ -445,6 +489,16 @@ pub const DispatchState = struct {
     /// always set it, and the default exists for unit tests that
     /// exercise binding behaviour without the surrounding buffers.
     shred_key: ?*?[]u8 = null,
+    /// The slot `shred_key` resolved to — the key every value this
+    /// activation writes seals under. Set alongside `shred_key`, so the
+    /// two never disagree about which identity is in force.
+    shred_slot: ?*?u64 = null,
+    /// How to resolve an identity to a slot. Null on the offline
+    /// engines and in unit tests; see `ShredCaps`.
+    shred: ?ShredCaps = null,
+    /// This activation's tenant, for the resolve above. Empty where the
+    /// site does not track one.
+    shred_instance_id: []const u8 = "",
     /// Set if a kv-level error needs to bubble back to the caller after
     /// the JS runs. We can't throw from inside the C callback cleanly in
     /// all cases, so we record the first error and let the dispatcher

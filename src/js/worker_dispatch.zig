@@ -2617,6 +2617,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .pending_wakes = &pending_wakes,
                 .pending_stream_chunks = &stream_chunks,
             },
+            // `request.shredKey(id)` resolves through the worker, which
+            // is what owns the tenant's slot pool and keyring.
+            .shred = .{
+                .ctx = @ptrCast(worker),
+                .resolve_slot = &@TypeOf(worker.*).resolveShredSlotTrampoline,
+            },
+            .shred_instance_id = scope_inst.id,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(

@@ -457,6 +457,13 @@ pub const Request = struct {
     admin: Admin = .{},
     /// Worker-supplied re-entry trampolines.
     trampolines: Trampolines = .{},
+    /// How `request.shredKey(id)` turns an identity into the slot whose
+    /// key this activation's writes seal under. Null off the worker —
+    /// the offline engines have no key material, and the surface still
+    /// validates and records the identity there.
+    shred: ?globals.ShredCaps = null,
+    /// This activation's tenant, for the resolve above.
+    shred_instance_id: []const u8 = "",
     /// Caller-owned effect accumulators.
     effects: PendingEffects = .{},
 };
