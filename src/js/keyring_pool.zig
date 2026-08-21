@@ -325,6 +325,17 @@ pub fn resolveSlot(
         else => return err,
     }
 
+    // A NEW identity from here on. This is the only place one is minted,
+    // and the only place the cap can be enforced without also capping a
+    // returning identity — which costs nothing and must stay free.
+    //
+    // Refused LOUDLY. The alternative every fallback offers is sealing
+    // under the tenant key instead, which silently downgrades erasure from
+    // per-identity to per-tenant at exactly the moment a customer is under
+    // load and least able to notice. An error the handler can see is the
+    // only honest answer.
+    if (!try admitNewIdentity(worker, slot)) return error.NewIdentityRateLimited;
+
     try ensurePool(worker, slot);
     const pool = if (slot.pool) |*p| p else return error.KeyringUnavailable;
 
@@ -528,4 +539,29 @@ pub fn reconcileDestroys(
         cursor = next;
     }
     return owed;
+}
+
+/// Is this tenant allowed one more NEW identity right now?
+///
+/// Capped because a new identity mints a key into a slot that is never
+/// reused — a permanent commitment no cleanup reclaims, landing on the
+/// keyring, the pool and the KMS together. Destroys are not capped here:
+/// they reclaim rather than commit.
+///
+/// The failure this guards against is a mistake, not abuse — a handler
+/// passing a request id or a per-call UUID as the shred key. That is
+/// always wrong, because a key used once can never be usefully shredded,
+/// and it turns every request into a permanent key. Identities are people
+/// or accounts, so they arrive at signup rate; a per-request id hits the
+/// wall almost at once, which is the point.
+fn admitNewIdentity(worker: anytype, slot: *deployment_cache.TenantSlot) !bool {
+    const lim = &worker.limiter;
+    const plan = slot.effectivePlan();
+    return lim.check(
+        slot.instance_id,
+        .new_identity,
+        plan.rate,
+        slot.plan_gen.load(.acquire),
+        @intCast(std.time.nanoTimestamp()),
+    );
 }
