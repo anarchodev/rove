@@ -527,6 +527,8 @@ var tag_list: std.ArrayList(TagPair) = .empty;
 /// state like `tag_list` beside it — these engines run one activation at
 /// a time.
 var shred_key: ?[]u8 = null;
+/// Destroys attempted this activation — the cap is engine state.
+var shred_destroys: usize = 0;
 
 fn tagsReset() void {
     if (tag_gen == host.generation) return;
@@ -580,6 +582,19 @@ pub const OfflineTag = struct {
         const dup = std.heap.c_allocator.dupe(u8, id) catch return false;
         if (shred_key) |old_id| std.heap.c_allocator.free(old_id);
         shred_key = dup;
+        return true;
+    }
+
+    pub fn destroyCount(_: OfflineTag) usize {
+        return shred_destroys;
+    }
+
+    /// Counted and validated, never performed: these engines hold no key
+    /// material. The surface must behave identically on every engine —
+    /// including the cap, so a handler that trips it offline trips it in
+    /// production too.
+    pub fn destroyShredKey(_: OfflineTag, _: []const u8) bool {
+        shred_destroys += 1;
         return true;
     }
 

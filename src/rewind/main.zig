@@ -192,6 +192,20 @@ fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.A
         node.deploy.enqueueDeployment(id_str, dep_id);
         return;
     }
+    // `_keys/dead/{slot}` — an identity's key destroyed. Every node does
+    // the same local work: evict now so a read stops resolving, and queue
+    // the shard rewrite because this is the pump thread and it may not
+    // fsync.
+    //
+    // The proposing node did this inline at the destroy (the observer does
+    // not fire there — the leader-skip returns before `notifyApply`), so
+    // between the two halves every node acts exactly once.
+    if (rjs.keyring_bind.parseDeadSlot(key)) |key_slot| {
+        if (node.deploy.tenant_files_map.get(id_str)) |slot| {
+            rjs.deployment_cache.evictAndQueueDestroy(slot, key_slot);
+        }
+        return;
+    }
     if (rjs.durable_wake.parseByTimeWhenNs(key)) |when_ns| {
         // The bridge mutex is NOT held during node.pump()'s apply (commit
         // hooks re-acquire it — bridge_pump.zig), so these bridge queries

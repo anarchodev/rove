@@ -257,6 +257,7 @@ pub const Dispatcher = struct {
         var shred_key_cell: ?[]u8 = null;
         defer if (shred_key_cell) |k| self.allocator.free(k);
         var shred_slot_cell: ?u64 = null;
+        var shred_destroys_cell: usize = 0;
 
         var state = globals.DispatchState{
             .allocator = self.allocator,
@@ -274,6 +275,7 @@ pub const Dispatcher = struct {
             .tags = &tags_buf,
             .shred_key = &shred_key_cell,
             .shred_slot = &shred_slot_cell,
+            .shred_destroys = &shred_destroys_cell,
             .shred = request.shred,
             .shred_instance_id = request.shred_instance_id,
             .readset = request.trace.readset,

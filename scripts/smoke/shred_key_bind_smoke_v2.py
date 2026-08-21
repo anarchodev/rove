@@ -50,18 +50,26 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # activation's raft entry carry the binding row.
 SRC = (
     'export function bind() {\n'
-    '  request.shredKey(request.query.split("=")[1] || "u_default");\n'
+    '  request.shredKey((request.query.match(/id=([^&]+)/) || [])[1] || "u_default");\n'
     '  kv.set("note", "v");\n'
     '  return "bound\\n";\n'
     '}\n'
     'export function secret() {\n'
-    '  request.shredKey(request.query.split("=")[1] || "u_default");\n'
+    '  request.shredKey((request.query.match(/id=([^&]+)/) || [])[1] || "u_default");\n'
     '  kv.set("card", "tuna-casserole-9f3a");\n'
     '  return "readback:" + kv.get("card") + "\\n";\n'
     '}\n'
     'export function plain() {\n'
     '  kv.set("plainrow", "pilchard-control-2b7e");\n'
     '  return "plain\\n";\n'
+    '}\n'
+    'export function erase() {\n'
+    '  request.shredKey.destroy((request.query.match(/id=([^&]+)/) || [])[1] || "u_default");\n'
+    '  return "erased\\n";\n'
+    '}\n'
+    'export function peek() {\n'
+    '  const v = kv.get("card");\n'
+    '  return (v === null ? "absent" : "present:" + v) + "\\n";\n'
     '}\n'
     'export function badId() {\n'
     '  try { request.shredKey(""); return "accepted\\n"; }\n'
@@ -199,7 +207,64 @@ def main() -> int:
               "the grep found nothing at all, so the check above proves nothing"
               if not found_control else f"found in {len(found_control)} file(s)")
 
-        print("step 8: an empty id is refused, not read as 'no identity'")
+        before_per_node = [sum(f.stat().st_size for f in shard_files(d)) for d in dirs]
+        print("step 8: destroy the identity — the key is erased on EVERY node")
+        # The whole scheme, end to end. The value was sealed under this
+        # identity's key; destroying the key must make it unreadable
+        # everywhere, permanently, and the read must go not-found rather
+        # than returning ciphertext.
+        r = c.get("acme", "/?fn=erase&id=u_gamma")
+        check("destroy → 200", r.status == 200 and "erased" in r.body,
+              f"got {r.status} {r.body!r}")
+
+        # The read the customer sees: absent, not ciphertext, not an error.
+        deadline = time.time() + 30
+        readback = None
+        while time.time() < deadline:
+            readback = c.get("acme", "/?fn=peek&id=u_gamma")
+            if "absent" in readback.body:
+                break
+            time.sleep(0.5)
+        check("the sealed row now reads ABSENT", "absent" in (readback.body or ""),
+              f"got {readback.status} {readback.body!r}")
+        if "absent" not in (readback.body or ""):
+            c.dump_node_log(grep=["shred", "keyring", "destroy", "bind", "error", "warn"])
+
+        print("step 9: the key is gone from the SHARDS, not just from memory")
+        # An in-memory eviction would satisfy step 8 while leaving the key
+        # on disk — erased where nobody looks, intact where it matters. So
+        # look at the bytes: the shard files must stop containing it.
+        # Verified by size, since the key itself is unguessable: a shard
+        # rewritten without an entry is 48 bytes shorter.
+        # Per node against ITS OWN pre-destroy size. A global `any(...)`
+        # would be satisfied by a node that never held a shard at all,
+        # which is a pass for entirely the wrong reason.
+        #
+        # And wait for EVERY holder: the proposing node destroys inline,
+        # the others when the tombstone applies and their driver sweeps,
+        # so "some node shrank" is just a race against the leader.
+        ENTRY = 48  # slot(8) + key(32) + created(8)
+        holders_idx = [i for i, b in enumerate(before_per_node) if b > 0]
+        deadline = time.time() + 60
+        deltas = []
+        while time.time() < deadline:
+            now = [sum(f.stat().st_size for f in shard_files(d)) for d in dirs]
+            deltas = [before_per_node[i] - now[i] for i in holders_idx]
+            if deltas and all(d == ENTRY for d in deltas):
+                break
+            time.sleep(0.5)
+
+        # EXACTLY one entry, on every node that held the shard. "Smaller"
+        # alone is not enough: a follower whose in-memory map was behind
+        # the file would write an almost-empty shard over the real one and
+        # still look "smaller" — erasing every key the leader had pushed
+        # instead of the single slot asked for. That is a real bug this
+        # assertion caught, and the difference is 48 bytes versus 196 KB.
+        check("every holder lost EXACTLY one entry, not its whole shard",
+              bool(deltas) and all(d == ENTRY for d in deltas),
+              f"deltas={deltas} (expected {ENTRY} on each of {len(holders_idx)} holders)")
+
+        print("step 10: an empty id is refused, not read as 'no identity'")
         r = c.get("acme", "/?fn=badId")
         check("shredKey('') throws TypeError", "refused:TypeError" in r.body,
               f"got {r.status} {r.body!r}")

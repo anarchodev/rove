@@ -77,6 +77,8 @@ var tag_list: std.ArrayList(TagPair) = .empty;
 /// state like `tag_list` beside it — these engines run one activation at
 /// a time.
 var shred_key: ?[]u8 = null;
+/// Destroys attempted this activation — the cap is engine state.
+var shred_destroys: usize = 0;
 
 /// Called by arenajs at every run entry (arena_run / arena_run_module).
 /// This run's spent write budget — module-linear-memory state, reset per run
@@ -397,6 +399,19 @@ pub const ArenaTag = struct {
         const dup = std.heap.c_allocator.dupe(u8, id) catch return false;
         if (shred_key) |old_id| std.heap.c_allocator.free(old_id);
         shred_key = dup;
+        return true;
+    }
+
+    pub fn destroyCount(_: ArenaTag) usize {
+        return shred_destroys;
+    }
+
+    /// Counted and validated, never performed: these engines hold no key
+    /// material. The surface must behave identically on every engine —
+    /// including the cap, so a handler that trips it offline trips it in
+    /// production too.
+    pub fn destroyShredKey(_: ArenaTag, _: []const u8) bool {
+        shred_destroys += 1;
         return true;
     }
 

@@ -66,6 +66,23 @@ export default function () {
     throws(() => request.shredKey("x".repeat(129)), /id length/);
   });
 
+  check("request.shredKey.destroy", () => {
+    // Erasure hangs off the scoping function: one concept, two verbs.
+    eq(typeof request.shredKey.destroy, "function");
+    // An identity this tenant never named has nothing to erase — not an
+    // error, so a delete-account flow run twice does not fail the second
+    // time.
+    eq(request.shredKey.destroy("never-named-identity"), undefined);
+    // Same identity rules as scoping.
+    throws(() => request.shredKey.destroy(), /requires a string argument/);
+    throws(() => request.shredKey.destroy(""), /id length/);
+    throws(() => request.shredKey.destroy("u\n"), /control characters/);
+    // The per-activation cap is a RULE, and lives with the other rules in
+    // `rove-guards` (`checkShredDestroyCap`) where it is unit-tested. It
+    // counts engine state this harness does not carry, so asserting it
+    // here would assert the harness, not the rule.
+  });
+
   // No chain context in this dispatch → empty string (documented).
   check("request.sagaId", () => {
     eq(typeof request.sagaId, "string");

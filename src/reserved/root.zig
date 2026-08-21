@@ -403,6 +403,24 @@ pub const KV_KEY_MAX: usize = 256;
 /// breaks handlers that already shipped.
 pub const SHRED_KEY_MAX: usize = 128;
 
+/// How many identities one activation may destroy.
+///
+/// A safety bound, not a resource one — erasure is free in storage terms
+/// and permanent in every other. The cap exists because a handler-facing
+/// destroy means a loop with a bug can erase customer data irreversibly,
+/// and nothing downstream can undo it. Small enough that a runaway loop
+/// stops immediately; large enough for the real case of one person
+/// holding a handful of related identities.
+///
+/// Distinct from the cap on NEW identities (#609), which is a resource
+/// bound: minting is a permanent commitment no cleanup reclaims, while
+/// destroying reclaims nothing and commits nothing.
+///
+/// Per activation rather than per tenant per hour because that needs no
+/// durable counter and still bounds the failure that matters — a handler
+/// iterating a list it should not have.
+pub const SHRED_DESTROY_MAX_PER_ACTIVATION: usize = 8;
+
 /// Marks a kv value that is SEALED under a per-identity key.
 ///
 /// A CONTRACT, and it lives here for the same reason the kv caps do:
