@@ -766,7 +766,6 @@ pub const DispatchState = struct {
         tenant_id: []const u8,
         corr: []const u8,
     ) blob_sessions_mod.Error!blob_sessions_mod.Sealed = null,
-    blob_session_ctx: ?*anyopaque = null,
     /// Plan-resolved rate caps + plan generation for `instance_id` (from its
     /// `TenantSlot`). The `email.send` rate check sizes its bucket from these
     /// (docs/architecture/control-plane.md Lever 1). Defaults = free/default caps on paths
@@ -802,7 +801,6 @@ pub const DispatchState = struct {
         send_id: []const u8,
         event_json: []const u8,
     ) bool = null,
-    resume_if_bound_ctx: ?*anyopaque = null,
 
     /// Outbound fetch / libcurl multi
     /// (`docs/architecture/configuration-and-network.md`): cancel-fetch
@@ -815,7 +813,6 @@ pub const DispatchState = struct {
         ctx: *anyopaque,
         id: []const u8,
     ) void = null,
-    cancel_fetch_ctx: ?*anyopaque = null,
 
     /// §2.6 durable-wake: trampoline backing `__rove_set_wake(when_ns)`.
     /// Sets THIS tenant's single next-fire watermark on its slot
@@ -830,6 +827,9 @@ pub const DispatchState = struct {
         tenant_id: []const u8,
         when_ns: i64,
     ) void = null,
+    /// The worker the hooks above run against — see
+    /// `Request.Trampolines.worker_ctx`.
+    worker_ctx: ?*anyopaque = null,
     set_wake_ctx: ?*anyopaque = null,
 
     /// §2.6 durable-wake: trampoline backing
@@ -845,7 +845,6 @@ pub const DispatchState = struct {
         ctx: *anyopaque,
         input: FireWakeInput,
     ) bool = null,
-    fire_wake_ctx: ?*anyopaque = null,
 
     /// The entity owning the chain this dispatch runs against —
     /// what the binding registers under `fetch_id` when `bind:

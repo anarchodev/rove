@@ -247,7 +247,7 @@ pub fn jsFireWake(
         // rather than a retained one.
         return globals.js_false;
     };
-    const fn_ctx = state.fire_wake_ctx orelse return globals.js_false;
+    const fn_ctx = state.worker_ctx orelse return globals.js_false;
     const fired = fn_ptr(fn_ctx, input);
     if (!fired) {
         _ = c.JS_ThrowInternalError(ctx, "__rove_fire_wake: no worker registered to receive the wake");

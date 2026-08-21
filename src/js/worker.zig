@@ -2500,6 +2500,45 @@ pub fn Worker(comptime opts: Options) type {
             try self.applyTargetWrite(allocator, inst, target_id, &ws);
         }
 
+        /// Every worker-backed trampoline, wired from ONE place.
+        ///
+        /// This was six hand-maintained struct literals: five byte-identical
+        /// copies of the ordinary worker set, and one disjoint scheduler-tick
+        /// set that wired only the wake pair. A seventh hook meant seven
+        /// edits, and a path that missed one got a null trampoline — which
+        /// every binding reads as "not supported" and answers with a throw or
+        /// a silent false. That is the failure `adminPlatformCaps` already
+        /// exists to prevent, one cluster over: *"a resume that forgot one
+        /// silently broke privileged platform writes."*
+        ///
+        /// `wake_slot` is the one difference that was real. The durable-wake
+        /// pair is for the baked `__system/scheduler_tick` fire path and
+        /// needs the tenant's slot, so a caller states it rather than having
+        /// it inferred — non-null on that path, null everywhere else, which
+        /// keeps `__rove.wake.*` off activations that have no business
+        /// arming the tenant's next-fire watermark.
+        ///
+        /// The worker hooks are now set on the scheduler path too, where they
+        /// were previously absent. That was omission rather than policy: each
+        /// is independently gated (`is_system_module`, or the binding throws
+        /// when the session is missing), so the effect is that a baked module
+        /// which reaches for one gets it instead of a confusing refusal.
+        pub fn trampolines(
+            self: *Self,
+            wake_slot: ?*deployment_cache.TenantSlot,
+        ) dispatcher_mod.Trampolines {
+            return .{
+                .worker_ctx = @ptrCast(self),
+                .resume_if_bound = &Self.resumeIfBoundTrampoline,
+                .cancel_fetch = &Self.cancelFetchTrampoline,
+                .blob_write = &Self.blobWriteTrampoline,
+                .blob_seal = &Self.blobSealTrampoline,
+                .fire_wake = if (wake_slot != null) &Self.fireWakeTrampoline else null,
+                .set_wake = if (wake_slot != null) &deployment_cache.TenantSlot.setWakeTrampoline else null,
+                .set_wake_ctx = if (wake_slot) |sl| @ptrCast(sl) else null,
+            };
+        }
+
         /// The admin-handler platform capability bundle for `inst` —
         /// `null` for non-admin instances. ONE source of truth so every
         /// DispatchState construction site (inbound + every resume path:

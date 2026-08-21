@@ -236,7 +236,7 @@ pub fn jsBlobWrite(
     };
 
     const total = write_fn(
-        state.blob_session_ctx.?,
+        state.worker_ctx.?,
         state.instance_id,
         state.saga_id,
         bytes,
@@ -308,7 +308,7 @@ pub fn jsBlobSeal(
     }
 
     const sealed = seal_fn(
-        state.blob_session_ctx.?,
+        state.worker_ctx.?,
         state.instance_id,
         state.saga_id,
     ) catch |err| {
