@@ -1112,7 +1112,6 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "console.js", CONSOLE_JS);
     evalSnippet(ctx, "crypto.js", CRYPTO_JS);
     evalSnippet(ctx, "http.js", HTTP_JS);
-    evalSnippet(ctx, "platform.js", PLATFORM_JS);
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
     // request.js needs TextDecoder (above): builds the shared
     // `__rove_request_proto` whose `text`/`json` accessors derive from
@@ -1126,6 +1125,11 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // package). webhook.js captures it below, before the `_harden.js`
     // `_system` delete. After base64/crypto/kv + time (its deps).
     evalSnippet(ctx, "schedule.js", SCHEDULE_JS);
+    // AFTER schedule.js: `platform.dispatch` captures the private
+    // `_system.sched` for its watchdog, the way webhook.js does. A capture
+    // that ran first would silently bind `undefined`, and the shim would
+    // fail only when someone actually dispatched.
+    evalSnippet(ctx, "platform.js", PLATFORM_JS);
     // The after.* connection wake triggers (canonical) + the on.* alias.
     evalSnippet(ctx, "after.js", AFTER_JS);
     // Connection output effects (`stream.*`).

@@ -118,6 +118,14 @@ const MODULES = [_]struct {
         .wake_targetable = true,
     },
     .{
+        // rove#691: the wake-fired half of `platform.dispatch` — crash
+        // recovery and the not-leader retry for a platform action placed in
+        // another tenant's scope.
+        .path = "__system/dispatch_fire.mjs",
+        .src = @embedFile("builtin_dispatch_fire_mjs"),
+        .wake_targetable = true,
+    },
+    .{
         // §2.6 durable scheduled wake (durable-wake P1; docs/architecture/effects-and-handlers.md).
         .path = "__system/scheduler_tick.mjs",
         .src = @embedFile("builtin_scheduler_tick_mjs"),
@@ -307,7 +315,7 @@ test "isWakeTargetable: only the three wake-driven jobs, and only by exact name"
     // The legitimate wake targets: a scheduled/retried send, the export
     // job's watchdog, and the cron recurrence engine. Both spellings — the
     // shims arm the extensionless form, the registry holds the `.mjs` one.
-    for ([_][]const u8{ "webhook_fire", "export_run", "cron_tick" }) |name| {
+    for ([_][]const u8{ "webhook_fire", "export_run", "cron_tick", "dispatch_fire" }) |name| {
         var bare_buf: [64]u8 = undefined;
         const bare = try std.fmt.bufPrint(&bare_buf, "__system/{s}", .{name});
         try testing.expect(isWakeTargetable(bare));
@@ -467,9 +475,13 @@ test "every wake-targetable module is one the platform actually arms" {
     // arm `export_run`; the cron package and cron_tick arm `cron_tick`). If a
     // module stops being armed, it should lose the flag rather than keep a
     // standing invitation.
+    //
+    // `dispatch_fire` is the fourth: `platform.dispatch` arms it by name for
+    // the crash-recovery watchdog, and the module re-arms itself per attempt
+    // (rove#691).
     var count: usize = 0;
     for (MODULES) |m| {
         if (m.wake_targetable) count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 4), count);
 }

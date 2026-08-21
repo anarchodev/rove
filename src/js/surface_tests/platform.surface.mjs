@@ -32,6 +32,23 @@ export default function () {
     throws(() => platform.instances.deployStarter("acme"), NOT_ADMIN);
   });
 
+  check("platform.dispatch", () => {
+    // The gate here is worth stating, because this verb is composed rather
+    // than native: `dispatch` writes a `_dispatch/owed/` marker and arms a
+    // scheduler wake, so without an admin check a customer tenant could arm
+    // wakes for a dispatch the router would refuse anyway. It gates by
+    // RESOLVING the target through `platform.scope`, which is natively
+    // enforced — so the refusal a customer sees is the same one every other
+    // `platform.*` verb gives, from the same place.
+    throws(() => platform.dispatch("acme", "__system/release", { ctx: { a: 1 } }), NOT_ADMIN);
+    // Argument validation runs BEFORE the gate, so a malformed call is a
+    // TypeError rather than a confusing admin refusal — and a customer
+    // probing this surface learns nothing about which tenants exist.
+    throws(() => platform.dispatch("", "__system/release"), /tenant must be a non-empty string/);
+    throws(() => platform.dispatch("acme", "handlers/mine.mjs"), /must be a baked/);
+    throws(() => platform.dispatch("acme", "__system/release", { actor: "root" }), /actor must be one of/);
+  });
+
   check("platform.releases.publish", () => {
     throws(() => platform.releases.publish("acme", "0123456789abcdef"), NOT_ADMIN);
   });

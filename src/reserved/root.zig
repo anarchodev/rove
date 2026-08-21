@@ -60,6 +60,10 @@ const std = @import("std");
 ///                         `_config/{lib}/{name}.json` in the
 ///                         customer's tree; mirror runs on release.
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
+///   `_dispatch/`        → `platform.dispatch` owed markers
+///                         (`_dispatch/owed/{id}`) + their scheduler
+///                         idempotency keys. Shim-writable — see
+///                         `SHIM_WRITABLE_PREFIXES`.
 ///   `_callback/`        → reserved receipt prefix (sends resolve via
 ///                         in-memory Completions + `_send/proof/`, not
 ///                         `_callback/` rows). Stays reserved so customer
@@ -96,6 +100,7 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_audit/",
     "_config/",
     "_deploy/",
+    "_dispatch/",
     "_callback/",
     "_keys/",
     "_log/",
@@ -135,6 +140,10 @@ pub const SHIM_WRITABLE_PREFIXES = [_][]const u8{
     // `_sched/` and `_send/`, and `__system/export_run` treats the record
     // defensively (unparseable ⇒ drop the chain rather than re-fire).
     "_export/",
+    // `platform.dispatch`'s owed marker (globals/platform.js) — the same
+    // posture as `_send/`: platform-managed, written from handler context by
+    // the shim, and only ever the dispatching tenant's own bookkeeping.
+    "_dispatch/",
     "_send/",
     "_blob/",
     "_sched/",

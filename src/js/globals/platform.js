@@ -23,6 +23,15 @@
   // cross-tenant streamed upload (extra target + ctx args, admin-gated).
   const sysBlobReceive = _system.blob.receive;
   const sysBlobPresign = _system.blob.presign;
+  // The durable scheduler core (globals/schedule.js) installs the private
+  // `_system.sched`; capture it before `_harden.js` deletes `_system`, the
+  // same way webhook.js does, so `platform.dispatch`'s watchdog keeps working
+  // post-harden without exposing an ambient `schedule` to customers.
+  const sysSched = _system.sched;
+
+  // One dispatch attempt's outside bound plus grace. Mirrored in
+  // `__system/dispatch_fire.mjs` (its per-attempt re-arm) — keep in sync.
+  const DISPATCH_WATCHDOG_MS = 40000;
 
   // Fail loud on a retired option spelling. Each shim keeps its own copy —
   // the helper in after.js is inside that file's IIFE. Silence here is worse
@@ -363,6 +372,98 @@
       publish(tenantId, depId) {
         return sys.releases.publish(tenantId, depId);
       },
+    },
+
+    /**
+     * Run a platform action in another tenant's scope — durably.
+     *
+     * The primitive that unfuses *whose code runs* from *whose data it runs
+     * against* (rove#691). `module` is the platform's own baked
+     * `__system/…` code; it executes on the worker anchoring `tenant`, under
+     * that tenant's lease, proposing into that tenant's own raft group. So
+     * the write takes a position in that tenant's activation order, instead
+     * of arriving from another tenant's raft log with no order relative to
+     * it — and it appears in that tenant's log, because it changed that
+     * tenant's data.
+     *
+     * **Webhook semantics, not a call.** This returns as soon as the intent
+     * is durable; it does not wait for the action to run. The activation is
+     * a NEW SAGA ROOT — an arm that crossed the durability boundary roots
+     * its own saga (`handler-shape.md` §3.2), and a parent in another
+     * tenant's namespace is not addressable from this one anyway.
+     *
+     * **At-least-once.** The marker below is the retry: the activation lands
+     * on whichever worker anchors `tenant`, and that node may not lead the
+     * target's raft group, in which case the propose faults and the attempt
+     * is gone. A watchdog re-fires it. `module` must therefore be idempotent
+     * — it is platform code, so that is a contract we hold, not a hope.
+     *
+     * Admin-only, like the rest of `platform.*`.
+     *
+     * @param {string} tenant - Target instance id — the SCOPE.
+     * @param {string} module - Baked `__system/…` module path.
+     * @param {object} [opts]
+     * @param {*} [opts.ctx] - Argument payload, JSON-serialisable.
+     * @param {string} [opts.fn] - Named export; default export when omitted.
+     * @param {"tenant_user"|"operator"|"system"} [opts.actor="system"] -
+     *   WHO caused this, as the target's log will record it. Three values
+     *   because "the dashboard did it" hides the split a reader most wants:
+     *   the tenant's own user acting through the admin app, a platform
+     *   operator acting on their data, or an automated sweep with no human.
+     *   Never the individual operator.
+     * @returns {string} The dispatch id — the `_dispatch/owed/{id}` marker.
+     * @example
+     * platform.dispatch("acme", "__system/release", {
+     *   ctx: { dep_id: depId }, actor: "tenant_user",
+     * });
+     */
+    dispatch(tenant, module, opts) {
+      opts = opts || {};
+      _rejectRenamed("platform.dispatch", opts, { on: "fn", context: "ctx" });
+      if (typeof tenant !== "string" || !tenant) {
+        throw new TypeError("platform.dispatch: tenant must be a non-empty string");
+      }
+      if (typeof module !== "string" || !module.startsWith("__system/")) {
+        throw new TypeError("platform.dispatch: module must be a baked `__system/…` path");
+      }
+      const actor = opts.actor === undefined ? "system" : opts.actor;
+      if (actor !== "tenant_user" && actor !== "operator" && actor !== "system") {
+        throw new TypeError("platform.dispatch: actor must be one of tenant_user, operator, system");
+      }
+
+      // Admin gate, and target existence, in one native call. Every other
+      // `platform.*` verb is gated in Zig on `state.platform`; this one
+      // composes over kv + the scheduler + a later `__rove.dispatch`, so
+      // without this a customer tenant could write its own `_dispatch/owed/`
+      // rows and arm wakes for a dispatch the router would refuse anyway.
+      // Reusing the enforced boundary beats a JS-side check that a customer
+      // handler shares a context with: `sys.scope` throws
+      // "platform is only available on the admin handler" for a non-admin
+      // handler, and `Error{code:"InstanceNotFound"}` for an unknown tenant.
+      sys.scope(tenant);
+
+      const id = crypto.randomUUID();
+      const marker = {
+        tenant: tenant,
+        module: module,
+        ctx: opts.ctx === undefined ? null : opts.ctx,
+        fn: typeof opts.fn === "string" ? opts.fn : null,
+        actor: actor,
+      };
+
+      // The marker and its watchdog ride THIS activation's writeset, so the
+      // intent and its recovery commit together or not at all. Written
+      // before the attempt for the same reason `webhook.send` writes its
+      // marker before firing: an attempt that escaped a rolled-back
+      // activation would be an effect the cluster never agreed to.
+      kv.set("_dispatch/owed/" + id, JSON.stringify(marker));
+      sysSched(
+        { in: DISPATCH_WATCHDOG_MS },
+        "__system/dispatch_fire",
+        { id: id },
+        { key: "_dispatch/" + id },
+      );
+      return id;
     },
 
     // Root-token auth is NOT here. The operator-root verdict is
