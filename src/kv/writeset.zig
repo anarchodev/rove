@@ -82,6 +82,25 @@ pub const WriteSet = struct {
         try self.ops.append(self.allocator, .{ .put = .{ .key = k, .value = v } });
     }
 
+    /// Swap a `put`'s value for `value`, copying it into owned storage.
+    ///
+    /// The old copy stays in `owned` and is freed at `deinit` rather than
+    /// immediately: `truncateTo` unwinds `owned` by LENGTH, so removing an
+    /// entry from the middle would make every captured boundary past it
+    /// free the wrong buffers. A superseded value is a few dozen bytes
+    /// held until the batch ends; a mis-aimed free is a use-after-free.
+    ///
+    /// Written for sealing, where a value is produced only once the
+    /// activation's identity is final and so cannot be known at `addPut`.
+    pub fn replacePutValue(
+        self: *WriteSet,
+        op: *Op,
+        value: []const u8,
+    ) !void {
+        const v = try self.copyBytes(value);
+        op.put.value = v;
+    }
+
     pub fn addDelete(self: *WriteSet, key: []const u8) !void {
         const k = try self.copyBytes(key);
         errdefer self.popOwned();

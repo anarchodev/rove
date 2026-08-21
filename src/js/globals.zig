@@ -340,6 +340,54 @@ pub const ShredCaps = struct {
         txn: *kv_mod.TrackedTxn,
         writeset: *kv_mod.WriteSet,
     ) anyerror!u64 = null,
+
+    /// Seal every customer value this activation wrote, under `slot`.
+    ///
+    /// Runs once the handler has returned and the activation's ops are
+    /// final — which is what makes LATE binding work: the identity in
+    /// force at that moment is the one the writes seal under, no matter
+    /// where in the handler it was named.
+    ///
+    /// Rewrites the ops in place from `ws_base` (the writeset is
+    /// batch-scoped; that slice is this activation's) AND re-puts each
+    /// through the txn, for the same reason the binding does both — one
+    /// without the other leaves the leader holding plaintext where its
+    /// followers hold ciphertext.
+    seal_writes: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        instance_id: []const u8,
+        slot: u64,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+        ws_base: usize,
+    ) anyerror!void = null,
+
+    /// Open a value read back from the store.
+    ///
+    /// The caller passes whatever the store held; this decides whether it
+    /// was sealed at all, and if so whether this node can still open it.
+    open_value: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        instance_id: []const u8,
+        value: []const u8,
+    ) anyerror!OpenedValue = null,
+};
+
+/// What a stored value turned out to be.
+pub const OpenedValue = union(enum) {
+    /// Not sealed. The bytes are the value.
+    plaintext,
+    /// Sealed and opened; caller frees.
+    opened: []u8,
+    /// Sealed, and its key is gone. The live read answers ABSENT —
+    /// "erased" reads like "absent" to everything downstream.
+    shredded,
+    /// Sealed, and this node cannot say whether the key is gone or
+    /// merely missing here. Never absent: a node that is short of key
+    /// material must not report an erasure it cannot stand behind.
+    unverified,
 };
 
 pub const PlatformCaps = struct {

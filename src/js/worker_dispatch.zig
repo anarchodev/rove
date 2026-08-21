@@ -2622,6 +2622,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .shred = .{
                 .ctx = @ptrCast(worker),
                 .resolve_slot = &@TypeOf(worker.*).resolveShredSlotTrampoline,
+                .seal_writes = &@TypeOf(worker.*).sealShredWritesTrampoline,
+                .open_value = &@TypeOf(worker.*).openShredValueTrampoline,
             },
             .shred_instance_id = scope_inst.id,
         };

@@ -54,6 +54,15 @@ SRC = (
     '  kv.set("note", "v");\n'
     '  return "bound\\n";\n'
     '}\n'
+    'export function secret() {\n'
+    '  request.shredKey(request.query.split("=")[1] || "u_default");\n'
+    '  kv.set("card", "tuna-casserole-9f3a");\n'
+    '  return "readback:" + kv.get("card") + "\\n";\n'
+    '}\n'
+    'export function plain() {\n'
+    '  kv.set("plainrow", "pilchard-control-2b7e");\n'
+    '  return "plain\\n";\n'
+    '}\n'
     'export function badId() {\n'
     '  try { request.shredKey(""); return "accepted\\n"; }\n'
     '  catch (e) { return "refused:" + e.constructor.name + "\\n"; }\n'
@@ -141,6 +150,54 @@ def main() -> int:
         r = c.get("acme", "/?fn=bind&id=u_alpha")
         check("returning identity → 200", r.status == 200 and "bound" in r.body,
               f"got {r.status} {r.body!r}")
+
+        print("step 7: the value is SEALED at rest, and reads back plaintext")
+        # Round-tripping proves nothing on its own — a no-op seal
+        # round-trips too. So: write a distinctive marker under an
+        # identity, then grep the tenant's store files for it. Finding it
+        # would mean the bytes went to disk in the clear.
+        r = c.get("acme", "/?fn=secret&id=u_gamma")
+        check("sealed write → 200", r.status == 200 and "readback:" in r.body,
+              f"got {r.status} {r.body!r}")
+        check("the handler reads its own value back as PLAINTEXT",
+              "readback:tuna-casserole-9f3a" in r.body, f"got {r.body!r}")
+
+        marker = b"tuna-casserole-9f3a"
+        on_disk = []
+        for d in c.data_dirs:
+            for f in d.rglob("*"):
+                if not f.is_file():
+                    continue
+                try:
+                    if marker in f.read_bytes():
+                        on_disk.append(str(f))
+                except OSError:
+                    pass
+        check("the plaintext is NOWHERE on disk", not on_disk,
+              f"found in {on_disk[:3]}")
+
+        # CONTROL. Without it, "not found on disk" is equally consistent
+        # with a grep that cannot find anything — wrong directory, value
+        # not flushed yet, compressed page. So write an UNSEALED value
+        # through the same path and require that the grep DOES find it.
+        # Only if this passes does the assertion above mean sealing.
+        r = c.get("acme", "/?fn=plain")
+        check("control write → 200", r.status == 200, f"got {r.status} {r.body!r}")
+        control = b"pilchard-control-2b7e"
+        found_control = []
+        for d in c.data_dirs:
+            for f in d.rglob("*"):
+                if not f.is_file():
+                    continue
+                try:
+                    if control in f.read_bytes():
+                        found_control.append(str(f))
+                except OSError:
+                    pass
+        check("CONTROL: an unsealed value IS findable on disk",
+              bool(found_control),
+              "the grep found nothing at all, so the check above proves nothing"
+              if not found_control else f"found in {len(found_control)} file(s)")
 
         print("step 8: an empty id is refused, not read as 'no identity'")
         r = c.get("acme", "/?fn=badId")
