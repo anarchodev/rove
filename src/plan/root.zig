@@ -46,6 +46,26 @@ pub const RateLimitCaps = struct {
     /// can't bypass it. Deferred fires — scheduled sends, retries, anything
     /// a baked `__system/*` module issues — count too: being
     /// platform-issued is not evidence the send was admitted.
+    /// Burst cap on NEW identities named by `request.shredKey` — the
+    /// footgun bound.
+    ///
+    /// A new identity mints a key, and slots are never reused, so this is
+    /// a PERMANENT commitment no later cleanup reclaims: it inflates the
+    /// keyring, the pool and the KMS together, and the KMS is the one
+    /// component with no backups. Destroys are free by comparison and are
+    /// not capped here.
+    ///
+    /// The realistic failure is a mistake rather than abuse — a handler
+    /// passing a request id or a per-call UUID as the shred key. That is
+    /// always wrong (a key used once can never be usefully shredded) and
+    /// it turns every request into a permanent key.
+    ///
+    /// Sized for the real shape: identities are PEOPLE or accounts, so
+    /// they arrive at signup rate, not request rate. A burst of 60 with
+    /// one per minute sustained absorbs an import while making a
+    /// per-request UUID hit the wall almost immediately.
+    new_identity_capacity: u32 = 60,
+    new_identity_refill_per_sec: u32 = 1,
     outbound_capacity: u32 = 100,
     /// 10/sec → 600/min sustained — well under any sane provider quota.
     outbound_refill_per_sec: u32 = 10,

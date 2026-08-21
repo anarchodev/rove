@@ -44,6 +44,11 @@ const plan_mod = @import("rove-plan");
 pub const Action = enum(u8) {
     request,
     outbound,
+    /// NEW identities named by `request.shredKey` — never destroys, which
+    /// are free. Each one mints a key into a slot that is never reused, so
+    /// admitting it is a permanent commitment; refusing it costs the
+    /// handler an error it can see and fix.
+    new_identity,
     /// Log-byte ingest rate — the ingest-rate guardrail
     /// (docs/strategy/pricing-model.md, throttle log-byte ingest RATE):
     /// bytes are the cost currency, so this bucket is denominated in RAW
@@ -208,6 +213,11 @@ const InstanceBuckets = struct {
         bs[@intFromEnum(Action.log_bytes)] = TokenBucket.init(
             caps.log_burst_bytes,
             caps.log_refill_bytes_per_sec,
+            now_ns,
+        );
+        bs[@intFromEnum(Action.new_identity)] = TokenBucket.init(
+            caps.new_identity_capacity,
+            caps.new_identity_refill_per_sec,
             now_ns,
         );
         const daily = sustainedOutboundBudget(caps);
@@ -567,6 +577,49 @@ test "limiter: outbound_sustained is a day-scale ceiling derived from the plan's
     try testing.expect(try rl.checkN("acme", .outbound_sustained, 50, caps, 0, 100 * std.time.ns_per_s));
     // But nowhere near the full budget again.
     try testing.expect(!(try rl.checkN("acme", .outbound_sustained, 8640, caps, 0, 101 * std.time.ns_per_s)));
+}
+
+test "limiter: a per-request UUID as a shred key hits the wall almost at once" {
+    // The failure this cap exists for, and it is a MISTAKE rather than
+    // abuse: a handler passing a request id or per-call UUID to
+    // `request.shredKey`. Always wrong — a key used once can never be
+    // usefully shredded — and every call would mint a permanent key into
+    // a slot that is never reused.
+    const caps = RateLimitCaps{};
+    var lim = RateLimiter.init(testing.allocator, caps);
+    defer lim.deinit();
+    var now: i64 = 0;
+    var admitted: u32 = 0;
+    // Same instant, so refill contributes nothing: pure burst.
+    var i: u32 = 0;
+    while (i < caps.new_identity_capacity * 4) : (i += 1) {
+        if (try lim.check("t", .new_identity, caps, 1, now)) admitted += 1;
+    }
+    try testing.expectEqual(caps.new_identity_capacity, admitted);
+    // And the next one is refused rather than silently downgraded.
+    try testing.expect(!try lim.check("t", .new_identity, caps, 1, now));
+
+    // Identities arrive at signup rate, not request rate, so the bucket
+    // recovers on a human timescale.
+    now += std.time.ns_per_s * 60;
+    try testing.expect(try lim.check("t", .new_identity, caps, 1, now));
+}
+
+test "limiter: the new-identity cap is independent of the request cap" {
+    // A tenant serving traffic normally must not have its identities
+    // throttled by request volume, nor the reverse — they bound different
+    // things, and one is permanent while the other is not.
+    const caps = RateLimitCaps{};
+    var lim = RateLimiter.init(testing.allocator, caps);
+    defer lim.deinit();
+    const now: i64 = 0;
+    var i: u32 = 0;
+    while (i < caps.new_identity_capacity) : (i += 1) {
+        _ = try lim.check("t", .new_identity, caps, 1, now);
+    }
+    try testing.expect(!try lim.check("t", .new_identity, caps, 1, now));
+    // Requests still flow.
+    try testing.expect(try lim.check("t", .request, caps, 1, now));
 }
 
 test "limiter: outbound_sustained never undercuts a burst-only plan" {

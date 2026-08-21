@@ -71,6 +71,11 @@ SRC = (
     '  const v = kv.get("card");\n'
     '  return (v === null ? "absent" : "present:" + v) + "\\n";\n'
     '}\n'
+    'export function burst() {\n'
+    '  const n = Number((request.query.match(/n=([0-9]+)/) || [])[1] || 0);\n'
+    '  try { request.shredKey("burst-" + n); return "ok\\n"; }\n'
+    '  catch (e) { return "refused\\n"; }\n'
+    '}\n'
     'export function badId() {\n'
     '  try { request.shredKey(""); return "accepted\\n"; }\n'
     '  catch (e) { return "refused:" + e.constructor.name + "\\n"; }\n'
@@ -264,7 +269,26 @@ def main() -> int:
               bool(deltas) and all(d == ENTRY for d in deltas),
               f"deltas={deltas} (expected {ENTRY} on each of {len(holders_idx)} holders)")
 
-        print("step 10: an empty id is refused, not read as 'no identity'")
+        print("step 10: a per-request identity hits the new-identity cap")
+        # The footgun the cap exists for: a handler passing something
+        # per-call (a UUID, a request id) as the shred key. Every call
+        # would mint a PERMANENT key into a slot that is never reused.
+        #
+        # Refused loudly, never downgraded — the alternative is sealing
+        # under the tenant key, which quietly turns per-identity erasure
+        # into per-tenant at the moment a tenant is busiest.
+        refused_at = None
+        for n in range(140):
+            rb = c.get("acme", f"/?fn=burst&n={n}")
+            if "refused" in rb.body:
+                refused_at = n
+                break
+        check("a distinct identity per request is eventually REFUSED",
+              refused_at is not None,
+              f"refused at call {refused_at}" if refused_at is not None
+              else "never refused in 140 calls")
+
+        print("step 11: an empty id is refused, not read as 'no identity'")
         r = c.get("acme", "/?fn=badId")
         check("shredKey('') throws TypeError", "refused:TypeError" in r.body,
               f"got {r.status} {r.body!r}")
