@@ -46,6 +46,8 @@ const reserve = @import("rove-reserve");
 const keyring_slots = @import("keyring_slots.zig");
 const keyring_shard = @import("keyring_shard.zig");
 const deployment_cache = @import("deployment_cache.zig");
+const keyring_bind = @import("keyring_bind.zig");
+const kv_mod = @import("raft-kv");
 
 /// Slots per reserved block — one shard's worth, so preparing a block is
 /// a single `mintRange` and a single shard push. Smaller blocks would
@@ -258,4 +260,63 @@ test "idle sweeps are cheap and failures back off harder" {
     // A tenant whose consensus is unavailable must not spin the driver
     // on behalf of every other tenant.
     try testing.expect(FAIL_SLEEP_NS > IDLE_SLEEP_NS);
+}
+
+// ── resolving an identity to its slot ────────────────────────────────
+
+/// Turn the identity a handler named into the slot its writes seal
+/// under, binding a fresh one the first time this tenant names it.
+///
+/// This is `ShredCaps.resolve_slot` (`js/globals.zig`) — the seam that
+/// keeps the worker's generic type out of the dispatcher.
+///
+/// A returning identity costs one kv read and nothing else. Only a NEW
+/// identity reaches the pool, which is why demand tracks new-identity
+/// rate rather than request rate, and why an empty pool is rare enough
+/// to alarm on.
+///
+/// The binding rides the activation's own raft entry: it is appended to
+/// the writeset the request was already sending, and written through the
+/// same txn, so naming an identity costs no extra round trip and no
+/// extra fsync on the request path.
+pub fn resolveSlot(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    slot: *deployment_cache.TenantSlot,
+    identity: []const u8,
+    txn: anytype,
+    writeset: *kv_mod.WriteSet,
+) !u64 {
+    const kr: *const crypt.keyring.Keyring = if (slot.keyring) |*k| k else
+        return error.KeyringUnavailable;
+    const pk = keyring_bind.pseudonymKey(kr.tenantSecret());
+
+    const bind_key = try keyring_bind.bindKey(allocator, pk, identity);
+    defer allocator.free(bind_key);
+
+    // Already bound? Read through the activation's own txn, so an
+    // identity named twice in one activation resolves to one slot
+    // instead of burning a second.
+    if (slot.app_kv.get(bind_key)) |raw| {
+        defer allocator.free(raw);
+        return keyring_bind.resolveBinding(raw, pk, identity);
+    } else |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    }
+
+    try ensurePool(worker, slot);
+    const pool = if (slot.pool) |*p| p else return error.KeyringUnavailable;
+
+    // Never waits. The worker is a poll loop, so blocking here would
+    // stall every tenant on the node rather than the one request that
+    // needed a slot.
+    const got = pool.tryAcquire() orelse return error.PoolEmpty;
+
+    const value = keyring_bind.bindingFor(pk, identity, got);
+    // Both, inseparably: the txn is this node's write, the writeset is
+    // what every other node applies.
+    try txn.put(bind_key, &value);
+    try writeset.addPut(bind_key, &value);
+    return got;
 }

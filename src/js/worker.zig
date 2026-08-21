@@ -115,6 +115,7 @@ const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
+const keyring_pool = @import("keyring_pool.zig");
 // The per-tenant raft bridge is the worker's consensus seam.
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
@@ -2820,6 +2821,34 @@ pub fn Worker(comptime opts: Options) type {
         /// `_system.blob.write` / `.seal` bindings reach this
         /// worker's `blob_sessions` collection through the same
         /// type-erased seam as the other worker re-entries.
+        /// `ShredCaps.resolve_slot` — turn the identity a handler named
+        /// into the slot whose key this activation's writes seal under.
+        ///
+        /// Lives on the worker because resolving needs the tenant's slot
+        /// pool and keyring, both of which hang off its deployment
+        /// cache, and because threading this generic type into the
+        /// dispatcher is what the capability seam exists to avoid.
+        pub fn resolveShredSlotTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            instance_id: []const u8,
+            identity: []const u8,
+            txn: *kv_mod.KvStore.TrackedTxn,
+            writeset: *kv_mod.WriteSet,
+        ) anyerror!u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
+                return error.KeyringUnavailable;
+            return keyring_pool.resolveSlot(
+                self,
+                allocator,
+                slot,
+                identity,
+                txn,
+                writeset,
+            );
+        }
+
         pub fn blobWriteTrampoline(
             ctx: *anyopaque,
             tenant_id: []const u8,

@@ -1147,9 +1147,13 @@ fn parseCookies(
 /// indexes).
 pub const WorkerTag = struct {
     state: *DispatchState,
+    /// Carried so a delegate can raise its own refusal. The binding
+    /// contract is "false means an exception is pending", and a delegate
+    /// that cannot reach the context has no way to make one.
+    ctx: ?*c.JSContext,
 
     pub fn fromCtx(ctx: ?*c.JSContext) WorkerTag {
-        return .{ .state = getState(ctx) };
+        return .{ .state = getState(ctx), .ctx = ctx };
     }
 
     pub fn allocator(self: WorkerTag) std.mem.Allocator {
@@ -1181,9 +1185,42 @@ pub const WorkerTag = struct {
     pub fn setShredKey(self: WorkerTag, id: []const u8) bool {
         const state = self.state;
         const cell = state.shred_key orelse return true;
+
+        // Resolve BEFORE recording, so a failure leaves the activation
+        // unscoped rather than scoped to an identity whose key it never
+        // got. Resolving here rather than at commit also puts the
+        // refusal at the call site, where a handler can see which
+        // `shredKey` failed — at commit the writes are already done.
+        var slot: ?u64 = null;
+        if (state.shred) |caps| {
+            if (caps.resolve_slot) |resolve| {
+                slot = resolve(
+                    caps.ctx,
+                    state.allocator,
+                    state.shred_instance_id,
+                    id,
+                    state.txn,
+                    state.writeset,
+                ) catch |err| {
+                    // Loud, and never a fallback. Every alternative
+                    // available here — sealing under the tenant key,
+                    // leaving the activation unscoped — silently gives
+                    // the customer weaker erasure than they asked for,
+                    // at the moment they are least able to notice.
+                    _ = c.JS_ThrowInternalError(
+                        self.ctx,
+                        "request.shredKey: could not bind this identity (%s)",
+                        @errorName(err).ptr,
+                    );
+                    return false;
+                };
+            }
+        }
+
         const dup = state.allocator.dupe(u8, id) catch return false;
         if (cell.*) |old_id| state.allocator.free(old_id);
         cell.* = dup;
+        if (state.shred_slot) |sc| sc.* = slot;
         return true;
     }
 

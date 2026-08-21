@@ -599,6 +599,11 @@
     "seconds": 4.9,
     "status": "pass"
   },
+  "shred_key_bind_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 0.0,
+    "status": "pass"
+  },
   "snap_catchup_smoke_v2.py": {
     "rc": 0,
     "seconds": 3.8,
