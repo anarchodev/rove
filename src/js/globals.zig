@@ -21,6 +21,7 @@
 const std = @import("std");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
+const keyring_mod = @import("rove-keyring");
 const tape_mod = @import("rove-tape");
 const log_mod = @import("rove-log");
 const tenant_mod = @import("rove-tenant");
@@ -373,7 +374,7 @@ pub const ShredCaps = struct {
         allocator: std.mem.Allocator,
         instance_id: []const u8,
         value: []const u8,
-    ) anyerror!OpenedValue = null,
+    ) anyerror!keyring_mod.keyspace.Opened = null,
 
     /// Erase `identity`'s key — permanently, everywhere.
     ///
@@ -392,21 +393,6 @@ pub const ShredCaps = struct {
         txn: *kv_mod.TrackedTxn,
         writeset: *kv_mod.WriteSet,
     ) anyerror!void = null,
-};
-
-/// What a stored value turned out to be.
-pub const OpenedValue = union(enum) {
-    /// Not sealed. The bytes are the value.
-    plaintext,
-    /// Sealed and opened; caller frees.
-    opened: []u8,
-    /// Sealed, and its key is gone. The live read answers ABSENT —
-    /// "erased" reads like "absent" to everything downstream.
-    shredded,
-    /// Sealed, and this node cannot say whether the key is gone or
-    /// merely missing here. Never absent: a node that is short of key
-    /// material must not report an erasure it cannot stand behind.
-    unverified,
 };
 
 pub const PlatformCaps = struct {

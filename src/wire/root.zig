@@ -106,7 +106,7 @@ pub const AttachEnvelope = struct {
     /// today a node that missed pushes stays short. It is not silent:
     /// such a node measures itself against the minted watermark, finds
     /// itself incomplete, and answers `unverified` rather than reporting
-    /// erasure it cannot stand behind (`js/keyring_bind.zig`).
+    /// erasure it cannot stand behind (`src/keyring/`).
     secret: ?[]const u8 = null,
 };
 

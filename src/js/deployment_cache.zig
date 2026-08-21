@@ -26,19 +26,8 @@ const module_execution = @import("module_execution.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const msg_router_mod = @import("msg_router.zig");
 const crypt_mod = @import("rove-crypt");
-const keyring_bind = @import("keyring_bind.zig");
+const keyring_mod = @import("rove-keyring");
 
-/// Set once at startup by `keyring_pool`, which owns the reconciliation
-/// but sits ABOVE this file in the import graph — it needs `TenantSlot`.
-/// A function pointer breaks the cycle without either side holding a
-/// back-pointer to the other.
-pub const keyring_pool_hook = struct {
-    pub var reconcile: *const fn (std.mem.Allocator, *TenantSlot) anyerror!usize = noReconcile;
-
-    fn noReconcile(_: std.mem.Allocator, _: *TenantSlot) anyerror!usize {
-        return 0;
-    }
-};
 const plan_mod = @import("rove-plan");
 const static_cache = @import("static_cache.zig");
 
@@ -585,65 +574,20 @@ pub const TenantSlot = struct {
     /// Atomic pointer to the current snapshot. Null until first load.
     current: std.atomic.Value(?*TenantFilesSnapshot),
 
-    /// This tenant's keyring — the shreddable key material, and the one
-    /// store whose *delete* is the erasure.
+    /// This tenant's key state: the keyring, the slot pool, whether this
+    /// node can vouch for what it holds, and the destroys it still owes.
     ///
-    /// Opened with the slot rather than on demand, because absence is
-    /// authoritative: a node has to know what it holds before it answers
-    /// anything about a missing key. Opening is file reads — no thread,
-    /// no network — so it costs what the blob backends beside it already
-    /// cost.
+    /// One pointer rather than the eight fields this used to be. Those
+    /// put a third of a struct about DEPLOYMENTS in service of
+    /// cryptography, which forced the deployment path to reach into key
+    /// state and key code to reach back — a cycle that had to be bridged
+    /// by a mutable function pointer installed at startup.
     ///
-    /// Null when this node has no `REWIND_KEYRING_KEK` (surface off), or
-    /// when the tenant predates crypto-shredding and has no keyring on
-    /// disk. Neither is an error, and neither may be read as "everything
-    /// was erased" — a lookup against a null keyring is `unverified`.
-    keyring: ?crypt_mod.keyring.Keyring = null,
-
-    /// Guards `keyring` against a destroy racing a read. Held only for
-    /// the map probe or the evict, never across the shard rewrite's
-    /// fsync — that runs on the destroy queue.
-    keyring_lock: std.Thread.Mutex = .{},
-
-    /// Does this node hold every key the tenant has minted? Recomputed
-    /// when the slot opens and after a destroy applies; read on the
-    /// lookup path. `incomplete` means a miss says nothing about
-    /// erasure, so nothing may report one.
-    keyring_complete: std.atomic.Value(bool) = .init(false),
-
-    /// This tenant's slot pool — minted keys waiting ahead of demand, so
-    /// binding an identity never waits on consensus. Null until
-    /// `keyring_pool.ensurePool` runs, and only ever on the node that
-    /// leads the tenant (two nodes refilling would disagree about which
-    /// key sits in a slot).
-    pool: ?crypt_mod.pool.SlotPool = null,
-    /// Type-erased callback context owned by the pool, with its free
-    /// function beside it so teardown needs no knowledge of its type.
-    pool_ctx: ?*anyopaque = null,
-    pool_ctx_free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
-
-    /// Handoff between the shared refill driver and slot teardown.
-    ///
-    /// `evictTenant` removes a slot under `tenant_files_lock` and frees
-    /// it OUTSIDE that lock, so a driver holding a raw slot pointer could
-    /// be working on freed memory. A driver claims this WHILE holding the
-    /// map lock — the slot is provably alive at that moment — and
-    /// teardown takes it before touching the pool, so it waits out an
-    /// in-flight refill instead of pulling the ground from under it.
-    pool_busy: std.Thread.Mutex = .{},
-
-    /// Slots whose keys this node has been told to destroy and has not
-    /// yet rewritten out of their shard.
-    ///
-    /// The eviction is already done by the time a slot lands here — that
-    /// happens synchronously at apply, so reads stop immediately — and
-    /// this is the durable half catching up. Batched because a shard is
-    /// ~192 KiB and every rewrite costs two fsyncs.
-    ///
-    /// Losing this list costs nothing: the tombstones commit through raft
-    /// before anything reaches here, so `reconcileDestroys` re-derives
-    /// the work from a tombstone whose slot the keyring still holds.
-    pending_destroys: std.ArrayListUnmanaged(u64) = .empty,
+    /// Null when the node has no `REWIND_KEYRING_KEK` (surface off) or
+    /// the tenant predates crypto-shredding. Neither is an error, and
+    /// neither may be read as "everything was erased": a lookup against a
+    /// null keyring is `unverified`.
+    keys: ?*keyring_mod.TenantKeys = null,
 
     /// Resolved per-tenant plan limits (docs/architecture/control-plane.md —
     /// operational state). Null until the CP delivers a plan
@@ -1143,18 +1087,19 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     // birth attach carried no secret — it leaves the slot with none,
     // and every lookup then answers `unverified` rather than inventing
     // an erasure it cannot stand behind.
-    var keyring: ?crypt_mod.keyring.Keyring = null;
+    // `TenantKeys.open` settles completeness and re-derives outstanding
+    // destroys before it returns, so a slot is never reachable in a state
+    // it cannot vouch for. That ordering is the module's to guarantee,
+    // which is precisely why it moved there.
+    var keys: ?*keyring_mod.TenantKeys = null;
     if (dc.keyring_kek) |kek| {
         if (dc.data_dir) |dd| {
-            const kdir = try keyring_bind.keyringDir(allocator, dd);
+            const kdir = try keyring_mod.keyspace.keyringDir(allocator, dd);
             defer allocator.free(kdir);
-            keyring = crypt_mod.keyring.Keyring.open(allocator, kdir, inst.id, kek) catch |err| switch (err) {
-                error.NoKeyring => null,
-                else => return err,
-            };
+            keys = try keyring_mod.TenantKeys.open(allocator, kdir, id_copy, kek, inst.kv);
         }
     }
-    errdefer if (keyring) |*k| k.deinit();
+    errdefer if (keys) |k| k.deinit();
 
     const slot = try allocator.create(TenantSlot);
     errdefer allocator.destroy(slot);
@@ -1169,30 +1114,8 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
         .current = .{ .raw = null },
-        .keyring = keyring,
+        .keys = keys,
     };
-
-    // Settle completeness before the slot is reachable, so no lookup can
-    // read the default. A tenant with no keyring stays `false` — it
-    // cannot vouch for anything.
-    if (slot.keyring != null) {
-        refreshKeyringCompleteness(slot);
-        // Re-derive destroys this node still owes, BEFORE the slot is
-        // reachable. A node that served first could hand out a key it had
-        // already been told to destroy — the tombstone is committed, so
-        // the instruction predates this node's readiness to honour it.
-        const owed = keyring_pool_hook.reconcile(allocator, slot) catch |err| blk: {
-            std.log.warn(
-                "keyring {s}: destroy reconciliation failed at open: {s}",
-                .{ slot.instance_id, @errorName(err) },
-            );
-            break :blk 0;
-        };
-        if (owed != 0) std.log.info(
-            "keyring {s}: {d} destroy(s) outstanding on this node, queued",
-            .{ slot.instance_id, owed },
-        );
-    }
 
     // Best-effort initial load. Read `_deploy/current` from the
     // tenant's app.db (set by release POST + replicated via raft);
@@ -1217,115 +1140,6 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
     return slot;
 }
 
-/// Recompute whether this node holds every key the tenant has minted.
-///
-/// One kv read for the watermark plus a paginated scan of the destroy
-/// tombstones — whose count grows with total-ever-destroyed rather than
-/// with live keys. Runs when a slot opens and after a destroy applies,
-/// never per request; the request path reads the cached answer.
-///
-/// Every failure path stores `false`. Claiming completeness while unsure
-/// is the one direction that turns a missing key into a reported
-/// erasure, so uncertainty must always cost availability rather than
-/// truthfulness.
-pub fn refreshKeyringCompleteness(slot: *TenantSlot) void {
-    const kr: *const crypt_mod.keyring.Keyring = if (slot.keyring) |*k| k else {
-        slot.keyring_complete.store(false, .release);
-        return;
-    };
-    const a = slot.allocator;
-
-    const minted: u64 = blk: {
-        const raw = slot.app_kv.get(keyring_bind.MINTED_KEY) catch |err| switch (err) {
-            // Never minted: nothing to be missing.
-            error.NotFound => break :blk 0,
-            else => {
-                slot.keyring_complete.store(false, .release);
-                return;
-            },
-        };
-        defer a.free(raw);
-        break :blk keyring_bind.decodeMinted(raw) catch {
-            slot.keyring_complete.store(false, .release);
-            return;
-        };
-    };
-
-    const dead = keyring_bind.countTombstones(slot.app_kv, a) catch {
-        slot.keyring_complete.store(false, .release);
-        return;
-    };
-
-    const c = keyring_bind.completeness(@intCast(kr.count()), dead, minted);
-    slot.keyring_complete.store(c == .complete, .release);
-}
-
-/// Resolve a slot to its key, or to why there isn't one.
-///
-/// The lock is held for a hash probe and nothing else — a destroy's
-/// shard rewrite runs off this path, so a reader never waits on an
-/// fsync.
-/// Evict a slot's key from memory and queue its durable removal.
-///
-/// Eviction is synchronous and the rewrite is not, deliberately: the
-/// observable change must lead the irreversible one, so a read stops
-/// resolving before the shard is rewritten rather than after. Neither the
-/// pump thread nor the poll loop may fsync, which is why the rewrite is
-/// queued at all.
-///
-/// A failed append is survivable and not worth failing an apply over —
-/// the tombstone is already committed, so reconciliation finds the work
-/// again from the tombstone-versus-keyring disagreement.
-pub fn evictAndQueueDestroy(slot: *TenantSlot, key_slot: u64) void {
-    slot.keyring_lock.lock();
-    defer slot.keyring_lock.unlock();
-    if (slot.keyring) |*kr| kr.evict(key_slot);
-    for (slot.pending_destroys.items) |q| if (q == key_slot) return; // already queued
-    slot.pending_destroys.append(slot.allocator, key_slot) catch |err| std.log.warn(
-        "keyring {s}: could not queue destroy of slot {d}: {s} — reconciliation will retry",
-        .{ slot.instance_id, key_slot, @errorName(err) },
-    );
-}
-
-/// Take everything queued, leaving the list empty. Caller owns the slice.
-pub fn takePendingDestroys(slot: *TenantSlot, allocator: std.mem.Allocator) ?[]u64 {
-    slot.keyring_lock.lock();
-    defer slot.keyring_lock.unlock();
-    if (slot.pending_destroys.items.len == 0) return null;
-    const out = allocator.dupe(u64, slot.pending_destroys.items) catch return null;
-    slot.pending_destroys.clearRetainingCapacity();
-    return out;
-}
-
-/// Rewrite the shards of everything queued. Runs on the shared driver —
-/// it fsyncs, so never on the pump thread or the poll loop.
-///
-/// KNOWN COST: `keyring_lock` is held across the rewrite, so a reader
-/// resolving a sealed value for this tenant waits out one shard rewrite
-/// (~192 KiB and two fsyncs). Bounded and rare — it needs a tenant using
-/// per-identity keys to read a sealed value at the moment a destroy is
-/// being written — but it is a wait on the poll loop, which is the one
-/// place waits are expensive. Splitting the map lock from the disk lock
-/// removes it and is deliberately left as its own change rather than
-/// folded in here.
-pub fn drainDestroys(slot: *TenantSlot, allocator: std.mem.Allocator) !usize {
-    const slots = takePendingDestroys(slot, allocator) orelse return 0;
-    defer allocator.free(slots);
-    slot.keyring_lock.lock();
-    defer slot.keyring_lock.unlock();
-    const kr: *crypt_mod.keyring.Keyring = if (slot.keyring) |*k| k else return 0;
-    return kr.destroyMany(slots);
-}
-
-pub fn keyringLookup(slot: *TenantSlot, key_slot: u64) keyring_bind.Lookup {
-    slot.keyring_lock.lock();
-    defer slot.keyring_lock.unlock();
-    const kr: *const crypt_mod.keyring.Keyring = if (slot.keyring) |*k| k else return .unverified;
-    const c: keyring_bind.Completeness =
-        if (slot.keyring_complete.load(.acquire)) .complete else .incomplete;
-    return keyring_bind.lookup(kr, key_slot, c);
-}
-
 fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
     // Drop the slot's reference to the current snapshot (if any).
     // In-flight pinned references keep the old snapshot alive until
@@ -1340,21 +1154,7 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
     if (slot.plan.load(.acquire)) |p| allocator.destroy(p);
     for (slot.plan_retired.items) |p| allocator.destroy(p);
     slot.plan_retired.deinit(allocator);
-    // Pool before keyring: the pool borrows the keyring it mints into,
-    // and its refill thread may be mid-`mintRange` right now. Taking
-    // `pool_busy` is what waits that out — see the note on the field.
-    {
-        slot.pool_busy.lock();
-        defer slot.pool_busy.unlock();
-        if (slot.pool) |*p| p.deinit();
-        slot.pool = null;
-        slot.pending_destroys.deinit(allocator);
-        if (slot.pool_ctx) |c| {
-            if (slot.pool_ctx_free) |f| f(allocator, c);
-            slot.pool_ctx = null;
-        }
-    }
-    if (slot.keyring) |*k| k.deinit();
+    if (slot.keys) |k| k.deinit();
     slot.manifest_backend.deinit();
     slot.blob_backend.deinit();
     allocator.free(slot.instance_id);

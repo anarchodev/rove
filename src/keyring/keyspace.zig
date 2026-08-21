@@ -169,6 +169,25 @@ pub const Lookup = union(enum) {
     unverified,
 };
 
+/// What a stored value turned out to be.
+///
+/// Lives beside the keyspace rather than in the engine's globals: it is
+/// the vocabulary of "can this node read that", and every reader needs
+/// the same four answers.
+pub const Opened = union(enum) {
+    /// Not sealed. The bytes are the value.
+    plaintext,
+    /// Sealed and opened; caller frees.
+    opened: []u8,
+    /// Sealed, and its key is gone. A live read answers ABSENT —
+    /// "erased" reads like "absent" to everything downstream.
+    shredded,
+    /// Sealed, and this node cannot say whether the key is gone or
+    /// merely missing here. Never absent: a node short of key material
+    /// must not report an erasure it cannot stand behind.
+    unverified,
+};
+
 pub const Error = error{
     /// Stored bytes this codec did not write.
     Corrupt,
@@ -306,31 +325,6 @@ pub fn lookup(kr: *const crypt.keyring.Keyring, slot: u64, c: Completeness) Look
         .complete => .shredded,
         .incomplete => .unverified,
     };
-}
-
-/// Count this tenant's destroy tombstones. Paginated, because the count
-/// grows with total-ever-destroyed rather than with live keys.
-///
-/// Off the hot path by construction — completeness is settled when a
-/// node takes up a tenant, not per request.
-pub fn countTombstones(kv: anytype, allocator: std.mem.Allocator) !u64 {
-    var total: u64 = 0;
-    var cursor: []const u8 = "";
-    var cursor_owned: ?[]u8 = null;
-    defer if (cursor_owned) |c| allocator.free(c);
-    while (true) {
-        var res = try kv.prefix(DEAD_PREFIX, cursor, 512);
-        defer res.deinit();
-        if (res.entries.len == 0) break;
-        total += res.entries.len;
-        if (res.entries.len < 512) break;
-        const last = res.entries[res.entries.len - 1].key;
-        const next = try allocator.dupe(u8, last);
-        if (cursor_owned) |c| allocator.free(c);
-        cursor_owned = next;
-        cursor = next;
-    }
-    return total;
 }
 
 pub fn encodeDead(destroyed_unix_ns: i64) [DEAD_VALUE_LEN]u8 {

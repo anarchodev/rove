@@ -40,7 +40,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const crypt = @import("rove-crypt");
-const keyring_bind = @import("keyring_bind.zig");
+const keyring_mod = @import("rove-keyring");
 const blob = @import("rove-blob");
 const curl = blob.curl;
 const respb = @import("response_builder.zig");
@@ -56,9 +56,9 @@ const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 /// policy.
 const MAX_VOTERS = 16;
 
-/// Re-exported from `keyring_bind`, which owns the keyring's on-disk
+/// Re-exported from `rove-keyring`'s keyspace, which owns the keyring's on-disk
 /// and keyspace facts. One name for the path, wherever it is needed.
-pub const keyringDir = keyring_bind.keyringDir;
+pub const keyringDir = keyring_mod.keyspace.keyringDir;
 
 // ── receive ──────────────────────────────────────────────────────────
 

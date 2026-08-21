@@ -116,6 +116,7 @@ const h2 = @import("rove-h2");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const keyring_pool = @import("keyring_pool.zig");
+const keyring_mod = @import("rove-keyring");
 // The per-tenant raft bridge is the worker's consensus seam.
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
@@ -2939,7 +2940,7 @@ pub fn Worker(comptime opts: Options) type {
             allocator: std.mem.Allocator,
             instance_id: []const u8,
             value: []const u8,
-        ) anyerror!globals.OpenedValue {
+        ) anyerror!keyring_mod.keyspace.Opened {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse
                 return error.KeyringUnavailable;

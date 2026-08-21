@@ -46,9 +46,9 @@ const reserve = @import("rove-reserve");
 const keyring_slots = @import("keyring_slots.zig");
 const keyring_shard = @import("keyring_shard.zig");
 const deployment_cache = @import("deployment_cache.zig");
-const keyring_bind = @import("keyring_bind.zig");
+const keyring_mod = @import("rove-keyring");
 const kv_mod = @import("raft-kv");
-const keyring_seal = @import("keyring_seal.zig");
+
 const reserved = @import("rove-reserved");
 const globals = @import("globals.zig");
 
@@ -133,31 +133,25 @@ pub fn Ctx(comptime W: type) type {
 /// wrong key later. Leadership already arbitrates every other write to
 /// this tenant.
 pub fn ensurePool(worker: anytype, slot: *deployment_cache.TenantSlot) !void {
-    slot.pool_busy.lock();
-    defer slot.pool_busy.unlock();
-    if (slot.pool != null) return;
-    if (slot.keyring == null) return;
+    const keys = slot.keys orelse return;
+    if (keys.hasPool()) return;
 
+    // Leader-gated: two nodes refilling the same tenant would produce
+    // shards that disagree about which key sits in a slot, and a peer
+    // installing the loser would hand back a wrong key later.
     const gid = worker.raft.gidForTenant(slot.instance_id) orelse return;
     if (!worker.raft.isLeaderOf(gid)) return;
 
-    const allocator = slot.allocator;
+    const allocator = keys.allocator;
     const C = Ctx(@TypeOf(worker));
     const ctx = try allocator.create(C);
     errdefer allocator.destroy(ctx);
     const tenant_owned = try allocator.dupe(u8, slot.instance_id);
-    errdefer allocator.free(tenant_owned);
     ctx.* = .{ .worker = worker, .allocator = allocator, .tenant = tenant_owned };
 
-    // In place: the allocator's state is captured by address, so the
-    // pool must already sit at its final home before it starts.
-    slot.pool = .{};
-    slot.pool.?.start(&slot.keyring.?, ctx.deps(), BLOCK_SLOTS, .external) catch |err| {
-        slot.pool = null;
-        return err;
-    };
-    slot.pool_ctx = ctx;
-    slot.pool_ctx_free = C.free;
+    // Ownership of `ctx` transfers: `startPool` frees it on any path
+    // that does not keep it, so there is one owner at every instant.
+    try keys.startPool(ctx.deps(), ctx, C.free, BLOCK_SLOTS, .external);
 }
 
 /// The shared refill worker set.
@@ -178,10 +172,6 @@ pub const RefillDriver = struct {
         allocator: std.mem.Allocator,
         dc: *deployment_cache.DeploymentCache,
     ) !void {
-        // Hand the cache its reconciliation, which it calls at slot open
-        // but cannot import (this file needs `TenantSlot`, so the edge
-        // only goes one way).
-        deployment_cache.keyring_pool_hook.reconcile = reconcileDestroys;
         self.* = .{ .allocator = allocator, .dc = dc };
         const ts = try allocator.alloc(std.Thread, WORKERS);
         errdefer allocator.free(ts);
@@ -211,46 +201,49 @@ pub const RefillDriver = struct {
     /// mutex. `tryLock` rather than `lock`, so a tenant another worker is
     /// already refilling is skipped instead of stalling the map lock
     /// behind a raft round trip.
-    fn claim(self: *RefillDriver) ?*deployment_cache.TenantSlot {
+    /// Claim one tenant with work, or null.
+    ///
+    /// The claim is taken while the map lock is held, which is what makes
+    /// the pointer safe to use after the lock is released: the slot was
+    /// alive at claim time, and teardown blocks on the same mutex.
+    fn claim(self: *RefillDriver) ?*keyring_mod.TenantKeys {
         self.dc.tenant_files_lock.lock();
         defer self.dc.tenant_files_lock.unlock();
         var it = self.dc.tenant_files_map.iterator();
         while (it.next()) |entry| {
-            const slot = entry.value_ptr.*;
-            // Either kind of work claims the slot. A destroy is owed even
-            // by a tenant with no pool — a node can hold keys for a tenant
-            // it does not lead, and it still has to erase them.
-            const wants_destroy = slot.pending_destroys.items.len != 0;
-            const wants_refill = if (slot.pool) |*p| p.needsRefill() else false;
-            if (!wants_destroy and !wants_refill) continue;
-            if (!slot.pool_busy.tryLock()) continue;
-            return slot;
+            const keys = entry.value_ptr.*.keys orelse continue;
+            // Either kind of work claims it. A destroy is owed even by a
+            // tenant with no pool — a node can hold keys for a tenant it
+            // does not lead, and it still has to erase them.
+            if (!keys.hasPendingDestroys() and !keys.poolNeedsRefill()) continue;
+            if (!keys.claim_lock.tryLock()) continue;
+            return keys;
         }
         return null;
     }
 
     fn loop(self: *RefillDriver) void {
         while (!self.stopping.load(.acquire)) {
-            const slot = self.claim() orelse {
+            const keys = self.claim() orelse {
                 std.Thread.sleep(IDLE_SLEEP_NS);
                 continue;
             };
             // Destroys first: an erasure this node owes outranks keeping
-            // its pool warm, and the queue is usually empty so this costs
-            // a length check.
-            _ = deployment_cache.drainDestroys(slot, self.allocator) catch |err| blk: {
+            // its pool warm, and the queue is usually empty.
+            const drained = keys.drainDestroys() catch |err| blk: {
                 std.log.warn(
                     "keyring {s}: destroy rewrite failed: {s} — reconciliation will retry",
-                    .{ slot.instance_id, @errorName(err) },
+                    .{ keys.instance_id, @errorName(err) },
                 );
                 break :blk 0;
             };
-            const res = if (slot.pool) |*pool| pool.refillOnce() else @as(anyerror!bool, false);
-            slot.pool_busy.unlock();
+            _ = drained;
+            const res = keys.refillPoolOnce();
+            keys.claim_lock.unlock();
             if (res) |_| {} else |err| {
                 std.log.warn(
                     "keyring pool {s}: refill failed: {s}",
-                    .{ slot.instance_id, @errorName(err) },
+                    .{ keys.instance_id, @errorName(err) },
                 );
                 std.Thread.sleep(FAIL_SLEEP_NS);
             }
@@ -307,19 +300,18 @@ pub fn resolveSlot(
     txn: anytype,
     writeset: *kv_mod.WriteSet,
 ) !u64 {
-    const kr: *const crypt.keyring.Keyring = if (slot.keyring) |*k| k else
-        return error.KeyringUnavailable;
-    const pk = keyring_bind.pseudonymKey(kr.tenantSecret());
+    const keys = slot.keys orelse return error.KeyringUnavailable;
+    const pk = keyring_mod.keyspace.pseudonymKey(keys.tenantSecret());
 
-    const bind_key = try keyring_bind.bindKey(allocator, pk, identity);
+    const bind_key = try keyring_mod.keyspace.bindKey(allocator, pk, identity);
     defer allocator.free(bind_key);
 
     // Already bound? Read through the activation's own txn, so an
     // identity named twice in one activation resolves to one slot
     // instead of burning a second.
-    if (slot.app_kv.get(bind_key)) |raw| {
+    if (keys.app_kv.get(bind_key)) |raw| {
         defer allocator.free(raw);
-        return keyring_bind.resolveBinding(raw, pk, identity);
+        return keyring_mod.keyspace.resolveBinding(raw, pk, identity);
     } else |err| switch (err) {
         error.NotFound => {},
         else => return err,
@@ -337,14 +329,12 @@ pub fn resolveSlot(
     if (!try admitNewIdentity(worker, slot)) return error.NewIdentityRateLimited;
 
     try ensurePool(worker, slot);
-    const pool = if (slot.pool) |*p| p else return error.KeyringUnavailable;
-
     // Never waits. The worker is a poll loop, so blocking here would
     // stall every tenant on the node rather than the one request that
     // needed a slot.
-    const got = pool.tryAcquire() orelse return error.PoolEmpty;
+    const got = keys.tryAcquireSlot() orelse return error.PoolEmpty;
 
-    const value = keyring_bind.bindingFor(pk, identity, got);
+    const value = keyring_mod.keyspace.bindingFor(pk, identity, got);
     // Both, inseparably: the txn is this node's write, the writeset is
     // what every other node applies.
     try txn.put(bind_key, &value);
@@ -371,9 +361,13 @@ pub fn sealWrites(
     writeset: *kv_mod.WriteSet,
     ws_base: usize,
 ) !void {
-    const kr: *const crypt.keyring.Keyring = if (slot_state.keyring) |*k| k else
-        return error.KeyringUnavailable;
-    const key = kr.keyAt(key_slot) orelse return error.KeyDestroyed;
+    const keys = slot_state.keys orelse return error.KeyringUnavailable;
+    const key = switch (keys.lookup(key_slot)) {
+        .key => |k| k,
+        // Sealing under a key that is gone, or one this node cannot
+        // vouch for, would write bytes nobody can ever open.
+        .shredded, .unverified => return error.KeyDestroyed,
+    };
 
     for (writeset.ops.items[ws_base..]) |*op| {
         const p = switch (op.*) {
@@ -386,7 +380,7 @@ pub fn sealWrites(
         // bookkeeping.
         if (reserved.isCustomerWriteReserved(p.key)) continue;
 
-        const sealed = try keyring_seal.seal(allocator, p.value, key, key_slot, KEY_VERSION);
+        const sealed = try keyring_mod.seal.seal(allocator, p.value, key, key_slot, keyring_mod.seal.KEY_VERSION);
         defer allocator.free(sealed);
         // Both, inseparably: the txn is this node's write, the writeset
         // is what every other node applies. One without the other leaves
@@ -398,28 +392,17 @@ pub fn sealWrites(
 }
 
 /// Decide what a stored value is, and open it if this node can.
+///
+/// The decision itself belongs to `TenantKeys`, which owns the keyring
+/// and the completeness verdict; this is the worker-side entry point.
 pub fn openValue(
     allocator: std.mem.Allocator,
     slot_state: *deployment_cache.TenantSlot,
     value: []const u8,
-) !globals.OpenedValue {
-    if (!keyring_seal.isSealed(value)) return .plaintext;
-    const key_slot = keyring_seal.slotOf(value) orelse return .unverified;
-
-    return switch (deployment_cache.keyringLookup(slot_state, key_slot)) {
-        .key => |k| .{ .opened = try keyring_seal.open(allocator, value, k) },
-        // The erasure, seen from a reader: the key is gone and this node
-        // holds everything it should, so absence is authoritative.
-        .shredded => .shredded,
-        // This node is short of key material. Saying "erased" here would
-        // be a claim it cannot stand behind.
-        .unverified => .unverified,
-    };
+) !keyring_mod.keyspace.Opened {
+    const keys = slot_state.keys orelse return .unverified;
+    return keys.openValue(allocator, value);
 }
-
-/// Key generation stamped into every seal. One today; `key_version`
-/// exists so a KEK rotation can roll it without stranding stored bytes.
-const KEY_VERSION: u32 = 1;
 
 // ── destroying an identity ───────────────────────────────────────────
 
@@ -450,35 +433,34 @@ pub fn destroyIdentity(
     txn: anytype,
     writeset: *kv_mod.WriteSet,
 ) !void {
-    const kr: *const crypt.keyring.Keyring = if (slot_state.keyring) |*k| k else
-        return error.KeyringUnavailable;
-    const pk = keyring_bind.pseudonymKey(kr.tenantSecret());
+    const keys = slot_state.keys orelse return error.KeyringUnavailable;
+    const pk = keyring_mod.keyspace.pseudonymKey(keys.tenantSecret());
 
-    const bind_key = try keyring_bind.bindKey(allocator, pk, identity);
+    const bind_key = try keyring_mod.keyspace.bindKey(allocator, pk, identity);
     defer allocator.free(bind_key);
 
     // An identity this tenant never named has nothing to erase. Not an
     // error: a retried destroy, or a delete-account flow run twice, must
     // not fail the second time.
-    const raw = slot_state.app_kv.get(bind_key) catch |err| switch (err) {
+    const raw = keys.app_kv.get(bind_key) catch |err| switch (err) {
         // Nothing to erase. Logged because a destroy that quietly does
         // nothing is indistinguishable from one that worked, and the
         // difference is whether a customer's data is gone.
         error.NotFound => {
             std.log.info(
                 "keyring {s}: destroy names an identity this tenant never bound — nothing to erase",
-                .{slot_state.instance_id},
+                .{keys.instance_id},
             );
             return;
         },
         else => return err,
     };
     defer allocator.free(raw);
-    const key_slot = try keyring_bind.resolveBinding(raw, pk, identity);
+    const key_slot = try keyring_mod.keyspace.resolveBinding(raw, pk, identity);
 
-    const dead_key = try keyring_bind.deadKey(allocator, key_slot);
+    const dead_key = try keyring_mod.keyspace.deadKey(allocator, key_slot);
     defer allocator.free(dead_key);
-    const dead_val = keyring_bind.encodeDead(@intCast(std.time.nanoTimestamp()));
+    const dead_val = keyring_mod.keyspace.encodeDead(@intCast(std.time.nanoTimestamp()));
 
     // Both ops, in one writeset and one txn — the atomicity above.
     try txn.delete(bind_key);
@@ -492,53 +474,10 @@ pub fn destroyIdentity(
     // the tombstone applies there.
     std.log.info(
         "keyring {s}: destroying slot {d} — identity erased",
-        .{ slot_state.instance_id, key_slot },
+        .{ keys.instance_id, key_slot },
     );
-    deployment_cache.evictAndQueueDestroy(slot_state, key_slot);
+    keys.evictAndQueue(key_slot);
     _ = worker;
-}
-
-/// Re-derive the destroys this node still owes, and queue them.
-///
-/// The tombstone says a slot is destroyed; the keyring still holding it
-/// says this node has not finished. That disagreement IS the todo list,
-/// which is why no separate marker is written and why nothing has to be
-/// cleaned up afterwards — the work disappears when the keyring agrees.
-///
-/// Per node by construction, which is the point: node A finishing must
-/// not clear node B's outstanding work, and a replicated marker removed
-/// on completion would do exactly that.
-///
-/// Runs when a node takes up a tenant, BEFORE the slot serves reads — a
-/// node that answered first could hand out a key it was already told to
-/// destroy — and again on the background sweep.
-pub fn reconcileDestroys(
-    allocator: std.mem.Allocator,
-    slot_state: *deployment_cache.TenantSlot,
-) !usize {
-    const kr: *const crypt.keyring.Keyring = if (slot_state.keyring) |*k| k else return 0;
-
-    var owed: usize = 0;
-    var cursor: []const u8 = "";
-    var cursor_owned: ?[]u8 = null;
-    defer if (cursor_owned) |c| allocator.free(c);
-    while (true) {
-        var res = try slot_state.app_kv.prefix(keyring_bind.DEAD_PREFIX, cursor, 512);
-        defer res.deinit();
-        if (res.entries.len == 0) break;
-        for (res.entries) |e| {
-            const key_slot = keyring_bind.parseDeadSlot(e.key) orelse continue;
-            if (kr.keyAt(key_slot) == null) continue; // already settled here
-            deployment_cache.evictAndQueueDestroy(slot_state, key_slot);
-            owed += 1;
-        }
-        if (res.entries.len < 512) break;
-        const next = try allocator.dupe(u8, res.entries[res.entries.len - 1].key);
-        if (cursor_owned) |c| allocator.free(c);
-        cursor_owned = next;
-        cursor = next;
-    }
-    return owed;
 }
 
 /// Is this tenant allowed one more NEW identity right now?

@@ -358,6 +358,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── rove-keyring: one tenant's key state, cluster-blind ─────────
+    //
+    // The keyring, the slot pool, completeness and the destroy queue,
+    // owned in one place with one lifetime. Everything that reaches
+    // other nodes — reserving a slot range through raft, pushing a shard
+    // over HTTP, publishing the minted watermark — arrives as a callback
+    // instead, so this module never learns the cluster exists and stays
+    // testable without one.
+    const keyring_mod = b.addModule("rove-keyring", .{
+        .root_source_file = b.path("src/keyring/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── rove-crypt: the sealed-envelope primitive ───────────────────
     //
     // Crypto shredding's one cipher seam: erasure is key destruction,
@@ -547,6 +561,7 @@ pub fn build(b: *std.Build) void {
     const crypt_tests = b.addTest(.{ .root_module = crypt_mod });
     test_step.dependOn(&b.addRunArtifact(crypt_tests).step);
 
+
     // rove-reserve tests
     const reserve_tests = b.addTest(.{ .root_module = reserve_mod });
     test_step.dependOn(&b.addRunArtifact(reserve_tests).step);
@@ -601,6 +616,16 @@ pub fn build(b: *std.Build) void {
     });
     const reserved_tests = b.addTest(.{ .root_module = reserved_mod });
     test_step.dependOn(&b.addRunArtifact(reserved_tests).step);
+
+    // rove-keyring's deps, wired here because they are declared above:
+    // the crypto primitive, the kv facade for the replicated `_keys/*`
+    // rows, the reserved-prefix contracts, and the block allocator.
+    keyring_mod.addImport("rove-crypt", crypt_mod);
+    keyring_mod.addImport("raft-kv", kv_mod);
+    keyring_mod.addImport("rove-reserved", reserved_mod);
+    keyring_mod.addImport("rove-reserve", reserve_mod);
+    const keyring_tests = b.addTest(.{ .root_module = keyring_mod });
+    test_step.dependOn(&b.addRunArtifact(keyring_tests).step);
 
     // ── rove-sizing: the sizing chain, one derivation ──
     //
@@ -760,6 +785,7 @@ pub fn build(b: *std.Build) void {
     // Keyring shard transport: the worker installs peer-sent shards and
     // pushes its own to a quorum (`keyring_shard.zig`).
     js_mod.addImport("rove-crypt", crypt_mod);
+    js_mod.addImport("rove-keyring", keyring_mod);
     js_mod.addImport("rove-reserved", reserved_mod);
     js_mod.addImport("rove-sizing", sizing_mod);
     js_mod.addImport("rove-guards", guards_mod);
