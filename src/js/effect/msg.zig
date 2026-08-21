@@ -86,6 +86,39 @@ pub const SendCallback = struct {
     }
 };
 
+/// A platform action dispatched into this tenant's scope (rove#691) — the
+/// platform's own BAKED code, run against this tenant's data, under this
+/// tenant's lease, proposing into this tenant's own raft group.
+///
+/// Deliberately not a `SendCallback` with a flag. The two differ in every
+/// way that matters: the principal is not this tenant, the target must be a
+/// baked module rather than customer code, and there is no saga to inherit —
+/// a parent in another tenant's namespace is not addressable here, so the
+/// field does not exist rather than being set to null at each call site.
+pub const PlatformDispatch = struct {
+    /// The SCOPE — whose data this runs against, and whose worker runs it.
+    /// Allocator-owned when non-empty.
+    tenant_id: []u8 = &.{},
+    /// Baked module path (`__system/…`). Allocator-owned. The router
+    /// refuses anything else, so this never names customer code.
+    module_path: []u8 = &.{},
+    /// Argument JSON for the action. Allocator-owned; "null" when omitted.
+    ctx_json: []u8 = &.{},
+    /// Optional named-export selector. Null = default export.
+    fn_name: ?[]u8 = null,
+    /// Which kind of principal caused this — the attribution the tenant's
+    /// log carries. Never the individual operator.
+    actor: log_mod.PlatformActor = .system,
+
+    pub fn deinit(self: *PlatformDispatch, allocator: std.mem.Allocator) void {
+        if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
+        if (self.module_path.len > 0) allocator.free(self.module_path);
+        if (self.ctx_json.len > 0) allocator.free(self.ctx_json);
+        if (self.fn_name) |fn_n| allocator.free(fn_n);
+        self.* = undefined;
+    }
+};
+
 /// Held-stream timer wake (streaming handlers,
 /// `docs/architecture/routing-and-ingress.md`). The
 /// `serviceParkedStreams` sweep detects timer expiry and resumes the
@@ -220,6 +253,7 @@ pub const Msg = union(ActivationSource) {
     /// entity's component, never this queue; the variant exists
     /// because the union is tagged by the wire enum.
     inbound_chunk: Inbound,
+    platform_dispatch: PlatformDispatch,
 
     /// Project to the tape's wire-stable activation tag.
     pub fn kind(self: Msg) ActivationSource {
@@ -284,6 +318,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .ws_message => .{ .ws_message = .{} },
             .inbound_headers => .{ .inbound_headers = .{} },
             .inbound_chunk => .{ .inbound_chunk = .{} },
+            .platform_dispatch => .{ .platform_dispatch = .{} },
         };
         try testing.expectEqual(tag, m.kind());
     }

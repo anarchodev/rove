@@ -35,6 +35,7 @@ const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const globals = @import("globals.zig");
 const builtin_modules = @import("builtin_modules.zig");
+const log_mod = @import("rove-log");
 
 const KvWakeInbox = worker_mod.KvWakeInbox;
 
@@ -573,6 +574,82 @@ pub const MsgRouter = struct {
         try self.enqueueMsgForTenant(tenant_id, .{ .send_callback = payload });
     }
 
+    /// Route a PLATFORM action into `tenant_id`'s scope (rove#691) — the
+    /// primitive that unfuses *whose code runs* from *whose data it runs
+    /// against*.
+    ///
+    /// `dispatcher_is_platform` is read from the DISPATCHING tenant's
+    /// identity at the call site, never inferred from a module path. That
+    /// distinction is the whole lesson of rove#643, where dispatch granted
+    /// `is_system_module` from the path and so handed the exemption to
+    /// anything a customer could arm. A path says what code will run; only
+    /// the caller's identity says who is entitled to run it somewhere else.
+    ///
+    /// Two rules, both here at the funnel so a second producer inherits
+    /// them, exactly as `isContinuationTargetable` is:
+    ///
+    ///   1. **Only a platform-bound dispatcher may target another scope.**
+    ///   2. **Only BAKED code may be the target.** Platform actions ship in
+    ///      the binary — public, scope-agnostic, and resolvable from the
+    ///      binary at replay, which is why they need no foreign-code
+    ///      mechanism and raise no question about a customer reading code
+    ///      they cannot see. Admitting a deployment path here would reopen
+    ///      both.
+    ///
+    /// There is no `saga_id` parameter, and that is deliberate: the
+    /// dispatcher's saga is not addressable in this tenant's namespace, so
+    /// the activation roots a new one. Absent by construction beats elided
+    /// by discipline — `_parent` is inherited BY DEFAULT elsewhere (stamped
+    /// from `armed_by` through `_sched/` state), so a field that existed
+    /// here would eventually get threaded through.
+    ///
+    /// Refusals DROP with a warning rather than erroring, matching the
+    /// chained-dispatch gate above: a refused dispatch is not an enqueue
+    /// failure, it is a call that was never permitted.
+    pub fn enqueuePlatformDispatchForTenant(
+        self: *MsgRouter,
+        tenant_id: []const u8,
+        module_path: []const u8,
+        ctx_json: []const u8,
+        fn_name: ?[]const u8,
+        actor: log_mod.PlatformActor,
+        dispatcher_is_platform: bool,
+    ) !void {
+        if (!dispatcher_is_platform) {
+            std.log.warn(
+                "rove-js platform dispatch: refusing target tenant={s} module={s} — dispatcher is not platform-bound",
+                .{ tenant_id, module_path },
+            );
+            return;
+        }
+        if (!builtin_modules.isBuiltinPath(module_path)) {
+            std.log.warn(
+                "rove-js platform dispatch: refusing non-baked target {s} for tenant={s}",
+                .{ module_path, tenant_id },
+            );
+            return;
+        }
+
+        const allocator = self.allocator;
+        const tid = try allocator.dupe(u8, tenant_id);
+        errdefer allocator.free(tid);
+        const mod = try allocator.dupe(u8, module_path);
+        errdefer allocator.free(mod);
+        const ctx = try allocator.dupe(u8, ctx_json);
+        errdefer allocator.free(ctx);
+        const fn_dup: ?[]u8 = if (fn_name) |f| try allocator.dupe(u8, f) else null;
+        errdefer if (fn_dup) |f| allocator.free(f);
+
+        const payload: effect_mod.msg.PlatformDispatch = .{
+            .tenant_id = tid,
+            .module_path = mod,
+            .ctx_json = ctx,
+            .fn_name = fn_dup,
+            .actor = actor,
+        };
+        try self.enqueueMsgForTenant(tenant_id, .{ .platform_dispatch = payload });
+    }
+
     /// Durable-wake: hash-route a `durable_wake` activation — one
     /// due `_sched/by_time` entry the baked `__system/scheduler_tick`
     /// fanned out via `__rove_fire_wake` — to the entry's owning
@@ -783,4 +860,112 @@ test "a departed worker's slot is tombstoned, so its siblings keep their index" 
     var late = effect_mod.MsgInbox.init(a);
     defer late.deinit();
     try testing.expectEqual(@as(usize, 3), try router.registerMsgInbox(&late));
+}
+
+// ── platform dispatch: the authority gate (rove#691) ──────────────────
+
+/// Drain and free whatever a test enqueued, so the inbox owns nothing at
+/// teardown. The payloads are allocator-owned by the enqueue path.
+fn drainAndFree(a: std.mem.Allocator, ib: *effect_mod.MsgInbox) usize {
+    var n: usize = 0;
+    for (ib.items.items) |*m| {
+        effect_mod.freeOwnedMsg(a, m);
+        n += 1;
+    }
+    ib.items.clearRetainingCapacity();
+    return n;
+}
+
+test "platform dispatch: only a platform-bound dispatcher may target another scope" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [4]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes) |*ib| _ = try router.registerMsgInbox(ib);
+
+    var buf: [32]u8 = undefined;
+    const tenant = tenantHashingTo(&buf, 1, 4);
+
+    // The confused-deputy case (rove#643's shape): a caller that is NOT
+    // platform-bound naming a perfectly legitimate baked module. Authority
+    // comes from the DISPATCHER's identity, never from the target path — so
+    // this is refused even though the path is one the platform itself uses.
+    try router.enqueuePlatformDispatchForTenant(
+        tenant, "__system/static.mjs", "null", null, .system, false,
+    );
+    try testing.expectEqual(@as(usize, 0), inboxes[1].items.items.len);
+
+    // Same call, platform-bound dispatcher: admitted.
+    try router.enqueuePlatformDispatchForTenant(
+        tenant, "__system/static.mjs", "null", null, .system, true,
+    );
+    try testing.expectEqual(@as(usize, 1), inboxes[1].items.items.len);
+    try testing.expectEqual(effect_mod.msg.ActivationSource.platform_dispatch, inboxes[1].items.items[0].kind());
+    _ = drainAndFree(a, &inboxes[1]);
+}
+
+test "platform dispatch: the target must be baked, never customer code" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [4]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes) |*ib| _ = try router.registerMsgInbox(ib);
+
+    var buf: [32]u8 = undefined;
+    const tenant = tenantHashingTo(&buf, 2, 4);
+
+    // Platform-bound dispatcher, ordinary module path. Refused: admitting a
+    // deployment path here would reopen both questions baked code closes —
+    // a customer reading code they cannot see, and replay resolving a
+    // dep_id out of the wrong tenant's namespace.
+    for ([_][]const u8{ "index.mjs", "handlers/admin.mjs", "" }) |path| {
+        try router.enqueuePlatformDispatchForTenant(
+            tenant, path, "null", null, .operator, true,
+        );
+    }
+    try testing.expectEqual(@as(usize, 0), inboxes[2].items.items.len);
+}
+
+test "platform dispatch: the actor rides the message, and there is no saga to inherit" {
+    const a = testing.allocator;
+    var router = MsgRouter.init(a);
+    defer router.deinit();
+
+    var inboxes: [2]effect_mod.MsgInbox = undefined;
+    for (&inboxes) |*ib| ib.* = effect_mod.MsgInbox.init(a);
+    defer for (&inboxes) |*ib| ib.deinit();
+    for (&inboxes) |*ib| _ = try router.registerMsgInbox(ib);
+
+    var buf: [32]u8 = undefined;
+    const tenant = tenantHashingTo(&buf, 0, 2);
+
+    // All three attribution values survive the hop distinctly: "was this me,
+    // or was this them?" is the split a reader most wants, and collapsing it
+    // to one value is what the vocabulary exists to prevent.
+    for ([_]log_mod.PlatformActor{ .tenant_user, .operator, .system }) |actor| {
+        try router.enqueuePlatformDispatchForTenant(
+            tenant, "__system/static.mjs", "{\"a\":1}", "onThing", actor, true,
+        );
+    }
+    try testing.expectEqual(@as(usize, 3), inboxes[0].items.items.len);
+    for (inboxes[0].items.items, [_]log_mod.PlatformActor{ .tenant_user, .operator, .system }) |m, want| {
+        const pd = m.platform_dispatch;
+        try testing.expectEqual(want, pd.actor);
+        try testing.expectEqualStrings(tenant, pd.tenant_id);
+        try testing.expectEqualStrings("{\"a\":1}", pd.ctx_json);
+        try testing.expectEqualStrings("onThing", pd.fn_name.?);
+    }
+    _ = drainAndFree(a, &inboxes[0]);
+
+    // The Msg has no saga field at all. A cross-scope hop has no parent
+    // addressable in this tenant's namespace, and `_parent` is inherited BY
+    // DEFAULT elsewhere — so absence by construction is what keeps a later
+    // caller from threading one through.
+    try testing.expect(!@hasField(effect_mod.msg.PlatformDispatch, "saga_id"));
 }

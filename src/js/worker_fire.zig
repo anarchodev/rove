@@ -544,6 +544,66 @@ pub fn fireChainedActivation(
     }, module_path, corr_full, module_path, "");
 }
 
+/// Dispatch a platform action in `pd.tenant_id`'s scope (rove#691).
+///
+/// The structural twin of `fireChainedActivation`, differing in exactly the
+/// three ways the primitive is about:
+///
+///   - **Capabilities follow the SCOPE, never the code's origin.** Every
+///     capability below is read off `p.dep.inst` — the tenant this runs
+///     against — so the platform's module gets that tenant's store, plan,
+///     keyring and `platform` grant, and nothing of the dispatcher's. This
+///     held by construction before the primitive existed; the test pins it
+///     so it stays an invariant rather than an accident.
+///   - **It roots a NEW saga.** The dispatch crossed the durability boundary
+///     (`handler-shape.md` §3.2), so there is no chain to inherit — and the
+///     dispatcher's saga id is not addressable in this tenant's namespace
+///     anyway. The `PlatformDispatch` Msg has no saga field to inherit from,
+///     so this cannot regress by someone threading one through later.
+///   - **The target is baked.** `enqueuePlatformDispatchForTenant` admits
+///     `__system/…` only, so `is_system_module` is true by construction
+///     rather than derived from the path here.
+pub fn fireDispatchActivation(
+    worker: anytype,
+    pd: *effect_mod.msg.PlatformDispatch,
+) void {
+    const allocator = worker.allocator;
+    const tenant_id = pd.tenant_id;
+    const module_path = pd.module_path;
+    var p = firePrep(worker, tenant_id, module_path, "platform-dispatch") orelse return;
+    defer p.deinit(allocator);
+
+    const ctx_src: []const u8 = if (pd.ctx_json.len > 0) pd.ctx_json else "null";
+    const body = synthCtxBody(allocator, ctx_src) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    // A fresh root, always minted — never inherited. See above.
+    var saga_buf: [80]u8 = undefined;
+    const corr_full: []const u8 = std.fmt.bufPrint(&saga_buf, "plat-{x:0>16}", .{p.request_id}) catch saga_buf[0..0];
+
+    const req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .fn_override = pd.fn_name,
+        .is_system_module = true,
+        .activation = .{ .platform_dispatch = .{ .actor = pd.actor } },
+        .trace = p.trace(corr_full, null),
+        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
+    };
+    runFire(worker, &p, req, .{
+        .act = .platform_dispatch,
+        .site = "platform-dispatch",
+        .on_cont = .enqueue,
+        .on_stream = .warn,
+        .readonly_cont_commits = true,
+        .tape = .callback,
+    }, module_path, corr_full, module_path, "");
+}
+
 /// Dispatch one upstream fetch event as a chain activation.
 /// Structural twin of `fireSubscriptionActivation` — no held socket,
 /// writes commit forgetfully — but the activation source + payload

@@ -245,6 +245,7 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .ws_message => "ws_message",
         .inbound_headers => "inbound_headers",
         .inbound_chunk => "inbound_chunk",
+        .platform_dispatch => "platform_dispatch",
     };
 }
 
