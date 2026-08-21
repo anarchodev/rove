@@ -599,6 +599,40 @@ pub fn fireDispatchActivation(
         .readonly_cont_commits = true,
         .tape = .callback,
     }, module_path, corr_full, module_path, "");
+
+    // The return path. The target cannot write into the origin's store —
+    // that cross-tenant write is what this arc removes — so completion comes
+    // back as its own activation in the origin's scope, and the ENGINE sends
+    // it. Doing it here rather than in each baked module is what stops it
+    // being a rule the second platform module forgets.
+    //
+    // Only on a committed terminal outcome (`completed_ok`). Every other exit
+    // — propose fault, handler throw, a continuation that has not finished —
+    // leaves the marker standing and the watchdog re-fires, which is the safe
+    // direction: reporting completion tells another tenant it may stop
+    // retrying.
+    if (!p.completed_ok) return;
+    if (pd.origin_tenant.len == 0 or pd.dispatch_id.len == 0) return;
+
+    const result_ctx = std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\"}}", .{pd.dispatch_id}) catch return;
+    defer allocator.free(result_ctx);
+    // Engine-originated, so platform-bound by construction: this hop is not a
+    // tenant asking to reach another scope, it is the engine closing a loop it
+    // opened. It carries NO origin of its own — a result that produced a
+    // result would volley between two tenants forever.
+    worker.node.router.enqueuePlatformDispatchForTenant(
+        pd.origin_tenant,
+        "__system/dispatch_result.mjs",
+        result_ctx,
+        null,
+        .system,
+        "",
+        "",
+        true,
+    ) catch |err| std.log.warn(
+        "rove-js platform dispatch: result hop to {s} for id={s} failed: {s}; the origin's watchdog will re-fire",
+        .{ pd.origin_tenant, pd.dispatch_id, @errorName(err) },
+    );
 }
 
 /// Dispatch one upstream fetch event as a chain activation.
