@@ -46,7 +46,7 @@
 //!
 //! ## Tamper
 //!
-//! `_usage/` is outside `SHIM_WRITABLE_PREFIXES` (`src/js/reserved.zig`), so
+//! `_usage/` is outside `SHIM_WRITABLE_PREFIXES` (`src/reserved/root.zig`), so
 //! customer and shim JS get `reserved_key` on any write to it, and only
 //! platform Zig — which bypasses the JS bindings — writes rows. The `_blob/`
 //! durability markers beside it are deliberately shim-writable; a meter cannot
