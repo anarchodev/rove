@@ -229,6 +229,7 @@ pub const Dispatcher = struct {
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
         resolver: ?*const module_execution.PackageResolver,
         hooks: ?*const globals.DeployHooks,
+        deployment_id: u64,
         request: Request,
         budget: *Budget,
         mode: qjs.snap.ReqMode,
@@ -265,6 +266,7 @@ pub const Dispatcher = struct {
             // after a failed attempt's rollback truncates the writeset, a
             // retry recaptures the same baseline.
             .ws_base = writeset.ops.items.len,
+            .deployment_id = deployment_id,
             .root_ws_base = if (request.admin.root_writeset) |rws| rws.ops.items.len else 0,
             .console = &console_buf,
             .tags = &tags_buf,
@@ -448,6 +450,13 @@ pub const Dispatcher = struct {
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
         resolver: ?*const module_execution.PackageResolver,
         hooks: ?*const globals.DeployHooks,
+        /// The deployment whose bytecode this is — what resolves the
+        /// `_config/` namespace, so a handler reads the config that shipped
+        /// WITH its code (`reserved.configStorageKey`). Required rather than
+        /// defaulted: zero means "authored world, no release", and a served
+        /// activation that quietly passed zero would read another
+        /// deployment's config and look like it worked.
+        deployment_id: u64,
         request: Request,
         budget: *Budget,
     ) DispatchError!RunOutcome {
@@ -470,7 +479,7 @@ pub const Dispatcher = struct {
         };
 
         var side_effects = false;
-        const first = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, request, budget, first_mode, &side_effects);
+        const first = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget, first_mode, &side_effects);
 
         // The arena's exhaustion record is the capacity-vs-user-error
         // discriminator; it survives until the NEXT reset, so read it
@@ -500,7 +509,7 @@ pub const Dispatcher = struct {
             self.last_arena_mode = .gc;
             self.last_arena_gc_retry = true;
             var side_effects2 = false;
-            const second = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, request, budget, .gc, &side_effects2);
+            const second = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget, .gc, &side_effects2);
             // Even the GC regime (ceiling = peak live set) can be too
             // small for a genuinely huge request. If it OOM'd too, the
             // outcome is a mangled/empty terminal — DON'T return it as a
@@ -636,10 +645,11 @@ pub const Dispatcher = struct {
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
         resolver: ?*const module_execution.PackageResolver,
         hooks: ?*const globals.DeployHooks,
+        deployment_id: u64,
         request: Request,
         budget: *Budget,
     ) DispatchError!Response {
-        var outcome = try self.runOutcome(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, request, budget);
+        var outcome = try self.runOutcome(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget);
         switch (outcome) {
             .terminal => |r| return r,
             .continuation => |*cont| {

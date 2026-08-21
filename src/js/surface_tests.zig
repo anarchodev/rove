@@ -190,7 +190,7 @@ fn runSurfaceModule(
         .plan = .{ .storage = .{ .id = "surface", .incarnation = .legacy }, .blob_cfg = &TEST_BLOB_CFG },
     };
 
-    var outcome = d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, null, request, &budget) catch |err| {
+    var outcome = d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, null, 0, request, &budget) catch |err| {
         std.debug.print("\nsurface-tests [{s}]: dispatch failed: {s}\n", .{ name, @errorName(err) });
         return error.SurfaceModuleDispatchFailed;
     };
@@ -345,7 +345,7 @@ test "surface tests: behavior + two-way inventory gate" {
         var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
         var hdr_buf: [STD_HEADER_PAIRS.len]h2.HeaderField = undefined;
         const hdrs = makeReqHeaders(&hdr_buf, &STD_HEADER_PAIRS);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, null, 0, .{
             .method = "POST",
             .path = "/surface",
             .host = "surface.test",

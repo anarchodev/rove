@@ -25,6 +25,7 @@ Sibling docs that carry adjacent leads:
 | RC-4 — CP move/provision UAF + stale follower routing | #100 |
 | RC-5 — corruption-gated silent defaults (epoch `catch 0`; wrong-length compaction marker) | #101 |
 | C4 — debug dirty-since-last-flush assertion in `on_persist` | #102 |
+| D — power-loss crash-consistency validation (`dm-flakey` soak; includes C3 rename durability) | #103 |
 | Truncation-after-fold soak — the deterministic RC-1 reproducer | #104 |
 | Engine sweep — C1 storage-rc collapse, C2 loud malformed-record skips, C5/B4 informational | #105 |
 | Transport — truncated coalesced frame drops the rest of the batch | #106 |
@@ -170,4 +171,5 @@ Listed so they are not re-opened. Provenance preserved.
 | B3 (correctness) reconciler re-address UAF | `Directory.resolveOwned` deep-copies the node set UNDER THE LOCK; reconciler uses it + `deinit`s per tenant. NOTE: move paths still aliased → **RC-4 (open above)** | `src/cp/main.zig` + `src/cp/directory.zig` |
 | raft-rs-zig WAL (C1–C5 first pass) | `ed29bac` (release-optimized staticlib, closes `-O0` `movaps` GPF in `confchange::restore`), `c5c9a9c` (term-0 baseline reject `-5`, null-checks, loud drops), `6165419` (`-1`→`UnknownGroup`, baseline gate, `GapInLog` panic), `87ed59e` (C1 compaction-marker fsync-before-unlink, C2 `roll()` header+dir fsync, C4 malformed fixed-size reject, C5 confstate corruption propagation, S3 `FileNotFound` distinction, C3 unlink-fail log) | raft-rs-zig `main` |
 | D soak harness | `scripts/smoke/raft_soak_prod.py` 3-node crash-recovery + wipe-heal soak, green incl. leader-kill mid-churn | (power-loss coverage still open — see Crash-consistency above) |
+| RC-1 truncation-after-fold reproducer | `scripts/smoke/truncation_after_fold_smoke_v2.py` — an entry appended on a leader that cannot reach quorum is refused to the client, absent on the survivors, and truncated when its leader rejoins. The precondition is asserted (`last_index` must GROW), so a run that reproduces nothing fails rather than passing empty | `scripts/smoke/` |
 | D — power-loss crash consistency | `scripts/ops/powerloss/run.py` — the real `rewind-worker` on a `dm-flakey` device that stops accepting writes mid-run. Every ACKED write survives the cut; a never-fsynced sentinel must be ABSENT or the round is VOID rather than passing. C3 covered when a run rolls a segment (`--writes 2000 --value-bytes 65536`, >64 MiB of WAL) | `scripts/ops/powerloss/` |

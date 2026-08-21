@@ -505,6 +505,13 @@ pub const DispatchState = struct {
     /// the batch wrote is a FOREIGN read for this one; eliding it leaves
     /// the record unreplayable (rove#532).
     ws_base: usize = 0,
+    /// The deployment this activation runs under — what resolves the
+    /// `_config/` namespace, so code and its config switch at the same
+    /// instant (`reserved.configStorageKey`). Zero means "no deployment",
+    /// which is an authored world in the offline engines, never a served
+    /// request: a served activation always resolved a snapshot to get its
+    /// bytecode.
+    deployment_id: u64 = 0,
     /// What THIS activation has written so far — ops, and key+value bytes —
     /// against `reserved.KV_WRITES_MAX` / `KV_WRITE_BYTES_MAX`. Counted here
     /// rather than derived from the writeset because the writeset is
