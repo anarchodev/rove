@@ -150,6 +150,15 @@ pub const InboundChunk = struct {
     ctx_json: ?[]const u8 = null,
 };
 
+/// Carried on `Activation.platform_dispatch`. The scope tenant is implicit
+/// (it is whose worker runs this), so what the activation needs to say is
+/// only WHO caused it — attribution without traversal. No saga id: a parent
+/// in another tenant's namespace is not addressable from this one, so the
+/// field does not exist rather than being elided at each call site.
+pub const PlatformDispatch = struct {
+    actor: log_mod.PlatformActor,
+};
+
 /// What caused this activation, carrying the per-source payload. Only the
 /// active variant is meaningful; `installRequest` switches on it to build
 /// the JS-side `request.activation` shape. Recorded on the tape via
@@ -175,6 +184,10 @@ pub const Activation = union(enum) {
     durable_wake: DurableWake,
     ws_message: WsMessage,
     inbound_chunk: InboundChunk,
+    /// A platform action in this tenant's scope (rove#691) — the platform's
+    /// own baked code, dispatched by a principal that is not this tenant,
+    /// running against this tenant's data.
+    platform_dispatch: PlatformDispatch,
 
     /// The log/tape wire enum for this activation. Keeps
     /// `log_mod.ActivationSource` authoritative for the record while the
@@ -193,6 +206,7 @@ pub const Activation = union(enum) {
             .durable_wake => .durable_wake,
             .ws_message => .ws_message,
             .inbound_chunk => .inbound_chunk,
+            .platform_dispatch => .platform_dispatch,
         };
     }
 
@@ -212,6 +226,18 @@ pub const Activation = union(enum) {
             .inbound, .inbound_headers, .ws_message, .inbound_chunk => false,
             .send_callback, .timer, .disconnect, .kv_wake, .wake_batch,
             .subscription_fire, .fetch_chunk, .durable_wake => true,
+            // Middleware is the tenant's authn/authz gate for the trust
+            // boundary, and this activation did not cross one: it carries no
+            // external caller and no credentials, so a gate could only 401
+            // it. `durable_wake` sits here for the same reason despite also
+            // being a fresh activation rather than a resume.
+            //
+            // Safe because the router admits BAKED targets only, so the code
+            // running is the platform's own. If a customer-deployed module
+            // ever becomes dispatchable, revisit this line first — skipping
+            // middleware for foreign code the tenant did not authorize is a
+            // different question than skipping it for the platform's.
+            .platform_dispatch => true,
         };
     }
 
@@ -227,7 +253,7 @@ pub const Activation = union(enum) {
             .timer => .timer,
             .disconnect => .disconnect,
             .kv_wake => .kv_wake,
-            .wake_batch, .subscription_fire, .fetch_chunk, .durable_wake, .ws_message, .inbound_chunk => std.debug.panic(
+            .wake_batch, .subscription_fire, .fetch_chunk, .durable_wake, .ws_message, .inbound_chunk, .platform_dispatch => std.debug.panic(
                 "Activation.fromSource: {s} carries a payload; build the arm explicitly",
                 .{@tagName(src)},
             ),

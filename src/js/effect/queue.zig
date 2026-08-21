@@ -57,6 +57,7 @@ pub fn freeOwnedMsg(allocator: std.mem.Allocator, msg: *Msg) void {
         .fetch_chunk => |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator),
         .send_callback => |*sc| sc.deinit(allocator),
         .durable_wake => |*dw| dw.deinit(allocator),
+        .platform_dispatch => |*pd| pd.deinit(allocator),
         // No-owned-bytes variants. Inbound has a placeholder payload;
         // dispatch for inbound stays entity-driven through H2, so no
         // enqueueMsg path exists for it.

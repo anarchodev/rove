@@ -3262,6 +3262,18 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 sc.deinit(allocator);
                 fired += 1;
             },
+            .platform_dispatch => |pd_const| {
+                // A platform action in this tenant's scope (rove#691). Runs
+                // here, on the worker anchoring the tenant, so the writeset
+                // is proposed into that tenant's OWN group under its own
+                // lease — which is the whole point: it takes a position in
+                // this tenant's activation order instead of arriving from
+                // another tenant's raft log with no order relative to it.
+                var pd = pd_const;
+                worker_fire.fireDispatchActivation(worker, &pd);
+                pd.deinit(allocator);
+                fired += 1;
+            },
             .durable_wake => |dw_const| {
                 // §2.6 durable-wake: one due `_sched/by_time` entry,
                 // fanned out by `scheduler_tick` via `__rove_fire_wake`.

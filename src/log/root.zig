@@ -203,6 +203,36 @@ pub const ActivationSource = enum(u8) {
     /// `done = true`. Chunk bytes are recorded inputs (L3) — they ride
     /// the activation's tape like fetch chunks.
     inbound_chunk = 11,
+    /// Platform action in this tenant's scope — the platform's own baked
+    /// code, dispatched against this tenant's data by a principal that is
+    /// not this tenant (rove#691).
+    ///
+    /// It appears in the tenant's log BECAUSE it changed the tenant's data:
+    /// a log that omitted it would be an incomplete account of what moved.
+    /// The tag is the attribution — `PlatformActor` says which kind of
+    /// principal acted — and it deliberately carries no saga id, because a
+    /// parent in another tenant's namespace is not addressable from this
+    /// one.
+    platform_dispatch = 12,
+};
+
+/// Who caused a `platform_dispatch`. Three values rather than one, because
+/// "the dashboard did it" hides the split a reader most wants: *was this me,
+/// or was this them?*
+///
+/// Attribution WITHOUT traversal — enough for a support conversation, not
+/// enough to join. The individual operator is deliberately not named here;
+/// adding that later is additive, and removing it later is not.
+pub const PlatformActor = enum(u8) {
+    /// The tenant's own user, acting on their own data through the admin
+    /// app. The common case, and fully safe to attribute.
+    tenant_user = 0,
+    /// A platform operator acting on this tenant's data. The tenant has a
+    /// reasonable claim to know a human touched it.
+    operator = 1,
+    /// An automated platform action with no human behind it — a backfill, a
+    /// sweep, a deployment step.
+    system = 2,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

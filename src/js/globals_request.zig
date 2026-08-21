@@ -259,6 +259,10 @@ pub fn installRequest(
         .inbound_headers => "inbound_headers",
         // gap 2.4 (`docs/architecture/effects-and-handlers.md`): streaming inbound body chunk.
         .inbound_chunk => "inbound_chunk",
+        // A platform action in this tenant's scope. The handler sees it
+        // because it changed this tenant's data; `actor` says which kind of
+        // principal acted, never which individual.
+        .platform_dispatch => "platform_dispatch",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation == .wake_batch) {
