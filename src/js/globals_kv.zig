@@ -274,13 +274,9 @@ pub const WorkerKv = struct {
 
     fn openStoredValue(state: *DispatchState, stored: []const u8) ValueOutcome {
         const caps = state.shred orelse return .keep;
-        const open_fn = caps.open_value orelse return .keep;
-        const outcome = open_fn(
-            caps.ctx,
-            state.allocator,
-            state.shred_instance_id,
-            stored,
-        ) catch |err| return .{ .fault = err };
+        const keys = caps.keys_for(caps.ctx, state.shred_instance_id) orelse return .keep;
+        const outcome = keys.openValue(state.allocator, stored) catch |err|
+            return .{ .fault = err };
         return switch (outcome) {
             .plaintext => .keep,
             .opened => |plain| .{ .replaced = plain },
