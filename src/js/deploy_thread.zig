@@ -35,12 +35,23 @@
 //!    `release` (a separate raft step) later flips `_deploy/current`.
 
 const std = @import("std");
+
+/// Per-pair JSON framing in the dispatch ctx — the two keys, the quotes and
+/// the separators. Approximate on purpose: it only has to keep the batch
+/// bound conservative, not exact.
+const CONFIG_PAIR_OVERHEAD: usize = 32;
+
+/// Bytes of config rows per activation. Held well under the per-activation
+/// write budget so the ctx, the writeset and the raft entry all fit with room
+/// for the framing each adds.
+const CONFIG_BATCH_BYTES: usize = 192 * 1024;
 const blob_mod = @import("rove-blob");
 const tenant_mod = @import("rove-tenant");
 const files_mod = @import("rove-files");
 const qjs = @import("rove-qjs");
 const components_mod = @import("components.zig");
 const msg_router_mod = @import("msg_router.zig");
+const config_mirror = @import("config_mirror.zig");
 const module_execution = @import("module_execution.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 
@@ -292,8 +303,111 @@ pub const DeployThread = struct {
             std.log.warn("deploy thread: manifest_put open {s}/deployments failed: {s}", .{ job.tenant_id, @errorName(err) });
             put_ok = false;
         }
+        // The deployment is durable, so hand its config rows to the tenant
+        // BEFORE anyone can release it. Ordering is structural rather than
+        // signalled: you cannot release a deployment that was never deployed.
+        if (put_ok) dispatchConfigInstall(self, job);
+
         const ctx_json = std.fmt.allocPrint(a, "{{\"ok\":{s},\"dep_id\":\"{x:0>16}\"}}", .{ if (put_ok) "true" else "false", job.dep_id }) catch return;
         routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, if (put_ok) 200 else 502, put_ok, ctx_json, &.{}, "");
+    }
+
+    /// Hand this deployment's `_config/**` rows to the tenant, as activations
+    /// in the tenant's own scope (rove#719).
+    ///
+    /// The reads happen HERE because they are S3 reads and this thread is off
+    /// the poll loop; the WRITES happen in the tenant because that is the only
+    /// place they take a position in the tenant's activation order and leave a
+    /// record. Before this, the deployment-loader thread did both — a second
+    /// executor writing a tenant's store with nothing in the log to show for
+    /// it, and only after the release had already flipped.
+    ///
+    /// Best-effort and unawaited: the loader-side mirror still runs at load
+    /// and is idempotent, so a failure here costs the ordering this exists to
+    /// give, not the config. Split across several dispatches when large —
+    /// rows are immutable and deployment-scoped, so a partially-installed
+    /// deployment is invisible (nothing reads it until `_deploy/current`
+    /// names it) rather than half-applied.
+    fn dispatchConfigInstall(self: *DeployThread, job: *Job) void {
+        const router = self.router orelse return;
+        const a = self.allocator;
+
+        var manifest = files_mod.manifest_json.decode(a, job.payload) catch return;
+        defer manifest.deinit();
+
+        const storage = tenant_mod.TenantStorage{ .id = job.tenant_id, .incarnation = job.incarnation };
+        var file_be = storage.openBackend(a, self.blob_cfg, "file-blobs") catch |err| {
+            std.log.warn("deploy thread: config install: open {s}/file-blobs failed: {s}", .{ job.tenant_id, @errorName(err) });
+            return;
+        };
+        defer file_be.deinit();
+
+        const pairs = config_mirror.collectConfigPairs(a, job.dep_id, manifest, file_be.blobStore()) catch |err| {
+            std.log.warn("deploy thread: config install: collect {s} dep={x:0>16}: {s}", .{ job.tenant_id, job.dep_id, @errorName(err) });
+            return;
+        };
+        defer config_mirror.freePairs(a, pairs);
+        if (pairs.len == 0) return;
+
+        // Batch by BYTES, not by count: one activation's writes ride one raft
+        // entry and are charged against its write budget, so a handful of
+        // large config files must not arrive as one undeliverable activation.
+        var i: usize = 0;
+        while (i < pairs.len) {
+            var end = i;
+            var bytes: usize = 0;
+            while (end < pairs.len) {
+                const cost = pairs[end].key.len + pairs[end].value.len + CONFIG_PAIR_OVERHEAD;
+                if (end > i and bytes + cost > CONFIG_BATCH_BYTES) break;
+                bytes += cost;
+                end += 1;
+            }
+            dispatchOneConfigBatch(self, router, job, pairs[i..end]);
+            i = end;
+        }
+    }
+
+    /// One batch of config rows → one activation in the tenant's scope.
+    fn dispatchOneConfigBatch(
+        self: *DeployThread,
+        router: *msg_router_mod.MsgRouter,
+        job: *Job,
+        batch: []const config_mirror.Pair,
+    ) void {
+        const a = self.allocator;
+
+        const CtxPair = struct { key: []const u8, value: []const u8 };
+        var rows = a.alloc(CtxPair, batch.len) catch return;
+        defer a.free(rows);
+        for (batch, 0..) |pr, n| rows[n] = .{ .key = pr.key, .value = pr.value };
+
+        var dep_buf: [16]u8 = undefined;
+        const dep_hex = std.fmt.bufPrint(&dep_buf, "{x:0>16}", .{job.dep_id}) catch return;
+        const ctx_json = std.json.Stringify.valueAlloc(
+            a,
+            .{ .dep = dep_hex, .pairs = rows },
+            .{},
+        ) catch return;
+        defer a.free(ctx_json);
+
+        // Engine-originated, so platform-bound by construction — the deploy
+        // path is not a tenant asking to reach another scope. No owed marker:
+        // the loader-side mirror still self-heals at load, so this wants
+        // at-most-once delivery rather than a retry that could outlive the
+        // deployment it belongs to.
+        router.enqueuePlatformDispatchForTenant(
+            job.tenant_id,
+            "__system/config_install.mjs",
+            ctx_json,
+            null,
+            .system,
+            "",
+            "",
+            true,
+        ) catch |err| std.log.warn(
+            "deploy thread: config install: enqueue {s} dep={x:0>16}: {s}",
+            .{ job.tenant_id, job.dep_id, @errorName(err) },
+        );
     }
 
     /// Compile + stage the batch into the SCOPE tenant, then emit ONE
