@@ -29,6 +29,11 @@ const B64 = std.base64.url_safe_no_pad;
 
 pub const Error = error{
     Malformed,
+    /// The payload names a claims-schema version this binary does not
+    /// implement. Distinct from `Malformed`: the token is well-formed and
+    /// correctly signed, and the only thing wrong with it is that the
+    /// verifier is older than the minter.
+    UnsupportedVersion,
     BadSignature,
     Expired,
     MissingCap,
@@ -387,6 +392,24 @@ fn verifyAndDecodePayload(
         return Error.Malformed;
     const json = payload_json_buf[0..payload_json_len];
 
+    // The claims-schema version, checked BEFORE any claim is read.
+    //
+    // `mint` stamps `"v":1` so a future claim change is a soft upgrade
+    // rather than a silent reinterpretation — but a field no reader
+    // branches on is indistinguishable from no field at all, and until
+    // this check existed that is exactly what it was.
+    //
+    // A token with NO `v` is accepted. That is not back-compat by
+    // preference: service tokens are also minted outside this repo (the
+    // smoke harness, and the operator tooling in rewind-infra), and a
+    // verifier that hard-required the claim would reject a live minter
+    // this tree cannot audit. What the check DOES buy is the case that
+    // matters — a token stamped with a version this binary does not
+    // implement is refused rather than read at today's meanings.
+    if (parseVersion(json)) |v| {
+        if (v != CLAIMS_VERSION) return Error.UnsupportedVersion;
+    }
+
     const exp_ms = parseExp(json) orelse return Error.Malformed;
     if (now_ms >= exp_ms) return Error.Expired;
 
@@ -397,6 +420,37 @@ fn verifyAndDecodePayload(
         if (!hasTenant(json, t)) return Error.WrongTenant;
     }
     return .{ .exp_ms = exp_ms };
+}
+
+/// Claims-schema version this binary mints and accepts.
+pub const CLAIMS_VERSION: i64 = 1;
+
+/// The payload's `"v"` claim, or null when absent. Same hand-rolled scan
+/// as `parseExp` — the payload is a small, mint-controlled JSON object and
+/// a parser here would be a dependency on the hot auth path.
+///
+/// Deliberately anchored on `"v":` at an object or comma boundary, so a
+/// customer-influenced string value containing the text cannot be read as
+/// the version.
+fn parseVersion(json: []const u8) ?i64 {
+    const needle = "\"v\":";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, json, from, needle)) |idx| {
+        from = idx + needle.len;
+        // Must sit right after `{` or `,` — otherwise it is inside some
+        // other value and means nothing.
+        if (idx == 0) continue;
+        const prev = json[idx - 1];
+        if (prev != '{' and prev != ',') continue;
+        var i = from;
+        while (i < json.len and (json[i] == ' ' or json[i] == '\t')) i += 1;
+        const start = i;
+        if (i < json.len and json[i] == '-') i += 1;
+        while (i < json.len and json[i] >= '0' and json[i] <= '9') i += 1;
+        if (i == start) return null;
+        return std.fmt.parseInt(i64, json[start..i], 10) catch null;
+    }
+    return null;
 }
 
 /// Parse `{"exp":<i64>}`. Returns null on any deviation. Tight
@@ -725,4 +779,44 @@ test "decodeSecretHex: round-trips, and each malformed form is its own error" {
 pub fn loadSecretFromEnvOpt(allocator: std.mem.Allocator, var_name: []const u8) SecretLoadError!?[]u8 {
     const hex = std.posix.getenv(var_name) orelse return null;
     return try decodeSecretHex(allocator, hex);
+}
+
+test "a token from a newer claims schema is refused, not read at today's meanings" {
+    const a = testing.allocator;
+    const secret = "0123456789abcdef";
+    const now: i64 = 1_000_000;
+
+    // The version this binary mints round-trips.
+    const ok = try mint(a, secret, .{ .exp_ms = now + 60_000 });
+    defer a.free(ok);
+    _ = try verify(secret, ok, now);
+    try testing.expect(std.mem.indexOf(u8, ok, "") != null);
+
+    // A correctly SIGNED token whose claims schema this binary does not
+    // implement. Signature and expiry are both fine — the only thing wrong
+    // is that the minter is newer, and reading `caps` or `tenant` out of a
+    // schema whose meanings moved is how an authorization check silently
+    // starts answering a different question.
+    const future = try mintWithPayload(a, secret, "{\"v\":2,\"exp\":1000060000}");
+    defer a.free(future);
+    try testing.expectError(Error.UnsupportedVersion, verify(secret, future, now));
+
+    // A token with no `v` at all is still accepted: service tokens are
+    // minted outside this repo too (see the note at the check).
+    const legacy = try mintWithPayload(a, secret, "{\"exp\":1000060000}");
+    defer a.free(legacy);
+    _ = try verify(secret, legacy, now);
+
+    // The version is checked BEFORE expiry, so an old-schema token does not
+    // get to masquerade as merely expired — the operator needs the version
+    // in the error, not a red herring.
+    const future_expired = try mintWithPayload(a, secret, "{\"v\":2,\"exp\":1}");
+    defer a.free(future_expired);
+    try testing.expectError(Error.UnsupportedVersion, verify(secret, future_expired, now));
+
+    // And a `v` that is not at a field boundary is not the version: a claim
+    // whose VALUE contains the text must not be able to spoof one.
+    const decoy = try mintWithPayload(a, secret, "{\"exp\":1000060000,\"tenant\":\"a\\\"v\\\":2\"}");
+    defer a.free(decoy);
+    _ = try verify(secret, decoy, now);
 }

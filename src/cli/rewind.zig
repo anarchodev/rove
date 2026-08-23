@@ -376,8 +376,8 @@ fn readLockfile(a: std.mem.Allocator, bundle: []const u8) ?packages.Resolution {
     // upgrade schedule, not ours — and reading one at the old shape
     // mis-PINS a deploy instead of failing it, which is the drift the lock
     // exists to prevent (#630 made it an input, not a record).
-    const v = packages.lockfileVersion(bytes) catch
-        c.fatal("{s} carries no readable format version — `rewind lock {s}` rewrites it", .{ path, bundle });
+    const v = packages.lockfileVersion(bytes) catch |err|
+        c.fatal("{s} carries no readable format version ({s}) — `rewind lock {s}` rewrites it", .{ path, @errorName(err), bundle });
     if (v != packages.LOCKFILE_VERSION)
         c.fatal("{s} is v{d}; this rewind writes v{d}. Upgrade rewind, or `rewind lock {s}` to rewrite it at this version.", .{ path, v, packages.LOCKFILE_VERSION, bundle });
 

@@ -350,6 +350,15 @@ def mint_jwt(secret_hex: str, payload: dict, *, alg: str = "HS256") -> str:
     # IMPORTANT: compact separators — the worker's `hasCap` searches for
     # the literal substring `"caps":[`, so dumps' default `, ` spacing
     # produces a 401. See memory/feedback_python_jwt_compact_json.md.
+    # The claims-schema version the Zig minter stamps (`src/jwt/root.zig`
+    # CLAIMS_VERSION). The harness is a SECOND implementation of this
+    # format, and it went from the format freeze to now without the field
+    # while nothing noticed — which is what a version no reader branches on
+    # looks like. Verifiers
+    # tolerate its absence (other minters live outside this repo), so
+    # stamping it here is about the harness exercising the shape production
+    # actually sends, not about passing a check.
+    payload = {"v": 1, **payload} if "v" not in payload else payload
     body = json.dumps(payload, separators=(",", ":")).encode()
     signing_input = (_b64u(header) + "." + _b64u(body)).encode()
     sig = hmac.new(bytes.fromhex(secret_hex), signing_input, hashlib.sha256).digest()

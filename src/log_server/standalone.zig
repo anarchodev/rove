@@ -373,6 +373,11 @@ fn jwtErrMsg(err: jwt.Error) []const u8 {
         jwt.Error.Malformed, jwt.Error.UnsupportedAlg, jwt.Error.InvalidTenant => "malformed token\n",
         jwt.Error.MissingCap, jwt.Error.InvalidCap => "missing required capability\n",
         jwt.Error.WrongTenant => "token not valid for this tenant\n",
+        // Named separately from "malformed": the token is well-formed and
+        // correctly signed, and the fault is that THIS binary is older than
+        // the one that minted it. An operator chasing a 401 during a rolling
+        // deploy needs that sentence, not a generic one.
+        jwt.Error.UnsupportedVersion => "token claims-schema version not supported by this build\n",
         jwt.Error.OutOfMemory => "out of memory\n",
     };
 }

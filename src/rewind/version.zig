@@ -92,10 +92,6 @@ pub const LOG_PUSH_PATH = "/v1/_internal/batch-pushed";
 /// `src/jwt/root.zig` (string-embedded; not a numeric const to import).
 pub const SERVICE_JWT_VERSION: u8 = 1;
 
-/// SSE / rich-payload JWT claims-schema version (`"v"`). Canonical:
-/// `src/jwt/root.zig` `signPayload`'s callers (string-embedded).
-pub const RICH_JWT_VERSION: u8 = 1;
-
 
 /// Record versions for the shim-owned JSON in the reserved `_` keyspace.
 /// These live in JavaScript — `globals/*.js`, the baked `__system/*`
@@ -123,7 +119,6 @@ pub fn dump(w: *std.Io.Writer) !void {
     try w.print("  snapshot_stream      v{d} (magic 0x{X:0>8})\n", .{ kv.snapshot_stream.STREAM_VERSION, kv.snapshot_stream.STREAM_MAGIC });
     try w.print("  cert_pack            v{d} (src/cp/directory.zig)\n", .{CERT_PACK_VERSION});
     try w.print("  keyring_kv_value     v{d} (_keys/bind|dead|minted|next_slot)\n", .{KEYRING_VALUE_VERSION});
-    try w.print("  rich_jwt             v{d}\n", .{RICH_JWT_VERSION});
     try w.print("  shim_kv_records      v{d} (_send/owed,_blob/owed,_dispatch/owed,_sched/by_id,_export,_oidc,_rp,_seg) — JS-owned\n", .{SHIM_RECORD_VERSIONS});
     try w.print("  service_jwt          v{d}\n", .{SERVICE_JWT_VERSION});
     try w.print("  deployment_manifest  v{d}\n", .{files.manifest_json.VERSION});
