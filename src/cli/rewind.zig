@@ -371,6 +371,16 @@ fn readLockfile(a: std.mem.Allocator, bundle: []const u8) ?packages.Resolution {
         error.FileNotFound => return null,
         else => c.fatal("read {s}: {s}", .{ path, @errorName(err) }),
     };
+    // Version before shape. A lockfile from a NEWER `rewind` is the case
+    // that will actually happen here — the binary is on the customer's
+    // upgrade schedule, not ours — and reading one at the old shape
+    // mis-PINS a deploy instead of failing it, which is the drift the lock
+    // exists to prevent (#630 made it an input, not a record).
+    const v = packages.lockfileVersion(bytes) catch
+        c.fatal("{s} carries no readable format version — `rewind lock {s}` rewrites it", .{ path, bundle });
+    if (v != packages.LOCKFILE_VERSION)
+        c.fatal("{s} is v{d}; this rewind writes v{d}. Upgrade rewind, or `rewind lock {s}` to rewrite it at this version.", .{ path, v, packages.LOCKFILE_VERSION, bundle });
+
     return packages.parseResolveResponse(a, bytes) catch |err|
         c.fatal("{s} is not a readable lockfile ({s}) — `rewind lock {s}` rewrites it", .{ path, @errorName(err), bundle });
 }
@@ -771,12 +781,20 @@ fn cutBody(a: std.mem.Allocator, tenant: []const u8, resolution: []const u8) []c
 fn writeLockfile(bundle: []const u8, body: []const u8) void {
     var buf: [4096]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/rewind.lock", .{bundle}) catch return;
+    // The registry's body verbatim, plus this CLI's format stamp — see
+    // `packages.stampLockfile` for why the body is not re-serialized.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const stamped = packages.stampLockfile(arena.allocator(), body) catch |err| {
+        std.debug.print("  ! could not stamp {s}: {s}\n", .{ path, @errorName(err) });
+        return;
+    };
     const f = std.fs.cwd().createFile(path, .{}) catch |err| {
         std.debug.print("  ! could not write {s}: {s}\n", .{ path, @errorName(err) });
         return;
     };
     defer f.close();
-    f.writeAll(body) catch {};
+    f.writeAll(stamped) catch {};
 }
 
 /// `rewind release <tenant> <dep_id_hex>` — flip the live pointer.

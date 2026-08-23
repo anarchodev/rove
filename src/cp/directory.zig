@@ -572,12 +572,38 @@ pub const Directory = struct {
 
     /// Parse a `cluster/*` value (`url1,url2,…`) and upsert the cluster into
     /// the projection (no replication — this IS the replicated state).
+    ///
+    /// ## Why this value carries no version field, and how it is versioned
+    ///
+    /// The directory's values are read across a ROLLING control-plane
+    /// upgrade: both builds are live at once, by design. That rules out an
+    /// in-band version marker, because there is no marker an OLD reader
+    /// distinguishes from data — prefix `v1,` here and the previous build
+    /// dials a cluster node called `v1`. The field cannot be introduced by
+    /// the deploy that introduces it.
+    ///
+    /// So the directory versions by KEY, the same idiom the inter-binary
+    /// HTTP surfaces use (`/v1/…`, `v2-snapshot-stream`): a changed value
+    /// shape is a NEW KEY, invisible to old readers by construction, and a
+    /// new reader prefers it and falls back. Nothing to migrate, and
+    /// nothing to get wrong during the window when both are running.
+    ///
+    /// That only holds while the value cannot be widened in place, which is
+    /// what the check below is for. It is a SHAPE guard, not a validity
+    /// check — dialability is `seedClusters`' job, where an operator's typo
+    /// is caught before it replicates and this apply path must still accept
+    /// the hostname origins tests and single-node bring-ups use. All it
+    /// asserts is that every member carries the `:` of a `host:port`, which
+    /// is what a bare marker prepended to the list would not. Without it a
+    /// future field silently becomes a node nobody can dial, and the symptom
+    /// is a cluster quietly short a replica.
     fn applyClusterFromJoined(self: *Directory, id: []const u8, joined: []const u8) Error!void {
         var node_buf: [MAX_CLUSTER_NODES][]const u8 = undefined;
         var n: usize = 0;
         var it = std.mem.tokenizeScalar(u8, joined, ',');
         while (it.next()) |u| {
             if (n >= node_buf.len) return Error.BadConfig;
+            if (std.mem.indexOfScalar(u8, u, ':') == null) return Error.BadConfig;
             node_buf[n] = u;
             n += 1;
         }
@@ -2347,6 +2373,35 @@ test "directory: seedClusters rejects origins the front door cannot dial" {
     var c3b = try tCluster(&dir, "c3");
     defer c3b.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 3), c3b.nodes.len);
+}
+
+test "directory: a cluster value cannot be widened in place" {
+    // The directory versions by KEY, not in-band, because its values are
+    // read across a rolling CP upgrade where no in-band marker is
+    // distinguishable from data (see `applyClusterFromJoined`). This is the
+    // guard that keeps that true: a marker prepended to the member list is
+    // refused rather than dialed as a node.
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+
+    try testing.expectError(
+        Error.BadConfig,
+        dir.applyClusterFromJoined("c1", "v1,http://10.0.0.1:8443"),
+    );
+    try testing.expectError(
+        Error.BadConfig,
+        dir.applyClusterFromJoined("c1", "http://10.0.0.1:8443,region=bhs"),
+    );
+    // Nothing was half-applied on the way to the refusal.
+    try testing.expect((try dir.clusterById(testing.allocator, "c1")) == null);
+
+    // And the shapes a member legitimately takes still pass — with a
+    // scheme, without one, and the hostname form a single-node bring-up
+    // uses. Dialability is `seedClusters`' concern, not this one.
+    try dir.applyClusterFromJoined("c2", "http://10.0.0.1:8443,10.0.0.2:8443,http://h:1");
+    var c2 = try tCluster(&dir, "c2");
+    defer c2.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), c2.nodes.len);
 }
 
 // ── Replicated (durable) directory ──────────────────────────────────────
