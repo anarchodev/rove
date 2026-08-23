@@ -65,11 +65,33 @@ EXCLUDED = {
                           "flake — genesis_smoke_v2 is the gate",
 }
 
+# Build steps a caller must invoke to produce what the suite spawns. Exported
+# (`--build-steps`) so a builder — the nightly — asks this file instead of
+# keeping its own copy. The two lists drifted once and cost six nights of
+# coverage: the nightly built five of them, `run_all` had grown a dependency on
+# the `rewind` CLI too, and every run exited before a single smoke (rove#373).
+BUILD_STEPS = ["rewind-worker", "rewind-cp", "rewind-front", "rewind-logs",
+               "rewind-ops", "rewind"]
+
+# Produced by the DEFAULT `zig build` install step. Their same-named steps RUN
+# the servers rather than building them, so a builder that passes these to
+# `zig build` hangs forever holding a listening socket — which is exactly what
+# happened the first time this list was exported as one flat set.
+EXAMPLE_BINARIES = ["h2-echo-server", "echo-server", "ws-echo"]
+
+# What must EXIST before any smoke starts.
+REQUIRED_BINARIES = BUILD_STEPS + EXAMPLE_BINARIES
+
 # A smoke that cannot run in this environment (e.g. no rewind-apps checkout)
 # exits with THIS code after printing why. The runner reports it as "skip" —
 # NOT as a pass: a baseline recorded in a stripped environment must not
 # silently bless members that never ran.
 SKIP_RC = 77
+# The suite could not RUN — missing binaries, no env, nothing to execute. A
+# caller must not report this as "newly broken vs baseline": it is the absence
+# of a measurement, not the result of one, and conflating them is how a
+# setup failure spends six nights impersonating a product regression.
+CANNOT_RUN_RC = 2
 # A timing-sensitive smoke that saw its failure while the box was stalled.
 # Distinct from a fail: the assertion did not hold, but the run cannot say
 # whether the code or the machine is responsible, so it must not be recorded
@@ -172,6 +194,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--filter", default=None, help="substring match on the script name")
     ap.add_argument("--list", action="store_true", help="list what would run, then exit")
+    ap.add_argument("--build-steps", action="store_true",
+                    help="print the `zig build` STEPS that produce what the suite "
+                         "spawns (the examples come from the default install step, "
+                         "and their same-named steps RUN rather than build)")
+    ap.add_argument("--required-binaries", action="store_true",
+                    help="print the binaries that must exist before a smoke starts")
     ap.add_argument("--jobs", type=int, default=1,
                     help="concurrent smokes (SERIAL members always run alone)")
     ap.add_argument("--timeout", type=int, default=420,
@@ -180,6 +208,15 @@ def main() -> int:
     ap.add_argument("--json", default=None, help="write a machine-readable summary here")
     ap.add_argument("--baseline", default=None, help="compare against a prior --json summary")
     args = ap.parse_args()
+
+    # Answered before any environment check: a BUILD step asks this, and it has
+    # nothing built and no S3 env yet by definition.
+    if args.build_steps:
+        print(" ".join(BUILD_STEPS))
+        return 0
+    if args.required_binaries:
+        print(" ".join(REQUIRED_BINARIES))
+        return 0
 
     smokes = discover(args.filter)
     if args.list:
@@ -202,14 +239,12 @@ def main() -> int:
     # build, which is exactly the kind of noise that teaches people to stop
     # reading the report.
     bin_dir = HERE.parent.parent / "zig-out" / "bin"
-    needed = ["rewind-worker", "rewind-cp", "rewind-front", "rewind-logs",
-              "rewind-ops", "rewind", "h2-echo-server", "echo-server", "ws-echo"]
-    missing = [b for b in needed if not (bin_dir / b).exists()]
+    missing = [b for b in REQUIRED_BINARIES if not (bin_dir / b).exists()]
     if missing:
         print(f"missing binaries in {bin_dir}: {', '.join(missing)}", file=sys.stderr)
-        print("run `zig build` (default install) AND `zig build rewind rewind-worker "
-              "rewind-cp rewind-front rewind-logs rewind-ops` first", file=sys.stderr)
-        return 2
+        print("run `zig build` (default install) AND "
+              f"`zig build {' '.join(BUILD_STEPS)}` first", file=sys.stderr)
+        return CANNOT_RUN_RC
 
     # Clear what earlier runs left behind BEFORE allocating anything: an
     # orphaned node holds a port block and adds I/O the timing-sensitive
@@ -367,6 +402,11 @@ def main() -> int:
     failed = [n for n, r in results.items()
               if r["status"] not in ("pass", "flaky", "skip", "inconclusive")]
     flaky = [n for n, r in results.items() if r["status"] == "flaky"]
+    if not results:
+        print("\nran ZERO smokes — nothing was measured. That is a broken runner, "
+              "never a clean run (rove#373).", file=sys.stderr)
+        return CANNOT_RUN_RC
+
     print(f"\n{'=' * 62}")
     print(f"{len(passed)}/{len(results) - len(skipped)} passed in {elapsed / 60:.0f}m"
           f"{f' ({len(flaky)} flaky)' if flaky else ''}"
