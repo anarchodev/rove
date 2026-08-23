@@ -77,8 +77,12 @@ const raft_propose = @import("raft_propose.zig");
 /// decision), so a handler cannot forge a reservation.
 pub const COUNTER_KEY = "_keys/next_slot";
 
-/// `[8B end LE][8B nonce LE]`
-const VALUE_LEN: usize = 16;
+/// `[1B version][8B end LE][8B nonce LE]` — the version is
+/// `rove-keyring`'s `keyspace.VALUE_VERSION`, shared with the binding,
+/// the tombstone and the watermark. One namespace, one version: a node
+/// that cannot read one `_keys/*` value cannot be trusted to read the
+/// rest of the tenant's key state either.
+const VALUE_LEN: usize = 1 + 8 + 8;
 
 /// How long to wait for the counter write to commit. Generous: this is
 /// a background refill, never a request, so a slow round trip costs
@@ -97,14 +101,21 @@ pub const Error = error{
     NotCommitted,
     /// The stored counter is not a value this codec wrote.
     Corrupt,
+    /// The counter carries a version this binary does not implement.
+    /// Kept distinct from `Corrupt`: reserving on top of a counter
+    /// written by a newer node would hand out slots that node believes
+    /// are already taken.
+    UnsupportedVersion,
     OutOfMemory,
 };
 
 fn decode(bytes: []const u8) Error!struct { end: u64, nonce: u64 } {
+    if (bytes.len == 0) return Error.Corrupt;
+    if (bytes[0] != keyring_mod.keyspace.VALUE_VERSION) return Error.UnsupportedVersion;
     if (bytes.len != VALUE_LEN) return Error.Corrupt;
     return .{
-        .end = std.mem.readInt(u64, bytes[0..8], .little),
-        .nonce = std.mem.readInt(u64, bytes[8..16], .little),
+        .end = std.mem.readInt(u64, bytes[1..9], .little),
+        .nonce = std.mem.readInt(u64, bytes[9..17], .little),
     };
 }
 
@@ -153,8 +164,9 @@ pub fn reserve(
     std.crypto.random.bytes(std.mem.asBytes(&nonce));
 
     var value: [VALUE_LEN]u8 = undefined;
-    std.mem.writeInt(u64, value[0..8], new_end, .little);
-    std.mem.writeInt(u64, value[8..16], nonce, .little);
+    value[0] = keyring_mod.keyspace.VALUE_VERSION;
+    std.mem.writeInt(u64, value[1..9], new_end, .little);
+    std.mem.writeInt(u64, value[9..17], nonce, .little);
 
     try writeReplicated(worker, tenant, COUNTER_KEY, &value);
 
@@ -258,8 +270,9 @@ test "the counter key is closed to customer writes" {
 
 test "value round-trips end and nonce" {
     var buf: [VALUE_LEN]u8 = undefined;
-    std.mem.writeInt(u64, buf[0..8], 4096, .little);
-    std.mem.writeInt(u64, buf[8..16], 0xDEADBEEF, .little);
+    buf[0] = keyring_mod.keyspace.VALUE_VERSION;
+    std.mem.writeInt(u64, buf[1..9], 4096, .little);
+    std.mem.writeInt(u64, buf[9..17], 0xDEADBEEF, .little);
     const d = try decode(&buf);
     try testing.expectEqual(@as(u64, 4096), d.end);
     try testing.expectEqual(@as(u64, 0xDEADBEEF), d.nonce);
@@ -267,10 +280,44 @@ test "value round-trips end and nonce" {
 
 test "a short or oversized counter value is refused, never guessed at" {
     // Guessing here would mean handing out a slot range derived from
-    // bytes this codec did not write.
+    // bytes this codec did not write. Both widths carry the RIGHT
+    // version, so the length check has to fire on its own.
+    var short = [_]u8{0} ** (VALUE_LEN - 1);
+    short[0] = keyring_mod.keyspace.VALUE_VERSION;
+    var long = [_]u8{0} ** (VALUE_LEN + 1);
+    long[0] = keyring_mod.keyspace.VALUE_VERSION;
     try testing.expectError(Error.Corrupt, decode(""));
-    try testing.expectError(Error.Corrupt, decode(&[_]u8{0} ** (VALUE_LEN - 1)));
-    try testing.expectError(Error.Corrupt, decode(&[_]u8{0} ** (VALUE_LEN + 1)));
+    try testing.expectError(Error.Corrupt, decode(&short));
+    try testing.expectError(Error.Corrupt, decode(&long));
+}
+
+test "a counter written by a newer binary is refused, not reserved on top of" {
+    // The interpretation switch. Reading a v2 counter at v1 widths would
+    // return a slot range shifted by whatever the new layout put first —
+    // and this codec's answer becomes the range a tenant's keys are
+    // minted into, so a plausible wrong number is worse than no answer.
+    var future: [VALUE_LEN]u8 = undefined;
+    future[0] = keyring_mod.keyspace.VALUE_VERSION + 1;
+    std.mem.writeInt(u64, future[1..9], 4096, .little);
+    std.mem.writeInt(u64, future[9..17], 0xDEADBEEF, .little);
+    try testing.expectError(Error.UnsupportedVersion, decode(&future));
+}
+
+test "the pre-version counter layout is refused" {
+    // `[8B end][8B nonce]`, byte-for-byte. Reading one at today's widths
+    // would shift `end` by a byte and hand out a range that overlaps a
+    // block already minted.
+    //
+    // Which refusal it gets is not determined: byte 0 of the old layout
+    // is the low byte of `end`, so a counter ending in 0x01 passes the
+    // version check and fails on width, while any other fails on
+    // version. Both refuse — that is the requirement, and pinning one
+    // would assert a property of an arbitrary counter value.
+    for ([_]u64{ 4096, 4097, 0xFF00 }) |old_end| {
+        var old = [_]u8{0} ** 16;
+        std.mem.writeInt(u64, old[0..8], old_end, .little);
+        if (decode(&old)) |_| return error.TestExpectedError else |_| {}
+    }
 }
 
 test "the floor rule keeps blocks from overlapping" {

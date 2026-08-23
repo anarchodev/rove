@@ -65,6 +65,11 @@ pub const ENTRY_FRAME_VERSION: u8 = 1;
 /// `src/consensus/envelope.zig`.
 pub const ENVELOPE_FORMAT_VERSION: u8 = 1;
 
+/// Every `_keys/*` value — binding, tombstone, minted watermark, slot
+/// counter — carries a leading version byte. Canonical:
+/// `src/keyring/keyspace.zig` (`VALUE_VERSION`).
+pub const KEYRING_VALUE_VERSION: u8 = rjs.keyring.keyspace.VALUE_VERSION;
+
 /// Cert-pack frame carries an explicit leading version byte. Canonical
 /// constant + tests live in `src/cp/directory.zig` (`CERT_PACK_VERSION`),
 /// which the worker does not link — mirrored here for the audit dump.
@@ -89,6 +94,7 @@ pub fn dump(w: *std.Io.Writer) !void {
     try w.print("  coalesced_transport  v{d}\n", .{bridge.transport.FRAME_VERSION});
     try w.print("  snapshot_stream      v{d} (magic 0x{X:0>8})\n", .{ kv.snapshot_stream.STREAM_VERSION, kv.snapshot_stream.STREAM_MAGIC });
     try w.print("  cert_pack            v{d} (src/cp/directory.zig)\n", .{CERT_PACK_VERSION});
+    try w.print("  keyring_kv_value     v{d} (_keys/bind|dead|minted|next_slot)\n", .{KEYRING_VALUE_VERSION});
     try w.print("  service_jwt          v{d}\n", .{SERVICE_JWT_VERSION});
     try w.print("  deployment_manifest  v{d}\n", .{files.manifest_json.VERSION});
     // The customer's `<bundle>/rewind.lock`, written and read by the `rewind`
@@ -125,4 +131,9 @@ test "registry dump renders all format lines without error" {
     // of the whole surface, and dropping the entries with nothing to print is
     // how a load-bearing format goes unnoticed.
     try std.testing.expect(std.mem.indexOf(u8, out, "bundle_lockfile      (unversioned)") != null);
+    // The keyring's KV values, whose version byte is the one this
+    // registry most needs to keep honest: `_keys/bind/` is the only
+    // route from an identity to the slot its ciphertext was sealed
+    // under, and there is no wipe that recovers from mis-reading it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "keyring_kv_value     v1") != null);
 }
