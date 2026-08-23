@@ -11,6 +11,7 @@
 //! `worker.zig` re-exports the public types for callers.
 
 const std = @import("std");
+const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 // Per-tenant raft bridge (one group per tenant).
 const Bridge = @import("bridge").Bridge;
@@ -1319,8 +1320,8 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_
     // this function with `dep_id == slot.currentDeploymentId()` is
     // already filtered out in `deploymentLoadFnNode`. No in-function
     // cached-bytes short-circuit needed.
-    var key_buf: [25]u8 = undefined;
-    const manifest_key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+    var key_buf: [files_mod.manifest_json.MANIFEST_KEY_MAX]u8 = undefined;
+    const manifest_key = files_mod.manifest_json.manifestKey(&key_buf, qjs.bcVersion(), dep_id);
     const json_bytes = slot.manifest_backend.blobStore().get(manifest_key, allocator) catch |err| switch (err) {
         error.NotFound => return error.NoDeployment,
         else => return err,

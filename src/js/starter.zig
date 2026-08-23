@@ -10,6 +10,7 @@
 //! `deployStarterTrampoline`.
 
 const std = @import("std");
+const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
@@ -174,8 +175,8 @@ pub fn deployBakedBundle(
     var manifest_be = try storage.openBackend(allocator, blob_cfg, "deployments");
     defer manifest_be.deinit();
 
-    var key_buf: [25]u8 = undefined;
-    const key = files_mod.manifest_json.manifestKey(&key_buf, next_id);
+    var key_buf: [files_mod.manifest_json.MANIFEST_KEY_MAX]u8 = undefined;
+    const key = files_mod.manifest_json.manifestKey(&key_buf, qjs.bcVersion(), next_id);
     try manifest_be.blobStore().put(key, json_bytes);
 
     // Stage `_deploy/current = next_id` so the caller's raft propose

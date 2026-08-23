@@ -25,6 +25,42 @@ pub const c = @cImport({
     @cInclude("qjs-arena.h");
 });
 
+/// The engine's bytecode format version — READ FROM THE ENGINE, never
+/// declared.
+///
+/// `JS_ReadObject` rejects a payload whose first byte is not the running
+/// build's `BC_VERSION`, so bytecode is only loadable by the build that wrote
+/// it. That number therefore has to key anything derived from a compile, and
+/// getting it wrong is not a crash but silent staleness: a deployment loads
+/// clean and then every request fails at module execution.
+///
+/// So it is not a constant anyone maintains. `JS_WriteObject` puts
+/// `BC_VERSION` in byte 0 of its output, so compiling one trivial module and
+/// reading that byte gives the exact number the running engine will accept —
+/// and it moves on its own when the engine does. `JS_ENGINE_VERSION` beside
+/// this is a different thing: a rove-declared tag for replay identity, bumped
+/// by a documented SOP. A number a human must remember to bump is the wrong
+/// key for a failure that is silent.
+var bc_version_cache: ?u8 = null;
+
+pub fn bcVersion() u8 {
+    if (bc_version_cache) |v| return v;
+    var rt = Runtime.init() catch return 0;
+    defer rt.deinit();
+    var ctx = rt.newContext() catch return 0;
+    defer ctx.deinit();
+    const bc = ctx.compileToBytecode(
+        "export const v = 1;",
+        "bcversion.mjs",
+        std.heap.c_allocator,
+        .{ .kind = .module },
+    ) catch return 0;
+    defer std.heap.c_allocator.free(bc);
+    if (bc.len == 0) return 0;
+    bc_version_cache = bc[0];
+    return bc[0];
+}
+
 pub const snap = @import("snap.zig");
 pub const Snapshot = snap.Snapshot;
 pub const InitFn = snap.InitFn;
@@ -558,4 +594,14 @@ test "setInterruptHandler does not fire for short handlers" {
 
 test {
     _ = @import("snap.zig");
+}
+
+test "bcVersion: read from the engine, stable across calls, and non-zero" {
+    // Non-zero is the assertion that matters: a 0 would mean the probe failed
+    // and every derived artifact would be keyed on a lie. Deliberately not
+    // asserting a LITERAL — the number is the engine's to choose, and pinning
+    // it here would just be a second place to update when it moves.
+    const v = bcVersion();
+    try std.testing.expect(v != 0);
+    try std.testing.expectEqual(v, bcVersion());
 }
