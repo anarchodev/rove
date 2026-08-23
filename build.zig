@@ -2008,6 +2008,23 @@ pub fn build(b: *std.Build) void {
     ambient_ratchet.has_side_effects = true;
     ambient_ratchet.expectExitCode(0);
 
+    // Every shim-owned record in the reserved `_` keyspace carries a
+    // version, and every reader checks it
+    // (`docs/architecture/format-versioning.md` §1f). The versions cannot
+    // share a constant — a baked `__system/*` module runs post-harden and
+    // cannot reach a shim's closure, a package ships in the tenant's
+    // deployment, a global ships in the prelude, and there is no import
+    // path between the three — so they are declared per file and this is
+    // what keeps the copies in step. The `_sched/by_id/` record alone is
+    // written from six near-identical `schedArm` copies. Always run: the
+    // set of shim files is data, not a declared input, and a file added
+    // but not declared here would leave the gate cached-green on exactly
+    // the change it exists to catch.
+    const record_version_lint = b.addSystemCommand(&.{"python3"});
+    record_version_lint.addFileArg(b.path("scripts/ops/record_version_lint.py"));
+    record_version_lint.has_side_effects = true;
+    record_version_lint.expectExitCode(0);
+
     const docs_contract_fresh = b.addSystemCommand(&.{"python3"});
     docs_contract_fresh.addFileArg(b.path("scripts/ops/gen_docs_contract.py"));
     docs_contract_fresh.addArg("--verify");
@@ -2064,5 +2081,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&prelude_fresh.step);
     test_step.dependOn(&docs_contract_fresh.step);
     test_step.dependOn(&ambient_ratchet.step);
+    test_step.dependOn(&record_version_lint.step);
     test_step.dependOn(&docs_reference_fresh.step);
 }

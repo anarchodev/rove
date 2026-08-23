@@ -33,6 +33,11 @@
 // contains a superset of the loser's rows.
 
 
+// `_seg/{log}/s/` index-row version (`format-versioning.md` §1f).
+// Written by `__system/segments_onsealed`, which ships in the worker
+// binary while this package ships in the tenant's deployment.
+const SEG_IDX_V = 1;
+
 const HOT = (s) => "_seg/" + s + "/h/";
 const IDX = (s) => "_seg/" + s + "/s/";
 const NEXT = (s) => "_seg/" + s + "/n";
@@ -181,7 +186,16 @@ const segments = {
     // outgrows that.
     const rows = kv.prefix(IDX(log), null, 4096);
     for (const row of rows) {
-      const idx = JSON.parse(row.value);
+      let idx;
+      try {
+        idx = JSON.parse(row.value);
+      } catch (_e) {
+        continue; // not an index row we wrote
+      }
+      // An index row this build cannot read is skipped, not guessed at:
+      // `first_seq`/`last_seq` decide which blob holds the record, and a
+      // misread range fetches the wrong segment.
+      if (idx.v !== SEG_IDX_V) continue;
       if (seq >= idx.first_seq && seq <= idx.last_seq) {
         if (typeof on_key !== "string")
           throw new TypeError("segments.get: record is sealed — pass { on } and finish in that export");

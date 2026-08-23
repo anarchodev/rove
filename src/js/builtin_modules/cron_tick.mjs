@@ -117,6 +117,15 @@ function cronNext(expr) {
 }
 
 // ── durable-scheduler arm (inlined from the private _system.sched core) ──
+// `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
+// record shape is written from every module that arms a wake, so the
+// field is what stops one of them shipping a new shape that the tick
+// reads at the old one. An unknown `v` is treated exactly like an
+// unparseable record — this is a shim-writable namespace, so a value
+// this reader does not understand is as likely a customer's write as an
+// engine skew, and dropping the entry is the response both deserve.
+const SCHED_REC_V = 1;
+
 function schedByTimeKey(whenNs, id) {
     return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
@@ -132,11 +141,12 @@ function schedArm(whenNs, target, msg, key) {
         // time-index entry if the fire time moved.
         try {
             const old = JSON.parse(prev);
+            if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
             if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
-        } catch (_e) { /* corrupt prior record — overwrite below */ }
+        } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
-    const rec = { when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
+    const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
     // Provenance: the arming saga rides to the fired record as the
     // reserved `_parent` tag (handler-shape.md §3.2). A re-arm's armer
     // is the CURRENT fire — the linked-list-through-fires shape.

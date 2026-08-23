@@ -64,6 +64,18 @@ const MAX_PART_ATTEMPTS = 5;
 // `_system.sched` closure. Writes the exact `_sched/` rows
 // globals/schedule.js + scheduler_tick.mjs use.
 const SCHED_TICK_NS = 1_000_000_000n;
+// `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
+// record shape is written from every module that arms a wake, so the
+// field is what stops one of them shipping a new shape that the tick
+// reads at the old one. An unknown `v` is treated exactly like an
+// unparseable record — this is a shim-writable namespace, so a value
+// this reader does not understand is as likely a customer's write as an
+// engine skew, and dropping the entry is the response both deserve.
+const SCHED_REC_V = 1;
+
+// `_export/{id}` record version (`format-versioning.md` §1f).
+const EXPORT_REC_V = 1;
+
 function schedByTimeKey(whenNs, id) {
     return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
@@ -76,11 +88,12 @@ function schedArm(whenNs, target, msg, key) {
     if (prev !== null) {
         try {
             const old = JSON.parse(prev);
+            if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
             if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
-        } catch (_e) { /* corrupt prior record — overwrite below */ }
+        } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
-    const rec = { when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
+    const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
     // Provenance: the arming saga rides to the fired record as the
     // reserved `_parent` tag (handler-shape.md §3.2). A re-arm's armer
     // is the CURRENT fire — the linked-list-through-fires shape.
@@ -95,8 +108,9 @@ function schedCancel(id) {
     if (raw === null) return false;
     try {
         const rec = JSON.parse(raw);
+        if (rec.v !== SCHED_REC_V) throw new Error("version");
         kv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
-    } catch (_e) { /* corrupt record — still drop by_id below */ }
+    } catch (_e) { /* corrupt or unknown-version record — still drop by_id below */ }
     kv.delete("_sched/by_id/" + id);
     return true;
 }
@@ -134,6 +148,16 @@ export default function () {
     } catch (_e) {
         // Unparseable state cannot be advanced or trusted; end the chain
         // rather than re-firing a watchdog against it forever.
+        kv.delete(key);
+        schedCancel(crypto.sha256b64url(key));
+        return { status: 200 };
+    }
+    // A record version this build does not implement gets the same
+    // answer. `_export/` is shim-writable, so an unknown `v` is as
+    // likely a forged record as a newer engine — and advancing an
+    // export from fields that may mean something else now would write
+    // the customer's data into parts described by the wrong shape.
+    if (st.v !== EXPORT_REC_V) {
         kv.delete(key);
         schedCancel(crypto.sha256b64url(key));
         return { status: 200 };

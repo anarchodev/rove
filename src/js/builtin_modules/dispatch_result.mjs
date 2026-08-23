@@ -16,6 +16,15 @@
 // marker delete, so the pair cannot half-apply and leave a wake firing for
 // work that is already done.
 
+// `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
+// shape is written from every module that arms a wake, so the field is
+// what stops one of them shipping a new shape that another reads at the
+// old one. An unknown `v` is treated exactly like an unparseable
+// record: this is a shim-writable namespace, so a value this reader
+// does not understand is as likely a customer's write as an engine
+// skew, and dropping the entry answers both.
+const SCHED_REC_V = 1;
+
 // Durable-scheduler cancel, inlined over the ambient `kv`: a baked
 // `__system/*` module runs post-harden and cannot reach the private
 // `_system.sched` closure. Mirrors `webhook_onresult.mjs` — keep in step.
@@ -27,8 +36,9 @@ function schedCancel(id) {
     if (raw === null) return false;
     try {
         const rec = JSON.parse(raw);
+        if (rec.v !== SCHED_REC_V) throw new Error("version");
         kv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
-    } catch (_e) { /* corrupt record — still drop by_id below */ }
+    } catch (_e) { /* corrupt or unknown-version record — still drop by_id below */ }
     kv.delete("_sched/by_id/" + id);
     return true;
 }

@@ -19,6 +19,10 @@
 // wins and its blob contains a superset of the earlier one's rows;
 // double deletes are no-ops.
 
+// `_seg/{log}/s/` index-row version (`format-versioning.md` §1f).
+// Mirrored by the reader in `@rewind/segments`.
+const SEG_IDX_V = 1;
+
 const PAD = "00000000000000000000";
 
 function pad(seq) {
@@ -48,6 +52,11 @@ export default function () {
     }
 
     kv.set("_seg/" + log + "/s/" + pad(first), JSON.stringify({
+        // `_seg/{log}/s/` index-row version
+        // (`format-versioning.md` §1f). The permanent pointer to a
+        // sealed segment blob: it outlives the hot rows it replaced
+        // and every deployment either side of the seal.
+        v: SEG_IDX_V,
         hash: request.activation.hash,
         first_seq: first,
         last_seq: last,

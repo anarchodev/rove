@@ -32,6 +32,42 @@ import jwt from "@rewind/jwt";
 
 const _OIDC_SECONDS = (ms) => Math.floor(ms / 1000);
 
+// `_oidc/*` and `_rp/*` record version (`format-versioning.md` §1f).
+//
+// One version for the whole namespace rather than one per key family.
+// Every shape here — keyset, code, device, access/refresh token, RP
+// state, jwks cache, session — is written and read by this one module,
+// and a build that cannot read one of them has no business acting on
+// the others: they are halves of a single login.
+//
+// The field is what a package pin cannot supply. A row outlives the
+// deployment that wrote it, so a tenant upgrading `@rewind/oidc` reads
+// rows its previous version wrote, and the manifest's record of which
+// package version was installed is not reachable from the row.
+const REC_V = 1;
+
+// Stamp a record on the way out. `v` goes first so it is visible in a
+// kv dump without reading the whole value.
+function _rec(o) {
+  return Object.assign({ v: REC_V }, o);
+}
+
+// Read a record, refusing a version this build does not implement.
+// `_oidc/`/`_rp/` are shim-writable, so an unknown `v` is as likely a
+// forged row as a newer engine — and both deserve the same answer,
+// which is to act as though no record is there rather than to trust
+// fields that may mean something else now.
+function _readRec(raw) {
+  if (raw == null) return null;
+  let o;
+  try {
+    o = JSON.parse(raw);
+  } catch (_e) {
+    return null;
+  }
+  return o.v === REC_V ? o : null;
+}
+
 function _b64urlRandom(n) {
   const b = new Uint8Array(n);
   crypto.getRandomValues(b);
@@ -157,7 +193,19 @@ class OIDCProvider {
   //    header (see §4.6 "Grounded correction 2026-05-16"). ──
   _keyset() {
     const raw = kv.get(this.cfg.keyset_path);
-    if (raw != null) return JSON.parse(raw);
+    if (raw != null) {
+      const ks = _readRec(raw);
+      // The one record here that must NOT fail soft. Every other read
+      // treats an unreadable record as absent, but absent means GENESIS
+      // for the keyset — it would mint a fresh key and write it over
+      // the record it could not read, destroying the issuer's signing
+      // keys and every token derived from them.
+      if (ks == null) {
+        throw new Error("oidc: keyset at " + this.cfg.keyset_path +
+          " is a record version this build does not implement — refusing to overwrite it");
+      }
+      return ks;
+    }
     // Genesis: first request to a fresh issuer mints one `current`
     // key. Safe to sign immediately — no prior key, no stale RP
     // JWKS cache to contradict (§4.6). No issuer-host capture: the
@@ -174,7 +222,7 @@ class OIDCProvider {
         since: now,
       }],
     };
-    kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
+    kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
     this._armRotation(now + this.cfg.rotation_period_ms);
     return keyset;
   }
@@ -267,7 +315,7 @@ class OIDCProvider {
     const keyset = this._keyset(); // genesis if somehow absent
     const now = Date.now();
     const next_deadline = this._advance(keyset, now);
-    kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
+    kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
     this._armRotation(next_deadline);
     response.status = 200;
     response.headers = { "content-type": "application/json" };
@@ -287,7 +335,7 @@ class OIDCProvider {
       kid: k.kid, status: "current", priv: k.priv, jwk: k.jwk, since: now,
     }];
     keyset.min_iat = Math.floor(now / 1000);
-    kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
+    kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
     this._armRotation(now + this.cfg.rotation_period_ms);
   }
 
@@ -504,7 +552,10 @@ class OIDCProvider {
     // not the hint.
     const sid = request.session && request.session.id;
     const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
-    if (sess_raw == null) {
+    // An unreadable session is no session: bounce to login rather than
+    // act on fields that may mean something else now.
+    const sess0 = _readRec(sess_raw);
+    if (sess0 == null) {
       const here = this._iss() + "/authorize?" + q.toString();
       const hint = q.get("login_hint");
       response.status = 302;
@@ -514,12 +565,12 @@ class OIDCProvider {
       };
       return null;
     }
-    const sess = JSON.parse(sess_raw);
+    const sess = sess0;
 
     // Mint a single-use authorization code bound to everything the
     // token endpoint must re-check.
     const code = _b64urlRandom(32);
-    kv.set(this.cfg.code_path + "/" + code, JSON.stringify({
+    kv.set(this.cfg.code_path + "/" + code, JSON.stringify(_rec({
       client_id,
       redirect_uri,
       code_challenge,
@@ -528,7 +579,7 @@ class OIDCProvider {
       auth_time: sess.auth_time || _OIDC_SECONDS(Date.now()),
       scope,
       exp: Date.now() + this.cfg.code_ttl_ms,
-    }));
+    })));
 
     const p = new URLSearchParams({ code });
     if (state) p.set("state", state);
@@ -552,10 +603,10 @@ class OIDCProvider {
     const device_code = _b64urlRandom(32);
     const user_code = _deviceUserCode();
     const now = Date.now();
-    kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify({
+    kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(_rec({
       client_id, scope, user_code, status: "pending", sub: null,
       exp: now + this.cfg.device_ttl_ms,
-    }));
+    })));
     kv.set(this.cfg.device_user_path + "/" + user_code, device_code);
 
     const iss = this._iss();
@@ -587,8 +638,10 @@ class OIDCProvider {
     const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
     const m = request.method;
     const reqQuery = new URLSearchParams(request.query || "");
-    if (sess_raw == null) {
-      // No session → bounce to the IdP login, returning here (keep the code).
+    const sess0 = _readRec(sess_raw);
+    if (sess0 == null) {
+      // No session (or one this build cannot read) → bounce to the IdP
+      // login, returning here (keep the code).
       const uc = reqQuery.get("user_code");
       const here = this._iss() + "/device" +
         (uc ? "?user_code=" + encodeURIComponent(uc) : "");
@@ -598,7 +651,7 @@ class OIDCProvider {
       };
       return null;
     }
-    const sess = JSON.parse(sess_raw);
+    const sess = sess0;
 
     let user_code, action = null;
     if (m === "POST") {
@@ -625,8 +678,8 @@ class OIDCProvider {
       return this._deviceHtml(400,
         "<h1>Invalid code</h1><p>That code is unknown, used, or expired.</p>");
     }
-    const st = JSON.parse(raw);
-    if (Date.now() > st.exp) {
+    const st = _readRec(raw);
+    if (st == null || Date.now() > st.exp) {
       return this._deviceHtml(400,
         "<h1>Code expired</h1><p>Start the login again from your terminal.</p>");
     }
@@ -634,7 +687,7 @@ class OIDCProvider {
     if (m === "POST") {
       st.status = action === "approve" ? "approved" : "denied";
       if (st.status === "approved") st.sub = sess.sub;
-      kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(st));
+      kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(_rec(st)));
       return this._deviceHtml(200, st.status === "approved"
         ? "<h1>Approved</h1><p>You can return to your terminal.</p>"
         : "<h1>Denied</h1><p>No device was linked.</p>");
@@ -682,14 +735,14 @@ class OIDCProvider {
     // Opaque access + refresh tokens, kv-stored (§4.6: opaque
     // refresh bounds the retired-key window + allows hard revoke).
     const at = _b64urlRandom(32);
-    kv.set(this.cfg.at_path + "/" + at, JSON.stringify({
+    kv.set(this.cfg.at_path + "/" + at, JSON.stringify(_rec({
       sub, client_id, scope, exp: Date.now() + this.cfg.id_token_ttl_ms,
-    }));
+    })));
     const rt = _b64urlRandom(32);
-    kv.set(this.cfg.rt_path + "/" + rt, JSON.stringify({
+    kv.set(this.cfg.rt_path + "/" + rt, JSON.stringify(_rec({
       sub, client_id, scope, nonce: nonce || null, auth_time,
       iat: Date.now(), exp: Date.now() + this.cfg.refresh_ttl_ms,
-    }));
+    })));
     return this._json({
       access_token: at,
       token_type: "Bearer",
@@ -717,7 +770,8 @@ class OIDCProvider {
       // Single-use: consume before any check so a replay can't race.
       kv.delete(key);
       if (raw == null) return this._tokenErr("invalid_grant", "unknown or used code");
-      const st = JSON.parse(raw);
+      const st = _readRec(raw);
+      if (st == null) return this._tokenErr("invalid_grant", "unknown or used code");
       if (Date.now() > st.exp) return this._tokenErr("invalid_grant", "code expired");
       if (st.client_id !== client_id) {
         return this._tokenErr("invalid_grant", "client_id mismatch");
@@ -741,7 +795,8 @@ class OIDCProvider {
       const raw = kv.get(key);
       kv.delete(key); // rotate refresh tokens (single-use)
       if (raw == null) return this._tokenErr("invalid_grant", "unknown refresh_token");
-      const st = JSON.parse(raw);
+      const st = _readRec(raw);
+      if (st == null) return this._tokenErr("invalid_grant", "unknown refresh_token");
       if (Date.now() > st.exp) return this._tokenErr("invalid_grant", "refresh_token expired");
       if (st.client_id !== client_id) {
         return this._tokenErr("invalid_grant", "client_id mismatch");
@@ -765,7 +820,8 @@ class OIDCProvider {
       const key = this.cfg.device_path + "/" + device_code;
       const raw = kv.get(key);
       if (raw == null) return this._tokenErr("expired_token", "unknown or expired device_code");
-      const st = JSON.parse(raw);
+      const st = _readRec(raw);
+      if (st == null) return this._tokenErr("expired_token", "unknown or expired device_code");
       if (st.client_id !== client_id) {
         return this._tokenErr("invalid_grant", "client_id mismatch");
       }
@@ -918,9 +974,9 @@ class OIDCRelyingParty {
     const verifier = _b64urlRandom(32);
     const challenge = _s256(verifier);
 
-    kv.set(this.cfg.state_path + "/" + state, JSON.stringify({
+    kv.set(this.cfg.state_path + "/" + state, JSON.stringify(_rec({
       verifier, sid, return_to, created_at: Date.now(),
-    }));
+    })));
 
     const p = new URLSearchParams({
       client_id: this.cfg.client_id,
@@ -988,8 +1044,8 @@ class OIDCRelyingParty {
       response.status = 400;
       return "unknown or used sign-in state";
     }
-    const st = JSON.parse(raw);
-    if (Date.now() - st.created_at > this.cfg.state_ttl_ms) {
+    const st = _readRec(raw);
+    if (st == null || Date.now() - st.created_at > this.cfg.state_ttl_ms) {
       response.status = 400;
       return "sign-in state expired";
     }
@@ -1074,7 +1130,7 @@ class OIDCRelyingParty {
 
     const cachedRaw = kv.get(this.cfg.jwks_path);
     if (cachedRaw != null) {
-      const cached = JSON.parse(cachedRaw);
+      const cached = _readRec(cachedRaw) || { keys: [] };
       const kid = dec.header && dec.header.kid;
       const have = (cached.keys || []).some((k) => k.kid === kid);
       if (have) {
@@ -1111,9 +1167,9 @@ class OIDCRelyingParty {
       response.status = 200;
       return "malformed jwks";
     }
-    kv.set(this.cfg.jwks_path, JSON.stringify({
+    kv.set(this.cfg.jwks_path, JSON.stringify(_rec({
       keys: jwks.keys, fetched_at: Date.now(),
-    }));
+    })));
     return this._finish(ctx.id_token, jwks, ctx.sid, ctx.return_to);
   }
 
@@ -1143,10 +1199,10 @@ class OIDCRelyingParty {
     if (this.cfg.operator_prefix) {
       is_root = kv.get(this.cfg.operator_prefix + crypto.sha256(sub)) != null;
     }
-    kv.set(this.cfg.sess_path + "/" + sid, JSON.stringify({
+    kv.set(this.cfg.sess_path + "/" + sid, JSON.stringify(_rec({
       sub, is_root,
       exp: Date.now() + this.cfg.session_ttl_ms,
-    }));
+    })));
     response.status = 200;
     return "ok";
   }
@@ -1179,7 +1235,7 @@ class OIDCRelyingParty {
 
     const cachedRaw = kv.get(this.cfg.jwks_path);
     if (cachedRaw != null) {
-      const cached = JSON.parse(cachedRaw);
+      const cached = _readRec(cachedRaw) || { keys: [] };
       const kid = dec.header && dec.header.kid;
       if ((cached.keys || []).some((k) => k.kid === kid)) {
         const res = this._finish(id_token, cached, sid, null);
@@ -1214,8 +1270,7 @@ class OIDCRelyingParty {
     const key = this.cfg.sess_path + "/" + sid;
     const raw = kv.get(key);
     if (raw == null) return null;
-    let s = null;
-    try { s = JSON.parse(raw); } catch (_) {}
+    const s = _readRec(raw);
     if (!s) { kv.delete(key); return null; }
     if (Date.now() >= s.exp) { kv.delete(key); return null; }
     return { sub: s.sub, is_root: !!s.is_root };

@@ -53,6 +53,15 @@
   const SCHED_MAX_OUTSTANDING = 10_000;
   const SCHED_MAX_MSG_BYTES = 16 * 1024;
 
+  // `_sched/by_id/{id}` record version (`format-versioning.md` §1f).
+  // The shape is written from every module that arms a wake, so the
+  // field is what stops one of them shipping a new shape that another
+  // reads at the old one. An unknown `v` is treated exactly like an
+  // unparseable record: this is a shim-writable namespace, so a value
+  // this reader does not understand is as likely a customer's write as
+  // an engine skew, and dropping the entry answers both.
+  const SCHED_REC_V = 1;
+
   const BY_ID_PREFIX = "_sched/by_id/";
   const BY_TIME_PREFIX = "_sched/by_time/";
 
@@ -152,7 +161,7 @@
       _enforceOutstandingCap();
     }
 
-    const record = { when_ns: String(rounded), target: target, msg: payload };
+    const record = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: payload };
     if (key !== null) record.key = key;
     // Provenance: the saga arming this entry. The FIRE roots its own
     // saga (crossing the durability boundary starts a new saga —
@@ -240,9 +249,11 @@
       if (raw === null) return false;
       try {
         const rec = JSON.parse(raw);
+        if (rec.v !== SCHED_REC_V) throw new Error("version");
         kv.delete(_byTimeKey(BigInt(rec.when_ns), id));
       } catch (_e) {
-        // Corrupt record — still drop the by_id entry below. A stale
+        // Corrupt or unknown-version record — still drop the by_id
+        // entry below. A stale
         // by_time index entry self-heals (scheduler_tick deletes an
         // index entry whose by_id is gone).
       }
@@ -272,6 +283,9 @@
       } catch (_e) {
         return null;
       }
+      // A record this build cannot read is reported as absent rather
+      // than described from fields it may be misreading.
+      if (rec.v !== SCHED_REC_V) return null;
       return {
         id: id,
         whenNs: BigInt(rec.when_ns),

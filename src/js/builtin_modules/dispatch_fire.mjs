@@ -42,6 +42,18 @@ const WATCHDOG_MS = 40_000;
 // globals/schedule.js + scheduler_tick.mjs use. Mirrors webhook_fire.mjs —
 // keep the two in step.
 const SCHED_TICK_NS = 1_000_000_000n;
+// `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
+// record shape is written from every module that arms a wake, so the
+// field is what stops one of them shipping a new shape that the tick
+// reads at the old one. An unknown `v` is treated exactly like an
+// unparseable record — this is a shim-writable namespace, so a value
+// this reader does not understand is as likely a customer's write as an
+// engine skew, and dropping the entry is the response both deserve.
+const SCHED_REC_V = 1;
+
+// `_dispatch/owed/{id}` marker version (`format-versioning.md` §1f).
+const DISPATCH_OWED_V = 1;
+
 function schedByTimeKey(whenNs, id) {
     return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
@@ -54,11 +66,12 @@ function schedArm(whenNs, target, msg, key) {
     if (prev !== null) {
         try {
             const old = JSON.parse(prev);
+            if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
             if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
-        } catch (_e) { /* corrupt prior record — overwrite below */ }
+        } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
-    const rec = { when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
+    const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
     if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) rec.armed_by = request.sagaId;
     if (key) rec.key = key;
     kv.set(byIdKey, JSON.stringify(rec));
@@ -86,6 +99,15 @@ export default function () {
     } catch (_e) {
         // Unparseable marker: drop the chain rather than re-fire forever.
         // Same defensive posture `__system/export_run` takes on its record.
+        kv.delete(markerKey);
+        return { status: 200 };
+    }
+    // A version this build does not implement gets the same answer, for
+    // the same reason: the namespace is shim-writable, so an unknown
+    // `v` is as likely a customer's write as a newer engine, and
+    // re-dispatching from fields we may be misreading is worse than
+    // dropping the chain.
+    if (marker.v !== DISPATCH_OWED_V) {
         kv.delete(markerKey);
         return { status: 200 };
     }

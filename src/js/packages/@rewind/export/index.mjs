@@ -72,11 +72,12 @@ function _schedArm(kvh, whenNs, target, msg, key) {
   if (prev !== null) {
     try {
       const old = JSON.parse(prev);
+      if (old.v !== SCHED_REC_V) throw new Error("version");
       const oldWhen = BigInt(old.when_ns);
       if (oldWhen !== rounded) kvh.delete(_schedByTimeKey(oldWhen, id));
     } catch (_e) { /* corrupt prior record — overwrite below */ }
   }
-  const rec = { when_ns: String(rounded), target: target, msg: msg, key: key };
+  const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg, key: key };
   // Provenance: the arming saga rides to the fired record as `armed_by`
   // (handler-shape.md §3.2 — what the seam scan reads to link a fired job
   // back to whoever started it). Every `_sched/` writer stamps it; a
@@ -89,6 +90,11 @@ function _schedArm(kvh, whenNs, target, msg, key) {
   return id;
 }
 
+// `_export/{id}` record version, and the `_sched/by_id/` record version
+// this module arms its wakes with (`format-versioning.md` §1f).
+const EXPORT_REC_V = 1;
+const SCHED_REC_V = 1;
+
 function _start(kvh, opts) {
   const id = crypto.randomUUID();
   // The marker IS the job: `export_run` reads it on every activation and
@@ -96,6 +102,12 @@ function _start(kvh, opts) {
   // Written BEFORE the wake is armed — a wake that fired first would find
   // nothing and drop the chain.
   kvh.set(_key(id), JSON.stringify({
+    // `_export/{id}` RECORD version (`format-versioning.md` §1f) — the
+    // layout of this bookkeeping object. Distinct from `format` below,
+    // which versions the export ARTIFACT the job produces: one is how
+    // to read this record, the other is what the customer downloads,
+    // and they move independently.
+    v: EXPORT_REC_V,
     format: 2,
     state: "running",
     cursor: "",

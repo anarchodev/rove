@@ -101,6 +101,16 @@
   // Crash-recovery watchdog distance for the immediate-fire path: one
   // attempt timeout (the fetch binding's 30 s cap) + grace. Mirrored in
   // `__system/webhook_fire.mjs` (its per-attempt re-arm) — keep in sync.
+  // `_send/owed/{id}` record version (`format-versioning.md` §1f).
+  // Read by `__system/webhook_fire` and `__system/webhook_onresult`,
+  // which ship in the worker binary while this shim ships in the
+  // tenant's deployment — the two can be from different builds, and
+  // the marker is the only thing that crosses between them. Declared
+  // per file because there is no import path between a global, a baked
+  // module and a package; `scripts/ops/record_version_lint.py` is what
+  // keeps the copies in step.
+  const SEND_OWED_V = 1;
+
   const WEBHOOK_WATCHDOG_MS = 40_000;
 
   /**
@@ -252,6 +262,8 @@
         : 5;
 
       const marker = {
+        // `_send/owed/{id}` record version (`format-versioning.md`
+        v: SEND_OWED_V,
         url: opts.url,
         method: opts.method || "POST",
         body: body,
