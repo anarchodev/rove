@@ -404,7 +404,7 @@ pub const Dispatcher = struct {
             const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending,
                 "_middlewares/index.mjs is not an ES module")) orelse
                 return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
-            module_execution.runMiddleware(self, &rt, &ctx, mw_fun_val, budget, &pending) catch |err| switch (err) {
+            module_execution.runMiddleware(self, &rt, &ctx, mw_fun_val, activation, budget, &pending) catch |err| switch (err) {
                 error.Interrupted => return DispatchError.Interrupted,
                 error.OutOfMemory => return DispatchError.OutOfMemory,
                 error.JsException => pending.short_circuit = true,
