@@ -8,7 +8,7 @@
 //!
 //! Every id the platform mints counts up from state inside a tenant's app.db —
 //! `_log/next_request_seq` for request ids, the deployment sequence for
-//! `deployments/{dep_id:020d}.json`. A cold bring-up wipes that state, so the
+//! `deployments/e{bc_version}/{dep_id:020d}.json`. A cold bring-up wipes that state, so the
 //! counters restart at zero. The object store is NOT wiped alongside it: S3 has
 //! no delete-by-prefix (deleting means LIST + DeleteObjects over every key),
 //! and the blobs are the deployed code. So without a namespace the new
