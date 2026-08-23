@@ -374,6 +374,24 @@ pub const BodyInbound = struct {
     receiving: bool = false,
 };
 
+/// One request, one rate token (the per-instance request bucket,
+/// `docs/architecture/control-plane.md`). `dispatchOnce` takes the token
+/// before it knows the request is dispatchable — deliberately, so a static
+/// file counts against the bucket too — and the walk has several paths that
+/// then DEFER the entity: another tenant anchored this tick, the batch
+/// stopped admitting, a sibling worker holds the tenant's dispatch lease, an
+/// armed chunk sink whose head is not fireable yet. A deferred entity stays
+/// in `request_out` and is walked again next tick, so without this marker the
+/// bucket meters WALKS, not requests: one request charges a token per tick it
+/// waits, and the tenant collects a fast, plausible 429 that names the wrong
+/// subsystem. Set when the token is taken, checked before taking another;
+/// zero-init (false) is what every fresh entity carries, and it rides the
+/// entity through the park collections so a body-durability round trip
+/// doesn't re-charge either.
+pub const RateCharged = struct {
+    charged: bool = false,
+};
+
 pub const BodyDurabilityWait = struct {
     /// Coord durability key — opaque to the dispatch path.
     worker_seq: u64 = 0,
@@ -1421,6 +1439,7 @@ pub fn Worker(comptime opts: Options) type {
         ForwardWait,
         BodyDurabilityWait,
         BodyInbound,
+        RateCharged,
         components_mod.ChainContext,
         components_mod.ContDescriptor,
         components_mod.StreamChain,
@@ -4708,4 +4727,42 @@ test "mintRequestId: a worker that never served the tenant opens its log instead
     // The open is cached, so the next activation on this worker draws
     // from the same minter and ids stay monotone within it.
     try testing.expect(mintRequestId(&fake, inst) > first);
+}
+
+test "RateCharged: fresh on create, carried across a park, and reset when the slot is reused" {
+    // The three properties the "one request, one rate token" marker rests
+    // on. The middle one is why the mark is a component rather than a side
+    // map keyed by entity; the last one is the dangerous half — a stale
+    // `true` on a recycled slot would serve a tenant's requests for free.
+    var reg = try rove.Registry.init(testing.allocator, .{ .max_entities = 8 });
+    defer reg.deinit();
+
+    const Req = rove.Row(&.{RateCharged});
+    var request_out = try rove.Collection(Req, .{}).init(testing.allocator);
+    defer request_out.deinit();
+    reg.registerCollection(&request_out);
+
+    var parked = try rove.Collection(Req, .{}).init(testing.allocator);
+    defer parked.deinit();
+    reg.registerCollection(&parked);
+
+    const e = try reg.create(&request_out);
+    try testing.expect(!(try reg.get(e, &request_out, RateCharged)).charged);
+
+    try reg.set(e, &request_out, RateCharged, .{ .charged = true });
+
+    // A body-durability park and its resume: the mark rides the entity, so
+    // the walk that picks it back up does not take a second token.
+    try reg.move(e, &request_out, &parked);
+    try reg.flush();
+    try reg.move(e, &parked, &request_out);
+    try reg.flush();
+    try testing.expect((try reg.get(e, &request_out, RateCharged)).charged);
+
+    // The answered request's entity goes back to the pool. Whatever request
+    // lands on that slot next is a new one and pays its own token.
+    try reg.destroy(e);
+    try reg.flush();
+    const reused = try reg.create(&request_out);
+    try testing.expect(!(try reg.get(reused, &request_out, RateCharged)).charged);
 }
