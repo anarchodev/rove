@@ -68,6 +68,12 @@ QUIET_EXCLUSIVE = {
                                     # the victim catches up before the gap
                                     # opens. Flaked "failed under load, passed
                                     # alone" in 2 of 3 suite runs on 2026-08-18.
+    "churn_kv_convergence_smoke_v2.py",  # six writers on ONE key + forced
+                                    # leadership flips + rolling restarts, then
+                                    # a three-node agreement check. Co-load
+                                    # stretches the quiesce window and the
+                                    # apply lag it is measuring against, so a
+                                    # neighbour's build reads as a fork.
 }
 
 # How long a waiter blocks before giving up and running contended.
