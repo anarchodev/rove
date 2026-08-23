@@ -100,18 +100,38 @@ consulted — and could not be load-bearing as written, because it describes
 The rule matters more than the list: it classifies whatever gets added
 later without a fresh argument each time.
 
+The split, **enumerated from what the shims actually install** — the
+authority is `__rove.caps` in `installStatic`, asserted by identity in
+`globals.zig`'s capability-template test:
+
 | Capability — received | Ambient — stays global |
 |---|---|
-| `kv`, `http`, `blob`, `platform` | the ES intrinsics |
-| `after`/`events`, `schedule`, `stream`, `next` | `TextEncoder`/`TextDecoder`, `URLSearchParams` |
-| `webhook`, `email`, `retry` (compose over `http`) | `atob`/`btoa`, `base64`, `hex` |
-| `request`, `response`, `session` | `crypto` — pure + seeded, reaches nothing outside |
-| `tag`, `unmaskedIp`, `shredKey` (§3.4) | `console` — see §3.5 |
+| `after`, `blob`, `http`, `kv` | the ES intrinsics |
+| `next`, `platform`, `stream`, `webhook` | `TextEncoder`/`TextDecoder`, `URLSearchParams` |
+| `request`, `response` (per-activation) | `atob`/`btoa`, `base64url`, `hex` |
+| `tag`, `unmaskedIp`, `shredKey` (§3.4) | `time` — pure ns coercion |
+| | `crypto` — pure + seeded, reaches nothing outside |
+| | `console` — see §3.5 |
 
 `crypto` stays ambient deliberately: `sha256`/`hmac` are pure, and
 `randomUUID`/`getRandomValues` are *non-determinism*, not authority — the
 replay story handles them by seeding (`JS_SetRandomSeed`), not by
 capability.
+
+**Names that are not on this list because they are not globals.** An
+earlier draft of the table named `events`, `schedule`, `email` and
+`retry` as capabilities. None of them exist as top-level names:
+`schedule` is the private `_system.sched` behind the `@rewind/schedule`
+package, and `email`/`retry` are packages too. Packages receive
+capabilities like any other package — being first-party buys them no
+ambient reach. `session` likewise is not a top-level name; it is
+`request.session`, and rides on `request`.
+
+That error is worth recording rather than quietly fixing: a capability
+list assembled from documentation drifts from the one the engine
+installs, and the drift is invisible because both halves keep working.
+Hence the identity assertion in the test — the template must hold **the**
+ambient object, not an equivalent one.
 
 ### 3.2 The handler surface
 
@@ -306,7 +326,7 @@ show the narrowed form so the ecosystem copies it.
 | `http` | `to(host \| host[])` |
 | `blob` | `scoped(prefix)`, `readonly()` |
 | `tag` | `keys([…])` — an allowlist, which also sub-divides the 4-slot budget |
-| `after`/`events` | `only("module.method")` — which target it may arm |
+| `after` | `only("module.method")` — which target it may arm |
 | `shredKey`, `unmaskedIp` | none; all-or-nothing, and rarely granted |
 
 The shape is already proven in-tree: `platform.scope(id)` returns a
