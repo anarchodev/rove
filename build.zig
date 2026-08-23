@@ -1667,6 +1667,10 @@ pub fn build(b: *std.Build) void {
     driver_smoke_mod.addImport("rove-binding", binding_mod);
     driver_smoke_mod.addImport("interaction-digest", idigest_mod);
     driver_smoke_mod.addImport("rove-files", files_mod); // world.zig: manifest package types
+    // epilogue.zig generates `__CAPS` from rove-reserved's CAPABILITY_NAMES
+    // (the one list every engine's activation object is built from), so the
+    // driver smoke needs the module its own epilogue reads.
+    driver_smoke_mod.addImport("rove-reserved", reserved_mod);
     // The lifted first-party @rewind/* package sources (P-Lift, rove#123),
     // embedded so the driver smoke can prove the real libs resolve + run
     // offline as packages — incl. the oauth→jwt intra-set dependency graph.

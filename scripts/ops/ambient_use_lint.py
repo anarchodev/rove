@@ -16,9 +16,9 @@ number in the gate rather than a vibe. `--update` re-records the ceiling;
 earned it**, never as drive-by maintenance in an unrelated one.
 
 A capability is a name that reaches outside the module (the §3.1
-classification rule). The authority for the set is `__rove.caps` in
-`src/js/globals.zig`, asserted by identity in its capability-template
-test; this list must match it.
+classification rule). The authority for the set is `CAPABILITY_NAMES` in
+`src/reserved/root.zig`, which every engine builds its activation object
+from; this script reads it rather than holding a copy.
 
 Heuristics, each a deliberate under-count rather than a false alarm:
 
@@ -46,17 +46,29 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
 
-# Must match `__rove.caps` in src/js/globals.zig (the capability template).
-CAPABILITIES = (
-    "after",
-    "blob",
-    "http",
-    "kv",
-    "next",
-    "platform",
-    "stream",
-    "webhook",
-)
+def _capabilities() -> tuple[str, ...]:
+    """Read the list from its Zig authority rather than holding a copy.
+
+    `rove-reserved`'s `CAPABILITY_NAMES` is what the worker, the replay
+    driver and the browser arena all build their activation object from.
+    A second copy here would drift, and the drift would be invisible: a
+    name dropped from it simply stops being counted, so the ratchet would
+    report progress that never happened.
+    """
+    src = (REPO / "src" / "reserved" / "root.zig").read_text(encoding="utf-8")
+    m = re.search(r"CAPABILITY_NAMES\s*=\s*\[_\]\[\]const u8\{(.*?)\}", src, re.S)
+    if not m:
+        raise SystemExit(
+            "ambient-use lint: CAPABILITY_NAMES not found in "
+            "src/reserved/root.zig — the list moved; follow it."
+        )
+    names = tuple(re.findall(r'"([^"]+)"', m.group(1)))
+    if not names:
+        raise SystemExit("ambient-use lint: CAPABILITY_NAMES is empty")
+    return names
+
+
+CAPABILITIES = _capabilities()
 
 # Trees holding customer-shaped handler JS — code that runs in an engine
 # and will have to receive its effects.

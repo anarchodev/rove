@@ -529,6 +529,45 @@ pub const TAG_MAX: usize = 4;
 pub const TAG_KEY_MAX: usize = 32;
 pub const TAG_VAL_MAX: usize = 64;
 
+/// The capability names — the ambient globals that REACH OUTSIDE the module
+/// and therefore arrive as part of the activation object rather than as free
+/// variables (`docs/architecture/package-isolation.md`, the classification
+/// rule; tracker #753).
+///
+/// Here for the same reason the caps and tag limits above are: three engines
+/// have to agree, and the worker, the offline replay driver and the browser
+/// arena each build the activation object separately. A name added to one
+/// engine's list and not the others is a capability that is passable in one
+/// place and not another — which reads as a handler bug, far from the cause.
+///
+/// The pure and web-platform names (`crypto`, `console`, `time`,
+/// `base64url`, `hex`, `atob`/`btoa`, `TextEncoder`/`TextDecoder`,
+/// `URLSearchParams`) stay ambient and are deliberately absent.
+///
+/// `src/js/globals.zig`'s capability-template test asserts the RUNTIME
+/// template against this list by identity, so a name here that no shim
+/// installs fails the build rather than yielding an undefined member.
+pub const CAPABILITY_NAMES = [_][]const u8{
+    "after",
+    "blob",
+    "http",
+    "kv",
+    "next",
+    "platform",
+    "stream",
+    "webhook",
+};
+
+/// The capability list as a JS object-literal body (`a, b, c,`), for the
+/// engines that build their activation object by evaluating source.
+pub fn capabilityLiteralBody() []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (CAPABILITY_NAMES) |n| out = out ++ n ++ ", ";
+        return out;
+    }
+}
+
 test "isEngineOnly: engine namespaces are hidden, customer keys are not" {
     try std.testing.expect(isEngineOnly("_usage/blob/deadbeef"));
     try std.testing.expect(isEngineOnly("_keys/next_slot"));

@@ -1114,11 +1114,8 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // `referencesPrivilegedSurface`). While the ambient globals still
     // exist this duplicates them; removing them is what makes this the
     // only path (tracker #753).
-    evalSnippet(ctx, "_caps.js",
-        \\globalThis.__rove.caps = {
-        \\  after, blob, http, kv, next, platform, stream, webhook,
-        \\};
-    );
+    evalSnippet(ctx, "_caps.js", comptime "globalThis.__rove.caps = { " ++
+        reserved.capabilityLiteralBody() ++ "};");
 
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
