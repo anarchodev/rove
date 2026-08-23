@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import pathlib
 import re
 import sys
@@ -142,6 +143,43 @@ BANNER = """\
 """
 
 
+def capability_names() -> list[str]:
+    """The capability list, read from its Zig authority.
+
+    `rove-reserved`'s `CAPABILITY_NAMES` is what the worker and the offline
+    replay driver each build their activation object from. The browser
+    arena's driver lives in another repo, so without this it would need a
+    hand-copied fourth list — and a list that drifts silently is how one
+    engine ends up able to pass a capability the others cannot. Emitting it
+    into the prelude puts the arena on the same authority, and the existing
+    staleness gates (`--verify` here, `--check` consumer-side) then cover
+    it for free.
+    """
+    src = (ROVE / "src" / "reserved" / "root.zig").read_text(encoding="utf-8")
+    m = re.search(r"CAPABILITY_NAMES\s*=\s*\[_\]\[\]const u8\{(.*?)\}", src, re.S)
+    if not m:
+        raise SystemExit(
+            "gen_replay_prelude: CAPABILITY_NAMES not found in "
+            "src/reserved/root.zig — the list moved; follow it."
+        )
+    names = re.findall(r'"([^"]+)"', m.group(1))
+    if not names:
+        raise SystemExit("gen_replay_prelude: CAPABILITY_NAMES is empty")
+    return names
+
+
+def caps_block() -> str:
+    names = ", ".join(json.dumps(n) for n in capability_names())
+    return (
+        "\n// ── the capability names (rove-reserved CAPABILITY_NAMES) ──\n"
+        ";// The activation object's members — see\n"
+        ";// docs/architecture/package-isolation.md. Generated from the same\n"
+        ";// Zig constant the worker and the native replay driver build from,\n"
+        ";// so the browser arena cannot drift from either.\n"
+        f"globalThis.__CAPS = [{names}];\n"
+    )
+
+
 def build() -> str:
     parts = [BANNER]
     for path, iife in PIECES:
@@ -149,6 +187,7 @@ def build() -> str:
         rel = path.relative_to(ROVE)
         parts.append(f"\n// ── {rel} ──\n;")
         parts.append(f"(function () {{\n{src}\n}})();" if iife else src)
+    parts.append(caps_block())
     parts.append(EPILOGUE)
     return "".join(parts)
 
