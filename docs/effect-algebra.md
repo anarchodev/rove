@@ -1,13 +1,13 @@
 # The effect algebra
 
-> **Forward pointer — effects here are described as ambient globals.**
+> **Effects are received, not ambient.** This doc spells them as globals
+> throughout; they arrive as a destructured parameter — see
+> [`handler-shape.md`](handler-shape.md) §1.1 for the form, and
 > [`architecture/package-isolation.md`](architecture/package-isolation.md)
-> (tracker #751, not built) makes them *received* instead: an effect that
-> reaches outside the module arrives as a parameter, while pure and
-> web-platform surfaces stay ambient. The algebra itself is unchanged —
-> the same four primitives, reached differently — but the classification
-> rule there is the one to apply when asking whether a *new* effect is
-> ambient or granted.
+> (tracker #753) for the arc. The algebra is unchanged — the same four
+> primitives, reached differently — but the classification rule there is
+> what decides whether a *new* effect is ambient or granted: if it can
+> reach outside the module, it is a capability.
 
 
 > **Status**: principles — the effect model every shipped or proposed

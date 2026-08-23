@@ -1,14 +1,11 @@
 # Handler shape — pattern-matching at module level
 
-> **Forward pointer — the surface below is as-built and ambient.**
+> **Effects are received, not ambient — see §1.1.** Every export takes one
+> argument and destructures what it needs. The ambient spellings used
+> throughout the examples below still work and are being migrated;
+> §1.1 is the form to write new code in. The arc is
 > [`architecture/package-isolation.md`](architecture/package-isolation.md)
-> (tracker #751, not built) replaces ambient authority with capabilities
-> the handler *receives*: one destructured parameter
-> (`async ({ request, response, kv, http }) => …`), with `tag`,
-> `unmaskedIp` and `shredKey` moving off `request` because each is an
-> effect rather than data. The **one-ctx** invariant below is unaffected
-> and is why that parameter goes unnamed. This doc keeps documenting the
-> ambient surface until that ships.
+> (tracker #753).
 
 
 > **Status:** SHIPPED (2026-06-03). All phases of the implementation plan
@@ -81,6 +78,113 @@ A module exports the subset of variants it cares about; the runtime
 introspects exports at load (§6) and dispatches each activation to its
 matching export. The default export handles inbound HTTP — the 80%+
 case; everything else is opt-in via additional named exports.
+
+### 1.1 Capabilities — how a handler reaches its effects
+
+**Every export the platform invokes receives one argument: the
+activation.** Destructure what you need.
+
+The same names are also still bound as globals, so the ambient spellings
+in the examples further down keep working — that is the migration, not
+the contract. Write new code against the parameter: the globals go away,
+and when they do, a capability you were not handed is simply not there.
+
+```js
+export default async ({ request, response, kv, webhook }) => {
+  const v = kv.get("k");
+  response.status = 201;
+  webhook.send("https://api.example/x", { body: v });
+  return { ok: true };
+};
+```
+
+This holds for every platform-invoked export — the default, each
+`on…` variant, a resume target named by `{on: …}`, and `_middlewares`'
+`before`. It does **not** hold for exports your own JS calls, like the
+`rpc` recipe in §3.1: the platform passes those nothing, so they keep
+whatever signature you gave them.
+
+**What arrives, and what stays ambient.** The rule is reach, not
+convenience: a name that can touch tenant data, the network, another
+activation or a durable record is a capability and arrives as a
+parameter. Pure computation and web-platform standards stay global.
+
+| Received | Ambient |
+|---|---|
+| `kv`, `http`, `blob`, `platform` | the ES intrinsics |
+| `after`, `next`, `stream`, `webhook` | `TextEncoder`/`TextDecoder`, `URLSearchParams` |
+| `request`, `response` | `atob`/`btoa`, `base64url`, `hex`, `time` |
+| `tag`, `unmaskedIp`, `shredKey` | `crypto` — pure, and seeded for replay |
+
+The last row moved off `request`. Each is an effect that had been sitting
+on a data shape: `tag` writes a durable exported record against a shared
+budget, `unmaskedIp` is the deliberate escalation past `request.ip`'s
+masking, and `shredKey` **replaces** the activation's erasure identity
+rather than adding to it.
+
+**Helpers take a destructured first parameter too.** A module-scope
+helper has no activation to receive from, so its caller hands over what
+it needs:
+
+```js (doc-only)
+function kvStoreFor({ platform }, id) { return platform.scope(id).kv; }
+function kvRead({ platform }, id, q)  { return kvStoreFor({ platform }, id).get(q.key); }
+```
+
+One shape everywhere, so there is no parameter-order convention to
+remember — `{ kv, platform }` and `{ platform, kv }` are the same call —
+and adding a need adds a key rather than renumbering call sites.
+
+It also makes the chain **narrow monotonically**. A function that binds
+`{ platform }` cannot pass `kv` onward, because it never bound it:
+
+```js (doc-only)
+function kvRead({ platform }, id, q) {
+  return kvStoreFor({ platform, kv }, id);   // ReferenceError: kv is not defined
+}
+```
+
+**A route table stays readable as a grant table.** A module-scope table
+cannot close over a per-activation value, so the thunk is where the
+activation is unpacked — which means the table shows at a glance which
+routes touch what:
+
+```js (doc-only)
+const ROUTES = [
+  ["GET",  "/v1/accounts/:aid",        ({ kv }, c)          => getAccount({ kv }, c.params.aid)],
+  ["GET",  "/v1/instances/:id/kv",     ({ platform }, c)    => kvRead({ platform }, c.params.id, c.query)],
+  ["POST", "/v1/accounts/:aid/invite", ({ kv, webhook }, c) => inviteMember({ kv, webhook }, c.params.aid, c.body)],
+];
+
+export default function (a) {                 // named, because forwarding to
+  const m = matchRoute(request.method, request.path);   // unknown-need thunks
+  if (!m) { response.status = 404; return { error: "not found" }; }
+  return m.thunk(a, { params: m.params, query: parseQuery(qs), body: parseBody() });
+}
+```
+
+The dispatcher is the one place that names the whole activation instead
+of destructuring it. That is its job, and it is the trust root.
+
+**A package receives capabilities the same way**, which is the point:
+promoting a module to a package is a move, not a rewrite.
+
+```js (doc-only)
+export function charge({ http }, amount) {
+  return http.fetch("https://api.stripe.com/v1/charges", { method: "POST" });
+}
+
+// at the call site, narrow before you delegate
+charge({ http: http.to("api.stripe.com") }, amount);
+```
+
+**Two failure shapes worth recognising.** Calling a capability-taking
+function with no argument throws at the callee, naming it:
+`Cannot convert undefined or null to object`, with that function on top
+of the stack. Passing an activation that lacks the key does **not** throw
+there — destructuring a missing key binds `undefined`, so it surfaces at
+first use as `cannot read property 'x' of undefined`. That second shape
+means the capability was not granted to this activation.
 
 ## 2. The verb surface — the verb is the scope
 
