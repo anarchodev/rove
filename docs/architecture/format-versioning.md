@@ -61,14 +61,24 @@ frame that produced it, the reader has nothing to dispatch on. §1f is where
 that distinction decides most of the rows.
 
 Every table below carries the **Class** column. The tally across all 55
-rows: **23 versioned · 8 inherits · 16 by-decision · 2 gap · 6 unwritten.**
+rows: **24 versioned · 8 inherits · 17 by-decision · 0 gap · 6 unwritten.**
 
-The two gaps are `<bundle>/rewind.lock` (§1d) and `cluster/{id}` (§1g).
-Both share a property none of the by-decision rows have: they are read by
-something that is NOT upgraded in lockstep with their writer — the
-customer's checkout in one case, the other half of a rolling CP upgrade
-in the other. That, rather than how important a format looks, is what
-separates a gap from a decision.
+No gaps remain. The last two were the rows read by something NOT upgraded
+in lockstep with their writer, and they closed differently because that
+difference is what a version field can and cannot fix:
+
+- `<bundle>/rewind.lock` took a `"v"`. Its reader is the customer's
+  `rewind` binary, upgraded on their schedule, and a version field
+  works there because the file is handed over whole.
+- `cluster/{id}` could not. Its readers are the two halves of a rolling
+  CP upgrade, both live at once, so an in-band marker is indistinguishable
+  from data to the older one — the field cannot be introduced by the
+  deploy that introduces it. It versions by KEY instead, and the value's
+  shape is guarded so it cannot be widened in place.
+
+That asymmetry is the general rule: a version field needs a reader that
+can be told about it before it arrives. Where the reader is already
+running, the version belongs in the NAME.
 
 The runtime registry (`src/rewind/version.zig`, dumped by
 `rewind --version`) names every row that is not in the *inherits* class,
@@ -118,13 +128,13 @@ nothing to see.
 | kvexp store (app.db / __root__.db) | kvexp (fetched, **not vendored**); `data_dir/{id}/app.db` | LMDB B+tree; applied-raft-idx watermark in kvexp meta | LMDB internal | **inherits** ← the `kvexp` pin. LMDB's own on-disk format is versioned by LMDB and refuses a file it does not know | C |
 | Group manifest (node-local) | `src/consensus/node_core.zig` (`{data_dir}/__groups__/app.db`) | kvexp; key=group id, value=epoch decimal ASCII | none | **by-decision** — a monotonic decimal integer has no shape to change, and the file is node-local: a node that loses it re-derives its groups from the directory rather than reading a peer's copy, so no two builds ever read the same bytes | C |
 | ACME account key | `src/cp/acme.zig` (`{data_dir}/acme/account.key`) | PKCS#8 PEM | none | **by-decision** — PKCS#8 is an external standard with its own structure. Versioning it would be inventing a dialect of someone else's format | C |
-| Bundle lockfile (`<bundle>/rewind.lock`) | written `src/cli/rewind.zig` `writeLockfile`, read `readLockfile`; shape `src/cli/packages.zig` `parseResolveResponse` | the registry's `/v1/resolve` body verbatim — JSON `{packages[{spec,version,pkg_hash,files,imports,capabilities,private}], app_imports{spec:pkg_hash}}` | **none** | **gap** — the last one in the inventory. It is an INPUT to a deploy (see below), it lives in the customer's tree where no engine wipe reaches it, and it is the registry's response shape verbatim, so it moves when the registry does | C |
+| Bundle lockfile (`<bundle>/rewind.lock`) | written `src/cli/rewind.zig` `writeLockfile`, read `readLockfile`; shape + stamp `src/cli/packages.zig` (`LOCKFILE_VERSION`, `stampLockfile`, `lockfileVersion`) | JSON `{v:1, packages[…], app_imports{…}}` — the registry's `/v1/resolve` body with the CLI's stamp inserted, otherwise byte-for-byte | **yes (`v`)** | **versioned** — the stamp is the CLI's, not the registry's: `parseResolveResponse` still reads a live response that carries no `v`. Read-side checks the version BEFORE the shape, because a lock from a newer `rewind` mis-PINS a deploy rather than failing it | C |
 
 > **`rewind.lock` became load-bearing** when `deploy` started resolving through
-> it (#630): it is now an INPUT to a deploy, not a record of one, so a shape
-> change silently mis-pins rather than being ignored. It carries no version
-> field yet — that lands with the versioning pass (#244), and the entry is
-> listed here so the inventory is complete in the meantime.
+> it (#630): it is an INPUT to a deploy, not a record of one, so a shape change
+> would silently mis-pin rather than be ignored. That is what its `"v"` guards,
+> and why the reader checks the version before the shape — a lock written by a
+> newer `rewind` than the one reading it is the ordinary case here, not an edge.
 
 > **Stale / dead (not live formats):** the per-instance SQLite `files.db` /
 > `log.db` are gone. What survives is prose: `src/tenant/root.zig` still names
@@ -218,7 +228,7 @@ Source: `src/cp/directory.zig`.
 
 | Key | Value | Ver? | Class | Notes |
 |---|---|---|---|---|
-| `cluster/{id}` | `"url1,url2,…"` comma-joined origins | none | **gap** — a delimited list with no discriminant, read across a ROLLING CP upgrade, so the two builds are live at once by design. Anything added to a member (a role, a weight) is misread by the older parser as part of an origin | topology SSOT |
+| `cluster/{id}` | `"url1,url2,…"` comma-joined origins | none (versioned by KEY) | **by-decision** — the directory's values are read across a ROLLING CP upgrade, where no in-band marker is distinguishable from data: prefix `v1,` and the previous build dials a node called `v1`. The field cannot be introduced by the deploy that introduces it. So the directory versions by KEY — a changed shape is a NEW key, invisible to old readers by construction — the same idiom as the path-versioned surfaces in §1b. `applyClusterFromJoined` guards the shape so it cannot be widened in place instead | topology SSOT |
 | `placement/{tenant}` | bare `{cluster_id}` | none | **by-decision** — wipe-on-change, and that is not a hope: this value has ALREADY changed shape once, from `{state}:{cluster}` to a bare id, and the wipe is how it was done | domain of one identifier |
 | `plan/{tenant}` | JSON `{tier, overrides{…}}` | none | **by-decision** — additive by construction (`ignore_unknown_fields`), and a blob the parser cannot read resolves to the tenant's DEFAULT rather than failing the request: free for a customer, platform for a reserved id. A format that fails toward a safe answer does not need a version to fail safely | CP dumb, DP parses (`src/plan/root.zig` `parseBlob`) |
 | `host/{host}` | `{tenant_id}` | none | **by-decision** — a single identifier; a richer value would be a different key | domain index |

@@ -243,6 +243,53 @@ fn writeStringMap(out: *std.ArrayList(u8), a: std.mem.Allocator, entries: []cons
 /// into an owned `Resolution`. A `{"error":…}` body (e.g. the registry's
 /// `422 unresolved`) → `Error.Unresolved`. Everything is duped into the
 /// resolution's arena.
+/// `<bundle>/rewind.lock` format version
+/// (`docs/architecture/format-versioning.md` §1d).
+///
+/// The lockfile is the registry's `/v1/resolve` body with this field
+/// stamped on, and it is the one format in the inventory that lives in the
+/// CUSTOMER's checkout — no engine wipe reaches it, and the `rewind` binary
+/// that reads it is upgraded on their schedule, not ours. So a lockfile
+/// written by a newer CLI is a case that will actually happen, and reading
+/// one at the old shape mis-PINS a deploy rather than failing it (#630 made
+/// the lock an input, not a record).
+pub const LOCKFILE_VERSION: u32 = 1;
+
+/// Read the lockfile's `v`, refusing a version this binary does not
+/// implement. Separate from `parseResolveResponse` on purpose: that parses
+/// the registry's LIVE response too, which carries no `v` — the field is
+/// the CLI's stamp on what it wrote, not part of the registry's contract.
+pub fn lockfileVersion(json_bytes: []const u8) Error!u32 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), json_bytes, .{}) catch
+        return Error.ParseFailed;
+    if (parsed.value != .object) return Error.BadResolution;
+    const v = parsed.value.object.get("v") orelse return Error.BadResolution;
+    if (v != .integer) return Error.BadResolution;
+    if (v.integer < 0 or v.integer > std.math.maxInt(u32)) return Error.BadResolution;
+    return @intCast(v.integer);
+}
+
+/// Stamp `v` onto a resolve body so it can be written as a lockfile. The
+/// body is preserved byte-for-byte apart from the inserted field — the
+/// lock's whole job is to pin exactly what the registry answered, so
+/// re-serializing it through a parser would risk pinning something subtly
+/// different from what was resolved. Caller frees.
+pub fn stampLockfile(a: std.mem.Allocator, body: []const u8) Error![]u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '{') return Error.BadResolution;
+    // `{` then the field, then the rest — including the `}` of an empty
+    // object, which needs no comma.
+    const rest = trimmed[1..];
+    const needs_comma = std.mem.trim(u8, rest, " \t\r\n")[0] != '}';
+    return std.fmt.allocPrint(a, "{{\"v\":{d}{s}{s}", .{
+        LOCKFILE_VERSION,
+        if (needs_comma) "," else "",
+        rest,
+    }) catch return Error.OutOfMemory;
+}
+
 pub fn parseResolveResponse(gpa: std.mem.Allocator, json_bytes: []const u8) Error!Resolution {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -766,4 +813,46 @@ test "topoSort: a cycle is rejected" {
     var res = try parseResolveResponse(testing.allocator, json);
     defer res.deinit();
     try testing.expectError(Error.BadResolution, topoSort(&res));
+}
+
+test "lockfile: the stamp round-trips, and a version this build cannot read is refused" {
+    const a = testing.allocator;
+
+    // The registry's body, stamped. Everything the registry answered is
+    // preserved byte-for-byte — the lock's job is to pin exactly what was
+    // resolved, so the stamp is an insertion, never a re-serialization.
+    const body = "{\"packages\":[],\"app_imports\":{}}";
+    const stamped = try stampLockfile(a, body);
+    defer a.free(stamped);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"packages\":[],\"app_imports\":{}}",
+        stamped,
+    );
+    try testing.expectEqual(LOCKFILE_VERSION, try lockfileVersion(stamped));
+
+    // An empty object needs no separator.
+    const empty = try stampLockfile(a, "{}");
+    defer a.free(empty);
+    try testing.expectEqualStrings("{\"v\":1}", empty);
+
+    // A lockfile from a NEWER rewind. This is the case that actually
+    // happens: the binary is on the customer's upgrade schedule, and
+    // reading their lock at the old shape mis-PINS a deploy rather than
+    // failing it.
+    try testing.expectEqual(
+        @as(u32, 2),
+        try lockfileVersion("{\"v\":2,\"packages\":[]}"),
+    );
+
+    // A pre-version lockfile carries no `v` at all, and is refused rather
+    // than assumed to be v1: the shape it was written at is exactly what
+    // this build cannot know.
+    try testing.expectError(Error.BadResolution, lockfileVersion(body));
+    try testing.expectError(Error.ParseFailed, lockfileVersion("not json"));
+
+    // The stamped body is still a readable resolution — the field rides
+    // alongside the response, it does not replace parsing it.
+    var res = try parseResolveResponse(a, stamped);
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 0), res.packages.len);
 }

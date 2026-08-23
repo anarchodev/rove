@@ -80,6 +80,11 @@ pub const CERT_PACK_VERSION: u8 = 1;
 /// instead of mis-parsing it. Recorded here because a path IS the
 /// version for these, and an inventory that only counted embedded bytes
 /// would report them as unversioned.
+/// The customer's `<bundle>/rewind.lock`. Canonical constant + tests live
+/// in `src/cli/packages.zig` (`LOCKFILE_VERSION`), which this binary does
+/// not link — mirrored here for the audit dump.
+pub const BUNDLE_LOCKFILE_VERSION: u32 = 1;
+
 pub const SNAPSHOT_SINK_PATH = "/_system/v2-snapshot-stream";
 pub const LOG_PUSH_PATH = "/v1/_internal/batch-pushed";
 
@@ -122,12 +127,7 @@ pub fn dump(w: *std.Io.Writer) !void {
     try w.print("  shim_kv_records      v{d} (_send/owed,_blob/owed,_dispatch/owed,_sched/by_id,_export,_oidc,_rp,_seg) — JS-owned\n", .{SHIM_RECORD_VERSIONS});
     try w.print("  service_jwt          v{d}\n", .{SERVICE_JWT_VERSION});
     try w.print("  deployment_manifest  v{d}\n", .{files.manifest_json.VERSION});
-    // The customer's `<bundle>/rewind.lock`, written and read by the `rewind`
-    // CLI (`src/cli/packages.zig` owns the shape; not in this binary's import
-    // graph, hence no constant to reference). An INPUT to a deploy since #630,
-    // so a shape change mis-pins rather than being ignored — versioning it is
-    // #244's pass.
-    try w.writeAll("  bundle_lockfile      (unversioned) — src/cli/packages.zig\n");
+    try w.print("  bundle_lockfile      v{d} (src/cli/packages.zig)\n", .{BUNDLE_LOCKFILE_VERSION});
     try w.print("  log_sidecar          v{d}\n", .{log_server.sidecar.VERSION});
     try w.print("  pool_object          v{d} (magic 0x{X:0>8})\n", .{
         blob.pool_object.VERSION,
@@ -156,10 +156,7 @@ test "registry dump renders all format lines without error" {
     try std.testing.expect(std.mem.indexOf(u8, out, "js_engine_version") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "readset              v11") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "request_id           req_<16hex>") != null);
-    // An unversioned format still has to appear: the registry is an inventory
-    // of the whole surface, and dropping the entries with nothing to print is
-    // how a load-bearing format goes unnoticed.
-    try std.testing.expect(std.mem.indexOf(u8, out, "bundle_lockfile      (unversioned)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bundle_lockfile      v1") != null);
     // The keyring's KV values, whose version byte is the one this
     // registry most needs to keep honest: `_keys/bind/` is the only
     // route from an identity to the slot its ciphertext was sealed
