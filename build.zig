@@ -1989,6 +1989,20 @@ pub fn build(b: *std.Build) void {
     // given above: declaring inputs would mirror each generator's source list
     // here, and a doc or shim added there but not here would leave the gate
     // cached-green on the very change it exists to catch.
+    // The received-not-ambient ratchet (tracker #753,
+    // docs/architecture/package-isolation.md). Counts customer-shaped JS
+    // that still reaches a capability as an ambient global; the number may
+    // only go DOWN. The migration is a dual-support window across two
+    // repos and three engines, and its known failure mode is that the
+    // window never closes — so the remaining tail is a number in the gate
+    // rather than a vibe. Always run: the corpus it scans is data, not a
+    // declared input, and a file added but not declared here would leave
+    // this cached-green on the very change it exists to catch.
+    const ambient_ratchet = b.addSystemCommand(&.{"python3"});
+    ambient_ratchet.addFileArg(b.path("scripts/ops/ambient_use_lint.py"));
+    ambient_ratchet.has_side_effects = true;
+    ambient_ratchet.expectExitCode(0);
+
     const docs_contract_fresh = b.addSystemCommand(&.{"python3"});
     docs_contract_fresh.addFileArg(b.path("scripts/ops/gen_docs_contract.py"));
     docs_contract_fresh.addArg("--verify");
@@ -2044,5 +2058,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&conf_run.step);
     test_step.dependOn(&prelude_fresh.step);
     test_step.dependOn(&docs_contract_fresh.step);
+    test_step.dependOn(&ambient_ratchet.step);
     test_step.dependOn(&docs_reference_fresh.step);
 }
