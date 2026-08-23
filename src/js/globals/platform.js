@@ -18,6 +18,13 @@
   const sys = _system.platform;
   // `after.fetch` native (captured before `_harden.js` deletes `_system`) —
   // `platform.compile` lowers to a bound fetch to a trusted compile door.
+  // `_dispatch/owed/{id}` record version (`format-versioning.md` §1f).
+  // Read by `__system/dispatch_fire`; `__system/dispatch_result` keys on
+  // the marker's PRESENCE, not its contents, so it needs no version of
+  // its own. Declared per file — see
+  // `scripts/ops/record_version_lint.py`.
+  const DISPATCH_OWED_V = 1;
+
   const sysOn = _system.after;
   // `blob.receive` native — `platform.scope(t).blob.receive` lowers to a
   // cross-tenant streamed upload (extra target + ctx args, admin-gated).
@@ -444,6 +451,7 @@
 
       const id = crypto.randomUUID();
       const marker = {
+        v: DISPATCH_OWED_V,
         tenant: tenant,
         module: module,
         ctx: opts.ctx === undefined ? null : opts.ctx,

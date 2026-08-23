@@ -43,6 +43,18 @@ function computeNextAtNs(attempts) {
 // `_system.sched` closure. Writes the exact `_sched/` rows
 // globals/schedule.js + scheduler_tick.mjs use.
 const SCHED_TICK_NS = 1_000_000_000n;
+// `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
+// record shape is written from every module that arms a wake, so the
+// field is what stops one of them shipping a new shape that the tick
+// reads at the old one. An unknown `v` is treated exactly like an
+// unparseable record — this is a shim-writable namespace, so a value
+// this reader does not understand is as likely a customer's write as an
+// engine skew, and dropping the entry is the response both deserve.
+const SCHED_REC_V = 1;
+
+// `_send/owed/{id}` marker version (`format-versioning.md` §1f).
+const SEND_OWED_V = 1;
+
 function schedByTimeKey(whenNs, id) {
     return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
@@ -55,11 +67,12 @@ function schedArm(whenNs, target, msg, key) {
     if (prev !== null) {
         try {
             const old = JSON.parse(prev);
+            if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
             if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
-        } catch (_e) { /* corrupt prior record — overwrite below */ }
+        } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
-    const rec = { when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
+    const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
     // Provenance: the arming saga rides to the fired record as the
     // reserved `_parent` tag (handler-shape.md §3.2). A retry re-arm's
     // armer is the CURRENT delivery saga — the linked-list shape, so
@@ -75,8 +88,9 @@ function schedCancel(id) {
     if (raw === null) return false;
     try {
         const rec = JSON.parse(raw);
+        if (rec.v !== SCHED_REC_V) throw new Error("version");
         kv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
-    } catch (_e) { /* corrupt record — still drop by_id below */ }
+    } catch (_e) { /* corrupt or unknown-version record — still drop by_id below */ }
     kv.delete("_sched/by_id/" + id);
     return true;
 }
@@ -103,6 +117,13 @@ export default function () {
     const owed_raw = kv.get("_send/owed/" + id);
     if (owed_raw == null) return { status: 200 };
     const owed = JSON.parse(owed_raw);
+    // Loud, matching the parse above: this module ROUND-TRIPS the
+    // marker on a retry re-arm, so continuing past a version it does
+    // not implement would rewrite the record in the old shape and
+    // discard whatever the new one carried.
+    if (owed.v !== SEND_OWED_V) {
+        throw new Error("webhook_onresult: _send/owed/" + id + " is v" + owed.v + ", this build writes v" + SEND_OWED_V);
+    }
 
     // Result shape — handed to __rove_next as {ctx:{result, context}};
     // the runtime then flattens it onto the customer's `{on}` request

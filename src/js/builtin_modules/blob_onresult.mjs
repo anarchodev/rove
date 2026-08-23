@@ -18,6 +18,9 @@
 // Then hands off to the customer's on_result module (if registered)
 // via __rove_next, mirroring __system/webhook_onresult.
 
+// `_blob/owed/{hash}` marker version (`format-versioning.md` §1f).
+const BLOB_OWED_V = 1;
+
 export default function () {
     const a = request.activation;
     if (a.kind !== "fetch_chunk" && a.kind !== "send_callback") {
@@ -37,6 +40,14 @@ export default function () {
         return { status: 200 };
     }
     const owed = JSON.parse(owed_raw);
+    // `_blob/owed/{hash}` record version (`format-versioning.md` §1f).
+    // Loud, matching the unguarded parse above: the failure path
+    // ROUND-TRIPS this marker, so continuing past a version this build
+    // does not implement would rewrite it in the old shape and discard
+    // whatever the new one carried.
+    if (owed.v !== BLOB_OWED_V) {
+        throw new Error("blob_onresult: _blob/owed/" + hash + " is v" + owed.v + ", this build writes v" + BLOB_OWED_V);
+    }
 
     const status = (a.kind === "fetch_chunk") ? a.status : 0;
     // Success is a 2xx PUT. `status === 0` is a hard transport failure

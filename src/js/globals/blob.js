@@ -36,6 +36,12 @@ function _rejectRenamedBlob(verb, opts) {
   }
 }
 
+// `_blob/owed/{hash}` record version (`format-versioning.md` §1f).
+// Read by `__system/blob_onresult`, which ships in the worker binary
+// while this shim ships in the tenant's deployment. Declared per file —
+// see `scripts/ops/record_version_lint.py` for why the copies exist.
+const BLOB_OWED_V = 1;
+
 const BLOB_ORIGIN = "http://rove-blob.internal/";
 const COMPOSE_ORIGIN = "http://rove-compose.internal/";
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -146,6 +152,7 @@ globalThis.blob = {
     const context = opts.ctx !== undefined ? opts.ctx : null;
 
     const marker = {
+      v: BLOB_OWED_V,
       hash: hash,
       content_type: opts.contentType || null,
       attempts: 1,

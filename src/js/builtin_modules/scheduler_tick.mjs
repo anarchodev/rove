@@ -27,6 +27,12 @@
 // `__rove.wake.fire` ops (which throw for customer code) are reachable.
 
 const BY_TIME_PREFIX = "_sched/by_time/";
+// `_sched/by_id/{id}` record version (`format-versioning.md` §1f). A
+// record this tick cannot read is dropped WITH its index entry — firing
+// a target named by fields we may be misreading is worse than not
+// firing, and leaving the pair would retry the misread every tick.
+const SCHED_REC_V = 1;
+
 const BY_ID_PREFIX = "_sched/by_id/";
 
 // Thundering-herd bound: at most this many wakes fire per tick when
@@ -90,6 +96,11 @@ export default function () {
         try {
             rec = JSON.parse(recRaw);
         } catch (_e) {
+            kv.delete(byIdKey);
+            kv.delete(key);
+            continue;
+        }
+        if (rec.v !== SCHED_REC_V) {
             kv.delete(byIdKey);
             kv.delete(key);
             continue;
