@@ -10,6 +10,7 @@ Needs S3 env: `set -a; . ./.env; set +a` first.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 
@@ -34,6 +35,20 @@ def s3_curl(method: str, key: str, data: bytes | None = None) -> tuple[int, byte
     return int(code), body
 
 
+def s3_find_one(prefix: str, suffix: str) -> str | None:
+    """The one key under `prefix` ending in `suffix`, or None.
+
+    Keeps this smoke independent of how the deployments prefix is
+    sub-divided: it asserts what the deploy path DID, not where it put it.
+    """
+    code, body = s3_curl("GET", f"?list-type=2&prefix={prefix}")
+    if code != 200:
+        return None
+    hits = [k.decode() for k in re.findall(rb"<Key>([^<]+)</Key>", body)
+            if k.decode().endswith(suffix)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def main() -> int:
     with V2Cluster.spawn("manifow", nodes=1) as c:
         assert c.provision("manifow").status == 200
@@ -45,7 +60,16 @@ def main() -> int:
         # product for the segment rather than assuming the layout.
         inc = c.incarnation("manifow")
         scope = f"manifow/{inc}" if inc else "manifow"
-        key = f"{c.s3_prefix}{scope}/deployments/{int(dep):020d}.json"
+        # DISCOVER the object rather than spelling its path. The prefix is
+        # incarnation-scoped (rove#357) and now engine-scoped as well — the
+        # manifest lives under `deployments/e{bc}/` so two engine builds
+        # cannot write different derivations to one key (decisions.md §11.7).
+        # Hardcoding the layout is what broke this smoke when that segment
+        # arrived; listing it keeps the test about OVERWRITE, which is its
+        # subject, rather than about where the object sits.
+        prefix = f"{c.s3_prefix}{scope}/deployments/"
+        key = s3_find_one(prefix, f"{int(dep):020d}.json")
+        assert key, f"no manifest under {prefix} ending {int(dep):020d}.json"
         code, body = s3_curl("GET", key)
         assert code == 200 and b'"v":2' in body, (code, body[:100])
         print(f"  manifest at {key}: v2, {len(body)}B")
