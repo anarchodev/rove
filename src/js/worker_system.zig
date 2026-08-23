@@ -23,6 +23,7 @@ const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const raft_propose = @import("raft_propose.zig");
 const v2_move = @import("v2_move.zig");
+const deploy_door = @import("deploy_door.zig");
 const worker_mod = @import("worker.zig");
 
 const RaftWait = worker_mod.RaftWait;
@@ -90,6 +91,17 @@ pub fn tryHandleSystem(
     // arrives here if the listener is wedged.
     if (std.mem.eql(u8, sys_rest, "health")) {
         try respb.setSystemResponse(server, ent, sid, sess, 200, "ok\n", allocator, cors_origin, null);
+        return true;
+    }
+
+    // The engine publish door (`deploy`, `deploy/version`, `deploy/blob/…`).
+    // It short-circuits BEFORE the family gate below on purpose: root is
+    // platform-wide and the door is the family member that will take the most
+    // hostile traffic, so its credential rule is its own rather than inherited
+    // (`deploy_door.zig`, and the plane note there for why a peer address
+    // cannot express "private"). That separation is also what keeps the
+    // tenant-scoped deploy capability a verifier swap rather than a re-plumb.
+    if (try deploy_door.tryHandleDeployDoor(server, allocator, worker, ent, sid, sess, method, sys_rest, rh, cors_origin)) {
         return true;
     }
 

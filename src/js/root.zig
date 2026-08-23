@@ -181,6 +181,7 @@ test {
     _ = @import("kv_export.zig");
     _ = @import("builtin_modules.zig");
     _ = @import("bytecode_cache.zig");
+    _ = @import("deploy_door.zig");
     _ = @import("deployment_cache.zig");
     _ = @import("durable_wake.zig");
     _ = @import("fetch_engine.zig");
