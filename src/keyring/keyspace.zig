@@ -107,6 +107,27 @@
 const std = @import("std");
 const crypt = @import("rove-crypt");
 
+/// Format version carried by every `_keys/*` value — the binding, the
+/// destroy tombstone, the minted watermark and the slot counter
+/// (`src/js/keyring_slots.zig`, which reads this constant).
+///
+/// One byte, first, ahead of the payload: the packed-binary KV idiom
+/// the cert frame already uses (`docs/architecture/format-versioning.md`,
+/// the packed-binary-KV-value convention). One version for the whole
+/// namespace rather than four independent ones — these values are
+/// written and read by a single subsystem, and a change to one is a
+/// change to how a node reads the tenant's key state as a whole.
+///
+/// The byte matters more here than anywhere else in the reserved
+/// keyspace. Every other unversioned `_`-namespace is derived
+/// (`_usage/`), discardable (`_log/next_request_seq`) or regenerable —
+/// this one is not: `_keys/bind/` is the only route from an identity to
+/// the slot its ciphertext was sealed under, so losing the ability to
+/// read it is indistinguishable from erasing the customer's data. It is
+/// the one namespace a wipe cannot rescue, which is exactly why the
+/// field has to exist before the first change rather than after it.
+pub const VALUE_VERSION: u8 = 1;
+
 /// Identity→slot bindings. Platform-reserved: the leading `_` keyspace
 /// is closed to customer writes, so a handler cannot rebind itself onto
 /// another identity's key.
@@ -136,13 +157,17 @@ pub fn keyringDir(allocator: std.mem.Allocator, data_dir: []const u8) Error![]u8
 /// every sealing key: this one names data, it never opens it.
 const PSEUDONYM_LABEL = "rewind-identity-ref/v1";
 
-/// `[8B slot LE][32B full mac]`
-const BIND_VALUE_LEN: usize = 8 + std.crypto.auth.hmac.sha2.HmacSha256.mac_length;
+/// `[1B version][8B slot LE][32B full mac]`
+const BIND_VALUE_LEN: usize = 1 + 8 + std.crypto.auth.hmac.sha2.HmacSha256.mac_length;
 
-/// `[8B destroyed_unix_ns LE]`. Stamped by the proposer and replicated,
-/// never recomputed per node — a value derived at apply time would
-/// differ between nodes applying the same entry.
-const DEAD_VALUE_LEN: usize = 8;
+/// `[1B version][8B destroyed_unix_ns LE]`. The timestamp is stamped by
+/// the proposer and replicated, never recomputed per node — a value
+/// derived at apply time would differ between nodes applying the same
+/// entry.
+const DEAD_VALUE_LEN: usize = 1 + 8;
+
+/// `[1B version][8B end LE]`
+const MINTED_VALUE_LEN: usize = 1 + 8;
 
 const HEX_REF_LEN: usize = crypt.KEY_REF_LEN * 2;
 
@@ -191,6 +216,12 @@ pub const Opened = union(enum) {
 pub const Error = error{
     /// Stored bytes this codec did not write.
     Corrupt,
+    /// The value carries a version this binary does not implement — a
+    /// node reading key state written by a newer one. Distinct from
+    /// `Corrupt` because the two want opposite responses: corruption is
+    /// this node's problem, a future version is this node's age, and
+    /// answering either as the other sends the operator the wrong way.
+    UnsupportedVersion,
     /// The ref matched but the full mac did not: two identities hashed
     /// to one ref. Never resolved to a slot — that would hand them one
     /// key, and shredding either would shred both.
@@ -263,15 +294,17 @@ pub fn parseDeadSlot(key: []const u8) ?u64 {
 
 pub fn encodeBinding(slot: u64, mac: [32]u8) [BIND_VALUE_LEN]u8 {
     var out: [BIND_VALUE_LEN]u8 = undefined;
-    std.mem.writeInt(u64, out[0..8], slot, .little);
-    @memcpy(out[8..], &mac);
+    out[0] = VALUE_VERSION;
+    std.mem.writeInt(u64, out[1..9], slot, .little);
+    @memcpy(out[9..], &mac);
     return out;
 }
 
 pub fn decodeBinding(bytes: []const u8) Error!Binding {
+    try checkVersion(bytes);
     if (bytes.len != BIND_VALUE_LEN) return Error.Corrupt;
-    var b: Binding = .{ .slot = std.mem.readInt(u64, bytes[0..8], .little), .mac = undefined };
-    @memcpy(&b.mac, bytes[8..]);
+    var b: Binding = .{ .slot = std.mem.readInt(u64, bytes[1..9], .little), .mac = undefined };
+    @memcpy(&b.mac, bytes[9..]);
     return b;
 }
 
@@ -294,15 +327,17 @@ pub fn bindingFor(pk: crypt.Key, identity: []const u8, slot: u64) [BIND_VALUE_LE
     return encodeBinding(slot, fullMac(pk, identity));
 }
 
-pub fn encodeMinted(end: u64) [8]u8 {
-    var out: [8]u8 = undefined;
-    std.mem.writeInt(u64, &out, end, .little);
+pub fn encodeMinted(end: u64) [MINTED_VALUE_LEN]u8 {
+    var out: [MINTED_VALUE_LEN]u8 = undefined;
+    out[0] = VALUE_VERSION;
+    std.mem.writeInt(u64, out[1..9], end, .little);
     return out;
 }
 
 pub fn decodeMinted(bytes: []const u8) Error!u64 {
-    if (bytes.len != 8) return Error.Corrupt;
-    return std.mem.readInt(u64, bytes[0..8], .little);
+    try checkVersion(bytes);
+    if (bytes.len != MINTED_VALUE_LEN) return Error.Corrupt;
+    return std.mem.readInt(u64, bytes[1..9], .little);
 }
 
 /// Does this node hold everything the tenant has minted?
@@ -329,13 +364,27 @@ pub fn lookup(kr: *const crypt.keyring.Keyring, slot: u64, c: Completeness) Look
 
 pub fn encodeDead(destroyed_unix_ns: i64) [DEAD_VALUE_LEN]u8 {
     var out: [DEAD_VALUE_LEN]u8 = undefined;
-    std.mem.writeInt(i64, out[0..8], destroyed_unix_ns, .little);
+    out[0] = VALUE_VERSION;
+    std.mem.writeInt(i64, out[1..9], destroyed_unix_ns, .little);
     return out;
 }
 
 pub fn decodeDead(bytes: []const u8) Error!i64 {
+    try checkVersion(bytes);
     if (bytes.len != DEAD_VALUE_LEN) return Error.Corrupt;
-    return std.mem.readInt(i64, bytes[0..8], .little);
+    return std.mem.readInt(i64, bytes[1..9], .little);
+}
+
+/// The interpretation switch, ahead of every length check.
+///
+/// Version before length, because the two failures are different
+/// questions and the order decides which one a future value gets told.
+/// A v2 value is a version this binary cannot read — a length check
+/// first would call that corruption and send the operator hunting for a
+/// disk fault instead of a rolling upgrade.
+fn checkVersion(bytes: []const u8) Error!void {
+    if (bytes.len == 0) return Error.Corrupt;
+    if (bytes[0] != VALUE_VERSION) return Error.UnsupportedVersion;
 }
 
 // ── tests ────────────────────────────────────────────────────────────
@@ -400,9 +449,74 @@ test "a ref collision fails loudly instead of sharing a key" {
 }
 
 test "a short or oversized binding value is refused, never guessed at" {
+    // Correctly versioned, wrong width: the length check still has to
+    // fire on its own, not ride on the version byte disagreeing.
+    var short = [_]u8{0} ** (BIND_VALUE_LEN - 1);
+    short[0] = VALUE_VERSION;
+    var long = [_]u8{0} ** (BIND_VALUE_LEN + 1);
+    long[0] = VALUE_VERSION;
     try testing.expectError(Error.Corrupt, decodeBinding(""));
-    try testing.expectError(Error.Corrupt, decodeBinding(&[_]u8{0} ** (BIND_VALUE_LEN - 1)));
-    try testing.expectError(Error.Corrupt, decodeBinding(&[_]u8{0} ** (BIND_VALUE_LEN + 1)));
+    try testing.expectError(Error.Corrupt, decodeBinding(&short));
+    try testing.expectError(Error.Corrupt, decodeBinding(&long));
+}
+
+test "a value from a newer binary is refused as a version, not as corruption" {
+    // The interpretation switch, exercised before there is a v2 to need
+    // it. Every field in the tree sits at v1 and no reader has ever
+    // branched on one, so the first real bump would otherwise be the
+    // first execution of this path — at the moment a mistake means a
+    // node mis-reads a tenant's key state.
+    //
+    // The synthetic v2 need not be a real format change. What it proves
+    // is that the reader dispatches on the byte and refuses what it does
+    // not understand, rather than reading a future layout at today's
+    // widths and returning a plausible wrong slot.
+    var future = encodeBinding(4096, [_]u8{0xAB} ** 32);
+    future[0] = VALUE_VERSION + 1;
+    try testing.expectError(Error.UnsupportedVersion, decodeBinding(&future));
+
+    var future_minted = encodeMinted(12288);
+    future_minted[0] = VALUE_VERSION + 1;
+    try testing.expectError(Error.UnsupportedVersion, decodeMinted(&future_minted));
+
+    var future_dead = encodeDead(1787000000000000000);
+    future_dead[0] = VALUE_VERSION + 1;
+    try testing.expectError(Error.UnsupportedVersion, decodeDead(&future_dead));
+
+    // A v2 that is ALSO a different width must still read as a version
+    // problem: version before length, or a rolling upgrade looks like a
+    // disk fault.
+    var wide = [_]u8{0} ** (BIND_VALUE_LEN + 8);
+    wide[0] = VALUE_VERSION + 1;
+    try testing.expectError(Error.UnsupportedVersion, decodeBinding(&wide));
+}
+
+test "an unversioned value from before the byte existed is refused" {
+    // The pre-version layouts, byte-for-byte: `[8B slot][32B mac]` and
+    // `[8B end]`. Nothing may read one — the slot it would hand back is
+    // shifted by a byte, and a wrong slot resolves an identity onto
+    // another identity's key.
+    //
+    // WHICH refusal it gets is not determined, and deliberately not
+    // asserted: byte 0 of the old layout is the low byte of a slot
+    // number, so a slot ending in 0x01 passes the version check and
+    // fails on width, while any other slot fails on version. Both
+    // refuse, which is the whole requirement. Pinning one of them would
+    // be a test asserting a property of an arbitrary slot number.
+    for ([_]u64{ 4096, 4097, 0xFF00 }) |old_slot| {
+        var old_binding = [_]u8{0} ** 40;
+        std.mem.writeInt(u64, old_binding[0..8], old_slot, .little);
+        try expectRefused(decodeBinding(&old_binding));
+
+        var old_minted = [_]u8{0} ** 8;
+        std.mem.writeInt(u64, old_minted[0..8], old_slot, .little);
+        try expectRefused(decodeMinted(&old_minted));
+    }
+}
+
+/// Assert a decode refused, without pinning which refusal.
+fn expectRefused(result: anytype) !void {
+    if (result) |_| return error.TestExpectedError else |_| {}
 }
 
 test "a dead key round-trips its slot" {
@@ -501,7 +615,9 @@ test "an incomplete node answers unverified, never shredded" {
 test "a minted watermark round-trips" {
     try testing.expectEqual(@as(u64, 12288), try decodeMinted(&encodeMinted(12288)));
     try testing.expectError(Error.Corrupt, decodeMinted(""));
-    try testing.expectError(Error.Corrupt, decodeMinted(&[_]u8{0} ** 7));
+    var short = [_]u8{0} ** (MINTED_VALUE_LEN - 1);
+    short[0] = VALUE_VERSION;
+    try testing.expectError(Error.Corrupt, decodeMinted(&short));
 }
 
 test "the watermark key is closed to customer writes" {
