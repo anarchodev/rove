@@ -568,6 +568,42 @@ pub fn capabilityLiteralBody() []const u8 {
     }
 }
 
+/// Members of the activation object that are sourced from `request` rather
+/// than from a global — the three effects that hid on a documented data
+/// shape (`docs/architecture/package-isolation.md` §3.4):
+///
+///   - `tag`        writes the durable, OTel-exported log record against a
+///                  SHARED 4-slot budget that throws on over-cap, so a
+///                  package can exhaust it and make the handler's own call
+///                  fail;
+///   - `unmaskedIp` the deliberate escalation past `request.ip`'s masking;
+///   - `shredKey`   sets the activation's crypto-shred identity, and
+///                  REPLACES rather than adds — so a package can silently
+///                  re-file the handler's writes under another erasure
+///                  identity.
+///
+/// They stay reachable as `request.*` through the transition and move for
+/// real at the cutover (tracker #753). Their natives ignore the receiver
+/// (`binding.Tag`/`ShredKey` resolve state from the context), so exposing
+/// the same function object on the activation binds nothing.
+/// NUL-terminated: the worker hands these straight to `JS_SetPropertyStr`,
+/// which takes a C string.
+pub const REQUEST_EFFECT_NAMES = [_][:0]const u8{
+    "tag",
+    "unmaskedIp",
+    "shredKey",
+};
+
+/// `REQUEST_EFFECT_NAMES` as a JS array literal, for engines that build the
+/// activation object by evaluating source.
+pub fn requestEffectArrayLiteral() []const u8 {
+    comptime {
+        var out: []const u8 = "[";
+        for (REQUEST_EFFECT_NAMES) |n| out = out ++ "\"" ++ n ++ "\", ";
+        return out ++ "]";
+    }
+}
+
 test "isEngineOnly: engine namespaces are hidden, customer keys are not" {
     try std.testing.expect(isEngineOnly("_usage/blob/deadbeef"));
     try std.testing.expect(isEngineOnly("_keys/next_slot"));
