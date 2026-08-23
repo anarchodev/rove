@@ -1,5 +1,16 @@
 # Handler shape — pattern-matching at module level
 
+> **Forward pointer — the surface below is as-built and ambient.**
+> [`architecture/package-isolation.md`](architecture/package-isolation.md)
+> (tracker #751, not built) replaces ambient authority with capabilities
+> the handler *receives*: one destructured parameter
+> (`async ({ request, response, kv, http }) => …`), with `tag`,
+> `unmaskedIp` and `shredKey` moving off `request` because each is an
+> effect rather than data. The **one-ctx** invariant below is unaffected
+> and is why that parameter goes unnamed. This doc keeps documenting the
+> ambient surface until that ships.
+
+
 > **Status:** SHIPPED (2026-06-03). All phases of the implementation plan
 > landed (the plan doc is folded-and-deleted; this doc is the contract):
 > `on.*` connection wakes (Phase 1), the `stream.*` effect surface with

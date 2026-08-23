@@ -69,6 +69,7 @@ The maintained set. Subsystem-owned, kept current with the code.
 > - [front-door-hardening.md](architecture/front-door-hardening.md) — the reverse-proxy protection set (all shipped; cited by the `front_*` teeth smokes).
 > - [cp-membership-reconciler.md](architecture/cp-membership-reconciler.md) — the additive-only learner-first membership reconciler (shipped, live; follow-ons #125).
 > - [package-resolution.md](architecture/package-resolution.md) + [package-compile-caching.md](architecture/package-compile-caching.md) — the `@scope/pkg` seam, manifest v2, and the no-compile-cache decision (shipped; PM tracker #130).
+> - [package-isolation.md](architecture/package-isolation.md) — **capabilities: effects are received, never ambient**. The package-poisoning threat model, the capability/ambient classification rule, the destructured handler parameter, attenuators (`http.to(host|host[])`), intrinsic freezing and `eval` revocation (**design of record, NOT built**; supersedes `package-resolution.md`'s P2 gate; tracker #751).
 > - [builtin-libs.md](architecture/builtin-libs.md) + [privileged-surface.md](architecture/privileged-surface.md) — the `_system.*`/`globals/` shim model and the `__rove.*` privileged-ops surface (shipped; docs phases #87–#89, ratelimit #120).
 > - [blob-write-recipes.md](architecture/blob-write-recipes.md) — the blob recipe substrate + `blob.seal` completion contract (phases A–C shipped; D–F = #93/#96/#97).
 

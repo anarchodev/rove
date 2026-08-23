@@ -19,7 +19,15 @@ or produce them.
 |---|---|
 | `resolveSpecifier`/`normalize` extension for `@scope/pkg` (per-importer) | Fetching package bytecode from the shared `packages/` prefix + populating the tenant map (**P1**) |
 | The per-importer `PackageResolver` + its home in the Ctx / snapshot | Producing the manifest's package set — the client resolver (**P-CLI**) |
-| `manifest_json.zig` v2 schema (parse/encode/dep-id) | The registry app (**P-Reg**), the static capability gate (**P2**) |
+| `manifest_json.zig` v2 schema (parse/encode/dep-id) | The registry app (**P-Reg**), the static capability gate (**P2** — superseded, see below) |
+
+**P2's capability gate is superseded by
+[`package-isolation.md`](package-isolation.md).** A manifest-declared
+capability list checks an *intent* while authority stays ambient on the
+shared realm, so it constrains an honest package and not a hostile one.
+That doc removes ambient authority instead — effects are passed to the
+handler and delegated onward, narrowed — and keeps the manifest field as
+the declaration layer, which is what it is actually good for.
 
 **Deliverable:** given a hand-authored resolver + bytecode map, an app
 handler's `import { x } from "@rewind/oidc"` resolves and runs, and

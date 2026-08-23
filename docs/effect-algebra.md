@@ -1,5 +1,15 @@
 # The effect algebra
 
+> **Forward pointer — effects here are described as ambient globals.**
+> [`architecture/package-isolation.md`](architecture/package-isolation.md)
+> (tracker #751, not built) makes them *received* instead: an effect that
+> reaches outside the module arrives as a parameter, while pure and
+> web-platform surfaces stay ambient. The algebra itself is unchanged —
+> the same four primitives, reached differently — but the classification
+> rule there is the one to apply when asking whether a *new* effect is
+> ambient or granted.
+
+
 > **Status**: principles — the effect model every shipped or proposed
 > effect must fit. Distilled 2026-05-22 from a full effect-system audit;
 > the audit tables and worklist that used to live here (old §5–§7) are
