@@ -43,6 +43,26 @@ shipped.
 
 Legend — **Ver?**: explicit version field present today. **Tier**: see §2.
 
+**Class** answers the question `Ver?` cannot: *why* a format has no version.
+An unclassified `none` is indistinguishable from an oversight, which is what
+lets the next new format inherit a precedent nobody chose.
+
+| Class | Meaning |
+|---|---|
+| **versioned** | carries its own version field, and is named in the runtime registry (`src/rewind/version.zig`) |
+| **inherits** | governed by an enclosing frame's version — the frame is named, and must be recoverable **at read time**, not merely at write time |
+| **by-decision** | deliberately unversioned, with the reason: immutable shape, derived/rebuildable, or never persisted across a deploy |
+| **gap** | should carry a version and does not |
+| **unwritten** | a claimed namespace with no producer yet — not a format, and classified when one appears |
+
+The read-time clause in *inherits* is load-bearing. A value whose writer is
+versioned does not thereby inherit that version: if the value outlives the
+frame that produced it, the reader has nothing to dispatch on. §1f is where
+that distinction decides most of the rows.
+
+Only §1f carries the **Class** column so far. The remaining tables are
+classified as each is worked (the tracker's audit leaf).
+
 ### 1a. Raft-replicated / log-persisted (hardest — replicas must agree)
 
 | Format | File | Layout (current) | Ver? | Tier |
@@ -110,20 +130,55 @@ in lockstep with the JS-side `rtap.mjs` parser.
 
 ### 1f. Persisted KV key-schemas (implicit value formats)
 
-Each `_`-prefixed namespace is an implicit format. None are versioned. Source:
-`src/js/reserved.zig:82-92` (registry), plus the producers below.
+Each `_`-prefixed namespace is an implicit format, and none carries a version
+field. The reservation itself is blanket rather than enumerated: `kv.set` /
+`kv.delete` from customer or shim JS refuse **every** leading-`_` key except the
+shim-writable exceptions, so the platform can claim a new `_…/` family later
+without colliding with customer data (`src/reserved/root.zig`
+`isCustomerWriteReserved`).
 
-| Key | Value | Producer | Notes |
-|---|---|---|---|
-| `_deploy/current` | hex u64 (`{x:0>16}`) | `src/js/starter.zig:200` | atomic release pointer |
-| `_config/{path}` | JSON | `src/js/config_mirror.zig:26` | mirrors deploy-tree `_config/*.json` |
-| `_send/owed/{id}` | JSON marker | `globals/webhook.js` (envelope-0); recognized `src/js/owed_retry.zig:23` | JS-shim-owned |
-| `_blob/owed/{hash}` | marker | `globals/blob.js` | JS-shim-owned |
-| `_sched/by_time/{ns_hex}/{id}`, `_sched/by_id/{id}` | JSON wake | `globals/scheduler.js` + `src/js/durable_wake.zig:32` | load-bearing; JS-shim-owned |
-| `_oidc/*`, `_rp/*` | JSON | `src/js/globals/oidc.js` | many sub-keys; mostly RFC-shaped |
-| `_admin/operator/{sha256(email)}` | empty marker | `oidc.js:1242` | allowlist |
-| `_log/next_request_seq` | decimal counter | `src/js/worker_log.zig` | internal |
-| `_app/`, `_audit/`, `_magic/`, `_triggers/`, `_subscriptions/`, `_sessions/` | mixed | `reserved.zig` | some reserved/unused |
+Three lists in `src/reserved/root.zig` carve that keyspace up, and a namespace's
+list membership is what its versioning story will inherit from:
+
+- `PLATFORM_KV_PREFIXES` — the catalog of known platform-owned namespaces,
+  used for the bidirectional trigger-prefix collision check.
+- `SHIM_WRITABLE_PREFIXES` — the exceptions: prefixes platform JS *libraries*
+  write from ordinary handler context. Platform-managed but not
+  platform-reserved; a tenant that writes one corrupts only its own durability
+  markers.
+- `ENGINE_ONLY_PREFIXES` — keys a handler cannot even *see*; a read behaves as
+  though the key is absent. This is what lets an engine write to them without
+  an activation or a log record, since nothing a handler observes ever moved.
+
+| Key | Value | Class | Producer | Notes |
+|---|---|---|---|---|
+| `_admin/operator/{sha256(email)}` | empty marker | **by-decision** — the key *is* the datum; an empty value has no format to change | seeded out-of-band by `rewind-ops`; read by `@rewind/oidc` (`src/js/packages/@rewind/oidc/index.mjs` `operator_prefix`) | operator allowlist; in NO list — reserved by the blanket leading-`_` rule, and deliberately read-only from shims |
+| `_app/` | — | **unwritten** | none | Reserved for a distributable app's manifest + derived capability set (`handler-shape.md` §8); consumer is post-launch |
+| `_audit/` | — | **unwritten** | none | Reserved for a future audit log |
+| `_blob/owed/{hash}` | JSON marker `{hash, content_type, attempts, on_result, context, created_at_ns}` | **gap** | `src/js/globals/blob.js:156` | shim-writable; `blob.put` durability marker. Survives the deployment that wrote it |
+| `_callback/` | — | **unwritten** | none | Engine-only. Sends resolve via in-memory Completions, not rows here; stays reserved so customer JS cannot forge a receipt key |
+| `_config/{dep_id:016x}/{path}` | JSON | **inherits** ← deployment manifest (`{v:2}`), and the frame is recoverable at read time because `dep_id` is *in the key* | `src/js/config_mirror.zig` (release-time mirror of the deploy tree's `_config/*.json`) | **storage key is deployment-scoped**; a handler names the *visible* key `_config/{path}` and `reserved.configStorageKey` maps it. Immutable write-once rows, so the single `_deploy/current` flip switches code and config atomically — including a rollback and a deploy that REMOVES a key. `dep_id == 0` (sim / replay arena) uses the visible key unchanged |
+| `_deploy/current` | hex u64 (`{x:0>16}`) | **by-decision** — fixed-width immutable shape; a different pointer format is a different key | `src/js/starter.zig:188`, `src/js/worker_system.zig` | atomic release pointer; customer-readable (rest of `_deploy/` reserved, unwritten). What it points AT is versioned |
+| `_dispatch/owed/{id}` | JSON marker `{tenant, module, ctx, fn, actor}` | **gap** | `src/js/globals/platform.js:459` | shim-writable; `platform.dispatch`'s owed marker — same posture as `_send/owed/`. Cross-tenant intent, so the record outlives both deployments involved |
+| `_export/{job}` | JSON `{format, state, cursor, parts[], bytes, entries, …}` | **gap** | `src/js/packages/@rewind/export/index.mjs` via `src/js/kv_export.zig` (`EXPORT_STATE_PREFIX`) | shim-writable; excluded from its own export — the record mutates as the export proceeds. A long-running job spans deploys |
+| `_keys/next_slot` | `[8B end LE][8B nonce LE]` | **gap** — fixed-length binary, length-validated, so a shape change reads as `Corrupt` with no upgrade path | `src/js/keyring_slots.zig:78` | engine-only. Slots RESERVED |
+| `_keys/minted`, `_keys/bind/{identity}`, `_keys/dead/{slot}` | `[8B end LE]` / `[u64 slot LE][32B HMAC]` / `[8B destroyed_ns LE]` | **gap** — same fixed-length binary shape, and the one namespace here that **cannot be wiped post-launch**: destroying it destroys the tenant's ability to decrypt | `src/keyring/keyspace.zig:113-126` | engine-only. Crypto-shredding: `minted` is slots made quorum-durable, `bind/` is identity→slot, `dead/` carries an erasure through the log |
+| `_log/next_request_seq` | decimal counter | **by-decision** — a monotonic integer has no shape to change, and advancing it past any observed value repairs it | `src/js/worker_log.zig:64` | engine-only. In app.db, not a log.db — so the worker opens no log.db |
+| `_magic/` | — | **unwritten** | none | Engine-only; reserved for magic-link tokens |
+| `_oidc/*` | JSON | **gap** | `src/js/packages/@rewind/oidc/index.mjs` | shim-writable; provider state — session/keyset/code/at/rt/device. Mostly RFC-shaped, but the *envelope* is ours |
+| `_rp/*` | JSON | **gap** | `src/js/packages/@rewind/oidc/index.mjs` (relying-party half); read by `src/js/starter/upload.mjs:42` | shim-writable; RP state — `state`/`sess/{sid}`/`jwks` |
+| `_sched/by_time/{ns_hex}/{id}`, `_sched/by_id/{id}` | JSON wake | **gap** — the strongest case in the table: a wake can be scheduled months out, so it is *guaranteed* to outlive the package version that wrote it | `src/js/globals/schedule.js` + `src/js/durable_wake.zig` | shim-writable; load-bearing. Fixed-width zero-pad so lexicographic order == time order |
+| `_seg/{log}/n` | decimal counter | **by-decision** — monotonic integer, same as `_log/next_request_seq` | `src/js/packages/@rewind/segments/index.mjs:138` | shim-writable |
+| `_seg/{log}/h/{seq:020}` | the customer's own record bytes, opaque | **by-decision** — not our format; the value is passed through untouched | `src/js/packages/@rewind/segments/index.mjs:137` | shim-writable; hot rows, deleted on seal |
+| `_seg/{log}/s/{first:020}` | JSON `{hash, first_seq, last_seq, count}` | **gap** | `src/js/builtin_modules/segments_onsealed.mjs` | shim-writable; the permanent pointer to a sealed segment blob — outlives everything around it |
+| `_send/owed/{id}` | JSON marker | **gap** | `src/js/globals/webhook.js:314`; Zig-visible surface `src/js/owed_retry.zig:24` | shim-writable; `webhook.send` / `email.send` durability marker (ordinary envelope-0 kv — no apply-time special case) |
+| `_sessions/` | — | **unwritten** | none | Engine-only; reserved for future platform session storage. The platform session *cookie* (`src/js/session.zig`) stores nothing here |
+| `_triggers/` | — | **unwritten** as kv | none in app.db | Engine-only. Trigger modules are deploy-tree paths in the manifest (`_triggers/{prefix}/index.mjs`), not rows |
+| `_usage/blob/{app\|file}/{sha256}` | length in decimal ASCII | **by-decision** — derived and rebuildable by rescanning the blob store; the key is a content hash, so a rebuild is idempotent | `src/kv/usage.zig:59`, platform Zig at write time | engine-only. One row per stored object and **no stored total** — the total is a prefix scan, because a value folded at apply time exists on followers and not on the leader. This is the number the storage quota is enforced against |
+
+`_subscriptions/` is **not** a KV namespace — it is a deploy-tree path prefix
+for subscription modules (`_subscriptions/{name}/index.mjs`,
+`src/js/deployment_cache.zig`), and appears in none of the three lists.
 
 ### 1g. Control-plane directory (replicated KV in `__directory__` group)
 
@@ -334,7 +389,8 @@ API shapes → wire/disk formats (Part I).**
 
 ### 7.1 KV namespace reservation — **CRITICAL, do now**
 
-`src/js/reserved.zig:82-92` reserves only **9 enumerated prefixes** from customer
+`src/js/reserved.zig:82-92` (the module now lives at `src/reserved/root.zig`)
+reserves only **9 enumerated prefixes** from customer
 writes (`isCustomerWriteReserved`, `globals.zig:738,832`). A customer can write
 `_mydata`, `_events/...`, `_outbox/...`, or any `_foo` that isn't one of the 9 —
 so we can **never** claim a new `_`-prefix for the platform later. Worse: the
