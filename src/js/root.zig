@@ -160,6 +160,7 @@ test {
     _ = @import("worker_inbound_chunk.zig");
     _ = @import("worker_upload_walker.zig");
     _ = @import("log_walker.zig");
+    _ = @import("logs_door_shred.zig");
     _ = @import("static_cache.zig");
     _ = @import("blob_usage.zig");
     _ = @import("keyring_slots.zig");

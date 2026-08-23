@@ -67,6 +67,7 @@ const tenant_mod = @import("rove-tenant");
 const kv_mod = @import("raft-kv");
 const files_mod = @import("rove-files");
 const static_cache = @import("static_cache.zig");
+const logs_door_shred = @import("logs_door_shred.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -758,6 +759,10 @@ pub const FetchEngine = struct {
         // door is reachable without the `blob.put` shim.
         var stored_hash: ?[64]u8 = null;
         var stored_bytes: u64 = 0;
+        // Logs door: the target tenant, captured before the rewrite
+        // replaces the URL. Owned; handed to the FetchCtx below.
+        var logs_tenant: ?[]u8 = null;
+        errdefer if (logs_tenant) |t| self.allocator.free(t);
         // A blob READ names an object that is already durable and immutable in
         // this tenant's own store, so its bytes never need recording — the
         // recorder references them by this hash instead (rove#430). Captured
@@ -816,7 +821,7 @@ pub const FetchEngine = struct {
             // base + attach a tenant-scoped `logs-read` token. Like the blob
             // door, the rewritten URL targets a platform-configured internal
             // origin (never customer-controlled), so it skips the SSRF gate.
-            try self.rewriteAndAuthLogsFetch(pf, method, &headers_list);
+            logs_tenant = try self.rewriteAndAuthLogsFetch(pf, method, &headers_list);
         } else if (is_cp_door) {
             // `rewind-cp.internal` door: rewrite to the CP base + attach the
             // move-secret. Same SSRF-exempt internal-origin posture as the
@@ -921,6 +926,7 @@ pub const FetchEngine = struct {
             .held = pf.held,
             .cache_hash = static_cache_hash,
             .static_serve = is_static_door,
+            .logs_tenant = logs_tenant,
             .stored_hash = stored_hash,
             .get_hash = get_hash,
             .stored_bytes = stored_bytes,
@@ -1234,12 +1240,20 @@ pub const FetchEngine = struct {
         pf: *PendingFetch,
         method: blob_curl_multi.Method,
         headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
-    ) !void {
+    ) ![]u8 {
         const is_admin = std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID);
         const secret = self.node.services_jwt_secret orelse return error.LogsDoorUnconfigured;
         const base = self.node.log_internal_base orelse return error.LogsDoorUnconfigured;
         // Read-only surface: the log query routes are all GET.
         if (method != .GET) return error.LogsMethodDenied;
+        // A record leaves through this door OPENED or not at all
+        // (`logs_door_shred.zig`), and the gate rewrites a whole
+        // response body — which a streamed transfer never has in hand.
+        // Refusing is the only honest option: serving the chunks would
+        // hand out ciphertext, and hand a customer a way to ask for it.
+        // Nothing streams here — the log routes answer records, and both
+        // the dashboard and `@rewind/browser` issue buffered fetches.
+        if (pf.stream) return error.LogsStreamDenied;
 
         // Path after the door prefix, e.g. `v1/{tenant}/list?limit=20`.
         const remainder = pf.url[LOGS_ORIGIN_PREFIX.len..];
@@ -1249,6 +1263,13 @@ pub const FetchEngine = struct {
         // logs. __admin__ skips this (it reads from the URL path).
         if (!is_admin and !std.mem.eql(u8, pf.tenant_id, target_tenant))
             return error.LogsDoorForbidden;
+
+        // Own the tenant NOW: `target_tenant` points into `pf.url`, which
+        // the rewrite below frees and replaces. Duping after that reads
+        // freed memory, and the failure is quiet — the shred gate refuses
+        // records for a garbage tenant name rather than crashing.
+        const owned_tenant = try self.allocator.dupe(u8, target_tenant);
+        errdefer self.allocator.free(owned_tenant);
 
         const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
         const token = jwt.mint(self.allocator, secret, .{
@@ -1287,6 +1308,8 @@ pub const FetchEngine = struct {
         errdefer self.allocator.free(owned_name);
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
         headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = auth_value });
+
+        return owned_tenant;
     }
 
     /// `rewind-cp.internal` trusted door (docs/architecture/auth-consolidation.md B4). The `__admin__`
@@ -1495,6 +1518,13 @@ const FetchCtx = struct {
     /// True for the `__system/static` streamer's own fetches — their chunks
     /// are never recorded (rove#391).
     static_serve: bool = false,
+    /// The logs door's target tenant, owned, or null for every other
+    /// transfer. Captured BEFORE `rewriteAndAuthLogsFetch` replaces
+    /// `pf.url` with the internal log-server base, which is the only
+    /// place the tenant is still legible. It is what the serve-side
+    /// shred gate opens the response's sealed values against
+    /// (`logs_door_shred.zig`).
+    logs_tenant: ?[]u8 = null,
     /// Set for a `blob.get`: the content hash the fetch names. Stamped onto
     /// every event so the recorder can reference the payload rather than
     /// copy it (rove#430).
@@ -1535,6 +1565,7 @@ const FetchCtx = struct {
         self.headers.deinit(self.allocator);
         self.body_buf.deinit(self.allocator);
         self.cache_buf.deinit(self.allocator);
+        if (self.logs_tenant) |t| self.allocator.free(t);
         self.allocator.destroy(self);
     }
 
@@ -1986,12 +2017,45 @@ fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
 
 fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     const a = s.allocator;
-    var ev = try buildChunkEvent(a, &s.pf, s.emitted_seq, s.byte_offset, s.body_buf.items, null);
+
+    // The serve-side shred gate. A record whose kv tape holds values
+    // sealed under a per-identity key leaves this door OPENED, stays
+    // sealed only where the key is genuinely destroyed, and does not
+    // leave at all when this node cannot tell those apart
+    // (`logs_door_shred.zig`).
+    var gate_status = status;
+    var body: []const u8 = s.body_buf.items;
+    var gated: ?[]u8 = null;
+    defer if (gated) |g| a.free(g);
+    if (s.logs_tenant) |tenant| {
+        if (status >= 200 and status < 300) {
+            if (openLogsRecords(s, tenant)) |rewritten| {
+                if (rewritten) |r| {
+                    gated = r;
+                    body = r;
+                }
+            } else |err| {
+                std.log.warn(
+                    "rove-js fetch_engine: logs door refusing a record for {s}: {s} — this node cannot vouch for its key material",
+                    .{ tenant, @errorName(err) },
+                );
+                gate_status = 503;
+                gated = a.dupe(u8, KEY_MATERIAL_UNVERIFIED_BODY) catch null;
+                // Never fall back to the ungated records. A 503 carrying
+                // the real response is the leak this refusal exists to
+                // stop, so an OOM here costs the explanation, not the
+                // refusal.
+                body = gated orelse "";
+            }
+        }
+    }
+
+    var ev = try buildChunkEvent(a, &s.pf, s.emitted_seq, s.byte_offset, body, null);
     if (s.emitted_seq == 0 and s.headers.items.len > 0) {
         ev.fetch_headers = parseHeadersWireToJson(a, s.headers.items) catch null;
     }
     ev.final = true;
-    ev.terminal_status = status;
+    ev.terminal_status = gate_status;
     ev.terminal_ok = ok;
     ev.body_truncated = s.capped;
     stampStored(&ev, a, s);
@@ -2003,6 +2067,44 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
         return err;
     };
     s.emitted_seq += 1;
+}
+
+/// What the logs door answers when this node cannot vouch for its key
+/// material. Names the condition rather than reporting a generic
+/// failure: the caller has to be able to tell "this node is behind" from
+/// "the identity was erased", and those are the two answers this whole
+/// mechanism exists to keep apart.
+const KEY_MATERIAL_UNVERIFIED_BODY =
+    "{\"error\":\"key_material_unverified\"," ++
+    "\"message\":\"this node does not hold every key this tenant has minted, " ++
+    "so it cannot say whether a sealed value was erased or is merely unreadable here; " ++
+    "retry once the node's keyring is complete\"}";
+
+/// Run the serve-side shred gate over a buffered logs-door response.
+///
+/// Returns the rewritten body, or null when nothing was sealed (the
+/// common case — no re-encode, no allocation). Errors mean the response
+/// must not be served as-is.
+fn openLogsRecords(s: *FetchCtx, tenant: []const u8) !?[]u8 {
+    const Bound = struct {
+        ctx: *FetchCtx,
+        tenant: []const u8,
+
+        fn open(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            value: []const u8,
+        ) anyerror!logs_door_shred.Opened {
+            const b: *@This() = @ptrCast(@alignCast(ptr));
+            return b.ctx.engine.node.deploy.openSealedValue(allocator, b.tenant, value);
+        }
+    };
+    var bound: Bound = .{ .ctx = s, .tenant = tenant };
+    return logs_door_shred.openResponse(
+        s.allocator,
+        s.body_buf.items,
+        .{ .ctx = &bound, .open = &Bound.open },
+    );
 }
 
 /// Carry the storage-accounting facts onto a terminal event. Only the
