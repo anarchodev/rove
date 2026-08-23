@@ -2603,7 +2603,8 @@ pub fn Worker(comptime opts: Options) type {
                 return fail(router, a, &pf, 400, "expected {scope, entries:[...]}");
             defer parsed.deinit();
             const p = parsed.value;
-            if (p.scope.len == 0 or p.entries.len == 0 or p.entries.len > 256)
+            if (p.scope.len == 0 or p.entries.len == 0 or
+                p.entries.len > files_mod.manifest_json.MAX_CANONICAL_ITEMS)
                 return fail(router, a, &pf, 400, "scope required + 1..256 entries");
 
             const entries = a.alloc(files_mod.Entry, p.entries.len) catch
@@ -2649,7 +2650,11 @@ pub fn Worker(comptime opts: Options) type {
             const res_app_imports: []const files_mod.manifest_json.ImportEntry =
                 if (resolution) |r| r.app_imports else &.{};
 
-            const dep_id = files_mod.manifest_json.computeDeploymentId(entries, res_packages, res_app_imports);
+            // Fails closed when the resolution declares more packages or app
+            // imports than the canonical ordering accepts — client-supplied
+            // counts, so the check is the door's, not an invariant.
+            const dep_id = files_mod.manifest_json.computeDeploymentId(entries, res_packages, res_app_imports) catch
+                return fail(router, a, &pf, 400, "resolution too large (max 256 packages, 256 app imports)");
             const json = files_mod.manifest_json.encode(a, dep_id, entries, res_packages, res_app_imports) catch
                 return fail(router, a, &pf, 500, "manifest encode failed");
             // `json` is owned → transferred to the job below (or freed on any
