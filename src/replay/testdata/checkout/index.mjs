@@ -3,7 +3,7 @@ import email from "@rewind/email";
 // (build.zig `rewind-test-smoke`) exercises through the saga test library.
 // Inbound reads a cart, opens a pending order, and fires an upstream charge;
 // the charge result (a dependent `fetch_chunk` activation) settles the order.
-export default function () {
+export default function ({ after, kv, next }) {
   const user = request.json.user;
   const cart = JSON.parse(kv.get("cart/" + user) || "{}");
   response.status = 202;
@@ -17,7 +17,7 @@ export default function () {
   return next({ user });
 }
 
-export function onCharge() {
+export function onCharge({ kv }) {
   const user = request.ctx.user;
   if (request.status >= 200 && request.status < 300) {
     kv.set("order/" + user, JSON.stringify({ status: "paid" }));

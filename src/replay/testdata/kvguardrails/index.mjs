@@ -10,7 +10,7 @@ const cap = (fn) => {
   }
 };
 
-export default function () {
+export default function ({ kv }) {
   const p = request.path;
   if (p === "/guards") {
     return {

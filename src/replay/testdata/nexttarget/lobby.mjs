@@ -3,7 +3,7 @@
 // dispatches there (the one next() semantic; docs/handler-shape.md §2.1).
 // The post-join arm is a decoy: a frame that wrongly re-enters the lobby
 // writes `lobby/decoy`, which the test asserts absent.
-export function onMessage() {
+export function onMessage({ kv, next, stream }) {
   const { data } = request.activation;
   if (data === "join") {
     kv.set("lobby/joined", "1");

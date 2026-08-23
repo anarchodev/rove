@@ -12,29 +12,31 @@
 //   • an `after.kv` arm fires only for a change UNDER its prefix.
 //
 // Buffered (cont-family) holds — `next(ctx)` without `stream.start()`.
-function hold(ctx) { return next(ctx); }
+// `next` is threaded rather than ambient: a module-scope helper has no
+// activation to receive it from, so its caller hands it over.
+function hold(next, ctx) { return next(ctx); }
 
-export default function () {
+export default function ({ after, next }) {
   if (request.path === "/twotimers") {
     after.ms(1000, { on: "onEarly" });
     after.ms(3000, { on: "onLate" });
-    return hold({ armed: "twotimers" });
+    return hold(next, { armed: "twotimers" });
   }
   if (request.path === "/perarm") {
     after.ms(1200, { on: "onTimeout" });
     after.kv("msg/r1/", { on: "onMsg" });
-    return hold({ room: "r1" });
+    return hold(next, { room: "r1" });
   }
   return { ok: true };
 }
 
 // Only `onLate` may ever run for /twotimers — `onEarly`'s arm was overwritten.
-export function onEarly() { kv.set("fired", "early"); return { fired: "early" }; }
-export function onLate() { kv.set("fired", "late"); return { fired: "late" }; }
+export function onEarly({ kv }) { kv.set("fired", "early"); return { fired: "early" }; }
+export function onLate({ kv }) { kv.set("fired", "late"); return { fired: "late" }; }
 
 // Distinct arms, distinct exports.
-export function onTimeout() { kv.set("route", "onTimeout"); return { via: "onTimeout" }; }
-export function onMsg() {
+export function onTimeout({ kv }) { kv.set("route", "onTimeout"); return { via: "onTimeout" }; }
+export function onMsg({ kv }) {
   const w = request.activation.wakes[0];
   kv.set("route", JSON.stringify({ via: "onMsg", prefix: w.prefix }));
   return { via: "onMsg" };

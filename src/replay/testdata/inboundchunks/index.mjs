@@ -1,7 +1,7 @@
 // A streaming-upload handler (the raw onChunk trust boundary): each chunk
 // appends to an in-kv buffer and threads a running count via next({ctx}); the
 // terminal chunk responds with the assembled body. request.done marks the last.
-export function onChunk() {
+export function onChunk({ kv, next }) {
   const seq = request.chunkSeq;
   const prev = (request.ctx && request.ctx.count) || 0;
   const buf = kv.get("upload/buf") || "";

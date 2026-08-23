@@ -1,7 +1,7 @@
 // Holds on a connection timer; the wake reads the payload-less resume
 // surface — accessors undefined (prod: no `bytes` on wake kinds), the
 // activation bag kind, and the identity pinned on resumes too.
-export default function () {
+export default function ({ after, next }) {
   after.ms(100);
   return next();
 }

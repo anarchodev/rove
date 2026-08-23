@@ -4,7 +4,7 @@ import browser from "@rewind/browser";
 // fetch's OWN ctx if it carried one, else the chain's parked next({ctx}) — one
 // rule, and the same as HTTP. (Before the fix the sim always used the fetch's
 // ctx while prod-WS always used the chain ctx; they disagreed.)
-export function onMessage() {
+export function onMessage({ after, next }) {
   const msg = browser.message() || {};
   if (msg.t === "noctx") {
     after.fetch("https://x.test/y", { on: "onResp" }); // NO fetch ctx
@@ -15,7 +15,7 @@ export function onMessage() {
   return next({ tag: "CC" });
 }
 
-export function onResp() {
+export function onResp({ kv }) {
   kv.set("saw", JSON.stringify(request.ctx));
   return "ok";
 }

@@ -5,7 +5,7 @@
 //   /stream  — one stream:true fetch; onChunk records which fields each
 //              chunk event carries (prod stamps status/bodyTruncated only on
 //              the terminal event; request.ok does not exist).
-export default function () {
+export default function ({ after, kv, next }) {
   if (request.path === "/stream") {
     after.fetch("https://s.example/stream", { stream: true, on: "onChunk" });
     return next();
@@ -16,7 +16,7 @@ export default function () {
   return next();
 }
 
-export function onLeg() {
+export function onLeg({ kv }) {
   const ids = JSON.parse(kv.get("ids"));
   const leg = request.ctx.leg;
   kv.set("seen/" + leg, JSON.stringify({
@@ -29,7 +29,7 @@ export function onLeg() {
   return { leg };
 }
 
-export function onChunk() {
+export function onChunk({ kv, next }) {
   if (!request.done) {
     kv.set("chunk/" + request.chunkSeq, JSON.stringify({
       hasStatus: request.status !== undefined,

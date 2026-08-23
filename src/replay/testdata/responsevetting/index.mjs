@@ -2,7 +2,7 @@
 // and the return value (response_building.zig + worker_dispatch): header
 // sanitize + caps, Set-Cookie Domain= strip, status coercion + clamp,
 // auto/suppressed content-type, binary bodies, stream-then-terminal prepend.
-export default function () {
+export default function ({ stream }) {
   const p = request.path;
   if (p === "/head") {
     response.status = "207.9"; // ToInt32 coercion → 207

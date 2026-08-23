@@ -4,7 +4,7 @@ import browser from "@rewind/browser";
 // request.text regardless of opcode (the runtime browser.message() contract); a
 // binary frame's bytes read back via request.bytes. onMessage records what it
 // saw and replies, threading a per-connection count.
-export function onMessage() {
+export function onMessage({ kv, next, stream }) {
   const count = (request.ctx.count || 0) + 1;
   // A binary frame carries raw bytes; a text frame carries JSON.
   const a = request.activation;

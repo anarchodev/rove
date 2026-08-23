@@ -7,13 +7,13 @@
 // Order-independent by construction: both orders terminate at step 2 with
 // step/0 + step/1 recorded. Without the evolving-ctx thread the second leg
 // re-reads step 0, re-holds, and the chain never terminates — the teeth.
-export default function () {
+export default function ({ after, next }) {
   after.fetch("https://a.example.com/", { on: "onLeg" }); // no own ctx
   after.fetch("https://b.example.com/", { on: "onLeg" }); // no own ctx
   return next({ step: 0 });
 }
 
-export function onLeg() {
+export function onLeg({ kv, next }) {
   const step = request.ctx.step;
   kv.set("step/" + step, "1"); // record which step THIS leg observed
   const nextStep = step + 1;

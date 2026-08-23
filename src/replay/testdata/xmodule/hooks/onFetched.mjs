@@ -5,7 +5,7 @@
 // request.activation.status and the chunk payload on request.activation.bytes
 // (a Uint8Array; decode for text). Records it under the threaded ctx key —
 // proving the RIGHT module ran (only this file writes result/*).
-export default function () {
+export default function ({ kv }) {
   const ctx = request.ctx || {};
   const a = request.activation;
   const body = new TextDecoder().decode(a.bytes);

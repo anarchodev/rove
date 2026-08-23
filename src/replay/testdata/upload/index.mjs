@@ -9,7 +9,7 @@
 // PUT /v1/upload?tenant=X&path=Y&content_type=Z  (raw bytes as the body)
 const WS = "_workspace/";
 
-export function onHeaders() {
+export function onHeaders({ next, platform }) {
   const q = new URLSearchParams(request.query || "");
   const tenant = q.get("tenant");
   const path = q.get("path");
@@ -27,7 +27,7 @@ export function onHeaders() {
   return next();
 }
 
-export function onStored() {
+export function onStored({ kv, platform }) {
   const ctx = request.ctx || {};
   const app = ctx.app || {};
   // A completed receive resumes as a BOUND fetch_chunk — record the surface

@@ -4,7 +4,7 @@
 // door-side, so its emission never throws. The handler probes each and reports
 // "ok" or the thrown message, so one fixture covers both the admin and non-admin
 // runs (selected by scenario({ admin })).
-export default function () {
+export default function ({ platform }) {
   const out = {};
   const probe = (name, fn) => {
     try { fn(); out[name] = "ok"; }

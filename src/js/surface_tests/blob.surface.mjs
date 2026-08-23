@@ -7,7 +7,7 @@
 // session verbs.
 const SHA_HELLO = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
-export default function () {
+export default function ({ blob, kv }) {
   check("blob.put", () => {
     const hash = blob.put("hello", { contentType: "text/plain", on: "onStored", ctx: { k: 1 } });
     eq(hash, SHA_HELLO); // content-addressed: sha256 of the bytes

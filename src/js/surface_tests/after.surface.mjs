@@ -4,7 +4,7 @@
 // without a wake accumulator (the connectionless shape), so ms/kv are
 // inert-undefined per the documented model — but argument validation
 // still fires first, and after.fetch still mints its ftch_ id.
-export default function () {
+export default function ({ after }) {
   check("after.ms", () => {
     eq(after.ms(30_000), undefined);
     eq(after.ms(1, { on: "onTimeout" }), undefined);

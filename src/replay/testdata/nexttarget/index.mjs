@@ -5,7 +5,7 @@
 // This module's own resume exports are decoys: each writes an `index/*` key
 // the test asserts ABSENT — a resume that wrongly re-enters the parent is
 // caught by its distinct write, not just its return value.
-export default function () {
+export default function ({ after, next }) {
   response.status = 202;
   after.ms(30_000);
   after.kv("job/");
@@ -13,17 +13,17 @@ export default function () {
   return next("flows/step2.mjs", { job: "j1" });
 }
 
-export function onWake() {
+export function onWake({ kv }) {
   kv.set("index/woke", "wrong-module");
   return { wrong: true };
 }
 
-export function onFetchResult() {
+export function onFetchResult({ kv }) {
   kv.set("index/fetched", "wrong-module");
   return { wrong: true };
 }
 
-export function onDisconnect() {
+export function onDisconnect({ kv }) {
   kv.set("index/bye", "wrong-module");
   return { wrong: true };
 }

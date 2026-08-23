@@ -3,7 +3,7 @@
 // the platform root — writing the SAME key "shared" to each. In the sim these
 // are isolated (namespaced under __rove_store/{tag}/), so no write bleeds across
 // stores, and seeded values read back through the right facade.
-export default function () {
+export default function ({ kv, platform }) {
   kv.set("shared", "own");
 
   const acme = platform.scope("acme");

@@ -5,7 +5,7 @@ import browser from "@rewind/browser";
 // sends the next frame → onMessage again, seeing the resume's ctx + writes.
 // Before the fix, the fetch resume was a plain Node, so `.receive(nextFrame)`
 // couldn't continue the conversation.
-export function onMessage() {
+export function onMessage({ after, kv, next, stream }) {
   const turn = request.ctx.turn || 0;
   const msg = browser.message() || {};
   if (msg.t === "start") {
@@ -18,7 +18,7 @@ export function onMessage() {
   return next({ turn });
 }
 
-export function onResult() {
+export function onResult({ kv, next, stream }) {
   const turn = request.ctx.turn;
   kv.set("ws/llm", JSON.stringify({ turn: turn, ok: request.status >= 200 && request.status < 300 }));
   stream.write("llm-done");

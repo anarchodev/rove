@@ -5,7 +5,7 @@
 // system-internal unbound fetch's `on_chunk`), so the sim recorder throws the
 // same TypeError. The continuation module itself (hooks/onFetched.mjs) stays
 // testable standalone via `scenario.fetchResult`.
-export default function () {
+export default function ({ after, next }) {
   const key = new URLSearchParams(request.query || "").get("k") || "k";
   try {
     after.fetch("https://api.example.com/data", {

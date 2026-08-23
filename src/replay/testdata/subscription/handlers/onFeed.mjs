@@ -1,7 +1,7 @@
 // The subscription's per-writeback continuation (UNBOUND — a separate chain).
 // Each event carries a chunk on request.activation.bytes; the terminal event
 // (final:true, status 0) signals end-of-stream. Accumulate across events in kv.
-export default function () {
+export default function ({ kv }) {
   const a = request.activation;
   if (a.final) {
     kv.set("feed/ended", "status:" + a.status);
