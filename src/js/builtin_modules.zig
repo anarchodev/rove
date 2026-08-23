@@ -126,6 +126,14 @@ const MODULES = [_]struct {
         .wake_targetable = true,
     },
     .{
+        // rove#719: a deployment's config rows, written by the tenant in its
+        // own scope. Dispatched by the deploy path once the manifest lands,
+        // so the rows are durable before anything can release that
+        // deployment.
+        .path = "__system/config_install.mjs",
+        .src = @embedFile("builtin_config_install_mjs"),
+    },
+    .{
         // rove#691: the return half — resolves the owed marker in the ORIGIN
         // tenant's scope once the target's activation has committed. Enqueued
         // by the engine, not named by any shim, so it needs no targetable

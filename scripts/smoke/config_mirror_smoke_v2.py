@@ -80,6 +80,7 @@ def main() -> int:
             failures.append(label)
 
     with V2Cluster.spawn("config-mirror", nodes=1) as c:
+        c.spawn_log_server(poll_interval_ms=200)
         print("step 1: provision tenant 'acme' via the CP")
         r = c.provision("acme")
         check("provision → 200", r.status == 200, f"got {r.status} {r.body!r}")
@@ -156,11 +157,54 @@ def main() -> int:
             c.dump_node_log(grep=["config", "mirror", "kv", "cfg", "resolve",
                                   "404", "error", "warn"])
 
-        print("step 7: direct /_system/v2-kv GET reads back the mirrored bytes")
-        r = c.admin_kv_get("acme", CONFIG_KEY)
+        # A deployment's config is addressed BY that deployment
+        # (`_config/{dep_id:016x}/…`, rove#726), so the raw kv door — which
+        # does not go through the handler binding's resolution — must be
+        # asked for the scoped key. Step 6 above is the behavioural assertion
+        # and it reads the name a handler uses; this one pins the LAYOUT,
+        # because the layout is what makes code and config switch together.
+        scoped_key = f"_config/{int(dep2):016x}/oauth/google"
+        print(f"step 7: direct /_system/v2-kv GET reads back {scoped_key}")
+        r = c.admin_kv_get("acme", scoped_key)
         check("v2-kv GET → 200 round-trip (mirror committed to kv)",
               r.status == 200 and json.loads(r.body) == json.loads(CONFIG_JSON),
               f"got {r.status} {r.body!r}")
+
+        # …and the flat key is NOT there. Without this the smoke would pass
+        # again the moment someone reintroduced the shared mutable namespace,
+        # which is the regression the scoping exists to prevent: one deploy
+        # overwriting another's config, with the switch not atomic against
+        # the code's.
+        r_flat = c.admin_kv_get("acme", CONFIG_KEY)
+        check("the unscoped key is absent (config is not shared mutable state)",
+              r_flat.status == 404,
+              f"got {r_flat.status} {r_flat.body!r}")
+
+        # ⭐ The rows arrived as an ACTIVATION in this tenant's scope, not as a
+        # background thread writing its store (rove#719). This is the
+        # assertion that distinguishes the two: every check above passes
+        # either way, because the loader-side mirror is still there as a
+        # self-heal and would produce the same rows. Only the record says
+        # WHICH path ran — and a deployment being visible in the tenant's own
+        # log is the point of moving the write.
+        deadline = time.time() + 20.0
+        rec = None
+        while time.time() < deadline and rec is None:
+            lr = c.log_get(f"acme/list?limit=200", timeout=15.0)
+            if lr.status == 200:
+                for row in json.loads(lr.body).get("records", []):
+                    if "config_install" in json.dumps(row):
+                        rec = row
+                        break
+            if rec is None:
+                time.sleep(0.5)
+        check("⭐ the config rows arrived as an activation in the tenant's log",
+              rec is not None,
+              f"no config_install record in acme's log; got {lr.status}")
+        if rec is not None:
+            check("…attributed as a platform action, not as the tenant's own traffic",
+                  rec.get("activation") == "platform_dispatch",
+                  f"activation={rec.get('activation')!r}")
 
         if got is not None:
             check("marker field round-tripped",
@@ -171,7 +215,8 @@ def main() -> int:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
     print("\nPASS config-mirror smoke (v2) — deploy-time blob→kv mirror drove "
-          "the _config/oauth/google row; /cfg served it + v2-kv round-tripped.")
+          "the deployment-scoped _config row; /cfg served it + v2-kv "
+          "round-tripped at the scoped key.")
     return 0
 
 
