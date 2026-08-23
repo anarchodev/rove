@@ -1636,6 +1636,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // is still inbound (ReqBody is empty by invariant) and they
     // dispatch as `.inbound_headers`.
     const body_inbounds = server.request_out.column(worker_mod.BodyInbound);
+    // One request, one rate token: the marker that survives a deferral
+    // (`worker_mod.RateCharged`). Several paths below leave an entity in
+    // `request_out` to be walked again, and the rate check sits above all of
+    // them.
+    const rate_charges = server.request_out.column(worker_mod.RateCharged);
 
     // Per-tenant leadership is enforced at TWO points. The dispatch-gate
     // (per request, below — just before handler execution) 421s any
@@ -1742,7 +1747,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
     var processed: usize = 0;
 
-    for (entities, sids, sessions, req_hdrs, req_bodies, body_waits, body_inbounds) |ent, sid, sess, rh, req_body, body_wait, body_inbound| {
+    for (entities, sids, sessions, req_hdrs, req_bodies, body_waits, body_inbounds, rate_charges) |ent, sid, sess, rh, req_body, body_wait, body_inbound, rate_charged| {
         const received_ns: i64 = @intCast(std.time.nanoTimestamp());
 
         const method = respb.findHeader(rh, ":method") orelse "GET";
@@ -1894,13 +1899,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // `--rate-limit-request-refill`; the right answer is to
         // size the bucket, not to bypass it. Runs BEFORE static
         // dispatch so static file requests count against the bucket
-        // too. On exhaustion: 429 + Retry-After header.
-        // Gap-2.4 chunk wait: an armed sink entity whose head fire
-        // isn't ready (bytes still arriving / durability park in
-        // flight) idles in request_out across many walks — skip it
-        // BEFORE the rate check or every waiting tick charges a
-        // request token (the first walk charged on arm; the firing
-        // walk charges below).
+        // too — which is why the check cannot simply move below the
+        // deferral paths, and why the charge is marked instead.
+        // On exhaustion: 429 + Retry-After header.
+        // An armed chunk sink whose head fire isn't ready (bytes still
+        // arriving / durability park in flight) idles in request_out across
+        // many walks: skip it, it has nothing to dispatch yet. The token it
+        // took on the arming walk stands — `RateCharged` is what stops the
+        // firing walk taking a second one.
         if (worker.inbound_chunk_jobs.get(ent)) |jb| {
             if (!jb.classic_fallback and !jb.dead) {
                 const fireable = if (jb.head()) |h|
@@ -1916,10 +1922,20 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // limiter re-snapshot caps when a tier change lands (Lever 1).
         const plan = slot.effectivePlan();
         const plan_gen = slot.plan_gen.load(.acquire);
-        const allowed = worker.limiter.check(scope_inst.id, .request, plan.rate, plan_gen, received_ns) catch |err| blk: {
+        // Charge ONCE per request, not once per walk. A request this walk
+        // defers (anchor mismatch, batch full, busy tenant, chunk head not
+        // fireable) comes back through here next tick already carrying its
+        // token; charging again would meter waiting rather than serving, and
+        // the tenant would see a 429 it did not earn.
+        const allowed = if (rate_charged.charged) true else worker.limiter.check(scope_inst.id, .request, plan.rate, plan_gen, received_ns) catch |err| blk: {
             std.log.warn("rove-js: limiter.check({s}) failed: {s} — fail open", .{ scope_inst.id, @errorName(err) });
             break :blk true;
         };
+        // Marked on admission only: a refused request is answered with the
+        // 429 below and never walked again, so it has nothing to remember.
+        if (allowed and !rate_charged.charged) {
+            try server.reg.set(ent, &server.request_out, worker_mod.RateCharged, .{ .charged = true });
+        }
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
             try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, "rate limit exceeded", retry_after);
