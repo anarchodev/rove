@@ -572,6 +572,15 @@ pub fn manifestKey(buf: *[25]u8, dep_id: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:0>20}.json", .{dep_id}) catch unreachable;
 }
 
+/// Largest item count the canonical `computeDeploymentId` ordering accepts,
+/// applied to each of the three lists it sorts (entries, packages, app
+/// imports). The limit lives beside the sort rather than at each caller
+/// because exceeding it is *unsound*, not merely invalid: the sort indexes
+/// fixed buffers, so a caller that forgot the check would write past them in
+/// a build where `assert` compiles out. `computeDeploymentId` therefore fails
+/// closed on its own inputs and no caller can forget.
+pub const MAX_CANONICAL_ITEMS: usize = 256;
+
 /// Compute a deploy id from the manifest's entry list.
 ///
 /// dep_id is sha-256 of a canonical encoding of the entries
@@ -597,10 +606,13 @@ pub fn computeDeploymentId(
     entries: []const root.Entry,
     packages: []const Package,
     app_imports: []const ImportEntry,
-) u64 {
-    var sorted_indices: [256]usize = undefined;
+) Error!u64 {
+    if (entries.len > MAX_CANONICAL_ITEMS or
+        packages.len > MAX_CANONICAL_ITEMS or
+        app_imports.len > MAX_CANONICAL_ITEMS) return Error.InvalidManifest;
+
+    var sorted_indices: [MAX_CANONICAL_ITEMS]usize = undefined;
     const n = entries.len;
-    std.debug.assert(n <= sorted_indices.len);
     for (0..n) |i| sorted_indices[i] = i;
     const idx_slice = sorted_indices[0..n];
     std.mem.sort(usize, idx_slice, entries, struct {
@@ -629,8 +641,7 @@ pub fn computeDeploymentId(
     // version fully — no nested sort. Skipped entirely when there are no
     // packages (cheap common case).
     if (packages.len > 0 or app_imports.len > 0) {
-        var pkg_idx: [256]usize = undefined;
-        std.debug.assert(packages.len <= pkg_idx.len);
+        var pkg_idx: [MAX_CANONICAL_ITEMS]usize = undefined;
         for (0..packages.len) |i| pkg_idx[i] = i;
         const pkg_slice = pkg_idx[0..packages.len];
         std.mem.sort(usize, pkg_slice, packages, struct {
@@ -652,8 +663,7 @@ pub fn computeDeploymentId(
             hasher.update(&.{0});
         }
 
-        var ai_idx: [256]usize = undefined;
-        std.debug.assert(app_imports.len <= ai_idx.len);
+        var ai_idx: [MAX_CANONICAL_ITEMS]usize = undefined;
         for (0..app_imports.len) |i| ai_idx[i] = i;
         const ai_slice = ai_idx[0..app_imports.len];
         std.mem.sort(usize, ai_slice, app_imports, struct {
@@ -757,8 +767,8 @@ test "computeDeploymentId: same entries → same id (idempotent)" {
             .bytecode_hex = @splat(0),
         },
     };
-    const id_a = computeDeploymentId(&entries, &.{}, &.{});
-    const id_b = computeDeploymentId(&entries, &.{}, &.{});
+    const id_a = try computeDeploymentId(&entries, &.{}, &.{});
+    const id_b = try computeDeploymentId(&entries, &.{}, &.{});
     try testing.expectEqual(id_a, id_b);
 }
 
@@ -788,8 +798,8 @@ test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
         },
     };
     try testing.expectEqual(
-        computeDeploymentId(&entries_a, &.{}, &.{}),
-        computeDeploymentId(&entries_b, &.{}, &.{}),
+        try computeDeploymentId(&entries_a, &.{}, &.{}),
+        try computeDeploymentId(&entries_b, &.{}, &.{}),
     );
 }
 
@@ -805,15 +815,53 @@ test "computeDeploymentId: changing content yields different id" {
         .source_hex = @splat('a'), .bytecode_hex = @splat('c'), // different bytecode
     }};
     try testing.expect(
-        computeDeploymentId(&entries_a, &.{}, &.{}) != computeDeploymentId(&entries_b, &.{}, &.{}),
+        try computeDeploymentId(&entries_a, &.{}, &.{}) != try computeDeploymentId(&entries_b, &.{}, &.{}),
     );
 }
 
 test "computeDeploymentId: empty entries is stable" {
     const empty: []const root.Entry = &.{};
-    const id_a = computeDeploymentId(empty, &.{}, &.{});
-    const id_b = computeDeploymentId(empty, &.{}, &.{});
+    const id_a = try computeDeploymentId(empty, &.{}, &.{});
+    const id_b = try computeDeploymentId(empty, &.{}, &.{});
     try testing.expectEqual(id_a, id_b);
+}
+
+test "computeDeploymentId: over-long lists are rejected, not written past the sort buffer" {
+    // The counts below are client-supplied in production (the `resolution`
+    // a deploy carries), so exceeding the canonical ordering's capacity has
+    // to be a refusal. It used to be `std.debug.assert`, which a ReleaseFast
+    // build compiles out — leaving an out-of-bounds write into the sort's
+    // fixed index buffer.
+    const over = MAX_CANONICAL_ITEMS + 1;
+
+    const pkgs = try testing.allocator.alloc(Package, over);
+    defer testing.allocator.free(pkgs);
+    for (pkgs) |*pk| pk.* = .{
+        .spec = "@x/y",
+        .version = "1.0.0",
+        .pkg_hash_hex = @splat('a'),
+        .files = &.{},
+        .imports = &.{},
+        .capabilities = &.{},
+        .private = false,
+    };
+    try testing.expectError(Error.InvalidManifest, computeDeploymentId(&.{}, pkgs, &.{}));
+
+    const imports = try testing.allocator.alloc(ImportEntry, over);
+    defer testing.allocator.free(imports);
+    for (imports) |*ie| ie.* = .{ .specifier = "@x/y", .pkg_hash_hex = @splat('a') };
+    try testing.expectError(Error.InvalidManifest, computeDeploymentId(&.{}, &.{}, imports));
+
+    const entries = try testing.allocator.alloc(root.Entry, over);
+    defer testing.allocator.free(entries);
+    for (entries) |*e| e.* = .{
+        .path = "index.mjs",
+        .kind = .handler,
+        .content_type = "",
+        .source_hex = @splat('a'),
+        .bytecode_hex = @splat('b'),
+    };
+    try testing.expectError(Error.InvalidManifest, computeDeploymentId(entries, &.{}, &.{}));
 }
 
 // ── package manager: manifest v2 ───────────────────────────────────
@@ -891,7 +939,7 @@ test "v2: a package-less deploy has no packages/app_imports sections" {
         .content_type = @constCast(""),
         .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
     }};
-    const id_no_pkg = computeDeploymentId(&entries, &.{}, &.{});
+    const id_no_pkg = try computeDeploymentId(&entries, &.{}, &.{});
 
     const bytes = try encode(testing.allocator, id_no_pkg, &entries, &.{}, &.{});
     defer testing.allocator.free(bytes);
@@ -902,7 +950,7 @@ test "v2: a package-less deploy has no packages/app_imports sections" {
     // Adding a package must change the dep_id (content-addressed).
     var files = [_]PkgFile{.{ .path = @constCast("index.mjs"), .bytecode_hex = @splat('1'), .source_hex = @splat('2') }};
     var pkgs = [_]Package{.{ .spec = @constCast("@rewind/jwt"), .version = @constCast("1.0.0"), .pkg_hash_hex = @splat('J'), .files = &files, .imports = &.{}, .capabilities = &.{}, .private = false }};
-    const id_with_pkg = computeDeploymentId(&entries, &pkgs, &.{});
+    const id_with_pkg = try computeDeploymentId(&entries, &pkgs, &.{});
     try testing.expect(id_no_pkg != id_with_pkg);
 }
 

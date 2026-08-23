@@ -166,7 +166,7 @@ pub fn deployBakedBundle(
     // mints the same id — and the per-tenant S3 prefix scopes the
     // manifest so cross-tenant collisions don't matter at all (each
     // tenant has its own `{inst_id}/deployments/` namespace).
-    const next_id = files_mod.manifest_json.computeDeploymentId(entries, &.{}, &.{});
+    const next_id = try files_mod.manifest_json.computeDeploymentId(entries, &.{}, &.{});
 
     const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries, &.{}, &.{});
     defer allocator.free(json_bytes);
