@@ -22,11 +22,12 @@ from; this script reads it rather than holding a copy.
 
 Heuristics, each a deliberate under-count rather than a false alarm:
 
-  1. **A locally-bound name is already migrated.** `({ request, kv })`
-     in a signature, or `const { kv } = ...`, means the file receives the
-     capability — every later `kv.foo()` in it is the NEW idiom, so the
-     name is skipped for that whole file. This is what makes the number
-     mean "unmigrated" rather than "mentions a capability".
+  1. **A locally-bound name is already migrated — but only in scope.**
+     `({ request, kv })` on a function means uses INSIDE that function
+     receive the capability. Scope matters: a file whose default export
+     destructures `kv` may still have a module-scope helper reaching the
+     ambient one, and that helper is exactly what breaks at the cutover.
+     An earlier file-scoped version of this check hid those.
   2. **Comments don't execute.** `//` and ` *` lines are skipped.
   3. **Member access isn't a free variable.** `foo.kv.get()` is a
      property chain, not the global.
@@ -89,17 +90,112 @@ def _is_comment(line: str) -> bool:
     return t.startswith("//") or t.startswith("*") or t.startswith("/*")
 
 
-def _locally_bound(src: str, name: str) -> bool:
-    """True if the file destructures `name` — i.e. already migrated.
+def _strip_literals(src: str) -> str:
+    """Blank out comments and string bodies, preserving line structure.
 
-    Matches the two shapes that matter: a destructuring declaration
-    (`const { kv } = …`) and a destructured parameter
-    (`({ request, kv }) =>`, `function h({ kv })`). Braces are matched
-    non-greedily and without nesting, which is enough for a signature or
-    a declaration and avoids swallowing a whole function body.
+    Without this the count is dominated by text that never executes. The
+    `_tests/` scenario files pin the exact wording of engine errors —
+    `row("msZero", "TypeError", "after.ms(ms): ms must be > 0")` — and a
+    plain scan reads every one of those as an ambient `after` use. Those
+    files need no migration at all, so counting them would make the
+    ratchet unreachable and point a codemod at the wrong files.
+
+    Template literals keep their `${...}` interpolations, which are real
+    code; only the literal text between them is dropped. Regex literals
+    are left alone — a capability name inside one is vanishingly rare and
+    distinguishing `/` division from a regex needs a real parser.
     """
-    pat = re.compile(r"[\(,=]\s*\{[^{}]{0,300}\b" + re.escape(name) + r"\b[^{}]{0,300}\}")
-    return bool(pat.search(src))
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif ch == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(c if c == "\n" else " " for c in src[i:j]))
+            i = j
+        elif ch in "\"'":
+            j = i + 1
+            while j < n and src[j] != ch:
+                j += 2 if src[j] == "\\" else 1
+            j = min(j + 1, n)
+            out.append("".join(c if c == "\n" else " " for c in src[i:j]))
+            i = j
+        elif ch == "`":
+            j = i + 1
+            buf = [" "]
+            while j < n and src[j] != "`":
+                if src[j] == "\\":
+                    buf.append("  ")
+                    j += 2
+                    continue
+                if src[j] == "$" and j + 1 < n and src[j + 1] == "{":
+                    depth, k = 1, j + 2
+                    while k < n and depth:
+                        if src[k] == "{":
+                            depth += 1
+                        elif src[k] == "}":
+                            depth -= 1
+                        k += 1
+                    buf.append("  " + src[j + 2 : k])  # keep the interpolation
+                    j = k
+                    continue
+                buf.append("\n" if src[j] == "\n" else " ")
+                j += 1
+            buf.append(" ")
+            out.append("".join(buf))
+            i = min(j + 1, n)
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _binding_spans(src: str, name: str) -> list[tuple[int, int]]:
+    """Body extents of every function that destructures `name` in its
+    parameter list, plus the rest of the block after a destructuring
+    declaration. A use inside one of these is receiving the capability.
+    """
+    out: list[tuple[int, int]] = []
+    # A parameter list naming `name` — destructured (`({ kv })`) or plain
+    # (`function hold(next, ctx)`, the shape a module-scope helper takes once
+    # its caller threads the capability in). Requiring a block body right
+    # after the `)` is what keeps a CALL like `hold(next, { … })` from
+    # reading as a binding.
+    pat = re.compile(
+        r"\(([^()]{0,400}?\b" + re.escape(name) + r"\b[^()]{0,400}?)\)\s*(?:=>\s*)?\{"
+    )
+    for m in pat.finditer(src):
+        i = m.end() - 1
+        depth, j = 0, i
+        while j < len(src):
+            if src[j] == "{":
+                depth += 1
+            elif src[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        out.append((i, j))
+    # `const { kv } = …` binds for the remainder of its enclosing block;
+    # approximating that as "to end of file" is the safe direction here —
+    # it under-counts rather than inventing work.
+    decl = re.compile(
+        r"(?:const|let|var)\s*\{[^{}]{0,400}?\b" + re.escape(name) + r"\b[^{}]{0,400}?\}\s*="
+    )
+    for m in decl.finditer(src):
+        out.append((m.end(), len(src)))
+    return out
+
+
+def _locally_bound(src: str, name: str) -> bool:
+    """Kept for callers that only need "does this file bind it anywhere"."""
+    return bool(_binding_spans(src, name))
 
 
 def _count_file(path: Path) -> dict[str, int]:
@@ -107,16 +203,16 @@ def _count_file(path: Path) -> dict[str, int]:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {}
+    src = _strip_literals(src)
     out: dict[str, int] = {}
     for name in CAPABILITIES:
-        if _locally_bound(src, name):
-            continue  # migrated: it receives this capability
+        bound = _binding_spans(src, name)
         # A free-variable use: not preceded by `.` or an identifier char.
         pat = re.compile(r"(?<![\w.$])" + re.escape(name) + r"\s*[.(]")
         n = sum(
-            len(pat.findall(line))
-            for line in src.splitlines()
-            if not _is_comment(line)
+            1
+            for m in pat.finditer(src)
+            if not any(a <= m.start() <= b for a, b in bound)
         )
         if n:
             out[name] = n

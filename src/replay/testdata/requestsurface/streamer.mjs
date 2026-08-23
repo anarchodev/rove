@@ -1,12 +1,12 @@
 // Streams an upstream fetch chunk by chunk, recording each event's
 // activation-bag fields (seq/byteOffset/final + seq-0 headers) so the test
 // can assert the per-event bag matches prod's fetch_chunk arm.
-export default function () {
+export default function ({ after, next }) {
   after.fetch("https://upstream.example/s", { stream: true, maxChunkBytes: 4, on: "onChunk" });
   return next();
 }
 
-export function onChunk() {
+export function onChunk({ kv, next }) {
   const a = request.activation;
   kv.set("chunk/" + a.seq, JSON.stringify({
     off: a.byteOffset,

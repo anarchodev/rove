@@ -3,7 +3,7 @@
 // `next()`, the wakes arm) or returns a terminal body (prod discards every
 // connection-scoped effect at the success seam — they must not satisfy
 // matchers offline either).
-export default function () {
+export default function ({ after, kv, next }) {
   const mode = request.json.mode;
   after.fetch("https://api.example.test/poll", { on: "onPoll", ctx: { mode } });
   after.ms(5000, { on: "onTick" });

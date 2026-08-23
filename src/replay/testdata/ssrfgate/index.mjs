@@ -3,7 +3,7 @@
 // scheme policy always rejects, and an ordinary public https URL. Issuing is
 // legal in every case (the policy surfaces ASYNC in prod, never a throw) —
 // what the offline harness must police is which OUTCOMES are authorable.
-export default function () {
+export default function ({ after, next }) {
   after.fetch("https://169.254.169.254/latest/meta-data/", { on: "onMeta" });
   // The blocked-class arms share onMeta: their only authorable outcome is
   // the transport failure, which resumes there like the metadata arm's.

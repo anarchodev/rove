@@ -9,7 +9,7 @@ import schedule from "@rewind/schedule";
 // metadata from `request.activation.{id, key, scheduledAtNs}`; then re-arms
 // itself under a stable idempotency key — the self-rescheduling recurring
 // reminder recipe.
-export default function () {
+export default function ({ kv }) {
   const a = request.activation;
   const { user, count = 0 } = request.ctx || {};
   const n = count + 1;
@@ -30,7 +30,7 @@ export default function () {
 // A NAMED export — the target of a `schedule(..., "jobs/reminder.mjs.weekly")`.
 // Writes a distinct marker so a test can prove the method ran
 // rather than `default`.
-export function weekly() {
+export function weekly({ kv }) {
   const a = request.activation;
   const { user } = request.ctx || {};
   kv.set("weekly/" + user, JSON.stringify({ export: "weekly", firedFrom: a.id }));

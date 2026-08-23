@@ -25,7 +25,10 @@ function jerr(status, msg) {
 
 // Stage one HANDLER file: compile → content-address into the target's blobs,
 // record the workspace entry from the `onFileStaged` continuation.
-function deployFile(b) {
+// `platform` and `next` are threaded rather than ambient: a module-scope
+// helper has no activation to receive them from, so the export that
+// routes to it hands them over.
+function deployFile(platform, next, b) {
   if (!b.tenant || !b.path) return jerr(400, "tenant + path required");
   platform.compile([{ path: b.path, source: b.source || "" }], {
     scope: b.tenant,
@@ -35,7 +38,7 @@ function deployFile(b) {
   return next();
 }
 
-export function onFileStaged() {
+export function onFileStaged({ platform }) {
   const ctx = request.ctx;
   if (!ctx || !ctx.ok) {
     response.status = 500;
@@ -54,7 +57,7 @@ export function onFileStaged() {
 // Stage one PACKAGE file: compiled under the package's module identity, keyed
 // on `onPkgStaged` — a SECOND compile door in the same handler class, so the
 // harness `compile({on})` selector is exercised.
-function deployPkg(b) {
+function deployPkg(platform, next, b) {
   if (!b.tenant || !b.pkg_hash || !b.path)
     return jerr(400, "tenant + pkg_hash + path required");
   platform.compile([{ path: b.path, source: b.source || "" }], {
@@ -65,7 +68,7 @@ function deployPkg(b) {
   return next();
 }
 
-export function onPkgStaged() {
+export function onPkgStaged({ platform }) {
   const ctx = request.ctx;
   if (!ctx || !ctx.ok) {
     response.status = 500;
@@ -82,7 +85,7 @@ export function onPkgStaged() {
 
 // Cut a release: assemble the manifest from the workspace → stampManifest (the
 // staging barrier) → dep_id resumes at `onCut`.
-function deployCut(b) {
+function deployCut(platform, next, b) {
   if (!b.tenant) return jerr(400, "tenant required");
   const sk = platform.scope(b.tenant).kv;
   const rows = sk.prefix(WS, "", 1000);
@@ -109,7 +112,7 @@ export function onCut() {
   return JSON.stringify(ctx); // { ok, dep_id }
 }
 
-export default function () {
+export default function ({ platform, next }) {
   if (request.method !== "POST") { response.status = 405; return "POST only\n"; }
   // Engine-computed operator-root verdict; the bearer is stripped from
   // request.headers on a platform-bound handler so it can't reach the tape.
@@ -119,9 +122,9 @@ export default function () {
   }
   const b = request.json || {};
   switch (request.path) {
-    case "/v1/deploy/file": return deployFile(b);
-    case "/v1/deploy/pkg": return deployPkg(b);
-    case "/v1/deploy/cut": return deployCut(b);
+    case "/v1/deploy/file": return deployFile(platform, next, b);
+    case "/v1/deploy/pkg": return deployPkg(platform, next, b);
+    case "/v1/deploy/cut": return deployCut(platform, next, b);
     default: response.status = 404; return "not found\n";
   }
 }

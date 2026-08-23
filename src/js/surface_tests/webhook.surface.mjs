@@ -4,7 +4,7 @@
 // the internal fetch + durable scheduled wakes. In-process the fetch
 // is a buffered Cmd; what's observable is the marker row, the
 // schedule entry it arms, the id derivation, and the option contract.
-export default function () {
+export default function ({ kv, webhook }) {
   check("webhook.send", () => {
     // Immediate fire: marker + crash-recovery watchdog wake.
     const id = webhook.send("https://hooks.example.test/x", {

@@ -1,7 +1,7 @@
 // Error-semantics fixture: the sim must report the PROD outcome
 // for a thrown handler (500 "handler threw: …" + rollback), a pending-promise
 // return (200 "{}"), and a held chain whose module has no onDisconnect (no-op).
-export default function () {
+export default function ({ after, kv, next }) {
   if (request.path === "/throw") {
     kv.set("before-throw", "1");
     after.fetch("https://api.example.com/x");

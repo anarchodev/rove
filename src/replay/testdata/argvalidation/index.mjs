@@ -2,7 +2,7 @@
 // shape prod rejects synchronously, catches, and reports the error surface
 // (type / message / code) so the test can pin it against the prod throw
 // table (bindings/{on,http,stream,blob,crypto}.zig + globals.zig).
-export default function () {
+export default function ({ after, blob, http, platform, stream }) {
   const out = {};
   const probe = (name, fn) => {
     try { fn(); out[name] = null; }
@@ -33,7 +33,7 @@ export default function () {
 
 // Headers-first branch: the SECOND receive throws (one inbound body per
 // request); the first arms normally and the chain holds.
-export function onHeaders() {
+export function onHeaders({ blob, kv, next }) {
   blob.receive({ on: "onStored" });
   try {
     blob.receive({ on: "onStored" });

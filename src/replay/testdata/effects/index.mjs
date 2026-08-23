@@ -4,7 +4,7 @@ import schedule from "@rewind/schedule";
 // `_tests/effects.mjs` test sees them decompose
 // into primitives (`_send/owed/*` + `_sched/*` kv writes + an `http.fetch`)
 // instead of one high-level `{kind:"webhook"|"schedule"}` effect each.
-export default function () {
+export default function ({ kv, webhook }) {
   const user = request.json.user;
 
   // Durable outbound HTTP. Real shim: writes the _send/owed/{id} marker, arms a

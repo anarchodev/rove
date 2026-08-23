@@ -1,7 +1,7 @@
 // Arms a bound fetch; the resume reads prod's per-event activation bag
 // (globals.zig fetch_chunk arm): fetchId/seq/byteOffset/bytes/final +
 // terminal status, with the upstream's headers on the seq-0 event.
-export default function () {
+export default function ({ after, next }) {
   after.fetch("https://upstream.example/data", { on: "onDone" });
   return next();
 }

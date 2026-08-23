@@ -5,7 +5,7 @@ import browser from "@rewind/browser";
 // Mirrors rewind-apps:agent-sample's think() replay leg. Without a
 // sagaId, getReplay can't build the logs URL and returns false — so the
 // success bounce into onReplay is only driveable when a test supplies both ids.
-export function onMessage() {
+export function onMessage({ next, stream }) {
   const issued = browser.getReplay({ on: "onReplay" });
   if (!issued) {
     stream.write("replay unavailable");
@@ -14,7 +14,7 @@ export function onMessage() {
   return next(); // hold for the bound replay fetch
 }
 
-export function onReplay() {
+export function onReplay({ kv, stream }) {
   kv.set("replay/log", JSON.stringify({ ok: request.status >= 200 && request.status < 300, body: request.text }));
   stream.write("replay ready");
   return;

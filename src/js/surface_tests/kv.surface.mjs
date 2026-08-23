@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // kv — tenant KV store: read-your-writes within the activation txn,
 // reserved-prefix enforcement, prefix pagination.
-export default function () {
+export default function ({ kv }) {
   check("kv.get", () => {
     eq(kv.get("nope/absent"), null);
   });

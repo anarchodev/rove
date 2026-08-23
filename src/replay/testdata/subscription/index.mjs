@@ -1,6 +1,6 @@
 // http.subscribe (held outbound stream) + the kv-reactive onSubscription side +
 // the dirty-marker injection a watched-prefix write triggers (#36, #38).
-export default function () {
+export default function ({ http, kv }) {
   if (request.path === "/order") {
     // Two writes under a watched prefix — the platform injects ONE coalesced
     // _sub/dirty/{name} marker per activation, not one per write.
@@ -21,7 +21,7 @@ export default function () {
   return { subscribed: true };
 }
 
-export function onSubscription() {
+export function onSubscription({ kv }) {
   const name = request.activation.name;
   kv.set("subs/" + name, "fired"); // subscription chains persist state in kv
   return { fired: name, kind: request.activation.kind };

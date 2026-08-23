@@ -14,7 +14,7 @@ const CASES = [
   { one: "z", parts: [] },                                          // empty recipe
 ];
 
-export default function () {
+export default function ({ blob }) {
   const c = CASES[request.json.i];
   const putHash = blob.put(c.one, { contentType: "text/plain" });
   for (const p of c.parts) blob.write(p);

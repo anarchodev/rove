@@ -3,13 +3,13 @@
 // once BOTH legs are in. The invariant: the final total is the same regardless of
 // which upstream responds first, and each leg is counted exactly once. This is the
 // arrival-order-independence property `whenConcurrent` exists to check.
-export default function () {
+export default function ({ after, next }) {
   after.fetch("https://a.example.com/", { ctx: { amt: 10 }, on: "onResult" });
   after.fetch("https://b.example.com/", { ctx: { amt: 20 }, on: "onResult" });
   return next();
 }
 
-export function onResult() {
+export function onResult({ kv, next }) {
   const amt = request.ctx.amt;
   // Idempotent per leg: only apply once even if this leg somehow re-delivers.
   if (kv.get("seen/" + amt) !== "1") {

@@ -3,7 +3,7 @@
 // http — held outbound subscriptions. In this harness there is no
 // fetch accumulator, so the transport never fires; the pinnable
 // contract is the id shape, option validation, and cancel's no-op.
-export default function () {
+export default function ({ http }) {
   check("http.subscribe", () => {
     const id = http.subscribe({
       url: "https://upstream.example/feed",

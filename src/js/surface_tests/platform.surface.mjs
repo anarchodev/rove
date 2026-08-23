@@ -7,7 +7,7 @@
 
 const NOT_ADMIN = /platform is only available on the admin handler/;
 
-export default function () {
+export default function ({ platform }) {
   check("platform.scope", () => {
     throws(() => platform.scope("some-tenant"), NOT_ADMIN);
   });

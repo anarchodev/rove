@@ -1,5 +1,5 @@
 // A handler whose users/ writes pass through the registered trigger.
-export default function () {
+export default function ({ kv }) {
   const p = request.path;
   if (p === "/good") { kv.set("users/1", JSON.stringify({ name: "ada" })); return { stored: kv.get("users/1") }; }
   if (p === "/bad") {

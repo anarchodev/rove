@@ -7,7 +7,7 @@ import stripe from "@rewind/stripe";
 
 const sk = () => stripe.client({ apiKey: "sk_test_x", on: "onStripe" });
 
-export default function () {
+export default function ({ next }) {
   if (request.path === "/intent") {
     sk().setupIntents.create({ customer: "cus_1" }, { on: "onIntent" });
     return next();                      // held — the resume answers the browser
