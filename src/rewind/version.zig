@@ -75,9 +75,32 @@ pub const KEYRING_VALUE_VERSION: u8 = rjs.keyring.keyspace.VALUE_VERSION;
 /// which the worker does not link — mirrored here for the audit dump.
 pub const CERT_PACK_VERSION: u8 = 1;
 
+/// Two inter-binary HTTP surfaces version themselves the way HTTP does:
+/// a path segment, so a peer that does not implement the shape 404s
+/// instead of mis-parsing it. Recorded here because a path IS the
+/// version for these, and an inventory that only counted embedded bytes
+/// would report them as unversioned.
+pub const SNAPSHOT_SINK_PATH = "/_system/v2-snapshot-stream";
+pub const LOG_PUSH_PATH = "/v1/_internal/batch-pushed";
+
 /// Base service-JWT claims-schema version (`"v":1`). Canonical:
 /// `src/jwt/root.zig` (string-embedded; not a numeric const to import).
 pub const SERVICE_JWT_VERSION: u8 = 1;
+
+/// SSE / rich-payload JWT claims-schema version (`"v"`). Canonical:
+/// `src/jwt/root.zig` `signPayload`'s callers (string-embedded).
+pub const RICH_JWT_VERSION: u8 = 1;
+
+
+/// Record versions for the shim-owned JSON in the reserved `_` keyspace.
+/// These live in JavaScript — `globals/*.js`, the baked `__system/*`
+/// modules and the `@rewind/*` packages — so there is no Zig constant to
+/// reference and these are mirrored values, kept honest by
+/// `scripts/ops/record_version_lint.py` rather than by the compiler.
+/// Listed anyway: the registry's job is to make the whole surface
+/// auditable at a glance, and a format the dump omits reads as one with
+/// nothing to see (`docs/architecture/format-versioning.md` §1f).
+pub const SHIM_RECORD_VERSIONS: u8 = 1;
 
 /// Write the whole registry as human-readable lines to `w`.
 pub fn dump(w: *std.Io.Writer) !void {
@@ -95,6 +118,8 @@ pub fn dump(w: *std.Io.Writer) !void {
     try w.print("  snapshot_stream      v{d} (magic 0x{X:0>8})\n", .{ kv.snapshot_stream.STREAM_VERSION, kv.snapshot_stream.STREAM_MAGIC });
     try w.print("  cert_pack            v{d} (src/cp/directory.zig)\n", .{CERT_PACK_VERSION});
     try w.print("  keyring_kv_value     v{d} (_keys/bind|dead|minted|next_slot)\n", .{KEYRING_VALUE_VERSION});
+    try w.print("  rich_jwt             v{d}\n", .{RICH_JWT_VERSION});
+    try w.print("  shim_kv_records      v{d} (_send/owed,_blob/owed,_dispatch/owed,_sched/by_id,_export,_oidc,_rp,_seg) — JS-owned\n", .{SHIM_RECORD_VERSIONS});
     try w.print("  service_jwt          v{d}\n", .{SERVICE_JWT_VERSION});
     try w.print("  deployment_manifest  v{d}\n", .{files.manifest_json.VERSION});
     // The customer's `<bundle>/rewind.lock`, written and read by the `rewind`
@@ -108,6 +133,10 @@ pub fn dump(w: *std.Io.Writer) !void {
         blob.pool_object.VERSION,
         blob.pool_object.MAGIC,
     });
+    try w.writeAll("  -- path-versioned inter-binary surfaces --\n");
+    try w.print("  snapshot_sink        {s}\n", .{SNAPSHOT_SINK_PATH});
+    try w.print("  log_push             {s}\n", .{LOG_PUSH_PATH});
+    try w.print("  deployment_objects   tenants/{{id}}/deployments/e{{bc_version}}/  (bc_version={d})\n", .{qjs.bcVersion()});
     try w.writeAll("  -- replay / tape (must lockstep with rtap.mjs / wasm-app.mjs) --\n");
     try w.print("  tape                 v{d} (magic 0x{X:0>8})\n", .{ rjs.tape.VERSION, rjs.tape.MAGIC });
     try w.print("  readset              v{d} (magic 0x{X:0>8})\n", .{ rjs.tape.READSET_VERSION, rjs.tape.READSET_MAGIC });
@@ -136,4 +165,10 @@ test "registry dump renders all format lines without error" {
     // route from an identity to the slot its ciphertext was sealed
     // under, and there is no wipe that recovers from mis-reading it.
     try std.testing.expect(std.mem.indexOf(u8, out, "keyring_kv_value     v1") != null);
+    // The JS-owned record versions and the path-versioned surfaces. Both
+    // are mirrored values rather than imported constants, which is
+    // exactly why leaving them out of the dump would be the easy mistake.
+    try std.testing.expect(std.mem.indexOf(u8, out, "shim_kv_records      v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "snapshot_sink        /_system/v2-snapshot-stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "deployment_objects") != null);
 }
