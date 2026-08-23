@@ -360,7 +360,8 @@ pub const Dispatcher = struct {
             &loader_ctx,
         );
 
-        globals.installRequest(ctx.raw, &state, request);
+        const activation = globals.installRequest(ctx.raw, &state, request);
+        defer c.JS_FreeValue(ctx.raw, activation);
 
         var pending: PendingResponse = .{};
         errdefer pending.deinit(self.allocator);
@@ -418,7 +419,7 @@ pub const Dispatcher = struct {
             "handler bytecode is not an ES module (.mjs)")) orelse
             return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
 
-        module_execution.runModule(self, &rt, &ctx, fun_val, request, budget, &pending) catch |err| switch (err) {
+        module_execution.runModule(self, &rt, &ctx, fun_val, request, activation, budget, &pending) catch |err| switch (err) {
             error.Interrupted => return DispatchError.Interrupted,
             error.OutOfMemory => return DispatchError.OutOfMemory,
             error.JsException => {}, // pending.exception already populated

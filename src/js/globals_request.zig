@@ -63,11 +63,25 @@ fn liftThreadedCtx(ctx: *c.JSContext, req_obj: c.JSValue, body: []const u8, allo
     _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_GetPropertyStr(ctx, parsed, "ctx"));
 }
 
+/// Installs the per-activation surface and returns **the activation
+/// object** — the single argument the entry export receives
+/// (`docs/architecture/package-isolation.md`, the received-not-ambient
+/// model). Its prototype is the base-resident `__rove.caps` template, so
+/// the capabilities resolve through the chain at no per-request copy
+/// cost, and `request`/`response` are own properties.
+///
+/// The ambient `request`/`response` globals are still installed alongside
+/// it. That duplication is the transition window (tracker #753): the
+/// object is passed first so every corpus can migrate against its final
+/// shape, and the globals come out last.
+///
+/// The returned value is owned by the caller — free it after the
+/// activation.
 pub fn installRequest(
     ctx: *c.JSContext,
     state: *DispatchState,
     request: anytype,
-) void {
+) c.JSValue {
     c.JS_SetContextOpaque(ctx, state);
 
     // Within-activation non-determinism replay
@@ -714,6 +728,26 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, resp_obj, "headers", c.JS_NewObject(ctx));
     _ = c.JS_SetPropertyStr(ctx, resp_obj, "cookies", c.JS_NewArray(ctx));
     _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
+
+    // The activation object. Capabilities arrive by prototype from the
+    // base template; `request`/`response` are own properties, so a
+    // handler destructuring `{ request, kv }` reads one of each.
+    // `JS_GetPropertyStr` on the base `__rove` holder is a read, so it
+    // allocates no per-request shadow.
+    const rove_holder = c.JS_GetPropertyStr(ctx, global, "__rove");
+    defer c.JS_FreeValue(ctx, rove_holder);
+    const caps = c.JS_GetPropertyStr(ctx, rove_holder, "caps");
+    defer c.JS_FreeValue(ctx, caps);
+    const act = if (c.JS_IsObject(caps))
+        c.JS_NewObjectProto(ctx, caps)
+    else
+        // Contexts built without the shim install (unit-test paths)
+        // have no template; a plain object still carries
+        // request/response so the export's argument shape is uniform.
+        c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, act, "request", c.JS_DupValue(ctx, req_obj));
+    _ = c.JS_SetPropertyStr(ctx, act, "response", c.JS_DupValue(ctx, resp_obj));
+    return act;
 }
 
 // The IP-transport strip list lives in `reserved_headers.zig`
