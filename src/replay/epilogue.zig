@@ -335,7 +335,21 @@ const TEXTCODEC_PURE = @embedFile("js/textcodec_pure.js");
 /// module's package. Shared verbatim with the browser replay arena.
 const JS_INTERACTION_DIGEST = @embedFile("js_interaction_digest");
 
-const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ EPILOGUE_BODY_TAIL;
+const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ CAPS_DECL ++ "\n" ++ EPILOGUE_BODY_TAIL;
+
+/// `__CAPS` — the capability names the activation object carries, generated
+/// from `rove-reserved`'s `CAPABILITY_NAMES` rather than restated here.
+///
+/// The worker builds its template from the same constant
+/// (`globals.zig`'s `_caps.js`). A hand-copied second list is how one
+/// engine ends up able to pass a capability the others cannot, which
+/// surfaces as a handler that works offline and not in prod — the exact
+/// divergence `scripts/conformance/` exists to catch, found the slow way.
+const CAPS_DECL = blk: {
+    var out: []const u8 = "  const __CAPS = [";
+    for (reserved.CAPABILITY_NAMES) |n| out = out ++ "\"" ++ n ++ "\", ";
+    break :blk out ++ "];";
+};
 
 const EPILOGUE_BODY_HEAD =
     \\  // An off-tape read POISONS the run and returns absent — it does not
@@ -692,6 +706,20 @@ const EPILOGUE_BODY_TAIL =
     \\  request.shredKey = __rove_request_shred_key;
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
+    \\  // The activation object — the single argument every export receives
+    \\  // (docs/architecture/package-isolation.md, the received-not-ambient
+    \\  // model). Built HERE, before middleware, because that is where the
+    \\  // worker builds it (globals.installRequest runs ahead of
+    \\  // module_execution.runMiddleware), and `request`/`response` are the
+    \\  // same objects the globals name — so a middleware that mutates
+    \\  // `request` is seen through either spelling. Capability names absent
+    \\  // from this arena are skipped rather than set undefined: the arena
+    \\  // installs a subset of the worker's shims, and an own property
+    \\  // holding `undefined` reads differently from an absent one.
+    \\  const __act = {};
+    \\  for (const __k of __CAPS) if (__k in globalThis) __act[__k] = globalThis[__k];
+    \\  __act.request = request;
+    \\  __act.response = globalThis.response;
     \\  let __result = null, __err = null, __short = false;
     \\  // Await like the worker's pumpJobs: drain microtasks, and if the promise
     \\  // is STILL pending treat it as a plain value (prod ships its JSON — "{}")
@@ -742,14 +770,14 @@ const EPILOGUE_BODY_TAIL =
     \\    if (!__short) {
     \\      const __fn = ns[D.fn];
     \\      if (typeof __fn === "function") {
-    \\        __result = (await __settled(__fn())).v;
+    \\        __result = (await __settled(__fn(__act))).v;
     \\      } else if (D.kind === "disconnect") {
     \\        // Prod: a missing onDisconnect is a no-op, not a 404 — the held
     \\        // stream closes regardless (module_execution).
     \\      } else if ((D.kind === "inbound_headers" || D.kind === "inbound_chunk") && typeof ns["default"] === "function") {
     \\        // Prod: no onHeaders/onChunk probe hit → fall back to the classic
     \\        // buffered dispatch at the default export (worker_dispatch §3.5).
-    \\        __result = (await __settled(ns["default"]())).v;
+    \\        __result = (await __settled(ns["default"](__act))).v;
     \\      } else {
     \\        // Prod 404s any other missing export (module_execution).
     \\        globalThis.response = { status: 404, headers: {}, cookies: [] };
@@ -1025,6 +1053,24 @@ test "build: GET embeds request meta + parks output under sentinel" {
     try testing.expect(std.mem.indexOf(u8, src, "__rove_park_output(__out)") != null);
 }
 
+
+test "the driver passes the activation object, built from the shared list" {
+    // Both halves, because either alone passes while the engines disagree:
+    // the object has to be BUILT from `rove-reserved`'s list (so the worker
+    // and this driver carry the same names), and it has to be PASSED at the
+    // export call (so a handler that destructures its capabilities gets
+    // them). A driver that builds it and calls `__fn()` looks correct in
+    // review and hands every handler `undefined`.
+    for (reserved.CAPABILITY_NAMES) |n| {
+        try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, n) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __CAPS = [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__fn(__act)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "ns[\"default\"](__act)") != null);
+    // Middleware keeps zero arguments: the worker's runMiddleware was not
+    // changed, and parity is the point.
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__rove_mw.before()") != null);
+}
 
 test "no guard evaluation is left in the epilogue" {
     // The inverse of the old splice assertion: the native engines' checks
