@@ -206,6 +206,12 @@ def main() -> int:
             cli("lock", d)   # first: `lock` is the UPDATE verb, stays newest
             assert locked_version() == NEWEST, "`rewind lock` should resolve to the newest"
             lock.write_text(json.dumps({
+                # `v` is the lockfile format version the CLI stamps and
+                # checks (`src/cli/packages.zig` LOCKFILE_VERSION). This
+                # fixture is a SECOND implementation of the format — it
+                # hand-writes what `rewind lock` would — so it has to carry
+                # the field or the deploy below refuses it, correctly.
+                "v": 1,
                 "packages": [{
                     "spec": "@rewind/greet", "version": OLDEST,
                     "pkg_hash": VERSIONS[OLDEST]["pkg_hash"],

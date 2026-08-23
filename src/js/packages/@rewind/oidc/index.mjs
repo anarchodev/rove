@@ -552,9 +552,13 @@ class OIDCProvider {
     // not the hint.
     const sid = request.session && request.session.id;
     const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
-    // An unreadable session is no session: bounce to login rather than
-    // act on fields that may mean something else now.
-    const sess0 = _readRec(sess_raw);
+    // NOT `_readRec`: `_oidc/session/{sid}` is the CUSTOMER's record, not
+    // this package's. Their login handler writes it — `{sub, auth_time}`
+    // at a documented seam — and this package only reads it. Requiring a
+    // `v` here would demand a stamp from every tenant's own login code,
+    // including apps in other repos, which is a reader upgraded ahead of
+    // its writers: the exact hazard `_rec` exists to avoid.
+    const sess0 = sess_raw == null ? null : JSON.parse(sess_raw);
     if (sess0 == null) {
       const here = this._iss() + "/authorize?" + q.toString();
       const hint = q.get("login_hint");
@@ -638,10 +642,11 @@ class OIDCProvider {
     const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
     const m = request.method;
     const reqQuery = new URLSearchParams(request.query || "");
-    const sess0 = _readRec(sess_raw);
+    // Customer-owned record — see the note in `_authorize`.
+    const sess0 = sess_raw == null ? null : JSON.parse(sess_raw);
     if (sess0 == null) {
-      // No session (or one this build cannot read) → bounce to the IdP
-      // login, returning here (keep the code).
+      // No session → bounce to the IdP login, returning here (keep the
+      // code).
       const uc = reqQuery.get("user_code");
       const here = this._iss() + "/device" +
         (uc ? "?user_code=" + encodeURIComponent(uc) : "");

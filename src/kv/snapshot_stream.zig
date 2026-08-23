@@ -718,6 +718,38 @@ test "snapshot stream finish() rejects a truncated body" {
     try testing.expectError(Error.TruncatedStream, loader.finish());
 }
 
+test "snapshot stream from a newer node is refused, not replayed at v1 widths" {
+    // The magic test above proves a FOREIGN format is refused. This is the
+    // other half, and the one that will actually happen: our own format,
+    // one version on, arriving from a node that is further through a
+    // rolling deploy. Replaying it at v1 widths would install a store
+    // built from mis-sliced keys and values — and a snapshot install
+    // REPLACES the destination, so the damage is not a bad read, it is the
+    // tenant's data replaced by a plausible-looking wrong one.
+    const a = testing.allocator;
+    var dst = try TestManifest.init();
+    defer dst.deinit();
+    var loader = try StreamLoader.init(a, dst.manifest, .{});
+    defer loader.deinit();
+
+    var hdr: [HEADER_LEN]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], STREAM_MAGIC, .little);
+    hdr[4] = STREAM_VERSION + 1;
+    std.mem.writeInt(u64, hdr[5..13], 1, .little);
+    try testing.expectError(Error.UnsupportedStreamVersion, loader.feed(&hdr));
+
+    // Named for the condition, not lumped in with a bad magic: one says
+    // "these are not our bytes", the other says "these are ours and this
+    // binary is too old", and an operator needs to tell those apart.
+    var older: [HEADER_LEN]u8 = undefined;
+    std.mem.writeInt(u32, older[0..4], STREAM_MAGIC, .little);
+    older[4] = STREAM_VERSION - 1;
+    std.mem.writeInt(u64, older[5..13], 1, .little);
+    var loader2 = try StreamLoader.init(a, dst.manifest, .{});
+    defer loader2.deinit();
+    try testing.expectError(Error.UnsupportedStreamVersion, loader2.feed(&older));
+}
+
 test "snapshot stream rejects a foreign magic" {
     const a = testing.allocator;
     var dst = try TestManifest.init();

@@ -749,6 +749,59 @@ test "transport: coalesced envelope round-trips message bytes" {
     try testing.expectEqual(p.len, off);
 }
 
+test "transport: a frame from a newer node is dropped by the REAL decoder" {
+    // Drives `onRecv` itself rather than hand-decoding the way the
+    // round-trip test above does. That distinction is the whole point: a
+    // test that mirrors the decoder passes with the version check deleted,
+    // which makes it evidence of nothing.
+    //
+    // What a mis-step would cost: the bytes after the version byte are a
+    // count and then raft protobufs, so reading a v2 frame at v1 widths
+    // steps garbage into the raft state machine — votes and appends for
+    // groups picked out of misaligned memory. Dropping is the only honest
+    // answer to a frame this binary cannot parse.
+    const a = testing.allocator;
+    var mgr = raft.Manager.init() catch return error.SkipZigTest;
+    defer mgr.deinit();
+    const listen = try std.net.Address.parseIp("127.0.0.1", 0);
+    var peers = [_]PeerAddr{.{ .host = "127.0.0.1", .port = 18090 }};
+    const t = Transport.init(a, .{
+        .node_id = 1,
+        .listen_addr = listen,
+        .peers = &peers,
+        .manager = &mgr,
+    }) catch |e| {
+        if (e == Error.TransportInit) return error.SkipZigTest;
+        return e;
+    };
+    defer t.deinit();
+
+    // One well-formed record, wrapped in a frame version this build does
+    // not implement.
+    var frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer frame.deinit(a);
+    try frame.append(a, FRAME_VERSION + 1);
+    var cnt: [4]u8 = undefined;
+    std.mem.writeInt(u32, &cnt, 1, .little);
+    try frame.appendSlice(a, &cnt);
+    var hdr: [RECORD_HDR_SIZE]u8 = undefined;
+    std.mem.writeInt(u64, hdr[0..8], 7, .little);
+    std.mem.writeInt(u64, hdr[8..16], 0, .little);
+    std.mem.writeInt(u32, hdr[16..20], 4, .little);
+    try frame.appendSlice(a, &hdr);
+    try frame.appendSlice(a, "abcd");
+
+    try testing.expectEqual(@as(u64, 0), t.bad_frame_count);
+    Transport.onRecv(0, frame.items, t);
+    try testing.expectEqual(@as(u64, 1), t.bad_frame_count);
+
+    // A frame at the CURRENT version is not counted — otherwise the
+    // assertion above would hold for a decoder that dropped everything.
+    frame.items[0] = FRAME_VERSION;
+    Transport.onRecv(0, frame.items, t);
+    try testing.expectEqual(@as(u64, 1), t.bad_frame_count);
+}
+
 test "transport: queueOut resolves + registers a peer beyond the init set (growth seam)" {
     // The cluster-genesis growth seam (§3.3): a node born knowing only a subset
     // of the cluster can still address a node it learns later — the first

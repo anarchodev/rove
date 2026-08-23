@@ -399,6 +399,12 @@ test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)
     try testing.expectEqualStrings("POST", obj.get("method").?.string);
     try testing.expectEqualStrings("x", obj.get("body").?.string);
     try testing.expectEqual(@as(i64, 0), obj.get("attempts").?.integer);
+    // The record version the baked readers switch on
+    // (`format-versioning.md` §1f). Asserted on the WRITER side because
+    // that is the half no lint can check: `record_version_lint.py` proves
+    // the constant is declared in every file that touches the namespace,
+    // not that the marker actually carries it.
+    try testing.expectEqual(@as(i64, 1), obj.get("v").?.integer);
     // Timing left the marker — the scheduler
     // entry under key `_send/{id}` is the durable next-fire authority.
     try testing.expectEqual(@as(?std.json.Value, null), obj.get("next_at_ns"));

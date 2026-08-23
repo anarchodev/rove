@@ -61,7 +61,7 @@ frame that produced it, the reader has nothing to dispatch on. §1f is where
 that distinction decides most of the rows.
 
 Every table below carries the **Class** column. The tally across all 55
-rows: **24 versioned · 8 inherits · 17 by-decision · 0 gap · 6 unwritten.**
+rows: **23 versioned · 8 inherits · 17 by-decision · 0 gap · 7 unwritten.**
 
 No gaps remain. The last two were the rows read by something NOT upgraded
 in lockstep with their writer, and they closed differently because that
@@ -191,7 +191,7 @@ list membership is what its versioning story will inherit from:
 | `_keys/minted`, `_keys/bind/{identity}`, `_keys/dead/{slot}` | `[1B v][8B end LE]` / `[1B v][8B slot LE][32B HMAC]` / `[1B v][8B destroyed_ns LE]` | **versioned** — one `VALUE_VERSION` for the whole namespace; readers check the byte BEFORE the width, so a future value reads as `UnsupportedVersion` rather than as corruption | `src/keyring/keyspace.zig` (`VALUE_VERSION`, `encodeBinding`/`encodeDead`/`encodeMinted`) | engine-only. Crypto-shredding: `minted` is slots made quorum-durable, `bind/` is identity→slot, `dead/` carries an erasure through the log. The one namespace here a wipe cannot rescue — `bind/` is the only route from an identity to the slot its ciphertext was sealed under |
 | `_log/next_request_seq` | decimal counter | **by-decision** — a monotonic integer has no shape to change, and advancing it past any observed value repairs it | `src/js/worker_log.zig` (`seq_key`) | engine-only. In app.db, not a log.db — so the worker opens no log.db |
 | `_magic/` | — | **unwritten** | none | Engine-only; reserved for magic-link tokens |
-| `_oidc/*` | JSON `{v, …}` | **versioned** (`REC_V`, one for the whole namespace — every shape here is a half of a single login) | `src/js/packages/@rewind/oidc/index.mjs` | shim-writable; provider state — session/keyset/code/at/rt/device. Mostly RFC-shaped, but the *envelope* is ours |
+| `_oidc/*` | JSON `{v, …}` for the records the package WRITES | **versioned** (`REC_V`, one for the whole namespace — the shapes it owns are halves of a single login). **Two sub-keys are excluded and the exclusion is the point:** `_oidc/session/{sid}` is written by the TENANT's login handler (`web/auth/index.mjs`) and only read here, and `_oidc/config/{name}` is operator-seeded. A reader cannot demand a stamp from a writer it does not own — that is a reader upgraded ahead of its writers, which is the same hazard `cluster/{id}` has in §1g | `src/js/packages/@rewind/oidc/index.mjs` | shim-writable; keyset/code/at/rt/device/state. Mostly RFC-shaped, but the *envelope* is ours |
 | `_rp/*` | JSON `{v, …}` | **versioned** (`REC_V`, shared with `_oidc/*`) | `src/js/packages/@rewind/oidc/index.mjs` (relying-party half); read by `src/js/starter/upload.mjs` | shim-writable; RP state — `state`/`sess/{sid}`/`jwks` |
 | `_sched/by_time/{ns_hex}/{id}`, `_sched/by_id/{id}` | JSON wake `{v, when_ns, target, msg, key?, armed_by?}` | **versioned** (`SCHED_REC_V`) — written from SIX near-identical `schedArm` copies, which is why `scripts/ops/record_version_lint.py` exists | `src/js/globals/schedule.js` + `src/js/durable_wake.zig` | shim-writable; load-bearing. Fixed-width zero-pad so lexicographic order == time order |
 | `_seg/{log}/n` | decimal counter | **by-decision** — monotonic integer, same as `_log/next_request_seq` | `src/js/packages/@rewind/segments/index.mjs` (`append`) | shim-writable |
@@ -238,10 +238,52 @@ Source: `src/cp/directory.zig`.
 
 | Format | File | Layout | Ver? | Class |
 |---|---|---|---|---|
-| Service JWT (HS256) | `src/jwt/root.zig` (`mint`) | `{v:1, exp[,caps][,tenant]}` HS256 | **yes (`v`)** | **versioned** (registry `service_jwt`) — Phase 1 added the claim; the inventory said "none" long after it shipped, which is the drift a Class column exists to make visible | 
-| SSE/rich-payload JWT | `src/jwt/root.zig` (`signPayload`) | `{v,tenant_id,sid,caps,exp}` | **yes (`v`)** | **versioned** |
+| Service JWT (HS256) | `src/jwt/root.zig` (`mint`, `CLAIMS_VERSION`) | `{v:1, exp[,caps][,tenant]}` HS256 | **yes (`v`)** | **versioned** (registry `service_jwt`). The claim shipped at the freeze and NOTHING read it until §1i's pass — a token stamped with an unknown version is now refused, before any claim is parsed. A `v`-less token is still accepted: service tokens are minted outside this repo too | 
+| SSE/rich-payload JWT | `src/jwt/root.zig` (`mintWithPayload`) | `{v,tenant_id,sid,caps,exp}` as the SSE design describes it | — | **unwritten** — the mint FUNCTION exists and nothing calls it. The shape in this row lives in a doc comment, not in a producer, so there is no format here yet to version. Found by asking whether the `v` was exercised, which is the question §1i exists to ask |
 | Move secret | `src/js/snapshot_catchup.zig` (`MOVE_SECRET_HEADER`) | hex shared secret | n/a | **by-decision** — an opaque secret compared for equality. There is no structure to interpret, so there is nothing a version could change |
 | Services JWT secret | `src/jwt/root.zig` | hex shared secret | n/a | **by-decision** — same |
+
+### 1i. Exercising the switch
+
+Every version in the inventory is at v1 (the deployment manifest at v2), so
+until these tests existed no reader had ever *branched* on one — the first
+real bump would have been the first execution of every switch site, at the
+moment a mistake means a replica or a replay reads the wrong bytes.
+
+Each versioned format with a Zig decoder now has a test that encodes the
+current version and a synthetic future one and asserts the reader refuses
+what it does not implement. (The JS-owned records are the exception, and
+the note at the end of this section says so rather than implying otherwise.) Three properties are worth stating, because they are what the
+tests are actually for:
+
+- **Refusal, not interpretation.** No reader here dispatches to a second
+  implementation, and that is the deliberate posture, not a gap: pre-launch
+  there is no corpus to keep readable, so a version it does not know is
+  refused and the data is rewritten (`decisions.md` — no pre-launch
+  back-compat). The switch these fields buy is *fail loudly instead of
+  mis-reading*; a genuine two-version reader is a post-launch problem.
+- **Version before width.** A future value is usually a different length
+  too, and checking length first reports a rolling upgrade as corruption —
+  which sends an operator after a disk fault. The keyring, the JWT and the
+  lockfile all check version first, and their tests pin that ordering.
+- **Drive the real decoder.** A test that re-implements the decode to assert
+  on it passes with the check deleted. The transport test calls `onRecv`
+  itself for exactly this reason.
+
+A version field no reader branches on is indistinguishable from no field at
+all, and the base service JWT was the proof: it stamped `"v":1` from the
+freeze onward, nothing ever read it, and a second minter (the smoke harness)
+did not even emit it — for months, with no symptom.
+
+**What is still untested, stated rather than papered over:** the eight
+shim-owned records in §1f have their readers' checks written but not
+exercised. Those readers are baked `__system/*` modules and packages, which
+the Zig unit-test harness cannot dispatch (it compiles inline source, not a
+deployment), so a refusal test needs a conformance case or a smoke. What IS
+covered today is the writer side — that the marker carries `v` — plus
+`record_version_lint.py`, which proves every file touching a namespace
+declares the constant. Neither proves the reader drops a record it cannot
+read.
 
 ## 2. Sensitivity tiers (drives the strategy)
 

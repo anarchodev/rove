@@ -2375,6 +2375,36 @@ test "directory: seedClusters rejects origins the front door cannot dial" {
     try testing.expectEqual(@as(usize, 3), c3b.nodes.len);
 }
 
+test "directory: a packed cert from a newer CP is refused, not mis-sliced" {
+    // The interpretation switch for the one directory value that HAS an
+    // in-band version. A v2 frame read at v1 widths would slice the
+    // `cert_len` out of whatever the new layout put there and hand the
+    // front door a certificate and key cut at the wrong offset — which
+    // fails as a TLS error on the customer's domain, one hop from anything
+    // that names the real cause.
+    const a = testing.allocator;
+    const packed_v1 = try Directory.packCert(a, "CERTPEM", "KEYPEM");
+    defer a.free(packed_v1);
+
+    const round = Directory.unpackCert(packed_v1).?;
+    try testing.expectEqualStrings("CERTPEM", round.cert_pem);
+    try testing.expectEqualStrings("KEYPEM", round.key_pem);
+
+    // Same bytes, one version on. Refused rather than read.
+    const future = try a.dupe(u8, packed_v1);
+    defer a.free(future);
+    future[0] = Directory.CERT_PACK_VERSION + 1;
+    try testing.expect(Directory.unpackCert(future) == null);
+
+    // And a version BELOW the current one is equally unreadable: there is
+    // no v0 to be compatible with, and treating an unknown byte as "old"
+    // is how a mis-slice gets rationalised.
+    const past = try a.dupe(u8, packed_v1);
+    defer a.free(past);
+    past[0] = Directory.CERT_PACK_VERSION - 1;
+    try testing.expect(Directory.unpackCert(past) == null);
+}
+
 test "directory: a cluster value cannot be widened in place" {
     // The directory versions by KEY, not in-band, because its values are
     // read across a rolling CP upgrade where no in-band marker is
