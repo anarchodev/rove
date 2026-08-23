@@ -302,7 +302,10 @@ pub fn extractDepId(a: std.mem.Allocator, body: []const u8) ?[]const u8 {
     return extractField(a, body, "dep_id");
 }
 
-// ── bundle classification (mirrors publish_tenant.py) ──────────────────────
+// ── bundle classification ──────────────────────────────────────────────────
+// The ONLY implementation now that `publish_tenant.py` is retired. The server
+// re-derives nothing today, so this decides what ships; rove#556 moves the
+// authority server-side and deletes this.
 
 pub const Handler = struct { path: []const u8, source: []const u8 };
 /// Statics stream straight to S3 (raw bytes → PUT /v1/upload), so carry the raw
@@ -347,8 +350,8 @@ pub fn classify(a: std.mem.Allocator, bundle_path: []const u8) Bundle {
         // Handler test files (`_tests/`, incl. `__snapshots__/` + `__fixtures__/`)
         // live in the dev repo only — never ship them (docs/architecture/replay-and-sim.md).
         // The server enforces the same rule defensively (`files.isTestArtifactPath`,
-        // rejected in the worker's `/_system/deploy`), so a direct poster can't
-        // bypass this client-side strip.
+        // rejected by the worker's `stampManifest` primitive), so a direct poster
+        // can't bypass this client-side strip.
         if (std.mem.startsWith(u8, rel, "_tests/")) {
             skipped.append(a, rel) catch oom();
         } else if (std.mem.startsWith(u8, rel, "_static/") or std.mem.startsWith(u8, rel, "_config/")) {

@@ -379,9 +379,10 @@ fn workerMain(args: *WorkerCtx) !void {
     });
     defer worker.destroy();
 
-    // Background compile+stage thread for `/_system/deploy`
-    // (docs/architecture/cli-and-deploy.md §4). Owns its
-    // own QuickJS runtime so it never races the poll-loop compiler.
+    // Background compile+stage thread for the publish path — driven by the
+    // `__admin__` app's `/v1/deploy/*` routes through the `platform.*`
+    // trusted-door primitives (docs/architecture/cli-and-deploy.md §4.2). Owns
+    // its own QuickJS runtime so it never races the poll-loop compiler.
     try worker.startDeployThread();
 
     // Out-of-band snapshot catch-up driver: the pump's

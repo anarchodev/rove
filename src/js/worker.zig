@@ -2211,8 +2211,10 @@ pub fn Worker(comptime opts: Options) type {
             allocator.destroy(self);
         }
 
-        /// Start the background compile+stage thread that backs
-        /// `/_system/deploy` (`docs/architecture/cli-and-deploy.md` §4). Idempotent
+        /// Start the background compile+stage thread that backs the publish
+        /// path — the `__admin__` app's `/v1/deploy/*` routes reach it through
+        /// the `platform.*` trusted-door primitives
+        /// (`docs/architecture/cli-and-deploy.md` §4.2). Idempotent
         /// guard: a second call is a no-op. Opens the thread against the
         /// node's shared blob backend config so each job writes the
         /// target tenant's own `file-blobs/` + `deployments/` keys.

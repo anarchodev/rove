@@ -448,8 +448,8 @@ pub fn build(b: *std.Build) void {
     const boot_tests = b.addTest(.{ .root_module = boot_mod });
     const run_boot_tests = b.addRunArtifact(boot_tests);
 
-    // rove-files-server was dissolved into the worker's `/_system/deploy`
-    // endpoint (docs/architecture/cli-and-deploy.md §4): the worker already links
+    // rove-files-server was dissolved into the worker's `DeployThread`
+    // (docs/architecture/cli-and-deploy.md §4.2): the worker already links
     // rove-files + rove-qjs + rove-blob, so compile + content-address +
     // stamp-manifest now runs IN the worker (on the background
     // DeployThread). The separate binary + its trust domain are gone.
@@ -930,10 +930,11 @@ pub fn build(b: *std.Build) void {
 
     // files-server (V1 `files-server-standalone` and the cluster-free V2
     // `files-server-v2`) is RETIRED — dissolved into the worker's
-    // `/_system/deploy` endpoint (docs/architecture/cli-and-deploy.md §4). Compile +
-    // manifest + blob-write run IN the worker on the background
-    // DeployThread; the `_deploy/current` flip stays the worker's
-    // `/_system/release`. No separate deploy binary or trust domain.
+    // `DeployThread` (docs/architecture/cli-and-deploy.md §4.2). Compile +
+    // manifest + blob-write run IN the worker on that thread, driven by the
+    // `__admin__` app's `/v1/deploy/*` routes; the `_deploy/current` flip stays
+    // the worker's `/_system/release`. No separate deploy binary or trust
+    // domain.
 
     // sse-server-standalone: RETIRED (task #10 Phase 3). The SSE
     // notification service now runs as a loop46-internal thread

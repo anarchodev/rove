@@ -1,13 +1,22 @@
 # CLI & deploy — as-built reference (design-of-record)
 
 > **Shipped** (graduated from `plans/`). The `rewind-ops` operator CLI and the
-> `rewind` OIDC customer CLI are built (`v0.1` released); the files-server
-> dissolved into the worker's `/_system/deploy` (§4). This is the
-> **design-of-record** the source, `build.zig`, `CLAUDE.md`, and downstream
-> plans cite by section (`§2`–`§7`, `Track 2/3`) — the deploy/publish split,
-> the in-tenant `/_system/deploy` + `/_system/release` seam, and the
-> two-planes / capability-token design rationale (`§7`, the design basis for
+> `rewind` OIDC customer CLI are built (`v0.1` released); the files-server is
+> deleted. This is the **design-of-record** the source, `build.zig`,
+> `CLAUDE.md`, and downstream plans cite by section (`§2`–`§7`, `Track 2/3`) —
+> the deploy/publish split, the release seam, and the two-planes /
+> capability-token design rationale (`§7`, the design basis for
 > `auth-consolidation.md`). "Still ahead" notes below are historical.
+>
+> **Read §4.2 for the as-built deploy path; §4 and §4.1 are the reasoning that
+> led there and describe surfaces that no longer exist.** There is no
+> `/_system/deploy` route. Arbitrary bundles are published through the standing
+> `__admin__` app's `/v1/deploy/*` routes plus `PUT /v1/upload`, which reach the
+> worker's `DeployThread` via the `platform.*` trusted-door primitives; the
+> worker's own native deploy surfaces are `/_system/release` (the activation
+> flip) and `/_system/reset` (the baked `__admin__` bundle, bootstrap and
+> break-glass). The engine door that would replace the app's protocol is
+> designed but unbuilt — rove#556.
 
 This began as the design proposal for a Zig `rewind` CLI to replace
 `scripts/ops/publish_tenant.py` and the hand-run curl around it, and to name
@@ -21,7 +30,7 @@ good shape:
 | | Platform binaries | Tenant content |
 |---|---|---|
 | What ships | `rewind` / `rewind-cp` / `rewind-front` | a tenant's handler bundle + statics |
-| Driver | rove `scripts/ops/build.sh` → rewind-infra `scripts/deploy.sh` (the `/deploy` skill) | `scripts/ops/publish_tenant.py` (the `/publish` skill) |
+| Driver | rove `scripts/ops/build.sh` → rewind-infra `scripts/deploy.sh` (the `/deploy` skill) | `rewind-ops deploy` (one tenant) / `scripts/ops/publish_firstparty.py` (the first-party set) |
 | Cadence | rare (engine changes) | every site/handler edit |
 | Reaches | the 3 hosts over SSH + systemctl | S3 + CP + a worker over the private plane |
 
@@ -34,13 +43,13 @@ systemd units + `scripts/deploy.sh` moved to the private rewind-infra repo;
 infra orchestration, not a tenant operation, and a CLI should not absorb
 it.
 
-The tenant-content path is the ad-hoc half. `publish_tenant.py` welds
+The tenant-content path was the ad-hoc half. `publish_tenant.py` (retired; see the header) welded
 four conceptually-separate operations into one Python script driven by
 optional flags, and reaches four different binaries on three planes with
 five different secrets, entirely via hand-rolled `curl` (much of it
 tunneled over SSH because the targets are private-plane only).
 
-### What `publish_tenant.py` does today (the welded operations)
+### What `publish_tenant.py` did (the welded operations)
 
 1. **Classify** the bundle locally — duplicates `classify()` in
    `src/files_server/bootstrap.zig`; can silently drift.
@@ -280,6 +289,13 @@ to avoid, and in-tenant execution sidesteps it.
 
 ### The shape: a per-tenant `/_system/deploy` on the worker
 
+> **Superseded by §4.2 — this route does not exist.** It was built, then removed
+> on 2026-06-16 when arbitrary-bundle deploys moved into the standing `__admin__`
+> app. §4.2 works through why the native route never needed to carry an external
+> bundle. Kept because the *reasoning* below — in-tenant execution sidesteps the
+> cross-tenant write problem, compile must run off the poll loop — still governs
+> the as-built path and the engine door in rove#556.
+
 Add a worker system endpoint, sibling to the existing `/_system/release`:
 
 ```
@@ -330,14 +346,24 @@ piece exists in the worker). The thin CLI (§3) then points at two worker
 endpoints (`/_system/deploy`, `/_system/release`) + CP for provision/host,
 and the `files-server-v2 → rewind-files` rename is **moot** (no binary).
 
-Open question deferred to implementation: whether `/_system/deploy` is reached
-only on the **private plane** (operator + first-party website via the internal
-front) or also **publicly** (external customer tooling) — the same trust call
-as the eventual customer CLI; private-plane-only is the safe launch default.
+Open question deferred to implementation: whether the door is reached only on
+the **private plane** (operator + first-party website via the internal front) or
+also **publicly** (external customer tooling) — the same trust call as the
+eventual customer CLI; private-plane-only is the safe launch default.
+
+> **Settled on rove#556: publicly reachable**, because publishing already is —
+> `/v1/deploy/*` are `__admin__` routes served through the front door, and
+> `/_system/*` is itself publicly reachable, gated by credential rather than by
+> plane. The riders are that the door gets its own gate rather than inheriting
+> the `/_system/*` family's, that a tenant-scoped capability is what belongs on
+> the public listener (root only on private/loopback, since root is
+> platform-wide), and that the credential is checked on headers before any body
+> streams.
 
 ### 4.1 Next evolution — deploy as composable admin-tenant JS (`platform.compile`)
 
-**Status: in progress (2026-06-15).** The Zig `/_system/deploy` route (above)
+**Status: this is what shipped, and it is the as-built path today** (see §4.2
+for the end-state it settled into). The Zig `/_system/deploy` route (above)
 is the bootstrap/transition substrate; the next step makes *customer* deploys a
 **rewind.js app on the `__admin__` tenant** composed from two privileged
 primitives, so the deploy logic is hackable JS on the same surface customers
@@ -430,7 +456,7 @@ an implicit leadership side-effect.
 
 The smoke harness's `deploy_bundle` POSTs to the app through the front door
 (`_ensure_admin_app` calls `/_system/reset` once per cluster to bootstrap it).
-`publish_tenant.py` likewise POSTs bundles to the app; only `/_system/reset` is
+`publish_tenant.py` was retired rather than repointed at the app; only `/_system/reset` is
 operator-native.
 
 > **Two premises above expired (2026-08-15) — see `decisions.md` §11.5.** Both

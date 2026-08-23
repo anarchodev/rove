@@ -51,7 +51,7 @@ fixture smoke verified end to end.
 ## 2. Ground truth: where compile/bytecode caching lives
 
 - **The deploy path has NO compile cache — by decision, not omission.**
-  `/_system/deploy` → `DeployThread` → `compileAndStage` recompiles
+  `/v1/deploy/*` → `platform.compile` → `DeployThread` → `compileAndStage` recompiles
   every handler each deploy and dedups blob PUTs by *bytecode* hash
   (`putBlobIfMissingTo`). The old `bytecode/{source_sha256}` kv cache
   died with `FileStore` (deleted; its last caller, the starter deploy,
