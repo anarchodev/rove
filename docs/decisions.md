@@ -1856,6 +1856,69 @@ storage decisions that section assumes. (The customer-logs-vs-operator-signals
 
 ---
 
+### 11.7 `dep_id` is SOURCE identity; bytecode is a derived artifact keyed by engine build (2026-08-23)
+
+- **The problem**: `computeDeploymentId` hashes `bytecode_hex`, so a deployment's
+  identity mixes what the customer wrote with which engine compiled it. Identical
+  source under two engine builds yields two different `dep_id`s, and stored
+  bytecode is only loadable by the build that produced it — `JS_ReadObject`
+  rejects a `BC_VERSION` mismatch. Latent until arenajs v0.5.0 moved
+  `BC_VERSION` 25 → 27 (from upstream quickjs-ng syncs, not the fork), which
+  makes every previously-released deployment's bytecode unloadable.
+- **Decision**: `dep_id` hashes source, path, kind and content-type — **not
+  bytecode**. Bytecode becomes a derived artifact keyed by
+  `(platform_version, dep_id)`, recompiled when the engine moves.
+- **The trade, stated**: this chooses **source-reproducibility over
+  binary-reproducibility**. A `dep_id` no longer pins exact bytes. Binary
+  reproducibility stays *recoverable* — `(dep_id, platform_version)` determines
+  the bytes exactly — which is how build systems normally work: the lockfile
+  pins sources, the toolchain version is recorded beside it. Bytecode is
+  engine-specific by nature, so pinning it in the identity was never going to
+  give both.
+- **Why replay survives it**: because source is the identity, replay does not
+  need archived bytecode — it recompiles the recorded source under the archived
+  engine and reproduces the original bytes deterministically. That is what makes
+  bit-identical replay achievable *and* lets bytecode stay out of `dep_id`.
+- **Costs accepted**: a per-request platform version touches `LogRecord` and the
+  log-server index (interned id, not a string per record); derived artifacts
+  keyed by `(platform_version, dep_id)` accumulate across bumps and eventually
+  need a sweep.
+- **Half-done is the dangerous state**: two concurrent engine versions writing
+  different derivations under one key is what a rolling deploy produces. The
+  split has to land before a roll spans an engine bump.
+- **Status**: decided; **not yet implemented** — the code still hashes
+  `bytecode_hex`. Tracked by rove#767, with the archived-artifact design in
+  rove#769.
+
+### 11.8 A deployment's config belongs to that deployment (2026-08-21)
+
+- **The problem**: bytecode and statics are per-deployment and content-addressed;
+  config was the one piece of deployment content flattened into a shared mutable
+  namespace (`_config/{lib}/{name}`) that every deployment overwrote in place.
+  Release commits `_deploy/current` first and the mirror ran after, so the live
+  window was NEW code against OLD config — and the directions are not symmetric:
+  `fromConfig` throws on a missing key, while old code against new config ignores
+  keys it does not know.
+- **Decision**: address config by deployment — `_config/{dep_id:016x}/…`. Since
+  `dep_id` is a content hash, those rows are immutable and write-once, so
+  mirroring is idempotent and order-free and the single-key `_deploy/current`
+  flip is what makes a deployment's config visible. **The pointer is the
+  transaction.**
+- **Why ordering alone was not enough**: "mirror, then flip" fixes the forward
+  additive deploy and nothing else. A rollback inverts which side is new, and a
+  deploy that REMOVES a key deletes it out from under the still-running previous
+  deployment. The shared mutable namespace was the problem, not the write order.
+- **What it buys downstream**: a partially-installed deployment is *invisible*
+  rather than half-applied, because nothing reads a deployment's config until the
+  pointer names it. That is what lets the deploy path split a large config across
+  several activations without any of them being atomic.
+- **The read rule is shared**: `reserved.configStorageKey` states it once and the
+  common binding applies it, so the spelling a handler uses does not depend on
+  which engine runs it. `configScope() == 0` means an authored world with no
+  release — the offline sim and the replay arena — which reads and writes the
+  visible key unchanged.
+- **Shipped** rove#726/#728. Superseded `_config/` GC is rove#729.
+
 ## 12. Rejected effect-surface primitives
 
 Effect/handler-surface primitives considered and **rejected** — do not re-propose
@@ -2145,3 +2208,90 @@ re-genesis'd under the frozen v1 formats 2026-06-26.
   type-checking. (c) Dissolving a god-hub itself (e.g. `worker.zig`'s coupling to
   every spoke) as part of a cycle pass — that is the separate, larger
   illegal-states / owned-sub-struct goal, not decoupling.
+
+## 16. Activation scope — one tenant per activation
+
+The arc is rove#691. These are settled; the leaves that implement them are
+tracked there.
+
+### 16.1 Every raft entry for a tenant is produced by activations in that tenant's scope (2026-08-20)
+
+- **The invariant**: *every raft entry for a tenant is produced by a contiguous
+  run of activations in that tenant's scope, and the log's order is the
+  activation order.*
+- **Stated against the LOG, not the store**, for two reasons. A batch already
+  carries several activations of one tenant in one entry, so activation↔entry was
+  never 1:1. And the log phrasing makes the carve-outs exact rather than
+  apologetic: the pump applying a committed entry is the order being *realized*,
+  a snapshot install is the log's compacted prefix, and a move-restore seeds a
+  store before its group serves. None of those is a second writer.
+- **Enforcement is the propose path** — `Bridge.propose` takes an activation
+  identity, so a producer with no activation cannot compile. An invariant that
+  has to be remembered is one that rots.
+- **Two different violations, not one.** Where a producer proposes decides which:
+  a write landing in a group that is not the target's means two independent raft
+  logs write one store, so replicas can converge on different values for a key
+  both touch — that breaks the ORDER and is a correctness fix. A write into the
+  tenant's own group with no activation behind it is correctly ordered and merely
+  unaccounted — that breaks the RECORD, and fixing it is purely additive.
+
+### 16.2 `__root__` is a tenant (2026-08-20)
+
+- **Decision**: `__root__` gets its own raft group and is written only through a
+  dispatched activation, like any other tenant. Root writes become ordinary
+  type-0 writesets; **envelope type 2 disappears, and with no cross-tenant inners
+  left `multi` has no producer either — the live envelope table goes to ONE
+  type.** That is the arc's done-signal.
+- **Accepted consequences**: root is per-cluster
+  (`openClusterOwned(…, "cluster.kv", "__root__")`), so `__root__` is one tenant
+  per cluster and its id is not globally unique; and the **CP becomes a
+  dispatcher** alongside admin, because admin lives on one cluster and cannot
+  reach another cluster's root.
+- Root needs no code of its own and never will, which is the sharpest argument
+  for the primitive being `(code, scope, trigger)` unfused rather than "admin
+  gets a cross-tenant grant". A tenant with no deployment can still have
+  activations.
+- **Correction of record**: `__root__` holds `instance/{id}` and `domain/{host}`
+  only. `cert/{host}` is an axis of the CP directory group, not a root write.
+
+### 16.3 Platform actions run BAKED code, not admin-deployment code (2026-08-20)
+
+- **Decision**: when the platform acts in a tenant's scope, the module is baked
+  `__system/*`, never code shipped in a deployment.
+- **Why**: baked code is already public, already scope-agnostic, and already
+  resolved from the binary at replay. So the two costs of foreign code in tenant
+  scope both evaporate — it does not make admin-deployment code
+  customer-readable, and replay never has to resolve a `dep_id` out of the wrong
+  tenant's namespace. Platform actions need no foreign-code mechanism at all: a
+  dispatch and an authority check.
+- **Authority follows the SCOPE, never the code's origin.** Who may dispatch is
+  checked from the dispatching tenant's identity at the dispatch path, never
+  inferred from a module path — rove#643 is the precedent, where dispatch granted
+  `is_system_module` from the path so anything a customer could arm inherited the
+  exemption.
+
+### 16.4 The snapshot holds nothing mutable a handler can observe (2026-08-21)
+
+- **The rule**: *if a handler cannot observe it, an engine write to it needs no
+  activation and no log record.* That is what lets meters and engine counters
+  (`_usage/`, `_keys/next_slot`) stay engine writes while every handler-visible
+  namespace gets an activation behind it.
+- **The precondition had to be made true.** The reserved-prefix rule was
+  write-only — reads were explicitly not guarded — so a handler could read its
+  own meter, and because reads are recorded that put a platform billing number in
+  the customer's tape, where redaction is not available. Engine-only prefixes are
+  now unreadable; `_config/` and `_deploy/` stay readable and therefore owe their
+  writers an activation.
+- **And the snapshot itself must hold nothing mutable a handler can reach.** An
+  unwrapped shim's top-level bindings land in the base context's global lexical
+  scope, where handler modules resolve them by name — measured, a handler read
+  and wrote a base64 decode table, and saw `sysHttp`/`sysSched` while `_system`
+  was correctly undefined. The base arena is per worker thread, shared by every
+  tenant that worker serves, so a writable one is a cross-tenant channel.
+- **Enclosed AND immutable, as a pair.** Wrapping a shim MOVES its top-level
+  bindings out of the global lexical environment (which the engine shadows per
+  request) into closure cells (which it historically did not), so an IIFE wrap
+  alone can trade a reachability leak for an isolation one. Module scope must
+  therefore be `const`. Both halves are checked by a lint over the shim sources.
+- **Shipped** rove#718/#722, rove#748/#772.
+
