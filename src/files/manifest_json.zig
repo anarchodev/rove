@@ -568,9 +568,24 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
 /// (truncated sha-256, see `computeDeploymentId` below), the
 /// lexicographic order is content-bound rather than chronological;
 /// chronology lives in the per-tenant release history side table.
-pub fn manifestKey(buf: *[25]u8, dep_id: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "{d:0>20}.json", .{dep_id}) catch unreachable;
+/// Where a deployment's manifest lives: `e{bc}/{dep_id}.json`.
+///
+/// The engine segment is what makes dropping bytecode from `dep_id` safe. Two
+/// engine builds compiling one source tree now agree on the `dep_id` — that is
+/// the point — so without it they would write DIFFERENT manifests, naming
+/// different bytecode hashes, to one key. A rolling deploy spanning an engine
+/// bump is exactly that situation, and the loser's nodes would fetch bytecode
+/// their engine cannot read.
+///
+/// Grouping by engine rather than suffixing it also makes a superseded build's
+/// artifacts a prefix, which is what a future sweep wants (decisions.md §11.7
+/// records the GC as an accepted cost).
+pub fn manifestKey(buf: *[MANIFEST_KEY_MAX]u8, bc_version: u8, dep_id: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "e{d:0>3}/{d:0>20}.json", .{ bc_version, dep_id }) catch unreachable;
 }
+
+/// `e000/` + 20 digits + `.json`.
+pub const MANIFEST_KEY_MAX: usize = 5 + 20 + 5;
 
 /// Largest item count the canonical `computeDeploymentId` ordering accepts,
 /// applied to each of the three lists it sorts (entries, packages, app
@@ -632,8 +647,12 @@ pub fn computeDeploymentId(
         hasher.update(&.{0});
         hasher.update(&e.source_hex);
         hasher.update(&.{0});
-        if (e.kind == .handler) hasher.update(&e.bytecode_hex);
-        hasher.update(&.{0});
+        // Bytecode is DELIBERATELY absent. It is a derived artifact keyed by
+        // engine build — `JS_ReadObject` rejects a payload written by a
+        // different `BC_VERSION` — so hashing it made a deployment's identity
+        // move when the engine moved, with the source unchanged. `dep_id` is
+        // source identity; the compile lives under `manifestKey`'s engine
+        // segment (decisions.md §11.7).
     }
 
     // `pkg_hash` is the package's content identity (over its files +
@@ -745,9 +764,15 @@ test "decode allows missing bytecode_hash on static" {
 }
 
 test "manifestKey produces zero-padded {N:020d}.json" {
-    var buf: [25]u8 = undefined;
-    try testing.expectEqualStrings("00000000000000000001.json", manifestKey(&buf, 1));
-    try testing.expectEqualStrings("00000000000000004242.json", manifestKey(&buf, 4242));
+    var buf: [MANIFEST_KEY_MAX]u8 = undefined;
+    // The engine segment is part of the key, not decoration: two builds
+    // compiling one source tree now agree on the dep_id, so without it they
+    // would write different manifests to the same object.
+    try testing.expectEqualStrings("e025/00000000000000000001.json", manifestKey(&buf, 25, 1));
+    try testing.expectEqualStrings("e027/00000000000000004242.json", manifestKey(&buf, 27, 4242));
+    // One dep_id, two engines, two keys — the property the whole split rests on.
+    var buf2: [MANIFEST_KEY_MAX]u8 = undefined;
+    try testing.expect(!std.mem.eql(u8, manifestKey(&buf, 25, 7), manifestKey(&buf2, 27, 7)));
 }
 
 test "computeDeploymentId: same entries → same id (idempotent)" {
@@ -803,7 +828,11 @@ test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
     );
 }
 
-test "computeDeploymentId: changing content yields different id" {
+test "computeDeploymentId: bytecode does NOT change the id, source does" {
+    // The inversion decisions.md §11.7 makes. This test used to assert the
+    // opposite — that different bytecode yielded a different id — which is
+    // exactly the coupling that made a deployment's identity move when the
+    // engine moved with the source unchanged.
     var entries_a = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
@@ -812,10 +841,21 @@ test "computeDeploymentId: changing content yields different id" {
     var entries_b = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
-        .source_hex = @splat('a'), .bytecode_hex = @splat('c'), // different bytecode
+        .source_hex = @splat('a'), .bytecode_hex = @splat('c'), // recompiled
+    }};
+    try testing.expectEqual(
+        try computeDeploymentId(&entries_a, &.{}, &.{}),
+        try computeDeploymentId(&entries_b, &.{}, &.{}),
+    );
+
+    // …and source still does, or the id would identify nothing.
+    var entries_c = [_]root.Entry{.{
+        .path = @constCast("index.mjs"), .kind = .handler,
+        .content_type = @constCast(""),
+        .source_hex = @splat('z'), .bytecode_hex = @splat('b'),
     }};
     try testing.expect(
-        try computeDeploymentId(&entries_a, &.{}, &.{}) != try computeDeploymentId(&entries_b, &.{}, &.{}),
+        try computeDeploymentId(&entries_a, &.{}, &.{}) != try computeDeploymentId(&entries_c, &.{}, &.{}),
     );
 }
 

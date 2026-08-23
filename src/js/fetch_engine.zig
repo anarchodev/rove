@@ -55,6 +55,7 @@
 //! customer's chain just stops.
 
 const std = @import("std");
+const qjs = @import("rove-qjs");
 const blob_mod = @import("rove-blob");
 const blob_curl_multi = @import("rove-blob").curl_multi;
 const blob_sigv4 = @import("rove-blob").sigv4;
@@ -1180,7 +1181,7 @@ pub const FetchEngine = struct {
 
         // Resolve the subdir + the actual blob key by kind. The charset/format
         // checks pin the key so it can't escape the tenant prefix.
-        var key_buf: [25]u8 = undefined;
+        var key_buf: [files_mod.manifest_json.MANIFEST_KEY_MAX]u8 = undefined;
         var subdir: []const u8 = undefined;
         var blob_key: []const u8 = undefined;
         if (std.mem.eql(u8, kind, "blob")) {
@@ -1190,7 +1191,7 @@ pub const FetchEngine = struct {
         } else if (std.mem.eql(u8, kind, "manifest")) {
             const dep_id = std.fmt.parseInt(u64, ukey, 16) catch return error.BlobReadBadPath;
             subdir = "deployments";
-            blob_key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+            blob_key = files_mod.manifest_json.manifestKey(&key_buf, qjs.bcVersion(), dep_id);
         } else return error.BlobReadBadPath;
 
         // The TARGET tenant's storage handle (#357) — the door reads whatever

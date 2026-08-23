@@ -2659,8 +2659,8 @@ pub fn Worker(comptime opts: Options) type {
                 return fail(router, a, &pf, 500, "manifest encode failed");
             // `json` is owned → transferred to the job below (or freed on any
             // dupe/enqueue failure before then).
-            var key_buf: [25]u8 = undefined;
-            const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+            var key_buf: [files_mod.manifest_json.MANIFEST_KEY_MAX]u8 = undefined;
+            const key = files_mod.manifest_json.manifestKey(&key_buf, qjs.bcVersion(), dep_id);
 
             const t = a.dupe(u8, p.scope) catch {
                 a.free(json);
