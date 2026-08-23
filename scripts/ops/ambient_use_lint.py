@@ -56,7 +56,7 @@ def _capabilities() -> tuple[str, ...]:
     report progress that never happened.
     """
     src = (REPO / "src" / "reserved" / "root.zig").read_text(encoding="utf-8")
-    m = re.search(r"CAPABILITY_NAMES\s*=\s*\[_\]\[\]const u8\{(.*?)\}", src, re.S)
+    m = re.search(r"CAPABILITY_NAMES\s*=\s*\[_\]\[[^\]]*\]const u8\s*\{(.*?)\}", src, re.S)
     if not m:
         raise SystemExit(
             "ambient-use lint: CAPABILITY_NAMES not found in "

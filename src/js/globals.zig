@@ -1725,6 +1725,13 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\    if (caps[k] !== globalThis[k])
         \\      throw new Error("caps." + k + " is not the ambient " + k);
         \\  // Pure / web-platform names stay ambient and out of the template.
+        \\  // The request-sourced effects are NOT capability-template members:
+        \\  // they are per-activation own properties (installRequest), so a
+        \\  // template that carried them would be sharing one activation's
+        \\  // binding with every other.
+        \\  for (const k of ["tag", "unmaskedIp", "shredKey"])
+        \\    if (k in caps)
+        \\      throw new Error(k + " must be per-activation, not on the template");
         \\  for (const k of ["crypto", "console", "time", "base64url", "hex",
         \\                   "atob", "btoa", "TextEncoder", "TextDecoder",
         \\                   "URLSearchParams", "request", "response"])

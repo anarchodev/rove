@@ -348,7 +348,8 @@ const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ CAPS_DECL ++ "\n" ++ EPILOGU
 const CAPS_DECL = blk: {
     var out: []const u8 = "  const __CAPS = [";
     for (reserved.CAPABILITY_NAMES) |n| out = out ++ "\"" ++ n ++ "\", ";
-    break :blk out ++ "];";
+    out = out ++ "];\n  const __REQ_FX = " ++ reserved.requestEffectArrayLiteral() ++ ";";
+    break :blk out;
 };
 
 const EPILOGUE_BODY_HEAD =
@@ -720,6 +721,9 @@ const EPILOGUE_BODY_TAIL =
     \\  for (const __k of __CAPS) if (__k in globalThis) __act[__k] = globalThis[__k];
     \\  __act.request = request;
     \\  __act.response = globalThis.response;
+    \\  // The three effects that hid on `request` (package-isolation.md §3.4).
+    \\  // Same function objects; they stay on `request` through the transition.
+    \\  for (const __k of __REQ_FX) if (request[__k] !== undefined) __act[__k] = request[__k];
     \\  let __result = null, __err = null, __short = false;
     \\  // Await like the worker's pumpJobs: drain microtasks, and if the promise
     \\  // is STILL pending treat it as a plain value (prod ships its JSON — "{}")
@@ -1065,6 +1069,10 @@ test "the driver passes the activation object, built from the shared list" {
         try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, n) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __CAPS = [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __REQ_FX = [") != null);
+    for (reserved.REQUEST_EFFECT_NAMES) |n| {
+        try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, n) != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__fn(__act)") != null);
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "ns[\"default\"](__act)") != null);
     // Middleware keeps zero arguments: the worker's runMiddleware was not

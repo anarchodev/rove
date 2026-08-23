@@ -747,6 +747,14 @@ pub fn installRequest(
         c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, act, "request", c.JS_DupValue(ctx, req_obj));
     _ = c.JS_SetPropertyStr(ctx, act, "response", c.JS_DupValue(ctx, resp_obj));
+    // The three effects that hid on `request` (package-isolation.md §3.4).
+    // Same function objects, exposed under the activation as well — their
+    // natives resolve state from the context and ignore the receiver, so
+    // there is nothing to rebind. They stay on `request` through the
+    // transition and move for real at the cutover.
+    inline for (reserved.REQUEST_EFFECT_NAMES) |n| {
+        _ = c.JS_SetPropertyStr(ctx, act, n, c.JS_GetPropertyStr(ctx, req_obj, n));
+    }
     return act;
 }
 
