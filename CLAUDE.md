@@ -70,8 +70,10 @@ a NEWLY broken smoke, which is the question that matters.
 
 `scripts/smoke/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
 rewind-cp + front door + rewind node(s) and exposes `provision` /
-`deploy_handlers` / `wait_for_handler` (deploys go through the worker's
-`/_system/deploy` — files-server dissolved, `docs/architecture/cli-and-deploy.md` §4);
+`deploy_handlers` / `wait_for_handler` (deploys go through the standing
+`__admin__` app's `/v1/deploy/*` routes + `PUT /v1/upload`, which reach the
+worker's `DeployThread` via the `platform.*` primitives — files-server
+dissolved, `docs/architecture/cli-and-deploy.md` §4.2);
 `scripts/smoke/v2_topology.py`
 holds the per-binary spawn primitives. The functional smokes are the
 `*_smoke_v2.py` set; the original un-suffixed versions spawned the retired
@@ -99,7 +101,7 @@ rove-qjs (arenajs JS engine wrapper) ─────┤
 rove-acme (ACME HTTP-01 client) ──────────┤
                                           ↓
                   rove-js (worker dispatcher; imports bridge + the above;
-                           compiles + stages deploys via /_system/deploy)
+                           compiles + stages deploys on the DeployThread)
                   rove-log-server (log query HTTP surface)
 
 consensus (src/consensus/, V2): node.zig (per-tenant raft-rs groups, pump,
@@ -113,8 +115,11 @@ binaries:  rewind-worker (src/rewind/)  the worker — rove-js on the bridge
            rewind-cp     (src/cp/)      replicated directory + provisioning + moves
            rewind-front  (src/front/)   stateless Host→cluster proxy — no raft state
            rewind-logs   (src/log_server/main.zig)  log query surface
-           (deploy/publish is the worker's /_system/deploy — no separate
-            files-server binary; docs/architecture/cli-and-deploy.md §4)
+           (deploy/publish is the __admin__ app's /v1/deploy/* → the worker's
+            DeployThread; no separate files-server binary, and no
+            /_system/deploy route — docs/architecture/cli-and-deploy.md §4.2.
+            The engine door that would replace it is designed but unbuilt:
+            rove#556)
 ```
 
 **`raft-kv` is the spine-free KV facade** (`src/kv/kvlimbs.zig`) — the

@@ -5,8 +5,9 @@ The V1 `smoke_lib.Cluster` spawned a 3-node `loop46` cluster over TLS with
 leader-direct addressing + follower-503 semantics. V2 is a different shape:
 per-tenant raft groups behind a CP (directory + provisioning) and a stateless
 front door (Host→cluster proxy, serve-or-forward), plaintext h2c, with deploys
-compiled + staged IN the worker (`/_system/deploy` — files-server dissolved,
-docs/architecture/cli-and-deploy.md §4). So this is a purpose-built V2 harness rather than
+compiled + staged IN the worker on a background `DeployThread`, driven by the
+standing `__admin__` app's `/v1/deploy/*` routes (files-server dissolved; there
+is no `/_system/deploy` route — docs/architecture/cli-and-deploy.md §4.2). So this is a purpose-built V2 harness rather than
 a drop-in for the V1 `Cluster`.
 
 `V2Cluster` brings up the topology and exposes the deploy contract the
@@ -555,8 +556,8 @@ class V2Cluster:
                                    # Disable the privileged :80 ACME/redirect
                                    # listener (TLS mode defaults it to 80).
                                    "REWIND_HTTP_PORT": "0"})
-        # Deploy now runs IN the worker (/_system/deploy) — no files-server to
-        # spawn. The services JWT stays minted client-side for the log-server
+        # Deploy now runs IN the worker on the DeployThread, driven by the
+        # __admin__ app's /v1/deploy/* routes — no files-server to spawn. The services JWT stays minted client-side for the log-server
         # query surface (spawn_log_server verifies sig+exp).
         self.services_jwt = mint_jwt(JWT_SECRET_HEX,
                                      {"exp": int((time.time() + 3600) * 1000)})
@@ -1016,7 +1017,7 @@ class V2Cluster:
     def deploy_with_static(self, tenant: str, handler_files: dict[str, str],
                            static_files: dict[str, tuple], *, node: int = 0) -> str:
         """Deploy handlers PLUS one or more STATIC manifest entries (e.g. a
-        `_config/*.json` row) in ONE `/_system/deploy` bundle, then release.
+        `_config/*.json` row) in ONE deploy bundle, then release.
         Statics drive the deploy-time `_config/` → kv mirror
         (`src/js/config_mirror.zig` via the loader's `reloadDeployment`).
 

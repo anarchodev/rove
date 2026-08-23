@@ -2,22 +2,29 @@
 
 > 🟢 **As-built reference.** How customer code is published and loaded, how
 > static assets are served, and how request logs reach a queryable store. Owns
-> the publish path (now the worker's `/_system/deploy`), the worker's
+> the publish path, the worker's
 > deployment loader (`src/js/deployment_cache.zig` + siblings), `src/blob/`,
 > and `src/log_server/`. Neither path goes through raft for bytes — both ride
 > the shared content-addressed store / S3. Why: [decisions.md §7](../decisions.md)
 > (the customer-logs vs operator-signals split) and §11 (deployment/logs
 > storage decisions).
 >
-> ⚠️ **Update (2026-06-15): files-server dissolved.** The separate
-> `files-server-v2` publisher binary is **gone** — compile + content-address +
-> stamp-manifest now run **in the worker** on a background `DeployThread`
-> behind `POST /_system/deploy` (sibling to `/_system/release`). The mechanism
-> below (compile → content-addressed blobs → manifest in the per-tenant
-> `deployments/` backend → `_deploy/current` flip) is unchanged; only the
-> *host* moved from a standalone binary into the worker. Where this doc says
-> "files-server", read "the worker's `/_system/deploy`". See
-> [cli-and-deploy.md §4](cli-and-deploy.md) for the why + the design.
+>  **files-server dissolved.** The separate `files-server-v2` publisher
+> binary is **gone** — compile + content-address + stamp-manifest run **in the
+> worker** on a background `DeployThread`. The mechanism below (compile →
+> content-addressed blobs → manifest in the per-tenant `deployments/` backend →
+> `_deploy/current` flip) is unchanged; only the *host* moved from a standalone
+> binary into the worker. Where this doc says "files-server", read "the worker's
+> `DeployThread`".
+>
+> It is driven by the standing `__admin__` app's `/v1/deploy/*` routes plus
+> `PUT /v1/upload`, which reach the thread through the `platform.*` trusted-door
+> primitives. **There is no `/_system/deploy` route** — one was built and then
+> removed on 2026-06-16 when arbitrary-bundle deploys moved into the app. The
+> worker's native deploy surfaces are `/_system/release` (the activation flip)
+> and `/_system/reset` (the baked `__admin__` bundle). See
+> [cli-and-deploy.md §4.2](cli-and-deploy.md) for the as-built path and the why;
+> the engine door that would replace the app's protocol is rove#556.
 
 ## The shape in one paragraph
 
@@ -57,9 +64,12 @@ SQLite for query.
    PUTs each blob to `{prefix}{tenant}/file-blobs/{hash}` (content-addressed,
    immutable).
 2. **Deploy** — it assembles the manifest and PUTs
-   `{prefix}{tenant}/deployments/{dep_id}.json` with `If-None-Match: *`
-   (lexicographic dep_id = chronological). It returns the `dep_id`; it does
-   **not** touch the release marker.
+   `{prefix}{tenant}/deployments/e{bc}/{dep_id}.json` with `If-None-Match: *`.
+   The key is scoped by engine build (`bc_version`, from `qjs.bcVersion()`) so
+   two engine builds cannot write different derivations to one key; `dep_id` is
+   content-addressed over SOURCE, so lexicographic order is content-bound
+   rather than chronological (`decisions.md` §11.7). It returns the `dep_id`;
+   it does **not** touch the release marker.
 3. **Release** (a separate, approval-gated step) — `POST worker/_system/release
    {tenant, dep_id}` writes `_deploy/current` to the tenant KV and proposes it
    via **envelope 0**. The apply path detects the marker and enqueues the loader.
@@ -126,7 +136,7 @@ subdir)` scopes every per-tenant store to `{key_prefix_base}{id}/{subdir}/`,
 mirroring the on-disk layout so leader and followers hit identical keys:
 
 - `…/{tenant}/file-blobs/{sha256}` — bytecode + statics (immutable).
-- `…/{tenant}/deployments/{dep_id}.json` — manifests.
+- `…/{tenant}/deployments/e{bc}/{dep_id}.json` — manifests, keyed by engine build.
 - `…/_logs/{node_id}/{batch_id}.ndjson` — log batches (cluster-scoped, **not**
   per-tenant — see below).
 
@@ -141,9 +151,9 @@ storage's blob-replication rule).
 are different things.
 
 Most keys above are named by an id that counts up from state inside a tenant's
-`app.db` — `_log/next_request_seq` for request ids, the deployment sequence for
-`deployments/{dep_id}.json`. A cold bring-up wipes `~/.rove/data`, so those
-counters restart at zero. The object store is deliberately **not** wiped
+`app.db` — `_log/next_request_seq` for request ids. (`dep_id` is the exception:
+it is content-addressed over source, not a counter.) A cold bring-up wipes
+`~/.rove/data`, so those counters restart at zero. The object store is deliberately **not** wiped
 alongside it: S3 has no delete-by-prefix (deleting means LIST + DeleteObjects
 over every key), and the blobs are the deployed code. A cluster that came up
 into the un-namespaced store would therefore re-issue ids over keys a previous

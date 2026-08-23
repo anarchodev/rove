@@ -450,9 +450,9 @@ envelopes, OR is leader-pinned by definition.
 The principle holds in V2 and is *why* `log-server` is a separate binary (no
 raft participation, state in S3) while the per-tenant consensus stays in
 `rewind`. (Deploy/publish was *also* a separate binary — `files-server-v2` —
-on the same reasoning, but it folded back into the worker's `/_system/deploy`
-once it turned out to need no cross-tenant reach: compile + content-address +
-stamp run in-tenant on the worker, `architecture/cli-and-deploy.md` §4.) The V1 examples
+on the same reasoning, but it folded back into the worker once it turned out to
+need no cross-tenant reach: compile + content-address + stamp run in-tenant on
+the worker's `DeployThread`, `architecture/cli-and-deploy.md` §4.2.) The V1 examples
 that used to live in a table here
 (the single `loop46` binary, the leader-pinned `webhook-server` thread) are
 retired — durability is now a JS shim, not a raft-participating subsystem. The
@@ -816,14 +816,16 @@ rewind.js ships as **five binaries**, all `zig build` steps from this repo:
 
 | Binary | Source | Build step | Owns |
 |---|---|---|---|
-| `rewind-worker` | `src/rewind/main.zig` | `zig build rewind-worker` | The **worker / data-plane node**: per-worker QuickJS (arenajs) dispatcher; the per-tenant `Bridge` over the multi-raft `Node`; HTTP/2 serving; held-connection + streaming state; the durable-wake scheduler sweep (`_sched/`, gap 2.6 — webhook/email deferred fires, durable cron, and crash-recovery watchdogs all ride it; the per-feature owed/cron sweeps are deleted); `/_system/deploy` (compile + content-address + stamp manifest, on a background `DeployThread` off the poll loop — files-server dissolved, `architecture/cli-and-deploy.md` §4), `/_system/release`, `/_system/v2-*` (move), `/_system/admin-kv` machine-to-machine endpoints. Hosts the DP system tenants `__admin__` / `__replay__` / `__auth__`. |
+| `rewind-worker` | `src/rewind/main.zig` | `zig build rewind-worker` | The **worker / data-plane node**: per-worker QuickJS (arenajs) dispatcher; the per-tenant `Bridge` over the multi-raft `Node`; HTTP/2 serving; held-connection + streaming state; the durable-wake scheduler sweep (`_sched/`, gap 2.6 — webhook/email deferred fires, durable cron, and crash-recovery watchdogs all ride it; the per-feature owed/cron sweeps are deleted); compile + content-address + stamp manifest on a background `DeployThread` off the poll loop, driven by the `__admin__` app's `/v1/deploy/*` routes through the `platform.*` primitives (files-server dissolved; no `/_system/deploy` route — `architecture/cli-and-deploy.md` §4.2); `/_system/release`, `/_system/reset`, `/_system/v2-*` (move), `/_system/admin-kv` machine-to-machine endpoints. Hosts the DP system tenants `__admin__` / `__replay__` / `__auth__`. |
 | `rewind-front` | `src/front/main.zig` + `src/front/proxy.zig` | `zig build rewind-front` | The **front door** (stateless edge): terminates TLS (own ACME), routes `Host → cluster` from the CP directory (cached, off the hot path), STREAMING leader-aware proxy (pooled h2c client legs, bodies relay both directions as they arrive, 421 re-aim with replay buffer). (Tenant moves are the CP's `POST /_control/move`.) |
 | `rewind-cp` | `src/cp/main.zig` | `zig build rewind-cp` | The **control plane** (a small dedicated raft cluster, 3–5 voters): the replicated `__directory__` group — authoritative `Host → cluster` placement, per-tenant `plan/*`, ACME `cert/*`. Sequences tenant moves; the directory flip is the move commit point. |
 | `log-server` | `src/log_server/*` | (standalone) | The **request-log query surface**: polls S3 for per-node `.ndjson` log batches + sidecars, maintains a local SQLite `log_index.db`, serves `/v1/{tenant}/{list,show,count}` to the dashboard. No raft. |
 
-Deploy/publish is **not** a separate binary: the worker's `/_system/deploy`
-endpoint compiles + content-addresses + stamps the manifest in-tenant on a
-background thread (files-server dissolved — `architecture/cli-and-deploy.md` §4); the
+Deploy/publish is **not** a separate binary: the worker compiles +
+content-addresses + stamps the manifest in-tenant on a background
+`DeployThread`, driven by the standing `__admin__` app's `/v1/deploy/*` routes
+through the `platform.*` trusted-door primitives (files-server dissolved, and
+there is no `/_system/deploy` route — `architecture/cli-and-deploy.md` §4.2); the
 `_deploy/current` flip stays `/_system/release`.
 
 The CP/DP split is the V2 structural call (decisions.md §10.1): per-tenant
@@ -858,8 +860,8 @@ tenants, not a privileged platform path (`architecture/auth-and-domains.md`).
 | `__admin__` / `__auth__` / `__replay__` `app.db` | per cluster (system tenants) | raft envelope 0 | OIDC RP/IdP state, operator allowlist, account/instance ownership, platform config |
 | CP `__directory__` (kvexp) | CP cluster | CP raft (apply-observer projection on every node) | `cluster/{id}`, `placement/{tenant}`, `plan/{tenant}`, `host/{host}`, `cert/{host}` |
 | shared WAL | per node | n/a (it *is* the log) | all of a node's raft groups interleaved; one fsync per pump cycle; per-group recovery + compaction watermark |
-| `{id}/file-blobs/{hash}` | per tenant, in `BlobBackend` (s3) | shared backend across nodes | the worker's `/_system/deploy` writes; worker reads on bytecode-cache miss; bytes never ride raft |
-| `{prefix}{id}/deployments/{dep_id}.json` | per-tenant manifest, S3 | shared backend | the worker's `/_system/deploy` writes; worker fetches on the `_deploy/current` flip; `dep_id` content-addressed, immutable |
+| `{id}/file-blobs/{hash}` | per tenant, in `BlobBackend` (s3) | shared backend across nodes | the worker's `DeployThread` writes; worker reads on bytecode-cache miss; bytes never ride raft |
+| `{prefix}{id}/deployments/e{bc}/{dep_id}.json` | per-tenant manifest, S3 | shared backend | the worker's `DeployThread` writes; worker fetches on the `_deploy/current` flip; `dep_id` content-addressed over SOURCE, immutable; keyed by engine build so two `bc_version`s cannot clobber one key (`decisions.md` §11.7) |
 | `{prefix}_logs/{node_id}/{batch_id}.ndjson` (+ sidecar) | per node, S3/fs | n/a (log-server polls + by-key push) | worker batches; log-server indexes |
 | `log_index.db` | log-server-local | rebuildable from S3 | log-server |
 

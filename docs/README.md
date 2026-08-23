@@ -62,7 +62,7 @@ The maintained set. Subsystem-owned, kept current with the code.
 > Cross-cutting reference (cited by ~17 source files via its `§`-anchors): [format-versioning.md](architecture/format-versioning.md) — the as-built wire/on-disk/key-schema version scheme, the JS-engine-version tag, and the pre-launch freeze rules (shipped; the locked rules are also in `decisions.md` §14).
 >
 > Design-of-record references (graduated from `plans/`; cited by source + smoke scripts via their `§`/label anchors):
-> - [cli-and-deploy.md](architecture/cli-and-deploy.md) — the `rewind-ops`/`rewind` CLIs + the deploy/publish split + the in-tenant `/_system/deploy` seam (shipped).
+> - [cli-and-deploy.md](architecture/cli-and-deploy.md) — the `rewind-ops`/`rewind` CLIs + the deploy/publish split + the in-tenant publish seam (shipped; read §4.2 for the as-built path — §4/§4.1 describe a `/_system/deploy` route that was removed in June).
 > - [auth-consolidation.md](architecture/auth-consolidation.md) — the two auth planes + the `rewind-logs.internal`/`rewind-cp.internal` trusted doors + tenant-scoped caps (shipped; cited by `A*`/`B*` labels). Subsystem doc is `auth-and-domains.md`.
 > - [raft-best-practices.md](architecture/raft-best-practices.md) — election/heartbeat sizing (the `configuration-and-network.md` sizing authority) + the RawNode-FFI hardening backlog.
 > - [consensus-robustness.md](architecture/consensus-robustness.md) — the error-classification + pin-coordination conventions, the fold-gate invariant, the shipped-proof record; open backlog = tracker #128.
