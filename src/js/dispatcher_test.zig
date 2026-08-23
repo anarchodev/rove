@@ -2517,6 +2517,39 @@ test "dispatch: middleware that returns undefined → handler runs" {
     try testing.expectEqualStrings("handler-ran", resp.body);
 }
 
+test "dispatch: middleware receives the activation object" {
+    // The WORKER's middleware call arity, which nothing covered. Both
+    // `_middlewares` fixtures under src/replay/testdata are capability-free,
+    // and those run on the sim/replay driver anyway — so when
+    // `runMiddleware` still called `before` with zero arguments, a tenant
+    // whose middleware destructured `kv` threw on every request and the gate
+    // stayed green. Destructure a capability here, or this test cannot fail
+    // for the reason it exists.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runWithMiddleware(
+        &d,
+        kv,
+        \\return "ok:" + request.auth.seen;
+    ,
+        \\export function before({ kv }) {
+        \\    kv.set("mw/seen", "yes");
+        \\    request.auth = { seen: kv.get("mw/seen") };
+        \\}
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok:yes", resp.body);
+}
+
 test "dispatch: middleware mutation of request.auth flows to handler" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

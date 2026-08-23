@@ -767,7 +767,7 @@ const EPILOGUE_BODY_TAIL =
     \\        __result = "_middlewares/index.mjs must export a `before` function\n";
     \\        __short = true;
     \\      } else {
-    \\        const __mwr = (await __settled(__rove_mw.before())).v;
+    \\        const __mwr = (await __settled(__rove_mw.before(__act))).v;
     \\        if (__mwr !== undefined && __mwr !== null) { __result = __mwr; __short = true; }
     \\      }
     \\    }
@@ -1075,9 +1075,11 @@ test "the driver passes the activation object, built from the shared list" {
     }
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__fn(__act)") != null);
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "ns[\"default\"](__act)") != null);
-    // Middleware keeps zero arguments: the worker's runMiddleware was not
-    // changed, and parity is the point.
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__rove_mw.before()") != null);
+    // Middleware receives it too — it is a platform-invoked entry point at
+    // the inbound trust boundary, and reaches `kv` to check a session as
+    // often as a handler does. Leaving it at zero arguments shipped a
+    // handler-throws bug in a tenant whose middleware destructured `kv`.
+    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__rove_mw.before(__act)") != null);
 }
 
 test "no guard evaluation is left in the epilogue" {

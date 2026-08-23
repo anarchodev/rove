@@ -240,6 +240,12 @@ pub fn runMiddleware(
     rt: *qjs.Runtime,
     ctx: *qjs.Context,
     fun_val_in: qjs.Value,
+    /// The activation object, same one the handler export receives
+    /// (`docs/architecture/package-isolation.md`). Middleware is a
+    /// platform-invoked entry point like any other: it runs at the inbound
+    /// trust boundary, and reaches `kv` to check a session as often as a
+    /// handler does. Borrowed; the caller owns it.
+    activation: c.JSValue,
     budget: *Budget,
     pending: *PendingResponse,
 ) RunError!void {
@@ -262,7 +268,8 @@ pub fn runMiddleware(
         return;
     }
 
-    const ret = c.JS_Call(ctx.raw, before_fn, globals.js_undefined, 0, null);
+    var mw_argv = [_]c.JSValue{activation};
+    const ret = c.JS_Call(ctx.raw, before_fn, globals.js_undefined, mw_argv.len, &mw_argv);
     var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
     defer ret_val.deinit();
 
