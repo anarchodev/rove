@@ -231,10 +231,13 @@ It cannot go yet, on two dependencies:
   no plumbing yet. Note the tag budget is 4 with a fail-loud over-cap;
   revisit that ceiling *as part of* removing console, not after.
 
-When it goes, bind the name to a thrower naming replay and linking the
-record. `ReferenceError: console is not defined` teaches nothing; *"console
-is not available — this request is replayable at ‹url›"* teaches the whole
-model at the moment someone is receptive.
+When it goes, it goes — the name is simply absent, and
+`ReferenceError: console is not defined` is the whole story. A thrower
+that named replay would teach more at that one moment, but it is the
+shape this design exists to remove: a capability that is *present and
+refuses* rather than *not there*. Keeping one exception for the most
+reflexive name in JS is how the exception becomes the rule. The docs
+carry the explanation; the runtime carries the absence.
 
 ## 4. Mechanism
 
@@ -455,6 +458,16 @@ or `eval is not supported` concludes the platform is broken and leaves;
 they do not file a relaxation request. Each needs catching and re-throwing
 with a message naming the restriction and its relaxation path, plus a
 metric, so relaxation decisions come from fleet data.
+
+This covers **refusals**, not **absences** — a distinction worth holding,
+because they look alike and want opposite treatment. A refusal is an
+operation that exists and was denied: `Array.prototype.map = f` is legal
+JS, and `Cannot assign to read only property 'map'` does not say a
+platform decided that on purpose. An absence is a name that is not there,
+and `ReferenceError: console is not defined` already says so exactly. So
+a withheld capability, or a retired global, is simply gone; adding a
+thrower to explain it would rebuild the present-and-refuses shape this
+design exists to remove (§3.5).
 
 **Two deadlines, and neither is "launch" generically.** The registry
 publishes only `@rewind/*` and only to an operator; third-party self-serve
