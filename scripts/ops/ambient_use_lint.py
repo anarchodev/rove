@@ -182,11 +182,14 @@ def _binding_spans(src: str, name: str) -> list[tuple[int, int]]:
                     break
             j += 1
         out.append((i, j))
-    # `const { kv } = …` binds for the remainder of its enclosing block;
+    # A declaration binds for the remainder of its enclosing block;
     # approximating that as "to end of file" is the safe direction here —
-    # it under-counts rather than inventing work.
+    # it under-counts rather than inventing work. Both the destructuring
+    # form (`const { kv } = …`) and the plain one (`const blob = …`, which a
+    # test file uses for a response object that merely shares the name).
     decl = re.compile(
-        r"(?:const|let|var)\s*\{[^{}]{0,400}?\b" + re.escape(name) + r"\b[^{}]{0,400}?\}\s*="
+        r"(?:const|let|var)\s*(?:\{[^{}]{0,400}?\b" + re.escape(name) + r"\b[^{}]{0,400}?\}"
+        r"|" + re.escape(name) + r"\b)\s*="
     )
     for m in decl.finditer(src):
         out.append((m.end(), len(src)))
