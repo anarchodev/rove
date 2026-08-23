@@ -25,8 +25,9 @@ or produce them.
 [`package-isolation.md`](package-isolation.md).** A manifest-declared
 capability list checks an *intent* while authority stays ambient on the
 shared realm, so it constrains an honest package and not a hostile one.
-That doc keeps the manifest field as the declaration layer and puts the
-enforcement in package module scope.
+That doc removes ambient authority instead — effects are passed to the
+handler and delegated onward, narrowed — and keeps the manifest field as
+the declaration layer, which is what it is actually good for.
 
 **Deliverable:** given a hand-authored resolver + bytecode map, an app
 handler's `import { x } from "@rewind/oidc"` resolves and runs, and
