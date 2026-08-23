@@ -294,6 +294,11 @@ pub fn runModule(
     ctx: *qjs.Context,
     fun_val_in: qjs.Value,
     request: Request,
+    /// The activation object from `globals.installRequest` — the single
+    /// argument the export receives
+    /// (`docs/architecture/package-isolation.md`, the
+    /// received-not-ambient model). Borrowed; the caller owns it.
+    activation: c.JSValue,
     budget: *Budget,
     pending: *PendingResponse,
 ) RunError!void {
@@ -346,16 +351,22 @@ pub fn runModule(
         return;
     }
 
-    // The export is called with no positional arguments. Resume
-    // payloads (ctx / outcome) ride `request.body` and the typed
-    // `request.activation` union, read through the request surface so
-    // every read is taped (decisions.md §4.5).
+    // The export receives ONE argument: the activation object
+    // (`docs/architecture/package-isolation.md`, the received-not-ambient
+    // model), carrying `request`/`response` as own properties and the
+    // capabilities by prototype. Resume payloads (ctx / outcome) still
+    // ride `request.body` and the typed `request.activation` union, read
+    // through the request surface so every read is taped
+    // (decisions.md §4.5) — reaching that surface by parameter rather
+    // than by free variable changes nothing about taping, because the
+    // accessors live on the object.
+    var argv = [_]c.JSValue{activation};
     const ret = c.JS_Call(
         ctx.raw,
         handler,
         globals.js_undefined,
-        0,
-        null,
+        argv.len,
+        &argv,
     );
     var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
     defer ret_val.deinit();

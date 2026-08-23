@@ -1095,6 +1095,31 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // hygiene: keep `_system.*` free to change. Pairs with
     // scripts/ops/globals_lint.py (catches refs in-tree; this makes the
     // global physically absent at runtime).
+    // The capability template (docs/architecture/package-isolation.md, the
+    // received-not-ambient model): exactly the ambient names that REACH
+    // OUTSIDE the module, which is what an activation is handed. The pure
+    // and web-platform names (`atob`/`btoa`/`base64url`/`hex`/`time`/
+    // `crypto`/`console`/`TextEncoder`/`TextDecoder`/`URLSearchParams`)
+    // stay ambient and are deliberately absent.
+    //
+    // Built ONCE in base; each activation gets a fresh object with this as
+    // its PROTOTYPE (`installRequest`), so the per-request cost is one
+    // allocation rather than a property copy per capability, and the
+    // object's visible shape is already the post-cutover shape — corpus
+    // migrated against it does not have to move twice.
+    //
+    // It lives under the persistent `__rove.*` holder rather than a bare
+    // global: `_harden.js` below deletes `_system`, and package source
+    // naming `__rove` is rejected at deploy (`deploy_thread.zig`
+    // `referencesPrivilegedSurface`). While the ambient globals still
+    // exist this duplicates them; removing them is what makes this the
+    // only path (tracker #753).
+    evalSnippet(ctx, "_caps.js",
+        \\globalThis.__rove.caps = {
+        \\  after, blob, http, kv, next, platform, stream, webhook,
+        \\};
+    );
+
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
 
@@ -1471,7 +1496,9 @@ pub fn install(
     request: anytype,
 ) void {
     installStatic(ctx);
-    installRequest(ctx, state, request);
+    // Throwaway-context helper: the activation object is not dispatched
+    // from here, so its reference is released immediately.
+    c.JS_FreeValue(ctx, installRequest(ctx, state, request));
 }
 
 // ── Phase A documentation lints (docs/architecture/builtin-libs.md) ──
@@ -1664,6 +1691,59 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
         if (ctx.takeExceptionMessage(std.testing.allocator)) |m| {
             defer std.testing.allocator.free(m);
             std.debug.print("\nharden regression: {s}\n", .{m});
+        } else |_| {}
+        return e;
+    };
+    defer result.deinit();
+}
+
+test "caps: the activation template holds every reaching name and nothing pure" {
+    // The capability template is the classification rule
+    // (`docs/architecture/package-isolation.md`) made executable: a name
+    // that can reach outside the module belongs in it, a pure or
+    // web-platform name does not. Adding a reaching global without adding
+    // it here would leave a capability ambient-only after the cutover
+    // (tracker #753) — silently un-passable, and un-deniable. Adding a
+    // pure name here would make handlers thread it for no reason.
+    //
+    // Identity, not shape: the template must hold THE ambient object, so
+    // the two cannot drift into separate implementations while both work.
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    installStatic(ctx.raw);
+
+    const assertion =
+        \\(function () {
+        \\  const caps = globalThis.__rove.caps;
+        \\  if (typeof caps !== "object") throw new Error("__rove.caps missing");
+        \\  const got = Object.keys(caps).sort().join(",");
+        \\  const want = "after,blob,http,kv,next,platform,stream,webhook";
+        \\  if (got !== want)
+        \\    throw new Error("capability set drifted: got [" + got + "] want [" + want + "]");
+        \\  // Same object, not a copy.
+        \\  for (const k of Object.keys(caps))
+        \\    if (caps[k] !== globalThis[k])
+        \\      throw new Error("caps." + k + " is not the ambient " + k);
+        \\  // Pure / web-platform names stay ambient and out of the template.
+        \\  for (const k of ["crypto", "console", "time", "base64url", "hex",
+        \\                   "atob", "btoa", "TextEncoder", "TextDecoder",
+        \\                   "URLSearchParams", "request", "response"])
+        \\    if (k in caps)
+        \\      throw new Error(k + " must not be in the capability template");
+        \\  // The mechanism installRequest uses: capabilities resolve through
+        \\  // the prototype chain, so a per-activation object costs one alloc.
+        \\  const act = Object.create(caps);
+        \\  if (act.kv !== globalThis.kv) throw new Error("prototype chain broke");
+        \\  return true;
+        \\})();
+    ;
+    var result = ctx.eval(assertion, "_caps_test.js", .{}) catch |e| {
+        if (ctx.takeExceptionMessage(std.testing.allocator)) |m| {
+            defer std.testing.allocator.free(m);
+            std.debug.print("\ncaps regression: {s}\n", .{m});
         } else |_| {}
         return e;
     };
