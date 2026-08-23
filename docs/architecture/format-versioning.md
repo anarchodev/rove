@@ -60,50 +60,65 @@ versioned does not thereby inherit that version: if the value outlives the
 frame that produced it, the reader has nothing to dispatch on. §1f is where
 that distinction decides most of the rows.
 
-Only §1f carries the **Class** column so far. The remaining tables are
-classified as each is worked (the tracker's audit leaf).
+Every table below carries the **Class** column. The tally across all 55
+rows: **23 versioned · 8 inherits · 16 by-decision · 2 gap · 6 unwritten.**
+
+The two gaps are `<bundle>/rewind.lock` (§1d) and `cluster/{id}` (§1g).
+Both share a property none of the by-decision rows have: they are read by
+something that is NOT upgraded in lockstep with their writer — the
+customer's checkout in one case, the other half of a rolling CP upgrade
+in the other. That, rather than how important a format looks, is what
+separates a gap from a decision.
+
+The runtime registry (`src/rewind/version.zig`, dumped by
+`rewind --version`) names every row that is not in the *inherits* class,
+including the ones with no Zig constant to import: the JS-owned shim
+record versions and the two path-versioned HTTP surfaces are listed as
+mirrored values, because a format the dump omits reads as one with
+nothing to see.
 
 ### 1a. Raft-replicated / log-persisted (hardest — replicas must agree)
 
-| Format | File | Layout (current) | Ver? | Tier |
-|---|---|---|---|---|
-| Entry frame (per raft entry) | `src/consensus/envelope.zig:68` (`ENTRY_FRAME_MAGIC=0xF7`), encode/decode `:83-109` | `[1B 0xF7][8B origin LE][8B seq LE][envelope]` | magic only | A |
-| Envelope codec header | `src/consensus/envelope.zig:116-199`; lib copy `src/kv/envelope_codec.zig:27-57` | `[1B type][2B id_len BE][id][payload]`; types 0=writeset,1=multi,2=root_writeset (3–11 retired, rejected loud) | type enum | A |
-| Writeset payload (type 0) | `src/kv/writeset.zig:127-201`; readset framing `src/js/apply.zig:116-170` | `[u32 BE op_count]·[op][klen][k][vlen][v]…` then `[u32 ws_len][ws][u32 rs_len][rs]` | none | A |
-| Multi payload (type 1) | `src/kv/envelope_codec.zig:80-100` | `[u8 count]·[u32 LE inner_len][inner_envelope]…` | none | A |
-| Snapshot baseline (index/term/ConfState) | raft-rs opaque; installed `src/consensus/node.zig:824-850` | `{index u64, term u64, conf_state{voters,learners}}` | raft-rs internal | C |
+| Format | File | Layout (current) | Ver? | Class | Tier |
+|---|---|---|---|---|---|
+| Entry frame (per raft entry) | `src/consensus/envelope.zig` (`ENTRY_FRAME_MAGIC=0xF7`, `encodeEntryFrame`/`decodeEntryFrame`) | `[1B 0xF7][8B origin LE][8B seq LE][envelope]` | magic only | **versioned** — magic IS the version (registry `entry_frame`); the next change reserves `0xF8`, and an unframed byte is rejected loudly | A |
+| Envelope codec header | `src/consensus/envelope.zig`; lib copy `src/kv/envelope_codec.zig` | `[1B type][2B id_len BE][id][payload]`; types 0=writeset,1=multi,2=root_writeset (3–11 retired, rejected loud) | type enum | **versioned** — the type byte IS the discriminant (registry `envelope_codec`); a retired or unknown type is rejected loudly, which is what makes a stale log entry surface instead of mis-applying | A |
+| Writeset payload (type 0) | `src/kv/writeset.zig`; readset framing `src/js/apply.zig` | `[u32 BE op_count]·[op][klen][k][vlen][v]…` then `[u32 ws_len][ws][u32 rs_len][rs]` | none | **inherits** ← the envelope type byte (0). The frame is recoverable at read time by construction: the type precedes the payload in the same entry, and no payload is ever read without it | A |
+| Multi payload (type 1) | `src/kv/envelope_codec.zig` | `[u8 count]·[u32 LE inner_len][inner_envelope]…` | none | **inherits** ← the envelope type byte (1); same argument | A |
+| Snapshot baseline (index/term/ConfState) | raft-rs opaque; installed `src/consensus/node.zig` | `{index u64, term u64, conf_state{voters,learners}}` | raft-rs internal | **inherits** ← the `raft-rs-zig` pin in `build.zig.zon`. A dependency pin is a legitimate frame, but a weaker one than a byte on the wire: it is recoverable from the BUILD, not from the data, so it only holds while every node reading a WAL was built from the same pin | C |
 
 ### 1b. On-wire ephemeral (cross-node / inter-binary)
 
-| Format | File | Layout | Ver? | Tier |
-|---|---|---|---|---|
-| Coalesced raft transport | `src/consensus/transport.zig:22-35`, `RECORD_HDR_SIZE=20` | `[u8 ver][u32 count]·[u64 group][u64 epoch][u32 msg_len][msg]…` (msg = raft-rs protobuf) | **yes (v1 frame byte)** + epoch fences | **B-hot** |
-| Raft-net frame codec | `src/kv/raft_rpc.zig:18-47` | `[u32 BE len][u32 BE crc][payload]`; ident handshake type=5 | MsgType enum | B-hot |
-| Snapshot stream wire | `src/kv/snapshot_stream.zig:43-52` | `[u32 LE MAGIC "MGS2"][u8 ver=1][u64 store_id]·[u16 klen][u32 vlen][k][v]…` | **yes (v1)** | B |
-| Snapshot sink endpoint | `src/js/snapshot_sink.zig` + `POST /_system/v2-snapshot-stream` | headers `{mode,tenant,index,term,move-secret}` + stream body | path `v2-` | B |
-| Worker→log-server push | `src/js/worker_log.zig:630` `POST /v1/_internal/batch-pushed` | newline-delimited S3 keys, Bearer JWT | path `/v1/` | B |
-| Front↔worker proxy (h2c) | `src/front/proxy.zig` | RFC 7540/8441 h2c; headers | n/a (HTTP) | B |
+| Format | File | Layout | Ver? | Class | Tier |
+|---|---|---|---|---|---|
+| Coalesced raft transport | `src/consensus/transport.zig` (`FRAME_VERSION`, `RECORD_HDR_SIZE=20`) | `[u8 ver][u32 count]·[u64 group][u64 epoch][u32 msg_len][msg]…` (msg = raft-rs protobuf) | **yes (v1 frame byte)** + epoch fences | **versioned** (registry `coalesced_transport`). Its version byte shares `payload[0]` with raft-net's `ident` tag (=5) one layer down, so `FRAME_VERSION` may never become 5 — a comptime assert beside the constant fails the build on the bump that would collide | **B-hot** |
+| Raft-net frame codec | `src/kv/raft_rpc.zig` | `[u32 BE len][u32 BE crc][payload]`; ident handshake type=5 | MsgType enum | **by-decision** — the framing carries a length and a checksum and nothing to interpret; what the payload MEANS is versioned one layer in (the coalesced frame's byte, or the fixed 5-byte `ident`). See the byte-0 constraint noted above | B-hot |
+| Snapshot stream wire | `src/kv/snapshot_stream.zig` (`STREAM_VERSION`) | `[u32 LE MAGIC "MGS2"][u8 ver=1][u64 store_id]·[u16 klen][u32 vlen][k][v]…` | **yes (v1)** | **versioned** (registry `snapshot_stream`); an unknown version is `UnsupportedStreamVersion` | B |
+| Snapshot sink endpoint | `src/js/snapshot_sink.zig` + `POST /_system/v2-snapshot-stream` | headers `{mode,tenant,index,term,move-secret}` + stream body | path `v2-` | **versioned** — in HTTP's own idiom, the version is a path segment: a new shape is a new path, and an old peer 404s instead of mis-parsing | B |
+| Worker→log-server push | `src/js/worker_log.zig` (`POST /v1/_internal/batch-pushed`) | newline-delimited S3 keys, Bearer JWT | path `/v1/` | **versioned** — same path-segment idiom | B |
+| Front↔worker proxy (h2c) | `src/front/proxy.zig` | RFC 7540/8441 h2c; headers | n/a (HTTP) | **by-decision** — the format is an RFC, versioned by its own negotiation. Not ours to version, and adding a field would be inventing a dialect | B |
 
 ### 1c. S3 objects (content-addressed or batched)
 
-| Format | File | Layout | Ver? | Tier |
-|---|---|---|---|---|
-| Blob keys (source/bytecode/static) | `src/blob/backend.zig:74-100` | `{prefix_base}{instance}/{file-blobs\|deployments\|log-blobs}/{sha256}` | **no key-prefix version** | B |
-| Deployment manifest | `src/files/manifest_json.zig:42,86` | JSON `{v:1, deployment_id, entries[{path,kind,content_type,hash,bytecode_hash}]}` | **yes (v1)** | B |
-| Log batch object | `src/log_server/flush_writer.zig:6-18` | `[u32 LE sidecar_len][sidecar JSON][deflate frames…]` | sidecar **v1**; records none | B |
-| Log sidecar JSON | `src/log_server/sidecar.zig:26,36-103` | JSON `{v:1, node_id, batch_id, records[…]}` | **yes (v1)** | B |
-| Per-record JSON (+ inline tapes) | `src/log_server/flush_writer.zig:232-266` | deflate-wrapped JSON incl. base64 tape payloads | none | B |
-| Body-batch pool object | `src/blob/pool_object.zig` (`_pool/{written_ms}-{digest}`) | header + entry table + concatenated bodies, referenced by `BodyRef{written_unix_ms,digest,offset,len}` | v1 (magic `RPL1`) | B |
+| Format | File | Layout | Ver? | Class | Tier |
+|---|---|---|---|---|---|
+| Content-addressed blob keys | `src/blob/backend.zig` | `{prefix_base}{instance}/{file-blobs\|log-blobs}/{sha256}` | no key version | **by-decision** — the key IS the SHA-256 of the bytes, so different content is a different key and there is no shape to disagree about. A content address is the one kind of name that cannot go stale | B |
+| Deployment manifest object key | `src/files/manifest_json.zig`, `src/blob/namespace.zig` | `tenants/{id}/deployments/e{bc_version}/{dep_id:020d}.json` | **yes — `e{bc_version}` segment** | **versioned** — the key-prefix version segment §6's Phase 2 asks about, for the one namespace that needs it. The object is DERIVED (a compile keyed by engine build), not content-addressed, so its name carries the derivation's version and a miss recompiles instead of mis-reading | B |
+| Deployment manifest | `src/files/manifest_json.zig` (`VERSION`) | JSON `{v:2, deployment_id, entries[…], packages?, app_imports?}` | **yes (v2)** | **versioned** (registry `deployment_manifest`) — and the only format here that has ALREADY been bumped: v1→v2 was resolved by refusing v1 and redeploying, not by a compatibility branch | B |
+| Log batch object | `src/log_server/flush_writer.zig` | `[u32 LE sidecar_len][sidecar JSON][deflate frames…]` | sidecar **v1** | **inherits** ← the log sidecar's `v`, which sits at a fixed offset 4 in the SAME object and is read before anything it describes. The 4-byte length prefix ahead of it is a fixed frame with nothing to interpret | B |
+| Log sidecar JSON | `src/log_server/sidecar.zig` (`VERSION`) | JSON `{v:1, node_id, batch_id, records[…]}` | **yes (v1)** | **versioned** (registry `log_sidecar`) | B |
+| Per-record JSON (+ inline tapes) | `src/log_server/flush_writer.zig` | deflate-wrapped JSON incl. base64 tape payloads | none | **inherits** ← the log sidecar's `v`. This is the §1f test passing rather than failing: the records and the sidecar are written by one writer into one sealed object, and the reader reaches a record only through the sidecar's offsets — so unlike a shim-owned kv row, the frame genuinely travels with the value | B |
+| Body-batch pool object | `src/blob/pool_object.zig` (`_pool/{written_ms}-{digest}`) | `[u32 magic "RPL1"][u16 ver]…` + entry table + bodies, referenced by `BodyRef{written_unix_ms,digest,offset,len}` | **yes (v1)** | **versioned** (registry `pool_object`); a `VERSION + 1` object is refused, and there is a test that says so | B |
 
 ### 1d. Local on-disk (opaque / pinned by dep)
 
-| Format | File | Layout | Ver? | Tier |
-|---|---|---|---|---|
-| Raft WAL (shared, all groups) | raft-rs-zig (`{data_dir}/raft-wal/`); opened `src/consensus/node.zig:593` | raft-rs segments + CRC records + hardstate; rove wraps each entry w/ 0xF7 frame | raft-rs internal + entry frame | C |
-| kvexp store (app.db / __root__.db) | kvexp (fetched, **not vendored**); `data_dir/{id}/app.db` | LMDB B+tree; applied-raft-idx watermark in kvexp meta | LMDB internal | C |
-| Group manifest (node-local) | `src/consensus/node.zig:703-789` (`{data_dir}/__groups__/app.db`) | kvexp; key=id_str, value=epoch decimal ASCII | none | C |
-| ACME account key | `src/cp/acme.zig:199-220` (`{data_dir}/acme/account.key`) | PKCS#8 PEM | none | C |
-| Bundle lockfile (`<bundle>/rewind.lock`) | written `src/cli/rewind.zig` `writeLockfile`, read `readLockfile`; shape `src/cli/packages.zig` `parseResolveResponse` | the registry's `/v1/resolve` body verbatim — JSON `{packages[{spec,version,pkg_hash,files,imports,capabilities,private}], app_imports{spec:pkg_hash}}` | **none** | C |
+| Format | File | Layout | Ver? | Class | Tier |
+|---|---|---|---|---|---|
+| Raft WAL (shared, all groups) | raft-rs-zig (`{data_dir}/raft-wal/`); opened `src/consensus/node.zig` | raft-rs segments + CRC records + hardstate; rove wraps each entry w/ 0xF7 frame | raft-rs internal + entry frame | **inherits** ← the `raft-rs-zig` pin (segments) + the entry frame's magic (rove's wrapper). Two frames, one per layer, which is why the row reads as two things | C |
+| kvexp store (app.db / __root__.db) | kvexp (fetched, **not vendored**); `data_dir/{id}/app.db` | LMDB B+tree; applied-raft-idx watermark in kvexp meta | LMDB internal | **inherits** ← the `kvexp` pin. LMDB's own on-disk format is versioned by LMDB and refuses a file it does not know | C |
+| Group manifest (node-local) | `src/consensus/node_core.zig` (`{data_dir}/__groups__/app.db`) | kvexp; key=group id, value=epoch decimal ASCII | none | **by-decision** — a monotonic decimal integer has no shape to change, and the file is node-local: a node that loses it re-derives its groups from the directory rather than reading a peer's copy, so no two builds ever read the same bytes | C |
+| ACME account key | `src/cp/acme.zig` (`{data_dir}/acme/account.key`) | PKCS#8 PEM | none | **by-decision** — PKCS#8 is an external standard with its own structure. Versioning it would be inventing a dialect of someone else's format | C |
+| Bundle lockfile (`<bundle>/rewind.lock`) | written `src/cli/rewind.zig` `writeLockfile`, read `readLockfile`; shape `src/cli/packages.zig` `parseResolveResponse` | the registry's `/v1/resolve` body verbatim — JSON `{packages[{spec,version,pkg_hash,files,imports,capabilities,private}], app_imports{spec:pkg_hash}}` | **none** | **gap** — the last one in the inventory. It is an INPUT to a deploy (see below), it lives in the customer's tree where no engine wipe reaches it, and it is the registry's response shape verbatim, so it moves when the registry does | C |
 
 > **`rewind.lock` became load-bearing** when `deploy` started resolving through
 > it (#630): it is now an INPUT to a deploy, not a record of one, so a shape
@@ -111,11 +126,12 @@ classified as each is worked (the tracker's audit leaf).
 > field yet — that lands with the versioning pass (#244), and the entry is
 > listed here so the inventory is complete in the meantime.
 
-> **Stale / dead (not live formats):** per-instance SQLite `files.db` / `log.db`
-> referenced in `src/files/root.zig`, `src/tenant/root.zig:146`, `src/log/root.zig`
-> — all comments describe the **retired** files-server/log.db model. The
-> `tenant/root.zig` provisioning comment still *names* them; confirm it's dead
-> code before relying on it, but treat SQLite-per-instance as gone.
+> **Stale / dead (not live formats):** the per-instance SQLite `files.db` /
+> `log.db` are gone. What survives is prose: `src/tenant/root.zig` still names
+> them in three comments describing the on-disk layout. No code opens either,
+> and `src/files/root.zig` and `src/log/root.zig` no longer mention them at
+> all. Treat SQLite-per-instance as retired; the remaining comments are a
+> naming cleanup, not a format.
 
 ### 1e. Replay / tape (already the best-versioned subsystem)
 
@@ -200,22 +216,22 @@ for subscription modules (`_subscriptions/{name}/index.mjs`,
 
 Source: `src/cp/directory.zig`.
 
-| Key | Value | Ver? | Notes |
-|---|---|---|---|
-| `cluster/{id}` | `"url1,url2,…"` comma-joined origins | none | topology SSOT |
-| `placement/{tenant}` | bare `{cluster_id}` | none | **already post-wipe shape** (was `{state}:{cluster}`) |
-| `plan/{tenant}` | opaque JSON | in-payload | CP dumb, DP parses |
-| `host/{host}` | `{tenant_id}` | none | domain index |
-| `cert/{host}` | **packed binary** `[u8 v=1][u32 BE cert_len][cert_pem][key_pem]` (`directory.zig` `packCert`/`CERT_PACK_VERSION`) | **yes (v1)** | front-door mirror in `front/main.zig` |
+| Key | Value | Ver? | Class | Notes |
+|---|---|---|---|---|
+| `cluster/{id}` | `"url1,url2,…"` comma-joined origins | none | **gap** — a delimited list with no discriminant, read across a ROLLING CP upgrade, so the two builds are live at once by design. Anything added to a member (a role, a weight) is misread by the older parser as part of an origin | topology SSOT |
+| `placement/{tenant}` | bare `{cluster_id}` | none | **by-decision** — wipe-on-change, and that is not a hope: this value has ALREADY changed shape once, from `{state}:{cluster}` to a bare id, and the wipe is how it was done | domain of one identifier |
+| `plan/{tenant}` | JSON `{tier, overrides{…}}` | none | **by-decision** — additive by construction (`ignore_unknown_fields`), and a blob the parser cannot read resolves to the tenant's DEFAULT rather than failing the request: free for a customer, platform for a reserved id. A format that fails toward a safe answer does not need a version to fail safely | CP dumb, DP parses (`src/plan/root.zig` `parseBlob`) |
+| `host/{host}` | `{tenant_id}` | none | **by-decision** — a single identifier; a richer value would be a different key | domain index |
+| `cert/{host}` | **packed binary** `[u8 v=1][u32 BE cert_len][cert_pem][key_pem]` (`directory.zig` `packCert`/`CERT_PACK_VERSION`) | **yes (v1)** | **versioned** (registry `cert_pack`) — the packed-binary KV idiom `_keys/*` now follows | front-door mirror in `front/main.zig` |
 
 ### 1h. Tokens / credentials
 
-| Format | File | Layout | Ver? |
-|---|---|---|---|
-| Service JWT (HS256) | `src/jwt/root.zig:1-110` | `{exp[,caps][,tenant]}` HS256 | none |
-| SSE/rich-payload JWT | `src/jwt/root.zig:218-255` | `{v,tenant_id,sid,caps,exp}` | **yes (`v`)** |
-| Move secret | `src/js/snapshot_catchup.zig:6` header | hex shared secret | n/a |
-| Services JWT secret | `src/jwt/root.zig:18-21` | hex shared secret | n/a |
+| Format | File | Layout | Ver? | Class |
+|---|---|---|---|---|
+| Service JWT (HS256) | `src/jwt/root.zig` (`mint`) | `{v:1, exp[,caps][,tenant]}` HS256 | **yes (`v`)** | **versioned** (registry `service_jwt`) — Phase 1 added the claim; the inventory said "none" long after it shipped, which is the drift a Class column exists to make visible | 
+| SSE/rich-payload JWT | `src/jwt/root.zig` (`signPayload`) | `{v,tenant_id,sid,caps,exp}` | **yes (`v`)** | **versioned** |
+| Move secret | `src/js/snapshot_catchup.zig` (`MOVE_SECRET_HEADER`) | hex shared secret | n/a | **by-decision** — an opaque secret compared for equality. There is no structure to interpret, so there is nothing a version could change |
+| Services JWT secret | `src/jwt/root.zig` | hex shared secret | n/a | **by-decision** — same |
 
 ## 2. Sensitivity tiers (drives the strategy)
 

@@ -101,6 +101,21 @@ const RECORD_HDR_SIZE: usize = sizing.RECORD_HDR_BYTES;
 /// Bump when the frame/record layout changes; the decoder rejects any
 /// other value loudly. Frozen v1 at the pre-launch format freeze.
 pub const FRAME_VERSION: u8 = 1;
+
+comptime {
+    // The version byte and raft-net's `ident` handshake tag are the SAME
+    // byte of the frame payload: a coalesced frame writes `FRAME_VERSION`
+    // at `payload[0]`, and `raft_net` identifies an inbound peer's first
+    // frame by testing `payload[0] == MsgType.ident`. If they ever agree,
+    // the first coalesced frame from a not-yet-identified peer is consumed
+    // as a handshake and its raft messages are silently dropped — after a
+    // reconnect, which is exactly when the cluster can least afford it.
+    //
+    // Nothing about bumping a version byte suggests consulting a handshake
+    // tag two layers down, so the constraint is asserted here rather than
+    // written down: the next bump that would collide fails the build.
+    std.debug.assert(FRAME_VERSION != @intFromEnum(rpc.MsgType.ident));
+}
 /// Bytes the frame prepends to the body before the records: `version:u8`
 /// + `count:u32`.
 const FRAME_PREFIX_SIZE: usize = sizing.FRAME_PREFIX_BYTES;
