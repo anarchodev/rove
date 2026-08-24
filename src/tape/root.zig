@@ -443,8 +443,13 @@ pub const Entry = union(Channel) {
     pub const ModuleEntry = struct {
         /// Requested path as the handler wrote it.
         specifier: []const u8,
-        /// SHA-256 of the bytecode that resolved for this specifier,
-        /// hex-encoded. 64 chars.
+        /// SHA-256 of the SOURCE that resolved for this specifier,
+        /// hex-encoded. 64 chars. Source, not bytecode: the engines
+        /// that replay a tape are different builds from the one that
+        /// recorded it (prod worker, offline sim, browser WASM arena)
+        /// and bytecode is specific to the build that emitted it, so
+        /// source is the only portable pin. The replay shell fetches
+        /// these bytes by hash to rebuild production's module graph.
         source_hash_hex: []const u8,
     };
 
