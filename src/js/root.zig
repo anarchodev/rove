@@ -50,6 +50,8 @@ const std = @import("std");
 pub const tape = @import("rove-tape");
 pub const log = @import("rove-log");
 
+pub const io = @import("rove-io");
+pub const deploy_door = @import("deploy_door.zig");
 pub const dispatcher = @import("dispatcher.zig");
 pub const effect = @import("effect/root.zig");
 pub const globals = @import("globals.zig");

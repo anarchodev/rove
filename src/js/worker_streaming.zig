@@ -2772,7 +2772,11 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
                     return;
                 };
                 const wid = h.event.coord_queue_id;
-                if (coord.durableSeq(wid) <= h.event.coord_seq) {
+                // A rejected queue id is unreachable (the id came from a
+                // validated `submit`) and defers like any not-yet-durable
+                // head, so the poll loop stays the single retry path.
+                const hwm = coord.durableSeq(wid) catch return;
+                if (hwm <= h.event.coord_seq) {
                     // Bytes not durable yet — defer this head.
                     return;
                 }

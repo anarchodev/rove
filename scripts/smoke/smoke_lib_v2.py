@@ -692,6 +692,15 @@ class V2Cluster:
         # (The render itself is cheap — <1ms measured; the load-correlated
         # pump stalls are the WAL fsync tail, rove#377.)
         env.setdefault("REWIND_METRICS_PORT", "0")
+        # Private deploy listener OFF by default, same port hygiene as the
+        # metrics listener above: it binds a FIXED loopback port, so on a box
+        # running several nodes only the first would win it and the rest would
+        # log a warning that means nothing here. Nothing in the suite presents
+        # the root bearer to the publish door yet — its routes are not
+        # implemented — so leaving it off costs no coverage. A smoke that needs
+        # it (the door's own acceptance) sets its own allocated port and wins,
+        # because this is a setdefault.
+        env.setdefault("REWIND_DEPLOY_PRIVATE_PORT", "0")
         # Step 3 B4: the CP base for the `rewind-cp.internal` door (the worker's
         # node.cp_internal_base = cp_urls[0]), so the __admin__ dashboard can
         # drive CP control ops. cluster_id stays unset → serve-or-forward off
