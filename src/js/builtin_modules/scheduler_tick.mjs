@@ -31,6 +31,13 @@ const BY_TIME_PREFIX = "_sched/by_time/";
 // record this tick cannot read is dropped WITH its index entry — firing
 // a target named by fields we may be misreading is worse than not
 // firing, and leaving the pair would retry the misread every tick.
+// The version an UNSTAMPED record is. Permanently 1: every `_`-namespace
+// gained its `v` in one commit, so a row without the field is the shape v1
+// describes. It must NOT track the current version — when a format reaches
+// v2, an unstamped row is still v1, and defaulting to "whatever we read
+// now" would silently reinterpret it.
+const UNSTAMPED_V = __rove.formats.unstamped;
+
 const SCHED_REC_V = __rove.formats.sched;
 
 const BY_ID_PREFIX = "_sched/by_id/";
@@ -101,19 +108,31 @@ export default function () {
             kv.delete(key);
             continue;
         }
-        if (typeof rec.v !== "number") {
-            // Absent or non-numeric `v` is NOT "written by something
-            // newer" — a newer build writes a HIGHER number. It means a
-            // pre-versioning row or a hand-written one (this namespace is
-            // shim-writable, so a handler can author these directly), and
-            // no future build will understand it better than this one
-            // does. Deferring it would keep it forever and log every
-            // tick. Same answer as unparseable: drop it.
+        // An ABSENT `v` reads as v1 — the pre-stamp shape — because
+        // adding the field changed NOTHING else. `{when_ns, target, msg,
+        // key?, armed_by?}` is exactly what this reader wants, so a row
+        // without the stamp is fully readable and refusing it would
+        // discard a wake the customer armed over a field that carries no
+        // information this code needs.
+        //
+        // That makes v0→v1 the trivial migration: a pure field addition,
+        // whose upconversion IS the default below. No table, no branch.
+        //
+        // And it is permanent, not a genesis-era accommodation. `_sched/`
+        // is in `SHIM_WRITABLE_PREFIXES` — the raw shape is documented as
+        // one any handler may write directly — so unstamped rows are not
+        // only legacy, they arrive whenever a customer authors one.
+        //
+        // A NON-numeric `v` is different: something claimed a version and
+        // it is not one, which is corruption, and the unparseable branch
+        // above already owns that answer.
+        if (rec.v !== undefined && typeof rec.v !== "number") {
             kv.delete(byIdKey);
             kv.delete(key);
             continue;
         }
-        if (rec.v !== SCHED_REC_V) {
+        const rec_v = rec.v ?? UNSTAMPED_V;
+        if (rec_v !== SCHED_REC_V) {
             // A version we do not implement, from something that DOES
             // version its records. Recoverable by another build — during
             // a rolling upgrade the node beside this one reads it fine —
