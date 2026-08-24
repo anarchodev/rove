@@ -4,7 +4,7 @@
 //! of `worker_streaming.zig`.
 //!
 //! Each of these fires a customer handler synchronously from a `Msg`, with
-//! no held socket: disconnect, subscription (cron / kv-react / boot), the
+//! no held socket: disconnect, subscription (kv-react), the
 //! scheduler tick, durable-wake, chained (send_callback), blob-compose, and
 //! fetch-chunk. All are thin wrappers over the shared `firePrep` + `runFire`
 //! scaffold that stays in `worker_streaming.zig` (imported here as
@@ -94,8 +94,12 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 /// but slimmer — no held stream to drain, no chunks to clean up.
 ///
 /// **TEA framing:**
-///   - **Msg**: `(subscription_fire, source)` where source is
-///     one of {cron firedAt, kv key+op, boot deployment_id}.
+///   - **Msg**: `(subscription_fire, source)` — `SubscriptionFireSource`
+///     has one variant, `kv{prefix}`: a coalesced level-trigger saying
+///     the watched prefix is dirty. Cron composes over the durable
+///     scheduler instead (`__system/cron_tick` re-dispatched through
+///     `schedule({in:0}, …)`), so it arrives as a `durable_wake`, not
+///     here.
 ///   - **prep**: resolveDeployment(tenant_id, module_path); mint
 ///     a fresh saga_id; synthesize Request body `{ctx:{}}`.
 ///   - **run**: `dispatcher.runOutcome` (chain-origin txn).
@@ -105,7 +109,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 ///       • continuation / stream → recorded + logged; ignored
 ///         (a subscription chain has no held socket so multi-hop
 ///         chains aren't expressible in v1; customer composes
-///         multi-step via `http.send({on_result: ...})` which
+///         multi-step via `webhook.send(url, {on: ...})` which
 ///         routes as a `send_callback` activation, not as a held
 ///         continuation).
 ///
@@ -650,8 +654,11 @@ pub fn fireDispatchActivation(
 ///     one fetch shares a chain identity; body `{ctx: <ctx_json>}`.
 ///   - **run**: `dispatcher.runOutcome`.
 ///   - **apply**: terminal → propose writes (if any) + log;
-///     continuation / stream → recorded + logged + ignored (a
-///     fetch chain has no held socket, same as subscription_fire).
+///     continuation → `.enqueue`, so a `next()` from a chunk
+///     handler chains as a `send_callback` hop inheriting this
+///     fetch's saga_id — the route `__system/webhook_onresult`
+///     takes to a customer's `{on}`; stream → warn + ignored,
+///     there being no held socket to stream to.
 ///
 /// Errors return `void` — `dispatchFetchEvents` is best-effort. An
 /// event with an empty `on_chunk_module` (binding-side regression)
