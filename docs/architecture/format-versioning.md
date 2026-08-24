@@ -193,7 +193,7 @@ list membership is what its versioning story will inherit from:
 | `_magic/` | — | **unwritten** | none | Engine-only; reserved for magic-link tokens |
 | `_oidc/*` | JSON `{v, …}` for the records the package WRITES | **versioned** (`REC_V`, one for the whole namespace — the shapes it owns are halves of a single login). **Two sub-keys are excluded and the exclusion is the point:** `_oidc/session/{sid}` is written by the TENANT's login handler (`web/auth/index.mjs`) and only read here, and `_oidc/config/{name}` is operator-seeded. A reader cannot demand a stamp from a writer it does not own — that is a reader upgraded ahead of its writers, which is the same hazard `cluster/{id}` has in §1g | `src/js/packages/@rewind/oidc/index.mjs` | shim-writable; keyset/code/at/rt/device/state. Mostly RFC-shaped, but the *envelope* is ours |
 | `_rp/*` | JSON `{v, …}` | **versioned** (`REC_V`, shared with `_oidc/*`) | `src/js/packages/@rewind/oidc/index.mjs` (relying-party half); read by `src/js/starter/upload.mjs` | shim-writable; RP state — `state`/`sess/{sid}`/`jwks` |
-| `_sched/by_time/{ns_hex}/{id}`, `_sched/by_id/{id}` | JSON wake `{v, when_ns, target, msg, key?, armed_by?}` | **versioned** (`SCHED_REC_V`) — written from SIX near-identical `schedArm` copies, which is why `scripts/ops/record_version_lint.py` exists | `src/js/globals/schedule.js` + `src/js/durable_wake.zig` | shim-writable; load-bearing. Fixed-width zero-pad so lexicographic order == time order |
+| `_sched/by_time/{ns_hex}/{id}`, `_sched/by_id/{id}` | JSON wake `{v, when_ns, target, msg, key?, armed_by?}` | **versioned** (`RecordVersions.sched`, `src/js/globals.zig`) — written from SIX near-identical `schedArm` copies, which now read ONE declaration rather than each carrying its own | `src/js/globals/schedule.js` + `src/js/durable_wake.zig` | shim-writable; load-bearing. Fixed-width zero-pad so lexicographic order == time order |
 | `_seg/{log}/n` | decimal counter | **by-decision** — monotonic integer, same as `_log/next_request_seq` | `src/js/packages/@rewind/segments/index.mjs` (`append`) | shim-writable |
 | `_seg/{log}/h/{seq:020}` | the customer's own record bytes, opaque | **by-decision** — not our format; the value is passed through untouched | `src/js/packages/@rewind/segments/index.mjs` (`append`) | shim-writable; hot rows, deleted on seal |
 | `_seg/{log}/s/{first:020}` | JSON `{v, hash, first_seq, last_seq, count}` | **versioned** (`SEG_IDX_V`) | `src/js/builtin_modules/segments_onsealed.mjs` | shim-writable; the permanent pointer to a sealed segment blob — outlives everything around it |
@@ -202,19 +202,64 @@ list membership is what its versioning story will inherit from:
 | `_triggers/` | — | **unwritten** as kv | none in app.db | Engine-only. Trigger modules are deploy-tree paths in the manifest (`_triggers/{prefix}/index.mjs`), not rows |
 | `_usage/blob/{app\|file}/{sha256}` | length in decimal ASCII | **by-decision** — derived and rebuildable by rescanning the blob store; the key is a content hash, so a rebuild is idempotent | `src/kv/usage.zig` (`ROW_PREFIX`), platform Zig at write time | engine-only. One row per stored object and **no stored total** — the total is a prefix scan, because a value folded at apply time exists on followers and not on the leader. This is the number the storage quota is enforced against |
 
-The shim-owned records above cannot share a version constant: a baked
-`__system/*` module runs post-harden and cannot reach a shim's closure, a
-package ships in the tenant's deployment, a global ships in the prelude,
-and there is no import path between the three. Each declares its own, and
-`scripts/ops/record_version_lint.py` (run by `zig build test`) enforces
-both halves — that every file touching a namespace declares the constant,
-and that no file outside the list writes into one.
+These versions have **two declarations**, and the second one is the
+interesting part.
 
-A reader refuses a version it does not implement the same way it refuses
-an unparseable record, because these namespaces are shim-WRITABLE: a `v`
-this build does not know is as likely a customer's forged row as a newer
-engine, and both deserve the same answer. The exception is the OIDC
-keyset, which throws instead — absent means GENESIS there, so failing
+The worker's is `RecordVersions` in `src/js/globals.zig`, installed as
+`__rove.formats` and read by all thirteen sites that ship inside the binary
+— the baked `__system/*` modules and the `globals/*.js` shims. It is
+`__rove` rather than `_system` for two reasons pointing the same way: baked
+modules run AFTER `_harden.js` deletes `_system`, and `lint(c)` requires
+every `_system.*` namespace to have a customer-facing shim, which a bag of
+integers has no business being. Its neighbours there are
+`is_system_module`-gated; this entry is data, so there is nothing to gate —
+reading a number grants no authority.
+
+The second declaration exists because **`globals/*.js` run on three
+engines.** In the worker `_system.*`/`__rove.*` are native bindings; in the
+CLI sim and the browser replay arena they are
+`src/replay/js/system_recorders.js`, a JS layer those runtimes compose over.
+A natively-installed constant exists in one engine of three, and the prelude
+fails to evaluate in the other two — which is exactly how this was found. So
+the recorders declare the same numbers, and
+`test "record versions agree with the offline recorders"` parses that file
+and fails the build if the two disagree or if a property is missing. It
+reads DECLARATIONS, not call sites, which is why it cannot be defeated the
+way the lint below was.
+
+**The `@rewind/*` packages read neither**, and that is the rule stated
+precisely rather than an exception to it: a package's record shape is pinned
+with the package in the tenant's lockfile, so one reading this binary's
+number would stamp a version it did not write. Its literal is the version of
+the code actually deployed in that tenant.
+
+So of the ten `_sched/` declarations there were, eight were one binary
+describing itself eight times, and two are real.
+
+A lint was tried first and removed. It checked that every file in a
+hand-maintained list declared the constant, and that no file outside the
+list wrote the namespace — but the second rule only matched a literal key
+inside `kv.set(`, and every `schedArm` copy assigns the key to a variable
+first, so a new copy written like the real ones passed it green. It was
+policing a duplication that should not have existed; centralizing removed
+the thing it was policing.
+
+**An unknown version is not the unparseable case, and the difference is
+what the field is for.** Corrupt bytes are unrecoverable, so dropping them
+loses nothing. A record written by a newer build is recoverable BY THAT
+BUILD — during a rolling upgrade the node beside this one reads it fine —
+so deleting it destroys durable customer work on an ordinary deploy, and
+it is the OLDER node that does the destroying.
+
+Readers of the durability markers therefore DEFER rather than drop: leave
+the record, leave its index rows, fire nothing, and keep the recovery
+mechanism armed so a build that understands it gets a turn. Keeping the
+recovery armed is not optional — the fan-out stages a fired entry's
+`_sched/` cleanup into the same writeset, so returning early without
+re-arming commits that deletion and orphans the record, trading data loss
+for a row nothing will ever read.
+
+The OIDC keyset throws instead: absent means GENESIS there, so failing
 soft would mint a fresh key over the record it could not read and destroy
 every token derived from it.
 
@@ -256,12 +301,13 @@ what it does not implement. (The JS-owned records are the exception, and
 the note at the end of this section says so rather than implying otherwise.) Three properties are worth stating, because they are what the
 tests are actually for:
 
-- **Refusal, not interpretation.** No reader here dispatches to a second
-  implementation, and that is the deliberate posture, not a gap: pre-launch
-  there is no corpus to keep readable, so a version it does not know is
-  refused and the data is rewritten (`decisions.md` — no pre-launch
-  back-compat). The switch these fields buy is *fail loudly instead of
-  mis-reading*; a genuine two-version reader is a post-launch problem.
+- **Refusal for a frame, deferral for a record.** A message in flight can
+  be dropped — the sender retries — so the transport and the snapshot
+  stream refuse and say so. A durable record cannot: it IS the customer's
+  work, and refusing it has to mean "not now", never "not ever". The
+  markers defer and stay put. Neither is yet a genuine two-version
+  reader; migrating an older record on read is the remaining half, and it
+  is what a bump will need before one can land.
 - **Version before width.** A future value is usually a different length
   too, and checking length first reports a rolling upgrade as corruption —
   which sends an operator after a disk fault. The keyring, the JWT and the
@@ -280,10 +326,9 @@ shim-owned records in §1f have their readers' checks written but not
 exercised. Those readers are baked `__system/*` modules and packages, which
 the Zig unit-test harness cannot dispatch (it compiles inline source, not a
 deployment), so a refusal test needs a conformance case or a smoke. What IS
-covered today is the writer side — that the marker carries `v` — plus
-`record_version_lint.py`, which proves every file touching a namespace
-declares the constant. Neither proves the reader drops a record it cannot
-read.
+covered today is the writer side: one dispatcher test asserts a written
+marker actually carries `v`. Nothing proves a reader drops a record it
+cannot read.
 
 ## 2. Sensitivity tiers (drives the strategy)
 

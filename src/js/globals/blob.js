@@ -38,9 +38,8 @@ function _rejectRenamedBlob(verb, opts) {
 
 // `_blob/owed/{hash}` record version (`format-versioning.md` §1f).
 // Read by `__system/blob_onresult`, which ships in the worker binary
-// while this shim ships in the tenant's deployment. Declared per file —
-// see `scripts/ops/record_version_lint.py` for why the copies exist.
-const BLOB_OWED_V = 1;
+// while this shim ships in the tenant's deployment.
+const BLOB_OWED_V = __rove.formats.blobOwed;
 
 const BLOB_ORIGIN = "http://rove-blob.internal/";
 const COMPOSE_ORIGIN = "http://rove-compose.internal/";

@@ -94,14 +94,17 @@ pub const SERVICE_JWT_VERSION: u8 = 1;
 
 
 /// Record versions for the shim-owned JSON in the reserved `_` keyspace.
-/// These live in JavaScript — `globals/*.js`, the baked `__system/*`
-/// modules and the `@rewind/*` packages — so there is no Zig constant to
-/// reference and these are mirrored values, kept honest by
-/// `scripts/ops/record_version_lint.py` rather than by the compiler.
-/// Listed anyway: the registry's job is to make the whole surface
-/// auditable at a glance, and a format the dump omits reads as one with
-/// nothing to see (`docs/architecture/format-versioning.md` §1f).
-pub const SHIM_RECORD_VERSIONS: u8 = 1;
+/// The JavaScript that reads and writes them ships inside this binary and
+/// takes the numbers from `RecordVersions` in `src/js/globals.zig`, so this
+/// is a REFERENCE, not a mirror.
+///
+/// Two things it deliberately does not cover. The offline engines declare
+/// the same numbers in `src/replay/js/system_recorders.js` (no native
+/// bindings there) — pinned to the Zig side by a test, not by the type
+/// system. And the `@rewind/*` packages keep their own literal, because a
+/// package's record shape is pinned with the package in the tenant's
+/// lockfile (`docs/architecture/format-versioning.md` §1f).
+pub const SHIM_RECORD_VERSIONS: u8 = @intCast(rjs.globals.RecordVersions.sched);
 
 /// Write the whole registry as human-readable lines to `w`.
 pub fn dump(w: *std.Io.Writer) !void {

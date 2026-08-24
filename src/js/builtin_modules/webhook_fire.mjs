@@ -44,15 +44,18 @@ const WATCHDOG_MS = 40_000;
 const SCHED_TICK_NS = 1_000_000_000n;
 // `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
 // record shape is written from every module that arms a wake, so the
-// field is what stops one of them shipping a new shape that the tick
-// reads at the old one. An unknown `v` is treated exactly like an
-// unparseable record — this is a shim-writable namespace, so a value
-// this reader does not understand is as likely a customer's write as an
-// engine skew, and dropping the entry is the response both deserve.
-const SCHED_REC_V = 1;
+// field is what stops one of them shipping a new shape that another
+// reads at the old one.
+//
+// An unknown `v` is NOT treated like an unparseable record. Corrupt
+// bytes are unrecoverable, so dropping them loses nothing; a record
+// written by a newer build is recoverable by that build, and deleting
+// it would destroy durable customer work during an ordinary rolling
+// deploy. Readers defer such a record and leave both its rows alone.
+const SCHED_REC_V = __rove.formats.sched;
 
 // `_send/owed/{id}` marker version (`format-versioning.md` §1f).
-const SEND_OWED_V = 1;
+const SEND_OWED_V = __rove.formats.sendOwed;
 
 function schedByTimeKey(whenNs, id) {
     return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
@@ -103,13 +106,30 @@ export default function () {
         kv.delete(markerKey);
         return { status: 200 };
     }
-    // Same treatment for a version this build does not implement: the
-    // namespace is shim-writable, so an unknown `v` is as likely a
-    // customer's write as a newer engine, and firing a send described
-    // by fields we may be misreading is the one outcome worse than not
-    // firing it.
-    if (owed.v !== SEND_OWED_V) {
+    // A version this build does not implement is NOT the same as an
+    // unparseable marker, and the difference is the whole point of the
+    // field. Corrupt bytes are unrecoverable, so dropping them loses
+    // nothing. A version we do not know is recoverable BY A DIFFERENT
+    // BUILD — during a rolling upgrade the node beside this one may read
+    // it fine — so deleting it would destroy a customer's durable send
+    // on an ordinary deploy.
+    //
+    // Leave the marker, re-arm the watchdog, fire nothing. The re-arm is
+    // not optional: the fan-out already staged this entry's `_sched/`
+    // cleanup into THIS writeset, so returning without it commits the
+    // deletion and orphans the marker forever — trading data loss for a
+    // row nothing will ever look at again.
+    if (typeof owed.v !== "number") {
+        // Absent or non-numeric: pre-versioning or hand-written, not
+        // "newer than us". No future build reads it better — drop it,
+        // the same answer the unparseable branch above gives.
         kv.delete(markerKey);
+        return { status: 200 };
+    }
+    if (owed.v !== SEND_OWED_V) {
+        console.warn("webhook_fire: _send/owed/" + id + " is v" + owed.v +
+                     ", this build reads v" + SEND_OWED_V + " — deferred, not dropped");
+        schedArm(BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
         return { status: 200 };
     }
     if (typeof owed.url !== "string" || owed.url.length === 0) {

@@ -53,6 +53,13 @@ export function armBaked(target) {
     const sid = "hand-" + target.replace(/[^a-z_]/g, "");
     const when = String(BigInt(Date.now()) * 1_000_000n);
     kv.set("_sched/by_id/" + sid, JSON.stringify({
+        // The record version the tick switches on (RecordVersions.sched in
+        // src/js/globals.zig). This handler is a SECOND implementation of
+        // the record shape — the point of the smoke is that any handler can
+        // write one — so it has to carry `v` or the tick drops it as
+        // unversioned and this stops testing the bad-TARGET path it exists
+        // to test.
+        v: 1,
         when_ns: when,
         target: target,
         msg: { id: "probe", sid: sid },
