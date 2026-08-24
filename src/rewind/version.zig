@@ -80,6 +80,26 @@ pub const CERT_PACK_VERSION: u8 = 1;
 /// instead of mis-parsing it. Recorded here because a path IS the
 /// version for these, and an inventory that only counted embedded bytes
 /// would report them as unversioned.
+/// Packed node-address frame (`node/{cluster}/{id}` in the CP directory):
+/// `[u8 version][raft_addr\tcp_raft_addr\thttp_url]`. Canonical constant +
+/// tests live in `src/cp/directory.zig` (`NODE_ADDR_PACK_VERSION`), which the
+/// worker does not link — mirrored here for the audit dump, like the cert
+/// pack beside it.
+pub const NODE_ADDR_PACK_VERSION: u8 = 1;
+
+/// Key generation stamped into every sealed value, so a KEK rotation can
+/// roll without stranding stored bytes. Canonical: `src/keyring/seal.zig`.
+pub const SEAL_KEY_VERSION: u32 = rjs.keyring.seal.KEY_VERSION;
+
+/// The publish door's wire protocol. NEGOTIATED rather than fixed, which
+/// makes it the odd one here: a client sends `min(its own max, ours)` as `v`
+/// on every call, so the pair is the accepted RANGE rather than a single
+/// number. `MIN` moves only when support for an older shape is actually
+/// dropped — it strands a pinned self-hoster CLI on purpose.
+/// Canonical: `src/js/deploy_door.zig`.
+pub const DOOR_WIRE_VERSION_MIN: u32 = rjs.deploy_door.WIRE_VERSION_MIN;
+pub const DOOR_WIRE_VERSION_MAX: u32 = rjs.deploy_door.WIRE_VERSION_MAX;
+
 /// The customer's `<bundle>/rewind.lock`. Canonical constant + tests live
 /// in `src/cli/packages.zig` (`LOCKFILE_VERSION`), which this binary does
 /// not link — mirrored here for the audit dump.
@@ -121,6 +141,9 @@ pub fn dump(w: *std.Io.Writer) !void {
     try w.print("  coalesced_transport  v{d}\n", .{bridge.transport.FRAME_VERSION});
     try w.print("  snapshot_stream      v{d} (magic 0x{X:0>8})\n", .{ kv.snapshot_stream.STREAM_VERSION, kv.snapshot_stream.STREAM_MAGIC });
     try w.print("  cert_pack            v{d} (src/cp/directory.zig)\n", .{CERT_PACK_VERSION});
+    try w.print("  node_addr_pack       v{d} (src/cp/directory.zig)\n", .{NODE_ADDR_PACK_VERSION});
+    try w.print("  seal_key             v{d}\n", .{SEAL_KEY_VERSION});
+    try w.print("  deploy_door_wire     v{d}..v{d} (negotiated)\n", .{ DOOR_WIRE_VERSION_MIN, DOOR_WIRE_VERSION_MAX });
     try w.print("  keyring_kv_value     v{d} (_keys/bind|dead|minted|next_slot)\n", .{KEYRING_VALUE_VERSION});
     try w.print("  shim_kv_records      v{d} (_send/owed,_blob/owed,_dispatch/owed,_sched/by_id,_export,_oidc,_rp,_seg) — JS-owned\n", .{SHIM_RECORD_VERSIONS});
     try w.print("  service_jwt          v{d}\n", .{SERVICE_JWT_VERSION});
@@ -164,6 +187,12 @@ test "registry dump renders all format lines without error" {
     // are mirrored values rather than imported constants, which is
     // exactly why leaving them out of the dump would be the easy mistake.
     try std.testing.expect(std.mem.indexOf(u8, out, "shim_kv_records      v1") != null);
+    // The three that were declared but unregistered until the registry was
+    // diffed against the tree's `*_VERSION` constants. A hand-maintained
+    // inventory falls behind; this is what that looks like.
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_addr_pack       v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "seal_key             v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "deploy_door_wire     v1..v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "snapshot_sink        /_system/v2-snapshot-stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "deployment_objects") != null);
 }

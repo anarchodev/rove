@@ -60,8 +60,15 @@ versioned does not thereby inherit that version: if the value outlives the
 frame that produced it, the reader has nothing to dispatch on. §1f is where
 that distinction decides most of the rows.
 
-Every table below carries the **Class** column. The tally across all 55
-rows: **23 versioned · 8 inherits · 17 by-decision · 0 gap · 7 unwritten.**
+Every table below carries the **Class** column. The tally across all 58
+rows: **26 versioned · 8 inherits · 17 by-decision · 0 gap · 7 unwritten.**
+
+Three of those rows were added after the fact, and how they were found is
+the useful part: diffing the tree's `*_VERSION` constants against what
+`rewind --version` dumps. The sealed value, the packed node address and the
+publish door's negotiated wire all carried versions and appeared in neither
+the registry nor this table. A hand-maintained inventory falls behind — the
+registry is the thing a lint can check (#242).
 
 No gaps remain. The last two were the rows read by something NOT upgraded
 in lockstep with their writer, and they closed differently because that
@@ -95,6 +102,7 @@ nothing to see.
 | Envelope codec header | `src/consensus/envelope.zig`; lib copy `src/kv/envelope_codec.zig` | `[1B type][2B id_len BE][id][payload]`; types 0=writeset,1=multi,2=root_writeset (3–11 retired, rejected loud) | type enum | **versioned** — the type byte IS the discriminant (registry `envelope_codec`); a retired or unknown type is rejected loudly, which is what makes a stale log entry surface instead of mis-applying | A |
 | Writeset payload (type 0) | `src/kv/writeset.zig`; readset framing `src/js/apply.zig` | `[u32 BE op_count]·[op][klen][k][vlen][v]…` then `[u32 ws_len][ws][u32 rs_len][rs]` | none | **inherits** ← the envelope type byte (0). The frame is recoverable at read time by construction: the type precedes the payload in the same entry, and no payload is ever read without it | A |
 | Multi payload (type 1) | `src/kv/envelope_codec.zig` | `[u8 count]·[u32 LE inner_len][inner_envelope]…` | none | **inherits** ← the envelope type byte (1); same argument | A |
+| Sealed customer value | `src/keyring/seal.zig` (`SEAL_MARKER`, `KEY_VERSION`), envelope `src/crypt/root.zig` | `[1B 0xFF marker][1B alg_id][4B key_version LE][8B key_ref][12B nonce][ciphertext][16B tag]` | **yes — two of them** | **versioned** — and the only row carrying TWO independent numbers, correctly: `alg_id` versions the construction and `key_version` the key generation, so a KEK rotation rolls one without touching the other. Rides inside a writeset, so every replica reads it | A |
 | Snapshot baseline (index/term/ConfState) | raft-rs opaque; installed `src/consensus/node.zig` | `{index u64, term u64, conf_state{voters,learners}}` | raft-rs internal | **inherits** ← the `raft-rs-zig` pin in `build.zig.zon`. A dependency pin is a legitimate frame, but a weaker one than a byte on the wire: it is recoverable from the BUILD, not from the data, so it only holds while every node reading a WAL was built from the same pin | C |
 
 ### 1b. On-wire ephemeral (cross-node / inter-binary)
@@ -106,6 +114,7 @@ nothing to see.
 | Snapshot stream wire | `src/kv/snapshot_stream.zig` (`STREAM_VERSION`) | `[u32 LE MAGIC "MGS2"][u8 ver=1][u64 store_id]·[u16 klen][u32 vlen][k][v]…` | **yes (v1)** | **versioned** (registry `snapshot_stream`); an unknown version is `UnsupportedStreamVersion` | B |
 | Snapshot sink endpoint | `src/js/snapshot_sink.zig` + `POST /_system/v2-snapshot-stream` | headers `{mode,tenant,index,term,move-secret}` + stream body | path `v2-` | **versioned** — in HTTP's own idiom, the version is a path segment: a new shape is a new path, and an old peer 404s instead of mis-parsing | B |
 | Worker→log-server push | `src/js/worker_log.zig` (`POST /v1/_internal/batch-pushed`) | newline-delimited S3 keys, Bearer JWT | path `/v1/` | **versioned** — same path-segment idiom | B |
+| Publish-door wire | `src/js/deploy_door.zig` (`WIRE_VERSION_MIN`/`MAX`) | `v` on every call to `/_system/deploy` and its sub-routes | **yes — a negotiated RANGE** | **versioned**, and the only NEGOTIATED one here: the client sends `min(its own max, ours)`, so the pair is what this build accepts rather than what it writes. `MIN` moves only when support for an older shape is actually dropped — it strands a pinned self-hoster's CLI on purpose, which is the honest way to do it | B |
 | Front↔worker proxy (h2c) | `src/front/proxy.zig` | RFC 7540/8441 h2c; headers | n/a (HTTP) | **by-decision** — the format is an RFC, versioned by its own negotiation. Not ours to version, and adding a field would be inventing a dialect | B |
 
 ### 1c. S3 objects (content-addressed or batched)
@@ -277,6 +286,7 @@ Source: `src/cp/directory.zig`.
 | `placement/{tenant}` | bare `{cluster_id}` | none | **by-decision** — wipe-on-change, and that is not a hope: this value has ALREADY changed shape once, from `{state}:{cluster}` to a bare id, and the wipe is how it was done | domain of one identifier |
 | `plan/{tenant}` | JSON `{tier, overrides{…}}` | none | **by-decision** — additive by construction (`ignore_unknown_fields`), and a blob the parser cannot read resolves to the tenant's DEFAULT rather than failing the request: free for a customer, platform for a reserved id. A format that fails toward a safe answer does not need a version to fail safely | CP dumb, DP parses (`src/plan/root.zig` `parseBlob`) |
 | `host/{host}` | `{tenant_id}` | none | **by-decision** — a single identifier; a richer value would be a different key | domain index |
+| `node/{cluster}/{id}` | **packed** `[u8 v=1][raft_addr \t cp_raft_addr \t http_url]` (`directory.zig` `packNodeAddr`/`NODE_ADDR_PACK_VERSION`) | **yes (v1)** | **versioned** — the counter-example to `cluster/{id}` two rows up. Same directory, same rolling-upgrade readers, but this value was introduced already packed, so the leading byte was free; `cluster/{id}`'s was not, and that is the whole difference between the two rows | node-address registry |
 | `cert/{host}` | **packed binary** `[u8 v=1][u32 BE cert_len][cert_pem][key_pem]` (`directory.zig` `packCert`/`CERT_PACK_VERSION`) | **yes (v1)** | **versioned** (registry `cert_pack`) — the packed-binary KV idiom `_keys/*` now follows | front-door mirror in `front/main.zig` |
 
 ### 1h. Tokens / credentials
