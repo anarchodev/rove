@@ -18,6 +18,12 @@ Gates (essential behavior, unchanged from V1):
      fires it (the per-tenant-group durable _sched state survives + the new
      leader's promotion sweep reconstructs next_wake_ns). nodes=3.
   C. Fail-loud cap — a >16 KiB msg trips SCHED_MAX_MSG_BYTES → 500.
+  D. Deferral preserves — a `_sched/by_id/` record at a version this build does
+     not read is DEFERRED: not fired, and neither the record nor its by_time
+     index entry is deleted, so the build that understands it still fires it.
+     `format-versioning.md` names these readers' checks as written-but-
+     unexercised (the Zig harness cannot dispatch a baked `__system/*` module),
+     so this is the lane that can cover one.
 
 V2 specifics (vs V1): plaintext h2c (no TLS/cacert); no V1 discover_leader —
 multi-node uses V2Cluster.leader_node/stop_node + request_retry. Side-effect
@@ -47,10 +53,33 @@ def _src(rel: str) -> str:
     return (DEMO / rel).read_text()
 
 
+SEED_FUTURE_VERSION = """
+// Arm a REAL wake, then rewrite its record at a version this build cannot
+// read. Arming through `schedule()` is load-bearing: it is what lowers the
+// engine's next-wake watermark, and a hand-written `_sched/` pair does NOT —
+// so a hand-seeded row is never swept, and a test built on one passes
+// whatever the tick does. (Learned the hard way: the first version of this
+// gate hand-wrote both rows and stayed green against the destructive code.)
+//
+// The rewrite rides the SAME activation, so it commits in one writeset with
+// the arm — the tick can never observe the v1 record.
+import schedule from "@rewind/schedule";
+export default () => {
+    const id = schedule({ in: 4000 }, "schedtarget", { tag: "futurev" });
+    const byId = "_sched/by_id/" + id;
+    const rec = JSON.parse(kv.get(byId));
+    rec.v = 99;
+    kv.set(byId, JSON.stringify(rec));
+    const byTime = "_sched/by_time/" + String(rec.when_ns).padStart(20, "0") + "/" + id;
+    return JSON.stringify({ id: id, by_id: byId, by_time: byTime });
+};
+"""
+
 # Handler JS reused verbatim from the V1 demo tenant.
 HANDLERS = {
     "schedfire/index.mjs": _src("schedfire/index.mjs"),
     "schedtarget.mjs": _src("schedtarget.mjs"),
+    "seedfuturev/index.mjs": SEED_FUTURE_VERSION,
 }
 
 
@@ -158,6 +187,52 @@ def main() -> int:
         r = c.request_retry("acme", "/schedfire?big=20000", want_status=500)
         check("Gate C: >16 KiB msg → 500 (fail-loud)", r.status == 500,
               f"got {r.status}: {r.body!r}")
+
+        # ── Gate D: a record this build cannot read is DEFERRED ───────
+        # `format-versioning.md` calls the refusal posture deliberate, and it
+        # is — but refusal must not mean DELETION, or the two-version reader
+        # that section defers to post-launch has nothing left to upconvert.
+        # The doc names this as untested ("readers' checks written but not
+        # exercised"), because the Zig harness cannot dispatch a baked
+        # `__system/*` module. A smoke can.
+        print("step 2b: a v99 _sched record is de-indexed but PRESERVED")
+        fires_before = _kv_int(c, "sched-fire-count") or 0
+        r = c.request_retry("acme", "/seedfuturev?tag=d1", want_status=200)
+        check("Gate D: seeded a v99 _sched record", r.status == 200,
+              f"got {r.status}: {r.body!r}")
+        if r.status == 200:
+            seeded = json.loads(r.body)
+            # Past the due time, plus a sweep. The tick is leader-gated and
+            # throttled, so give it the same generous window Gate A uses.
+            # Give the tick several sweeps to see the row and decline it.
+            deadline = time.time() + 25.0
+            while time.time() < deadline:
+                rec = c.admin_kv_get("acme", seeded["by_id"])
+                if rec.status == 404:
+                    break  # destroyed — the failure this gate exists to catch
+                time.sleep(1.0)
+            # The RECORD survives — this is the whole point.
+            rr = c.admin_kv_get("acme", seeded["by_id"])
+            check("Gate D: the v99 record is deferred, not deleted",
+                  rr.status == 200 and '"v":99' in rr.body.replace(" ", ""),
+                  f"status={rr.status} body={rr.body!r}")
+            # The INDEX survives too, and that is the half that makes
+            # preservation mean something. Nothing in the tree reconstructs a
+            # by_time entry — every writer is an arm path, and both the steady
+            # sweep and the promotion pass enumerate by_time — so a de-indexed
+            # row would be bytes that can never fire again, invisible to the
+            # tick and to leadership recovery while still listed by
+            # `schedule.list()`. Left indexed, it fires as soon as a build that
+            # reads its version runs.
+            idx = c.admin_kv_get("acme", seeded["by_time"])
+            check("Gate D: the by_time index is PRESERVED (still recoverable)",
+                  idx.status == 200,
+                  f"index gone (status={idx.status}) — the wake can never fire again")
+            # And it never fired.
+            fires_after = _kv_int(c, "sched-fire-count") or 0
+            check("Gate D: the unreadable wake did NOT fire",
+                  fires_after == fires_before,
+                  f"fire-count {fires_before} → {fires_after}")
 
         # ── Gate B: failover survival ─────────────────────────────────
         print("step 3: schedule a wake, kill the leader before it fires, "
