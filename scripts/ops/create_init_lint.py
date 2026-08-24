@@ -23,8 +23,7 @@ whole-value assignment —
 comptime-generated field set) carries its own compile-time completeness
 guard and an allowlist entry HERE naming that guard.
 
-Standalone, like its siblings `doc_pointer_lint.py` / `spdx_lint.py` /
-`test_reachability_lint.py` — no general lint CI; run by hand or pre-commit.
+Run by `zig build test`, with its siblings in `scripts/ops/*_lint.py`.
 """
 
 from __future__ import annotations

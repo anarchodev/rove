@@ -29,8 +29,7 @@ is `TenantStorage.s3ObjectPath`/`keyPrefix`, or a new method on the handle.
 
 Exit 0 = clean, 1 = hand-built prefix found.
 
-Sibling to `test_reachability_lint.py`; run standalone (there is no general
-CI workflow yet — only `release-rewind.yml`).
+Run by `zig build test`, with its siblings in `scripts/ops/*_lint.py`.
 """
 from __future__ import annotations
 

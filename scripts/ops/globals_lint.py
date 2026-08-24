@@ -45,6 +45,24 @@ SCAN_ROOTS = [
 ]
 SKIP_DIR_PARTS = {"node_modules", ".git"}
 
+# A GENERATED file in a scan root is the engine's own shims, shipped there —
+# `arena-prelude.js` and `arena-system-modules.js` ARE `src/js/globals/*.js`
+# and the baked `__system/*` modules, composed for the offline runtimes. They
+# reference `_system.*` because they are the legitimate referrers this lint
+# exempts at their source path; it just never knew their generated one.
+#
+# Detected by banner rather than by a path list, so the next generated mirror
+# is covered without anyone remembering to add it — a hardcoded list is how
+# this went red in the first place.
+GENERATED_RE = re.compile(r"^//\s*GENERATED\b", re.M)
+
+# `_system.` inside a STRING is data, not a reference: `web/registry`'s
+# publish test posts `"const p = _system.kv;"` as a rejected-input probe, and
+# flagging it would mean the lint fires on code proving the rule holds.
+# Template literals are not stripped — a real reference inside one would be
+# missed, which is the safer direction for a lint that must not cry wolf.
+STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
+
 # `_system` used as a namespace member access (`_system.kv`), not
 # preceded by `/` (HTTP path) or a word char (e.g. `my_system`).
 REF_RE = re.compile(r"(?<![\w/])_system\s*\.")
@@ -70,11 +88,13 @@ def main() -> int:
             text = path.read_text(errors="replace")
             if LOCAL_DECL_RE.search(text):
                 continue  # local `_system` stand-in (bench tenants)
+            if GENERATED_RE.search(text[:4096]):
+                continue  # the engine's own shims, shipped here
             rel = path.relative_to(REPO)
             for n, line in enumerate(text.splitlines(), 1):
                 if _is_comment(line):
                     continue
-                if REF_RE.search(line):
+                if REF_RE.search(STRING_RE.sub('""', line)):
                     violations.append(f"{rel}:{n}: {line.strip()}")
 
     if violations:

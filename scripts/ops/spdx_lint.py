@@ -8,7 +8,8 @@ which matters for a repo whose pitch is "read it, fork it". The root
 Run with `--fix` to stamp anything missing; with no arguments it lints and
 exits non-zero if any file lacks a header. Standalone, like its siblings
 `doc_pointer_lint.py` and `test_reachability_lint.py` — there is no general
-lint CI, so this is run by hand or from a pre-commit hook.
+lint CI, so `zig build test` runs this with its siblings in
+`scripts/ops/*_lint.py`.
 
 Two trees are deliberately EXCLUDED, and the exclusions are the interesting
 part of this file:

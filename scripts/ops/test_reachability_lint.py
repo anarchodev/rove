@@ -16,8 +16,7 @@ which nobody does by habit. So the build has to say it instead.
 
 Exit 0 = every test file is reachable, 1 = orphaned test file(s) found.
 
-Sibling to `doc_pointer_lint.py`; run standalone (there is no general CI
-workflow yet — only `release-rewind.yml`).
+Run by `zig build test`, with its siblings in `scripts/ops/*_lint.py`.
 """
 from __future__ import annotations
 
