@@ -533,8 +533,14 @@ pub const BlobCoordinator = struct {
     /// Per-worker high water mark — every submission on this
     /// worker's queue with `seq < return value` is durable (or
     /// terminally failed; check `bodyRef(seq)` to distinguish).
-    pub fn durableSeq(self: *Self, queue: QueueId) u64 {
-        std.debug.assert(queue.index() < self.config.worker_count);
+    pub fn durableSeq(self: *Self, queue: QueueId) Error!u64 {
+        // Carries the error rather than asserting: a bare `std.debug.assert`
+        // is not a guard, because ReleaseFast removes it AND the implicit
+        // bounds check, leaving a read past `workers`. Returning `0` would
+        // also be safe (the module header defines it as "nothing durable")
+        // but would let a miscounted worker slot look like a slow upload
+        // forever, which is the hard bug to find.
+        if (queue.index() >= self.config.worker_count) return Error.InvalidWorkerId;
         return self.workers[queue.index()].durable_seq.load(.acquire);
     }
 
@@ -544,7 +550,7 @@ pub const BlobCoordinator = struct {
     /// terminally failed, error.UnknownSeq if the seq was never
     /// submitted (caller bug — either misuse or seq out of range).
     pub fn bodyRef(self: *Self, queue: QueueId, seq: u64) Error!BodyRef {
-        std.debug.assert(queue.index() < self.config.worker_count);
+        if (queue.index() >= self.config.worker_count) return Error.InvalidWorkerId;
         const w = &self.workers[queue.index()];
         w.mu.lock();
         defer w.mu.unlock();
@@ -573,7 +579,7 @@ pub const BlobCoordinator = struct {
         seq: u64,
         allocator: std.mem.Allocator,
     ) Error![]u8 {
-        std.debug.assert(queue.index() < self.config.worker_count);
+        if (queue.index() >= self.config.worker_count) return Error.InvalidWorkerId;
         const w = &self.workers[queue.index()];
         w.mu.lock();
         defer w.mu.unlock();
@@ -668,7 +674,7 @@ pub const BlobCoordinator = struct {
         target_exclusive: u64,
         timeout_ns: u64,
     ) !void {
-        std.debug.assert(queue.index() < self.config.worker_count);
+        if (queue.index() >= self.config.worker_count) return Error.InvalidWorkerId;
         const w = &self.workers[queue.index()];
         const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
         w.mu.lock();
@@ -1213,7 +1219,7 @@ test "coordinator: submit advances durable_seq when batch commits" {
     try testing.expectEqual(@as(u64, 0), seq);
 
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 1), try coord.durableSeq(qid(0)));
 
     const ref = try coord.bodyRef(qid(0), 0);
     try testing.expectEqual(@as(u32, 11), ref.len);
@@ -1344,11 +1350,11 @@ test "coordinator: HWM is monotonic across in-flight + queued seqs" {
     _ = try coord.submit(qid(0), T_A, "CCCC");
 
     // Mid-flight: HWM is still 0 (seq 0 not committed yet).
-    try testing.expectEqual(@as(u64, 0), coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 0), try coord.durableSeq(qid(0)));
 
     // After all batches commit, HWM jumps to 3.
     try coord.waitForSeq(qid(0), 3, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 3), coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 3), try coord.durableSeq(qid(0)));
 }
 
 test "coordinator: rejects oversized submit" {
@@ -1403,7 +1409,7 @@ test "coordinator: terminal failure stalls durable_seq + bodyRef returns PutFail
         std.Thread.sleep(1 * std.time.ns_per_ms);
     } else return error.TestTimeout;
 
-    try testing.expectEqual(@as(u64, 0), coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 0), try coord.durableSeq(qid(0)));
     try testing.expectError(Error.PutFailed, coord.bodyRef(qid(0), 0));
 }
 
@@ -1491,7 +1497,7 @@ test "coordinator: release frees retained batch when fully consumed" {
     // later retry after it becomes durable succeeds.
     const s2 = try coord.submit(qid(0), T_A, "delta");
     // Before durability the ref isn't set → release defers.
-    if (coord.durableSeq(qid(0)) <= s2) try testing.expect(!coord.release(qid(0), s2));
+    if (try coord.durableSeq(qid(0)) <= s2) try testing.expect(!coord.release(qid(0), s2));
     try coord.waitForSeq(qid(0), s2 + 1, 5 * std.time.ns_per_s);
     try testing.expect(coord.release(qid(0), s2));
 }
@@ -1512,9 +1518,9 @@ test "coordinator: per-worker HWMs are independent" {
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
     try coord.waitForSeq(qid(1), 1, 5 * std.time.ns_per_s);
     try coord.waitForSeq(qid(2), 1, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(1)));
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(2)));
+    try testing.expectEqual(@as(u64, 1), try coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 1), try coord.durableSeq(qid(1)));
+    try testing.expectEqual(@as(u64, 1), try coord.durableSeq(qid(2)));
 }
 
 test "coordinator: retries SlowDown then succeeds" {
@@ -1537,7 +1543,7 @@ test "coordinator: retries SlowDown then succeeds" {
     _ = try coord.submit(qid(0), T_A, "persistent");
 
     try coord.waitForSeq(qid(0), 1, 5 * std.time.ns_per_s);
-    try testing.expectEqual(@as(u64, 1), coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 1), try coord.durableSeq(qid(0)));
     _ = try coord.bodyRef(qid(0), 0); // .durable, no error
     try testing.expectEqual(@as(u32, 4), store.put_attempts.load(.monotonic));
 }
@@ -1569,7 +1575,7 @@ test "coordinator: retry budget exhausted → terminal PutFailed" {
         std.Thread.sleep(1 * std.time.ns_per_ms);
     } else return error.TestTimeout;
 
-    try testing.expectEqual(@as(u64, 0), coord.durableSeq(qid(0)));
+    try testing.expectEqual(@as(u64, 0), try coord.durableSeq(qid(0)));
     try testing.expectEqual(@as(u32, 5), store.put_attempts.load(.monotonic));
 }
 
@@ -1699,8 +1705,8 @@ test "coordinator: cross-tenant pool — different workers share one batch" {
     // resolve durably without collision and reference valid bytes.
     _ = ref0;
     _ = ref1;
-    try testing.expect(coord.durableSeq(qid(0)) == 1);
-    try testing.expect(coord.durableSeq(qid(1)) == 1);
+    try testing.expect(try coord.durableSeq(qid(0)) == 1);
+    try testing.expect(try coord.durableSeq(qid(1)) == 1);
 }
 
 test "coordinator: executor_size knob bounds concurrency" {
@@ -1761,4 +1767,24 @@ test "coordinator: PUTs the LEAF — its store is already scoped to the pool" {
     var key_buf: [pool_object.KEY_LEN]u8 = undefined;
     const door_key = ref.key(&key_buf);
     try testing.expectEqualStrings(door_key[pool_object.PREFIX.len..], stored_key);
+}
+
+test "worker-index bounds fail closed, not by assert" {
+    // The guard has to hold in ReleaseFast, where `std.debug.assert` and the
+    // implicit bounds check are both removed. Adding a worker thread (the
+    // private deploy listener) is what makes an out-of-range index reachable
+    // at all, so this pins the behaviour rather than the assertion.
+    var store = TestStore.init(testing.allocator);
+    defer store.deinit();
+
+    const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
+        .worker_count = 1,
+        .executor_size = 2,
+    });
+    defer coord.deinit();
+
+    const beyond = qid(1); // worker_count is 1, so index 1 is one past the end.
+    try testing.expectError(Error.InvalidWorkerId, coord.bodyRef(beyond, 0));
+    try testing.expectError(Error.InvalidWorkerId, coord.submit(beyond, T_A, "x"));
+    try testing.expectError(Error.InvalidWorkerId, coord.durableSeq(beyond));
 }

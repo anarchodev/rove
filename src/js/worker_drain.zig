@@ -2761,7 +2761,13 @@ fn pollDurableBodyRef(
 ) DurableBody {
     // Count semantics: durableSeq is the exclusive HWM (lowest
     // not-yet-durable seq), so `seq < durableSeq` ⇒ resolved.
-    if (seq >= coord.durableSeq(queue_id)) return .not_yet;
+    // `durableSeq` rejects a queue id past `worker_count`. Unreachable here —
+    // this id came from a `submit` that already validated it — and `.not_yet`
+    // is the conservative answer either way: the caller re-polls. A miscounted
+    // worker slot surfaces at startup, where it can be read, not as a body
+    // that never resolves.
+    const hwm = coord.durableSeq(queue_id) catch return .not_yet;
+    if (seq >= hwm) return .not_yet;
     const ref = coord.bodyRef(queue_id, seq) catch |err| {
         std.log.warn(
             "rove-js {s}: coord.bodyRef tenant={s} seq={d}: {s}",

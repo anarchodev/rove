@@ -146,6 +146,7 @@ const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
 const spool_registry = @import("spool_registry.zig");
 const effect_mod = @import("effect/root.zig");
+const deploy_door = @import("deploy_door.zig");
 const globals = @import("globals.zig");
 const raft_propose = @import("raft_propose.zig");
 const config_mirror = @import("config_mirror.zig");
@@ -1287,6 +1288,14 @@ pub const WorkerConfig = struct {
     raft: *Bridge,
     /// Listen address passed through to rove-io.
     addr: std.net.Address,
+    /// Which plane this worker's listener serves. `.public` is the shared
+    /// `0.0.0.0` serving socket every worker thread binds with SO_REUSEPORT;
+    /// `.private` is a loopback-bound listener the OS keeps local, which is
+    /// what lets the publish door accept the platform-wide root bearer on it
+    /// and refuse the same credential on the public one. Defaults to `.public`
+    /// so a caller that has not thought about it cannot accidentally create a
+    /// privileged listener.
+    plane: deploy_door.Plane = .public,
     /// rove-io options (ring size, buffer pool). Defaults are sensible.
     io_opts: rio.IoOptions = .{},
     /// rove-h2 options (window sizes, limits).
@@ -1827,6 +1836,11 @@ pub fn Worker(comptime opts: Options) type {
         /// exhausted.
         limiter: limiter_mod.RateLimiter,
         commit_wait_timeout_ns: u64,
+        /// Borrowed from `WorkerConfig.plane`. Read by the publish door's
+        /// credential gate; a listener's plane is fixed for the life of the
+        /// process, so this is a property of the worker rather than of a
+        /// request.
+        plane: deploy_door.Plane,
         /// Borrowed from `WorkerConfig.admin_origin`. See the config
         /// field for semantics. Null when CORS is disabled.
         admin_origin: ?[]const u8,
@@ -1955,6 +1969,7 @@ pub fn Worker(comptime opts: Options) type {
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
+                .plane = config.plane,
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
                 .data_dir = config.data_dir,

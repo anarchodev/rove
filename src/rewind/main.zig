@@ -31,6 +31,9 @@ const jwt = @import("rove-jwt");
 const bridge_mod = @import("bridge");
 const kv = @import("raft-kv");
 const h2_mod = @import("rove-h2");
+/// rove-io reached through rove-js, which already depends on it — the worker
+/// binary needs only the `IoOptions` type, not a direct module edge.
+const rio = rjs.io;
 const blob_mod = @import("rove-blob");
 const tenant_mod = @import("rove-tenant");
 const qjs = @import("rove-qjs");
@@ -90,10 +93,56 @@ const QjsCompiler = struct {
 };
 
 // ── Worker thread ─────────────────────────────────────────────────────
+/// rove-io options for a public serving thread. `buf_count * buf_size` is
+/// allocated up front, so this is ~67 MB of recv buffers per thread — the cost
+/// of serving at full rate.
+const PUBLIC_IO_OPTS: rio.IoOptions = .{
+    .max_connections = 4096,
+    .buf_count = 4096,
+    .buf_size = 16384,
+    .listen_backlog = 4096,
+    .reuseport = true,
+};
+
+/// rove-io options for the private loopback listener. Deliberately ~64× smaller
+/// than `PUBLIC_IO_OPTS`: the buffer pool is allocated eagerly, so copying the
+/// serving profile would add ~67 MB of resident memory per node for a socket
+/// that carries a deploy every few minutes. `reuseport` is off because exactly
+/// one thread binds this address.
+///
+/// The trade this makes explicit: the private plane cannot absorb a large
+/// parallel blob upload the way the public one can. That is the right shape for
+/// a break-glass and bootstrap path, and it is a choice rather than an
+/// inheritance.
+const PRIVATE_IO_OPTS: rio.IoOptions = .{
+    .max_connections = 64,
+    .buf_count = 256,
+    .buf_size = 16384,
+    .listen_backlog = 64,
+    .reuseport = false,
+};
+
+/// Default port for the private loopback deploy listener. Adjacent to the
+/// metrics range (9110-9113) because it is the same kind of surface: bound to
+/// 127.0.0.1, restricted by the OS rather than by a credential check.
+/// `REWIND_DEPLOY_PRIVATE_PORT=0` disables it, which also removes the only way
+/// to present the root bearer to the publish door.
+const DEPLOY_PRIVATE_PORT: u16 = 9120;
+
 const WorkerCtx = struct {
     allocator: std.mem.Allocator,
     worker_idx: u16,
     http_addr: std.net.Address,
+    /// Which plane this thread's listener serves. Exactly one thread may be
+    /// `.private` — the loopback-bound listener the publish door accepts the
+    /// root bearer on. Everything else shares the public SO_REUSEPORT socket.
+    plane: rjs.deploy_door.Plane = .public,
+    /// rove-io options for this thread's ring. The private listener takes a
+    /// much smaller buffer pool than a serving thread — see `PRIVATE_IO_OPTS`.
+    io_opts: rio.IoOptions,
+    /// Set by the thread if it died instead of reaching `ready`. Read once,
+    /// after the startup barrier.
+    failed: std.atomic.Value(bool) = .{ .raw = false },
     raft: *Bridge,
     node: *rjs.NodeState,
     log_batch_store: log_server.batch_store.BatchStore,
@@ -282,6 +331,14 @@ fn runPromotionHook(worker: anytype, last_sweep_gen: *u64) void {
 fn workerThreadEntry(args: *WorkerCtx) void {
     workerMain(args) catch |err| {
         std.log.err("rewind worker {d} exited: {s}", .{ args.worker_idx, @errorName(err) });
+        args.failed.store(true, .release);
+        // Release the startup barrier even on failure. The parent waits on
+        // every worker's `ready`, so a thread that dies before signalling —
+        // a port already bound is the ordinary way — would otherwise hang the
+        // process at startup with no output after the last worker's line.
+        // Signalling lets the parent decide: a public worker is fatal, the
+        // private listener is optional.
+        args.ready.set();
     };
 }
 
@@ -301,13 +358,8 @@ fn workerMain(args: *WorkerCtx) !void {
         .node = args.node,
         .raft = args.raft,
         .addr = args.http_addr,
-        .io_opts = .{
-            .max_connections = 4096,
-            .buf_count = 4096,
-            .buf_size = 16384,
-            .listen_backlog = 4096,
-            .reuseport = true,
-        },
+        .plane = args.plane,
+        .io_opts = args.io_opts,
         .h2_opts = .{
             .max_concurrent_streams = 512,
             .initial_window_size = 1024 * 1024,
@@ -404,7 +456,13 @@ fn workerMain(args: *WorkerCtx) !void {
     // pushes (`/_system/v2-snapshot-push` → `armSnapshotPush` enqueues here).
     worker.snapshot_push_driver = catchup;
 
-    std.log.info("rewind worker {d}: ready (SO_REUSEPORT)", .{args.worker_idx});
+    std.log.info("rewind worker {d}: ready ({s})", .{
+        args.worker_idx,
+        switch (args.plane) {
+            .public => "SO_REUSEPORT",
+            .private => "loopback, private plane",
+        },
+    });
     args.ready.set();
 
     var blocked_tenants: rjs.BlockedTenants = .{};
@@ -1065,11 +1123,43 @@ pub fn main() !void {
     // coordinator queues) allocate one slot per worker and a worker's slot
     // index is its routing identity for the life of the process
     // (`msg_router.zig`).
-    const worker_count = boot.parseWorkerCountEnv("REWIND_WORKERS", 1);
-    try node_state.startProxyEngine(worker_count);
-    try node_state.blob_coord.start(@intCast(worker_count));
+    // The private loopback listener occupies a worker slot like any other
+    // thread, so it comes out of the SAME budget rather than being added on top
+    // of it. `MinterId` partitions request ids as 8 bits node + 8 bits worker
+    // and hard-errors past index 255, and the per-worker-sized subsystems take
+    // a `u8` count — so `public + private` is what must fit, not `public`.
+    //
+    // When the budget is already full, the public count gives up the slot. A
+    // node with 254 serving threads instead of 255 is a non-event; a node that
+    // silently lost its break-glass listener is an operator debugging a
+    // rejected root token at the worst possible moment.
+    const private_port = boot.parsePortEnv("REWIND_DEPLOY_PRIVATE_PORT", DEPLOY_PRIVATE_PORT);
+    const want_private = private_port != 0;
+    const requested_workers = boot.parseWorkerCountEnv("REWIND_WORKERS", 1);
+    const worker_count = if (want_private and requested_workers >= boot.MAX_WORKERS) blk: {
+        std.log.warn(
+            "REWIND_WORKERS={d} leaves no slot for the private deploy listener; " ++
+                "serving with {d} worker(s) so the loopback listener keeps its slot",
+            .{ requested_workers, boot.MAX_WORKERS - 1 },
+        );
+        break :blk boot.MAX_WORKERS - 1;
+    } else requested_workers;
+
+    // One slot per thread, private included. Sizing these from `worker_count`
+    // alone would leave the private worker indexing one past the end of both
+    // arrays: the proxy inboxes bounds-check and would silently DROP its
+    // results, and `blob_coord`'s `durableSeq` / `bodyRef` guard only with
+    // `std.debug.assert`, which ReleaseFast removes — an out-of-bounds read in
+    // the build production runs.
+    const total_workers = worker_count + @intFromBool(want_private);
+    try node_state.startProxyEngine(total_workers);
+    try node_state.blob_coord.start(@intCast(total_workers));
 
     const addr = try std.net.Address.parseIp("0.0.0.0", port);
+    // Loopback by construction: the OS, not a header or a peer-address
+    // heuristic, is what makes this plane private. The publish door accepts the
+    // platform-wide root bearer only on a request that arrived here.
+    const private_addr = try std.net.Address.parseIp("127.0.0.1", private_port);
 
     // Dedicated loopback HTTP/1.1 operator-metrics listener — separate from the
     // h2c data port (:8443) so stock Prometheus/Alloy can scrape it (they can't
@@ -1080,19 +1170,23 @@ pub fn main() !void {
         boot.metricsFromEnv(allocator, "REWIND_METRICS_PORT", boot.METRICS_PORT_WORKER, "rewind");
     defer if (metrics_srv) |m| m.deinit();
 
-    const readies = try allocator.alloc(std.Thread.ResetEvent, worker_count);
+    const readies = try allocator.alloc(std.Thread.ResetEvent, total_workers);
     defer allocator.free(readies);
     for (readies) |*ev| ev.* = .{};
-    const ctxs = try allocator.alloc(WorkerCtx, worker_count);
+    const ctxs = try allocator.alloc(WorkerCtx, total_workers);
     defer allocator.free(ctxs);
-    const threads = try allocator.alloc(std.Thread, worker_count);
+    const threads = try allocator.alloc(std.Thread, total_workers);
     defer allocator.free(threads);
 
     for (ctxs, threads, readies, 0..) |*ctx, *th, *ready, i| {
         ctx.* = .{
             .allocator = allocator,
             .worker_idx = @intCast(i),
-            .http_addr = addr,
+            // The last slot is the private listener when one is configured;
+            // every other slot shares the public SO_REUSEPORT socket.
+            .http_addr = if (want_private and i == total_workers - 1) private_addr else addr,
+            .plane = if (want_private and i == total_workers - 1) .private else .public,
+            .io_opts = if (want_private and i == total_workers - 1) PRIVATE_IO_OPTS else PUBLIC_IO_OPTS,
             .raft = bridge,
             .node = &node_state,
             .log_batch_store = log_batch_store,
@@ -1117,10 +1211,46 @@ pub fn main() !void {
     // Every worker, not just the first: a partially-ready start would
     // accept connections into a worker that has not opened its stores.
     for (readies) |*ev| ev.wait();
+
+    // A public serving thread that could not start is fatal — the node would
+    // silently serve at a fraction of its configured capacity, which reads as
+    // a performance mystery rather than a failure. The private listener is
+    // optional in the same sense the metrics listener is: its port may already
+    // be held by another node on this box, and losing it costs break-glass
+    // access, not service. Losing it is loud here AND at the door, which
+    // refuses the root bearer on every remaining listener.
+    var private_up = want_private;
+    for (ctxs) |*ctx| {
+        if (!ctx.failed.load(.acquire)) continue;
+        if (ctx.plane == .private) {
+            private_up = false;
+        } else {
+            std.log.err("rewind: worker {d} failed to start; refusing to serve degraded", .{ctx.worker_idx});
+            return error.WorkerStartFailed;
+        }
+    }
     std.log.info(
         "rewind: listening on 0.0.0.0:{d} with {d} worker(s) (data_dir={s}, admin_domain={s})",
         .{ port, worker_count, data_dir, admin_api_domain },
     );
+    if (private_up) {
+        std.log.info(
+            "rewind: private deploy listener on http://127.0.0.1:{d} (root bearer accepted here only)",
+            .{private_port},
+        );
+    } else if (want_private) {
+        std.log.warn(
+            "rewind: private deploy listener on 127.0.0.1:{d} did not start " ++
+                "(port already in use?) — the publish door will refuse the root bearer",
+            .{private_port},
+        );
+    } else {
+        std.log.warn(
+            "rewind: no private deploy listener (REWIND_DEPLOY_PRIVATE_PORT=0) — " ++
+                "the publish door will refuse the root bearer on every listener",
+            .{},
+        );
+    }
 
     while (!stop_flag.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
     // Join ALL workers before the leadership handoff below — a group

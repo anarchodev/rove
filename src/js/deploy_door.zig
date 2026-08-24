@@ -42,12 +42,13 @@
 //! so an address heuristic fails where it matters most. `x-forwarded-for` is no
 //! better — the front stamps it, so a direct connection can forge it.
 //!
-//! The sound signal is which listener accepted the connection, the way
-//! `boot.metricsFromEnv` already binds the operator metrics surface to
-//! `127.0.0.1` and lets the OS enforce it. Until the worker binds such a
-//! listener, `Plane.of` reports `.public` for everything and the
-//! gate refuses root — failing closed, so no deployment can quietly accept a
-//! platform-wide credential from the internet on the strength of a heuristic.
+//! The sound signal is which listener accepted the connection, and the OS
+//! enforces it: the worker binds an optional loopback-only listener alongside
+//! the shared `0.0.0.0` serving socket, the way `boot.metricsFromEnv` already
+//! binds the operator metrics surface to `127.0.0.1`. A worker carries its
+//! listener's plane, so `Plane.of` reads a fact rather than guessing from a
+//! spoofable one. With no private listener configured there is simply no
+//! `.private` worker, and the gate refuses root everywhere — failing closed.
 
 const std = @import("std");
 const rove = @import("rove");
@@ -85,13 +86,13 @@ pub const Plane = enum {
     /// operator on loopback. This is the fail-closed direction: it can only
     /// refuse a credential that would otherwise have been accepted.
     ///
-    /// When the worker binds a private listener and threads its plane through
-    /// `WorkerCtx` → `Worker`, this reports the accepting listener's own plane
-    /// instead of a constant. Until both that listener and the tenant-scoped
-    /// deploy capability exist, the door deliberately authenticates nobody.
-    /// That is the safe direction to be incomplete in.
-    pub fn of(_: anytype) Plane {
-        return .public;
+    /// The plane is a property of the listener that accepted the connection,
+    /// fixed for the life of the process, so it is read off the worker rather
+    /// than derived per request. A worker whose listener is loopback-bound
+    /// reports `.private`; every SO_REUSEPORT thread on the shared `0.0.0.0`
+    /// socket reports `.public`.
+    pub fn of(worker: anytype) Plane {
+        return worker.plane;
     }
 };
 
@@ -310,7 +311,7 @@ pub fn tryHandleDeployDoor(
     // on HEADERS — nothing below reads the body — so when the blob PUT arms a
     // streaming receive it refuses before the first DATA frame rather than
     // after megabytes have landed in the object store.
-    switch (authorize(worker, rh, Plane.of(sess))) {
+    switch (authorize(worker, rh, Plane.of(worker))) {
         .allow => {},
         .deny => |r| {
             try denyWith(server, allocator, ent, sid, sess, cors_origin, r);
@@ -403,9 +404,19 @@ test "a root bearer is refused on the public plane, with its own code" {
     try testing.expect(!std.mem.eql(u8, d.codeOf(), DenyReason.unauthenticated.codeOf()));
 }
 
-test "the plane is fail-closed while no private listener exists" {
+test "the plane is the listener's, read off the worker" {
     const testing = std.testing;
-    // Documents the current derivation rather than asserting a permanent truth:
-    // when the worker binds a private listener, this test changes with it.
-    try testing.expectEqual(Plane.public, Plane.of({}));
+    const Fake = struct { plane: Plane };
+    try testing.expectEqual(Plane.public, Plane.of(Fake{ .plane = .public }));
+    try testing.expectEqual(Plane.private, Plane.of(Fake{ .plane = .private }));
+}
+
+test "a worker config that says nothing gets the public plane" {
+    const testing = std.testing;
+    // The default matters more than it looks: a caller who has not thought
+    // about planes must not be able to create a privileged listener by
+    // omission. Every fixture and test worker inherits `.public`, so the door
+    // refuses root there.
+    const Cfg = struct { plane: Plane = .public };
+    try testing.expectEqual(Plane.public, (Cfg{}).plane);
 }
