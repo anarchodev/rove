@@ -756,15 +756,27 @@ pub fn build(b: *std.Build) void {
     const tenant_tests = b.addTest(.{ .root_module = tenant_mod });
     test_step.dependOn(&b.addRunArtifact(tenant_tests).step);
 
+    // ── wire-headers: THE registry of platform-reserved header names.
+    //    Pure std — no rove-blob, so no libcurl — because the binaries that
+    //    link neither (`rewind-ops`, `rewind`) must still hold the one
+    //    spelling. `scripts/ops/reserved_header_lint.py` keeps it the only
+    //    place a name literal lives.
+    const wire_headers_mod = b.addModule("wire-headers", .{
+        .root_source_file = b.path("src/wire/headers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── rove-wire: CP↔worker wire contracts (one encode/decode pair per
     //    envelope — docs/defect-patterns.md class 3). Shared by rewind-cp
-    //    (senders) and rove-js (receivers).
+    //    (senders) and rove-js (receivers); re-exports the names above.
     const wire_mod = b.addModule("rove-wire", .{
         .root_source_file = b.path("src/wire/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     wire_mod.addImport("rove-blob", blob_mod);
+    wire_mod.addImport("wire-headers", wire_headers_mod);
 
     const wire_tests = b.addTest(.{ .root_module = wire_mod });
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
@@ -1521,6 +1533,7 @@ pub fn build(b: *std.Build) void {
     front_mod.addImport("rove-boot", boot_mod);
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
+    front_mod.addImport("rove-wire", wire_mod);
     front_mod.addImport("metrics-server", metrics_server_mod);
     // Origin parsing, shared with the CP that hands these origins over.
     front_mod.addImport("rove-origin", origin_mod);
@@ -1624,6 +1637,7 @@ pub fn build(b: *std.Build) void {
     // Both files are pure-std halves of rove-blob, imported rather than
     // restated so the CLI and the platform cannot drift on the marker key,
     // the segment rules, or the signature.
+    ops_mod.addImport("wire-headers", wire_headers_mod);
     ops_mod.addAnonymousImport("sigv4", .{ .root_source_file = b.path("src/blob/sigv4.zig") });
     ops_mod.addAnonymousImport("blob-namespace", .{ .root_source_file = b.path("src/blob/namespace.zig") });
     const ops_exe = b.addExecutable(.{ .name = "rewind-ops", .root_module = ops_mod });
@@ -1802,6 +1816,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cli_mod.addImport("rove-replay", replay_mod);
+    cli_mod.addImport("wire-headers", wire_headers_mod);
     cli_mod.addImport("build_options", cli_opts.createModule());
     linkReplayEngine(cli_mod, arenajs_dep);
     const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
@@ -2045,6 +2060,7 @@ pub fn build(b: *std.Build) void {
         "scripts/ops/create_init_lint.py",
         "scripts/ops/doc_pointer_lint.py",
         "scripts/ops/globals_lint.py",
+        "scripts/ops/reserved_header_lint.py",
         "scripts/ops/spdx_lint.py",
         "scripts/ops/tenant_prefix_lint.py",
         "scripts/ops/test_reachability_lint.py",

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Loop46, Inc.
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! rove-wire — the CP↔worker wire contracts, each with ONE encode/decode
-//! pair shared by every sender and the receiver.
+//! rove-wire — the internal wire contracts (CP↔worker, worker↔front),
+//! each with ONE encode/decode pair shared by every sender and the
+//! receiver, and ONE spelling of every platform-reserved header name.
 //!
 //! Why this module exists (docs/defect-patterns.md class 3): the
 //! `/_system/v2-attach` envelope used to exist only as parallel header
@@ -20,28 +21,29 @@ const blob = @import("rove-blob");
 const curl = blob.curl;
 
 // ── Header names ──────────────────────────────────────────────────────
-// Lowercase (HTTP/2 wire form); libcurl sends names verbatim and HTTP
-// headers are case-insensitive, so one spelling serves both directions.
+// Re-exported from `headers.zig`, which is pure std so the libcurl-free
+// binaries (`rewind-ops`, `rewind`) can hold the same spellings. Aliases
+// rather than copies: there is exactly one string literal per name, and
+// `scripts/ops/reserved_header_lint.py` fails the build on a second.
+pub const header_names = @import("wire-headers");
 
-pub const TENANT = "x-rewind-tenant";
-pub const INCARNATION = "x-rewind-incarnation";
-/// The tenant's keyring root secret, 64 lowercase hex, minted ONCE at
-/// birth. Present only on a birth attach; see `AttachEnvelope.secret`.
-pub const KEYRING_SECRET = "x-rewind-keyring-secret";
-pub const PLAN = "x-rewind-plan";
-/// RETIRED (with the buffered bundle path + the atomic baseline attach): a
-/// joiner is born EMPTY and its state arrives raft-natively — log
-/// replication, or the streamed catch-up whose END_STREAM install carries
-/// the baseline. The names are kept only so the decoder can REJECT a stale
-/// sender loudly instead of silently birthing a group it thinks is at a
-/// baseline it never installed.
-pub const BASELINE_INDEX = "x-rewind-baseline-index";
-pub const BASELINE_TERM = "x-rewind-baseline-term";
-pub const EPOCH = "x-rewind-epoch";
-pub const JOIN_AS_LEARNER = "x-rewind-join-as-learner";
-pub const VOTERS = "x-rewind-voters";
-pub const LEARNERS = "x-rewind-learners";
-pub const PEER_ADDRS = "x-rewind-peer-addrs";
+pub const TENANT = header_names.TENANT;
+pub const INCARNATION = header_names.INCARNATION;
+pub const KEYRING_SECRET = header_names.KEYRING_SECRET;
+pub const PLAN = header_names.PLAN;
+pub const BASELINE_INDEX = header_names.BASELINE_INDEX;
+pub const BASELINE_TERM = header_names.BASELINE_TERM;
+pub const EPOCH = header_names.EPOCH;
+pub const JOIN_AS_LEARNER = header_names.JOIN_AS_LEARNER;
+pub const VOTERS = header_names.VOTERS;
+pub const LEARNERS = header_names.LEARNERS;
+pub const PEER_ADDRS = header_names.PEER_ADDRS;
+pub const MOVE_SECRET = header_names.MOVE_SECRET;
+pub const DEST = header_names.DEST;
+pub const SNAPSHOT_INDEX = header_names.SNAPSHOT_INDEX;
+pub const SNAPSHOT_TERM = header_names.SNAPSHOT_TERM;
+pub const SNAPSHOT_MODE = header_names.SNAPSHOT_MODE;
+pub const LEADER = header_names.LEADER;
 
 /// Wire spelling of "this tenant is on the legacy name-keyed storage
 /// layout". An explicit token rather than an empty header value, because

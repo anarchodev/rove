@@ -39,12 +39,15 @@ const snapshot_sink_mod = @import("snapshot_sink.zig");
 const wire = @import("rove-wire");
 const curl = blob_mod.curl;
 
-const SNAP_MODE_HEADER = "x-rewind-snapshot-mode";
-
-const TENANT_HEADER = "X-Rewind-Tenant";
-const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
-const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
-const SNAP_TERM_HEADER = "x-rewind-snapshot-term";
+// Names from the registry, not re-typed here: this file is the SENDER
+// half of the streamed catch-up whose receiver is `v2_move.zig`, and a
+// pair that disagreed on a spelling would fail as a missing header at
+// the far end rather than at the edit.
+const SNAP_MODE_HEADER = wire.SNAPSHOT_MODE;
+const TENANT_HEADER = wire.TENANT;
+const MOVE_SECRET_HEADER = wire.MOVE_SECRET;
+const SNAP_INDEX_HEADER = wire.SNAPSHOT_INDEX;
+const SNAP_TERM_HEADER = wire.SNAPSHOT_TERM;
 
 /// Upload producer over a held-snapshot `StreamDumper`: libcurl
 /// pulls the next wire slice via `fill` only as fast as the peer's receive

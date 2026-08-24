@@ -22,6 +22,11 @@
 //!                           a namespace to grow into without colliding
 //!                           with anything a customer already set.
 //!
+//! Every reserved NAME is spelled once, in the `wire-headers` registry
+//! (`src/wire/headers.zig`) — this file owns the PREFIX rule, that one owns
+//! the vocabulary, and `scripts/ops/reserved_header_lint.py` fails the build
+//! on a name literal outside the two.
+//!
 //! The reservation is enforced in BOTH directions:
 //!   - stripped from inbound `request.headers` (globals.zig installHeaders),
 //!     so a customer/attacker can't read internal topology or spoof a
@@ -36,6 +41,12 @@
 //!
 //! Pre-launch reservation: claiming these prefixes now (before customers can
 //! depend on reading/setting them) is free; reclaiming them later is not.
+//!
+//! The tests below cover the PREDICATES only, and a predicate that is right
+//! but never consulted looks identical from here. What proves the two
+//! enforcement points actually run is `scripts/smoke/reserved_headers_smoke_v2.py`,
+//! which fires reserved headers at a real front door and asserts a real
+//! handler can neither see nor emit them.
 
 const std = @import("std");
 

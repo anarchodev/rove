@@ -539,6 +539,11 @@
     "seconds": 1.7,
     "status": "pass"
   },
+  "reserved_headers_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 27.1,
+    "status": "pass"
+  },
   "reset_smoke_v2.py": {
     "rc": 0,
     "seconds": 1.5,

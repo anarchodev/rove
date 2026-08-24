@@ -63,16 +63,14 @@ const keyring_shard = @import("keyring_shard.zig");
 const crypt = @import("rove-crypt");
 const keyring_mod = @import("rove-keyring");
 
-const MOVE_SECRET_HEADER = "x-rewind-move-secret";
+// Every name comes from the registry — see `rove-wire` for why the
+// spellings live in one place.
+const MOVE_SECRET_HEADER = wire.MOVE_SECRET;
 const TENANT_HEADER = wire.TENANT;
-// Streamed-snapshot baseline, carried in headers so the body is the pure
-// pair stream.
-const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
-const SNAP_TERM_HEADER = "x-rewind-snapshot-term";
-// "replace" (default, catch-up/promote-back) | "merge" (zero-downtime move).
-const SNAP_MODE_HEADER = "x-rewind-snapshot-mode";
-// v2-snapshot-push: the dest node base URL the source streams to.
-const DEST_HEADER = "x-rewind-dest";
+const SNAP_INDEX_HEADER = wire.SNAPSHOT_INDEX;
+const SNAP_TERM_HEADER = wire.SNAPSHOT_TERM;
+const SNAP_MODE_HEADER = wire.SNAPSHOT_MODE;
+const DEST_HEADER = wire.DEST;
 const snapshot_sink_mod = @import("snapshot_sink.zig");
 
 /// Constant-time byte-slice equality for secret comparison: the
@@ -950,7 +948,7 @@ fn forwardWriteOne(allocator: std.mem.Allocator, secret: []const u8, dest: []con
     defer headers.deinit(allocator);
     // The dest's v2-apply is move-secret gated; forwarding is between
     // clusters that share the secret, so present it (the worker holds it).
-    try headers.append(allocator, .{ .name = "X-Rewind-Move-Secret", .value = secret });
+    try headers.append(allocator, .{ .name = MOVE_SECRET_HEADER, .value = secret });
     try headers.append(allocator, .{ .name = "Content-Type", .value = "application/json" });
 
     var resp = try curl.cpPost(allocator, url, payload, .{ .headers = headers.items });
@@ -1495,7 +1493,7 @@ pub fn armSnapshotStream(
     if (!std.mem.eql(u8, method, "POST"))
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
     const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+        return reply(server, allocator, ent, sid, sess, 400, "missing " ++ TENANT_HEADER ++ "\n");
     const mode: snapshot_sink_mod.Mode =
         if (respb.findHeader(rh, SNAP_MODE_HEADER)) |m|
             (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "merge")) .merge else .replace)
@@ -1530,9 +1528,9 @@ pub fn armSnapshotStream(
             // {index>0, term>0} (index 0 is a no-op, term 0 crashes restore),
             // and a leader can't restore a snapshot to itself.
             const idx_s = respb.findHeader(rh, SNAP_INDEX_HEADER) orelse
-                return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Index\n");
+                return reply(server, allocator, ent, sid, sess, 400, "missing " ++ SNAP_INDEX_HEADER ++ "\n");
             const term_s = respb.findHeader(rh, SNAP_TERM_HEADER) orelse
-                return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Term\n");
+                return reply(server, allocator, ent, sid, sess, 400, "missing " ++ SNAP_TERM_HEADER ++ "\n");
             index = std.fmt.parseInt(u64, idx_s, 10) catch
                 return reply(server, allocator, ent, sid, sess, 400, "bad snapshot index\n");
             term = std.fmt.parseInt(u64, term_s, 10) catch
@@ -1547,12 +1545,12 @@ pub fn armSnapshotStream(
             // 400, never silently collapsed to "absent".
             if (respb.findHeader(rh, wire.VOTERS)) |vs| {
                 const n = wire.parseIds(vs, &voters_buf) catch
-                    return reply(server, allocator, ent, sid, sess, 400, "malformed x-rewind-voters\n");
+                    return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ wire.VOTERS ++ "\n");
                 conf_voters = voters_buf[0..n];
             }
             if (respb.findHeader(rh, wire.LEARNERS)) |ls| {
                 const n = wire.parseIds(ls, &learners_buf) catch
-                    return reply(server, allocator, ent, sid, sess, 400, "malformed x-rewind-learners\n");
+                    return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ wire.LEARNERS ++ "\n");
                 conf_learners = learners_buf[0..n];
             }
             gid = worker.raft.gidForTenant(tenant) orelse
@@ -1677,9 +1675,9 @@ pub fn armSnapshotPush(
     if (!std.mem.eql(u8, method, "POST"))
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
     const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+        return reply(server, allocator, ent, sid, sess, 400, "missing " ++ TENANT_HEADER ++ "\n");
     const dest = respb.findHeader(rh, DEST_HEADER) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Dest\n");
+        return reply(server, allocator, ent, sid, sess, 400, "missing " ++ DEST_HEADER ++ "\n");
     // A CP push is always the move's MERGE stream. Replace streams carry a
     // data-free baseline + ConfState the LEADER computes at trigger time —
     // only the auto catch-up driver produces them; a push job has no baseline

@@ -14,6 +14,7 @@ const c = qjs.c;
 
 const globals = @import("globals.zig");
 const reserved_headers = @import("reserved_headers.zig");
+const wire = @import("rove-wire");
 const request_mod = @import("request.zig");
 const ResponseHeader = request_mod.ResponseHeader;
 
@@ -281,10 +282,17 @@ test "isEmittableHeaderName rejects platform-reserved internal prefixes" {
     // Hop-by-hop / platform-managed (pre-existing).
     try testing.expect(!isEmittableHeaderName("set-cookie"));
     try testing.expect(!isEmittableHeaderName("content-length"));
-    // Platform-reserved internal header prefixes — a handler can't emit them.
-    try testing.expect(!isEmittableHeaderName("x-rewind-tenant"));
-    try testing.expect(!isEmittableHeaderName("X-Rewind-Move-Secret"));
-    try testing.expect(!isEmittableHeaderName("x-rove-internal-foo"));
+    // Platform-reserved internal headers — a handler can't emit them.
+    // Real names come from the registry (so a name added there is covered
+    // here without an edit); the synthetic ones cover every reserved
+    // PREFIX, including one no name uses yet.
+    try testing.expect(!isEmittableHeaderName(wire.TENANT));
+    try testing.expect(!isEmittableHeaderName(wire.MOVE_SECRET));
+    for (reserved_headers.RESERVED_HEADER_PREFIXES) |prefix| {
+        var buf: [64]u8 = undefined;
+        const synthetic = try std.fmt.bufPrint(&buf, "{s}not-a-real-name", .{prefix});
+        try testing.expect(!isEmittableHeaderName(synthetic));
+    }
     // Ordinary + the one customer-facing tracing header stay emittable.
     try testing.expect(isEmittableHeaderName("content-type"));
     try testing.expect(isEmittableHeaderName("x-custom"));

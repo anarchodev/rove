@@ -42,6 +42,7 @@ const h2 = @import("rove-h2");
 const crypt = @import("rove-crypt");
 const keyring_mod = @import("rove-keyring");
 const blob = @import("rove-blob");
+const wire = @import("rove-wire");
 const curl = blob.curl;
 const respb = @import("response_builder.zig");
 
@@ -49,7 +50,7 @@ const respb = @import("response_builder.zig");
 /// it inherits that family's move-secret gate.
 pub const ROUTE = "v2-keyring-shard";
 
-const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
+const MOVE_SECRET_HEADER = wire.MOVE_SECRET;
 
 /// Cap on a tenant's voter set when reading its membership. Groups are
 /// three or five voters in practice; this is a buffer bound, not a

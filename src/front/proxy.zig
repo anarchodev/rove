@@ -52,6 +52,7 @@ const rove = @import("rove");
 const origin_mod = @import("rove-origin");
 const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
+const wire = @import("rove-wire");
 
 const curl = blob.curl;
 const Entity = rove.Entity;
@@ -172,7 +173,7 @@ pub const respHeaderValue = util.respHeaderValue;
 /// (then the caller forgets its stale hint and re-scans, rather than trusting
 /// a bad map).
 fn leaderOriginHint(rh: h2.RespHeaders, nodes: []const []const u8) ?[]const u8 {
-    const v = respHeaderValue(rh, "x-rewind-leader") orelse return null;
+    const v = respHeaderValue(rh, wire.LEADER) orelse return null;
     const id = std.fmt.parseInt(u64, v, 10) catch return null;
     if (id == 0 or id > nodes.len) return null;
     return nodes[id - 1];
@@ -2400,7 +2401,7 @@ test "leaderOriginHint maps the x-rewind-leader raft id to its positional node" 
     // Build a RespHeaders carrying a single `x-rewind-leader: <val>`.
     const mk = struct {
         fn go(field: *h2.HeaderField, val: []const u8) h2.RespHeaders {
-            const name = "x-rewind-leader";
+            const name = wire.LEADER;
             field.* = .{ .name = name.ptr, .name_len = name.len, .value = val.ptr, .value_len = @intCast(val.len) };
             return .{ .fields = @as([*]h2.HeaderField, @ptrCast(field)), .count = 1 };
         }

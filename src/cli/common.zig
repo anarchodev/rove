@@ -6,9 +6,12 @@
 //! move-secret + ops-secret live in `rewind-ops`; tenant verbs that carry an
 //! OIDC session live in `rewind`. This module is the credential-agnostic
 //! core both reuse: operator env loader, curl/ssh transport, JSON helpers, and
-//! the bundle classifier. std-only — no rove modules, no system libs.
+//! the bundle classifier. std-only — no system libs, and the only rove
+//! module is the dependency-free header-name registry (`wire-headers`), so
+//! the CLI cannot drift from the platform on a wire header name.
 
 const std = @import("std");
+const wire = @import("wire-headers");
 
 pub const Resp = struct { code: u32, body: []u8 };
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -254,7 +257,7 @@ pub fn cpPost(a: std.mem.Allocator, env: *const Env, path: []const u8, body: []c
     const cp = env.get("ROVE_CP_URL_INTERNAL") orelse fatal("this command needs ROVE_CP_URL_INTERNAL", .{});
     const ms = env.require("REWIND_MOVE_SECRET");
     const headers = [_]Header{
-        .{ .name = "X-Rewind-Move-Secret", .value = ms },
+        .{ .name = wire.MOVE_SECRET, .value = ms },
         .{ .name = "Content-Type", .value = "application/json" },
     };
     const url = std.fmt.allocPrint(a, "{s}{s}", .{ cp, path }) catch oom();
