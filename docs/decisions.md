@@ -1865,9 +1865,32 @@ storage decisions that section assumes. (The customer-logs-vs-operator-signals
   rejects a `BC_VERSION` mismatch. Latent until arenajs v0.5.0 moved
   `BC_VERSION` 25 → 27 (from upstream quickjs-ng syncs, not the fork), which
   makes every previously-released deployment's bytecode unloadable.
-- **Decision**: `dep_id` hashes source, path, kind and content-type — **not
-  bytecode**. Bytecode becomes a derived artifact keyed by
-  `(platform_version, dep_id)`, recompiled when the engine moves.
+- **Decision**: `dep_id` hashes **source identity and nothing else** — path,
+  content-type, source hash, and each imported package's `(spec, pkg_hash)`.
+  Bytecode becomes a derived artifact keyed by `(platform_version, dep_id)`,
+  recompiled when the engine moves.
+- **The rule that decides membership**: a field belongs in `dep_id` only if it
+  is an author input. Two kinds of field are therefore excluded, and naming both
+  is what keeps the list from regrowing:
+  - **Derivations of a field already hashed.** `kind` is `f(path)` — `.mjs` is a
+    handler, everything else is a static (`cli/common.zig` `classify`) — so the
+    path already carries it, and folding it in only adds a surface that moves
+    `dep_id` when a *derivation rule* moves, with the source unchanged.
+    `content_type` is `f(path)` today too but is **retained**, because it is the
+    one of the two that a per-file author-supplied content-type would turn into
+    a real input; `kind` has no such future.
+  - **Labels that point at content.** A package `version` is a name for content,
+    not the content. Folding it in made a first-party seed bump (`SEED_VERSION`
+    in `cli/ops.zig` republishes the whole set) re-key every importing
+    deployment even when every package's bytes were unchanged. `spec` stays — it
+    is stable across version bumps, so it costs no churn, and it keeps
+    same-content packages under different names distinguishable.
+- **Many labels, one identity**: dropping the version label means a `dep_id`, or
+  a `pkg_hash`, may be named by more than one version — the way several tags can
+  name one git object. That is the correct model, not a collision: surfaces that
+  present a deployment should show *every* version that resolves to it rather
+  than assuming one. Storage keyed by a content hash must not assume a unique
+  label either (see the registry's `pkg/hash/{pkg_hash}` record).
 - **The trade, stated**: this chooses **source-reproducibility over
   binary-reproducibility**. A `dep_id` no longer pins exact bytes. Binary
   reproducibility stays *recoverable* — `(dep_id, platform_version)` determines
@@ -1886,9 +1909,16 @@ storage decisions that section assumes. (The customer-logs-vs-operator-signals
 - **Half-done is the dangerous state**: two concurrent engine versions writing
   different derivations under one key is what a rolling deploy produces. The
   split has to land before a roll spans an engine bump.
-- **Status**: decided; **not yet implemented** — the code still hashes
-  `bytecode_hex`. Tracked by rove#767, with the archived-artifact design in
-  rove#769.
+- **Status**: the bytecode half shipped in rove#777 — `computeDeploymentId` no
+  longer hashes `bytecode_hex`, and `manifestKey` writes
+  `e{bc:0>3}/{dep_id:0>20}.json` so two engine builds cannot clobber one key.
+  The rest of the source-identity rule above — no `kind`, no package `version` —
+  ships in rove#811, and is a NO-OP on its own: `pkg_hash` still encodes the
+  version, so a seed bump still moves `dep_id` until rewind-apps#121 lands the
+  other half. What remains is rove#787: an engine bump still leaves a deployment with no
+  manifest under the new key, so it recompiles-on-load rather than needing a
+  redeploy. Archived-artifact design in rove#769; the `pkg_hash` half of the
+  label rule is rove#205.
 
 ### 11.8 A deployment's config belongs to that deployment (2026-08-21)
 

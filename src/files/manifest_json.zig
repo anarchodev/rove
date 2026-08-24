@@ -641,8 +641,17 @@ pub fn computeDeploymentId(
         const e = entries[i];
         hasher.update(e.path);
         hasher.update(&.{0});
-        hasher.update(if (e.kind == .handler) "handler" else "static");
-        hasher.update(&.{0});
+        // `kind` is DELIBERATELY absent: it is `f(path)` — `.mjs` is a handler
+        // and everything else is a static (`cli/common.zig` `classify`) — so
+        // the path above already carries it, and folding a derivation in only
+        // adds a surface that moves `dep_id` when a derivation rule moves,
+        // with the source unchanged.
+        //
+        // `content_type` stays, and the asymmetry is deliberate: it is
+        // `f(path)` today too (`cli/common.zig` `contentType`), but it is the
+        // one of the two that a per-file author-supplied content-type would
+        // turn into a real author input. `kind` has no such future — a file is
+        // a handler or it is not, decided by its extension.
         hasher.update(e.content_type);
         hasher.update(&.{0});
         hasher.update(&e.source_hex);
@@ -655,28 +664,33 @@ pub fn computeDeploymentId(
         // segment (decisions.md §11.7).
     }
 
-    // `pkg_hash` is the package's content identity (over its files +
-    // imports), so hashing (spec, version, pkg_hash) captures each package
-    // version fully — no nested sort. Skipped entirely when there are no
-    // packages (cheap common case).
+    // `pkg_hash` is the package's content identity (over its files + imports),
+    // so folding (spec, pkg_hash) captures the package fully — no nested sort.
+    // Skipped entirely when there are no packages (cheap common case).
+    //
+    // `version` is DELIBERATELY absent, for the same reason bytecode is: a
+    // version is a LABEL POINTING AT content, not the content, and many labels
+    // may point at one identity the way several tags can name one git object.
+    // Folding it in made a first-party seed bump re-key every importing
+    // deployment even when every package's bytes were unchanged. `spec` stays
+    // — it is stable across version bumps, so it costs no churn, and it keeps
+    // two same-content packages under different names distinguishable.
     if (packages.len > 0 or app_imports.len > 0) {
         var pkg_idx: [MAX_CANONICAL_ITEMS]usize = undefined;
         for (0..packages.len) |i| pkg_idx[i] = i;
         const pkg_slice = pkg_idx[0..packages.len];
         std.mem.sort(usize, pkg_slice, packages, struct {
             fn lt(ctx: []const Package, a: usize, b: usize) bool {
+                // Orders on exactly what is folded below, so the sort cannot
+                // order by a field the hash ignores.
                 const c = std.mem.order(u8, ctx[a].spec, ctx[b].spec);
                 if (c != .eq) return c == .lt;
-                const cv = std.mem.order(u8, ctx[a].version, ctx[b].version);
-                if (cv != .eq) return cv == .lt;
                 return std.mem.lessThan(u8, &ctx[a].pkg_hash_hex, &ctx[b].pkg_hash_hex);
             }
         }.lt);
         for (pkg_slice) |i| {
             const p = packages[i];
             hasher.update(p.spec);
-            hasher.update(&.{0});
-            hasher.update(p.version);
             hasher.update(&.{0});
             hasher.update(&p.pkg_hash_hex);
             hasher.update(&.{0});
@@ -857,6 +871,80 @@ test "computeDeploymentId: bytecode does NOT change the id, source does" {
     try testing.expect(
         try computeDeploymentId(&entries_a, &.{}, &.{}) != try computeDeploymentId(&entries_c, &.{}, &.{}),
     );
+}
+
+test "computeDeploymentId: kind does NOT change the id (it is f(path))" {
+    // `.mjs` is a handler and everything else is a static, so a manifest that
+    // disagreed with `classify` about one path would be malformed rather than
+    // a second identity. Pinning this stops `kind` drifting back into the fold.
+    const entries_a = [_]root.Entry{.{
+        .path = "asset.bin", .kind = .static, .content_type = "application/octet-stream",
+        .source_hex = @splat('a'), .bytecode_hex = @splat('0'),
+    }};
+    const entries_b = [_]root.Entry{.{
+        .path = "asset.bin", .kind = .handler, .content_type = "application/octet-stream",
+        .source_hex = @splat('a'), .bytecode_hex = @splat('0'),
+    }};
+    try testing.expectEqual(
+        try computeDeploymentId(&entries_a, &.{}, &.{}),
+        try computeDeploymentId(&entries_b, &.{}, &.{}),
+    );
+}
+
+test "computeDeploymentId: content_type DOES change the id" {
+    // The other half of the asymmetry above — `content_type` is retained
+    // precisely because it may become author-supplied, so it must stay live.
+    const entries_a = [_]root.Entry{.{
+        .path = "a.bin", .kind = .static, .content_type = "application/octet-stream",
+        .source_hex = @splat('a'), .bytecode_hex = @splat('0'),
+    }};
+    const entries_b = [_]root.Entry{.{
+        .path = "a.bin", .kind = .static, .content_type = "image/png",
+        .source_hex = @splat('a'), .bytecode_hex = @splat('0'),
+    }};
+    try testing.expect(
+        try computeDeploymentId(&entries_a, &.{}, &.{}) !=
+            try computeDeploymentId(&entries_b, &.{}, &.{}),
+    );
+}
+
+test "computeDeploymentId: a package VERSION label does not change the id" {
+    // The seed-bump case: `rewind-ops seed-packages` republishes the whole
+    // first-party set at a new version. When a package's content is unchanged
+    // its `pkg_hash` is unchanged, and the deployment importing it must keep
+    // its `dep_id` — a version is a label pointing at content, not the content.
+    const pkgs_a = [_]Package{.{
+        .spec = "@rewind/jwt", .version = "1.0.4", .pkg_hash_hex = @splat('J'),
+        .files = &.{}, .imports = &.{}, .capabilities = &.{}, .private = false,
+    }};
+    const pkgs_b = [_]Package{.{
+        .spec = "@rewind/jwt", .version = "1.0.5", .pkg_hash_hex = @splat('J'),
+        .files = &.{}, .imports = &.{}, .capabilities = &.{}, .private = false,
+    }};
+    try testing.expectEqual(
+        try computeDeploymentId(&.{}, &pkgs_a, &.{}),
+        try computeDeploymentId(&.{}, &pkgs_b, &.{}),
+    );
+}
+
+test "computeDeploymentId: a package's CONTENT still changes the id" {
+    // The guard on the test above: dropping the version label must not have
+    // dropped the package's identity along with it.
+    const pkgs_a = [_]Package{.{
+        .spec = "@rewind/jwt", .version = "1.0.4", .pkg_hash_hex = @splat('J'),
+        .files = &.{}, .imports = &.{}, .capabilities = &.{}, .private = false,
+    }};
+    const pkgs_b = [_]Package{.{
+        .spec = "@rewind/jwt", .version = "1.0.4", .pkg_hash_hex = @splat('K'),
+        .files = &.{}, .imports = &.{}, .capabilities = &.{}, .private = false,
+    }};
+    const pkgs_c = [_]Package{.{
+        .spec = "@rewind/other", .version = "1.0.4", .pkg_hash_hex = @splat('J'),
+        .files = &.{}, .imports = &.{}, .capabilities = &.{}, .private = false,
+    }};
+    const a = try computeDeploymentId(&.{}, &pkgs_a, &.{});
+    try testing.expect(a != try computeDeploymentId(&.{}, &pkgs_b, &.{}));
+    try testing.expect(a != try computeDeploymentId(&.{}, &pkgs_c, &.{}));
 }
 
 test "computeDeploymentId: empty entries is stable" {
