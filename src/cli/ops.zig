@@ -38,6 +38,7 @@
 const std = @import("std");
 const c = @import("common.zig");
 const storage_namespace = @import("storage_namespace.zig");
+const wire = @import("wire-headers");
 
 const Header = c.Header;
 const fatal = c.fatal;
@@ -360,7 +361,7 @@ fn cmdRelease(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, dep_i
 fn cmdKvPut(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, key: []const u8, value: []const u8) void {
     const ms = env.require("REWIND_MOVE_SECRET");
     const headers = [_]Header{
-        .{ .name = "X-Rewind-Move-Secret", .value = ms },
+        .{ .name = wire.MOVE_SECRET, .value = ms },
         .{ .name = "Content-Type", .value = "application/json" },
     };
     var body = std.ArrayList(u8){};
@@ -698,7 +699,7 @@ fn countJsonArray(body: []const u8, key: []const u8) usize {
 /// on a grow. Followers 409/421; the leader 200s.
 fn waitVoters(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, want: usize, timeout_s: i64) void {
     const ms = env.require("REWIND_MOVE_SECRET");
-    const headers = [_]Header{.{ .name = "X-Rewind-Move-Secret", .value = ms }};
+    const headers = [_]Header{.{ .name = wire.MOVE_SECRET, .value = ms }};
     const path = std.fmt.allocPrint(a, "/_system/v2-member-status?tenant={s}", .{tenant}) catch oom();
     const deadline = std.time.timestamp() + timeout_s;
     var last: usize = 0;

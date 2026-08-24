@@ -219,8 +219,8 @@ pub fn snapshotPushToLeader(router: anytype, src_nodes: []const []const u8, tena
     const a = router.allocator;
     const hdrs = [_]curl.Header{
         .{ .name = wire.TENANT, .value = tenant },
-        .{ .name = "x-rewind-dest", .value = dest },
-        .{ .name = "x-rewind-snapshot-mode", .value = "merge" },
+        .{ .name = wire.DEST, .value = dest },
+        .{ .name = wire.SNAPSHOT_MODE, .value = "merge" },
     };
     for (src_nodes) |base| {
         const resp = bc.callTimeout(router, base, "/_system/v2-snapshot-push", .POST, "", &hdrs, 40 * 60 * 1000) catch |err| {

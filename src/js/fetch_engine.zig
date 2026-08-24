@@ -65,6 +65,7 @@ const globals = @import("globals.zig");
 const ssrf_mod = @import("rove-ssrf");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
+const wire = @import("rove-wire");
 const kv_mod = @import("raft-kv");
 const files_mod = @import("rove-files");
 const static_cache = @import("static_cache.zig");
@@ -1349,7 +1350,7 @@ pub const FetchEngine = struct {
         var i: usize = 0;
         while (i < headers_list.items.len) {
             const h = headers_list.items[i];
-            if (std.ascii.eqlIgnoreCase(h.name, "x-rewind-move-secret")) {
+            if (std.ascii.eqlIgnoreCase(h.name, wire.MOVE_SECRET)) {
                 self.allocator.free(h.name);
                 self.allocator.free(h.value);
                 _ = headers_list.swapRemove(i);
@@ -1358,7 +1359,7 @@ pub const FetchEngine = struct {
             i += 1;
         }
         try headers_list.ensureUnusedCapacity(self.allocator, 1);
-        const owned_name = try self.allocator.dupe(u8, "x-rewind-move-secret");
+        const owned_name = try self.allocator.dupe(u8, wire.MOVE_SECRET);
         errdefer self.allocator.free(owned_name);
         const owned_val = try self.allocator.dupe(u8, secret);
         headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = owned_val });
@@ -2283,7 +2284,7 @@ fn buildChunkEvent(
     return ev;
 }
 
-fn parseHeadersWireToJson(a: std.mem.Allocator, wire: []const u8) ![]u8 {
+fn parseHeadersWireToJson(a: std.mem.Allocator, wire_bytes: []const u8) ![]u8 {
     var obj: std.json.ObjectMap = .init(a);
     defer {
         var it = obj.iterator();
@@ -2293,7 +2294,7 @@ fn parseHeadersWireToJson(a: std.mem.Allocator, wire: []const u8) ![]u8 {
         }
         obj.deinit();
     }
-    var line_it = std.mem.splitSequence(u8, wire, "\r\n");
+    var line_it = std.mem.splitSequence(u8, wire_bytes, "\r\n");
     while (line_it.next()) |line| {
         if (line.len == 0) continue;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;

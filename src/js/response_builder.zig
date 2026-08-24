@@ -12,6 +12,7 @@
 const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
+const wire = @import("rove-wire");
 const files_mod = @import("rove-files");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -500,7 +501,7 @@ pub fn setNotLeaderResponse(
     if (leader_id != 0) {
         const id_str = try std.fmt.allocPrint(allocator, "{d}", .{leader_id});
         defer allocator.free(id_str);
-        hdrs = try packRespHeaders(allocator, &.{.{ .name = "x-rewind-leader", .value = id_str }});
+        hdrs = try packRespHeaders(allocator, &.{.{ .name = wire.LEADER, .value = id_str }});
     }
     try finalizeResponse(server, ent, sid, sess, 421, hdrs, copy.ptr, @intCast(copy.len));
 }

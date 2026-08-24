@@ -13,10 +13,13 @@
 const std = @import("std");
 const blob = @import("rove-blob");
 const curl = blob.curl;
+const wire = @import("rove-wire");
 
-/// Header carrying the shared move-secret, required on every CP↔worker
-/// `/_system/*` call and checked on the CP's own `/_control/*` writes.
-pub const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
+/// The shared move-secret header (spelled in the `wire-headers` registry),
+/// required on every CP↔worker `/_system/*` call and checked on the CP's own
+/// `/_control/*` writes. Re-exported so `cp/main.zig` reads it from the
+/// module that sends it.
+pub const MOVE_SECRET_HEADER = wire.MOVE_SECRET;
 
 /// One backend response the orchestrator cares about: status + an owned
 /// copy of the body (the source bundle, relayed into the attach call).
