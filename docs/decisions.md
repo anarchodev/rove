@@ -2158,6 +2158,54 @@ re-genesis'd under the frozen v1 formats 2026-06-26.
   the artifact; verifiers ignore an unknown alg rather than hard-failing, so a
   new alg can roll without a flag day.
 
+### 14.1 A package declares the record versions it writes; the engine advertises what it reads (2026-08-23)
+
+- **The asymmetry**: for the shim-owned namespaces (`format-versioning.md` §1f),
+  the READER is baked into the binary (`builtin_modules.zig` `@embedFile`) and
+  moves with every deploy, fleet-uniform. One WRITER is not: `@rewind/schedule`
+  is pinned in a tenant's lockfile at a `pkg_hash` and lags until *that tenant*
+  redeploys. The other writers (`globals/schedule.js` in the prelude, the baked
+  `__system/*` re-arm paths) move with the binary. So the runtime pairing is
+  (tenant's frozen package) × (fleet binary), and those move independently.
+- **What that means**: bumping a record version breaks every tenant still pinned
+  to the old package — its writes are refused by the new reader, permanently,
+  until it redeploys. This is NOT the one-time pre-stamp population a re-genesis
+  clears; it is a standing condition with a per-tenant trigger. Same class as
+  §11.7's engine-bump problem, one layer up: the engine's version must not
+  invalidate the tenant's artifact.
+- **Decision**: the engine reads every version any shipped writer wrote, for as
+  long as that writer may still be pinned — accept OLDER (including absent,
+  which is pre-stamp v1), refuse only NEWER. `record_version_lint.py` cannot
+  enforce this: it proves the copies agree within one build, and the obligation
+  is across builds.
+- **Decision**: a package DECLARES the record versions it writes, on the same
+  rails as `capabilities` — extracted from source at publish, recorded on the
+  version record and in `manifest_json.Package`, and deliberately NOT in
+  `pkg_hash` (identity stays content-only; see §11.7's label rule). The lint
+  gains a second job: prove a package's declaration matches the constant in its
+  own source, so deploy gates on a verified fact rather than a claim.
+- **Decision**: deploy REFUSES, hard, a package writing a version the engine
+  cannot read. Soft-warn reintroduces the silent case the declaration exists to
+  remove, and this failure class is invisible until a wake does not fire.
+- **Decision**: the engine ADVERTISES its readable set rather than deploy
+  knowing it. The check stays symmetric, and it survives the engine and the
+  deploy path being different binaries — which rove#813 shows is a real
+  condition here, not a hypothetical.
+- **What it buys beyond closing the gap**: "read v1 forever" becomes a
+  MEASURABLE set. The engine can enumerate the versions live deployments
+  actually write, so "who still pins a v1 writer?" is answerable and support for
+  a version can be retired deliberately. An unbounded promise becomes a
+  deprecation path with an exit condition.
+- **Rejected**: an npm-style `engines: ">=1.2"` range against the binary
+  version. Coarse, and it goes stale for reasons unrelated to formats. What
+  matters is the per-namespace record version, which is already §1f's inventory.
+- **Consequence accepted**: the v1 record shape is frozen for the support
+  window, and each future bump ships an upconverter the baked reader carries for
+  as long as any pinned writer emits that version. The reader accumulates
+  versions; it never migrates off one unilaterally.
+- **Status**: decided, unbuilt. Refusal-does-not-destroy shipped in rove#818.
+  Tracked by rove#820.
+
 ## 15. Code organization & refactoring
 
 ### 15.1 Decouple before you split — invert two-way logic coupling to a DAG *first*
