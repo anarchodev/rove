@@ -74,6 +74,13 @@ const SCHED_TICK_NS = 1_000_000_000n;
 // written by a newer build is recoverable by that build, and deleting
 // it would destroy durable customer work during an ordinary rolling
 // deploy. Readers defer such a record and leave both its rows alone.
+// The version an UNSTAMPED record is. Permanently 1: every `_`-namespace
+// gained its `v` in one commit, so a row without the field is the shape v1
+// describes. It must NOT track the current version — when a format reaches
+// v2, an unstamped row is still v1, and defaulting to "whatever we read
+// now" would silently reinterpret it.
+const UNSTAMPED_V = __rove.formats.unstamped;
+
 const SCHED_REC_V = __rove.formats.sched;
 
 // `_export/{id}` record version (`format-versioning.md` §1f).
@@ -161,15 +168,15 @@ export default function () {
     // the customer's data. Leave the record and leave the watchdog
     // armed — cancelling it here is what would strand the job — and
     // advance nothing.
-    if (typeof st.v !== "number") {
-        // Absent or non-numeric: pre-versioning or hand-written, not
-        // "newer than us". Drop, as the unparseable branch does.
+    // Absent reads as the pre-stamp shape — see `__system/scheduler_tick`.
+    if (st.v !== undefined && typeof st.v !== "number") {
         kv.delete(key);
         schedCancel(crypto.sha256b64url(key));
         return { status: 200 };
     }
-    if (st.v !== EXPORT_REC_V) {
-        console.warn("export_run: _export/" + id + " is v" + st.v +
+    const st_v = st.v ?? UNSTAMPED_V;
+    if (st_v !== EXPORT_REC_V) {
+        console.warn("export_run: _export/" + id + " is v" + st_v +
                      ", this build reads v" + EXPORT_REC_V + " — deferred, not dropped");
         return { status: 200 };
     }

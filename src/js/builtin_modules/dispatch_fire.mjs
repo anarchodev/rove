@@ -52,6 +52,13 @@ const SCHED_TICK_NS = 1_000_000_000n;
 // written by a newer build is recoverable by that build, and deleting
 // it would destroy durable customer work during an ordinary rolling
 // deploy. Readers defer such a record and leave both its rows alone.
+// The version an UNSTAMPED record is. Permanently 1: every `_`-namespace
+// gained its `v` in one commit, so a row without the field is the shape v1
+// describes. It must NOT track the current version — when a format reaches
+// v2, an unstamped row is still v1, and defaulting to "whatever we read
+// now" would silently reinterpret it.
+const UNSTAMPED_V = __rove.formats.unstamped;
+
 const SCHED_REC_V = __rove.formats.sched;
 
 // `_dispatch/owed/{id}` marker version (`format-versioning.md` §1f).
@@ -111,14 +118,14 @@ export default function () {
     // destroy a cross-tenant dispatch on an ordinary rolling deploy.
     // Leave it, re-arm the watchdog so a build that understands it gets
     // a turn, dispatch nothing. (Mirrors webhook_fire.mjs.)
-    if (typeof marker.v !== "number") {
-        // Absent or non-numeric: pre-versioning or hand-written, not
-        // "newer than us". Drop, as the unparseable branch does.
+    // Absent reads as the pre-stamp shape — see `__system/scheduler_tick`.
+    if (marker.v !== undefined && typeof marker.v !== "number") {
         kv.delete(markerKey);
         return { status: 200 };
     }
-    if (marker.v !== DISPATCH_OWED_V) {
-        console.warn("dispatch_fire: _dispatch/owed/" + id + " is v" + marker.v +
+    const marker_v = marker.v ?? UNSTAMPED_V;
+    if (marker_v !== DISPATCH_OWED_V) {
+        console.warn("dispatch_fire: _dispatch/owed/" + id + " is v" + marker_v +
                      ", this build reads v" + DISPATCH_OWED_V + " — deferred, not dropped");
         schedArm(
             BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n,

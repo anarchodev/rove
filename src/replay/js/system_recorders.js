@@ -377,6 +377,7 @@
   // records the worker later has to read.
   globalThis.__rove = globalThis.__rove || {};
   globalThis.__rove.formats = {
+    unstamped: 1,
     sched: 1,
     sendOwed: 1,
     blobOwed: 1,

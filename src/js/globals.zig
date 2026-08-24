@@ -1178,6 +1178,21 @@ const NamespaceBindings = struct {
 /// shape is pinned with the package in the tenant's lockfile, so one that
 /// read this binary's number would stamp a version it did not write.
 pub const RecordVersions = struct {
+    /// The version an UNSTAMPED record is — one number for every namespace,
+    /// because they all gained their `v` in the same commit, so a row
+    /// without the field is the shape v1 describes.
+    ///
+    /// Permanently 1. It must NOT track the current version: when a format
+    /// reaches v2, an unstamped row is still v1, and a default that read
+    /// "whatever this build writes" would silently reinterpret the oldest
+    /// records as the newest shape — the exact misread the field exists to
+    /// prevent.
+    ///
+    /// This is what makes v0→v1 a migration with no upconversion step:
+    /// adding `v` changed no other field, so the pre-stamp layout is
+    /// already what the reader wants. Reading it is the migration.
+    pub const unstamped: i32 = 1;
+
     pub const sched: i32 = 1;
     pub const send_owed: i32 = 1;
     pub const blob_owed: i32 = 1;
@@ -1189,6 +1204,7 @@ pub const RecordVersions = struct {
 /// JS property name → value, in one place so the installer and the
 /// drift test read the same list.
 pub const FORMAT_CONSTS = [_]ConstBinding{
+    .{ .name = "unstamped", .value = RecordVersions.unstamped },
     .{ .name = "sched", .value = RecordVersions.sched },
     .{ .name = "sendOwed", .value = RecordVersions.send_owed },
     .{ .name = "blobOwed", .value = RecordVersions.blob_owed },

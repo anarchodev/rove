@@ -52,6 +52,13 @@ const SCHED_TICK_NS = 1_000_000_000n;
 // written by a newer build is recoverable by that build, and deleting
 // it would destroy durable customer work during an ordinary rolling
 // deploy. Readers defer such a record and leave both its rows alone.
+// The version an UNSTAMPED record is. Permanently 1: every `_`-namespace
+// gained its `v` in one commit, so a row without the field is the shape v1
+// describes. It must NOT track the current version — when a format reaches
+// v2, an unstamped row is still v1, and defaulting to "whatever we read
+// now" would silently reinterpret it.
+const UNSTAMPED_V = __rove.formats.unstamped;
+
 const SCHED_REC_V = __rove.formats.sched;
 
 // `_send/owed/{id}` marker version (`format-versioning.md` §1f).
@@ -119,15 +126,16 @@ export default function () {
     // cleanup into THIS writeset, so returning without it commits the
     // deletion and orphans the marker forever — trading data loss for a
     // row nothing will ever look at again.
-    if (typeof owed.v !== "number") {
-        // Absent or non-numeric: pre-versioning or hand-written, not
-        // "newer than us". No future build reads it better — drop it,
-        // the same answer the unparseable branch above gives.
+    // Absent reads as the pre-stamp shape — see the note in
+    // `__system/scheduler_tick`. Non-numeric is corruption, and the
+    // unparseable branch above owns that.
+    if (owed.v !== undefined && typeof owed.v !== "number") {
         kv.delete(markerKey);
         return { status: 200 };
     }
-    if (owed.v !== SEND_OWED_V) {
-        console.warn("webhook_fire: _send/owed/" + id + " is v" + owed.v +
+    const owed_v = owed.v ?? UNSTAMPED_V;
+    if (owed_v !== SEND_OWED_V) {
+        console.warn("webhook_fire: _send/owed/" + id + " is v" + owed_v +
                      ", this build reads v" + SEND_OWED_V + " — deferred, not dropped");
         schedArm(BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
         return { status: 200 };
