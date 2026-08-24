@@ -20,7 +20,7 @@ this tree's docs.
 
 Exit 0 = every referenced path resolves, 1 = dangling reference(s) found.
 
-Sibling to `globals_lint.py`; run standalone (there is no general CI
+Sibling to `globals_lint.py`; run by `zig build test` (there is no general CI
 workflow yet — only `release-rewind.yml`).
 """
 

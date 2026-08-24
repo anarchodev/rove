@@ -704,6 +704,20 @@ pub fn build(b: *std.Build) void {
     });
     binding_mod.addImport("rove-guards", guards_mod);
     binding_mod.addImport("interaction-digest", idigest_mod);
+    // Needed to root a test artifact here (std's C allocator). Safe on the
+    // shared module: every in-build consumer (`js_mod`, `replay_mod`,
+    // `driver_smoke_mod`) already links libc for arenajs, and the browser
+    // wasm arena assembles its own module graph in
+    // `scripts/ops/build_wasm_arena.sh` rather than using this one.
+    binding_mod.link_libc = true;
+
+    // The binding's own tests. Importing a module does NOT bring its tests
+    // along — `js_mod`/`replay_mod` import this one for its declarations, and
+    // its two offline-shred tests were compiling nowhere until
+    // `test_reachability_lint.py` was finally run (it had never been wired
+    // into a step, so nothing said so).
+    const binding_tests = b.addTest(.{ .root_module = binding_mod });
+    test_step.dependOn(&b.addRunArtifact(binding_tests).step);
 
     // ── wasm-arena: the browser replay arena, built IN-TREE ──
     //
@@ -2014,6 +2028,34 @@ pub fn build(b: *std.Build) void {
     ambient_ratchet.addFileArg(b.path("scripts/ops/ambient_use_lint.py"));
     ambient_ratchet.has_side_effects = true;
     ambient_ratchet.expectExitCode(0);
+
+    // ── the standalone lints, on the gate ──
+    //
+    // These were "run by hand or pre-commit", which meant never: when they
+    // were finally run, `globals_lint` had been red since the replay prelude
+    // mirror landed (it scans `web/`, and the GENERATED mirror of the engine's
+    // own shims lives there), and `test_reachability_lint` was reporting 3
+    // tests that had never compiled. Both work; nothing was invoking them.
+    //
+    // A lint nobody runs is a rule nobody keeps — the same failure the lints
+    // exist to prevent, one level up. Always run: each scans the tree as data
+    // rather than as declared inputs, so declaring inputs here would leave
+    // them cached-green on exactly the change they exist to catch.
+    const standalone_lints = [_][]const u8{
+        "scripts/ops/create_init_lint.py",
+        "scripts/ops/doc_pointer_lint.py",
+        "scripts/ops/globals_lint.py",
+        "scripts/ops/spdx_lint.py",
+        "scripts/ops/tenant_prefix_lint.py",
+        "scripts/ops/test_reachability_lint.py",
+    };
+    for (standalone_lints) |lint_path| {
+        const run_lint = b.addSystemCommand(&.{"python3"});
+        run_lint.addFileArg(b.path(lint_path));
+        run_lint.has_side_effects = true;
+        run_lint.expectExitCode(0);
+        test_step.dependOn(&run_lint.step);
+    }
 
     const docs_contract_fresh = b.addSystemCommand(&.{"python3"});
     docs_contract_fresh.addFileArg(b.path("scripts/ops/gen_docs_contract.py"));

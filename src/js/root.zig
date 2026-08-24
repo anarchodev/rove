@@ -194,6 +194,7 @@ test {
     _ = @import("msg_router.zig");
     _ = @import("owed_retry.zig");
     _ = @import("package_resolver.zig");
+    _ = @import("request.zig");
     _ = @import("raft_propose.zig");
     _ = @import("reserved_headers.zig");
     _ = @import("response_builder.zig");
