@@ -1935,6 +1935,31 @@ test "every global shim is IIFE-wrapped, so its top level stays out of handler s
     }
 }
 
+test "the unstamped version is pinned to 1, whatever the current versions are" {
+    // `RecordVersions.unstamped` is load-bearing in a way a doc comment cannot
+    // hold: it is the version a row with NO `v` field is, so it must stay at 1
+    // forever. The agreement test above only proves the two declarations MATCH
+    // — bump `unstamped` on both sides and it passes, while every pre-stamp row
+    // in every tenant silently reinterprets as the newest shape.
+    //
+    // That edit is the natural one to make. A future bump reads as a column of
+    // constants all at 1 and `unstamped` sits at the top of it.
+    //
+    // Note this is stronger than asserting `unstamped != sched` once `sched`
+    // moves, which was the first shape proposed for this: that version passes
+    // if both are set to 2, which is exactly the mistake.
+    try std.testing.expectEqual(@as(i32, 1), RecordVersions.unstamped);
+
+    // And it is not merely "the same as everything else today" — it is pinned
+    // independently. If this fires alongside a deliberate format bump, the fix
+    // is to leave `unstamped` alone, never to move it with the others.
+    for (FORMAT_CONSTS) |cb| {
+        if (std.mem.eql(u8, cb.name, "unstamped")) {
+            try std.testing.expectEqual(@as(i32, 1), cb.value);
+        }
+    }
+}
+
 test "record versions agree with the offline recorders" {
     // `RecordVersions` is installed natively for the worker. The CLI sim and
     // the browser replay arena have no native bindings — they compose over
