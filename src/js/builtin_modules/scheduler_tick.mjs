@@ -101,7 +101,22 @@ export default function () {
             continue;
         }
         if (rec.v !== SCHED_REC_V) {
-            kv.delete(byIdKey);
+            // Refuse, but do NOT destroy. The record is the only copy of a
+            // wake a customer armed; a build that cannot read it must not be
+            // the reason it stops existing, or the two-version reader
+            // `format-versioning.md` defers to post-launch has nothing left
+            // to upconvert.
+            //
+            // Only the by_time entry goes, and it is safe to drop because it
+            // is DERIVED — `when_ns` lives in the by_id record, so a later
+            // build rebuilds the index from it. Dropping it is also what
+            // makes this terminate: this scan walks by_time in time order and
+            // breaks at the first future entry, so a due row left indexed
+            // would sit at the head of every page forever and eventually
+            // starve the live wakes behind it.
+            console.error("scheduler_tick: _sched/by_id/" + id + " is v" +
+                rec.v + ", this build reads v" + SCHED_REC_V +
+                " — record PRESERVED, de-indexed, not fired");
             kv.delete(key);
             continue;
         }

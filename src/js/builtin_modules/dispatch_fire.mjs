@@ -108,7 +108,13 @@ export default function () {
     // re-dispatching from fields we may be misreading is worse than
     // dropping the chain.
     if (marker.v !== DISPATCH_OWED_V) {
-        kv.delete(markerKey);
+        // Refuse, but do NOT destroy: this marker is the only record that
+        // the send is owed. The wake that brought us here is consumed, so
+        // nothing retries it — the row simply survives for a build that can
+        // read it (`format-versioning.md`, refusal vs deletion).
+        console.error("dispatch_fire: _dispatch/owed/" + id + " is v" + marker.v +
+            ", this build reads v" + DISPATCH_OWED_V +
+            " — marker PRESERVED, not fired");
         return { status: 200 };
     }
 

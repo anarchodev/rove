@@ -109,7 +109,13 @@ export default function () {
     // by fields we may be misreading is the one outcome worse than not
     // firing it.
     if (owed.v !== SEND_OWED_V) {
-        kv.delete(markerKey);
+        // Refuse, but do NOT destroy: this marker is the only record that
+        // the send is owed. The wake that brought us here is consumed, so
+        // nothing retries it — the row simply survives for a build that can
+        // read it (`format-versioning.md`, refusal vs deletion).
+        console.error("webhook_fire: _send/owed/" + id + " is v" + owed.v +
+            ", this build reads v" + SEND_OWED_V +
+            " — marker PRESERVED, not fired");
         return { status: 200 };
     }
     if (typeof owed.url !== "string" || owed.url.length === 0) {

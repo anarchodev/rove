@@ -158,7 +158,13 @@ export default function () {
     // export from fields that may mean something else now would write
     // the customer's data into parts described by the wrong shape.
     if (st.v !== EXPORT_REC_V) {
-        kv.delete(key);
+        // Refuse, but do NOT destroy: the row is the export's only progress
+        // record, and deleting it loses which parts were already written.
+        // The watchdog IS cancelled — an unreadable export must stop costing
+        // wakes, and the schedule is derived state a later build re-arms.
+        console.error("export_run: " + key + " is v" + st.v +
+            ", this build reads v" + EXPORT_REC_V +
+            " — state PRESERVED, watchdog cancelled, not advanced");
         schedCancel(crypto.sha256b64url(key));
         return { status: 200 };
     }
