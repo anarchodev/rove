@@ -21,9 +21,8 @@
   // `_dispatch/owed/{id}` record version (`format-versioning.md` §1f).
   // Read by `__system/dispatch_fire`; `__system/dispatch_result` keys on
   // the marker's PRESENCE, not its contents, so it needs no version of
-  // its own. Declared per file — see
-  // `scripts/ops/record_version_lint.py`.
-  const DISPATCH_OWED_V = 1;
+  // its own.
+  const DISPATCH_OWED_V = __rove.formats.dispatchOwed;
 
   const sysOn = _system.after;
   // `blob.receive` native — `platform.scope(t).blob.receive` lowers to a

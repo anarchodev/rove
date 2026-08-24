@@ -21,7 +21,7 @@
 
 // `_seg/{log}/s/` index-row version (`format-versioning.md` §1f).
 // Mirrored by the reader in `@rewind/segments`.
-const SEG_IDX_V = 1;
+const SEG_IDX_V = __rove.formats.segIdx;
 
 const PAD = "00000000000000000000";
 

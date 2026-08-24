@@ -105,11 +105,8 @@
   // Read by `__system/webhook_fire` and `__system/webhook_onresult`,
   // which ship in the worker binary while this shim ships in the
   // tenant's deployment — the two can be from different builds, and
-  // the marker is the only thing that crosses between them. Declared
-  // per file because there is no import path between a global, a baked
-  // module and a package; `scripts/ops/record_version_lint.py` is what
-  // keeps the copies in step.
-  const SEND_OWED_V = 1;
+  // the marker is the only thing that crosses between them.
+  const SEND_OWED_V = __rove.formats.sendOwed;
 
   const WEBHOOK_WATCHDOG_MS = 40_000;
 

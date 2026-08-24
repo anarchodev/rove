@@ -19,7 +19,7 @@
 // via __rove_next, mirroring __system/webhook_onresult.
 
 // `_blob/owed/{hash}` marker version (`format-versioning.md` §1f).
-const BLOB_OWED_V = 1;
+const BLOB_OWED_V = __rove.formats.blobOwed;
 
 export default function () {
     const a = request.activation;

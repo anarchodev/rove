@@ -365,6 +365,26 @@
       maxTotalBytes: (o && o.max_total_response_bytes != null) ? o.max_total_response_bytes : 52428800 });
     return id;
   };
+  // Record-format versions for the shim-owned `_`-namespaces
+  // (docs/architecture/format-versioning.md §1f). The worker installs these
+  // natively from `RecordVersions` in src/js/globals.zig; the offline
+  // runtimes have no native bindings, so the same numbers are declared here.
+  //
+  // These two declarations are pinned to each other by
+  // `test "record versions agree with the offline recorders"` in globals.zig,
+  // which parses THIS file. Change one side and that test fails — which is
+  // the point, because the shims and baked modules that read this write
+  // records the worker later has to read.
+  globalThis.__rove = globalThis.__rove || {};
+  globalThis.__rove.formats = {
+    sched: 1,
+    sendOwed: 1,
+    blobOwed: 1,
+    dispatchOwed: 1,
+    segIdx: 1,
+    exportRec: 1,
+  };
+
   globalThis._system = {
     // The park/continue native (`next.js` captures this at base-eval).
     // Mirrors the worker's disposition: target "" = same-module;

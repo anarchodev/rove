@@ -60,7 +60,7 @@
   // unparseable record: this is a shim-writable namespace, so a value
   // this reader does not understand is as likely a customer's write as
   // an engine skew, and dropping the entry answers both.
-  const SCHED_REC_V = 1;
+  const SCHED_REC_V = __rove.formats.sched;
 
   const BY_ID_PREFIX = "_sched/by_id/";
   const BY_TIME_PREFIX = "_sched/by_time/";

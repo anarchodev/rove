@@ -19,11 +19,13 @@
 // `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
 // shape is written from every module that arms a wake, so the field is
 // what stops one of them shipping a new shape that another reads at the
-// old one. An unknown `v` is treated exactly like an unparseable
-// record: this is a shim-writable namespace, so a value this reader
-// does not understand is as likely a customer's write as an engine
-// skew, and dropping the entry answers both.
-const SCHED_REC_V = 1;
+// old one.
+//
+// This module CANCELS a wake rather than firing one, which is why an
+// unknown `v` here is benign: it means the by_time key cannot be
+// derived, so that row is left behind as an orphan and the tick's own
+// orphan sweep collects it. Nothing durable is destroyed either way.
+const SCHED_REC_V = __rove.formats.sched;
 
 // Durable-scheduler cancel, inlined over the ambient `kv`: a baked
 // `__system/*` module runs post-harden and cannot reach the private

@@ -1133,11 +1133,68 @@ const FnBinding = struct {
     argc: c_int,
 };
 
+/// An integer constant installed as a data property on a namespace.
+/// Distinct from `FnBinding`: nothing to call, so nothing to gate.
+const ConstBinding = struct {
+    name: [:0]const u8,
+    value: i32,
+};
+
 const NamespaceBindings = struct {
     /// Path under globalThis. Non-empty. Multi-element paths require
     /// their parent path to appear earlier in STATIC_NAMESPACES.
     path: []const [:0]const u8,
     fns: []const FnBinding,
+    consts: []const ConstBinding = &.{},
+};
+
+/// Record-format versions for the shim-owned `_`-namespaces
+/// (`docs/architecture/format-versioning.md` §1f).
+///
+/// They were literals in ten JS files. Eight of those ship inside this
+/// binary and describe ONE build's behaviour, so eight copies of the number
+/// were an artifact, and bumping a format meant editing eight files with
+/// nothing to catch a partial edit.
+///
+/// `__rove.formats` rather than `_system.formats`, for two reasons that
+/// both point the same way: baked `__system/*` modules run AFTER
+/// `_harden.js` deletes `_system`, so they could not read it there; and
+/// `lint(c)` requires every `_system.*` namespace to have a customer-facing
+/// `globals/*.js` shim, which a bag of integers has no business being.
+///
+/// The `__rove` functions beside this are `is_system_module`-gated and the
+/// surface is documented as one no customer-facing shim touches. This entry
+/// is the exception and stays sound: it is DATA, so there is nothing to
+/// gate — reading a number grants no authority, and a handler could read it
+/// whether or not the shims do.
+///
+/// **This is one of two declarations.** The CLI sim and the browser replay
+/// arena have no native bindings; they compose over
+/// `src/replay/js/system_recorders.js`, which declares the same numbers in
+/// JS. `test "record versions agree with the offline recorders"` below is
+/// what stops the two drifting.
+///
+/// The `@rewind/*` packages deliberately read NEITHER. A package's record
+/// shape is pinned with the package in the tenant's lockfile, so one that
+/// read this binary's number would stamp a version it did not write.
+pub const RecordVersions = struct {
+    pub const sched: i32 = 1;
+    pub const send_owed: i32 = 1;
+    pub const blob_owed: i32 = 1;
+    pub const dispatch_owed: i32 = 1;
+    pub const seg_idx: i32 = 1;
+    pub const export_rec: i32 = 1;
+};
+
+/// JS property name → value, in one place so the installer and the
+/// drift test read the same list.
+pub const FORMAT_CONSTS = [_]ConstBinding{
+    .{ .name = "sched", .value = RecordVersions.sched },
+    .{ .name = "sendOwed", .value = RecordVersions.send_owed },
+    .{ .name = "blobOwed", .value = RecordVersions.blob_owed },
+    .{ .name = "dispatchOwed", .value = RecordVersions.dispatch_owed },
+    .{ .name = "segIdx", .value = RecordVersions.seg_idx },
+    .{ .name = "exportRec", .value = RecordVersions.export_rec },
 };
 
 const STATIC_NAMESPACES = [_]NamespaceBindings{
@@ -1344,6 +1401,8 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "set", .cfunc = scheduler_b.jsSetWake, .argc = 1 },
         .{ .name = "fire", .cfunc = scheduler_b.jsFireWake, .argc = 6 },
     } },
+    // The record-format versions (see `RecordVersions`). Data, not ops.
+    .{ .path = &.{ "__rove", "formats" }, .fns = &.{}, .consts = &FORMAT_CONSTS },
 };
 
 const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
@@ -1415,6 +1474,9 @@ pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
     const leaf = c.JS_NewObject(ctx);
     for (ns.fns) |fb| attachFn(ctx, leaf, fb);
+    for (ns.consts) |cb| {
+        _ = c.JS_SetPropertyStr(ctx, leaf, cb.name.ptr, c.JS_NewInt32(ctx, cb.value));
+    }
 
     // Walk to the parent of the leaf. parent starts as a fresh dup
     // so the same free-and-replace pattern works on iteration zero
@@ -1853,6 +1915,54 @@ test "every global shim is IIFE-wrapped, so its top level stays out of handler s
                 .{g.name},
             );
             return error.ShimNotEnclosed;
+        }
+    }
+}
+
+test "record versions agree with the offline recorders" {
+    // `RecordVersions` is installed natively for the worker. The CLI sim and
+    // the browser replay arena have no native bindings — they compose over
+    // `src/replay/js/system_recorders.js`, which declares the same numbers in
+    // JavaScript. Two declarations, because `globals/*.js` run on three
+    // engines and only one of them has this binding layer.
+    //
+    // Nothing else pins them together. A bump applied to one side alone gives
+    // the offline engines a different record version than the worker, which
+    // surfaces as sim/prod divergence in the conformance corpus — a long way
+    // from the edit that caused it, and only if a case happens to cover the
+    // format. This reads the declarations rather than the call sites, so
+    // unlike a grep over `kv.set(` it cannot be defeated by assigning the key
+    // to a variable first.
+    const recorders = @embedFile("system_recorders");
+
+    for (FORMAT_CONSTS) |cb| {
+        // `  sched: 1,` — the property as the recorders declare it.
+        var needle_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "{s}: ", .{cb.name});
+        const at = std.mem.indexOf(u8, recorders, needle) orelse {
+            std.debug.print(
+                "\nrecord versions: `{s}` is installed on __rove.formats but " ++
+                    "src/replay/js/system_recorders.js declares no such property — " ++
+                    "the offline engines would see it as undefined\n",
+                .{cb.name},
+            );
+            return error.MissingOfflineRecordVersion;
+        };
+        var i = at + needle.len;
+        const start = i;
+        while (i < recorders.len and recorders[i] >= '0' and recorders[i] <= '9') i += 1;
+        const got = std.fmt.parseInt(i32, recorders[start..i], 10) catch {
+            std.debug.print("\nrecord versions: `{s}` in the recorders is not an integer\n", .{cb.name});
+            return error.BadOfflineRecordVersion;
+        };
+        if (got != cb.value) {
+            std.debug.print(
+                "\nrecord versions: `{s}` is {d} in globals.zig and {d} in " ++
+                    "src/replay/js/system_recorders.js — bump both, or the " ++
+                    "offline engines write a version the worker does not read\n",
+                .{ cb.name, cb.value, got },
+            );
+            return error.OfflineRecordVersionDrift;
         }
     }
 }

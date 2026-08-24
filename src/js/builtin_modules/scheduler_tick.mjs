@@ -31,7 +31,7 @@ const BY_TIME_PREFIX = "_sched/by_time/";
 // record this tick cannot read is dropped WITH its index entry — firing
 // a target named by fields we may be misreading is worse than not
 // firing, and leaving the pair would retry the misread every tick.
-const SCHED_REC_V = 1;
+const SCHED_REC_V = __rove.formats.sched;
 
 const BY_ID_PREFIX = "_sched/by_id/";
 
@@ -58,6 +58,7 @@ export default function () {
 
     let fired = 0;
     let nextWatermark = 0n; // 0n ⇒ "no wake pending"
+    let deferred = 0; // due entries this build cannot read (see below)
 
     for (let i = 0; i < page.length; i++) {
         const key = page[i].key;
@@ -100,9 +101,29 @@ export default function () {
             kv.delete(key);
             continue;
         }
-        if (rec.v !== SCHED_REC_V) {
+        if (typeof rec.v !== "number") {
+            // Absent or non-numeric `v` is NOT "written by something
+            // newer" — a newer build writes a HIGHER number. It means a
+            // pre-versioning row or a hand-written one (this namespace is
+            // shim-writable, so a handler can author these directly), and
+            // no future build will understand it better than this one
+            // does. Deferring it would keep it forever and log every
+            // tick. Same answer as unparseable: drop it.
             kv.delete(byIdKey);
             kv.delete(key);
+            continue;
+        }
+        if (rec.v !== SCHED_REC_V) {
+            // A version we do not implement, from something that DOES
+            // version its records. Recoverable by another build — during
+            // a rolling upgrade the node beside this one reads it fine —
+            // so deleting it would destroy a customer's scheduled work on
+            // an ordinary deploy, and it is the OLD node that would do
+            // the destroying.
+            //
+            // Touch neither key, fire nothing, count it. Both rows stay
+            // exactly where the build that understands them will look.
+            deferred++;
             continue;
         }
 
@@ -151,6 +172,18 @@ export default function () {
     // gone. A backlog beyond the per-tick cap drains the same way (one
     // batch per tick). When nothing fired, the watermark is the first
     // future entry (or 0n for "no wake pending").
-    __rove.wake.set(String(fired > 0 ? nowNs : nextWatermark));
+    // A deferred entry has to keep the tick alive. It sits BEFORE
+    // `nextWatermark` (it is due), so handing the watermark the first
+    // future entry — or 0n, "no wake pending" — would stop the sweep and
+    // strand the entry even after a build that can read it takes over.
+    // Re-arming at `nowNs` costs one tick per second for as long as the
+    // skew lasts, which is the scheduler's normal cadence, not extra load.
+    if (deferred > 0) {
+        console.warn("scheduler_tick: " + deferred + " due entr" +
+                     (deferred === 1 ? "y" : "ies") +
+                     " written at a _sched/by_id version this build does not read (v" +
+                     SCHED_REC_V + ") — deferred, not dropped");
+    }
+    __rove.wake.set(String(fired > 0 || deferred > 0 ? nowNs : nextWatermark));
     return { status: 200 };
 }

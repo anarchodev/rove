@@ -45,15 +45,18 @@ function computeNextAtNs(attempts) {
 const SCHED_TICK_NS = 1_000_000_000n;
 // `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
 // record shape is written from every module that arms a wake, so the
-// field is what stops one of them shipping a new shape that the tick
-// reads at the old one. An unknown `v` is treated exactly like an
-// unparseable record — this is a shim-writable namespace, so a value
-// this reader does not understand is as likely a customer's write as an
-// engine skew, and dropping the entry is the response both deserve.
-const SCHED_REC_V = 1;
+// field is what stops one of them shipping a new shape that another
+// reads at the old one.
+//
+// An unknown `v` is NOT treated like an unparseable record. Corrupt
+// bytes are unrecoverable, so dropping them loses nothing; a record
+// written by a newer build is recoverable by that build, and deleting
+// it would destroy durable customer work during an ordinary rolling
+// deploy. Readers defer such a record and leave both its rows alone.
+const SCHED_REC_V = __rove.formats.sched;
 
 // `_send/owed/{id}` marker version (`format-versioning.md` §1f).
-const SEND_OWED_V = 1;
+const SEND_OWED_V = __rove.formats.sendOwed;
 
 function schedByTimeKey(whenNs, id) {
     return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;

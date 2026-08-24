@@ -66,15 +66,18 @@ const MAX_PART_ATTEMPTS = 5;
 const SCHED_TICK_NS = 1_000_000_000n;
 // `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
 // record shape is written from every module that arms a wake, so the
-// field is what stops one of them shipping a new shape that the tick
-// reads at the old one. An unknown `v` is treated exactly like an
-// unparseable record — this is a shim-writable namespace, so a value
-// this reader does not understand is as likely a customer's write as an
-// engine skew, and dropping the entry is the response both deserve.
-const SCHED_REC_V = 1;
+// field is what stops one of them shipping a new shape that another
+// reads at the old one.
+//
+// An unknown `v` is NOT treated like an unparseable record. Corrupt
+// bytes are unrecoverable, so dropping them loses nothing; a record
+// written by a newer build is recoverable by that build, and deleting
+// it would destroy durable customer work during an ordinary rolling
+// deploy. Readers defer such a record and leave both its rows alone.
+const SCHED_REC_V = __rove.formats.sched;
 
 // `_export/{id}` record version (`format-versioning.md` §1f).
-const EXPORT_REC_V = 1;
+const EXPORT_REC_V = __rove.formats.exportRec;
 
 function schedByTimeKey(whenNs, id) {
     return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
@@ -152,14 +155,22 @@ export default function () {
         schedCancel(crypto.sha256b64url(key));
         return { status: 200 };
     }
-    // A record version this build does not implement gets the same
-    // answer. `_export/` is shim-writable, so an unknown `v` is as
-    // likely a forged record as a newer engine — and advancing an
-    // export from fields that may mean something else now would write
-    // the customer's data into parts described by the wrong shape.
-    if (st.v !== EXPORT_REC_V) {
+    // A version this build does not implement is NOT the unparseable
+    // case above. Those bytes are unrecoverable; this record is
+    // recoverable by a different build, and an export job is hours of
+    // the customer's data. Leave the record and leave the watchdog
+    // armed — cancelling it here is what would strand the job — and
+    // advance nothing.
+    if (typeof st.v !== "number") {
+        // Absent or non-numeric: pre-versioning or hand-written, not
+        // "newer than us". Drop, as the unparseable branch does.
         kv.delete(key);
         schedCancel(crypto.sha256b64url(key));
+        return { status: 200 };
+    }
+    if (st.v !== EXPORT_REC_V) {
+        console.warn("export_run: _export/" + id + " is v" + st.v +
+                     ", this build reads v" + EXPORT_REC_V + " — deferred, not dropped");
         return { status: 200 };
     }
     if (st.state !== "running") {
