@@ -58,6 +58,7 @@ export default function () {
 
     let fired = 0;
     let nextWatermark = 0n; // 0n ⇒ "no wake pending"
+    let unreadable = 0; // due rows at a version this build cannot read
 
     for (let i = 0; i < page.length; i++) {
         const key = page[i].key;
@@ -101,23 +102,31 @@ export default function () {
             continue;
         }
         if (rec.v !== SCHED_REC_V) {
-            // Refuse, but do NOT destroy. The record is the only copy of a
-            // wake a customer armed; a build that cannot read it must not be
-            // the reason it stops existing, or the two-version reader
+            // Refuse, but destroy NOTHING — not the record, and not its
+            // index entry either. The record is the only copy of a wake a
+            // customer armed; a build that cannot read it must not be the
+            // reason it stops existing, or the two-version reader
             // `format-versioning.md` defers to post-launch has nothing left
-            // to upconvert.
+            // to pick up.
             //
-            // Only the by_time entry goes, and it is safe to drop because it
-            // is DERIVED — `when_ns` lives in the by_id record, so a later
-            // build rebuilds the index from it. Dropping it is also what
-            // makes this terminate: this scan walks by_time in time order and
-            // breaks at the first future entry, so a due row left indexed
-            // would sit at the head of every page forever and eventually
-            // starve the live wakes behind it.
-            console.error("scheduler_tick: _sched/by_id/" + id + " is v" +
-                rec.v + ", this build reads v" + SCHED_REC_V +
-                " — record PRESERVED, de-indexed, not fired");
-            kv.delete(key);
+            // Keeping the by_time entry is the load-bearing half. Nothing in
+            // the tree reconstructs one: every by_time writer is an ARM path
+            // writing a fresh record, the steady sweep enumerates by_time
+            // only, and `durable_wake.sweepDurableWakesOnPromotion` scans
+            // by_time too — so a de-indexed row is invisible to the tick, to
+            // the watermark (lowered on a by_time PUT) and to leadership
+            // recovery. It would survive as bytes and never fire again, which
+            // is a worse shape than either extreme: still listed by
+            // `schedule.list()`, permanently dormant. Left indexed, it fires
+            // the moment a build that can read it runs.
+            //
+            // The cost is bounded and the starvation risk is not what it
+            // looks like: the page is MAX_FIRES_PER_TICK + 1 = 257, and this
+            // arm `continue`s, so live wakes behind an unreadable row are
+            // still reached. Only 257+ simultaneously-due unreadable rows
+            // could crowd a page — and a sweep stalling on that is a loud,
+            // bounded, recoverable condition, unlike silent dormancy.
+            unreadable++;
             continue;
         }
 
@@ -167,5 +176,14 @@ export default function () {
     // batch per tick). When nothing fired, the watermark is the first
     // future entry (or 0n for "no wake pending").
     __rove.wake.set(String(fired > 0 ? nowNs : nextWatermark));
+    // One line per TICK, not per row: an unreadable row is a standing
+    // condition, and at the 257-row page cap a per-row log would be 257
+    // lines a second. The count is what an operator needs — that some wakes
+    // are held for a build that can read them, and how many.
+    if (unreadable > 0) {
+        console.error("scheduler_tick: " + unreadable + " due wake(s) at a " +
+            "record version this build does not read (expects v" +
+            SCHED_REC_V + ") — held, not fired, not deleted");
+    }
     return { status: 200 };
 }

@@ -19,7 +19,8 @@ Gates (essential behavior, unchanged from V1):
      leader's promotion sweep reconstructs next_wake_ns). nodes=3.
   C. Fail-loud cap — a >16 KiB msg trips SCHED_MAX_MSG_BYTES → 500.
   D. Refusal preserves — a `_sched/by_id/` record at a version this build
-     cannot read is de-indexed and never fired, but the RECORD SURVIVES.
+     cannot read is HELD: not fired, and neither the record nor its by_time
+     index entry is deleted, so a build that can read it still fires it.
      Refusal must not mean deletion: `format-versioning.md` defers a genuine
      two-version reader to post-launch, and a build that deletes what it
      cannot read leaves that reader nothing to upconvert. That section names
@@ -210,13 +211,9 @@ def main() -> int:
             seeded = json.loads(r.body)
             # Past the due time, plus a sweep. The tick is leader-gated and
             # throttled, so give it the same generous window Gate A uses.
+            # Give the tick several sweeps to see the row and decline it.
             deadline = time.time() + 25.0
-            by_time_gone = False
             while time.time() < deadline:
-                idx = c.admin_kv_get("acme", seeded["by_time"])
-                if idx.status == 404:
-                    by_time_gone = True
-                    break
                 rec = c.admin_kv_get("acme", seeded["by_id"])
                 if rec.status == 404:
                     break  # destroyed — the failure this gate exists to catch
@@ -226,11 +223,18 @@ def main() -> int:
             check("Gate D: the v99 record is PRESERVED, not deleted",
                   rr.status == 200 and '"v":99' in rr.body.replace(" ", ""),
                   f"status={rr.status} body={rr.body!r}")
-            # The derived index goes, so the scan terminates instead of
-            # re-reading a permanently-due row at the head of every page.
-            check("Gate D: the by_time index entry is dropped (scan terminates)",
-                  by_time_gone,
-                  f"still indexed at {seeded['by_time']} after 25s")
+            # The INDEX survives too, and that is the half that makes
+            # preservation mean something. Nothing in the tree reconstructs a
+            # by_time entry — every writer is an arm path, and both the steady
+            # sweep and the promotion pass enumerate by_time — so a de-indexed
+            # row would be bytes that can never fire again, invisible to the
+            # tick and to leadership recovery while still listed by
+            # `schedule.list()`. Left indexed, it fires as soon as a build that
+            # reads its version runs.
+            idx = c.admin_kv_get("acme", seeded["by_time"])
+            check("Gate D: the by_time index is PRESERVED (still recoverable)",
+                  idx.status == 200,
+                  f"index gone (status={idx.status}) — the wake can never fire again")
             # And it never fired.
             fires_after = _kv_int(c, "sched-fire-count") or 0
             check("Gate D: the unreadable wake did NOT fire",
