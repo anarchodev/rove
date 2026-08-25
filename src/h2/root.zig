@@ -650,8 +650,30 @@ pub fn H2(comptime opts: Options) type {
         }
 
         /// All collections a connection entity can be in (io's + h2's).
-        inline fn connColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl } {
-            return .{ &h2.io.connections, &h2._conn_tls_handshake, &h2._conn_active };
+        inline fn connColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl, *@TypeOf(h2.io.conn_closing) } {
+            return .{ &h2.io.connections, &h2._conn_tls_handshake, &h2._conn_active, &h2.io.conn_closing };
+        }
+
+        /// End a connection. h2 decides a conn should stop; io ends it — so
+        /// this moves the entity into io's `conn_closing` seam from whichever
+        /// conn collection currently holds it, and never calls `reg.destroy`.
+        /// io created the conn in `handleAccept`, so io releases its
+        /// descriptor slot.
+        ///
+        /// Skips an entity already mid-move: rove refuses a second transition
+        /// in one tick, and every caller here is a periodic sweep that will
+        /// come back around. A caller on a one-shot error path must not rely
+        /// on that.
+        fn closeConn(h2: *Self, entity: Entity) void {
+            if (h2.reg.isStale(entity)) return;
+            if (h2.reg.isMoving(entity)) return;
+            if (h2.reg.isInCollection(entity, &h2.io.conn_closing)) return;
+            inline for (.{ &h2.io.connections, &h2._conn_tls_handshake, &h2._conn_active }) |src| {
+                if (h2.reg.isInCollection(entity, src)) {
+                    h2.reg.move(entity, src, &h2.io.conn_closing) catch {};
+                    return;
+                }
+            }
         }
 
         /// Find the current collection of a server stream entity, set H2IoResult, and move to response_out.
@@ -3065,7 +3087,7 @@ pub fn H2(comptime opts: Options) type {
 
                 if (conn_ptr.tls_conn != null and conn_ptr.ng_session == null) {
                     if (max > 0 and active_count >= max) {
-                        try self.reg.destroy(ent);
+                        self.closeConn(ent);
                         continue;
                     }
                     conn_ptr.last_active_ns = monotonicNs();
@@ -3087,7 +3109,7 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 if (max > 0 and active_count >= max) {
-                    try self.reg.destroy(ent);
+                    self.closeConn(ent);
                     continue;
                 }
 
@@ -4786,7 +4808,7 @@ pub fn H2(comptime opts: Options) type {
                 // want_write path below) and force-destroy once the peer
                 // drains or the grace deadline fires. `draining` is sticky.
                 if (conn_ptr.draining and now >= conn_ptr.drain_deadline_ns) {
-                    try self.reg.destroy(ent);
+                    self.closeConn(ent);
                     continue;
                 }
 
@@ -4801,7 +4823,7 @@ pub fn H2(comptime opts: Options) type {
                     // the queue; the draining-deadline force-destroy above is
                     // the backstop for a peer that stops reading.
                     if (conn_ptr.send_inflight or conn_ptr.send_queue.items.len > 0) continue;
-                    try self.reg.destroy(ent);
+                    self.closeConn(ent);
                     continue;
                 }
 
@@ -4950,7 +4972,7 @@ pub fn H2(comptime opts: Options) type {
                         conn_ptr.last_active_ns != 0 and
                         now -| conn_ptr.last_active_ns > quiet_ns)
                     {
-                        try self.reg.destroy(ent);
+                        self.closeConn(ent);
                     } else if (!h1c.closing) {
                         // Mid-request — INCLUDING a parked pending Upgrade
                         // (pending_upgrade ⇒ in_flight): the eventual
@@ -5021,7 +5043,7 @@ pub fn H2(comptime opts: Options) type {
                     if (conn_ptr.last_active_ns == 0) continue;
                     if (now -| conn_ptr.last_active_ns <= budget) continue;
                     self.handshake_reaped_total += 1;
-                    try self.reg.destroy(ent);
+                    self.closeConn(ent);
                 }
                 const hs = self._conn_tls_handshake.entitySlice();
                 for (hs) |ent| {
@@ -5030,7 +5052,7 @@ pub fn H2(comptime opts: Options) type {
                     if (conn_ptr.last_active_ns == 0) continue;
                     if (now -| conn_ptr.last_active_ns <= budget) continue;
                     self.handshake_reaped_total += 1;
-                    try self.reg.destroy(ent);
+                    self.closeConn(ent);
                 }
             }
 
@@ -5060,7 +5082,7 @@ pub fn H2(comptime opts: Options) type {
 
                 // h1: no session to drain — destroy directly.
                 if (conn_ptr.ng_session == null) {
-                    if (conn_ptr.h1 != null) try self.reg.destroy(ent);
+                    if (conn_ptr.h1 != null) self.closeConn(ent);
                     continue;
                 }
 
@@ -5135,7 +5157,7 @@ pub fn H2(comptime opts: Options) type {
                 self.clientSessionCreate(conn_ptr, ent) catch {
                     self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = -1 }) catch {};
                     self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_errors) catch {};
-                    self.reg.destroy(ent) catch {};
+                    self.closeConn(ent);
                     continue;
                 };
 
