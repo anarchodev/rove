@@ -22,7 +22,6 @@ const BlobBytes = bytecode_cache_mod.BlobBytes;
 const c = qjs.c;
 
 const dispatcher_mod = @import("dispatcher.zig");
-const reserved = @import("rove-reserved");
 const JS_ENGINE_VERSION = dispatcher_mod.JS_ENGINE_VERSION;
 const DispatchError = dispatcher_mod.DispatchError;
 const Budget = dispatcher_mod.Budget;
@@ -65,20 +64,6 @@ fn openTempKv(allocator: std.mem.Allocator, buf: *[64]u8) !*kv_mod.KvStore {
     return try kv_mod.KvStore.open(allocator, path);
 }
 
-/// The store-side spelling of a key a handler NAMES.
-///
-/// These tests seed and inspect the store DIRECTLY, and a handler's `kv.*`
-/// resolves under `reserved.USER_KEY_ROOT` before it reaches storage — so a
-/// test that seeds `"k"` and a handler that names `"k"` are talking about
-/// different rows unless the test resolves too. JS source inside a test stays
-/// in the handler's spelling; only the Zig side of the seam resolves.
-///
-/// Spelled through the constant rather than a literal so a change of root
-/// carries these with it instead of leaving them asserting a stale depth.
-inline fn uk(comptime named: []const u8) []const u8 {
-    return reserved.USER_KEY_ROOT ++ named;
-}
-
 fn cleanupTempKv(buf: *[64]u8) void {
     const path_slice = std.mem.sliceTo(buf, 0);
     std.fs.cwd().deleteFile(path_slice) catch {};
@@ -92,8 +77,7 @@ test "dispatch: simple response write-back" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -117,8 +101,7 @@ test "dispatch: kv.get on missing key returns null" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -142,7 +125,8 @@ fn runOneOutcome(
     body: []const u8,
     request_in: Request,
 ) !RunOutcome {
-    const wrapped = try std.fmt.allocPrint(testing.allocator, "export function go() {{ {s} }}\n", .{body});
+    const wrapped = try std.fmt.allocPrint(testing.allocator,
+        "export function go() {{ {s} }}\n", .{body});
     defer testing.allocator.free(wrapped);
 
     var rt = try qjs.Runtime.init();
@@ -197,7 +181,7 @@ fn runOne(
 /// frees with `testing.allocator.free`.
 fn readOwedMarker(kv: *kv_mod.KvStore, id: []const u8) ![]u8 {
     var key_buf: [256]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, reserved.USER_KEY_ROOT ++ "_send/owed/{s}", .{id}) catch unreachable;
+    const key = std.fmt.bufPrint(&key_buf, "_send/owed/{s}", .{id}) catch unreachable;
     return kv.get(key);
 }
 
@@ -282,8 +266,7 @@ test "dispatch: kv.set + kv.get round trip" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
     var r1 = try runOne(
         &d,
@@ -308,6 +291,7 @@ test "dispatch: kv.set + kv.get round trip" {
 
     try testing.expectEqualStrings("rove", r2.body);
 }
+
 
 /// Run `body` as a handler for a tenant whose plan is `caps`, with a real
 /// limiter wired. The outbound gate reads `state.plan_rate` and keys its
@@ -447,7 +431,7 @@ fn readSchedByKey(kv: *kv_mod.KvStore, send_id: []const u8) ![]u8 {
     var id_buf: [43]u8 = undefined;
     const sched_id = std.base64.url_safe_no_pad.Encoder.encode(&id_buf, &digest);
     var kv_key_buf: [300]u8 = undefined;
-    const kv_key = std.fmt.bufPrint(&kv_key_buf, reserved.USER_KEY_ROOT ++ "_sched/by_id/{s}", .{sched_id}) catch unreachable;
+    const kv_key = std.fmt.bufPrint(&kv_key_buf, "_sched/by_id/{s}", .{sched_id}) catch unreachable;
     return kv.get(kv_key);
 }
 
@@ -1162,7 +1146,7 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
     // staged write — read-your-writes across attempts would yield 7).
     {
         var txn = try kv.beginTrackedImmediate();
-        try txn.put(uk("n"), "5");
+        try txn.put("n", "5");
         try txn.commit();
     }
 
@@ -1194,7 +1178,7 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
     }
     try testing.expectEqual(@as(usize, 1), n_reads);
     // The committed value is the retry's single increment.
-    const v = try kv.get(uk("n"));
+    const v = try kv.get("n");
     defer testing.allocator.free(v);
     try testing.expectEqualStrings("6", v);
 }
@@ -1429,7 +1413,7 @@ test "dispatch: durable_wake payload reads as request.ctx ONLY (one-ctx §2.4)" 
     try testing.expectEqualStrings("[{\"a\":2},\"undefined\",\"number\",\"undefined\"]", resp.body);
 }
 
-test "dispatch: a customer write to a platform NAME lands in the customer's keyspace" {
+test "dispatch: kv.set rejects platform-reserved prefixes" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1440,17 +1424,15 @@ test "dispatch: a customer write to a platform NAME lands in the customer's keys
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Spoofing a callback row used to throw `Error{code:"reserved_key"}`. It
-    // cannot be spoofed now for a better reason: the handler's kv is rooted, so
-    // the name reaches a row of the handler's own and the platform's row of that
-    // name is not addressable at all. Nothing is refused, and nothing needs to
-    // be — which is the whole of what the reserved-prefix rule was for.
+    // Attempting to spoof a callback row from customer code throws
+    // Error{code: "reserved_key"}. Same shape applies to _events/,
+    // _audit/, _magic/, _triggers/, etc.
     var resp = try runOne(
         &d,
         kv,
         \\try {
         \\  kv.set("_callback/spoofed", "x");
-        \\  return "ok:" + kv.get("_callback/spoofed");
+        \\  return "no_throw";
         \\} catch (e) {
         \\  return e.code + ":" + e.message;
         \\}
@@ -1459,15 +1441,14 @@ test "dispatch: a customer write to a platform NAME lands in the customer's keys
     );
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqualStrings("ok:x", resp.body);
+    try testing.expect(std.mem.startsWith(u8, resp.body, "reserved_key:"));
+    try testing.expect(std.mem.indexOf(u8, resp.body, "_callback/spoofed") != null);
 
-    // The platform's row of that name was never touched — different key.
+    // The spoofed row must NOT be in the kv after commit.
     try testing.expectError(error.NotFound, kv.get("_callback/spoofed"));
-    const own = try kv.get(uk("_callback/spoofed"));
-    defer testing.allocator.free(own);
-    try testing.expectEqualStrings("x", own);
 }
-test "dispatch: a customer delete of a platform NAME cannot reach the platform's row" {
+
+test "dispatch: kv.delete rejects platform-reserved prefixes" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1478,31 +1459,33 @@ test "dispatch: a customer delete of a platform NAME cannot reach the platform's
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // The engine's row, planted below the binding the way platform Zig writes.
-    try kv.put("_callback/real", "engine");
+    // Seed a callback row directly through the kv (simulating a real
+    // envelope-5 apply having written it earlier).
+    try kv.put("_callback/abc123", "real_receipt");
 
+    // Customer kv.delete against the reserved prefix throws.
     var resp = try runOne(
         &d,
         kv,
         \\try {
-        \\  kv.delete("_callback/real");
-        \\  return "deleted";
+        \\  kv.delete("_callback/abc123");
+        \\  return "no_throw";
         \\} catch (e) {
         \\  return e.code;
         \\}
     ,
-        .{ .method = "DELETE", .path = "/" },
+        .{ .method = "POST", .path = "/" },
     );
     defer resp.deinit(testing.allocator);
 
-    // The delete succeeds — against a row in the handler's own keyspace, which
-    // did not exist. The engine's row survives, which is the property that used
-    // to need a predicate on every write.
-    try testing.expectEqualStrings("deleted", resp.body);
-    const engine = try kv.get("_callback/real");
-    defer testing.allocator.free(engine);
-    try testing.expectEqualStrings("engine", engine);
+    try testing.expectEqualStrings("reserved_key", resp.body);
+
+    // The seeded row must still be there.
+    const v = try kv.get("_callback/abc123");
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("real_receipt", v);
 }
+
 test "dispatch: kv.set into customer namespace still works" {
     // Regression: the reserved-prefix guard must not catch normal
     // customer keys that happen to share a prefix substring (e.g.
@@ -1529,10 +1512,10 @@ test "dispatch: kv.set into customer namespace still works" {
     defer r1.deinit(testing.allocator);
     try testing.expectEqualStrings("ok", r1.body);
 
-    const a = try kv.get(uk("my_audit/x"));
+    const a = try kv.get("my_audit/x");
     defer testing.allocator.free(a);
     try testing.expectEqualStrings("v1", a);
-    const b = try kv.get(uk("users/alice"));
+    const b = try kv.get("users/alice");
     defer testing.allocator.free(b);
     try testing.expectEqualStrings("v2", b);
 }
@@ -1545,10 +1528,9 @@ test "dispatch: kv.delete removes key" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
-    try kv.put(uk("k"), "v");
+    try kv.put("k", "v");
 
     var r1 = try runOne(
         &d,
@@ -1561,7 +1543,7 @@ test "dispatch: kv.delete removes key" {
     defer r1.deinit(testing.allocator);
 
     // After commit, the key is gone.
-    try testing.expectError(error.NotFound, kv.get(uk("k")));
+    try testing.expectError(error.NotFound, kv.get("k"));
 }
 
 test "dispatch: request.host is exposed verbatim from :authority" {
@@ -1597,8 +1579,7 @@ test "dispatch: read-your-writes within one handler works via TrackedTxn" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -1620,8 +1601,7 @@ test "dispatch: console.log captured into response.console" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -1879,8 +1859,7 @@ test "dispatch: malformed bytecode surfaces in exception field" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -1914,8 +1893,7 @@ test "dispatch: runtime throw leaves exception + partial response" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -1943,8 +1921,7 @@ test "dispatch: per-store isolation by passing different kv per run" {
         cleanupTempKv(&buf_b);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
     var r1 = try runOne(
         &d,
@@ -1987,7 +1964,7 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     }
 
     // Seed a key so the handler can observe both .ok and .not_found.
-    try kv.put(uk("seeded"), "v1");
+    try kv.put("seeded", "v1");
 
     // Tape-only test: seed value irrelevant (no Math.random/crypto in
     // the handler), timestamp 0 is fine.
@@ -2013,8 +1990,7 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -2053,11 +2029,8 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     // dispatch path can replicate + apply them. Tape minimization
     // is purely a capture-side compression.
     try testing.expectEqual(@as(usize, 2), ws.ops.items.len);
-    // The WRITESET holds resolved keys — it rides the raft entry, and the
-    // entry is what every node applies. The tape above holds the names the
-    // handler used. Both spellings, each where it belongs.
-    try testing.expect(ws.containsKey(uk("new")));
-    try testing.expect(ws.containsKey(uk("seeded")));
+    try testing.expect(ws.containsKey("new"));
+    try testing.expect(ws.containsKey("seeded"));
 }
 
 test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
@@ -2092,8 +2065,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -2111,7 +2083,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     // Tape carries ZERO entries: the kv.set is an output (not taped),
     // the kv.get reads from the writeset (own-read, not taped).
     try testing.expectEqual(@as(usize, 0), readset.kv.entries.items.len);
-    try testing.expect(ws.containsKey(uk("own")));
+    try testing.expect(ws.containsKey("own"));
 }
 
 test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (rove#532)" {
@@ -2143,8 +2115,7 @@ test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (
     );
     defer testing.allocator.free(bytecode);
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     // ONE txn + ONE writeset across both runs — the worker's batch shape
     // (several same-tenant activations share them; one raft `multi` entry).
     var txn = try kv.beginTrackedImmediate();
@@ -2239,8 +2210,7 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var body_1: []u8 = &.{};
     defer if (body_1.len > 0) testing.allocator.free(body_1);
     {
@@ -2327,8 +2297,7 @@ test "dispatch: tight loop hits budget and returns Interrupted" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -2368,8 +2337,7 @@ test "dispatch: short handler does not trip budget" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -2414,8 +2382,7 @@ test "dispatch: .mjs module + internal fn_override dispatch" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
     // fn_override=greet reads request.path → "hi /hello", status 200.
     {
@@ -2498,7 +2465,8 @@ fn runWithMiddleware(
     middleware_src: []const u8,
     request_in: Request,
 ) !Response {
-    const wrapped = try std.fmt.allocPrint(testing.allocator, "export function go() {{ {s} }}\n", .{handler_body});
+    const wrapped = try std.fmt.allocPrint(testing.allocator,
+        "export function go() {{ {s} }}\n", .{handler_body});
     defer testing.allocator.free(wrapped);
 
     var rt = try qjs.Runtime.init();
@@ -3747,8 +3715,7 @@ test "dispatch: async module handler gets unwrapped" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -3772,8 +3739,7 @@ test "dispatch: request object fields populated" {
         cleanupTempKv(&buf);
     }
 
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -3810,6 +3776,7 @@ test "dispatch: request.query exposes raw query string" {
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("q=go&name=alice&tags=x%20y", resp.body);
 }
+
 
 test "dispatch: webhook.send (JS shim) writes _send/owed/{id} markers" {
     var buf: [64]u8 = undefined;
@@ -4240,7 +4207,7 @@ test "dispatch: crypto.ecdsa keygen→sign→verify roundtrip (secp256k1)" {
     try testing.expectEqualStrings("32,33,64,true,false", resp.body);
 }
 
-test "dispatch: a handler's _config/ write cannot reach real config" {
+test "dispatch: handlers cannot write _config/* (reserved prefix)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -4250,26 +4217,18 @@ test "dispatch: a handler's _config/ write cannot reach real config" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Real config, as the deploy mirror writes it: under the deployment that
-    // shipped it, below the binding.
-    try kv.put("_config/oauth/google", "{\"sub\":\"real\"}");
-
-    // The handler's write no longer throws — it lands in the handler's own
-    // keyspace. What protects the atomic code+config switch is not a refusal
-    // any more; it is that a rooted capability cannot name the config row at
-    // all. Reaching real config is the `config` capability's job (rove#830).
     var resp = try runOne(&d, kv,
-        \\kv.set("_config/oauth/google", "{\"sub\":\"attacker\"}");
-        \\return "wrote";
+        \\try {
+        \\  kv.set("_config/oauth/evil", "{\"sub\":\"attacker\"}");
+        \\  return "no-throw";
+        \\} catch (e) {
+        \\  return "threw:" + (e.message.includes("reserved") ? "ok" : e.message);
+        \\}
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("wrote", resp.body);
-
-    // The deploy-time row is untouched.
-    const real = try kv.get("_config/oauth/google");
-    defer testing.allocator.free(real);
-    try testing.expectEqualStrings("{\"sub\":\"real\"}", real);
+    try testing.expectEqualStrings("threw:ok", resp.body);
 }
+
 test "dispatch: PKCE-style flow uses sha256 + hex.decode + base64url.encode" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
@@ -5333,7 +5292,7 @@ test "trigger: afterPut fires after a kv.set inside the handler" {
     try testing.expectEqualStrings("ok", resp.body);
 
     // Trigger should have written the reverse-index row.
-    const indexed = try kv.get(uk("users/by-session/abc"));
+    const indexed = try kv.get("users/by-session/abc");
     defer testing.allocator.free(indexed);
     try testing.expectEqualStrings("u42", indexed);
 }
@@ -5394,7 +5353,7 @@ test "trigger: afterDelete fires with previousValue" {
 
     try testing.expectEqual(@as(i32, 200), resp.status);
 
-    const audit = try kv.get(uk("audit/deleted-totals"));
+    const audit = try kv.get("audit/deleted-totals");
     defer testing.allocator.free(audit);
     try testing.expectEqualStrings("100", audit);
 }
@@ -5466,7 +5425,7 @@ test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
 
     try testing.expectEqual(@as(i32, 200), resp.status);
 
-    const trace = try kv.get(uk("trace"));
+    const trace = try kv.get("trace");
     defer testing.allocator.free(trace);
     // AFTER chain fires innermost-first per PLAN §2.5.
     try testing.expectEqualStrings("inner;outer;", trace);
@@ -5709,7 +5668,7 @@ test "trigger: beforePut return-value mutates the written value" {
 
     try testing.expectEqual(@as(i32, 200), resp.status);
 
-    const stored = try kv.get(uk("users/abc"));
+    const stored = try kv.get("users/abc");
     defer testing.allocator.free(stored);
     try testing.expectEqualStrings("alice", stored);
 }
@@ -5908,7 +5867,7 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
 
     try testing.expectEqual(@as(i32, 200), resp.status);
 
-    const trace = try kv.get(uk("trace"));
+    const trace = try kv.get("trace");
     defer testing.allocator.free(trace);
     // BEFORE: outer first, then inner. (AFTER would be inner;outer; — see earlier test.)
     try testing.expectEqualStrings("outer;inner;", trace);
@@ -5972,7 +5931,7 @@ test "trigger: default export is the catchall when no named export matches" {
 
     try testing.expectEqual(@as(i32, 200), resp.status);
 
-    const trace = try kv.get(uk("trace"));
+    const trace = try kv.get("trace");
     defer testing.allocator.free(trace);
     // put fires before+after (catchall handles both); then delete
     // fires before+after. AFTER innermost-first, BEFORE outermost-first
@@ -6039,7 +5998,7 @@ test "trigger: BEFORE sees previousValue on update" {
 
     try testing.expectEqual(@as(i32, 200), resp.status);
 
-    const trace = try kv.get(uk("trace"));
+    const trace = try kv.get("trace");
     defer testing.allocator.free(trace);
     // First put: previousValue is null (no existing key). Second put:
     // previousValue is "v1" (the just-written first value, visible
@@ -6113,17 +6072,17 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     try testing.expectEqual(@as(i32, 200), resp.status);
 
     // Trigger A fires at depth 1 (handler invocation is depth 0).
-    const trace_a = try kv.get(uk("trace_a"));
+    const trace_a = try kv.get("trace_a");
     defer testing.allocator.free(trace_a);
     try testing.expectEqualStrings("depth=1", trace_a);
 
     // Trigger B fires at depth 2 (cascade from A).
-    const trace_b = try kv.get(uk("trace_b"));
+    const trace_b = try kv.get("trace_b");
     defer testing.allocator.free(trace_b);
     try testing.expectEqualStrings("depth=2", trace_b);
 
     // All three writes landed.
-    const c_value = try kv.get(uk("c/z"));
+    const c_value = try kv.get("c/z");
     defer testing.allocator.free(c_value);
     try testing.expectEqualStrings("c-from-b", c_value);
 }
@@ -6145,7 +6104,7 @@ test "interaction digest: folds reads, writes and the response as they happen" {
 
     {
         var txn = try kv.beginTrackedImmediate();
-        try txn.put(uk("n"), "5");
+        try txn.put("n", "5");
         try txn.commit();
     }
 
@@ -6168,7 +6127,7 @@ test "interaction digest: folds reads, writes and the response as they happen" {
     // a replay depends on. (Fresh kv value so the read sees "5" again.)
     {
         var txn = try kv.beginTrackedImmediate();
-        try txn.put(uk("n"), "5");
+        try txn.put("n", "5");
         try txn.commit();
     }
     var rs2 = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
@@ -6182,7 +6141,7 @@ test "interaction digest: folds reads, writes and the response as they happen" {
     // output-only or status-only check misses.
     {
         var txn = try kv.beginTrackedImmediate();
-        try txn.put(uk("n"), "5");
+        try txn.put("n", "5");
         try txn.commit();
     }
     var rs3 = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
@@ -6193,7 +6152,7 @@ test "interaction digest: folds reads, writes and the response as they happen" {
         \\return "n=" + n;
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 3, .readset = &rs3 } });
     defer resp3.deinit(testing.allocator);
-    try testing.expectEqualStrings(resp.body, resp3.body); // same response
+    try testing.expectEqualStrings(resp.body, resp3.body);          // same response
     try testing.expect(rs.interaction_digest != rs3.interaction_digest); // different behaviour
 }
 

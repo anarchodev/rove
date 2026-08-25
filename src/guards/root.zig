@@ -55,6 +55,7 @@ pub fn coercionMessage(comptime surface: []const u8, comptime what: []const u8) 
 // Each entry is a constraint plus the refusal it produces. Adding a rule here
 // adds it to every engine at once; that is the entire point.
 
+
 fn utf8Len(s: []const u8) usize {
     return s.len; // already bytes on the Zig side
 }
@@ -123,26 +124,26 @@ fn kvTooLargeMessage(comptime which: []const u8, comptime limit: usize) []const 
 }
 
 /// The worker's `kv.set` / `kv.delete` gate. `value` is null for a delete.
+/// `is_system_module` exempts the platform's own baked modules from the
+/// reserved-prefix rule — they write those namespaces by design.
 ///
-/// There is no reserved-prefix rule here. Which keys a caller may write is
-/// decided by the ROOT of the capability it holds, not by a predicate at the
-/// write: a handler's kv resolves under `reserved.USER_KEY_ROOT`, so a key it
-/// names is inside its own keyspace by construction and there is nothing left
-/// to refuse. What remains are the rules that are about the write ITSELF —
-/// how big it is, and how much this activation has already spent.
-///
-/// ORDER IS CONTRACT: key size, then value size, then the activation's write
-/// budget. A key that breaks two rules must report the same one in every
-/// engine — and the budget comes last so a write that is individually illegal
-/// says so, rather than being blamed on the activation's total.
+/// ORDER IS CONTRACT: reserved, then key size, then value size, then the
+/// activation's write budget. A key that breaks two rules must report the
+/// same one in every engine — and the budget comes last so a write that is
+/// individually illegal says so, rather than being blamed on the activation's
+/// total.
 ///
 /// `spent` is what this activation has written BEFORE this call; the budget
 /// rules judge `spent + this write`.
 pub fn checkKvWrite(
     key: []const u8,
     value: ?[]const u8,
+    is_system_module: bool,
     spent: WriteBudget,
 ) Verdict {
+    if (!is_system_module and reserved.isCustomerWriteReserved(key)) {
+        return .{ .throw = .err, .code = kv_reserved_code, .message = "" };
+    }
     if (utf8Len(key) > reserved.KV_KEY_MAX) {
         return .{
             .throw = .err,
@@ -377,30 +378,22 @@ pub fn checkShredDestroyCap(count: usize) Verdict {
 
 const testing = std.testing;
 
-test "kv: a leading-underscore key is an ordinary write" {
-    // The reserved-prefix rule is gone, and with it the last reason a customer
-    // could not use the `_` keyspace. Which keys a caller may write is decided
-    // by the ROOT of the capability it holds — a handler's kv resolves under
-    // `reserved.USER_KEY_ROOT`, so this key names a row inside the handler's
-    // own keyspace and there is nothing to refuse.
-    try testing.expect(checkKvWrite("_secret/mine", "v", .{}) == null);
-    try testing.expect(checkKvWrite("_sched/by_id/x", "v", .{}) == null);
+test "kv: order is contract — reserved before size" {
+    // A key that is both reserved AND oversized must report `reserved_key`,
+    // because that is what the worker reported before this table existed and
+    // what the offline engines report today. Order is the part of a rule set
+    // most easily lost in a rewrite, and it is customer-visible.
+    const long_reserved = "_secret/" ++ ("k" ** 300);
+    const v = checkKvWrite(long_reserved, "v", false, .{}).?;
+    try testing.expectEqualStrings(kv_reserved_code, v.code);
 }
 
-test "kv: order is contract — key size before value size" {
-    // Order is the part of a rule set most easily lost in a rewrite, and it is
-    // customer-visible: a write that breaks two rules must report the same one
-    // in every engine.
-    const long = "k" ** (reserved.KV_KEY_MAX + 1);
+test "kv: a system module writes reserved keys, and still cannot exceed the caps" {
+    try testing.expect(checkKvWrite("_sched/by_id/x", "v", true, .{}) == null);
+    // The exemption is for the NAMESPACE, not the size — a baked module
+    // writing 2 MiB would still break the stream frame.
     const big = "x" ** (reserved.KV_VAL_MAX + 1);
-    try testing.expectEqualStrings(kv_key_too_large_code, checkKvWrite(long, big, .{}).?.code);
-}
-
-test "kv: the size caps bind whoever is writing" {
-    // No namespace exemption survives, so there is no caller for whom the caps
-    // do not apply — a 2 MiB value would break the stream frame either way.
-    const big = "x" ** (reserved.KV_VAL_MAX + 1);
-    try testing.expectEqualStrings(kv_value_too_large_code, checkKvWrite("k", big, .{}).?.code);
+    try testing.expectEqualStrings(kv_value_too_large_code, checkKvWrite("k", big, true, .{}).?.code);
 }
 
 test "kv: the activation's write budget is judged last, and only after the write's own rules" {
@@ -409,19 +402,17 @@ test "kv: the activation's write budget is judged last, and only after the write
     // handler looking in the wrong place.
     const spent_full: WriteBudget = .{ .ops = reserved.KV_WRITES_MAX, .bytes = reserved.KV_WRITE_BYTES_MAX };
     const big = "x" ** (reserved.KV_VAL_MAX + 1);
-    try testing.expectEqualStrings(kv_value_too_large_code, checkKvWrite("k", big, spent_full).?.code);
-    // A key that is merely long reports its own size, not the activation's.
-    const long = "k" ** (reserved.KV_KEY_MAX + 1);
-    try testing.expectEqualStrings(kv_key_too_large_code, checkKvWrite(long, "v", spent_full).?.code);
+    try testing.expectEqualStrings(kv_value_too_large_code, checkKvWrite("k", big, false, spent_full).?.code);
+    try testing.expectEqualStrings(kv_reserved_code, checkKvWrite("_secret/k", "v", false, spent_full).?.code);
 }
 
 test "kv: the write budget refuses on ops and on bytes, and a fresh activation is clear" {
     // The count half.
     try testing.expectEqualStrings(
         kv_too_many_writes_code,
-        checkKvWrite("k", "v", .{ .ops = reserved.KV_WRITES_MAX }).?.code,
+        checkKvWrite("k", "v", false, .{ .ops = reserved.KV_WRITES_MAX }).?.code,
     );
-    try testing.expect(checkKvWrite("k", "v", .{ .ops = reserved.KV_WRITES_MAX - 1 }) == null);
+    try testing.expect(checkKvWrite("k", "v", false, .{ .ops = reserved.KV_WRITES_MAX - 1 }) == null);
 
     // The byte half judges `spent + this write`, so the boundary is exact:
     // the write that lands ON the cap is allowed, the one that crosses it is
@@ -432,17 +423,17 @@ test "kv: the write budget refuses on ops and on bytes, and a fresh activation i
     const cost = sizing.writeOpBytes(1, v.len);
     try testing.expectEqual(@as(usize, 1 + v.len + sizing.WS_OP_BYTES), cost);
     const at = reserved.KV_WRITE_BYTES_MAX - cost;
-    try testing.expect(checkKvWrite("k", v, .{ .bytes = at }) == null);
+    try testing.expect(checkKvWrite("k", v, false, .{ .bytes = at }) == null);
     try testing.expectEqualStrings(
         kv_writes_too_large_code,
-        checkKvWrite("k", v, .{ .bytes = at + 1 }).?.code,
+        checkKvWrite("k", v, false, .{ .bytes = at + 1 }).?.code,
     );
 
     // A delete costs its key and its framing, not a value.
-    try testing.expect(checkKvWrite("k", null, .{
+    try testing.expect(checkKvWrite("k", null, false, .{
         .bytes = reserved.KV_WRITE_BYTES_MAX - sizing.writeOpBytes(1, 0),
     }) == null);
-    try testing.expectEqualStrings(kv_writes_too_large_code, checkKvWrite("k", null, .{
+    try testing.expectEqualStrings(kv_writes_too_large_code, checkKvWrite("k", null, false, .{
         .bytes = reserved.KV_WRITE_BYTES_MAX - sizing.writeOpBytes(1, 0) + 1,
     }).?.code);
 
@@ -450,24 +441,18 @@ test "kv: the write budget refuses on ops and on bytes, and a fresh activation i
     // it rides the same entry as anything else.
     try testing.expectEqualStrings(
         kv_too_many_writes_code,
-        checkKvWrite("_sched/x", "v", .{ .ops = reserved.KV_WRITES_MAX }).?.code,
+        checkKvWrite("_sched/x", "v", true, .{ .ops = reserved.KV_WRITES_MAX }).?.code,
     );
 }
 
-test "kv: no namespace is refused — the allowlist has nothing left to allow" {
-    // `SHIM_WRITABLE_PREFIXES` existed as the exception to a blanket
-    // leading-`_` denial: the durability shims had to write `_send/`, `_sched/`
-    // and friends from ordinary handler context, so the denial needed holes.
-    // With the denial gone the holes are gone too — every one of these is now
-    // an ordinary key in whatever keyspace the writer's capability is rooted
-    // in, which is what makes the list retirable rather than merely shorter.
+test "kv: shim-writable prefixes pass for a customer, other reserved ones do not" {
     for (reserved.SHIM_WRITABLE_PREFIXES) |p| {
         var buf: [64]u8 = undefined;
         const k = try std.fmt.bufPrint(&buf, "{s}x", .{p});
-        try testing.expect(checkKvWrite(k, "v", .{}) == null);
+        try testing.expect(checkKvWrite(k, "v", false, .{}) == null);
     }
-    try testing.expect(checkKvWrite("_secret/x", "v", .{}) == null);
-    try testing.expect(checkKvWrite("orders/1", "v", .{}) == null);
+    try testing.expect(checkKvWrite("_secret/x", "v", false, .{}) != null);
+    try testing.expect(checkKvWrite("orders/1", "v", false, .{}) == null);
 }
 
 test "tag: every rule, in the worker's order" {
@@ -496,6 +481,8 @@ test "tag: capacity refuses only at the cap" {
     );
 }
 
+
+
 test "kv: a legal value under a legal key is writable by a fresh activation" {
     // The two rules have to be satisfiable together, framing included — a
     // value the guard calls legal that no handler can actually write is a cap
@@ -503,7 +490,7 @@ test "kv: a legal value under a legal key is writable by a fresh activation" {
     // arithmetic; this is the same claim through the surface that enforces it.
     const k = "k" ** reserved.KV_KEY_MAX;
     const v = "v" ** reserved.KV_VAL_MAX;
-    try testing.expect(checkKvWrite(k, v, .{}) == null);
+    try testing.expect(checkKvWrite(k, v, false, .{}) == null);
 }
 
 test "kv: the check and the charge are the same function" {
@@ -514,9 +501,9 @@ test "kv: the check and the charge are the same function" {
     // replicated. Both call this.
     try testing.expectEqual(@as(usize, 9 + 3 + 5), kvWriteCost(3, 5));
     const at = reserved.KV_WRITE_BYTES_MAX - kvWriteCost(3, 5);
-    try testing.expect(checkKvWrite("abc", "defgh", .{ .bytes = at }) == null);
+    try testing.expect(checkKvWrite("abc", "defgh", false, .{ .bytes = at }) == null);
     try testing.expectEqualStrings(
         kv_writes_too_large_code,
-        checkKvWrite("abc", "defgh", .{ .bytes = at + 1 }).?.code,
+        checkKvWrite("abc", "defgh", false, .{ .bytes = at + 1 }).?.code,
     );
 }
