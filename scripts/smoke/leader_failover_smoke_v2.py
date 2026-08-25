@@ -121,7 +121,7 @@ def main() -> int:
               r.status == 200 and VALUE1 in r.body, f"got {r.status} {r.body!r}")
         # And visible on every node's replicated store (sanity before the kill).
         for i in range(3):
-            r = c.admin_kv_get("acme", KEY, node=i)
+            r = c.node_kv_get("acme", KEY, node=i)
             check(f"admin_kv_get node {i + 1} pre-kill → {VALUE1!r}",
                   r.status == 200 and VALUE1 in r.body, f"got {r.status} {r.body!r}")
 
@@ -205,7 +205,7 @@ def main() -> int:
 
         print("step 6: ⭐ data survived the kill — each survivor holds it")
         for i in survivors:
-            r = c.admin_kv_get("acme", KEY, node=i)
+            r = c.node_kv_get("acme", KEY, node=i)
             check(f"admin_kv_get survivor node {i + 1} → {VALUE1!r}",
                   r.status == 200 and VALUE1 in r.body, f"got {r.status} {r.body!r}")
 
@@ -221,7 +221,7 @@ def main() -> int:
             import time
             deadline = time.time() + 25.0
             while time.time() < deadline:
-                rp = c.admin_kv_put("acme", KEY, VALUE2, node=new_lead)
+                rp = c.node_kv_put("acme", KEY, VALUE2, node=new_lead)
                 if rp.status in (200, 204):
                     wrote = True
                     break
@@ -240,7 +240,7 @@ def main() -> int:
                 rg = None
                 deadline = time.time() + 15.0
                 while time.time() < deadline:
-                    rg = c.admin_kv_get("acme", KEY, node=i)
+                    rg = c.node_kv_get("acme", KEY, node=i)
                     if rg.status == 200 and VALUE2 in rg.body:
                         ok_read = True
                         break

@@ -170,7 +170,7 @@ def main() -> int:
         def converged_now():
             vals = {}
             for i in range(3):
-                r = c.admin_kv_get("acme", KEY, node=i)
+                r = c.node_kv_get("acme", KEY, node=i)
                 vals[i] = r.body.strip() if r.status == 200 else f"<{r.status}>"
             ok = all(not v.startswith("<") for v in vals.values()) and vals[0] == vals[1] == vals[2]
             return ok, vals

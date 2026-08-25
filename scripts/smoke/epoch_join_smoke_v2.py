@@ -184,7 +184,7 @@ def main() -> int:
             c.request_retry("acme", "/?fn=handler", method="POST", data='{"key":"final/marker","value":"epoch-ok"}', want_status=204, deadline_s=15)
             repl = False
             for _ in range(40):
-                if "epoch-ok" in c.admin_kv_get("acme", "final/marker", node=victim).body:
+                if "epoch-ok" in c.node_kv_get("acme", "final/marker", node=victim).body:
                     repl = True; break
                 time.sleep(0.5)
             check(f"⭐ fresh write replicated to node {vnid}", repl)

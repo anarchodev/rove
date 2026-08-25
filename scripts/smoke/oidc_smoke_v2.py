@@ -138,7 +138,7 @@ def main() -> int:
             ],
             "login_path": "/login",
         }, separators=(",", ":"))
-        r = c.admin_kv_put("__auth__", "_oidc/config/default", cfg)
+        r = c.node_kv_put("__auth__", "_oidc/config/default", cfg)
         check("seed _oidc/config/default (v2-kv) → 204", r.status == 204,
               f"got {r.status} {r.body!r}")
 

@@ -166,7 +166,7 @@ def main() -> int:
         print(f"step 6: ⭐ node {vnid} catches up (no deadlock) — holds the latest value")
         caught = False
         for _ in range(40):  # ~20s
-            rg = c.admin_kv_get("acme", KEY, node=victim)
+            rg = c.node_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and latest in rg.body:
                 caught = True
                 break
@@ -182,7 +182,7 @@ def main() -> int:
             c.request_retry("acme", "/?fn=handler", method="POST", data='{"value":"after-promote"}', want_status=204, deadline_s=15)
             repl = False
             for _ in range(40):
-                if "after-promote" in c.admin_kv_get("acme", KEY, node=victim).body:
+                if "after-promote" in c.node_kv_get("acme", KEY, node=victim).body:
                     repl = True; break
                 time.sleep(0.5)
             check(f"⭐ fresh write replicated to node {vnid}", repl)

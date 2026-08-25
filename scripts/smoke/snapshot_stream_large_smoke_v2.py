@@ -160,7 +160,7 @@ def main() -> int:
         ok_vals = 0
         sample = ["big/0000", "big/0099", f"big/{N_BIG - 1:04d}"]
         for k in sample:
-            body = c.admin_kv_get("acme", k, node=victim).body
+            body = c.node_kv_get("acme", k, node=victim).body
             if len(body) == VAL_BYTES and body[:1] == "v":
                 ok_vals += 1
         check(f"⭐ sampled big values byte-exact on recovered node {vnid}",

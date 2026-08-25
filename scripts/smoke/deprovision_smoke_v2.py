@@ -89,7 +89,7 @@ def main() -> int:
         put_ok = False
         for _ in range(20):
             for n in range(len(c.node_ports)):
-                if c.admin_kv_put(TENANT, "secret", "alice-private-data", node=n).status == 204:
+                if c.node_kv_put(TENANT, "secret", "alice-private-data", node=n).status == 204:
                     put_ok = True
                     break
             if put_ok:

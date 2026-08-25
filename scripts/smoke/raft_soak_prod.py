@@ -105,7 +105,7 @@ def main() -> int:
             seq += 1
 
     def kv_on(c, node, key):
-        return c.admin_kv_get(TENANT, key, node=node).body
+        return c.node_kv_get(TENANT, key, node=node).body
 
     def verify_node(c, node, label, sample=8):
         """Assert `node` has the expected value for a sample of keys (newest first)."""

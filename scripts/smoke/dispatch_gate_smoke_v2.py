@@ -111,7 +111,7 @@ def main() -> int:
             rg = None
             deadline = time.time() + 15.0
             while time.time() < deadline:
-                rg = c.admin_kv_get("acme", KEY, node=i)
+                rg = c.node_kv_get("acme", KEY, node=i)
                 if rg.status == 200 and VALUE in rg.body:
                     ok_rep = True
                     break

@@ -117,7 +117,7 @@ def main() -> int:
                     ctr[0] += 1
                     i = ctr[0]
                 k, v = f"k/{i}", f"v/{i}"
-                r = c.admin_kv_put("acme", k, v, node=node)
+                r = c.node_kv_put("acme", k, v, node=node)
                 if r.status in (200, 204):
                     with wlock:
                         written[k] = v
@@ -160,7 +160,7 @@ def main() -> int:
             ok = False
             deadline = time.time() + 10.0
             while time.time() < deadline:
-                if c.admin_kv_get("acme", seed_k, node=i).body.find(written[seed_k]) >= 0:
+                if c.node_kv_get("acme", seed_k, node=i).body.find(written[seed_k]) >= 0:
                     ok = True
                     break
                 time.sleep(0.3)
@@ -212,7 +212,7 @@ def main() -> int:
         marker = f"k/{ctr[0]}"
         deadline = time.time() + 30.0
         while time.time() < deadline:
-            if c.admin_kv_get("acme", marker, node=victim).body.find(written.get(marker, "\0")) >= 0:
+            if c.node_kv_get("acme", marker, node=victim).body.find(written.get(marker, "\0")) >= 0:
                 break
             time.sleep(0.5)
 
@@ -226,13 +226,13 @@ def main() -> int:
             # brief per-key retry to absorb in-flight apply, not to mask a fork
             ok = False
             for _ in range(3):
-                b = c.admin_kv_get("acme", k, node=victim).body
+                b = c.node_kv_get("acme", k, node=victim).body
                 if v in b:
                     ok = True
                     break
                 time.sleep(0.2)
             if not ok:
-                b = c.admin_kv_get("acme", k, node=victim).body
+                b = c.node_kv_get("acme", k, node=victim).body
                 (missing if (b == "" or "none" in b or "404" in b) else mismatch).append(k)
         check(f"⭐ victim holds ALL {len(keys)} acked keys (no fork)",
               not missing and not mismatch,

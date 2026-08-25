@@ -122,7 +122,7 @@ def main() -> int:
         # re-created an empty group).
         repl, seen = False, ""
         for _ in range(40):
-            seen = c.admin_kv_get("acme", "during/down", node=victim).body
+            seen = c.node_kv_get("acme", "during/down", node=victim).body
             if "written-while-down" in seen:
                 repl = True; break
             time.sleep(0.5)

@@ -62,7 +62,7 @@ def main() -> int:
         deadline = time.time() + deadline_s
         last = None
         while time.time() < deadline:
-            last = c.admin_kv_get(tenant, key, node=node)
+            last = c.node_kv_get(tenant, key, node=node)
             if last.status == 200 and last.body == want:
                 return last
             time.sleep(0.3)
@@ -75,7 +75,7 @@ def main() -> int:
         while time.time() < deadline:
             leader = node_fn()
             if leader is not None:
-                last = c.admin_kv_put(tenant, key, value, node=leader)
+                last = c.node_kv_put(tenant, key, value, node=leader)
                 if last.status == 204:
                     return last
             time.sleep(0.3)
@@ -103,7 +103,7 @@ def main() -> int:
         leader = c.leader_node(TENANT)
         check("found a leader", leader is not None, f"node {leader}")
         if leader is not None:
-            r = c.admin_kv_put(TENANT, KEY, V1, node=leader)
+            r = c.node_kv_put(TENANT, KEY, V1, node=leader)
             check("PUT seed via leader → 204", r.status == 204, f"got {r.status}")
             for i in range(nodes):
                 rr = kv_get_retry(c, TENANT, KEY, i, V1)

@@ -436,7 +436,109 @@ export function onCut() {
   return JSON.stringify(request.ctx); // { ok, dep_id }
 }
 
+// GET/PUT /v1/instances/:id/kv — read or seed a tenant's kv as the operator.
+//
+// Same argument as the CP relay below: the deployed dashboard has this route
+// (`web/admin` `/v1/instances/:id/kv`, via `platform.scope(id).kv`), and the
+// BAKED app needs it too, or a tenant's kv is unreadable on every cluster that
+// has not published the dashboard — which is every freshly-genesis'd one.
+//
+// It reads through `platform.scope(id).kv`, the same door the dashboard uses,
+// so it answers in whatever spelling a handler of that tenant would use. That
+// is the point: an operator asking "what does this tenant see at K" gets the
+// tenant's answer, not storage's. `/_system/v2-kv` answers the other question —
+// it belongs to the tenant-MOVE protocol, where the store's own spelling is
+// what a move has to carry — and the two must not be conflated (rove#870).
+//
+// Shape mirrors `v2-kv`'s so callers read the same: 200 + the raw value, or
+// 404 `no such key`.
+// One parameter out of a raw query string. Decodes `+` and %-escapes, so a key
+// with a slash or a space round-trips.
+function qsParam(qs, name) {
+  const parts = qs.split("&");
+  for (let i = 0; i < parts.length; i++) {
+    const eq = parts[i].indexOf("=");
+    if (eq === -1) continue;
+    if (decodeURIComponent(parts[i].slice(0, eq)) !== name) continue;
+    return decodeURIComponent(parts[i].slice(eq + 1).replace(/\+/g, " "));
+  }
+  return null;
+}
+
+function kvStoreFor(id) {
+  try {
+    return platform.scope(id).kv;
+  } catch (e) {
+    if (e && e.code === "InstanceNotFound") return null;
+    throw e;
+  }
+}
+
+// `/v1/instances/{id}/kv` and nothing else. Matching is separate from serving
+// so the dispatcher can decide the route BEFORE the method gate without
+// changing what any other path answers.
+function isKvRoute(p) {
+  if (p.indexOf("/v1/instances/") !== 0) return false;
+  const rest = p.slice("/v1/instances/".length);
+  const slash = rest.indexOf("/");
+  return slash > 0 && rest.slice(slash) === "/kv";
+}
+
+function instanceKvRoute(p, method, body) {
+  const rest = p.slice("/v1/instances/".length);
+  const id = rest.slice(0, rest.indexOf("/"));
+  const store = kvStoreFor(id);
+  if (store === null) return jerr(404, "unknown instance");
+
+  if (method === "GET") {
+    // `request.path` never carries the query string — it lives only on
+    // `request.query`, as a raw string (handler-shape.md, the default-activation
+    // surface). Splitting `path` on "?" yields an empty query and a door that
+    // never sees its parameter.
+    const key = qsParam(request.query || "", "key");
+    if (!key) return jerr(400, "missing ?key");
+    const v = store.get(key);
+    if (v === null) {
+      response.status = 404;
+      return "no such key\n";
+    }
+    response.status = 200;
+    return v;
+  }
+  if (method === "PUT" || method === "POST") {
+    if (!body || typeof body.key !== "string" || !body.key) {
+      return jerr(400, "missing key");
+    }
+    if (typeof body.value !== "string") return jerr(400, "value must be a string");
+    store.set(body.key, body.value);
+    // 204, matching `/_system/v2-kv`'s PUT — the two doors answer different
+    // QUESTIONS, but a caller switching between them should not also have to
+    // switch status codes.
+    response.status = 204;
+    return "";
+  }
+  return jerr(405, "GET to read, PUT to write");
+}
+
 export default function () {
+  // The kv route serves GET, so it is decided BEFORE the POST-only gate below.
+  // Everything else keeps the original order — an unauthenticated GET of any
+  // other path still answers 405, which is what the readiness probe asserts.
+  if (isKvRoute(request.path)) {
+    // The operator-root verdict, computed by the engine. `authorization` is not
+    // readable here — a bearer the handler reads is a bearer the tape records
+    // (docs/architecture/privileged-surface.md).
+    if (!request.rewind.isRoot) {
+      response.status = 401;
+      return "unauthenticated\n";
+    }
+    let kb;
+    if (request.method !== "GET") {
+      try { kb = request.json; }
+      catch (e) { return jerr(400, "expected JSON body"); }
+    }
+    return instanceKvRoute(request.path, request.method, kb);
+  }
   if (request.method !== "POST") {
     response.status = 405;
     return "POST only\n";
