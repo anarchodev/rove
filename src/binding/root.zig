@@ -389,8 +389,9 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
             // module, not at any call site. An exempt key is not a customer
             // write at all and skips the table, exactly as the JS evaluator's
             // isExempt parameter does.
-            if (d.decides() and !d.isExempt(key)) {
-                if (guards.checkKvWrite(key, value, d.isSystemModule(), d.writeBudget())) |refusal| {
+            const exempt = d.isExempt(key);
+            if (d.decides() and !exempt) {
+                if (guards.checkKvWrite(key, value, d.writeBudget())) |refusal| {
                     d.recordRefusal(.set, key, refusal);
                     return throwRefusal(d, ctx, refusal, key);
                 }
@@ -409,7 +410,12 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
             // refused or failed one costs nothing, or a handler could be
             // starved by writes that never reached the entry. Charged on the
             // key that rides the entry, which is the resolved one.
-            d.noteWrite(guards.kvWriteCost(skey.len, value.len));
+            // An exempt key is not a customer write, so it does not spend the
+            // customer's allowance either — charging it would let harness
+            // scaffolding starve the handler it is scaffolding. The check-skip
+            // and the charge-skip are the same statement; splitting them is
+            // what let this hide behind the reserved rule's ordering.
+            if (!exempt) d.noteWrite(guards.kvWriteCost(skey.len, value.len));
             return js_undefined;
         }
 
@@ -430,8 +436,9 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
             }
             // Same rules, same authority — null value: a delete has none to
             // size-check.
-            if (d.decides() and !d.isExempt(key)) {
-                if (guards.checkKvWrite(key, null, d.isSystemModule(), d.writeBudget())) |refusal| {
+            const exempt = d.isExempt(key);
+            if (d.decides() and !exempt) {
+                if (guards.checkKvWrite(key, null, d.writeBudget())) |refusal| {
                     d.recordRefusal(.delete, key, refusal);
                     return throwRefusal(d, ctx, refusal, key);
                 }
@@ -443,7 +450,7 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
             if (!d.del(ctx, .{ .named = key, .stored = skey })) return js_exception;
             // A delete is an op with a key and no value — it rides the entry
             // like any other.
-            d.noteWrite(guards.kvWriteCost(skey.len, 0));
+            if (!exempt) d.noteWrite(guards.kvWriteCost(skey.len, 0));
             return js_undefined;
         }
 
