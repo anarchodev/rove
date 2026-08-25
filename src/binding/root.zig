@@ -77,16 +77,26 @@
 //!                                         //   runs under, for resolving the
 //!                                         //   `_config/` namespace; 0 = an
 //!                                         //   authored world with no release
-//! get(d, key) GetResult                   // value (owned) | absent | thrown
+//! get(d, key: Key) GetResult              // value (owned) | absent | thrown
 //!                                         //   — the delegate records/tapes/
 //!                                         //   folds internally
 //! release(d, bytes) void                  // free a get() result
-//! put(d, ctx, key, value) bool            // false = a JS exception is pending
-//! del(d, ctx, key) bool                   //   (trigger rejection, …)
-//! prefix(d, p, cursor, limit) ?Page       // null = storage error → JS null;
+//! put(d, ctx, key: Key, value) bool       // false = a JS exception is pending
+//! del(d, ctx, key: Key) bool              //   (trigger rejection, …)
+//! prefix(d, scan: Scan) ?Page             // null = storage error → JS null;
 //!                                         //   Page has .entries ([]{key,value})
-//!                                         //   and deinit()
+//!                                         //   and deinit(). Row keys come back
+//!                                         //   STORED; `scan.visible(k)` is the
+//!                                         //   caller's spelling.
 //! ```
+//!
+//! `Key` carries both spellings because a rooted binding has two, and the rule
+//! for choosing is uniform: **`named` for anything the caller named or
+//! observes** (tape, digest, trigger and subscription matching, harness
+//! assertions), **`stored` for anything reaching storage or the wire** (the
+//! store, the writeset, the entry byte budget). Resolving once here rather than
+//! in each delegate is what keeps three engines from drifting into three
+//! resolutions.
 //!
 //! `put`/`del` take the context because an engine's post-write machinery may
 //! run JS (the worker's kv-trigger chains); `get`/`prefix` deliberately do
@@ -122,6 +132,58 @@ pub const GetResult = union(enum) {
 /// mirrors the tape's `KvOp` without importing the tape module here.
 pub const WriteOp = enum { set, delete };
 
+/// A key in both of its spellings, because a rooted binding has two and every
+/// consumer wants a specific one.
+///
+/// The split is not a detail of the rooting — it is the rule for using it, and
+/// it is the same rule everywhere: **anything the caller named or observes uses
+/// `named`; anything that reaches storage or the wire uses `stored`.**
+///
+///   `named`   tape, interaction digest, trigger matching, subscription
+///             matching, refusal messages, harness assertions — all of these
+///             are about a key the handler chose, and a trigger registered at
+///             `orders/` must fire for `kv.set("orders/1")` whatever root the
+///             row lands under.
+///   `stored`  the store, the writeset (it rides the raft entry), and the
+///             entry byte budget.
+///
+/// Passing both rather than resolving inside each delegate keeps ONE
+/// implementation of the resolution — three delegates each doing their own is
+/// the writer/reader prefix-depth split, which this codebase has paid for. The
+/// cost is a wider delegate contract, and that is the right trade: the two
+/// spellings are explicit at every call site instead of implied.
+///
+/// The two are the same slice under `.raw` for everything but `_config/`.
+pub const Key = struct {
+    named: []const u8,
+    stored: []const u8,
+};
+
+/// A `kv.prefix` request, in both spellings, plus what a delegate needs to put
+/// a row key back into the caller's spelling.
+///
+/// A scan is the asymmetry a get/set pair does not have: the prefix and cursor
+/// go DOWN resolved, and row keys come back UP in whatever form storage holds.
+/// So a delegate that records the scan — for a tape, a digest, or a harness
+/// assertion — has to un-root each row itself, and `visible` is how.
+pub const Scan = struct {
+    prefix: Key,
+    cursor: Key,
+    limit: u32,
+    /// The binding's root, so a delegate can un-map. Empty under `.raw`.
+    root: []const u8,
+
+    /// A stored row key in the spelling the caller paged with. Returns the key
+    /// unchanged when it does not carry the root, which under `.user` cannot
+    /// happen — the scan is bounded by the root — and under `.raw` is every
+    /// key.
+    pub fn visible(self: Scan, stored: []const u8) []const u8 {
+        if (self.root.len == 0) return stored;
+        if (!std.mem.startsWith(u8, stored, self.root)) return stored;
+        return stored[self.root.len..];
+    }
+};
+
 /// quickjs.h defines JS_UNDEFINED etc. as compound-literal macros the C
 /// translator cannot expand; reconstruct them per import instance, branching
 /// on the value REPRESENTATION: 64-bit builds carry the {u, tag} struct,
@@ -142,11 +204,43 @@ fn Vals(comptime q: type) type {
     };
 }
 
-pub fn Kv(comptime q: type, comptime D: type) type {
+/// The keyspace a `Kv` instantiation is rooted in — the whole of what
+/// separates the capability a handler holds from the one the engine keeps.
+///
+/// Two instantiations of the identical code, differing only here. Which one an
+/// activation is handed is decided when its activation object is assembled,
+/// from the module path (`builtin_modules.isBuiltinPath`), and that decision is
+/// the entire access-control mechanism: a handler cannot reach an engine key
+/// because the object it holds is rooted elsewhere, not because a predicate
+/// refuses it (`docs/architecture/package-isolation.md`, not installing is the
+/// denial).
+///
+/// Per-*activation* is the correct granularity for a GRANT even though it is
+/// the wrong granularity for a check — a package executing inside a customer
+/// activation is indistinguishable from the handler at call time, which is why
+/// nothing here consults who is calling.
+pub const Root = enum {
+    /// Every key reroots under `reserved.USER_KEY_ROOT`, with no exception.
+    /// The engine keyspace is not refused, it is unnameable.
+    user,
+    /// Storage as it lies. Held by baked `__system/` activations and by the
+    /// natives that implement narrower capabilities (`config`) over it.
+    raw,
+
+    fn prefix(comptime self: Root) []const u8 {
+        return switch (self) {
+            .user => guards.reserved.USER_KEY_ROOT,
+            .raw => "",
+        };
+    }
+};
+
+pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
     return struct {
         const js_undefined = Vals(q).js_undefined;
         const js_null = Vals(q).js_null;
         const js_exception = Vals(q).js_exception;
+        const key_root = root.prefix();
 
         /// JSValue → owned bytes via the engine allocator, no type
         /// restriction — `kv.get({})` reads the key `"[object Object]"`,
@@ -250,19 +344,15 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             const key = coerce(d, ctx, argv[0]) catch return js_exception;
             defer d.allocator().free(key);
 
-            // The engine-only keyspace is INVISIBLE, not refused
-            // (`guards.kvReadHidden`) — so the read answers absent without
-            // reaching storage, and nothing about it enters the readset or
-            // the digest. Gated on `decides()` like the write table: a
-            // captured world replays the read that happened, not the read
-            // today's rules would allow.
-            if (d.decides() and guards.kvReadHidden(key, d.isSystemModule())) return js_null;
-
-            // `_config/` resolves under the asking activation's deployment.
-            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            // No hidden-keyspace check. A scoped read of an engine namespace
+            // is not answered "absent" as a policy — it lands inside the
+            // caller's own root, where the row genuinely is absent unless the
+            // caller put it there. The engine keyspace is not concealed from
+            // this binding; it is unreachable through it.
+            var skey_buf: [guards.reserved.STORAGE_KEY_MAX]u8 = undefined;
             const skey = storageKey(d, &skey_buf, key) orelse return js_null;
 
-            switch (d.get(skey)) {
+            switch (d.get(.{ .named = key, .stored = skey })) {
                 .value => |v| {
                     defer d.release(v);
                     return q.JS_NewStringLen(ctx, v.ptr, v.len);
@@ -311,10 +401,10 @@ pub fn Kv(comptime q: type, comptime D: type) type {
             // same row. Only the mirror writes `_config/` in production, but
             // an asymmetry here is the kind that surfaces years later as a
             // config write nobody can find.
-            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            var skey_buf: [guards.reserved.STORAGE_KEY_MAX]u8 = undefined;
             const skey = storageKey(d, &skey_buf, key) orelse return js_exception;
 
-            if (!d.put(ctx, skey, value)) return js_exception;
+            if (!d.put(ctx, .{ .named = key, .stored = skey }, value)) return js_exception;
             // Spend the activation's budget only on a write that HAPPENED: a
             // refused or failed one costs nothing, or a handler could be
             // starved by writes that never reached the entry. Charged on the
@@ -347,30 +437,72 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 }
             }
 
-            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            var skey_buf: [guards.reserved.STORAGE_KEY_MAX]u8 = undefined;
             const skey = storageKey(d, &skey_buf, key) orelse return js_exception;
 
-            if (!d.del(ctx, skey)) return js_exception;
+            if (!d.del(ctx, .{ .named = key, .stored = skey })) return js_exception;
             // A delete is an op with a key and no value — it rides the entry
             // like any other.
             d.noteWrite(guards.kvWriteCost(skey.len, 0));
             return js_undefined;
         }
 
-        /// Where a `_config/` key LIVES for the activation doing the asking.
+        /// Where the key a caller NAMED actually lives.
         ///
-        /// A handler names config by its deployed path; storage holds it under
-        /// the deployment that shipped it, so code and config switch at the
-        /// same instant (`reserved.configStorageKey`). The rule is shared and
-        /// the deployment id is the engine's, which is why this sits in the
-        /// binding rather than in four delegates: the spelling a handler uses
-        /// must not depend on which engine is running it.
+        /// Under `.user` this is the whole of the scoping rule and it has no
+        /// exceptions: every key reroots, so there is no spelling that escapes
+        /// the root and nothing to enumerate. An exception here would be a key
+        /// the handler could name outside its own keyspace, which is exactly
+        /// the property the root exists to remove.
         ///
-        /// Returns the key unchanged for everything that is not config, and
-        /// for an authored world with no release (`configScope() == 0`).
+        /// Under `.raw` the one resolution that remains is config's: a caller
+        /// names config by its deployed path and storage holds it under the
+        /// deployment that shipped it, so code and config switch at the same
+        /// instant (`reserved.configStorageKey`). That rule sits in the binding
+        /// rather than in four delegates because the spelling must not depend
+        /// on which engine is running. It does not apply under `.user` —
+        /// handler-named config is reached through the narrower `config`
+        /// capability, which is implemented over a `.raw` binding.
+        ///
+        /// Returns null only when the resolved key would not fit `buf`; callers
+        /// size it `reserved.STORAGE_KEY_MAX`, which holds either resolution.
         fn storageKey(d: D, buf: []u8, key: []const u8) ?[]const u8 {
+            if (comptime root == .user) {
+                // An exempt key is not a customer write — the delegate has
+                // said so — and so is not the caller's to have rerooted. The
+                // offline engines' store facade (`__rove_store/`) addresses
+                // OTHER stores through this binding, and rooting those would
+                // point them at a namespace inside the caller's own. This is
+                // an engine-declared exemption, not a spelling that escapes
+                // the rule: the worker returns false unconditionally, so
+                // production has no such key.
+                if (d.isExempt(key)) return key;
+                return std.fmt.bufPrint(buf, "{s}{s}", .{ key_root, key }) catch null;
+            }
             if (!guards.reserved.isConfigKey(key)) return key;
             return guards.reserved.configStorageKey(buf, d.configScope(), key);
+        }
+
+        /// The inverse of `storageKey` for a key STORAGE produced — used on the
+        /// scan path, the one place resolved keys travel back to the caller.
+        ///
+        /// A scan is the asymmetry that a get/set pair does not have: the key
+        /// goes down resolved and comes back up in whatever form storage holds.
+        /// Leaving it resolved is the writer/reader prefix-depth split this
+        /// codebase has paid for before — the caller pages with a cursor it was
+        /// handed, so a key returned in one depth and accepted in another
+        /// silently truncates the scan rather than failing it.
+        ///
+        /// A row that does not carry the root cannot be addressed by the caller
+        /// and is skipped; under `.user` a scan is bounded by the root, so that
+        /// is unreachable rather than merely unlikely.
+        /// `eff_root` is empty when the scan was not rooted — a `.raw`
+        /// binding, or an exempt prefix, whose rows are addressed exactly as
+        /// storage holds them.
+        fn visibleKey(eff_root: []const u8, stored: []const u8) ?[]const u8 {
+            if (eff_root.len == 0) return stored;
+            if (!std.mem.startsWith(u8, stored, eff_root)) return null;
+            return stored[eff_root.len..];
         }
 
         /// `kv.prefix(prefix, cursor?, limit?)` → `[ { key, value }, ... ]`
@@ -401,100 +533,65 @@ pub fn Kv(comptime q: type, comptime D: type) type {
                 break :blk @min(@as(u32, @intCast(n)), KV_PREFIX_MAX);
             } else KV_PREFIX_DEFAULT;
 
-            // Two hidden-aware paths before the plain one. A scan wholly
-            // inside an engine-only namespace has nothing visible to return
-            // and must not touch storage; a scan that merely SPANS one has to
-            // filter AND refill (`reserved.scanSpansEngineOnly`). Every other
-            // scan — the overwhelming majority, any prefix that is not an
-            // ancestor of a platform namespace — takes the plain path below
-            // and pays nothing.
-            if (d.decides() and guards.kvScanAllHidden(prefix, d.isSystemModule())) {
-                return q.JS_NewArray(ctx);
-            }
-            if (d.decides() and guards.kvScanFilters(prefix, d.isSystemModule())) {
-                return kvPrefixFiltered(d, ctx, prefix, cursor, limit);
-            }
+            // A scan resolves the same way a get does — `kv.prefix("_config/")`
+            // sees this deployment's rows and not every deployment's, and a
+            // scoped scan is bounded by its root.
+            //
+            // There is no hidden-row filtering here and no page refilling.
+            // A scoped scan cannot reach an engine key: the key is not removed
+            // from the range, it was never in it. That is the difference
+            // between a boundary drawn by the shape of the capability and one
+            // policed on every row — the second needed a refill loop, because
+            // a run of hidden rows longer than a page reads as end-of-data to
+            // the documented paging idiom (`handler-shape.md` §5.7).
+            // A scan whose prefix the delegate calls exempt is not rooted —
+            // the offline facade addresses other stores through this binding —
+            // so it must not be un-rooted on the way out either. Deriving the
+            // effective root once, here, is what keeps the two directions from
+            // disagreeing: the earlier version rooted neither and un-rooted
+            // both, which dropped every facade row and read as an empty page.
+            const eff_root: []const u8 = if (comptime root == .raw)
+                ""
+            else if (d.isExempt(prefix))
+                ""
+            else
+                key_root;
 
-            // A scan of the config namespace resolves the same way a get
-            // does, so `kv.prefix("_config/")` sees this deployment's rows and
-            // not every deployment's.
-            var spfx_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            var spfx_buf: [guards.reserved.STORAGE_KEY_MAX]u8 = undefined;
             const spfx = storageKey(d, &spfx_buf, prefix) orelse return js_null;
 
-            var page = d.prefix(spfx, cursor, limit) orelse return js_null;
+            // The cursor is a key the CALLER was handed, so it comes back in
+            // the visible spelling and has to be resolved like any other key
+            // before storage compares it. An empty cursor means "from the
+            // start" and stays empty — resolving it would name the root, which
+            // is not a row. Getting this wrong is the writer/reader
+            // prefix-depth split: the scan still returns a first page, then
+            // pages that silently repeat or skip.
+            var scur_buf: [guards.reserved.STORAGE_KEY_MAX]u8 = undefined;
+            const scur = if (cursor.len == 0)
+                cursor
+            else
+                storageKey(d, &scur_buf, cursor) orelse return js_null;
+
+            var page = d.prefix(.{
+                .prefix = .{ .named = prefix, .stored = spfx },
+                .cursor = .{ .named = cursor, .stored = scur },
+                .limit = limit,
+                .root = eff_root,
+            }) orelse return js_null;
             defer page.deinit();
 
             const arr = q.JS_NewArray(ctx);
-            for (page.entries, 0..) |e, i| {
-                const obj = q.JS_NewObject(ctx);
-                _ = q.JS_SetPropertyStr(ctx, obj, "key", q.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
-                _ = q.JS_SetPropertyStr(ctx, obj, "value", q.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
-                _ = q.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
-            }
-            return arr;
-        }
-
-        /// `kv.prefix` over a range that contains engine-only keys: skip them,
-        /// and keep scanning until the page is full or storage runs out.
-        ///
-        /// Refilling is the whole point. Filtering a single page would let a
-        /// run of hidden rows longer than one page come back EMPTY, and the
-        /// documented paging idiom stops on an empty page
-        /// (`handler-shape.md` §5.7) — so a tenant with a few hundred meter
-        /// rows would see its own scan end early and silently lose everything
-        /// sorted after them.
-        ///
-        /// Each iteration is a separate delegate scan, so it is a separate
-        /// taped read; the loop lives in the shared binding precisely so every
-        /// engine performs the identical sequence and replay reconstructs it.
-        fn kvPrefixFiltered(
-            d: D,
-            ctx: ?*q.JSContext,
-            prefix: []const u8,
-            cursor: []const u8,
-            limit: u32,
-        ) q.JSValue {
-            const arr = q.JS_NewArray(ctx);
             var n: u32 = 0;
-            // Advances past the last row EXAMINED, hidden rows included, so
-            // each pass starts strictly later than the one before and the
-            // loop terminates.
-            var cur: []u8 = d.allocator().dupe(u8, cursor) catch return js_exception;
-            defer d.allocator().free(cur);
-
-            while (n < limit) {
-                var page = d.prefix(prefix, cur, limit) orelse return js_null;
-                const fetched = page.entries.len;
-                var last: ?[]const u8 = null;
-                for (page.entries) |e| {
-                    if (n >= limit) break;
-                    last = e.key;
-                    if (guards.kvRowHidden(e.key)) continue;
-                    const obj = q.JS_NewObject(ctx);
-                    _ = q.JS_SetPropertyStr(ctx, obj, "key", q.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
-                    _ = q.JS_SetPropertyStr(ctx, obj, "value", q.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
-                    _ = q.JS_SetPropertyUint32(ctx, arr, n, obj);
-                    n += 1;
-                }
-                // Dup before the page's storage goes away.
-                const advanced: ?[]u8 = if (last) |l|
-                    (d.allocator().dupe(u8, l) catch {
-                        page.deinit();
-                        return js_exception;
-                    })
-                else
-                    null;
-                page.deinit();
-                // A short page means storage is exhausted — there is nothing
-                // left to refill from, however many rows were filtered.
-                if (fetched < limit) {
-                    if (advanced) |a| d.allocator().free(a);
-                    break;
-                }
-                if (advanced) |a| {
-                    d.allocator().free(cur);
-                    cur = a;
-                } else break;
+            for (page.entries) |e| {
+                // Hand back the spelling the caller uses, so the key it pages
+                // with next is one this same call would accept.
+                const vkey = visibleKey(eff_root, e.key) orelse continue;
+                const obj = q.JS_NewObject(ctx);
+                _ = q.JS_SetPropertyStr(ctx, obj, "key", q.JS_NewStringLen(ctx, vkey.ptr, vkey.len));
+                _ = q.JS_SetPropertyStr(ctx, obj, "value", q.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
+                _ = q.JS_SetPropertyUint32(ctx, arr, n, obj);
+                n += 1;
             }
             return arr;
         }

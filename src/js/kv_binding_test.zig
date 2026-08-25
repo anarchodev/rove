@@ -107,7 +107,8 @@ const MockKv = struct {
         st.recorded_refusal_code = refusal.code;
     }
 
-    pub fn get(self: MockKv, key: []const u8) binding.GetResult {
+    pub fn get(self: MockKv, k: binding.Key) binding.GetResult {
+        const key = k.stored;
         const v = self.st.map.get(key) orelse return .absent;
         return .{ .value = self.st.a.dupe(u8, v) catch return .absent };
     }
@@ -116,7 +117,8 @@ const MockKv = struct {
         self.st.a.free(bytes);
     }
 
-    pub fn put(self: MockKv, _: ?*c.JSContext, key: []const u8, value: []const u8) bool {
+    pub fn put(self: MockKv, _: ?*c.JSContext, k: binding.Key, value: []const u8) bool {
+        const key = k.stored;
         const st = self.st;
         const vdup = st.a.dupe(u8, value) catch return true;
         if (st.map.getEntry(key)) |e| {
@@ -135,7 +137,8 @@ const MockKv = struct {
         return true;
     }
 
-    pub fn del(self: MockKv, _: ?*c.JSContext, key: []const u8) bool {
+    pub fn del(self: MockKv, _: ?*c.JSContext, k: binding.Key) bool {
+        const key = k.stored;
         const st = self.st;
         if (st.map.fetchSwapRemove(key)) |kv| {
             st.a.free(kv.key);
@@ -155,7 +158,10 @@ const MockKv = struct {
         }
     };
 
-    pub fn prefix(self: MockKv, p: []const u8, cursor: []const u8, limit: u32) ?Page {
+    pub fn prefix(self: MockKv, req: binding.Scan) ?Page {
+        const p = req.prefix.stored;
+        const cursor = req.cursor.stored;
+        const limit = req.limit;
         const st = self.st;
         @memcpy(st.last_prefix[0..p.len], p);
         st.last_prefix_len = p.len;
@@ -182,7 +188,7 @@ const MockKv = struct {
     }
 };
 
-const B = binding.Kv(c, MockKv);
+const B = binding.Kv(c, MockKv, .user);
 
 fn evalStr(ctx: qjs.Context, a: std.mem.Allocator, src: []const u8) ![]u8 {
     // JS_Eval requires a NUL-terminated buffer in addition to the length.
@@ -248,16 +254,11 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.get({}))", "ok:\"objval\"");
 
     // ── write coercion: primitives only, TypeError otherwise ──
-    try expectEval(ctx, a, "__t(() => kv.set('k', {a:1}))",
-        "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.set({}, 'v'))",
-        "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.set('k', null))",
-        "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.set('k', undefined))",
-        "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.delete(null))",
-        "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set('k', {a:1}))", "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set({}, 'v'))", "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set('k', null))", "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set('k', undefined))", "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.delete(null))", "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
     // Primitives coerce and store.
     try expectEval(ctx, a, "__t(() => kv.set('n', 42))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.get('n'))", "ok:\"42\"");
@@ -265,26 +266,20 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.get('b'))", "ok:\"true\"");
 
     // ── guard refusals: shape, code, and order ──
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/x', 'v'))",
-        "Error|reserved_key|kv: '_secret/x' is in a platform-reserved prefix");
-    try expectEval(ctx, a, "__t(() => kv.delete('_secret/x'))",
-        "Error|reserved_key|kv: '_secret/x' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/x', 'v'))", "Error|reserved_key|kv: '_secret/x' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.delete('_secret/x'))", "Error|reserved_key|kv: '_secret/x' is in a platform-reserved prefix");
     try expectEval(ctx, a, "__t(() => kv.set('_send/owed/abc', 'v'))", "ok:null"); // shim-writable
-    try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(257), 'v'))",
-        "Error|key_too_large|kv: key exceeds the 256-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(257), 'v'))", "Error|key_too_large|kv: key exceeds the 256-byte limit");
     try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(256), 'v'))", "ok:null"); // boundary
-    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((384 * 1024) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((384 * 1024) + 1)))", "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     // Order is contract: a key breaking the reserved rule AND the size cap
     // reports reserved_key.
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/' + 'k'.repeat(300), 'v'))",
-        "Error|reserved_key|kv: '_secret/" ++ "k" ** 300 ++ "' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/' + 'k'.repeat(300), 'v'))", "Error|reserved_key|kv: '_secret/" ++ "k" ** 300 ++ "' is in a platform-reserved prefix");
 
     // ── the system-module exemption: namespace only, never the caps ──
     st.system_module = true;
     try expectEval(ctx, a, "__t(() => kv.set('_sched/by_id/x', 'v'))", "ok:null");
-    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((384 * 1024) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((384 * 1024) + 1)))", "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     st.system_module = false;
 
     // ── the per-key exemption: NOT a customer write, EVERY check skipped ──
@@ -295,8 +290,7 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.set('__h/_secret-ish', 'x'.repeat((1 << 20) + 1)))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.delete('__h/_secret-ish'))", "ok:null");
     // …and a non-matching key is still a customer write.
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/y', 'v'))",
-        "Error|reserved_key|kv: '_secret/y' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/y', 'v'))", "Error|reserved_key|kv: '_secret/y' is in a platform-reserved prefix");
     st.exempt_prefix = "";
 
     // ── argc short-circuits: undefined, nothing stored, nothing thrown ──
@@ -352,13 +346,11 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     // key today's rules would ALLOW.
     st.taped_refusal_key = "orders/fine";
     st.taped_refusal_code = "reserved_key";
-    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))",
-        "Error|reserved_key|kv: 'orders/fine' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))", "Error|reserved_key|kv: 'orders/fine' is in a platform-reserved prefix");
     // A RETIRED code (rule gone from today's table) still throws, code
     // verbatim, with the generic capture message.
     st.taped_refusal_code = "some_retired_rule";
-    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))",
-        "Error|some_retired_rule|kv: 'orders/fine' was refused at capture");
+    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))", "Error|some_retired_rule|kv: 'orders/fine' was refused at capture");
     st.taped_refusal_key = "";
     // In captured mode (decides = false) the rules are not consulted at all:
     // a write with no taped refusal succeeded at capture and must succeed
@@ -367,8 +359,7 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.set('_secret/captured-ok', 'v'))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.get('_secret/captured-ok'))", "ok:\"v\"");
     st.decide = true;
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/captured-ok', 'v'))",
-        "Error|reserved_key|kv: '_secret/captured-ok' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/captured-ok', 'v'))", "Error|reserved_key|kv: '_secret/captured-ok' is in a platform-reserved prefix");
     // …and a LIVE refusal is offered to the delegate for taping.
     try testing.expectEqualStrings("_secret/captured-ok", st.recorded_refusal_key[0..st.recorded_refusal_key_len]);
     try testing.expectEqualStrings("reserved_key", st.recorded_refusal_code);
@@ -425,8 +416,7 @@ test "kv binding: the engine-only keyspace is invisible to a handler" {
     // an empty array, and the documented idiom stops on an empty page — so a
     // tenant with a few hundred meter rows would silently lose everything
     // sorted after them. The scan must keep going until the page is full.
-    try expectEval(ctx, a, "__t(() => kv.prefix('', '', 2))",
-        "ok:[{\"key\":\"_config/mail.json\",\"value\":\"cfg\"},{\"key\":\"users/1\",\"value\":\"alice\"}]");
+    try expectEval(ctx, a, "__t(() => kv.prefix('', '', 2))", "ok:[{\"key\":\"_config/mail.json\",\"value\":\"cfg\"},{\"key\":\"users/1\",\"value\":\"alice\"}]");
 
     // ── the system-module exemption: the platform's own modules still see ──
     st.system_module = true;

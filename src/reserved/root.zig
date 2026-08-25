@@ -159,6 +159,26 @@ pub const CONFIG_PREFIX = "_config/";
 /// the visible key plus `{dep_id:016x}/`.
 pub const CONFIG_STORAGE_KEY_MAX = KV_KEY_MAX + 17;
 
+/// The root every handler-named key resolves under.
+///
+/// A handler names `orders/42`; storage holds `_user/orders/42`, and it never
+/// learns the difference. Engine bookkeeping lives outside this root, so a
+/// handler cannot *name* an engine key — the boundary is the shape of the
+/// capability it was handed, not a predicate consulted on every write
+/// (`docs/architecture/package-isolation.md`, not installing is the denial).
+///
+/// The leading `_` matters: it keeps the root outside the keyspace reachable
+/// from inside it, so a handler cannot address its own root and `_user/`
+/// cannot nest into itself.
+pub const USER_KEY_ROOT = "_user/";
+
+/// `KV_KEY_MAX` is LOGICAL — it bounds the key a handler NAMES, and the root
+/// is invisible to it, so the root costs the handler nothing. This is what a
+/// resolved key can reach: the largest root plus the largest legal name.
+/// Config's `{dep_id:016x}/` insert is the other resolution and is measured
+/// the same way, so a buffer sized to this holds either.
+pub const STORAGE_KEY_MAX = KV_KEY_MAX + @max(USER_KEY_ROOT.len, 17);
+
 /// `key` is one a handler names in the config namespace.
 pub fn isConfigKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, CONFIG_PREFIX);
