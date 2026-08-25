@@ -19,6 +19,11 @@
     "seconds": 35.4,
     "status": "pass"
   },
+  "admin_kv_activation_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.0,
+    "status": "pass"
+  },
   "admin_self_deploy_smoke_v2.py": {
     "rc": 0,
     "seconds": 6.0,
