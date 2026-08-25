@@ -220,35 +220,36 @@ pub const ArenaKv = struct {
     /// The arena produces no tapes.
     pub fn recordRefusal(_: ArenaKv, _: binding.WriteOp, _: []const u8, _: anytype) void {}
 
-    pub fn get(self: ArenaKv, key: []const u8) binding.GetResult {
+    pub fn get(self: ArenaKv, k: binding.Key) binding.GetResult {
+        const key = k.stored;
         var outcome: c_int = 0;
         var val: [*c]u8 = null;
         var val_len: c_int = 0;
         const rc = _arena_host_kv_get(key.ptr, @intCast(key.len), &outcome, &val, &val_len);
-        const facade = exempt(key);
+        const facade = exempt(k.named);
         if (rc != 0) {
             if (val != null) std.c.free(val);
             // No entry for this key: authored-absent shape in both modes; a
             // CAPTURED world also records the divergence verdict host-side
             // (the poison model — nothing thrown, nothing catchable).
-            if (isCaptured(self.ctx)) poison(key);
-            if (!facade) FX.read(self.ctx, key, null);
+            if (isCaptured(self.ctx)) poison(k.named);
+            if (!facade) FX.read(self.ctx, k.named, null);
             return .absent;
         }
         switch (outcome) {
             0 => {
                 if (val == null or val_len == 0) {
                     if (val != null) std.c.free(val);
-                    if (!facade) FX.read(self.ctx, key, "");
+                    if (!facade) FX.read(self.ctx, k.named, "");
                     return .{ .value = "" };
                 }
                 const v: []const u8 = val[0..@intCast(val_len)];
-                if (!facade) FX.read(self.ctx, key, v);
+                if (!facade) FX.read(self.ctx, k.named, v);
                 return .{ .value = v };
             },
             1 => {
                 if (val != null) std.c.free(val);
-                if (!facade) FX.read(self.ctx, key, null);
+                if (!facade) FX.read(self.ctx, k.named, null);
                 return .absent;
             },
             // `elided` (`src/tape/root.zig` `KvOutcome`): the capture resolved
@@ -260,7 +261,7 @@ pub const ArenaKv = struct {
             4 => {
                 if (val != null) std.c.free(val);
                 poison(key);
-                if (!facade) FX.read(self.ctx, key, null);
+                if (!facade) FX.read(self.ctx, k.named, null);
                 return .absent;
             },
             else => {
@@ -276,7 +277,8 @@ pub const ArenaKv = struct {
         if (bytes.len > 0) std.c.free(@constCast(bytes.ptr));
     }
 
-    pub fn put(self: ArenaKv, _: ?*c.JSContext, key: []const u8, value: []const u8) bool {
+    pub fn put(self: ArenaKv, _: ?*c.JSContext, k: binding.Key, value: []const u8) bool {
+        const key = k.stored;
         var outcome: c_int = 0;
         const rc = _arena_host_kv_set(key.ptr, @intCast(key.len), value.ptr, @intCast(value.len), &outcome);
         if (rc != 0) {
@@ -287,11 +289,12 @@ pub const ArenaKv = struct {
             _ = c.JS_ThrowInternalError(self.ctx, "kv.set: recorded failure");
             return false;
         }
-        if (!exempt(key)) FX.write(self.ctx, key, value);
+        if (!exempt(k.named)) FX.write(self.ctx, k.named, value);
         return true;
     }
 
-    pub fn del(self: ArenaKv, _: ?*c.JSContext, key: []const u8) bool {
+    pub fn del(self: ArenaKv, _: ?*c.JSContext, k: binding.Key) bool {
+        const key = k.stored;
         var outcome: c_int = 0;
         const rc = _arena_host_kv_delete(key.ptr, @intCast(key.len), &outcome);
         if (rc != 0) {
@@ -302,7 +305,7 @@ pub const ArenaKv = struct {
             _ = c.JS_ThrowInternalError(self.ctx, "kv.delete: recorded failure");
             return false;
         }
-        if (!exempt(key)) FX.del(self.ctx, key);
+        if (!exempt(k.named)) FX.del(self.ctx, k.named);
         return true;
     }
 
@@ -323,7 +326,10 @@ pub const ArenaKv = struct {
     /// overlay — arenajs#1); rows the handler observes have harness keys
     /// stripped, and the scan records `count` + `rowsFold` like every
     /// engine.
-    pub fn prefix(self: ArenaKv, p: []const u8, cursor: []const u8, limit: u32) ?Page {
+    pub fn prefix(self: ArenaKv, req: binding.Scan) ?Page {
+        const p = req.prefix.stored;
+        const cursor = req.cursor.stored;
+        const limit = req.limit;
         var outcome: c_int = 0;
         var json: [*c]u8 = null;
         var json_len: c_int = 0;
@@ -337,13 +343,13 @@ pub const ArenaKv = struct {
         // that as a scan result would present an EMPTY page as a complete one
         // — the shape a partial page would have, and the reason the capture
         // elides pages all-or-nothing. Poison, then let the run unwind.
-        if (outcome == 4) poison(p);
+        if (outcome == 4) poison(req.prefix.named);
         const bytes: []const u8 = json[0..@intCast(json_len)];
         var parsed = std.json.parseFromSlice([]Row, std.heap.c_allocator, bytes, .{}) catch {
             std.c.free(json);
             return null;
         };
-        if (exempt(p)) {
+        if (exempt(req.prefix.named)) {
             return .{ .parsed = parsed, .json_ptr = json, .entries = parsed.value };
         }
         var n: usize = 0;
@@ -353,7 +359,15 @@ pub const ArenaKv = struct {
             n += 1;
         }
         const rows = parsed.value[0..n];
-        FX.prefixScan(self.ctx, std.heap.c_allocator, p, rows);
+        // Recorded in the spelling the handler used; `rows` stays STORED for
+        // the binding to un-map (see the offline delegate for why).
+        if (req.root.len == 0) {
+            FX.prefixScan(self.ctx, std.heap.c_allocator, req.prefix.named, rows);
+        } else if (std.heap.c_allocator.alloc(Row, rows.len)) |vis| {
+            defer std.heap.c_allocator.free(vis);
+            for (rows, 0..) |row, i| vis[i] = .{ .key = req.visible(row.key), .value = row.value };
+            FX.prefixScan(self.ctx, std.heap.c_allocator, req.prefix.named, vis);
+        } else |_| {}
         return .{ .parsed = parsed, .json_ptr = json, .entries = rows };
     }
 };
@@ -427,7 +441,7 @@ pub const ArenaTag = struct {
 
 // ── natives ──────────────────────────────────────────────────────────────
 
-const B = binding.Kv(c, ArenaKv);
+const B = binding.Kv(c, ArenaKv, .user);
 const T = binding.Tag(c, ArenaTag);
 
 fn undef() c.JSValue {
