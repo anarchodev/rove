@@ -452,19 +452,6 @@ export function onCut() {
 //
 // Shape mirrors `v2-kv`'s so callers read the same: 200 + the raw value, or
 // 404 `no such key`.
-// One parameter out of a raw query string. Decodes `+` and %-escapes, so a key
-// with a slash or a space round-trips.
-function qsParam(qs, name) {
-  const parts = qs.split("&");
-  for (let i = 0; i < parts.length; i++) {
-    const eq = parts[i].indexOf("=");
-    if (eq === -1) continue;
-    if (decodeURIComponent(parts[i].slice(0, eq)) !== name) continue;
-    return decodeURIComponent(parts[i].slice(eq + 1).replace(/\+/g, " "));
-  }
-  return null;
-}
-
 function kvStoreFor(id) {
   try {
     return platform.scope(id).kv;
@@ -495,7 +482,10 @@ function instanceKvRoute(p, method, body) {
     // `request.query`, as a raw string (handler-shape.md, the default-activation
     // surface). Splitting `path` on "?" yields an empty query and a door that
     // never sees its parameter.
-    const key = qsParam(request.query || "", "key");
+    // `URLSearchParams` over the raw query string. Hand-rolling this is how
+    // `+`, `%2B` and an encoded KEY end up handled three different ways in
+    // three handlers (rove#883) — the platform already has the rules.
+    const key = new URLSearchParams(request.query || "").get("key");
     if (!key) return jerr(400, "missing ?key");
     const v = store.get(key);
     if (v === null) {

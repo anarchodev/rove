@@ -545,14 +545,15 @@ every other read:
 function rpc(fns) {
   return function () {
     let fn = null, args = [];
-    for (const part of (request.query || "").split("&")) {
-      const eq = part.indexOf("=");
-      const k = eq === -1 ? part : part.slice(0, eq);
-      if (k !== "fn" && k !== "args") continue;
-      const v = eq === -1 ? "" : decodeURIComponent(part.slice(eq + 1).replace(/\+/g, "%20"));
-      if (k === "fn" && v) fn = v;
-      else if (k === "args" && v) { try { args = JSON.parse(v); } catch (_) {} }
-    }
+    // `request.query` is the raw query STRING. `URLSearchParams` is installed
+    // (see the ambient names above) and knows the encoding rules — `+` for a
+    // space, `%2B` for a literal plus, escapes in the KEY as well as the value.
+    // Parsing it by hand is how those end up handled three different ways in
+    // three handlers.
+    const q = new URLSearchParams(request.query || "");
+    fn = q.get("fn") || null;
+    const rawArgs = q.get("args");
+    if (rawArgs) { try { args = JSON.parse(rawArgs); } catch (_) {} }
     if (!fn && request.text) {
       try {
         const b = request.json;
