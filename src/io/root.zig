@@ -297,6 +297,15 @@ pub fn Io(comptime opts: Options) type {
 
         // Collections
         connections: ConnColl,
+        /// Connections on their way out. A conn ends by moving here —
+        /// never by `reg.destroy` from an upper layer — so the layer that
+        /// created it is the layer that releases its descriptor slot, and
+        /// so the ending is a state the loop can see, count, and order
+        /// rather than a destructor firing inside `flush`.
+        ///
+        /// Unprefixed on purpose: this is a seam other code moves entities
+        /// into, like `read_in` / `write_in`, not internal bookkeeping.
+        conn_closing: ConnColl,
         read_results: ReadResultColl,
         write_results: WriteResultColl,
         read_in: ReadInColl,
@@ -376,7 +385,7 @@ pub fn Io(comptime opts: Options) type {
             if (self.fd_resolver) |resolver| {
                 return resolver(self.fd_resolver_ctx.?, entity);
             }
-            return self.reg.get(entity, &self.connections, Fd) catch null;
+            return self.reg.getAny(entity, .{ &self.connections, &self.conn_closing }, Fd) catch null;
         }
 
         /// Register an external FD resolver. Used by rove-h2 to search its own
@@ -394,7 +403,7 @@ pub fn Io(comptime opts: Options) type {
             if (self.peer_resolver) |resolver| {
                 return resolver(self.peer_resolver_ctx.?, entity);
             }
-            return self.reg.get(entity, &self.connections, PeerAddr) catch null;
+            return self.reg.getAny(entity, .{ &self.connections, &self.conn_closing }, PeerAddr) catch null;
         }
 
         pub fn setPeerResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*PeerAddr) void {
@@ -465,6 +474,7 @@ pub fn Io(comptime opts: Options) type {
             const self = try allocator.create(Self);
             self.* = .{
                 .connections = try ConnColl.init(allocator),
+                .conn_closing = try ConnColl.init(allocator),
                 .read_results = try ReadResultColl.init(allocator),
                 .write_results = try WriteResultColl.init(allocator),
                 .read_in = try ReadInColl.init(allocator),
@@ -500,6 +510,7 @@ pub fn Io(comptime opts: Options) type {
 
             // Register collections with registry
             reg.registerCollection(&self.connections);
+            reg.registerCollection(&self.conn_closing);
             reg.registerCollection(&self.read_results);
             reg.registerCollection(&self.write_results);
             reg.registerCollection(&self.read_in);
@@ -527,6 +538,7 @@ pub fn Io(comptime opts: Options) type {
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
             self.connections.deinit();
+            self.conn_closing.deinit();
             self.read_results.deinit();
             self.write_results.deinit();
             self.read_in.deinit();
@@ -547,6 +559,9 @@ pub fn Io(comptime opts: Options) type {
         }
 
         pub fn poll(self: *Self, min_complete: u32) !u32 {
+            // Phase 0: Retire connections that finished closing.
+            try self.processConnClosing();
+
             // Phase 1: Process user inputs (deferred moves)
             try self.processWriteIn();
             try self.processReadIn();
@@ -589,6 +604,7 @@ pub fn Io(comptime opts: Options) type {
         /// Caller's Call" rule — the library still doesn't decide,
         /// it just gives you a richer primitive to express the choice.
         pub fn pollWithTimeout(self: *Self, timeout_ns: u64) !u32 {
+            try self.processConnClosing();
             try self.processWriteIn();
             try self.processReadIn();
             if (has_connect) try self.processConnectIn();
@@ -623,6 +639,21 @@ pub fn Io(comptime opts: Options) type {
         // Input processing (deferred ops, forward iteration)
         // =============================================================
 
+        /// Retire the connections an upper layer moved into `conn_closing`.
+        ///
+        /// Today this is the destroy that used to happen at the call site,
+        /// relocated — the socket teardown still runs from `Fd.deinit`, in
+        /// row-declaration order. What the collection buys immediately is
+        /// that the ending is now a state: countable for admission, and a
+        /// place for the ordered, confirmation-driven teardown to live.
+        fn processConnClosing(self: *Self) !void {
+            for (self.conn_closing.entitySlice()) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                if (self.reg.isMoving(ent)) continue;
+                try self.reg.destroy(ent);
+            }
+        }
+
         fn processWriteIn(self: *Self) !void {
             const entities = self.write_in.entitySlice();
             const conn_ents = self.write_in.column(ConnEntity);
@@ -630,6 +661,15 @@ pub fn Io(comptime opts: Options) type {
 
             for (entities, conn_ents, wbufs) |ent, conn_ent, wb| {
                 if (self.reg.isStale(conn_ent.entity)) {
+                    try self.reg.destroy(ent);
+                    continue;
+                }
+
+                // A conn in `conn_closing` still resolves — it has to, so
+                // an in-flight completion can find it — but it takes no new
+                // work. Arming a send here would race the teardown for the
+                // same descriptor slot.
+                if (self.reg.isInCollection(conn_ent.entity, &self.conn_closing)) {
                     try self.reg.destroy(ent);
                     continue;
                 }
@@ -666,6 +706,20 @@ pub fn Io(comptime opts: Options) type {
                         // ring's producer tail, shrinks the distinct-buffer pool,
                         // and manifests as recv ENOBUFS → the front crash-loop.
                         // Same return-then-clear the healthy path uses (below).
+                        rr.* = .{};
+                    }
+                    try self.reg.destroy(ent);
+                    continue;
+                }
+
+                // A closing conn takes no new recv. Return any buffer this
+                // cycle is still holding, then drop the read entity — the
+                // same return-then-clear the isStale branch above does, and
+                // for the same double-return reason.
+                if (self.reg.isInCollection(conn_ent.entity, &self.conn_closing)) {
+                    if (rr.data != null) {
+                        self.returnBufferToRing(rr.buf_id, mask, armed);
+                        armed += 1;
                         rr.* = .{};
                     }
                     try self.reg.destroy(ent);
@@ -806,7 +860,12 @@ pub fn Io(comptime opts: Options) type {
             // either bumping `buf_count` or, under attack, putting
             // a CDN/edge in front. Reserved headroom: 12.5% of
             // `buf_count`.
-            const io_conns = self.connections.entitySlice().len;
+            // A conn that is closing still owns its descriptor slot until
+            // the teardown completes, so it counts against the budget just
+            // like a live one. Admitting into a slot that is not free yet is
+            // how the pool goes negative under churn.
+            const io_conns = self.connections.entitySlice().len +
+                self.conn_closing.entitySlice().len;
             const upper_conns: usize = if (self.extra_conns_fn) |f|
                 f(self.extra_conns_ctx.?)
             else
