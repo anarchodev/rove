@@ -2419,6 +2419,10 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            // Our conn collections deinit below, before `io.destroy` runs.
+            // Tell io first, or every still-live conn reads as a conn that
+            // bypassed `conn_closing`.
+            self.io.beginTeardown();
             for (self.body_sinks.items) |ref| {
                 ref.sink.abort(ref.sink.ctx);
                 ref.sink.release(ref.sink.ctx);
