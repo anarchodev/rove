@@ -49,11 +49,10 @@ export default function ({ kv }) {
       seg: cap(() => kv.set("_seg/idx/1", "v")),
       oidc: cap(() => kv.set("_oidc/session/s", "v")),
       rp: cap(() => kv.set("_rp/sess/s", "v")),
-      // Once the other side of the allowlist, and now the point in reverse:
-      // this must SUCCEED in every engine. rove#502 was the browser arena
-      // being more permissive than prod here; the risk now inverts, to an
-      // engine still carrying a rule the others dropped — which is the same
-      // drift, and the same probe catches it.
+      // The other side of the allowlist: a reserved prefix that is NOT on it
+      // must be refused, by the same code and message, in every engine. This
+      // probe is why the case exists — the browser arena used to allow it
+      // (rove#502), which is replay being more permissive than prod.
       reserved: cap(() => kv.set("_secret/x", "v")),
       // …and the size caps, which came from the same shared file.
       bigKey: cap(() => kv.set("K".repeat(257), "v")),

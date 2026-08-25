@@ -3,8 +3,7 @@
 // handler that throws instantly in prod also throws — and with the SAME
 // `err.code`/`err.name` — under `rewind test`:
 //   object/array/null/undefined value or key → TypeError (no code)
-//   leading-`_` write → an ORDINARY write (the reserved-prefix rule is gone;
-//     a handler's kv is rooted, so the name reaches a row of its own)
+//   leading-`_` write outside the shim allowlist → Error{code:"reserved_key"}
 //   key > 256 B → Error{code:"key_too_large"}; value > 1 MiB → "value_too_large"
 //   kv.prefix pages: omitted/≤0 limit → 100, any request capped at 1000
 import { scenario, expect } from "rewind:test";
@@ -24,12 +23,10 @@ for (const c of [b.objVal, b.arrVal, b.nullVal, b.undefVal, b.objKey]) {
 expect(b.numOk.ok).toBe(true);
 expect(b.boolOk.ok).toBe(true);
 
-// (b) no reserved-prefix guard. A leading-`_` name is an ordinary key inside
-// the handler's own root — the platform's row of that name is not addressable
-// through this capability at all, so there is nothing to refuse. Every engine
-// must agree on that, which is what this probe now pins.
-expect(b.reservedSet.code).toBe(undefined);
-expect(b.reservedDel.code).toBe(undefined);
+// (b) reserved-prefix guard — set and delete both reject, with the branchable code.
+expect(b.reservedSet.code).toBe("reserved_key");
+expect(b.reservedSet.message).toMatch(/platform-reserved prefix/);
+expect(b.reservedDel.code).toBe("reserved_key");
 // Shim-writable `_send/` and ordinary customer keys are allowed through.
 expect(b.shimOk.ok).toBe(true);
 expect(b.custOk.ok).toBe(true);

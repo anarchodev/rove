@@ -25,20 +25,6 @@ const decode = @import("tape_decode.zig");
 const path_confine = @import("path_confine.zig");
 const guards = @import("rove-binding").guards;
 
-/// A stored key in the spelling the HANDLER used.
-///
-/// The host sits below the binding, so every key it sees has already resolved
-/// under `reserved.USER_KEY_ROOT`. That is right for lookups and wrong for
-/// prose: a divergence message is read by the person who wrote
-/// `kv.get("big/blob")`, and telling them `kv.get("_user/big/blob")` names a
-/// key they have never typed and cannot search for. The root is invisible to a
-/// handler everywhere else; a diagnostic is not the place to leak it.
-fn named(k: []const u8) []const u8 {
-    const root = guards.reserved.USER_KEY_ROOT;
-    if (!std.mem.startsWith(u8, k, root)) return k;
-    return k[root.len..];
-}
-
 /// The C ABI struct (`arena_replay_host`). Field order + signatures mirror the
 /// header exactly; a NULL responder reports "tape not installed" (code 1).
 pub const ReplayHost = extern struct {
@@ -286,12 +272,12 @@ fn kvGet(
                 "kv.get(\"{s}\") — sealed under a per-identity key " ++
                     "(request.shredKey) that has been destroyed, so this value is " ++
                     "permanently unreadable and this run cannot be replayed against it",
-                .{named(k)},
+                .{k},
             );
         } else h.setDiv(
             "kv.get(\"{s}\") — the capture elided this value ({d} bytes over the " ++
                 "activation's kv budget), so this run cannot be replayed against it",
-            .{ named(k), lost.bytes },
+            .{ k, lost.bytes },
         );
         out_outcome.* = @intFromEnum(decode.KvOutcome.elided);
         out_val.* = null;
@@ -379,12 +365,12 @@ fn kvPrefix(
                     "per-identity key (request.shredKey) that has been destroyed, so " ++
                     "the page is permanently incomplete and this run cannot be " ++
                     "replayed against it",
-                .{named(p)},
+                .{p},
             );
         } else h.setDiv(
             "kv.prefix(\"{s}\") — the capture elided this page ({d} row bytes over " ++
                 "the activation's kv budget), so this run cannot be replayed against it",
-            .{ named(p), lost.bytes },
+            .{ p, lost.bytes },
         );
     }
     // Reconstruct the scan from the closed-world map: keys under the prefix,

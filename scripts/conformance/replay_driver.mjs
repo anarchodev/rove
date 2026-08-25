@@ -118,29 +118,13 @@ Module.tapes = {
     trigger_payload: [],
 };
 
-// The root a handler's kv capability resolves under — `reserved.USER_KEY_ROOT`
-// (`src/reserved/root.zig`), which the arena's compiled binding applies to every
-// key before it reaches this overlay. The overlay IS the arena's store, so it is
-// keyed the way the store is; a world is authored in the handler's spelling, so
-// seeding resolves and the write-back un-resolves.
-//
-// Getting this wrong does not fail loudly: the world seeds, every read misses,
-// and the case reports a divergence that reads like a behaviour change.
-const USER_KEY_ROOT = "_user/";
-// The harness's cross-store facade addresses OTHER stores, so it is exempt from
-// the rooting on both sides — same carve-out the binding makes.
-const isExemptKey = (k) => k.startsWith("__rove_store/") || k === REPLAY_OUTPUT_KEY;
-const storeKey = (k) => (isExemptKey(k) ? k : USER_KEY_ROOT + k);
-const namedKey = (k) =>
-    !isExemptKey(k) && k.startsWith(USER_KEY_ROOT) ? k.slice(USER_KEY_ROOT.length) : k;
-
 // The world's closed-world kv map, seeded into the overlay so declared reads
 // resolve before the (empty) tape is consulted. A JSON-shaped value is
 // stringified, matching `world.zig`: kv holds byte strings the handler parses
 // itself, so an author may write an object and mean its serialization.
 const overlay = new Map();
 for (const [k, v] of Object.entries(world.kv || {})) {
-    overlay.set(storeKey(k), typeof v === "string" ? v : JSON.stringify(v));
+    overlay.set(k, typeof v === "string" ? v : JSON.stringify(v));
 }
 Module._kvOverlay = overlay;
 
@@ -262,12 +246,9 @@ if (rawOut != null) {
 // are excluded — they are host scaffolding the worker never wrote, and folding
 // them in would report writes no other engine can have.
 const writes = [];
-for (const [sk, v] of overlay) {
-    if (sk === REPLAY_OUTPUT_KEY || sk.startsWith("__rove_store/")) continue;
-    // Reported in the spelling the handler used, so `writes` compares against
-    // the other engines' — they record what was named, not where it landed.
-    const k = namedKey(sk);
-    if (Object.prototype.hasOwnProperty.call(world.kv || {}, k) && v === overlay.get(sk)) {
+for (const [k, v] of overlay) {
+    if (k === REPLAY_OUTPUT_KEY || k.startsWith("__rove_store/")) continue;
+    if (Object.prototype.hasOwnProperty.call(world.kv || {}, k) && v === overlay.get(k)) {
         // Unchanged seed value — a read, not a write. A genuine rewrite to the
         // same value is indistinguishable here and is reported through
         // `effects` instead, which records the operation rather than the state.

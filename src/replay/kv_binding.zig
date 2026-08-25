@@ -58,24 +58,10 @@ const digest_mod = @import("interaction-digest");
 /// allowed here where prod refuses (the namespace is a harness construct
 /// prod has never heard of). Same posture the JS wrapper had; closes when
 /// the facade gets its own door.
-pub const STORE_NS = "__rove_store/";
+const STORE_NS = "__rove_store/";
 
-pub fn exempt(key: []const u8) bool {
+fn exempt(key: []const u8) bool {
     return std.mem.startsWith(u8, key, STORE_NS);
-}
-
-/// A handler-spelled key as the STORE holds it — the seeding side of the same
-/// rule `binding.Kv(.user)` applies on the calling side. Authored worlds and
-/// fixtures are written in the handler's spelling; anything that seeds the
-/// host's maps has to resolve, or the world seeds at one depth and reads at
-/// another (the writer/reader prefix-depth split: it presents as a world that
-/// loads cleanly and then reads back empty).
-///
-/// Exempt keys are not the caller's to have rerooted — same carve-out, same
-/// reason, as the binding's.
-pub fn storeKey(a: std.mem.Allocator, named: []const u8) ![]const u8 {
-    if (exempt(named)) return named;
-    return std.mem.concat(a, u8, &.{ binding.guards.reserved.USER_KEY_ROOT, named });
 }
 
 /// Per-run `_sub/dirty/` marker dedup — the worker's `subs_marked` bitmask,
@@ -294,8 +280,7 @@ pub const OfflineKv = struct {
 
     // ── the delegate surface the binding calls ───────────────────────────
 
-    pub fn get(self: OfflineKv, k: binding.Key) binding.GetResult {
-        const key = k.stored;
+    pub fn get(self: OfflineKv, key: []const u8) binding.GetResult {
         const vt = self.vtable() orelse {
             self.throwHostError("get", 1);
             return .thrown;
@@ -313,23 +298,23 @@ pub const OfflineKv = struct {
             self.throwHostError("get", rc);
             return .thrown;
         }
-        const facade = exempt(k.named);
+        const facade = exempt(key);
         switch (@as(decode.KvOutcome, @enumFromInt(outcome))) {
             .ok => {
                 // An empty value's buffer is freed here (release() frees by
                 // pointer only when the slice is non-empty).
                 if (val == null or val_len == 0) {
                     if (val != null) std.c.free(val);
-                    if (!facade) FX.read(self.ctx, k.named, "");
+                    if (!facade) FX.read(self.ctx, key, "");
                     return .{ .value = "" };
                 }
                 const v: []const u8 = val[0..@intCast(val_len)];
-                if (!facade) FX.read(self.ctx, k.named, v);
+                if (!facade) FX.read(self.ctx, key, v);
                 return .{ .value = v };
             },
             .not_found => {
                 if (val != null) std.c.free(val);
-                if (!facade) FX.read(self.ctx, k.named, null);
+                if (!facade) FX.read(self.ctx, key, null);
                 return .absent;
             },
             .err => {
@@ -346,7 +331,7 @@ pub const OfflineKv = struct {
             // could catch and turn into a plausible alternative path.
             .elided => {
                 if (val != null) std.c.free(val);
-                if (!facade) FX.read(self.ctx, k.named, null);
+                if (!facade) FX.read(self.ctx, key, null);
                 return .absent;
             },
             // `refused` exists only on write entries; a host answering a GET
@@ -365,11 +350,10 @@ pub const OfflineKv = struct {
         if (bytes.len > 0) std.c.free(@constCast(bytes.ptr));
     }
 
-    pub fn put(self: OfflineKv, _: ?*c.JSContext, k: binding.Key, value: []const u8) bool {
-        const key = k.stored;
+    pub fn put(self: OfflineKv, _: ?*c.JSContext, key: []const u8, value: []const u8) bool {
         // Facade writes are the harness's own: stored raw, never recorded,
         // no triggers, no markers.
-        if (exempt(k.named)) {
+        if (exempt(key)) {
             if (!self.rawSet(key, value)) {
                 self.throwHostError("set", -1);
                 return false;
@@ -384,7 +368,7 @@ pub const OfflineKv = struct {
         const prev = self.rawGet(key);
         defer if (prev) |p| std.c.free(@constCast(p.ptr));
 
-        const before = self.runTriggers("put", "before", k.named, value, prev);
+        const before = self.runTriggers("put", "before", key, value, prev);
         const write_value: []const u8, const owned: bool = switch (before) {
             .thrown => return false,
             .proceed => |p| .{ p.value.?, p.mutated },
@@ -410,19 +394,18 @@ pub const OfflineKv = struct {
             return false;
         }
 
-        FX.write(self.ctx, k.named, write_value);
-        self.markSubscriptionsDirty(k.named);
+        FX.write(self.ctx, key, write_value);
+        self.markSubscriptionsDirty(key);
 
-        switch (self.runTriggers("put", "after", k.named, write_value, prev)) {
+        switch (self.runTriggers("put", "after", key, write_value, prev)) {
             .thrown => return false,
             .proceed => |p| if (p.mutated) std.heap.c_allocator.free(@constCast(p.value.?)),
         }
         return true;
     }
 
-    pub fn del(self: OfflineKv, _: ?*c.JSContext, k: binding.Key) bool {
-        const key = k.stored;
-        if (exempt(k.named)) {
+    pub fn del(self: OfflineKv, _: ?*c.JSContext, key: []const u8) bool {
+        if (exempt(key)) {
             const vt0 = self.vtable() orelse return true;
             const resp0 = vt0.kv_delete orelse return true;
             var oc0: c_int = 0;
@@ -433,7 +416,7 @@ pub const OfflineKv = struct {
         const prev = self.rawGet(key);
         defer if (prev) |p| std.c.free(@constCast(p.ptr));
 
-        switch (self.runTriggers("delete", "before", k.named, null, prev)) {
+        switch (self.runTriggers("delete", "before", key, null, prev)) {
             .thrown => return false,
             .proceed => |p| if (p.mutated) std.heap.c_allocator.free(@constCast(p.value.?)),
         }
@@ -457,10 +440,10 @@ pub const OfflineKv = struct {
             return false;
         }
 
-        FX.del(self.ctx, k.named);
-        self.markSubscriptionsDirty(k.named);
+        FX.del(self.ctx, key);
+        self.markSubscriptionsDirty(key);
 
-        switch (self.runTriggers("delete", "after", k.named, null, prev)) {
+        switch (self.runTriggers("delete", "after", key, null, prev)) {
             .thrown => return false,
             .proceed => |p| if (p.mutated) std.heap.c_allocator.free(@constCast(p.value.?)),
         }
@@ -486,10 +469,7 @@ pub const OfflineKv = struct {
     /// for the facade to strip and is not recorded; a customer scan never
     /// sees namespaced rows and records `count` + `rowsFold` over what it
     /// observed.
-    pub fn prefix(self: OfflineKv, req: binding.Scan) ?Page {
-        const p = req.prefix.stored;
-        const cursor = req.cursor.stored;
-        const limit = req.limit;
+    pub fn prefix(self: OfflineKv, p: []const u8, cursor: []const u8, limit: u32) ?Page {
         const vt = self.vtable() orelse return null;
         const responder = vt.kv_prefix orelse return null;
         var outcome: c_int = 0;
@@ -515,7 +495,7 @@ pub const OfflineKv = struct {
             std.c.free(json);
             return null;
         };
-        if (exempt(req.prefix.named)) {
+        if (exempt(p)) {
             return .{ .parsed = parsed, .json_ptr = json, .entries = parsed.value };
         }
         // Strip harness-namespaced rows in place — prod has none to see.
@@ -526,18 +506,7 @@ pub const OfflineKv = struct {
             n += 1;
         }
         const rows = parsed.value[0..n];
-        // The effect log records the scan the HANDLER saw, so its row keys are
-        // un-rooted — `toHaveScanned("orders/")` asserts the spelling the
-        // handler used. `rows` itself stays STORED: the binding un-maps on the
-        // way out, and a row handed back already-visible would fail that check
-        // and be dropped from the page.
-        if (req.root.len == 0) {
-            FX.prefixScan(self.ctx, std.heap.c_allocator, req.prefix.named, rows);
-        } else if (std.heap.c_allocator.alloc(Row, rows.len)) |vis| {
-            defer std.heap.c_allocator.free(vis);
-            for (rows, 0..) |row, i| vis[i] = .{ .key = req.visible(row.key), .value = row.value };
-            FX.prefixScan(self.ctx, std.heap.c_allocator, req.prefix.named, vis);
-        } else |_| {}
+        FX.prefixScan(self.ctx, std.heap.c_allocator, p, rows);
         return .{ .parsed = parsed, .json_ptr = json, .entries = rows };
     }
 };
@@ -643,7 +612,7 @@ pub const OfflineTag = struct {
     }
 };
 
-const B = binding.Kv(c, OfflineKv, .user);
+const B = binding.Kv(c, OfflineKv);
 const T = binding.Tag(c, OfflineTag);
 
 /// `__rove_poison(what)` — the epilogue's divergence verdict, as a native so

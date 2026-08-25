@@ -56,7 +56,7 @@ fn refusePlatformWrite(
     key: []const u8,
     value: ?[]const u8,
 ) ?c.JSValue {
-    const refusal = guards.checkKvWrite(key, value, .{
+    const refusal = guards.checkKvWrite(key, value, true, .{
         .ops = state.write_ops,
         // The side envelope this write lands on costs framing beyond the op
         // itself, and `notePlatformWrite` charges it. Judge against the same
