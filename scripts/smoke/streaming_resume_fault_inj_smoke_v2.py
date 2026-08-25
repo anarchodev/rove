@@ -241,7 +241,7 @@ def main() -> int:
             advisory = "no new leader elected; rely on ASSERTION 1"
         else:
             print(f"  ok  killed node{L}; new leader=node{nl}")
-            r = c.admin_kv_get("streamfi", "counter", node=nl)
+            r = c.node_kv_get("streamfi", "counter", node=nl)
             # An absent key returns 404 (or 200 with an empty/sentinel body).
             absent = r.status == 404 or (r.status == 200 and r.body.strip() == "")
             check("ASSERTION 2 (advisory): `counter` absent on the new leader",

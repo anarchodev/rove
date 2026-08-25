@@ -241,7 +241,7 @@ def main() -> int:
         check("final write accepted (204)", w.status == 204, f"got {w.status}")
         repl, seen = False, ""
         for _ in range(40):
-            seen = c.admin_kv_get("acme", "final/marker", node=victim).body
+            seen = c.node_kv_get("acme", "final/marker", node=victim).body
             if "after-recovery" in seen:
                 repl = True; break
             time.sleep(0.5)

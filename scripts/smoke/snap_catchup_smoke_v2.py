@@ -100,7 +100,7 @@ def main() -> int:
             rg = None
             deadline = time.time() + 10.0
             while time.time() < deadline:
-                rg = c.admin_kv_get("acme", KEY, node=i)
+                rg = c.node_kv_get("acme", KEY, node=i)
                 if rg.status == 200 and SEED in rg.body:
                     ok_read = True
                     break
@@ -123,13 +123,13 @@ def main() -> int:
         r = None
         for n in range(ADVANCE_WRITES):
             latest = f"advance-{n}"
-            r = c.admin_kv_put("acme", KEY, latest, node=lead)
+            r = c.node_kv_put("acme", KEY, latest, node=lead)
             if r.status not in (200, 204):
                 # leader may have changed; re-resolve among survivors
                 nl = c.leader_node("acme", deadline_s=10.0)
                 if nl is not None and nl in survivors:
                     lead = nl
-                    r = c.admin_kv_put("acme", KEY, latest, node=lead)
+                    r = c.node_kv_put("acme", KEY, latest, node=lead)
         check("final advance write committed", r is not None and r.status in (200, 204),
               f"got {r.status if r else '-'} latest={latest!r}")
 
@@ -139,7 +139,7 @@ def main() -> int:
             rg = None
             deadline = time.time() + 10.0
             while time.time() < deadline:
-                rg = c.admin_kv_get("acme", KEY, node=i)
+                rg = c.node_kv_get("acme", KEY, node=i)
                 if rg.status == 200 and latest in rg.body:
                     ok_read = True
                     break
@@ -153,7 +153,7 @@ def main() -> int:
         rg = None
         deadline = time.time() + 15.0
         while time.time() < deadline:
-            rg = c.admin_kv_get("acme", KEY, node=follower)
+            rg = c.node_kv_get("acme", KEY, node=follower)
             if rg.status == 200:
                 break
             time.sleep(0.4)
@@ -172,8 +172,8 @@ def main() -> int:
         while time.time() < deadline:
             ld = c.leader_node("acme", deadline_s=5.0)
             if ld is not None:
-                c.admin_kv_put("acme", KEY, latest2, node=ld)
-            rg = c.admin_kv_get("acme", KEY, node=follower)
+                c.node_kv_put("acme", KEY, latest2, node=ld)
+            rg = c.node_kv_get("acme", KEY, node=follower)
             if rg.status == 200 and latest2 in rg.body:
                 ok_catchup = True
                 break

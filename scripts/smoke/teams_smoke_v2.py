@@ -235,7 +235,13 @@ def main() -> int:
         check("reused invite token → 404",
               req(bob, "POST", "/v1/invites/accept", {"token": token}).status == 404)
         # durable membership row replicated (read back via the move-secret kv door)
-        kr = c.admin_kv_get("__admin__", f"account/{acme}/members/{user_hash(BOB)}")
+        # `node_kv_get`: this smoke publishes the DASHBOARD over the genesis
+        # app, and the dashboard is a pure OIDC relying party with no
+        # root-token path (`web/admin`, "no root-token human path — deleted
+        # with Fork B"), so the handler door is unreachable from a smoke
+        # holding only the operator bearer. The claim here is durability
+        # anyway, which is a question about the store.
+        kr = c.node_kv_get("__admin__", f"account/{acme}/members/{user_hash(BOB)}")
         check("bob's member row durable in __admin__ kv",
               kr.status == 200 and "member" in kr.body, f"got {kr.status} {kr.body[:80]!r}")
         whob = body(req(bob, "GET", "/v1/session"))

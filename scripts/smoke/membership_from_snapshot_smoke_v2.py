@@ -171,7 +171,7 @@ def main() -> int:
         check("final write accepted (204)", w.status == 204, f"got {w.status}")
         repl = False
         for _ in range(40):
-            if "after-2d" in c.admin_kv_get("acme", "final/marker", node=victim).body:
+            if "after-2d" in c.node_kv_get("acme", "final/marker", node=victim).body:
                 repl = True; break
             time.sleep(0.5)
         check(f"⭐ fresh write replicated to node {vnid}", repl)

@@ -115,7 +115,7 @@ def main() -> int:
         print(f"       leader=node {lead + 1}; victim (fresh-voter) = node {vnid}")
 
         print(f"step 2: STOP node {vnid}, WIPE its data dir → a fresh voter with NO group")
-        check(f"victim holds data before wipe", latest in c.admin_kv_get("acme", KEY, node=victim).body)
+        check(f"victim holds data before wipe", latest in c.node_kv_get("acme", KEY, node=victim).body)
         c.stop_node(victim)
         subprocess.run(["rm", "-rf", str(c.data_dirs[victim])])
         c.start_node(victim)
@@ -124,7 +124,7 @@ def main() -> int:
         # and cannot catch up by replication (no local group instance to receive).
         stuck = True
         for _ in range(12):  # ~6s
-            rg = c.admin_kv_get("acme", KEY, node=victim)
+            rg = c.node_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and latest in rg.body:
                 stuck = False
                 break
@@ -184,7 +184,7 @@ def main() -> int:
         print(f"step 5: ⭐ the auto-catchup streams the store onto the empty-born node {vnid}")
         caught = False
         for _ in range(80):  # ~40s — trigger fires ≤100ms; dump+stream is the tail
-            rg = c.admin_kv_get("acme", KEY, node=victim)
+            rg = c.node_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and latest in rg.body:
                 caught = True
                 break
@@ -209,7 +209,7 @@ def main() -> int:
                         data='{"value":"after-join"}', want_status=204, deadline_s=15)
         repl = False
         for _ in range(60):  # ~30s
-            rg = c.admin_kv_get("acme", KEY, node=victim)
+            rg = c.node_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and "after-join" in rg.body:
                 repl = True
                 break
@@ -225,7 +225,7 @@ def main() -> int:
         if new_lead is not None:
             wrote = False
             for _ in range(20):
-                if c.admin_kv_put("acme", "cc/post-kill", "ok", node=new_lead).status in (200, 204):
+                if c.node_kv_put("acme", "cc/post-kill", "ok", node=new_lead).status in (200, 204):
                     wrote = True
                     break
                 time.sleep(0.5)

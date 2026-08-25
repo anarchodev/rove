@@ -92,7 +92,7 @@ def main() -> int:
                             data='{"value":"%s"}' % VALUE1, want_status=204)
         check("POST write → 204", r.status == 204, f"got {r.status} {r.body!r}")
         for i in range(3):
-            r = c.admin_kv_get("acme", KEY, node=i)
+            r = c.node_kv_get("acme", KEY, node=i)
             check(f"replicated to node {i + 1}",
                   r.status == 200 and VALUE1 in r.body, f"got {r.status} {r.body!r}")
 
@@ -151,7 +151,7 @@ def main() -> int:
         if new_lead is not None:
             deadline = time.time() + 20.0
             while time.time() < deadline:
-                rp = c.admin_kv_put("acme", KEY, VALUE2, node=new_lead)
+                rp = c.node_kv_put("acme", KEY, VALUE2, node=new_lead)
                 if rp.status in (200, 204):
                     wrote = True
                     break
@@ -167,7 +167,7 @@ def main() -> int:
                 rg = None
                 deadline = time.time() + 15.0
                 while time.time() < deadline:
-                    rg = c.admin_kv_get("acme", KEY, node=i)
+                    rg = c.node_kv_get("acme", KEY, node=i)
                     if rg.status == 200 and VALUE2 in rg.body:
                         ok_read = True
                         break

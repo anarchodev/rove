@@ -104,7 +104,7 @@ def main() -> int:
                             data='{"value":"seed"}', want_status=204)
         check("seed write → 204", r.status == 204, f"got {r.status}")
         for i in range(3):
-            rg = c.admin_kv_get("acme", KEY, node=i)
+            rg = c.node_kv_get("acme", KEY, node=i)
             check(f"node {i + 1} holds seed", rg.status == 200 and "seed" in rg.body,
                   f"got {rg.status} {rg.body!r}")
 
