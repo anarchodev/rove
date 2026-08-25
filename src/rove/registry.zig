@@ -29,8 +29,13 @@ pub const Registry = struct {
     null_pool: []Entity,
     null_count: u32,
 
-    // Collection registry — collections register themselves
-    next_collection_id: u8,
+    // Which collection ids are taken. Ids are DECLARED by the registering
+    // layer (so an entity's `collection_ids` byte is directly interpretable
+    // as that layer's collection enum) rather than handed out by a counter,
+    // which means nothing but this guard stops two layers from picking the
+    // same slot — and a silent overlap would resolve entities into the
+    // wrong collection.
+    id_used: [MAX_COLLECTIONS]bool,
 
     // Deferred queue — type-erased recipe fn pointers
     deferred_ops: []DeferredOp,
@@ -119,7 +124,7 @@ pub const Registry = struct {
             .max_entities = max,
             .null_pool = null_pool,
             .null_count = max,
-            .next_collection_id = 1, // 0 is reserved for null
+            .id_used = [_]bool{false} ** MAX_COLLECTIONS,
             .deferred_ops = deferred_ops,
             .deferred_count = 0,
             .deferred_capacity = config.deferred_queue_capacity,
@@ -144,13 +149,28 @@ pub const Registry = struct {
         self.* = undefined;
     }
 
-    /// Register an already-created collection with the registry.
-    /// Assigns an ID and propagates any registered init/deinit contexts.
-    pub inline fn registerCollection(self: *Self, coll: anytype) void {
+    /// Register an already-created collection under a DECLARED id, and
+    /// propagate any registered init/deinit contexts.
+    ///
+    /// The id is the caller's to choose because it is what makes an
+    /// entity's state readable: `collection_ids[entity.index]` is that id,
+    /// so a layer whose collection enum has these values can recover the
+    /// collection with a cast instead of comparing against every candidate.
+    /// Id 0 is the free/null pool and is never a collection.
+    pub inline fn registerCollection(self: *Self, coll: anytype, id: u8) void {
         const CollType = @typeInfo(@TypeOf(coll)).pointer.child;
 
-        coll.registry_id = self.next_collection_id;
-        self.next_collection_id += 1;
+        // Explicit rather than `assert`: the shipped build is ReleaseFast,
+        // where an assert is not compiled. Id 0 is the free/null pool, so a
+        // collection registered there would make every FREE entity resolve
+        // as one of its members.
+        if (id == 0) std.debug.panic("registry: collection id 0 is the free pool", .{});
+        if (self.id_used[id]) std.debug.panic(
+            "registry: collection id {d} registered twice — two layers' id ranges overlap",
+            .{id},
+        );
+        self.id_used[id] = true;
+        coll.registry_id = id;
 
         // Apply any already-registered deinit contexts to this collection
         for (self.deinit_ctx_entries[0..self.deinit_ctx_count]) |entry| {
@@ -799,11 +819,11 @@ test "minimal app" {
 
     var spawning = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer spawning.deinit();
-    reg.registerCollection(&spawning);
+    reg.registerCollection(&spawning, 1);
 
     var active = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer active.deinit();
-    reg.registerCollection(&active);
+    reg.registerCollection(&active, 2);
 
     const e = try reg.create(&spawning);
     (try reg.get(e, &spawning, Position)).* = .{ .x = 1, .y = 2, .z = 0 };
@@ -822,7 +842,7 @@ test "create entity in standalone collection" {
 
     var active = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer active.deinit();
-    reg.registerCollection(&active);
+    reg.registerCollection(&active, 1);
 
     const e = try reg.create(&active);
     try testing.expect(!reg.isStale(e));
@@ -835,11 +855,11 @@ test "move between standalone collections" {
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 1);
 
     var wide = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 2);
 
     const e = try reg.create(&narrow);
     const pos_ptr = try reg.get(e, &narrow, Position);
@@ -861,7 +881,7 @@ test "destroy entity" {
 
     var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const e = try reg.create(&coll);
     try reg.destroy(e);
@@ -877,7 +897,7 @@ test "row-polymorphic system" {
 
     var coll = try Collection(Row(&.{Position}).merge(Row(&.{Health})), .{}).init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const e = try reg.create(&coll);
     const pos = try reg.get(e, &coll, Position);
@@ -903,11 +923,11 @@ test "multiple moves then flush" {
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     var b = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer b.deinit();
-    reg.registerCollection(&b);
+    reg.registerCollection(&b, 2);
 
     var entities: [5]Entity = undefined;
     for (&entities, 0..) |*e, i| {
@@ -935,19 +955,19 @@ test "moveAny — entity in one of several sources" {
 
     var init_coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer init_coll.deinit();
-    reg.registerCollection(&init_coll);
+    reg.registerCollection(&init_coll, 1);
 
     var pending = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer pending.deinit();
-    reg.registerCollection(&pending);
+    reg.registerCollection(&pending, 2);
 
     var active = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer active.deinit();
-    reg.registerCollection(&active);
+    reg.registerCollection(&active, 3);
 
     var done = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer done.deinit();
-    reg.registerCollection(&done);
+    reg.registerCollection(&done, 4);
 
     const e1 = try reg.create(&init_coll);
     (try reg.get(e1, &init_coll, Position)).x = 1;
@@ -979,15 +999,15 @@ test "moveAny — wrong collection returns error" {
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer b.deinit();
-    reg.registerCollection(&b);
+    reg.registerCollection(&b, 2);
 
     var dst = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer dst.deinit();
-    reg.registerCollection(&dst);
+    reg.registerCollection(&dst, 3);
 
     const e = try reg.create(&a);
     try testing.expectError(error.WrongCollection, reg.moveAny(e, .{&b}, &dst));
@@ -999,15 +1019,15 @@ test "getAny — entity in one of several collections" {
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     var b = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer b.deinit();
-    reg.registerCollection(&b);
+    reg.registerCollection(&b, 2);
 
     var c = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer c.deinit();
-    reg.registerCollection(&c);
+    reg.registerCollection(&c, 3);
 
     // Entity in b, but we want Position (which all three collections have)
     const e = try reg.create(&b);
@@ -1023,11 +1043,11 @@ test "getAny — wrong collection returns error" {
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer b.deinit();
-    reg.registerCollection(&b);
+    reg.registerCollection(&b, 2);
 
     const e = try reg.create(&a);
     try testing.expectError(error.WrongCollection, reg.getAny(e, .{&b}, Position));
@@ -1061,11 +1081,11 @@ test "move — deinit fires on dropped components" {
 
     var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 1);
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     const e = try reg.create(&wide);
     try testing.expectEqual(@as(u32, 1), init_counter);
@@ -1090,11 +1110,11 @@ test "move — init fires on new components, shared components copied" {
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 1);
 
     var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 2);
 
     const e = try reg.create(&narrow);
     (try reg.get(e, &narrow, Position)).x = 77;
@@ -1121,15 +1141,15 @@ test "moveAny — lifecycle through multiple sources" {
 
     var src_a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer src_a.deinit();
-    reg.registerCollection(&src_a);
+    reg.registerCollection(&src_a, 1);
 
     var src_b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer src_b.deinit();
-    reg.registerCollection(&src_b);
+    reg.registerCollection(&src_b, 2);
 
     var dst = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
     defer dst.deinit();
-    reg.registerCollection(&dst);
+    reg.registerCollection(&dst, 3);
 
     const e1 = try reg.create(&src_a);
     (try reg.get(e1, &src_a, Position)).x = 10;
@@ -1172,7 +1192,7 @@ test "setDeinitCtx — propagates to registered collections" {
 
     // Register context BEFORE collection — forward propagation
     reg.setDeinitCtx(Resource, &counter);
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const e = try reg.create(&coll);
     (try reg.get(e, &coll, Resource)).handle = 42;
@@ -1204,7 +1224,7 @@ test "setDeinitCtx — retroactive propagation" {
     defer coll.deinit();
 
     // Register collection BEFORE context — retroactive propagation
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
     reg.setDeinitCtx(Resource, &counter);
 
     const e = try reg.create(&coll);
@@ -1222,11 +1242,11 @@ test "moveStrip — explicit component drop" {
 
     var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 1);
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     const e = try reg.create(&wide);
     (try reg.get(e, &wide, Position)).x = 55;
@@ -1246,11 +1266,11 @@ test "moveImmediate — visible before flush" {
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     var b = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer b.deinit();
-    reg.registerCollection(&b);
+    reg.registerCollection(&b, 2);
 
     const e = try reg.create(&a);
     (try reg.get(e, &a, Position)).x = 99;
@@ -1271,11 +1291,11 @@ test "moveStripImmediate — immediate with component drop" {
 
     var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 1);
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     const e = try reg.create(&wide);
     (try reg.get(e, &wide, Position)).x = 77;
@@ -1299,7 +1319,7 @@ test "destroyImmediate — no flush needed" {
 
     var coll = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const e = try reg.create(&coll);
     deinit_counter = 0;
@@ -1319,11 +1339,11 @@ test "moveImmediate — init fires on new components" {
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 1);
 
     var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 2);
 
     const e = try reg.create(&narrow);
     (try reg.get(e, &narrow, Position)).x = 42;
@@ -1342,7 +1362,7 @@ test "set — convenience write" {
 
     var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const e = try reg.create(&coll);
     try reg.set(e, &coll, Position, .{ .x = 5, .y = 10, .z = 15 });
@@ -1359,11 +1379,11 @@ test "isInCollection" {
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer b.deinit();
-    reg.registerCollection(&b);
+    reg.registerCollection(&b, 2);
 
     const e = try reg.create(&a);
     try testing.expect(reg.isInCollection(e, &a));
@@ -1386,11 +1406,11 @@ test "isMoving" {
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     var b = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer b.deinit();
-    reg.registerCollection(&b);
+    reg.registerCollection(&b, 2);
 
     const e = try reg.create(&a);
     try testing.expect(!reg.isMoving(e));
@@ -1410,7 +1430,7 @@ test "createBatch — multiple entities" {
 
     var coll = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const entities = try reg.createBatch(&coll, 10);
     try testing.expectEqual(@as(usize, 10), entities.len);
@@ -1451,7 +1471,7 @@ test "fresh components get declared defaults, not zeroes — create" {
 
     var a = try Collection(Row(&.{Defaulted}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     const e = try reg.create(&a);
     const d = try reg.get(e, &a, Defaulted);
@@ -1465,11 +1485,11 @@ test "fresh components get declared defaults, not zeroes — moveImmediate New s
 
     var src = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer src.deinit();
-    reg.registerCollection(&src);
+    reg.registerCollection(&src, 1);
 
     var dst = try Collection(Row(&.{ Position, Defaulted }), .{}).init(testing.allocator);
     defer dst.deinit();
-    reg.registerCollection(&dst);
+    reg.registerCollection(&dst, 2);
 
     const e = try reg.create(&src);
     try reg.moveImmediate(e, &src, &dst);
@@ -1486,11 +1506,11 @@ test "fresh components get declared defaults, not zeroes — deferred move New s
 
     var src = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer src.deinit();
-    reg.registerCollection(&src);
+    reg.registerCollection(&src, 1);
 
     var dst = try Collection(Row(&.{ Position, Defaulted }), .{}).init(testing.allocator);
     defer dst.deinit();
-    reg.registerCollection(&dst);
+    reg.registerCollection(&dst, 2);
 
     const e = try reg.create(&src);
     try reg.move(e, &src, &dst);
@@ -1509,7 +1529,7 @@ test "components without field defaults still zero-init" {
     // zeroing rather than failing to compile.
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
-    reg.registerCollection(&a);
+    reg.registerCollection(&a, 1);
 
     const e = try reg.create(&a);
     const p = try reg.get(e, &a, Position);

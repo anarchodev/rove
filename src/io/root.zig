@@ -249,6 +249,31 @@ pub const ClosingState = struct {
     deadline_ns: u64 = 0,
 };
 
+/// io's collections, as data. An upper layer merges this with its own set
+/// to build ONE collection enum over the shared registry, so an entity's
+/// collection can be read from `collection_ids` rather than tested against
+/// each candidate in turn.
+pub const CollRef = struct {
+    name: [:0]const u8,
+    /// Registered only when the instance has the connect (client) half.
+    connect_only: bool = false,
+};
+
+pub const COLLECTIONS = [_]CollRef{
+    .{ .name = "connections" },
+    .{ .name = "conn_closing" },
+    .{ .name = "read_results" },
+    .{ .name = "write_results" },
+    .{ .name = "read_in" },
+    .{ .name = "write_in" },
+    .{ .name = "_read_pending" },
+    .{ .name = "_write_pending" },
+    .{ .name = "connect_in", .connect_only = true },
+    .{ .name = "connect_errors", .connect_only = true },
+    .{ .name = "_connect_socket_pending", .connect_only = true },
+    .{ .name = "_connect_pending", .connect_only = true },
+};
+
 pub const ConnectionBaseRow = Row(&.{ Fd, ReadCycleEntity, PeerAddr });
 /// The closing row is the connection row plus `ClosingState`, so a move in
 /// from any live conn collection is an ordinary widening — no components are
@@ -291,6 +316,11 @@ pub const Options = struct {
     read_row: type = Row(&.{}),
     write_row: type = Row(&.{}),
     connect: bool = false,
+    /// First registry collection id for this instance. io's collections
+    /// take `[id_base, id_base + COLLECTIONS.len)` in declaration order
+    /// (skipping the connect-only ones when `connect` is false), so the
+    /// layer above can build ONE enum whose values match these ids.
+    id_base: u8 = 1,
 };
 
 pub const IoOptions = struct {
@@ -573,19 +603,11 @@ pub fn Io(comptime opts: Options) type {
             self.cleanup_ctx.ring = &self.ring;
 
             // Register collections with registry
-            reg.registerCollection(&self.connections);
-            reg.registerCollection(&self.conn_closing);
-            reg.registerCollection(&self.read_results);
-            reg.registerCollection(&self.write_results);
-            reg.registerCollection(&self.read_in);
-            reg.registerCollection(&self.write_in);
-            reg.registerCollection(&self._read_pending);
-            reg.registerCollection(&self._write_pending);
-            if (has_connect) {
-                reg.registerCollection(&self.connect_in);
-                reg.registerCollection(&self.connect_errors);
-                reg.registerCollection(&self._connect_socket_pending);
-                reg.registerCollection(&self._connect_pending);
+            comptime var next_id: u8 = 0;
+            inline for (COLLECTIONS) |c| {
+                if (c.connect_only and !has_connect) continue;
+                reg.registerCollection(&@field(self, c.name), opts.id_base + next_id);
+                next_id += 1;
             }
 
             // Register deinit contexts. `ReadResult.deinit` returns
@@ -1273,7 +1295,7 @@ test "works with user collections on same registry" {
     // User collection on the same registry
     var players = try Collection(PlayerRow, .{}).init(testing.allocator);
     defer players.deinit();
-    reg.registerCollection(&players);
+    reg.registerCollection(&players, 1);
 
     const player = try reg.create(&players);
     try testing.expect(!reg.isStale(player));

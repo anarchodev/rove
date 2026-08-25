@@ -71,7 +71,8 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         /// Create a new collection. For fixed-capacity collections, this
         /// performs the single up-front allocation. For dynamic collections,
         /// no allocation occurs until the first append.
-        /// After init, call registry.registerCollection(&coll) to assign an ID.
+        /// After init, call registry.registerCollection(&coll, id) with the id this
+        /// collection is declared under — see `Registry.registerCollection`.
         pub fn init(allocator: std.mem.Allocator) !Self {
             var self = Self{
                 .entities = null,

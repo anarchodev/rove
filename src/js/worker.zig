@@ -1469,6 +1469,24 @@ pub fn Worker(comptime opts: Options) type {
         .client = true,
     });
 
+    // The worker's own collections, declared as VALUES. Ids continue
+    // where `H2Type`'s leave off, so io + h2 + this layer share one
+    // namespace over the registry's `collection_ids` byte — which is what
+    // lets any of the three read an entity's state instead of testing it
+    // against each candidate collection in turn.
+    const Coll = enum(u8) {
+        raft_pending_response = H2Type.COLL_ID_END,
+        raft_pending_cont,
+        raft_pending_stream,
+        body_pending,
+        forward_pending,
+        parked_continuations,
+        snapshot_streams,
+        snapshot_pushes,
+        parked_units,
+        blob_sessions,
+    };
+
     const StreamRow = H2Type.StreamRow;
     const StreamColl = rove.Collection(StreamRow, .{});
 
@@ -1997,16 +2015,11 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
-            reg.registerCollection(&self.raft_pending_response);
-            reg.registerCollection(&self.raft_pending_cont);
-            reg.registerCollection(&self.raft_pending_stream);
-            reg.registerCollection(&self.body_pending);
-            reg.registerCollection(&self.forward_pending);
-            reg.registerCollection(&self.parked_continuations);
-            reg.registerCollection(&self.snapshot_streams);
-            reg.registerCollection(&self.snapshot_pushes);
-            reg.registerCollection(&self.parked_units);
-            reg.registerCollection(&self.blob_sessions);
+            // The enum IS the registration list, so a field cannot be
+            // registered under an id other than the one it is declared under.
+            inline for (@typeInfo(Coll).@"enum".fields) |f| {
+                reg.registerCollection(&@field(self, f.name), f.value);
+            }
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -4757,11 +4770,11 @@ test "RateCharged: fresh on create, carried across a park, and reset when the sl
     const Req = rove.Row(&.{RateCharged});
     var request_out = try rove.Collection(Req, .{}).init(testing.allocator);
     defer request_out.deinit();
-    reg.registerCollection(&request_out);
+    reg.registerCollection(&request_out, 1);
 
     var parked = try rove.Collection(Req, .{}).init(testing.allocator);
     defer parked.deinit();
-    reg.registerCollection(&parked);
+    reg.registerCollection(&parked, 2);
 
     const e = try reg.create(&request_out);
     try testing.expect(!(try reg.get(e, &request_out, RateCharged)).charged);
