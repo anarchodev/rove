@@ -53,7 +53,7 @@ function _rec(o) {
 }
 
 // The version an UNSTAMPED record is. Permanently 1, and a LITERAL: this
-// package must not read `__rove.formats.unstamped`, because a package's record
+// package must not read the engine's own format registry, because a package's record
 // shape is pinned with the package in the tenant's lockfile — one that read the
 // running binary's number would claim a version it did not write.
 const UNSTAMPED_V = 1;
