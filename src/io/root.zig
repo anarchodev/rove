@@ -359,6 +359,11 @@ pub fn Io(comptime opts: Options) type {
         /// state disagree.
         recv_completions_with_data: u64 = 0,
         recv_buffers_returned: u64 = 0,
+        /// Buffers reclaimed from a completion whose entity had already
+        /// been destroyed. Counted apart from `recv_buffers_returned` so
+        /// the source of a return stays attributable, the same way
+        /// `IoCleanupCtx.recv_buffers_returned_via_deinit` is.
+        recv_buffers_returned_via_stale: u64 = 0,
 
         reg: *Registry,
         allocator: std.mem.Allocator,
@@ -723,7 +728,17 @@ pub fn Io(comptime opts: Options) type {
             }
 
             const entity = decodeEntity(cqe.user_data);
-            if (self.reg.isStale(entity)) return;
+            if (self.reg.isStale(entity)) {
+                // The op outlived its entity. A recv that completed with
+                // data still consumed a registered buffer, and this is the
+                // last mention of it — dropping the completion here without
+                // returning it removes that buffer from the pool for the
+                // life of the process. The ring then runs dry under
+                // connection churn and recv answers ENOBUFS at a connection
+                // count nowhere near the limit.
+                self.reclaimStaleBuffer(cqe);
+                return;
+            }
 
             if (self.reg.isInCollection(entity, &self._read_pending)) {
                 try self.handleRecv(entity, cqe);
@@ -962,6 +977,21 @@ pub fn Io(comptime opts: Options) type {
             sqe.user_data = encodeEntity(entity);
         }
 
+        /// Return the buffer carried by a completion whose entity is gone.
+        /// Silent no-op for completions without one — sends, connects, and
+        /// the fixed-fd install all land here too.
+        fn reclaimStaleBuffer(self: *Self, cqe: linux.io_uring_cqe) void {
+            const buf_id = cqe.buffer_id() catch return;
+            const mask = linux.IoUring.buf_ring_mask(self.buf_count);
+            self.returnBufferToRing(buf_id, mask, 0);
+            linux.IoUring.buf_ring_advance(self.buf_ring, 1);
+            // Count the completion on both sides of the balance: the kernel
+            // did hand us this buffer, and we did give it back. Omitting the
+            // `with_data` half would drive the in-flight delta negative.
+            self.recv_completions_with_data += 1;
+            self.recv_buffers_returned_via_stale += 1;
+        }
+
         fn returnBufferToRing(self: *Self, buf_id: u16, mask: u16, offset: u16) void {
             const pos: usize = @as(usize, self.buf_size) * buf_id;
             linux.IoUring.buf_ring_add(self.buf_ring, self.buf_base[pos .. pos + self.buf_size], buf_id, mask, offset);
@@ -1047,4 +1077,77 @@ test "entity encoding round-trip" {
     const e = Entity{ .index = 42, .generation = 7 };
     const decoded = decodeEntity(encodeEntity(e));
     try testing.expect(e.eql(decoded));
+}
+
+test "stale completion carrying a buffer returns it to the ring" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+
+    const IoType = Io(.{});
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    const io = IoType.create(&reg, testing.allocator, addr, .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        // io_uring unavailable (restricted sandbox / old kernel) — the
+        // reclaim logic is unexercised rather than wrong.
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer io.destroy();
+
+    // An entity that has been destroyed: its generation is bumped, so any
+    // completion still referencing it decodes as stale.
+    const doomed = try reg.create(&io._read_pending);
+    try reg.destroyImmediate(doomed);
+    try testing.expect(reg.isStale(doomed));
+
+    const before = io.recv_buffers_returned_via_stale;
+
+    // The shape the kernel produces for a recv that completed with data:
+    // F_BUFFER set, buffer id in the high 16 bits.
+    const buf_id: u16 = 3;
+    try io.handleCqe(.{
+        .user_data = encodeEntity(doomed),
+        .res = 128,
+        .flags = linux.IORING_CQE_F_BUFFER | (@as(u32, buf_id) << linux.IORING_CQE_BUFFER_SHIFT),
+    });
+
+    try testing.expectEqual(before + 1, io.recv_buffers_returned_via_stale);
+}
+
+test "stale completion without a buffer is dropped silently" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+
+    const IoType = Io(.{});
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    const io = IoType.create(&reg, testing.allocator, addr, .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer io.destroy();
+
+    const doomed = try reg.create(&io._write_pending);
+    try reg.destroyImmediate(doomed);
+
+    const before = io.recv_buffers_returned_via_stale;
+
+    // A send completion: no F_BUFFER, nothing to reclaim. Must not
+    // advance the ring — a spurious advance over-reports the producer
+    // tail and shrinks the distinct-buffer pool.
+    try io.handleCqe(.{
+        .user_data = encodeEntity(doomed),
+        .res = 64,
+        .flags = 0,
+    });
+
+    try testing.expectEqual(before, io.recv_buffers_returned_via_stale);
 }
