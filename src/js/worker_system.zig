@@ -268,8 +268,8 @@ fn authorizeSystemRequest(
 /// Names follow Prometheus conventions (snake_case, `_total` suffix
 /// on counters, no suffix on gauges). Labels (`{src="..."}`) are
 /// used when one logical counter has multiple sources, e.g.
-/// io_recv_buffers_returned_total has `src="drain"` and
-/// `src="deinit"` so the postmortem-relevant split stays visible.
+/// io_recv_buffers_returned_total has `src="drain"`, `src="deinit"`,
+/// and `src="stale"` so the postmortem-relevant split stays visible.
 ///
 /// Not gated behind a feature flag — the cost is one allocPrint
 /// per call. The endpoint isn't scraped continuously by anything
