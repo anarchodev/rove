@@ -53,11 +53,6 @@ pub const IoCleanupCtx = struct {
     /// something destroyed a conn entity without routing it through
     /// `conn_closing`. Should never move.
     fd_destroyed_live: u64 = 0,
-    /// Set once the process is tearing the stack down. Collection deinit
-    /// then destroys every conn still live, which is not the layering
-    /// break `Fd.deinit` exists to catch — the OS reclaims these
-    /// descriptors, and there is no ring left to close them through.
-    in_teardown: bool = false,
 };
 
 /// Peer (remote) address of an accepted connection, resolved once at
@@ -83,20 +78,49 @@ pub const Fd = struct {
     /// the shutdown and close and clears `fd` — so on every legal path this
     /// sees -1 and does nothing.
     ///
-    /// A live fd here means an entity was destroyed without passing through
-    /// the closing state. Closing the socket for it would be worse than
-    /// useless: it would paper over the layering break, and the descriptor
-    /// slot may already have been reissued to a new accept, so the close
-    /// would land on somebody else's connection. The slot leaks — a bounded,
-    /// diagnosable fault, where a misdirected close is neither.
+    /// A live fd here means a conn was destroyed around the closing state.
+    /// That is a programmer error, not an operating error, and the honest
+    /// response is to stop: the descriptor leaks, the peer never observes a
+    /// close, and — the part that actually decides it — a path that was
+    /// supposed to be unreachable just ran, so nothing else it did can be
+    /// trusted either. "It is only an fd" is an assumption about code we
+    /// have just established we do not understand.
     ///
-    /// This only counts. Reporting is `poll`'s, because a destructor that
-    /// logs is a destructor doing work beyond its own memory, which is the
-    /// property this whole teardown design rests on.
+    /// Closing the socket instead would be worse than useless: it would hide
+    /// the break, and the slot number may already have been reissued to a new
+    /// accept, so the close would land on somebody else's connection.
+    ///
+    /// Teardown is not an exception. `shutdownAllConns` takes every remaining
+    /// conn through the closing path before any collection is deinited, so
+    /// the fds are already -1 when destruction reaches them. An invariant
+    /// with a mode flag that switches it off is not an invariant — and that
+    /// flag would have been held by the very layer whose destroys this
+    /// exists to police.
+    ///
+    /// An explicit check and `abort`, not `std.debug.assert`, because the
+    /// shipped binaries are ReleaseFast (`scripts/ops/build.sh`) where an
+    /// assert compiles to nothing — the same reason the recv-buffer
+    /// invariant in rove-h2 is written this way. Aborting is the one kind of
+    /// work a destructor may do beyond its own memory: there is no ordering
+    /// to get wrong and no re-entrancy to worry about when the process is
+    /// ending.
     pub fn deinit(_: std.mem.Allocator, items: []Fd, ctx: *DeinitCtx) void {
-        if (ctx.in_teardown) return;
         for (items) |item| {
-            if (item.fd >= 0) ctx.fd_destroyed_live += 1;
+            if (item.fd < 0) continue;
+            ctx.fd_destroyed_live += 1;
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "\n================================================================\n" ++
+                    "ROVE IO: conn destroyed while its fd ({d}) was still live.\n" ++
+                    "  It bypassed `conn_closing`, so the socket was never shut down\n" ++
+                    "  and the descriptor slot is leaked. A path that cannot be\n" ++
+                    "  reached has been reached; the rest of its work is suspect.\n" ++
+                    "================================================================\n",
+                .{item.fd},
+            ) catch buf[0..0];
+            _ = posix.write(2, msg) catch {};
+            std.process.abort();
         }
     }
 };
@@ -407,8 +431,6 @@ pub fn Io(comptime opts: Options) type {
         /// grace window, not the teardown, is what to look at.
         conn_closing_retired: u64 = 0,
         conn_closing_deadline_expired: u64 = 0,
-        fd_destroyed_live_logged: u64 = 0,
-        fd_destroyed_live_decade: u64 = 0,
 
         reg: *Registry,
         allocator: std.mem.Allocator,
@@ -577,17 +599,36 @@ pub fn Io(comptime opts: Options) type {
             return self;
         }
 
-        /// Mark the stack as tearing down, so `Fd.deinit` stops treating a
-        /// live descriptor as a layering break. An upper layer that deinits
-        /// its own conn collections before calling `destroy` must call this
-        /// first — rove-h2 does.
-        pub fn beginTeardown(self: *Self) void {
-            self.cleanup_ctx.in_teardown = true;
+        /// End every connection still live, through the same closing path
+        /// every other connection takes: move it in, post its shutdown and
+        /// close, give up its slot. Afterwards no conn holds a live fd, so
+        /// destruction proceeds without `Fd.deinit` needing an exception for
+        /// teardown.
+        ///
+        /// An upper layer holding conn collections of its own must close
+        /// those first — rove-h2 does, at the top of its `destroy`.
+        ///
+        /// The submit is the point. Without it the shutdown and close SQEs
+        /// sit in the submission queue until `ring.deinit` discards them,
+        /// which is what made teardown's graceful close a fiction: the peer
+        /// got a reset, or nothing at all. Completions are not waited for —
+        /// the kernel has the ops, and blocking teardown to watch them land
+        /// buys the peer nothing it does not already have.
+        pub fn shutdownAllConns(self: *Self) void {
+            for (self.connections.entitySlice()) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                if (self.reg.isMoving(ent)) continue;
+                self.reg.move(ent, &self.connections, &self.conn_closing) catch continue;
+            }
+            self.reg.flush() catch {};
+            self.processConnClosing() catch {};
+            self.reg.flush() catch {};
+            _ = self.ring.submit() catch {};
         }
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
-            self.beginTeardown();
+            self.shutdownAllConns();
             self.connections.deinit();
             self.conn_closing.deinit();
             self.read_results.deinit();
@@ -704,22 +745,6 @@ pub fn Io(comptime opts: Options) type {
         /// it BEFORE handing the conn over. Arriving here means "the protocol
         /// is finished with this connection; take the socket down."
         fn processConnClosing(self: *Self) !void {
-            // Surface any conn that reached destruction around the closing
-            // state. Loud on the first, then once per decade, matching the
-            // admission-denial cadence — this must never be routine.
-            const bypassed = self.cleanup_ctx.fd_destroyed_live;
-            if (bypassed != self.fd_destroyed_live_logged) {
-                const decade = bypassed / 10_000;
-                if (self.fd_destroyed_live_logged == 0 or decade != self.fd_destroyed_live_decade) {
-                    self.fd_destroyed_live_decade = decade;
-                    std.log.err(
-                        "rove-io: {d} conn(s) destroyed while their fd was live — they bypassed `conn_closing`; those descriptor slots are leaked",
-                        .{bypassed},
-                    );
-                }
-                self.fd_destroyed_live_logged = bypassed;
-            }
-
             const now = monotonicNs();
             const entities = self.conn_closing.entitySlice();
             const states = self.conn_closing.column(ClosingState);
@@ -1432,17 +1457,9 @@ test "a peer that never finishes closing does not pin the slot" {
     try testing.expectEqual(@as(u64, 1), io.conn_closing_deadline_expired);
 }
 
-test "destroying a conn around the closing state is counted, not closed" {
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
-    defer reg.deinit();
-    const io = try testIo(&reg);
-    defer io.destroy();
-
-    const conn = try reg.create(&io.connections);
-    try reg.set(conn, &io.connections, Fd, .{ .fd = 3 });
-
-    const before = io.cleanup_ctx.fd_destroyed_live;
-    try reg.destroy(conn); // the layering break this exists to catch
-    try reg.flush();
-    try testing.expectEqual(before + 1, io.cleanup_ctx.fd_destroyed_live);
-}
+// NOTE: there is deliberately no test for a conn destroyed around
+// `conn_closing`. The guard in `Fd.deinit` aborts the process, so exercising
+// it would take the test runner down with it — the standing cost of a check
+// that stops rather than reports. What IS covered is the legal path: the
+// tests above assert `fd` is -1 by the time a conn is retired, which is the
+// condition that keeps the guard silent.

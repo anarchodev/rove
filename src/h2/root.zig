@@ -2419,10 +2419,15 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
-            // Our conn collections deinit below, before `io.destroy` runs.
-            // Tell io first, or every still-live conn reads as a conn that
-            // bypassed `conn_closing`.
-            self.io.beginTeardown();
+            // End every live conn the way every conn ends. Our collections
+            // deinit below, before `io.destroy` runs, so io cannot reach
+            // these — and a conn destroyed still holding its fd is the one
+            // thing `Fd.deinit` refuses to tolerate.
+            inline for (self.liveConnColls()) |coll| {
+                for (coll.entitySlice()) |ent| _ = self.closeConn(ent);
+            }
+            self.reg.flush() catch {};
+            self.io.shutdownAllConns();
             for (self.body_sinks.items) |ref| {
                 ref.sink.abort(ref.sink.ctx);
                 ref.sink.release(ref.sink.ctx);
