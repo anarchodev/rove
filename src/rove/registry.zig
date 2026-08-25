@@ -449,10 +449,11 @@ pub const Registry = struct {
             dst.column(T)[new_offset] = src.column(T)[src_offset];
         }
 
-        // Zero-init + init new components
+        // Default-init + init new components (declared field defaults, not
+        // zero — see `row.fillDefault`).
         inline for (New.types) |T| {
             if (@sizeOf(T) > 0) {
-                dst.column(T)[new_offset] = std.mem.zeroes(T);
+                row_mod.fillDefault(T, dst.column(T)[new_offset .. new_offset + 1]);
             }
         }
         inline for (comptime New.initTypes()) |T| {
@@ -700,14 +701,11 @@ pub const Registry = struct {
                     );
                 }
 
-                // Zero-init + init only NEW components (not in source row)
+                // Default-init only NEW components (not in source row) —
+                // declared field defaults, not zero (see `row.fillDefault`).
                 inline for (New.types) |T| {
                     if (@sizeOf(T) > 0) {
-                        const col = dst_coll.column(T);
-                        const bytes: [*]u8 = @ptrCast(col.ptr);
-                        const byte_offset = dest_base * @sizeOf(T);
-                        const byte_len = count * @sizeOf(T);
-                        @memset(bytes[byte_offset .. byte_offset + byte_len], 0);
+                        row_mod.fillDefault(T, dst_coll.column(T)[dest_base .. dest_base + count]);
                     }
                 }
                 inline for (comptime New.initTypes()) |T| {
@@ -1436,4 +1434,86 @@ test "createBatch — multiple entities" {
         try reg.set(e, &coll, Position, .{ .x = @floatFromInt(i), .y = 0, .z = 0 });
     }
     try testing.expectEqual(@as(f32, 5), coll.column(Position)[5].x);
+}
+
+// A component whose neutral value is NOT all-zeros — the shape that made
+// zero-init a hazard in rove-io (`Fd{ .fd = -1 }` reborn as fd 0, a live
+// descriptor slot; `ReadCycleEntity{ .entity = Entity.nil }` reborn as a
+// resolvable handle, since `Entity.nil.index` is `maxInt(u32)`).
+const Defaulted = struct {
+    fd: i32 = -1,
+    handle: Entity = Entity.nil,
+};
+
+test "fresh components get declared defaults, not zeroes — create" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Defaulted}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    const e = try reg.create(&a);
+    const d = try reg.get(e, &a, Defaulted);
+    try testing.expectEqual(@as(i32, -1), d.fd);
+    try testing.expect(d.handle.isNil());
+}
+
+test "fresh components get declared defaults, not zeroes — moveImmediate New set" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var src = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer src.deinit();
+    reg.registerCollection(&src);
+
+    var dst = try Collection(Row(&.{ Position, Defaulted }), .{}).init(testing.allocator);
+    defer dst.deinit();
+    reg.registerCollection(&dst);
+
+    const e = try reg.create(&src);
+    try reg.moveImmediate(e, &src, &dst);
+
+    // `Defaulted` is in the New set — the source never carried it.
+    const d = try reg.get(e, &dst, Defaulted);
+    try testing.expectEqual(@as(i32, -1), d.fd);
+    try testing.expect(d.handle.isNil());
+}
+
+test "fresh components get declared defaults, not zeroes — deferred move New set" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var src = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer src.deinit();
+    reg.registerCollection(&src);
+
+    var dst = try Collection(Row(&.{ Position, Defaulted }), .{}).init(testing.allocator);
+    defer dst.deinit();
+    reg.registerCollection(&dst);
+
+    const e = try reg.create(&src);
+    try reg.move(e, &src, &dst);
+    try reg.flush();
+
+    const d = try reg.get(e, &dst, Defaulted);
+    try testing.expectEqual(@as(i32, -1), d.fd);
+    try testing.expect(d.handle.isNil());
+}
+
+test "components without field defaults still zero-init" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    // `Position` declares no defaults — `fillDefault` must fall back to
+    // zeroing rather than failing to compile.
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    const e = try reg.create(&a);
+    const p = try reg.get(e, &a, Position);
+    try testing.expectEqual(@as(f32, 0), p.x);
+    try testing.expectEqual(@as(f32, 0), p.y);
+    try testing.expectEqual(@as(f32, 0), p.z);
 }
