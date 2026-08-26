@@ -106,11 +106,14 @@ io with components io has never heard of.
 - [ ] The h2-side call sites that want `getRow` (close/dispatch paths
       reading several components of a stream) — currently on compat
       getAny/moveAny, which FatRegistry now provides.
-- [ ] **Smoke suite** (`scripts/smoke/run_all.py --baseline`) — owed
-      since the coll-enum merge regardless, mandatory before any of this
-      approaches main. `zig build test` cannot see socket lifecycle.
-      NOTE: the worker still runs archetype — the suite exercises the
-      port only via unit gates until the worker opts in.
+- [x] **Smoke suite — RUN 2026-08-26 after the declared-world arc:**
+      167/168, and vs baseline the one "newly broken"
+      (log_failover_walker_smoke_v2) passed standalone on an idle box —
+      its two in-suite failures coincided with concurrent zig compiles,
+      the saturated-box election-timeout class. So the suite is green
+      for the arc: the archetype h2/io accessor sweep (~380 sites) is
+      smoke-verified, not just unit-gated. The worker still runs
+      archetype — a fat worker needs its own suite run when it opts in.
 
 ## 3 — Edge clauses
 
