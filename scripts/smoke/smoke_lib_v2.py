@@ -406,6 +406,12 @@ class V2Cluster:
     log_data_dir: Path
     procs: list = field(default_factory=list)
     node_procs: dict = field(default_factory=dict)  # node index → Popen (for stop/start)
+    # Node indices currently SIGSTOPped by `freeze_node`. A frozen process is
+    # ALIVE — `poll()` returns None — so liveness cannot distinguish it from a
+    # healthy node, and every helper that polls a node over HTTP would block
+    # for its full timeout instead. Anything that talks to nodes must skip
+    # these; `alive_nodes()` is the one place that rule lives.
+    frozen_nodes: set = field(default_factory=set)
     log_paths: dict = field(default_factory=dict)
     # The log-server's operator-metrics port (the loopback :9113 listener in
     # production) — per-cluster allocation so concurrent smokes never scrape
@@ -630,7 +636,7 @@ class V2Cluster:
         """The leader's per-peer membership view for `tenant`'s group, or None if
         no node answers as leader. Tries each node's leader-gated
         `/_system/v2-member-status` (a follower 421s)."""
-        for i in range(len(self.node_ports)):
+        for i in self.alive_nodes():
             r = _curl(f"{self.node_url(i)}/_system/v2-member-status?tenant="
                       f"{urllib.parse.quote(tenant)}", timeout=5.0,
                       headers={"X-Rewind-Move-Secret": MOVE_SECRET})
@@ -745,6 +751,11 @@ class V2Cluster:
         await_ready(p, f"n{i + 1}", "listening on")
 
     def shutdown(self) -> None:
+        # Thaw first: a SIGSTOPped process does not act on SIGTERM until it
+        # resumes, so a frozen node would burn the 10s wait below and then be
+        # SIGKILLed — losing whatever it would have said on the way out.
+        for i in list(self.frozen_nodes):
+            self.thaw_node(i)
         for p in self.procs:
             if p.poll() is None:
                 p.send_signal(signal.SIGTERM)
@@ -1517,8 +1528,9 @@ class V2Cluster:
         """Single-shot (NO polling): index of a live node whose
         `/_system/v2-leader` returns 200 for `tenant`, else None. For tight
         failover-timing loops where the 0.4s `leader_node` poll is too coarse."""
-        for i in (nodes if nodes is not None else range(len(self.node_ports))):
-            if i not in self.node_procs or self.node_procs[i].poll() is not None:
+        alive = self.alive_nodes()
+        for i in (nodes if nodes is not None else alive):
+            if i not in alive:
                 continue
             r = _curl(f"{self.node_url(i)}/_system/v2-leader?tenant={tenant}",
                       headers={"X-Rewind-Move-Secret": MOVE_SECRET})
@@ -1537,6 +1549,35 @@ class V2Cluster:
                 return got
             time.sleep(0.4)
         return None
+
+    def alive_nodes(self) -> list:
+        """Node indices that can actually answer: spawned, not exited, and not
+        frozen. Every node-polling helper iterates THIS, never
+        `range(len(node_ports))` — a SIGSTOPped node accepts the connection and
+        never replies, so polling it costs the caller its whole timeout and
+        then raises out of the smoke."""
+        return [i for i in range(len(self.node_ports))
+                if i in self.node_procs
+                and self.node_procs[i].poll() is None
+                and i not in self.frozen_nodes]
+
+    def freeze_node(self, i: int) -> None:
+        """SIGSTOP node `i` — models a partitioned or arbitrarily-slow peer that
+        is still a cluster member (unlike `stop_node`/`kill_node`, which remove
+        it). Recorded in `frozen_nodes` so the polling helpers skip it; use
+        `thaw_node` to resume."""
+        p = self.node_procs.get(i)
+        if p is None or p.poll() is not None:
+            return
+        p.send_signal(signal.SIGSTOP)
+        self.frozen_nodes.add(i)
+
+    def thaw_node(self, i: int) -> None:
+        """SIGCONT node `i`, undoing `freeze_node`."""
+        p = self.node_procs.get(i)
+        if p is not None and p.poll() is None and i in self.frozen_nodes:
+            p.send_signal(signal.SIGCONT)
+        self.frozen_nodes.discard(i)
 
     def stop_node(self, i: int) -> None:
         """SIGTERM node `i` (simulate a node death / leader kill)."""
