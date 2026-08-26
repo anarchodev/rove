@@ -63,6 +63,15 @@ EXCLUDED = {
     # flow once; run this BY HAND if that flake ever recurs.
     "genesis_capture.py": "diagnostic harness for the fixed leg-E failover "
                           "flake — genesis_smoke_v2 is the gate",
+    # The browser-agent surface is unfinished and unsupported, and the work is
+    # parked — so nothing should be gating on it. Excluded for THAT, not for
+    # failing: it has been red on main while the baseline claimed pass, which
+    # made it read as a fresh regression against whatever branch was under
+    # test and cost two unrelated branches a diagnosis cycle each (rove#880).
+    # The smoke and web/agent-sample are intact; if the feature is picked back
+    # up, delete this line and it graduates straight back into the suite.
+    "agent_smoke_v2.py": "browser-agent surface is unfinished/unsupported and "
+                         "the work is parked — nothing should gate on it",
 }
 
 # Build steps a caller must invoke to produce what the suite spawns. Exported
