@@ -156,6 +156,48 @@ never diverge.
   Whether any component *wants* enforced destruction on exit is a
   per-component question this model answers with convention.
 
+## Prior art
+
+The pieces all exist; the package as a *semantic contract* is the
+less-traveled part.
+
+- **Handmade Hero sim regions** (Muratori): entities live chunk-resident in
+  packed low-frequency form and are unpacked into the sim region's dense
+  working collections (static / moving geometry) when near the camera, then
+  packed back out. Park/unpark with a *spatial* predicate where ours is
+  *state*. His pack step must swizzle entity pointers to stored IDs and
+  back; rove's `Entity` handles are already the stable reference, so park
+  is bitwise.
+- **EnTT sparse sets + owning groups**: per-component sparse sets are the
+  base table; an owning group incrementally reorders its pools so members
+  sit contiguous — a materialized view maintained by swaps, down to the
+  same partition-ish constraint (a pool owned by at most one group). No
+  declared state graph, no park (nothing ever leaves the base table).
+- **Archetype engines patching toward the same end** — evidence the pain is
+  recognized: Unity DOTS enableable components (a state flip masks a
+  component instead of causing a structural move; storage stays allocated)
+  and flecs union relationships (state changes that do not move the entity
+  between tables). Both keep membership as a filtered scan rather than a
+  dense set, and neither makes lossless moves a guarantee.
+- **Databases**: materialized views + incremental view maintenance is the
+  literature this doc's framing borrows. Vertica/C-store is the sharpest
+  match — base store plus differently-organized materialized projections,
+  with a *tuple mover* migrating records between write- and read-optimized
+  homes. SAP HANA's delta/main split is the same shape; a Postgres partial
+  index is a membership predicate, materialized.
+- **DOD canon**: Fabian's existence-based processing (membership in a table
+  IS the boolean) is the ancestry of rove-library principle #1 itself;
+  hot/cold structure splitting is what this model does *dynamically per
+  state* — the view is the hot split, the shadow the cold one, and the
+  split point moves with the entity's phase. Kelley's "Practical
+  Data-Oriented Design" is the Zig-world statement of
+  state-as-array-membership.
+- **Structural analogies** that are more than cute: register allocation
+  (columns are registers, the shadow the stack slot, park/unpark are
+  spill/fill, "safe to read" is live-range analysis) and virtual memory
+  (resident vs paged-out over one canonical backing store) — both live
+  under the same one-live-copy discipline.
+
 ## What would come next (none of it committed)
 
 The h2-shaped composite-tick benchmark (does the bookkeeping show at h2's
