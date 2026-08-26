@@ -16,10 +16,15 @@ ids (coll-enum merged) · `collectionIdOf` · `EntitySet` + per-entity mask ·
 (probe-verified) · zero hooks and zero residency contracts in fat io ·
 `all_conns` admission + sweep · empty-queue precondition on the sweep ·
 fat-bench (parity at every altitude measured) · getAny/moveAny compat ·
-extra_components threading (io + h2) · conn_dead hand-off phase +
-reaper · **rove-h2 ported** (h2-echo-fat probe-verified).
+conn_dead hand-off phase + reaper · **rove-h2 ported** (h2-echo-fat
+probe-verified) · **declared world** (`rove.World` tables: parts per
+layer, ids by table position, registry-owned storage, sets as row-less
+registry-internal entries addressed by tag) · **`rove_world` root
+pattern** (both fat examples; fat-without-world is a compile error;
+explicit `.world` for tests' mini-worlds) · the extra_components
+threading deleted with it.
 
-## 1 — Universe composition — BUILT 2026-08-26 (as the threading mechanism)
+## 1 — Universe composition — BUILT 2026-08-26 (threading), REBUILT as the declared world (same day)
 
 "Top" is a role, not a layer: whoever terminates the stack in a given
 program (echo example → io directly; h2-echo example → h2; the rewind
@@ -53,29 +58,31 @@ io with components io has never heard of.
       collections tables, table-position ids, registry-owned storage)
       remains the intended successor; the threading is its sanctioned
       fallback and is subsumed by it.
-- [ ] **DECIDED (2026-08-26): the `rove_world` root pattern is the
-      intended endpoint** — the std_options idiom: each binary's root
-      module declares `pub const rove_world = rove.World(.{ .parts =
-      ... })` once; rove exposes `declared_world` via @import("root")
-      with null fallback; layers consult it instead of threading.
-      Rules that make it sound: (1) the root declares TYPES, main and
-      each worker thread construct VALUES — one world type per program,
-      N registries of it (prod's 8 shared-nothing workers are 8 values
-      of one type; a registry VALUE at root scope is forbidden and
-      corrupting); (2) `.registry_model = .fat` stays on
-      instantiations as intent, and fat-without-a-root-world is a
-      compile error — no silent mode flip; (3) parts must be pure data
-      declared outside the layer type functions (no value recursion
-      through @import("root")); (4) library test builds see no world
-      (their root is the library file) and default archetype; explicit
-      World(...) construction remains load-bearing underneath — tests'
-      mini-worlds and any heterogeneous-worlds binary use it directly;
-      (5) heterogeneous worlds in one binary are out of scope by
-      construction (rove ships separate binaries). Lands naturally
-      WITH the declared-world tables, since those make parts pure data
-      anyway.; when axes (item 4) land,
-      the contribution becomes per-axis and the re-grouping is
-      mechanical. Do not block the h2 port on axes.
+- [x] **BUILT (2026-08-26): the `rove_world` root pattern + declared
+      world tables** (`src/rove/world.zig`) — the std_options idiom:
+      each binary's root module declares `pub const rove_world =
+      rove.World(.{ .parts = ... })` once; rove exposes
+      `declared_world` via @import("root") with null fallback; layers
+      consult it (explicit `.world` wins, for tests' mini-worlds).
+      All five soundness rules hold as designed: types at root /
+      values in main, `.fat` stays on instantiations with
+      fat-without-world a compile error, parts are pure data at file
+      scope (`rio.parts` / `rh2.parts`, sharing the layer's own row
+      computation so root and instantiation cannot drift — a comptime
+      identity check per collection proves it), library test builds
+      see null, heterogeneous worlds out of scope. What the build
+      added beyond the decision record: ids by table position valued
+      as registry ids directly (`W.CollId`, h2's `Coll` IS it under a
+      world — `extra_collections` dissolves into the composer's own
+      parts, the io-names-first prefix contract binds only the
+      archetype enum); registry-owned storage behind one heap Storage
+      pointer so `Reg.init` keeps the value-returning idiom; sets as
+      row-less entries in the same table, registry-internal and
+      tag-addressed (`join/leave/inSet/setMembers`) — the axes-4c
+      storage merge can now land with zero consumer blast radius; the
+      `coll(.name)` accessor as the one address-taking spelling valid
+      under every model. When axes (item 4) land, the contribution
+      becomes per-axis and the re-grouping is mechanical.
 
 ## 2 — The h2 port (the real consumer test)
 
@@ -187,7 +194,10 @@ comes last so only the constraints that survive 4a–4c get syntax.
       system deciding `leave` owns resetting first if policy wants a
       fresh start — same contract as `fd = -1` at close. A set is a
       partial axis with zero components — and at this step the
-      implementations MERGE (no half-refactor): EntitySet is deleted;
+      implementations MERGE (no half-refactor): the consumer surface
+      is ALREADY tag-shaped (the declared world made sets row-less
+      registry-internal entries), so the merge is storage-only with
+      zero consumer blast radius; EntitySet is deleted;
       sets become Collection(empty row) on one-state axes (the shared
       recipes' component loops vanish at comptime for an empty row);
       the set's sparse table moves into the per-axis offsets where it
