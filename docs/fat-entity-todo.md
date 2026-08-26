@@ -15,7 +15,9 @@ ids (coll-enum merged) · `collectionIdOf` · `EntitySet` + per-entity mask ·
 `evictImmediate` · Io generic over registry model · echo server on fat
 (probe-verified) · zero hooks and zero residency contracts in fat io ·
 `all_conns` admission + sweep · empty-queue precondition on the sweep ·
-fat-bench (parity at every altitude measured).
+fat-bench (parity at every altitude measured) · getAny/moveAny compat ·
+extra_components threading (io + h2) · conn_dead hand-off phase +
+reaper · **rove-h2 ported** (h2-echo-fat probe-verified).
 
 ## 1 — Universe composition (blocks the h2 port)
 
@@ -53,14 +55,31 @@ io with components io has never heard of.
 
 ## 2 — The h2 port (the real consumer test)
 
-- [ ] Genericize rove-h2 over the registry model the way io went.
-      Expected mostly mechanical after item 1; the `conn_closing`
-      two-type `getAny` seam dissolves under fat (rows never diverge).
+- [x] Genericize rove-h2 over the registry model — DONE (2026-08-26).
+      extra_components threading built at both boundaries (item 1's
+      fallback mechanism; the declared-world interface still supersedes
+      it later); Reg re-exported; hooks not installed under fat. Two
+      foreign-state problems surfaced and solved: (a) Conn.deinit's
+      work (nghttp2/TLS/h1) moved to the `conn_dead` hand-off phase —
+      io retires by move under `on_retire = .hand_off`, h2's
+      pollPostlude reaps (free via getFat, then destroy), teardown
+      reaps conn_dead AND still-closing; (b) the four buffer-owning
+      stream components route every ending through `destroyEntity`
+      (frees-then-destroys under fat; safe on any entity via
+      null-defaults). Probe-verified: churn/multiplex/concurrency,
+      byte-exact, archetype control identical.
+- [ ] Convert the four stream components (Req/Resp Headers/Body) to
+      release-by-transition or per-request arena — h2's analog of
+      rove#885. Retires destroyEntity's fat branch and the consumer
+      contract ("end terminal entities through destroyEntity").
 - [ ] The h2-side call sites that want `getRow` (close/dispatch paths
-      reading several components of a stream).
+      reading several components of a stream) — currently on compat
+      getAny/moveAny, which FatRegistry now provides.
 - [ ] **Smoke suite** (`scripts/smoke/run_all.py --baseline`) — owed
       since the coll-enum merge regardless, mandatory before any of this
       approaches main. `zig build test` cannot see socket lifecycle.
+      NOTE: the worker still runs archetype — the suite exercises the
+      port only via unit gates until the worker opts in.
 
 ## 3 — Edge clauses
 
