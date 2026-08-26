@@ -189,9 +189,164 @@ pub const Options = struct {
     registry_model: rio.RegistryModel = .archetype,
     /// The composing layer's universe contribution (fat model): everything
     /// its own collections carry, plus shadow-only components. Folded into
-    /// what this layer passes rove-io. Ignored under archetype.
+    /// what this layer passes rove-io. Ignored under archetype and
+    /// superseded by a declared world, which carries every part itself.
     extra_components: type = Row(&.{}),
+    /// The declared world this instantiation runs in (fat model). When
+    /// null, the root module's `rove_world` declaration is consulted
+    /// (`rove.declared_world`). The world must contain h2's parts — build
+    /// it from `parts(the same Options)`, appending the composing layer's
+    /// own parts.
+    world: ?type = null,
 };
+
+/// The rows h2's collections materialize, given the caller's fragments —
+/// the single computation `H2(...)` and `parts(...)` both read, so a
+/// declared world and the instantiated types cannot drift apart.
+fn RowsFor(comptime opts: Options) type {
+    return struct {
+        pub const stream = StreamBaseRow.merge(opts.request_row);
+        pub const connect_full = Row(&.{ ConnectTarget, Session, H2IoResult }).merge(opts.request_row);
+        pub const full_conn = rio.ConnectionBaseRow.merge(Row(&.{Conn})).merge(opts.connection_row);
+        pub const ws_seam = Row(&.{ Session, ReqBody, WsMeta, H2IoResult }).merge(opts.request_row);
+    };
+}
+
+/// The rove-io options this layer derives from its own — the single
+/// derivation `H2(...)` and `parts(...)` share. Under fat, everything
+/// h2's own collections carry folds into io's universe (the threading
+/// composition mechanism; a declared world supersedes it), and
+/// retirement hands conns to `conn_dead` so `processConnDead` can free
+/// the foreign state `Conn.deinit` frees under the archetype (nghttp2
+/// session, TLS conn, h1) at a point provably after every reader.
+pub fn ioOptions(comptime opts: Options) rio.Options {
+    const contribution = StreamBaseRow
+        .merge(opts.request_row)
+        .merge(Row(&.{ Conn, WsMeta, ConnectTarget }))
+        .merge(opts.connection_row)
+        .merge(opts.extra_components);
+    return .{
+        .connection_row = Row(&.{Conn}).merge(opts.connection_row),
+        .connect = opts.client,
+        .registry_model = opts.registry_model,
+        .extra_components = contribution,
+        .on_retire = if (opts.registry_model == .fat) .hand_off else .destroy,
+        .world = opts.world,
+    };
+}
+
+/// Which of h2's collection shapes an entry stores; `.io` marks entries
+/// owned by rove-io (present so ONE flattened reference list spans the
+/// shared registry).
+const CollKind = enum {
+    io,
+    server_stream,
+    server_read,
+    server_conn,
+    server_ws,
+    client_connect,
+    client_stream,
+};
+
+const CollSpec = struct {
+    name: [:0]const u8,
+    kind: CollKind,
+    client_only: bool = false,
+    // True for collections that hold an entity in some
+    // intermediate state of the kind's pipeline (so the
+    // serverStreamClose / clientStreamClose helpers iterate
+    // them looking for the entity's current home). False for
+    // terminal collections (response_out / client_response_out)
+    // — those are the move target, not a search target.
+    in_chain: bool = false,
+};
+
+// Single source of truth for h2's collection fields. Drives init,
+// registerCollection, deinit, the `Coll` enum + chain lookups, and the
+// layer's world part, so adding a collection is a one-line spec change
+// rather than edits in 4–6 places. The storage type is derived from
+// `.kind` (see `collRowFor` / `H2`'s `CollTypeOf`).
+const COLLECTIONS = [_]CollSpec{
+    .{ .name = "request_out", .kind = .server_stream, .in_chain = true },
+    .{ .name = "request_receiving", .kind = .server_stream, .in_chain = true },
+    .{ .name = "request_buffering", .kind = .server_stream, .in_chain = true },
+    .{ .name = "response_in", .kind = .server_stream, .in_chain = true },
+    .{ .name = "response_out", .kind = .server_stream },
+    .{ .name = "_response_sending", .kind = .server_stream, .in_chain = true },
+    .{ .name = "stream_response_in", .kind = .server_stream, .in_chain = true },
+    .{ .name = "stream_data_out", .kind = .server_stream, .in_chain = true },
+    .{ .name = "stream_data_in", .kind = .server_stream, .in_chain = true },
+    .{ .name = "stream_close_in", .kind = .server_stream, .in_chain = true },
+    .{ .name = "_stream_data_sending", .kind = .server_stream, .in_chain = true },
+    .{ .name = "ws_message_out", .kind = .server_ws },
+    .{ .name = "ws_send_in", .kind = .server_ws },
+    // Not in_chain: WS identity entities die with their stream
+    // (destroyed in onStreamCloseCb), never via serverStreamClose.
+    .{ .name = "ws_connect_out", .kind = .server_stream },
+    .{ .name = "ws_streams", .kind = .server_stream },
+    .{ .name = "ws_upgrade_out", .kind = .server_stream },
+    .{ .name = "_read_errors", .kind = .server_read },
+    .{ .name = "_read_init", .kind = .server_read },
+    .{ .name = "_read_active", .kind = .server_read },
+    .{ .name = "_read_handshake", .kind = .server_read },
+    .{ .name = "_read_h1_paused", .kind = .server_read },
+    .{ .name = "_conn_tls_handshake", .kind = .server_conn },
+    .{ .name = "_conn_active", .kind = .server_conn },
+    .{ .name = "client_connect_in", .kind = .client_connect, .client_only = true },
+    .{ .name = "client_connect_out", .kind = .client_connect, .client_only = true },
+    .{ .name = "client_connect_errors", .kind = .client_connect, .client_only = true },
+    .{ .name = "_client_connect_pending", .kind = .client_connect, .client_only = true },
+    .{ .name = "client_request_in", .kind = .client_stream, .client_only = true, .in_chain = true },
+    .{ .name = "client_response_out", .kind = .client_stream, .client_only = true },
+    // Output-only, never a request entity's home — out of the
+    // chain so clientStreamClose/streamSet never match it.
+    .{ .name = "client_response_receiving", .kind = .client_stream, .client_only = true },
+    .{ .name = "_client_request_sending", .kind = .client_stream, .client_only = true, .in_chain = true },
+    .{ .name = "client_stream_request_in", .kind = .client_stream, .client_only = true, .in_chain = true },
+    .{ .name = "client_stream_data_out", .kind = .client_stream, .client_only = true, .in_chain = true },
+    .{ .name = "client_stream_data_in", .kind = .client_stream, .client_only = true, .in_chain = true },
+    .{ .name = "client_stream_close_in", .kind = .client_stream, .client_only = true, .in_chain = true },
+    .{ .name = "_client_stream_data_sending", .kind = .client_stream, .client_only = true, .in_chain = true },
+};
+
+fn collRowFor(comptime opts: Options, comptime kind: CollKind) type {
+    const rows = RowsFor(opts);
+    return switch (kind) {
+        .io => @compileError("io-owned entries come from rio.parts, not h2's table"),
+        .server_stream, .client_stream => rows.stream,
+        .server_read => rio.ReadBaseRow,
+        .server_conn => rows.full_conn,
+        .server_ws => rows.ws_seam,
+        .client_connect => rows.connect_full,
+    };
+}
+
+/// h2's contribution to a declared world: io's parts (with the io
+/// options this layer derives) followed by h2's own. A binary on the
+/// fat model composes its root `rove_world` from this — appending its
+/// own parts — passing the SAME options value it instantiates `H2`
+/// with.
+pub fn parts(comptime opts: Options) []const rove.Part {
+    comptime var decls: []const rove.CollDecl = &.{};
+    inline for (COLLECTIONS) |s| {
+        if (s.client_only and !opts.client) continue;
+        decls = decls ++ [_]rove.CollDecl{.{ .name = s.name, .row = collRowFor(opts, s.kind) }};
+    }
+    return rio.parts(ioOptions(opts)) ++ [_]rove.Part{.{ .name = "rove-h2", .collections = decls }};
+}
+
+/// Comptime guard: the declared world's storage type for `name` must be
+/// the very type this instantiation computed — see rove-io's twin.
+fn checkWorldColl(comptime WorldT: type, comptime name: [:0]const u8, comptime Local: type) void {
+    if (!@hasField(WorldT.CollId, name)) @compileError(
+        "rove-h2: the declared world lacks h2's '" ++ name ++
+            "' — build the root rove_world from rh2.parts(the same Options)",
+    );
+    if (WorldT.CollOf(@field(WorldT.CollId, name)) != Local) @compileError(
+        "rove-h2: world row for '" ++ name ++
+            "' does not match this instantiation — the root rove_world was built from different Options; declare the options once and use the same value at both sites",
+    );
+}
 
 pub const H2Options = struct {
     max_concurrent_streams: u32 = 128,
@@ -301,31 +456,17 @@ pub const H2Options = struct {
 // =============================================================================
 
 pub fn H2(comptime opts: Options) type {
-    const stream_row = StreamBaseRow.merge(opts.request_row);
-    const connect_row_full = Row(&.{ ConnectTarget, Session, H2IoResult }).merge(opts.request_row);
-    const full_conn_row = rio.ConnectionBaseRow.merge(Row(&.{Conn})).merge(opts.connection_row);
+    const rows = RowsFor(opts);
+    const stream_row = rows.stream;
+    const connect_row_full = rows.connect_full;
+    const full_conn_row = rows.full_conn;
 
     const has_client = opts.client;
     const is_fat = opts.registry_model == .fat;
 
-    // Rove-io type for this h2 configuration. Under fat, everything h2's
-    // own collections carry folds into io's universe (the composition
-    // mechanism), and retirement hands conns to `conn_dead` so
-    // `processConnDead` can free the foreign state `Conn.deinit` frees
-    // under the archetype (nghttp2 session, TLS conn, h1) at a point
-    // provably after every reader.
-    const h2_universe_contribution = StreamBaseRow
-        .merge(opts.request_row)
-        .merge(Row(&.{ Conn, WsMeta, ConnectTarget }))
-        .merge(opts.connection_row)
-        .merge(opts.extra_components);
-    const IoType = rio.Io(.{
-        .connection_row = Row(&.{Conn}).merge(opts.connection_row),
-        .connect = has_client,
-        .registry_model = opts.registry_model,
-        .extra_components = h2_universe_contribution,
-        .on_retire = if (is_fat) .hand_off else .destroy,
-    });
+    // Rove-io type for this h2 configuration — see `ioOptions` for what
+    // this layer derives and folds.
+    const IoType = rio.Io(ioOptions(opts));
 
     // WebSocket seam row (docs/architecture/websockets.md): one entity per inbound
     // completed message (`ws_message_out`) or outbound frame (`ws_send_in`).
@@ -333,7 +474,7 @@ pub fn H2(comptime opts: Options) type {
     // (`WsMeta`), and an error slot (`H2IoResult`), plus the worker's
     // `request_row` so piece D can attach per-activation state — mirroring how
     // `stream_row` merges it for normal requests.
-    const ws_row = Row(&.{ Session, ReqBody, WsMeta, H2IoResult }).merge(opts.request_row);
+    const ws_row = rows.ws_seam;
 
     // Collection types (for comptime)
     const StreamColl = Collection(stream_row, .{});
@@ -343,6 +484,21 @@ pub fn H2(comptime opts: Options) type {
 
     const ClientConnectColl = if (has_client) Collection(connect_row_full, .{}) else void;
     const ClientStreamColl = if (has_client) Collection(stream_row, .{}) else void;
+
+    // The declared world, when there is one — same resolution as rove-io:
+    // the explicit option wins, the root's `rove_world` is the fallback.
+    const maybe_world: ?type = if (opts.world) |W| W else rove.declared_world;
+    const uses_world = is_fat and maybe_world != null;
+    const WorldT = if (uses_world) maybe_world.? else void;
+
+    comptime {
+        if (uses_world) {
+            for (COLLECTIONS) |s| {
+                if (s.client_only and !has_client) continue;
+                checkWorldColl(WorldT, s.name, Collection(collRowFor(opts, s.kind), .{}));
+            }
+        }
+    }
 
     return struct {
         const Self = @This();
@@ -372,7 +528,7 @@ pub fn H2(comptime opts: Options) type {
         // headers_first receiving/buffering stopovers); the consumer
         // answers on `response_in`, drained by Phase 1's
         // `consumeResponses` and shipped by Phase 2.
-        request_out: StreamColl,
+        request_out: CollField(StreamColl),
         // headers_first early-emission pipeline (h2_opts.headers_first
         // doc). A request entity whose body is still inbound lives in
         // `request_receiving` (fresh — consumer hasn't decided) or
@@ -381,11 +537,11 @@ pub fn H2(comptime opts: Options) type {
         // `request_out` when END_STREAM lands, so `request_out` keeps
         // its body-complete contract. Always-empty when headers_first
         // is off.
-        request_receiving: StreamColl,
-        request_buffering: StreamColl,
-        response_in: StreamColl,
-        response_out: StreamColl,
-        _response_sending: StreamColl,
+        request_receiving: CollField(StreamColl),
+        request_buffering: CollField(StreamColl),
+        response_in: CollField(StreamColl),
+        response_out: CollField(StreamColl),
+        _response_sending: CollField(StreamColl),
 
         // Streaming responses: consumer feeds `stream_response_in` /
         // `stream_data_in` / `stream_close_in`; Phase 1's
@@ -393,11 +549,11 @@ pub fn H2(comptime opts: Options) type {
         // "push the next piece" signal back to the consumer, released
         // by write completions (`writesAccount`) — one write in
         // flight per stream is the backpressure.
-        stream_response_in: StreamColl,
-        stream_data_out: StreamColl,
-        stream_data_in: StreamColl,
-        stream_close_in: StreamColl,
-        _stream_data_sending: StreamColl,
+        stream_response_in: CollField(StreamColl),
+        stream_data_out: CollField(StreamColl),
+        stream_data_in: CollField(StreamColl),
+        stream_close_in: CollField(StreamColl),
+        _stream_data_sending: CollField(StreamColl),
 
         // WebSocket seam (docs/architecture/websockets.md). `ws_message_out` holds a
         // completed inbound message for the consumer (piece D → `onMessage`);
@@ -407,8 +563,8 @@ pub fn H2(comptime opts: Options) type {
         // time), not on
         // these entities — so control frames (pong/close) interleave with data
         // frames in wire order, which a per-entity `sending_entity` can't model.
-        ws_message_out: WsColl,
-        ws_send_in: WsColl,
+        ws_message_out: CollField(WsColl),
+        ws_send_in: CollField(WsColl),
 
         // Extended-CONNECT WS identity entities (architecture/websockets.md,
         // `extended_connect` instances only). One entity per WS-over-h2
@@ -418,62 +574,62 @@ pub fn H2(comptime opts: Options) type {
         // `ws_streams`: live tunnels — the entity IS the logical WS
         // connection identity the consumer keys its state by (the h2
         // mirror of the h1 conn entity); destroyed at stream close.
-        ws_connect_out: StreamColl,
-        ws_streams: StreamColl,
+        ws_connect_out: CollField(StreamColl),
+        ws_streams: CollField(StreamColl),
         // websocket_surface instances (the front): h1 Upgrade heads
         // awaiting the consumer's disposition (`wsUpgradeAccept` /
         // `wsUpgradeReject`). Session = conn, ReqHeaders = the head.
-        ws_upgrade_out: StreamColl,
+        ws_upgrade_out: CollField(StreamColl),
 
         // Read triage (h2-internal): Phase 4 `readsTriage` routes each
         // completed read here by connection state; Phase 5 feeds
         // `_read_active` data to the parsers.
-        _read_errors: ReadColl,
-        _read_init: ReadColl,
-        _read_active: ReadColl,
-        _read_handshake: ReadColl,
+        _read_errors: CollField(ReadColl),
+        _read_init: CollField(ReadColl),
+        _read_active: CollField(ReadColl),
+        _read_handshake: CollField(ReadColl),
         // h1 inbound-body backpressure: the conn's read entity parks here
         // (instead of re-arming via io.read_in) while streamed body bytes
         // have outrun the consumer; `http1UnparkRead` re-arms it. At most
         // one entry per h1 conn (`Http1Conn.paused_read`).
-        _read_h1_paused: ReadColl,
+        _read_h1_paused: CollField(ReadColl),
 
         // Connection pipeline (h2-internal): Phase 4 transitions
         // accepted conns through TLS handshake into active.
-        _conn_tls_handshake: ConnColl,
-        _conn_active: ConnColl,
+        _conn_tls_handshake: CollField(ConnColl),
+        _conn_active: CollField(ConnColl),
 
         // Client connect lifecycle (client instances): consumer feeds
         // `client_connect_in` (Phase 1 drains); Phase 4's
         // `processConnectResults`/`Errors` emit `_out`/`_errors`.
-        client_connect_in: ClientConnectColl,
-        client_connect_out: ClientConnectColl,
-        client_connect_errors: ClientConnectColl,
-        _client_connect_pending: ClientConnectColl,
+        client_connect_in: CollField(ClientConnectColl),
+        client_connect_out: CollField(ClientConnectColl),
+        client_connect_errors: CollField(ClientConnectColl),
+        _client_connect_pending: CollField(ClientConnectColl),
 
         // Client request/response (client instances): consumer feeds
         // `client_request_in` (Phase 1); Phase 5 emits
         // `client_response_out` (+ the client_headers_first
         // receiving stopover).
-        client_request_in: ClientStreamColl,
-        client_response_out: ClientStreamColl,
-        _client_request_sending: ClientStreamColl,
+        client_request_in: CollField(ClientStreamColl),
+        client_response_out: CollField(ClientStreamColl),
+        _client_request_sending: CollField(ClientStreamColl),
         // client_headers_first early-emission output (see the
         // `H2Options.client_headers_first` doc): one FRESH entity per
         // streaming response's HEADERS (Status + RespHeaders + Session
         // + StreamId). Consumer-owned — read it, attach a body sink
         // via `requestBodySink`, destroy it. Always-empty when
         // client_headers_first is off.
-        client_response_receiving: ClientStreamColl,
+        client_response_receiving: CollField(ClientStreamColl),
 
         // Client streaming (client instances): same shape as the
         // server streaming group, mirrored (consumer-fed `_in`s
         // drained by Phase 1; `_out` released by write completions).
-        client_stream_request_in: ClientStreamColl,
-        client_stream_data_out: ClientStreamColl,
-        client_stream_data_in: ClientStreamColl,
-        client_stream_close_in: ClientStreamColl,
-        _client_stream_data_sending: ClientStreamColl,
+        client_stream_request_in: CollField(ClientStreamColl),
+        client_stream_data_out: CollField(ClientStreamColl),
+        client_stream_data_in: CollField(ClientStreamColl),
+        client_stream_close_in: CollField(ClientStreamColl),
+        _client_stream_data_sending: CollField(ClientStreamColl),
 
         h2_opts: H2Options,
         reg: *Reg,
@@ -561,81 +717,47 @@ pub fn H2(comptime opts: Options) type {
         const HELD_CONN_RECV_WINDOW: i32 = 16 * 1024 * 1024;
 
         // =============================================================
-        // COLLECTIONS — single source of truth for the 27 collection
-        // fields above. Drives init, registerCollection, deinit, and
-        // the `Coll` enum + chain lookups via comptime loops, so adding
-        // a collection is a one-line spec change rather than edits in
-        // 4–6 places.
+        // COLLECTIONS (file scope) — single source of truth for the
+        // collection fields above. Drives init, registerCollection,
+        // deinit, the `Coll` enum + chain lookups, and `parts`, so
+        // adding a collection is a one-line spec change rather than
+        // edits in 4–6 places.
         // =============================================================
 
-        const Kind = enum {
-            /// Registered by rove-io, not by this layer. Present in `Coll`
-            /// so ONE enum spans the shared registry.
-            io,
-            server_stream,
-            server_read,
-            server_conn,
-            server_ws,
-            client_connect,
-            client_stream,
-        };
+        /// The storage type behind a spec's kind, in this instantiation.
+        fn CollTypeOf(comptime kind: CollKind) type {
+            return switch (kind) {
+                .io => @compileError("io-owned entries have no h2 storage type"),
+                .server_stream => StreamColl,
+                .server_read => ReadColl,
+                .server_conn => ConnColl,
+                .server_ws => WsColl,
+                .client_connect => ClientConnectColl,
+                .client_stream => ClientStreamColl,
+            };
+        }
 
-        const CollSpec = struct {
-            name: [:0]const u8,
-            Coll: type,
-            kind: Kind,
-            client_only: bool = false,
-            // True for collections that hold an entity in some
-            // intermediate state of the kind's pipeline (so the
-            // serverStreamClose / clientStreamClose helpers iterate
-            // them looking for the entity's current home). False for
-            // terminal collections (response_out / client_response_out)
-            // — those are the move target, not a search target.
-            in_chain: bool = false,
-        };
+        /// Collection storage per model: registry-owned (a stable
+        /// pointer fetched at `create`) under a declared world, an
+        /// h2 field otherwise.
+        fn CollField(comptime C: type) type {
+            if (C == void) return void;
+            return if (uses_world) *C else C;
+        }
 
-        const COLLECTIONS = [_]CollSpec{
-            .{ .name = "request_out",          .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "request_receiving",    .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "request_buffering",    .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "response_in",          .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "response_out",         .Coll = StreamColl, .kind = .server_stream },
-            .{ .name = "_response_sending",    .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "stream_response_in",   .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "stream_data_out",      .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "stream_data_in",       .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "stream_close_in",      .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "_stream_data_sending", .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
-            .{ .name = "ws_message_out",       .Coll = WsColl,     .kind = .server_ws },
-            .{ .name = "ws_send_in",           .Coll = WsColl,     .kind = .server_ws },
-            // Not in_chain: WS identity entities die with their stream
-            // (destroyed in onStreamCloseCb), never via serverStreamClose.
-            .{ .name = "ws_connect_out",       .Coll = StreamColl, .kind = .server_stream },
-            .{ .name = "ws_streams",           .Coll = StreamColl, .kind = .server_stream },
-            .{ .name = "ws_upgrade_out",       .Coll = StreamColl, .kind = .server_stream },
-            .{ .name = "_read_errors",         .Coll = ReadColl,   .kind = .server_read },
-            .{ .name = "_read_init",           .Coll = ReadColl,   .kind = .server_read },
-            .{ .name = "_read_active",         .Coll = ReadColl,   .kind = .server_read },
-            .{ .name = "_read_handshake",      .Coll = ReadColl,   .kind = .server_read },
-            .{ .name = "_read_h1_paused",      .Coll = ReadColl,   .kind = .server_read },
-            .{ .name = "_conn_tls_handshake",  .Coll = ConnColl,   .kind = .server_conn },
-            .{ .name = "_conn_active",         .Coll = ConnColl,   .kind = .server_conn },
-            .{ .name = "client_connect_in",        .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
-            .{ .name = "client_connect_out",       .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
-            .{ .name = "client_connect_errors",    .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
-            .{ .name = "_client_connect_pending",  .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
-            .{ .name = "client_request_in",           .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
-            .{ .name = "client_response_out",         .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true },
-            // Output-only, never a request entity's home — out of the
-            // chain so clientStreamClose/streamSet never match it.
-            .{ .name = "client_response_receiving",   .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true },
-            .{ .name = "_client_request_sending",     .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
-            .{ .name = "client_stream_request_in",    .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
-            .{ .name = "client_stream_data_out",      .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
-            .{ .name = "client_stream_data_in",       .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
-            .{ .name = "client_stream_close_in",      .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
-            .{ .name = "_client_stream_data_sending", .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
-        };
+        fn CollPtr(comptime name: @TypeOf(.enum_literal)) type {
+            const F = @FieldType(Self, @tagName(name));
+            return if (uses_world) F else *F;
+        }
+
+        /// Pointer to one of h2's collections, whichever model owns the
+        /// storage — the one spelling valid under every registry model
+        /// (`&self.<name>` is not, once the field is itself a pointer
+        /// into registry-owned storage).
+        pub inline fn coll(self: *Self, comptime name: @TypeOf(.enum_literal)) CollPtr(name) {
+            const f = &@field(self, @tagName(name));
+            return if (comptime uses_world) f.* else f;
+        }
 
         // =============================================================
         // Coll — the collection set as declared VALUES
@@ -658,7 +780,7 @@ pub fn H2(comptime opts: Options) type {
         const CollRef = struct {
             name: [:0]const u8,
             owner: Owner,
-            kind: Kind,
+            kind: CollKind,
             in_chain: bool = false,
         };
 
@@ -690,14 +812,16 @@ pub fn H2(comptime opts: Options) type {
 
         comptime {
             @setEvalBranchQuota(100_000);
-            // io numbers itself off its own name list, so `Coll` must place
-            // io's names first and in that order or an io collection's
-            // registry id will not match the variant naming it here — every
-            // conn entity would then resolve to the wrong collection.
-            for (rio.activeNames(has_client), 0..) |n, i| {
+            // io numbers itself off its own name list (threading model
+            // only — under a declared world every id comes from the
+            // world's one table), so `Coll` must place io's names first
+            // and in that order or an io collection's registry id will
+            // not match the variant naming it here — every conn entity
+            // would then resolve to the wrong collection.
+            if (!uses_world) for (rio.activeNames(has_client), 0..) |n, i| {
                 if (@intFromEnum(@field(Coll, n)) != i)
                     @compileError("io's collection '" ++ n ++ "' sits at a different position in Coll than in io's own namespace");
-            }
+            };
             // One namespace: a duplicate name would silently shadow a
             // variant and mis-resolve every entity in that collection.
             for (ACTIVE, 0..) |a, i| for (ACTIVE[i + 1 ..]) |b| {
@@ -711,33 +835,48 @@ pub fn H2(comptime opts: Options) type {
         /// `opts.extra_collections`. A registry id IS a variant's value plus
         /// one, so every layer numbers itself off this enum and none needs
         /// to know where another's ids end.
-        pub const Coll = rio.CollEnum(blk: {
-            var names: []const [:0]const u8 = &.{};
-            for (ACTIVE) |s| names = names ++ &[_][:0]const u8{s.name};
-            break :blk names ++ opts.extra_collections;
-        });
+        pub const Coll = if (uses_world)
+            // The world's table IS the namespace: one enum over every
+            // part's entries, valued by registry id directly. Composer
+            // collections are its parts, so `extra_collections` has
+            // nothing to add here.
+            WorldT.CollId
+        else
+            rio.CollEnum(blk: {
+                var names: []const [:0]const u8 = &.{};
+                for (ACTIVE) |s| names = names ++ &[_][:0]const u8{s.name};
+                break :blk names ++ opts.extra_collections;
+            });
 
         /// The `CollRef` behind a variant, or null when the variant belongs
         /// to the composing layer — this layer can name those collections
         /// but owns none of them, so every accessor here declines them.
         fn specOf(comptime k: Coll) ?CollRef {
-            // `Coll` is built from ACTIVE's names in order, then the
-            // composing layer's — so a variant below ACTIVE.len indexes
-            // ACTIVE directly and anything at or above it belongs to the
-            // composer. Structural, not a search: the enum IS that list.
-            const i = @intFromEnum(k);
-            return if (i < ACTIVE.len) ACTIVE[i] else null;
+            // By name, because the two enum shapes number differently:
+            // threading `Coll` is ACTIVE's order (then the composer's),
+            // a world's `CollId` is the world table's. The names are the
+            // stable identity either way; a variant not in ACTIVE (a
+            // composer's collection, or a world set entry) is declined.
+            @setEvalBranchQuota(100_000);
+            inline for (ACTIVE) |a| {
+                if (comptime std.mem.eql(u8, a.name, @tagName(k))) return a;
+            }
+            return null;
         }
 
         /// The field behind a variant this layer owns, on whichever of the
         /// two layers holds it. Only called from an arm that has already
         /// established `specOf(k) != null`.
-        inline fn fieldOf(h2: *Self, comptime k: Coll) *@FieldType(
-            if (specOf(k).?.owner == .io) IoType else Self,
-            specOf(k).?.name,
-        ) {
+        fn FieldPtrOf(comptime k: Coll) type {
+            const s = specOf(k).?;
+            const F = @FieldType(if (s.owner == .io) IoType else Self, s.name);
+            return if (uses_world) F else *F;
+        }
+
+        inline fn fieldOf(h2: *Self, comptime k: Coll) FieldPtrOf(k) {
             const s = comptime specOf(k).?;
-            return if (comptime s.owner == .io) &@field(h2.io, s.name) else &@field(h2, s.name);
+            const f = if (comptime s.owner == .io) &@field(h2.io, s.name) else &@field(h2, s.name);
+            return if (comptime uses_world) f.* else f;
         }
 
         /// The collection an entity is in, as a value.
@@ -754,13 +893,16 @@ pub fn H2(comptime opts: Options) type {
         /// sits in a collection registered by a layer ABOVE this one — those
         /// share the registry but are not in `Coll`.
         pub fn collectionOf(h2: *const Self, entity: Entity) ?Coll {
+            const core = if (comptime uses_world) &h2.reg.core else h2.reg;
             const idx = entity.index;
-            if (idx >= h2.reg.max_entities) return null;
-            if (h2.reg.generations[idx] != entity.generation) return null;
-            const raw = h2.reg.collection_ids[idx];
+            if (idx >= core.max_entities) return null;
+            if (core.generations[idx] != entity.generation) return null;
+            const raw = core.collection_ids[idx];
             // 0 is the registry's free pool and is never a collection.
             if (raw == 0) return null;
-            return @enumFromInt(raw - 1);
+            // A world's `CollId` is valued by registry id directly; the
+            // threading enum sits one below its ids.
+            return @enumFromInt(if (comptime uses_world) raw else raw - 1);
         }
 
         /// The server-stream chain collection a state names, or null if the
@@ -772,7 +914,8 @@ pub fn H2(comptime opts: Options) type {
                 inline else => |tag| blk: {
                     const s = comptime specOf(tag) orelse break :blk null;
                     if (comptime s.kind == .server_stream and s.in_chain) {
-                        break :blk &@field(h2, s.name);
+                        const f = &@field(h2, s.name);
+                        break :blk if (comptime uses_world) f.* else f;
                     } else {
                         break :blk null;
                     }
@@ -787,7 +930,8 @@ pub fn H2(comptime opts: Options) type {
                 inline else => |tag| blk: {
                     const s = comptime specOf(tag) orelse break :blk null;
                     if (comptime s.kind == .client_stream and s.in_chain) {
-                        break :blk &@field(h2, s.name);
+                        const f = &@field(h2, s.name);
+                        break :blk if (comptime uses_world) f.* else f;
                     } else {
                         break :blk null;
                     }
@@ -814,16 +958,16 @@ pub fn H2(comptime opts: Options) type {
         /// The collections a LIVE conn can be in — the sources `closeConn`
         /// moves from. `conn_closing` is deliberately absent: it is the
         /// destination, never a source.
-        inline fn liveConnColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl } {
-            return .{ &h2.io.connections, &h2._conn_tls_handshake, &h2._conn_active };
+        inline fn liveConnColls(h2: *Self) struct { @TypeOf(h2.io.coll(.connections)), *ConnColl, *ConnColl } {
+            return .{ h2.io.coll(.connections), h2.coll(._conn_tls_handshake), h2.coll(._conn_active) };
         }
 
         /// Every collection a conn entity can be in, closing included — a
         /// completion that lands after the move still has to resolve its
         /// conn. Derived from `liveConnColls` so the two cannot drift.
-        inline fn connColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl, *@TypeOf(h2.io.conn_closing) } {
+        inline fn connColls(h2: *Self) struct { @TypeOf(h2.io.coll(.connections)), *ConnColl, *ConnColl, @TypeOf(h2.io.coll(.conn_closing)) } {
             const live = h2.liveConnColls();
-            return live ++ .{&h2.io.conn_closing};
+            return live ++ .{h2.io.coll(.conn_closing)};
         }
 
         /// End a connection. h2 decides a conn should stop; io ends it — so
@@ -839,9 +983,9 @@ pub fn H2(comptime opts: Options) type {
         /// for callers that must know whether it took effect now.
         fn closeConn(h2: *Self, entity: Entity) bool {
             // Already closing — done, not an error.
-            if (h2.reg.isInCollection(entity, &h2.io.conn_closing)) return true;
+            if (h2.reg.isInCollection(entity, h2.io.coll(.conn_closing))) return true;
 
-            h2.reg.moveAny(entity, h2.liveConnColls(), &h2.io.conn_closing) catch |err| switch (err) {
+            h2.reg.moveAny(entity, h2.liveConnColls(), h2.io.coll(.conn_closing)) catch |err| switch (err) {
                 // Already gone: nothing holds a slot, so the conn is ended.
                 error.Stale, error.InvalidEntity => return true,
                 // Mid-transition — record the request and pick it up next
@@ -873,9 +1017,9 @@ pub fn H2(comptime opts: Options) type {
         fn retryPendingCloses(h2: *Self) void {
             if (h2.close_requests_deferred == 0) return;
             h2.close_requests_deferred = 0;
-            inline for (h2.liveConnColls()) |coll| {
-                for (coll.entitySlice()) |ent| {
-                    const cp = h2.reg.get(ent, coll, Conn) catch continue;
+            inline for (h2.liveConnColls()) |cl| {
+                for (cl.entitySlice()) |ent| {
+                    const cp = h2.reg.get(ent, cl, Conn) catch continue;
                     if (!cp.close_requested) continue;
                     _ = h2.closeConn(ent);
                 }
@@ -888,7 +1032,7 @@ pub fn H2(comptime opts: Options) type {
             const k = h2.collectionOf(entity) orelse return;
             const src = h2.serverChainColl(k) orelse return;
             h2.reg.set(entity, src, H2IoResult, .{ .err = err }) catch {};
-            h2.reg.move(entity, src, &h2.response_out) catch {};
+            h2.reg.move(entity, src, h2.coll(.response_out)) catch {};
         }
 
         /// Set a component on a stream entity in whichever chain it is in.
@@ -911,7 +1055,7 @@ pub fn H2(comptime opts: Options) type {
             const k = h2.collectionOf(entity) orelse return;
             const src = h2.clientChainColl(k) orelse return;
             h2.reg.set(entity, src, H2IoResult, .{ .err = err, .head_written = head_written }) catch {};
-            h2.reg.move(entity, src, &h2.client_response_out) catch {};
+            h2.reg.move(entity, src, h2.coll(.client_response_out)) catch {};
         }
 
         /// Get the Conn component for a connection entity (searches the three conn collections).
@@ -949,10 +1093,10 @@ pub fn H2(comptime opts: Options) type {
         /// or, when END_STREAM already landed, attaches the
         /// accumulated body in place.
         pub fn requestBodyBuffer(h2: *Self, ent: Entity) BufferDecision {
-            for ([_]*StreamColl{ &h2.request_receiving, &h2.request_out }) |coll| {
-                if (h2.reg.isInCollection(ent, coll)) {
-                    const sess = h2.reg.get(ent, coll, Session) catch return .gone;
-                    const sid = h2.reg.get(ent, coll, StreamId) catch return .gone;
+            for ([_]*StreamColl{ h2.coll(.request_receiving), h2.coll(.request_out) }) |cl| {
+                if (h2.reg.isInCollection(ent, cl)) {
+                    const sess = h2.reg.get(ent, cl, Session) catch return .gone;
+                    const sid = h2.reg.get(ent, cl, StreamId) catch return .gone;
 
                     const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
 
@@ -968,14 +1112,14 @@ pub fn H2(comptime opts: Options) type {
                         const s = hst.stream orelse return .gone;
                         if (!s.entity.eql(ent)) return .gone;
                         if (s.inbound_eof) {
-                            h2.reg.set(ent, coll, ReqBody, takeBody(s)) catch return .gone;
+                            h2.reg.set(ent, cl, ReqBody, takeBody(s)) catch return .gone;
                             return .body_complete;
                         }
                         s.body_mode = .buffer;
                         s.unconsumed = 0;
                         h2.http1MaybeContinueStored(conn_ptr, sess.entity);
                         h2.http1UnparkRead(h1c);
-                        h2.reg.move(ent, coll, &h2.request_buffering) catch return .gone;
+                        h2.reg.move(ent, cl, h2.coll(.request_buffering)) catch return .gone;
                         return .buffering;
                     }
 
@@ -986,7 +1130,7 @@ pub fn H2(comptime opts: Options) type {
                     const s = stream orelse return .gone;
 
                     if (s.inbound_eof) {
-                        h2.reg.set(ent, coll, ReqBody, takeBody(s)) catch return .gone;
+                        h2.reg.set(ent, cl, ReqBody, takeBody(s)) catch return .gone;
                         return .body_complete;
                     }
                     s.body_mode = .buffer;
@@ -994,7 +1138,7 @@ pub fn H2(comptime opts: Options) type {
                         _ = c.nghttp2_session_consume(ng_session, @intCast(sid.id), s.unconsumed);
                         s.unconsumed = 0;
                     }
-                    h2.reg.move(ent, coll, &h2.request_buffering) catch return .gone;
+                    h2.reg.move(ent, cl, h2.coll(.request_buffering)) catch return .gone;
                     return .buffering;
                 }
             }
@@ -1221,9 +1365,9 @@ pub fn H2(comptime opts: Options) type {
         /// entity lives (`ws_connect_out` pre-accept, `ws_streams`
         /// after); borrowed slices — the consumer dupes what it keeps.
         pub fn wsStreamRouting(h2: *Self, ws_ent: Entity) ?struct { authority: []const u8, path: []const u8 } {
-            for ([_]*StreamColl{ &h2.ws_streams, &h2.ws_connect_out }) |coll| {
-                if (!h2.reg.isInCollection(ws_ent, coll)) continue;
-                const rh = h2.reg.get(ws_ent, coll, ReqHeaders) catch return null;
+            for ([_]*StreamColl{ h2.coll(.ws_streams), h2.coll(.ws_connect_out) }) |cl| {
+                if (!h2.reg.isInCollection(ws_ent, cl)) continue;
+                const rh = h2.reg.get(ws_ent, cl, ReqHeaders) catch return null;
                 const fields = rh.fields orelse return null;
                 var authority: ?[]const u8 = null;
                 var path: ?[]const u8 = null;
@@ -1238,9 +1382,9 @@ pub fn H2(comptime opts: Options) type {
         }
 
         /// Resolve a WS identity entity to its live nghttp2 stream.
-        fn wsStreamOf(h2: *Self, coll: *StreamColl, ws_ent: Entity) ?struct { ng: *c.nghttp2_session, sid: i32, s: *Stream } {
-            const sess = h2.reg.get(ws_ent, coll, Session) catch return null;
-            const sid = h2.reg.get(ws_ent, coll, StreamId) catch return null;
+        fn wsStreamOf(h2: *Self, cl: *StreamColl, ws_ent: Entity) ?struct { ng: *c.nghttp2_session, sid: i32, s: *Stream } {
+            const sess = h2.reg.get(ws_ent, cl, Session) catch return null;
+            const sid = h2.reg.get(ws_ent, cl, StreamId) catch return null;
             const conn_ptr = getConn(h2, sess.entity) orelse return null;
             const ng = conn_ptr.ng_session orelse return null;
             const st: ?*Stream = @ptrCast(@alignCast(
@@ -1288,8 +1432,8 @@ pub fn H2(comptime opts: Options) type {
         /// `ws_streams`. From here inbound messages surface on
         /// `ws_message_out` and `ws_send_in` frames ship back.
         pub fn wsConnectAccept(h2: *Self, ws_ent: Entity) WsConnectDecision {
-            if (!h2.reg.isInCollection(ws_ent, &h2.ws_connect_out)) return .gone;
-            const live = h2.wsStreamOf(&h2.ws_connect_out, ws_ent) orelse return .gone;
+            if (!h2.reg.isInCollection(ws_ent, h2.coll(.ws_connect_out))) return .gone;
+            const live = h2.wsStreamOf(h2.coll(.ws_connect_out), ws_ent) orelse return .gone;
             const s = live.s;
             const wr = WsReassembler.create(h2.allocator) orelse return .gone;
 
@@ -1330,7 +1474,7 @@ pub fn H2(comptime opts: Options) type {
                 s.unconsumed = 0;
             }
             s.body_mode = .auto;
-            h2.reg.move(ws_ent, &h2.ws_connect_out, &h2.ws_streams) catch return .gone;
+            h2.reg.move(ws_ent, h2.coll(.ws_connect_out), h2.coll(.ws_streams)) catch return .gone;
             h2.wsStreamDrive(live.ng, s);
             return .ok;
         }
@@ -1340,8 +1484,8 @@ pub fn H2(comptime opts: Options) type {
         /// response carries END_STREAM; the identity entity dies here
         /// (stream close skips it via staleness).
         pub fn wsConnectReject(h2: *Self, ws_ent: Entity, status: u16) void {
-            if (!h2.reg.isInCollection(ws_ent, &h2.ws_connect_out)) return;
-            if (h2.wsStreamOf(&h2.ws_connect_out, ws_ent)) |live| {
+            if (!h2.reg.isInCollection(ws_ent, h2.coll(.ws_connect_out))) return;
+            if (h2.wsStreamOf(h2.coll(.ws_connect_out), ws_ent)) |live| {
                 var status_buf: [3]u8 = undefined;
                 const code = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch "500";
                 var nva = [_]c.nghttp2_nv{.{
@@ -1447,7 +1591,7 @@ pub fn H2(comptime opts: Options) type {
         /// `consumeWsSends`). Close → Close frame then END_STREAM once
         /// the queue drains.
         fn wsStreamSend(h2: *Self, ws_ent: Entity, opcode: u8, payload: []const u8) void {
-            const live = h2.wsStreamOf(&h2.ws_streams, ws_ent) orelse return;
+            const live = h2.wsStreamOf(h2.coll(.ws_streams), ws_ent) orelse return;
             const wr = live.s.ws_reasm orelse return;
             if (wr.closing) return;
             const op: ws.Opcode = @enumFromInt(@as(u4, @truncate(opcode)));
@@ -1593,7 +1737,7 @@ pub fn H2(comptime opts: Options) type {
             return 0;
         }
 
-        /// Create a request entity in `coll` with the stream's
+        /// Create a request entity in `cl` with the stream's
         /// finalized headers. Capacity is set at boot via the
         /// registry's `max_entities`; the per-tenant rate limiter is
         /// the gate that's supposed to keep entity counts inside that
@@ -1603,12 +1747,12 @@ pub fn H2(comptime opts: Options) type {
         /// of having streams silently rejected.
         fn emitRequestEntity(
             h2: *Self,
-            coll: *StreamColl,
+            cl: *StreamColl,
             s: *Stream,
             stream_id: i32,
             conn_entity: Entity,
         ) ?Entity {
-            const req_entity = h2.reg.create(coll) catch |err| switch (err) {
+            const req_entity = h2.reg.create(cl) catch |err| switch (err) {
                 error.Full => {
                     var buf: [512]u8 = undefined;
                     const msg = std.fmt.bufPrint(
@@ -1631,9 +1775,9 @@ pub fn H2(comptime opts: Options) type {
             var buf_len: u32 = 0;
             const hdr_buf = s.hdrFinalize(&fields, &count, &buf_len);
 
-            h2.reg.set(req_entity, coll, StreamId, .{ .id = @intCast(stream_id) }) catch return null;
-            h2.reg.set(req_entity, coll, Session, .{ .entity = conn_entity }) catch return null;
-            h2.reg.set(req_entity, coll, ReqHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return null;
+            h2.reg.set(req_entity, cl, StreamId, .{ .id = @intCast(stream_id) }) catch return null;
+            h2.reg.set(req_entity, cl, Session, .{ .entity = conn_entity }) catch return null;
+            h2.reg.set(req_entity, cl, ReqHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return null;
             return req_entity;
         }
 
@@ -1688,9 +1832,9 @@ pub fn H2(comptime opts: Options) type {
                             _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, frame.*.hd.stream_id, c.NGHTTP2_REFUSED_STREAM);
                             return 0;
                         }
-                        const ws_ent = emitRequestEntity(h2, &h2.ws_connect_out, s, frame.*.hd.stream_id, nctx.conn_entity) orelse
+                        const ws_ent = emitRequestEntity(h2, h2.coll(.ws_connect_out), s, frame.*.hd.stream_id, nctx.conn_entity) orelse
                             return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                        h2.reg.set(ws_ent, &h2.ws_connect_out, ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                        h2.reg.set(ws_ent, h2.coll(.ws_connect_out), ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                         s.emitted = true;
                         s.is_ws = true;
                         s.ng_stream_id = frame.*.hd.stream_id;
@@ -1728,9 +1872,9 @@ pub fn H2(comptime opts: Options) type {
             // from headers alone; the stream holds the flow-control
             // window shut (`.hold`) until it does.
             if (h2.h2_opts.headers_first and frame.*.hd.type == c.NGHTTP2_HEADERS and !end_stream and !s.emitted) {
-                const req_entity = emitRequestEntity(h2, &h2.request_receiving, s, frame.*.hd.stream_id, nctx.conn_entity) orelse
+                const req_entity = emitRequestEntity(h2, h2.coll(.request_receiving), s, frame.*.hd.stream_id, nctx.conn_entity) orelse
                     return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(req_entity, &h2.request_receiving, ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(req_entity, h2.coll(.request_receiving), ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 s.emitted = true;
                 s.ng_stream_id = frame.*.hd.stream_id;
                 s.body_mode = .hold;
@@ -1770,9 +1914,9 @@ pub fn H2(comptime opts: Options) type {
                 // `inbound_eof`, attached in place by
                 // `requestBodyBuffer` or drained by a `blob.receive`
                 // sink.
-                if (h2.reg.isInCollection(s.entity, &h2.request_buffering)) {
-                    h2.reg.set(s.entity, &h2.request_buffering, ReqBody, takeBody(s)) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                    h2.reg.move(s.entity, &h2.request_buffering, &h2.request_out) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                if (h2.reg.isInCollection(s.entity, h2.coll(.request_buffering))) {
+                    h2.reg.set(s.entity, h2.coll(.request_buffering), ReqBody, takeBody(s)) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                    h2.reg.move(s.entity, h2.coll(.request_buffering), h2.coll(.request_out)) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 }
                 return 0;
             }
@@ -1781,9 +1925,9 @@ pub fn H2(comptime opts: Options) type {
             // full body attached.
             s.emitted = true;
             s.ng_stream_id = frame.*.hd.stream_id;
-            const req_entity = emitRequestEntity(h2, &h2.request_out, s, frame.*.hd.stream_id, nctx.conn_entity) orelse
+            const req_entity = emitRequestEntity(h2, h2.coll(.request_out), s, frame.*.hd.stream_id, nctx.conn_entity) orelse
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-            h2.reg.set(req_entity, &h2.request_out, ReqBody, takeBody(s)) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            h2.reg.set(req_entity, h2.coll(.request_out), ReqBody, takeBody(s)) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             s.entity = req_entity;
             return 0;
         }
@@ -1898,12 +2042,12 @@ pub fn H2(comptime opts: Options) type {
                         const h2 = nctx.h2;
                         if (comptime has_client) {
                             if (s.client_stream) {
-                                h2.reg.move(s.entity, &h2._client_stream_data_sending, &h2.client_stream_data_out) catch {};
+                                h2.reg.move(s.entity, h2.coll(._client_stream_data_sending), h2.coll(.client_stream_data_out)) catch {};
                             } else {
-                                h2.reg.move(s.entity, &h2._stream_data_sending, &h2.stream_data_out) catch {};
+                                h2.reg.move(s.entity, h2.coll(._stream_data_sending), h2.coll(.stream_data_out)) catch {};
                             }
                         } else {
-                            h2.reg.move(s.entity, &h2._stream_data_sending, &h2.stream_data_out) catch {};
+                            h2.reg.move(s.entity, h2.coll(._stream_data_sending), h2.coll(.stream_data_out)) catch {};
                         }
                     }
                     return @intCast(to_copy);
@@ -2098,21 +2242,21 @@ pub fn H2(comptime opts: Options) type {
                 frame.*.headers.cat == c.NGHTTP2_HCAT_RESPONSE and
                 !end_stream and !s.resp_emitted and s.response_status >= 200)
             {
-                const coll = &h2.client_response_receiving;
-                const resp_entity = h2.reg.create(coll) catch
+                const cl = h2.coll(.client_response_receiving);
+                const resp_entity = h2.reg.create(cl) catch
                     return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 var fields: ?[*]HeaderField = null;
                 var count: u32 = 0;
                 var buf_len: u32 = 0;
                 const hdr_buf = s.hdrFinalize(&fields, &count, &buf_len);
-                h2.reg.set(resp_entity, coll, StreamId, .{ .id = @intCast(frame.*.hd.stream_id) }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(resp_entity, coll, Session, .{ .entity = nctx.conn_entity }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(resp_entity, coll, Status, .{ .code = s.response_status }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(resp_entity, coll, RespHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(resp_entity, coll, ReqHeaders, .{ .fields = null, .count = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(resp_entity, coll, ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(resp_entity, coll, RespBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                h2.reg.set(resp_entity, coll, H2IoResult, .{ .err = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, StreamId, .{ .id = @intCast(frame.*.hd.stream_id) }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, Session, .{ .entity = nctx.conn_entity }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, Status, .{ .code = s.response_status }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, RespHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, ReqHeaders, .{ .fields = null, .count = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, RespBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, cl, H2IoResult, .{ .err = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 s.resp_emitted = true;
                 s.body_mode = .hold;
                 return 0;
@@ -2562,20 +2706,28 @@ pub fn H2(comptime opts: Options) type {
 
             // Init every collection field. Disabled (client_only with
             // has_client = false) collections have field type `void` —
-            // assign `{}` so the field is defined.
+            // assign `{}` so the field is defined. Under a declared world
+            // the registry constructed and registered every entry
+            // already; fetch its stable pointers instead.
             inline for (COLLECTIONS) |s| {
-                if (s.client_only and !has_client) {
+                if (comptime s.client_only and !has_client) {
                     @field(self, s.name) = {};
+                } else if (comptime uses_world) {
+                    @field(self, s.name) = reg.coll(@field(WorldT.CollId, s.name));
                 } else {
-                    @field(self, s.name) = try s.Coll.init(allocator);
+                    @field(self, s.name) = try CollTypeOf(s.kind).init(allocator);
                 }
             }
 
             // Ids ARE the enum values (+1 for the reserved free-pool 0), so
             // `collection_ids[entity.index]` needs no side table to decode.
-            inline for (COLLECTIONS) |s| {
-                if (s.client_only and !has_client) continue;
-                reg.registerCollection(&@field(self, s.name), @intFromEnum(@field(Coll, s.name)) + 1);
+            // (World model: ids come from the world's table and the world's
+            // registry already registered the storage.)
+            if (comptime !uses_world) {
+                inline for (COLLECTIONS) |s| {
+                    if (s.client_only and !has_client) continue;
+                    reg.registerCollection(&@field(self, s.name), @intFromEnum(@field(Coll, s.name)) + 1);
+                }
             }
 
             // Register the three archetype hooks: FD/peer resolvers (so
@@ -2600,8 +2752,8 @@ pub fn H2(comptime opts: Options) type {
             // deinit below, before `io.destroy` runs, so io cannot reach
             // these — and a conn destroyed still holding its fd is the one
             // thing `Fd.deinit` refuses to tolerate.
-            inline for (self.liveConnColls()) |coll| {
-                for (coll.entitySlice()) |ent| _ = self.closeConn(ent);
+            inline for (self.liveConnColls()) |cl| {
+                for (cl.entitySlice()) |ent| _ = self.closeConn(ent);
             }
             self.reg.flush() catch {};
             self.io.shutdownAllConns();
@@ -2613,8 +2765,8 @@ pub fn H2(comptime opts: Options) type {
                 // in conn_closing (shutdown posted, recv not yet quiet)
                 // are reaped too — their socket ops are already with the
                 // kernel, and nothing reads the session after this point.
-                self.reapConnForeign(&self.io.conn_dead);
-                self.reapConnForeign(&self.io.conn_closing);
+                self.reapConnForeign(self.io.coll(.conn_dead));
+                self.reapConnForeign(self.io.coll(.conn_closing));
                 self.reg.flush() catch {};
             }
             for (self.body_sinks.items) |ref| {
@@ -2622,9 +2774,13 @@ pub fn H2(comptime opts: Options) type {
                 ref.sink.release(ref.sink.ctx);
             }
             self.body_sinks.deinit(allocator);
-            inline for (COLLECTIONS) |s| {
-                if (s.client_only and !has_client) continue;
-                @field(self, s.name).deinit();
+            // Under a declared world the registry owns every collection —
+            // its deinit releases them.
+            if (comptime !uses_world) {
+                inline for (COLLECTIONS) |s| {
+                    if (s.client_only and !has_client) continue;
+                    @field(self, s.name).deinit();
+                }
             }
             self.io.destroy();
             allocator.destroy(self);
@@ -2668,8 +2824,8 @@ pub fn H2(comptime opts: Options) type {
         /// parked by the time a conn reaches `conn_dead` — `getFat`
         /// resolves it wherever it lives — and `conn_state.Conn.deinit`
         /// nulls what it frees, so a slot can never double-free.
-        fn reapConnForeign(self: *Self, coll: anytype) void {
-            for (coll.entitySlice()) |ent| {
+        fn reapConnForeign(self: *Self, cl: anytype) void {
+            for (cl.entitySlice()) |ent| {
                 if (self.reg.isStale(ent)) continue;
                 if (self.reg.isMoving(ent)) continue;
                 const conn_ptr = self.reg.getFat(ent, Conn) catch continue;
@@ -2683,7 +2839,7 @@ pub fn H2(comptime opts: Options) type {
         /// reader left — so this is provably after every access, the same
         /// guarantee destroy-time firing gave the archetype's hook.
         fn processConnDead(self: *Self) void {
-            self.reapConnForeign(&self.io.conn_dead);
+            self.reapConnForeign(self.io.coll(.conn_dead));
         }
 
         /// End an h2-owned entity. Under the archetype this is a plain
@@ -2806,13 +2962,13 @@ pub fn H2(comptime opts: Options) type {
         /// closed streams.
         fn sweepOrphanedInbound(self: *Self) void {
             if (!self.h2_opts.headers_first) return;
-            for ([_]*StreamColl{ &self.request_receiving, &self.request_buffering }) |coll| {
-                const entities = coll.entitySlice();
-                const sessions = coll.column(Session);
+            for ([_]*StreamColl{ self.coll(.request_receiving), self.coll(.request_buffering) }) |cl| {
+                const entities = cl.entitySlice();
+                const sessions = cl.column(Session);
                 for (entities, sessions) |ent, sess| {
                     if (getConn(self, sess.entity) == null) {
-                        self.reg.set(ent, coll, H2IoResult, .{ .err = -1 }) catch {};
-                        self.reg.move(ent, coll, &self.response_out) catch {};
+                        self.reg.set(ent, cl, H2IoResult, .{ .err = -1 }) catch {};
+                        self.reg.move(ent, cl, self.coll(.response_out)) catch {};
                     }
                 }
             }
@@ -2830,13 +2986,13 @@ pub fn H2(comptime opts: Options) type {
         /// way.)
         fn sweepOrphanedClient(self: *Self) void {
             if (!has_client) return;
-            for ([_]*ClientStreamColl{ &self.client_stream_data_out, &self._client_stream_data_sending, &self._client_request_sending }) |coll| {
-                const entities = coll.entitySlice();
-                const sessions = coll.column(Session);
+            for ([_]*ClientStreamColl{ self.coll(.client_stream_data_out), self.coll(._client_stream_data_sending), self.coll(._client_request_sending) }) |cl| {
+                const entities = cl.entitySlice();
+                const sessions = cl.column(Session);
                 for (entities, sessions) |ent, sess| {
                     if (getConn(self, sess.entity) == null) {
-                        self.reg.set(ent, coll, H2IoResult, .{ .err = -1 }) catch {};
-                        self.reg.move(ent, coll, &self.client_response_out) catch {};
+                        self.reg.set(ent, cl, H2IoResult, .{ .err = -1 }) catch {};
+                        self.reg.move(ent, cl, self.coll(.client_response_out)) catch {};
                     }
                 }
             }
@@ -2863,7 +3019,7 @@ pub fn H2(comptime opts: Options) type {
                 if (notableStatusIndex(status.code)) |ni| self.http_status_notable[ni] += 1;
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                     continue;
                 };
 
@@ -2872,14 +3028,14 @@ pub fn H2(comptime opts: Options) type {
                 if (conn_ptr.h1 != null) {
                     self.http1WriteResponse(ent, conn_ptr, sess.entity, status, rh, rb, io_res) catch {
                         io_res.err = -1;
-                        try self.reg.move(ent, &self.response_in, &self.response_out);
+                        try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                     };
                     continue;
                 }
 
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                     continue;
                 }
 
@@ -2893,7 +3049,7 @@ pub fn H2(comptime opts: Options) type {
                 const nv_count: usize = 1 + @as(usize, rh.count);
                 const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                     continue;
                 };
                 const nva: [*]c.nghttp2_nv = nva_slice.ptr;
@@ -2924,7 +3080,7 @@ pub fn H2(comptime opts: Options) type {
                 if (rb.data != null and rb.len > 0) {
                     body_data_ptr = BodyData.create(self.allocator, rb.data.?, rb.len) orelse {
                         io_res.err = -1;
-                        try self.reg.move(ent, &self.response_in, &self.response_out);
+                        try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                         continue;
                     };
                     data_prd.source = .{ .ptr = @ptrCast(body_data_ptr) };
@@ -2936,7 +3092,7 @@ pub fn H2(comptime opts: Options) type {
                 if (rv < 0) {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                     continue;
                 }
 
@@ -2947,11 +3103,11 @@ pub fn H2(comptime opts: Options) type {
                     s.entity = ent;
                     s.send_complete = (data_prd.read_callback == null);
                     s.send_data = body_data_ptr;
-                    try self.reg.move(ent, &self.response_in, &self._response_sending);
+                    try self.reg.move(ent, self.coll(.response_in), self.coll(._response_sending));
                 } else {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                 }
             }
         }
@@ -2989,7 +3145,7 @@ pub fn H2(comptime opts: Options) type {
             for (entities, sessions, sids, statuses, resp_hdrs, io_results) |ent, sess, sid, status, rh, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.response_out));
                     continue;
                 };
 
@@ -2997,14 +3153,14 @@ pub fn H2(comptime opts: Options) type {
                 if (conn_ptr.h1 != null) {
                     self.http1StreamBegin(ent, conn_ptr, sess.entity, status, rh, io_res) catch {
                         io_res.err = -1;
-                        try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                        try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.response_out));
                     };
                     continue;
                 }
 
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.response_out));
                     continue;
                 }
 
@@ -3017,7 +3173,7 @@ pub fn H2(comptime opts: Options) type {
                 const nv_count: usize = 1 + @as(usize, rh.count);
                 const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.response_out));
                     continue;
                 };
                 const nva: [*]c.nghttp2_nv = nva_slice.ptr;
@@ -3050,7 +3206,7 @@ pub fn H2(comptime opts: Options) type {
                 const rv = c.nghttp2_submit_response(ng_session, @intCast(sid.id), nva, nv_count, &data_prd);
                 if (rv < 0) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.response_out));
                     continue;
                 }
 
@@ -3063,10 +3219,10 @@ pub fn H2(comptime opts: Options) type {
                     s.streaming = true;
                     s.send_complete = false;
                     s.send_data = null;
-                    try self.reg.move(ent, &self.stream_response_in, &self.stream_data_out);
+                    try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.stream_data_out));
                 } else {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.response_out));
                 }
             }
         }
@@ -3085,7 +3241,7 @@ pub fn H2(comptime opts: Options) type {
             for (entities, sessions, sids, resp_bodies, io_results) |ent, sess, sid, *rb, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_data_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_data_in), self.coll(.response_out));
                     continue;
                 };
 
@@ -3093,19 +3249,19 @@ pub fn H2(comptime opts: Options) type {
                 if (conn_ptr.h1 != null) {
                     self.http1StreamChunk(ent, conn_ptr, sess.entity, rb) catch {
                         io_res.err = -1;
-                        try self.reg.move(ent, &self.stream_data_in, &self.response_out);
+                        try self.reg.move(ent, self.coll(.stream_data_in), self.coll(.response_out));
                     };
                     continue;
                 }
 
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_data_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_data_in), self.coll(.response_out));
                     continue;
                 }
 
                 if (rb.data == null or rb.len == 0) {
-                    try self.reg.move(ent, &self.stream_data_in, &self.stream_data_out);
+                    try self.reg.move(ent, self.coll(.stream_data_in), self.coll(.stream_data_out));
                     continue;
                 }
 
@@ -3115,7 +3271,7 @@ pub fn H2(comptime opts: Options) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_data_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_data_in), self.coll(.response_out));
                     continue;
                 }
 
@@ -3129,7 +3285,7 @@ pub fn H2(comptime opts: Options) type {
 
                 _ = c.nghttp2_session_resume_data(ng_session, s.ng_stream_id);
 
-                try self.reg.move(ent, &self.stream_data_in, &self._stream_data_sending);
+                try self.reg.move(ent, self.coll(.stream_data_in), self.coll(._stream_data_sending));
             }
         }
 
@@ -3146,7 +3302,7 @@ pub fn H2(comptime opts: Options) type {
             for (entities, sessions, sids, io_results) |ent, sess, sid, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_close_in), self.coll(.response_out));
                     continue;
                 };
 
@@ -3154,14 +3310,14 @@ pub fn H2(comptime opts: Options) type {
                 if (conn_ptr.h1 != null) {
                     self.http1StreamEnd(ent, conn_ptr, sess.entity, io_res) catch {
                         io_res.err = -1;
-                        try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+                        try self.reg.move(ent, self.coll(.stream_close_in), self.coll(.response_out));
                     };
                     continue;
                 }
 
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_close_in), self.coll(.response_out));
                     continue;
                 }
 
@@ -3171,14 +3327,14 @@ pub fn H2(comptime opts: Options) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_close_in), self.coll(.response_out));
                     continue;
                 }
 
                 stream.?.stream_eof = true;
                 _ = c.nghttp2_session_resume_data(ng_session, stream.?.ng_stream_id);
 
-                try self.reg.move(ent, &self.stream_close_in, &self._stream_data_sending);
+                try self.reg.move(ent, self.coll(.stream_close_in), self.coll(._stream_data_sending));
             }
         }
 
@@ -3201,7 +3357,7 @@ pub fn H2(comptime opts: Options) type {
             var enobufs_this_pass: u32 = 0;
             for (entities, conn_ents, results) |ent, conn_ent, rr| {
                 if (self.reg.isStale(conn_ent.entity) or self.reg.isMoving(conn_ent.entity)) {
-                    try self.reg.move(ent, &self.io.read_results, &self._read_errors);
+                    try self.reg.move(ent, self.io.coll(.read_results), self.coll(._read_errors));
                     continue;
                 }
                 if (rr.result == ENOBUFS) {
@@ -3210,26 +3366,26 @@ pub fn H2(comptime opts: Options) type {
                     // refills as other recvs complete + return their
                     // buffers via returnBufferToRing.
                     enobufs_this_pass += 1;
-                    try self.reg.move(ent, &self.io.read_results, &self.io.read_in);
+                    try self.reg.move(ent, self.io.coll(.read_results), self.io.coll(.read_in));
                     continue;
                 }
                 if (rr.result <= 0) {
-                    try self.reg.move(ent, &self.io.read_results, &self._read_errors);
+                    try self.reg.move(ent, self.io.coll(.read_results), self.coll(._read_errors));
                     continue;
                 }
-                if (self.reg.isInCollection(conn_ent.entity, &self.io.connections)) {
-                    try self.reg.move(ent, &self.io.read_results, &self._read_init);
+                if (self.reg.isInCollection(conn_ent.entity, self.io.coll(.connections))) {
+                    try self.reg.move(ent, self.io.coll(.read_results), self.coll(._read_init));
                     continue;
                 }
-                if (self.reg.isInCollection(conn_ent.entity, &self._conn_tls_handshake)) {
-                    try self.reg.move(ent, &self.io.read_results, &self._read_handshake);
+                if (self.reg.isInCollection(conn_ent.entity, self.coll(._conn_tls_handshake))) {
+                    try self.reg.move(ent, self.io.coll(.read_results), self.coll(._read_handshake));
                     continue;
                 }
-                if (self.reg.isInCollection(conn_ent.entity, &self._conn_active)) {
-                    try self.reg.move(ent, &self.io.read_results, &self._read_active);
+                if (self.reg.isInCollection(conn_ent.entity, self.coll(._conn_active))) {
+                    try self.reg.move(ent, self.io.coll(.read_results), self.coll(._read_active));
                     continue;
                 }
-                try self.reg.move(ent, &self.io.read_results, &self._read_errors);
+                try self.reg.move(ent, self.io.coll(.read_results), self.coll(._read_errors));
             }
 
             // Loud surfacing of recv back-pressure. The pool size is
@@ -3336,7 +3492,7 @@ pub fn H2(comptime opts: Options) type {
                 if (!self.reg.isStale(conn_ent.entity)) {
                     _ = self.closeConn(conn_ent.entity);
                 }
-                try self.reg.move(ent, &self._read_errors, &self.io.read_in);
+                try self.reg.move(ent, self.coll(._read_errors), self.io.coll(.read_in));
             }
         }
 
@@ -3350,29 +3506,29 @@ pub fn H2(comptime opts: Options) type {
 
             for (entities, conn_ents) |ent, conn_ent| {
                 if (self.reg.isStale(conn_ent.entity)) {
-                    try self.reg.move(ent, &self._read_init, &self.io.read_in);
+                    try self.reg.move(ent, self.coll(._read_init), self.io.coll(.read_in));
                     continue;
                 }
 
-                const conn_ptr = self.reg.get(conn_ent.entity, &self.io.connections, Conn) catch {
-                    try self.reg.move(ent, &self._read_init, &self.io.read_in);
+                const conn_ptr = self.reg.get(conn_ent.entity, self.io.coll(.connections), Conn) catch {
+                    try self.reg.move(ent, self.coll(._read_init), self.io.coll(.read_in));
                     continue;
                 };
 
                 if (self.h2_opts.tls_config) |tls_cfg| {
                     conn_ptr.tls_conn = tls.TlsConn.create(tls_cfg, self.allocator) catch {
                         _ = self.closeConn(conn_ent.entity);
-                        try self.reg.move(ent, &self._read_init, &self.io.read_in);
+                        try self.reg.move(ent, self.coll(._read_init), self.io.coll(.read_in));
                         continue;
                     };
-                    try self.reg.move(ent, &self._read_init, &self._read_handshake);
+                    try self.reg.move(ent, self.coll(._read_init), self.coll(._read_handshake));
                 } else {
                     self.sessionCreate(conn_ptr, conn_ent.entity) catch {
                         _ = self.closeConn(conn_ent.entity);
-                        try self.reg.move(ent, &self._read_init, &self.io.read_in);
+                        try self.reg.move(ent, self.coll(._read_init), self.io.coll(.read_in));
                         continue;
                     };
-                    try self.reg.move(ent, &self._read_init, &self._read_active);
+                    try self.reg.move(ent, self.coll(._read_init), self.coll(._read_active));
                 }
             }
         }
@@ -3387,7 +3543,7 @@ pub fn H2(comptime opts: Options) type {
             var active_count: u32 = @intCast(self._conn_active.entitySlice().len);
 
             for (entities) |ent| {
-                const conn_ptr = self.reg.get(ent, &self.io.connections, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, self.io.coll(.connections), Conn) catch continue;
 
                 if (conn_ptr.tls_conn != null and conn_ptr.ng_session == null) {
                     if (max > 0 and active_count >= max) {
@@ -3395,7 +3551,7 @@ pub fn H2(comptime opts: Options) type {
                         continue;
                     }
                     conn_ptr.last_active_ns = monotonicNs();
-                    try self.reg.move(ent, &self.io.connections, &self._conn_tls_handshake);
+                    try self.reg.move(ent, self.io.coll(.connections), self.coll(._conn_tls_handshake));
                     active_count += 1;
                     continue;
                 }
@@ -3418,7 +3574,7 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 conn_ptr.last_active_ns = monotonicNs();
-                try self.reg.move(ent, &self.io.connections, &self._conn_active);
+                try self.reg.move(ent, self.io.coll(.connections), self.coll(._conn_active));
                 active_count += 1;
             }
         }
@@ -3434,17 +3590,17 @@ pub fn H2(comptime opts: Options) type {
 
             for (entities, conn_ents, results) |ent, conn_ent, rr| {
                 if (self.reg.isStale(conn_ent.entity)) {
-                    try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                    try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                     continue;
                 }
 
                 const conn_ptr = getConn(self, conn_ent.entity) orelse {
-                    try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                    try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                     continue;
                 };
 
                 const tc = conn_ptr.tls_conn orelse {
-                    try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                    try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                     continue;
                 };
 
@@ -3459,7 +3615,7 @@ pub fn H2(comptime opts: Options) type {
                                 self.allocator.free(output);
                             };
                         }
-                        try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                        try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                     },
                     .handshake_done => {
                         if (tc.drainOutput(self.allocator) catch null) |output| {
@@ -3478,24 +3634,24 @@ pub fn H2(comptime opts: Options) type {
                         if (!std.mem.eql(u8, tc.alpnProtocol(), "h2")) {
                             if (!self.h2_opts.accept_http1) {
                                 _ = self.closeConn(conn_ent.entity);
-                                try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                                try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                                 continue;
                             }
                             const h1c = Http1Conn.create(self.allocator) orelse {
                                 _ = self.closeConn(conn_ent.entity);
-                                try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                                try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                                 continue;
                             };
                             conn_ptr.h1 = h1c;
                             if (feed_result.out_len > 0) {
                                 self.http1Feed(conn_ptr, conn_ent.entity, decrypt_buf[0..feed_result.out_len]);
                             }
-                            try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                            try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                             continue;
                         }
                         self.sessionCreate(conn_ptr, conn_ent.entity) catch {
                             _ = self.closeConn(conn_ent.entity);
-                            try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                            try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                             continue;
                         };
                         if (feed_result.out_len > 0 and conn_ptr.ng_session != null) {
@@ -3505,11 +3661,11 @@ pub fn H2(comptime opts: Options) type {
                                 feed_result.out_len,
                             );
                         }
-                        try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                        try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                     },
                     .data, .err => {
                         _ = self.closeConn(conn_ent.entity);
-                        try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                        try self.reg.move(ent, self.coll(._read_handshake), self.io.coll(.read_in));
                     },
                 }
             }
@@ -3518,12 +3674,12 @@ pub fn H2(comptime opts: Options) type {
         fn transitionHandshakeConnections(self: *Self) !void {
             const entities = self._conn_tls_handshake.entitySlice();
             for (entities) |ent| {
-                const conn_ptr = self.reg.get(ent, &self._conn_tls_handshake, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, self.coll(._conn_tls_handshake), Conn) catch continue;
                 // An ALPN-h1 conn (Phase 3) has no ng_session but is ready once
                 // its Http1Conn is set — it must reach _conn_active so its reads
                 // are processed and the idle GC can see it.
                 if (conn_ptr.ng_session != null or conn_ptr.h1 != null) {
-                    try self.reg.move(ent, &self._conn_tls_handshake, &self._conn_active);
+                    try self.reg.move(ent, self.coll(._conn_tls_handshake), self.coll(._conn_active));
                 }
             }
         }
@@ -3771,7 +3927,7 @@ pub fn H2(comptime opts: Options) type {
             s.ng_stream_id = 1;
             s.body_mode = .hold;
 
-            const req_entity = self.http1CreateEntity(&self.request_receiving, conn_entity, head, scheme) catch {
+            const req_entity = self.http1CreateEntity(self.coll(.request_receiving), conn_entity, head, scheme) catch {
                 s.free();
                 self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
@@ -3924,9 +4080,9 @@ pub fn H2(comptime opts: Options) type {
                 // for the consumer's disposition (`requestBodyBuffer`
                 // attaches in place / a sink drains them at attach).
                 .buffer => {
-                    if (self.reg.isInCollection(s.entity, &self.request_buffering)) {
-                        self.reg.set(s.entity, &self.request_buffering, ReqBody, takeBody(s)) catch {};
-                        self.reg.move(s.entity, &self.request_buffering, &self.request_out) catch {};
+                    if (self.reg.isInCollection(s.entity, self.coll(.request_buffering))) {
+                        self.reg.set(s.entity, self.coll(.request_buffering), ReqBody, takeBody(s)) catch {};
+                        self.reg.move(s.entity, self.coll(.request_buffering), self.coll(.request_out)) catch {};
                     }
                 },
                 .hold, .auto => {},
@@ -4009,7 +4165,7 @@ pub fn H2(comptime opts: Options) type {
             if (h1c.paused_read.isNil()) return;
             const ent = h1c.paused_read;
             h1c.paused_read = Entity.nil;
-            self.reg.move(ent, &self._read_h1_paused, &self.io.read_in) catch {};
+            self.reg.move(ent, self.coll(._read_h1_paused), self.io.coll(.read_in)) catch {};
         }
 
         /// True when the in-flight streaming body has outrun its consumer:
@@ -4046,32 +4202,32 @@ pub fn H2(comptime opts: Options) type {
             const conn_ents = self._read_h1_paused.column(rio.ConnEntity);
             for (entities, conn_ents) |ent, ce| {
                 if (self.reg.isStale(ce.entity)) {
-                    self.reg.move(ent, &self._read_h1_paused, &self.io.read_in) catch {};
+                    self.reg.move(ent, self.coll(._read_h1_paused), self.io.coll(.read_in)) catch {};
                 }
             }
         }
 
-        /// Create a request entity in `coll` from a parsed h1 head, synthesizing
+        /// Create a request entity in `cl` from a parsed h1 head, synthesizing
         /// the h2-style pseudo-headers so all downstream routing/dispatch is
         /// protocol-agnostic. `StreamId` is the synthetic 1 (one request/conn);
         /// `ReqBody` starts empty (the caller attaches a complete body or
         /// streams into it).
-        fn http1CreateEntity(self: *Self, coll: *StreamColl, conn_entity: Entity, head: http1.Head, scheme: []const u8) !Entity {
-            const req_entity = try self.reg.create(coll);
+        fn http1CreateEntity(self: *Self, cl: *StreamColl, conn_entity: Entity, head: http1.Head, scheme: []const u8) !Entity {
+            const req_entity = try self.reg.create(cl);
             errdefer self.destroyEntity(req_entity) catch {};
 
-            try self.reg.set(req_entity, coll, StreamId, .{ .id = 1 });
-            try self.reg.set(req_entity, coll, Session, .{ .entity = conn_entity });
+            try self.reg.set(req_entity, cl, StreamId, .{ .id = 1 });
+            try self.reg.set(req_entity, cl, Session, .{ .entity = conn_entity });
 
             const rh = try self.http1BuildReqHeaders(head, scheme);
-            try self.reg.set(req_entity, coll, ReqHeaders, rh);
-            try self.reg.set(req_entity, coll, ReqBody, .{ .data = null, .len = 0 });
+            try self.reg.set(req_entity, cl, ReqHeaders, rh);
+            try self.reg.set(req_entity, cl, ReqBody, .{ .data = null, .len = 0 });
             return req_entity;
         }
 
         /// Build a `request_out` entity from a parsed h1 head + complete body.
         fn http1EmitRequest(self: *Self, conn_entity: Entity, head: http1.Head, body: []const u8, scheme: []const u8) !void {
-            const req_entity = try self.http1CreateEntity(&self.request_out, conn_entity, head, scheme);
+            const req_entity = try self.http1CreateEntity(self.coll(.request_out), conn_entity, head, scheme);
             errdefer self.destroyEntity(req_entity) catch {};
 
             var body_data: ?[*]u8 = null;
@@ -4079,7 +4235,7 @@ pub fn H2(comptime opts: Options) type {
                 const copy = try self.allocator.dupe(u8, body);
                 body_data = copy.ptr;
             }
-            try self.reg.set(req_entity, &self.request_out, ReqBody, .{ .data = body_data, .len = @intCast(body.len) });
+            try self.reg.set(req_entity, self.coll(.request_out), ReqBody, .{ .data = body_data, .len = @intCast(body.len) });
         }
 
         /// True for HTTP/1 connection-specific (hop-by-hop) headers that must not
@@ -4207,7 +4363,7 @@ pub fn H2(comptime opts: Options) type {
             };
             if (h1c.closing or st == null) {
                 io_res.err = -1;
-                try self.reg.move(ent, &self.response_in, &self.response_out);
+                try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
                 return;
             }
             // Responding while the request body is still inbound (early 4xx,
@@ -4237,7 +4393,7 @@ pub fn H2(comptime opts: Options) type {
             self.http1Send(conn_ptr, conn_entity, data);
 
             io_res.err = 0;
-            try self.reg.move(ent, &self.response_in, &self.response_out);
+            try self.reg.move(ent, self.coll(.response_in), self.coll(.response_out));
 
             if (st.?.keep_alive) {
                 st.?.in_flight = false;
@@ -4276,7 +4432,7 @@ pub fn H2(comptime opts: Options) type {
             };
             if (h1c.closing or st == null) {
                 io_res.err = -1;
-                try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                try self.reg.move(ent, self.coll(.stream_response_in), self.coll(.response_out));
                 return;
             }
             // Same early-reply rule as `http1WriteResponse`: a streaming
@@ -4308,7 +4464,7 @@ pub fn H2(comptime opts: Options) type {
             // worker can't push the first chunk until the head is on the wire
             // (keeps the single-write-in-flight invariant from the very start).
             st.?.sending_entity = ent;
-            try self.reg.move(ent, &self.stream_response_in, &self._stream_data_sending);
+            try self.reg.move(ent, self.coll(.stream_response_in), self.coll(._stream_data_sending));
         }
 
         /// Write one body piece as a chunk, then return the entity to
@@ -4326,7 +4482,7 @@ pub fn H2(comptime opts: Options) type {
                         rb.data = null;
                         rb.len = 0;
                     }
-                    try self.reg.move(ent, &self.stream_data_in, &self.stream_data_out);
+                    try self.reg.move(ent, self.coll(.stream_data_in), self.coll(.stream_data_out));
                     return;
                 },
             };
@@ -4343,7 +4499,7 @@ pub fn H2(comptime opts: Options) type {
                     // Backpressure: hold the entity until this chunk's write
                     // drains; `writesAccount` releases it back to stream_data_out.
                     st.sending_entity = ent;
-                    try self.reg.move(ent, &self.stream_data_in, &self._stream_data_sending);
+                    try self.reg.move(ent, self.coll(.stream_data_in), self.coll(._stream_data_sending));
                     return;
                 }
                 self.allocator.free(d[0..rb.len]);
@@ -4352,7 +4508,7 @@ pub fn H2(comptime opts: Options) type {
             }
             // Empty piece — nothing to write, so no backpressure: return the
             // entity immediately for the next push.
-            try self.reg.move(ent, &self.stream_data_in, &self.stream_data_out);
+            try self.reg.move(ent, self.coll(.stream_data_in), self.coll(.stream_data_out));
         }
 
         /// End a streaming response: write the zero-terminator, then finalize the
@@ -4366,7 +4522,7 @@ pub fn H2(comptime opts: Options) type {
                 // entity without touching conn state.
                 else => {
                     io_res.err = 0;
-                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+                    try self.reg.move(ent, self.coll(.stream_close_in), self.coll(.response_out));
                     return;
                 },
             };
@@ -4374,7 +4530,7 @@ pub fn H2(comptime opts: Options) type {
             self.http1Send(conn_ptr, conn_entity, term);
             st.streaming = false;
             io_res.err = 0;
-            try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+            try self.reg.move(ent, self.coll(.stream_close_in), self.coll(.response_out));
             if (st.keep_alive) {
                 st.in_flight = false;
                 if (!st.body_active) {
@@ -4434,7 +4590,7 @@ pub fn H2(comptime opts: Options) type {
                 return;
             };
             const scheme: []const u8 = if (conn_ptr.tls_conn != null) "https" else "http";
-            _ = self.http1CreateEntity(&self.ws_upgrade_out, conn_entity, head, scheme) catch {
+            _ = self.http1CreateEntity(self.coll(.ws_upgrade_out), conn_entity, head, scheme) catch {
                 self.allocator.free(key_owned);
                 self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
@@ -4455,8 +4611,8 @@ pub fn H2(comptime opts: Options) type {
         /// `sweepBodySinks` when the connection dies; window repayment is
         /// the socket-read park/unpark at the streamed-body cap.
         pub fn wsUpgradeAccept(h2: *Self, ent: Entity, sink: BodySink) WsUpgradeDecision {
-            if (!h2.reg.isInCollection(ent, &h2.ws_upgrade_out)) return .gone;
-            const sess = h2.reg.get(ent, &h2.ws_upgrade_out, Session) catch return .gone;
+            if (!h2.reg.isInCollection(ent, h2.coll(.ws_upgrade_out))) return .gone;
+            const sess = h2.reg.get(ent, h2.coll(.ws_upgrade_out), Session) catch return .gone;
             defer h2.reg.destroy(ent) catch {};
             const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
             const h1c = conn_ptr.h1 orelse return .gone;
@@ -4509,8 +4665,8 @@ pub fn H2(comptime opts: Options) type {
         /// Refuse a surfaced Upgrade with a plain HTTP status — the client
         /// never sees a 101.
         pub fn wsUpgradeReject(h2: *Self, ent: Entity, status: u16) void {
-            if (!h2.reg.isInCollection(ent, &h2.ws_upgrade_out)) return;
-            const sess = h2.reg.get(ent, &h2.ws_upgrade_out, Session) catch return;
+            if (!h2.reg.isInCollection(ent, h2.coll(.ws_upgrade_out))) return;
+            const sess = h2.reg.get(ent, h2.coll(.ws_upgrade_out), Session) catch return;
             defer h2.reg.destroy(ent) catch {};
             const conn_ptr = getConn(h2, sess.entity) orelse return;
             self_reject: {
@@ -4718,16 +4874,16 @@ pub fn H2(comptime opts: Options) type {
         /// onto `ws_message_out` for the consumer. `payload` is copied into an
         /// allocator-owned `ReqBody` the entity's destroy frees.
         fn wsEmitMessage(self: *Self, conn_entity: Entity, opcode: u8, payload: []const u8) !void {
-            const ent = try self.reg.create(&self.ws_message_out);
+            const ent = try self.reg.create(self.coll(.ws_message_out));
             errdefer self.destroyEntity(ent) catch {};
-            try self.reg.set(ent, &self.ws_message_out, Session, .{ .entity = conn_entity });
-            try self.reg.set(ent, &self.ws_message_out, WsMeta, .{ .opcode = opcode });
+            try self.reg.set(ent, self.coll(.ws_message_out), Session, .{ .entity = conn_entity });
+            try self.reg.set(ent, self.coll(.ws_message_out), WsMeta, .{ .opcode = opcode });
             var data: ?[*]u8 = null;
             if (payload.len > 0) {
                 const copy = try self.allocator.dupe(u8, payload);
                 data = copy.ptr;
             }
-            try self.reg.set(ent, &self.ws_message_out, ReqBody, .{ .data = data, .len = @intCast(payload.len) });
+            try self.reg.set(ent, self.coll(.ws_message_out), ReqBody, .{ .data = data, .len = @intCast(payload.len) });
         }
 
         /// Queue a Close frame and begin teardown; the connection is destroyed by
@@ -4778,7 +4934,7 @@ pub fn H2(comptime opts: Options) type {
                 // Extended-CONNECT tunnel: the Session is a WS identity
                 // entity (not a conn) — frames ride the stream's send
                 // queue.
-                if (self.reg.isInCollection(sess.entity, &self.ws_streams)) {
+                if (self.reg.isInCollection(sess.entity, self.coll(.ws_streams))) {
                     const payload = if (body.data) |d| d[0..body.len] else "";
                     self.wsStreamSend(sess.entity, meta.opcode, payload);
                     try self.destroyEntity(ent);
@@ -4821,9 +4977,9 @@ pub fn H2(comptime opts: Options) type {
         // =============================================================
 
         fn submitWrite(self: *Self, conn_entity: Entity, data: []u8) !void {
-            const we = try self.reg.create(&self.io.write_in);
-            try self.reg.set(we, &self.io.write_in, rio.ConnEntity, .{ .entity = conn_entity });
-            try self.reg.set(we, &self.io.write_in, rio.WriteBuf, .{ .data = data.ptr, .len = @intCast(data.len) });
+            const we = try self.reg.create(self.io.coll(.write_in));
+            try self.reg.set(we, self.io.coll(.write_in), rio.ConnEntity, .{ .entity = conn_entity });
+            try self.reg.set(we, self.io.coll(.write_in), rio.WriteBuf, .{ .data = data.ptr, .len = @intCast(data.len) });
         }
 
         /// Serialized egress for the h2 server DATA path: hand `data` to the
@@ -4891,12 +5047,12 @@ pub fn H2(comptime opts: Options) type {
 
             for (entities, conn_ents, results) |ent, conn_ent, rr| {
                 if (self.reg.isStale(conn_ent.entity)) {
-                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                    try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                     continue;
                 }
 
-                const conn_ptr = self.reg.get(conn_ent.entity, &self._conn_active, Conn) catch {
-                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                const conn_ptr = self.reg.get(conn_ent.entity, self.coll(._conn_active), Conn) catch {
+                    try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                     continue;
                 };
 
@@ -4913,7 +5069,7 @@ pub fn H2(comptime opts: Options) type {
                                 const fr = tc.feed(data_ptr[0..data_len], &decrypt_buf);
                                 if (fr.result == .err) {
                                     _ = self.closeConn(conn_ent.entity);
-                                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                    try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                                     continue;
                                 }
                                 if (fr.out_len > 0) self.http1Feed(conn_ptr, conn_ent.entity, decrypt_buf[0..fr.out_len]);
@@ -4931,17 +5087,17 @@ pub fn H2(comptime opts: Options) type {
                         if (getConn(self, conn_ent.entity)) |cp| {
                             if (self.http1ReadShouldPause(cp)) {
                                 cp.h1.?.paused_read = ent;
-                                try self.reg.move(ent, &self._read_active, &self._read_h1_paused);
+                                try self.reg.move(ent, self.coll(._read_active), self.coll(._read_h1_paused));
                                 continue;
                             }
                         }
                     }
-                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                    try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                     continue;
                 }
 
                 if (conn_ptr.ng_session == null) {
-                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                    try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                     continue;
                 }
 
@@ -4953,14 +5109,14 @@ pub fn H2(comptime opts: Options) type {
                         const feed_result = tc.feed(data_ptr[0..data_len], &decrypt_buf);
                         if (feed_result.result == .err) {
                             _ = self.closeConn(conn_ent.entity);
-                            try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                            try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                             continue;
                         }
                         if (feed_result.out_len > 0) {
                             const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, &decrypt_buf, feed_result.out_len);
                             if (rv < 0) {
                                 _ = self.closeConn(conn_ent.entity);
-                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                                 continue;
                             }
                         }
@@ -4980,32 +5136,32 @@ pub fn H2(comptime opts: Options) type {
                             // front; refuse rather than swap in.
                             if (!self.h2_opts.accept_http1) {
                                 _ = self.closeConn(conn_ent.entity);
-                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                                 continue;
                             }
                             conn_ptr.first_read_seen = true;
                             _ = self.http1SwapIn(conn_ptr) orelse {
                                 _ = self.closeConn(conn_ent.entity);
-                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                                 continue;
                             };
                             self.http1Feed(conn_ptr, conn_ent.entity, data_ptr[0..data_len]);
                             conn_ptr.last_active_ns = monotonicNs();
-                            try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                            try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                             continue;
                         }
                         conn_ptr.first_read_seen = true;
                         const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, data_ptr, data_len);
                         if (rv < 0) {
                             _ = self.closeConn(conn_ent.entity);
-                            try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                            try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
                             continue;
                         }
                     }
                     conn_ptr.last_active_ns = monotonicNs();
                 }
 
-                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                try self.reg.move(ent, self.coll(._read_active), self.io.coll(.read_in));
             }
         }
 
@@ -5050,16 +5206,16 @@ pub fn H2(comptime opts: Options) type {
                             } else if (!h1c.state.http1.sending_entity.isNil()) {
                                 const sent = h1c.state.http1.sending_entity;
                                 h1c.state.http1.sending_entity = Entity.nil;
-                                if (self.reg.isInCollection(sent, &self._stream_data_sending)) {
+                                if (self.reg.isInCollection(sent, self.coll(._stream_data_sending))) {
                                     if (failed) {
                                         // The write failed (conn is about to be
                                         // destroyed): surface it so the worker
                                         // reaps the stream from response_out.
-                                        try self.reg.set(sent, &self._stream_data_sending, H2IoResult, .{ .err = -1 });
-                                        try self.reg.move(sent, &self._stream_data_sending, &self.response_out);
+                                        try self.reg.set(sent, self.coll(._stream_data_sending), H2IoResult, .{ .err = -1 });
+                                        try self.reg.move(sent, self.coll(._stream_data_sending), self.coll(.response_out));
                                     } else {
                                         // Drained — let the worker push the next.
-                                        try self.reg.move(sent, &self._stream_data_sending, &self.stream_data_out);
+                                        try self.reg.move(sent, self.coll(._stream_data_sending), self.coll(.stream_data_out));
                                     }
                                 }
                             }
@@ -5079,7 +5235,7 @@ pub fn H2(comptime opts: Options) type {
                 }
                 // io owns the buffer's release: it was kernel-visible until the
                 // completion landed, and reaching `write_done` is what proves it did.
-                try self.reg.move(ent, &self.io.write_results, &self.io.write_done);
+                try self.reg.move(ent, self.io.coll(.write_results), self.io.coll(.write_done));
             }
         }
 
@@ -5094,7 +5250,7 @@ pub fn H2(comptime opts: Options) type {
             for (entities) |ent| {
                 if (self.reg.isStale(ent)) continue;
 
-                const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, self.coll(._conn_active), Conn) catch continue;
 
                 // h1 connections have no nghttp2 session to drive — responses
                 // are written synchronously in `http1WriteResponse`. Idle
@@ -5249,7 +5405,7 @@ pub fn H2(comptime opts: Options) type {
             const now = monotonicNs();
             for (entities) |ent| {
                 if (self.reg.isStale(ent)) continue;
-                const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, self.coll(._conn_active), Conn) catch continue;
                 if (conn_ptr.direction != .server) continue;
                 if (conn_ptr.ng_session) |ng| {
                     if (conn_ptr.draining) continue;
@@ -5341,7 +5497,7 @@ pub fn H2(comptime opts: Options) type {
                 const raw = self.io.connections.entitySlice();
                 for (raw) |ent| {
                     if (self.reg.isStale(ent)) continue;
-                    const conn_ptr = self.reg.get(ent, &self.io.connections, Conn) catch continue;
+                    const conn_ptr = self.reg.get(ent, self.io.coll(.connections), Conn) catch continue;
                     if (conn_ptr.direction != .server) continue;
                     // Claimable / mid-transition conns belong to the
                     // handshake or active sweeps.
@@ -5354,7 +5510,7 @@ pub fn H2(comptime opts: Options) type {
                 const hs = self._conn_tls_handshake.entitySlice();
                 for (hs) |ent| {
                     if (self.reg.isStale(ent)) continue;
-                    const conn_ptr = self.reg.get(ent, &self._conn_tls_handshake, Conn) catch continue;
+                    const conn_ptr = self.reg.get(ent, self.coll(._conn_tls_handshake), Conn) catch continue;
                     if (conn_ptr.last_active_ns == 0) continue;
                     if (now -| conn_ptr.last_active_ns <= budget) continue;
                     self.handshake_reaped_total += 1;
@@ -5364,7 +5520,7 @@ pub fn H2(comptime opts: Options) type {
 
             for (entities) |ent| {
                 if (self.reg.isStale(ent)) continue;
-                const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, self.coll(._conn_active), Conn) catch continue;
 
                 // Direction-aware idle budget: client legs may reap
                 // sooner than server connections (LB-idle < backend-idle).
@@ -5414,9 +5570,9 @@ pub fn H2(comptime opts: Options) type {
             const targets = self.client_connect_in.column(ConnectTarget);
 
             for (entities, targets) |ent, target| {
-                const ce = self.reg.create(&self.io.connect_in) catch {
-                    try self.reg.set(ent, &self.client_connect_in, H2IoResult, .{ .err = -1 });
-                    try self.reg.move(ent, &self.client_connect_in, &self.client_connect_errors);
+                const ce = self.reg.create(self.io.coll(.connect_in)) catch {
+                    try self.reg.set(ent, self.coll(.client_connect_in), H2IoResult, .{ .err = -1 });
+                    try self.reg.move(ent, self.coll(.client_connect_in), self.coll(.client_connect_errors));
                     continue;
                 };
 
@@ -5425,10 +5581,10 @@ pub fn H2(comptime opts: Options) type {
                 // component column is not, and `prep_connect` outlives the
                 // move that would reshuffle it. No allocation, so no failure
                 // path and nothing to free.
-                try self.io.setConnectAddr(ce, &self.io.connect_in, target.addr);
-                try self.reg.set(ce, &self.io.connect_in, Conn, .{ .direction = .client, .pending_connect_entity = ent });
+                try self.io.setConnectAddr(ce, self.io.coll(.connect_in), target.addr);
+                try self.reg.set(ce, self.io.coll(.connect_in), Conn, .{ .direction = .client, .pending_connect_entity = ent });
 
-                try self.reg.move(ent, &self.client_connect_in, &self._client_connect_pending);
+                try self.reg.move(ent, self.coll(.client_connect_in), self.coll(._client_connect_pending));
             }
         }
 
@@ -5441,7 +5597,7 @@ pub fn H2(comptime opts: Options) type {
             const entities = self.io.connections.entitySlice();
 
             for (entities) |ent| {
-                const conn_ptr = self.reg.get(ent, &self.io.connections, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, self.io.coll(.connections), Conn) catch continue;
                 if (conn_ptr.direction != .client) continue;
                 if (conn_ptr.pending_connect_entity.isNil()) continue;
 
@@ -5452,15 +5608,15 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 self.clientSessionCreate(conn_ptr, ent) catch {
-                    self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = -1 }) catch {};
-                    self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_errors) catch {};
+                    self.reg.set(user_ent, self.coll(._client_connect_pending), H2IoResult, .{ .err = -1 }) catch {};
+                    self.reg.move(user_ent, self.coll(._client_connect_pending), self.coll(.client_connect_errors)) catch {};
                     _ = self.closeConn(ent);
                     continue;
                 };
 
-                self.reg.set(user_ent, &self._client_connect_pending, Session, .{ .entity = ent }) catch {};
-                self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = 0 }) catch {};
-                self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_out) catch {};
+                self.reg.set(user_ent, self.coll(._client_connect_pending), Session, .{ .entity = ent }) catch {};
+                self.reg.set(user_ent, self.coll(._client_connect_pending), H2IoResult, .{ .err = 0 }) catch {};
+                self.reg.move(user_ent, self.coll(._client_connect_pending), self.coll(.client_connect_out)) catch {};
 
                 conn_ptr.pending_connect_entity = Entity.nil;
                 conn_ptr.last_active_ns = monotonicNs();
@@ -5479,8 +5635,8 @@ pub fn H2(comptime opts: Options) type {
             for (entities, conns) |ent, conn| {
                 const user_ent = conn.pending_connect_entity;
                 if (!user_ent.isNil() and !self.reg.isStale(user_ent)) {
-                    self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = -1 }) catch {};
-                    self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_errors) catch {};
+                    self.reg.set(user_ent, self.coll(._client_connect_pending), H2IoResult, .{ .err = -1 }) catch {};
+                    self.reg.move(user_ent, self.coll(._client_connect_pending), self.coll(.client_connect_errors)) catch {};
                 }
                 try self.destroyEntity(ent);
             }
@@ -5501,12 +5657,12 @@ pub fn H2(comptime opts: Options) type {
             for (entities, sessions, req_hdrs, req_bodies, io_results) |ent, sess, rh, rb, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
                     continue;
                 };
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
                     continue;
                 }
 
@@ -5515,13 +5671,13 @@ pub fn H2(comptime opts: Options) type {
                 const nv_count: usize = @as(usize, rh.count);
                 if (nv_count == 0) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
                     continue;
                 }
 
                 const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
                     continue;
                 };
                 defer self.allocator.free(nva_slice);
@@ -5543,7 +5699,7 @@ pub fn H2(comptime opts: Options) type {
                 if (rb.data != null and rb.len > 0) {
                     body_data_ptr = BodyData.create(self.allocator, rb.data.?, rb.len) orelse {
                         io_res.err = -1;
-                        try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
+                        try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
                         continue;
                     };
                     data_prd.source = .{ .ptr = @ptrCast(body_data_ptr) };
@@ -5562,14 +5718,14 @@ pub fn H2(comptime opts: Options) type {
                 if (stream_id < 0) {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
                     continue;
                 }
 
                 const stream = Stream.create(sess.entity, self.allocator) orelse {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
                     continue;
                 };
                 stream.entity = ent;
@@ -5579,8 +5735,8 @@ pub fn H2(comptime opts: Options) type {
                 _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
                 if (getConn(self, sess.entity)) |cp| cp.open_streams += 1;
 
-                try self.reg.set(ent, &self.client_request_in, StreamId, .{ .id = @intCast(stream_id) });
-                try self.reg.move(ent, &self.client_request_in, &self._client_request_sending);
+                try self.reg.set(ent, self.coll(.client_request_in), StreamId, .{ .id = @intCast(stream_id) });
+                try self.reg.move(ent, self.coll(.client_request_in), self.coll(._client_request_sending));
             }
         }
 
@@ -5599,12 +5755,12 @@ pub fn H2(comptime opts: Options) type {
             for (entities, sessions, req_hdrs, req_bodies, io_results) |ent, sess, rh, rb, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
                     continue;
                 };
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
                     continue;
                 }
 
@@ -5613,13 +5769,13 @@ pub fn H2(comptime opts: Options) type {
                 const nv_count: usize = @as(usize, rh.count);
                 if (nv_count == 0) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
                     continue;
                 }
 
                 const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
                     continue;
                 };
                 defer self.allocator.free(nva_slice);
@@ -5652,7 +5808,7 @@ pub fn H2(comptime opts: Options) type {
                     if (rb.data != null and rb.len > 0) {
                         body_data_ptr = BodyData.create(self.allocator, rb.data.?, rb.len) orelse {
                             io_res.err = -1;
-                            try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                            try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
                             continue;
                         };
                         data_prd.source = .{ .ptr = @ptrCast(body_data_ptr) };
@@ -5673,14 +5829,14 @@ pub fn H2(comptime opts: Options) type {
                 if (stream_id < 0) {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
                     continue;
                 }
 
                 const stream = Stream.create(sess.entity, self.allocator) orelse {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
                     continue;
                 };
                 stream.entity = ent;
@@ -5693,8 +5849,8 @@ pub fn H2(comptime opts: Options) type {
                 _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
                 if (getConn(self, sess.entity)) |cp| cp.open_streams += 1;
 
-                try self.reg.set(ent, &self.client_stream_request_in, StreamId, .{ .id = @intCast(stream_id) });
-                try self.reg.move(ent, &self.client_stream_request_in, &self.client_stream_data_out);
+                try self.reg.set(ent, self.coll(.client_stream_request_in), StreamId, .{ .id = @intCast(stream_id) });
+                try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_stream_data_out));
             }
         }
 
@@ -5713,17 +5869,17 @@ pub fn H2(comptime opts: Options) type {
             for (entities, sessions, sids, req_bodies, io_results) |ent, sess, sid, *rb, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_data_in), self.coll(.client_response_out));
                     continue;
                 };
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_data_in), self.coll(.client_response_out));
                     continue;
                 }
 
                 if (rb.data == null or rb.len == 0) {
-                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_stream_data_out);
+                    try self.reg.move(ent, self.coll(.client_stream_data_in), self.coll(.client_stream_data_out));
                     continue;
                 }
 
@@ -5733,7 +5889,7 @@ pub fn H2(comptime opts: Options) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_data_in), self.coll(.client_response_out));
                     continue;
                 }
 
@@ -5747,7 +5903,7 @@ pub fn H2(comptime opts: Options) type {
 
                 _ = c.nghttp2_session_resume_data(ng_session, s.ng_stream_id);
 
-                try self.reg.move(ent, &self.client_stream_data_in, &self._client_stream_data_sending);
+                try self.reg.move(ent, self.coll(.client_stream_data_in), self.coll(._client_stream_data_sending));
             }
         }
 
@@ -5765,12 +5921,12 @@ pub fn H2(comptime opts: Options) type {
             for (entities, sessions, sids, io_results) |ent, sess, sid, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_close_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_close_in), self.coll(.client_response_out));
                     continue;
                 };
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_close_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_close_in), self.coll(.client_response_out));
                     continue;
                 }
 
@@ -5780,14 +5936,14 @@ pub fn H2(comptime opts: Options) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try self.reg.move(ent, &self.client_stream_close_in, &self.client_response_out);
+                    try self.reg.move(ent, self.coll(.client_stream_close_in), self.coll(.client_response_out));
                     continue;
                 }
 
                 stream.?.stream_eof = true;
                 _ = c.nghttp2_session_resume_data(ng_session, stream.?.ng_stream_id);
 
-                try self.reg.move(ent, &self.client_stream_close_in, &self._client_stream_data_sending);
+                try self.reg.move(ent, self.coll(.client_stream_close_in), self.coll(._client_stream_data_sending));
             }
         }
     };

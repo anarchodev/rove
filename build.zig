@@ -1097,6 +1097,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     h2_echo_fat_mod.addImport("rove-h2", h2_mod);
+    h2_echo_fat_mod.addImport("rove", rove_mod);
     h2_echo_fat_mod.link_libc = true;
     h2_echo_fat_mod.linkSystemLibrary("nghttp2", .{});
     h2_echo_fat_mod.linkSystemLibrary("ssl", .{});
