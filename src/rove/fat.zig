@@ -1604,7 +1604,8 @@ test "getAny and moveAny — candidate-tuple compat over fat storage" {
     const e = try reg.create(&a);
     try reg.set(e, &a, Fdish, .{ .fd = 6 });
 
-    try testing.expectEqual(@as(i32, 6), (try reg.getAny(e, .{ &a, &b }, Fdish)).fd);
+    // Every candidate must carry T at comptime, as under the archetype.
+    try testing.expectEqual(@as(i32, 6), (try reg.getAny(e, .{ &a, &dst }, Fdish)).fd);
     try testing.expectError(error.WrongCollection, reg.getAny(e, .{&b}, Position));
 
     // moveAny is total: b → dst would DROP nothing even though b's row
