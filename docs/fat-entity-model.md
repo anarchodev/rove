@@ -125,6 +125,21 @@ Zero payload errors either side across ~10^6 round-trips and ~5x10^5
 churned connections. Absolute rates are box-load-dependent; only the
 within-run comparison is meaningful.
 
+**The conclusion the measurements support:** at rove's scale — thousands
+of entities, components kept small because kernel-visible and large data
+live behind pointers anyway — *move cost was never the binding
+constraint*. An operation's ECS traffic is ~100ns inside even the
+thinnest 7µs echo request; iteration density is the term that actually
+scales, and both models share it. The row-subset discipline priced
+itself as speed (keep rows tight so moves stay cheap) but was actually
+buying safety (don't silently lose data). With safety provided
+structurally instead, transitions are free to spend on clarity: as many
+phases, seams, and per-resource close collections as the state machine
+wants — each hop costs ~10ns, and each buys a place where a system with
+a full view owns one step. The regime where this reverses is the one
+rove is not in: per-tick moves over game-engine-scale populations, or
+large inline components.
+
 ## Relationship to coll-enum
 
 The declared-collection-id work (merged into this branch) composes with the
