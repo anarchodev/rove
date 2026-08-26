@@ -619,6 +619,62 @@ pub fn capabilityLiteralBody() []const u8 {
     }
 }
 
+/// Capabilities in the CUSTOMER set only. A baked `__system/` activation's
+/// template (`SYSTEM_CAPABILITY_NAMES`) omits them:
+///
+///   - `kv` — a baked module holds ONE kv, the storage-rooted `rootKv`
+///     (#848), and spells the user root explicitly when it wants a row a
+///     handler named. Handing both spellings to one module is the
+///     writer/reader prefix-depth hazard: the same row nameable at two
+///     depths, and the mismatch surfaces as a scan that silently misses.
+///
+/// Every name here must also appear in `CAPABILITY_NAMES` — the comptime
+/// derivation below fails the build otherwise, so this list cannot drift
+/// into naming a capability that does not exist.
+pub const CUSTOMER_ONLY_CAPABILITY_NAMES = [_][]const u8{
+    "kv",
+};
+
+/// The capability set a baked `__system/` activation receives instead of the
+/// customer one — selected by code origin when the activation object is
+/// assembled (`package-isolation.md`: which set an activation holds is
+/// decided at assembly; not installing is the denial). Derived, not
+/// restated: `CAPABILITY_NAMES` minus `CUSTOMER_ONLY_CAPABILITY_NAMES`.
+pub const SYSTEM_CAPABILITY_NAMES = blk: {
+    var count: usize = 0;
+    for (CAPABILITY_NAMES) |n| {
+        if (!nameInList(n, &CUSTOMER_ONLY_CAPABILITY_NAMES)) count += 1;
+    }
+    // Every customer-only name must subtract a real member, or the list
+    // names a capability that does not exist.
+    if (count != CAPABILITY_NAMES.len - CUSTOMER_ONLY_CAPABILITY_NAMES.len)
+        @compileError("CUSTOMER_ONLY_CAPABILITY_NAMES has a name not in CAPABILITY_NAMES");
+    var out: [count][]const u8 = undefined;
+    var i: usize = 0;
+    for (CAPABILITY_NAMES) |n| {
+        if (!nameInList(n, &CUSTOMER_ONLY_CAPABILITY_NAMES)) {
+            out[i] = n;
+            i += 1;
+        }
+    }
+    break :blk out;
+};
+
+fn nameInList(name: []const u8, list: []const []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// `SYSTEM_CAPABILITY_NAMES` as a JS object-literal body, the system-set
+/// twin of `capabilityLiteralBody`.
+pub fn systemCapabilityLiteralBody() []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (SYSTEM_CAPABILITY_NAMES) |n| out = out ++ n ++ ", ";
+        return out;
+    }
+}
+
 /// Members of the activation object that are sourced from `request` rather
 /// than from a global — the three effects that hid on a documented data
 /// shape (`docs/architecture/package-isolation.md` §3.4):
