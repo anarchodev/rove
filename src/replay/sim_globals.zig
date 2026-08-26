@@ -42,6 +42,11 @@ const SYSTEM_SHIM = @embedFile("js/system_recorders.js");
 // `addSimGlobalEmbeds` — they live in src/js/globals/, outside this module's
 // package, so `@embedFile` takes the import NAME, not a path).
 pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
+    // The factory registry, the same shape the worker's installStatic
+    // creates (`_factories.js`): a factory-shaped shim registers itself
+    // here instead of assigning a global, and the invoker at the end of
+    // this prelude calls it with the caps a platform shim receives.
+    "\n;globalThis.__rove_factories = {};" ++
     "\n;" ++ @embedFile("g_crypto") ++
     "\n;" ++ @embedFile("g_http") ++
     "\n;" ++ @embedFile("g_request") ++
@@ -62,19 +67,41 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     // `schedule` (coerces `{at}`/`{in}` through `time`; installs the PRIVATE
     // `_system.sched`, NOT a customer global — that's the @rewind/schedule
     // package, resolved per-request like the other lifted libs) → `webhook`
-    // (captures `_system.http` + `_system.sched` at eval — so it MUST land
-    // before the `delete globalThis._system` below). `schedule.js` is
-    // self-IIFE'd (freeze-safe as embedded); `webhook.js` carries top-level
-    // `const`s (`sysHttp`/`sysSched`), so wrap it to keep those lexicals out
-    // of the base-snapshot's global lexical scope (the freeze corrupts on bare
-    // top-level bindings — see globals-shim-iife-required).
+    // (a factory: it receives `http`/`sched`/`kv`/`formats` from the
+    // invoker below rather than capturing `_system.*` at eval, so eval
+    // order no longer constrains it; the registration itself has no
+    // top-level bindings, so it is freeze-safe embedded bare).
+    // `schedule.js` is self-IIFE'd (freeze-safe as embedded).
     "\n;" ++ @embedFile("g_time") ++
     "\n;" ++ @embedFile("g_schedule") ++
-    "\n;(function(){\n" ++ @embedFile("g_webhook") ++ "\n})();" ++
+    "\n;" ++ @embedFile("g_webhook") ++
     // `blob` — real shim over the `_system.blob` recorder + `_system.http` (PUT /
     // compose) + the pure-JS streaming sha256; `blob.get` composes on the base
     // `after.fetch`, so it lands after `g_after`. Its recipe rows / owed markers
     // are ordinary kv writes. IIFE-wrapped upstream (`(() => { … })()`), so it
     // captures `_system` before the delete below and stays freeze-safe.
     "\n;" ++ @embedFile("g_blob") ++
+    // Invoke the registered factories — after every shim, before the
+    // `_system` delete, mirroring the worker's `_factories_invoke.js` with
+    // one sim-shaped difference: the kv recorder is EPILOGUE-local (per
+    // run), so `kv` is a call-time forwarder to whatever `globalThis.kv`
+    // the epilogue has installed — exactly the late binding the ambient
+    // reference used to provide. The other caps are the base recorders.
+    "\n;(function () {" ++
+    "\n  const reg = globalThis.__rove_factories;" ++
+    "\n  const caps = {" ++
+    "\n    http: _system.http," ++
+    "\n    sched: _system.sched," ++
+    "\n    kv: {" ++
+    "\n      get: (k) => globalThis.kv.get(k)," ++
+    "\n      set: (k, v) => globalThis.kv.set(k, v)," ++
+    "\n      delete: (k) => globalThis.kv.delete(k)," ++
+    "\n      prefix: (p, c, l) => globalThis.kv.prefix(p, c, l)," ++
+    "\n    }," ++
+    "\n    formats: __rove.formats," ++
+    "\n  };" ++
+    "\n  for (const name of Object.keys(reg)) {" ++
+    "\n    globalThis[name] = reg[name](caps);" ++
+    "\n  }" ++
+    "\n})();" ++
     "\n;delete globalThis._system;\n";

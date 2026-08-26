@@ -85,20 +85,47 @@ PIECES = [
     (ROVE / "src" / "js" / "globals" / "stream.js", False),
     (ROVE / "src" / "js" / "globals" / "next.js", False),
     # The durable verbs: `time` (shared coercion) -> `schedule` (installs
-    # the private `_system.sched`) -> `webhook` (captures `_system.http`
-    # and `_system.sched` at eval). `webhook.js` carries top-level `const`
-    # bindings, so it is IIFE-wrapped here to keep those lexicals out of
-    # the base snapshot's global lexical scope — a bare top-level binding
-    # corrupts the freeze (globals-shim-iife-required).
+    # the private `_system.sched`) -> `webhook` (a FACTORY: it receives its
+    # capabilities from the invoker below rather than capturing `_system.*`
+    # at eval; the registration has no top-level bindings, so it is
+    # freeze-safe embedded bare).
     (ROVE / "src" / "js" / "globals" / "time.js", False),
     (ROVE / "src" / "js" / "globals" / "schedule.js", False),
-    (ROVE / "src" / "js" / "globals" / "webhook.js", True),
+    (ROVE / "src" / "js" / "globals" / "webhook.js", False),
     # `blob` composes on the base `after.fetch`, so it lands after it.
     (ROVE / "src" / "js" / "globals" / "blob.js", False),
 ]
 
+# The factory registry precedes the shims, and the invoker follows them —
+# the same pair the worker's installStatic evals (`_factories.js` /
+# `_factories_invoke.js`) and the CLI sim's prelude splices
+# (sim_globals.zig). `kv` is a call-time forwarder: the arena's kv binding
+# is engine-installed per shell, and the forwarder preserves the late
+# binding the ambient reference used to provide.
+REGISTRY = "\n;globalThis.__rove_factories = {};\n"
+INVOKER = """
+;(function () {
+  const reg = globalThis.__rove_factories;
+  const caps = {
+    http: _system.http,
+    sched: _system.sched,
+    kv: {
+      get: (k) => globalThis.kv.get(k),
+      set: (k, v) => globalThis.kv.set(k, v),
+      delete: (k) => globalThis.kv.delete(k),
+      prefix: (p, c, l) => globalThis.kv.prefix(p, c, l),
+    },
+    formats: __rove.formats,
+  };
+  for (const name of Object.keys(reg)) {
+    globalThis[name] = reg[name](caps);
+  }
+})();
+"""
+
 # Evaled last: `_system` is the shims' private construction material, not
-# customer surface. Every shim above captured what it needs in a closure.
+# customer surface. Every shim above captured what it needs in a closure —
+# or, for a factory, received it from the invoker.
 EPILOGUE = "\n;delete globalThis._system;\n"
 
 # The handler-facing RULES are not in this prelude any more: the arena's
@@ -199,12 +226,13 @@ def caps_block() -> str:
 
 
 def build() -> str:
-    parts = [BANNER]
+    parts = [BANNER, REGISTRY]
     for path, iife in PIECES:
         src = path.read_text(encoding="utf-8")
         rel = path.relative_to(ROVE)
         parts.append(f"\n// ── {rel} ──\n;")
         parts.append(f"(function () {{\n{src}\n}})();" if iife else src)
+    parts.append(INVOKER)
     parts.append(caps_block())
     parts.append(EPILOGUE)
     return "".join(parts)
