@@ -51,8 +51,29 @@ io with components io has never heard of.
       alone; the materialization knob's zero position.
 - [x] Built FLAT. The declared-world interface (components +
       collections tables, table-position ids, registry-owned storage)
-      remains the intended successor — see the model doc discussion;
-      the threading is its sanctioned fallback and is subsumed by it.; when axes (item 4) land,
+      remains the intended successor; the threading is its sanctioned
+      fallback and is subsumed by it.
+- [ ] **DECIDED (2026-08-26): the `rove_world` root pattern is the
+      intended endpoint** — the std_options idiom: each binary's root
+      module declares `pub const rove_world = rove.World(.{ .parts =
+      ... })` once; rove exposes `declared_world` via @import("root")
+      with null fallback; layers consult it instead of threading.
+      Rules that make it sound: (1) the root declares TYPES, main and
+      each worker thread construct VALUES — one world type per program,
+      N registries of it (prod's 8 shared-nothing workers are 8 values
+      of one type; a registry VALUE at root scope is forbidden and
+      corrupting); (2) `.registry_model = .fat` stays on
+      instantiations as intent, and fat-without-a-root-world is a
+      compile error — no silent mode flip; (3) parts must be pure data
+      declared outside the layer type functions (no value recursion
+      through @import("root")); (4) library test builds see no world
+      (their root is the library file) and default archetype; explicit
+      World(...) construction remains load-bearing underneath — tests'
+      mini-worlds and any heterogeneous-worlds binary use it directly;
+      (5) heterogeneous worlds in one binary are out of scope by
+      construction (rove ships separate binaries). Lands naturally
+      WITH the declared-world tables, since those make parts pure data
+      anyway.; when axes (item 4) land,
       the contribution becomes per-axis and the re-grouping is
       mechanical. Do not block the h2 port on axes.
 
