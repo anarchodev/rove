@@ -60,4 +60,5 @@ test {
     _ = registry_mod;
     _ = fat_mod;
     _ = world_mod;
+    _ = @import("axes_spike.zig");
 }
