@@ -34,9 +34,7 @@ const guards = @import("rove-binding").guards;
 /// key they have never typed and cannot search for. The root is invisible to a
 /// handler everywhere else; a diagnostic is not the place to leak it.
 fn named(k: []const u8) []const u8 {
-    const root = guards.reserved.USER_KEY_ROOT;
-    if (!std.mem.startsWith(u8, k, root)) return k;
-    return k[root.len..];
+    return guards.reserved.userNamedKey(k);
 }
 
 /// The C ABI struct (`arena_replay_host`). Field order + signatures mirror the

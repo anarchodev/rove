@@ -1190,7 +1190,7 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
     try testing.expectEqual(qjs.JS_ENGINE_VERSION, rs.js_engine_version & qjs.ENGINE_VERSION_MASK);
     var n_reads: usize = 0;
     for (rs.kv.entries.items) |e| {
-        if (std.mem.eql(u8, e.kv.key, "n")) n_reads += 1;
+        if (std.mem.eql(u8, e.kv.key, "_user/n")) n_reads += 1;
     }
     try testing.expectEqual(@as(usize, 1), n_reads);
     // The committed value is the retry's single increment.
@@ -2040,22 +2040,22 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
 
     const e0 = readset.kv.entries.items[0].kv;
     try testing.expectEqual(tape_mod.KvOp.get, e0.op);
-    try testing.expectEqualStrings("seeded", e0.key);
+    try testing.expectEqualStrings("_user/seeded", e0.key);
     try testing.expectEqualStrings("v1", e0.value);
     try testing.expectEqual(tape_mod.KvOutcome.ok, e0.outcome);
 
     const e1 = readset.kv.entries.items[1].kv;
     try testing.expectEqual(tape_mod.KvOp.get, e1.op);
-    try testing.expectEqualStrings("missing", e1.key);
+    try testing.expectEqualStrings("_user/missing", e1.key);
     try testing.expectEqual(tape_mod.KvOutcome.not_found, e1.outcome);
 
     // Read-taping invariant: the writeset still records the writes so the
     // dispatch path can replicate + apply them. Tape minimization
     // is purely a capture-side compression.
     try testing.expectEqual(@as(usize, 2), ws.ops.items.len);
-    // The WRITESET holds resolved keys — it rides the raft entry, and the
-    // entry is what every node applies. The tape above holds the names the
-    // handler used. Both spellings, each where it belongs.
+    // The WRITESET and the TAPE both hold resolved keys — the writeset rides
+    // the raft entry, and the tape's read entries feed replay overlays
+    // verbatim, so the two agree with the store by construction.
     try testing.expect(ws.containsKey(uk("new")));
     try testing.expect(ws.containsKey(uk("seeded")));
 }
@@ -2185,7 +2185,7 @@ test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (
     try testing.expectEqual(@as(usize, 1), rs2.kv.entries.items.len);
     const e = rs2.kv.entries.items[0].kv;
     try testing.expectEqual(tape_mod.KvOp.get, e.op);
-    try testing.expectEqualStrings("count", e.key);
+    try testing.expectEqualStrings("_user/count", e.key);
     try testing.expectEqualStrings("1", e.value);
     try testing.expectEqual(tape_mod.KvOutcome.ok, e.outcome);
 

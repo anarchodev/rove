@@ -141,7 +141,16 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // rows (so a replay-time re-scan finds them). Closed world: a not_found read
     // is simply omitted (the key isn't in the map → not_found on replay). No
     // exact prefix-rows are kept: replay reconstructs the scan from the map
-    // (+ the handler's own re-executed writes), honoring cursor/limit. ──
+    // (+ the handler's own re-executed writes), honoring cursor/limit.
+    //
+    // The tape's storage-modeling keys are STORE-spelled (they carry the user
+    // root); a world is AUTHORED in the handler's spelling, and this transcode
+    // is a presentation seam — the person reading the fixture wrote
+    // `kv.get("orders/42")`. So every key crossing into the world strips the
+    // root (`reserved.userNamedKey`); seeding re-resolves it
+    // (`kv_binding.storeKey`), and the round trip is exact because the strip
+    // and the resolve are each other's inverse. Refusal keys pass through:
+    // they are taped NAMED already (a verdict on what the handler named). ──
     var seen = std.StringHashMapUnmanaged(void){};
     var kv = std.ArrayList(KvPair){};
     // Guard refusals the capture recorded (KvOutcome.refused; value = the
@@ -166,8 +175,9 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     }){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
-            if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
-            try seen.put(a, e.key, {});
+            const nk = reserved.userNamedKey(e.key);
+            if (seen.contains(nk)) continue; // re-read / post-write — overlay reproduces it
+            try seen.put(a, nk, {});
             switch (e.outcome) {
                 // A SEALED value cannot travel into the world at all: the
                 // world is JSON, and JSON strings are Unicode text, so the
@@ -179,13 +189,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
                 // transcode it into different bytes.
                 .ok => if (reserved.isSealedValue(e.value)) try elided.append(a, .{
                     .op = "get",
-                    .key = e.key,
+                    .key = nk,
                     .bytes = e.value.len,
                     .sealed = true,
-                }) else try kv.append(a, .{ .key = e.key, .value = e.value }),
+                }) else try kv.append(a, .{ .key = nk, .value = e.value }),
                 .elided => try elided.append(a, .{
                     .op = "get",
-                    .key = e.key,
+                    .key = nk,
                     .bytes = std.fmt.parseInt(u64, e.value, 10) catch 0,
                 }),
                 .not_found, .err, .refused => {}, // omit — closed world resolves to not_found
@@ -197,14 +207,15 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
             if (e.outcome == .elided) {
                 try elided.append(a, .{
                     .op = "prefix",
-                    .key = e.key,
+                    .key = reserved.userNamedKey(e.key),
                     .bytes = std.fmt.parseInt(u64, e.value, 10) catch 0,
                 });
                 continue;
             }
             for (e.results) |row| {
-                if (seen.contains(row.key)) continue;
-                try seen.put(a, row.key, {});
+                const rk = reserved.userNamedKey(row.key);
+                if (seen.contains(rk)) continue;
+                try seen.put(a, rk, {});
                 // One sealed row refuses the whole PAGE, not just itself: a
                 // page short by a row replays as a complete, shorter one,
                 // which is the all-or-nothing rule the elided page above
@@ -212,13 +223,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
                 if (reserved.isSealedValue(row.value)) {
                     try elided.append(a, .{
                         .op = "prefix",
-                        .key = e.key,
+                        .key = reserved.userNamedKey(e.key),
                         .bytes = row.value.len,
                         .sealed = true,
                     });
                     break;
                 }
-                try kv.append(a, .{ .key = row.key, .value = row.value });
+                try kv.append(a, .{ .key = rk, .value = row.value });
             }
         },
         .set, .delete => {

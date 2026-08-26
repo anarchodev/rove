@@ -19,7 +19,7 @@
 const std = @import("std");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 9; // lockstep-asserted against src/tape/root.zig
+pub const VERSION: u16 = 10; // lockstep-asserted against src/tape/root.zig
 /// The oldest layout this reader still understands.
 ///
 /// A range is only sound while every version in it can be told apart by

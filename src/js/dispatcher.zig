@@ -813,17 +813,20 @@ fn finishResponse(
                 .put => |p| p.key,
                 .delete => |del| del.key,
             };
-            // Recorded in the spelling the handler used. The writeset holds
-            // resolved keys; the kv tape beside this holds named ones, and the
-            // seam scan intersects the two — so a write recorded at the store's
-            // depth intersects nothing and every seam reads as no-interference.
+            // Recorded as STORED, the writeset's own spelling — the kv tape
+            // beside this holds store-spelled keys too, and the seam scan
+            // intersects the two, so both sides carry the root and the
+            // intersection is exact. The seam's RENDER strips it
+            // (`reserved.userNamedKey`); recording stripped here and
+            // intersecting a mixed pair is the depth split that reads as
+            // no-interference.
             //
             // A write outside the user root is engine bookkeeping the handler
             // did not make (the `_sub/dirty/` marker the write path injects),
             // and it has no place in a blame view of what this activation
             // touched.
             if (!std.mem.startsWith(u8, key, reserved.USER_KEY_ROOT)) continue;
-            rs.appendWriteKey(key[reserved.USER_KEY_ROOT.len..]) catch break;
+            rs.appendWriteKey(key) catch break;
         }
     }
 

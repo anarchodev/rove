@@ -39,6 +39,7 @@ const log_mod = @import("rove-log");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const seam_mod = @import("seam.zig");
+const reserved = @import("rove-reserved");
 const body_ref_mod = @import("body_ref.zig");
 const indexer_mod = @import("indexer.zig");
 const metrics_mod = @import("metrics.zig");
@@ -1137,15 +1138,19 @@ fn renderSeamJson(
             try writeJsonString(w, cand.outcome);
             try w.writeAll(",\"activation\":");
             try writeJsonString(w, cand.activation);
+            // The seam intersects STORE-spelled keys (the kv tape and the
+            // write-key list both carry the user root); the reader wrote
+            // `kv.get("orders/42")`, so the render is where the root strips —
+            // the presentation-seam half of `reserved.userNamedKey`'s rule.
             try w.writeAll(",\"wrote\":[");
             for (wrote.keys, 0..) |k, i| {
                 if (i > 0) try w.writeAll(",");
-                try writeJsonString(w, k);
+                try writeJsonString(w, reserved.userNamedKey(k));
             }
             try w.writeAll("],\"read\":[");
             for (read.keys, 0..) |k, i| {
                 if (i > 0) try w.writeAll(",");
-                try writeJsonString(w, k);
+                try writeJsonString(w, reserved.userNamedKey(k));
             }
             try w.print("],\"keys_truncated\":{}}}", .{wrote.truncated or read.truncated});
         }

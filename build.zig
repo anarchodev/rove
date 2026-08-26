@@ -624,6 +624,10 @@ pub fn build(b: *std.Build) void {
     keyring_mod.addImport("raft-kv", kv_mod);
     keyring_mod.addImport("rove-reserved", reserved_mod);
     keyring_mod.addImport("rove-reserve", reserve_mod);
+    // The log-server's seam view renders store-spelled keys back in the
+    // handler's spelling (`reserved.userNamedKey`); wired here because
+    // rove-reserved is declared below rove-log-server.
+    log_server_mod.addImport("rove-reserved", reserved_mod);
     const keyring_tests = b.addTest(.{ .root_module = keyring_mod });
     test_step.dependOn(&b.addRunArtifact(keyring_tests).step);
 

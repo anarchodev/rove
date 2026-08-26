@@ -203,6 +203,13 @@ pub const WorkerKv = struct {
     /// re-deciding — an old tape stays faithful to the rules that were live
     /// when it was cut. Refusals fold NOTHING into the digest (a refused
     /// write never happened), which is already true in every engine.
+    ///
+    /// Keyed by the NAMED spelling — the one exception to the tape's
+    /// store-spelled keys, and a principled one: a refusal is a verdict on
+    /// what the handler NAMED, judged and replayed BEFORE the key resolves
+    /// (a key the guards refuse as over-long has no resolved spelling at
+    /// all). It models no stored row and feeds no overlay; its only consumer
+    /// is `tapedRefusal`, which the binding consults with the named key.
     pub fn recordRefusal(self: WorkerKv, op: binding.WriteOp, key: []const u8, refusal: guards.Refusal) void {
         const state = self.state;
         if (state.readset) |rs| {
@@ -224,9 +231,13 @@ pub const WorkerKv = struct {
     /// folds them regardless (see the fold header above).
     pub fn get(self: WorkerKv, k: binding.Key) binding.GetResult {
         const state = self.state;
-        // Storage and the writeset take the resolved key; the tape and the
-        // digest take the one the handler named, so a tape stays readable
-        // across a change of root.
+        // Storage, the writeset, and the TAPE take the resolved key — the
+        // tape's read entries are the store's stand-in during replay, and an
+        // overlay fed from them must be keyed the way the store is (a
+        // named-keyed tape forces every feed to restate the root, which is
+        // the writer/reader prefix-depth split). Only the digest and the
+        // matching surfaces take the one the handler named; a RENDERED tape
+        // key is stripped at the presentation seam (`reserved.userNamedKey`).
         const key = k.stored;
         // Since `ws_base`, not the whole writeset: the writeset is shared by
         // the batch, and a key an earlier activation in the batch wrote is a
@@ -236,7 +247,7 @@ pub const WorkerKv = struct {
 
         const value = state.kv.get(key) catch |err| switch (err) {
             error.NotFound => {
-                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.named, "", .not_found) catch {};
+                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.stored, "", .not_found) catch {};
                 foldRead(state, k.named, false, "");
                 return .absent;
             },
@@ -244,7 +255,7 @@ pub const WorkerKv = struct {
                 // A read never throws in prod: the storage error parks on the
                 // dispatch state and the handler sees absent.
                 state.pending_kv_error = err;
-                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.named, "", .err) catch {};
+                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.stored, "", .err) catch {};
                 return .absent;
             },
         };
@@ -253,7 +264,7 @@ pub const WorkerKv = struct {
         // whole scheme: if the value were opened before this, the tape
         // would hold plaintext and destroying the key would erase
         // everything except the copy replay keeps.
-        if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.named, value, .ok) catch {};
+        if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.stored, value, .ok) catch {};
 
         // Then open it, and fold + return the PLAINTEXT. The digest must
         // be over the same bytes in every engine, and the offline engines
@@ -522,7 +533,7 @@ pub const WorkerKv = struct {
             // Capture the failure path too — replay needs to surface the
             // same null return, otherwise a defensive `if (page === null)`
             // branch in the handler would diverge.
-            if (state.readset) |rs| rs.kv.appendKvPrefix(req.prefix.named, req.cursor.named, limit, &.{}, .err) catch {};
+            if (state.readset) |rs| rs.kv.appendKvPrefix(req.prefix.stored, req.cursor.stored, limit, &.{}, .err) catch {};
             return null;
         };
 
@@ -548,13 +559,16 @@ pub const WorkerKv = struct {
             // refactored read of such a key can't be served a stale write value.
             var np: usize = 0;
             for (scan.entries) |e| {
-                // The writeset holds STORED keys; the tape holds the spelling
-                // the handler paged with, so it survives a change of root.
+                // Row keys ride the tape as STORED — the same spelling the
+                // writeset and the store use, so the three agree and a replay
+                // overlay serves the rows verbatim. The handler-visible
+                // spelling is the binding's to produce (`visibleKey`), and
+                // the digest's rows-fold uses it; the tape does not.
                 if (state.writeset.containsKeySince(state.ws_base, e.key)) continue;
-                pairs[np] = .{ .key = req.visible(e.key), .value = e.value };
+                pairs[np] = .{ .key = e.key, .value = e.value };
                 np += 1;
             }
-            rs.kv.appendKvPrefix(req.prefix.named, req.cursor.named, limit, pairs[0..np], .ok) catch {};
+            rs.kv.appendKvPrefix(req.prefix.stored, req.cursor.stored, limit, pairs[0..np], .ok) catch {};
         }
 
         // Opened AFTER the tape, for the reason `get` states: the tape

@@ -146,8 +146,9 @@ pub const OfflineKv = struct {
 
     /// Authored worlds have no release to scope `_config/` by, so a seeded
     /// key reads back exactly as the world wrote it. A captured world does
-    /// not need one either: its reads come from the tape, which recorded the
-    /// key the handler named.
+    /// not need one either: this binding is `.user`-rooted, where the config
+    /// resolution does not apply — handler-named config is the narrower
+    /// `config` capability's to serve, over a `.raw` binding.
     pub fn configScope(_: OfflineKv) u64 {
         return 0;
     }

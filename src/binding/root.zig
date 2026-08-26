@@ -91,11 +91,15 @@
 //! ```
 //!
 //! `Key` carries both spellings because a rooted binding has two, and the rule
-//! for choosing is uniform: **`named` for anything the caller named or
-//! observes** (tape, digest, trigger and subscription matching, harness
-//! assertions), **`stored` for anything reaching storage or the wire** (the
-//! store, the writeset, the entry byte budget). Resolving once here rather than
-//! in each delegate is what keeps three engines from drifting into three
+//! for choosing is a LAYER rule: **`stored` for everything at or below
+//! persistence** (the store, the writeset, the entry byte budget, and the kv
+//! TAPE — its storage-modeling entries feed replay overlays verbatim, so they
+//! are keyed the way the store is), **`named` for the handler surface and
+//! what derives from it** (the digest, trigger and subscription matching,
+//! refusal verdicts and their tape entries, harness assertions). Anything
+//! RENDERED for the person who named the key strips the root at the
+//! presentation seam (`reserved.userNamedKey`). Resolving once here rather
+//! than in each delegate is what keeps three engines from drifting into three
 //! resolutions.
 //!
 //! `put`/`del` take the context because an engine's post-write machinery may
@@ -136,16 +140,20 @@ pub const WriteOp = enum { set, delete };
 /// consumer wants a specific one.
 ///
 /// The split is not a detail of the rooting — it is the rule for using it, and
-/// it is the same rule everywhere: **anything the caller named or observes uses
-/// `named`; anything that reaches storage or the wire uses `stored`.**
+/// it is a LAYER rule: **everything at or below persistence uses `stored`;
+/// the handler surface and what derives from it uses `named`.**
 ///
-///   `named`   tape, interaction digest, trigger matching, subscription
-///             matching, refusal messages, harness assertions — all of these
-///             are about a key the handler chose, and a trigger registered at
-///             `orders/` must fire for `kv.set("orders/1")` whatever root the
-///             row lands under.
-///   `stored`  the store, the writeset (it rides the raft entry), and the
-///             entry byte budget.
+///   `named`   interaction digest, trigger matching, subscription matching,
+///             refusal messages and refusal tape entries, harness assertions
+///             — all of these are about a key the handler chose, and a
+///             trigger registered at `orders/` must fire for
+///             `kv.set("orders/1")` whatever root the row lands under.
+///   `stored`  the store, the writeset (it rides the raft entry), the entry
+///             byte budget, and the TAPE's storage-modeling entries (gets,
+///             prefix requests and rows) — the tape is the store's stand-in
+///             during replay, so its keys are the store's. A tape key
+///             rendered for a person strips the root at the presentation
+///             seam (`reserved.userNamedKey`).
 ///
 /// Passing both rather than resolving inside each delegate keeps ONE
 /// implementation of the resolution — three delegates each doing their own is
@@ -164,8 +172,10 @@ pub const Key = struct {
 ///
 /// A scan is the asymmetry a get/set pair does not have: the prefix and cursor
 /// go DOWN resolved, and row keys come back UP in whatever form storage holds.
-/// So a delegate that records the scan — for a tape, a digest, or a harness
-/// assertion — has to un-root each row itself, and `visible` is how.
+/// The tape wants them exactly so (store-spelled, like every storage-modeling
+/// entry); a delegate that surfaces the scan in the CALLER's spelling — the
+/// digest's rows-fold, a harness assertion — has to un-root each row itself,
+/// and `visible` is how.
 pub const Scan = struct {
     prefix: Key,
     cursor: Key,

@@ -179,6 +179,36 @@ pub const USER_KEY_ROOT = "_user/";
 /// the same way, so a buffer sized to this holds either.
 pub const STORAGE_KEY_MAX = KV_KEY_MAX + @max(USER_KEY_ROOT.len, 17);
 
+/// A STORE-spelled key back in the spelling the handler named — the one
+/// inverse of the root, for the presentation seams.
+///
+/// Everything at or below persistence carries the root: the store, the
+/// writeset, and the kv TAPE (whose storage-modeling entries feed replay
+/// overlays verbatim, so they are keyed the way the store is). The named
+/// spelling exists only at the handler surface, in matching and the digest,
+/// and in anything RENDERED for the person who wrote `kv.get("orders/42")` —
+/// a seam view, a divergence message, a transcoded world. Those render
+/// through this function, so the root never leaks into prose and there is
+/// exactly one strip per seam instead of a per-consumer spelling rule.
+///
+/// A key outside the root passes through unchanged: engine keys (a system
+/// activation's raw writes, the offline harness's `__rove_store/` facade)
+/// have no named spelling other than themselves.
+pub fn userNamedKey(stored: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, stored, USER_KEY_ROOT)) return stored;
+    return stored[USER_KEY_ROOT.len..];
+}
+
+test "userNamedKey strips exactly the user root" {
+    try std.testing.expectEqualStrings("orders/42", userNamedKey("_user/orders/42"));
+    // The root does not nest: one strip is the whole inverse.
+    try std.testing.expectEqualStrings("_user/x", userNamedKey("_user/_user/x"));
+    // Engine keys and facade keys are their own spelling.
+    try std.testing.expectEqualStrings("_deploy/current", userNamedKey("_deploy/current"));
+    try std.testing.expectEqualStrings("__rove_store/r/x", userNamedKey("__rove_store/r/x"));
+    try std.testing.expectEqualStrings("", userNamedKey(""));
+}
+
 /// `key` is one a handler names in the config namespace.
 pub fn isConfigKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, CONFIG_PREFIX);
