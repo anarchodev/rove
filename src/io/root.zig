@@ -1877,6 +1877,41 @@ test "fat: the sweep ends a conn adopted by a collection io cannot name" {
     try testing.expectEqual(@as(u32, 0), upper.count);
 }
 
+test "fat: hand_off retirement parks the conn in conn_dead for the reaper" {
+    const FatIo = Io(.{ .registry_model = .fat, .on_retire = .hand_off });
+    var reg = try FatIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const io = FatIo.create(&reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer io.destroy();
+
+    const conn = try reg.create(&io.connections);
+    try reg.set(conn, &io.connections, Fd, .{ .fd = 2 });
+    _ = try reg.join(conn, &io.all_conns);
+    try reg.move(conn, &io.connections, &io.conn_closing);
+    try reg.flush();
+
+    try io.processConnClosing(); // posts the shutdown, gives up the slot
+    try io.processConnClosing(); // recv quiet — retires, but hands off
+    try reg.flush();
+
+    // Retired WITHOUT being destroyed: the composing layer owns the end.
+    try testing.expect(!reg.isStale(conn));
+    try testing.expect(reg.isInCollection(conn, &io.conn_dead));
+    try testing.expect(reg.inSet(conn, &io.all_conns));
+
+    // The sweep must not resurrect a handed-off conn into conn_closing.
+    io.shutdownAllConns();
+    try testing.expect(reg.isInCollection(conn, &io.conn_dead));
+}
+
 test "a connect target survives the swap-remove that reshuffles its neighbours" {
     // The bug this guards: two concurrent connects each handed the kernel
     // `&ConnectAddr.addr.any` — a pointer INTO the column — and swap-remove
