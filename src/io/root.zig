@@ -338,6 +338,13 @@ pub const IoOptions = struct {
 /// valued by position. The registry id is the variant's value plus one,
 /// because id 0 is the registry's free pool.
 pub fn CollEnum(comptime names: []const [:0]const u8) type {
+    // A registry id is one byte and 0 is the free pool, so every layer
+    // sharing a registry fits in 255 collections between them. Checked at
+    // the single point where a namespace is built: past the bound the tag
+    // type silently wraps and two collections alias, which resolves entities
+    // into the wrong one with no other symptom.
+    if (names.len > 255) @compileError("collection namespace exceeds the one-byte registry id: " ++
+        std.fmt.comptimePrint("{d}", .{names.len}) ++ " collections, 255 available");
     var fields: [names.len]std.builtin.Type.EnumField = undefined;
     for (names, 0..) |n, i| fields[i] = .{ .name = n, .value = i };
     return @Type(.{ .@"enum" = .{
