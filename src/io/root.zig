@@ -316,11 +316,6 @@ pub const Options = struct {
     read_row: type = Row(&.{}),
     write_row: type = Row(&.{}),
     connect: bool = false,
-    /// First registry collection id for this instance. io's collections
-    /// take `[id_base, id_base + COLLECTIONS.len)` in declaration order
-    /// (skipping the connect-only ones when `connect` is false), so the
-    /// layer above can build ONE enum whose values match these ids.
-    id_base: u8 = 1,
 };
 
 pub const IoOptions = struct {
@@ -339,7 +334,35 @@ pub const IoOptions = struct {
     reuseport: bool = false,
 };
 
+/// Build a collection namespace from a name list: one variant per name,
+/// valued by position. The registry id is the variant's value plus one,
+/// because id 0 is the registry's free pool.
+pub fn CollEnum(comptime names: []const [:0]const u8) type {
+    var fields: [names.len]std.builtin.Type.EnumField = undefined;
+    for (names, 0..) |n, i| fields[i] = .{ .name = n, .value = i };
+    return @Type(.{ .@"enum" = .{
+        .tag_type = u8,
+        .fields = &fields,
+        .decls = &.{},
+        .is_exhaustive = true,
+    } });
+}
+
+/// The names io registers, given whether the connect half is present.
+pub fn activeNames(comptime connect: bool) []const [:0]const u8 {
+    var out: []const [:0]const u8 = &.{};
+    for (COLLECTIONS) |c| {
+        if (c.connect_only and !connect) continue;
+        out = out ++ &[_][:0]const u8{c.name};
+    }
+    return out;
+}
+
 pub fn Io(comptime opts: Options) type {
+    // io numbers its collections off its OWN name list. A layer above that
+    // builds a wider namespace must place these names first and in this
+    // order so the two agree; rove-h2 asserts exactly that.
+    const Coll = CollEnum(activeNames(opts.connect));
     const conn_row = ConnectionBaseRow.merge(opts.connection_row);
     const read_row = ReadBaseRow.merge(opts.read_row);
     const write_in_row = WriteInBaseRow.merge(opts.write_row);
@@ -603,11 +626,9 @@ pub fn Io(comptime opts: Options) type {
             self.cleanup_ctx.ring = &self.ring;
 
             // Register collections with registry
-            comptime var next_id: u8 = 0;
             inline for (COLLECTIONS) |c| {
                 if (c.connect_only and !has_connect) continue;
-                reg.registerCollection(&@field(self, c.name), opts.id_base + next_id);
-                next_id += 1;
+                reg.registerCollection(&@field(self, c.name), @intFromEnum(@field(Coll, c.name)) + 1);
             }
 
             // Register deinit contexts. `ReadResult.deinit` returns

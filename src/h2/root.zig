@@ -178,6 +178,11 @@ pub const ConnectTarget = struct {
 };
 
 pub const Options = struct {
+    /// Collections the COMPOSING layer registers on the same registry.
+    /// Appending them here puts every collection in one namespace, so the
+    /// composer numbers its own off `Coll` rather than continuing from
+    /// wherever this layer's ids happen to end.
+    extra_collections: []const [:0]const u8 = &.{},
     request_row: type = Row(&.{}),
     connection_row: type = Row(&.{}),
     client: bool = false,
@@ -301,8 +306,6 @@ pub fn H2(comptime opts: Options) type {
     const IoType = rio.Io(.{
         .connection_row = Row(&.{Conn}).merge(opts.connection_row),
         .connect = has_client,
-        // io's collections come FIRST in `Coll`, so its ids start at 1.
-        .id_base = 1,
     });
 
     // WebSocket seam row (docs/architecture/websockets.md): one entity per inbound
@@ -663,6 +666,14 @@ pub fn H2(comptime opts: Options) type {
 
         comptime {
             @setEvalBranchQuota(100_000);
+            // io numbers itself off its own name list, so `Coll` must place
+            // io's names first and in that order or an io collection's
+            // registry id will not match the variant naming it here — every
+            // conn entity would then resolve to the wrong collection.
+            for (rio.activeNames(has_client), 0..) |n, i| {
+                if (@intFromEnum(@field(Coll, n)) != i)
+                    @compileError("io's collection '" ++ n ++ "' sits at a different position in Coll than in io's own namespace");
+            }
             // One namespace: a duplicate name would silently shadow a
             // variant and mis-resolve every entity in that collection.
             for (ACTIVE, 0..) |a, i| for (ACTIVE[i + 1 ..]) |b| {
@@ -671,30 +682,34 @@ pub fn H2(comptime opts: Options) type {
             };
         }
 
-        /// One variant per live collection, named exactly as the field is.
-        pub const Coll = blk: {
-            var fields: [ACTIVE.len]std.builtin.Type.EnumField = undefined;
-            for (ACTIVE, 0..) |s, i| fields[i] = .{ .name = s.name, .value = i };
-            break :blk @Type(.{ .@"enum" = .{
-                .tag_type = u8,
-                .fields = &fields,
-                .decls = &.{},
-                .is_exhaustive = true,
-            } });
-        };
+        /// One variant per collection on the shared registry — io's, this
+        /// layer's, and any the composing layer names via
+        /// `opts.extra_collections`. A registry id IS a variant's value plus
+        /// one, so every layer numbers itself off this enum and none needs
+        /// to know where another's ids end.
+        pub const Coll = rio.CollEnum(blk: {
+            var names: []const [:0]const u8 = &.{};
+            for (ACTIVE) |s| names = names ++ &[_][:0]const u8{s.name};
+            break :blk names ++ opts.extra_collections;
+        });
 
-        /// The `CollSpec` behind a variant — the inverse of the generation
-        /// above, so a switch arm can consult `kind` / `in_chain`.
-        fn specOf(comptime k: Coll) CollRef {
-            return ACTIVE[@intFromEnum(k)];
+        /// The `CollRef` behind a variant, or null when the variant belongs
+        /// to the composing layer — this layer can name those collections
+        /// but owns none of them, so every accessor here declines them.
+        fn specOf(comptime k: Coll) ?CollRef {
+            @setEvalBranchQuota(100_000);
+            for (ACTIVE) |s| if (std.mem.eql(u8, s.name, @tagName(k))) return s;
+            return null;
         }
 
-        /// The field behind a variant, on whichever layer owns it.
+        /// The field behind a variant this layer owns, on whichever of the
+        /// two layers holds it. Only called from an arm that has already
+        /// established `specOf(k) != null`.
         inline fn fieldOf(h2: *Self, comptime k: Coll) *@FieldType(
-            if (specOf(k).owner == .io) IoType else Self,
-            specOf(k).name,
+            if (specOf(k).?.owner == .io) IoType else Self,
+            specOf(k).?.name,
         ) {
-            const s = comptime specOf(k);
+            const s = comptime specOf(k).?;
             return if (comptime s.owner == .io) &@field(h2.io, s.name) else &@field(h2, s.name);
         }
 
@@ -711,18 +726,13 @@ pub fn H2(comptime opts: Options) type {
         /// Null when the handle is stale or out of range, or when the entity
         /// sits in a collection registered by a layer ABOVE this one — those
         /// share the registry but are not in `Coll`.
-        /// First registry id NOT claimed by this instance. A layer above
-        /// (the worker's own collections) must start here.
-        pub const COLL_ID_END: u8 = ACTIVE.len + 1;
-
         pub fn collectionOf(h2: *const Self, entity: Entity) ?Coll {
             const idx = entity.index;
             if (idx >= h2.reg.max_entities) return null;
             if (h2.reg.generations[idx] != entity.generation) return null;
             const raw = h2.reg.collection_ids[idx];
-            // 0 is the registry's free pool; anything at or past
-            // `COLL_ID_END` belongs to a layer this enum does not describe.
-            if (raw == 0 or raw >= COLL_ID_END) return null;
+            // 0 is the registry's free pool and is never a collection.
+            if (raw == 0) return null;
             return @enumFromInt(raw - 1);
         }
 
@@ -733,7 +743,7 @@ pub fn H2(comptime opts: Options) type {
         inline fn serverChainColl(h2: *Self, k: Coll) ?*StreamColl {
             return switch (k) {
                 inline else => |tag| blk: {
-                    const s = comptime specOf(tag);
+                    const s = comptime specOf(tag) orelse break :blk null;
                     if (comptime s.kind == .server_stream and s.in_chain) {
                         break :blk &@field(h2, s.name);
                     } else {
@@ -748,7 +758,7 @@ pub fn H2(comptime opts: Options) type {
         inline fn clientChainColl(h2: *Self, k: Coll) ?*ClientStreamColl {
             return switch (k) {
                 inline else => |tag| blk: {
-                    const s = comptime specOf(tag);
+                    const s = comptime specOf(tag) orelse break :blk null;
                     if (comptime s.kind == .client_stream and s.in_chain) {
                         break :blk &@field(h2, s.name);
                     } else {

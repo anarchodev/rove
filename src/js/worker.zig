@@ -1463,29 +1463,29 @@ pub fn Worker(comptime opts: Options) type {
         snapshot_sink_mod.SnapshotStream,
     }).merge(opts.request_row);
 
+    // The worker's own collections, named here and nowhere else. They go
+    // into H2Type's namespace, and the registration below numbers them off
+    // that enum — so no id is written down, and no layer continues from
+    // where another layer's ids happen to stop.
+    const WORKER_COLLECTIONS = [_][:0]const u8{
+        "raft_pending_response",
+        "raft_pending_cont",
+        "raft_pending_stream",
+        "body_pending",
+        "forward_pending",
+        "parked_continuations",
+        "snapshot_streams",
+        "snapshot_pushes",
+        "parked_units",
+        "blob_sessions",
+    };
+
     const H2Type = h2.H2(.{
+        .extra_collections = &WORKER_COLLECTIONS,
         .request_row = merged_request_row,
         .connection_row = opts.connection_row,
         .client = true,
     });
-
-    // The worker's own collections, declared as VALUES. Ids continue
-    // where `H2Type`'s leave off, so io + h2 + this layer share one
-    // namespace over the registry's `collection_ids` byte — which is what
-    // lets any of the three read an entity's state instead of testing it
-    // against each candidate collection in turn.
-    const Coll = enum(u8) {
-        raft_pending_response = H2Type.COLL_ID_END,
-        raft_pending_cont,
-        raft_pending_stream,
-        body_pending,
-        forward_pending,
-        parked_continuations,
-        snapshot_streams,
-        snapshot_pushes,
-        parked_units,
-        blob_sessions,
-    };
 
     const StreamRow = H2Type.StreamRow;
     const StreamColl = rove.Collection(StreamRow, .{});
@@ -2015,10 +2015,10 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
-            // The enum IS the registration list, so a field cannot be
-            // registered under an id other than the one it is declared under.
-            inline for (@typeInfo(Coll).@"enum".fields) |f| {
-                reg.registerCollection(&@field(self, f.name), f.value);
+            // The name list IS the registration list, and the id comes from
+            // the shared namespace rather than from a counter or an offset.
+            inline for (WORKER_COLLECTIONS) |name| {
+                reg.registerCollection(&@field(self, name), @intFromEnum(@field(H2Type.Coll, name)) + 1);
             }
 
             // Register the inbox with the node so apply.zig +
