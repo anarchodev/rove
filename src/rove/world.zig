@@ -57,14 +57,41 @@ const RowView = fat_mod.RowView;
 
 pub const CollKind = enum { collection, set };
 
+/// The registry's own membership axis — liveness. Exactly one axis is
+/// total, and it is this one, because liveness is the registry's
+/// concept: position on it always exists (0 = the free pool), birth
+/// requires it, there is no leave, and it is the default when a
+/// collection declares no `.axis`.
+///
+/// An axis is a TYPE, and its identity is its declaration site: a part
+/// that owns an orthogonal concern declares the axis as a plain struct
+/// (`pub const throttle_axis = struct { pub const axis_name = ... };`)
+/// and layers above reference the decl (`.axis = rio.throttle_axis`) —
+/// unforgeable, typo-proof, private by default, shared only by
+/// explicit import. Two layers independently inventing an axis called
+/// "pending" get two distinct types, never one accidentally fused
+/// exclusivity domain; the world merges axes by type identity.
+pub const lifecycle = struct {
+    pub const axis_name: [:0]const u8 = "lifecycle";
+};
+
 /// One entry in a part's collection table. The row is the machinery
 /// describing the collection — which components it materializes as SoA
 /// columns. A set entry keeps the default empty row (pure membership).
+///
+/// `.axis` tags which membership axis the collection lives on; the
+/// partition over components is EMERGENT: a component inherits the
+/// axis of the collections that materialize it, and materialization on
+/// two different axes is a compile error at world build (overlap
+/// freely WITHIN an axis — state alternation — never across: that is
+/// contested storage). A component in no collection's row is axis-free
+/// (the shadow is axis-blind).
 pub const CollDecl = struct {
     name: [:0]const u8,
     row: type = Row(&.{}),
     kind: CollKind = .collection,
     options: CollectionOptions = .{},
+    axis: type = lifecycle,
 };
 
 /// One layer's contribution to the world: pure data, declared outside
@@ -131,15 +158,6 @@ pub fn World(comptime cfg: WorldConfig) type {
         }
     }
 
-    const n_sets = comptime blk: {
-        var n: usize = 0;
-        for (table) |d| n += @intFromBool(d.kind == .set);
-        break :blk n;
-    };
-    comptime {
-        if (n_sets > 32) @compileError("world: more than 32 set entries — the per-entity membership mask is u32");
-    }
-
     // The closed universe: every part's shadow-only components plus
     // every entry's row, canonically merged.
     const universe = comptime blk: {
@@ -148,6 +166,62 @@ pub fn World(comptime cfg: WorldConfig) type {
         for (table) |d| u = u.merge(d.row);
         break :blk u;
     };
+
+    comptime {
+        // Axis declarations are well-formed, and sets take none — a set
+        // is its own one-state axis (their storage merge is the axes
+        // work's 4c step; the tag surface here does not change then).
+        for (table) |d| {
+            if (!@hasDecl(d.axis, "axis_name")) @compileError(
+                "world: collection '" ++ d.name ++ "' declares an axis with no `axis_name` — an axis is a struct type with `pub const axis_name` (see rove.lifecycle)",
+            );
+            if (d.kind == .set and d.axis != lifecycle) @compileError(
+                "world: set entry '" ++ d.name ++ "' declares an axis — a set IS its own one-state axis and takes no `.axis`",
+            );
+        }
+        // The emergent partition: a component inherits the axis of the
+        // collections that materialize it; materialization on two axes
+        // is contested storage — two live homes at once — and the error
+        // names the component and both sites. (Conflict graphs that are
+        // not axis-representable are rejected here by construction:
+        // remodel by flattening cliques or splitting meanings.)
+        for (universe.types) |T| {
+            var first: ?CollDecl = null;
+            for (table) |d| {
+                if (d.kind == .set) continue;
+                if (!d.row.contains(T)) continue;
+                if (first) |f| {
+                    if (f.axis != d.axis) @compileError(
+                        "world: component " ++ @typeName(T) ++ " is materialized by '" ++ f.name ++
+                            "' (axis '" ++ f.axis.axis_name ++ "') and by '" ++ d.name ++ "' (axis '" ++
+                            d.axis.axis_name ++ "') — overlap freely within an axis, never across",
+                    );
+                } else first = d;
+            }
+        }
+    }
+
+    // Every distinct axis in the world, lifecycle (the total axis)
+    // first, then declaration order. Merged by type identity.
+    const axis_list: []const type = comptime blk: {
+        var out: []const type = &.{lifecycle};
+        for (table) |d| {
+            if (d.kind == .set) continue;
+            var seen = false;
+            for (out) |A| seen = seen or (A == d.axis);
+            if (!seen) out = out ++ [_]type{d.axis};
+        }
+        break :blk out;
+    };
+
+    const n_sets = comptime blk: {
+        var n: usize = 0;
+        for (table) |d| n += @intFromBool(d.kind == .set);
+        break :blk n;
+    };
+    comptime {
+        if (n_sets > 32) @compileError("world: more than 32 set entries — the per-entity membership mask is u32");
+    }
 
     // The id namespace: variant per entry in table order, valued by
     // registry id directly (position + 1) so no call site does the +1.
@@ -174,6 +248,27 @@ pub fn World(comptime cfg: WorldConfig) type {
 
         pub fn RowOf(comptime id: CollId) type {
             return declOf(id).row;
+        }
+
+        /// Every distinct axis in the world — lifecycle (the total
+        /// axis) first, then declaration order.
+        pub const axes = axis_list;
+
+        /// The axis a declared entry's collection lives on.
+        pub fn axisOfColl(comptime id: CollId) type {
+            return declOf(id).axis;
+        }
+
+        /// The owning axis of a materialized component (emergent from
+        /// the collections that materialize it — the partition check
+        /// above makes it unique), or null when the component is
+        /// axis-free: in no collection's row, shadow-only.
+        pub fn axisOf(comptime T: type) ?type {
+            inline for (table) |d| {
+                if (comptime d.kind == .set) continue;
+                if (comptime d.row.contains(T)) return d.axis;
+            }
+            return null;
         }
 
         /// The Collection type of a declared entry. Set entries have no
@@ -413,6 +508,37 @@ const app_part = Part{
 };
 
 const TestWorld = World(.{ .parts = &.{ io_ish_part, app_part } });
+
+// A part-owned orthogonal axis (4a): identity is the declaration site.
+const TTokens = struct { left: u32 = 8 };
+const throttle_axis = struct {
+    pub const axis_name: [:0]const u8 = "throttle";
+};
+const throttle_part = Part{
+    .name = "throttler",
+    .collections = &.{
+        .{ .name = "throttled", .row = Row(&.{TTokens}), .axis = throttle_axis },
+    },
+};
+const AxisWorld = World(.{ .parts = &.{ io_ish_part, app_part, throttle_part } });
+
+test "world: the emergent partition — components inherit their collections' axis" {
+    // Materialized components resolve to their axis; the same component
+    // in two same-axis collections is fine (active/closing share TPos).
+    try testing.expect(AxisWorld.axisOf(TPos).? == lifecycle);
+    try testing.expect(AxisWorld.axisOf(THp).? == lifecycle);
+    try testing.expect(AxisWorld.axisOf(TTokens).? == throttle_axis);
+    // Shadow-only components are axis-free.
+    try testing.expect(AxisWorld.axisOf(TTag) == null);
+    // lifecycle first, then declaration order; a world with no tagged
+    // collections still has the total axis.
+    try testing.expectEqual(@as(usize, 2), AxisWorld.axes.len);
+    try testing.expect(AxisWorld.axes[0] == lifecycle);
+    try testing.expect(AxisWorld.axes[1] == throttle_axis);
+    try testing.expectEqual(@as(usize, 1), TestWorld.axes.len);
+    try testing.expect(AxisWorld.axisOfColl(.throttled) == throttle_axis);
+    try testing.expect(AxisWorld.axisOfColl(.active) == lifecycle);
+}
 
 test "world: ids by table position, one namespace across parts" {
     try testing.expectEqual(@as(u8, 1), @intFromEnum(TestWorld.CollId.active));

@@ -143,11 +143,18 @@ every entry path because move and enter funnel through one point —
 evidence for 4d's state-attached-as-default lean; destroy exits every
 axis and per-axis offsets stay exact under swap-remove churn.
 
-- [ ] **4a. Partition.** `rove.Axes(.{ .lifecycle = Row(...), .throttle
-      = Row(...), ... })` — every component in exactly ONE axis (compile
-      error otherwise); every collection declares `.axis` with row ⊆
-      axis row checked at registration; universe = union of axis rows;
-      the shadow struct is axis-blind and unchanged. Co-residency safe
+- [x] **4a. Partition — BUILT 2026-08-26, as the EMERGENT form.** No
+      axis-owned row: a `CollDecl` tags `.axis` (default
+      `rove.lifecycle`), a component INHERITS the axis of the
+      collections that materialize it, and materialization on two axes
+      is the compile error (named component, both sites) — so the
+      partition falls out of the tables the world already has, the
+      universe stays the row union, and the shadow struct is axis-blind
+      and unchanged. `W.axes` lists distinct axes (lifecycle first),
+      `W.axisOf(T)` resolves a component (null = shadow-only,
+      axis-free), `W.axisOfColl(id)` a collection. Sets take no
+      `.axis` — a set IS its own one-state axis until 4c merges the
+      storage. Co-residency safe
       by construction — the disjointness condition becomes a property of
       the type system, no pairwise or runtime checks. Why a
       data-carrying axis at all: a system gets DENSE iteration over an

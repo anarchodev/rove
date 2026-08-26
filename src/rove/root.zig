@@ -19,6 +19,7 @@ pub const World = world_mod.World;
 pub const Part = world_mod.Part;
 pub const CollDecl = world_mod.CollDecl;
 pub const CollKind = world_mod.CollKind;
+pub const lifecycle = world_mod.lifecycle;
 
 /// The world the program's root module declared, or null — the
 /// `std_options` idiom. A binary on the fat model declares its world
