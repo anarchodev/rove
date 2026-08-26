@@ -293,6 +293,7 @@ pub const CollRef = struct {
 pub const COLLECTIONS = [_]CollRef{
     .{ .name = "connections" },
     .{ .name = "conn_closing" },
+    .{ .name = "conn_dead" },
     .{ .name = "read_results" },
     .{ .name = "write_results" },
     .{ .name = "write_done" },
@@ -352,12 +353,29 @@ fn decodeEntity(user_data: u64) Entity {
 /// transition either way).
 pub const RegistryModel = enum { archetype, fat };
 
+/// What retirement out of `conn_closing` does with the entity.
+/// `.destroy` ends it (the default). `.hand_off` moves it into the
+/// terminal `conn_dead` collection instead, for a composing layer that
+/// must release foreign state riding the entity (rove-h2's nghttp2
+/// session / TLS conn) at a point provably after every reader — the
+/// layer that opts in OWNS draining `conn_dead` (free, then destroy),
+/// including once at teardown BEFORE io's destroy. Fat model only: the
+/// archetype releases foreign state via `Conn.deinit` at destroy-time
+/// and needs no phase.
+pub const RetireMode = enum { destroy, hand_off };
+
 pub const Options = struct {
     connection_row: type = Row(&.{}),
     read_row: type = Row(&.{}),
     write_row: type = Row(&.{}),
     connect: bool = false,
     registry_model: RegistryModel = .archetype,
+    /// Components in no row anywhere — "in the world, materialized
+    /// nowhere" — plus a composing layer's fold of everything its own
+    /// collections carry. Merged into the fat registry's universe;
+    /// ignored under the archetype model.
+    extra_components: type = Row(&.{}),
+    on_retire: RetireMode = .destroy,
 };
 
 pub const IoOptions = struct {
@@ -429,6 +447,7 @@ pub fn Io(comptime opts: Options) type {
     // Collection types
     const ConnColl = Collection(conn_row, .{});
     const ClosingColl = Collection(ClosingBaseRow.merge(opts.connection_row), .{});
+    const DeadColl = Collection(Row(&.{}), .{});
     const ReadResultColl = Collection(read_row, .{});
     const WriteResultColl = Collection(write_result_row, .{});
     const ReadInColl = Collection(read_row, .{});
@@ -463,10 +482,15 @@ pub fn Io(comptime opts: Options) type {
         .merge(read_row)
         .merge(write_in_row)
         .merge(write_result_row);
-    const universe = if (has_connect)
+    const universe = (if (has_connect)
         universe_base.merge(connect_in_row).merge(connect_error_row)
     else
-        universe_base;
+        universe_base).merge(opts.extra_components);
+
+    const hand_off = opts.on_retire == .hand_off;
+    comptime {
+        if (hand_off and !is_fat) @compileError("on_retire = .hand_off requires the fat registry model — the archetype releases foreign conn state via Conn.deinit at destroy and has no use for the phase");
+    }
 
     return struct {
         const Self = @This();
@@ -492,6 +516,10 @@ pub fn Io(comptime opts: Options) type {
         /// Unprefixed on purpose: this is a seam other code moves entities
         /// into, like `read_in` / `write_in`, not internal bookkeeping.
         conn_closing: ClosingColl,
+        /// Terminal hand-off collection (empty row): retirement under
+        /// `.hand_off` moves conns here instead of destroying, and the
+        /// composing layer drains it — free foreign state, then destroy.
+        conn_dead: DeadColl,
 
         /// Connect targets, indexed by `entity.index`. Sized at startup from
         /// the registry's entity capacity and never resized, so a slot's
@@ -727,6 +755,7 @@ pub fn Io(comptime opts: Options) type {
             self.* = .{
                 .connections = try ConnColl.init(allocator),
                 .conn_closing = try ClosingColl.init(allocator),
+                .conn_dead = try DeadColl.init(allocator),
                 .connect_addrs = if (has_connect)
                     try allocator.alloc(std.net.Address, reg.max_entities)
                 else
@@ -837,6 +866,9 @@ pub fn Io(comptime opts: Options) type {
                     if (self.reg.isStale(ent)) continue;
                     if (self.reg.isMoving(ent)) continue;
                     if (self.reg.isInCollection(ent, &self.conn_closing)) continue;
+                    if (comptime hand_off) {
+                        if (self.reg.isInCollection(ent, &self.conn_dead)) continue;
+                    }
                     self.reg.evictImmediate(ent, &self.conn_closing) catch continue;
                 }
             } else {
@@ -857,6 +889,7 @@ pub fn Io(comptime opts: Options) type {
             self.shutdownAllConns();
             self.connections.deinit();
             self.conn_closing.deinit();
+            self.conn_dead.deinit();
             if (comptime is_fat) self.all_conns.deinit();
             if (has_connect) allocator.free(self.connect_addrs);
             self.read_results.deinit();
@@ -1077,7 +1110,11 @@ pub fn Io(comptime opts: Options) type {
                 // grace window expired), which is the condition that makes
                 // destroying it safe — and only this loop knows that.
                 self.releaseReadCycle(cycle);
-                try self.reg.destroy(ent);
+                if (comptime hand_off) {
+                    try self.reg.move(ent, &self.conn_closing, &self.conn_dead);
+                } else {
+                    try self.reg.destroy(ent);
+                }
             }
         }
 
