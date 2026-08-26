@@ -451,6 +451,9 @@ pub fn Io(comptime opts: Options) type {
     const fd_resolver_none: FdResolverField = if (is_fat) {} else null;
     const peer_resolver_none: PeerResolverField = if (is_fat) {} else null;
     const resolver_ctx_none: ResolverCtxField = if (is_fat) {} else null;
+    const ExtraConnsFnField = if (is_fat) void else ?*const fn (ctx: *anyopaque) usize;
+    const extra_conns_none: ExtraConnsFnField = if (is_fat) {} else null;
+    const AllConnsField = if (is_fat) rove.fat_mod.EntitySet else void;
     // The fat registry's comptime-closed component world: the union of
     // every row io declares, user fragments included. This is the
     // gather-up point — a composing layer that shares the registry must
@@ -548,8 +551,16 @@ pub fn Io(comptime opts: Options) type {
         /// total in-flight conn count for admission control. When
         /// unset (or returns 0) the budget check uses only
         /// `self.connections.len`.
-        extra_conns_fn: ?*const fn (ctx: *anyopaque) usize = null,
-        extra_conns_ctx: ?*anyopaque = null,
+        extra_conns_fn: ExtraConnsFnField = extra_conns_none,
+        extra_conns_ctx: ResolverCtxField = resolver_ctx_none,
+
+        /// Every live conn this instance ever created, wherever it lives —
+        /// a pure membership set (fat model only). The accept and connect
+        /// paths join it; destroy leaves it structurally. Replaces
+        /// `extra_conns_fn`: admission control reads `all_conns.count`,
+        /// which is exact regardless of which layer or collection holds
+        /// any conn.
+        all_conns: AllConnsField,
 
         /// Admission-control telemetry. Friendly back-pressure when
         /// the conn count approaches `buf_count` — we refuse the
@@ -656,6 +667,7 @@ pub fn Io(comptime opts: Options) type {
         /// `handleAccept`'s admission-control check to estimate total
         /// in-flight conn count vs. `buf_count`.
         pub fn setExtraConnsFn(self: *Self, ctx: *anyopaque, f: *const fn (*anyopaque) usize) void {
+            if (comptime is_fat) @compileError("no extra-conns hook under the fat model — admission reads all_conns.count, which is exact wherever conns live");
             self.extra_conns_ctx = ctx;
             self.extra_conns_fn = f;
         }
@@ -749,6 +761,7 @@ pub fn Io(comptime opts: Options) type {
                     .buf_size = io_opts.buf_size,
                     .buf_count = io_opts.buf_count,
                 },
+                .all_conns = if (comptime is_fat) try rove.fat_mod.EntitySet.init(allocator, reg.max_entities) else {},
                 .reg = reg,
                 .allocator = allocator,
             };
@@ -761,6 +774,7 @@ pub fn Io(comptime opts: Options) type {
                 if (c.connect_only and !has_connect) continue;
                 reg.registerCollection(&@field(self, c.name), @intFromEnum(@field(Coll, c.name)) + 1);
             }
+            if (comptime is_fat) reg.registerSet(&self.all_conns, 0);
 
             // Register deinit contexts. `ReadResult.deinit` returns
             // the buffer (if any) to the registered ring when its
@@ -812,6 +826,7 @@ pub fn Io(comptime opts: Options) type {
             self.shutdownAllConns();
             self.connections.deinit();
             self.conn_closing.deinit();
+            if (comptime is_fat) self.all_conns.deinit();
             if (has_connect) allocator.free(self.connect_addrs);
             self.read_results.deinit();
             self.write_results.deinit();
@@ -1286,13 +1301,19 @@ pub fn Io(comptime opts: Options) type {
             // the teardown completes, so it counts against the budget just
             // like a live one. Admitting into a slot that is not free yet is
             // how the pool goes negative under churn.
-            const io_conns = self.connections.entitySlice().len +
-                self.conn_closing.entitySlice().len;
-            const upper_conns: usize = if (self.extra_conns_fn) |f|
-                f(self.extra_conns_ctx.?)
-            else
-                0;
-            const total_conns = io_conns + upper_conns;
+            const total_conns: usize = if (comptime is_fat)
+                // The membership set counts every conn this instance
+                // created, wherever it lives — no estimate, no hook.
+                self.all_conns.count
+            else blk: {
+                const io_conns = self.connections.entitySlice().len +
+                    self.conn_closing.entitySlice().len;
+                const upper_conns: usize = if (self.extra_conns_fn) |f|
+                    f(self.extra_conns_ctx.?)
+                else
+                    0;
+                break :blk io_conns + upper_conns;
+            };
             const budget: usize = @as(usize, self.buf_count) - (@as(usize, self.buf_count) / 8);
             if (total_conns >= budget) {
                 const close_sqe = try getSqeOrSubmit(&self.ring);
@@ -1324,6 +1345,7 @@ pub fn Io(comptime opts: Options) type {
             const conn = try self.reg.create(&self.connections);
             try self.reg.set(conn, &self.connections, Fd, .{ .fd = @intCast(file_slot) });
             try self.reg.set(conn, &self.connections, PeerAddr, .{});
+            if (comptime is_fat) _ = try self.reg.join(conn, &self.all_conns);
 
             // Resolve the peer address (see `PeerAddr`): install the
             // fixed file into the process fd table; the install CQE
@@ -1443,6 +1465,7 @@ pub fn Io(comptime opts: Options) type {
             try self.armRecv(read_ent, slot);
 
             try self.reg.moveStripImmediate(entity, &self._connect_pending, &self.connections, &.{ ConnectAddr, IoResult });
+            if (comptime is_fat) _ = try self.reg.join(entity, &self.all_conns);
             // The `connect_addrs` slot needs no cleanup — the next entity to
             // take this index overwrites it.
         }

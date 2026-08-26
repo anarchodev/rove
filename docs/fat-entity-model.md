@@ -199,7 +199,7 @@ never diverge.
   Whether any component *wants* enforced destruction on exit is a
   per-component question this model answers with convention.
 
-## Membership axes and edge clauses (designed, unbuilt)
+## Membership axes and edge clauses (sets built; axes and clauses unbuilt)
 
 **The safety condition for multiple membership** falls out of the model's
 one invariant: each component has exactly one live home. Two memberships
@@ -253,20 +253,24 @@ statically discharged, self-repairing, or carries a named assert, and
 the assert list is greppable the way `unsafe` blocks are — except these
 stay checked at runtime.
 
-**Worked example — `all_conns` retires `extra_conns_fn` and the sweep
-contract.** io declares an empty-row set on its own axis; the accept
-edge joins it, and the retirement edge out of `conn_closing` carries
-`leaves = .{&all_conns}` — the membership's lifetime is coupled to the
-lifecycle axis by exactly one clause. Admission control becomes
-`all_conns.count` (O(1), exact, regardless of which layer or collection
-holds any conn), so the last resolver hook dies; and io's shutdown sweep
-iterates `all_conns` instead of only its own collections, ending every
-conn it ever created wherever it wandered — which needs one new
-registry primitive, a type-erased *evict* recipe (park the row, remove
-from the collection) symmetric with the existing destroy recipe, so io
-can extract an entity from a foreign collection without naming its
-type. With that, io has zero hooks and zero residency contracts: create
-it, and it comes back to you — now true for the aggregate too.
+**Worked example — `all_conns` retires `extra_conns_fn` (BUILT).**
+`EntitySet` is implemented: dense list + sparse index, declared bit ids,
+membership orthogonal to the entity's collection, and destroy draining a
+per-entity mask so a set can never hold a dead entity — the "leaves on
+the terminal edge" clause exists today as destroy-leaves-all, pending
+real edge clauses. io (fat model) declares `all_conns`, joins it on the
+accept and connect-promotion edges, and admission control reads
+`all_conns.count` — O(1), exact, regardless of which layer or collection
+holds any conn — so `extra_conns_fn` is void under fat and its setter a
+compile error. Verified by the churn probe: 500 sequential connections
+against a ~224-conn admission budget stalls within the first 256 if a
+member ever leaks.
+
+Still unbuilt from the example: sweeping `all_conns` at shutdown (ending
+conns held in foreign collections needs the type-erased *evict* recipe —
+park the row, remove from the collection — symmetric with the existing
+destroy recipe). Until then the shutdown sweep keeps its
+close-your-own-first contract; the admission contract is gone.
 
 ## Prior art
 
