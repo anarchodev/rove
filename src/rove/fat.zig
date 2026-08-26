@@ -75,6 +75,53 @@ fn toAlignment(comptime bytes: comptime_int) std.mem.Alignment {
     return @enumFromInt(std.math.log2_int(usize, bytes));
 }
 
+/// A pure membership set — the empty-row collection, and the degenerate
+/// case of a membership axis that is unconditionally safe to overlap
+/// with anything: it materializes no components, so it can contest no
+/// live copy. Membership is SECONDARY and orthogonal to the entity's
+/// collection: it survives every move, and only destroy ends it (the
+/// registry leaves all sets structurally — release cannot be forgotten).
+///
+/// Storage is a dense entity list (iterable, countable in O(1)) plus a
+/// sparse entity.index → offset table, both sized max_entities at init
+/// so joining can never fail. Register with `registry.registerSet` and
+/// operate through the registry (`join` / `leave` / `inSet`), which
+/// keeps the per-entity membership mask that makes destroy exact.
+pub const EntitySet = struct {
+    entities: [*]Entity,
+    /// entity.index → dense offset + 1; 0 = not a member.
+    sparse: [*]u32,
+    count: u32,
+    max_entities: u32,
+    /// Registry-declared bit index (0..MAX_SETS-1). Set by registerSet.
+    set_id: u5 = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, max_entities: u32) !EntitySet {
+        const entities = try allocator.alloc(Entity, max_entities);
+        const sparse = try allocator.alloc(u32, max_entities);
+        @memset(sparse, 0);
+        return .{
+            .entities = entities.ptr,
+            .sparse = sparse.ptr,
+            .count = 0,
+            .max_entities = max_entities,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *EntitySet) void {
+        self.allocator.free(self.entities[0..self.max_entities]);
+        self.allocator.free(self.sparse[0..self.max_entities]);
+        self.* = undefined;
+    }
+
+    /// The dense member list. Valid until the next join/leave/destroy.
+    pub fn members(self: *const EntitySet) []const Entity {
+        return self.entities[0..self.count];
+    }
+};
+
 /// `Universe` is a `Row` of every component type any registered collection
 /// may carry — the comptime-closed component world. Collections whose row
 /// is not covered by it are rejected at registration (comptime).
@@ -124,10 +171,17 @@ pub fn FatRegistry(comptime Universe: type) type {
         coll_ptrs: [MAX_COLLECTIONS]?*anyopaque,
         destroy_recipes: [MAX_COLLECTIONS]DestroyEntry,
 
+        // Secondary memberships: one bit per registered set, per entity.
+        // The mask is what makes destroy leave every set the entity
+        // joined — membership release is structural, never remembered.
+        set_memberships: []u32,
+        set_ptrs: [MAX_SETS]?*EntitySet,
+
         allocator: std.mem.Allocator,
 
         const PENDING_MOVE: u8 = 1;
         const MAX_COLLECTIONS: usize = 256;
+        const MAX_SETS: usize = 32;
         const NEVER_STAMPED: u32 = std.math.maxInt(u32);
 
         const ColumnFn = *const fn (*anyopaque, u32) [*]u8;
@@ -183,6 +237,9 @@ pub fn FatRegistry(comptime Universe: type) type {
             const column_fns = try allocator.alloc(?ColumnFn, MAX_COLLECTIONS * Universe.len);
             @memset(column_fns, null);
 
+            const set_memberships = try allocator.alloc(u32, max);
+            @memset(set_memberships, 0);
+
             return .{
                 .generations = generations,
                 .collection_ids = collection_ids,
@@ -200,6 +257,8 @@ pub fn FatRegistry(comptime Universe: type) type {
                 .column_fns = column_fns,
                 .coll_ptrs = [_]?*anyopaque{null} ** MAX_COLLECTIONS,
                 .destroy_recipes = undefined,
+                .set_memberships = set_memberships,
+                .set_ptrs = [_]?*EntitySet{null} ** MAX_SETS,
                 .allocator = allocator,
             };
         }
@@ -212,6 +271,7 @@ pub fn FatRegistry(comptime Universe: type) type {
             }
             self.allocator.free(self.stamps);
             self.allocator.free(self.column_fns);
+            self.allocator.free(self.set_memberships);
             self.allocator.free(self.generations);
             self.allocator.free(self.collection_ids);
             self.allocator.free(self.offsets);
@@ -262,6 +322,82 @@ pub fn FatRegistry(comptime Universe: type) type {
                     self.column_fns[id * Universe.len + ci] = columnFn(CollType, T);
                 }
             }
+        }
+
+        /// Register a membership set under a DECLARED bit index
+        /// (0..MAX_SETS-1), mirroring collection registration: declared so
+        /// the per-entity membership mask is directly interpretable by the
+        /// layer that numbered its sets. The set must be sized to this
+        /// registry's max_entities — checked loudly, since a short sparse
+        /// table would index out of bounds on a high entity index.
+        pub fn registerSet(self: *Self, s: *EntitySet, declared_id: u5) void {
+            if (s.max_entities != self.max_entities) std.debug.panic(
+                "fat registry: set sized for {d} entities registered on a registry of {d}",
+                .{ s.max_entities, self.max_entities },
+            );
+            if (self.set_ptrs[declared_id] != null) std.debug.panic(
+                "fat registry: set id {d} registered twice",
+                .{declared_id},
+            );
+            s.set_id = declared_id;
+            self.set_ptrs[declared_id] = s;
+        }
+
+        /// Join a set. Idempotent: returns false if already a member.
+        /// Membership is orthogonal to the entity's collection — it
+        /// survives every move and ends only at leave or destroy.
+        pub fn join(self: *Self, entity: Entity, s: *EntitySet) !bool {
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            if (s.sparse[idx] != 0) return false;
+            s.entities[s.count] = entity;
+            s.sparse[idx] = s.count + 1;
+            s.count += 1;
+            self.set_memberships[idx] |= @as(u32, 1) << s.set_id;
+            return true;
+        }
+
+        /// Leave a set. Returns false if not a member.
+        pub fn leave(self: *Self, entity: Entity, s: *EntitySet) !bool {
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            if (s.sparse[idx] == 0) return false;
+            self.removeFromSet(s, idx);
+            self.set_memberships[idx] &= ~(@as(u32, 1) << s.set_id);
+            return true;
+        }
+
+        pub fn inSet(self: *const Self, entity: Entity, s: *const EntitySet) bool {
+            const idx = entity.index;
+            if (idx >= self.max_entities) return false;
+            if (self.generations[idx] != entity.generation) return false;
+            return s.sparse[idx] != 0;
+        }
+
+        fn removeFromSet(self: *Self, s: *EntitySet, idx: u32) void {
+            _ = self;
+            const off = s.sparse[idx] - 1;
+            const last = s.count - 1;
+            const moved = s.entities[last];
+            s.entities[off] = moved;
+            s.sparse[moved.index] = off + 1;
+            s.count -= 1;
+            s.sparse[idx] = 0;
+        }
+
+        /// Destroy's structural half of membership: leave every set the
+        /// entity joined, driven by the mask — so a set can never hold a
+        /// dead entity and counts stay exact.
+        fn leaveAllSets(self: *Self, idx: u32) void {
+            var mask = self.set_memberships[idx];
+            while (mask != 0) {
+                const bit: u5 = @intCast(@ctz(mask));
+                mask &= mask - 1;
+                self.removeFromSet(self.set_ptrs[bit].?, idx);
+            }
+            self.set_memberships[idx] = 0;
         }
 
         // =============================================================
@@ -716,6 +852,7 @@ pub fn FatRegistry(comptime Universe: type) type {
                     for (0..count) |k| {
                         const entity = src_entities[src_offset + k];
                         const idx = entity.index;
+                        reg.leaveAllSets(idx);
                         reg.generations[idx] += 1;
                         reg.collection_ids[idx] = 0;
                         reg.flags[idx] &= ~PENDING_MOVE;
@@ -1118,6 +1255,99 @@ test "getRow — ZST members and stale handles" {
     try reg.destroy(e);
     try reg.flush();
     try testing.expectError(error.Stale, reg.getRow(e, Row(&.{Position})));
+}
+
+test "sets — membership is orthogonal to collections and survives moves" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a, 1);
+    var b = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b, 2);
+
+    var live = try EntitySet.init(testing.allocator, 16);
+    defer live.deinit();
+    reg.registerSet(&live, 0);
+
+    const e = try reg.create(&a);
+    try testing.expect(try reg.join(e, &live));
+    try testing.expect(!try reg.join(e, &live)); // idempotent
+    try testing.expectEqual(@as(u32, 1), live.count);
+    try testing.expect(reg.inSet(e, &live));
+
+    // Moves do not disturb secondary membership.
+    try reg.move(e, &a, &b);
+    try reg.flush();
+    try testing.expect(reg.inSet(e, &live));
+    try testing.expectEqual(@as(u32, 1), live.count);
+
+    try testing.expect(try reg.leave(e, &live));
+    try testing.expect(!try reg.leave(e, &live));
+    try testing.expectEqual(@as(u32, 0), live.count);
+}
+
+test "sets — swap-remove keeps the dense list and sparse table agreeing" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer coll.deinit();
+    reg.registerCollection(&coll, 1);
+    var set = try EntitySet.init(testing.allocator, 16);
+    defer set.deinit();
+    reg.registerSet(&set, 0);
+
+    var ents: [3]Entity = undefined;
+    for (&ents) |*e| {
+        e.* = try reg.create(&coll);
+        _ = try reg.join(e.*, &set);
+    }
+
+    // Leave the middle member: the tail fills its slot.
+    _ = try reg.leave(ents[1], &set);
+    try testing.expectEqual(@as(u32, 2), set.count);
+    try testing.expect(reg.inSet(ents[0], &set));
+    try testing.expect(!reg.inSet(ents[1], &set));
+    try testing.expect(reg.inSet(ents[2], &set));
+    for (set.members()) |m| try testing.expect(!m.eql(ents[1]));
+}
+
+test "sets — destroy leaves every joined set, exactly" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer coll.deinit();
+    reg.registerCollection(&coll, 1);
+
+    var s0 = try EntitySet.init(testing.allocator, 16);
+    defer s0.deinit();
+    reg.registerSet(&s0, 0);
+    var s1 = try EntitySet.init(testing.allocator, 16);
+    defer s1.deinit();
+    reg.registerSet(&s1, 5);
+
+    const e = try reg.create(&coll);
+    const bystander = try reg.create(&coll);
+    _ = try reg.join(e, &s0);
+    _ = try reg.join(e, &s1);
+    _ = try reg.join(bystander, &s0);
+
+    try reg.destroy(e);
+    try reg.flush();
+
+    try testing.expectEqual(@as(u32, 1), s0.count);
+    try testing.expectEqual(@as(u32, 0), s1.count);
+    try testing.expect(reg.inSet(bystander, &s0));
+
+    // A reborn index is not a member of its predecessor's sets.
+    const reborn = try reg.create(&coll);
+    try testing.expectEqual(e.index, reborn.index);
+    try testing.expect(!reg.inSet(reborn, &s0));
+    try testing.expect(!reg.inSet(reborn, &s1));
 }
 
 test "destroy — entity leaves, handle goes stale, pool refills" {
