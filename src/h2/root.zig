@@ -697,9 +697,12 @@ pub fn H2(comptime opts: Options) type {
         /// to the composing layer — this layer can name those collections
         /// but owns none of them, so every accessor here declines them.
         fn specOf(comptime k: Coll) ?CollRef {
-            @setEvalBranchQuota(100_000);
-            for (ACTIVE) |s| if (std.mem.eql(u8, s.name, @tagName(k))) return s;
-            return null;
+            // `Coll` is built from ACTIVE's names in order, then the
+            // composing layer's — so a variant below ACTIVE.len indexes
+            // ACTIVE directly and anything at or above it belongs to the
+            // composer. Structural, not a search: the enum IS that list.
+            const i = @intFromEnum(k);
+            return if (i < ACTIVE.len) ACTIVE[i] else null;
         }
 
         /// The field behind a variant this layer owns, on whichever of the
