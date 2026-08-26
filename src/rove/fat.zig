@@ -713,6 +713,62 @@ pub fn FatRegistry(comptime Universe: type) type {
             return slot;
         }
 
+        /// Call-site-compatible `getAny`: resolve T through a bounded
+        /// candidate tuple. Under the fat model `getFat` answers without
+        /// candidates and is usually what new code wants; this exists so
+        /// call sites written against the archetype registry — candidate
+        /// sets over collections whose rows genuinely diverge — compile
+        /// unchanged. Semantics match the archetype's: error if the
+        /// entity is in none of the candidates.
+        pub inline fn getAny(self: *Self, entity: Entity, colls: anytype, comptime T: type) !*T {
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+
+            const current_id = self.collection_ids[idx];
+            inline for (@typeInfo(@TypeOf(colls)).@"struct".fields) |field| {
+                const coll = @field(colls, field.name);
+                if (current_id == coll.registry_id) {
+                    return &coll.column(T)[self.offsets[idx]];
+                }
+            }
+            return error.WrongCollection;
+        }
+
+        /// Call-site-compatible `moveAny`: move to `dst` from whichever
+        /// of `sources` currently holds the entity. No row-subset
+        /// requirement (moves are total); the tuple's only job is
+        /// naming which sources the call site expects — an entity in
+        /// none of them is an error, exactly as under the archetype.
+        pub inline fn moveAny(self: *Self, entity: Entity, sources: anytype, dst: anytype) !void {
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
+
+            const current_id = self.collection_ids[idx];
+            const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+
+            inline for (@typeInfo(@TypeOf(sources)).@"struct".fields) |field| {
+                const src = @field(sources, field.name);
+                const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
+                if (current_id == src.registry_id) {
+                    self.flags[idx] |= PENDING_MOVE;
+                    const recipe = moveRecipe(SrcColl, DstColl);
+                    try self.enqueueOp(.{
+                        .src_collection_id = src.registry_id,
+                        .src_offset = self.offsets[idx],
+                        .count = 1,
+                        .execute = recipe,
+                        .src_ptr = @ptrCast(src),
+                        .dst_ptr = @ptrCast(dst),
+                    });
+                    return;
+                }
+            }
+            return error.WrongCollection;
+        }
+
         /// The declared id of the entity's current collection, or null
         /// when the handle is stale or out of range. Because ids are
         /// declared, the byte IS the registering layer's collection enum
@@ -1529,6 +1585,36 @@ test "evictImmediate — evict-to-self is refused; stale handles rejected" {
     try reg.destroy(e);
     try reg.flush();
     try testing.expectError(error.Stale, reg.evictImmediate(e, &other));
+}
+
+test "getAny and moveAny — candidate-tuple compat over fat storage" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a, 1);
+    var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b, 2);
+    var dst = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
+    defer dst.deinit();
+    reg.registerCollection(&dst, 3);
+
+    const e = try reg.create(&a);
+    try reg.set(e, &a, Fdish, .{ .fd = 6 });
+
+    try testing.expectEqual(@as(i32, 6), (try reg.getAny(e, .{ &a, &b }, Fdish)).fd);
+    try testing.expectError(error.WrongCollection, reg.getAny(e, .{&b}, Position));
+
+    // moveAny is total: b → dst would DROP nothing even though b's row
+    // is narrower — the archetype's subset requirement is gone.
+    try reg.moveAny(e, .{ &a, &b }, &b);
+    try reg.flush();
+    try reg.moveAny(e, .{ &a, &b }, &dst);
+    try reg.flush();
+    try testing.expectEqual(@as(i32, 6), (try reg.get(e, &dst, Fdish)).fd);
+    try testing.expectError(error.WrongCollection, reg.moveAny(e, .{ &a, &b }, &dst));
 }
 
 test "destroy — entity leaves, handle goes stale, pool refills" {
