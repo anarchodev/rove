@@ -177,6 +177,10 @@ pub fn FatRegistry(comptime Universe: type) type {
         set_memberships: []u32,
         set_ptrs: [MAX_SETS]?*EntitySet,
 
+        // Per-collection evict recipes — the type-erased extraction half
+        // of evictImmediate, indexed by collection_id like destroy_recipes.
+        evict_recipes: [MAX_COLLECTIONS]EvictEntry,
+
         allocator: std.mem.Allocator,
 
         const PENDING_MOVE: u8 = 1;
@@ -188,6 +192,11 @@ pub fn FatRegistry(comptime Universe: type) type {
 
         const DestroyEntry = struct {
             recipe: *const fn (*Self, *anyopaque, *anyopaque, u32, u32) anyerror!void,
+            ptr: *anyopaque,
+        };
+
+        const EvictEntry = struct {
+            recipe: *const fn (*Self, *anyopaque, u32) void,
             ptr: *anyopaque,
         };
 
@@ -259,6 +268,7 @@ pub fn FatRegistry(comptime Universe: type) type {
                 .destroy_recipes = undefined,
                 .set_memberships = set_memberships,
                 .set_ptrs = [_]?*EntitySet{null} ** MAX_SETS,
+                .evict_recipes = undefined,
                 .allocator = allocator,
             };
         }
@@ -314,6 +324,10 @@ pub fn FatRegistry(comptime Universe: type) type {
             self.coll_ptrs[id] = @ptrCast(coll);
             self.destroy_recipes[id] = .{
                 .recipe = destroyRecipe(CollType),
+                .ptr = @ptrCast(coll),
+            };
+            self.evict_recipes[id] = .{
+                .recipe = evictRecipe(CollType),
                 .ptr = @ptrCast(coll),
             };
 
@@ -688,6 +702,48 @@ pub fn FatRegistry(comptime Universe: type) type {
             return raw;
         }
 
+        /// Move the entity into `dst` from WHATEVER collection currently
+        /// holds it, without the caller naming the source type: the
+        /// extraction half runs through a type-erased per-collection
+        /// recipe (park the whole row, remove from the collection), the
+        /// insertion half is an ordinary typed unpark of dst's row. This
+        /// is what lets a layer end an entity it created after another
+        /// layer adopted it into a collection the creator cannot name.
+        ///
+        /// The destination slot is reserved FIRST — the only fallible
+        /// step — so a failure never leaves the entity collection-less
+        /// (a live entity carrying the free-pool id would alias dead
+        /// ones; there is deliberately no observable "in no collection"
+        /// state). Evict-to-self is refused: the reserve/extract
+        /// interleave is unsound within one collection, and an ordinary
+        /// move covers it. Components in both rows take a park/unpark
+        /// round trip instead of a direct copy — eviction is a cold
+        /// path, and the detour is the price of the type erasure.
+        pub inline fn evictImmediate(self: *Self, entity: Entity, dst: anytype) !void {
+            const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
+            const src_id = self.collection_ids[idx];
+            if (src_id == 0) return error.InvalidEntity;
+            if (src_id == dst.registry_id) return error.WrongCollection;
+
+            const new_offset = try dst.reserveSlots(1);
+
+            const entry = self.evict_recipes[src_id];
+            entry.recipe(self, entry.ptr, self.offsets[idx]);
+
+            dst.entitySlice()[new_offset] = entity;
+            inline for (DstColl.RowType.types) |T| {
+                if (comptime @sizeOf(T) > 0) {
+                    self.unparkOne(T, entity, &dst.column(T)[new_offset]);
+                }
+            }
+            self.collection_ids[idx] = dst.registry_id;
+            self.offsets[idx] = new_offset;
+        }
+
         /// Cast the entity to a row type: one handle validation, then one
         /// `getFat` resolution per component of R. The RowType is the call
         /// site's DECLARED claim about which component set is meaningful
@@ -837,6 +893,27 @@ pub fn FatRegistry(comptime Universe: type) type {
                     for (moved, 0..) |moved_entity, r| {
                         reg.offsets[moved_entity.index] = src_offset + @as(u32, @intCast(r));
                     }
+                }
+            }.execute;
+        }
+
+        /// Comptime-generated evict recipe: park the entity's whole row
+        /// into the shadow and remove it from the collection. The typed
+        /// half of eviction (insertion into a destination) lives in
+        /// `evictImmediate`; this half is what gets type-erased so a
+        /// foreign layer can extract without naming the collection.
+        fn evictRecipe(comptime SrcColl: type) *const fn (*Self, *anyopaque, u32) void {
+            return &struct {
+                fn execute(reg: *Self, src_raw: *anyopaque, src_offset: u32) void {
+                    const src_coll: *SrcColl = @ptrCast(@alignCast(src_raw));
+                    const entity = src_coll.entitySlice()[src_offset];
+                    inline for (SrcColl.RowType.types) |T| {
+                        if (comptime @sizeOf(T) > 0) {
+                            reg.parkOne(T, entity, src_coll.column(T)[src_offset]);
+                        }
+                    }
+                    const moved = src_coll.removeRun(src_offset, 1);
+                    for (moved) |m| reg.offsets[m.index] = src_offset;
                 }
             }.execute;
         }
@@ -1348,6 +1425,70 @@ test "sets — destroy leaves every joined set, exactly" {
     try testing.expectEqual(e.index, reborn.index);
     try testing.expect(!reg.inSet(reborn, &s0));
     try testing.expect(!reg.inSet(reborn, &s1));
+}
+
+test "evictImmediate — extract from a collection the caller cannot name" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    // The "foreign" collection: the evicting code below never names its
+    // type — extraction goes through the type-erased recipe by id.
+    var foreign = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
+    defer foreign.deinit();
+    reg.registerCollection(&foreign, 1);
+
+    var home = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
+    defer home.deinit();
+    reg.registerCollection(&home, 2);
+
+    var set = try EntitySet.init(testing.allocator, 16);
+    defer set.deinit();
+    reg.registerSet(&set, 0);
+
+    var ents: [3]Entity = undefined;
+    for (&ents, 0..) |*e, i| {
+        e.* = try reg.create(&foreign);
+        try reg.set(e.*, &foreign, Fdish, .{ .fd = @intCast(i + 10) });
+        _ = try reg.join(e.*, &set);
+    }
+
+    // Evict the middle entity: the whole row parks, the tail bystander
+    // fills its slot, membership survives.
+    try reg.evictImmediate(ents[1], &home);
+    try testing.expectEqual(@as(u32, 2), foreign.count);
+    try testing.expectEqual(@as(i32, 11), (try reg.get(ents[1], &home, Fdish)).fd);
+    try testing.expectEqual(@as(i32, 10), (try reg.get(ents[0], &foreign, Fdish)).fd);
+    try testing.expectEqual(@as(i32, 12), (try reg.get(ents[2], &foreign, Fdish)).fd);
+    try testing.expect(reg.inSet(ents[1], &set));
+
+    // Round trip through park: evict into a NARROW destination, the fd
+    // stays parked, and rides home into a later gain.
+    var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer narrow.deinit();
+    reg.registerCollection(&narrow, 3);
+    try reg.evictImmediate(ents[1], &narrow);
+    try testing.expectEqual(@as(i32, 11), (try reg.getFat(ents[1], Fdish)).fd);
+    try reg.moveImmediate(ents[1], &narrow, &home);
+    try testing.expectEqual(@as(i32, 11), (try reg.get(ents[1], &home, Fdish)).fd);
+}
+
+test "evictImmediate — evict-to-self is refused; stale handles rejected" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer coll.deinit();
+    reg.registerCollection(&coll, 1);
+    var other = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer other.deinit();
+    reg.registerCollection(&other, 2);
+
+    const e = try reg.create(&coll);
+    try testing.expectError(error.WrongCollection, reg.evictImmediate(e, &coll));
+
+    try reg.destroy(e);
+    try reg.flush();
+    try testing.expectError(error.Stale, reg.evictImmediate(e, &other));
 }
 
 test "destroy — entity leaves, handle goes stale, pool refills" {
