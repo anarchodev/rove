@@ -77,7 +77,11 @@ pub fn FatRegistry(comptime Universe: type) type {
         null_pool: []Entity,
         null_count: u32,
 
-        next_collection_id: u8,
+        // Which collection ids are taken. Ids are DECLARED by the
+        // registering layer, so an entity's `collection_ids` byte is
+        // directly interpretable as that layer's collection enum; this
+        // guard is all that stops two layers from picking the same slot.
+        id_used: [MAX_COLLECTIONS]bool,
 
         // Deferred queue
         deferred_ops: []DeferredOp,
@@ -166,7 +170,7 @@ pub fn FatRegistry(comptime Universe: type) type {
                 .max_entities = max,
                 .null_pool = null_pool,
                 .null_count = max,
-                .next_collection_id = 1, // 0 is reserved for null
+                .id_used = [_]bool{false} ** MAX_COLLECTIONS,
                 .deferred_ops = deferred_ops,
                 .deferred_count = 0,
                 .deferred_capacity = config.deferred_queue_capacity,
@@ -196,10 +200,15 @@ pub fn FatRegistry(comptime Universe: type) type {
             self.* = undefined;
         }
 
-        /// Register an already-created collection. Its row must be covered
-        /// by the Universe (comptime). Assigns the collection id and fills
-        /// the accessor table `getFat` resolves residents through.
-        pub inline fn registerCollection(self: *Self, coll: anytype) void {
+        /// Register an already-created collection under a DECLARED id,
+        /// mirroring `Registry.registerCollection`: the id is the caller's
+        /// to choose because it is what makes an entity's state readable —
+        /// `collection_ids[entity.index]` is that id, so a layer whose
+        /// collection enum declared these values recovers the typed
+        /// collection with a cast + switch instead of a candidate scan.
+        /// The row must be covered by the Universe (comptime); id 0 is the
+        /// free/null pool and is never a collection.
+        pub inline fn registerCollection(self: *Self, coll: anytype, declared_id: u8) void {
             const CollType = @typeInfo(@TypeOf(coll)).pointer.child;
             comptime {
                 @setEvalBranchQuota(100_000);
@@ -208,9 +217,18 @@ pub fn FatRegistry(comptime Universe: type) type {
                 }
             }
 
-            coll.registry_id = self.next_collection_id;
-            self.next_collection_id += 1;
-            const id: usize = coll.registry_id;
+            // Explicit rather than `assert`: the shipped build is
+            // ReleaseFast, where an assert is not compiled. Id 0 is the
+            // free pool; a collection there would make every FREE entity
+            // resolve as one of its members.
+            if (declared_id == 0) std.debug.panic("fat registry: collection id 0 is the free pool", .{});
+            if (self.id_used[declared_id]) std.debug.panic(
+                "fat registry: collection id {d} registered twice — two layers' id ranges overlap",
+                .{declared_id},
+            );
+            self.id_used[declared_id] = true;
+            coll.registry_id = declared_id;
+            const id: usize = declared_id;
 
             self.coll_ptrs[id] = @ptrCast(coll);
             self.destroy_recipes[id] = .{
@@ -476,20 +494,22 @@ pub fn FatRegistry(comptime Universe: type) type {
             return slot;
         }
 
-        /// Resolve the entity's current collection as a typed pointer —
-        /// the id-indexed dispatch the model enables where every candidate
-        /// collection shares one type (rows coincide): one indexed load
-        /// instead of an N-way candidate scan. The type is the CALLER's
-        /// assertion — every collection the entity can currently be in
-        /// must be a CollType; a wrong assertion is undetected here. The
-        /// declared-collections direction makes it checkable.
-        pub inline fn homeAs(self: *Self, entity: Entity, comptime CollType: type) !*CollType {
+        /// The declared id of the entity's current collection, or null
+        /// when the handle is stale or out of range. Because ids are
+        /// declared, the byte IS the registering layer's collection enum
+        /// value: the layer casts it and recovers the typed collection
+        /// through an exhaustive switch (a jump table via `inline else`),
+        /// which is checked where an "assert the type and cast" accessor
+        /// cannot be. Never null for a live entity — a live entity is
+        /// always a member of exactly one collection.
+        pub fn collectionIdOf(self: *const Self, entity: Entity) ?u8 {
             const idx = entity.index;
-            if (idx >= self.max_entities) return error.InvalidEntity;
-            if (self.generations[idx] != entity.generation) return error.Stale;
-            const id = self.collection_ids[idx];
-            if (id == 0) return error.InvalidEntity;
-            return @ptrCast(@alignCast(self.coll_ptrs[id].?));
+            if (idx >= self.max_entities) return null;
+            if (self.generations[idx] != entity.generation) return null;
+            const raw = self.collection_ids[idx];
+            // 0 is the registry's free pool and is never a collection.
+            if (raw == 0) return null;
+            return raw;
         }
 
         // =============================================================
@@ -683,11 +703,11 @@ test "move is total — wide to narrow and back preserves the dropped value" {
 
     var wide = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 1);
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     const e = try reg.create(&wide);
     try reg.set(e, &wide, Velocity, .{ .x = 3, .y = 4 });
@@ -715,11 +735,11 @@ test "gained component never held arrives with declared defaults" {
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 1);
 
     var with_fd = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
     defer with_fd.deinit();
-    reg.registerCollection(&with_fd);
+    reg.registerCollection(&with_fd, 2);
 
     const e = try reg.create(&narrow);
     try reg.move(e, &narrow, &with_fd);
@@ -734,11 +754,11 @@ test "rebirth does not resurrect the predecessor's parked values" {
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 1);
 
     var with_fd = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
     defer with_fd.deinit();
-    reg.registerCollection(&with_fd);
+    reg.registerCollection(&with_fd, 2);
 
     const e = try reg.create(&with_fd);
     try reg.set(e, &with_fd, Fdish, .{ .fd = 9 });
@@ -766,7 +786,7 @@ test "getFat — resident resolves to the column" {
 
     var with_fd = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
     defer with_fd.deinit();
-    reg.registerCollection(&with_fd);
+    reg.registerCollection(&with_fd, 1);
 
     const e = try reg.create(&with_fd);
     try reg.set(e, &with_fd, Fdish, .{ .fd = 5 });
@@ -785,11 +805,11 @@ test "getFat — parked reads and writes the shadow, and the value rides home" {
 
     var with_fd = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
     defer with_fd.deinit();
-    reg.registerCollection(&with_fd);
+    reg.registerCollection(&with_fd, 1);
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     const e = try reg.create(&with_fd);
     try reg.set(e, &with_fd, Fdish, .{ .fd = 5 });
@@ -813,7 +833,7 @@ test "getFat — virgin slot materializes declared defaults" {
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 1);
 
     const e = try reg.create(&narrow);
     try testing.expectEqual(@as(i32, -1), (try reg.getFat(e, Fdish)).fd);
@@ -825,11 +845,11 @@ test "parked slot address is stable across unrelated churn" {
 
     var with_fd = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
     defer with_fd.deinit();
-    reg.registerCollection(&with_fd);
+    reg.registerCollection(&with_fd, 1);
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     const a = try reg.create(&with_fd);
     try reg.set(a, &with_fd, Fdish, .{ .fd = 3 });
@@ -858,11 +878,11 @@ test "deferred batch — several entities move through one flush" {
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 1);
 
     var wide = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 2);
 
     var ents: [4]Entity = undefined;
     for (0..4) |i| {
@@ -886,11 +906,11 @@ test "moveImmediate — total, lossless, visible this tick" {
 
     var wide = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 1);
 
     var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     const e = try reg.create(&wide);
     try reg.set(e, &wide, Velocity, .{ .x = 7, .y = 0 });
@@ -908,11 +928,11 @@ test "ZST components ride moves and getFat" {
 
     var tagged = try Collection(Row(&.{ Position, Tag }), .{}).init(testing.allocator);
     defer tagged.deinit();
-    reg.registerCollection(&tagged);
+    reg.registerCollection(&tagged, 1);
 
     var plain = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer plain.deinit();
-    reg.registerCollection(&plain);
+    reg.registerCollection(&plain, 2);
 
     const e = try reg.create(&tagged);
     try reg.move(e, &tagged, &plain);
@@ -923,29 +943,47 @@ test "ZST components ride moves and getFat" {
     try testing.expectEqual(@as(u32, 1), tagged.count);
 }
 
-test "homeAs — id-indexed home resolution over same-type collections" {
+test "collectionIdOf — declared ids make membership readable and typed" {
     var reg = try testReg();
     defer reg.deinit();
 
     const PhaseColl = Collection(Row(&.{ Position, Fdish }), .{});
+    // The consumer's declared namespace: a variant's value + 1 is the
+    // registry id, the numbering rove-h2's collection enum uses. The
+    // exhaustive switch is what makes recovery CHECKED: a new variant is
+    // a compile error here, not a candidate list nobody updated.
+    const Coll = enum(u8) { phase_a, phase_b };
+
     var pa = try PhaseColl.init(testing.allocator);
     defer pa.deinit();
-    reg.registerCollection(&pa);
+    reg.registerCollection(&pa, @intFromEnum(Coll.phase_a) + 1);
     var pb = try PhaseColl.init(testing.allocator);
     defer pb.deinit();
-    reg.registerCollection(&pb);
+    reg.registerCollection(&pb, @intFromEnum(Coll.phase_b) + 1);
+
+    const resolve = struct {
+        fn go(pa_: *PhaseColl, pb_: *PhaseColl, k: Coll) *PhaseColl {
+            return switch (k) {
+                .phase_a => pa_,
+                .phase_b => pb_,
+            };
+        }
+    }.go;
 
     const e = try reg.create(&pa);
-    try testing.expectEqual(&pa, try reg.homeAs(e, PhaseColl));
+    var k: Coll = @enumFromInt(reg.collectionIdOf(e).? - 1);
+    try testing.expectEqual(Coll.phase_a, k);
+    try testing.expectEqual(&pa, resolve(&pa, &pb, k));
 
-    // Move through the resolved home, no candidate set anywhere.
-    try reg.move(e, try reg.homeAs(e, PhaseColl), &pb);
+    // Move through the recovered home — no candidate set anywhere.
+    try reg.move(e, resolve(&pa, &pb, k), &pb);
     try reg.flush();
-    try testing.expectEqual(&pb, try reg.homeAs(e, PhaseColl));
+    k = @enumFromInt(reg.collectionIdOf(e).? - 1);
+    try testing.expectEqual(Coll.phase_b, k);
 
     try reg.destroy(e);
     try reg.flush();
-    try testing.expectError(error.Stale, reg.homeAs(e, PhaseColl));
+    try testing.expectEqual(@as(?u8, null), reg.collectionIdOf(e));
 }
 
 test "destroy — entity leaves, handle goes stale, pool refills" {
@@ -954,7 +992,7 @@ test "destroy — entity leaves, handle goes stale, pool refills" {
 
     var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const e = try reg.create(&coll);
     try reg.destroy(e);
@@ -971,11 +1009,11 @@ test "swap-remove bookkeeping — offsets stay correct after a middle move" {
 
     var src = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
     defer src.deinit();
-    reg.registerCollection(&src);
+    reg.registerCollection(&src, 1);
 
     var dst = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer dst.deinit();
-    reg.registerCollection(&dst);
+    reg.registerCollection(&dst, 2);
 
     var ents: [3]Entity = undefined;
     for (0..3) |i| {

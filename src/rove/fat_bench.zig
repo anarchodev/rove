@@ -135,10 +135,10 @@ fn benchPhaseMoves(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var pa = try Coll(PhaseRow).init(alloc);
         defer pa.deinit();
-        reg.registerCollection(&pa);
+        reg.registerCollection(&pa, 1);
         var pb = try Coll(PhaseRow).init(alloc);
         defer pb.deinit();
-        reg.registerCollection(&pb);
+        reg.registerCollection(&pb, 2);
 
         var ents: [K]Entity = undefined;
         try createAll(&reg, &pa, &ents);
@@ -150,10 +150,10 @@ fn benchPhaseMoves(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var pa = try Coll(PhaseRow).init(alloc);
         defer pa.deinit();
-        reg.registerCollection(&pa);
+        reg.registerCollection(&pa, 1);
         var pb = try Coll(PhaseRow).init(alloc);
         defer pb.deinit();
-        reg.registerCollection(&pb);
+        reg.registerCollection(&pb, 2);
 
         var ents: [K]Entity = undefined;
         try createAll(&reg, &pa, &ents);
@@ -172,10 +172,10 @@ fn benchDetourSurvive(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
-        reg.registerCollection(&wide);
+        reg.registerCollection(&wide, 1);
         var carry = try Coll(WideRow).init(alloc);
         defer carry.deinit();
-        reg.registerCollection(&carry);
+        reg.registerCollection(&carry, 2);
 
         var ents: [K]Entity = undefined;
         try createAll(&reg, &wide, &ents);
@@ -187,10 +187,10 @@ fn benchDetourSurvive(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
-        reg.registerCollection(&wide);
+        reg.registerCollection(&wide, 1);
         var narrow = try Coll(NarrowRow).init(alloc);
         defer narrow.deinit();
-        reg.registerCollection(&narrow);
+        reg.registerCollection(&narrow, 2);
 
         var ents: [K]Entity = undefined;
         try createAll(&reg, &wide, &ents);
@@ -226,10 +226,10 @@ fn benchResidentChurn(alloc: std.mem.Allocator, comptime K_RES: u32, comptime C:
         defer reg.deinit();
         var idle = try CollN(WideRow, K_RES).init(alloc);
         defer idle.deinit();
-        reg.registerCollection(&idle);
+        reg.registerCollection(&idle, 1);
         var active = try CollN(WideRow, K_RES).init(alloc);
         defer active.deinit();
-        reg.registerCollection(&active);
+        reg.registerCollection(&active, 2);
 
         const ents = try alloc.alloc(Entity, K_RES);
         defer alloc.free(ents);
@@ -246,10 +246,10 @@ fn benchResidentChurn(alloc: std.mem.Allocator, comptime K_RES: u32, comptime C:
         defer reg.deinit();
         var idle = try CollN(NarrowRow, K_RES).init(alloc);
         defer idle.deinit();
-        reg.registerCollection(&idle);
+        reg.registerCollection(&idle, 1);
         var active = try CollN(WideRow, K_RES).init(alloc);
         defer active.deinit();
-        reg.registerCollection(&active);
+        reg.registerCollection(&active, 2);
 
         const ents = try alloc.alloc(Entity, K_RES);
         defer alloc.free(ents);
@@ -273,10 +273,10 @@ fn benchDetourLossy(alloc: std.mem.Allocator) !void {
     defer reg.deinit();
     var wide = try Coll(WideRow).init(alloc);
     defer wide.deinit();
-    reg.registerCollection(&wide);
+    reg.registerCollection(&wide, 1);
     var narrow = try Coll(NarrowRow).init(alloc);
     defer narrow.deinit();
-    reg.registerCollection(&narrow);
+    reg.registerCollection(&narrow, 2);
 
     var ents: [K]Entity = undefined;
     try createAll(&reg, &wide, &ents);
@@ -322,7 +322,7 @@ fn benchIterate(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
-        reg.registerCollection(&wide);
+        reg.registerCollection(&wide, 1);
         var ents: [K]Entity = undefined;
         try run("iterate column M | archetype", &reg, &wide, &ents);
     }
@@ -331,7 +331,7 @@ fn benchIterate(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
-        reg.registerCollection(&wide);
+        reg.registerCollection(&wide, 1);
         var ents: [K]Entity = undefined;
         try run("iterate column M | fat", &reg, &wide, &ents);
     }
@@ -346,7 +346,7 @@ fn benchLookup(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
-        reg.registerCollection(&wide);
+        reg.registerCollection(&wide, 1);
         var ents: [K]Entity = undefined;
         try createAll(&reg, &wide, &ents);
 
@@ -368,10 +368,10 @@ fn benchLookup(alloc: std.mem.Allocator) !void {
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
-        reg.registerCollection(&wide);
+        reg.registerCollection(&wide, 1);
         var narrow = try Coll(NarrowRow).init(alloc);
         defer narrow.deinit();
-        reg.registerCollection(&narrow);
+        reg.registerCollection(&narrow, 2);
         var ents: [K]Entity = undefined;
         try createAll(&reg, &wide, &ents);
 
@@ -412,7 +412,8 @@ fn benchLookup(alloc: std.mem.Allocator) !void {
 // and streamSet resolve "which collection holds this entity" by scanning
 // a candidate tuple (serverStreamColls + isInCollection / getAny /
 // moveAny). This measures that dispatch pattern against the fat model's
-// id-indexed answers: getFat for reads, homeAs for moves.
+// id-indexed answers: getFat for reads, collectionIdOf + declared-id
+// index for moves (the coll-enum discipline on fat storage).
 
 const Sid = struct { id: u32 = 0, weight: u16 = 0, flags: u16 = 0 };
 const Sess = struct { ptr: usize = 0 };
@@ -437,10 +438,10 @@ fn benchUnknownHome(alloc: std.mem.Allocator) !void {
         var chain: [NCHAIN]StreamColl = undefined;
         for (&chain) |*c| c.* = try StreamColl.init(alloc);
         defer for (&chain) |*c| c.deinit();
-        for (&chain) |*c| reg.registerCollection(c);
+        for (&chain, 0..) |*c, ci| reg.registerCollection(c, @intCast(ci + 1));
         var terminal = try StreamColl.init(alloc);
         defer terminal.deinit();
-        reg.registerCollection(&terminal);
+        reg.registerCollection(&terminal, NCHAIN + 1);
 
         const t11 = .{
             &chain[0], &chain[1], &chain[2], &chain[3], &chain[4], &chain[5],
@@ -585,10 +586,10 @@ fn benchUnknownHome(alloc: std.mem.Allocator) !void {
         var chain: [NCHAIN]StreamColl = undefined;
         for (&chain) |*c| c.* = try StreamColl.init(alloc);
         defer for (&chain) |*c| c.deinit();
-        for (&chain) |*c| reg.registerCollection(c);
+        for (&chain, 0..) |*c, ci| reg.registerCollection(c, @intCast(ci + 1));
         var terminal = try StreamColl.init(alloc);
         defer terminal.deinit();
-        reg.registerCollection(&terminal);
+        reg.registerCollection(&terminal, NCHAIN + 1);
 
         const ents = try alloc.alloc(Entity, K);
         defer alloc.free(ents);
@@ -611,21 +612,26 @@ fn benchUnknownHome(alloc: std.mem.Allocator) !void {
             report("resolve | fat getFat, any distribution", totals, LOOKUP_PASSES * K);
         }
 
-        // close from unknown home: homeAs id-dispatch, then flush
+        // close from unknown home: membership read via collectionIdOf,
+        // typed collection recovered by declared-id index (all chain
+        // collections share one type, so the enum switch is an index)
         {
             var totals: [REPS]u64 = undefined;
             for (0..REPS + 1) |rep| {
                 var t: u64 = 0;
                 for (0..CLOSE_CYCLES) |_| {
                     var timer = try std.time.Timer.start();
-                    for (ents) |e| try reg.move(e, try reg.homeAs(e, StreamColl), &terminal);
+                    for (ents) |e| {
+                        const raw = reg.collectionIdOf(e) orelse return error.Stale;
+                        try reg.move(e, &chain[raw - 1], &terminal);
+                    }
                     try reg.flush();
                     t += timer.read();
                     for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
                 }
                 if (rep > 0) totals[rep - 1] = t;
             }
-            report("close   | fat homeAs id-dispatch, uniform", totals, CLOSE_CYCLES * K);
+            report("close   | fat id-index (coll-enum ids), uniform", totals, CLOSE_CYCLES * K);
         }
     }
 }
