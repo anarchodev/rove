@@ -174,6 +174,23 @@ never diverge.
   read through to the base table (the §2 fixed-pool exemption, reappearing
   as "don't materialize this column"). Kernel-visible components should be
   base-table-only: intermittent address stability is worse than none.
+  The knob already has an API surface: `Io`'s `connection_row` stops
+  meaning "required, or your data doesn't exist" and comes to mean
+  "materialize my component in io's views, I iterate it" — per-entity
+  access needs only universe membership. (Gap: the prototype derives the
+  universe from rows, so a row-less component has no shadow column yet;
+  an `extra_components` option is the missing "in the world,
+  materialized nowhere.")
+- **Residency assumptions, censused against io.** Of the three resolver
+  hooks the archetype model forced on io, universal reads dissolve two
+  (`fd_resolver`, `peer_resolver` — completions name entities by id and
+  `getFat` answers wherever the conn lives, so an upper layer may hold
+  conn entities in its own collections). What survives as contract: io's
+  admission count and shutdown sweep see only io's own collections — a
+  membership *aggregate*, which per-entity reads cannot dissolve and a
+  shared reference-set view would. The teardown seam itself gets more
+  permissive: ending a conn is one total move into `conn_closing` from
+  any collection at all.
 - **Views are still a partition.** An entity is in exactly one collection;
   seams-as-reference-sets (membership without data implications, possibly
   overlapping) is the natural generalization the model makes expressible
