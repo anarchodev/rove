@@ -1,10 +1,9 @@
 const std = @import("std");
-const rove = @import("rove");
 const rio = @import("rove-io");
 
 const MyIo = rio.Io(.{});
 
-fn processReads(io: *MyIo, reg: *rove.Registry, alloc: std.mem.Allocator) !void {
+fn processReads(io: *MyIo, reg: *MyIo.Reg, alloc: std.mem.Allocator) !void {
     for (
         io.read_results.entitySlice(),
         io.read_results.column(rio.ConnEntity),
@@ -24,15 +23,24 @@ fn processReads(io: *MyIo, reg: *rove.Registry, alloc: std.mem.Allocator) !void 
 
             try reg.move(ent, &io.read_results, &io.read_in);
         } else {
-            try reg.destroy(conn_ent.entity);
+            // EOF or error: the conn still owns a live fd, so hand it to
+            // `conn_closing` — io's teardown system shuts the socket down
+            // and retires it. A direct destroy bypasses that path (and
+            // `Fd.deinit` aborts on the leaked descriptor slot). The read
+            // entity holds no buffer at EOF/error and can simply go.
             try reg.destroy(ent);
+            try reg.move(conn_ent.entity, &io.connections, &io.conn_closing);
         }
     }
 }
 
-fn processWrites(io: *MyIo, reg: *rove.Registry) !void {
+fn processWrites(io: *MyIo, reg: *MyIo.Reg) !void {
+    // `write_done` is the terminal collection whose system frees the
+    // buffer — an entity can only reach it from `write_results`, so being
+    // there means the send's CQE landed and the kernel is done with the
+    // bytes. Destroying straight out of `write_results` leaks the copy.
     for (io.write_results.entitySlice()) |ent| {
-        try reg.destroy(ent);
+        try reg.move(ent, &io.write_results, &io.write_done);
     }
 }
 
@@ -41,7 +49,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var reg = try rove.Registry.init(alloc, .{
+    var reg = try MyIo.Reg.init(alloc, .{
         .max_entities = 4096,
         .deferred_queue_capacity = 1024,
     });
