@@ -813,6 +813,15 @@ pub fn Io(comptime opts: Options) type {
         /// the kernel has the ops, and blocking teardown to watch them land
         /// buys the peer nothing it does not already have.
         pub fn shutdownAllConns(self: *Self) void {
+            // Retire the deferred queue first. The sweep must skip
+            // PENDING_MOVE entities (immediate ops over a queued op's
+            // captured offsets would corrupt the flush), so a conn
+            // mid-move at sweep time would otherwise be skipped, land in
+            // its destination at the tail flush — after the loop already
+            // passed it — and never close. Flushing first means no entity
+            // is pending and "all" means all; the isMoving guard below
+            // stays as defense, vestigial on this path.
+            self.reg.flush() catch {};
             if (comptime is_fat) {
                 // End every conn this instance ever created, wherever it
                 // lives — including collections an upper layer owns, which
@@ -1805,14 +1814,26 @@ test "fat: the sweep ends a conn adopted by a collection io cannot name" {
     _ = try reg.join(conn, &io.all_conns);
     try reg.moveImmediate(conn, &io.connections, &upper);
 
+    // A second conn caught MID-MOVE at sweep time: the deferred move to
+    // the foreign collection is enqueued but not flushed. The sweep must
+    // retire the queue before walking, or this conn would be skipped as
+    // pending, land in `upper` after the loop, and never close.
+    const conn2 = try reg.create(&io.connections);
+    try reg.set(conn2, &io.connections, Fd, .{ .fd = 3 });
+    _ = try reg.join(conn2, &io.all_conns);
+    try reg.move(conn2, &io.connections, &upper);
+    try testing.expect(reg.isMoving(conn2));
+
     io.shutdownAllConns();
 
-    // Swept: extracted from the foreign collection into conn_closing,
+    // Both swept: extracted from the foreign collection into conn_closing,
     // shutdown posted, descriptor slot given up — the ordinary teardown,
-    // reached without io knowing where the conn lived.
-    try testing.expect(reg.isInCollection(conn, &io.conn_closing));
-    try testing.expect((try reg.get(conn, &io.conn_closing, ClosingState)).shutdown_posted);
-    try testing.expectEqual(@as(i32, -1), (try reg.get(conn, &io.conn_closing, Fd)).fd);
+    // reached without io knowing where either conn lived.
+    for ([_]Entity{ conn, conn2 }) |c| {
+        try testing.expect(reg.isInCollection(c, &io.conn_closing));
+        try testing.expect((try reg.get(c, &io.conn_closing, ClosingState)).shutdown_posted);
+        try testing.expectEqual(@as(i32, -1), (try reg.get(c, &io.conn_closing, Fd)).fd);
+    }
     try testing.expectEqual(@as(u32, 0), upper.count);
 }
 
