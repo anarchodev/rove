@@ -470,6 +470,21 @@ pub fn build(b: *std.Build) void {
     const rove_test_step = b.step("rove-test", "Run the core rove (ECS) unit tests in isolation");
     rove_test_step.dependOn(&b.addRunArtifact(rove_tests).step);
 
+    // fat-bench: core-ECS move-cost microbenchmark — Registry (archetype)
+    // vs FatRegistry (fat-entity shadow model) on the same Collection
+    // machinery. Its own module rooted in src/rove so the registry code
+    // under measurement compiles at ReleaseFast (rove_mod compiles at the
+    // session's optimize mode). The gate compiles it; only the step runs it.
+    const fat_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/rove/fat_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const fat_bench = b.addExecutable(.{ .name = "fat-bench", .root_module = fat_bench_mod });
+    test_step.dependOn(&fat_bench.step);
+    const fat_bench_step = b.step("fat-bench", "Run the core-ECS move-cost microbenchmark (ReleaseFast)");
+    fat_bench_step.dependOn(&b.addRunArtifact(fat_bench).step);
+
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);
