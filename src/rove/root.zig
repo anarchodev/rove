@@ -6,11 +6,13 @@ pub const entity_mod = @import("entity.zig");
 pub const row_mod = @import("row.zig");
 pub const collection_mod = @import("collection.zig");
 pub const registry_mod = @import("registry.zig");
+pub const fat_mod = @import("fat.zig");
 
 pub const Entity = entity_mod.Entity;
 pub const Row = row_mod.Row;
 pub const Collection = collection_mod.Collection;
 pub const Registry = registry_mod.Registry;
+pub const FatRegistry = fat_mod.FatRegistry;
 pub const effectiveAlign = collection_mod.effectiveAlign;
 
 /// Make the process's stderr/stdout non-blocking so `std.log` writes on a
@@ -39,4 +41,5 @@ test {
     _ = row_mod;
     _ = collection_mod;
     _ = registry_mod;
+    _ = fat_mod;
 }

@@ -465,6 +465,10 @@ pub fn build(b: *std.Build) void {
     // rove tests
     const rove_tests = b.addTest(.{ .root_module = rove_mod });
     test_step.dependOn(&b.addRunArtifact(rove_tests).step);
+    // Isolated core-ECS test step — entity/row/collection/registry/fat
+    // without the rest of the suite.
+    const rove_test_step = b.step("rove-test", "Run the core rove (ECS) unit tests in isolation");
+    rove_test_step.dependOn(&b.addRunArtifact(rove_tests).step);
 
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
