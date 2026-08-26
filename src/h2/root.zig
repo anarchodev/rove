@@ -186,6 +186,11 @@ pub const Options = struct {
     request_row: type = Row(&.{}),
     connection_row: type = Row(&.{}),
     client: bool = false,
+    registry_model: rio.RegistryModel = .archetype,
+    /// The composing layer's universe contribution (fat model): everything
+    /// its own collections carry, plus shadow-only components. Folded into
+    /// what this layer passes rove-io. Ignored under archetype.
+    extra_components: type = Row(&.{}),
 };
 
 pub const H2Options = struct {
@@ -301,11 +306,25 @@ pub fn H2(comptime opts: Options) type {
     const full_conn_row = rio.ConnectionBaseRow.merge(Row(&.{Conn})).merge(opts.connection_row);
 
     const has_client = opts.client;
+    const is_fat = opts.registry_model == .fat;
 
-    // Rove-io type for this h2 configuration
+    // Rove-io type for this h2 configuration. Under fat, everything h2's
+    // own collections carry folds into io's universe (the composition
+    // mechanism), and retirement hands conns to `conn_dead` so
+    // `processConnDead` can free the foreign state `Conn.deinit` frees
+    // under the archetype (nghttp2 session, TLS conn, h1) at a point
+    // provably after every reader.
+    const h2_universe_contribution = StreamBaseRow
+        .merge(opts.request_row)
+        .merge(Row(&.{ Conn, WsMeta, ConnectTarget }))
+        .merge(opts.connection_row)
+        .merge(opts.extra_components);
     const IoType = rio.Io(.{
         .connection_row = Row(&.{Conn}).merge(opts.connection_row),
         .connect = has_client,
+        .registry_model = opts.registry_model,
+        .extra_components = h2_universe_contribution,
+        .on_retire = if (is_fat) .hand_off else .destroy,
     });
 
     // WebSocket seam row (docs/architecture/websockets.md): one entity per inbound
@@ -331,6 +350,11 @@ pub fn H2(comptime opts: Options) type {
         // Public row types (for external access)
         pub const StreamRow = stream_row;
         pub const ConnectionRow = full_conn_row;
+
+        /// The registry type this instantiation runs on (crystallized by
+        /// rove-io from the folded universe; re-exported here so the
+        /// composing layer writes `MyH2.Reg` without knowing the layers).
+        pub const Reg = IoType.Reg;
 
         // The io instance (heap-allocated by rio.Io.create)
         io: *IoType,
@@ -452,7 +476,7 @@ pub fn H2(comptime opts: Options) type {
         _client_stream_data_sending: ClientStreamColl,
 
         h2_opts: H2Options,
-        reg: *Registry,
+        reg: *Reg,
         allocator: std.mem.Allocator,
 
 
@@ -2515,7 +2539,7 @@ pub fn H2(comptime opts: Options) type {
             }
         }
 
-        pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
+        pub fn create(reg: *Reg, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
             try ensureCallbacks();
 
             const io = try IoType.create(reg, allocator, addr, io_opts);
@@ -2554,14 +2578,18 @@ pub fn H2(comptime opts: Options) type {
                 reg.registerCollection(&@field(self, s.name), @intFromEnum(@field(Coll, s.name)) + 1);
             }
 
-            // Register FD resolver with io so that processWriteIn/processReadIn
-            // can find connection Fds when h2 has moved them to _conn_active etc.
-            self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
-            self.io.setPeerResolver(@ptrCast(self), &resolvePeerThunk);
-            // Admission control: io counts conns in `io.connections` +
-            // whatever this callback returns. h2 holds promoted conns
-            // in `_conn_tls_handshake` + `_conn_active`.
-            self.io.setExtraConnsFn(@ptrCast(self), &extraConnsThunk);
+            // Register the three archetype hooks: FD/peer resolvers (so
+            // io's completion paths can find conns h2 moved into its own
+            // collections) and the admission-count callback. Under the fat
+            // model all three are structurally unnecessary — getFat
+            // resolves components wherever the entity lives, and
+            // all_conns counts exactly — and their setters are compile
+            // errors there.
+            if (comptime !is_fat) {
+                self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
+                self.io.setPeerResolver(@ptrCast(self), &resolvePeerThunk);
+                self.io.setExtraConnsFn(@ptrCast(self), &extraConnsThunk);
+            }
 
             return self;
         }
@@ -2577,6 +2605,18 @@ pub fn H2(comptime opts: Options) type {
             }
             self.reg.flush() catch {};
             self.io.shutdownAllConns();
+            if (comptime is_fat) {
+                // The archetype frees each conn's foreign state (nghttp2
+                // session, TLS conn, h1) via Conn.deinit when collections
+                // deinit below. The fat model runs no hooks, so reap
+                // explicitly: conn_dead holds the retired, and conns still
+                // in conn_closing (shutdown posted, recv not yet quiet)
+                // are reaped too — their socket ops are already with the
+                // kernel, and nothing reads the session after this point.
+                self.reapConnForeign(&self.io.conn_dead);
+                self.reapConnForeign(&self.io.conn_closing);
+                self.reg.flush() catch {};
+            }
             for (self.body_sinks.items) |ref| {
                 ref.sink.abort(ref.sink.ctx);
                 ref.sink.release(ref.sink.ctx);
@@ -2623,6 +2663,50 @@ pub fn H2(comptime opts: Options) type {
             try self.pollPostlude();
         }
 
+        /// Free one collection's members' foreign conn state and destroy
+        /// the entities (deferred; caller flushes). The Conn component is
+        /// parked by the time a conn reaches `conn_dead` — `getFat`
+        /// resolves it wherever it lives — and `conn_state.Conn.deinit`
+        /// nulls what it frees, so a slot can never double-free.
+        fn reapConnForeign(self: *Self, coll: anytype) void {
+            for (coll.entitySlice()) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                if (self.reg.isMoving(ent)) continue;
+                const conn_ptr = self.reg.getFat(ent, Conn) catch continue;
+                conn_state.Conn.deinit(self.allocator, @as([*]Conn, @ptrCast(conn_ptr))[0..1]);
+                self.destroyEntity(ent) catch {};
+            }
+        }
+
+        /// Drain the terminal hand-off collection (fat model): every conn
+        /// here finished teardown — socket down, read cycle released, no
+        /// reader left — so this is provably after every access, the same
+        /// guarantee destroy-time firing gave the archetype's hook.
+        fn processConnDead(self: *Self) void {
+            self.reapConnForeign(&self.io.conn_dead);
+        }
+
+        /// End an h2-owned entity. Under the archetype this is a plain
+        /// destroy — the four buffer-owning stream components (ReqHeaders,
+        /// ReqBody, RespHeaders, RespBody) free their heap memory via
+        /// their deinit hooks. The fat model runs no hooks, so this frees
+        /// them explicitly first, through getFat — which is safe on ANY
+        /// entity: a component the entity never held reads as its declared
+        /// default (null data), and the free skips. Consumers of terminal
+        /// collections (response_out and kin) must end entities through
+        /// this, not reg.destroy, or the fat model leaks the buffers.
+        pub fn destroyEntity(self: *Self, ent: Entity) !void {
+            if (comptime is_fat) self.freeStreamForeign(ent);
+            try self.reg.destroy(ent);
+        }
+
+        fn freeStreamForeign(self: *Self, ent: Entity) void {
+            inline for (.{ ReqHeaders, ReqBody, RespHeaders, RespBody }) |T| {
+                const p = self.reg.getFat(ent, T) catch return;
+                T.deinit(self.allocator, @as([*]T, @ptrCast(p))[0..1]);
+            }
+        }
+
         fn pollPrelude(self: *Self) !void {
             // Phase 1: Consume user inputs queued between polls (responses, chunks).
             // Must run before io.poll so the writes they generate can be submitted
@@ -2650,6 +2734,14 @@ pub fn H2(comptime opts: Options) type {
         }
 
         fn pollPostlude(self: *Self) !void {
+            // The terminal phase first: conns io retired into `conn_dead`
+            // this pass get their foreign state freed and their entities
+            // destroyed — the fat model's home for what `Conn.deinit`
+            // does at destroy-time under the archetype.
+            if (comptime is_fat) {
+                self.processConnDead();
+                try self.reg.flush();
+            }
             // A close decided last pass but blocked by an in-flight move
             // lands first, so nothing below treats the conn as live.
             self.retryPendingCloses();
@@ -3966,7 +4058,7 @@ pub fn H2(comptime opts: Options) type {
         /// streams into it).
         fn http1CreateEntity(self: *Self, coll: *StreamColl, conn_entity: Entity, head: http1.Head, scheme: []const u8) !Entity {
             const req_entity = try self.reg.create(coll);
-            errdefer self.reg.destroy(req_entity) catch {};
+            errdefer self.destroyEntity(req_entity) catch {};
 
             try self.reg.set(req_entity, coll, StreamId, .{ .id = 1 });
             try self.reg.set(req_entity, coll, Session, .{ .entity = conn_entity });
@@ -3980,7 +4072,7 @@ pub fn H2(comptime opts: Options) type {
         /// Build a `request_out` entity from a parsed h1 head + complete body.
         fn http1EmitRequest(self: *Self, conn_entity: Entity, head: http1.Head, body: []const u8, scheme: []const u8) !void {
             const req_entity = try self.http1CreateEntity(&self.request_out, conn_entity, head, scheme);
-            errdefer self.reg.destroy(req_entity) catch {};
+            errdefer self.destroyEntity(req_entity) catch {};
 
             var body_data: ?[*]u8 = null;
             if (body.len > 0) {
@@ -4627,7 +4719,7 @@ pub fn H2(comptime opts: Options) type {
         /// allocator-owned `ReqBody` the entity's destroy frees.
         fn wsEmitMessage(self: *Self, conn_entity: Entity, opcode: u8, payload: []const u8) !void {
             const ent = try self.reg.create(&self.ws_message_out);
-            errdefer self.reg.destroy(ent) catch {};
+            errdefer self.destroyEntity(ent) catch {};
             try self.reg.set(ent, &self.ws_message_out, Session, .{ .entity = conn_entity });
             try self.reg.set(ent, &self.ws_message_out, WsMeta, .{ .opcode = opcode });
             var data: ?[*]u8 = null;
@@ -4680,7 +4772,7 @@ pub fn H2(comptime opts: Options) type {
 
             for (entities, sessions, metas, bodies) |ent, sess, meta, *body| {
                 if (self.reg.isStale(sess.entity)) {
-                    try self.reg.destroy(ent);
+                    try self.destroyEntity(ent);
                     continue;
                 }
                 // Extended-CONNECT tunnel: the Session is a WS identity
@@ -4689,23 +4781,23 @@ pub fn H2(comptime opts: Options) type {
                 if (self.reg.isInCollection(sess.entity, &self.ws_streams)) {
                     const payload = if (body.data) |d| d[0..body.len] else "";
                     self.wsStreamSend(sess.entity, meta.opcode, payload);
-                    try self.reg.destroy(ent);
+                    try self.destroyEntity(ent);
                     continue;
                 }
                 const conn_ptr = getConn(self, sess.entity) orelse {
-                    try self.reg.destroy(ent);
+                    try self.destroyEntity(ent);
                     continue;
                 };
                 const h1c = conn_ptr.h1 orelse {
-                    try self.reg.destroy(ent);
+                    try self.destroyEntity(ent);
                     continue;
                 };
                 const wr = h1c.wsWrite() orelse {
-                    try self.reg.destroy(ent);
+                    try self.destroyEntity(ent);
                     continue;
                 };
                 if (wr.closing) {
-                    try self.reg.destroy(ent);
+                    try self.destroyEntity(ent);
                     continue;
                 }
 
@@ -4715,12 +4807,12 @@ pub fn H2(comptime opts: Options) type {
                     self.wsClose(conn_ptr, sess.entity, ws.CloseCode.normal);
                 } else {
                     ws.writeFrame(&wr.out, self.allocator, opcode, payload) catch {
-                        try self.reg.destroy(ent);
+                        try self.destroyEntity(ent);
                         continue;
                     };
                     self.wsFlush(conn_ptr, sess.entity);
                 }
-                try self.reg.destroy(ent);
+                try self.destroyEntity(ent);
             }
         }
 
@@ -5057,7 +5149,7 @@ pub fn H2(comptime opts: Options) type {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
-                            try self.reg.destroy(ent);
+                            try self.destroyEntity(ent);
                             broke = true;
                             break;
                         }
@@ -5065,7 +5157,7 @@ pub fn H2(comptime opts: Options) type {
                         const flen: usize = @intCast(len);
                         if (accum_len + flen > accum_buf.len) {
                             const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
-                                try self.reg.destroy(ent);
+                                try self.destroyEntity(ent);
                                 broke = true;
                                 break;
                             };
@@ -5080,7 +5172,7 @@ pub fn H2(comptime opts: Options) type {
 
                     if (!broke and accum_len > 0) {
                         const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
-                            try self.reg.destroy(ent);
+                            try self.destroyEntity(ent);
                             continue;
                         };
                         self.enqueueConnSend(conn_ptr, ent, cipher);
@@ -5100,7 +5192,7 @@ pub fn H2(comptime opts: Options) type {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
-                            try self.reg.destroy(ent);
+                            try self.destroyEntity(ent);
                             broke = true;
                             break;
                         }
@@ -5114,7 +5206,7 @@ pub fn H2(comptime opts: Options) type {
                             // corrupted — loopback masks it (buffers rarely
                             // fill), a real network doesn't.
                             const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
-                                try self.reg.destroy(ent);
+                                try self.destroyEntity(ent);
                                 broke = true;
                                 break;
                             };
@@ -5127,7 +5219,7 @@ pub fn H2(comptime opts: Options) type {
 
                     if (!broke and accum_len > 0) {
                         const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
-                            try self.reg.destroy(ent);
+                            try self.destroyEntity(ent);
                             continue;
                         };
                         self.enqueueConnSend(conn_ptr, ent, copy);
@@ -5390,7 +5482,7 @@ pub fn H2(comptime opts: Options) type {
                     self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = -1 }) catch {};
                     self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_errors) catch {};
                 }
-                try self.reg.destroy(ent);
+                try self.destroyEntity(ent);
             }
         }
 
