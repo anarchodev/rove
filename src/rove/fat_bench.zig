@@ -405,6 +405,231 @@ fn benchLookup(alloc: std.mem.Allocator) !void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scenario A — unknown-home resolution, shaped like rove-h2's stream chain
+// ---------------------------------------------------------------------------
+// rove-h2's 11 server-stream chain collections share ONE row type; close
+// and streamSet resolve "which collection holds this entity" by scanning
+// a candidate tuple (serverStreamColls + isInCollection / getAny /
+// moveAny). This measures that dispatch pattern against the fat model's
+// id-indexed answers: getFat for reads, homeAs for moves.
+
+const Sid = struct { id: u32 = 0, weight: u16 = 0, flags: u16 = 0 };
+const Sess = struct { ptr: usize = 0 };
+const ReqH = struct { ptr: usize = 0, len: u32 = 0, cap: u32 = 0 };
+const ReqB = struct { ptr: usize = 0, len: u32 = 0, cap: u32 = 0 };
+const RespH = struct { ptr: usize = 0, len: u32 = 0, cap: u32 = 0 };
+const RespB = struct { ptr: usize = 0, len: u32 = 0, cap: u32 = 0 };
+const St = struct { code: u16 = 0, phase: u16 = 0, r: u32 = 0 };
+const IoRes = struct { v: u64 = 0 };
+
+const StreamRow = Row(&.{ Sid, Sess, ReqH, ReqB, RespH, RespB, St, IoRes });
+const StreamColl = Collection(StreamRow, .{ .capacity = K });
+const FatStreamReg = FatRegistry(StreamRow);
+const NCHAIN = 11;
+const CLOSE_CYCLES = 10;
+
+fn benchUnknownHome(alloc: std.mem.Allocator) !void {
+    // ---- archetype: candidate-tuple scan ----
+    {
+        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 8192 });
+        defer reg.deinit();
+        var chain: [NCHAIN]StreamColl = undefined;
+        for (&chain) |*c| c.* = try StreamColl.init(alloc);
+        defer for (&chain) |*c| c.deinit();
+        for (&chain) |*c| reg.registerCollection(c);
+        var terminal = try StreamColl.init(alloc);
+        defer terminal.deinit();
+        reg.registerCollection(&terminal);
+
+        const t11 = .{
+            &chain[0], &chain[1], &chain[2], &chain[3], &chain[4], &chain[5],
+            &chain[6], &chain[7], &chain[8], &chain[9], &chain[10],
+        };
+
+        const ents = try alloc.alloc(Entity, K);
+        defer alloc.free(ents);
+        for (ents, 0..) |*e, i| e.* = try reg.create(&chain[i % NCHAIN]);
+
+        // resolve, uniform distribution over the 11 candidates
+        {
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var acc: u64 = 0;
+                var timer = try std.time.Timer.start();
+                for (0..LOOKUP_PASSES) |_| {
+                    for (ents) |e| acc +%= (try reg.getAny(e, t11, Sid)).id;
+                }
+                const t = timer.read();
+                std.mem.doNotOptimizeAway(acc);
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("resolve | archetype getAny 11-scan, uniform", totals, LOOKUP_PASSES * K);
+        }
+
+        // resolve, worst case: every entity in the LAST-scanned candidate
+        {
+            for (ents) |e| {
+                if (!reg.isInCollection(e, &chain[NCHAIN - 1])) {
+                    try reg.moveAny(e, t11, &chain[NCHAIN - 1]);
+                }
+            }
+            try reg.flush();
+
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var acc: u64 = 0;
+                var timer = try std.time.Timer.start();
+                for (0..LOOKUP_PASSES) |_| {
+                    for (ents) |e| acc +%= (try reg.getAny(e, t11, Sid)).id;
+                }
+                const t = timer.read();
+                std.mem.doNotOptimizeAway(acc);
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("resolve | archetype getAny 11-scan, worst(last)", totals, LOOKUP_PASSES * K);
+
+            // back to uniform for the close scenarios
+            for (ents, 0..) |e, i| {
+                if (i % NCHAIN != NCHAIN - 1) try reg.moveImmediate(e, &chain[NCHAIN - 1], &chain[i % NCHAIN]);
+            }
+        }
+
+        // resolve, coll-enum style: ids declared (here: known from
+        // registration order), so membership is READ and the typed
+        // collection is indexed — the parked coll-enum branch's
+        // `collectionOf` + `inline else` switch, position-independent.
+        // Same archetype storage; only the dispatch discipline differs.
+        {
+            const first_id = chain[0].registry_id;
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var acc: u64 = 0;
+                var timer = try std.time.Timer.start();
+                for (0..LOOKUP_PASSES) |_| {
+                    for (ents) |e| {
+                        const idx = e.index;
+                        if (reg.generations[idx] != e.generation) return error.Stale;
+                        const raw = reg.collection_ids[idx];
+                        if (raw < first_id or raw >= first_id + NCHAIN) return error.WrongCollection;
+                        acc +%= chain[raw - first_id].column(Sid)[reg.offsets[idx]].id;
+                    }
+                }
+                const t = timer.read();
+                std.mem.doNotOptimizeAway(acc);
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("resolve | archetype id-index (coll-enum style)", totals, LOOKUP_PASSES * K);
+        }
+
+        // close from unknown home: moveAny scan, then flush; redistribute untimed
+        {
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var t: u64 = 0;
+                for (0..CLOSE_CYCLES) |_| {
+                    var timer = try std.time.Timer.start();
+                    for (ents) |e| try reg.moveAny(e, t11, &terminal);
+                    try reg.flush();
+                    t += timer.read();
+                    for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
+                }
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("close   | archetype moveAny 11-scan, uniform", totals, CLOSE_CYCLES * K);
+        }
+
+        // close, coll-enum style: membership read, source indexed. `move`
+        // re-validates the handle, so no pre-checks here.
+        {
+            const first_id = chain[0].registry_id;
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var t: u64 = 0;
+                for (0..CLOSE_CYCLES) |_| {
+                    var timer = try std.time.Timer.start();
+                    for (ents) |e| {
+                        try reg.move(e, &chain[reg.collection_ids[e.index] - first_id], &terminal);
+                    }
+                    try reg.flush();
+                    t += timer.read();
+                    for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
+                }
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("close   | archetype id-index (coll-enum style)", totals, CLOSE_CYCLES * K);
+        }
+
+        // close with the home KNOWN at the call site — the scan-free floor
+        {
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var t: u64 = 0;
+                for (0..CLOSE_CYCLES) |_| {
+                    var timer = try std.time.Timer.start();
+                    for (ents, 0..) |e, i| try reg.move(e, &chain[i % NCHAIN], &terminal);
+                    try reg.flush();
+                    t += timer.read();
+                    for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
+                }
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("close   | known home, direct move (floor)", totals, CLOSE_CYCLES * K);
+        }
+    }
+
+    // ---- fat: id-indexed dispatch ----
+    {
+        var reg = try FatStreamReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 8192 });
+        defer reg.deinit();
+        var chain: [NCHAIN]StreamColl = undefined;
+        for (&chain) |*c| c.* = try StreamColl.init(alloc);
+        defer for (&chain) |*c| c.deinit();
+        for (&chain) |*c| reg.registerCollection(c);
+        var terminal = try StreamColl.init(alloc);
+        defer terminal.deinit();
+        reg.registerCollection(&terminal);
+
+        const ents = try alloc.alloc(Entity, K);
+        defer alloc.free(ents);
+        for (ents, 0..) |*e, i| e.* = try reg.create(&chain[i % NCHAIN]);
+
+        // resolve: getFat is position-independent — one row covers
+        // uniform and worst alike
+        {
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var acc: u64 = 0;
+                var timer = try std.time.Timer.start();
+                for (0..LOOKUP_PASSES) |_| {
+                    for (ents) |e| acc +%= (try reg.getFat(e, Sid)).id;
+                }
+                const t = timer.read();
+                std.mem.doNotOptimizeAway(acc);
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("resolve | fat getFat, any distribution", totals, LOOKUP_PASSES * K);
+        }
+
+        // close from unknown home: homeAs id-dispatch, then flush
+        {
+            var totals: [REPS]u64 = undefined;
+            for (0..REPS + 1) |rep| {
+                var t: u64 = 0;
+                for (0..CLOSE_CYCLES) |_| {
+                    var timer = try std.time.Timer.start();
+                    for (ents) |e| try reg.move(e, try reg.homeAs(e, StreamColl), &terminal);
+                    try reg.flush();
+                    t += timer.read();
+                    for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
+                }
+                if (rep > 0) totals[rep - 1] = t;
+            }
+            report("close   | fat homeAs id-dispatch, uniform", totals, CLOSE_CYCLES * K);
+        }
+    }
+}
+
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
@@ -431,4 +656,12 @@ pub fn main() !void {
     try benchIterate(alloc);
     std.debug.print("\n", .{});
     try benchLookup(alloc);
+    std.debug.print("\nscenario A — h2-shaped unknown-home dispatch ({d} chain colls, {d}B stream row, K={d} uniform)\n", .{ NCHAIN, comptime rowSize(StreamRow), K });
+    try benchUnknownHome(alloc);
+}
+
+fn rowSize(comptime R: type) comptime_int {
+    comptime var n = 0;
+    inline for (R.types) |T| n += @sizeOf(T);
+    return n;
 }

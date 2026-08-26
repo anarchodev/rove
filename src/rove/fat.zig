@@ -476,6 +476,22 @@ pub fn FatRegistry(comptime Universe: type) type {
             return slot;
         }
 
+        /// Resolve the entity's current collection as a typed pointer —
+        /// the id-indexed dispatch the model enables where every candidate
+        /// collection shares one type (rows coincide): one indexed load
+        /// instead of an N-way candidate scan. The type is the CALLER's
+        /// assertion — every collection the entity can currently be in
+        /// must be a CollType; a wrong assertion is undetected here. The
+        /// declared-collections direction makes it checkable.
+        pub inline fn homeAs(self: *Self, entity: Entity, comptime CollType: type) !*CollType {
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            const id = self.collection_ids[idx];
+            if (id == 0) return error.InvalidEntity;
+            return @ptrCast(@alignCast(self.coll_ptrs[id].?));
+        }
+
         // =============================================================
         // Internal
         // =============================================================
@@ -905,6 +921,31 @@ test "ZST components ride moves and getFat" {
     try reg.flush();
     _ = try reg.getFat(e, Tag);
     try testing.expectEqual(@as(u32, 1), tagged.count);
+}
+
+test "homeAs — id-indexed home resolution over same-type collections" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    const PhaseColl = Collection(Row(&.{ Position, Fdish }), .{});
+    var pa = try PhaseColl.init(testing.allocator);
+    defer pa.deinit();
+    reg.registerCollection(&pa);
+    var pb = try PhaseColl.init(testing.allocator);
+    defer pb.deinit();
+    reg.registerCollection(&pb);
+
+    const e = try reg.create(&pa);
+    try testing.expectEqual(&pa, try reg.homeAs(e, PhaseColl));
+
+    // Move through the resolved home, no candidate set anywhere.
+    try reg.move(e, try reg.homeAs(e, PhaseColl), &pb);
+    try reg.flush();
+    try testing.expectEqual(&pb, try reg.homeAs(e, PhaseColl));
+
+    try reg.destroy(e);
+    try reg.flush();
+    try testing.expectError(error.Stale, reg.homeAs(e, PhaseColl));
 }
 
 test "destroy — entity leaves, handle goes stale, pool refills" {
