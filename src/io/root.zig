@@ -49,6 +49,10 @@ pub const IoCleanupCtx = struct {
     /// kept separate so the source of returns is attributable in the
     /// diagnostic log.
     recv_buffers_returned_via_deinit: u64 = 0,
+    /// Conns destroyed while still holding a live descriptor slot — i.e.
+    /// something destroyed a conn entity without routing it through
+    /// `conn_closing`. Should never move.
+    fd_destroyed_live: u64 = 0,
 };
 
 /// Peer (remote) address of an accepted connection, resolved once at
@@ -70,31 +74,53 @@ pub const Fd = struct {
 
     pub const DeinitCtx = IoCleanupCtx;
 
+    /// A connection reaches destruction through `conn_closing`, which posts
+    /// the shutdown and close and clears `fd` — so on every legal path this
+    /// sees -1 and does nothing.
+    ///
+    /// A live fd here means a conn was destroyed around the closing state.
+    /// That is a programmer error, not an operating error, and the honest
+    /// response is to stop: the descriptor leaks, the peer never observes a
+    /// close, and — the part that actually decides it — a path that was
+    /// supposed to be unreachable just ran, so nothing else it did can be
+    /// trusted either. "It is only an fd" is an assumption about code we
+    /// have just established we do not understand.
+    ///
+    /// Closing the socket instead would be worse than useless: it would hide
+    /// the break, and the slot number may already have been reissued to a new
+    /// accept, so the close would land on somebody else's connection.
+    ///
+    /// Teardown is not an exception. `shutdownAllConns` takes every remaining
+    /// conn through the closing path before any collection is deinited, so
+    /// the fds are already -1 when destruction reaches them. An invariant
+    /// with a mode flag that switches it off is not an invariant — and that
+    /// flag would have been held by the very layer whose destroys this
+    /// exists to police.
+    ///
+    /// An explicit check and `abort`, not `std.debug.assert`, because the
+    /// shipped binaries are ReleaseFast (`scripts/ops/build.sh`) where an
+    /// assert compiles to nothing — the same reason the recv-buffer
+    /// invariant in rove-h2 is written this way. Aborting is the one kind of
+    /// work a destructor may do beyond its own memory: there is no ordering
+    /// to get wrong and no re-entrancy to worry about when the process is
+    /// ending.
     pub fn deinit(_: std.mem.Allocator, items: []Fd, ctx: *DeinitCtx) void {
         for (items) |item| {
-            if (item.fd >= 0 and @as(u32, @intCast(item.fd)) < ctx.max_connections) {
-                // Graceful close: shut the socket down before freeing its
-                // direct-descriptor slot. `close_direct` alone is not enough —
-                // a connection torn down while a recv is still armed keeps the
-                // socket alive (the slot ref the recv holds outlives the close),
-                // so the peer never observes a close (h2spec http2/5.4.1); and a
-                // bare close() with unread RX bytes emits a TCP RST instead of a
-                // clean FIN (h2spec generic/5, http2/7). SHUT_RDWR sends the FIN
-                // and completes the pending recv (dropping the slot ref), so the
-                // hard-linked close then frees the slot. Hard-link (not soft) so
-                // the close still runs if shutdown reports the socket already
-                // gone (e.g. ENOTCONN after the peer's own FIN).
-                const sh = getSqeOrSubmit(ctx.ring) catch
-                    @panic("SQ full during Fd.deinit shutdown even after submit — ring too small");
-                sh.prep_shutdown(@intCast(item.fd), linux.SHUT.RDWR);
-                sh.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK;
-                sh.user_data = INTERNAL_SENTINEL;
-
-                const sqe = getSqeOrSubmit(ctx.ring) catch
-                    @panic("SQ full during Fd.deinit even after submit — ring too small");
-                sqe.prep_close_direct(@intCast(item.fd));
-                sqe.user_data = INTERNAL_SENTINEL;
-            }
+            if (item.fd < 0) continue;
+            ctx.fd_destroyed_live += 1;
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "\n================================================================\n" ++
+                    "ROVE IO: conn destroyed while its fd ({d}) was still live.\n" ++
+                    "  It bypassed `conn_closing`, so the socket was never shut down\n" ++
+                    "  and the descriptor slot is leaked. A path that cannot be\n" ++
+                    "  reached has been reached; the rest of its work is suspect.\n" ++
+                    "================================================================\n",
+                .{item.fd},
+            ) catch buf[0..0];
+            _ = posix.write(2, msg) catch {};
+            std.process.abort();
         }
     }
 };
@@ -203,7 +229,31 @@ pub const ReadCycleEntity = struct {
 // Base row types
 // =============================================================================
 
+fn monotonicNs() u64 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
+    return @intCast(ts.sec * std.time.ns_per_s + ts.nsec);
+}
+
+/// Per-connection teardown progress, carried only while the conn sits in
+/// `conn_closing`. Absent from every live conn row, so a conn acquires it
+/// by moving into the closing state and it cannot be consulted before then.
+pub const ClosingState = struct {
+    /// `shutdown` + `close_direct` have been posted. Set once — posting a
+    /// second close for the same descriptor slot would free a slot the
+    /// kernel may already have handed to a new accept.
+    shutdown_posted: bool = false,
+    /// Monotonic deadline for the armed recv to complete. A peer that
+    /// never finishes closing must not pin a slot forever, so past this
+    /// the conn is retired with the recv still outstanding — the stale
+    /// completion then reclaims its buffer in `handleCqe`.
+    deadline_ns: u64 = 0,
+};
+
 pub const ConnectionBaseRow = Row(&.{ Fd, ReadCycleEntity, PeerAddr });
+/// The closing row is the connection row plus `ClosingState`, so a move in
+/// from any live conn collection is an ordinary widening — no components are
+/// dropped, and nothing is destroyed by the transition itself.
+pub const ClosingBaseRow = ConnectionBaseRow.merge(Row(&.{ClosingState}));
 pub const ReadBaseRow = Row(&.{ ConnEntity, ReadResult });
 pub const WriteInBaseRow = Row(&.{ ConnEntity, WriteBuf });
 pub const WriteResultBaseRow = Row(&.{ ConnEntity, WriteBuf, IoResult });
@@ -276,6 +326,7 @@ pub fn Io(comptime opts: Options) type {
 
     // Collection types
     const ConnColl = Collection(conn_row, .{});
+    const ClosingColl = Collection(ClosingBaseRow.merge(opts.connection_row), .{});
     const ReadResultColl = Collection(read_row, .{});
     const WriteResultColl = Collection(write_result_row, .{});
     const ReadInColl = Collection(read_row, .{});
@@ -305,7 +356,7 @@ pub fn Io(comptime opts: Options) type {
         ///
         /// Unprefixed on purpose: this is a seam other code moves entities
         /// into, like `read_in` / `write_in`, not internal bookkeeping.
-        conn_closing: ConnColl,
+        conn_closing: ClosingColl,
         read_results: ReadResultColl,
         write_results: WriteResultColl,
         read_in: ReadInColl,
@@ -374,10 +425,23 @@ pub fn Io(comptime opts: Options) type {
         /// `IoCleanupCtx.recv_buffers_returned_via_deinit` is.
         recv_buffers_returned_via_stale: u64 = 0,
 
+        /// Connections retired out of `conn_closing`, and how many of those
+        /// gave up on the recv rather than seeing it complete. A rising
+        /// second number means peers are not finishing their close — the
+        /// grace window, not the teardown, is what to look at.
+        conn_closing_retired: u64 = 0,
+        conn_closing_deadline_expired: u64 = 0,
+
         reg: *Registry,
         allocator: std.mem.Allocator,
 
         const BUF_GROUP_ID: u16 = 0;
+
+        /// How long a closing conn waits for its armed recv to complete
+        /// before being retired anyway. Bounded because a peer that never
+        /// finishes closing must not pin a descriptor slot; the stale
+        /// completion that arrives afterwards still returns its buffer.
+        const CLOSE_RECV_GRACE_NS: u64 = 2 * std.time.ns_per_s;
 
         /// Look up the Fd for a connection entity. Uses the custom resolver if
         /// set, otherwise searches `self.connections` directly.
@@ -474,7 +538,7 @@ pub fn Io(comptime opts: Options) type {
             const self = try allocator.create(Self);
             self.* = .{
                 .connections = try ConnColl.init(allocator),
-                .conn_closing = try ConnColl.init(allocator),
+                .conn_closing = try ClosingColl.init(allocator),
                 .read_results = try ReadResultColl.init(allocator),
                 .write_results = try WriteResultColl.init(allocator),
                 .read_in = try ReadInColl.init(allocator),
@@ -535,8 +599,36 @@ pub fn Io(comptime opts: Options) type {
             return self;
         }
 
+        /// End every connection still live, through the same closing path
+        /// every other connection takes: move it in, post its shutdown and
+        /// close, give up its slot. Afterwards no conn holds a live fd, so
+        /// destruction proceeds without `Fd.deinit` needing an exception for
+        /// teardown.
+        ///
+        /// An upper layer holding conn collections of its own must close
+        /// those first — rove-h2 does, at the top of its `destroy`.
+        ///
+        /// The submit is the point. Without it the shutdown and close SQEs
+        /// sit in the submission queue until `ring.deinit` discards them,
+        /// which is what made teardown's graceful close a fiction: the peer
+        /// got a reset, or nothing at all. Completions are not waited for —
+        /// the kernel has the ops, and blocking teardown to watch them land
+        /// buys the peer nothing it does not already have.
+        pub fn shutdownAllConns(self: *Self) void {
+            for (self.connections.entitySlice()) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                if (self.reg.isMoving(ent)) continue;
+                self.reg.move(ent, &self.connections, &self.conn_closing) catch continue;
+            }
+            self.reg.flush() catch {};
+            self.processConnClosing() catch {};
+            self.reg.flush() catch {};
+            _ = self.ring.submit() catch {};
+        }
+
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            self.shutdownAllConns();
             self.connections.deinit();
             self.conn_closing.deinit();
             self.read_results.deinit();
@@ -639,17 +731,75 @@ pub fn Io(comptime opts: Options) type {
         // Input processing (deferred ops, forward iteration)
         // =============================================================
 
-        /// Retire the connections an upper layer moved into `conn_closing`.
+        /// Own the teardown of every connection an upper layer handed over.
         ///
-        /// Today this is the destroy that used to happen at the call site,
-        /// relocated — the socket teardown still runs from `Fd.deinit`, in
-        /// row-declaration order. What the collection buys immediately is
-        /// that the ending is now a state: countable for admission, and a
-        /// place for the ordered, confirmation-driven teardown to live.
+        /// The sequence is the reason this is a state and not a destructor.
+        /// A destructor is synchronous: it can post the shutdown, but it
+        /// cannot then WAIT for the recv that shutdown completes, so the
+        /// entity dies while a completion is still in flight against it.
+        /// Here the conn simply stays in `conn_closing` until its read cycle
+        /// is quiet, and only then is retired.
+        ///
+        /// GOAWAY is deliberately not part of this. It is nghttp2's, and io
+        /// knows nothing of sessions — so the upper layer sends it and drains
+        /// it BEFORE handing the conn over. Arriving here means "the protocol
+        /// is finished with this connection; take the socket down."
         fn processConnClosing(self: *Self) !void {
-            for (self.conn_closing.entitySlice()) |ent| {
+            const now = monotonicNs();
+            const entities = self.conn_closing.entitySlice();
+            const states = self.conn_closing.column(ClosingState);
+            const fds = self.conn_closing.column(Fd);
+            const cycles = self.conn_closing.column(ReadCycleEntity);
+
+            for (entities, states, fds, cycles) |ent, *st, *fd, cycle| {
                 if (self.reg.isStale(ent)) continue;
                 if (self.reg.isMoving(ent)) continue;
+
+                if (!st.shutdown_posted) {
+                    st.shutdown_posted = true;
+                    st.deadline_ns = now + CLOSE_RECV_GRACE_NS;
+                    if (fd.fd >= 0 and @as(u32, @intCast(fd.fd)) < self.max_connections) {
+                        // Shut down before freeing the slot. `close_direct`
+                        // alone is not enough: a conn torn down with a recv
+                        // still armed keeps the socket alive, because the
+                        // slot reference the recv holds outlives the close —
+                        // so the peer never observes a close (h2spec
+                        // http2/5.4.1). And a bare close with unread RX bytes
+                        // emits RST rather than a clean FIN (h2spec generic/5,
+                        // http2/7). SHUT_RDWR sends the FIN and completes the
+                        // pending recv, dropping that reference, so the
+                        // hard-linked close then frees the slot. Hard-link,
+                        // not soft, so the close still runs when shutdown
+                        // reports the socket already gone (ENOTCONN after the
+                        // peer's own FIN).
+                        const sh = try getSqeOrSubmit(&self.ring);
+                        sh.prep_shutdown(@intCast(fd.fd), linux.SHUT.RDWR);
+                        sh.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK;
+                        sh.user_data = INTERNAL_SENTINEL;
+
+                        const cl = try getSqeOrSubmit(&self.ring);
+                        cl.prep_close_direct(@intCast(fd.fd));
+                        cl.user_data = INTERNAL_SENTINEL;
+
+                        // The slot is spoken for. Clearing it here is what
+                        // makes `Fd.deinit` an assertion rather than a second
+                        // close of a descriptor the kernel may already have
+                        // reissued to a new accept.
+                        fd.fd = -1;
+                    }
+                    continue;
+                }
+
+                // Wait for the armed recv that the shutdown completes. Its
+                // buffer comes back through the ordinary path, and the
+                // entity outlives the completion that names it.
+                const recv_armed = !cycle.entity.isNil() and
+                    !self.reg.isStale(cycle.entity) and
+                    self.reg.isInCollection(cycle.entity, &self._read_pending);
+                if (recv_armed and now < st.deadline_ns) continue;
+
+                self.conn_closing_retired += 1;
+                if (recv_armed) self.conn_closing_deadline_expired += 1;
                 try self.reg.destroy(ent);
             }
         }
@@ -1210,3 +1360,106 @@ test "stale completion without a buffer is dropped silently" {
 
     try testing.expectEqual(before, io.recv_buffers_returned_via_stale);
 }
+
+fn testIo(reg: *Registry) !*Io(.{}) {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    return Io(.{}).create(reg, testing.allocator, addr, .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => error.SkipZigTest,
+        else => err,
+    };
+}
+
+test "closing posts the shutdown once and gives up the slot" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const io = try testIo(&reg);
+    defer io.destroy();
+
+    const conn = try reg.create(&io.connections);
+    try reg.set(conn, &io.connections, Fd, .{ .fd = 2 });
+    try reg.move(conn, &io.connections, &io.conn_closing);
+    try reg.flush();
+
+    try io.processConnClosing();
+
+    const st = try reg.get(conn, &io.conn_closing, ClosingState);
+    try testing.expect(st.shutdown_posted);
+    try testing.expect(st.deadline_ns > 0);
+
+    // The slot is spoken for. Leaving a live fd here would let `Fd.deinit`
+    // close a descriptor the kernel may have already reissued.
+    try testing.expectEqual(@as(i32, -1), (try reg.get(conn, &io.conn_closing, Fd)).fd);
+
+    // Posting is not retiring — the conn survives the pass that posts.
+    try testing.expect(!reg.isStale(conn));
+}
+
+test "a closing conn outlives its armed recv, then retires" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const io = try testIo(&reg);
+    defer io.destroy();
+
+    const conn = try reg.create(&io.connections);
+    try reg.set(conn, &io.connections, Fd, .{ .fd = 2 });
+    const read_ent = try reg.create(&io._read_pending);
+    try reg.set(read_ent, &io._read_pending, ConnEntity, .{ .entity = conn });
+    try reg.set(conn, &io.connections, ReadCycleEntity, .{ .entity = read_ent });
+    try reg.move(conn, &io.connections, &io.conn_closing);
+    try reg.flush();
+
+    try io.processConnClosing(); // posts the shutdown
+    try reg.flush();
+    try io.processConnClosing(); // recv still armed — must not retire
+    try reg.flush();
+    try testing.expect(!reg.isStale(conn));
+    try testing.expectEqual(@as(u64, 0), io.conn_closing_retired);
+
+    // The shutdown completes the recv: the read entity leaves _read_pending.
+    try reg.moveImmediate(read_ent, &io._read_pending, &io.read_results);
+
+    try io.processConnClosing();
+    try reg.flush();
+    try testing.expect(reg.isStale(conn));
+    try testing.expectEqual(@as(u64, 1), io.conn_closing_retired);
+    // It saw the recv finish, so the grace window never came into it.
+    try testing.expectEqual(@as(u64, 0), io.conn_closing_deadline_expired);
+}
+
+test "a peer that never finishes closing does not pin the slot" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const io = try testIo(&reg);
+    defer io.destroy();
+
+    const conn = try reg.create(&io.connections);
+    try reg.set(conn, &io.connections, Fd, .{ .fd = 2 });
+    const read_ent = try reg.create(&io._read_pending);
+    try reg.set(read_ent, &io._read_pending, ConnEntity, .{ .entity = conn });
+    try reg.set(conn, &io.connections, ReadCycleEntity, .{ .entity = read_ent });
+    try reg.move(conn, &io.connections, &io.conn_closing);
+    try reg.flush();
+
+    try io.processConnClosing();
+    try reg.flush();
+
+    // Expire the grace window with the recv still armed.
+    (try reg.get(conn, &io.conn_closing, ClosingState)).deadline_ns = 1;
+
+    try io.processConnClosing();
+    try reg.flush();
+    try testing.expect(reg.isStale(conn));
+    try testing.expectEqual(@as(u64, 1), io.conn_closing_deadline_expired);
+}
+
+// NOTE: there is deliberately no test for a conn destroyed around
+// `conn_closing`. The guard in `Fd.deinit` aborts the process, so exercising
+// it would take the test runner down with it — the standing cost of a check
+// that stops rather than reports. What IS covered is the legal path: the
+// tests above assert `fd` is -1 by the time a conn is retired, which is the
+// condition that keeps the guard silent.

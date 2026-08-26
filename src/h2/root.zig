@@ -462,6 +462,9 @@ pub fn H2(comptime opts: Options) type {
         /// climbing rate under normal load means someone is holding
         /// slots open with stalled handshakes.
         handshake_reaped_total: u64 = 0,
+        /// Conns whose close could not be applied this pass; drives whether
+        /// `retryPendingCloses` walks at all.
+        close_requests_deferred: u32 = 0,
         recv_enobufs_logged: bool = false,
         recv_enobufs_last_logged_decade: u64 = 0,
         /// Server-side response counts by HTTP status CLASS, indexed
@@ -670,14 +673,12 @@ pub fn H2(comptime opts: Options) type {
         /// calls `reg.destroy`. io created the conn in `handleAccept`, so io
         /// is what releases its descriptor slot.
         ///
-        /// Returns whether the conn is now closing. **False means it is
-        /// still live** — rove refuses a second transition in one tick, so a
-        /// conn already mid-move cannot be closed until the next one. A
-        /// periodic sweep may ignore that and catch it next pass; a one-shot
-        /// error path may not, and must retry or the slot leaks.
-        ///
-        /// The bool is deliberately not `void`: Zig refuses to discard it
-        /// silently, so every call site has to say which kind it is.
+        /// Returns whether the conn is closing *yet*. False means the move
+        /// could not be applied this pass — rove refuses a second collection
+        /// transition in one tick — in which case the request is recorded on
+        /// the conn and `retryPendingCloses` applies it next pass. The close
+        /// still happens; no caller carries the retry. The bool exists only
+        /// for callers that must know whether it took effect now.
         fn closeConn(h2: *Self, entity: Entity) bool {
             // Already closing — done, not an error.
             if (h2.reg.isInCollection(entity, &h2.io.conn_closing)) return true;
@@ -685,8 +686,18 @@ pub fn H2(comptime opts: Options) type {
             h2.reg.moveAny(entity, h2.liveConnColls(), &h2.io.conn_closing) catch |err| switch (err) {
                 // Already gone: nothing holds a slot, so the conn is ended.
                 error.Stale, error.InvalidEntity => return true,
-                // Mid-transition. The caller decides whether to come back.
-                error.PendingMove => return false,
+                // Mid-transition — record the request and pick it up next
+                // pass. Silently dropping it here would strand the conn in a
+                // live collection after something decided it must end.
+                error.PendingMove => {
+                    if (getConn(h2, entity)) |cp| {
+                        if (!cp.close_requested) {
+                            cp.close_requested = true;
+                            h2.close_requests_deferred += 1;
+                        }
+                    }
+                    return false;
+                },
                 // In a conn collection `liveConnColls` does not name. Not
                 // reachable by construction, and silence here would be a
                 // leaked descriptor slot with no symptom until accepts fail.
@@ -696,6 +707,21 @@ pub fn H2(comptime opts: Options) type {
                 },
             };
             return true;
+        }
+
+        /// Apply close requests that `closeConn` could not place last pass.
+        /// Skipped entirely when none are outstanding, so the common path
+        /// pays one integer compare rather than a walk of every live conn.
+        fn retryPendingCloses(h2: *Self) void {
+            if (h2.close_requests_deferred == 0) return;
+            h2.close_requests_deferred = 0;
+            inline for (h2.liveConnColls()) |coll| {
+                for (coll.entitySlice()) |ent| {
+                    const cp = h2.reg.get(ent, coll, Conn) catch continue;
+                    if (!cp.close_requested) continue;
+                    _ = h2.closeConn(ent);
+                }
+            }
         }
 
         /// Find the current collection of a server stream entity, set H2IoResult, and move to response_out.
@@ -1023,7 +1049,7 @@ pub fn H2(comptime opts: Options) type {
         pub fn serverStreamAbort(h2: *Self, conn_entity: Entity, stream_id: u32) void {
             const conn_ptr = getConn(h2, conn_entity) orelse return;
             if (conn_ptr.h1 != null) {
-                h2.reg.destroy(conn_entity) catch {};
+                _ = h2.closeConn(conn_entity);
                 return;
             }
             const ng = conn_ptr.ng_session orelse return;
@@ -2330,6 +2356,7 @@ pub fn H2(comptime opts: Options) type {
             "io",           "h2_opts",                        "reg",                  "allocator",
             "recv_enobufs_total", "handshake_reaped_total",   "recv_enobufs_logged",  "recv_enobufs_last_logged_decade",
             "recv_enobufs_low_outstanding_streak", "http_status_class", "http_status_notable", "body_sinks",
+            "close_requests_deferred",
         };
         comptime {
             @setEvalBranchQuota(100_000);
@@ -2354,6 +2381,7 @@ pub fn H2(comptime opts: Options) type {
             self.allocator = allocator;
             self.recv_enobufs_total = 0;
             self.handshake_reaped_total = 0;
+            self.close_requests_deferred = 0;
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
@@ -2391,6 +2419,15 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            // End every live conn the way every conn ends. Our collections
+            // deinit below, before `io.destroy` runs, so io cannot reach
+            // these — and a conn destroyed still holding its fd is the one
+            // thing `Fd.deinit` refuses to tolerate.
+            inline for (self.liveConnColls()) |coll| {
+                for (coll.entitySlice()) |ent| _ = self.closeConn(ent);
+            }
+            self.reg.flush() catch {};
+            self.io.shutdownAllConns();
             for (self.body_sinks.items) |ref| {
                 ref.sink.abort(ref.sink.ctx);
                 ref.sink.release(ref.sink.ctx);
@@ -2464,6 +2501,10 @@ pub fn H2(comptime opts: Options) type {
         }
 
         fn pollPostlude(self: *Self) !void {
+            // A close decided last pass but blocked by an in-flight move
+            // lands first, so nothing below treats the conn as live.
+            self.retryPendingCloses();
+            try self.reg.flush();
 
             // Phase 4: Triage reads that just arrived.
             try self.readsTriage();
@@ -3052,7 +3093,7 @@ pub fn H2(comptime opts: Options) type {
 
             for (entities, conn_ents) |ent, conn_ent| {
                 if (!self.reg.isStale(conn_ent.entity)) {
-                    try self.reg.destroy(conn_ent.entity);
+                    _ = self.closeConn(conn_ent.entity);
                 }
                 try self.reg.move(ent, &self._read_errors, &self.io.read_in);
             }
@@ -3079,14 +3120,14 @@ pub fn H2(comptime opts: Options) type {
 
                 if (self.h2_opts.tls_config) |tls_cfg| {
                     conn_ptr.tls_conn = tls.TlsConn.create(tls_cfg, self.allocator) catch {
-                        try self.reg.destroy(conn_ent.entity);
+                        _ = self.closeConn(conn_ent.entity);
                         try self.reg.move(ent, &self._read_init, &self.io.read_in);
                         continue;
                     };
                     try self.reg.move(ent, &self._read_init, &self._read_handshake);
                 } else {
                     self.sessionCreate(conn_ptr, conn_ent.entity) catch {
-                        try self.reg.destroy(conn_ent.entity);
+                        _ = self.closeConn(conn_ent.entity);
                         try self.reg.move(ent, &self._read_init, &self.io.read_in);
                         continue;
                     };
@@ -3195,12 +3236,12 @@ pub fn H2(comptime opts: Options) type {
                         // `decrypt_buf`.
                         if (!std.mem.eql(u8, tc.alpnProtocol(), "h2")) {
                             if (!self.h2_opts.accept_http1) {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                                 continue;
                             }
                             const h1c = Http1Conn.create(self.allocator) orelse {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                                 continue;
                             };
@@ -3212,7 +3253,7 @@ pub fn H2(comptime opts: Options) type {
                             continue;
                         }
                         self.sessionCreate(conn_ptr, conn_ent.entity) catch {
-                            try self.reg.destroy(conn_ent.entity);
+                            _ = self.closeConn(conn_ent.entity);
                             try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                             continue;
                         };
@@ -3226,7 +3267,7 @@ pub fn H2(comptime opts: Options) type {
                         try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     },
                     .data, .err => {
-                        try self.reg.destroy(conn_ent.entity);
+                        _ = self.closeConn(conn_ent.entity);
                         try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     },
                 }
@@ -3281,7 +3322,7 @@ pub fn H2(comptime opts: Options) type {
                 .ws_tunnel => |*tn| {
                     if (!tn.sink.push(tn.sink.ctx, bytes)) {
                         h1c.closing = true;
-                        self.reg.destroy(conn_entity) catch {};
+                        _ = self.closeConn(conn_entity);
                         return;
                     }
                     tn.unconsumed +|= @intCast(bytes.len);
@@ -3609,7 +3650,7 @@ pub fn H2(comptime opts: Options) type {
                 },
                 .sink_failed => {
                     h1c.closing = true;
-                    self.reg.destroy(conn_entity) catch {};
+                    _ = self.closeConn(conn_entity);
                     return false;
                 },
             }
@@ -4264,7 +4305,7 @@ pub fn H2(comptime opts: Options) type {
             const conn_ptr = getConn(h2, conn_entity) orelse return;
             const h1c = conn_ptr.h1 orelse return;
             const wr = h1c.wsWrite() orelse {
-                h2.reg.destroy(conn_entity) catch {};
+                _ = h2.closeConn(conn_entity);
                 return;
             };
             wr.closing = true;
@@ -4293,12 +4334,12 @@ pub fn H2(comptime opts: Options) type {
             // OOM duping either fails the connection, same as the response
             // appends below.
             const authority = self.allocator.dupe(u8, head.host orelse "") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             const path = self.allocator.dupe(u8, head.target) catch {
                 self.allocator.free(authority);
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
 
@@ -4316,28 +4357,28 @@ pub fn H2(comptime opts: Options) type {
             var resp: std.ArrayList(u8) = .empty;
             defer resp.deinit(self.allocator);
             resp.appendSlice(self.allocator, "HTTP/1.1 101 Switching Protocols\r\n") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, "Upgrade: websocket\r\nConnection: Upgrade\r\n") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, "Sec-WebSocket-Accept: ") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, accept) catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, "\r\n\r\n") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
 
             fr.wr.out.appendSlice(self.allocator, resp.items) catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             self.wsFlush(conn_ptr, conn_entity);
@@ -4470,7 +4511,7 @@ pub fn H2(comptime opts: Options) type {
             const wr = h1c.wsWrite() orelse return;
             if (wr.write_inflight) return;
             if (wr.out.items.len == 0) {
-                if (wr.closing) self.reg.destroy(conn_entity) catch {};
+                if (wr.closing) _ = self.closeConn(conn_entity);
                 return;
             }
             const data = wr.out.toOwnedSlice(self.allocator) catch return;
@@ -4630,7 +4671,7 @@ pub fn H2(comptime opts: Options) type {
                                 var decrypt_buf: [65536]u8 = undefined;
                                 const fr = tc.feed(data_ptr[0..data_len], &decrypt_buf);
                                 if (fr.result == .err) {
-                                    try self.reg.destroy(conn_ent.entity);
+                                    _ = self.closeConn(conn_ent.entity);
                                     try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                     continue;
                                 }
@@ -4670,14 +4711,14 @@ pub fn H2(comptime opts: Options) type {
                         var decrypt_buf: [65536]u8 = undefined;
                         const feed_result = tc.feed(data_ptr[0..data_len], &decrypt_buf);
                         if (feed_result.result == .err) {
-                            try self.reg.destroy(conn_ent.entity);
+                            _ = self.closeConn(conn_ent.entity);
                             try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
                         }
                         if (feed_result.out_len > 0) {
                             const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, &decrypt_buf, feed_result.out_len);
                             if (rv < 0) {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             }
@@ -4697,13 +4738,13 @@ pub fn H2(comptime opts: Options) type {
                             // architecture/websockets.md): h1 terminates at the
                             // front; refuse rather than swap in.
                             if (!self.h2_opts.accept_http1) {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             }
                             conn_ptr.first_read_seen = true;
                             _ = self.http1SwapIn(conn_ptr) orelse {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             };
@@ -4715,7 +4756,7 @@ pub fn H2(comptime opts: Options) type {
                         conn_ptr.first_read_seen = true;
                         const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, data_ptr, data_len);
                         if (rv < 0) {
-                            try self.reg.destroy(conn_ent.entity);
+                            _ = self.closeConn(conn_ent.entity);
                             try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
                         }
@@ -4793,7 +4834,7 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 if (failed) {
-                    try self.reg.destroy(conn_ent.entity);
+                    _ = self.closeConn(conn_ent.entity);
                 }
                 try self.reg.destroy(ent);
             }
