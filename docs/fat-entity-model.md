@@ -191,14 +191,82 @@ never diverge.
   shared reference-set view would. The teardown seam itself gets more
   permissive: ending a conn is one total move into `conn_closing` from
   any collection at all.
-- **Views are still a partition.** An entity is in exactly one collection;
-  seams-as-reference-sets (membership without data implications, possibly
-  overlapping) is the natural generalization the model makes expressible
-  but the prototype does not implement.
+- **Views are still a partition — in the prototype.** The designed
+  generalization is membership axes with edge clauses (next section):
+  multiple simultaneous memberships made safe by construction.
 - **What the archetype still holds:** "left the collection" is structural
   destruction there. Under fat it is a contract kept by releasing systems.
   Whether any component *wants* enforced destruction on exit is a
   per-component question this model answers with convention.
+
+## Membership axes and edge clauses (designed, unbuilt)
+
+**The safety condition for multiple membership** falls out of the model's
+one invariant: each component has exactly one live home. Two memberships
+may coexist iff their *materialized* rows are disjoint — then no component
+is contested, and reads/writes stay coherent with zero copies. Overlap is
+fine when only one membership materializes the shared component (the
+others read through), and a deliberately stale materialized copy is
+legitimate only as *declared snapshot semantics* with a named refresh
+point (double buffering). "Only one is writable" is not a safety
+condition by itself: an unrefreshed read-only copy is a silent fork.
+
+**The axis partition makes disjointness structural.** Assign every
+component to an axis; a collection materializes only its own axis's
+components. Then an entity holds one membership *per axis* — a product
+state: a definite position in each of several independent state machines
+— and cross-axis co-residency is safe by construction, no pairwise row
+checking. Exclusivity within an axis is maintained by the operation
+itself: changing axis-k membership IS the move on axis k. Mechanics:
+`collection_ids` grows from one byte to one per axis; per-membership
+offsets live in per-collection sparse indexes (the sparse-set layout);
+destroy leaves every axis. The phase/seam/home trichotomy collapses into
+axis shapes — a phase is a many-state axis, a seam a two-state axis (in
+the mailbox or not), a home a one-state axis — and the empty-row set
+(pure membership, zero components) is unconditionally safe to overlap
+with anything. This also completes rove-library principle #1: flags like
+`close_requested` exist today because the single membership slot is
+occupied by lifecycle; with axes, "never a flag, always a collection"
+becomes fully honorable.
+
+**Edge clauses replace whole-graph analysis.** There is no global
+comptime pass over the transition graph, and none is needed: safety is
+inductive if every edge either statically preserves the invariants or
+carries a declared, runtime-checked clause. Two clause flavors, in
+preference order:
+
+- `leaves = .{...}` — the edge *performs* the repair (moving lifecycle
+  into `conn_closing` atomically leaves `ws_send_in`). No failure path.
+  Prefer this: edges do work, the same philosophy as release-by-transition.
+- `asserts = .{...}` — the edge *detects* a can't-happen (the entity
+  being in the conflicting state would mean an upstream bug). The check
+  is a framework primitive compiling to explicit check-and-abort in every
+  build mode — a violated co-residency precondition is an infallibility
+  violation (two live copies = corruption), and the shipped build strips
+  `std.debug.assert`, so the loudness cannot be left to the caller.
+
+Cross-axis constraints — which product states are legal — are the real
+design surface the partition opens ("entanglement": axes that may not
+move independently). They are expressed as clauses on the edges that
+could violate them, so residual risk is *enumerable*: every edge is
+statically discharged, self-repairing, or carries a named assert, and
+the assert list is greppable the way `unsafe` blocks are — except these
+stay checked at runtime.
+
+**Worked example — `all_conns` retires `extra_conns_fn` and the sweep
+contract.** io declares an empty-row set on its own axis; the accept
+edge joins it, and the retirement edge out of `conn_closing` carries
+`leaves = .{&all_conns}` — the membership's lifetime is coupled to the
+lifecycle axis by exactly one clause. Admission control becomes
+`all_conns.count` (O(1), exact, regardless of which layer or collection
+holds any conn), so the last resolver hook dies; and io's shutdown sweep
+iterates `all_conns` instead of only its own collections, ending every
+conn it ever created wherever it wandered — which needs one new
+registry primitive, a type-erased *evict* recipe (park the row, remove
+from the collection) symmetric with the existing destroy recipe, so io
+can extract an entity from a foreign collection without naming its
+type. With that, io has zero hooks and zero residency contracts: create
+it, and it comes back to you — now true for the aggregate too.
 
 ## Prior art
 
