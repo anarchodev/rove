@@ -370,13 +370,6 @@ pub const Options = struct {
     write_row: type = Row(&.{}),
     connect: bool = false,
     registry_model: RegistryModel = .archetype,
-    /// Components in no row anywhere — "in the world, materialized
-    /// nowhere" — plus a composing layer's fold of everything its own
-    /// collections carry. Merged into the fat registry's universe;
-    /// ignored under the archetype model and superseded by a declared
-    /// world (`world` / root `rove_world`), which carries every part's
-    /// components itself.
-    extra_components: type = Row(&.{}),
     on_retire: RetireMode = .destroy,
     /// The declared world this instantiation runs in (fat model). When
     /// null, the root module's `rove_world` declaration is consulted
@@ -527,12 +520,17 @@ pub fn Io(comptime opts: Options) type {
 
     const is_fat = opts.registry_model == .fat;
 
-    // The declared world, when there is one: the explicit option wins,
-    // the root module's `rove_world` is the fallback. Fat-without-world
-    // remains the threading path (`extra_components`) until every
-    // consumer declares a world.
+    // The declared world: the explicit option wins, the root module's
+    // `rove_world` is the fallback. The fat model REQUIRES one — there
+    // is no silent fallback registry to flip into: the world is where
+    // the closed universe and the id namespace come from.
     const maybe_world: ?type = if (opts.world) |W| W else rove.declared_world;
-    const uses_world = is_fat and maybe_world != null;
+    comptime {
+        if (is_fat and maybe_world == null) @compileError(
+            "rove-io: registry_model .fat requires a declared world — declare `pub const rove_world = rove.World(.{ .parts = rio.parts(opts) })` in the binary's root module, or pass `.world` explicitly (tests' mini-worlds)",
+        );
+    }
+    const uses_world = is_fat;
     const WorldT = if (uses_world) maybe_world.? else void;
 
     comptime {
@@ -587,23 +585,6 @@ pub fn Io(comptime opts: Options) type {
     const resolver_ctx_none: ResolverCtxField = if (is_fat) {} else null;
     const ExtraConnsFnField = if (is_fat) void else ?*const fn (ctx: *anyopaque) usize;
     const extra_conns_none: ExtraConnsFnField = if (is_fat) {} else null;
-    // Under a declared world the set is a registry-internal row-less
-    // entry, addressed by tag; only the threading path owns the value.
-    const AllConnsField = if (is_fat and !uses_world) rove.fat_mod.EntitySet else void;
-    // The fat registry's comptime-closed component world: the union of
-    // every row io declares, user fragments included. This is the
-    // gather-up point — a composing layer that shares the registry must
-    // build its own union and instantiate the registry off that instead.
-    const universe_base = conn_row
-        .merge(ClosingBaseRow.merge(opts.connection_row))
-        .merge(read_row)
-        .merge(write_in_row)
-        .merge(write_result_row);
-    const universe = (if (has_connect)
-        universe_base.merge(connect_in_row).merge(connect_error_row)
-    else
-        universe_base).merge(opts.extra_components);
-
     const hand_off = opts.on_retire == .hand_off;
     comptime {
         if (hand_off and !is_fat) @compileError("on_retire = .hand_off requires the fat registry model — the archetype releases foreign conn state via Conn.deinit at destroy and has no use for the phase");
@@ -617,12 +598,7 @@ pub fn Io(comptime opts: Options) type {
         /// share field names, so an anonymous `.{ .max_entities = N }`
         /// literal works for any of them. Under a declared world this is
         /// the world's registry, which OWNS every declared collection.
-        pub const Reg = if (uses_world)
-            WorldT.Reg
-        else if (is_fat)
-            rove.FatRegistry(universe)
-        else
-            Registry;
+        pub const Reg = if (is_fat) WorldT.Reg else Registry;
 
         /// Collection storage per model: registry-owned (a stable
         /// pointer fetched at `create`) under a declared world, an Io
@@ -726,14 +702,6 @@ pub fn Io(comptime opts: Options) type {
         /// `self.connections.len`.
         extra_conns_fn: ExtraConnsFnField = extra_conns_none,
         extra_conns_ctx: ResolverCtxField = resolver_ctx_none,
-
-        /// Every live conn this instance ever created, wherever it lives —
-        /// a pure membership set (fat model only). The accept and connect
-        /// paths join it; destroy leaves it structurally. Replaces
-        /// `extra_conns_fn`: admission control reads `all_conns.count`,
-        /// which is exact regardless of which layer or collection holds
-        /// any conn.
-        all_conns: AllConnsField,
 
         /// Admission-control telemetry. Friendly back-pressure when
         /// the conn count approaches `buf_count` — we refuse the
@@ -951,7 +919,6 @@ pub fn Io(comptime opts: Options) type {
                     .buf_size = io_opts.buf_size,
                     .buf_count = io_opts.buf_count,
                 },
-                .all_conns = if (comptime is_fat and !uses_world) try rove.fat_mod.EntitySet.init(allocator, reg.max_entities) else {},
                 .reg = reg,
                 .allocator = allocator,
             };
@@ -967,7 +934,6 @@ pub fn Io(comptime opts: Options) type {
                     if (c.connect_only and !has_connect) continue;
                     reg.registerCollection(&@field(self, c.name), @intFromEnum(@field(Coll, c.name)) + 1);
                 }
-                if (comptime is_fat) reg.registerSet(&self.all_conns, 0);
             }
 
             // Register deinit contexts. `ReadResult.deinit` returns
@@ -1027,11 +993,7 @@ pub fn Io(comptime opts: Options) type {
                 // makes that expressible. Membership in all_conns is
                 // orthogonal to the moves, so the member list is stable
                 // across the loop (entities leave it only at destroy).
-                const members = if (comptime uses_world)
-                    self.reg.setMembers(.all_conns)
-                else
-                    self.all_conns.members();
-                for (members) |ent| {
+                for (self.reg.setMembers(.all_conns)) |ent| {
                     if (self.reg.isStale(ent)) continue;
                     if (self.reg.isMoving(ent)) continue;
                     if (self.reg.isInCollection(ent, self.coll(.conn_closing))) continue;
@@ -1062,7 +1024,6 @@ pub fn Io(comptime opts: Options) type {
                 self.connections.deinit();
                 self.conn_closing.deinit();
                 self.conn_dead.deinit();
-                if (comptime is_fat) self.all_conns.deinit();
                 self.read_results.deinit();
                 self.write_results.deinit();
                 self.write_done.deinit();
@@ -1542,12 +1503,10 @@ pub fn Io(comptime opts: Options) type {
             // the teardown completes, so it counts against the budget just
             // like a live one. Admitting into a slot that is not free yet is
             // how the pool goes negative under churn.
-            const total_conns: usize = if (comptime uses_world)
+            const total_conns: usize = if (comptime is_fat)
                 // The membership set counts every conn this instance
                 // created, wherever it lives — no estimate, no hook.
                 self.reg.setCount(.all_conns)
-            else if (comptime is_fat)
-                self.all_conns.count
             else blk: {
                 const io_conns = self.connections.entitySlice().len +
                     self.conn_closing.entitySlice().len;
@@ -1588,11 +1547,7 @@ pub fn Io(comptime opts: Options) type {
             const conn = try self.reg.create(self.coll(.connections));
             try self.reg.set(conn, self.coll(.connections), Fd, .{ .fd = @intCast(file_slot) });
             try self.reg.set(conn, self.coll(.connections), PeerAddr, .{});
-            if (comptime uses_world) {
-                _ = try self.reg.join(conn, .all_conns);
-            } else if (comptime is_fat) {
-                _ = try self.reg.join(conn, &self.all_conns);
-            }
+            if (comptime is_fat) _ = try self.reg.join(conn, .all_conns);
 
             // Resolve the peer address (see `PeerAddr`): install the
             // fixed file into the process fd table; the install CQE
@@ -1712,11 +1667,7 @@ pub fn Io(comptime opts: Options) type {
             try self.armRecv(read_ent, slot);
 
             try self.reg.moveStripImmediate(entity, self.coll(._connect_pending), self.coll(.connections), &.{ ConnectAddr, IoResult });
-            if (comptime uses_world) {
-                _ = try self.reg.join(entity, .all_conns);
-            } else if (comptime is_fat) {
-                _ = try self.reg.join(entity, &self.all_conns);
-            }
+            if (comptime is_fat) _ = try self.reg.join(entity, .all_conns);
             // The `connect_addrs` slot needs no cleanup — the next entity to
             // take this index overwrites it.
         }
@@ -2011,57 +1962,10 @@ test "a peer that never finishes closing does not pin the slot" {
 // tests above assert `fd` is -1 by the time a conn is retired, which is the
 // condition that keeps the guard silent.
 
-test "fat: the sweep ends a conn adopted by a collection io cannot name" {
-    const FatIo = Io(.{ .registry_model = .fat });
-    var reg = try FatIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
-    defer reg.deinit();
-    const io = FatIo.create(&reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{
-        .ring_entries = 8,
-        .buf_count = 8,
-        .buf_size = 256,
-        .max_connections = 8,
-    }) catch |err| switch (err) {
-        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
-        else => return err,
-    };
-    defer io.destroy();
-
-    // An upper layer's collection, in its own declared id space. io
-    // never names this type — the sweep reaches the conn through
-    // all_conns membership and the type-erased evict recipe.
-    var upper = try Collection(ConnectionBaseRow, .{}).init(testing.allocator);
-    defer upper.deinit();
-    reg.registerCollection(&upper, 40);
-
-    const conn = try reg.create(&io.connections);
-    try reg.set(conn, &io.connections, Fd, .{ .fd = 2 });
-    _ = try reg.join(conn, &io.all_conns);
-    try reg.moveImmediate(conn, &io.connections, &upper);
-
-    // A second conn whose deferred move to the foreign collection lands
-    // at the caller-owned flush that is shutdownAllConns's precondition.
-    // The sweep must still find and close it over there.
-    const conn2 = try reg.create(&io.connections);
-    try reg.set(conn2, &io.connections, Fd, .{ .fd = 3 });
-    _ = try reg.join(conn2, &io.all_conns);
-    try reg.move(conn2, &io.connections, &upper);
-    try reg.flush(); // the boundary the precondition demands
-
-    io.shutdownAllConns();
-
-    // Both swept: extracted from the foreign collection into conn_closing,
-    // shutdown posted, descriptor slot given up — the ordinary teardown,
-    // reached without io knowing where either conn lived.
-    for ([_]Entity{ conn, conn2 }) |c| {
-        try testing.expect(reg.isInCollection(c, &io.conn_closing));
-        try testing.expect((try reg.get(c, &io.conn_closing, ClosingState)).shutdown_posted);
-        try testing.expectEqual(@as(i32, -1), (try reg.get(c, &io.conn_closing, Fd)).fd);
-    }
-    try testing.expectEqual(@as(u32, 0), upper.count);
-}
-
 test "fat: hand_off retirement parks the conn in conn_dead for the reaper" {
-    const FatIo = Io(.{ .registry_model = .fat, .on_retire = .hand_off });
+    const io_opts = Options{ .registry_model = .fat, .on_retire = .hand_off };
+    const W = rove.World(.{ .parts = parts(io_opts) });
+    const FatIo = Io(.{ .registry_model = .fat, .on_retire = .hand_off, .world = W });
     var reg = try FatIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
     const io = FatIo.create(&reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{
@@ -2075,10 +1979,11 @@ test "fat: hand_off retirement parks the conn in conn_dead for the reaper" {
     };
     defer io.destroy();
 
-    const conn = try reg.create(&io.connections);
-    try reg.set(conn, &io.connections, Fd, .{ .fd = 2 });
-    _ = try reg.join(conn, &io.all_conns);
-    try reg.move(conn, &io.connections, &io.conn_closing);
+    const connections = reg.coll(.connections);
+    const conn = try reg.create(connections);
+    try reg.set(conn, connections, Fd, .{ .fd = 2 });
+    _ = try reg.join(conn, .all_conns);
+    try reg.move(conn, connections, reg.coll(.conn_closing));
     try reg.flush();
 
     try io.processConnClosing(); // posts the shutdown, gives up the slot
@@ -2087,12 +1992,12 @@ test "fat: hand_off retirement parks the conn in conn_dead for the reaper" {
 
     // Retired WITHOUT being destroyed: the composing layer owns the end.
     try testing.expect(!reg.isStale(conn));
-    try testing.expect(reg.isInCollection(conn, &io.conn_dead));
-    try testing.expect(reg.inSet(conn, &io.all_conns));
+    try testing.expect(reg.isInCollection(conn, reg.coll(.conn_dead)));
+    try testing.expect(reg.inSet(conn, .all_conns));
 
     // The sweep must not resurrect a handed-off conn into conn_closing.
     io.shutdownAllConns();
-    try testing.expect(reg.isInCollection(conn, &io.conn_dead));
+    try testing.expect(reg.isInCollection(conn, reg.coll(.conn_dead)));
 }
 
 test "fat: a declared world — registry-owned storage, tag-addressed set, sweep across parts" {
@@ -2128,14 +2033,25 @@ test "fat: a declared world — registry-owned storage, tag-addressed set, sweep
     try reg.moveImmediate(conn, connections, upper);
     try testing.expect(reg.inSet(conn, .all_conns));
 
+    // A second conn whose deferred move to the sibling part's collection
+    // lands at the caller-owned flush that is shutdownAllConns's
+    // precondition. The sweep must still find and close it over there.
+    const conn2 = try reg.create(connections);
+    try reg.set(conn2, connections, Fd, .{ .fd = 3 });
+    _ = try reg.join(conn2, .all_conns);
+    try reg.move(conn2, connections, upper);
+    try reg.flush(); // the boundary the precondition demands
+
     io.shutdownAllConns();
 
-    // Swept out of the sibling part's collection into conn_closing —
+    // Both swept out of the sibling part's collection into conn_closing —
     // the ordinary teardown, with storage the registry owns end to end.
     const conn_closing = reg.coll(.conn_closing);
-    try testing.expect(reg.isInCollection(conn, conn_closing));
-    try testing.expect((try reg.get(conn, conn_closing, ClosingState)).shutdown_posted);
-    try testing.expectEqual(@as(i32, -1), (try reg.get(conn, conn_closing, Fd)).fd);
+    for ([_]Entity{ conn, conn2 }) |ce| {
+        try testing.expect(reg.isInCollection(ce, conn_closing));
+        try testing.expect((try reg.get(ce, conn_closing, ClosingState)).shutdown_posted);
+        try testing.expectEqual(@as(i32, -1), (try reg.get(ce, conn_closing, Fd)).fd);
+    }
     try testing.expectEqual(@as(u32, 0), upper.count);
 }
 

@@ -187,11 +187,6 @@ pub const Options = struct {
     connection_row: type = Row(&.{}),
     client: bool = false,
     registry_model: rio.RegistryModel = .archetype,
-    /// The composing layer's universe contribution (fat model): everything
-    /// its own collections carry, plus shadow-only components. Folded into
-    /// what this layer passes rove-io. Ignored under archetype and
-    /// superseded by a declared world, which carries every part itself.
-    extra_components: type = Row(&.{}),
     /// The declared world this instantiation runs in (fat model). When
     /// null, the root module's `rove_world` declaration is consulted
     /// (`rove.declared_world`). The world must contain h2's parts — build
@@ -213,23 +208,15 @@ fn RowsFor(comptime opts: Options) type {
 }
 
 /// The rove-io options this layer derives from its own — the single
-/// derivation `H2(...)` and `parts(...)` share. Under fat, everything
-/// h2's own collections carry folds into io's universe (the threading
-/// composition mechanism; a declared world supersedes it), and
-/// retirement hands conns to `conn_dead` so `processConnDead` can free
-/// the foreign state `Conn.deinit` frees under the archetype (nghttp2
-/// session, TLS conn, h1) at a point provably after every reader.
+/// derivation `H2(...)` and `parts(...)` share. Under fat, retirement
+/// hands conns to `conn_dead` so `processConnDead` can free the foreign
+/// state `Conn.deinit` frees under the archetype (nghttp2 session, TLS
+/// conn, h1) at a point provably after every reader.
 pub fn ioOptions(comptime opts: Options) rio.Options {
-    const contribution = StreamBaseRow
-        .merge(opts.request_row)
-        .merge(Row(&.{ Conn, WsMeta, ConnectTarget }))
-        .merge(opts.connection_row)
-        .merge(opts.extra_components);
     return .{
         .connection_row = Row(&.{Conn}).merge(opts.connection_row),
         .connect = opts.client,
         .registry_model = opts.registry_model,
-        .extra_components = contribution,
         .on_retire = if (opts.registry_model == .fat) .hand_off else .destroy,
         .world = opts.world,
     };
@@ -464,8 +451,14 @@ pub fn H2(comptime opts: Options) type {
     const has_client = opts.client;
     const is_fat = opts.registry_model == .fat;
 
+    comptime {
+        if (is_fat and opts.world == null and rove.declared_world == null) @compileError(
+            "rove-h2: registry_model .fat requires a declared world — declare `pub const rove_world = rove.World(.{ .parts = rh2.parts(opts) })` in the binary's root module, or pass `.world` explicitly (tests' mini-worlds)",
+        );
+    }
+
     // Rove-io type for this h2 configuration — see `ioOptions` for what
-    // this layer derives and folds.
+    // this layer derives.
     const IoType = rio.Io(ioOptions(opts));
 
     // WebSocket seam row (docs/architecture/websockets.md): one entity per inbound
@@ -485,10 +478,11 @@ pub fn H2(comptime opts: Options) type {
     const ClientConnectColl = if (has_client) Collection(connect_row_full, .{}) else void;
     const ClientStreamColl = if (has_client) Collection(stream_row, .{}) else void;
 
-    // The declared world, when there is one — same resolution as rove-io:
-    // the explicit option wins, the root's `rove_world` is the fallback.
+    // The declared world — same resolution as rove-io: the explicit
+    // option wins, the root's `rove_world` is the fallback. The fat
+    // model requires one (checked above).
     const maybe_world: ?type = if (opts.world) |W| W else rove.declared_world;
-    const uses_world = is_fat and maybe_world != null;
+    const uses_world = is_fat;
     const WorldT = if (uses_world) maybe_world.? else void;
 
     comptime {
