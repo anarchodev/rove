@@ -21,15 +21,21 @@
 //!   §16, release-is-a-transition): the system that releases a resource
 //!   writes the component back to its declared default as part of that
 //!   release. Birth is the single defaulting point.
-//! - **The shadow store is a table, not a collection.** One column per
-//!   Universe component, `max_entities` long, addressed by `entity.index`
-//!   — the same never-compacted shape as the registry's own metadata
-//!   arrays. A parked component's address is stable for the entity's
-//!   whole lifetime; nothing ever swap-removes it.
-//! - **Slots are generation-stamped.** A shadow slot's bytes belong to
-//!   the generation recorded beside them. A reborn index never reads its
-//!   predecessor's parked values: mismatched stamp reads as the declared
-//!   default. This is what makes birth/death O(row), not O(universe).
+//! - **The shadow store is the fat struct, literally.** One AoS array of
+//!   a comptime-built universe struct, `max_entities` long, addressed by
+//!   `entity.index`, never compacted — a parked component's address is
+//!   stable for the entity's whole lifetime. AoS because the shadow is
+//!   NEVER iterated (that is what collections are for): every access is
+//!   per-entity and usually multi-component, so clustering one entity's
+//!   components beats columns for exactly the operations the shadow
+//!   serves. Collections remain the SoA projections of this base table.
+//! - **Validity is a per-entity header, not per-slot stamps.** Each
+//!   struct opens with `{ gen, written }`: the generation these bytes
+//!   belong to plus a written-this-generation bitmask over the universe.
+//!   A reborn index never reads its predecessor's parked values —
+//!   mismatched gen makes the whole mask read as zero, lazily — and the
+//!   check shares a cache line with the data it guards. This is what
+//!   makes birth/death O(row), not O(universe).
 //!
 //! `getFat(entity, T)` is the universal read the model promises: it
 //! resolves T wherever it currently lives — the owning collection's
@@ -71,8 +77,45 @@ pub fn RowView(comptime R: type) type {
     };
 }
 
-fn toAlignment(comptime bytes: comptime_int) std.mem.Alignment {
-    return @enumFromInt(std.math.log2_int(usize, bytes));
+/// Per-entity validity header, first field of the shadow struct. The
+/// bytes after it belong to generation `gen`; bit i of `written` says
+/// component i (by Universe index) has been written for that generation.
+/// A mismatched gen makes the whole mask read as zero — rebirth
+/// invalidation without any sweep.
+pub const ShadowHeader = struct { gen: u32 = 0, written: u64 = 0 };
+
+/// The comptime-built universe struct: header first, then one field per
+/// non-ZST Universe component (named by Universe index, over-alignment
+/// honored per field). The shadow is one AoS array of these.
+fn ShadowStruct(comptime Universe: type) type {
+    if (Universe.len > 64) @compileError("shadow written-mask is u64 — widen it for a universe past 64 components");
+    comptime var fields: [Universe.len + 1]std.builtin.Type.StructField = undefined;
+    fields[0] = .{
+        .name = "hdr",
+        .type = ShadowHeader,
+        .default_value_ptr = null,
+        .is_comptime = false,
+        .alignment = @alignOf(ShadowHeader),
+    };
+    comptime var n: usize = 1;
+    inline for (Universe.types, 0..) |T, ci| {
+        if (@sizeOf(T) == 0) continue;
+        fields[n] = .{
+            .name = std.fmt.comptimePrint("c{d}", .{ci}),
+            .type = T,
+            .default_value_ptr = null,
+            .is_comptime = false,
+            .alignment = effectiveAlign(T),
+        };
+        n += 1;
+    }
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .backing_integer = null,
+        .fields = fields[0..n],
+        .decls = &.{},
+        .is_tuple = false,
+    } });
 }
 
 /// A pure membership set — the empty-row collection, and the degenerate
@@ -156,13 +199,10 @@ pub fn FatRegistry(comptime Universe: type) type {
         deferred_count: u32,
         deferred_capacity: u32,
 
-        // Shadow store: one column per Universe component, max_entities
-        // long, addressed by entity.index. ZST components hold a dangling
-        // aligned pointer (never dereferenced).
-        shadow: [Universe.len][*]u8,
-        // Generation stamps, Universe.len * max_entities. NEVER_STAMPED
-        // means the slot has held no value for any generation.
-        stamps: []u32,
+        // The base table: one universe struct per entity, addressed by
+        // entity.index, never compacted. Point access only — the shadow
+        // is never iterated.
+        fat_table: []Fat,
 
         // Runtime (collection_id, component) → element accessor. Null when
         // that collection's row lacks the component (the shadow is then the
@@ -186,7 +226,8 @@ pub fn FatRegistry(comptime Universe: type) type {
         const PENDING_MOVE: u8 = 1;
         const MAX_COLLECTIONS: usize = 256;
         const MAX_SETS: usize = 32;
-        const NEVER_STAMPED: u32 = std.math.maxInt(u32);
+
+        pub const Fat = ShadowStruct(Universe);
 
         const ColumnFn = *const fn (*anyopaque, u32) [*]u8;
 
@@ -230,18 +271,11 @@ pub fn FatRegistry(comptime Universe: type) type {
 
             const deferred_ops = try allocator.alloc(DeferredOp, config.deferred_queue_capacity);
 
-            var shadow: [Universe.len][*]u8 = undefined;
-            inline for (Universe.types, 0..) |T, i| {
-                if (comptime @sizeOf(T) == 0) {
-                    shadow[i] = @ptrFromInt(effectiveAlign(T));
-                } else {
-                    const col = try allocator.alignedAlloc(T, comptime toAlignment(effectiveAlign(T)), max);
-                    shadow[i] = @ptrCast(col.ptr);
-                }
-            }
-
-            const stamps = try allocator.alloc(u32, Universe.len * max);
-            @memset(stamps, NEVER_STAMPED);
+            const fat_table = try allocator.alloc(Fat, max);
+            // Headers only: gen 0 + empty mask reads as "nothing written"
+            // for every generation, including 0. Component bytes stay
+            // untouched until first park/materialize.
+            for (fat_table) |*f| f.hdr = .{};
 
             const column_fns = try allocator.alloc(?ColumnFn, MAX_COLLECTIONS * Universe.len);
             @memset(column_fns, null);
@@ -261,8 +295,7 @@ pub fn FatRegistry(comptime Universe: type) type {
                 .deferred_ops = deferred_ops,
                 .deferred_count = 0,
                 .deferred_capacity = config.deferred_queue_capacity,
-                .shadow = shadow,
-                .stamps = stamps,
+                .fat_table = fat_table,
                 .column_fns = column_fns,
                 .coll_ptrs = [_]?*anyopaque{null} ** MAX_COLLECTIONS,
                 .destroy_recipes = undefined,
@@ -274,12 +307,7 @@ pub fn FatRegistry(comptime Universe: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            inline for (Universe.types, 0..) |T, i| {
-                if (comptime @sizeOf(T) > 0) {
-                    self.allocator.free(shadowColumnOf(T, self.shadow[i])[0..self.max_entities]);
-                }
-            }
-            self.allocator.free(self.stamps);
+            self.allocator.free(self.fat_table);
             self.allocator.free(self.column_fns);
             self.allocator.free(self.set_memberships);
             self.allocator.free(self.generations);
@@ -675,11 +703,12 @@ pub fn FatRegistry(comptime Universe: type) type {
                 }
             }
 
-            const slot = &self.shadowColumn(T)[idx];
-            const sp = &self.stamps[ci * self.max_entities + idx];
-            if (sp.* != entity.generation) {
-                row_mod.fillDefault(T, self.shadowColumn(T)[idx .. idx + 1]);
-                sp.* = entity.generation;
+            const f = &self.fat_table[idx];
+            const slot = fatPtr(f, T);
+            if (f.hdr.gen != entity.generation or (f.hdr.written & comptime shadowBit(T)) == 0) {
+                freshHeader(f, entity.generation);
+                row_mod.fillDefault(T, @as([*]T, @ptrCast(slot))[0..1]);
+                f.hdr.written |= comptime shadowBit(T);
             }
             return slot;
         }
@@ -795,27 +824,38 @@ pub fn FatRegistry(comptime Universe: type) type {
             @compileError("Component " ++ @typeName(T) ++ " is not in the registry Universe");
         }
 
-        fn shadowColumnOf(comptime T: type, raw: [*]u8) [*]align(effectiveAlign(T)) T {
-            return @ptrCast(@alignCast(raw));
+        /// The shadow field for component T inside one entity's struct.
+        fn fatPtr(f: *Fat, comptime T: type) *T {
+            return &@field(f, std.fmt.comptimePrint("c{d}", .{compIndex(T)}));
         }
 
-        fn shadowColumn(self: *Self, comptime T: type) [*]align(effectiveAlign(T)) T {
-            return shadowColumnOf(T, self.shadow[comptime compIndex(T)]);
+        /// Bring an entity's header to its current generation, invalidating
+        /// any previous generation's bytes in one write.
+        fn freshHeader(f: *Fat, generation: u32) void {
+            if (f.hdr.gen != generation) {
+                f.hdr.gen = generation;
+                f.hdr.written = 0;
+            }
         }
 
-        /// Park a dropped component: the shadow slot becomes the live copy.
+        fn shadowBit(comptime T: type) u64 {
+            return @as(u64, 1) << comptime compIndex(T);
+        }
+
+        /// Park a dropped component: the shadow field becomes the live copy.
         fn parkOne(self: *Self, comptime T: type, entity: Entity, value: T) void {
-            const ci = comptime compIndex(T);
-            self.shadowColumn(T)[entity.index] = value;
-            self.stamps[ci * self.max_entities + entity.index] = entity.generation;
+            const f = &self.fat_table[entity.index];
+            freshHeader(f, entity.generation);
+            f.hdr.written |= comptime shadowBit(T);
+            fatPtr(f, T).* = value;
         }
 
         /// Unpark a gained component into its column slot: the parked value
         /// if this generation ever held one, the declared defaults otherwise.
         fn unparkOne(self: *Self, comptime T: type, entity: Entity, out: *T) void {
-            const ci = comptime compIndex(T);
-            if (self.stamps[ci * self.max_entities + entity.index] == entity.generation) {
-                out.* = self.shadowColumn(T)[entity.index];
+            const f = &self.fat_table[entity.index];
+            if (f.hdr.gen == entity.generation and (f.hdr.written & comptime shadowBit(T)) != 0) {
+                out.* = fatPtr(f, T).*;
             } else {
                 row_mod.fillDefault(T, @as([*]T, @ptrCast(out))[0..1]);
             }

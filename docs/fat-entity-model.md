@@ -19,12 +19,14 @@ type-gated iteration sets that are the reason an ECS exists.
 
 One sentence per piece:
 
-- **Base table.** The shadow store: one column per component in a
-  comptime-closed `Universe`, `max_entities` long, addressed by
-  `entity.index` — the same never-compacted shape as the registry's own
-  metadata arrays, so a parked component's address is stable for the
-  entity's lifetime. Conceptually this *is* the fat-struct array, stored
-  SoA.
+- **Base table.** The shadow store: one AoS array of a comptime-built
+  universe struct, `max_entities` long, addressed by `entity.index`,
+  never compacted — a parked component's address is stable for the
+  entity's lifetime. This is the fat-struct array *literally*, not just
+  conceptually — AoS because the shadow is never iterated (collections
+  are for that); every access is per-entity and usually multi-component,
+  so clustering one entity's components wins for exactly the operations
+  the shadow serves. Collections are its SoA projections.
 - **Materialized views.** A collection is a membership predicate (the
   state) plus a column projection (the row), physically maintained: moving
   an entity copies shared columns view-to-view, *parks* dropped columns in
@@ -35,10 +37,12 @@ One sentence per piece:
   path-independent: always the last value a system wrote, never a function
   of the route the entity took through the collection graph.
 - **One defaulting point.** Birth writes declared field defaults
-  (`row.fillDefault`); per-slot generation stamps make a virgin or reborn
-  slot read as the default lazily, so birth and death are O(row), not
-  O(universe), and a reborn index can never resurrect its predecessor's
-  values.
+  (`row.fillDefault`); a per-entity `{ gen, written-mask }` header at the
+  front of each shadow struct makes a virgin or reborn slot read as the
+  default lazily — a mismatched gen zeroes the whole mask in one write —
+  so birth and death are O(row), not O(universe), a reborn index can
+  never resurrect its predecessor's values, and the validity check
+  shares a cache line with the data it guards.
 - **No lifecycle hooks.** Moves and destroys run no component init/deinit.
   Release is a transition owned by a system (rove-style §16); the releasing
   system writes the component back to its default as part of the release it
