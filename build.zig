@@ -1051,6 +1051,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     echo_fat_mod.addImport("rove-io", io_mod);
+    echo_fat_mod.addImport("rove", rove_mod);
 
     const echo_server_fat = b.addExecutable(.{
         .name = "echo-server-fat",
