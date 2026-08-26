@@ -343,6 +343,25 @@ pub fn FatRegistry(comptime Universe: type) type {
             self.offsets[idx] = new_offset;
         }
 
+        /// Call-site-compatible `moveStrip`: under the fat model nothing
+        /// is dropped — components the destination lacks are parked, not
+        /// destroyed — so this IS `moveImmediate`. The strip list is still
+        /// comptime-checked against the rows' difference: it remains the
+        /// call site's declaration of what the destination does not read,
+        /// and a stale list is a compile error rather than rot.
+        pub inline fn moveStripImmediate(self: *Self, entity: Entity, src: anytype, dst: anytype, comptime strip: []const type) !void {
+            const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
+            const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+            comptime {
+                @setEvalBranchQuota(100_000);
+                const lost = SrcColl.RowType.subtract(&DstColl.RowType.types);
+                if (!Row(strip).equal(lost)) {
+                    @compileError("moveStripImmediate: strip list does not match the components the destination lacks");
+                }
+            }
+            return self.moveImmediate(entity, src, dst);
+        }
+
         // =============================================================
         // Destroy
         // =============================================================
@@ -984,6 +1003,29 @@ test "collectionIdOf — declared ids make membership readable and typed" {
     try reg.destroy(e);
     try reg.flush();
     try testing.expectEqual(@as(?u8, null), reg.collectionIdOf(e));
+}
+
+test "moveStripImmediate — the strip list parks instead of destroying" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var with_fd = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
+    defer with_fd.deinit();
+    reg.registerCollection(&with_fd, 1);
+
+    var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer narrow.deinit();
+    reg.registerCollection(&narrow, 2);
+
+    const e = try reg.create(&with_fd);
+    try reg.set(e, &with_fd, Fdish, .{ .fd = 8 });
+
+    // In the archetype registry this destroys the Fdish; here it parks.
+    try reg.moveStripImmediate(e, &with_fd, &narrow, &.{Fdish});
+    try testing.expectEqual(@as(i32, 8), (try reg.getFat(e, Fdish)).fd);
+
+    try reg.moveImmediate(e, &narrow, &with_fd);
+    try testing.expectEqual(@as(i32, 8), (try reg.get(e, &with_fd, Fdish)).fd);
 }
 
 test "destroy — entity leaves, handle goes stale, pool refills" {
