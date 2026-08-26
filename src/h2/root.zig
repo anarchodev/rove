@@ -178,6 +178,11 @@ pub const ConnectTarget = struct {
 };
 
 pub const Options = struct {
+    /// Collections the COMPOSING layer registers on the same registry.
+    /// Appending them here puts every collection in one namespace, so the
+    /// composer numbers its own off `Coll` rather than continuing from
+    /// wherever this layer's ids happen to end.
+    extra_collections: []const [:0]const u8 = &.{},
     request_row: type = Row(&.{}),
     connection_row: type = Row(&.{}),
     client: bool = false,
@@ -450,6 +455,7 @@ pub fn H2(comptime opts: Options) type {
         reg: *Registry,
         allocator: std.mem.Allocator,
 
+
         // ENOBUFS-on-recv tracking. The kernel returns ENOBUFS when
         // the io_uring registered buffer pool (`buf_count`) is empty
         // at recv time. Treated as back-pressure: the connection is
@@ -533,12 +539,15 @@ pub fn H2(comptime opts: Options) type {
         // =============================================================
         // COLLECTIONS — single source of truth for the 27 collection
         // fields above. Drives init, registerCollection, deinit, and
-        // the serverStreamColls / clientStreamColls helpers via
-        // comptime loops, so adding a collection is a one-line spec
-        // change rather than edits in 4–6 places.
+        // the `Coll` enum + chain lookups via comptime loops, so adding
+        // a collection is a one-line spec change rather than edits in
+        // 4–6 places.
         // =============================================================
 
         const Kind = enum {
+            /// Registered by rove-io, not by this layer. Present in `Coll`
+            /// so ONE enum spans the shared registry.
+            io,
             server_stream,
             server_read,
             server_conn,
@@ -548,7 +557,7 @@ pub fn H2(comptime opts: Options) type {
         };
 
         const CollSpec = struct {
-            name: []const u8,
+            name: [:0]const u8,
             Coll: type,
             kind: Kind,
             client_only: bool = false,
@@ -604,21 +613,164 @@ pub fn H2(comptime opts: Options) type {
             .{ .name = "_client_stream_data_sending", .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
         };
 
-        const SERVER_STREAM_CHAIN: []const []const u8 = blk: {
-            var names: []const []const u8 = &.{};
-            for (COLLECTIONS) |s| {
-                if (s.kind == .server_stream and s.in_chain) names = names ++ &[_][]const u8{s.name};
-            }
-            break :blk names;
+        // =============================================================
+        // Coll — the collection set as declared VALUES
+        // =============================================================
+        // `COLLECTIONS` names every collection; this enum gives those names
+        // VALUES, and the registry ids are declared off it. That is what
+        // makes an entity's collection readable rather than merely testable:
+        // `collectionOf` is a cast over the registry's `collection_ids` byte,
+        // and a `switch` on the result recovers the typed collection pointer.
+        // An id assigned from a counter is anonymous, and recovering the
+        // collection from one means walking a candidate list per call site.
+
+        /// The collections live in THIS instantiation. `client_only` specs
+        /// drop out when the instance has no client half, so `Coll` never
+        /// names a field whose type is `void`.
+        /// Which layer owns the field a variant names.
+        const Owner = enum { io, h2 };
+
+        /// A variant's backing collection, flattened across both layers.
+        const CollRef = struct {
+            name: [:0]const u8,
+            owner: Owner,
+            kind: Kind,
+            in_chain: bool = false,
         };
 
-        const CLIENT_STREAM_CHAIN: []const []const u8 = blk: {
-            var names: []const []const u8 = &.{};
-            for (COLLECTIONS) |s| {
-                if (s.kind == .client_stream and s.in_chain) names = names ++ &[_][]const u8{s.name};
+        /// io's collections followed by this instance's. The merge mirrors
+        /// `Row.merge`: io publishes its set, the upper layer extends it —
+        /// except the enum flows back DOWN as the shared interpretation of
+        /// the registry's `collection_ids` byte.
+        const ACTIVE: []const CollRef = blk: {
+            var out: []const CollRef = &.{};
+            for (rio.COLLECTIONS) |ic| {
+                if (ic.connect_only and !has_client) continue;
+                out = out ++ &[_]CollRef{.{
+                    .name = ic.name,
+                    .owner = .io,
+                    .kind = .io,
+                }};
             }
-            break :blk names;
+            for (COLLECTIONS) |hc| {
+                if (hc.client_only and !has_client) continue;
+                out = out ++ &[_]CollRef{.{
+                    .name = hc.name,
+                    .owner = .h2,
+                    .kind = hc.kind,
+                    .in_chain = hc.in_chain,
+                }};
+            }
+            break :blk out;
         };
+
+        comptime {
+            @setEvalBranchQuota(100_000);
+            // io numbers itself off its own name list, so `Coll` must place
+            // io's names first and in that order or an io collection's
+            // registry id will not match the variant naming it here — every
+            // conn entity would then resolve to the wrong collection.
+            for (rio.activeNames(has_client), 0..) |n, i| {
+                if (@intFromEnum(@field(Coll, n)) != i)
+                    @compileError("io's collection '" ++ n ++ "' sits at a different position in Coll than in io's own namespace");
+            }
+            // One namespace: a duplicate name would silently shadow a
+            // variant and mis-resolve every entity in that collection.
+            for (ACTIVE, 0..) |a, i| for (ACTIVE[i + 1 ..]) |b| {
+                if (std.mem.eql(u8, a.name, b.name))
+                    @compileError("collection name '" ++ a.name ++ "' declared in both layers");
+            };
+        }
+
+        /// One variant per collection on the shared registry — io's, this
+        /// layer's, and any the composing layer names via
+        /// `opts.extra_collections`. A registry id IS a variant's value plus
+        /// one, so every layer numbers itself off this enum and none needs
+        /// to know where another's ids end.
+        pub const Coll = rio.CollEnum(blk: {
+            var names: []const [:0]const u8 = &.{};
+            for (ACTIVE) |s| names = names ++ &[_][:0]const u8{s.name};
+            break :blk names ++ opts.extra_collections;
+        });
+
+        /// The `CollRef` behind a variant, or null when the variant belongs
+        /// to the composing layer — this layer can name those collections
+        /// but owns none of them, so every accessor here declines them.
+        fn specOf(comptime k: Coll) ?CollRef {
+            // `Coll` is built from ACTIVE's names in order, then the
+            // composing layer's — so a variant below ACTIVE.len indexes
+            // ACTIVE directly and anything at or above it belongs to the
+            // composer. Structural, not a search: the enum IS that list.
+            const i = @intFromEnum(k);
+            return if (i < ACTIVE.len) ACTIVE[i] else null;
+        }
+
+        /// The field behind a variant this layer owns, on whichever of the
+        /// two layers holds it. Only called from an arm that has already
+        /// established `specOf(k) != null`.
+        inline fn fieldOf(h2: *Self, comptime k: Coll) *@FieldType(
+            if (specOf(k).?.owner == .io) IoType else Self,
+            specOf(k).?.name,
+        ) {
+            const s = comptime specOf(k).?;
+            return if (comptime s.owner == .io) &@field(h2.io, s.name) else &@field(h2, s.name);
+        }
+
+        /// The collection an entity is in, as a value.
+        ///
+        /// Named for what it returns, not for what the design reads into it.
+        /// Collection membership IS how lifecycle state is encoded here, but
+        /// that is a property of most of these collections, not all: some are
+        /// pipeline phases (`request_receiving` → `request_buffering`), some
+        /// are seams a consumer drains (`response_in`, `ws_send_in`), and some
+        /// are identity homes (`ws_streams`). "Collection" is the part that is
+        /// uniformly true.
+        ///
+        /// Null when the handle is stale or out of range, or when the entity
+        /// sits in a collection registered by a layer ABOVE this one — those
+        /// share the registry but are not in `Coll`.
+        pub fn collectionOf(h2: *const Self, entity: Entity) ?Coll {
+            const idx = entity.index;
+            if (idx >= h2.reg.max_entities) return null;
+            if (h2.reg.generations[idx] != entity.generation) return null;
+            const raw = h2.reg.collection_ids[idx];
+            // 0 is the registry's free pool and is never a collection.
+            if (raw == 0) return null;
+            return @enumFromInt(raw - 1);
+        }
+
+        /// The server-stream chain collection a state names, or null if the
+        /// state is not one. `inline else` makes this a jump table over
+        /// `Coll` — the typed `getCollection` an anonymous `registry_id`
+        /// cannot express, and what replaces walking a candidate list.
+        inline fn serverChainColl(h2: *Self, k: Coll) ?*StreamColl {
+            return switch (k) {
+                inline else => |tag| blk: {
+                    const s = comptime specOf(tag) orelse break :blk null;
+                    if (comptime s.kind == .server_stream and s.in_chain) {
+                        break :blk &@field(h2, s.name);
+                    } else {
+                        break :blk null;
+                    }
+                },
+            };
+        }
+
+
+        /// Client mirror of `serverChainColl`.
+        inline fn clientChainColl(h2: *Self, k: Coll) ?*ClientStreamColl {
+            return switch (k) {
+                inline else => |tag| blk: {
+                    const s = comptime specOf(tag) orelse break :blk null;
+                    if (comptime s.kind == .client_stream and s.in_chain) {
+                        break :blk &@field(h2, s.name);
+                    } else {
+                        break :blk null;
+                    }
+                },
+            };
+        }
+
 
         // =============================================================
         // NgCtx — nghttp2 session user_data, holds *Self for collection access
@@ -633,24 +785,6 @@ pub fn H2(comptime opts: Options) type {
         // =============================================================
         // Helpers for entity dispatch across collections
         // =============================================================
-
-        /// All collections a server stream entity can be in between request_out and response_out.
-        inline fn serverStreamColls(h2: *Self) [SERVER_STREAM_CHAIN.len]*StreamColl {
-            var out: [SERVER_STREAM_CHAIN.len]*StreamColl = undefined;
-            inline for (SERVER_STREAM_CHAIN, 0..) |name, i| {
-                out[i] = &@field(h2, name);
-            }
-            return out;
-        }
-
-        /// All collections a client stream entity can be in between client_request_in and client_response_out.
-        inline fn clientStreamColls(h2: *Self) [CLIENT_STREAM_CHAIN.len]*ClientStreamColl {
-            var out: [CLIENT_STREAM_CHAIN.len]*ClientStreamColl = undefined;
-            inline for (CLIENT_STREAM_CHAIN, 0..) |name, i| {
-                out[i] = &@field(h2, name);
-            }
-            return out;
-        }
 
         /// All collections a connection entity can be in (io's + h2's).
         /// The collections a LIVE conn can be in — the sources `closeConn`
@@ -724,45 +858,36 @@ pub fn H2(comptime opts: Options) type {
             }
         }
 
-        /// Find the current collection of a server stream entity, set H2IoResult, and move to response_out.
+        /// Set H2IoResult on a server stream entity and move it to
+        /// response_out. The entity's collection is READ, not searched.
         fn serverStreamClose(h2: *Self, entity: Entity, err: i32) void {
-            for (h2.serverStreamColls()) |src| {
-                if (h2.reg.isInCollection(entity, src)) {
-                    h2.reg.set(entity, src, H2IoResult, .{ .err = err }) catch {};
-                    h2.reg.move(entity, src, &h2.response_out) catch {};
-                    return;
-                }
-            }
+            const k = h2.collectionOf(entity) orelse return;
+            const src = h2.serverChainColl(k) orelse return;
+            h2.reg.set(entity, src, H2IoResult, .{ .err = err }) catch {};
+            h2.reg.move(entity, src, &h2.response_out) catch {};
         }
 
-        /// Find a stream entity's current collection and set a component (shared among stream collections).
+        /// Set a component on a stream entity in whichever chain it is in.
         fn streamSet(h2: *Self, entity: Entity, comptime T: type, value: T) void {
-            for (h2.serverStreamColls()) |src| {
-                if (h2.reg.isInCollection(entity, src)) {
-                    h2.reg.set(entity, src, T, value) catch {};
-                    return;
-                }
+            const k = h2.collectionOf(entity) orelse return;
+            if (h2.serverChainColl(k)) |src| {
+                h2.reg.set(entity, src, T, value) catch {};
+                return;
             }
             if (comptime has_client) {
-                for (h2.clientStreamColls()) |src| {
-                    if (h2.reg.isInCollection(entity, src)) {
-                        h2.reg.set(entity, src, T, value) catch {};
-                        return;
-                    }
+                if (h2.clientChainColl(k)) |src| {
+                    h2.reg.set(entity, src, T, value) catch {};
                 }
             }
         }
 
         /// Find the current collection of a client stream entity, set H2IoResult, and move to client_response_out.
         fn clientStreamClose(h2: *Self, entity: Entity, err: i32, head_written: bool) void {
-            if (!has_client) return;
-            for (h2.clientStreamColls()) |src| {
-                if (h2.reg.isInCollection(entity, src)) {
-                    h2.reg.set(entity, src, H2IoResult, .{ .err = err, .head_written = head_written }) catch {};
-                    h2.reg.move(entity, src, &h2.client_response_out) catch {};
-                    return;
-                }
-            }
+            if (comptime !has_client) return;
+            const k = h2.collectionOf(entity) orelse return;
+            const src = h2.clientChainColl(k) orelse return;
+            h2.reg.set(entity, src, H2IoResult, .{ .err = err, .head_written = head_written }) catch {};
+            h2.reg.move(entity, src, &h2.client_response_out) catch {};
         }
 
         /// Get the Conn component for a connection entity (searches the three conn collections).
@@ -2400,9 +2525,11 @@ pub fn H2(comptime opts: Options) type {
                 }
             }
 
+            // Ids ARE the enum values (+1 for the reserved free-pool 0), so
+            // `collection_ids[entity.index]` needs no side table to decode.
             inline for (COLLECTIONS) |s| {
                 if (s.client_only and !has_client) continue;
-                reg.registerCollection(&@field(self, s.name));
+                reg.registerCollection(&@field(self, s.name), @intFromEnum(@field(Coll, s.name)) + 1);
             }
 
             // Register FD resolver with io so that processWriteIn/processReadIn

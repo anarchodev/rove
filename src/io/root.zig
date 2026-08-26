@@ -247,6 +247,31 @@ pub const ClosingState = struct {
     deadline_ns: u64 = 0,
 };
 
+/// io's collections, as data. An upper layer merges this with its own set
+/// to build ONE collection enum over the shared registry, so an entity's
+/// collection can be read from `collection_ids` rather than tested against
+/// each candidate in turn.
+pub const CollRef = struct {
+    name: [:0]const u8,
+    /// Registered only when the instance has the connect (client) half.
+    connect_only: bool = false,
+};
+
+pub const COLLECTIONS = [_]CollRef{
+    .{ .name = "connections" },
+    .{ .name = "conn_closing" },
+    .{ .name = "read_results" },
+    .{ .name = "write_results" },
+    .{ .name = "read_in" },
+    .{ .name = "write_in" },
+    .{ .name = "_read_pending" },
+    .{ .name = "_write_pending" },
+    .{ .name = "connect_in", .connect_only = true },
+    .{ .name = "connect_errors", .connect_only = true },
+    .{ .name = "_connect_socket_pending", .connect_only = true },
+    .{ .name = "_connect_pending", .connect_only = true },
+};
+
 pub const ConnectionBaseRow = Row(&.{ Fd, ReadCycleEntity, PeerAddr });
 /// The closing row is the connection row plus `ClosingState`, so a move in
 /// from any live conn collection is an ordinary widening — no components are
@@ -307,7 +332,42 @@ pub const IoOptions = struct {
     reuseport: bool = false,
 };
 
+/// Build a collection namespace from a name list: one variant per name,
+/// valued by position. The registry id is the variant's value plus one,
+/// because id 0 is the registry's free pool.
+pub fn CollEnum(comptime names: []const [:0]const u8) type {
+    // A registry id is one byte and 0 is the free pool, so every layer
+    // sharing a registry fits in 255 collections between them. Checked at
+    // the single point where a namespace is built: past the bound the tag
+    // type silently wraps and two collections alias, which resolves entities
+    // into the wrong one with no other symptom.
+    if (names.len > 255) @compileError("collection namespace exceeds the one-byte registry id: " ++
+        std.fmt.comptimePrint("{d}", .{names.len}) ++ " collections, 255 available");
+    var fields: [names.len]std.builtin.Type.EnumField = undefined;
+    for (names, 0..) |n, i| fields[i] = .{ .name = n, .value = i };
+    return @Type(.{ .@"enum" = .{
+        .tag_type = u8,
+        .fields = &fields,
+        .decls = &.{},
+        .is_exhaustive = true,
+    } });
+}
+
+/// The names io registers, given whether the connect half is present.
+pub fn activeNames(comptime connect: bool) []const [:0]const u8 {
+    var out: []const [:0]const u8 = &.{};
+    for (COLLECTIONS) |c| {
+        if (c.connect_only and !connect) continue;
+        out = out ++ &[_][:0]const u8{c.name};
+    }
+    return out;
+}
+
 pub fn Io(comptime opts: Options) type {
+    // io numbers its collections off its OWN name list. A layer above that
+    // builds a wider namespace must place these names first and in this
+    // order so the two agree; rove-h2 asserts exactly that.
+    const Coll = CollEnum(activeNames(opts.connect));
     const conn_row = ConnectionBaseRow.merge(opts.connection_row);
     const read_row = ReadBaseRow.merge(opts.read_row);
     const write_in_row = WriteInBaseRow.merge(opts.write_row);
@@ -592,19 +652,9 @@ pub fn Io(comptime opts: Options) type {
             self.cleanup_ctx.ring = &self.ring;
 
             // Register collections with registry
-            reg.registerCollection(&self.connections);
-            reg.registerCollection(&self.conn_closing);
-            reg.registerCollection(&self.read_results);
-            reg.registerCollection(&self.write_results);
-            reg.registerCollection(&self.read_in);
-            reg.registerCollection(&self.write_in);
-            reg.registerCollection(&self._read_pending);
-            reg.registerCollection(&self._write_pending);
-            if (has_connect) {
-                reg.registerCollection(&self.connect_in);
-                reg.registerCollection(&self.connect_errors);
-                reg.registerCollection(&self._connect_socket_pending);
-                reg.registerCollection(&self._connect_pending);
+            inline for (COLLECTIONS) |c| {
+                if (c.connect_only and !has_connect) continue;
+                reg.registerCollection(&@field(self, c.name), @intFromEnum(@field(Coll, c.name)) + 1);
             }
 
             // Register deinit contexts. `ReadResult.deinit` returns
@@ -1294,7 +1344,7 @@ test "works with user collections on same registry" {
     // User collection on the same registry
     var players = try Collection(PlayerRow, .{}).init(testing.allocator);
     defer players.deinit();
-    reg.registerCollection(&players);
+    reg.registerCollection(&players, 1);
 
     const player = try reg.create(&players);
     try testing.expect(!reg.isStale(player));

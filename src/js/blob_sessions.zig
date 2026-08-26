@@ -225,7 +225,7 @@ test "blob session write/seal round-trip matches one-shot sha256" {
     defer reg.deinit();
     var coll = try TestColl.init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     _ = try write(testing.allocator, &reg, &coll, "t1", "c1", "hello ", 1);
     const total = try write(testing.allocator, &reg, &coll, "t1", "c1", "world", 2);
@@ -255,7 +255,7 @@ test "blob session per-tenant cap + isolation" {
     defer reg.deinit();
     var coll = try TestColl.init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     _ = try write(testing.allocator, &reg, &coll, "t1", "c1", "a", 1);
     _ = try write(testing.allocator, &reg, &coll, "t1", "c2", "b", 1);
@@ -284,7 +284,7 @@ test "blob session size cap" {
     defer reg.deinit();
     var coll = try TestColl.init(testing.allocator);
     defer coll.deinit();
-    reg.registerCollection(&coll);
+    reg.registerCollection(&coll, 1);
 
     const chunk = try testing.allocator.alloc(u8, MAX_SESSION_BYTES);
     defer testing.allocator.free(chunk);
