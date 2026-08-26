@@ -96,6 +96,32 @@ comes last so only the constraints that survive 4a–4c get syntax.
       flag can't (scan everything), the single membership can't (slot
       taken by lifecycle). `close_requested`, the style guide's
       confessed flag-exception, exists because the slot was occupied.
+- [ ] **4a-identity. Axes are declared VALUES with owners, not merged
+      names.** String-matched axis names invite accidental capture: two
+      layers independently inventing `.pending` for unrelated concerns
+      get silently fused into one axis, imposing exclusivity between
+      states that have nothing to do with each other — valid
+      declarations, no error. So: a part EXPORTS the axes it owns
+      (`pub const throttle_axis = ...`), layers above reference the
+      decl (`.axis = rio.throttle_axis`) — unforgeable, typo-proof,
+      private by default, shared only by explicit import; the world
+      merges by identity. The total axis is rove's own (`rove.
+      lifecycle`, the default when `.axis` is omitted) because
+      liveness is the registry's concept. Layering is reference-DOWN
+      only: upper layers contribute collections into axes lower layers
+      export; io cannot see h2's. Cross-layer shared axes are not new
+      capability — today's single membership byte IS an unnamed
+      lifecycle axis spanning io and h2 (conn adoption is a move
+      because of cross-layer exclusivity on it); naming makes the
+      sharing addressable. Interface rule per co-residency: overlap
+      freely WITHIN an axis (state alternation — the whole h2 chain),
+      never across axes (contested storage); the checker's error names
+      the component and both sites. Not axis-representable (conflict
+      graphs that are not disjoint unions of cliques, e.g. two
+      overlapping tilings / K2,2): rejected at declaration — remodel
+      by flattening cliques, splitting meanings into distinct
+      components with declared sync, or (someday, with cause) a mode
+      byte selecting the active partition.
 - [ ] **4b. Mechanics.** Membership record becomes one `(id, offset)`
       pair PER AXIS — per-axis arrays, not per-collection sparse tables,
       because membership within an axis is exclusive (sets needed
