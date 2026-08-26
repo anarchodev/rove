@@ -113,6 +113,18 @@ Findings that matter more than any single number:
   nanoseconds under a request path dominated by nghttp2/TLS/syscalls.
   These numbers bound relative overhead; they predict no throughput.
 
+**End to end** — the rove-io echo server runs on both models
+(`echo-server` / `echo-server-fat`, same wiring, one option line apart)
+and a side-by-side bench (ReleaseFast, 8 client threads, 512B verified
+echoes, reps alternating variants) lands where the microbench said it
+would: connection churn at parity (~15.8k conns/s both — connect/accept/
+shutdown/close syscalls dominate, the ECS layer is invisible), and
+persistent round-trips at parity (medians within ~1% across a 10-rep
+alternating run, 5 wins each; an earlier 4% fat edge did not reproduce).
+Zero payload errors either side across ~10^6 round-trips and ~5x10^5
+churned connections. Absolute rates are box-load-dependent; only the
+within-run comparison is meaningful.
+
 ## Relationship to coll-enum
 
 The declared-collection-id work (merged into this branch) composes with the
