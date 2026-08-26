@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -118,7 +117,7 @@ def main() -> int:
 
         print(f"step 2: FREEZE node {vnid} (SIGSTOP) — quorum 2/3 survives")
         frozen_idx = last_index(victim)
-        c.node_procs[victim].send_signal(signal.SIGSTOP)
+        c.freeze_node(victim)
         check(f"node {vnid} frozen", frozen_idx > 0, f"frozen at last_index={frozen_idx}")
 
         print(f"step 3: write a LARGE store on the survivors "
@@ -140,7 +139,7 @@ def main() -> int:
               f"leader_last={ll} frozen_idx={frozen_idx}")
 
         print(f"step 4: THAW node {vnid} (SIGCONT) — recovers by STREAMING the store")
-        c.node_procs[victim].send_signal(signal.SIGCONT)
+        c.thaw_node(victim)
 
         print(f"step 5: ⭐ node {vnid} streams the large store + applies it in batches")
         caught = False
