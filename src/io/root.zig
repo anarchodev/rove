@@ -442,6 +442,15 @@ pub fn Io(comptime opts: Options) type {
     const ConnectPendingColl = if (has_connect) Collection(connect_pending_row, .{}) else void;
 
     const is_fat = opts.registry_model == .fat;
+
+    // Resolver-hook plumbing exists only for the archetype model (see the
+    // field docs); under fat the fields dissolve to void.
+    const FdResolverField = if (is_fat) void else ?*const fn (ctx: *anyopaque, entity: Entity) ?*Fd;
+    const PeerResolverField = if (is_fat) void else ?*const fn (ctx: *anyopaque, entity: Entity) ?*PeerAddr;
+    const ResolverCtxField = if (is_fat) void else ?*anyopaque;
+    const fd_resolver_none: FdResolverField = if (is_fat) {} else null;
+    const peer_resolver_none: PeerResolverField = if (is_fat) {} else null;
+    const resolver_ctx_none: ResolverCtxField = if (is_fat) {} else null;
     // The fat registry's comptime-closed component world: the union of
     // every row io declares, user fragments included. This is the
     // gather-up point — a composing layer that shares the registry must
@@ -521,12 +530,15 @@ pub fn Io(comptime opts: Options) type {
 
         /// Optional FD resolver. If set, used to look up the Fd for a connection
         /// entity — needed when a library (like rove-h2) moves connection entities
-        /// out of `self.connections` into its own collections. Defaults to looking
-        /// up in `self.connections`.
-        fd_resolver: ?*const fn (ctx: *anyopaque, entity: Entity) ?*Fd = null,
-        fd_resolver_ctx: ?*anyopaque = null,
-        peer_resolver: ?*const fn (ctx: *anyopaque, entity: Entity) ?*PeerAddr = null,
-        peer_resolver_ctx: ?*anyopaque = null,
+        /// out of `self.connections` into its own collections and the registry is
+        /// archetype-shaped, so io cannot resolve an entity it no longer holds.
+        /// Absent under the fat model (the fields are void and the setters are
+        /// compile errors): `getFat` resolves the component wherever the entity
+        /// lives, so there is nothing for a hook to add.
+        fd_resolver: FdResolverField = fd_resolver_none,
+        fd_resolver_ctx: ResolverCtxField = resolver_ctx_none,
+        peer_resolver: PeerResolverField = peer_resolver_none,
+        peer_resolver_ctx: ResolverCtxField = resolver_ctx_none,
 
         /// Optional callback that returns the number of conn entities
         /// the upper layer (e.g. rove-h2) is currently holding outside
@@ -593,14 +605,14 @@ pub fn Io(comptime opts: Options) type {
         /// Look up the Fd for a connection entity. Uses the custom resolver if
         /// set, otherwise searches `self.connections` directly.
         pub fn getFd(self: *Self, entity: Entity) ?*Fd {
+            // Under the fat model the component resolves wherever the
+            // entity is — the candidate set and the resolver hook exist
+            // only because archetype storage cannot answer without them.
+            // Callers pass conn entities only.
+            if (comptime is_fat) return self.reg.getFat(entity, Fd) catch null;
             if (self.fd_resolver) |resolver| {
                 return resolver(self.fd_resolver_ctx.?, entity);
             }
-            // Under the fat model the component resolves wherever the
-            // entity is — the candidate set (and the resolver hooks above)
-            // exist only because archetype storage cannot answer without
-            // one. Callers pass conn entities only.
-            if (comptime is_fat) return self.reg.getFat(entity, Fd) catch null;
             return self.reg.getAny(entity, .{ &self.connections, &self.conn_closing }, Fd) catch null;
         }
 
@@ -616,6 +628,7 @@ pub fn Io(comptime opts: Options) type {
         /// Register an external FD resolver. Used by rove-h2 to search its own
         /// connection collections (_conn_active, _conn_tls_handshake).
         pub fn setFdResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*Fd) void {
+            if (comptime is_fat) @compileError("no resolver hooks under the fat model — getFat resolves the component wherever the entity lives");
             self.fd_resolver_ctx = ctx;
             self.fd_resolver = resolver;
         }
@@ -625,14 +638,15 @@ pub fn Io(comptime opts: Options) type {
         /// fixed-fd-install CQE lands, so resolution goes through the
         /// same external-resolver hook.
         pub fn getPeerAddr(self: *Self, entity: Entity) ?*PeerAddr {
+            if (comptime is_fat) return self.reg.getFat(entity, PeerAddr) catch null;
             if (self.peer_resolver) |resolver| {
                 return resolver(self.peer_resolver_ctx.?, entity);
             }
-            if (comptime is_fat) return self.reg.getFat(entity, PeerAddr) catch null;
             return self.reg.getAny(entity, .{ &self.connections, &self.conn_closing }, PeerAddr) catch null;
         }
 
         pub fn setPeerResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*PeerAddr) void {
+            if (comptime is_fat) @compileError("no resolver hooks under the fat model — getFat resolves the component wherever the entity lives");
             self.peer_resolver_ctx = ctx;
             self.peer_resolver = resolver;
         }
