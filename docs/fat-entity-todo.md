@@ -56,17 +56,60 @@ fat-bench (parity at every altitude measured).
 
 ## 4 — Membership axes
 
-- [ ] Component→axis partition declared at comptime; a collection
-      materializes only its axis's components; cross-axis co-residency
-      safe by construction.
-- [ ] `collection_ids` becomes one byte per axis; per-membership offsets
-      move into per-collection sparse indexes (the EntitySet layout —
-      sets are the rehearsal).
-- [ ] Total vs partial axes: lifecycle total (no-limbo, evict's
-      reserve-first discipline), tag/seam/index axes partial (`leave` is
-      legal). Sets become one-state partial axes of the general thing.
-- [ ] Cross-axis constraints ("entanglement") expressed as edge clauses
-      — the actual design work hiding inside the axis idea.
+Ship each step alone: (a) is pure annotation, (b) must be bit-identical
+for the single-axis case, (c) delivers the first real second axis, (d)
+comes last so only the constraints that survive 4a–4c get syntax.
+
+- [ ] **4a. Partition.** `rove.Axes(.{ .lifecycle = Row(...), .throttle
+      = Row(...), ... })` — every component in exactly ONE axis (compile
+      error otherwise); every collection declares `.axis` with row ⊆
+      axis row checked at registration; universe = union of axis rows;
+      the shadow struct is axis-blind and unchanged. Co-residency safe
+      by construction — the disjointness condition becomes a property of
+      the type system, no pairwise or runtime checks. Why a
+      data-carrying axis at all: a system gets DENSE iteration over an
+      orthogonal concern's state (a `throttled` collection whose refill
+      system iterates only limited conns) — a set can't (no columns), a
+      flag can't (scan everything), the single membership can't (slot
+      taken by lifecycle). `close_requested`, the style guide's
+      confessed flag-exception, exists because the slot was occupied.
+- [ ] **4b. Mechanics.** Membership record becomes one `(id, offset)`
+      pair PER AXIS — per-axis arrays, not per-collection sparse tables,
+      because membership within an axis is exclusive (sets needed
+      per-set tables only because sets are not mutually exclusive; they
+      rehearsed the mechanism and axes skip its expensive half). Keep
+      the id namespace global 0..255 so coll_ptrs / column_fns /
+      destroy+evict recipes are unchanged. move comptime-checks
+      src.axis == dst.axis; getFat computes axisOf(T) at comptime, same
+      instruction count; evict infers the axis from dst; destroy exits
+      every axis (K id bytes, K small); create births onto dst's axis.
+      Cost: 5 bytes per entity per axis.
+- [ ] **4c. Total vs partial.** Exactly ONE total axis (lifecycle):
+      position always exists, 0 = free pool, birth requires it, no
+      leave, evict's reserve-first no-limbo discipline applies. All
+      other axes partial: 0 = "not on this axis" (legal — liveness is
+      the total axis's and the generations' job). Partial axes gain
+      `enter` (Gained-path with no source) and `leave` (Dropped-path
+      with no destination — PARKS, nothing destroyed). Freshness sharp
+      edge: re-enter restores parked values (path-independence); the
+      system deciding `leave` owns resetting first if policy wants a
+      fresh start — same contract as `fd = -1` at close. A set is a
+      partial axis with zero components; whether sets keep the bitmask
+      implementation is an implementation choice, not semantic.
+- [ ] **4d. Cross-axis constraints ("entanglement") — the real design
+      work.** Two attachment points: edge-attached clauses (precise,
+      but every call site must repeat them — forgettable) vs
+      STATE-ATTACHED declarations on the collection (`on_enter_leaves =
+      .{ .throttle }`, `excludes = ...`) enforced on every entry however
+      reached — cannot be bypassed, and being destination-properties
+      they are exactly what an erased-source evict can honor. Lean
+      state-attached as default, edge-attached as override. Standing
+      example: "no send work once lifecycle ∈ conn_closing", today a
+      runtime skip-check in processWriteIn. Asserts remain for genuine
+      can't-happens — framework-owned check-and-abort surviving
+      ReleaseFast — which is where the lost Fd bypass-abort class
+      returns, firing at the transition where the story is tellable
+      rather than at destruction where it is archaeology.
 
 ## 5 — Deferred + batch evict
 
