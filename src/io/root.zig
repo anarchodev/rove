@@ -53,6 +53,9 @@ pub const IoCleanupCtx = struct {
     /// something destroyed a conn entity without routing it through
     /// `conn_closing`. Should never move.
     fd_destroyed_live: u64 = 0,
+    /// Write entities destroyed while still holding a buffer — they bypassed
+    /// `write_done` / `releaseWriteBuf`, so that buffer leaked.
+    write_bufs_destroyed_live: u64 = 0,
 };
 
 /// Peer (remote) address of an accepted connection, resolved once at
@@ -170,12 +173,28 @@ pub const WriteBuf = struct {
     len: u32 = 0,
     offset: u32 = 0,
 
-    pub fn deinit(allocator: std.mem.Allocator, items: []WriteBuf) void {
-        for (items) |*item| {
-            if (item.len > 0) {
-                allocator.free(@constCast(item.data[0..item.len]));
-            }
-            item.len = 0;
+    /// A write buffer is released by TRANSITION, not by destruction —
+    /// `processWriteDone` frees it and clears this component, and the
+    /// pre-submission drops in `processWriteIn` call `releaseWriteBuf`. So on
+    /// every legal path this sees `len == 0` and does nothing.
+    ///
+    /// The free cannot live here because the buffer is kernel-visible:
+    /// `prep_send` hands the kernel a pointer into it and keeps reading until
+    /// the completion lands, across a short-write resubmit that re-posts the
+    /// same allocation at a new offset. A destructor cannot know whether that
+    /// completion has arrived. A `len > 0` here means a write entity was
+    /// destroyed around the release path, so the buffer leaks — and had the
+    /// old destructor still been freeing, it could have freed memory the
+    /// kernel was mid-read on.
+    ///
+    /// Counted rather than aborted, unlike `Fd`: a leaked heap buffer is
+    /// bounded and diagnosable where a leaked descriptor slot is a fixed
+    /// resource that runs out.
+    pub const DeinitCtx = IoCleanupCtx;
+
+    pub fn deinit(_: std.mem.Allocator, items: []WriteBuf, ctx: *DeinitCtx) void {
+        for (items) |item| {
+            if (item.len > 0) ctx.write_bufs_destroyed_live += 1;
         }
     }
 };
@@ -365,6 +384,14 @@ pub fn Io(comptime opts: Options) type {
         connect_addrs: []std.net.Address,
         read_results: ReadResultColl,
         write_results: WriteResultColl,
+        /// Write entities the upper layer is finished with. Its buffer is
+        /// still live here — releasing it is this layer's job, in
+        /// `processWriteDone`, because the buffer was kernel-visible and only
+        /// io knows the completion has landed.
+        ///
+        /// Unprefixed: a seam the upper layer moves entities into, like
+        /// `write_in`, not internal bookkeeping.
+        write_done: WriteResultColl,
         read_in: ReadInColl,
         write_in: WriteInColl,
         _read_pending: ReadPendingColl,
@@ -435,6 +462,14 @@ pub fn Io(comptime opts: Options) type {
         /// gave up on the recv rather than seeing it complete. A rising
         /// second number means peers are not finishing their close — the
         /// grace window, not the teardown, is what to look at.
+        /// High-water count of live `WriteBuf` components — every egress
+        /// buffer io is holding, wherever it sits in the write cycle. This is
+        /// the number a fixed buffer pool has to cover (rove#885), and it is
+        /// READ from collection membership rather than tracked: the
+        /// collections already count them, and a parallel counter would be the
+        /// same fact in two places with a missed-decrement failure mode.
+        write_bufs_peak: usize = 0,
+
         conn_closing_retired: u64 = 0,
         conn_closing_deadline_expired: u64 = 0,
 
@@ -560,6 +595,7 @@ pub fn Io(comptime opts: Options) type {
                     &.{},
                 .read_results = try ReadResultColl.init(allocator),
                 .write_results = try WriteResultColl.init(allocator),
+                .write_done = try WriteResultColl.init(allocator),
                 .read_in = try ReadInColl.init(allocator),
                 .write_in = try WriteInColl.init(allocator),
                 ._read_pending = try ReadPendingColl.init(allocator),
@@ -596,6 +632,7 @@ pub fn Io(comptime opts: Options) type {
             reg.registerCollection(&self.conn_closing);
             reg.registerCollection(&self.read_results);
             reg.registerCollection(&self.write_results);
+            reg.registerCollection(&self.write_done);
             reg.registerCollection(&self.read_in);
             reg.registerCollection(&self.write_in);
             reg.registerCollection(&self._read_pending);
@@ -612,6 +649,7 @@ pub fn Io(comptime opts: Options) type {
             // owning read entity is destroyed — the fix for the
             // leak that drained the ring at xargs+curl workloads.
             reg.setDeinitCtx(Fd, &self.cleanup_ctx);
+            reg.setDeinitCtx(WriteBuf, &self.cleanup_ctx);
             reg.setDeinitCtx(ReadCycleEntity, &self.cleanup_ctx);
             reg.setDeinitCtx(ReadResult, &self.cleanup_ctx);
 
@@ -653,6 +691,7 @@ pub fn Io(comptime opts: Options) type {
             if (has_connect) allocator.free(self.connect_addrs);
             self.read_results.deinit();
             self.write_results.deinit();
+            self.write_done.deinit();
             self.read_in.deinit();
             self.write_in.deinit();
             self._read_pending.deinit();
@@ -671,7 +710,8 @@ pub fn Io(comptime opts: Options) type {
         }
 
         pub fn poll(self: *Self, min_complete: u32) !u32 {
-            // Phase 0: Retire connections that finished closing.
+            // Phase 0: Retire what finished last pass.
+            try self.processWriteDone();
             try self.processConnClosing();
 
             // Phase 1: Process user inputs (deferred moves)
@@ -716,6 +756,7 @@ pub fn Io(comptime opts: Options) type {
         /// Caller's Call" rule — the library still doesn't decide,
         /// it just gives you a richer primitive to express the choice.
         pub fn pollWithTimeout(self: *Self, timeout_ns: u64) !u32 {
+            try self.processWriteDone();
             try self.processConnClosing();
             try self.processWriteIn();
             try self.processReadIn();
@@ -751,6 +792,32 @@ pub fn Io(comptime opts: Options) type {
         // Input processing (deferred ops, forward iteration)
         // =============================================================
 
+        /// Release the buffers of write entities the upper layer has finished
+        /// with, then retire them.
+        ///
+        /// The free lives here and not in a destructor for the same reason the
+        /// socket close does: `prep_send` hands the kernel a pointer INTO this
+        /// buffer and keeps reading it until the completion lands — across a
+        /// short-write resubmit, which re-posts the same allocation at a new
+        /// offset. A destructor cannot know whether that completion has
+        /// arrived; a terminal collection an entity can only reach FROM
+        /// `write_results` can, because reaching it means the CQE landed.
+        fn processWriteDone(self: *Self) !void {
+            const entities = self.write_done.entitySlice();
+            const wbufs = self.write_done.column(WriteBuf);
+            for (entities, wbufs) |ent, *wb| {
+                if (self.reg.isStale(ent)) continue;
+                if (self.reg.isMoving(ent)) continue;
+                if (wb.len > 0) {
+                    self.allocator.free(@constCast(wb.data)[0..wb.len]);
+                    // Cleared so `WriteBuf.deinit`'s assertion sees a released
+                    // buffer rather than reporting this as a bypass.
+                    wb.* = .{};
+                }
+                try self.reg.destroy(ent);
+            }
+        }
+
         /// Own the teardown of every connection an upper layer handed over.
         ///
         /// The sequence is the reason this is a state and not a destructor.
@@ -764,7 +831,22 @@ pub fn Io(comptime opts: Options) type {
         /// knows nothing of sessions — so the upper layer sends it and drains
         /// it BEFORE handing the conn over. Arriving here means "the protocol
         /// is finished with this connection; take the socket down."
+        /// Live `WriteBuf` count: the collections whose row carries one,
+        /// summed. Derived at comptime from the rows, so a write collection
+        /// added later is included without anyone remembering to.
+        pub fn writeBufsLive(self: *Self) usize {
+            var n: usize = 0;
+            inline for (.{ &self.write_in, &self._write_pending, &self.write_results, &self.write_done }) |coll| {
+                const Coll = @typeInfo(@TypeOf(coll)).pointer.child;
+                if (comptime Coll.RowType.contains(WriteBuf)) n += coll.entitySlice().len;
+            }
+            return n;
+        }
+
         fn processConnClosing(self: *Self) !void {
+            const live_bufs = self.writeBufsLive();
+            if (live_bufs > self.write_bufs_peak) self.write_bufs_peak = live_bufs;
+
             const now = monotonicNs();
             const entities = self.conn_closing.entitySlice();
             const states = self.conn_closing.column(ClosingState);
@@ -824,13 +906,24 @@ pub fn Io(comptime opts: Options) type {
             }
         }
 
+        /// Release a write buffer and clear the component, so the entity can
+        /// be destroyed without `WriteBuf.deinit` reading it as a bypass.
+        /// Safe for the pre-submission drops below — no SQE has been posted,
+        /// so the kernel never saw this pointer. A buffer whose SQE IS in
+        /// flight must go through `write_done` instead.
+        inline fn releaseWriteBuf(self: *Self, wb: *WriteBuf) void {
+            if (wb.len > 0) self.allocator.free(@constCast(wb.data)[0..wb.len]);
+            wb.* = .{};
+        }
+
         fn processWriteIn(self: *Self) !void {
             const entities = self.write_in.entitySlice();
             const conn_ents = self.write_in.column(ConnEntity);
             const wbufs = self.write_in.column(WriteBuf);
 
-            for (entities, conn_ents, wbufs) |ent, conn_ent, wb| {
+            for (entities, conn_ents, wbufs) |ent, conn_ent, *wb| {
                 if (self.reg.isStale(conn_ent.entity)) {
+                    self.releaseWriteBuf(wb);
                     try self.reg.destroy(ent);
                     continue;
                 }
@@ -840,11 +933,13 @@ pub fn Io(comptime opts: Options) type {
                 // work. Arming a send here would race the teardown for the
                 // same descriptor slot.
                 if (self.reg.isInCollection(conn_ent.entity, &self.conn_closing)) {
+                    self.releaseWriteBuf(wb);
                     try self.reg.destroy(ent);
                     continue;
                 }
 
                 const conn_fd = self.getFd(conn_ent.entity) orelse {
+                    self.releaseWriteBuf(wb);
                     try self.reg.destroy(ent);
                     continue;
                 };
