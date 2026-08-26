@@ -5177,21 +5177,12 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 };
 
-                // Heap-allocate the target address so the pointer we
-                // hand io_uring is stable across swap-remove. Ownership
-                // transfers to the `ConnectAddr` component; its deinit
-                // frees the allocation when the entity is destroyed or
-                // the component is stripped during `moveStripImmediate`
-                // on connect success.
-                const addr_ptr = self.allocator.create(std.net.Address) catch {
-                    try self.reg.destroy(ce);
-                    try self.reg.set(ent, &self.client_connect_in, H2IoResult, .{ .err = -1 });
-                    try self.reg.move(ent, &self.client_connect_in, &self.client_connect_errors);
-                    continue;
-                };
-                addr_ptr.* = target.addr;
-
-                try self.reg.set(ce, &self.io.connect_in, rio.ConnectAddr, .{ .addr = addr_ptr });
+                // The target address goes into io's `connect_addrs` table,
+                // whose slots are stable for the entity's lifetime — a
+                // component column is not, and `prep_connect` outlives the
+                // move that would reshuffle it. No allocation, so no failure
+                // path and nothing to free.
+                try self.io.setConnectAddr(ce, &self.io.connect_in, target.addr);
                 try self.reg.set(ce, &self.io.connect_in, Conn, .{ .direction = .client, .pending_connect_entity = ent });
 
                 try self.reg.move(ent, &self.client_connect_in, &self._client_connect_pending);
