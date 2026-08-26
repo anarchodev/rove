@@ -2345,6 +2345,13 @@ pub fn H2(comptime opts: Options) type {
             conn_tls_handshake: usize,
             handshake_reaped: u64,
             io_connections: usize,
+            /// Peak live `WriteBuf` count — what a fixed egress pool must
+            /// cover. Read from collection membership, not counted.
+            write_bufs_peak: usize,
+            write_bufs_now: usize,
+            /// Write entities destroyed still holding a buffer — they bypassed
+            /// the release path and that buffer leaked. Must stay 0.
+            write_bufs_leaked: u64,
         };
 
         pub fn connStats(self: *Self) ConnStats {
@@ -2368,6 +2375,9 @@ pub fn H2(comptime opts: Options) type {
                 .conn_tls_handshake = self._conn_tls_handshake.entitySlice().len,
                 .handshake_reaped = self.handshake_reaped_total,
                 .io_connections = self.io.connections.entitySlice().len,
+                .write_bufs_peak = self.io.write_bufs_peak,
+                .write_bufs_now = self.io.writeBufsLive(),
+                .write_bufs_leaked = self.io.cleanup_ctx.write_bufs_destroyed_live,
             };
         }
 
@@ -2414,6 +2424,15 @@ pub fn H2(comptime opts: Options) type {
                 \\# HELP h2_handshake_reaped_total connections destroyed for blowing the TLS handshake budget (slowloris canary).
                 \\# TYPE h2_handshake_reaped_total counter
                 \\h2_handshake_reaped_total {d}
+                \\# HELP io_write_bufs_live egress buffers io is holding right now, across write_in + _write_pending + write_results.
+                \\# TYPE io_write_bufs_live gauge
+                \\io_write_bufs_live {d}
+                \\# HELP io_write_bufs_peak high-water of the above — the size a fixed egress buffer pool would have to cover.
+                \\# TYPE io_write_bufs_peak gauge
+                \\io_write_bufs_peak {d}
+                \\# HELP io_write_bufs_leaked_total write entities destroyed while still holding a buffer — bypassed the release path. Must be 0.
+                \\# TYPE io_write_bufs_leaked_total counter
+                \\io_write_bufs_leaked_total {d}
                 \\# HELP h2_io_connections_size raw tcp connections owned by the io layer (pre-handshake or post-handshake unclaimed).
                 \\# TYPE h2_io_connections_size gauge
                 \\h2_io_connections_size {d}
@@ -2433,6 +2452,9 @@ pub fn H2(comptime opts: Options) type {
                 s.conn_active,
                 s.conn_tls_handshake,
                 s.handshake_reaped,
+                s.write_bufs_now,
+                s.write_bufs_peak,
+                s.write_bufs_leaked,
                 s.io_connections,
             });
 
@@ -4963,7 +4985,9 @@ pub fn H2(comptime opts: Options) type {
                 if (failed) {
                     _ = self.closeConn(conn_ent.entity);
                 }
-                try self.reg.destroy(ent);
+                // io owns the buffer's release: it was kernel-visible until the
+                // completion landed, and reaching `write_done` is what proves it did.
+                try self.reg.move(ent, &self.io.write_results, &self.io.write_done);
             }
         }
 

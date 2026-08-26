@@ -151,6 +151,23 @@ pub const Conn = struct {
     send_done: u64 = 0,
     send_fail_seq: u64 = 0,
 
+    /// The one destructor rove-io/h2 keeps, and deliberately.
+    ///
+    /// It releases foreign allocations — an nghttp2 session, an OpenSSL TLS
+    /// conn, an `Http1Conn` — plus this struct's own queued buffers. Those
+    /// frees have no async hazard: nothing reads the session after the conn
+    /// leaves the live collections, so unlike `Fd` or `WriteBuf` there is no
+    /// completion to wait for and nothing a phase could establish that this
+    /// cannot.
+    ///
+    /// Moving it into `closeConn` was considered and rejected: 19 of the
+    /// ~36 `closeConn` call sites still read `conn_ptr` on the lines after
+    /// the call, so freeing there would hand them a pointer to released
+    /// state. Destroying the entity is what actually ends every reader's
+    /// access, which is exactly when this fires.
+    ///
+    /// See rove#885 — "a component should not own memory to free" is the
+    /// rule; foreign allocators are the residue it does not reach.
     pub fn deinit(allocator: std.mem.Allocator, items: []Conn) void {
         for (items) |*item| {
             for (item.send_queue.items) |buf| allocator.free(buf);
