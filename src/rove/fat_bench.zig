@@ -60,6 +60,10 @@ fn Coll(comptime R: type) type {
     return Collection(R, .{ .capacity = K });
 }
 
+fn CollN(comptime R: type, comptime cap: u32) type {
+    return Collection(R, .{ .capacity = cap });
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -192,6 +196,72 @@ fn benchDetourSurvive(alloc: std.mem.Allocator) !void {
         try createAll(&reg, &wide, &ents);
         try runMoveScenario("detour survive | fat park/unpark     | batch", true, &reg, &ents, &wide, &narrow);
         try runMoveScenario("detour survive | fat park/unpark     | immediate", false, &reg, &ents, &wide, &narrow);
+    }
+}
+
+/// A large population RESIDES in the detour state while a small cohort
+/// cycles in and out of an active state. The cohort's own copies are at
+/// parity between the models (see detour-survive); what residency
+/// isolates is everything else: each churn hop swap-fills the hole with
+/// a BYSTANDER's row — 8B under fat, 152B under carry-all — and the idle
+/// collection's working set is K_RES×8B vs K_RES×152B, which is the
+/// difference between staying cache-hot and not once K_RES grows.
+fn benchResidentChurn(alloc: std.mem.Allocator, comptime K_RES: u32, comptime C: u32) !void {
+    const iters: usize = 200_000 / (2 * C);
+    const ops: u64 = iters * 2 * C;
+
+    const churnOnce = struct {
+        fn go(reg: anytype, churners: []const Entity, idle: anytype, active: anytype) !u64 {
+            var timer = try std.time.Timer.start();
+            for (0..iters) |_| {
+                for (churners) |e| try reg.moveImmediate(e, idle, active);
+                for (churners) |e| try reg.moveImmediate(e, active, idle);
+            }
+            return timer.read();
+        }
+    }.go;
+
+    {
+        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
+        defer reg.deinit();
+        var idle = try CollN(WideRow, K_RES).init(alloc);
+        defer idle.deinit();
+        reg.registerCollection(&idle);
+        var active = try CollN(WideRow, K_RES).init(alloc);
+        defer active.deinit();
+        reg.registerCollection(&active);
+
+        const ents = try alloc.alloc(Entity, K_RES);
+        defer alloc.free(ents);
+        try createAll(&reg, &idle, ents);
+        const churners = ents[0..C];
+
+        var totals: [REPS]u64 = undefined;
+        _ = try churnOnce(&reg, churners, &idle, &active);
+        for (&totals) |*t| t.* = try churnOnce(&reg, churners, &idle, &active);
+        report(std.fmt.comptimePrint("churn K={d} C={d} | archetype idle 152B", .{ K_RES, C }), totals, ops);
+    }
+    {
+        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
+        defer reg.deinit();
+        var idle = try CollN(NarrowRow, K_RES).init(alloc);
+        defer idle.deinit();
+        reg.registerCollection(&idle);
+        var active = try CollN(WideRow, K_RES).init(alloc);
+        defer active.deinit();
+        reg.registerCollection(&active);
+
+        const ents = try alloc.alloc(Entity, K_RES);
+        defer alloc.free(ents);
+        try createAll(&reg, &active, ents);
+        for (ents) |e| try reg.move(e, &active, &idle); // park M+Addr
+        try reg.flush();
+        const churners = ents[0..C];
+
+        var totals: [REPS]u64 = undefined;
+        _ = try churnOnce(&reg, churners, &idle, &active);
+        for (&totals) |*t| t.* = try churnOnce(&reg, churners, &idle, &active);
+        report(std.fmt.comptimePrint("churn K={d} C={d} | fat idle 8B (144B parked)", .{ K_RES, C }), totals, ops);
     }
 }
 
@@ -354,6 +424,9 @@ pub fn main() !void {
     std.debug.print("\n", .{});
     try benchDetourSurvive(alloc);
     try benchDetourLossy(alloc);
+    std.debug.print("\n", .{});
+    try benchResidentChurn(alloc, 4096, 256);
+    try benchResidentChurn(alloc, 16384, 512);
     std.debug.print("\n", .{});
     try benchIterate(alloc);
     std.debug.print("\n", .{});
