@@ -214,6 +214,24 @@ pub fn World(comptime cfg: WorldConfig) type {
         break :blk out;
     };
 
+    // The emergent partition, flattened for the registry: one axis
+    // index per universe component (axis-free components map to the
+    // total axis — their reads never consult membership).
+    const comp_axis: [universe.len]u8 = comptime blk: {
+        var out: [universe.len]u8 = @splat(0);
+        for (universe.types, 0..) |T, i| {
+            for (table) |d| {
+                if (d.kind == .set) continue;
+                if (!d.row.contains(T)) continue;
+                for (axis_list, 0..) |A, k| {
+                    if (A == d.axis) out[i] = k;
+                }
+                break;
+            }
+        }
+        break :blk out;
+    };
+
     const n_sets = comptime blk: {
         var n: usize = 0;
         for (table) |d| n += @intFromBool(d.kind == .set);
@@ -257,6 +275,15 @@ pub fn World(comptime cfg: WorldConfig) type {
         /// The axis a declared entry's collection lives on.
         pub fn axisOfColl(comptime id: CollId) type {
             return declOf(id).axis;
+        }
+
+        /// An axis's index in `axes` — the registry's axis numbering
+        /// (0 = lifecycle, the total axis).
+        pub fn axisIndex(comptime A: type) u8 {
+            inline for (axis_list, 0..) |B, i| {
+                if (comptime A == B) return i;
+            }
+            @compileError("world: axis '" ++ A.axis_name ++ "' is not in this world");
         }
 
         /// The owning axis of a materialized component (emergent from
@@ -334,7 +361,10 @@ pub fn World(comptime cfg: WorldConfig) type {
             core: Core,
             storage: *Storage,
 
-            pub const Core = FatRegistry(universe);
+            pub const Core = fat_mod.FatRegistryAxes(universe, .{
+                .n_axes = axis_list.len,
+                .comp_axis = &comp_axis,
+            });
             pub const Fat = Core.Fat;
 
             pub fn init(allocator: std.mem.Allocator, config: FatRegistryConfig) !Reg {
@@ -355,7 +385,7 @@ pub fn World(comptime cfg: WorldConfig) type {
                     switch (d.kind) {
                         .collection => {
                             @field(storage.colls, d.name) = try Collection(d.row, d.options).init(allocator);
-                            core.registerCollection(&@field(storage.colls, d.name), i + 1);
+                            core.registerCollectionOnAxis(&@field(storage.colls, d.name), i + 1, comptime axisIndex(d.axis));
                         },
                         .set => {
                             const bit = comptime setBit(@field(CollId, d.name));
@@ -538,6 +568,31 @@ test "world: the emergent partition — components inherit their collections' ax
     try testing.expectEqual(@as(usize, 1), TestWorld.axes.len);
     try testing.expect(AxisWorld.axisOfColl(.throttled) == throttle_axis);
     try testing.expect(AxisWorld.axisOfColl(.active) == lifecycle);
+}
+
+test "world: a two-axis registry — lifecycle mechanics unchanged, axis edges guarded" {
+    var reg = try AxisWorld.Reg.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    const active = reg.coll(.active);
+    const e = try reg.create(active);
+
+    // Not on the throttle axis: its component resolves through the
+    // shadow as declared defaults, the same read shape as any parked
+    // component.
+    try testing.expectEqual(@as(u32, 8), (try reg.getFat(e, TTokens)).left);
+
+    // Birth is a total-axis event, and a membership changes only
+    // within its axis — both refused loudly, at the verb.
+    try testing.expectError(error.WrongAxis, reg.create(reg.coll(.throttled)));
+    try testing.expectError(error.WrongAxis, reg.moveImmediate(e, active, reg.coll(.throttled)));
+
+    // Lifecycle mechanics are unchanged by the second axis's presence.
+    (try reg.get(e, active, TPos)).* = .{ .x = 9, .y = 0 };
+    try reg.moveImmediate(e, active, reg.coll(.closing));
+    try testing.expectEqual(@as(f32, 9), (try reg.getFat(e, TPos)).x);
+    try reg.destroyImmediate(e);
+    try testing.expect(reg.collectionIdOf(e) == null);
 }
 
 test "world: ids by table position, one namespace across parts" {

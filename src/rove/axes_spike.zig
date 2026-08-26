@@ -199,24 +199,34 @@ fn SpikeWorld(comptime axes: []const AxisDecl, comptime colls: []const SpikeColl
         }
 
         pub fn init(allocator: std.mem.Allocator, max: u32) !Self {
-            var self: Self = undefined;
-            self.allocator = allocator;
-            self.max_entities = max;
-            self.generations = try allocator.alloc(u32, max);
-            @memset(self.generations, 0);
+            const generations = try allocator.alloc(u32, max);
+            @memset(generations, 0);
+            var axis_ids: [n_axes][]u8 = undefined;
+            var axis_offsets: [n_axes][]u32 = undefined;
             inline for (0..n_axes) |ax| {
-                self.axis_ids[ax] = try allocator.alloc(u8, max);
-                @memset(self.axis_ids[ax], 0);
-                self.axis_offsets[ax] = try allocator.alloc(u32, max);
+                axis_ids[ax] = try allocator.alloc(u8, max);
+                @memset(axis_ids[ax], 0);
+                axis_offsets[ax] = try allocator.alloc(u32, max);
             }
-            self.shadow = try allocator.alloc(Shadow, max);
-            for (self.shadow) |*sh| sh.hdr = .{};
-            self.null_pool = try allocator.alloc(Entity, max);
-            for (0..max) |i| self.null_pool[i] = .{ .index = @intCast(i), .generation = 0 };
-            self.null_count = max;
-            inline for (colls, 0..) |cd, i| {
-                _ = cd;
-                @field(self.storage, colls[i].name) = try Collection(colls[i].row, .{}).init(allocator);
+            const shadow = try allocator.alloc(Shadow, max);
+            for (shadow) |*sh| sh.hdr = .{};
+            const null_pool = try allocator.alloc(Entity, max);
+            for (0..max) |i| null_pool[i] = .{ .index = @intCast(i), .generation = 0 };
+            var self = Self{
+                .generations = generations,
+                .axis_ids = axis_ids,
+                .axis_offsets = axis_offsets,
+                .shadow = shadow,
+                .null_pool = null_pool,
+                .null_count = max,
+                // Filled by the loop just below — the fat.zig
+                // `.destroy_recipes = undefined` shape.
+                .storage = undefined,
+                .max_entities = max,
+                .allocator = allocator,
+            };
+            inline for (colls) |cd| {
+                @field(self.storage, cd.name) = try Collection(cd.row, .{}).init(allocator);
             }
             return self;
         }

@@ -165,12 +165,42 @@ pub const EntitySet = struct {
     }
 };
 
+/// The membership-axis shape of a registry (fat-entity-todo.md §4b).
+/// Axis 0 is the TOTAL axis (liveness): its record is the classic
+/// `collection_ids`/`offsets` pair, 0 = the free pool, and every entity
+/// always has a position on it. Axes 1..n are PARTIAL: 0 = "not on
+/// this axis", and their records live in parallel per-axis arrays.
+/// `comp_axis` maps each Universe component (by index) to the one axis
+/// whose collections may materialize it — the emergent partition a
+/// declared world derives; components in no collection map to 0 (their
+/// reads never consult membership). The default is the single-axis
+/// registry, which stores and executes exactly as it always has.
+pub const AxesSpec = struct {
+    n_axes: usize = 1,
+    comp_axis: []const u8 = &.{},
+};
+
 /// `Universe` is a `Row` of every component type any registered collection
 /// may carry — the comptime-closed component world. Collections whose row
 /// is not covered by it are rejected at registration (comptime).
 pub fn FatRegistry(comptime Universe: type) type {
+    return FatRegistryAxes(Universe, .{});
+}
+
+/// The axis-shaped registry — see `AxesSpec`. `FatRegistry` is the
+/// single-axis instantiation; a declared world passes its derived
+/// partition.
+pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) type {
     if (!@hasDecl(Universe, "types") or !@hasDecl(Universe, "len")) {
         @compileError("FatRegistry requires a Row type as its Universe");
+    }
+    comptime {
+        if (axes_spec.comp_axis.len != 0 and axes_spec.comp_axis.len != Universe.len) {
+            @compileError("FatRegistryAxes: comp_axis must be empty (all total-axis) or one entry per Universe component");
+        }
+        for (axes_spec.comp_axis) |ax| {
+            if (ax >= axes_spec.n_axes) @compileError("FatRegistryAxes: comp_axis entry out of range");
+        }
     }
 
     return struct {
@@ -221,7 +251,19 @@ pub fn FatRegistry(comptime Universe: type) type {
         // of evictImmediate, indexed by collection_id like destroy_recipes.
         evict_recipes: [MAX_COLLECTIONS]EvictEntry,
 
+        // ── Partial membership axes (§4b) ──
+        // Axis 0 is `collection_ids`/`offsets` above, untouched; each
+        // partial axis k+1 records membership here. 0 = not on the axis.
+        partial_ids: [n_partial][]u8,
+        partial_offsets: [n_partial][]u32,
+        // Which axis each registered collection id lives on — destroy
+        // walks it to exit every axis, evict checks it against the
+        // destination's.
+        id_axis: [MAX_COLLECTIONS]u8,
+
         allocator: std.mem.Allocator,
+
+        const n_partial = axes_spec.n_axes - 1;
 
         const PENDING_MOVE: u8 = 1;
         const MAX_COLLECTIONS: usize = 256;
@@ -283,6 +325,14 @@ pub fn FatRegistry(comptime Universe: type) type {
             const set_memberships = try allocator.alloc(u32, max);
             @memset(set_memberships, 0);
 
+            var partial_ids: [n_partial][]u8 = undefined;
+            var partial_offsets: [n_partial][]u32 = undefined;
+            inline for (0..n_partial) |k| {
+                partial_ids[k] = try allocator.alloc(u8, max);
+                @memset(partial_ids[k], 0);
+                partial_offsets[k] = try allocator.alloc(u32, max);
+            }
+
             return .{
                 .generations = generations,
                 .collection_ids = collection_ids,
@@ -302,11 +352,18 @@ pub fn FatRegistry(comptime Universe: type) type {
                 .set_memberships = set_memberships,
                 .set_ptrs = [_]?*EntitySet{null} ** MAX_SETS,
                 .evict_recipes = undefined,
+                .partial_ids = partial_ids,
+                .partial_offsets = partial_offsets,
+                .id_axis = [_]u8{0} ** MAX_COLLECTIONS,
                 .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            inline for (0..n_partial) |k| {
+                self.allocator.free(self.partial_ids[k]);
+                self.allocator.free(self.partial_offsets[k]);
+            }
             self.allocator.free(self.fat_table);
             self.allocator.free(self.column_fns);
             self.allocator.free(self.set_memberships);
@@ -328,7 +385,33 @@ pub fn FatRegistry(comptime Universe: type) type {
         /// The row must be covered by the Universe (comptime); id 0 is the
         /// free/null pool and is never a collection.
         pub inline fn registerCollection(self: *Self, coll: anytype, declared_id: u8) void {
+            self.registerCollectionOnAxis(coll, declared_id, 0);
+        }
+
+        /// Register a collection onto a membership axis (§4b). Axis 0 is
+        /// the total axis; a partial axis's collections record membership
+        /// in that axis's arrays. Every component of the row must belong
+        /// to the axis under `comp_axis` — the emergent partition a
+        /// declared world derives and checks; re-checked here so a bare
+        /// registry cannot register contested storage either.
+        pub inline fn registerCollectionOnAxis(self: *Self, coll: anytype, declared_id: u8, comptime axis: u8) void {
             const CollType = @typeInfo(@TypeOf(coll)).pointer.child;
+            comptime {
+                if (axis >= axes_spec.n_axes) @compileError("registerCollectionOnAxis: axis out of range");
+                if (axes_spec.comp_axis.len != 0) {
+                    for (CollType.RowType.types) |T| {
+                        const ci = blk: {
+                            for (Universe.types, 0..) |U, i| {
+                                if (U == T) break :blk i;
+                            }
+                            unreachable;
+                        };
+                        if (axes_spec.comp_axis[ci] != axis) @compileError(
+                            "registerCollectionOnAxis: component " ++ @typeName(T) ++ " belongs to a different axis than this collection",
+                        );
+                    }
+                }
+            }
             comptime {
                 @setEvalBranchQuota(100_000);
                 if (!CollType.RowType.isSubsetOf(Universe)) {
@@ -347,6 +430,8 @@ pub fn FatRegistry(comptime Universe: type) type {
             );
             self.id_used[declared_id] = true;
             coll.registry_id = declared_id;
+            coll.axis_index = axis;
+            self.id_axis[declared_id] = axis;
             const id: usize = declared_id;
 
             self.coll_ptrs[id] = @ptrCast(coll);
@@ -452,6 +537,11 @@ pub fn FatRegistry(comptime Universe: type) type {
         /// first touch (stamp mismatch reads as default).
         pub inline fn create(self: *Self, dst: anytype) !Entity {
             const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+            // Birth is a total-axis event: position on the total axis
+            // always exists, and a partial axis is entered later (§4c).
+            if (comptime axes_spec.n_axes > 1) {
+                if (dst.axis_index != 0) return error.WrongAxis;
+            }
             if (self.null_count == 0) return error.Full;
             self.null_count -= 1;
             const entity = self.null_pool[self.null_count];
@@ -481,14 +571,20 @@ pub fn FatRegistry(comptime Universe: type) type {
             if (idx >= self.max_entities) return error.InvalidEntity;
             if (self.generations[idx] != entity.generation) return error.Stale;
             if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
-            if (self.collection_ids[idx] != src.registry_id) return error.WrongCollection;
+            // A membership changes only within its axis (§4b). The flag
+            // freezes the whole entity, not one axis — conservative, and
+            // it keeps one flag byte.
+            if (comptime axes_spec.n_axes > 1) {
+                if (src.axis_index != dst.axis_index) return error.WrongAxis;
+            }
+            if (self.axisIds(src.axis_index)[idx] != src.registry_id) return error.WrongCollection;
 
             self.flags[idx] |= PENDING_MOVE;
 
             const recipe = moveRecipe(SrcColl, DstColl);
             try self.enqueueOp(.{
                 .src_collection_id = src.registry_id,
-                .src_offset = self.offsets[idx],
+                .src_offset = self.axisOffsets(src.axis_index)[idx],
                 .count = 1,
                 .execute = recipe,
                 .src_ptr = @ptrCast(src),
@@ -511,9 +607,13 @@ pub fn FatRegistry(comptime Universe: type) type {
             if (idx >= self.max_entities) return error.InvalidEntity;
             if (self.generations[idx] != entity.generation) return error.Stale;
             if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
-            if (self.collection_ids[idx] != src.registry_id) return error.WrongCollection;
+            if (comptime axes_spec.n_axes > 1) {
+                if (src.axis_index != dst.axis_index) return error.WrongAxis;
+            }
+            const ax = src.axis_index;
+            if (self.axisIds(ax)[idx] != src.registry_id) return error.WrongCollection;
 
-            const src_offset = self.offsets[idx];
+            const src_offset = self.axisOffsets(ax)[idx];
             const new_offset = try dst.reserveSlots(1);
             dst.entitySlice()[new_offset] = entity;
 
@@ -535,11 +635,11 @@ pub fn FatRegistry(comptime Universe: type) type {
 
             const moved = src.removeRun(src_offset, 1);
             for (moved) |moved_entity| {
-                self.offsets[moved_entity.index] = src_offset;
+                self.axisOffsets(ax)[moved_entity.index] = src_offset;
             }
 
-            self.collection_ids[idx] = dst.registry_id;
-            self.offsets[idx] = new_offset;
+            self.axisIds(ax)[idx] = dst.registry_id;
+            self.axisOffsets(ax)[idx] = new_offset;
         }
 
         /// Call-site-compatible `moveStrip`: under the fat model nothing
@@ -656,7 +756,7 @@ pub fn FatRegistry(comptime Universe: type) type {
         pub inline fn isInCollection(self: *const Self, entity: Entity, coll: anytype) bool {
             if (entity.index >= self.max_entities) return false;
             if (self.generations[entity.index] != entity.generation) return false;
-            return self.collection_ids[entity.index] == coll.registry_id;
+            return @constCast(self).axisIds(coll.axis_index)[entity.index] == coll.registry_id;
         }
 
         /// Read a component through a known collection — the dense-path
@@ -665,8 +765,8 @@ pub fn FatRegistry(comptime Universe: type) type {
             const idx = entity.index;
             if (idx >= self.max_entities) return error.InvalidEntity;
             if (self.generations[idx] != entity.generation) return error.Stale;
-            if (self.collection_ids[idx] != coll.registry_id) return error.WrongCollection;
-            return &coll.column(T)[self.offsets[idx]];
+            if (self.axisIds(coll.axis_index)[idx] != coll.registry_id) return error.WrongCollection;
+            return &coll.column(T)[self.axisOffsets(coll.axis_index)[idx]];
         }
 
         pub inline fn set(self: *Self, entity: Entity, coll: anytype, comptime T: type, value: T) !void {
@@ -696,10 +796,13 @@ pub fn FatRegistry(comptime Universe: type) type {
             }
 
             const ci = comptime compIndex(T);
-            const id: usize = self.collection_ids[idx];
+            // The component's owning axis (comptime): its collections may
+            // live only there, so one membership lookup answers.
+            const ax: u8 = comptime if (axes_spec.comp_axis.len == 0) 0 else axes_spec.comp_axis[ci];
+            const id: usize = self.axisIds(ax)[idx];
             if (id != 0) {
                 if (self.column_fns[id * Universe.len + ci]) |f| {
-                    return @ptrCast(@alignCast(f(self.coll_ptrs[id].?, self.offsets[idx])));
+                    return @ptrCast(@alignCast(f(self.coll_ptrs[id].?, self.axisOffsets(ax)[idx])));
                 }
             }
 
@@ -725,11 +828,10 @@ pub fn FatRegistry(comptime Universe: type) type {
             if (idx >= self.max_entities) return error.InvalidEntity;
             if (self.generations[idx] != entity.generation) return error.Stale;
 
-            const current_id = self.collection_ids[idx];
             inline for (@typeInfo(@TypeOf(colls)).@"struct".fields) |field| {
                 const coll = @field(colls, field.name);
-                if (current_id == coll.registry_id) {
-                    return &coll.column(T)[self.offsets[idx]];
+                if (self.axisIds(coll.axis_index)[idx] == coll.registry_id) {
+                    return &coll.column(T)[self.axisOffsets(coll.axis_index)[idx]];
                 }
             }
             return error.WrongCollection;
@@ -746,18 +848,20 @@ pub fn FatRegistry(comptime Universe: type) type {
             if (self.generations[idx] != entity.generation) return error.Stale;
             if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
 
-            const current_id = self.collection_ids[idx];
             const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
 
             inline for (@typeInfo(@TypeOf(sources)).@"struct".fields) |field| {
                 const src = @field(sources, field.name);
                 const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
-                if (current_id == src.registry_id) {
+                if (self.axisIds(src.axis_index)[idx] == src.registry_id) {
+                    if (comptime axes_spec.n_axes > 1) {
+                        if (src.axis_index != dst.axis_index) return error.WrongAxis;
+                    }
                     self.flags[idx] |= PENDING_MOVE;
                     const recipe = moveRecipe(SrcColl, DstColl);
                     try self.enqueueOp(.{
                         .src_collection_id = src.registry_id,
-                        .src_offset = self.offsets[idx],
+                        .src_offset = self.axisOffsets(src.axis_index)[idx],
                         .count = 1,
                         .execute = recipe,
                         .src_ptr = @ptrCast(src),
@@ -810,14 +914,18 @@ pub fn FatRegistry(comptime Universe: type) type {
             if (idx >= self.max_entities) return error.InvalidEntity;
             if (self.generations[idx] != entity.generation) return error.Stale;
             if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
-            const src_id = self.collection_ids[idx];
+            // The destination's axis names which membership is being
+            // rewritten; the erased source is whatever collection holds
+            // the entity THERE.
+            const ax = dst.axis_index;
+            const src_id = self.axisIds(ax)[idx];
             if (src_id == 0) return error.InvalidEntity;
             if (src_id == dst.registry_id) return error.WrongCollection;
 
             const new_offset = try dst.reserveSlots(1);
 
             const entry = self.evict_recipes[src_id];
-            entry.recipe(self, entry.ptr, self.offsets[idx]);
+            entry.recipe(self, entry.ptr, self.axisOffsets(ax)[idx]);
 
             dst.entitySlice()[new_offset] = entity;
             inline for (DstColl.RowType.types) |T| {
@@ -825,8 +933,8 @@ pub fn FatRegistry(comptime Universe: type) type {
                     self.unparkOne(T, entity, &dst.column(T)[new_offset]);
                 }
             }
-            self.collection_ids[idx] = dst.registry_id;
-            self.offsets[idx] = new_offset;
+            self.axisIds(ax)[idx] = dst.registry_id;
+            self.axisOffsets(ax)[idx] = new_offset;
         }
 
         /// Cast the entity to a row type: one handle validation, then one
@@ -848,6 +956,20 @@ pub fn FatRegistry(comptime Universe: type) type {
         // =============================================================
         // Internal
         // =============================================================
+
+        /// The membership-id array of an axis: 0 = collection_ids (the
+        /// total axis), k>0 = that partial axis's. Comptime-folds to the
+        /// classic fields on a single-axis registry, so that case costs
+        /// nothing new.
+        inline fn axisIds(self: *Self, ax: u8) []u8 {
+            if (comptime axes_spec.n_axes == 1) return self.collection_ids;
+            return if (ax == 0) self.collection_ids else self.partial_ids[ax - 1];
+        }
+
+        inline fn axisOffsets(self: *Self, ax: u8) []u32 {
+            if (comptime axes_spec.n_axes == 1) return self.offsets;
+            return if (ax == 0) self.offsets else self.partial_offsets[ax - 1];
+        }
 
         fn enqueueOp(self: *Self, op: DeferredOp) !void {
             // RLE coalescing: same src, same recipe fn, same dst ptr, contiguous offset
@@ -977,17 +1099,20 @@ pub fn FatRegistry(comptime Universe: type) type {
                         }
                     }
 
+                    // Same-axis by the verbs' check; the axis is read
+                    // off the destination at execute time.
+                    const ax = dst_coll.axis_index;
                     for (0..count) |k| {
                         const entity = src_entities[src_offset + k];
                         const idx = entity.index;
-                        reg.collection_ids[idx] = dst_coll.registry_id;
-                        reg.offsets[idx] = dest_base + @as(u32, @intCast(k));
+                        reg.axisIds(ax)[idx] = dst_coll.registry_id;
+                        reg.axisOffsets(ax)[idx] = dest_base + @as(u32, @intCast(k));
                         reg.flags[idx] &= ~PENDING_MOVE;
                     }
 
                     const moved = src_coll.removeRun(src_offset, count);
                     for (moved, 0..) |moved_entity, r| {
-                        reg.offsets[moved_entity.index] = src_offset + @as(u32, @intCast(r));
+                        reg.axisOffsets(ax)[moved_entity.index] = src_offset + @as(u32, @intCast(r));
                     }
                 }
             }.execute;
@@ -1009,7 +1134,7 @@ pub fn FatRegistry(comptime Universe: type) type {
                         }
                     }
                     const moved = src_coll.removeRun(src_offset, 1);
-                    for (moved) |m| reg.offsets[m.index] = src_offset;
+                    for (moved) |m| reg.axisOffsets(src_coll.axis_index)[m.index] = src_offset;
                 }
             }.execute;
         }
@@ -1025,6 +1150,21 @@ pub fn FatRegistry(comptime Universe: type) type {
                     for (0..count) |k| {
                         const entity = src_entities[src_offset + k];
                         const idx = entity.index;
+                        // Exit every partial axis first — like sets, no
+                        // axis may hold a dead entity. The evict recipe
+                        // does the removal (its parks are dead bytes the
+                        // generation bump below invalidates).
+                        if (comptime n_partial > 0) {
+                            for (1..axes_spec.n_axes) |ax_usize| {
+                                const ax: u8 = @intCast(ax_usize);
+                                const pid = reg.axisIds(ax)[idx];
+                                if (pid != 0) {
+                                    const pe = reg.evict_recipes[pid];
+                                    pe.recipe(reg, pe.ptr, reg.axisOffsets(ax)[idx]);
+                                    reg.axisIds(ax)[idx] = 0;
+                                }
+                            }
+                        }
                         reg.leaveAllSets(idx);
                         reg.generations[idx] += 1;
                         reg.collection_ids[idx] = 0;

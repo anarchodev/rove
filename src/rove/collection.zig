@@ -64,6 +64,11 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         /// Registry-assigned collection ID. Set after init via registry.allocateCollectionId().
         registry_id: u8 = 0,
 
+        /// Membership axis this collection lives on (fat model, §4b):
+        /// 0 = the total axis, k>0 = a partial axis. Set at
+        /// registration; the archetype registry leaves it 0.
+        axis_index: u8 = 0,
+
         // Lifecycle context pointers (one per component slot, null if not needed)
         init_ctxs: [R.len]?*anyopaque,
         deinit_ctxs: [R.len]?*anyopaque,
@@ -81,6 +86,7 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
                 .capacity = 0,
                 .allocator = allocator,
                 .registry_id = 0,
+                .axis_index = 0,
                 .init_ctxs = [_]?*anyopaque{null} ** R.len,
                 .deinit_ctxs = [_]?*anyopaque{null} ** R.len,
             };

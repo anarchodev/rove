@@ -192,17 +192,30 @@ axis and per-axis offsets stay exact under swap-remove churn.
       by flattening cliques, splitting meanings into distinct
       components with declared sync, or (someday, with cause) a mode
       byte selecting the active partition.
-- [ ] **4b. Mechanics.** Membership record becomes one `(id, offset)`
-      pair PER AXIS — per-axis arrays, not per-collection sparse tables,
-      because membership within an axis is exclusive (sets needed
-      per-set tables only because sets are not mutually exclusive; they
-      rehearsed the mechanism and axes skip its expensive half). Keep
-      the id namespace global 0..255 so coll_ptrs / column_fns /
-      destroy+evict recipes are unchanged. move comptime-checks
-      src.axis == dst.axis; getFat computes axisOf(T) at comptime, same
-      instruction count; evict infers the axis from dst; destroy exits
-      every axis (K id bytes, K small); create births onto dst's axis.
-      Cost: 5 bytes per entity per axis.
+- [x] **4b. Mechanics — BUILT 2026-08-26.** `FatRegistryAxes(Universe,
+      AxesSpec)` with `FatRegistry` = the single-axis instantiation.
+      The total axis KEEPS `collection_ids`/`offsets` literally —
+      single-axis stays shape-identical by construction, `axisIds(ax)`
+      comptime-folds to the classic fields when n_axes == 1, and
+      fat-bench confirms parity (move 5.7, churn 11.5, getFat 2.3–2.5
+      ns/op — the pre-axes figures). Partial axes are parallel
+      `(id, offset)` arrays; id namespace stays global 0..255 so
+      coll_ptrs / column_fns / recipes are unchanged; collections carry
+      `axis_index` from `registerCollectionOnAxis` (which re-checks the
+      partition), and `id_axis` records it per id. getFat computes the
+      axis at comptime; evict takes the axis from dst; destroy exits
+      every partial axis via the evict recipes before the generation
+      bump (their parks are dead bytes the bump invalidates); create
+      refuses partial-axis destinations (birth is a total-axis event).
+      DELTAS from the pinned sketch: the src/dst same-axis check is a
+      RUNTIME error at the verb (registration is runtime, so the core
+      cannot comptime it; the world's table could later), and
+      PENDING_MOVE stays ONE flag freezing the whole entity across
+      axes — conservative, one byte. The world derives the AxesSpec
+      from the emergent partition and registers entries onto
+      `axisIndex(d.axis)`. Partial-axis collections are UNREACHABLE
+      until 4c's enter/leave land — this step is the plumbing under
+      the unchanged single-axis behavior (127 tests green).
 - [ ] **4c. Total vs partial.** Exactly ONE total axis (lifecycle):
       position always exists, 0 = free pool, birth requires it, no
       leave, evict's reserve-first no-limbo discipline applies. All
