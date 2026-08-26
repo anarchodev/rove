@@ -52,7 +52,6 @@ const Collection = collection_mod.Collection;
 const CollectionOptions = collection_mod.CollectionOptions;
 const FatRegistry = fat_mod.FatRegistry;
 const FatRegistryConfig = fat_mod.FatRegistryConfig;
-const EntitySet = fat_mod.EntitySet;
 const RowView = fat_mod.RowView;
 
 pub const CollKind = enum { collection, set };
@@ -237,10 +236,6 @@ pub fn World(comptime cfg: WorldConfig) type {
         for (table) |d| n += @intFromBool(d.kind == .set);
         break :blk n;
     };
-    comptime {
-        if (n_sets > 32) @compileError("world: more than 32 set entries — the per-entity membership mask is u32");
-    }
-
     // The id namespace: variant per entry in table order, valued by
     // registry id directly (position + 1) so no call site does the +1.
     const IdEnum = comptime blk: {
@@ -308,26 +303,30 @@ pub fn World(comptime cfg: WorldConfig) type {
             return Collection(d.row, d.options);
         }
 
-        /// Bit index of a set entry in the registry's membership mask:
-        /// its position among the set-kind entries, in table order.
-        fn setBit(comptime id: CollId) u5 {
+        /// A set entry's position among the set-kind entries, in table
+        /// order — its one-state axis is `axis_list.len + setBit(id)`.
+        fn setBit(comptime id: CollId) usize {
             const d = comptime declOf(id);
             comptime {
                 if (d.kind != .set) @compileError("world: '" ++ d.name ++ "' is a collection entry, not a set");
             }
-            comptime var bit: u5 = 0;
+            comptime var bit: usize = 0;
             inline for (table[0 .. @intFromEnum(id) - 1]) |e| {
                 if (e.kind == .set) bit += 1;
             }
             return bit;
         }
 
-        // One field per collection-kind entry, named by the entry.
+        fn setAxis(comptime id: CollId) u8 {
+            return comptime @intCast(axis_list.len + setBit(id));
+        }
+
+        // One field per entry, named by the entry. A set entry's
+        // storage is its empty-row collection (the component loops in
+        // every shared recipe vanish at comptime for an empty row).
         const CollStorage = blk: {
             var fields: [table.len]std.builtin.Type.StructField = undefined;
-            var n: usize = 0;
-            for (table) |d| {
-                if (d.kind == .set) continue;
+            for (table, 0..) |d, n| {
                 fields[n] = .{
                     .name = d.name,
                     .type = Collection(d.row, d.options),
@@ -335,12 +334,11 @@ pub fn World(comptime cfg: WorldConfig) type {
                     .is_comptime = false,
                     .alignment = @alignOf(Collection(d.row, d.options)),
                 };
-                n += 1;
             }
             break :blk @Type(.{ .@"struct" = .{
                 .layout = .auto,
                 .backing_integer = null,
-                .fields = fields[0..n],
+                .fields = fields[0..table.len],
                 .decls = &.{},
                 .is_tuple = false,
             } });
@@ -348,7 +346,6 @@ pub fn World(comptime cfg: WorldConfig) type {
 
         const Storage = struct {
             colls: CollStorage,
-            sets: [n_sets]EntitySet,
         };
 
         /// The world's registry: `FatRegistry(Universe)` plus ownership
@@ -361,8 +358,12 @@ pub fn World(comptime cfg: WorldConfig) type {
             core: Core,
             storage: *Storage,
 
+            // One axis per declared axis, plus one ONE-STATE axis per
+            // set entry: a set is the empty-row collection on an axis
+            // of its own — its dense member list is the collection's
+            // entity slice, its old sparse table is the axis's offsets.
             pub const Core = fat_mod.FatRegistryAxes(universe, .{
-                .n_axes = axis_list.len,
+                .n_axes = axis_list.len + n_sets,
                 .comp_axis = &comp_axis,
             });
             pub const Fat = Core.Fat;
@@ -375,24 +376,17 @@ pub fn World(comptime cfg: WorldConfig) type {
 
                 var inited: usize = 0;
                 errdefer inline for (table, 0..) |d, i| {
-                    if (i < inited) switch (d.kind) {
-                        .collection => @field(storage.colls, d.name).deinit(),
-                        .set => storage.sets[comptime setBit(@field(CollId, d.name))].deinit(),
-                    };
+                    if (i < inited) @field(storage.colls, d.name).deinit();
                 };
 
                 inline for (table, 0..) |d, i| {
-                    switch (d.kind) {
-                        .collection => {
-                            @field(storage.colls, d.name) = try Collection(d.row, d.options).init(allocator);
-                            core.registerCollectionOnAxis(&@field(storage.colls, d.name), i + 1, comptime axisIndex(d.axis));
-                        },
-                        .set => {
-                            const bit = comptime setBit(@field(CollId, d.name));
-                            storage.sets[bit] = try EntitySet.init(allocator, config.max_entities);
-                            core.registerSet(&storage.sets[bit], bit);
-                        },
-                    }
+                    @field(storage.colls, d.name) = try Collection(d.row, d.options).init(allocator);
+                    const ax = comptime switch (d.kind) {
+                        .collection => axisIndex(d.axis),
+                        // A set's one-state axis, after the declared ones.
+                        .set => axis_list.len + setBit(@field(CollId, d.name)),
+                    };
+                    core.registerCollectionOnAxis(&@field(storage.colls, d.name), i + 1, ax);
                     inited = i + 1;
                 }
 
@@ -402,9 +396,8 @@ pub fn World(comptime cfg: WorldConfig) type {
             pub fn deinit(self: *Reg) void {
                 const allocator = self.core.allocator;
                 inline for (table) |d| {
-                    if (d.kind == .collection) @field(self.storage.colls, d.name).deinit();
+                    @field(self.storage.colls, d.name).deinit();
                 }
-                for (&self.storage.sets) |*s| s.deinit();
                 allocator.destroy(self.storage);
                 self.core.deinit();
                 self.* = undefined;
@@ -417,32 +410,63 @@ pub fn World(comptime cfg: WorldConfig) type {
                 return &@field(self.storage.colls, declOf(id).name);
             }
 
-            fn setPtr(self: *const Reg, comptime id: CollId) *EntitySet {
-                return &self.storage.sets[comptime setBit(id)];
+            fn setColl(self: *const Reg, comptime id: CollId) *Collection(Row(&.{}), .{}) {
+                comptime {
+                    if (declOf(id).kind != .set) @compileError("world: '" ++ declOf(id).name ++ "' is not a set entry");
+                }
+                return &@field(self.storage.colls, declOf(id).name);
             }
 
-            // ── Membership sets, by tag (storage stays internal) ──
+            // ── Membership sets, by tag — an empty-row collection on
+            //    its own one-state axis; the tag surface is unchanged
+            //    from the EntitySet era, which is the point ──
 
+            /// Join a set. Idempotent: returns false if already a
+            /// member. Membership survives every move on other axes and
+            /// ends only at leave or destroy.
             pub fn join(self: *Reg, entity: Entity, comptime id: CollId) !bool {
-                return self.core.join(entity, self.setPtr(id));
+                if (self.core.onAxis(entity, comptime setAxis(id))) return false;
+                try self.core.enter(entity, self.setColl(id));
+                return true;
             }
 
+            /// Leave a set. Returns false if not a member.
             pub fn leave(self: *Reg, entity: Entity, comptime id: CollId) !bool {
-                return self.core.leave(entity, self.setPtr(id));
+                return self.core.leave(entity, comptime setAxis(id));
             }
 
             pub fn inSet(self: *const Reg, entity: Entity, comptime id: CollId) bool {
-                return self.core.inSet(entity, self.setPtr(id));
+                return self.core.onAxis(entity, comptime setAxis(id));
             }
 
             /// The set's dense member list. Valid until the next
             /// join/leave/destroy.
             pub fn setMembers(self: *const Reg, comptime id: CollId) []const Entity {
-                return self.setPtr(id).members();
+                return self.setColl(id).entitySlice();
             }
 
             pub fn setCount(self: *const Reg, comptime id: CollId) u32 {
-                return self.setPtr(id).count;
+                return self.setColl(id).count;
+            }
+
+            // ── Partial-axis verbs (collections on a declared axis) ──
+
+            /// Enter a partial-axis collection (the Gained path with no
+            /// source): pass `reg.coll(.name)`. Total-axis membership
+            /// starts at `create`.
+            pub inline fn enter(self: *Reg, entity: Entity, dst: anytype) !void {
+                return self.core.enter(entity, dst);
+            }
+
+            /// Leave a declared partial axis — whichever collection
+            /// holds the entity there; its row parks. False if not on
+            /// the axis.
+            pub fn leaveAxis(self: *Reg, entity: Entity, comptime A: type) !bool {
+                return self.core.leave(entity, comptime axisIndex(A));
+            }
+
+            pub fn onAxis(self: *const Reg, entity: Entity, comptime A: type) bool {
+                return self.core.onAxis(entity, comptime axisIndex(A));
             }
 
             // ── Core forwards — one line each, so `reg.<verb>` reads
@@ -587,12 +611,30 @@ test "world: a two-axis registry — lifecycle mechanics unchanged, axis edges g
     try testing.expectError(error.WrongAxis, reg.create(reg.coll(.throttled)));
     try testing.expectError(error.WrongAxis, reg.moveImmediate(e, active, reg.coll(.throttled)));
 
-    // Lifecycle mechanics are unchanged by the second axis's presence.
+    // The real second axis: enter the throttled collection, iterate
+    // its columns densely, and watch lifecycle moves leave it alone.
+    try reg.enter(e, reg.coll(.throttled));
+    try testing.expect(reg.onAxis(e, throttle_axis));
+    for (reg.coll(.throttled).column(TTokens)) |*t| t.left -|= 1;
+    try testing.expectEqual(@as(u32, 7), (try reg.getFat(e, TTokens)).left);
+
+    // Lifecycle mechanics are unchanged by the second membership.
     (try reg.get(e, active, TPos)).* = .{ .x = 9, .y = 0 };
     try reg.moveImmediate(e, active, reg.coll(.closing));
     try testing.expectEqual(@as(f32, 9), (try reg.getFat(e, TPos)).x);
+    try testing.expect(reg.onAxis(e, throttle_axis));
+
+    // Leave parks; re-enter restores (path-independence's sharp edge:
+    // a fresh start is the leaving system's job, by resetting first).
+    try testing.expect(try reg.leaveAxis(e, throttle_axis));
+    try testing.expectEqual(@as(u32, 7), (try reg.getFat(e, TTokens)).left);
+    try reg.enter(e, reg.coll(.throttled));
+    try testing.expectEqual(@as(u32, 7), (try reg.getFat(e, TTokens)).left);
+
+    // Destroy exits every axis.
     try reg.destroyImmediate(e);
     try testing.expect(reg.collectionIdOf(e) == null);
+    try testing.expectEqual(@as(u32, 0), reg.coll(.throttled).count);
 }
 
 test "world: ids by table position, one namespace across parts" {

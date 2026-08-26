@@ -118,53 +118,6 @@ fn ShadowStruct(comptime Universe: type) type {
     } });
 }
 
-/// A pure membership set — the empty-row collection, and the degenerate
-/// case of a membership axis that is unconditionally safe to overlap
-/// with anything: it materializes no components, so it can contest no
-/// live copy. Membership is SECONDARY and orthogonal to the entity's
-/// collection: it survives every move, and only destroy ends it (the
-/// registry leaves all sets structurally — release cannot be forgotten).
-///
-/// Storage is a dense entity list (iterable, countable in O(1)) plus a
-/// sparse entity.index → offset table, both sized max_entities at init
-/// so joining can never fail. Register with `registry.registerSet` and
-/// operate through the registry (`join` / `leave` / `inSet`), which
-/// keeps the per-entity membership mask that makes destroy exact.
-pub const EntitySet = struct {
-    entities: [*]Entity,
-    /// entity.index → dense offset + 1; 0 = not a member.
-    sparse: [*]u32,
-    count: u32,
-    max_entities: u32,
-    /// Registry-declared bit index (0..MAX_SETS-1). Set by registerSet.
-    set_id: u5 = 0,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator, max_entities: u32) !EntitySet {
-        const entities = try allocator.alloc(Entity, max_entities);
-        const sparse = try allocator.alloc(u32, max_entities);
-        @memset(sparse, 0);
-        return .{
-            .entities = entities.ptr,
-            .sparse = sparse.ptr,
-            .count = 0,
-            .max_entities = max_entities,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *EntitySet) void {
-        self.allocator.free(self.entities[0..self.max_entities]);
-        self.allocator.free(self.sparse[0..self.max_entities]);
-        self.* = undefined;
-    }
-
-    /// The dense member list. Valid until the next join/leave/destroy.
-    pub fn members(self: *const EntitySet) []const Entity {
-        return self.entities[0..self.count];
-    }
-};
-
 /// The membership-axis shape of a registry (fat-entity-todo.md §4b).
 /// Axis 0 is the TOTAL axis (liveness): its record is the classic
 /// `collection_ids`/`offsets` pair, 0 = the free pool, and every entity
@@ -175,6 +128,12 @@ pub const EntitySet = struct {
 /// declared world derives; components in no collection map to 0 (their
 /// reads never consult membership). The default is the single-axis
 /// registry, which stores and executes exactly as it always has.
+///
+/// A pure membership set is the degenerate case: an EMPTY-ROW
+/// collection on a one-state axis of its own. Its dense member list is
+/// the collection's entity slice, the old sparse table is the axis's
+/// offsets array, and destroy's exit-every-axis walk is what used to
+/// be the per-set membership mask.
 pub const AxesSpec = struct {
     n_axes: usize = 1,
     comp_axis: []const u8 = &.{},
@@ -241,12 +200,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         coll_ptrs: [MAX_COLLECTIONS]?*anyopaque,
         destroy_recipes: [MAX_COLLECTIONS]DestroyEntry,
 
-        // Secondary memberships: one bit per registered set, per entity.
-        // The mask is what makes destroy leave every set the entity
-        // joined — membership release is structural, never remembered.
-        set_memberships: []u32,
-        set_ptrs: [MAX_SETS]?*EntitySet,
-
         // Per-collection evict recipes — the type-erased extraction half
         // of evictImmediate, indexed by collection_id like destroy_recipes.
         evict_recipes: [MAX_COLLECTIONS]EvictEntry,
@@ -267,7 +220,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
 
         const PENDING_MOVE: u8 = 1;
         const MAX_COLLECTIONS: usize = 256;
-        const MAX_SETS: usize = 32;
 
         pub const Fat = ShadowStruct(Universe);
 
@@ -322,9 +274,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             const column_fns = try allocator.alloc(?ColumnFn, MAX_COLLECTIONS * Universe.len);
             @memset(column_fns, null);
 
-            const set_memberships = try allocator.alloc(u32, max);
-            @memset(set_memberships, 0);
-
             var partial_ids: [n_partial][]u8 = undefined;
             var partial_offsets: [n_partial][]u32 = undefined;
             inline for (0..n_partial) |k| {
@@ -349,8 +298,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 .column_fns = column_fns,
                 .coll_ptrs = [_]?*anyopaque{null} ** MAX_COLLECTIONS,
                 .destroy_recipes = undefined,
-                .set_memberships = set_memberships,
-                .set_ptrs = [_]?*EntitySet{null} ** MAX_SETS,
                 .evict_recipes = undefined,
                 .partial_ids = partial_ids,
                 .partial_offsets = partial_offsets,
@@ -366,7 +313,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             }
             self.allocator.free(self.fat_table);
             self.allocator.free(self.column_fns);
-            self.allocator.free(self.set_memberships);
             self.allocator.free(self.generations);
             self.allocator.free(self.collection_ids);
             self.allocator.free(self.offsets);
@@ -449,82 +395,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                     self.column_fns[id * Universe.len + ci] = columnFn(CollType, T);
                 }
             }
-        }
-
-        /// Register a membership set under a DECLARED bit index
-        /// (0..MAX_SETS-1), mirroring collection registration: declared so
-        /// the per-entity membership mask is directly interpretable by the
-        /// layer that numbered its sets. The set must be sized to this
-        /// registry's max_entities — checked loudly, since a short sparse
-        /// table would index out of bounds on a high entity index.
-        pub fn registerSet(self: *Self, s: *EntitySet, declared_id: u5) void {
-            if (s.max_entities != self.max_entities) std.debug.panic(
-                "fat registry: set sized for {d} entities registered on a registry of {d}",
-                .{ s.max_entities, self.max_entities },
-            );
-            if (self.set_ptrs[declared_id] != null) std.debug.panic(
-                "fat registry: set id {d} registered twice",
-                .{declared_id},
-            );
-            s.set_id = declared_id;
-            self.set_ptrs[declared_id] = s;
-        }
-
-        /// Join a set. Idempotent: returns false if already a member.
-        /// Membership is orthogonal to the entity's collection — it
-        /// survives every move and ends only at leave or destroy.
-        pub fn join(self: *Self, entity: Entity, s: *EntitySet) !bool {
-            const idx = entity.index;
-            if (idx >= self.max_entities) return error.InvalidEntity;
-            if (self.generations[idx] != entity.generation) return error.Stale;
-            if (s.sparse[idx] != 0) return false;
-            s.entities[s.count] = entity;
-            s.sparse[idx] = s.count + 1;
-            s.count += 1;
-            self.set_memberships[idx] |= @as(u32, 1) << s.set_id;
-            return true;
-        }
-
-        /// Leave a set. Returns false if not a member.
-        pub fn leave(self: *Self, entity: Entity, s: *EntitySet) !bool {
-            const idx = entity.index;
-            if (idx >= self.max_entities) return error.InvalidEntity;
-            if (self.generations[idx] != entity.generation) return error.Stale;
-            if (s.sparse[idx] == 0) return false;
-            self.removeFromSet(s, idx);
-            self.set_memberships[idx] &= ~(@as(u32, 1) << s.set_id);
-            return true;
-        }
-
-        pub fn inSet(self: *const Self, entity: Entity, s: *const EntitySet) bool {
-            const idx = entity.index;
-            if (idx >= self.max_entities) return false;
-            if (self.generations[idx] != entity.generation) return false;
-            return s.sparse[idx] != 0;
-        }
-
-        fn removeFromSet(self: *Self, s: *EntitySet, idx: u32) void {
-            _ = self;
-            const off = s.sparse[idx] - 1;
-            const last = s.count - 1;
-            const moved = s.entities[last];
-            s.entities[off] = moved;
-            s.sparse[moved.index] = off + 1;
-            s.count -= 1;
-            s.sparse[idx] = 0;
-        }
-
-        /// Destroy's structural half of membership: leave every set the
-        /// entity joined, driven by the mask — so a set can never hold a
-        /// dead entity and counts stay exact.
-        fn leaveAllSets(self: *Self, idx: u32) void {
-            var mask = self.set_memberships[idx];
-            while (mask != 0) {
-                const bit: u5 = @intCast(@ctz(mask));
-                mask &= mask - 1;
-                self.removeFromSet(self.set_ptrs[bit].?, idx);
-            }
-            self.set_memberships[idx] = 0;
         }
 
         // =============================================================
@@ -659,6 +529,67 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 }
             }
             return self.moveImmediate(entity, src, dst);
+        }
+
+        // =============================================================
+        // Partial-axis verbs (§4c)
+        // =============================================================
+
+        /// Enter a partial-axis collection: the Gained path with no
+        /// source. Every component of the destination's row unparks —
+        /// the parked value if this generation ever held one, declared
+        /// defaults otherwise — so re-entering restores state
+        /// (path-independence; a system wanting a fresh start resets
+        /// before leaving). Total-axis membership starts at `create`,
+        /// never here.
+        pub inline fn enter(self: *Self, entity: Entity, dst: anytype) !void {
+            const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
+            const ax = dst.axis_index;
+            if (ax == 0) return error.WrongAxis;
+            if (self.axisIds(ax)[idx] != 0) return error.AlreadyOnAxis;
+
+            const off = try dst.reserveSlots(1);
+            dst.entitySlice()[off] = entity;
+            inline for (DstColl.RowType.types) |T| {
+                if (comptime @sizeOf(T) > 0) {
+                    self.unparkOne(T, entity, &dst.column(T)[off]);
+                }
+            }
+            self.axisIds(ax)[idx] = dst.registry_id;
+            self.axisOffsets(ax)[idx] = off;
+        }
+
+        /// Leave a partial axis — whichever collection holds the entity
+        /// there: the Dropped path with no destination. The whole row
+        /// PARKS (nothing is destroyed) through the type-erased evict
+        /// recipe, so the caller does not name the collection. Returns
+        /// false if the entity was not on the axis (idempotent, like
+        /// set leave always was). The total axis has no leave — destroy
+        /// is its only exit.
+        pub inline fn leave(self: *Self, entity: Entity, ax: u8) !bool {
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
+            if (ax == 0 or ax >= axes_spec.n_axes) return error.WrongAxis;
+
+            const id = self.axisIds(ax)[idx];
+            if (id == 0) return false;
+            const entry = self.evict_recipes[id];
+            entry.recipe(self, entry.ptr, self.axisOffsets(ax)[idx]);
+            self.axisIds(ax)[idx] = 0;
+            return true;
+        }
+
+        /// Is the entity on this axis? False for a stale handle.
+        pub inline fn onAxis(self: *const Self, entity: Entity, ax: u8) bool {
+            if (entity.index >= self.max_entities) return false;
+            if (self.generations[entity.index] != entity.generation) return false;
+            return @constCast(self).axisIds(ax)[entity.index] != 0;
         }
 
         // =============================================================
@@ -1165,7 +1096,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                                 }
                             }
                         }
-                        reg.leaveAllSets(idx);
                         reg.generations[idx] += 1;
                         reg.collection_ids[idx] = 0;
                         reg.flags[idx] &= ~PENDING_MOVE;
@@ -1570,8 +1500,8 @@ test "getRow — ZST members and stale handles" {
     try testing.expectError(error.Stale, reg.getRow(e, Row(&.{Position})));
 }
 
-test "sets — membership is orthogonal to collections and survives moves" {
-    var reg = try testReg();
+test "one-state axes — membership is orthogonal to collections and survives moves" {
+    var reg = try FatRegistryAxes(TestUniverse, .{ .n_axes = 2 }).init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
@@ -1581,90 +1511,93 @@ test "sets — membership is orthogonal to collections and survives moves" {
     defer b.deinit();
     reg.registerCollection(&b, 2);
 
-    var live = try EntitySet.init(testing.allocator, 16);
+    // The set, post-merge: an empty-row collection on its own one-state
+    // axis. The dense member list IS the collection's entity slice; the
+    // old sparse table lives in the axis offsets.
+    var live = try Collection(Row(&.{}), .{}).init(testing.allocator);
     defer live.deinit();
-    reg.registerSet(&live, 0);
+    reg.registerCollectionOnAxis(&live, 3, 1);
 
     const e = try reg.create(&a);
-    try testing.expect(try reg.join(e, &live));
-    try testing.expect(!try reg.join(e, &live)); // idempotent
+    try reg.enter(e, &live);
+    try testing.expectError(error.AlreadyOnAxis, reg.enter(e, &live));
     try testing.expectEqual(@as(u32, 1), live.count);
-    try testing.expect(reg.inSet(e, &live));
+    try testing.expect(reg.onAxis(e, 1));
 
-    // Moves do not disturb secondary membership.
+    // Total-axis moves do not disturb the orthogonal membership.
     try reg.move(e, &a, &b);
     try reg.flush();
-    try testing.expect(reg.inSet(e, &live));
+    try testing.expect(reg.onAxis(e, 1));
     try testing.expectEqual(@as(u32, 1), live.count);
 
-    try testing.expect(try reg.leave(e, &live));
-    try testing.expect(!try reg.leave(e, &live));
+    try testing.expect(try reg.leave(e, 1));
+    try testing.expect(!try reg.leave(e, 1));
     try testing.expectEqual(@as(u32, 0), live.count);
 }
 
-test "sets — swap-remove keeps the dense list and sparse table agreeing" {
-    var reg = try testReg();
+test "one-state axes — swap-remove keeps the member list and offsets agreeing" {
+    var reg = try FatRegistryAxes(TestUniverse, .{ .n_axes = 2 }).init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
 
     var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer coll.deinit();
     reg.registerCollection(&coll, 1);
-    var set = try EntitySet.init(testing.allocator, 16);
+    var set = try Collection(Row(&.{}), .{}).init(testing.allocator);
     defer set.deinit();
-    reg.registerSet(&set, 0);
+    reg.registerCollectionOnAxis(&set, 2, 1);
 
     var ents: [3]Entity = undefined;
     for (&ents) |*e| {
         e.* = try reg.create(&coll);
-        _ = try reg.join(e.*, &set);
+        try reg.enter(e.*, &set);
     }
 
     // Leave the middle member: the tail fills its slot.
-    _ = try reg.leave(ents[1], &set);
+    _ = try reg.leave(ents[1], 1);
     try testing.expectEqual(@as(u32, 2), set.count);
-    try testing.expect(reg.inSet(ents[0], &set));
-    try testing.expect(!reg.inSet(ents[1], &set));
-    try testing.expect(reg.inSet(ents[2], &set));
-    for (set.members()) |m| try testing.expect(!m.eql(ents[1]));
+    try testing.expect(reg.onAxis(ents[0], 1));
+    try testing.expect(!reg.onAxis(ents[1], 1));
+    try testing.expect(reg.onAxis(ents[2], 1));
+    for (set.entitySlice()) |m| try testing.expect(!m.eql(ents[1]));
 }
 
-test "sets — destroy leaves every joined set, exactly" {
-    var reg = try testReg();
+test "one-state axes — destroy exits every axis, exactly" {
+    var reg = try FatRegistryAxes(TestUniverse, .{ .n_axes = 3 }).init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
 
     var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer coll.deinit();
     reg.registerCollection(&coll, 1);
 
-    var s0 = try EntitySet.init(testing.allocator, 16);
+    var s0 = try Collection(Row(&.{}), .{}).init(testing.allocator);
     defer s0.deinit();
-    reg.registerSet(&s0, 0);
-    var s1 = try EntitySet.init(testing.allocator, 16);
+    reg.registerCollectionOnAxis(&s0, 2, 1);
+    var s1 = try Collection(Row(&.{}), .{}).init(testing.allocator);
     defer s1.deinit();
-    reg.registerSet(&s1, 5);
+    reg.registerCollectionOnAxis(&s1, 3, 2);
 
     const e = try reg.create(&coll);
     const bystander = try reg.create(&coll);
-    _ = try reg.join(e, &s0);
-    _ = try reg.join(e, &s1);
-    _ = try reg.join(bystander, &s0);
+    try reg.enter(e, &s0);
+    try reg.enter(e, &s1);
+    try reg.enter(bystander, &s0);
 
     try reg.destroy(e);
     try reg.flush();
 
     try testing.expectEqual(@as(u32, 1), s0.count);
     try testing.expectEqual(@as(u32, 0), s1.count);
-    try testing.expect(reg.inSet(bystander, &s0));
+    try testing.expect(reg.onAxis(bystander, 1));
 
-    // A reborn index is not a member of its predecessor's sets.
+    // A reborn index is not a member of its predecessor's axes.
     const reborn = try reg.create(&coll);
     try testing.expectEqual(e.index, reborn.index);
-    try testing.expect(!reg.inSet(reborn, &s0));
-    try testing.expect(!reg.inSet(reborn, &s1));
+    try testing.expect(!reg.onAxis(reborn, 1));
+    try testing.expect(!reg.onAxis(reborn, 2));
 }
 
 test "evictImmediate — extract from a collection the caller cannot name" {
-    var reg = try testReg();
+    var reg = try FatRegistryAxes(TestUniverse, .{ .n_axes = 2 }).init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
 
     // The "foreign" collection: the evicting code below never names its
@@ -1677,15 +1610,15 @@ test "evictImmediate — extract from a collection the caller cannot name" {
     defer home.deinit();
     reg.registerCollection(&home, 2);
 
-    var set = try EntitySet.init(testing.allocator, 16);
+    var set = try Collection(Row(&.{}), .{}).init(testing.allocator);
     defer set.deinit();
-    reg.registerSet(&set, 0);
+    reg.registerCollectionOnAxis(&set, 4, 1);
 
     var ents: [3]Entity = undefined;
     for (&ents, 0..) |*e, i| {
         e.* = try reg.create(&foreign);
         try reg.set(e.*, &foreign, Fdish, .{ .fd = @intCast(i + 10) });
-        _ = try reg.join(e.*, &set);
+        try reg.enter(e.*, &set);
     }
 
     // Evict the middle entity: the whole row parks, the tail bystander
@@ -1695,7 +1628,7 @@ test "evictImmediate — extract from a collection the caller cannot name" {
     try testing.expectEqual(@as(i32, 11), (try reg.get(ents[1], &home, Fdish)).fd);
     try testing.expectEqual(@as(i32, 10), (try reg.get(ents[0], &foreign, Fdish)).fd);
     try testing.expectEqual(@as(i32, 12), (try reg.get(ents[2], &foreign, Fdish)).fd);
-    try testing.expect(reg.inSet(ents[1], &set));
+    try testing.expect(reg.onAxis(ents[1], 1));
 
     // Round trip through park: evict into a NARROW destination, the fd
     // stays parked, and rides home into a later gain.

@@ -216,7 +216,26 @@ axis and per-axis offsets stay exact under swap-remove churn.
       `axisIndex(d.axis)`. Partial-axis collections are UNREACHABLE
       until 4c's enter/leave land — this step is the plumbing under
       the unchanged single-axis behavior (127 tests green).
-- [ ] **4c. Total vs partial.** Exactly ONE total axis (lifecycle):
+- [x] **4c. Total vs partial — BUILT 2026-08-26.** As pinned, with the
+      set/collection storage merge landing exactly as pre-paid: the
+      world's tag API (join/leave/inSet/setMembers/setCount) is
+      UNCHANGED — its test passed unmodified across the swap — while
+      underneath EntitySet, the membership mask, registerSet, and
+      MAX_SETS are deleted; a set is Collection(empty row) on a
+      one-state axis of its own (world axes = declared axes + one per
+      set entry), its dense list is the collection's entity slice, its
+      sparse table is the axis offsets, and destroy's exit-every-axis
+      walk replaces the mask. Core gains enter (Gained path, no
+      source; refuses the total axis), leave (Dropped path, no
+      destination — PARKS through the type-erased evict recipe, so the
+      caller never names the collection; idempotent-false; refuses the
+      total axis), and onAxis; the world adds enter/leaveAxis/onAxis
+      over declared axes. Verb availability by shape holds: create is
+      total-only, leave is partial-only, move stays within-axis. The
+      throttle case runs for real at the world level: dense iteration
+      over the orthogonal columns, lifecycle moves leaving the
+      membership alone, leave-parks/re-enter-restores. Original
+      sketch, for the record: Exactly ONE total axis (lifecycle):
       position always exists, 0 = free pool, birth requires it, no
       leave, evict's reserve-first no-limbo discipline applies. All
       other axes partial: 0 = "not on this axis" (legal — liveness is
