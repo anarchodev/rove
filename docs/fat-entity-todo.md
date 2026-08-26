@@ -133,6 +133,16 @@ Ship each step alone: (a) is pure annotation, (b) must be bit-identical
 for the single-axis case, (c) delivers the first real second axis, (d)
 comes last so only the constraints that survive 4a–4c get syntax.
 
+**SPIKE DONE (2026-08-26, `src/rove/axes_spike.zig` — dies when 4a–4d
+land):** the throttle test-world validates the mechanics end to end.
+Per-axis `(id, offset)` records give dense co-residency with zero
+copies; `axisOf(T)` comptime-resolves so the cross-axis getFat is ONE
+membership lookup; leave parks / re-enter restores (path-independence's
+sharp edge held); a state-attached `on_enter_leaves` clause fires on
+every entry path because move and enter funnel through one point —
+evidence for 4d's state-attached-as-default lean; destroy exits every
+axis and per-axis offsets stay exact under swap-remove churn.
+
 - [ ] **4a. Partition.** `rove.Axes(.{ .lifecycle = Row(...), .throttle
       = Row(...), ... })` — every component in exactly ONE axis (compile
       error otherwise); every collection declares `.axis` with row ⊆
