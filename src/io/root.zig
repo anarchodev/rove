@@ -1350,7 +1350,7 @@ pub fn Io(comptime opts: Options) type {
 
             if (cqe.res < 0) {
                 try self.reg.set(entity, &self._connect_socket_pending, IoResult, .{ .err = cqe.res });
-                try self.reg.moveStripImmediate(entity, &self._connect_socket_pending, &self.connect_errors, &.{ReadCycleEntity});
+                try self.reg.moveImmediate(entity, &self._connect_socket_pending, &self.connect_errors);
                 return;
             }
 
@@ -1396,7 +1396,7 @@ pub fn Io(comptime opts: Options) type {
                 conn_slot.fd = -1;
                 self.releaseConnSlot(entity);
                 try self.reg.set(entity, &self._connect_pending, IoResult, .{ .err = cqe.res });
-                try self.reg.moveStripImmediate(entity, &self._connect_pending, &self.connect_errors, &.{ReadCycleEntity});
+                try self.reg.moveImmediate(entity, &self._connect_pending, &self.connect_errors);
                 return;
             }
 
@@ -1406,7 +1406,7 @@ pub fn Io(comptime opts: Options) type {
 
             try self.armRecv(read_ent, slot);
 
-            try self.reg.moveStripImmediate(entity, &self._connect_pending, &self.connections, &.{ ConnectAddr, IoResult });
+            try self.reg.moveImmediate(entity, &self._connect_pending, &self.connections);
             // The `connect_addrs` slot needs no cleanup — the next entity to
             // take this index overwrites it.
         }
