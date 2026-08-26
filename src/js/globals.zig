@@ -1176,6 +1176,27 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "_caps_system.js", comptime "globalThis.__rove.capsSystem = { " ++
         reserved.systemCapabilityLiteralBody() ++ "};");
 
+    // The system set's one member the shorthand cannot express: the
+    // storage-rooted kv, nested as `__system.rootKv` — what a baked
+    // activation holds INSTEAD of the customer `kv`. The nesting is
+    // organisation, not a boundary: not handing it to customer activations
+    // is what makes it safe, and the natives behind it stay
+    // `is_system_module`-gated (`rootKvGate`) while the templates remain
+    // nameable in the shared realm. Same function objects as the
+    // `__rove.rootKv*` privileged surface — one implementation, two doors,
+    // and the door on the activation object is the one that survives the
+    // cutover.
+    evalSnippet(ctx, "_caps_system_rootkv.js",
+        \\globalThis.__rove.capsSystem.__system = {
+        \\  rootKv: {
+        \\    get: __rove.rootKvGet,
+        \\    set: __rove.rootKvSet,
+        \\    delete: __rove.rootKvDelete,
+        \\    prefix: __rove.rootKvPrefix,
+        \\  },
+        \\};
+    );
+
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
 
@@ -1918,15 +1939,27 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  if (typeof sys !== "object") throw new Error("__rove.capsSystem missing");
         \\  if (sys === caps) throw new Error("system template aliases the customer template");
         \\  const sgot = Object.keys(sys).sort().join(",");
-        \\  const swant = "after,blob,config,http,next,platform,stream,webhook";
+        \\  const swant = "__system,after,blob,config,http,next,platform,stream,webhook";
         \\  if (sgot !== swant)
         \\    throw new Error("system capability set drifted: got [" + sgot + "] want [" + swant + "]");
         \\  for (const k of Object.keys(sys))
-        \\    if (sys[k] !== globalThis[k])
+        \\    if (k !== "__system" && sys[k] !== globalThis[k])
         \\      throw new Error("capsSystem." + k + " is not the ambient " + k);
         \\  if ("kv" in sys) throw new Error("kv must not be in the system template");
         \\  if (Object.create(sys).kv !== undefined)
         \\    throw new Error("a system activation would inherit a kv");
+        \\  // The rootKv grant (#848): the same gated natives as the
+        \\  // `__rove.rootKv*` privileged surface, by identity — one
+        \\  // implementation, two doors. Absent from the customer set.
+        \\  const rk = sys.__system && sys.__system.rootKv;
+        \\  if (typeof rk !== "object") throw new Error("__system.rootKv missing");
+        \\  if (rk.get !== globalThis.__rove.rootKvGet ||
+        \\      rk.set !== globalThis.__rove.rootKvSet ||
+        \\      rk.delete !== globalThis.__rove.rootKvDelete ||
+        \\      rk.prefix !== globalThis.__rove.rootKvPrefix)
+        \\    throw new Error("rootKv members are not the gated natives");
+        \\  if ("__system" in caps)
+        \\    throw new Error("__system must not be in the customer template");
         \\  return true;
         \\})();
     ;

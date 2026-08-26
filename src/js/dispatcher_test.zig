@@ -132,29 +132,38 @@ test "dispatch: the cap set is selected by code origin (customer vs baked __syst
         \\const a = arguments[0];
         \\return JSON.stringify({
         \\  kv: typeof a.kv,
+        \\  sys: typeof a.__system,
         \\  proto: Object.getPrototypeOf(a) === globalThis.__rove.caps,
         \\});
     ,
         .{ .method = "GET", .path = "/" },
     );
     defer customer.deinit(testing.allocator);
-    try testing.expectEqualStrings("{\"kv\":\"object\",\"proto\":true}", customer.body);
+    try testing.expectEqualStrings(
+        "{\"kv\":\"object\",\"sys\":\"undefined\",\"proto\":true}",
+        customer.body,
+    );
 
+    // The baked activation holds the grant and it WORKS: a raw round-trip
+    // through `__system.rootKv`, whose spelling storage takes literally —
+    // no user-root reroot (the row is verified back through the raw door).
     var system = try runOne(
         &d,
         kv,
         \\const a = arguments[0];
+        \\a.__system.rootKv.set("_probe/raw", "1");
         \\return JSON.stringify({
         \\  kv: typeof a.kv,
         \\  next: typeof a.next,
         \\  proto: Object.getPrototypeOf(a) === globalThis.__rove.capsSystem,
+        \\  raw: a.__system.rootKv.get("_probe/raw"),
         \\});
     ,
         .{ .method = "GET", .path = "/", .is_system_module = true },
     );
     defer system.deinit(testing.allocator);
     try testing.expectEqualStrings(
-        "{\"kv\":\"undefined\",\"next\":\"function\",\"proto\":true}",
+        "{\"kv\":\"undefined\",\"next\":\"function\",\"proto\":true,\"raw\":\"1\"}",
         system.body,
     );
 }
