@@ -56,6 +56,9 @@ pub const IoCleanupCtx = struct {
     /// Write entities destroyed while still holding a buffer — they bypassed
     /// `write_done` / `releaseWriteBuf`, so that buffer leaked.
     write_bufs_destroyed_live: u64 = 0,
+    /// Conns destroyed while their read-cycle link was still live — they
+    /// bypassed `releaseReadCycle`, so that read entity leaked.
+    read_cycles_destroyed_live: u64 = 0,
 };
 
 /// Peer (remote) address of an accepted connection, resolved once at
@@ -233,11 +236,22 @@ pub const ReadCycleEntity = struct {
 
     pub const DeinitCtx = IoCleanupCtx;
 
+    /// Links a connection to its read-cycle entity.
+    ///
+    /// The link is a reference, not ownership: the read cycle is released by
+    /// `releaseReadCycle`, at the point `conn_closing` has established the
+    /// recv is quiet. That condition is the whole reason the release cannot
+    /// live here — a destructor fires whenever the entity happens to be
+    /// destroyed, which may be while a recv is still armed against the buffer
+    /// it would return.
+    ///
+    /// A live link here means a conn was destroyed around the closing state,
+    /// so its read entity leaks. Counted, not aborted: the entity is bounded
+    /// by the registry and the leak is diagnosable.
     pub fn deinit(_: std.mem.Allocator, items: []ReadCycleEntity, ctx: *DeinitCtx) void {
         for (items) |item| {
-            if (!item.entity.isNil() and !ctx.reg.isStale(item.entity)) {
-                ctx.reg.destroyImmediate(item.entity) catch {};
-            }
+            if (!item.entity.isNil() and !ctx.reg.isStale(item.entity))
+                ctx.read_cycles_destroyed_live += 1;
         }
     }
 };
@@ -902,8 +916,37 @@ pub fn Io(comptime opts: Options) type {
 
                 self.conn_closing_retired += 1;
                 if (recv_armed) self.conn_closing_deadline_expired += 1;
+                // Release the read cycle HERE rather than letting a destructor
+                // cascade into it. By this point the recv is quiet (or the
+                // grace window expired), which is the condition that makes
+                // destroying it safe — and only this loop knows that.
+                self.releaseReadCycle(cycle);
                 try self.reg.destroy(ent);
             }
+        }
+
+        /// Destroy a conn's read-cycle entity, returning any buffer it still
+        /// holds to the registered ring first.
+        ///
+        /// The ring return cannot be left to `ReadResult.deinit`: a buffer
+        /// returned twice over-advances the producer tail, shrinks the
+        /// distinct-buffer pool and surfaces as recv ENOBUFS at a tiny
+        /// connection count — so the return and the clear have to happen
+        /// together, which a destructor firing at an unknown time cannot
+        /// guarantee.
+        fn releaseReadCycle(self: *Self, cycle: ReadCycleEntity) void {
+            const e = cycle.entity;
+            if (e.isNil() or self.reg.isStale(e)) return;
+            if (self.reg.getAny(e, .{ &self._read_pending, &self.read_in, &self.read_results }, ReadResult) catch null) |rr| {
+                if (rr.data != null) {
+                    const mask = linux.IoUring.buf_ring_mask(self.buf_count);
+                    self.returnBufferToRing(rr.buf_id, mask, 0);
+                    linux.IoUring.buf_ring_advance(self.buf_ring, 1);
+                    self.recv_buffers_returned += 1;
+                    rr.* = .{};
+                }
+            }
+            self.reg.destroyImmediate(e) catch {};
         }
 
         /// Release a write buffer and clear the component, so the entity can
