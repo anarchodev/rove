@@ -48,6 +48,7 @@
 //! the manifest names.
 
 const std = @import("std");
+const reserved = @import("rove-reserved");
 const kvstore = @import("raft-kv").kvstore;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -63,7 +64,10 @@ const SCAN_PAGE: u32 = 1000;
 /// Everything else, including other platform-reserved namespaces, IS
 /// exported: which of those are meaningful to a customer is an import-side
 /// question, and dropping them here would silently lose data the tenant owns.
-pub const EXPORT_STATE_PREFIX = "_export/";
+/// The export job's own bookkeeping, which must not appear in the export it is
+/// producing. Rooted: `@rewind/export` writes these rows through the handler's
+/// kv, so they sit under the user root beside everything else being exported.
+pub const EXPORT_STATE_PREFIX = reserved.USER_KEY_ROOT ++ "_export/";
 
 pub const Part = struct {
     /// JSONL bytes for this slice. Caller owns.
@@ -111,7 +115,12 @@ pub fn buildPart(
     var budget_hit = false;
 
     outer: while (true) {
-        var page = try store.prefix("", scan_cursor, SCAN_PAGE);
+        // Bounded by the USER ROOT, not the whole store. An export is the
+        // tenant's own data; the engine namespaces beside it (`_usage/`,
+        // `_keys/`, the config mirror) are not the tenant's to receive, and
+        // before rooting the only thing keeping them out was that they were
+        // not asked for.
+        var page = try store.prefix(reserved.USER_KEY_ROOT, scan_cursor, SCAN_PAGE);
         defer page.deinit();
         if (page.entries.len == 0) {
             done = true;
@@ -128,7 +137,10 @@ pub fn buildPart(
             last_key = k;
 
             if (!std.mem.startsWith(u8, e.key, EXPORT_STATE_PREFIX)) {
-                try appendJsonLine(a, &out, e.key, e.value);
+                // Emitted in the spelling the HANDLER uses: an export a tenant
+                // reads back — or re-imports — must name keys the way their own
+                // code does, not the way storage happens to hold them.
+                try appendJsonLine(a, &out, e.key[reserved.USER_KEY_ROOT.len..], e.value);
                 entries += 1;
             }
 
@@ -409,7 +421,7 @@ test "kv export: a multi-part walk covers every key exactly once, in order" {
     var i: usize = 0;
     while (i < 250) : (i += 1) {
         var kb: [32]u8 = undefined;
-        const k = try std.fmt.bufPrint(&kb, "k/{d:0>4}", .{i});
+        const k = try std.fmt.bufPrint(&kb, reserved.USER_KEY_ROOT ++ "k/{d:0>4}", .{i});
         try store.put(k, "v");
     }
 
@@ -448,9 +460,14 @@ test "kv export: the job's own bookkeeping is excluded, everything else is not" 
         std.fs.cwd().deleteFile(std.mem.sliceTo(&buf, 0)) catch {};
     }
 
-    try store.put("_export/job-1", "{\"state\":\"running\"}");
-    try store.put("_sched/by_id/abc", "{}"); // platform, but the tenant's data
-    try store.put("customer/key", "value");
+    try store.put(reserved.USER_KEY_ROOT ++ "_export/job-1", "{\"state\":\"running\"}");
+    // Platform-managed, but written through the handler's kv by the shim — so
+    // it sits under the user root and IS the tenant's data to export.
+    try store.put(reserved.USER_KEY_ROOT ++ "_sched/by_id/abc", "{}");
+    try store.put(reserved.USER_KEY_ROOT ++ "customer/key", "value");
+    // Engine state, written below the binding. Outside the root, so the walk
+    // never reaches it — which is the property that replaces an exclusion list.
+    try store.put("_usage/blob/aaa", "1");
 
     var parts: usize = 0;
     const joined = try drainParts(a, store, 1 << 20, &parts);
@@ -476,7 +493,7 @@ test "kv export: the rewrite yields a self-describing part the job can chain on"
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         var kb: [32]u8 = undefined;
-        try store.put(try std.fmt.bufPrint(&kb, "k/{d:0>3}", .{i}), "value");
+        try store.put(try std.fmt.bufPrint(&kb, reserved.USER_KEY_ROOT ++ "k/{d:0>3}", .{i}), "value");
     }
 
     // A tiny budget so the first part stops mid-store and must chain.
@@ -607,10 +624,10 @@ test "kv export: a skipped key still advances the cursor" {
         std.fs.cwd().deleteFile(std.mem.sliceTo(&buf, 0)) catch {};
     }
 
-    try store.put("a/key", "v");
+    try store.put(reserved.USER_KEY_ROOT ++ "a/key", "v");
     // Sorts last, so the final page ends on an excluded key.
-    try store.put("_export/zzz", "x");
-    try store.put("zzz/last", "v");
+    try store.put(reserved.USER_KEY_ROOT ++ "_export/zzz", "x");
+    try store.put(reserved.USER_KEY_ROOT ++ "zzz/last", "v");
 
     var parts: usize = 0;
     const joined = try drainParts(a, store, 1 << 20, &parts);

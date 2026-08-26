@@ -941,8 +941,6 @@ pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c
     return c.JS_Throw(ctx, err);
 }
 
-
-
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
 // Within-activation non-determinism replay
@@ -1116,6 +1114,15 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // only path (tracker #753).
     evalSnippet(ctx, "_caps.js", comptime "globalThis.__rove.caps = { " ++
         reserved.capabilityLiteralBody() ++ "};");
+
+    // The SECOND capability template: what a baked `__system/` activation is
+    // handed instead of `caps`. Captured here because `_harden.js` below
+    // deletes `_system`, and a baked module — dispatched from the snapshot
+    // after that delete — can see neither `_system` nor a shim's closure.
+    //
+    // A customer activation is never given this object, which is the whole of
+    // the access control: there is no flag to check because there is nothing
+    // to check it on.
 
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
@@ -1399,6 +1406,20 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
             // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
             // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
             .{ .name = "resumeIfBound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
+            // Storage as it lies — the kv a baked module holds when it needs a
+            // row the tenant cannot name (the release pointer, the config
+            // mirror's deployment-scoped rows). A handler's own kv is rooted at
+            // `reserved.USER_KEY_ROOT` and cannot reach these at all, which is
+            // the point; this is the door for the code that must.
+            .{ .name = "rootKvGet", .cfunc = kv_bindings.jsRootKvGet, .argc = 1 },
+            .{ .name = "rootKvSet", .cfunc = kv_bindings.jsRootKvSet, .argc = 2 },
+            .{ .name = "rootKvDelete", .cfunc = kv_bindings.jsRootKvDelete, .argc = 1 },
+            .{ .name = "rootKvPrefix", .cfunc = kv_bindings.jsRootKvPrefix, .argc = 3 },
+            // Storage as it lies — the kv a baked module holds when it needs a
+            // row the tenant cannot name (the release pointer, the config
+            // mirror's deployment-scoped rows). A handler's own kv is rooted at
+            // `reserved.USER_KEY_ROOT` and cannot reach these at all, which is
+            // the point; this is the door for the code that must.
             // Raw privileged outbound fetch for baked delivery modules
             // (`__system/webhook_fire`); delegates to `_system.http.fetch`
             // internals so staging/commit-gating/limits are identical.
@@ -1843,7 +1864,6 @@ test "SubscriptionEntry.deinit frees kv spec" {
     };
     entry.deinit(a);
 }
-
 
 test "the kv write caps match the snapshot stream's frame bounds" {
     // The caps are a CONTRACT and live in `rove-reserved`, where the offline

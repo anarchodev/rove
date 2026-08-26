@@ -15,6 +15,7 @@
 //! share it without copying.
 
 const std = @import("std");
+const reserved = @import("rove-reserved");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const tape_mod = @import("rove-tape");
@@ -401,8 +402,7 @@ pub const Dispatcher = struct {
             break :blk null;
         };
         if (mw_bytecode_opt) |mw_bc| {
-            const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending,
-                "_middlewares/index.mjs is not an ES module")) orelse
+            const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending, "_middlewares/index.mjs is not an ES module")) orelse
                 return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
             module_execution.runMiddleware(self, &rt, &ctx, mw_fun_val, activation, budget, &pending) catch |err| switch (err) {
                 error.Interrupted => return DispatchError.Interrupted,
@@ -415,8 +415,7 @@ pub const Dispatcher = struct {
             return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
         }
 
-        const fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, bytecode, &pending,
-            "handler bytecode is not an ES module (.mjs)")) orelse
+        const fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, bytecode, &pending, "handler bytecode is not an ES module (.mjs)")) orelse
             return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
 
         module_execution.runModule(self, &rt, &ctx, fun_val, request, activation, budget, &pending) catch |err| switch (err) {
@@ -814,7 +813,17 @@ fn finishResponse(
                 .put => |p| p.key,
                 .delete => |del| del.key,
             };
-            rs.appendWriteKey(key) catch break;
+            // Recorded in the spelling the handler used. The writeset holds
+            // resolved keys; the kv tape beside this holds named ones, and the
+            // seam scan intersects the two — so a write recorded at the store's
+            // depth intersects nothing and every seam reads as no-interference.
+            //
+            // A write outside the user root is engine bookkeeping the handler
+            // did not make (the `_sub/dirty/` marker the write path injects),
+            // and it has no place in a blame view of what this activation
+            // touched.
+            if (!std.mem.startsWith(u8, key, reserved.USER_KEY_ROOT)) continue;
+            rs.appendWriteKey(key[reserved.USER_KEY_ROOT.len..]) catch break;
         }
     }
 

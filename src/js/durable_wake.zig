@@ -27,12 +27,17 @@ const std = @import("std");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_fire = @import("worker_fire.zig");
 const deployment_cache = @import("deployment_cache.zig");
+const reserved = @import("rove-reserved");
 
 /// `_sched/by_time/` kv prefix — the `scheduler` lib's time-ordered
 /// index. Used only by the promotion pass to probe "does this tenant
 /// have any scheduled wakes?" before firing a reconstruction tick;
 /// the steady sweep gates on the in-memory watermark instead.
-pub const SCHED_BY_TIME_PREFIX: []const u8 = "_sched/by_time/";
+/// Rooted: the `scheduler` shim writes these rows through the HANDLER's kv, so
+/// they live under `reserved.USER_KEY_ROOT` like anything else a handler names.
+/// Scanning the bare prefix finds nothing — and finds it silently, since an
+/// empty page is what "no wakes due" looks like.
+pub const SCHED_BY_TIME_PREFIX: []const u8 = reserved.USER_KEY_ROOT ++ "_sched/by_time/";
 
 /// Per-worker durable-wake sweep cadence. Matches `SCHED_TICK_RESOLUTION` — the
 /// `scheduler` lib rounds `whenNs` up to the next tick, so a 1 Hz sweep
@@ -190,9 +195,15 @@ pub fn parseByTimeWhenNs(key: []const u8) ?i64 {
 
 test "parseByTimeWhenNs: extracts padded timestamp" {
     const testing = std.testing;
-    try testing.expectEqual(@as(?i64, 1717200000000000000), parseByTimeWhenNs("_sched/by_time/01717200000000000000/abc123"));
-    try testing.expectEqual(@as(?i64, 5), parseByTimeWhenNs("_sched/by_time/00000000000000000005/x"));
-    try testing.expectEqual(@as(?i64, null), parseByTimeWhenNs("_sched/by_id/abc"));
-    try testing.expectEqual(@as(?i64, null), parseByTimeWhenNs("_sched/by_time/nodelim"));
-    try testing.expectEqual(@as(?i64, null), parseByTimeWhenNs("other/key"));
+    // The keys arrive off a writeset, so they carry the root the shim's write
+    // resolved under. Spelled through the constant rather than inline, so a
+    // change of root moves the case with it.
+    const R = reserved.USER_KEY_ROOT;
+    try testing.expectEqual(@as(?i64, 1717200000000000000), parseByTimeWhenNs(R ++ "_sched/by_time/01717200000000000000/abc123"));
+    try testing.expectEqual(@as(?i64, 5), parseByTimeWhenNs(R ++ "_sched/by_time/00000000000000000005/x"));
+    try testing.expectEqual(@as(?i64, null), parseByTimeWhenNs(R ++ "_sched/by_id/abc"));
+    try testing.expectEqual(@as(?i64, null), parseByTimeWhenNs(R ++ "_sched/by_time/nodelim"));
+    try testing.expectEqual(@as(?i64, null), parseByTimeWhenNs(R ++ "other/key"));
+    // Unrooted: an engine write below the binding, never a scheduler row.
+    try testing.expectEqual(@as(?i64, null), parseByTimeWhenNs("_sched/by_time/01717200000000000000/x"));
 }

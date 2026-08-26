@@ -333,7 +333,7 @@ def main() -> int:
         # it lands under the admin's dep_id where this tenant cannot read it.
         # Seeding config mimics the deploy mirror, which is a store write.
         for k, v in cfg.items():
-            r = c.node_kv_put(TENANT, k, v)
+            r = c.node_kv_put(TENANT, k, v, raw=True)
             check(f"set {k}", r.status == 204, f"got {r.status} {r.body!r}")
 
         print("step 3: WS upgrade through the front (Host → /agent)")

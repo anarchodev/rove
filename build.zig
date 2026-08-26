@@ -1638,6 +1638,9 @@ pub fn build(b: *std.Build) void {
     // restated so the CLI and the platform cannot drift on the marker key,
     // the segment rules, or the signature.
     ops_mod.addImport("wire-headers", wire_headers_mod);
+    // `kv-put` seeds HANDLER-visible bootstrap rows, so it resolves keys under
+    // the same root the handler binding does — one authority for that constant.
+    ops_mod.addImport("rove-reserved", reserved_mod);
     ops_mod.addAnonymousImport("sigv4", .{ .root_source_file = b.path("src/blob/sigv4.zig") });
     ops_mod.addAnonymousImport("blob-namespace", .{ .root_source_file = b.path("src/blob/namespace.zig") });
     const ops_exe = b.addExecutable(.{ .name = "rewind-ops", .root_module = ops_mod });
