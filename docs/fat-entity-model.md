@@ -279,6 +279,20 @@ that, io under the fat model has **zero hooks and zero residency
 contracts**: create it, and it comes back to you — for the component,
 the aggregate, and now the shutdown.
 
+**Deferred and batch eviction (designed, unbuilt).** A deferred evict is
+coherent because enqueueing sets PENDING_MOVE, which freezes the entity:
+"from wherever it is now" and "at flush" provably denote the same place.
+Its batching story: keep sets insertion-ordered (a set maintained in
+(collection, offset) order would have to observe every member move AND
+every bystander swap-fill — hot-path cost to speed a cold path), and
+instead SORT THE WORKLIST at the point of batch eviction — a one-byte
+counting pass on collection id, offsets within. For an all-members set
+like `all_conns` each bucket's offsets are the complete contiguous
+range, so K entities across M collections coalesce into M queue entries
+and, with a count-N evict recipe, into M memcpy-grade batch extractions.
+The same division of labor as a bitmap index scan: the index stays cheap
+to maintain, the consumer imposes physical order per operation.
+
 ## Prior art
 
 The pieces all exist; the package as a *semantic contract* is the
