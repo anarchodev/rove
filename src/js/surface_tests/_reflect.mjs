@@ -83,6 +83,7 @@ export default function () {
 
   const SHIM_ROOTS = {
     kv: () => addObj("kv", kv),
+    config: () => addObj("config", config),
     console: () => addObj("console", console),
     crypto: () => addObj("crypto", crypto),
     http: () => addObj("http", http),

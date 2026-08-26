@@ -428,6 +428,22 @@ without any one entry growing. The hops are separate transactions — write the
 loop so a repeat of the last hop is harmless (a cursor in `ctx`, idempotent
 keys), because that is what makes it resumable across a leader change.
 
+**Deploy-time config — `config.get`.** A JSON file deployed at
+`_config/<name>.json` is readable as `config.get("<name>")` — the file's
+bytes as a string (parse JSON yourself), or `null` if this deployment
+carries no such file. That is the whole surface, and it is the only one:
+config is not part of the kv keyspace, it cannot be written at runtime, and
+its values are scoped to the deployment the activation runs under — code
+and config switch atomically on release, including a rollback and a deploy
+that removes a file. The reads are recorded like kv reads, so replay and
+sim cover them; a sim world seeds them as ordinary `_config/<name>` rows.
+
+```js
+const raw = config.get("oauth/google");   // _config/oauth/google.json
+if (raw === null) { response.status = 500; return "missing config: oauth/google"; }
+const cfg = JSON.parse(raw);
+```
+
 ### 2.6 The rule, and why there are no scope flags
 
 > **All wakes registered through `after.*` are for the current connection.

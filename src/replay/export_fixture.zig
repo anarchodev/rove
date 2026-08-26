@@ -85,6 +85,16 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
 
     const export_name = jStr(obj, "export"); // recorded resolved export ({on}) — G3
     const recorded = if (obj.get("recorded")) |v| (if (v == .object) v.object else null) else null;
+    // The deployment this record ran under ("dep_{16 hex}") — the config
+    // door's resolution scope. A captured world must replay config.get
+    // against the SAME deployment-scoped rows the tape holds; without the
+    // scope, replay resolves to the visible spelling and every captured
+    // config read misses.
+    const deployment_hex: ?[]const u8 = blk: {
+        const d = jStr(obj, "deployment_id") orelse break :blk null;
+        if (!std.mem.startsWith(u8, d, "dep_")) break :blk null;
+        break :blk d["dep_".len..];
+    };
 
     const tapes = if (obj.get("tapes")) |v| (if (v == .object) v.object else null) else null;
     const kv_entries: []const decode.KvEntry = blk: {
@@ -141,7 +151,16 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // rows (so a replay-time re-scan finds them). Closed world: a not_found read
     // is simply omitted (the key isn't in the map → not_found on replay). No
     // exact prefix-rows are kept: replay reconstructs the scan from the map
-    // (+ the handler's own re-executed writes), honoring cursor/limit. ──
+    // (+ the handler's own re-executed writes), honoring cursor/limit.
+    //
+    // The tape's storage-modeling keys are STORE-spelled (they carry the user
+    // root); a world is AUTHORED in the handler's spelling, and this transcode
+    // is a presentation seam — the person reading the fixture wrote
+    // `kv.get("orders/42")`. So every key crossing into the world strips the
+    // root (`reserved.userNamedKey`); seeding re-resolves it
+    // (`kv_binding.storeKey`), and the round trip is exact because the strip
+    // and the resolve are each other's inverse. Refusal keys pass through:
+    // they are taped NAMED already (a verdict on what the handler named). ──
     var seen = std.StringHashMapUnmanaged(void){};
     var kv = std.ArrayList(KvPair){};
     // Guard refusals the capture recorded (KvOutcome.refused; value = the
@@ -166,8 +185,9 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     }){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
-            if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
-            try seen.put(a, e.key, {});
+            const nk = reserved.userNamedKey(e.key);
+            if (seen.contains(nk)) continue; // re-read / post-write — overlay reproduces it
+            try seen.put(a, nk, {});
             switch (e.outcome) {
                 // A SEALED value cannot travel into the world at all: the
                 // world is JSON, and JSON strings are Unicode text, so the
@@ -179,13 +199,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
                 // transcode it into different bytes.
                 .ok => if (reserved.isSealedValue(e.value)) try elided.append(a, .{
                     .op = "get",
-                    .key = e.key,
+                    .key = nk,
                     .bytes = e.value.len,
                     .sealed = true,
-                }) else try kv.append(a, .{ .key = e.key, .value = e.value }),
+                }) else try kv.append(a, .{ .key = nk, .value = e.value }),
                 .elided => try elided.append(a, .{
                     .op = "get",
-                    .key = e.key,
+                    .key = nk,
                     .bytes = std.fmt.parseInt(u64, e.value, 10) catch 0,
                 }),
                 .not_found, .err, .refused => {}, // omit — closed world resolves to not_found
@@ -197,14 +217,15 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
             if (e.outcome == .elided) {
                 try elided.append(a, .{
                     .op = "prefix",
-                    .key = e.key,
+                    .key = reserved.userNamedKey(e.key),
                     .bytes = std.fmt.parseInt(u64, e.value, 10) catch 0,
                 });
                 continue;
             }
             for (e.results) |row| {
-                if (seen.contains(row.key)) continue;
-                try seen.put(a, row.key, {});
+                const rk = reserved.userNamedKey(row.key);
+                if (seen.contains(rk)) continue;
+                try seen.put(a, rk, {});
                 // One sealed row refuses the whole PAGE, not just itself: a
                 // page short by a row replays as a complete, shorter one,
                 // which is the all-or-nothing rule the elided page above
@@ -212,13 +233,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
                 if (reserved.isSealedValue(row.value)) {
                     try elided.append(a, .{
                         .op = "prefix",
-                        .key = e.key,
+                        .key = reserved.userNamedKey(e.key),
                         .bytes = row.value.len,
                         .sealed = true,
                     });
                     break;
                 }
-                try kv.append(a, .{ .key = row.key, .value = row.value });
+                try kv.append(a, .{ .key = rk, .value = row.value });
             }
         },
         .set, .delete => {
@@ -539,6 +560,12 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // (`request.body`, `on.*`) so pinned old deployments replay; authored
     // worlds (no flag) mirror the live surface (world.zig `captured`).
     try w.writeAll(",\n  \"captured\": true");
+    if (deployment_hex) |dh| {
+        // Hex STRING, not a JSON number: a dep id is a 64-bit hash, above
+        // what a JS reader of world.json can hold in a number.
+        try w.writeAll(",\n  \"deployment_id\": ");
+        try jsonStr(w, dh);
+    }
     if (ts_ns) |s| {
         const ns = std.fmt.parseInt(i64, s, 10) catch 0;
         if (ns > 0) try w.print(",\n  \"now_ms\": {d}", .{@divTrunc(ns, std.time.ns_per_ms)});

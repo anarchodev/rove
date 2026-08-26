@@ -163,7 +163,7 @@ class OAuthProvider {
 export function fromConfig(arg) {
   if (arg == null || typeof arg === "string") {
     const name = arg || "default";
-    const raw = kv.get("_config/oauth/" + name);
+    const raw = config.get("oauth/" + name);
     if (raw == null) {
       throw new Error("oauth.fromConfig: config not found at _config/oauth/" + name + ". Did you deploy the file?");
     }

@@ -54,13 +54,14 @@ CONFIG_JSON = json.dumps({
 
 CONFIG_KEY = "_config/oauth/google"
 
-# The `/cfg` probe handler, verbatim from the V1 demo tenant
-# (examples/loop46-demo-tenants/acme/cfg/index.mjs).
+# The `/cfg` probe handler. `config.get` is the only door to deploy-time
+# config (rove#830): the raw `kv.get("_config/…")` spelling reroots into the
+# handler's own keyspace under the rooted kv, so it can never see config.
 CFG_SRC = r"""export default function () {
-  const raw = kv.get("_config/oauth/google");
+  const raw = config.get("oauth/google");
   if (raw == null) {
     response.status = 404;
-    return "no _config/oauth/google row";
+    return "no oauth/google config in this deployment";
   }
   response.status = 200;
   response.headers = { "content-type": "application/json" };
@@ -158,14 +159,15 @@ def main() -> int:
                                   "404", "error", "warn"])
 
         # A deployment's config is addressed BY that deployment
-        # (`_config/{dep_id:016x}/…`, rove#726), so the raw kv door — which
-        # does not go through the handler binding's resolution — must be
-        # asked for the scoped key. Step 6 above is the behavioural assertion
-        # and it reads the name a handler uses; this one pins the LAYOUT,
-        # because the layout is what makes code and config switch together.
+        # (`_config/{dep_id:016x}/…`, rove#726) and lives in the ENGINE
+        # namespace — outside the handler's root — so the STORE view
+        # (`node_kv_get raw=True`) is what pins the layout. Step 6 above is
+        # the behavioural assertion through the door; this one is about the
+        # layout, because the layout is what makes code and config switch
+        # together.
         scoped_key = f"_config/{int(dep2):016x}/oauth/google"
         print(f"step 7: direct /_system/v2-kv GET reads back {scoped_key}")
-        r = c.admin_kv_get("acme", scoped_key)
+        r = c.node_kv_get("acme", scoped_key, raw=True)
         check("v2-kv GET → 200 round-trip (mirror committed to kv)",
               r.status == 200 and json.loads(r.body) == json.loads(CONFIG_JSON),
               f"got {r.status} {r.body!r}")
@@ -175,7 +177,7 @@ def main() -> int:
         # which is the regression the scoping exists to prevent: one deploy
         # overwriting another's config, with the switch not atomic against
         # the code's.
-        r_flat = c.admin_kv_get("acme", CONFIG_KEY)
+        r_flat = c.node_kv_get("acme", CONFIG_KEY, raw=True)
         check("the unscoped key is absent (config is not shared mutable state)",
               r_flat.status == 404,
               f"got {r_flat.status} {r_flat.body!r}")

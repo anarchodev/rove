@@ -14,11 +14,16 @@ export default function ({ kv }) {
     eq(kv.get("st/user/1"), "v2");
   });
 
-  // Platform-reserved prefixes fail loud with err.code === "reserved_key".
+  // The leading-`_` keyspace is the handler's own. It used to be refused with
+  // err.code === "reserved_key"; a handler's kv is rooted now, so a name like
+  // this reaches a row of the handler's own and the platform's row of that
+  // name is not addressable at all. Nothing to refuse, and the customer gets
+  // the whole keyspace back.
   check("kv.set", () => {
     let code = null;
     try { kv.set("_config/x", "v"); } catch (e) { code = e.code; }
-    eq(code, "reserved_key");
+    eq(code, null);
+    eq(kv.get("_config/x"), "v");
   });
 
   check("kv.delete", () => {

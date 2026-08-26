@@ -23,7 +23,7 @@ Excluded on purpose: `request.js` (the shell's epilogue owns the request
 surface in the browser), `console.js` (live console output is already on
 the LogRecord, so replay's console is a no-op sink), `textcodec.js` (it
 needs the worker's native binding — the pure codec above stands in), and
-`kv` (native, from the replay bindings).
+`kv` and `config` (native, from the replay bindings).
 
 The shell evals the output into the arena BASE (arena_init_open ->
 arena_eval_base -> arena_freeze), before any run and outside every drill

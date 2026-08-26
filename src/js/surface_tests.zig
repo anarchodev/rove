@@ -43,6 +43,7 @@ const SurfaceTest = struct { name: []const u8, src: []const u8 };
 /// surfaces. Completeness against GLOBALS_FILES is asserted below.
 const SURFACE_TESTS = [_]SurfaceTest{
     .{ .name = "kv", .src = @embedFile("surface_tests/kv.surface.mjs") },
+    .{ .name = "config", .src = @embedFile("surface_tests/config.surface.mjs") },
     .{ .name = "console", .src = @embedFile("surface_tests/console.surface.mjs") },
     .{ .name = "crypto", .src = @embedFile("surface_tests/crypto.surface.mjs") },
     .{ .name = "http", .src = @embedFile("surface_tests/http.surface.mjs") },

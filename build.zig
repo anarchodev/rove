@@ -624,6 +624,10 @@ pub fn build(b: *std.Build) void {
     keyring_mod.addImport("raft-kv", kv_mod);
     keyring_mod.addImport("rove-reserved", reserved_mod);
     keyring_mod.addImport("rove-reserve", reserve_mod);
+    // The log-server's seam view renders store-spelled keys back in the
+    // handler's spelling (`reserved.userNamedKey`); wired here because
+    // rove-reserved is declared below rove-log-server.
+    log_server_mod.addImport("rove-reserved", reserved_mod);
     const keyring_tests = b.addTest(.{ .root_module = keyring_mod });
     test_step.dependOn(&b.addRunArtifact(keyring_tests).step);
 
@@ -828,6 +832,7 @@ pub fn build(b: *std.Build) void {
         // Public doc-carrying shims over `_system.*`
         // (docs/architecture/builtin-libs.md Phase A).
         .{ .name = "kv_js", .path = "src/js/globals/kv.js" },
+        .{ .name = "config_js", .path = "src/js/globals/config.js" },
         .{ .name = "console_js", .path = "src/js/globals/console.js" },
         .{ .name = "crypto_js", .path = "src/js/globals/crypto.js" },
         .{ .name = "http_js", .path = "src/js/globals/http.js" },
@@ -1638,6 +1643,9 @@ pub fn build(b: *std.Build) void {
     // restated so the CLI and the platform cannot drift on the marker key,
     // the segment rules, or the signature.
     ops_mod.addImport("wire-headers", wire_headers_mod);
+    // `kv-put` seeds HANDLER-visible bootstrap rows, so it resolves keys under
+    // the same root the handler binding does — one authority for that constant.
+    ops_mod.addImport("rove-reserved", reserved_mod);
     ops_mod.addAnonymousImport("sigv4", .{ .root_source_file = b.path("src/blob/sigv4.zig") });
     ops_mod.addAnonymousImport("blob-namespace", .{ .root_source_file = b.path("src/blob/namespace.zig") });
     const ops_exe = b.addExecutable(.{ .name = "rewind-ops", .root_module = ops_mod });
@@ -1913,6 +1921,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/utf8body", // multibyte UTF-8 request body round-trips (json/text/bytes)
         "src/replay/testdata/utf8encode", // TextEncoder/base64url/hash over non-ASCII ↔ utf8_encode_smoke_v2
         "src/replay/testdata/platformkv", // platform.scope(id)/root per-store kv isolation
+        "src/replay/testdata/configdoor", // config.get: deployed value, null when absent, disjoint from the handler's own _config/-spelled kv
         "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
         "src/replay/testdata/platformadmin", // platform.* admin-only gating (fail-closed)
         "src/replay/testdata/upload", // headers-first onHeaders + blob.receive → onStored continuation

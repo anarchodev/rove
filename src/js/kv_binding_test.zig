@@ -14,6 +14,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const binding = @import("rove-binding");
 const guards = binding.guards;
+const reserved = guards.reserved;
 
 const c = qjs.c;
 const testing = std.testing;
@@ -43,6 +44,13 @@ const MockState = struct {
     last_cursor: [64]u8 = undefined,
     last_cursor_len: usize = 0,
     last_limit: u32 = 0,
+
+    /// Plant a row the way ENGINE ZIG does — straight into storage, below the
+    /// binding, so it carries no root. This is what `_usage/` and `_keys/`
+    /// actually look like: rows a handler's capability cannot address.
+    fn plant(self: *MockState, key: []const u8, value: []const u8) !void {
+        try self.map.put(self.a, try self.a.dupe(u8, key), try self.a.dupe(u8, value));
+    }
 
     fn deinit(self: *MockState) void {
         var it = self.map.iterator();
@@ -107,7 +115,8 @@ const MockKv = struct {
         st.recorded_refusal_code = refusal.code;
     }
 
-    pub fn get(self: MockKv, key: []const u8) binding.GetResult {
+    pub fn get(self: MockKv, k: binding.Key) binding.GetResult {
+        const key = k.stored;
         const v = self.st.map.get(key) orelse return .absent;
         return .{ .value = self.st.a.dupe(u8, v) catch return .absent };
     }
@@ -116,7 +125,8 @@ const MockKv = struct {
         self.st.a.free(bytes);
     }
 
-    pub fn put(self: MockKv, _: ?*c.JSContext, key: []const u8, value: []const u8) bool {
+    pub fn put(self: MockKv, _: ?*c.JSContext, k: binding.Key, value: []const u8) bool {
+        const key = k.stored;
         const st = self.st;
         const vdup = st.a.dupe(u8, value) catch return true;
         if (st.map.getEntry(key)) |e| {
@@ -135,7 +145,8 @@ const MockKv = struct {
         return true;
     }
 
-    pub fn del(self: MockKv, _: ?*c.JSContext, key: []const u8) bool {
+    pub fn del(self: MockKv, _: ?*c.JSContext, k: binding.Key) bool {
+        const key = k.stored;
         const st = self.st;
         if (st.map.fetchSwapRemove(key)) |kv| {
             st.a.free(kv.key);
@@ -155,7 +166,10 @@ const MockKv = struct {
         }
     };
 
-    pub fn prefix(self: MockKv, p: []const u8, cursor: []const u8, limit: u32) ?Page {
+    pub fn prefix(self: MockKv, req: binding.Scan) ?Page {
+        const p = req.prefix.stored;
+        const cursor = req.cursor.stored;
+        const limit = req.limit;
         const st = self.st;
         @memcpy(st.last_prefix[0..p.len], p);
         st.last_prefix_len = p.len;
@@ -182,7 +196,8 @@ const MockKv = struct {
     }
 };
 
-const B = binding.Kv(c, MockKv);
+const B = binding.Kv(c, MockKv, .user);
+const BRaw = binding.Kv(c, MockKv, .raw);
 
 fn evalStr(ctx: qjs.Context, a: std.mem.Allocator, src: []const u8) ![]u8 {
     // JS_Eval requires a NUL-terminated buffer in addition to the length.
@@ -211,6 +226,30 @@ const PROBE =
 ;
 
 /// Register the binding as the global `kv`, the way an engine does.
+/// The `.raw` instantiation — what a baked `__system/` activation holds, and
+/// what a narrow capability (`config`) is implemented over. Installed as
+/// `rawkv` so one context can exercise both roots side by side, which is the
+/// only way to state what actually differs between them.
+fn installRawKv(ctx: qjs.Context) void {
+    const g = c.JS_GetGlobalObject(ctx.raw);
+    defer c.JS_FreeValue(ctx.raw, g);
+    const obj = c.JS_NewObject(ctx.raw);
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "get", c.JS_NewCFunction2(ctx.raw, BRaw.jsKvGet, "get", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "set", c.JS_NewCFunction2(ctx.raw, BRaw.jsKvSet, "set", 2, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "prefix", c.JS_NewCFunction2(ctx.raw, BRaw.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, g, "rawkv", obj);
+}
+
+fn installConfig(ctx: qjs.Context) void {
+    const g = c.JS_GetGlobalObject(ctx.raw);
+    defer c.JS_FreeValue(ctx.raw, g);
+    const obj = c.JS_NewObject(ctx.raw);
+    // Off the USER binding on purpose: the door must escape the root without
+    // being an escape hatch, so the root the binding carries must not matter.
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "get", c.JS_NewCFunction2(ctx.raw, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, g, "config", obj);
+}
+
 fn installKv(ctx: qjs.Context) void {
     const g = c.JS_GetGlobalObject(ctx.raw);
     defer c.JS_FreeValue(ctx.raw, g);
@@ -248,16 +287,11 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.get({}))", "ok:\"objval\"");
 
     // ── write coercion: primitives only, TypeError otherwise ──
-    try expectEval(ctx, a, "__t(() => kv.set('k', {a:1}))",
-        "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.set({}, 'v'))",
-        "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.set('k', null))",
-        "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.set('k', undefined))",
-        "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
-    try expectEval(ctx, a, "__t(() => kv.delete(null))",
-        "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set('k', {a:1}))", "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set({}, 'v'))", "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set('k', null))", "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.set('k', undefined))", "TypeError||kv: value must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
+    try expectEval(ctx, a, "__t(() => kv.delete(null))", "TypeError||kv: key must be a string (or number/boolean/bigint); JSON.stringify objects explicitly");
     // Primitives coerce and store.
     try expectEval(ctx, a, "__t(() => kv.set('n', 42))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.get('n'))", "ok:\"42\"");
@@ -265,26 +299,24 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.get('b'))", "ok:\"true\"");
 
     // ── guard refusals: shape, code, and order ──
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/x', 'v'))",
-        "Error|reserved_key|kv: '_secret/x' is in a platform-reserved prefix");
-    try expectEval(ctx, a, "__t(() => kv.delete('_secret/x'))",
-        "Error|reserved_key|kv: '_secret/x' is in a platform-reserved prefix");
+    // No reserved-prefix refusal: a leading-`_` name is an ordinary key inside
+    // the caller's own root (the dedicated case below states why).
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/x', 'v'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.delete('_secret/x'))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.set('_send/owed/abc', 'v'))", "ok:null"); // shim-writable
-    try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(257), 'v'))",
-        "Error|key_too_large|kv: key exceeds the 256-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(257), 'v'))", "Error|key_too_large|kv: key exceeds the 256-byte limit");
     try expectEval(ctx, a, "__t(() => kv.set('K'.repeat(256), 'v'))", "ok:null"); // boundary
-    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((384 * 1024) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('big', 'x'.repeat((384 * 1024) + 1)))", "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     // Order is contract: a key breaking the reserved rule AND the size cap
     // reports reserved_key.
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/' + 'k'.repeat(300), 'v'))",
-        "Error|reserved_key|kv: '_secret/" ++ "k" ** 300 ++ "' is in a platform-reserved prefix");
+    // A long leading-`_` key reports its SIZE — there is no reserved rule left
+    // to report first, so the order-is-contract case is now key-size-then-value.
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/' + 'k'.repeat(300), 'v'))", "Error|key_too_large|kv: key exceeds the 256-byte limit");
 
     // ── the system-module exemption: namespace only, never the caps ──
     st.system_module = true;
     try expectEval(ctx, a, "__t(() => kv.set('_sched/by_id/x', 'v'))", "ok:null");
-    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((384 * 1024) + 1)))",
-        "Error|value_too_large|kv: value exceeds the 393216-byte limit");
+    try expectEval(ctx, a, "__t(() => kv.set('k', 'x'.repeat((384 * 1024) + 1)))", "Error|value_too_large|kv: value exceeds the 393216-byte limit");
     st.system_module = false;
 
     // ── the per-key exemption: NOT a customer write, EVERY check skipped ──
@@ -295,8 +327,7 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.set('__h/_secret-ish', 'x'.repeat((1 << 20) + 1)))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.delete('__h/_secret-ish'))", "ok:null");
     // …and a non-matching key is still a customer write.
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/y', 'v'))",
-        "Error|reserved_key|kv: '_secret/y' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.set('_secret/y', 'v'))", "ok:null");
     st.exempt_prefix = "";
 
     // ── argc short-circuits: undefined, nothing stored, nothing thrown ──
@@ -320,7 +351,12 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try testing.expectEqual(@as(usize, 0), st.last_cursor_len);
     try expectEval(ctx, a, "__t(() => kv.prefix('p/', 'p/1', 5000).length)", "ok:1");
     try testing.expectEqual(@as(u32, 1000), st.last_limit); // capped
-    try testing.expectEqualStrings("p/1", st.last_cursor[0..st.last_cursor_len]);
+    // The delegate receives the cursor RESOLVED — it is a storage argument,
+    // and the caller paged with the visible spelling the binding handed back.
+    try testing.expectEqualStrings(
+        reserved.USER_KEY_ROOT ++ "p/1",
+        st.last_cursor[0..st.last_cursor_len],
+    );
     try expectEval(ctx, a, "__t(() => kv.prefix('p/', null, -3).length)", "ok:2");
     try testing.expectEqual(@as(u32, 100), st.last_limit); // non-positive → default
     // Storage error → null, not a throw (a read never throws).
@@ -352,29 +388,46 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     // key today's rules would ALLOW.
     st.taped_refusal_key = "orders/fine";
     st.taped_refusal_code = "reserved_key";
-    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))",
-        "Error|reserved_key|kv: 'orders/fine' is in a platform-reserved prefix");
+    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))", "Error|reserved_key|kv: 'orders/fine' is in a platform-reserved prefix");
     // A RETIRED code (rule gone from today's table) still throws, code
     // verbatim, with the generic capture message.
     st.taped_refusal_code = "some_retired_rule";
-    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))",
-        "Error|some_retired_rule|kv: 'orders/fine' was refused at capture");
+    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))", "Error|some_retired_rule|kv: 'orders/fine' was refused at capture");
     st.taped_refusal_key = "";
     // In captured mode (decides = false) the rules are not consulted at all:
     // a write with no taped refusal succeeded at capture and must succeed
     // here, whatever today's table says.
+    // Contrasted against a rule that still EXISTS — the reserved-prefix rule
+    // is gone, so a leading-`_` key no longer distinguishes the two modes.
     st.decide = false;
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/captured-ok', 'v'))", "ok:null");
-    try expectEval(ctx, a, "__t(() => kv.get('_secret/captured-ok'))", "ok:\"v\"");
+    try expectEval(ctx, a, "__t(() => kv.set('captured-ok', 'x'.repeat(2 * 1024 * 1024)))", "ok:null");
+    // The captured write CHARGED the activation — it happened. Clear it, or the
+    // budget rule fires before the value rule this case is contrasting.
+    st.write_ops = 0;
+    st.write_bytes = 0;
     st.decide = true;
-    try expectEval(ctx, a, "__t(() => kv.set('_secret/captured-ok', 'v'))",
-        "Error|reserved_key|kv: '_secret/captured-ok' is in a platform-reserved prefix");
+    try expectEval(
+        ctx,
+        a,
+        "__t(() => kv.set('captured-ok', 'x'.repeat(2 * 1024 * 1024)))",
+        "Error|value_too_large|" ++ guards.kv_value_too_large_message,
+    );
     // …and a LIVE refusal is offered to the delegate for taping.
-    try testing.expectEqualStrings("_secret/captured-ok", st.recorded_refusal_key[0..st.recorded_refusal_key_len]);
-    try testing.expectEqualStrings("reserved_key", st.recorded_refusal_code);
+    try testing.expectEqualStrings("captured-ok", st.recorded_refusal_key[0..st.recorded_refusal_key_len]);
+    try testing.expectEqualStrings("value_too_large", st.recorded_refusal_code);
 }
 
-test "kv binding: the engine-only keyspace is invisible to a handler" {
+test "kv binding: a handler cannot address the engine keyspace" {
+    // The property this replaces: the engine namespaces used to be READ-HIDDEN
+    // by a predicate consulted on every get and scan. They are not hidden now —
+    // they are unreachable. A handler's capability is rooted at
+    // `reserved.USER_KEY_ROOT`, so `_usage/blob/aaa` names a row inside the
+    // handler's OWN keyspace and the engine's row of that name is not in the
+    // range at all. Nothing is refused and nothing is filtered; there is simply
+    // no spelling that arrives there.
+    //
+    // The consequence worth pinning: the whole leading-`_` keyspace is the
+    // customer's again, and it no longer costs a predicate to say so.
     const a = testing.allocator;
 
     var st = MockState{ .a = a };
@@ -391,60 +444,52 @@ test "kv binding: the engine-only keyspace is invisible to a handler" {
         defer a.free(ready);
     }
 
-    // Seed the way the platform does — engine Zig bypasses these bindings, so
-    // the test wears the system-module badge to plant the same rows.
-    st.system_module = true;
-    for ([_][]const u8{
-        "__t(() => kv.set('_usage/blob/aaa', '1'))",
-        "__t(() => kv.set('_usage/blob/bbb', '2'))",
-        "__t(() => kv.set('_usage/blob/ccc', '3'))",
-        "__t(() => kv.set('_keys/next_slot', '9'))",
-        "__t(() => kv.set('_config/mail.json', 'cfg'))",
-        "__t(() => kv.set('users/1', 'alice'))",
-    }) |src| try expectEval(ctx, a, src, "ok:null");
-    st.system_module = false;
+    // Engine rows, planted below the binding the way platform Zig writes them.
+    try st.plant("_usage/blob/aaa", "1");
+    try st.plant("_usage/blob/bbb", "2");
+    try st.plant("_keys/next_slot", "9");
 
-    // ── get: hidden is ABSENT, not refused ──
-    // A refusal would disclose the namespace it is protecting, and a write
-    // that silently did nothing is a bug while a read of someone else's
-    // keyspace is honestly empty.
+    // ── the engine's rows are not reachable by naming them ──
     try expectEval(ctx, a, "__t(() => kv.get('_usage/blob/aaa'))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:null");
-    // Handler-readable platform namespaces are untouched.
-    try expectEval(ctx, a, "__t(() => kv.get('_config/mail.json'))", "ok:\"cfg\"");
-    try expectEval(ctx, a, "__t(() => kv.get('users/1'))", "ok:\"alice\"");
 
-    // ── a scan wholly inside a hidden namespace never reaches storage ──
-    st.last_limit = 0;
-    try expectEval(ctx, a, "__t(() => kv.prefix('_usage/'))", "ok:[]");
-    try testing.expectEqual(@as(u32, 0), st.last_limit); // the delegate was never called
+    // ── and naming one is an ordinary write into the handler's own keyspace,
+    //    not a refusal. `reserved_key` has no remaining producer here.
+    try expectEval(ctx, a, "__t(() => kv.set('_usage/blob/aaa', 'mine'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.get('_usage/blob/aaa'))", "ok:\"mine\"");
 
-    // ── a spanning scan filters AND REFILLS ──
-    // This is the case a naive filter gets wrong. At limit 2 the first two
-    // pages are entirely hidden rows; filtering alone would hand the handler
-    // an empty array, and the documented idiom stops on an empty page — so a
-    // tenant with a few hundred meter rows would silently lose everything
-    // sorted after them. The scan must keep going until the page is full.
-    try expectEval(ctx, a, "__t(() => kv.prefix('', '', 2))",
-        "ok:[{\"key\":\"_config/mail.json\",\"value\":\"cfg\"},{\"key\":\"users/1\",\"value\":\"alice\"}]");
+    // The engine's row is untouched by that write — different key, same name.
+    try testing.expectEqualStrings("1", st.map.get("_usage/blob/aaa").?);
+    try testing.expectEqualStrings(
+        "mine",
+        st.map.get(reserved.USER_KEY_ROOT ++ "_usage/blob/aaa").?,
+    );
 
-    // ── the system-module exemption: the platform's own modules still see ──
-    st.system_module = true;
-    try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:\"9\"");
-    try expectEval(ctx, a, "__t(() => kv.prefix('_usage/').length)", "ok:3");
-    st.system_module = false;
-
-    // ── a captured world replays the read that happened ──
-    // `decides()` false means the rules are not consulted, exactly as on the
-    // write path: a tape recorded before the namespace was hidden must replay
-    // as captured rather than as today's table would answer.
-    st.decide = false;
-    try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:\"9\"");
-    st.decide = true;
-    try expectEval(ctx, a, "__t(() => kv.get('_keys/next_slot'))", "ok:null");
+    // ── a catch-all scan sees the handler's rows and no engine row, with no
+    //    filtering and no refill: they were never in the scanned range. This is
+    //    what retires `scanSpansEngineOnly` and `kvPrefixFiltered` — a run of
+    //    engine rows can no longer truncate a customer's page, because there is
+    //    no run of them to skip.
+    try expectEval(ctx, a, "__t(() => kv.set('users/1', 'alice'))", "ok:null");
+    try expectEval(
+        ctx,
+        a,
+        "__t(() => kv.prefix('').map(r => r.key).sort().join(','))",
+        "ok:\"_usage/blob/aaa,users/1\"",
+    );
 }
-
-test "kv binding: _config/ resolves under the asking activation's deployment" {
+test "config.get is the door: deployment-scoped, read-only, root-independent" {
+    // Config is deployment-scoped storage: `config.get("oauth/google")` reads
+    // the row the CURRENT deployment shipped, so code and config switch
+    // together and a rollback is a pointer flip rather than a race
+    // (rove#830 — the only door to `_config/`).
+    //
+    // The door resolves independently of the binding's root: it is
+    // instantiated here off the `.user` binding — the handler's own — and
+    // still reaches config, while the same spelling through `kv.*` stays an
+    // ordinary key in the handler's keyspace. That is the design: `_config/`
+    // is not refused, it is unnameable; the door is the one spelling that
+    // means config, and it cannot write.
     const a = testing.allocator;
 
     var st = MockState{ .a = a };
@@ -456,62 +501,55 @@ test "kv binding: _config/ resolves under the asking activation's deployment" {
     defer ctx.deinit();
     c.JS_SetContextOpaque(ctx.raw, &st);
     installKv(ctx);
+    installRawKv(ctx);
+    installConfig(ctx);
     {
         const ready = try evalStr(ctx, a, PROBE);
         defer a.free(ready);
     }
 
-    // Two deployments ship the same config path with different content —
-    // the ordinary case of editing `_config/oauth/google.json`. Seeded as
-    // the mirror writes them: under the deployment, not over each other.
-    st.system_module = true;
-    try expectEval(ctx, a, "__t(() => kv.set('_config/0000000000000001/oauth/google', 'one'))", "ok:null");
-    try expectEval(ctx, a, "__t(() => kv.set('_config/0000000000000002/oauth/google', 'two'))", "ok:null");
-    st.system_module = false;
+    // Two deployments ship the same config path with different content — the
+    // ordinary case of editing `_config/oauth/google.json`. Seeded as the
+    // deploy thread's installer writes them: under the deployment, not over
+    // each other.
+    try st.plant("_config/0000000000000001/oauth/google", "one");
+    try st.plant("_config/0000000000000002/oauth/google", "two");
 
-    // The handler names the deployed path. Which deployment it is running
-    // under decides what it reads — so code and config move together, and a
-    // rollback to 1 is a pointer flip rather than a race.
+    // ── the deployment decides what the name means ──
     st.config_scope = 1;
-    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"one\"");
+    try expectEval(ctx, a, "__t(() => config.get('oauth/google'))", "ok:\"one\"");
     st.config_scope = 2;
-    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"two\"");
-
-    // A scan of the namespace resolves the same way, or a handler would see
-    // every deployment's rows at once.
-    try expectEval(ctx, a, "__t(() => kv.prefix('_config/').map((r) => r.value))", "ok:[\"two\"]");
+    try expectEval(ctx, a, "__t(() => config.get('oauth/google'))", "ok:\"two\"");
 
     // A deployment that shipped no such config reads absent — the honest
-    // answer, and what makes `fromConfig` throw its own message rather than
-    // silently serving another deployment's value.
+    // answer, and what makes a `fromConfig` wrapper throw its own message
+    // rather than silently serving another deployment's value.
     st.config_scope = 3;
-    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => config.get('oauth/google'))", "ok:null");
 
-    // An authored world has no release to scope by, so a seeded key reads
-    // back exactly as written — the offline sim and the replay arena.
+    // Scope 0 is the authored-world scope: the name resolves to its visible
+    // spelling, which is how a sim world seeds config without knowing
+    // deployment ids exist.
+    try st.plant("_config/authored/flag", "on");
     st.config_scope = 0;
-    st.system_module = true;
-    try expectEval(ctx, a, "__t(() => kv.set('_config/oauth/google', 'flat'))", "ok:null");
-    st.system_module = false;
-    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"flat\"");
+    try expectEval(ctx, a, "__t(() => config.get('authored/flag'))", "ok:\"on\"");
 
-    // A write resolves the same way a read does, so a config write and a
-    // config read of one name reach one row. Only the mirror writes this
-    // namespace in production; the symmetry is what stops a future writer
-    // landing somewhere no reader looks.
-    st.config_scope = 5;
-    st.system_module = true;
-    try expectEval(ctx, a, "__t(() => kv.set('_config/oauth/google', 'five'))", "ok:null");
-    st.system_module = false;
-    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"five\"");
-    // …and it landed under deployment 5, not over anyone else's row.
-    st.config_scope = 0;
-    try expectEval(ctx, a, "__t(() => kv.get('_config/0000000000000005/oauth/google'))", "ok:\"five\"");
+    // ── the same spelling through kv is just a key of the handler's own ──
     st.config_scope = 1;
-    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"one\"");
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.set('_config/oauth/google', 'mine'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:\"mine\"");
+    // …and it lands beside the handler's other rows, nowhere near config.
+    try testing.expectEqualStrings(
+        "mine",
+        st.map.get(reserved.USER_KEY_ROOT ++ "_config/oauth/google").?,
+    );
+    // The real row never moved.
+    try testing.expectEqualStrings("one", st.map.get("_config/0000000000000001/oauth/google").?);
 
-    // Nothing outside the namespace is touched at any deployment.
-    st.config_scope = 2;
-    try expectEval(ctx, a, "__t(() => kv.set('users/1', 'alice'))", "ok:null");
-    try expectEval(ctx, a, "__t(() => kv.get('users/1'))", "ok:\"alice\"");
+    // ── the raw binding reads storage as it lies: no resolution ──
+    // (The config installer's rows arrive already deployment-scoped, so a
+    // resolving raw door would double-scope them.)
+    try expectEval(ctx, a, "__t(() => rawkv.get('_config/0000000000000002/oauth/google'))", "ok:\"two\"");
+    try expectEval(ctx, a, "__t(() => rawkv.get('_config/oauth/google'))", "ok:null");
 }

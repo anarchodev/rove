@@ -95,7 +95,12 @@ export function handler() {
   // rove#516) and the WASM replay must throw the recorded verdict — same
   // code, same branch — WITHOUT re-deciding the rules.
   let refused = "none";
-  try { kv.set("_secret/spoof", "x"); } catch (e) { refused = e.code || "?"; }
+  // An oversized VALUE, not a reserved key: a handler's kv is rooted, so a
+  // leading-`_` name is an ordinary key of its own and refusing it is not a
+  // rule any more. The size caps are, and the property under test is the same
+  // one — a refusal taped by prod replays from the tape without the rules
+  // being re-decided.
+  try { kv.set("big", "x".repeat(2 * 1024 * 1024)); } catch (e) { refused = e.code || "?"; }
   return `replay-demo count=${next} die=${die} at=${at} probe=${probe} blen=${blen} ip=${ip} refused=${refused}\\n`;
 }
 """
@@ -283,12 +288,12 @@ def main() -> int:
                         check("replayed output reproduces the handler body",
                               parked.startswith("replay-demo count="),
                               f"parked_result={parked!r}")
-                        # Outcome-replay (rove#516): prod REFUSED the reserved
+                        # Outcome-replay (rove#516): prod REFUSED the oversized
                         # write and taped the verdict; the WASM replay must
                         # throw the recorded code — same catch branch, same
                         # output — WITHOUT re-deciding the rules.
-                        check("⭐ taped guard refusal replayed (refused=reserved_key)",
-                              "refused=reserved_key" in parked,
+                        check("⭐ taped guard refusal replayed (refused=value_too_large)",
+                              "refused=value_too_large" in parked,
                               f"parked_result={parked!r}")
 
     if failures:

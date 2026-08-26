@@ -242,7 +242,12 @@ export default function () {
                 // export; a marker without `bundle_requested` (pre-format-2,
                 // or an explicit {bundle:false}) finishes kv-only, exactly
                 // as before.
-                if (st.bundle_requested && kv.get("_deploy/current") !== null) {
+                // `__rove.rootKvGet`, not `kv.get`: the release pointer is
+                // ENGINE state, written below the binding, and a handler's kv
+                // is rooted at the user keyspace where it does not exist.
+                // Reading it through the handler door answers "absent" for
+                // every tenant, which reads here as "no deployment to bundle".
+                if (st.bundle_requested && __rove.rootKvGet("_deploy/current") !== null) {
                     st.phase = "bundle";
                     // Fall through to the shared issue tail below.
                 } else {

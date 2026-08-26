@@ -941,8 +941,6 @@ pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c
     return c.JS_Throw(ctx, err);
 }
 
-
-
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
 // Within-activation non-determinism replay
@@ -1051,6 +1049,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     //     and customer handlers see the documented top-level names
     //     rather than the raw natives.
     evalSnippet(ctx, "kv.js", KV_JS);
+    evalSnippet(ctx, "config.js", CONFIG_JS);
     evalSnippet(ctx, "console.js", CONSOLE_JS);
     evalSnippet(ctx, "crypto.js", CRYPTO_JS);
     evalSnippet(ctx, "http.js", HTTP_JS);
@@ -1116,6 +1115,15 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // only path (tracker #753).
     evalSnippet(ctx, "_caps.js", comptime "globalThis.__rove.caps = { " ++
         reserved.capabilityLiteralBody() ++ "};");
+
+    // The SECOND capability template: what a baked `__system/` activation is
+    // handed instead of `caps`. Captured here because `_harden.js` below
+    // deletes `_system`, and a baked module — dispatched from the snapshot
+    // after that delete — can see neither `_system` nor a shim's closure.
+    //
+    // A customer activation is never given this object, which is the whole of
+    // the access control: there is no flag to check because there is nothing
+    // to check it on.
 
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
@@ -1226,6 +1234,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "set", .cfunc = kv_bindings.jsKvSet, .argc = 2 },
         .{ .name = "delete", .cfunc = kv_bindings.jsKvDelete, .argc = 1 },
         .{ .name = "prefix", .cfunc = kv_bindings.jsKvPrefix, .argc = 3 },
+    } },
+    // The only door to deploy-time config (rove#830): a read-only,
+    // deployment-scoped get. `_config/` stops being an address customers
+    // name — under the rooted kv it is unreachable, and this is what
+    // replaces the raw read. Public spelling: globals/config.js.
+    .{ .path = &.{ "_system", "config" }, .fns = &.{
+        .{ .name = "get", .cfunc = kv_bindings.jsConfigGet, .argc = 1 },
     } },
     .{ .path = &.{ "_system", "console" }, .fns = &.{
         .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
@@ -1399,6 +1414,20 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
             // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
             // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
             .{ .name = "resumeIfBound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
+            // Storage as it lies — the kv a baked module holds when it needs a
+            // row the tenant cannot name (the release pointer, the config
+            // mirror's deployment-scoped rows). A handler's own kv is rooted at
+            // `reserved.USER_KEY_ROOT` and cannot reach these at all, which is
+            // the point; this is the door for the code that must.
+            .{ .name = "rootKvGet", .cfunc = kv_bindings.jsRootKvGet, .argc = 1 },
+            .{ .name = "rootKvSet", .cfunc = kv_bindings.jsRootKvSet, .argc = 2 },
+            .{ .name = "rootKvDelete", .cfunc = kv_bindings.jsRootKvDelete, .argc = 1 },
+            .{ .name = "rootKvPrefix", .cfunc = kv_bindings.jsRootKvPrefix, .argc = 3 },
+            // Storage as it lies — the kv a baked module holds when it needs a
+            // row the tenant cannot name (the release pointer, the config
+            // mirror's deployment-scoped rows). A handler's own kv is rooted at
+            // `reserved.USER_KEY_ROOT` and cannot reach these at all, which is
+            // the point; this is the door for the code that must.
             // Raw privileged outbound fetch for baked delivery modules
             // (`__system/webhook_fire`); delegates to `_system.http.fetch`
             // internals so staging/commit-gating/limits are identical.
@@ -1443,6 +1472,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{};
 // Public shims (docs/architecture/builtin-libs.md Phase A). JSDoc-carrying
 // JS over `_system.*`; this is the documentation source of truth.
 const KV_JS = @embedFile("kv_js");
+const CONFIG_JS = @embedFile("config_js");
 const CONSOLE_JS = @embedFile("console_js");
 const CRYPTO_JS = @embedFile("crypto_js");
 const HTTP_JS = @embedFile("http_js");
@@ -1468,6 +1498,7 @@ const BLOB_JS = @embedFile("blob_js");
 /// shim means adding it here too (and to build.zig + installStatic).
 pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "kv", .src = KV_JS },
+    .{ .name = "config", .src = CONFIG_JS },
     .{ .name = "console", .src = CONSOLE_JS },
     .{ .name = "crypto", .src = CRYPTO_JS },
     .{ .name = "http", .src = HTTP_JS },
@@ -1795,7 +1826,7 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  const caps = globalThis.__rove.caps;
         \\  if (typeof caps !== "object") throw new Error("__rove.caps missing");
         \\  const got = Object.keys(caps).sort().join(",");
-        \\  const want = "after,blob,http,kv,next,platform,stream,webhook";
+        \\  const want = "after,blob,config,http,kv,next,platform,stream,webhook";
         \\  if (got !== want)
         \\    throw new Error("capability set drifted: got [" + got + "] want [" + want + "]");
         \\  // Same object, not a copy.
@@ -1843,7 +1874,6 @@ test "SubscriptionEntry.deinit frees kv spec" {
     };
     entry.deinit(a);
 }
-
 
 test "the kv write caps match the snapshot stream's frame bounds" {
     // The caps are a CONTRACT and live in `rove-reserved`, where the offline

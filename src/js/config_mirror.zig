@@ -15,7 +15,9 @@
 //! locally and replicate together via raft envelope 0.
 //!
 //! Customers cannot write `_config/*` from handlers — the prefix is
-//! reserved (see reserved.zig). Handlers read via `kv.get("_config/...")`.
+//! reserved (see reserved.zig). Handlers read via `config.get(name)` — the
+//! only door to the namespace (rove#830); under the rooted kv the raw
+//! spelling is unreachable.
 //! Libraries that read config wrap the lookup in `lib.fromConfig(name)`
 //! (see oauth.js, sessions.js).
 
