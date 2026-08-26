@@ -62,10 +62,20 @@ pub var active_user: ?*anyopaque = null;
 /// subscription-marker dedup) resets when a new host takes over.
 pub var generation: u64 = 0;
 
+/// The active run's config-resolution scope (`world.deployment_id`) — the
+/// deployment whose `_config/{dep:016x}/…` rows `config.get` resolves to.
+/// 0 = authored world (visible spelling). Installed with the host so the kv
+/// delegate's `configScope` answers per run.
+pub var active_config_scope: u64 = 0;
+
 pub fn setHost(vt: *const ReplayHost, user: ?*anyopaque) void {
     active_vtable = vt;
     active_user = user;
     generation +%= 1;
+    // Authored scope by default on every install: a captured run's scope must
+    // not leak into the next run (the harness re-takes the host around nested
+    // sim runs). The captured-replay driver sets the real scope AFTER install.
+    active_config_scope = 0;
     arena_replay_set_host(vt, user);
 }
 

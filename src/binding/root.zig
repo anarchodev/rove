@@ -372,6 +372,57 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
             }
         }
 
+        /// `config.get(name)` → the deploy-time config value, or null — the
+        /// only door to the `_config/` namespace (rove#830: handlers stop
+        /// knowing it is a kv prefix).
+        ///
+        /// A read-only kv get underneath, which is a requirement rather than
+        /// a convenience: the read rides the ordinary kv tape entry and
+        /// digest fold, so replay covers it for free — a config read that
+        /// became its own effect kind would need its own tape treatment.
+        ///
+        /// The name resolves independently of this instantiation's root:
+        /// NAMED is `_config/{name}` (what the digest folds and a divergence
+        /// message shows), STORED is `reserved.configStorageKey` of it — the
+        /// deployment that shipped the config (`d.configScope()`; 0, the
+        /// authored-world scope, resolves to the visible spelling). Code and
+        /// config therefore switch on the same `_deploy/current` flip, and a
+        /// handler cannot name another deployment's rows: whatever `name`
+        /// contains is appended AFTER the scope segment.
+        ///
+        /// Write access does not exist here or anywhere reachable: under
+        /// `.user` a literal `kv.set("_config/…")` reroots into the caller's
+        /// own keyspace, so the deploy tree stays the single source of truth.
+        pub fn jsConfigGet(
+            ctx: ?*q.JSContext,
+            _: q.JSValue,
+            argc: c_int,
+            argv: [*c]q.JSValue,
+        ) callconv(.c) q.JSValue {
+            if (argc < 1) return js_undefined;
+            const d = D.fromCtx(ctx);
+
+            const name = coerce(d, ctx, argv[0]) catch return js_exception;
+            defer d.allocator().free(name);
+
+            var named_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const named = std.fmt.bufPrint(&named_buf, "{s}{s}", .{
+                guards.reserved.CONFIG_PREFIX, name,
+            }) catch return js_null; // longer than any deployable config path
+            var skey_buf: [guards.reserved.CONFIG_STORAGE_KEY_MAX]u8 = undefined;
+            const skey = guards.reserved.configStorageKey(&skey_buf, d.configScope(), named) orelse
+                return js_null;
+
+            switch (d.get(.{ .named = named, .stored = skey })) {
+                .value => |v| {
+                    defer d.release(v);
+                    return q.JS_NewStringLen(ctx, v.ptr, v.len);
+                },
+                .absent => return js_null,
+                .thrown => return js_exception,
+            }
+        }
+
         pub fn jsKvSet(
             ctx: ?*q.JSContext,
             _: q.JSValue,
@@ -472,17 +523,16 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
         /// the handler could name outside its own keyspace, which is exactly
         /// the property the root exists to remove.
         ///
-        /// Under `.raw` the one resolution that remains is config's: a caller
-        /// names config by its deployed path and storage holds it under the
-        /// deployment that shipped it, so code and config switch at the same
-        /// instant (`reserved.configStorageKey`). That rule sits in the binding
-        /// rather than in four delegates because the spelling must not depend
-        /// on which engine is running. It does not apply under `.user` —
-        /// handler-named config is reached through the narrower `config`
-        /// capability, which is implemented over a `.raw` binding.
+        /// Under `.raw` there is NO resolution: storage as it lies, literally.
+        /// The one logical→physical mapping that used to live here — config's
+        /// deployment scoping — belongs to `jsConfigGet` now, the door that
+        /// owns the visible spelling. Keeping a resolution inside `.raw`
+        /// would double-scope the config INSTALLER, whose rows arrive
+        /// already deployment-scoped from the deploy thread and must land
+        /// verbatim.
         ///
-        /// Returns null only when the resolved key would not fit `buf`; callers
-        /// size it `reserved.STORAGE_KEY_MAX`, which holds either resolution.
+        /// Returns null only when the resolved key would not fit `buf`;
+        /// callers size it `reserved.STORAGE_KEY_MAX`.
         fn storageKey(d: D, buf: []u8, key: []const u8) ?[]const u8 {
             if (comptime root == .user) {
                 // An exempt key is not a customer write — the delegate has
@@ -496,8 +546,7 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
                 if (d.isExempt(key)) return key;
                 return std.fmt.bufPrint(buf, "{s}{s}", .{ key_root, key }) catch null;
             }
-            if (!guards.reserved.isConfigKey(key)) return key;
-            return guards.reserved.configStorageKey(buf, d.configScope(), key);
+            return key;
         }
 
         /// The inverse of `storageKey` for a key STORAGE produced — used on the
@@ -550,9 +599,10 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
                 break :blk @min(@as(u32, @intCast(n)), KV_PREFIX_MAX);
             } else KV_PREFIX_DEFAULT;
 
-            // A scan resolves the same way a get does — `kv.prefix("_config/")`
-            // sees this deployment's rows and not every deployment's, and a
-            // scoped scan is bounded by its root.
+            // A scan resolves the same way a get does, and a scoped scan is
+            // bounded by its root. (Config has no scan: `config.get` is the
+            // whole door, and under `.user` a `kv.prefix("_config/")` pages
+            // the handler's own keyspace like any other spelling.)
             //
             // There is no hidden-row filtering here and no page refilling.
             // A scoped scan cannot reach an engine key: the key is not removed

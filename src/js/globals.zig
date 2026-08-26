@@ -1049,6 +1049,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     //     and customer handlers see the documented top-level names
     //     rather than the raw natives.
     evalSnippet(ctx, "kv.js", KV_JS);
+    evalSnippet(ctx, "config.js", CONFIG_JS);
     evalSnippet(ctx, "console.js", CONSOLE_JS);
     evalSnippet(ctx, "crypto.js", CRYPTO_JS);
     evalSnippet(ctx, "http.js", HTTP_JS);
@@ -1233,6 +1234,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "set", .cfunc = kv_bindings.jsKvSet, .argc = 2 },
         .{ .name = "delete", .cfunc = kv_bindings.jsKvDelete, .argc = 1 },
         .{ .name = "prefix", .cfunc = kv_bindings.jsKvPrefix, .argc = 3 },
+    } },
+    // The only door to deploy-time config (rove#830): a read-only,
+    // deployment-scoped get. `_config/` stops being an address customers
+    // name — under the rooted kv it is unreachable, and this is what
+    // replaces the raw read. Public spelling: globals/config.js.
+    .{ .path = &.{ "_system", "config" }, .fns = &.{
+        .{ .name = "get", .cfunc = kv_bindings.jsConfigGet, .argc = 1 },
     } },
     .{ .path = &.{ "_system", "console" }, .fns = &.{
         .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
@@ -1464,6 +1472,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{};
 // Public shims (docs/architecture/builtin-libs.md Phase A). JSDoc-carrying
 // JS over `_system.*`; this is the documentation source of truth.
 const KV_JS = @embedFile("kv_js");
+const CONFIG_JS = @embedFile("config_js");
 const CONSOLE_JS = @embedFile("console_js");
 const CRYPTO_JS = @embedFile("crypto_js");
 const HTTP_JS = @embedFile("http_js");
@@ -1489,6 +1498,7 @@ const BLOB_JS = @embedFile("blob_js");
 /// shim means adding it here too (and to build.zig + installStatic).
 pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "kv", .src = KV_JS },
+    .{ .name = "config", .src = CONFIG_JS },
     .{ .name = "console", .src = CONSOLE_JS },
     .{ .name = "crypto", .src = CRYPTO_JS },
     .{ .name = "http", .src = HTTP_JS },
@@ -1816,7 +1826,7 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  const caps = globalThis.__rove.caps;
         \\  if (typeof caps !== "object") throw new Error("__rove.caps missing");
         \\  const got = Object.keys(caps).sort().join(",");
-        \\  const want = "after,blob,http,kv,next,platform,stream,webhook";
+        \\  const want = "after,blob,config,http,kv,next,platform,stream,webhook";
         \\  if (got !== want)
         \\    throw new Error("capability set drifted: got [" + got + "] want [" + want + "]");
         \\  // Same object, not a copy.

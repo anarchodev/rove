@@ -480,6 +480,7 @@ pub const Engine = struct {
             .elided = elided,
         };
         host.install();
+        hostmod.active_config_scope = wv.deployment_id;
 
         // GC mode, every run. Set on each run because the mode
         // binds at the entry reset. Forward sim and replay both run GC: the sim

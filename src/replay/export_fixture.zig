@@ -85,6 +85,16 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
 
     const export_name = jStr(obj, "export"); // recorded resolved export ({on}) — G3
     const recorded = if (obj.get("recorded")) |v| (if (v == .object) v.object else null) else null;
+    // The deployment this record ran under ("dep_{16 hex}") — the config
+    // door's resolution scope. A captured world must replay config.get
+    // against the SAME deployment-scoped rows the tape holds; without the
+    // scope, replay resolves to the visible spelling and every captured
+    // config read misses.
+    const deployment_hex: ?[]const u8 = blk: {
+        const d = jStr(obj, "deployment_id") orelse break :blk null;
+        if (!std.mem.startsWith(u8, d, "dep_")) break :blk null;
+        break :blk d["dep_".len..];
+    };
 
     const tapes = if (obj.get("tapes")) |v| (if (v == .object) v.object else null) else null;
     const kv_entries: []const decode.KvEntry = blk: {
@@ -550,6 +560,12 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // (`request.body`, `on.*`) so pinned old deployments replay; authored
     // worlds (no flag) mirror the live surface (world.zig `captured`).
     try w.writeAll(",\n  \"captured\": true");
+    if (deployment_hex) |dh| {
+        // Hex STRING, not a JSON number: a dep id is a 64-bit hash, above
+        // what a JS reader of world.json can hold in a number.
+        try w.writeAll(",\n  \"deployment_id\": ");
+        try jsonStr(w, dh);
+    }
     if (ts_ns) |s| {
         const ns = std.fmt.parseInt(i64, s, 10) catch 0;
         if (ns > 0) try w.print(",\n  \"now_ms\": {d}", .{@divTrunc(ns, std.time.ns_per_ms)});

@@ -1402,7 +1402,7 @@ const oidc = {
       // documented override/template relationship in code — it makes
       // the prod path work with zero bootstrap glue.
       let raw = kv.get("_oidc/config/" + name);
-      if (raw == null) raw = kv.get("_config/oidc/" + name);
+      if (raw == null) raw = config.get("oidc/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.provider: no client registry at _oidc/config/" + name +
@@ -1442,7 +1442,7 @@ const oidc = {
       // (above). Without this an operator must hand-seed _oidc/rp after every
       // wipe or the dashboard 500s.
       let raw = kv.get("_oidc/rp/" + name);
-      if (raw == null) raw = kv.get("_config/oidc/rp/" + name);
+      if (raw == null) raw = config.get("oidc/rp/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.rp: no RP config at _oidc/rp/" + name +

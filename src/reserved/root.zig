@@ -600,6 +600,7 @@ pub const TAG_VAL_MAX: usize = 64;
 pub const CAPABILITY_NAMES = [_][]const u8{
     "after",
     "blob",
+    "config",
     "http",
     "kv",
     "next",

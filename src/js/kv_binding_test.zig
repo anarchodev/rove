@@ -240,6 +240,16 @@ fn installRawKv(ctx: qjs.Context) void {
     _ = c.JS_SetPropertyStr(ctx.raw, g, "rawkv", obj);
 }
 
+fn installConfig(ctx: qjs.Context) void {
+    const g = c.JS_GetGlobalObject(ctx.raw);
+    defer c.JS_FreeValue(ctx.raw, g);
+    const obj = c.JS_NewObject(ctx.raw);
+    // Off the USER binding on purpose: the door must escape the root without
+    // being an escape hatch, so the root the binding carries must not matter.
+    _ = c.JS_SetPropertyStr(ctx.raw, obj, "get", c.JS_NewCFunction2(ctx.raw, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx.raw, g, "config", obj);
+}
+
 fn installKv(ctx: qjs.Context) void {
     const g = c.JS_GetGlobalObject(ctx.raw);
     defer c.JS_FreeValue(ctx.raw, g);
@@ -468,18 +478,18 @@ test "kv binding: a handler cannot address the engine keyspace" {
         "ok:\"_usage/blob/aaa,users/1\"",
     );
 }
-test "kv binding: _config/ resolves under the deployment, on the raw root only" {
-    // Config is deployment-scoped storage: a caller names `_config/oauth/google`
-    // and the row lives under the deployment that shipped it, so code and
-    // config switch together and a rollback is a pointer flip rather than a
-    // race.
+test "config.get is the door: deployment-scoped, read-only, root-independent" {
+    // Config is deployment-scoped storage: `config.get("oauth/google")` reads
+    // the row the CURRENT deployment shipped, so code and config switch
+    // together and a rollback is a pointer flip rather than a race
+    // (rove#830 — the only door to `_config/`).
     //
-    // That resolution belongs to the RAW root now. A handler's kv is rooted at
-    // `reserved.USER_KEY_ROOT` with no exception, so `_config/…` named through
-    // it is an ordinary key in the handler's own keyspace — reaching real
-    // config is the `config` capability's job, and that capability is built
-    // over a raw binding. An escape here would be a spelling that leaves the
-    // handler's root, which is the property the root exists to remove.
+    // The door resolves independently of the binding's root: it is
+    // instantiated here off the `.user` binding — the handler's own — and
+    // still reaches config, while the same spelling through `kv.*` stays an
+    // ordinary key in the handler's keyspace. That is the design: `_config/`
+    // is not refused, it is unnameable; the door is the one spelling that
+    // means config, and it cannot write.
     const a = testing.allocator;
 
     var st = MockState{ .a = a };
@@ -492,6 +502,7 @@ test "kv binding: _config/ resolves under the deployment, on the raw root only" 
     c.JS_SetContextOpaque(ctx.raw, &st);
     installKv(ctx);
     installRawKv(ctx);
+    installConfig(ctx);
     {
         const ready = try evalStr(ctx, a, PROBE);
         defer a.free(ready);
@@ -499,27 +510,31 @@ test "kv binding: _config/ resolves under the deployment, on the raw root only" 
 
     // Two deployments ship the same config path with different content — the
     // ordinary case of editing `_config/oauth/google.json`. Seeded as the
-    // mirror writes them: under the deployment, not over each other.
+    // deploy thread's installer writes them: under the deployment, not over
+    // each other.
     try st.plant("_config/0000000000000001/oauth/google", "one");
     try st.plant("_config/0000000000000002/oauth/google", "two");
 
-    // ── raw: the deployment decides what the name means ──
+    // ── the deployment decides what the name means ──
     st.config_scope = 1;
-    try expectEval(ctx, a, "__t(() => rawkv.get('_config/oauth/google'))", "ok:\"one\"");
+    try expectEval(ctx, a, "__t(() => config.get('oauth/google'))", "ok:\"one\"");
     st.config_scope = 2;
-    try expectEval(ctx, a, "__t(() => rawkv.get('_config/oauth/google'))", "ok:\"two\"");
-
-    // A scan resolves the same way, or a caller would see every deployment's
-    // rows at once.
-    try expectEval(ctx, a, "__t(() => rawkv.prefix('_config/').map((r) => r.value))", "ok:[\"two\"]");
+    try expectEval(ctx, a, "__t(() => config.get('oauth/google'))", "ok:\"two\"");
 
     // A deployment that shipped no such config reads absent — the honest
-    // answer, and what makes `fromConfig` throw its own message rather than
-    // silently serving another deployment's value.
+    // answer, and what makes a `fromConfig` wrapper throw its own message
+    // rather than silently serving another deployment's value.
     st.config_scope = 3;
-    try expectEval(ctx, a, "__t(() => rawkv.get('_config/oauth/google'))", "ok:null");
+    try expectEval(ctx, a, "__t(() => config.get('oauth/google'))", "ok:null");
 
-    // ── user: the same spelling is just a key of the handler's own ──
+    // Scope 0 is the authored-world scope: the name resolves to its visible
+    // spelling, which is how a sim world seeds config without knowing
+    // deployment ids exist.
+    try st.plant("_config/authored/flag", "on");
+    st.config_scope = 0;
+    try expectEval(ctx, a, "__t(() => config.get('authored/flag'))", "ok:\"on\"");
+
+    // ── the same spelling through kv is just a key of the handler's own ──
     st.config_scope = 1;
     try expectEval(ctx, a, "__t(() => kv.get('_config/oauth/google'))", "ok:null");
     try expectEval(ctx, a, "__t(() => kv.set('_config/oauth/google', 'mine'))", "ok:null");
@@ -529,5 +544,12 @@ test "kv binding: _config/ resolves under the deployment, on the raw root only" 
         "mine",
         st.map.get(reserved.USER_KEY_ROOT ++ "_config/oauth/google").?,
     );
+    // The real row never moved.
     try testing.expectEqualStrings("one", st.map.get("_config/0000000000000001/oauth/google").?);
+
+    // ── the raw binding reads storage as it lies: no resolution ──
+    // (The config installer's rows arrive already deployment-scoped, so a
+    // resolving raw door would double-scope them.)
+    try expectEval(ctx, a, "__t(() => rawkv.get('_config/0000000000000002/oauth/google'))", "ok:\"two\"");
+    try expectEval(ctx, a, "__t(() => rawkv.get('_config/oauth/google'))", "ok:null");
 }

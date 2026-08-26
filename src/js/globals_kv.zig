@@ -665,3 +665,7 @@ pub const jsKvGet = B.jsKvGet;
 pub const jsKvSet = B.jsKvSet;
 pub const jsKvDelete = B.jsKvDelete;
 pub const jsKvPrefix = B.jsKvPrefix;
+/// The config door (rove#830) — root-independent by construction (it
+/// computes its own storage resolution), so either instantiation serves it;
+/// registered once from the handler-facing surface.
+pub const jsConfigGet = B.jsConfigGet;

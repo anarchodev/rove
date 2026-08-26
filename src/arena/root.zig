@@ -204,7 +204,7 @@ pub const ArenaKv = struct {
     /// not need one either: its reads come from the tape, which recorded the
     /// key the handler named.
     pub fn configScope(_: ArenaKv) u64 {
-        return 0;
+        return config_scope;
     }
 
     /// NOTE the binding treats the returned slice as borrowed for the
@@ -495,6 +495,24 @@ fn jsParkOutput(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSVal
 /// arenajs's base setup calls this (ROVE_ARENA): install the common binding
 /// over the wasm host + the arena natives. The same registration seam the
 /// native engines use.
+/// The config door's resolution scope for THIS run — the deployment the
+/// captured record ran under (0 = authored/visible spelling). Set by the
+/// shell through `__rove_set_config_scope` (a JS-callable native rather
+/// than a wasm C export: the emcc export list lives in arenajs's CMake,
+/// and a shell-control knob has no business needing a pin bump there).
+var config_scope: u64 = 0;
+
+fn jsSetConfigScope(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    if (argc < 1) return undef();
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (cstr == null) return undef();
+    defer c.JS_FreeCString(ctx, cstr);
+    const hex = @as([*]const u8, @ptrCast(cstr))[0..len];
+    config_scope = std.fmt.parseInt(u64, hex, 16) catch 0;
+    return undef();
+}
+
 export fn rove_arena_install(ctx: ?*c.JSContext) c_int {
     const g = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, g);
@@ -504,10 +522,16 @@ export fn rove_arena_install(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "delete", c.JS_NewCFunction2(ctx, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
+    // The config door (rove#830) — native like `kv`; the prelude excludes
+    // config.js for the same reason it excludes kv.js.
+    const cfg = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, cfg, "get", c.JS_NewCFunction2(ctx, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
+    if (c.JS_SetPropertyStr(ctx, g, "config", cfg) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_tag", c.JS_NewCFunction2(ctx, T.jsRequestTag, "__rove_request_tag", 2, c.JS_CFUNC_generic, 0));
     const SK = binding.ShredKey(c, ArenaTag);
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_shred_key", c.JS_NewCFunction2(ctx, SK.jsRequestShredKey, "__rove_request_shred_key", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, g, "__rove_set_config_scope", c.JS_NewCFunction2(ctx, jsSetConfigScope, "__rove_set_config_scope", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_divergence", c.JS_NewCFunction2(ctx, jsDivergence, "__rove_divergence", 0, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_park_output", c.JS_NewCFunction2(ctx, jsParkOutput, "__rove_park_output", 1, c.JS_CFUNC_generic, 0));
     return 0;

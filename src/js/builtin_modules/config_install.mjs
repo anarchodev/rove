@@ -34,8 +34,16 @@ export default function () {
         // so an identical write says nothing — and skipping keeps a re-run
         // from spending this activation's write budget, or a raft entry, on
         // work already done.
-        if (kv.get(p.key) === p.value) continue;
-        kv.set(p.key, p.value);
+        //
+        // `__rove.rootKv*`, not `kv.*`: the pairs arrive PRE-SCOPED
+        // (`_config/{dep_id}/…`) and must land in the engine namespace the
+        // config door reads (`config.get` resolves against it) — through the
+        // rooted handler binding they would reroot into this tenant's own
+        // keyspace and every reader would miss. This module is a baked
+        // `__system/` activation, which is exactly what the gated raw
+        // binding exists for.
+        if (__rove.rootKvGet(p.key) === p.value) continue;
+        __rove.rootKvSet(p.key, p.value);
         wrote += 1;
     }
     return { status: 200, body: { wrote: wrote, of: pairs.length } };

@@ -127,6 +127,14 @@ pub const World = struct {
     /// payload-less kinds, identity is always pinned, and the retired
     /// surfaces don't exist.
     captured: bool = false,
+    /// The deployment the capture ran under — the config door's resolution
+    /// scope (`config.get` resolves `_config/{name}` to
+    /// `_config/{dep:016x}/{name}` under it). 0 = an authored world: the
+    /// name resolves to its visible spelling, which is how a world seeds
+    /// config without knowing deployment ids exist. Carried in world.json as
+    /// a HEX STRING (a dep id is a 64-bit hash, above what a JS reader can
+    /// hold in a number).
+    deployment_id: u64 = 0,
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
@@ -194,7 +202,7 @@ pub const Error = error{BadWorld} || std.mem.Allocator.Error;
 /// spelling; world.zig reads `now_ms`) instead of silently running at epoch 0.
 const TOP_KEYS = [_][]const u8{
     "entry",   "activation", "export",  "source_dir", "ctx",     "seed",
-    "now_ms",  "arena_gc",   "captured", "request",   "kv",      "expected",
+    "now_ms",  "arena_gc",   "captured", "deployment_id", "request", "kv", "expected",
     "sources", "app_imports", "packages", "triggers", "kv_refusals",
     "kv_elided",
 };
@@ -295,6 +303,8 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     w.now_ms = jU64(obj, "now_ms") orelse 0;
     if (obj.get("arena_gc")) |gv| w.arena_gc = (gv == .bool and gv.bool);
     if (obj.get("captured")) |cv| w.captured = (cv == .bool and cv.bool);
+    if (jStr(obj, "deployment_id")) |dh|
+        w.deployment_id = std.fmt.parseInt(u64, dh, 16) catch return Error.BadWorld;
 
     // ── request surface ──
     if (obj.get("request")) |rv| {

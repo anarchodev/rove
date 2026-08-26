@@ -75,6 +75,13 @@ pub fn exempt(key: []const u8) bool {
 /// reason, as the binding's.
 pub fn storeKey(a: std.mem.Allocator, named: []const u8) ![]const u8 {
     if (exempt(named)) return named;
+    // `_config/` seeds RAW: config lives outside the handler root by design
+    // (the `config.get` door is the only way to read it, and a handler's
+    // literal `kv.get("_config/…")` reroots into its own keyspace). Rooting
+    // the seed would hide an authored world's config from the door — and a
+    // captured world's kv map holds the tape's deployment-scoped spelling,
+    // which is likewise storage's own.
+    if (std.mem.startsWith(u8, named, binding.guards.reserved.CONFIG_PREFIX)) return named;
     return std.mem.concat(a, u8, &.{ binding.guards.reserved.USER_KEY_ROOT, named });
 }
 
@@ -144,13 +151,13 @@ pub const OfflineKv = struct {
         return !host.activeReplaysOutcomes();
     }
 
-    /// Authored worlds have no release to scope `_config/` by, so a seeded
-    /// key reads back exactly as the world wrote it. A captured world does
-    /// not need one either: this binding is `.user`-rooted, where the config
-    /// resolution does not apply — handler-named config is the narrower
-    /// `config` capability's to serve, over a `.raw` binding.
+    /// The config door's resolution scope. An authored world's is 0 — a
+    /// seeded `_config/{name}` row reads back exactly as the world wrote it —
+    /// and a captured world's is the deployment the capture ran under
+    /// (`world.deployment_id`), so `config.get` resolves to the same
+    /// deployment-scoped stored keys the tape holds.
     pub fn configScope(_: OfflineKv) u64 {
-        return 0;
+        return host.active_config_scope;
     }
 
     pub fn tapedRefusal(_: OfflineKv, op: binding.WriteOp, key: []const u8) ?[]const u8 {
@@ -720,6 +727,14 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "delete", c.JS_NewCFunction2(ctx, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
+    // The config door (rove#830) — native here like `kv`, so the generated
+    // prelude excludes config.js the same way it excludes kv.js. Offline
+    // configScope 0 resolves a name to its visible spelling, which is how an
+    // authored world seeds config; a captured world's tape already holds the
+    // deployment-scoped stored key.
+    const cfg = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, cfg, "get", c.JS_NewCFunction2(ctx, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
+    if (c.JS_SetPropertyStr(ctx, g, "config", cfg) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
     // The common request.tag binding — the epilogue assigns it onto the
     // per-request `request` object (`request.tag = __rove_request_tag`).

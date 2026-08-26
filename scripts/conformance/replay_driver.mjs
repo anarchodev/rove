@@ -129,7 +129,13 @@ Module.tapes = {
 const USER_KEY_ROOT = "_user/";
 // The harness's cross-store facade addresses OTHER stores, so it is exempt from
 // the rooting on both sides — same carve-out the binding makes.
-const isExemptKey = (k) => k.startsWith("__rove_store/") || k === REPLAY_OUTPUT_KEY;
+const isExemptKey = (k) =>
+    k.startsWith("__rove_store/") || k === REPLAY_OUTPUT_KEY ||
+    // `_config/` lives outside the handler root by design: the `config.get`
+    // door (authored scope 0) reads it at the visible spelling, and a
+    // handler's literal `kv.get("_config/…")` reroots into its own keyspace
+    // — same exemption the native seeding makes (`kv_binding.storeKey`).
+    k.startsWith("_config/");
 const storeKey = (k) => (isExemptKey(k) ? k : USER_KEY_ROOT + k);
 const namedKey = (k) =>
     !isExemptKey(k) && k.startsWith(USER_KEY_ROOT) ? k.slice(USER_KEY_ROOT.length) : k;

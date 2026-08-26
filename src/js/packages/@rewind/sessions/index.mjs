@@ -229,7 +229,7 @@ const sessions = {
   fromConfig(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
-      const raw = kv.get("_config/sessions/" + name);
+      const raw = config.get("sessions/" + name);
       if (raw == null) {
         throw new Error("sessions.fromConfig: config not found at _config/sessions/" + name + ". Did you deploy the file?");
       }
