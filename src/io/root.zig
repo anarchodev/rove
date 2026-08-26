@@ -800,8 +800,11 @@ pub fn Io(comptime opts: Options) type {
         /// destruction proceeds without `Fd.deinit` needing an exception for
         /// teardown.
         ///
-        /// An upper layer holding conn collections of its own must close
-        /// those first — rove-h2 does, at the top of its `destroy`.
+        /// Under the archetype model, an upper layer holding conn
+        /// collections of its own must close those first — rove-h2 does,
+        /// at the top of its `destroy`. Under the fat model that contract
+        /// is gone: the sweep walks `all_conns` and evicts each member
+        /// into `conn_closing` from whichever collection holds it.
         ///
         /// The submit is the point. Without it the shutdown and close SQEs
         /// sit in the submission queue until `ring.deinit` discards them,
@@ -810,10 +813,25 @@ pub fn Io(comptime opts: Options) type {
         /// the kernel has the ops, and blocking teardown to watch them land
         /// buys the peer nothing it does not already have.
         pub fn shutdownAllConns(self: *Self) void {
-            for (self.connections.entitySlice()) |ent| {
-                if (self.reg.isStale(ent)) continue;
-                if (self.reg.isMoving(ent)) continue;
-                self.reg.move(ent, &self.connections, &self.conn_closing) catch continue;
+            if (comptime is_fat) {
+                // End every conn this instance ever created, wherever it
+                // lives — including collections an upper layer owns, which
+                // io cannot name; the type-erased evict recipe is what
+                // makes that expressible. Membership in all_conns is
+                // orthogonal to the moves, so the member list is stable
+                // across the loop (entities leave it only at destroy).
+                for (self.all_conns.members()) |ent| {
+                    if (self.reg.isStale(ent)) continue;
+                    if (self.reg.isMoving(ent)) continue;
+                    if (self.reg.isInCollection(ent, &self.conn_closing)) continue;
+                    self.reg.evictImmediate(ent, &self.conn_closing) catch continue;
+                }
+            } else {
+                for (self.connections.entitySlice()) |ent| {
+                    if (self.reg.isStale(ent)) continue;
+                    if (self.reg.isMoving(ent)) continue;
+                    self.reg.move(ent, &self.connections, &self.conn_closing) catch continue;
+                }
             }
             self.reg.flush() catch {};
             self.processConnClosing() catch {};
@@ -1759,6 +1777,44 @@ test "a peer that never finishes closing does not pin the slot" {
 // that stops rather than reports. What IS covered is the legal path: the
 // tests above assert `fd` is -1 by the time a conn is retired, which is the
 // condition that keeps the guard silent.
+
+test "fat: the sweep ends a conn adopted by a collection io cannot name" {
+    const FatIo = Io(.{ .registry_model = .fat });
+    var reg = try FatIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const io = FatIo.create(&reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer io.destroy();
+
+    // An upper layer's collection, in its own declared id space. io
+    // never names this type — the sweep reaches the conn through
+    // all_conns membership and the type-erased evict recipe.
+    var upper = try Collection(ConnectionBaseRow, .{}).init(testing.allocator);
+    defer upper.deinit();
+    reg.registerCollection(&upper, 40);
+
+    const conn = try reg.create(&io.connections);
+    try reg.set(conn, &io.connections, Fd, .{ .fd = 2 });
+    _ = try reg.join(conn, &io.all_conns);
+    try reg.moveImmediate(conn, &io.connections, &upper);
+
+    io.shutdownAllConns();
+
+    // Swept: extracted from the foreign collection into conn_closing,
+    // shutdown posted, descriptor slot given up — the ordinary teardown,
+    // reached without io knowing where the conn lived.
+    try testing.expect(reg.isInCollection(conn, &io.conn_closing));
+    try testing.expect((try reg.get(conn, &io.conn_closing, ClosingState)).shutdown_posted);
+    try testing.expectEqual(@as(i32, -1), (try reg.get(conn, &io.conn_closing, Fd)).fd);
+    try testing.expectEqual(@as(u32, 0), upper.count);
+}
 
 test "a connect target survives the swap-remove that reshuffles its neighbours" {
     // The bug this guards: two concurrent connects each handed the kernel

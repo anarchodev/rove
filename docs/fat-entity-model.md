@@ -266,11 +266,18 @@ compile error. Verified by the churn probe: 500 sequential connections
 against a ~224-conn admission budget stalls within the first 256 if a
 member ever leaks.
 
-Still unbuilt from the example: sweeping `all_conns` at shutdown (ending
-conns held in foreign collections needs the type-erased *evict* recipe —
-park the row, remove from the collection — symmetric with the existing
-destroy recipe). Until then the shutdown sweep keeps its
-close-your-own-first contract; the admission contract is gone.
+The evict recipe is BUILT too: `evictImmediate(entity, dst)` extracts
+from whatever collection holds the entity through a type-erased
+per-collection recipe (park the whole row, remove) and inserts into a
+typed destination — the destination slot reserved first so failure
+never leaves the entity collection-less, and there is deliberately no
+observable in-no-collection state. io's shutdown sweep (fat model)
+walks `all_conns` and evicts every member into `conn_closing` from
+wherever it lives, verified by a test that adopts a conn into a
+collection io cannot name and watches the sweep end it anyway. With
+that, io under the fat model has **zero hooks and zero residency
+contracts**: create it, and it comes back to you — for the component,
+the aggregate, and now the shutdown.
 
 ## Prior art
 
