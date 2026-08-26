@@ -19,14 +19,37 @@ fat-bench (parity at every altitude measured).
 
 ## 1 — Universe composition (blocks the h2 port)
 
-- [ ] A way for a stacking layer to widen the universe: either an
-      `extra_components: Row` option threading up from the top, or the
-      app computes the union and hands the `Reg` type into each layer.
-      Mirrors what coll-enum already does for the id namespace with
-      `opts.extra_collections`.
-- [ ] "In the world, materialized nowhere": a component in no row
-      currently has no shadow field. Same mechanism as above — the
-      universe must be declarable beyond the union of rows.
+"Top" is a role, not a layer: whoever terminates the stack in a given
+program (echo example → io directly; h2-echo example → h2; the rewind
+worker → h2 + its own collections — the case `extra_collections`
+already exists for). The design must work when top is two layers above
+io with components io has never heard of.
+
+- [ ] **`extra_components: Row` at every layer boundary, folded
+      downward.** Each layer merges its own non-row components plus its
+      caller's extras into what it passes the layer below; io (bottom)
+      computes `universe = own_rows ∪ extras` and defines `Reg`; each
+      layer re-exports `pub const Reg = Below.Reg`. Exactly parallel to
+      `extra_collections` for the id namespace — one aggregate per
+      boundary, threaded down.
+      - Division of labor: the BOTTOM defines the type, MIDDLES fold
+        and forward, the TOP contributes, constructs the registry
+        value (`Reg.init`), and registers its own collections against
+        it. Row options stay the materialization requests ("in your
+        views"); extra_components is existence ("in the world").
+- [ ] **No ordering fragility, unlike the id enum.** Row unions are
+      canonical (sorted, deduplicated), so the same component set gives
+      the identical type regardless of merge order or which layer
+      computes it — no prefix assertion needed; a mismatched union is a
+      pointer-coercion error at the seam, a missing component is the
+      coverage error at the offender's own registerCollection, both at
+      compile time.
+- [ ] **Gap B, same mechanism:** "in the world, materialized nowhere" —
+      a component in no row gets its shadow field via extra_components
+      alone; the materialization knob's zero position.
+- [ ] Build FLAT (a single Row per boundary); when axes (item 4) land,
+      the contribution becomes per-axis and the re-grouping is
+      mechanical. Do not block the h2 port on axes.
 
 ## 2 — The h2 port (the real consumer test)
 
