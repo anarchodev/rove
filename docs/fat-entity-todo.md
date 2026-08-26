@@ -117,8 +117,17 @@ comes last so only the constraints that survive 4a–4c get syntax.
       edge: re-enter restores parked values (path-independence); the
       system deciding `leave` owns resetting first if policy wants a
       fresh start — same contract as `fd = -1` at close. A set is a
-      partial axis with zero components; whether sets keep the bitmask
-      implementation is an implementation choice, not semantic.
+      partial axis with zero components — and at this step the
+      implementations MERGE (no half-refactor): EntitySet is deleted;
+      sets become Collection(empty row) on one-state axes (the shared
+      recipes' component loops vanish at comptime for an empty row);
+      the set's sparse table moves into the per-axis offsets where it
+      always belonged; the membership mask is deleted too (its drain
+      win is moot when destroy walks K axis bytes anyway) and may
+      return as a private compression only if dozens of tag axes ever
+      exist. What stays distinct is verb availability derived from
+      axis shape: total = create/move/evict, no leave; multi-state
+      partial = enter/move/leave; one-state partial = enter/leave.
 - [ ] **4d. Cross-axis constraints ("entanglement") — the real design
       work.** Two attachment points: edge-attached clauses (precise,
       but every call site must repeat them — forgettable) vs
