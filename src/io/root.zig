@@ -182,31 +182,29 @@ pub const WriteBuf = struct {
 
 pub const IoResult = struct { err: i32 = 0 };
 
-/// Target address for an outgoing `prep_connect`. The address is
-/// **heap-owned** — stored via a pointer rather than inline — so
-/// that `&addr.any` can be handed directly to io_uring and survive
-/// any rove swap-remove that reshuffles the source collection's
-/// column storage.
+/// Marks a connect entity as having a target address parked in io's
+/// `connect_addrs` table. The address itself is NOT here.
 ///
-/// This is the same shape as `WriteBuf` (whose `data` field is a
-/// pointer into heap memory): components that hold buffers the
-/// kernel reads asynchronously MUST store pointers, not values —
-/// see rove-library principle "Kernel-Visible Buffers Live Behind
-/// Pointers." Taking `&column_field` and handing it to io_uring
-/// would be invalidated by swap-remove the instant the owning
-/// entity moves collections.
+/// `prep_connect` needs an address whose lifetime outlives the SQE, and a
+/// component field cannot provide one: components live in columnar arrays,
+/// and a move does a swap-remove that copies the tail entity's row over the
+/// vacated slot. Two concurrent connects once cross-wired their destinations
+/// exactly that way — each had handed the kernel `&ConnectAddr.addr.any`, and
+/// swap-remove wrote the other entity's target into the slot before either
+/// SQE ran. One session's requests landed on the other session's socket.
+/// That is rove-library principle "Kernel-Visible Buffers Live Behind
+/// Pointers."
 ///
-/// `deinit` frees the allocation. Rove calls it when the entity is
-/// destroyed from a collection containing `ConnectAddr`, or when
-/// the component is stripped during a `moveStrip` transition (e.g.
-/// the `_connect_pending → connections` strip after a successful
-/// connect).
+/// The old fix was a heap allocation per connect, with a `deinit` to free it.
+/// A fixed table indexed by `entity.index` is the better one: `entity.index`
+/// is stable across every move, the slot never relocates, and there is
+/// nothing to free — so no destructor, and no way to leak one by forgetting
+/// a strip list. See `Io.connect_addrs`.
 pub const ConnectAddr = struct {
-    addr: *std.net.Address,
-
-    pub fn deinit(allocator: std.mem.Allocator, items: []ConnectAddr) void {
-        for (items) |it| allocator.destroy(it.addr);
-    }
+    /// The entity whose `connect_addrs` slot holds the address. Carried so
+    /// the component is self-describing; io indexes by it rather than
+    /// requiring callers to keep the pairing straight.
+    owner: Entity = Entity.nil,
 };
 
 /// Links a connection to its read-cycle entity. When the connection
@@ -357,6 +355,14 @@ pub fn Io(comptime opts: Options) type {
         /// Unprefixed on purpose: this is a seam other code moves entities
         /// into, like `read_in` / `write_in`, not internal bookkeeping.
         conn_closing: ClosingColl,
+
+        /// Connect targets, indexed by `entity.index`. Sized at startup from
+        /// the registry's entity capacity and never resized, so a slot's
+        /// address is stable for as long as the entity is — which is what
+        /// `prep_connect` requires and what a component column cannot give
+        /// (see `ConnectAddr`). Nothing to free: a slot is reused by the next
+        /// entity to claim that index.
+        connect_addrs: []std.net.Address,
         read_results: ReadResultColl,
         write_results: WriteResultColl,
         read_in: ReadInColl,
@@ -452,6 +458,15 @@ pub fn Io(comptime opts: Options) type {
             return self.reg.getAny(entity, .{ &self.connections, &self.conn_closing }, Fd) catch null;
         }
 
+        /// Park a connect target for `entity` and mark the component. The
+        /// address lives in `connect_addrs`, not in the component, because
+        /// only the table's slot is stable enough to hand to `prep_connect`.
+        pub fn setConnectAddr(self: *Self, entity: Entity, coll: anytype, addr: std.net.Address) !void {
+            if (!has_connect) @compileError("setConnectAddr requires .connect = true");
+            self.connect_addrs[entity.index] = addr;
+            try self.reg.set(entity, coll, ConnectAddr, .{ .owner = entity });
+        }
+
         /// Register an external FD resolver. Used by rove-h2 to search its own
         /// connection collections (_conn_active, _conn_tls_handshake).
         pub fn setFdResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*Fd) void {
@@ -539,6 +554,10 @@ pub fn Io(comptime opts: Options) type {
             self.* = .{
                 .connections = try ConnColl.init(allocator),
                 .conn_closing = try ClosingColl.init(allocator),
+                .connect_addrs = if (has_connect)
+                    try allocator.alloc(std.net.Address, reg.max_entities)
+                else
+                    &.{},
                 .read_results = try ReadResultColl.init(allocator),
                 .write_results = try WriteResultColl.init(allocator),
                 .read_in = try ReadInColl.init(allocator),
@@ -631,6 +650,7 @@ pub fn Io(comptime opts: Options) type {
             self.shutdownAllConns();
             self.connections.deinit();
             self.conn_closing.deinit();
+            if (has_connect) allocator.free(self.connect_addrs);
             self.read_results.deinit();
             self.write_results.deinit();
             self.read_in.deinit();
@@ -1134,15 +1154,14 @@ pub fn Io(comptime opts: Options) type {
             );
             nodelay_sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-            // `ca.addr` is a heap pointer (see `ConnectAddr` docs),
-            // so `&ca.addr.any` points into a stable heap allocation
-            // that survives the `moveImmediate` swap-remove below.
-            // No `ring.submit()` dance required — the pointer stays
-            // valid until the connect CQE fires and the strip move
-            // frees the storage via `ConnectAddr.deinit`.
-            const ca = try self.reg.get(entity, &self._connect_socket_pending, ConnectAddr);
+            // The address lives in `connect_addrs`, indexed by
+            // `entity.index` — a slot that does not move, unlike a component
+            // column, which swap-remove reshuffles the instant the entity
+            // changes collections. Nothing to free here, and nothing a strip
+            // list has to remember.
+            const target = &self.connect_addrs[entity.index];
             const sqe = try getSqeOrSubmit(&self.ring);
-            sqe.prep_connect(slot, &ca.addr.any, ca.addr.getOsSockLen());
+            sqe.prep_connect(slot, &target.any, target.getOsSockLen());
             sqe.flags |= linux.IOSQE_FIXED_FILE;
             sqe.user_data = encodeEntity(entity);
 
@@ -1172,6 +1191,8 @@ pub fn Io(comptime opts: Options) type {
             try self.armRecv(read_ent, slot);
 
             try self.reg.moveStripImmediate(entity, &self._connect_pending, &self.connections, &.{ ConnectAddr, IoResult });
+            // The `connect_addrs` slot needs no cleanup — the next entity to
+            // take this index overwrites it.
         }
 
         // =============================================================
@@ -1463,3 +1484,47 @@ test "a peer that never finishes closing does not pin the slot" {
 // that stops rather than reports. What IS covered is the legal path: the
 // tests above assert `fd` is -1 by the time a conn is retired, which is the
 // condition that keeps the guard silent.
+
+test "a connect target survives the swap-remove that reshuffles its neighbours" {
+    // The bug this guards: two concurrent connects each handed the kernel
+    // `&ConnectAddr.addr.any` — a pointer INTO the column — and swap-remove
+    // copied the other entity's target over the slot before either SQE ran.
+    // One session's requests landed on the other session's socket. A table
+    // indexed by `entity.index` cannot do that: the slot is the entity's for
+    // as long as the entity exists, whatever its collection does.
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+
+    const IoType = Io(.{ .connect = true });
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    const io = IoType.create(&reg, testing.allocator, addr, .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer io.destroy();
+
+    const a_addr = try std.net.Address.parseIp("10.0.0.1", 1111);
+    const b_addr = try std.net.Address.parseIp("10.0.0.2", 2222);
+
+    const a = try reg.create(&io.connect_in);
+    const b = try reg.create(&io.connect_in);
+    try io.setConnectAddr(a, &io.connect_in, a_addr);
+    try io.setConnectAddr(b, &io.connect_in, b_addr);
+
+    // Take `a` out from under `b`: `removeRun` swap-removes, copying the tail
+    // row over the vacated slot. Under the old layout this is the exact moment
+    // `&b`'s column pointer started referring to someone else's bytes.
+    try reg.moveImmediate(a, &io.connect_in, &io._connect_socket_pending);
+
+    try testing.expect(io.connect_addrs[a.index].eql(a_addr));
+    try testing.expect(io.connect_addrs[b.index].eql(b_addr));
+
+    // And the component still names its own entity after the move.
+    const ca = try reg.get(a, &io._connect_socket_pending, ConnectAddr);
+    try testing.expect(ca.owner.eql(a));
+}
