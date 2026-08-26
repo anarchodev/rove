@@ -50,6 +50,27 @@ pub const FatRegistryConfig = struct {
     deferred_queue_capacity: u32 = 256,
 };
 
+/// A typed pointer bundle over one entity's components for a declared
+/// Row — the fat model's "cast to a row type". Each pointer resolves to
+/// the component's live home at construction: the owning collection's
+/// column where materialized, the shadow slot otherwise. One live home
+/// per component is what makes the bundle coherent with zero copies —
+/// there is nothing to merge, and no contiguous row exists to return:
+/// a "row" is N pointers here exactly as it is N columns everywhere
+/// else in the system.
+///
+/// Validity is the WEAKEST member guarantee: pointers into columns die
+/// at the next flush/immediate op, so treat the whole bundle that way.
+pub fn RowView(comptime R: type) type {
+    return struct {
+        ptrs: [R.len]*anyopaque,
+
+        pub fn at(self: @This(), comptime T: type) *T {
+            return @ptrCast(@alignCast(self.ptrs[comptime R.indexOf(T)]));
+        }
+    };
+}
+
 fn toAlignment(comptime bytes: comptime_int) std.mem.Alignment {
     return @enumFromInt(std.math.log2_int(usize, bytes));
 }
@@ -529,6 +550,22 @@ pub fn FatRegistry(comptime Universe: type) type {
             // 0 is the registry's free pool and is never a collection.
             if (raw == 0) return null;
             return raw;
+        }
+
+        /// Cast the entity to a row type: one handle validation, then one
+        /// `getFat` resolution per component of R. The RowType is the call
+        /// site's DECLARED claim about which component set is meaningful
+        /// for this entity here — greppable and universe-checked, where a
+        /// bare `getFat` is anonymous point access. Access only; it does
+        /// not move the entity, materialize anything into a collection,
+        /// or check freshness (a member never written reads as declared
+        /// defaults, like any other fat read).
+        pub inline fn getRow(self: *Self, entity: Entity, comptime R: type) !RowView(R) {
+            var view: RowView(R) = undefined;
+            inline for (R.types, 0..) |T, i| {
+                view.ptrs[i] = @ptrCast(try self.getFat(entity, T));
+            }
+            return view;
         }
 
         // =============================================================
@@ -1026,6 +1063,61 @@ test "moveStripImmediate — the strip list parks instead of destroying" {
 
     try reg.moveImmediate(e, &narrow, &with_fd);
     try testing.expectEqual(@as(i32, 8), (try reg.get(e, &with_fd, Fdish)).fd);
+}
+
+test "getRow — one bundle spans materialized and parked components" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var with_fd = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator);
+    defer with_fd.deinit();
+    reg.registerCollection(&with_fd, 1);
+
+    var wide = try Collection(Row(&.{ Position, Fdish, Velocity }), .{}).init(testing.allocator);
+    defer wide.deinit();
+    reg.registerCollection(&wide, 2);
+
+    const e = try reg.create(&with_fd);
+    try reg.set(e, &with_fd, Fdish, .{ .fd = 4 });
+
+    const v = try reg.getRow(e, Row(&.{ Position, Fdish, Velocity }));
+
+    // Materialized members resolve to the columns (same pointers as get);
+    // Velocity is not in the current row, so it resolves to the shadow
+    // and reads as declared defaults.
+    try testing.expectEqual(try reg.get(e, &with_fd, Position), v.at(Position));
+    try testing.expectEqual(try reg.get(e, &with_fd, Fdish), v.at(Fdish));
+    try testing.expectEqual(@as(i32, 4), v.at(Fdish).fd);
+    try testing.expectEqual(@as(f32, 0), v.at(Velocity).x);
+
+    // Writes through the view hit the live copy on both sides of the
+    // split: the column write is visible to get, and the shadow write
+    // rides into a column when the entity gains the component.
+    v.at(Fdish).fd = 5;
+    v.at(Velocity).* = .{ .x = 9, .y = 0 };
+    try testing.expectEqual(@as(i32, 5), (try reg.get(e, &with_fd, Fdish)).fd);
+
+    try reg.move(e, &with_fd, &wide);
+    try reg.flush();
+    try testing.expectEqual(@as(f32, 9), (try reg.get(e, &wide, Velocity)).x);
+}
+
+test "getRow — ZST members and stale handles" {
+    var reg = try testReg();
+    defer reg.deinit();
+
+    var coll = try Collection(Row(&.{ Position, Tag }), .{}).init(testing.allocator);
+    defer coll.deinit();
+    reg.registerCollection(&coll, 1);
+
+    const e = try reg.create(&coll);
+    const v = try reg.getRow(e, Row(&.{ Position, Tag }));
+    _ = v.at(Tag);
+    try testing.expectEqual(try reg.get(e, &coll, Position), v.at(Position));
+
+    try reg.destroy(e);
+    try reg.flush();
+    try testing.expectError(error.Stale, reg.getRow(e, Row(&.{Position})));
 }
 
 test "destroy — entity leaves, handle goes stale, pool refills" {
