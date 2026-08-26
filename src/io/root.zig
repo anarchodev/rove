@@ -813,15 +813,19 @@ pub fn Io(comptime opts: Options) type {
         /// the kernel has the ops, and blocking teardown to watch them land
         /// buys the peer nothing it does not already have.
         pub fn shutdownAllConns(self: *Self) void {
-            // Retire the deferred queue first. The sweep must skip
-            // PENDING_MOVE entities (immediate ops over a queued op's
-            // captured offsets would corrupt the flush), so a conn
-            // mid-move at sweep time would otherwise be skipped, land in
-            // its destination at the tail flush — after the loop already
-            // passed it — and never close. Flushing first means no entity
-            // is pending and "all" means all; the isMoving guard below
-            // stays as defense, vestigial on this path.
-            self.reg.flush() catch {};
+            // PRECONDITION: the deferred queue is empty — the caller
+            // flushes at a boundary it owns before teardown. Checked
+            // loudly rather than flushed away here: flushes live outside
+            // systems, and a flush in here would execute other systems'
+            // queued ops at a point their enqueuer did not choose. Left
+            // unchecked, a dirty queue makes the sweep silently partial:
+            // a conn mid-move is skipped as pending, lands in its
+            // destination at the tail flush after the loop has passed
+            // it, and never closes.
+            if (self.reg.deferred_count != 0) std.debug.panic(
+                "shutdownAllConns: {d} deferred op(s) queued — flush at a caller-owned boundary before teardown",
+                .{self.reg.deferred_count},
+            );
             if (comptime is_fat) {
                 // End every conn this instance ever created, wherever it
                 // lives — including collections an upper layer owns, which
@@ -1814,15 +1818,14 @@ test "fat: the sweep ends a conn adopted by a collection io cannot name" {
     _ = try reg.join(conn, &io.all_conns);
     try reg.moveImmediate(conn, &io.connections, &upper);
 
-    // A second conn caught MID-MOVE at sweep time: the deferred move to
-    // the foreign collection is enqueued but not flushed. The sweep must
-    // retire the queue before walking, or this conn would be skipped as
-    // pending, land in `upper` after the loop, and never close.
+    // A second conn whose deferred move to the foreign collection lands
+    // at the caller-owned flush that is shutdownAllConns's precondition.
+    // The sweep must still find and close it over there.
     const conn2 = try reg.create(&io.connections);
     try reg.set(conn2, &io.connections, Fd, .{ .fd = 3 });
     _ = try reg.join(conn2, &io.all_conns);
     try reg.move(conn2, &io.connections, &upper);
-    try testing.expect(reg.isMoving(conn2));
+    try reg.flush(); // the boundary the precondition demands
 
     io.shutdownAllConns();
 
