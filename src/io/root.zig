@@ -343,11 +343,21 @@ fn decodeEntity(user_data: u64) Entity {
 // Io type
 // =============================================================================
 
+/// Which storage model backs the shared registry. `.archetype` is
+/// `rove.Registry` (row = storage; moves require the subset rule).
+/// `.fat` is `rove.FatRegistry` (shadow store + collections as views;
+/// moves are total and lossless, and NO lifecycle hooks run — the
+/// deinit residue on io's components, counters and the Fd bypass
+/// abort, is silent under this model; release itself is already by
+/// transition either way).
+pub const RegistryModel = enum { archetype, fat };
+
 pub const Options = struct {
     connection_row: type = Row(&.{}),
     read_row: type = Row(&.{}),
     write_row: type = Row(&.{}),
     connect: bool = false,
+    registry_model: RegistryModel = .archetype,
 };
 
 pub const IoOptions = struct {
@@ -431,8 +441,29 @@ pub fn Io(comptime opts: Options) type {
     const ConnectSocketPendingColl = if (has_connect) Collection(connect_socket_pending_row, .{}) else void;
     const ConnectPendingColl = if (has_connect) Collection(connect_pending_row, .{}) else void;
 
+    const is_fat = opts.registry_model == .fat;
+    // The fat registry's comptime-closed component world: the union of
+    // every row io declares, user fragments included. This is the
+    // gather-up point — a composing layer that shares the registry must
+    // build its own union and instantiate the registry off that instead.
+    const universe_base = conn_row
+        .merge(ClosingBaseRow.merge(opts.connection_row))
+        .merge(read_row)
+        .merge(write_in_row)
+        .merge(write_result_row);
+    const universe = if (has_connect)
+        universe_base.merge(connect_in_row).merge(connect_error_row)
+    else
+        universe_base;
+
     return struct {
         const Self = @This();
+
+        /// The registry type this instantiation runs on. Callers create
+        /// one of these and pass it to `create` — the two models' configs
+        /// share field names, so an anonymous `.{ .max_entities = N }`
+        /// literal works for either.
+        pub const Reg = if (is_fat) rove.FatRegistry(universe) else Registry;
 
         // Public collection types (for external access to row types)
         pub const ConnectionRow = conn_row;
@@ -548,7 +579,7 @@ pub fn Io(comptime opts: Options) type {
         conn_closing_retired: u64 = 0,
         conn_closing_deadline_expired: u64 = 0,
 
-        reg: *Registry,
+        reg: *Reg,
         allocator: std.mem.Allocator,
 
         const BUF_GROUP_ID: u16 = 0;
@@ -565,6 +596,11 @@ pub fn Io(comptime opts: Options) type {
             if (self.fd_resolver) |resolver| {
                 return resolver(self.fd_resolver_ctx.?, entity);
             }
+            // Under the fat model the component resolves wherever the
+            // entity is — the candidate set (and the resolver hooks above)
+            // exist only because archetype storage cannot answer without
+            // one. Callers pass conn entities only.
+            if (comptime is_fat) return self.reg.getFat(entity, Fd) catch null;
             return self.reg.getAny(entity, .{ &self.connections, &self.conn_closing }, Fd) catch null;
         }
 
@@ -592,6 +628,7 @@ pub fn Io(comptime opts: Options) type {
             if (self.peer_resolver) |resolver| {
                 return resolver(self.peer_resolver_ctx.?, entity);
             }
+            if (comptime is_fat) return self.reg.getFat(entity, PeerAddr) catch null;
             return self.reg.getAny(entity, .{ &self.connections, &self.conn_closing }, PeerAddr) catch null;
         }
 
@@ -609,7 +646,7 @@ pub fn Io(comptime opts: Options) type {
             self.extra_conns_fn = f;
         }
 
-        pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
+        pub fn create(reg: *Reg, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
             var ring = if (io_opts.ring_params) |params|
                 try linux.IoUring.init_params(io_opts.ring_entries, params)
             else
@@ -689,7 +726,10 @@ pub fn Io(comptime opts: Options) type {
                 .cleanup_ctx = .{
                     .ring = undefined, // set below
                     .max_connections = io_opts.max_connections,
-                    .reg = reg,
+                    // The ctx feeds deinit hooks, and the fat registry runs
+                    // none — the pointer is never read under that model, and
+                    // its declared type is the archetype registry's.
+                    .reg = if (comptime is_fat) undefined else reg,
                     .buf_ring = br,
                     .buf_base = buf_base,
                     .buf_size = io_opts.buf_size,
@@ -712,10 +752,16 @@ pub fn Io(comptime opts: Options) type {
             // the buffer (if any) to the registered ring when its
             // owning read entity is destroyed — the fix for the
             // leak that drained the ring at xargs+curl workloads.
-            reg.setDeinitCtx(Fd, &self.cleanup_ctx);
-            reg.setDeinitCtx(WriteBuf, &self.cleanup_ctx);
-            reg.setDeinitCtx(ReadCycleEntity, &self.cleanup_ctx);
-            reg.setDeinitCtx(ReadResult, &self.cleanup_ctx);
+            // The fat registry has no hook machinery: release is by
+            // transition on every live path already, so under that model
+            // these hooks' residue (bypass counters, the Fd abort) is
+            // simply absent.
+            if (comptime !is_fat) {
+                reg.setDeinitCtx(Fd, &self.cleanup_ctx);
+                reg.setDeinitCtx(WriteBuf, &self.cleanup_ctx);
+                reg.setDeinitCtx(ReadCycleEntity, &self.cleanup_ctx);
+                reg.setDeinitCtx(ReadResult, &self.cleanup_ctx);
+            }
 
             return self;
         }
@@ -987,7 +1033,11 @@ pub fn Io(comptime opts: Options) type {
         fn releaseReadCycle(self: *Self, cycle: ReadCycleEntity) void {
             const e = cycle.entity;
             if (e.isNil() or self.reg.isStale(e)) return;
-            if (self.reg.getAny(e, .{ &self._read_pending, &self.read_in, &self.read_results }, ReadResult) catch null) |rr| {
+            const found: ?*ReadResult = if (comptime is_fat)
+                self.reg.getFat(e, ReadResult) catch null
+            else
+                self.reg.getAny(e, .{ &self._read_pending, &self.read_in, &self.read_results }, ReadResult) catch null;
+            if (found) |rr| {
                 if (rr.data != null) {
                     const mask = linux.IoUring.buf_ring_mask(self.buf_count);
                     self.returnBufferToRing(rr.buf_id, mask, 0);
