@@ -1044,6 +1044,27 @@ pub fn build(b: *std.Build) void {
     const echo_step = b.step("echo-server", "Run the echo server example");
     echo_step.dependOn(&run_echo.step);
 
+    // echo server on the fat-entity registry model (port 8081)
+    const echo_fat_mod = b.addModule("echo-server-fat", .{
+        .root_source_file = b.path("examples/echo_server_fat.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    echo_fat_mod.addImport("rove-io", io_mod);
+
+    const echo_server_fat = b.addExecutable(.{
+        .name = "echo-server-fat",
+        .root_module = echo_fat_mod,
+    });
+    b.installArtifact(echo_server_fat);
+
+    const run_echo_fat = b.addRunArtifact(echo_server_fat);
+    const echo_fat_step = b.step("echo-server-fat", "Run the echo server example on the fat-entity registry");
+    echo_fat_step.dependOn(&run_echo_fat.step);
+    // The one artifact that instantiates Io under the fat registry model —
+    // gate its compile or that whole comptime path rots invisibly.
+    test_step.dependOn(&echo_server_fat.step);
+
     // h2 echo server
     const h2_echo_mod = b.addModule("h2-echo-server", .{
         .root_source_file = b.path("examples/h2_echo_server.zig"),
