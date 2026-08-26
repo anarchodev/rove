@@ -500,6 +500,7 @@ pub const Registry = struct {
 
             // Comptime validation per pair
             comptime {
+                @setEvalBranchQuota(100_000);
                 if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
                     @compileError("moveAny: source row is not a subset of destination row");
                 }
