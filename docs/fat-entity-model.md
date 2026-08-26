@@ -288,10 +288,20 @@ every bystander swap-fill — hot-path cost to speed a cold path), and
 instead SORT THE WORKLIST at the point of batch eviction — a one-byte
 counting pass on collection id, offsets within. For an all-members set
 like `all_conns` each bucket's offsets are the complete contiguous
-range, so K entities across M collections coalesce into M queue entries
-and, with a count-N evict recipe, into M memcpy-grade batch extractions.
-The same division of labor as a bitmap index scan: the index stays cheap
-to maintain, the consumer imposes physical order per operation.
+range, so K entities across M collections coalesce into M queue entries.
+Runs form at ENQUEUE (RLE over the sorted worklist); a count-N evict
+recipe then executes each run batched, as deferred moves already do.
+One honest asymmetry: the shadow is entity-indexed, so park/unpark is
+scatter/gather per entity even batched — the count-N recipe coalesces
+removeRun, reserve, and handles, and makes column access sequential,
+but not the component transfers. Full memcpy-grade needs the shadow
+BYPASS: the destination is comptime-known, so components the source
+also materializes (a null-check in the erased accessor table) copy
+column-to-column, one memcpy per component per run; only the row
+difference parks or defaults. For the sweep (conn row vs closing row
+differ by ClosingState alone) that is nearly everything. The same
+division of labor as a bitmap index scan: the index stays cheap to
+maintain, the consumer imposes physical order per operation.
 
 ## Prior art
 
