@@ -485,6 +485,19 @@ pub fn build(b: *std.Build) void {
     const fat_bench_step = b.step("fat-bench", "Run the core-ECS move-cost microbenchmark (ReleaseFast)");
     fat_bench_step.dependOn(&b.addRunArtifact(fat_bench).step);
 
+    // access-bench: dense-walk vs gather vs flag-scan — the memory-hierarchy
+    // number behind collections-as-dense-arrays. Same ReleaseFast isolation
+    // as fat-bench; the gate compiles it, only the step runs it.
+    const access_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/rove/access_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const access_bench = b.addExecutable(.{ .name = "access-bench", .root_module = access_bench_mod });
+    test_step.dependOn(&access_bench.step);
+    const access_bench_step = b.step("access-bench", "Run the access-pattern microbenchmark (ReleaseFast)");
+    access_bench_step.dependOn(&b.addRunArtifact(access_bench).step);
+
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);
