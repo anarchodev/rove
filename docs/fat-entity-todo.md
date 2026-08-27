@@ -409,23 +409,36 @@ axis and per-axis offsets stay exact under swap-remove churn.
       explicit release or funnel routings (WS chains/messages,
       parked-unit arms, blob sessions, snapshot aborts). Full suite
       167/168 (only #892's false pass).
-- [ ] **Drop the legacy registry** — the deletion arc: rove.Registry,
-      the archetype branches in io/h2 (deinit-hook machinery,
-      resolver hooks, CollEnum/activeNames/extra_collections, the
-      subset rule, the Only aliases), the close_requested retirement
-      (closeConn → pending-tolerant evictOnly; flag + counter +
-      retryPendingCloses deleted), archetype examples ported or
-      deleted, fat-bench loses its control. NOTE: this arc IS the
-      adoption decision the process section reserves — converting
-      every consumer and deleting the alternative is "rove becomes
-      this"; PLAN/decisions.md graduation happens when the branch
-      merges.
+- [x] **Drop the legacy registry — DONE 2026-08-27 (f2c4dc39,
+      −2,448 net lines).** rove.Registry deleted with its 28 tests;
+      Collection loses ALL lifecycle-hook machinery (which also
+      killed a latent teardown double-free — the hook loop re-freeing
+      what the world-era sweeps freed); io loses RegistryModel,
+      CollEnum/activeNames, the resolver/extra-conns hook API,
+      IoCleanupCtx and the destructor-era component deinits (their
+      invariants live on as struct docs naming the owning
+      transitions); h2 loses the archetype Coll enum,
+      extra_collections, the prefix contract, the thunks, and
+      destroyEntity's archetype arm; closeConn drops the candidate
+      tuple for pending-tolerant evictOnly and the close_requested
+      flag + counter + retryPendingCloses die with the refusability
+      that created them; examples all fat (the -fat duplicates
+      dissolved INTO the canonical files, contracts kept); fat-bench
+      is fat-only (historical comparison tables preserved in
+      fat-entity-model.md); every remaining test runs on a
+      mini-world. Wire metric identities kept (two destructor-era
+      counters read constant 0). This closed the adoption decision:
+      rove IS the fat model.
 
 ## Process, before merging anywhere
 
-- [ ] Smoke suite green with baseline (see item 2).
-- [ ] Decide the relationship to the parked `coll-enum` branch (this
-      branch contains it; landing either implies sequencing).
-- [ ] The actual adoption decision — "does rove become this" — is
-      deliberately not argued in the model doc and needs its own
-      conversation, with PLAN/decisions.md updates if yes.
+- [x] Smoke suite green with baseline — run at every conversion step
+      and after the drop.
+- [x] The parked `coll-enum` branch: contained in this branch and
+      long superseded by the world tables; nothing to sequence.
+- [x] The adoption decision — MADE 2026-08-27: every binary
+      converted, the legacy registry deleted. What remains at merge
+      time: PLAN.md + decisions.md graduation (record the model, the
+      rejected alternatives — constraint tables, per-request arenas —
+      and the funnel-verb release discipline), and CLAUDE.md's
+      architecture section (updated on this branch).
