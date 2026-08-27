@@ -313,6 +313,15 @@ fn collRowFor(comptime opts: Options, comptime kind: CollKind) type {
     };
 }
 
+/// The server-stream row this Options value produces — for a composer
+/// declaring its own collections on the same row (the worker's parked
+/// stream states). Identity with the instantiated `H2(...).StreamRow`
+/// holds because the row computation is shared and memoized on the
+/// same fragments.
+pub fn StreamRowFor(comptime opts: Options) type {
+    return RowsFor(opts).stream;
+}
+
 /// h2's contribution to a declared world: io's parts (with the io
 /// options this layer derives) followed by h2's own. A binary on the
 /// fat model composes its root `rove_world` from this — appending its
@@ -819,7 +828,7 @@ pub fn H2(comptime opts: Options) type {
         };
 
         comptime {
-            @setEvalBranchQuota(100_000);
+            @setEvalBranchQuota(1_000_000);
             // io numbers itself off its own name list (threading model
             // only — under a declared world every id comes from the
             // world's one table), so `Coll` must place io's names first
@@ -865,7 +874,7 @@ pub fn H2(comptime opts: Options) type {
             // a world's `CollId` is the world table's. The names are the
             // stable identity either way; a variant not in ACTIVE (a
             // composer's collection, or a world set entry) is declined.
-            @setEvalBranchQuota(100_000);
+            @setEvalBranchQuota(1_000_000);
             inline for (ACTIVE) |a| {
                 if (comptime std.mem.eql(u8, a.name, @tagName(k))) return a;
             }
@@ -2689,7 +2698,7 @@ pub fn H2(comptime opts: Options) type {
             "close_requests_deferred",
         };
         comptime {
-            @setEvalBranchQuota(100_000);
+            @setEvalBranchQuota(1_000_000);
             outer: for (@typeInfo(Self).@"struct".fields) |f| {
                 for (COLLECTIONS) |s| if (std.mem.eql(u8, s.name, f.name)) continue :outer;
                 for (CREATE_INITIALIZES) |n| if (std.mem.eql(u8, n, f.name)) continue :outer;
@@ -2785,13 +2794,18 @@ pub fn H2(comptime opts: Options) type {
                 self.reg.flush() catch {};
                 // Same for the stream-owned buffers: entities the
                 // consumer never ended (requests in flight at shutdown)
-                // and the dead-letter's unreaped tail. The registry owns
-                // the collections; the BYTES are h2's to release.
-                inline for (COLLECTIONS) |sc| {
-                    if (comptime sc.client_only and !has_client) continue;
-                    const f = &@field(self, sc.name);
-                    const cl2 = if (comptime uses_world) f.* else f;
-                    for (cl2.entitySlice()) |ent| self.freeStreamForeign(ent);
+                // and the dead-letter's unreaped tail. EVERY world
+                // collection is swept, a composer's parked stream states
+                // included — the release row is what bounds the sweep
+                // (io rows and worker-only rows read as null defaults
+                // through getFat and are skipped), so reading any
+                // entity is safe.
+                inline for (@typeInfo(WorldT.CollId).@"enum".fields) |cf| {
+                    const cid = @field(WorldT.CollId, cf.name);
+                    if (comptime WorldT.declOf(cid).kind == .set) continue;
+                    for (self.reg.coll(cid).entitySlice()) |ent| {
+                        self.freeStreamForeign(ent);
+                    }
                 }
             }
             for (self.body_sinks.items) |ref| {
@@ -2906,8 +2920,23 @@ pub fn H2(comptime opts: Options) type {
             try self.reg.destroy(ent);
         }
 
+        /// The union of the stream-shaped rows — server streams, the WS
+        /// seam, the client connect flow — which is h2's four buffer
+        /// components plus every consumer `request_row` fragment. NOT
+        /// the whole universe: conn and io rows release through their
+        /// own phases (conn_dead, write_done), and their deinits carry
+        /// guards and contexts a generic sweep must not trip.
+        const stream_release_row = stream_row.merge(ws_row).merge(
+            if (has_client) connect_row_full else Row(&.{}),
+        );
+
         fn freeStreamForeign(self: *Self, ent: Entity) void {
-            inline for (.{ ReqHeaders, ReqBody, RespHeaders, RespBody }) |T| {
+            inline for (comptime stream_release_row.deinitTypes()) |T| {
+                comptime {
+                    if (rove.row_mod.componentDeinitNeedsCtx(T)) @compileError(
+                        "stream component " ++ @typeName(T) ++ " wants a deinit ctx — the dead-letter reaper has none; use the ctx-less batch deinit (null out what you free)",
+                    );
+                }
                 const p = self.reg.getFat(ent, T) catch return;
                 T.deinit(self.allocator, @as([*]T, @ptrCast(p))[0..1]);
             }

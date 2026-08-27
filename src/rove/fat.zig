@@ -88,6 +88,7 @@ pub const ShadowHeader = struct { gen: u32 = 0, written: u64 = 0 };
 /// non-ZST Universe component (named by Universe index, over-alignment
 /// honored per field). The shadow is one AoS array of these.
 fn ShadowStruct(comptime Universe: type) type {
+    @setEvalBranchQuota(1_000_000);
     if (Universe.len > 64) @compileError("shadow written-mask is u64 — widen it for a universe past 64 components");
     comptime var fields: [Universe.len + 1]std.builtin.Type.StructField = undefined;
     fields[0] = .{
@@ -385,7 +386,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 }
             }
             comptime {
-                @setEvalBranchQuota(100_000);
+                @setEvalBranchQuota(1_000_000);
                 if (!CollType.RowType.isSubsetOf(Universe)) {
                     @compileError("registerCollection: collection row is not covered by the registry Universe");
                 }
@@ -569,7 +570,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
             const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
             comptime {
-                @setEvalBranchQuota(100_000);
+                @setEvalBranchQuota(1_000_000);
                 const lost = SrcColl.RowType.subtract(&DstColl.RowType.types);
                 if (!Row(strip).equal(lost)) {
                     @compileError("moveStripImmediate: strip list does not match the components the destination lacks");
