@@ -1,11 +1,13 @@
 # The fat-entity model
 
-**Status: design exploration on the `fat-entity` branch.** The prototype is
-`FatRegistry` (`src/rove/fat.zig`), living beside `Registry` on the same
-`Collection` machinery; the measurements are `zig build fat-bench`
-(`src/rove/fat_bench.zig`). Nothing here is a decision, and the branch's
-merged coll-enum work has not been through the smoke suite. This doc is the
-design record so the argument survives the conversation that produced it.
+**Status: ADOPTED — rove IS this model (2026-08-27).** The locked decisions
+and rejected alternatives are `decisions.md` §17; this doc is the design
+record — the argument, the measurements, and the prior art. The
+implementation is `FatRegistry` (`src/rove/fat.zig`) under the declared
+world tables (`src/rove/world.zig`); the measurements are `zig build
+fat-bench` and `zig build access-bench`. The archetype `Registry` this doc
+measures against was deleted at adoption — the comparison tables below are
+the record of why, and the only place the archetype numbers survive.
 
 ## Thesis
 
@@ -181,10 +183,9 @@ never diverge.
   The knob already has an API surface: `Io`'s `connection_row` stops
   meaning "required, or your data doesn't exist" and comes to mean
   "materialize my component in io's views, I iterate it" — per-entity
-  access needs only universe membership. (Gap: the prototype derives the
-  universe from rows, so a row-less component has no shadow column yet;
-  an `extra_components` option is the missing "in the world,
-  materialized nowhere.")
+  access needs only universe membership. (That gap closed in adoption: the declared world's
+  tables carry row-less components — "in the world, materialized
+  nowhere.")
 - **Residency assumptions, censused against io.** Of the three resolver
   hooks the archetype model forced on io, universal reads dissolve two
   (`fd_resolver`, `peer_resolver` — completions name entities by id and
@@ -203,7 +204,17 @@ never diverge.
   Whether any component *wants* enforced destruction on exit is a
   per-component question this model answers with convention.
 
-## Membership axes and edge clauses (sets built; axes and clauses unbuilt)
+## Membership axes and edge clauses (axes BUILT; edge clauses REJECTED)
+
+*As-built note:* the axes shipped as designed below — the emergent
+partition (axis = a type, identity = its declaration site), one total
+lifecycle axis, partial axes with enter/leave, and the set/collection
+storage merge (a set = an empty-row collection on a one-state axis). The
+edge-clause vocabulary did NOT ship: cross-axis quiescing became the
+imperative `moveOnly`/`evictOnly` verb family with identity-axis
+exemptions, and declared clauses — behavior or checks — were rejected
+(`decisions.md` §17.3). The clause design below is kept as the record of
+the road not taken.
 
 **The safety condition for multiple membership** falls out of the model's
 one invariant: each component has exactly one live home. Two memberships
@@ -349,9 +360,10 @@ less-traveled part.
   (resident vs paged-out over one canonical backing store) — both live
   under the same one-live-copy discipline.
 
-## What would come next (none of it committed)
+## What came next
 
-The h2-shaped composite-tick benchmark (does the bookkeeping show at h2's
-real op mix); seam views as reference sets; a port experiment of one small
-consumer. The V1-style question — should rove *become* this — is a
-separate decision this doc deliberately does not argue.
+The question this section once deferred — should rove *become* this — was
+answered 2026-08-27: h2, io, and all four binaries ported, the archetype
+registry deleted, the adoption locked (`decisions.md` §17.1). The follow-ons
+still open (batch/count-N evict with the shadow bypass, the cold-working-set
+benchmark) live in GitHub issues per the docs lifecycle.

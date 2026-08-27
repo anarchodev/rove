@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Loop46, Inc.
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! FatRegistry — the fat-entity storage model, living beside `Registry` so
-//! the two models can be compared on the same `Collection` machinery.
+//! FatRegistry — the fat-entity storage model every rove registry runs on.
+//! The full argument, the measurements that carried the adoption, and the
+//! prior art live in the design record
+//! (docs/architecture/fat-entity-model.md); the locked decisions in
+//! docs/decisions.md §17.
 //!
 //! Model: every entity conceptually carries every component in the
 //! registry's comptime-closed `Universe`. A collection does not define
@@ -119,7 +122,8 @@ fn ShadowStruct(comptime Universe: type) type {
     } });
 }
 
-/// The membership-axis shape of a registry (fat-entity-todo.md §4b).
+/// The membership-axis shape of a registry (the membership-axes design,
+/// docs/architecture/fat-entity-model.md).
 /// Axis 0 is the TOTAL axis (liveness): its record is the classic
 /// `collection_ids`/`offsets` pair, 0 = the free pool, and every entity
 /// always has a position on it. Axes 1..n are PARTIAL: 0 = "not on

@@ -2399,3 +2399,93 @@ tracked there.
   therefore be `const`. Both halves are checked by a lint over the shim sources.
 - **Shipped** rove#718/#722, rove#748/#772.
 
+---
+
+## 17. Engine entity model (rove core)
+
+The full argument, bench tables, and prior art:
+`architecture/fat-entity-model.md` (the design record).
+
+### 17.1 rove IS the fat-entity model (adopted 2026-08-27)
+
+- **Decision**: the core ECS is the fat-entity model — every entity
+  conceptually carries the whole component universe, stored as one AoS shadow
+  table (per-entity `{gen, written}` header makes birth/death O(row) and a
+  reborn slot unable to read its predecessor), and a collection is an SoA
+  **materialized view** over it: the dense, type-gated iteration set that is
+  the reason an ECS exists. Moves are **total and lossless** — any collection
+  to any collection; components the destination does not materialize *park*
+  in the shadow at a stable address — so a component's value is
+  path-independent. `getFat`/`getRow` read a component wherever it lives, no
+  candidate set at the call site. Worlds are **declared tables**
+  (`rove.World(.{ .parts = … })`, one `Part` per layer, declared by the
+  module that instantiates; N worker threads = N `Reg` values of one world
+  type). Membership is **per-axis**: one total lifecycle axis
+  (create/move/evict), partial state axes (enter/move/leave — leave parks),
+  and a set = an empty-row collection on its own one-state axis; an axis is
+  a type whose identity is its declaration site, and a component
+  materialized on two axes is a compile error. The archetype `Registry` is
+  deleted — one model, every test on a mini-world.
+- **Why (measured, not asserted)**: "the simplicity of fat structs, the
+  performance of the archetype." At rove's scale move cost was never the
+  binding constraint — fat-bench showed parity at every altitude (micro,
+  churn, dispatch, e2e echo) — and the archetype's row-subset discipline
+  priced itself as speed while actually buying safety (don't silently lose
+  data), which the fat model provides structurally. Row width became a
+  tuning parameter, not a semantic contract. The resource story is the
+  sharpest win: a component rides the shadow through every state any layer
+  invents, so the owner's close system is guaranteed to see it again —
+  the failure mode flips from silent leak to countable membership.
+- **Status**: every binary (worker, cp, front, logs) and both examples
+  converted 2026-08-27; the legacy registry dropped (−2.4k net lines); smoke
+  suite 168/168 against baseline on the drop build.
+
+### 17.2 Release is a transition at a funnel, never a destructor
+
+- **Decision**: no lifecycle hooks — moves and destroys run no component
+  init/deinit. Releasing a resource is a TRANSITION owned by a system with a
+  full view, at a funnel verb where endings already converge (`closeConn`,
+  `destroyEntity`, io's shutdown sweep). Foreign state frees in phases: conn
+  state (nghttp2/TLS/h1) via the `conn_dead` hand-off reaped in
+  pollPostlude; stream buffers via the `_stream_dead` dead-letter + reaper,
+  outside nghttp2's callbacks. Quiescing is imperative: the
+  `moveOnly`/`moveAnyOnly`/`evictOnly` verbs move to dst and drop every
+  non-identity partial axis — the call site names no axes, so a later state
+  axis is dropped at existing sites unchanged — and `.identity = true` set
+  entries (what the entity IS, e.g. `all_conns`) are exempt, ending only at
+  explicit leave/destroy. Deferred `evict` is entity-keyed: an ending is
+  never refused, a mid-move entity included.
+- **Why**: hook-at-structural-exit is where the resource-ordering bugs lived
+  — the drop itself killed a latent teardown double-free (the hook loop
+  re-freeing what world-era sweeps freed). A funnel is greppable, debuggable,
+  and phase-ordered; the destroy backstop (exit every axis) bounds a
+  forgotten quiesce to stale co-membership until retirement.
+- Supersedes the earlier "resource-owning components declare `deinit`" line
+  (rove#872 had already moved release onto transitions; the drop deleted the
+  hook machinery entirely).
+
+### 17.3 Rejected: a declared constraint vocabulary (edge clauses, entanglement tables, declared asserts)
+
+- **Rejected 2026-08-27, both halves**: behavior-in-data
+  (`on_enter = .{ .leaves = … }` clauses, a world-level entanglement table)
+  AND declared checks (`asserts = .{…}`, `enter_requires_live/_released`).
+- **The line**: world tables declare what the world IS — names, rows, axes,
+  kind, identity: closed classifications the verbs consult. What HAPPENS,
+  including what must be true when it happens, is imperative code at the
+  funnels. A predicate vocabulary is an interpreter growing feature by
+  feature inside a struct literal, poorly re-expressing what Zig states
+  natively with a debugger attached; reading a move should show everything
+  it does. What survives: assert what protects a real resource, inline at
+  its one move site (the `conn_dead` live-fd panic — a teardown path that
+  skipped the close). **Do not re-propose declared constraints — behavior OR
+  checks — without new information.**
+
+### 17.4 Rejected: per-request arena for h2 stream buffers
+
+- **Rejected 2026-08-27**: streams interleave on a connection with no
+  natural reset point, and an arena would force consumers to allocate
+  response bytes from h2's arena — a cross-model contract change. Stream
+  buffers release by transition through the `_stream_dead` reaper instead
+  (§17.2). (Distinct from the JS engine's per-request arena regime, §4.12,
+  which keeps its natural reset point — the request.)
+
