@@ -1269,6 +1269,18 @@ pub fn Io(comptime opts: Options) type {
                 // destroying it safe — and only this loop knows that.
                 self.releaseReadCycle(cycle);
                 if (comptime hand_off) {
+                    // The one entry into `conn_dead`, so the one place the
+                    // invariant is checkable at its transition: retirement
+                    // means the descriptor slot was given up. A live fd here
+                    // is a teardown path that skipped the close — about to
+                    // leak the slot with no symptom until accepts fail.
+                    // Explicit panic: the shipped build is ReleaseFast,
+                    // where an assert is not compiled.
+                    const fd_ptr = try self.reg.get(ent, self.coll(.conn_closing), Fd);
+                    if (fd_ptr.fd != -1) std.debug.panic(
+                        "rove-io: conn {d} retired into conn_dead holding live fd {d}",
+                        .{ ent.index, fd_ptr.fd },
+                    );
                     try self.reg.move(ent, self.coll(.conn_closing), self.coll(.conn_dead));
                 } else {
                     try self.reg.destroy(ent);

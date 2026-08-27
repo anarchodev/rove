@@ -135,20 +135,36 @@ io with components io has never heard of.
       smoke-verified, not just unit-gated. The worker still runs
       archetype — a fat worker needs its own suite run when it opts in.
 
-## 3 — Edge clauses
+## 3 — Edge clauses — REJECTED 2026-08-27 (the whole vocabulary)
 
-- [ ] `leaves = .{...}` on moves/evicts: the edge performs membership
-      repair atomically. Prefer over asserts (edges do work).
-- [ ] `asserts = .{...}`: framework-owned explicit check-and-abort that
-      survives ReleaseFast. This is also where the lost `Fd.deinit`
-      bypass-abort class returns — declared preconditions on edges
-      instead of destructor-time detection.
-- [ ] Constraint: evict edges can carry only destination-dependent
-      clauses (source is runtime-resolved); source-dependent ones
-      degrade to runtime asserts. Write this down in the clause design.
-- [ ] The checkable-handoff successor to the row-subset rule; a debug
-      `getRow` variant asserting requested members were written this
-      generation (the header mask already answers it).
+The clause syntax is dead in both halves, closing the arc 4d started:
+`leaves = .{...}` (behavior-in-data) fell at 4d to the funnel-verb
+pattern, and the declared-assert half (`asserts = .{...}`,
+`enter_requires_live/_released` — considered in the same discussion)
+falls with it: a check/behavior distinction does not stop the
+accretion — a predicate vocabulary is an interpreter growing feature
+by feature inside a struct literal, poorly re-expressing what Zig
+states natively with a debugger attached. The unbounded set of
+pre/postconditions someone may eventually want is exactly what a
+general-purpose language is for, and we have one. THE LINE: world
+tables declare what the world IS — names, rows, axes, kind,
+identity: closed classifications verbs consult. What HAPPENS,
+including what must be true when it happens, is imperative code at
+the funnels (closeConn, destroyEntity, the sweep), where entries
+already converge. Do not re-propose declared constraints — behavior
+OR checks — without new information.
+
+What survives, imperatively:
+- The `Fd` bypass-abort class lands as an inline check at the ONE
+  entry into `conn_dead` (processConnClosing's hand-off): a live fd
+  there means a teardown path skipped the close — explicit
+  `std.debug.panic`, surviving ReleaseFast, with the caller on the
+  stack. Assert what protects a real resource, at its move site;
+  skip the rest until a bug argues otherwise.
+- [ ] (optional tooling, unbuilt) a debug `getRow` variant asserting
+      requested members were written this generation — an API
+      function, not a declaration; build if a debugging session wants
+      it.
 
 ## 4 — Membership axes
 
