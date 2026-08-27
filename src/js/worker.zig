@@ -1463,28 +1463,60 @@ pub fn Worker(comptime opts: Options) type {
         snapshot_sink_mod.SnapshotStream,
     }).merge(opts.request_row);
 
-    // The worker's own collections, named here and nowhere else. They go
-    // into H2Type's namespace, and the registration below numbers them off
-    // that enum — so no id is written down, and no layer continues from
-    // where another layer's ids happen to stop.
-    const WORKER_COLLECTIONS = [_][:0]const u8{
-        "raft_pending_response",
-        "raft_pending_cont",
-        "raft_pending_stream",
-        "body_pending",
-        "forward_pending",
-        "parked_continuations",
-        "snapshot_streams",
-        "snapshot_pushes",
-        "parked_units",
-        "blob_sessions",
-    };
-
-    const H2Type = h2.H2(.{
-        .extra_collections = &WORKER_COLLECTIONS,
+    const worker_h2_opts = h2.Options{
         .request_row = merged_request_row,
         .connection_row = opts.connection_row,
         .client = true,
+        .registry_model = .fat,
+    };
+
+    // Worker-only collection for entity-less post-propose parked
+    // units (`parkSendOps` / `parkKvWakes` / `proposeForgetfulWrites`).
+    // A flat `ArrayList<ParkedUnit>` would need manual
+    // iterate-then-swapRemove inside drainRaftPending, risking an
+    // iterate-while-modify GPE. Collection-as-state gives
+    // deferred-destroy re-entrancy safety by construction (rove
+    // principle #1) + structural deinit (principle #2: data lifetime
+    // through components).
+    const ParkedUnitRow = rove.Row(&.{ParkedUnit});
+
+    // Blob upload-session collection (`docs/architecture/routing-and-ingress.md`): open blob upload sessions —
+    // one entity per (tenant, chain) accumulating `blob.write`
+    // bytes until `blob.seal`. Per-worker (a chain's activations
+    // all run on its owning worker). The dead-letter reaper cannot
+    // reach this non-stream row, so the sites that end these entities
+    // release the Session explicitly first.
+    const BlobSessionRow = rove.Row(&.{blob_sessions_mod.Session});
+
+    // The worker's world: h2's parts (which fold io's) plus the
+    // worker's own part — its collections named here and nowhere else,
+    // eight on the shared stream row and two on worker-only rows.
+    // Declared by the module that instantiates (explicit `.world`), so
+    // the same type serves the binary and the test roots. Prod runs N
+    // shared-nothing worker threads: N registry VALUES of this ONE
+    // world type.
+    const WorkerWorld = rove.World(.{ .parts = h2.parts(worker_h2_opts) ++ [_]rove.Part{.{
+        .name = "rove-js",
+        .collections = &.{
+            .{ .name = "raft_pending_response", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "raft_pending_cont", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "raft_pending_stream", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "body_pending", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "forward_pending", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "parked_continuations", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "snapshot_streams", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "snapshot_pushes", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "parked_units", .row = ParkedUnitRow },
+            .{ .name = "blob_sessions", .row = BlobSessionRow },
+        },
+    }} });
+
+    const H2Type = h2.H2(.{
+        .request_row = merged_request_row,
+        .connection_row = opts.connection_row,
+        .client = true,
+        .registry_model = .fat,
+        .world = WorkerWorld,
     });
 
     const StreamRow = H2Type.StreamRow;
@@ -1497,23 +1529,11 @@ pub fn Worker(comptime opts: Options) type {
     // queue. The cross-thread `SubscriptionFireInbox` is the boundary
     // for non-worker producers.
 
-    // Worker-only collection for entity-less post-propose parked
-    // units (`parkSendOps` / `parkKvWakes` / `proposeForgetfulWrites`).
-    // A flat `ArrayList<ParkedUnit>` would need manual
-    // iterate-then-swapRemove inside drainRaftPending, risking an
-    // iterate-while-modify GPE. Collection-as-state gives
-    // deferred-destroy re-entrancy safety by construction (rove
-    // principle #1) + structural deinit (principle #2: data lifetime
-    // through components).
-    const ParkedUnitRow = rove.Row(&.{ParkedUnit});
-    const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
+    // There is no `fetch_event_pending` collection: inbox messages
+    // drain directly onto `Worker.msg_queue` (the unified ingress);
+    // `dispatchPendingMsgs` fires them per tick.
 
-    // Blob upload-session collection (`docs/architecture/routing-and-ingress.md`): open blob upload sessions —
-    // one entity per (tenant, chain) accumulating `blob.write`
-    // bytes until `blob.seal`. Per-worker (a chain's activations
-    // all run on its owning worker). Session strings + buffer
-    // auto-deinit on entity destroy.
-    const BlobSessionRow = rove.Row(&.{blob_sessions_mod.Session});
+    const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
     const BlobSessionColl = rove.Collection(BlobSessionRow, .{});
 
     // There is no `fetch_event_pending` collection: inbox messages
@@ -1527,7 +1547,7 @@ pub fn Worker(comptime opts: Options) type {
         pub const RequestRow = StreamRow;
 
         allocator: std.mem.Allocator,
-        reg: *rove.Registry,
+        reg: *H2Type.Reg,
         h2: *H2Type,
         /// Handlers that exhausted the bump request arena — the
         /// dispatcher re-executed them under GC (`last_arena_gc_retry`)
@@ -1557,14 +1577,14 @@ pub fn Worker(comptime opts: Options) type {
         /// `raft_pending_cont` / `raft_pending_stream`) — the entity's
         /// collection IS the dispatch state, no membership field-check
         /// needed (principle #1, state-via-collection-membership).
-        raft_pending_response: StreamColl,
+        raft_pending_response: *StreamColl,
         /// Continuation-bound raft park. Commits route to
         /// `parked_continuations`. Same Row as `raft_pending_response`.
-        raft_pending_cont: StreamColl,
+        raft_pending_cont: *StreamColl,
         /// Stream-first-hop raft park. Commits route to
         /// `stream_response_in` (after the entity's stream components
         /// are set). Same Row.
-        raft_pending_stream: StreamColl,
+        raft_pending_stream: *StreamColl,
         /// Readset replication (`docs/architecture/effects-and-handlers.md`) park-on-
         /// durability. Entities `dispatchPending` parked after
         /// submitting their inbound body (> 16 KB) to the process-
@@ -1580,7 +1600,7 @@ pub fn Worker(comptime opts: Options) type {
         /// `reg.move` preserves every component on transit (the H2
         /// request headers / body / sid / etc. ride the entity until
         /// the response is built).
-        body_pending: StreamColl,
+        body_pending: *StreamColl,
         /// Async serve-or-forward park (`proxy_engine.zig`). A request
         /// for a tenant this cluster doesn't own parks here with a
         /// `ForwardWait` while the proxy engine runs the CP route-query
@@ -1589,7 +1609,7 @@ pub fn Worker(comptime opts: Options) type {
         /// to the parked entity and moving it to `response_in`. Same
         /// `StreamRow` as `raft_pending_*` so `reg.move` preserves the
         /// h2 sid/session/headers the response needs.
-        forward_pending: StreamColl,
+        forward_pending: *StreamColl,
         /// Background compile/stage thread backing the `platform.*` deploy
         /// primitives (`docs/architecture/cli-and-deploy.md` §4). Owns its own QuickJS
         /// runtime (the poll-loop `compile_fn` is used by
@@ -1624,21 +1644,21 @@ pub fn Worker(comptime opts: Options) type {
         /// Worker-owned sibling, same StreamRow as every h2
         /// collection so moves preserve all components — mirrors
         /// `raft_pending` exactly.
-        parked_continuations: StreamColl,
+        parked_continuations: *StreamColl,
         /// Streamed-snapshot dest: request entities receiving a
         /// `/_system/v2-snapshot-stream` body. Membership IS the "parked,
         /// mid-snapshot-stream" state (out of the dispatch walk); the per-entity
         /// `SnapshotStream` component owns the streaming `Box`. `arm` moves the
         /// entity here; `drainSnapshotStreams` finalizes (install baseline →
         /// `response_in`) or destroys it. Same StreamRow as every h2 collection.
-        snapshot_streams: StreamColl,
+        snapshot_streams: *StreamColl,
         /// SOURCE side of a streamed move: CP-trigger entities
         /// (`POST /_system/v2-snapshot-push`) parked while the off-loop driver
         /// streams the held snapshot to a dest. Membership IS "push in flight";
         /// `drainSnapshotPushes` responds + moves to `response_in` on completion.
         /// Same StreamRow as every h2 collection. No per-entity component — the
         /// push job state lives in the driver's `Job` (transport state, off-rove).
-        snapshot_pushes: StreamColl,
+        snapshot_pushes: *StreamColl,
         /// The off-loop streaming driver, shared with snapshot catch-up. Set by
         /// the run loop (main.zig) after both exist; `armSnapshotPush` enqueues
         /// move-push jobs here. Null until wired (push surface inert).
@@ -1693,11 +1713,11 @@ pub fn Worker(comptime opts: Options) type {
         /// (deferred to `reg.flush`) removes it on commit/fault.
         /// State-as-membership: presence in the collection IS the
         /// "awaiting raft commit" state.
-        parked_units: ParkedUnitColl,
+        parked_units: *ParkedUnitColl,
         /// Blob upload-session collection (`docs/architecture/routing-and-ingress.md`): open blob upload sessions
         /// (`blob.write` / `blob.seal`). TTL-swept via
         /// `blob_sessions.sweepBlobSessions` in the worker tick.
-        blob_sessions: BlobSessionColl,
+        blob_sessions: *BlobSessionColl,
         /// §3.5.1: per-(deployment, module) "exports onHeaders" cache,
         /// keyed `"{dep_id}:{module_base}"` (owned keys). Filled by
         /// dispatch outcomes (a deployment's exports are immutable),
@@ -1919,7 +1939,7 @@ pub fn Worker(comptime opts: Options) type {
         /// (lazy-open from the dispatch path) is a future session.
         pub fn create(
             allocator: std.mem.Allocator,
-            reg: *rove.Registry,
+            reg: *H2Type.Reg,
             config: WorkerConfig,
         ) !*Self {
             const server = try H2Type.create(
@@ -1937,16 +1957,16 @@ pub fn Worker(comptime opts: Options) type {
                 .allocator = allocator,
                 .reg = reg,
                 .h2 = server,
-                .raft_pending_response = try StreamColl.init(allocator),
-                .raft_pending_cont = try StreamColl.init(allocator),
-                .raft_pending_stream = try StreamColl.init(allocator),
-                .body_pending = try StreamColl.init(allocator),
-                .forward_pending = try StreamColl.init(allocator),
-                .parked_continuations = try StreamColl.init(allocator),
-                .snapshot_streams = try StreamColl.init(allocator),
-                .snapshot_pushes = try StreamColl.init(allocator),
-                .parked_units = try ParkedUnitColl.init(allocator),
-                .blob_sessions = try BlobSessionColl.init(allocator),
+                .raft_pending_response = reg.coll(.raft_pending_response),
+                .raft_pending_cont = reg.coll(.raft_pending_cont),
+                .raft_pending_stream = reg.coll(.raft_pending_stream),
+                .body_pending = reg.coll(.body_pending),
+                .forward_pending = reg.coll(.forward_pending),
+                .parked_continuations = reg.coll(.parked_continuations),
+                .snapshot_streams = reg.coll(.snapshot_streams),
+                .snapshot_pushes = reg.coll(.snapshot_pushes),
+                .parked_units = reg.coll(.parked_units),
+                .blob_sessions = reg.coll(.blob_sessions),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
                 // Cap chosen well above the typical per-tick fire
                 // rate (cron ≤ 1 Hz × N tenants; boot drains once per
@@ -2002,24 +2022,12 @@ pub fn Worker(comptime opts: Options) type {
                 .internal_insecure_tls = config.internal_insecure_tls,
                 .wake_inbox = KvWakeInbox.init(allocator),
             };
-            errdefer self.raft_pending_response.deinit();
-            errdefer self.raft_pending_cont.deinit();
-            errdefer self.raft_pending_stream.deinit();
-            errdefer self.body_pending.deinit();
-            errdefer self.forward_pending.deinit();
-            errdefer self.parked_continuations.deinit();
-            errdefer self.snapshot_streams.deinit();
-            errdefer self.snapshot_pushes.deinit();
-            errdefer self.parked_units.deinit();
-            errdefer self.blob_sessions.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
-            // The name list IS the registration list, and the id comes from
-            // the shared namespace rather than from a counter or an offset.
-            inline for (WORKER_COLLECTIONS) |name| {
-                reg.registerCollection(&@field(self, name), @intFromEnum(@field(H2Type.Coll, name)) + 1);
-            }
+            // No registration: the world's registry constructed and
+            // registered every collection the worker part names — the
+            // fields above are its stable pointers.
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -2208,9 +2216,13 @@ pub fn Worker(comptime opts: Options) type {
                 }
                 self.inbound_chunk_jobs.deinit(allocator);
             }
-            self.parked_continuations.deinit();
-            self.parked_units.deinit();
-            self.blob_sessions.deinit();
+            // The world's registry owns every collection's storage; what
+            // the worker owes at teardown is the FOREIGN memory riding
+            // its two non-stream rows. (h2's teardown sweep releases the
+            // stream-row components across every world collection, the
+            // eight parked stream states included.)
+            ParkedUnit.deinit(self.allocator, self.parked_units.column(ParkedUnit));
+            blob_sessions_mod.Session.deinit(self.allocator, self.blob_sessions.column(blob_sessions_mod.Session));
             // Stop the background deploy thread before tearing down the
             // collections it can never touch (it only touches its own
             // queue/result map, but join here makes shutdown ordering
@@ -2221,11 +2233,7 @@ pub fn Worker(comptime opts: Options) type {
                 dt.deinit();
                 self.deploy_thread = null;
             }
-            self.raft_pending_response.deinit();
-            self.raft_pending_cont.deinit();
-            self.raft_pending_stream.deinit();
-            self.body_pending.deinit();
-            self.forward_pending.deinit();
+
             // Drop any still-parked fetch chunks at shutdown
             // (best-effort, same lossy posture as the log flusher's
             // final drain). Each entry owns its UpstreamFetchEvent's
@@ -2822,14 +2830,14 @@ pub fn Worker(comptime opts: Options) type {
             const map_hit = self.lookupBoundSendEntity(send_id);
             var matched = false;
             if (map_hit) |ent| {
-                if (server.reg.isInCollection(ent, &self.parked_continuations)) {
+                if (server.reg.isInCollection(ent, self.parked_continuations)) {
                     // Verify the saga context matches the
                     // claimed tenant. (Defense in depth: a stale
                     // entry could conceivably point at a recycled
                     // entity from another tenant — gen check
                     // covers most of this; the tenant equality
                     // covers the residual.)
-                    if (server.reg.get(ent, &self.parked_continuations, components_mod.ChainContext)) |chain| {
+                    if (server.reg.get(ent, self.parked_continuations, components_mod.ChainContext)) |chain| {
                         if (std.mem.eql(u8, chain.tenant_id, tenant_id)) {
                             matched = true;
                         }
@@ -2998,7 +3006,7 @@ pub fn Worker(comptime opts: Options) type {
             return blob_sessions_mod.write(
                 self.allocator,
                 self.h2.reg,
-                &self.blob_sessions,
+                self.blob_sessions,
                 tenant_id,
                 corr,
                 bytes,
@@ -3015,7 +3023,7 @@ pub fn Worker(comptime opts: Options) type {
             return blob_sessions_mod.seal(
                 self.allocator,
                 self.h2.reg,
-                &self.blob_sessions,
+                self.blob_sessions,
                 tenant_id,
                 corr,
             );
@@ -3603,13 +3611,13 @@ pub fn Worker(comptime opts: Options) type {
                     return false;
                 },
             }
-            self.reg.set(ent, &self.h2.request_out, snapshot_sink_mod.SnapshotStream, .{ .box = box }) catch {
+            self.reg.set(ent, self.h2.coll(.request_out), snapshot_sink_mod.SnapshotStream, .{ .box = box }) catch {
                 // h2 holds the sink ref (released on stream reap); drop the
                 // component ref we accounted for at create time.
                 box.unref();
                 return false;
             };
-            self.reg.move(ent, &self.h2.request_out, &self.snapshot_streams) catch {
+            self.reg.move(ent, self.h2.coll(.request_out), self.snapshot_streams) catch {
                 // The component now owns the box (freed on the entity's
                 // teardown); the entity stays in request_out. Caller responds.
                 return false;
@@ -3624,7 +3632,7 @@ pub fn Worker(comptime opts: Options) type {
         fn streamIdentity(self: *Self, ent: rove.Entity) ?struct { conn: rove.Entity, sid: u32 } {
             const server = self.h2;
             if (server.reg.isStale(ent)) return null;
-            const colls = .{ &server.request_out, &self.raft_pending_cont, &self.parked_continuations };
+            const colls = .{ server.coll(.request_out), self.raft_pending_cont, self.parked_continuations };
             const sess = server.reg.getAny(ent, colls, h2.Session) catch return null;
             const sid = server.reg.getAny(ent, colls, h2.StreamId) catch return null;
             return .{ .conn = sess.entity, .sid = sid.id };
@@ -3676,7 +3684,7 @@ pub fn Worker(comptime opts: Options) type {
             // accessible. Surfaces as request.fetchesPending on
             // every subsequent onFetchChunk activation. Survives
             // entity moves (rove principle 8).
-            if (self.h2.reg.get(entity, &self.h2.request_out, components_mod.BoundFetchCount)) |cnt| {
+            if (self.h2.reg.get(entity, self.h2.coll(.request_out), components_mod.BoundFetchCount)) |cnt| {
                 cnt.pending +%= 1;
             } else |_| {
                 // Entity not in request_out — set fails. This is
@@ -3724,15 +3732,15 @@ pub fn Worker(comptime opts: Options) type {
         fn decrementBoundFetchCount(self: *Self, entity: rove.Entity) void {
             const server = self.h2;
             if (server.reg.getAny(entity, .{
-                &server.request_out,
-                &self.parked_continuations,
-                &self.raft_pending_cont,
-                &self.raft_pending_stream,
-                &self.raft_pending_response,
-                &server.stream_response_in,
-                &server.stream_data_out,
-                &server.response_in,
-                &server.response_out,
+                server.coll(.request_out),
+                self.parked_continuations,
+                self.raft_pending_cont,
+                self.raft_pending_stream,
+                self.raft_pending_response,
+                server.coll(.stream_response_in),
+                server.coll(.stream_data_out),
+                server.coll(.response_in),
+                server.coll(.response_out),
             }, components_mod.BoundFetchCount)) |cnt| {
                 if (cnt.pending > 0) cnt.pending -= 1;
             } else |_| {}

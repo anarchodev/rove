@@ -90,7 +90,9 @@ fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
         if (f.payload.len > 0) worker.allocator.free(f.payload);
     }
     st.queue.deinit(worker.allocator);
-    worker.h2.reg.destroy(st.chain) catch {};
+    // The chain entity's ChainContext/StreamChain own slices — through
+    // the stream funnel so the dead-letter reaper frees them.
+    worker.h2.destroyEntity(st.chain) catch {};
     _ = worker.ws_conns.remove(conn_ent);
 }
 
@@ -209,9 +211,11 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
     var saga_buf: [16]u8 = undefined;
     const corr = std.fmt.bufPrint(&saga_buf, "{x:0>16}", .{request_id}) catch unreachable;
 
-    const ent = try server.reg.create(&worker.parked_continuations);
-    errdefer server.reg.destroy(ent) catch {};
-    try server.reg.set(ent, &worker.parked_continuations, h2.Session, .{ .entity = conn_ent });
+    const ent = try server.reg.create(worker.parked_continuations);
+    // Through the funnel: components already transferred by the sets
+    // below must be released if a later set fails.
+    errdefer worker.h2.destroyEntity(ent) catch {};
+    try server.reg.set(ent, worker.parked_continuations, h2.Session, .{ .entity = conn_ent });
     // Each dup's errdefer is block-scoped so it fires ONLY if the `set` that
     // transfers ownership into the entity component fails. Once `set` succeeds
     // and the block exits normally, the dup is owned by the component (freed by
@@ -233,7 +237,7 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
         errdefer allocator.free(host_dup);
         const path_dup = try allocator.dupe(u8, routing.path);
         errdefer allocator.free(path_dup);
-        try server.reg.set(ent, &worker.parked_continuations, components_mod.ChainContext, .{
+        try server.reg.set(ent, worker.parked_continuations, components_mod.ChainContext, .{
             .tenant_id = tid_dup,
             .saga_id = saga_dup,
             .deployment_id = dep.tc.snap.deployment_id,
@@ -247,7 +251,7 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
         errdefer allocator.free(mod_dup);
         const ctx_dup = try allocator.dupe(u8, "{}");
         errdefer allocator.free(ctx_dup);
-        try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+        try server.reg.set(ent, worker.parked_continuations, components_mod.StreamChain, .{
             .module_path = mod_dup,
             .ctx_json = ctx_dup,
             .activation_count = 0,
@@ -260,7 +264,7 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
     // next tick). The default `StreamWakes` (interval_ms 0, empty ring) already
     // makes it non-wake-due, so the sweep skips WS chains entirely; frame
     // arrival (`serviceWsMessages`) is their only resume source.
-    try server.reg.set(ent, &worker.parked_continuations, components_mod.ContDescriptor, .{
+    try server.reg.set(ent, worker.parked_continuations, components_mod.ContDescriptor, .{
         .deadline_ns = std.math.maxInt(i64),
     });
     try worker.ws_conns.put(allocator, conn_ent, .{ .chain = ent });
@@ -396,7 +400,7 @@ pub fn serviceWsMessages(worker: anytype) !void {
             // Conn already gone — reap any chain (no onDisconnect: the socket
             // is dead, and an abrupt close is swept above). Drop the message.
             tearDownWsChain(worker, p.conn);
-            server.reg.destroy(p.ment) catch {};
+            worker.h2.destroyEntity(p.ment) catch {};
             continue;
         }
         // §4.5 input gate: while a writing frame's commit is in flight (or
@@ -411,7 +415,7 @@ pub fn serviceWsMessages(worker: anytype) !void {
                         // fail the connection loudly rather than drop a frame.
                         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
                         tearDownWsChain(worker, p.conn);
-                        server.reg.destroy(p.ment) catch {};
+                        worker.h2.destroyEntity(p.ment) catch {};
                         continue;
                     }
                 else
@@ -421,7 +425,7 @@ pub fn serviceWsMessages(worker: anytype) !void {
                     effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
                     tearDownWsChain(worker, p.conn);
                 };
-                server.reg.destroy(p.ment) catch {};
+                worker.h2.destroyEntity(p.ment) catch {};
                 continue;
             }
         }
@@ -431,7 +435,7 @@ pub fn serviceWsMessages(worker: anytype) !void {
                 fireWsDisconnect(worker, st.chain);
             }
             tearDownWsChain(worker, p.conn);
-            server.reg.destroy(p.ment) catch {};
+            worker.h2.destroyEntity(p.ment) catch {};
             continue;
         }
         // Data frame (text/binary) → find-or-establish the chain, run onMessage.
@@ -443,11 +447,11 @@ pub fn serviceWsMessages(worker: anytype) !void {
                 // Couldn't bind a tenant/module — send a Close so the client
                 // sees a clean shutdown rather than a hang.
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
-                server.reg.destroy(p.ment) catch {};
+                worker.h2.destroyEntity(p.ment) catch {};
                 continue;
             };
         fireWsMessage(worker, chain_ent, p.conn, p.opcode, p.payload);
-        server.reg.destroy(p.ment) catch {};
+        worker.h2.destroyEntity(p.ment) catch {};
     }
 }
 
@@ -662,8 +666,8 @@ fn fireWsMessage(
 ) void {
     const allocator = worker.allocator;
     const server = worker.h2;
-    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
+    const chain_ctx = server.reg.get(chain_ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamChain) catch return;
 
     const path = chain_st.module_path;
     // Log records name the CONNECTION, not the module — see wsRootLine.
@@ -773,7 +777,7 @@ fn installWsWakes(
     // export groups must NOT be dropped when the arm slice is rebuilt
     // (they ride to the next sweep tick). Move it out before the reset.
     var carried: std.ArrayListUnmanaged(components_mod.PendingWakeBatch) = .empty;
-    if (server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+    if (server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamWakes)) |old| {
         for (old.kv_prefixes) |arm| {
             allocator.free(arm.prefix);
             if (arm.on) |t| allocator.free(t);
@@ -818,10 +822,10 @@ fn installWsWakes(
         arms.deinit(allocator);
         if (timer_on) |t| allocator.free(t);
         // Preserve the carried queue even on OOM — set a minimal component.
-        server.reg.set(chain_ent, &worker.parked_continuations, components_mod.StreamWakes, .{ .pending_batches = carried }) catch {};
+        server.reg.set(chain_ent, worker.parked_continuations, components_mod.StreamWakes, .{ .pending_batches = carried }) catch {};
         return;
     };
-    server.reg.set(chain_ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+    server.reg.set(chain_ent, worker.parked_continuations, components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = kv_prefixes,
@@ -847,8 +851,8 @@ pub fn resumeBoundFetchChainWs(
 
     const allocator = worker.allocator;
     const server = worker.h2;
-    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
+    const chain_ctx = server.reg.get(chain_ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamChain) catch return;
 
     const path = chain_st.module_path;
     // Log records name the CONNECTION, not the module — see wsRootLine.
@@ -874,7 +878,7 @@ pub fn resumeBoundFetchChainWs(
     defer allocator.free(spath);
 
     const fetches_pending: u32 = blk: {
-        const cnt = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        const cnt = server.reg.get(chain_ent, worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
         break :blk cnt.pending;
     };
 
@@ -965,9 +969,9 @@ pub fn resumeBoundFetchChainWs(
 pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity) void {
     const allocator = worker.allocator;
     const server = worker.h2;
-    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
-    const wakes_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes) catch return;
+    const chain_ctx = server.reg.get(chain_ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamChain) catch return;
+    const wakes_st = server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamWakes) catch return;
 
     // Drain the fired arms — this resume consumes the "go look" edge, so
     // nothing re-fires next sweep (onWake re-reads authoritative kv).
@@ -1151,8 +1155,8 @@ fn shipWsFrames(
 fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     const allocator = worker.allocator;
     const server = worker.h2;
-    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
+    const chain_ctx = server.reg.get(chain_ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamChain) catch return;
 
     const path = chain_st.module_path;
     // Log records name the CONNECTION, not the module — see wsRootLine.

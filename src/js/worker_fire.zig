@@ -49,9 +49,9 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     const server = worker.h2;
     // Entity has a stream chain iff StreamChain.module_path
     // is non-empty — component presence is the membership test.
-    const chain_st = server.reg.get(ent, &server.response_out, components_mod.StreamChain) catch return;
+    const chain_st = server.reg.get(ent, server.coll(.response_out), components_mod.StreamChain) catch return;
     if (chain_st.module_path.len == 0) return;
-    const chain_ctx = server.reg.get(ent, &server.response_out, components_mod.ChainContext) catch return;
+    const chain_ctx = server.reg.get(ent, server.coll(.response_out), components_mod.ChainContext) catch return;
     std.log.info(
         "rove-js stream-disconnect: tenant={s} corr={s} activations={d}",
         .{ chain_ctx.tenant_id, chain_ctx.saga_id orelse "(none)", chain_st.activation_count },

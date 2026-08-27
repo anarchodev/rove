@@ -1584,7 +1584,7 @@ pub fn armSnapshotStream(
 /// is destroyed; either way its `SnapshotStream` component releases the box.
 pub fn drainSnapshotStreams(worker: anytype) !void {
     const server = worker.h2;
-    const coll = &worker.snapshot_streams;
+    const coll = worker.snapshot_streams;
     const entities = coll.entitySlice();
     const states = coll.column(snapshot_sink_mod.SnapshotStream);
     for (entities, states) |ent, *ss| {
@@ -1593,7 +1593,7 @@ pub fn drainSnapshotStreams(worker: anytype) !void {
             // Client reset mid-upload: no response is possible. Destroy — the
             // component deinit drops the box's component ref (the sink ref
             // releases when h2 reaps the stream).
-            try server.reg.destroy(ent);
+            try server.destroyEntity(ent);
             continue;
         }
         if (!box.eof and !box.failed) continue; // body still streaming
@@ -1642,7 +1642,7 @@ pub fn drainSnapshotStreams(worker: anytype) !void {
         try server.reg.set(ent, coll, h2.RespHeaders, .{ .fields = null, .count = 0 });
         try server.reg.set(ent, coll, h2.RespBody, .{ .data = null, .len = 0 });
         try server.reg.set(ent, coll, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.move(ent, coll, &server.response_in);
+        try server.reg.move(ent, coll, server.coll(.response_in));
         // The sink keeps its own ref until h2 reaps the stream; the value carried
         // into `response_in` is now inert.
         box.unref();
@@ -1698,7 +1698,7 @@ pub fn armSnapshotPush(
 
     // Park FIRST (deferred move — walk-safe), then enqueue. The job streams
     // off-loop; `drainSnapshotPushes` matches the completion back to this entity.
-    try server.reg.move(ent, &server.request_out, &worker.snapshot_pushes);
+    try server.reg.move(ent, server.coll(.request_out), worker.snapshot_pushes);
     driver.enqueuePush(ent, tenant, dest, .merge) catch
         return reply(server, allocator, ent, sid, sess, 500, "enqueue failed\n");
     // No reply — deferred to drainSnapshotPushes on completion.
@@ -1714,7 +1714,7 @@ pub fn drainSnapshotPushes(worker: anytype, driver: anytype) !void {
     try driver.drainPushCompletions(&completions);
     for (completions.items) |c| {
         if (server.reg.isStale(c.entity)) continue; // CP gave up / connection gone
-        if (!server.reg.isInCollection(c.entity, &worker.snapshot_pushes)) {
+        if (!server.reg.isInCollection(c.entity, worker.snapshot_pushes)) {
             // The park move hasn't flushed yet (a completion that beat the same
             // tick's flush — vanishingly rare given network RTT ≫ flush). Re-post
             // so we match it next tick rather than drop the reply.
@@ -1722,11 +1722,11 @@ pub fn drainSnapshotPushes(worker: anytype, driver: anytype) !void {
             continue;
         }
         const status: u16 = if (c.status == 0) 502 else c.status;
-        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.Status, .{ .code = status });
-        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.RespBody, .{ .data = null, .len = 0 });
-        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.move(c.entity, &worker.snapshot_pushes, &server.response_in);
+        try server.reg.set(c.entity, worker.snapshot_pushes, h2.Status, .{ .code = status });
+        try server.reg.set(c.entity, worker.snapshot_pushes, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(c.entity, worker.snapshot_pushes, h2.RespBody, .{ .data = null, .len = 0 });
+        try server.reg.set(c.entity, worker.snapshot_pushes, h2.H2IoResult, .{ .err = 0 });
+        try server.reg.move(c.entity, worker.snapshot_pushes, server.coll(.response_in));
     }
 }
 
