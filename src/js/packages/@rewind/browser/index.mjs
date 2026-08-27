@@ -206,7 +206,7 @@ const browser = {
      * (`request.sagaId`, indexed as the reserved `_saga` tag),
      * which is stamped on EVERY activation automatically — no per-frame
      * tagging needed. Pass `opts.session` to filter by a
-     * `request.tag("session", …)` value instead (survives reconnects).
+     * `tag("session", …)` capability value instead (survives reconnects).
      *
      * @param {object} opts - `{on, since?, limit?, session?}`. `on` is the
      *   callback export name (required); `since` an `after_received_ns`

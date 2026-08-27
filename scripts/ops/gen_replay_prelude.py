@@ -195,25 +195,11 @@ def capability_names() -> list[str]:
     return names
 
 
-def request_effect_names() -> list[str]:
-    """The activation members sourced from `request`, from the same Zig
-    authority as the capability list (see `capability_names`)."""
-    src = (ROVE / "src" / "reserved" / "root.zig").read_text(encoding="utf-8")
-    m = re.search(r"REQUEST_EFFECT_NAMES\s*=\s*\[_\]\[[^\]]*\]const u8\s*\{(.*?)\}", src, re.S)
-    if not m:
-        raise SystemExit(
-            "gen_replay_prelude: REQUEST_EFFECT_NAMES not found in "
-            "src/reserved/root.zig — the list moved; follow it."
-        )
-    names = re.findall(r'"([^"]+)"', m.group(1))
-    if not names:
-        raise SystemExit("gen_replay_prelude: REQUEST_EFFECT_NAMES is empty")
-    return names
-
-
 def caps_block() -> str:
     names = ", ".join(json.dumps(n) for n in capability_names())
-    fx = ", ".join(json.dumps(n) for n in request_effect_names())
+    # REQUEST_EFFECT_NAMES has no emission here any more: the shell assigns
+    # tag/unmaskedIp/shredKey onto the activation object directly (rove#849),
+    # the same way the worker and the native replay driver do.
     return (
         "\n// ── the capability names (rove-reserved CAPABILITY_NAMES) ──\n"
         ";// The activation object's members — see\n"
@@ -221,7 +207,6 @@ def caps_block() -> str:
         ";// Zig constant the worker and the native replay driver build from,\n"
         ";// so the browser arena cannot drift from either.\n"
         f"globalThis.__CAPS = [{names}];\n"
-        f"globalThis.__REQ_FX = [{fx}];\n"
     )
 
 

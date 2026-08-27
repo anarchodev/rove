@@ -2,12 +2,13 @@
 // (src/js/globals.zig) on authored worlds: identity always pinned
 // (session null / tenant "sim" / sagaId ""), the ip channels
 // masked+raw (null when un-authored, never a throw), the activation bag on
-// every kind, prod's request.tag validation, payload accessors reading
+// every kind, prod's tag-capability validation, payload accessors reading
 // undefined on payload-less resumes, and the retired driver-only surfaces
 // (request.body, on.*) gone.
 import { scenario, expect } from "rewind:test";
 
-// ── inbound: pinned identity, ip channels, tag validation, retired surfaces ──
+// ── inbound: pinned identity, ip channels, tag validation, retired surfaces
+//    (incl. request.tag/.unmaskedIp/.shredKey — capabilities now, #849) ──
 const s = scenario({});
 const r = s.inbound({ method: "POST", path: "/x", body: "hi", ip: "203.0.113.9" });
 expect(r.error).toBe(null);
@@ -20,6 +21,7 @@ expect(out.unmasked).toBe("203.0.113.9"); // raw channel works offline
 expect(out.hasBody).toBe(false); // request.body is retired live
 expect(out.onGlobal).toBe("undefined"); // on.* is retired live
 expect(out.activation).toEqual({ kind: "inbound" });
+expect(out.offRequest).toBe(true);
 expect(out.tagValid).toBe(true);
 expect(out.tagBadChars).toContain("[a-z0-9_]");
 expect(out.tagReserved).toContain("reserved");

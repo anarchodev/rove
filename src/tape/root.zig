@@ -266,7 +266,7 @@ pub const Channel = enum(u16) {
     /// `request.body` was touched (its absence is what licenses
     /// eliding the trigger_payload body reference), and
     /// `ip_masked` / `ip_raw` for `request.ip` /
-    /// `request.unmaskedIp()`. Replay reading anything NOT recorded
+    /// `unmaskedIp()`. Replay reading anything NOT recorded
     /// here is a divergence error, never a silent undefined.
     request_reads = 4,
     /// What the activation itself was: the export it dispatched to, and
@@ -399,7 +399,7 @@ pub const RequestReadKind = enum(u8) {
     /// First `request.ip` access. `name = ""`; `value` = the masked
     /// client IP returned (empty value ⇒ null was returned).
     ip_masked = 3,
-    /// First `request.unmaskedIp()` call — the deliberate, taped
+    /// First `unmaskedIp()` call — the deliberate, taped
     /// raw-IP escalation. `name = ""`; `value` = the unmasked IP
     /// returned (empty value ⇒ null was returned).
     ip_raw = 4,

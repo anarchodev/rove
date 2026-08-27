@@ -266,7 +266,7 @@ pub const Engine = struct {
             const why: ?[]const u8 = if (lower.len > 0 and lower[0] == ':')
                 "an HTTP/2 pseudo-header (request.method/path/host carry these)"
             else if (reserved_headers.isStrippedIpHeader(lower))
-                "the client IP is reachable only via request.ip / request.unmaskedIp()"
+                "the client IP is reachable only via request.ip / unmaskedIp()"
             else if (reserved_headers.isReservedInternalHeader(lower))
                 "platform-reserved (x-rewind-* / x-rove-internal-*)"
             else
@@ -310,7 +310,7 @@ pub const Engine = struct {
             } else {
                 // Authored ip: derive BOTH channels prod-style — `request.ip`
                 // reads the masked form (ip_mask.zig, the worker's rule) and
-                // `request.unmaskedIp()` the raw. A malformed authored ip
+                // `unmaskedIp()` the raw. A malformed authored ip
                 // masks to null (empty entry → `request.ip === null`) but
                 // stays reachable raw — the prod disposition for a malformed
                 // transport header.

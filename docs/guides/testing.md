@@ -121,12 +121,12 @@ missing one.)
 
 The rest of the request surface matches the worker rule for rule: `request.ip`
 is the **masked** form of the authored `inbound({ ip })` (v4 last octet zeroed,
-v6 kept to the /48) with the raw value on `request.unmaskedIp()`, and both read
+v6 kept to the /48) with the raw value on the `unmaskedIp()` capability, and both read
 `null` when no ip is authored; `request.activation.kind` is set on every
-activation; and `request.tag(key, value)` enforces prod's validation (key 1–32
+activation; and the `tag(key, value)` activation capability enforces prod's validation (key 1–32
 bytes of `[a-z0-9_]`, no leading `_`; value 1–64 bytes, no control characters;
 max 4 distinct keys) — each accepted tag lands in the effect log as
-`{kind: "tag"}`. The retired surfaces (`request.body`, the pre-rename `on.*`)
+`{kind: "tag"}`. The retired surfaces (`request.body`, the pre-rename `on.*`, the request-member spellings `request.tag`/`request.unmaskedIp`/`request.shredKey`)
 don't exist in a test or sim run.
 
 ## A node's surface

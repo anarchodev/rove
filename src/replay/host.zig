@@ -292,7 +292,7 @@ fn kvGet(
             // either: that identity's key is gone.
             h.setDiv(
                 "kv.get(\"{s}\") — sealed under a per-identity key " ++
-                    "(request.shredKey) that has been destroyed, so this value is " ++
+                    "(shredKey) that has been destroyed, so this value is " ++
                     "permanently unreadable and this run cannot be replayed against it",
                 .{named(k)},
             );
@@ -384,7 +384,7 @@ fn kvPrefix(
         if (lost.sealed) {
             h.setDiv(
                 "kv.prefix(\"{s}\") — a row on this page is sealed under a " ++
-                    "per-identity key (request.shredKey) that has been destroyed, so " ++
+                    "per-identity key (shredKey) that has been destroyed, so " ++
                     "the page is permanently incomplete and this run cannot be " ++
                     "replayed against it",
                 .{named(p)},

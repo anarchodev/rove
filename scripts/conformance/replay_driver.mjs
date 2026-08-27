@@ -186,7 +186,7 @@ if (headerNames.length) {
 // declared. An empty value is precisely how the channel spells "null was
 // returned" (`RequestReadKind.ip_masked`, src/tape/root.zig).
 for (const kind of [READ_KIND_IP_MASKED, READ_KIND_IP_RAW]) {
-    // Both channels: `request.ip` (masked) and `request.unmaskedIp()` (the
+    // Both channels: `request.ip` (masked) and `unmaskedIp()` (the
     // deliberate escalation). A world declares one address; which of the two a
     // handler reads is the handler's business, and gating either on the world
     // makes an authored world throw where prod returns a value or null.

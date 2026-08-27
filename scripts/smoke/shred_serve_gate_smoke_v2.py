@@ -2,7 +2,7 @@
 """The serve-side shred gate: a record leaves the logs door OPENED, or it
 does not leave at all.
 
-A value sealed under a per-identity key (`request.shredKey`) is sealed at
+A value sealed under a per-identity key (`shredKey`) is sealed at
 the WRITE boundary, so the ciphertext propagates by itself into every
 container below — including the execution tape. That is the mechanism, not
 an accident: opening before the tape append would put plaintext on the
@@ -39,7 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
+from smoke_lib_v2 import V2Cluster  # noqa: E402
 
 # The value whose bytes every assertion here is about. Distinctive enough
 # that finding it is never a coincidence.
@@ -49,19 +49,31 @@ MARKER = "sardine-serve-gate-7c41"
 # reads the stored value back, which is the one that puts ciphertext on
 # the kv tape. A read in the same activation as the write comes off the
 # overlay and is plaintext there — it would prove nothing.
+# Hand-composed default (the rpc_wrap recipe forwards no activation object
+# to named functions, and `shredKey` is a capability on it — rove#849):
+# destructure the caps once, route on ?fn= internally. Same wire as every
+# rpc_wrap smoke.
 SRC = (
-    'export function seal() {\n'
-    '  request.shredKey("u_serve");\n'
-    '  kv.set("card", "' + MARKER + '");\n'
-    '  return "sealed\\n";\n'
-    '}\n'
-    'export function read() {\n'
-    '  request.shredKey("u_serve");\n'
-    '  return "read:" + kv.get("card") + "\\n";\n'
-    '}\n'
-    'export function erase() {\n'
-    '  request.shredKey.destroy("u_serve");\n'
-    '  return "erased\\n";\n'
+    'export default function ({ shredKey }) {\n'
+    '  const fn = ((request.query || "").match(/fn=([^&]+)/) || [])[1];\n'
+    '  const fns = {\n'
+    '    seal() {\n'
+    '      shredKey("u_serve");\n'
+    '      kv.set("card", "' + MARKER + '");\n'
+    '      return "sealed\\n";\n'
+    '    },\n'
+    '    read() {\n'
+    '      shredKey("u_serve");\n'
+    '      return "read:" + kv.get("card") + "\\n";\n'
+    '    },\n'
+    '    erase() {\n'
+    '      shredKey.destroy("u_serve");\n'
+    '      return "erased\\n";\n'
+    '    },\n'
+    '  };\n'
+    '  const f = fns[fn];\n'
+    '  if (!f) { response.status = 404; return "no such fn: " + fn; }\n'
+    '  return f();\n'
     '}\n'
 )
 
@@ -95,7 +107,7 @@ export function onFetchDone() {
 """
 
 FIXTURE = {
-    "index.mjs": rpc_wrap(SRC),
+    "index.mjs": SRC,
     "probe/index.mjs": PROBE_SRC,
     "streamprobe/index.mjs": STREAM_SRC,
 }

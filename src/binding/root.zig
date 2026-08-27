@@ -668,7 +668,7 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
     };
 }
 
-/// `request.tag(key, value)` — the common binding for the tag surface. The
+/// `tag(key, value)` — the common binding for the tag surface. The
 /// arity/type gate, the pair rules, and the capacity rule (checked only when
 /// a call would ADD — re-tagging updates in place, which is engine state and
 /// why the guards module splits them) run here, once, in the contract's
@@ -733,7 +733,7 @@ pub fn Tag(comptime q: type, comptime D: type) type {
 
 /// The offline engines' shred state, shared because it was identical.
 ///
-/// The sim and the browser arena both need `request.shredKey` and its
+/// The sim and the browser arena both need `shredKey` and its
 /// `destroy` to behave exactly as they do in the worker — validate, count
 /// against the cap, return the same refusals — while performing no
 /// sealing at all: they run against a recorded tape, and the arena holds
@@ -800,7 +800,7 @@ test "the offline shred state re-scopes rather than accumulating" {
     OfflineShred.reset();
 }
 
-/// `request.shredKey(id)` — the common binding for the per-identity
+/// `shredKey(id)` — the common binding for the per-identity
 /// erasure surface.
 ///
 /// Scopes the whole ACTIVATION: every kv value the handler writes, the
@@ -852,7 +852,7 @@ pub fn ShredKey(comptime q: type, comptime D: type) type {
             return js_undefined;
         }
 
-        /// `request.shredKey.destroy(id)` — erase this identity's key.
+        /// `shredKey.destroy(id)` — erase this identity's key.
         ///
         /// Permanent, and unrecoverable by construction: every byte
         /// sealed under it becomes unreadable everywhere at once,

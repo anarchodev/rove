@@ -921,12 +921,14 @@ to **this handler's own tenant** — a customer can read only its own logs, neve
 another's (`decisions.md` §4.8/§4.10). By default it filters by the engine
 per-saga key (`request.sagaId`, auto-stamped on every activation of a
 saga as the reserved `_saga` tag), so no per-frame tagging is needed; pass
-`{session}` to filter by a `request.tag("session", …)` value instead (survives
+`{session}` to filter by a `tag("session", …)` value instead (survives
 reconnects).
 
-**User-defined index tags (`request.tag`).** Not browser-specific — any handler
-can attach low-cardinality index tags to its request's log record:
-`request.tag("flow", "checkout")`. The log query surface then filters
+**User-defined index tags (`tag`).** An activation capability — destructure it
+from the activation object (`({ tag }) => …`); it is not a `request` member,
+because `request` is a data shape and `tag` writes the durable record. Any
+handler can attach low-cardinality index tags to its request's log record:
+`tag("flow", "checkout")`. The log query surface then filters
 `?tag.flow=checkout` (and `/v1/{tenant}/session/{id}` is sugar for
 `tag.session`). Bounded + fail-loud: ≤4 tags/record, keys `[a-z0-9_]` (a leading
 `_` is reserved for engine tags like `_saga`), value ≤64 bytes — a violation
@@ -1069,10 +1071,13 @@ data-minimization story, see `decisions.md` §4.6):
   spoof-resistant) `x-forwarded-for` entry; `null` when no edge proxy
   reported one. Masked covers coarse geo and abuse heuristics without
   putting a precise IP on the tape.
-- `request.unmaskedIp()` returns the raw client IP. It is a *method*
+- `unmaskedIp()` — an activation capability (`({ unmaskedIp }) => …`, not a
+  `request` member) — returns the raw client IP. It is a *function*
   deliberately: calling it is your explicit decision, as the data
   controller, to process precise IPs — and the call puts the raw IP
-  on your replay tape, where your retention window applies.
+  on your replay tape, where your retention window applies. Being a
+  capability rather than request data means a handler chooses whether
+  anything it delegates to can escalate past the mask at all.
 
 On replay, reading anything the original run didn't read raises a
 loud `REPLAY DIVERGENCE` error rather than silently returning

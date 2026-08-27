@@ -1695,7 +1695,7 @@ test "dispatch: console.log captured into response.console" {
     try testing.expectEqualStrings("hello world\nline2\n", resp.console);
 }
 
-test "dispatch: request.tag captured into response.tags (update-in-place)" {
+test "dispatch: tag captured into response.tags (update-in-place)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1708,9 +1708,9 @@ test "dispatch: request.tag captured into response.tags (update-in-place)" {
     var resp = try runOne(
         &d,
         kv,
-        \\request.tag("session", "S1");
-        \\request.tag("flow", "checkout");
-        \\request.tag("session", "S2"); // same key â†’ updates in place
+        \\arguments[0].tag("session", "S1");
+        \\arguments[0].tag("flow", "checkout");
+        \\arguments[0].tag("session", "S2"); // same key â†’ updates in place
         \\return "x";
     ,
         .{ .method = "GET", .path = "/" },
@@ -1750,10 +1750,10 @@ test "dispatch: Trace.parent_saga seeds the reserved _parent tag alongside user 
     var resp = try runOne(
         &d,
         kv,
-        \\request.tag("flow", "checkout");
-        \\request.tag("a", "1");
-        \\request.tag("b", "2");
-        \\request.tag("c", "3");
+        \\arguments[0].tag("flow", "checkout");
+        \\arguments[0].tag("a", "1");
+        \\arguments[0].tag("b", "2");
+        \\arguments[0].tag("c", "3");
         \\return "x";
     ,
         .{ .method = "GET", .path = "/", .trace = .{ .parent_saga = "corr-armed-me" } },
@@ -1805,7 +1805,7 @@ test "dispatch: a forged/oversized parent_saga is dropped, never stamped" {
     try testing.expectEqual(@as(usize, 0), resp2.tags.len);
 }
 
-test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
+test "dispatch: tag rejects reserved + over-cap (fail loud)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1820,7 +1820,7 @@ test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
     var resp = try runOne(
         &d,
         kv,
-        \\request.tag("_saga", "nope");
+        \\arguments[0].tag("_saga", "nope");
         \\return "x";
     ,
         .{ .method = "GET", .path = "/" },
@@ -3471,7 +3471,7 @@ test "dispatch: request.ip masked, unmaskedIp() raw, IP transport headers stripp
         \\export default function () {
         \\    return JSON.stringify({
         \\        ip: request.ip,
-        \\        raw: request.unmaskedIp(),
+        \\        raw: arguments[0].unmaskedIp(),
         \\        xff: request.headers["x-forwarded-for"] === undefined,
         \\        keys: Object.keys(request.headers).join(","),
         \\    });
@@ -3543,7 +3543,7 @@ test "dispatch: request.ip prefers cf-connecting-ip; IPv6 masks to /48; absent â
     {
         const bytecode = try ctx.compileToBytecode(
             \\export default function () {
-            \\    return request.ip + "|" + request.unmaskedIp();
+            \\    return request.ip + "|" + arguments[0].unmaskedIp();
             \\}
         ,
             "h.mjs",
@@ -3581,7 +3581,7 @@ test "dispatch: request.ip prefers cf-connecting-ip; IPv6 masks to /48; absent â
     {
         const bytecode = try ctx.compileToBytecode(
             \\export default function () {
-            \\    return JSON.stringify({ ip: request.ip, raw: request.unmaskedIp() });
+            \\    return JSON.stringify({ ip: request.ip, raw: arguments[0].unmaskedIp() });
             \\}
         ,
             "h.mjs",

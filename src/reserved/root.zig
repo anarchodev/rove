@@ -15,7 +15,7 @@
 //!   allowed; the fire-time guard skips dispatch on platform keys.
 //!
 //! Also home to the handler-facing LIMITS every engine must agree on (the kv
-//! byte caps, the `request.tag` bounds). They sit in this leaf for the same
+//! byte caps, the `tag` bounds). They sit in this leaf for the same
 //! reason the prefixes do: the offline engines have to read them without
 //! importing the stack that gives them meaning, and a number transcribed into
 //! three preludes is three numbers waiting to disagree.
@@ -449,7 +449,7 @@ test "isCustomerWriteReserved: customer (non-_) keys allowed" {
 /// without breaking anyone, never lowered.
 pub const KV_KEY_MAX: usize = 256;
 
-/// Longest `request.shredKey(id)` identity, in bytes.
+/// Longest `shredKey(id)` identity, in bytes.
 ///
 /// A CONTRACT like the kv caps beside it: every engine must agree on what
 /// a handler may pass, or a handler is refused by one and accepted by
@@ -569,7 +569,7 @@ pub const KV_VAL_MAX: usize = 384 * 1024;
 pub const KV_WRITES_MAX: u32 = 1000;
 pub const KV_WRITE_BYTES_MAX: usize = 400 * 1024;
 
-/// `request.tag` limits — the low-cardinality index tags a handler may set.
+/// `tag` limits — the low-cardinality index tags a handler may set.
 ///
 /// Same reason the kv caps are here: a handler author reads "at most 4 tags"
 /// as a contract, and three engines have to agree on it. `src/log/root.zig`
@@ -689,10 +689,10 @@ pub fn systemCapabilityLiteralBody() []const u8 {
 ///                  re-file the handler's writes under another erasure
 ///                  identity.
 ///
-/// They stay reachable as `request.*` through the transition and move for
-/// real at the cutover (tracker #753). Their natives ignore the receiver
-/// (`binding.Tag`/`ShredKey` resolve state from the context), so exposing
-/// the same function object on the activation binds nothing.
+/// They are reachable ONLY on the activation object (#849) — `request` is a
+/// data shape and carries no effects. Their natives ignore the receiver
+/// (`binding.Tag`/`ShredKey` resolve state from the context), so where the
+/// function object is exposed binds nothing.
 /// NUL-terminated: the worker hands these straight to `JS_SetPropertyStr`,
 /// which takes a C string.
 pub const REQUEST_EFFECT_NAMES = [_][:0]const u8{
@@ -700,16 +700,6 @@ pub const REQUEST_EFFECT_NAMES = [_][:0]const u8{
     "unmaskedIp",
     "shredKey",
 };
-
-/// `REQUEST_EFFECT_NAMES` as a JS array literal, for engines that build the
-/// activation object by evaluating source.
-pub fn requestEffectArrayLiteral() []const u8 {
-    comptime {
-        var out: []const u8 = "[";
-        for (REQUEST_EFFECT_NAMES) |n| out = out ++ "\"" ++ n ++ "\", ";
-        return out ++ "]";
-    }
-}
 
 test "isEngineOnly: engine namespaces are hidden, customer keys are not" {
     try std.testing.expect(isEngineOnly("_usage/blob/deadbeef"));
