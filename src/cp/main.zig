@@ -51,7 +51,14 @@ const Bridge = bridge_mod.Bridge;
 const acme_issuer = @import("acme.zig");
 const MetricsServer = @import("metrics-server").MetricsServer;
 
-const CpH2 = h2.H2(.{});
+const cp_h2_opts = h2.Options{ .registry_model = .fat };
+
+/// The control plane's world, declared by the module that instantiates
+/// it (explicit `.world`, not the root rove_world pattern) so the same
+/// type works under test roots that declare nothing.
+pub const CpWorld = rove.World(.{ .parts = h2.parts(cp_h2_opts) });
+
+const CpH2 = h2.H2(.{ .registry_model = .fat, .world = CpWorld });
 
 /// Constant-time byte-slice equality for secret comparison: the
 /// compare time depends only on the (non-secret) length, never on how
@@ -241,25 +248,25 @@ const Router = struct {
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
     fn replyStatus(server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16) !void {
-        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-        try server.reg.set(ent, &server.request_out, h2.Session, sess);
-        try server.reg.move(ent, &server.request_out, &server.response_in);
+        try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = code });
+        try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{ .data = null, .len = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+        try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+        try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
     }
 
     /// Reply with a status + owned text body (`msg` is freed by the
     /// registry via `RespBody.deinit`).
     fn replyText(server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16, msg: []u8) !void {
-        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = msg.ptr, .len = @intCast(msg.len) });
-        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-        try server.reg.set(ent, &server.request_out, h2.Session, sess);
-        try server.reg.move(ent, &server.request_out, &server.response_in);
+        try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = code });
+        try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{ .data = msg.ptr, .len = @intCast(msg.len) });
+        try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+        try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+        try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
     }
 
     /// The CP serves ONLY its control surface — `/_control/*` (move
@@ -1694,7 +1701,7 @@ fn queryParam(path: []const u8, key: []const u8) ?[]const u8 {
 
 fn cleanupResponses(server: *CpH2) !void {
     const entities = server.response_out.entitySlice();
-    for (entities) |ent| try server.reg.destroy(ent);
+    for (entities) |ent| try server.destroyEntity(ent);
 }
 
 fn getEnvCfg(name: []const u8) []const u8 {
@@ -2108,7 +2115,7 @@ pub fn main() !void {
     // `/_control/move`. Unset → move control disabled.
     const move_secret: ?[]const u8 = std.posix.getenv("REWIND_MOVE_SECRET");
 
-    var reg = try rove.Registry.init(allocator, .{
+    var reg = try CpH2.Reg.init(allocator, .{
         .max_entities = 8192,
         .deferred_queue_capacity = 2048,
     });
