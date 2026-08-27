@@ -23,13 +23,13 @@ const h2 = @import("rove-h2");
 
 // Two worlds in one binary — the heterogeneous case explicit `.world`
 // exists for (a root `rove_world` could only name one).
-const server_opts = h2.Options{ .registry_model = .fat };
+const server_opts = h2.Options{};
 const ServerWorld = rove.World(.{ .parts = h2.parts(server_opts) });
-const ServerH2 = h2.H2(.{ .registry_model = .fat, .world = ServerWorld });
+const ServerH2 = h2.H2(.{ .world = ServerWorld });
 
-const client_opts = h2.Options{ .client = true, .registry_model = .fat };
+const client_opts = h2.Options{ .client = true };
 const ClientWorld = rove.World(.{ .parts = h2.parts(client_opts) });
-const ClientH2 = h2.H2(.{ .client = true, .registry_model = .fat, .world = ClientWorld });
+const ClientH2 = h2.H2(.{ .client = true, .world = ClientWorld });
 
 const PORT: u16 = 18441;
 

@@ -103,14 +103,6 @@ pub const Conn = struct {
     draining: bool = false,
     drain_deadline_ns: u64 = 0,
 
-    /// A close was requested for this conn but could not be applied — rove
-    /// refuses a second collection transition in one tick, so a conn that
-    /// already moved this pass cannot also move to `conn_closing`. The
-    /// request is sticky and `retryPendingCloses` applies it next pass, so
-    /// no caller has to carry the retry itself. Distinct from `draining`,
-    /// which means the opposite: a GOAWAY is out and the conn is being let
-    /// finish.
-    close_requested: bool = false,
 
     /// Streams currently open on this connection. The idle reaper skips a
     /// connection with any, because "idle" must mean NO WORK IN FLIGHT, not

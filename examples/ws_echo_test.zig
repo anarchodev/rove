@@ -17,7 +17,7 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
-const h2_opts = h2.Options{ .registry_model = .fat };
+const h2_opts = h2.Options{};
 
 pub const rove_world = rove.World(.{ .parts = h2.parts(h2_opts) });
 

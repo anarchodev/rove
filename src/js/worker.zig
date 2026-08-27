@@ -56,7 +56,7 @@
 //! own io_uring ring and its own `SO_REUSEPORT` listen socket, and the
 //! kernel spreads inbound connections across them. Everything a
 //! `Worker` holds by value is therefore per-worker, touched only by
-//! its own thread — the `rove.Registry` and h2 server, `pending_txns`,
+//! its own thread — the world registry and h2 server, `pending_txns`,
 //! `parked_units`, `blob_sessions`, `spools`, `ws_conns`,
 //! `tenant_logs`, `log` (including `log_buffer`, which is per-worker
 //! despite the `NodeLogBuffer` spelling — the "node" in the name means
@@ -1467,8 +1467,7 @@ pub fn Worker(comptime opts: Options) type {
         .request_row = merged_request_row,
         .connection_row = opts.connection_row,
         .client = true,
-        .registry_model = .fat,
-    };
+        };
 
     // Worker-only collection for entity-less post-propose parked
     // units (`parkSendOps` / `parkKvWakes` / `proposeForgetfulWrites`).
@@ -1515,8 +1514,7 @@ pub fn Worker(comptime opts: Options) type {
         .request_row = merged_request_row,
         .connection_row = opts.connection_row,
         .client = true,
-        .registry_model = .fat,
-        .world = WorkerWorld,
+            .world = WorkerWorld,
     });
 
     const StreamRow = H2Type.StreamRow;
@@ -4772,35 +4770,36 @@ test "RateCharged: fresh on create, carried across a park, and reset when the sl
     // on. The middle one is why the mark is a component rather than a side
     // map keyed by entity; the last one is the dangerous half — a stale
     // `true` on a recycled slot would serve a tenant's requests for free.
-    var reg = try rove.Registry.init(testing.allocator, .{ .max_entities = 8 });
-    defer reg.deinit();
-
     const Req = rove.Row(&.{RateCharged});
-    var request_out = try rove.Collection(Req, .{}).init(testing.allocator);
-    defer request_out.deinit();
-    reg.registerCollection(&request_out, 1);
+    const W = rove.World(.{ .parts = &.{.{
+        .name = "rate-test",
+        .collections = &.{
+            .{ .name = "request_out", .row = Req },
+            .{ .name = "parked", .row = Req },
+        },
+    }} });
+    var reg = try W.Reg.init(testing.allocator, .{ .max_entities = 8 });
+    defer reg.deinit();
+    const request_out = reg.coll(.request_out);
+    const parked = reg.coll(.parked);
 
-    var parked = try rove.Collection(Req, .{}).init(testing.allocator);
-    defer parked.deinit();
-    reg.registerCollection(&parked, 2);
+    const e = try reg.create(request_out);
+    try testing.expect(!(try reg.get(e, request_out, RateCharged)).charged);
 
-    const e = try reg.create(&request_out);
-    try testing.expect(!(try reg.get(e, &request_out, RateCharged)).charged);
-
-    try reg.set(e, &request_out, RateCharged, .{ .charged = true });
+    try reg.set(e, request_out, RateCharged, .{ .charged = true });
 
     // A body-durability park and its resume: the mark rides the entity, so
     // the walk that picks it back up does not take a second token.
-    try reg.move(e, &request_out, &parked);
+    try reg.move(e, request_out, parked);
     try reg.flush();
-    try reg.move(e, &parked, &request_out);
+    try reg.move(e, parked, request_out);
     try reg.flush();
-    try testing.expect((try reg.get(e, &request_out, RateCharged)).charged);
+    try testing.expect((try reg.get(e, request_out, RateCharged)).charged);
 
     // The answered request's entity goes back to the pool. Whatever request
     // lands on that slot next is a new one and pays its own token.
     try reg.destroy(e);
     try reg.flush();
-    const reused = try reg.create(&request_out);
-    try testing.expect(!(try reg.get(reused, &request_out, RateCharged)).charged);
+    const reused = try reg.create(request_out);
+    try testing.expect(!(try reg.get(reused, request_out, RateCharged)).charged);
 }

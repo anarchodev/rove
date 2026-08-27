@@ -32,7 +32,6 @@ const std = @import("std");
 const rove = @import("root.zig");
 const Row = rove.Row;
 const Collection = rove.Collection;
-const Registry = rove.Registry;
 const FatRegistry = rove.fat_mod.FatRegistry;
 const Entity = rove.Entity;
 
@@ -131,21 +130,6 @@ fn runMoveScenario(
 /// shape in both models; this is the parity check.
 fn benchPhaseMoves(alloc: std.mem.Allocator) !void {
     {
-        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
-        defer reg.deinit();
-        var pa = try Coll(PhaseRow).init(alloc);
-        defer pa.deinit();
-        reg.registerCollection(&pa, 1);
-        var pb = try Coll(PhaseRow).init(alloc);
-        defer pb.deinit();
-        reg.registerCollection(&pb, 2);
-
-        var ents: [K]Entity = undefined;
-        try createAll(&reg, &pa, &ents);
-        try runMoveScenario("phase move  40B row | archetype | batch", true, &reg, &ents, &pa, &pb);
-        try runMoveScenario("phase move  40B row | archetype | immediate", false, &reg, &ents, &pa, &pb);
-    }
-    {
         var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
         defer reg.deinit();
         var pa = try Coll(PhaseRow).init(alloc);
@@ -167,21 +151,6 @@ fn benchPhaseMoves(alloc: std.mem.Allocator) !void {
 /// residency is an 8B row; the archetype must carry all 152B through
 /// every hop to keep the values alive.
 fn benchDetourSurvive(alloc: std.mem.Allocator) !void {
-    {
-        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
-        defer reg.deinit();
-        var wide = try Coll(WideRow).init(alloc);
-        defer wide.deinit();
-        reg.registerCollection(&wide, 1);
-        var carry = try Coll(WideRow).init(alloc);
-        defer carry.deinit();
-        reg.registerCollection(&carry, 2);
-
-        var ents: [K]Entity = undefined;
-        try createAll(&reg, &wide, &ents);
-        try runMoveScenario("detour survive | archetype carry-all | batch", true, &reg, &ents, &wide, &carry);
-        try runMoveScenario("detour survive | archetype carry-all | immediate", false, &reg, &ents, &wide, &carry);
-    }
     {
         var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
         defer reg.deinit();
@@ -222,26 +191,6 @@ fn benchResidentChurn(alloc: std.mem.Allocator, comptime K_RES: u32, comptime C:
     }.go;
 
     {
-        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
-        defer reg.deinit();
-        var idle = try CollN(WideRow, K_RES).init(alloc);
-        defer idle.deinit();
-        reg.registerCollection(&idle, 1);
-        var active = try CollN(WideRow, K_RES).init(alloc);
-        defer active.deinit();
-        reg.registerCollection(&active, 2);
-
-        const ents = try alloc.alloc(Entity, K_RES);
-        defer alloc.free(ents);
-        try createAll(&reg, &idle, ents);
-        const churners = ents[0..C];
-
-        var totals: [REPS]u64 = undefined;
-        _ = try churnOnce(&reg, churners, &idle, &active);
-        for (&totals) |*t| t.* = try churnOnce(&reg, churners, &idle, &active);
-        report(std.fmt.comptimePrint("churn K={d} C={d} | archetype idle 152B", .{ K_RES, C }), totals, ops);
-    }
-    {
         var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
         defer reg.deinit();
         var idle = try CollN(NarrowRow, K_RES).init(alloc);
@@ -263,35 +212,6 @@ fn benchResidentChurn(alloc: std.mem.Allocator, comptime K_RES: u32, comptime C:
         for (&totals) |*t| t.* = try churnOnce(&reg, churners, &idle, &active);
         report(std.fmt.comptimePrint("churn K={d} C={d} | fat idle 8B (144B parked)", .{ K_RES, C }), totals, ops);
     }
-}
-
-/// Archetype detour through a TRUE narrow row: values destroyed on the
-/// way out, re-defaulted on the way back. The cheapest archetype detour
-/// — context for what carry-all's survival costs.
-fn benchDetourLossy(alloc: std.mem.Allocator) !void {
-    var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
-    defer reg.deinit();
-    var wide = try Coll(WideRow).init(alloc);
-    defer wide.deinit();
-    reg.registerCollection(&wide, 1);
-    var narrow = try Coll(NarrowRow).init(alloc);
-    defer narrow.deinit();
-    reg.registerCollection(&narrow, 2);
-
-    var ents: [K]Entity = undefined;
-    try createAll(&reg, &wide, &ents);
-
-    var totals: [REPS]u64 = undefined;
-    for (0..REPS + 1) |rep| {
-        var timer = try std.time.Timer.start();
-        for (0..MOVE_ITERS) |_| {
-            for (ents) |e| try reg.moveStripImmediate(e, &wide, &narrow, &.{ M, Addr });
-            for (ents) |e| try reg.moveImmediate(e, &narrow, &wide);
-        }
-        const t = timer.read();
-        if (rep > 0) totals[rep - 1] = t; // rep 0 is warmup
-    }
-    report("detour LOSSY   | archetype moveStrip | immediate", totals, MOVE_ITERS * 2 * K);
 }
 
 /// The dense hot path: iterate a column. Identical Collection storage in
@@ -318,15 +238,6 @@ fn benchIterate(alloc: std.mem.Allocator) !void {
     }.go;
 
     {
-        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
-        defer reg.deinit();
-        var wide = try Coll(WideRow).init(alloc);
-        defer wide.deinit();
-        reg.registerCollection(&wide, 1);
-        var ents: [K]Entity = undefined;
-        try run("iterate column M | archetype", &reg, &wide, &ents);
-    }
-    {
         var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
@@ -341,28 +252,6 @@ fn benchIterate(alloc: std.mem.Allocator) !void {
 /// models — same shape), `getFat` resident (fn-table dispatch into the
 /// column), `getFat` parked (shadow slot).
 fn benchLookup(alloc: std.mem.Allocator) !void {
-    {
-        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
-        defer reg.deinit();
-        var wide = try Coll(WideRow).init(alloc);
-        defer wide.deinit();
-        reg.registerCollection(&wide, 1);
-        var ents: [K]Entity = undefined;
-        try createAll(&reg, &wide, &ents);
-
-        var totals: [REPS]u64 = undefined;
-        for (0..REPS + 1) |rep| {
-            var acc: u64 = 0;
-            var timer = try std.time.Timer.start();
-            for (0..LOOKUP_PASSES) |_| {
-                for (ents) |e| acc +%= (try reg.get(e, &wide, M)).v[0];
-            }
-            const t = timer.read();
-            std.mem.doNotOptimizeAway(acc);
-            if (rep > 0) totals[rep - 1] = t;
-        }
-        report("lookup M | archetype get (known coll)", totals, LOOKUP_PASSES * K);
-    }
     {
         var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
         defer reg.deinit();
@@ -431,154 +320,6 @@ const NCHAIN = 11;
 const CLOSE_CYCLES = 10;
 
 fn benchUnknownHome(alloc: std.mem.Allocator) !void {
-    // ---- archetype: candidate-tuple scan ----
-    {
-        var reg = try Registry.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 8192 });
-        defer reg.deinit();
-        var chain: [NCHAIN]StreamColl = undefined;
-        for (&chain) |*c| c.* = try StreamColl.init(alloc);
-        defer for (&chain) |*c| c.deinit();
-        for (&chain, 0..) |*c, ci| reg.registerCollection(c, @intCast(ci + 1));
-        var terminal = try StreamColl.init(alloc);
-        defer terminal.deinit();
-        reg.registerCollection(&terminal, NCHAIN + 1);
-
-        const t11 = .{
-            &chain[0], &chain[1], &chain[2], &chain[3], &chain[4], &chain[5],
-            &chain[6], &chain[7], &chain[8], &chain[9], &chain[10],
-        };
-
-        const ents = try alloc.alloc(Entity, K);
-        defer alloc.free(ents);
-        for (ents, 0..) |*e, i| e.* = try reg.create(&chain[i % NCHAIN]);
-
-        // resolve, uniform distribution over the 11 candidates
-        {
-            var totals: [REPS]u64 = undefined;
-            for (0..REPS + 1) |rep| {
-                var acc: u64 = 0;
-                var timer = try std.time.Timer.start();
-                for (0..LOOKUP_PASSES) |_| {
-                    for (ents) |e| acc +%= (try reg.getAny(e, t11, Sid)).id;
-                }
-                const t = timer.read();
-                std.mem.doNotOptimizeAway(acc);
-                if (rep > 0) totals[rep - 1] = t;
-            }
-            report("resolve | archetype getAny 11-scan, uniform", totals, LOOKUP_PASSES * K);
-        }
-
-        // resolve, worst case: every entity in the LAST-scanned candidate
-        {
-            for (ents) |e| {
-                if (!reg.isInCollection(e, &chain[NCHAIN - 1])) {
-                    try reg.moveAny(e, t11, &chain[NCHAIN - 1]);
-                }
-            }
-            try reg.flush();
-
-            var totals: [REPS]u64 = undefined;
-            for (0..REPS + 1) |rep| {
-                var acc: u64 = 0;
-                var timer = try std.time.Timer.start();
-                for (0..LOOKUP_PASSES) |_| {
-                    for (ents) |e| acc +%= (try reg.getAny(e, t11, Sid)).id;
-                }
-                const t = timer.read();
-                std.mem.doNotOptimizeAway(acc);
-                if (rep > 0) totals[rep - 1] = t;
-            }
-            report("resolve | archetype getAny 11-scan, worst(last)", totals, LOOKUP_PASSES * K);
-
-            // back to uniform for the close scenarios
-            for (ents, 0..) |e, i| {
-                if (i % NCHAIN != NCHAIN - 1) try reg.moveImmediate(e, &chain[NCHAIN - 1], &chain[i % NCHAIN]);
-            }
-        }
-
-        // resolve, coll-enum style: ids declared (here: known from
-        // registration order), so membership is READ and the typed
-        // collection is indexed — the parked coll-enum branch's
-        // `collectionOf` + `inline else` switch, position-independent.
-        // Same archetype storage; only the dispatch discipline differs.
-        {
-            const first_id = chain[0].registry_id;
-            var totals: [REPS]u64 = undefined;
-            for (0..REPS + 1) |rep| {
-                var acc: u64 = 0;
-                var timer = try std.time.Timer.start();
-                for (0..LOOKUP_PASSES) |_| {
-                    for (ents) |e| {
-                        const idx = e.index;
-                        if (reg.generations[idx] != e.generation) return error.Stale;
-                        const raw = reg.collection_ids[idx];
-                        if (raw < first_id or raw >= first_id + NCHAIN) return error.WrongCollection;
-                        acc +%= chain[raw - first_id].column(Sid)[reg.offsets[idx]].id;
-                    }
-                }
-                const t = timer.read();
-                std.mem.doNotOptimizeAway(acc);
-                if (rep > 0) totals[rep - 1] = t;
-            }
-            report("resolve | archetype id-index (coll-enum style)", totals, LOOKUP_PASSES * K);
-        }
-
-        // close from unknown home: moveAny scan, then flush; redistribute untimed
-        {
-            var totals: [REPS]u64 = undefined;
-            for (0..REPS + 1) |rep| {
-                var t: u64 = 0;
-                for (0..CLOSE_CYCLES) |_| {
-                    var timer = try std.time.Timer.start();
-                    for (ents) |e| try reg.moveAny(e, t11, &terminal);
-                    try reg.flush();
-                    t += timer.read();
-                    for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
-                }
-                if (rep > 0) totals[rep - 1] = t;
-            }
-            report("close   | archetype moveAny 11-scan, uniform", totals, CLOSE_CYCLES * K);
-        }
-
-        // close, coll-enum style: membership read, source indexed. `move`
-        // re-validates the handle, so no pre-checks here.
-        {
-            const first_id = chain[0].registry_id;
-            var totals: [REPS]u64 = undefined;
-            for (0..REPS + 1) |rep| {
-                var t: u64 = 0;
-                for (0..CLOSE_CYCLES) |_| {
-                    var timer = try std.time.Timer.start();
-                    for (ents) |e| {
-                        try reg.move(e, &chain[reg.collection_ids[e.index] - first_id], &terminal);
-                    }
-                    try reg.flush();
-                    t += timer.read();
-                    for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
-                }
-                if (rep > 0) totals[rep - 1] = t;
-            }
-            report("close   | archetype id-index (coll-enum style)", totals, CLOSE_CYCLES * K);
-        }
-
-        // close with the home KNOWN at the call site — the scan-free floor
-        {
-            var totals: [REPS]u64 = undefined;
-            for (0..REPS + 1) |rep| {
-                var t: u64 = 0;
-                for (0..CLOSE_CYCLES) |_| {
-                    var timer = try std.time.Timer.start();
-                    for (ents, 0..) |e, i| try reg.move(e, &chain[i % NCHAIN], &terminal);
-                    try reg.flush();
-                    t += timer.read();
-                    for (ents, 0..) |e, i| try reg.moveImmediate(e, &terminal, &chain[i % NCHAIN]);
-                }
-                if (rep > 0) totals[rep - 1] = t;
-            }
-            report("close   | known home, direct move (floor)", totals, CLOSE_CYCLES * K);
-        }
-    }
-
     // ---- fat: id-indexed dispatch ----
     {
         var reg = try FatStreamReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 8192 });
@@ -654,7 +395,6 @@ pub fn main() !void {
     try benchPhaseMoves(alloc);
     std.debug.print("\n", .{});
     try benchDetourSurvive(alloc);
-    try benchDetourLossy(alloc);
     std.debug.print("\n", .{});
     try benchResidentChurn(alloc, 4096, 256);
     try benchResidentChurn(alloc, 16384, 512);

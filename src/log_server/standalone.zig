@@ -50,14 +50,14 @@ const zlib = @cImport({
     @cInclude("zlib.h");
 });
 
-const log_h2_opts = h2.Options{ .registry_model = .fat };
+const log_h2_opts = h2.Options{};
 
 /// The log server's world, declared by the module that instantiates it
 /// (explicit `.world`, not the root `rove_world` pattern): this module
 /// also compiles inside test builds, whose root declares nothing.
 pub const LogWorld = rove.World(.{ .parts = h2.parts(log_h2_opts) });
 
-const LogH2 = h2.H2(.{ .registry_model = .fat, .world = LogWorld });
+const LogH2 = h2.H2(.{ .world = LogWorld });
 
 pub const Config = struct {
     allocator: std.mem.Allocator,

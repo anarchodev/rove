@@ -13,7 +13,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 
-const h2_opts = h2.Options{ .registry_model = .fat };
+const h2_opts = h2.Options{};
 
 /// The world type, declared once at root scope; registry VALUES are
 /// constructed in `main` — never here.

@@ -3,9 +3,9 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
-const h2_opts = h2.Options{ .client = true, .registry_model = .fat };
+const h2_opts = h2.Options{ .client = true };
 const MyWorld = rove.World(.{ .parts = h2.parts(h2_opts) });
-const MyH2 = h2.H2(.{ .client = true, .registry_model = .fat, .world = MyWorld });
+const MyH2 = h2.H2(.{ .client = true, .world = MyWorld });
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

@@ -11,7 +11,7 @@ const std = @import("std");
 const rove = @import("rove");
 const rio = @import("rove-io");
 
-const io_opts = rio.Options{ .registry_model = .fat };
+const io_opts = rio.Options{};
 
 /// The world type, declared once at root scope. Values of its registry
 /// are constructed in `main` (one per worker thread in a threaded

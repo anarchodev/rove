@@ -5,7 +5,6 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const Row = rove.Row;
 const Collection = rove.Collection;
-const Registry = rove.Registry;
 const Entity = rove.Entity;
 pub const tls = @import("tls.zig");
 pub const TlsConfig = tls.TlsConfig;
@@ -178,20 +177,15 @@ pub const ConnectTarget = struct {
 };
 
 pub const Options = struct {
-    /// Collections the COMPOSING layer registers on the same registry.
-    /// Appending them here puts every collection in one namespace, so the
-    /// composer numbers its own off `Coll` rather than continuing from
-    /// wherever this layer's ids happen to end.
-    extra_collections: []const [:0]const u8 = &.{},
     request_row: type = Row(&.{}),
     connection_row: type = Row(&.{}),
     client: bool = false,
-    registry_model: rio.RegistryModel = .archetype,
-    /// The declared world this instantiation runs in (fat model). When
-    /// null, the root module's `rove_world` declaration is consulted
-    /// (`rove.declared_world`). The world must contain h2's parts — build
-    /// it from `parts(the same Options)`, appending the composing layer's
-    /// own parts.
+    /// The declared world this instantiation runs in. When null, the
+    /// root module's `rove_world` declaration is consulted
+    /// (`rove.declared_world`). The world must contain h2's parts —
+    /// build it from `parts(the same Options)`, appending the
+    /// composing layer's own parts; a composer's collections join the
+    /// one namespace as its own Part.
     world: ?type = null,
 };
 
@@ -208,16 +202,15 @@ fn RowsFor(comptime opts: Options) type {
 }
 
 /// The rove-io options this layer derives from its own — the single
-/// derivation `H2(...)` and `parts(...)` share. Under fat, retirement
-/// hands conns to `conn_dead` so `processConnDead` can free the foreign
-/// state `Conn.deinit` frees under the archetype (nghttp2 session, TLS
-/// conn, h1) at a point provably after every reader.
+/// derivation `H2(...)` and `parts(...)` share. Retirement hands conns
+/// to `conn_dead` so `processConnDead` can free the foreign state
+/// riding them (nghttp2 session, TLS conn, h1) at a point provably
+/// after every reader.
 pub fn ioOptions(comptime opts: Options) rio.Options {
     return .{
         .connection_row = Row(&.{Conn}).merge(opts.connection_row),
         .connect = opts.client,
-        .registry_model = opts.registry_model,
-        .on_retire = if (opts.registry_model == .fat) .hand_off else .destroy,
+        .on_retire = .hand_off,
         .world = opts.world,
     };
 }
@@ -463,11 +456,10 @@ pub fn H2(comptime opts: Options) type {
     const full_conn_row = rows.full_conn;
 
     const has_client = opts.client;
-    const is_fat = opts.registry_model == .fat;
 
     comptime {
-        if (is_fat and opts.world == null and rove.declared_world == null) @compileError(
-            "rove-h2: registry_model .fat requires a declared world — declare `pub const rove_world = rove.World(.{ .parts = rh2.parts(opts) })` in the binary's root module, or pass `.world` explicitly (tests' mini-worlds)",
+        if (opts.world == null and rove.declared_world == null) @compileError(
+            "rove-h2: no declared world — declare `pub const rove_world = rove.World(.{ .parts = rh2.parts(opts) })` in the binary's root module, or pass `.world` explicitly (tests' mini-worlds)",
         );
     }
 
@@ -494,18 +486,15 @@ pub fn H2(comptime opts: Options) type {
     const DeadColl = Collection(Row(&.{}), .{});
 
     // The declared world — same resolution as rove-io: the explicit
-    // option wins, the root's `rove_world` is the fallback. The fat
-    // model requires one (checked above).
+    // option wins, the root's `rove_world` is the fallback (required;
+    // checked above).
     const maybe_world: ?type = if (opts.world) |W| W else rove.declared_world;
-    const uses_world = is_fat;
-    const WorldT = if (uses_world) maybe_world.? else void;
+    const WorldT = maybe_world.?;
 
     comptime {
-        if (uses_world) {
-            for (COLLECTIONS) |s| {
-                if (s.client_only and !has_client) continue;
-                checkWorldColl(WorldT, s.name, Collection(collRowFor(opts, s.kind), .{}));
-            }
+        for (COLLECTIONS) |s| {
+            if (s.client_only and !has_client) continue;
+            checkWorldColl(WorldT, s.name, Collection(collRowFor(opts, s.kind), .{}));
         }
     }
 
@@ -664,9 +653,6 @@ pub fn H2(comptime opts: Options) type {
         /// climbing rate under normal load means someone is holding
         /// slots open with stalled handshakes.
         handshake_reaped_total: u64 = 0,
-        /// Conns whose close could not be applied this pass; drives whether
-        /// `retryPendingCloses` walks at all.
-        close_requests_deferred: u32 = 0,
         recv_enobufs_logged: bool = false,
         recv_enobufs_last_logged_decade: u64 = 0,
         /// Server-side response counts by HTTP status CLASS, indexed
@@ -759,21 +745,13 @@ pub fn H2(comptime opts: Options) type {
         /// h2 field otherwise.
         fn CollField(comptime C: type) type {
             if (C == void) return void;
-            return if (uses_world) *C else C;
+            return *C;
         }
 
-        fn CollPtr(comptime name: @TypeOf(.enum_literal)) type {
-            const F = @FieldType(Self, @tagName(name));
-            return if (uses_world) F else *F;
-        }
-
-        /// Pointer to one of h2's collections, whichever model owns the
-        /// storage — the one spelling valid under every registry model
-        /// (`&self.<name>` is not, once the field is itself a pointer
-        /// into registry-owned storage).
-        pub inline fn coll(self: *Self, comptime name: @TypeOf(.enum_literal)) CollPtr(name) {
-            const f = &@field(self, @tagName(name));
-            return if (comptime uses_world) f.* else f;
+        /// Pointer to one of h2's collections — the storage is the
+        /// registry's; these fields carry its stable pointers.
+        pub inline fn coll(self: *Self, comptime name: @TypeOf(.enum_literal)) @FieldType(Self, @tagName(name)) {
+            return @field(self, @tagName(name));
         }
 
         // =============================================================
@@ -827,53 +805,19 @@ pub fn H2(comptime opts: Options) type {
             break :blk out;
         };
 
-        comptime {
-            @setEvalBranchQuota(1_000_000);
-            // io numbers itself off its own name list (threading model
-            // only — under a declared world every id comes from the
-            // world's one table), so `Coll` must place io's names first
-            // and in that order or an io collection's registry id will
-            // not match the variant naming it here — every conn entity
-            // would then resolve to the wrong collection.
-            if (!uses_world) for (rio.activeNames(has_client), 0..) |n, i| {
-                if (@intFromEnum(@field(Coll, n)) != i)
-                    @compileError("io's collection '" ++ n ++ "' sits at a different position in Coll than in io's own namespace");
-            };
-            // One namespace: a duplicate name would silently shadow a
-            // variant and mis-resolve every entity in that collection.
-            for (ACTIVE, 0..) |a, i| for (ACTIVE[i + 1 ..]) |b| {
-                if (std.mem.eql(u8, a.name, b.name))
-                    @compileError("collection name '" ++ a.name ++ "' declared in both layers");
-            };
-        }
-
-        /// One variant per collection on the shared registry — io's, this
-        /// layer's, and any the composing layer names via
-        /// `opts.extra_collections`. A registry id IS a variant's value plus
-        /// one, so every layer numbers itself off this enum and none needs
-        /// to know where another's ids end.
-        pub const Coll = if (uses_world)
-            // The world's table IS the namespace: one enum over every
-            // part's entries, valued by registry id directly. Composer
-            // collections are its parts, so `extra_collections` has
-            // nothing to add here.
-            WorldT.CollId
-        else
-            rio.CollEnum(blk: {
-                var names: []const [:0]const u8 = &.{};
-                for (ACTIVE) |s| names = names ++ &[_][:0]const u8{s.name};
-                break :blk names ++ opts.extra_collections;
-            });
+        /// One namespace over the shared registry: the world's table IS
+        /// the enum, valued by registry id directly — io's entries, this
+        /// layer's, and any composing layer's own parts.
+        pub const Coll = WorldT.CollId;
 
         /// The `CollRef` behind a variant, or null when the variant belongs
         /// to the composing layer — this layer can name those collections
         /// but owns none of them, so every accessor here declines them.
         fn specOf(comptime k: Coll) ?CollRef {
-            // By name, because the two enum shapes number differently:
-            // threading `Coll` is ACTIVE's order (then the composer's),
-            // a world's `CollId` is the world table's. The names are the
-            // stable identity either way; a variant not in ACTIVE (a
-            // composer's collection, or a world set entry) is declined.
+            // By name — the world table's numbering is not ACTIVE's
+            // order; the names are the stable identity. A variant not
+            // in ACTIVE (a composer's collection, or a world set entry)
+            // is declined.
             @setEvalBranchQuota(1_000_000);
             inline for (ACTIVE) |a| {
                 if (comptime std.mem.eql(u8, a.name, @tagName(k))) return a;
@@ -884,16 +828,12 @@ pub fn H2(comptime opts: Options) type {
         /// The field behind a variant this layer owns, on whichever of the
         /// two layers holds it. Only called from an arm that has already
         /// established `specOf(k) != null`.
-        fn FieldPtrOf(comptime k: Coll) type {
-            const s = specOf(k).?;
-            const F = @FieldType(if (s.owner == .io) IoType else Self, s.name);
-            return if (uses_world) F else *F;
-        }
-
-        inline fn fieldOf(h2: *Self, comptime k: Coll) FieldPtrOf(k) {
+        inline fn fieldOf(h2: *Self, comptime k: Coll) @FieldType(
+            if (specOf(k).?.owner == .io) IoType else Self,
+            specOf(k).?.name,
+        ) {
             const s = comptime specOf(k).?;
-            const f = if (comptime s.owner == .io) &@field(h2.io, s.name) else &@field(h2, s.name);
-            return if (comptime uses_world) f.* else f;
+            return if (comptime s.owner == .io) @field(h2.io, s.name) else @field(h2, s.name);
         }
 
         /// The collection an entity is in, as a value.
@@ -910,16 +850,15 @@ pub fn H2(comptime opts: Options) type {
         /// sits in a collection registered by a layer ABOVE this one — those
         /// share the registry but are not in `Coll`.
         pub fn collectionOf(h2: *const Self, entity: Entity) ?Coll {
-            const core = if (comptime uses_world) &h2.reg.core else h2.reg;
+            const core = &h2.reg.core;
             const idx = entity.index;
             if (idx >= core.max_entities) return null;
             if (core.generations[idx] != entity.generation) return null;
             const raw = core.collection_ids[idx];
-            // 0 is the registry's free pool and is never a collection.
+            // 0 is the registry's free pool and is never a collection;
+            // `CollId` is valued by registry id directly.
             if (raw == 0) return null;
-            // A world's `CollId` is valued by registry id directly; the
-            // threading enum sits one below its ids.
-            return @enumFromInt(if (comptime uses_world) raw else raw - 1);
+            return @enumFromInt(raw);
         }
 
         /// The server-stream chain collection a state names, or null if the
@@ -931,8 +870,7 @@ pub fn H2(comptime opts: Options) type {
                 inline else => |tag| blk: {
                     const s = comptime specOf(tag) orelse break :blk null;
                     if (comptime s.kind == .server_stream and s.in_chain) {
-                        const f = &@field(h2, s.name);
-                        break :blk if (comptime uses_world) f.* else f;
+                        break :blk @field(h2, s.name);
                     } else {
                         break :blk null;
                     }
@@ -947,8 +885,7 @@ pub fn H2(comptime opts: Options) type {
                 inline else => |tag| blk: {
                     const s = comptime specOf(tag) orelse break :blk null;
                     if (comptime s.kind == .client_stream and s.in_chain) {
-                        const f = &@field(h2, s.name);
-                        break :blk if (comptime uses_world) f.* else f;
+                        break :blk @field(h2, s.name);
                     } else {
                         break :blk null;
                     }
@@ -987,63 +924,34 @@ pub fn H2(comptime opts: Options) type {
             return live ++ .{h2.io.coll(.conn_closing)};
         }
 
-        /// End a connection. h2 decides a conn should stop; io ends it — so
-        /// this moves the entity into io's `conn_closing` seam and never
-        /// calls `reg.destroy`. io created the conn in `handleAccept`, so io
-        /// is what releases its descriptor slot.
+        /// End a connection. h2 decides a conn should stop; io ends it —
+        /// so this routes the entity into io's `conn_closing` seam and
+        /// never calls `reg.destroy`. io created the conn in
+        /// `handleAccept`, so io is what releases its descriptor slot.
         ///
-        /// Returns whether the conn is closing *yet*. False means the move
-        /// could not be applied this pass — rove refuses a second collection
-        /// transition in one tick — in which case the request is recorded on
-        /// the conn and `retryPendingCloses` applies it next pass. The close
-        /// still happens; no caller carries the retry. The bool exists only
-        /// for callers that must know whether it took effect now.
+        /// The ending is `evictOnly` — deferred, entity-keyed, and
+        /// NEVER refused: a conn mid-move has its queued op land first
+        /// and is then collected from wherever it landed, so no caller
+        /// records a retry and no retry pass exists. The quiesce drops
+        /// every state-axis membership an upper layer gave the conn,
+        /// unnamed here; identity memberships (all_conns) survive.
+        /// Always returns true once the conn is ending (or already
+        /// ended); the bool remains for callers that check it.
         pub fn closeConn(h2: *Self, entity: Entity) bool {
-            // Already closing — done, not an error.
+            // Already ending (or ended): done, not an error. conn_dead
+            // must not be re-collected into conn_closing.
             if (h2.reg.isInCollection(entity, h2.io.coll(.conn_closing))) return true;
+            if (h2.reg.isInCollection(entity, h2.io.coll(.conn_dead))) return true;
 
-            // moveAnyOnly: ending a conn quiesces it — every state-axis
-            // membership an upper layer gave it drops with the move,
-            // unnamed here; identity memberships (all_conns) survive.
-            h2.reg.moveAnyOnly(entity, h2.liveConnColls(), h2.io.coll(.conn_closing)) catch |err| switch (err) {
+            h2.reg.evictOnly(entity, h2.io.coll(.conn_closing)) catch |err| switch (err) {
                 // Already gone: nothing holds a slot, so the conn is ended.
                 error.Stale, error.InvalidEntity => return true,
-                // Mid-transition — record the request and pick it up next
-                // pass. Silently dropping it here would strand the conn in a
-                // live collection after something decided it must end.
-                error.PendingMove => {
-                    if (getConn(h2, entity)) |cp| {
-                        if (!cp.close_requested) {
-                            cp.close_requested = true;
-                            h2.close_requests_deferred += 1;
-                        }
-                    }
-                    return false;
-                },
-                // In a conn collection `liveConnColls` does not name. Not
-                // reachable by construction, and silence here would be a
-                // leaked descriptor slot with no symptom until accepts fail.
                 else => {
-                    std.log.err("h2: closeConn could not place conn {d} — {s}", .{ entity.index, @errorName(err) });
+                    std.log.err("h2: closeConn could not queue conn {d}'s ending — {s}", .{ entity.index, @errorName(err) });
                     return false;
                 },
             };
             return true;
-        }
-
-        /// Apply close requests that `closeConn` could not place last pass.
-        /// Skipped entirely when none are outstanding, so the common path
-        /// pays one integer compare rather than a walk of every live conn.
-        fn retryPendingCloses(h2: *Self) void {
-            if (h2.close_requests_deferred == 0) return;
-            h2.close_requests_deferred = 0;
-            inline for (h2.liveConnColls()) |cl| {
-                for (cl.entitySlice()) |ent| {
-                    const cp = h2.reg.get(ent, cl, Conn) catch continue;
-                    if (!cp.close_requested) continue;
-                    _ = h2.closeConn(ent);
-                }
-            }
         }
 
         /// Set H2IoResult on a server stream entity and move it to
@@ -1624,30 +1532,6 @@ pub fn H2(comptime opts: Options) type {
                 ws.writeFrame(&wr.send_buf, h2.allocator, op, payload) catch return;
             }
             _ = c.nghttp2_session_resume_data(live.ng, live.sid);
-        }
-
-        /// FD resolver callback for io — searches h2's connection collections in addition to io's.
-        fn resolveFdThunk(ctx: *anyopaque, entity: Entity) ?*rio.Fd {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2.reg.getAny(entity, h2.connColls(), rio.Fd) catch null;
-        }
-
-        /// PeerAddr mirror of `resolveFdThunk` — the accept-time
-        /// fixed-fd-install CQE may land after the conn was promoted
-        /// out of `io.connections`.
-        fn resolvePeerThunk(ctx: *anyopaque, entity: Entity) ?*rio.PeerAddr {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2.reg.getAny(entity, h2.connColls(), rio.PeerAddr) catch null;
-        }
-
-        /// Extra-conns callback for io's admission control. Returns the
-        /// count of conn entities h2 holds outside `io.connections` —
-        /// i.e. those that have already been promoted past the
-        /// post-accept window. Combined with `io.connections.len` in
-        /// `handleAccept` to estimate total in-flight conns.
-        fn extraConnsThunk(ctx: *anyopaque) usize {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2._conn_tls_handshake.entitySlice().len + h2._conn_active.entitySlice().len;
         }
 
         // =============================================================
@@ -2548,7 +2432,10 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn connStats(self: *Self) ConnStats {
             const drain = self.io.recv_buffers_returned;
-            const deinit_r = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
+            // The destructor-era return path is gone (buffers return by
+            // transition only); the field stays 0 so the wire metric —
+            // and any dashboard on it — keeps its identity.
+            const deinit_r: u64 = 0;
             const stale_r = self.io.recv_buffers_returned_via_stale;
             const comp = self.io.recv_completions_with_data;
             return .{
@@ -2569,7 +2456,10 @@ pub fn H2(comptime opts: Options) type {
                 .io_connections = self.io.connections.entitySlice().len,
                 .write_bufs_peak = self.io.write_bufs_peak,
                 .write_bufs_now = self.io.writeBufsLive(),
-                .write_bufs_leaked = self.io.cleanup_ctx.write_bufs_destroyed_live,
+                // The bypass counter died with the destructor machinery;
+                // the invariant is now the write_done phase itself. 0
+                // keeps the must-stay-0 metric's identity.
+                .write_bufs_leaked = 0,
             };
         }
 
@@ -2695,7 +2585,6 @@ pub fn H2(comptime opts: Options) type {
             "io",           "h2_opts",                        "reg",                  "allocator",
             "recv_enobufs_total", "handshake_reaped_total",   "recv_enobufs_logged",  "recv_enobufs_last_logged_decade",
             "recv_enobufs_low_outstanding_streak", "http_status_class", "http_status_notable", "body_sinks",
-            "close_requests_deferred",
         };
         comptime {
             @setEvalBranchQuota(1_000_000);
@@ -2720,7 +2609,6 @@ pub fn H2(comptime opts: Options) type {
             self.allocator = allocator;
             self.recv_enobufs_total = 0;
             self.handshake_reaped_total = 0;
-            self.close_requests_deferred = 0;
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
@@ -2728,43 +2616,17 @@ pub fn H2(comptime opts: Options) type {
             self.http_status_notable = .{0} ** NOTABLE_STATUS.len;
             self.body_sinks = .empty;
 
-            // Init every collection field. Disabled (client_only with
-            // has_client = false) collections have field type `void` —
-            // assign `{}` so the field is defined. Under a declared world
-            // the registry constructed and registered every entry
-            // already; fetch its stable pointers instead.
+            // Every collection field is a stable pointer into the world
+            // registry's owned storage (it constructed and registered
+            // every entry). Disabled (client_only with has_client =
+            // false) collections have field type `void` — assign `{}`
+            // so the field is defined.
             inline for (COLLECTIONS) |s| {
                 if (comptime s.client_only and !has_client) {
                     @field(self, s.name) = {};
-                } else if (comptime uses_world) {
-                    @field(self, s.name) = reg.coll(@field(WorldT.CollId, s.name));
                 } else {
-                    @field(self, s.name) = try CollTypeOf(s.kind).init(allocator);
+                    @field(self, s.name) = reg.coll(@field(WorldT.CollId, s.name));
                 }
-            }
-
-            // Ids ARE the enum values (+1 for the reserved free-pool 0), so
-            // `collection_ids[entity.index]` needs no side table to decode.
-            // (World model: ids come from the world's table and the world's
-            // registry already registered the storage.)
-            if (comptime !uses_world) {
-                inline for (COLLECTIONS) |s| {
-                    if (s.client_only and !has_client) continue;
-                    reg.registerCollection(&@field(self, s.name), @intFromEnum(@field(Coll, s.name)) + 1);
-                }
-            }
-
-            // Register the three archetype hooks: FD/peer resolvers (so
-            // io's completion paths can find conns h2 moved into its own
-            // collections) and the admission-count callback. Under the fat
-            // model all three are structurally unnecessary — getFat
-            // resolves components wherever the entity lives, and
-            // all_conns counts exactly — and their setters are compile
-            // errors there.
-            if (comptime !is_fat) {
-                self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
-                self.io.setPeerResolver(@ptrCast(self), &resolvePeerThunk);
-                self.io.setExtraConnsFn(@ptrCast(self), &extraConnsThunk);
             }
 
             return self;
@@ -2772,40 +2634,33 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
-            // End every live conn the way every conn ends. Our collections
-            // deinit below, before `io.destroy` runs, so io cannot reach
-            // these — and a conn destroyed still holding its fd is the one
-            // thing `Fd.deinit` refuses to tolerate.
+            // End every live conn the way every conn ends.
             inline for (self.liveConnColls()) |cl| {
                 for (cl.entitySlice()) |ent| _ = self.closeConn(ent);
             }
             self.reg.flush() catch {};
             self.io.shutdownAllConns();
-            if (comptime is_fat) {
-                // The archetype frees each conn's foreign state (nghttp2
-                // session, TLS conn, h1) via Conn.deinit when collections
-                // deinit below. The fat model runs no hooks, so reap
-                // explicitly: conn_dead holds the retired, and conns still
-                // in conn_closing (shutdown posted, recv not yet quiet)
-                // are reaped too — their socket ops are already with the
-                // kernel, and nothing reads the session after this point.
-                self.reapConnForeign(self.io.coll(.conn_dead));
-                self.reapConnForeign(self.io.coll(.conn_closing));
-                self.reg.flush() catch {};
-                // Same for the stream-owned buffers: entities the
-                // consumer never ended (requests in flight at shutdown)
-                // and the dead-letter's unreaped tail. EVERY world
-                // collection is swept, a composer's parked stream states
-                // included — the release row is what bounds the sweep
-                // (io rows and worker-only rows read as null defaults
-                // through getFat and are skipped), so reading any
-                // entity is safe.
-                inline for (@typeInfo(WorldT.CollId).@"enum".fields) |cf| {
-                    const cid = @field(WorldT.CollId, cf.name);
-                    if (comptime WorldT.declOf(cid).kind == .set) continue;
-                    for (self.reg.coll(cid).entitySlice()) |ent| {
-                        self.freeStreamForeign(ent);
-                    }
+            // Reap the conns' foreign state (nghttp2 session, TLS, h1):
+            // conn_dead holds the retired, and conns still in
+            // conn_closing (shutdown posted, recv not yet quiet) are
+            // reaped too — their socket ops are already with the
+            // kernel, and nothing reads the session after this point.
+            self.reapConnForeign(self.io.coll(.conn_dead));
+            self.reapConnForeign(self.io.coll(.conn_closing));
+            self.reg.flush() catch {};
+            // Same for the stream-owned buffers: entities the
+            // consumer never ended (requests in flight at shutdown)
+            // and the dead-letter's unreaped tail. EVERY world
+            // collection is swept, a composer's parked stream states
+            // included — the release row is what bounds the sweep
+            // (io rows and worker-only rows read as null defaults
+            // through getFat and are skipped), so reading any
+            // entity is safe.
+            inline for (@typeInfo(WorldT.CollId).@"enum".fields) |cf| {
+                const cid = @field(WorldT.CollId, cf.name);
+                if (comptime WorldT.declOf(cid).kind == .set) continue;
+                for (self.reg.coll(cid).entitySlice()) |ent| {
+                    self.freeStreamForeign(ent);
                 }
             }
             for (self.body_sinks.items) |ref| {
@@ -2813,14 +2668,6 @@ pub fn H2(comptime opts: Options) type {
                 ref.sink.release(ref.sink.ctx);
             }
             self.body_sinks.deinit(allocator);
-            // Under a declared world the registry owns every collection —
-            // its deinit releases them.
-            if (comptime !uses_world) {
-                inline for (COLLECTIONS) |s| {
-                    if (s.client_only and !has_client) continue;
-                    @field(self, s.name).deinit();
-                }
-            }
             self.io.destroy();
             allocator.destroy(self);
         }
@@ -2899,25 +2746,18 @@ pub fn H2(comptime opts: Options) type {
         }
 
         /// End an h2-owned entity — the stream funnel verb, like
-        /// `closeConn` for conns. Under the archetype this is a plain
-        /// destroy: the four buffer-owning stream components (ReqHeaders,
-        /// ReqBody, RespHeaders, RespBody) free their heap memory via
-        /// their deinit hooks at the destroy's flush. Under fat, release
-        /// is the same transition made explicit: the entity routes to the
+        /// `closeConn` for conns. The entity routes to the
         /// `_stream_dead` dead-letter — an entity-keyed deferred evict,
         /// so an ending is NEVER refused, a mid-move entity included
         /// (the queued op lands first, then the ending collects it) —
-        /// and the pollPostlude reaper frees the buffers and destroys,
-        /// restoring the archetype's outside-the-callbacks free timing.
+        /// and the pollPostlude reaper frees the stream-owned buffers
+        /// and destroys, at a known phase outside nghttp2's callbacks.
         /// Consumers of terminal collections (response_out and kin) end
         /// entities through this, not reg.destroy — the same funnel
         /// contract every ending seam in this codebase carries.
         pub fn destroyEntity(self: *Self, ent: Entity) !void {
-            if (comptime is_fat) {
-                if (self.reg.isInCollection(ent, self.coll(._stream_dead))) return;
-                return self.reg.evict(ent, self.coll(._stream_dead));
-            }
-            try self.reg.destroy(ent);
+            if (self.reg.isInCollection(ent, self.coll(._stream_dead))) return;
+            return self.reg.evict(ent, self.coll(._stream_dead));
         }
 
         /// The union of the stream-shaped rows — server streams, the WS
@@ -2969,18 +2809,12 @@ pub fn H2(comptime opts: Options) type {
         }
 
         fn pollPostlude(self: *Self) !void {
-            // The terminal phase first: conns io retired into `conn_dead`
-            // this pass get their foreign state freed and their entities
-            // destroyed — the fat model's home for what `Conn.deinit`
-            // does at destroy-time under the archetype.
-            if (comptime is_fat) {
-                self.processConnDead();
-                self.processStreamDead();
-                try self.reg.flush();
-            }
-            // A close decided last pass but blocked by an in-flight move
-            // lands first, so nothing below treats the conn as live.
-            self.retryPendingCloses();
+            // The terminal phases first: conns io retired into
+            // `conn_dead` this pass get their foreign state freed, and
+            // the stream dead-letter is reaped — both at a known phase
+            // outside nghttp2's callbacks.
+            self.processConnDead();
+            self.processStreamDead();
             try self.reg.flush();
 
             // Phase 4: Triage reads that just arrived.
@@ -3486,9 +3320,8 @@ pub fn H2(comptime opts: Options) type {
                 // it's also the abort condition.
                 const consumed = self.io.recv_completions_with_data;
                 const returned_drain = self.io.recv_buffers_returned;
-                const returned_deinit = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
                 const returned_stale = self.io.recv_buffers_returned_via_stale;
-                const returned = returned_drain + returned_deinit + returned_stale;
+                const returned = returned_drain + returned_stale;
                 const outstanding = consumed -| returned;
 
                 // INVARIANT (impossible by construction): outstanding
@@ -3501,10 +3334,10 @@ pub fn H2(comptime opts: Options) type {
                         &buf,
                         "\n================================================================\n" ++
                             "ROVE H2: recv buffer accounting broken — outstanding ({d}) > buf_count ({d}).\n" ++
-                            "  consumed={d} returned_drain={d} returned_deinit={d} returned_stale={d}\n" ++
+                            "  consumed={d} returned_drain={d} returned_stale={d}\n" ++
                             "  This is impossible by construction; counters or ring management is buggy.\n" ++
                             "================================================================\n",
-                        .{ outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit, returned_stale },
+                        .{ outstanding, self.io.buf_count, consumed, returned_drain, returned_stale },
                     ) catch buf[0..0];
                     _ = std.posix.write(2, msg) catch {};
                     std.process.abort();
@@ -3536,11 +3369,11 @@ pub fn H2(comptime opts: Options) type {
                             "\n================================================================\n" ++
                                 "ROVE H2: recv ENOBUFS with low outstanding — buffer leak suspected.\n" ++
                                 "  enobufs={d} outstanding={d} buf_count={d}\n" ++
-                                "  consumed={d} returned_drain={d} returned_deinit={d}\n" ++
+                                "  consumed={d} returned_drain={d}\n" ++
                                 "  Some destruction path is taking buffers out of circulation\n" ++
                                 "  without returning them to the registered ring.\n" ++
                                 "================================================================\n",
-                            .{ self.recv_enobufs_total, outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit },
+                            .{ self.recv_enobufs_total, outstanding, self.io.buf_count, consumed, returned_drain },
                         ) catch buf[0..0];
                         _ = std.posix.write(2, msg) catch {};
                         std.process.abort();
@@ -3553,8 +3386,8 @@ pub fn H2(comptime opts: Options) type {
                     self.recv_enobufs_logged = true;
                     self.recv_enobufs_last_logged_decade = self.recv_enobufs_total / 10_000;
                     std.log.warn(
-                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass; consumed={d} returned_drain={d} returned_deinit={d} outstanding={d} of {d}). If `outstanding` is far below `buf_count`, this is a leak — see /_system/metrics for the running balance.",
-                        .{ self.recv_enobufs_total, enobufs_this_pass, consumed, returned_drain, returned_deinit, outstanding, self.io.buf_count },
+                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass; consumed={d} returned_drain={d} outstanding={d} of {d}). If `outstanding` is far below `buf_count`, this is a leak — see /_system/metrics for the running balance.",
+                        .{ self.recv_enobufs_total, enobufs_this_pass, consumed, returned_drain, outstanding, self.io.buf_count },
                     );
                 }
             }
@@ -6040,8 +5873,15 @@ pub fn H2(comptime opts: Options) type {
 
 const testing = std.testing;
 
+// Type-shape fixtures — tests' mini-worlds via explicit `.world`.
+const ShapeWorld = rove.World(.{ .parts = parts(.{}) });
+const ShapeH2 = H2(.{ .world = ShapeWorld });
+const client_shape_opts = Options{ .client = true };
+const ClientShapeWorld = rove.World(.{ .parts = parts(client_shape_opts) });
+const ClientShapeH2 = H2(.{ .client = true, .world = ClientShapeWorld });
+
 test "stream row contains all h2 base components" {
-    const H2Type = H2(.{});
+    const H2Type = ShapeH2;
     try testing.expect(H2Type.StreamRow.contains(StreamId));
     try testing.expect(H2Type.StreamRow.contains(Session));
     try testing.expect(H2Type.StreamRow.contains(ReqHeaders));
@@ -6053,22 +5893,27 @@ test "stream row contains all h2 base components" {
 }
 
 test "connection row contains Conn" {
-    const H2Type = H2(.{});
+    const H2Type = ShapeH2;
     try testing.expect(H2Type.ConnectionRow.contains(Conn));
     try testing.expect(H2Type.ConnectionRow.contains(rio.Fd));
     try testing.expect(H2Type.ConnectionRow.contains(rio.ReadCycleEntity));
 }
 
+const PassAppData = struct { tag: u64 };
+const PassSession = struct { id: u64 };
+const pass_opts = Options{ .request_row = Row(&.{PassAppData}), .connection_row = Row(&.{PassSession}) };
+const PassWorld = rove.World(.{ .parts = parts(pass_opts) });
+
 test "user rows pass through" {
-    const MyAppData = struct { tag: u64 };
-    const MySession = struct { id: u64 };
-    const H2Type = H2(.{ .request_row = Row(&.{MyAppData}), .connection_row = Row(&.{MySession}) });
+    const MyAppData = PassAppData;
+    const MySession = PassSession;
+    const H2Type = H2(.{ .request_row = Row(&.{PassAppData}), .connection_row = Row(&.{PassSession}), .world = PassWorld });
     try testing.expect(H2Type.StreamRow.contains(MyAppData));
     try testing.expect(H2Type.ConnectionRow.contains(MySession));
 }
 
 test "H2 type has expected collections" {
-    const H2Type = H2(.{});
+    const H2Type = ShapeH2;
     try testing.expect(@hasField(H2Type, "request_out"));
     try testing.expect(@hasField(H2Type, "response_in"));
     try testing.expect(@hasField(H2Type, "response_out"));
@@ -6077,7 +5922,7 @@ test "H2 type has expected collections" {
 }
 
 test "H2 client has client collections" {
-    const H2Type = H2(.{ .client = true });
+    const H2Type = ClientShapeH2;
     try testing.expect(@hasField(H2Type, "client_connect_in"));
     try testing.expect(@hasField(H2Type, "client_response_out"));
 }
@@ -6137,9 +5982,9 @@ test "stream accumulator — headers and body" {
 // through h2's allocator must be freed by the reaper or the teardown
 // sweep, or the test fails on leak.
 
-const fat_test_opts = Options{ .registry_model = .fat };
+const fat_test_opts = Options{};
 const FatTestWorld = rove.World(.{ .parts = parts(fat_test_opts) });
-const FatTestH2 = H2(.{ .registry_model = .fat, .world = FatTestWorld });
+const FatTestH2 = H2(.{ .world = FatTestWorld });
 
 fn fatTestServer(reg: *FatTestH2.Reg) !*FatTestH2 {
     return FatTestH2.create(reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{

@@ -69,9 +69,6 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         /// registration; the archetype registry leaves it 0.
         axis_index: u8 = 0,
 
-        // Lifecycle context pointers (one per component slot, null if not needed)
-        init_ctxs: [R.len]?*anyopaque,
-        deinit_ctxs: [R.len]?*anyopaque,
 
         /// Create a new collection. For fixed-capacity collections, this
         /// performs the single up-front allocation. For dynamic collections,
@@ -87,8 +84,6 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
                 .allocator = allocator,
                 .registry_id = 0,
                 .axis_index = 0,
-                .init_ctxs = [_]?*anyopaque{null} ** R.len,
-                .deinit_ctxs = [_]?*anyopaque{null} ** R.len,
             };
             if (options.capacity) |cap| {
                 try self.allocateStorage(cap);
@@ -97,13 +92,11 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         }
 
         pub fn deinit(self: *Self) void {
-            // Call batch deinit for every live entity
-            inline for (comptime R.deinitTypes()) |T| {
-                const idx = comptime columnIndex(T);
-                if (self.columns[idx]) |raw| {
-                    self.callDeinit(T, alignedSlice(T, raw, self.count));
-                }
-            }
+            // Storage only: no component hooks run — release is a
+            // transition owned by a system, and foreign memory still
+            // riding members at teardown is freed by the owning layer's
+            // sweep (h2's stream sweep, the worker's row sweeps) before
+            // the registry dies.
 
             // Free entity array
             if (self.entities) |e| {
@@ -132,20 +125,6 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         pub fn entitySlice(self: *const Self) []Entity {
             const ptr = self.entities orelse return &[_]Entity{};
             return ptr[0..self.count];
-        }
-
-        /// Register a typed init context for a component. The component must
-        /// declare `pub const InitCtx = SomeType` and its init must accept
-        /// `*InitCtx` as the second parameter.
-        pub fn setInitCtx(self: *Self, comptime T: type, ctx: *T.InitCtx) void {
-            const idx = comptime columnIndex(T);
-            self.init_ctxs[idx] = @ptrCast(ctx);
-        }
-
-        /// Register a typed deinit context for a component.
-        pub fn setDeinitCtx(self: *Self, comptime T: type, ctx: *T.DeinitCtx) void {
-            const idx = comptime columnIndex(T);
-            self.deinit_ctxs[idx] = @ptrCast(ctx);
         }
 
         /// Pre-allocate storage for at least `min_capacity` entities.
@@ -214,27 +193,13 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
                 }
             }
 
-            // Call batch init() on components that have it
-            inline for (comptime R.initTypes()) |T| {
-                const idx = comptime columnIndex(T);
-                const typed = alignedPtr(T, self.columns[idx].?);
-                self.callInit(T, typed[offset .. offset + count]);
-            }
-
             self.count += count;
             return offset;
         }
 
-        /// Remove a single entity at `offset`. Calls batch deinit on its
-        /// components. Convenience wrapper around removeRun.
+        /// Remove a single entity at `offset` — storage only, no
+        /// component hooks. Convenience wrapper around removeRun.
         pub fn swapRemove(self: *Self, offset: u32) ?Entity {
-            // Call deinit on the removed entity's components
-            inline for (comptime R.deinitTypes()) |T| {
-                const idx = comptime columnIndex(T);
-                const typed = alignedPtr(T, self.columns[idx].?);
-                self.callDeinit(T, typed[offset .. offset + 1]);
-            }
-
             const moved = self.removeRun(offset, 1);
             return if (moved.len > 0) moved[0] else null;
         }
@@ -272,30 +237,6 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         // ---------------------------------------------------------------
         // Internal helpers
         // ---------------------------------------------------------------
-
-        /// Call batch init with or without context, depending on the component type.
-        /// If a context is required but not registered, the init is skipped.
-        pub fn callInit(self: *Self, comptime T: type, items: []T) void {
-            if (comptime row_mod.componentInitNeedsCtx(T)) {
-                const idx = comptime columnIndex(T);
-                const raw = self.init_ctxs[idx] orelse return;
-                T.init(items, @ptrCast(@alignCast(raw)));
-            } else {
-                T.init(items);
-            }
-        }
-
-        /// Call batch deinit with or without context, depending on the component type.
-        /// If a context is required but not registered, the deinit is skipped.
-        pub fn callDeinit(self: *Self, comptime T: type, items: []T) void {
-            if (comptime row_mod.componentDeinitNeedsCtx(T)) {
-                const idx = comptime columnIndex(T);
-                const raw = self.deinit_ctxs[idx] orelse return;
-                T.deinit(self.allocator, items, @ptrCast(@alignCast(raw)));
-            } else {
-                T.deinit(self.allocator, items);
-            }
-        }
 
         /// Allocate (or reallocate) storage for `new_cap` entities.
         fn allocateStorage(self: *Self, new_cap: u32) !void {
@@ -442,16 +383,6 @@ test "zero-init" {
     try testing.expectEqual(@as(f32, 0), pos.z);
 }
 
-test "init called" {
-    var coll = try Collection(Row(&.{ Position, Health }), .{}).init(testing.allocator);
-    defer coll.deinit();
-
-    _ = try coll.appendEntity(makeEntity(0));
-    const hp = coll.column(Health)[0];
-    try testing.expectEqual(@as(i32, 100), hp.current);
-    try testing.expectEqual(@as(i32, 100), hp.max);
-}
-
 test "append multiple" {
     var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer coll.deinit();
@@ -518,18 +449,6 @@ test "swapRemove middle" {
     try testing.expectEqual(@as(f32, 2), coll.column(Position)[0].x);
 }
 
-test "swapRemove calls deinit" {
-    deinit_counter = 0;
-    var coll = try Collection(Row(&.{Tracked}), .{}).init(testing.allocator);
-    defer coll.deinit();
-
-    _ = try coll.appendEntity(makeEntity(0));
-    _ = try coll.appendEntity(makeEntity(1));
-
-    _ = coll.swapRemove(0);
-    try testing.expectEqual(@as(u32, 1), deinit_counter);
-}
-
 test "column slice length" {
     var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer coll.deinit();
@@ -561,18 +480,6 @@ test "empty row" {
     _ = try coll.appendEntity(makeEntity(1));
     try testing.expectEqual(@as(u32, 2), coll.count);
     try testing.expect(coll.entitySlice()[0].eql(makeEntity(0)));
-}
-
-test "deinit calls component deinit" {
-    deinit_counter = 0;
-    {
-        var coll = try Collection(Row(&.{Tracked}), .{}).init(testing.allocator);
-        _ = try coll.appendEntity(makeEntity(0));
-        _ = try coll.appendEntity(makeEntity(1));
-        _ = try coll.appendEntity(makeEntity(2));
-        coll.deinit();
-    }
-    try testing.expectEqual(@as(u32, 3), deinit_counter);
 }
 
 test "single component row" {
@@ -706,22 +613,6 @@ test "fixed — ensureCapacity beyond cap returns Full" {
 
     const result = coll.ensureCapacity(32);
     try testing.expectError(error.Full, result);
-}
-
-test "fixed — with init/deinit components" {
-    deinit_counter = 0;
-    {
-        var coll = try Collection(Row(&.{ Health, Tracked }), .{ .capacity = 8 }).init(testing.allocator);
-        _ = try coll.appendEntity(makeEntity(0));
-        _ = try coll.appendEntity(makeEntity(1));
-
-        // Verify Health.init was called
-        try testing.expectEqual(@as(i32, 100), coll.column(Health)[0].current);
-        try testing.expectEqual(@as(i32, 100), coll.column(Health)[1].current);
-
-        coll.deinit();
-    }
-    try testing.expectEqual(@as(u32, 2), deinit_counter);
 }
 
 test "fixed — SIMD aligned" {

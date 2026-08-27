@@ -61,7 +61,6 @@ test {
 const front_h2_opts = h2.Options{
     .client = true,
     .request_row = rove.Row(&.{proxy_mod.FlowRef}),
-    .registry_model = .fat,
 };
 
 /// The front door's world — module-declared (explicit `.world`), the
@@ -73,7 +72,6 @@ pub const FrontWorld = rove.World(.{ .parts = h2.parts(front_h2_opts) });
 const FrontH2 = h2.H2(.{
     .client = true,
     .request_row = rove.Row(&.{proxy_mod.FlowRef}),
-    .registry_model = .fat,
     .world = FrontWorld,
 });
 

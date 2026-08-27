@@ -51,14 +51,14 @@ const Bridge = bridge_mod.Bridge;
 const acme_issuer = @import("acme.zig");
 const MetricsServer = @import("metrics-server").MetricsServer;
 
-const cp_h2_opts = h2.Options{ .registry_model = .fat };
+const cp_h2_opts = h2.Options{};
 
 /// The control plane's world, declared by the module that instantiates
 /// it (explicit `.world`, not the root rove_world pattern) so the same
 /// type works under test roots that declare nothing.
 pub const CpWorld = rove.World(.{ .parts = h2.parts(cp_h2_opts) });
 
-const CpH2 = h2.H2(.{ .registry_model = .fat, .world = CpWorld });
+const CpH2 = h2.H2(.{ .world = CpWorld });
 
 /// Constant-time byte-slice equality for secret comparison: the
 /// compare time depends only on the (non-secret) length, never on how
