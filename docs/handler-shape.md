@@ -396,7 +396,11 @@ discovered:
 | written bytes per activation | 400 KiB (keys + values + 9 bytes framing per write) | `writes_too_large` |
 
 All four throw at the call site with a `code` you can branch on, so a handler
-never discovers a limit as a failed request. The byte budget counts what each
+never discovers a limit as a failed request. A write to the **empty key** is
+refused the same way (`empty_key`): a handler that computed an empty name — a
+missing id, an unparsed field — meant to name a row and got nothing.
+`kv.get("")` is `null`, not an error — reads never throw, and the refusal
+guarantees no row ever exists under the empty name. The byte budget counts what each
 write puts on the entry rather than the string lengths alone, so a thousand
 tiny writes spend 9 KB of it on framing — stated here because a budget
 measured in anything but the bytes it protects is one the entry can still
