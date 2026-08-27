@@ -381,6 +381,46 @@ axis and per-axis offsets stay exact under swap-remove churn.
       still destroys conns directly (aborts on first disconnect under
       the Fd guard) and leaks write buffers.
 
+## 8 — The conversion (2026-08-27): every binary on fat
+
+- [x] **rewind-logs** (0e8fae5b) — the pattern-setter: a
+      MODULE-DECLARED world (explicit `.world`, because modules also
+      compile under test roots that declare nothing; the module that
+      instantiates owns the declaration — this, not the root
+      rove_world pattern, is what all four binaries use), the world's
+      Reg, terminal drains through destroyEntity. Five log smokes
+      green.
+- [x] **rewind-cp** (dc6c9508) — same shape. Seven cp smokes green
+      incl. the full ctl provision→deploy→serve.
+- [x] **rewind-front** (2aadba2a) — the CLIENT half's first run under
+      fat anywhere; two registries (proxy + :80) as two values of one
+      world type. Found the same bug classes the h2 audit did: a
+      downstream-conn bare destroy in ws_tunnel (→ closeConn, now
+      pub as the consumer conn funnel). Eight front smokes green
+      incl. three-node HA and WS.
+- [x] **rewind-worker** (71931d69 + 46ee619b) — ten worker
+      collections as a world Part (eight on the shared stream row via
+      the new h2.StreamRowFor, two on worker rows);
+      extra_collections + the registration loop dissolve; N worker
+      threads = N Reg values of one world type. The dead-letter
+      reaper generalizes to every deinit-declaring component of the
+      stream-shaped rows, which is what carries the worker's
+      request_row fragments; hook-reliant destroy sites became
+      explicit release or funnel routings (WS chains/messages,
+      parked-unit arms, blob sessions, snapshot aborts). Full suite
+      167/168 (only #892's false pass).
+- [ ] **Drop the legacy registry** — the deletion arc: rove.Registry,
+      the archetype branches in io/h2 (deinit-hook machinery,
+      resolver hooks, CollEnum/activeNames/extra_collections, the
+      subset rule, the Only aliases), the close_requested retirement
+      (closeConn → pending-tolerant evictOnly; flag + counter +
+      retryPendingCloses deleted), archetype examples ported or
+      deleted, fat-bench loses its control. NOTE: this arc IS the
+      adoption decision the process section reserves — converting
+      every consumer and deleting the alternative is "rove becomes
+      this"; PLAN/decisions.md graduation happens when the branch
+      merges.
+
 ## Process, before merging anywhere
 
 - [ ] Smoke suite green with baseline (see item 2).
