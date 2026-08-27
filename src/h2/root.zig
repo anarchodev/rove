@@ -2215,7 +2215,7 @@ pub fn H2(comptime opts: Options) type {
         pub const ConnStats = struct {
             recv_completions: u64,
             recv_returned_drain: u64,
-            recv_returned_deinit: u64,
+            recv_bufs_leaked: u64,
             recv_returned_stale: u64,
             recv_outstanding: u64,
             buf_count: u64,
@@ -2239,15 +2239,15 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn connStats(self: *Self) ConnStats {
             const drain = self.io.recv_buffers_returned;
-            const deinit_r = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
+            const leaked = self.io.cleanup_ctx.recv_bufs_destroyed_live;
             const stale_r = self.io.recv_buffers_returned_via_stale;
             const comp = self.io.recv_completions_with_data;
             return .{
                 .recv_completions = comp,
                 .recv_returned_drain = drain,
-                .recv_returned_deinit = deinit_r,
+                .recv_bufs_leaked = leaked,
                 .recv_returned_stale = stale_r,
-                .recv_outstanding = comp -| (drain + deinit_r + stale_r),
+                .recv_outstanding = comp -| (drain + stale_r),
                 .buf_count = @as(u64, self.io.buf_count),
                 .recv_enobufs = self.recv_enobufs_total,
                 .admission_denied = self.io.admission_denied_total,
@@ -2275,8 +2275,10 @@ pub fn H2(comptime opts: Options) type {
                 \\# HELP io_recv_buffers_returned_total buffers returned to the registered ring, by source.
                 \\# TYPE io_recv_buffers_returned_total counter
                 \\io_recv_buffers_returned_total{{src="drain"}} {d}
-                \\io_recv_buffers_returned_total{{src="deinit"}} {d}
                 \\io_recv_buffers_returned_total{{src="stale"}} {d}
+                \\# HELP io_recv_bufs_leaked_total registered buffers lost because a read entity was destroyed still holding one. Reads 1 per process shutdown; a rise during operation drains the ring.
+                \\# TYPE io_recv_bufs_leaked_total counter
+                \\io_recv_bufs_leaked_total {d}
                 \\# HELP io_recv_outstanding buffers currently held by the kernel (completions - returned). Must stay below buf_count.
                 \\# TYPE io_recv_outstanding gauge
                 \\io_recv_outstanding {d}
@@ -2323,8 +2325,8 @@ pub fn H2(comptime opts: Options) type {
             , .{
                 s.recv_completions,
                 s.recv_returned_drain,
-                s.recv_returned_deinit,
                 s.recv_returned_stale,
+                s.recv_bufs_leaked,
                 s.recv_outstanding,
                 s.buf_count,
                 s.recv_enobufs,
@@ -3030,9 +3032,12 @@ pub fn H2(comptime opts: Options) type {
                 // it's also the abort condition.
                 const consumed = self.io.recv_completions_with_data;
                 const returned_drain = self.io.recv_buffers_returned;
-                const returned_deinit = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
                 const returned_stale = self.io.recv_buffers_returned_via_stale;
-                const returned = returned_drain + returned_deinit + returned_stale;
+                // Buffers lost at destruction are NOT a return term — they are
+                // gone from the ring, so they stay counted as outstanding.
+                // That is what makes a real leak move this number.
+                const leaked = self.io.cleanup_ctx.recv_bufs_destroyed_live;
+                const returned = returned_drain + returned_stale;
                 const outstanding = consumed -| returned;
 
                 // INVARIANT (impossible by construction): outstanding
@@ -3045,10 +3050,10 @@ pub fn H2(comptime opts: Options) type {
                         &buf,
                         "\n================================================================\n" ++
                             "ROVE H2: recv buffer accounting broken — outstanding ({d}) > buf_count ({d}).\n" ++
-                            "  consumed={d} returned_drain={d} returned_deinit={d} returned_stale={d}\n" ++
+                            "  consumed={d} returned_drain={d} returned_stale={d} leaked={d}\n" ++
                             "  This is impossible by construction; counters or ring management is buggy.\n" ++
                             "================================================================\n",
-                        .{ outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit, returned_stale },
+                        .{ outstanding, self.io.buf_count, consumed, returned_drain, returned_stale, leaked },
                     ) catch buf[0..0];
                     _ = std.posix.write(2, msg) catch {};
                     std.process.abort();
@@ -3080,11 +3085,11 @@ pub fn H2(comptime opts: Options) type {
                             "\n================================================================\n" ++
                                 "ROVE H2: recv ENOBUFS with low outstanding — buffer leak suspected.\n" ++
                                 "  enobufs={d} outstanding={d} buf_count={d}\n" ++
-                                "  consumed={d} returned_drain={d} returned_deinit={d}\n" ++
+                                "  consumed={d} returned_drain={d} leaked_at_destroy={d}\n" ++
                                 "  Some destruction path is taking buffers out of circulation\n" ++
                                 "  without returning them to the registered ring.\n" ++
                                 "================================================================\n",
-                            .{ self.recv_enobufs_total, outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit },
+                            .{ self.recv_enobufs_total, outstanding, self.io.buf_count, consumed, returned_drain, leaked },
                         ) catch buf[0..0];
                         _ = std.posix.write(2, msg) catch {};
                         std.process.abort();
@@ -3097,8 +3102,8 @@ pub fn H2(comptime opts: Options) type {
                     self.recv_enobufs_logged = true;
                     self.recv_enobufs_last_logged_decade = self.recv_enobufs_total / 10_000;
                     std.log.warn(
-                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass; consumed={d} returned_drain={d} returned_deinit={d} outstanding={d} of {d}). If `outstanding` is far below `buf_count`, this is a leak — see /_system/metrics for the running balance.",
-                        .{ self.recv_enobufs_total, enobufs_this_pass, consumed, returned_drain, returned_deinit, outstanding, self.io.buf_count },
+                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass; consumed={d} returned_drain={d} leaked_at_destroy={d} outstanding={d} of {d}). If `outstanding` is far below `buf_count`, this is a leak — see /_system/metrics for the running balance.",
+                        .{ self.recv_enobufs_total, enobufs_this_pass, consumed, returned_drain, leaked, outstanding, self.io.buf_count },
                     );
                 }
             }

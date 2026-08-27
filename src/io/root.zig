@@ -44,11 +44,17 @@ pub const IoCleanupCtx = struct {
     buf_base: []u8 = undefined,
     buf_size: u32 = 0,
     buf_count: u16 = 0,
-    /// Cumulative count of buffers returned via the deinit cascade.
-    /// Mirrors `Io.recv_buffers_returned` for the regular drain path —
-    /// kept separate so the source of returns is attributable in the
-    /// diagnostic log.
-    recv_buffers_returned_via_deinit: u64 = 0,
+    /// Read entities destroyed while still holding a registered buffer — they
+    /// bypassed the return-then-clear every live path does, so that buffer is
+    /// gone from the ring for the life of the process.
+    ///
+    /// Expected steady state is NOT zero: it reads **one per process
+    /// shutdown**. `Io.destroy` deinits the read collections directly, so a
+    /// connection still mid-read when the drain began lands here. That is
+    /// harmless — `free_buf_ring` runs a few lines later — and it is the only
+    /// path measured to reach it. A count rising during operation is the real
+    /// signal, and it means the ring is draining.
+    recv_bufs_destroyed_live: u64 = 0,
     /// Conns destroyed while still holding a live descriptor slot — i.e.
     /// something destroyed a conn entity without routing it through
     /// `conn_closing`. Should never move.
@@ -139,33 +145,26 @@ pub const ReadResult = struct {
 
     pub const DeinitCtx = IoCleanupCtx;
 
-    /// Return the kernel-held buffer (if any) to the ring when the
-    /// read entity is destroyed. Without this hook, the cascade in
-    /// `ReadCycleEntity.deinit` (which runs `destroyImmediate` on the
-    /// linked read entity when a conn dies) leaks every buffer that
-    /// was attached to a completed recv but had not yet flowed
-    /// through `processReadIn`. At workloads with many short-lived
-    /// connections (e.g. xargs + curl publishing many releases) the
-    /// leak drains the registered buffer ring to zero and recv starts
-    /// returning ENOBUFS even though the connection count is tiny.
+    /// A registered buffer is returned by TRANSITION, not by destruction.
+    /// Every path that drops a read entity returns the buffer to the ring and
+    /// clears this component first — `processReadIn`'s three drops,
+    /// `releaseReadCycle` at conn teardown, and `reclaimStaleBuffer` for a
+    /// completion that outlived its entity. So on every live path this sees
+    /// `data == null` and only counts.
+    ///
+    /// Returning the buffer here instead would put a ring operation in a
+    /// destructor, which is the one place that cannot know whether the return
+    /// already happened. A buffer added twice over-advances the ring's
+    /// producer tail, shrinks the distinct-buffer pool, and surfaces as recv
+    /// `ENOBUFS` at a connection count nowhere near the limit — a symptom
+    /// arbitrarily far from its cause.
+    ///
+    /// Counted rather than aborted, and counted rather than fixed: the buffer
+    /// is one of a fixed pool, so the loss is bounded and diagnosable, and a
+    /// destructor that quietly repairs the leak is a destructor that hides it.
     pub fn deinit(_: std.mem.Allocator, items: []ReadResult, ctx: *DeinitCtx) void {
-        var armed: u16 = 0;
-        const mask = linux.IoUring.buf_ring_mask(ctx.buf_count);
         for (items) |item| {
-            if (item.data == null) continue;
-            const pos = @as(usize, ctx.buf_size) * item.buf_id;
-            linux.IoUring.buf_ring_add(
-                ctx.buf_ring,
-                ctx.buf_base[pos .. pos + ctx.buf_size],
-                item.buf_id,
-                mask,
-                armed,
-            );
-            armed += 1;
-        }
-        if (armed > 0) {
-            linux.IoUring.buf_ring_advance(ctx.buf_ring, armed);
-            ctx.recv_buffers_returned_via_deinit += armed;
+            if (item.data != null) ctx.recv_bufs_destroyed_live += 1;
         }
     }
 };
@@ -462,7 +461,7 @@ pub fn Io(comptime opts: Options) type {
         /// Buffers reclaimed from a completion whose entity had already
         /// been destroyed. Counted apart from `recv_buffers_returned` so
         /// the source of a return stays attributable, the same way
-        /// `IoCleanupCtx.recv_buffers_returned_via_deinit` is.
+        /// `IoCleanupCtx.recv_bufs_destroyed_live` attributes a loss.
         recv_buffers_returned_via_stale: u64 = 0,
 
         /// Connections retired out of `conn_closing`, and how many of those
@@ -1524,6 +1523,63 @@ test "entity encoding round-trip" {
     const e = Entity{ .index = 42, .generation = 7 };
     const decoded = decodeEntity(encodeEntity(e));
     try testing.expect(e.eql(decoded));
+}
+
+test "a read entity destroyed still holding a buffer is counted, not repaired" {
+    // The teardown case, which no smoke can cover: a guard that fires only at
+    // shutdown runs after a smoke has stopped asserting. Measured against the
+    // real suite, this is the ONLY path that reaches `ReadResult.deinit` with
+    // a live buffer — one per process shutdown, on a conn still mid-read when
+    // the drain began.
+    //
+    // The destructor counts rather than returns. Returning here would put a
+    // ring operation in the one place that cannot know whether the return
+    // already happened, and a double `buf_ring_add` over-advances the producer
+    // tail into recv ENOBUFS at a tiny connection count.
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const io = try testIo(&reg);
+    defer io.destroy();
+
+    const ent = try reg.create(&io._read_pending);
+    // Stand in for a completed recv whose buffer has not yet flowed through
+    // `processReadIn`: `data` non-null is what makes it a held buffer.
+    try reg.set(ent, &io._read_pending, ReadResult, .{
+        .result = 8,
+        .data = io.buf_base.ptr,
+        .buf_id = 0,
+    });
+
+    try testing.expectEqual(@as(u64, 0), io.cleanup_ctx.recv_bufs_destroyed_live);
+
+    try reg.destroyImmediate(ent);
+
+    // Counted once, and the ring's producer tail is untouched — the buffer is
+    // out of circulation, which is the honest report.
+    try testing.expectEqual(@as(u64, 1), io.cleanup_ctx.recv_bufs_destroyed_live);
+}
+
+test "a read entity that returned its buffer first is not counted as a loss" {
+    // The live paths (`processReadIn`, `releaseReadCycle`, `reclaimStaleBuffer`)
+    // all return-then-clear, which is what keeps the counter at its shutdown
+    // baseline during operation. Clearing is the whole protocol.
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const io = try testIo(&reg);
+    defer io.destroy();
+
+    const ent = try reg.create(&io._read_pending);
+    try reg.set(ent, &io._read_pending, ReadResult, .{
+        .result = 8,
+        .data = io.buf_base.ptr,
+        .buf_id = 0,
+    });
+    // What every live path does before dropping the entity.
+    (try reg.get(ent, &io._read_pending, ReadResult)).* = .{};
+
+    try reg.destroyImmediate(ent);
+
+    try testing.expectEqual(@as(u64, 0), io.cleanup_ctx.recv_bufs_destroyed_live);
 }
 
 test "stale completion carrying a buffer returns it to the ring" {
