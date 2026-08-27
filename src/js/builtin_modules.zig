@@ -142,6 +142,14 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_config_install_mjs"),
     },
     .{
+        // rove#719: the release flip — `_deploy/current` + `_release/{ts}` —
+        // written by the target tenant in its own scope. Dispatched by the
+        // `/_system/release` route after it authenticates the operator; the
+        // record in the tenant's log IS the point.
+        .path = "__system/release_flip.mjs",
+        .src = @embedFile("builtin_release_flip_mjs"),
+    },
+    .{
         // rove#691: the return half — resolves the owed marker in the ORIGIN
         // tenant's scope once the target's activation has committed. Enqueued
         // by the engine, not named by any shim, so it needs no targetable

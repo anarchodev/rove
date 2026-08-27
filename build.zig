@@ -865,6 +865,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "builtin_dispatch_result_mjs", .path = "src/js/builtin_modules/dispatch_result.mjs" },
         .{ .name = "builtin_admin_kv_install_mjs", .path = "src/js/builtin_modules/admin_kv_install.mjs" },
         .{ .name = "builtin_config_install_mjs", .path = "src/js/builtin_modules/config_install.mjs" },
+        .{ .name = "builtin_release_flip_mjs", .path = "src/js/builtin_modules/release_flip.mjs" },
         // §2.6 durable scheduled wake — the `scheduler_tick` baked
         // module (durable-wake P1; docs/architecture/effects-and-handlers.md). Add an entry here AND
         // in `src/js/builtin_modules.zig`'s `MODULES` table.

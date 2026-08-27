@@ -801,6 +801,43 @@ pub fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryF
         // here too; their durable write also rode the worker's txn. The
         // worker DID write its own overlay (inst.kv), so the group is still
         // dirty: `durabilizeTick` folds that overlay + stamps the watermark.
+        //
+        // The observer STILL fires, with `origin = true`: an engine-visible
+        // key written by an activation (the `_deploy/current` release flip,
+        // rove#719) has no door left to run its side effect on the
+        // proposing node, and the pump is the one seam that sees every
+        // committed entry. Origin lets each observer branch keep its
+        // exactly-once story — see `ApplyObserver`. Only walked when an
+        // observer is registered, so the no-observer cost stays zero.
+        if (self.apply.apply_observer != null) {
+            switch (env.type) {
+                .writeset => {
+                    if (envelope.decodeWriteSetPayload(env.payload)) |wp|
+                        self.notifyApply(group_id, env.id, wp.ws_bytes, true)
+                    else |_| {}
+                },
+                .multi => blk: {
+                    const inner = envelope.decodeMultiInner(self.allocator, env.payload) catch break :blk;
+                    defer self.allocator.free(inner);
+                    for (inner) |inner_bytes| {
+                        const ie = envelope.decode(inner_bytes) catch continue;
+                        switch (ie.type) {
+                            .writeset => {
+                                if (envelope.decodeWriteSetPayload(ie.payload)) |wp|
+                                    self.notifyApply(group_id, ie.id, wp.ws_bytes, true)
+                                else |_| {}
+                            },
+                            // Nesting is rejected at encode; notify-only, so
+                            // skip rather than fault (the entry already
+                            // applied through the worker's own txn).
+                            .multi => {},
+                            .root_writeset => self.notifyApply(group_id, "", ie.payload, true),
+                        }
+                    }
+                },
+                .root_writeset => self.notifyApply(group_id, "", env.payload, true),
+            }
+        }
         if (self.groups.get(group_id)) |slot| {
             slot.applied_idx = index;
             self.markDirty(slot);
@@ -815,7 +852,7 @@ pub fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryF
             // readset rides for the tape, not the store).
             const wp = try envelope.decodeWriteSetPayload(env.payload);
             try writeset.applyEncodedDirect(store, index, wp.ws_bytes);
-            self.notifyApply(group_id, env.id, wp.ws_bytes);
+            self.notifyApply(group_id, env.id, wp.ws_bytes, false);
         },
         .multi => {
             const inner = try envelope.decodeMultiInner(self.allocator, env.payload);
@@ -834,7 +871,7 @@ pub fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryF
                         const store = self.storeFor(slot, ie.id) orelse return Error.UnroutedApply;
                         const wp = try envelope.decodeWriteSetPayload(ie.payload);
                         try writeset.applyEncodedDirect(store, index, wp.ws_bytes);
-                        self.notifyApply(group_id, ie.id, wp.ws_bytes);
+                        self.notifyApply(group_id, ie.id, wp.ws_bytes, false);
                     },
                     .multi => return envelope.Error.NestedMulti,
                     // A root inner (`platform.root.*` riding the admin
@@ -843,7 +880,7 @@ pub fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryF
                     .root_writeset => {
                         const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
                         try writeset.applyEncodedDirect(store, index, ie.payload);
-                        self.notifyApply(group_id, "", ie.payload);
+                        self.notifyApply(group_id, "", ie.payload, false);
                     },
                 }
             }
@@ -855,7 +892,7 @@ pub fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryF
         .root_writeset => {
             const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
             try writeset.applyEncodedDirect(store, index, env.payload);
-            self.notifyApply(group_id, "", env.payload);
+            self.notifyApply(group_id, "", env.payload, false);
         },
     }
     // One entry applied (all inners included): advance the group's
@@ -889,17 +926,17 @@ pub fn storeFor(self: *Node, slot: *TenantSlot, id_str: []const u8) ?*KvStore {
 /// `applyEncoded`, so a decode error here is not propagated (it would
 /// only mean a stale projection, recovered on the next apply / restart
 /// scan).
-pub fn notifyApply(self: *Node, group_id: u64, id_str: []const u8, ws_bytes: []const u8) void {
+pub fn notifyApply(self: *Node, group_id: u64, id_str: []const u8, ws_bytes: []const u8, origin: bool) void {
     const obs = self.apply.apply_observer orelse return;
     var ops: std.ArrayListUnmanaged(writeset.Op) = .empty;
     defer ops.deinit(self.allocator);
     writeset.decodeOps(ws_bytes, self.allocator, &ops) catch return;
     for (ops.items) |op| switch (op) {
-        .put => |p| obs.func(obs.ctx, group_id, id_str, .put, p.key, p.value),
+        .put => |p| obs.func(obs.ctx, group_id, id_str, .put, p.key, p.value, origin),
         // A delete carries no value; the observer decides what removal means
         // for its projection (the CP directory drops the row, so a follower
         // converges with the leader on a deprovision).
-        .delete => |d| obs.func(obs.ctx, group_id, id_str, .delete, d.key, ""),
+        .delete => |d| obs.func(obs.ctx, group_id, id_str, .delete, d.key, "", origin),
     };
 }
 

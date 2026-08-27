@@ -13,8 +13,10 @@
 > `/_system/deploy` route. Arbitrary bundles are published through the standing
 > `__admin__` app's `/v1/deploy/*` routes plus `PUT /v1/upload`, which reach the
 > worker's `DeployThread` via the `platform.*` trusted-door primitives; the
-> worker's own native deploy surfaces are `/_system/release` (the activation
-> flip) and `/_system/reset` (the baked `__admin__` bundle, bootstrap and
+> worker's own native deploy surfaces are `/_system/release` (the flip,
+> dispatched as an activation of baked `__system/release_flip` in the target
+> tenant's own scope — the deployment appears in the tenant's log) and
+> `/_system/reset` (the baked `__admin__` bundle, bootstrap and
 > break-glass). The engine door that would replace the app's protocol is
 > designed but unbuilt — rove#556.
 

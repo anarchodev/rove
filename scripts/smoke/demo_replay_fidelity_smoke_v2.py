@@ -147,6 +147,15 @@ def main() -> int:
                     print(f"    skipped (no handler ran): {label} "
                           f"status={full.get('status')} outcome={full.get('outcome')!r}")
                     continue
+                # A platform activation in the tenant's log (rove#719: the
+                # release flip). Its module is BAKED — not in this bundle,
+                # and not named by the record (rove#254) — so this checker,
+                # which replays the tenant's own sources, cannot run it.
+                # Skip loudly rather than replay the wrong code against it.
+                if (full.get("path") or "").startswith("/_system/"):
+                    skipped += 1
+                    print(f"    skipped (platform activation, baked module): {label}")
+                    continue
                 rec_path = os.path.join(td, "record.json")
                 with open(rec_path, "w") as f:
                     json.dump(full, f)
