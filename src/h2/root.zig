@@ -233,6 +233,9 @@ const CollKind = enum {
     server_ws,
     client_connect,
     client_stream,
+    /// The stream dead-letter: empty row, terminal, reaped by
+    /// `processStreamDead` (fat model).
+    dead,
 };
 
 const CollSpec = struct {
@@ -294,6 +297,7 @@ const COLLECTIONS = [_]CollSpec{
     .{ .name = "client_stream_data_in", .kind = .client_stream, .client_only = true, .in_chain = true },
     .{ .name = "client_stream_close_in", .kind = .client_stream, .client_only = true, .in_chain = true },
     .{ .name = "_client_stream_data_sending", .kind = .client_stream, .client_only = true, .in_chain = true },
+    .{ .name = "_stream_dead", .kind = .dead },
 };
 
 fn collRowFor(comptime opts: Options, comptime kind: CollKind) type {
@@ -305,6 +309,7 @@ fn collRowFor(comptime opts: Options, comptime kind: CollKind) type {
         .server_conn => rows.full_conn,
         .server_ws => rows.ws_seam,
         .client_connect => rows.connect_full,
+        .dead => Row(&.{}),
     };
 }
 
@@ -477,6 +482,7 @@ pub fn H2(comptime opts: Options) type {
 
     const ClientConnectColl = if (has_client) Collection(connect_row_full, .{}) else void;
     const ClientStreamColl = if (has_client) Collection(stream_row, .{}) else void;
+    const DeadColl = Collection(Row(&.{}), .{});
 
     // The declared world — same resolution as rove-io: the explicit
     // option wins, the root's `rove_world` is the fallback. The fat
@@ -624,6 +630,13 @@ pub fn H2(comptime opts: Options) type {
         client_stream_data_in: CollField(ClientStreamColl),
         client_stream_close_in: CollField(ClientStreamColl),
         _client_stream_data_sending: CollField(ClientStreamColl),
+        /// The stream dead-letter (fat model; empty and unused under the
+        /// archetype, whose deinit hooks free at destroy): every h2-owned
+        /// entity ends by moving here — `destroyEntity` routes it, even
+        /// mid-move — and `processStreamDead` frees the four buffer
+        /// components and destroys, at a known phase outside nghttp2's
+        /// callbacks.
+        _stream_dead: CollField(DeadColl),
 
         h2_opts: H2Options,
         reg: *Reg,
@@ -728,6 +741,7 @@ pub fn H2(comptime opts: Options) type {
                 .server_ws => WsColl,
                 .client_connect => ClientConnectColl,
                 .client_stream => ClientStreamColl,
+                .dead => DeadColl,
             };
         }
 
@@ -1500,7 +1514,9 @@ pub fn H2(comptime opts: Options) type {
                     live.s.unconsumed = 0;
                 }
             }
-            h2.reg.destroy(ws_ent) catch {};
+            // Through the stream funnel: the identity entity carries the
+            // CONNECT ReqHeaders, which the ending must release.
+            h2.destroyEntity(ws_ent) catch {};
         }
 
         /// Parse buffered inbound tunnel bytes into messages (the h2
@@ -1969,8 +1985,10 @@ pub fn H2(comptime opts: Options) type {
             if (s.is_ws) {
                 // WS identity entities die with their stream — the
                 // consumer's staleness sweep is the disconnect signal.
+                // Through the stream funnel: the identity entity owns its
+                // routing ReqHeaders.
                 if (!s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
-                    nctx.h2.reg.destroy(s.entity) catch {};
+                    nctx.h2.destroyEntity(s.entity) catch {};
                 }
             } else if (s.emitted and !s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
                 const err: i32 = if (s.send_complete and error_code == 0) 0 else -1;
@@ -2765,6 +2783,16 @@ pub fn H2(comptime opts: Options) type {
                 self.reapConnForeign(self.io.coll(.conn_dead));
                 self.reapConnForeign(self.io.coll(.conn_closing));
                 self.reg.flush() catch {};
+                // Same for the stream-owned buffers: entities the
+                // consumer never ended (requests in flight at shutdown)
+                // and the dead-letter's unreaped tail. The registry owns
+                // the collections; the BYTES are h2's to release.
+                inline for (COLLECTIONS) |sc| {
+                    if (comptime sc.client_only and !has_client) continue;
+                    const f = &@field(self, sc.name);
+                    const cl2 = if (comptime uses_world) f.* else f;
+                    for (cl2.entitySlice()) |ent| self.freeStreamForeign(ent);
+                }
             }
             for (self.body_sinks.items) |ref| {
                 ref.sink.abort(ref.sink.ctx);
@@ -2827,7 +2855,10 @@ pub fn H2(comptime opts: Options) type {
                 if (self.reg.isMoving(ent)) continue;
                 const conn_ptr = self.reg.getFat(ent, Conn) catch continue;
                 conn_state.Conn.deinit(self.allocator, @as([*]Conn, @ptrCast(conn_ptr))[0..1]);
-                self.destroyEntity(ent) catch {};
+                // Plain destroy, not the stream funnel: a conn entity
+                // carries no stream buffers, and its foreign state was
+                // just freed — the dead-letter would only add a lap.
+                self.reg.destroy(ent) catch {};
             }
         }
 
@@ -2839,17 +2870,39 @@ pub fn H2(comptime opts: Options) type {
             self.reapConnForeign(self.io.coll(.conn_dead));
         }
 
-        /// End an h2-owned entity. Under the archetype this is a plain
-        /// destroy — the four buffer-owning stream components (ReqHeaders,
+        /// Drain the stream dead-letter (fat): free each ended entity's
+        /// four buffer components — `getFat` resolves them resident or
+        /// parked, and a component never held reads as its null default
+        /// so the free skips — then destroy (deferred; the caller owns
+        /// the flush). Entities ended after this pass's flushes wait
+        /// one poll, exactly like `conn_dead`.
+        fn processStreamDead(self: *Self) void {
+            for (self.coll(._stream_dead).entitySlice()) |ent| {
+                if (self.reg.isStale(ent) or self.reg.isMoving(ent)) continue;
+                self.freeStreamForeign(ent);
+                self.reg.destroy(ent) catch {};
+            }
+        }
+
+        /// End an h2-owned entity — the stream funnel verb, like
+        /// `closeConn` for conns. Under the archetype this is a plain
+        /// destroy: the four buffer-owning stream components (ReqHeaders,
         /// ReqBody, RespHeaders, RespBody) free their heap memory via
-        /// their deinit hooks. The fat model runs no hooks, so this frees
-        /// them explicitly first, through getFat — which is safe on ANY
-        /// entity: a component the entity never held reads as its declared
-        /// default (null data), and the free skips. Consumers of terminal
-        /// collections (response_out and kin) must end entities through
-        /// this, not reg.destroy, or the fat model leaks the buffers.
+        /// their deinit hooks at the destroy's flush. Under fat, release
+        /// is the same transition made explicit: the entity routes to the
+        /// `_stream_dead` dead-letter — an entity-keyed deferred evict,
+        /// so an ending is NEVER refused, a mid-move entity included
+        /// (the queued op lands first, then the ending collects it) —
+        /// and the pollPostlude reaper frees the buffers and destroys,
+        /// restoring the archetype's outside-the-callbacks free timing.
+        /// Consumers of terminal collections (response_out and kin) end
+        /// entities through this, not reg.destroy — the same funnel
+        /// contract every ending seam in this codebase carries.
         pub fn destroyEntity(self: *Self, ent: Entity) !void {
-            if (comptime is_fat) self.freeStreamForeign(ent);
+            if (comptime is_fat) {
+                if (self.reg.isInCollection(ent, self.coll(._stream_dead))) return;
+                return self.reg.evict(ent, self.coll(._stream_dead));
+            }
             try self.reg.destroy(ent);
         }
 
@@ -2893,6 +2946,7 @@ pub fn H2(comptime opts: Options) type {
             // does at destroy-time under the archetype.
             if (comptime is_fat) {
                 self.processConnDead();
+                self.processStreamDead();
                 try self.reg.flush();
             }
             // A close decided last pass but blocked by an in-flight move
@@ -4610,7 +4664,7 @@ pub fn H2(comptime opts: Options) type {
         pub fn wsUpgradeAccept(h2: *Self, ent: Entity, sink: BodySink) WsUpgradeDecision {
             if (!h2.reg.isInCollection(ent, h2.coll(.ws_upgrade_out))) return .gone;
             const sess = h2.reg.get(ent, h2.coll(.ws_upgrade_out), Session) catch return .gone;
-            defer h2.reg.destroy(ent) catch {};
+            defer h2.destroyEntity(ent) catch {};
             const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
             const h1c = conn_ptr.h1 orelse return .gone;
             const pending_key = switch (h1c.state) {
@@ -4650,7 +4704,12 @@ pub fn H2(comptime opts: Options) type {
             // Early frame bytes that rode in with the handshake.
             if (h1c.buf.items.len > 0) {
                 if (!sink.push(sink.ctx, h1c.buf.items)) {
-                    h2.reg.destroy(sess.entity) catch {};
+                    // End the CONN the way every conn ends — through
+                    // conn_closing, so io releases the descriptor slot. A
+                    // bare destroy here bypassed the teardown entirely
+                    // (and, under the archetype, tripped the Fd guard's
+                    // conditions).
+                    _ = h2.closeConn(sess.entity);
                     return .ok; // sink owns the failure; conn is going down
                 }
                 h1c.state.ws_tunnel.unconsumed +|= @intCast(h1c.buf.items.len);
@@ -4664,7 +4723,7 @@ pub fn H2(comptime opts: Options) type {
         pub fn wsUpgradeReject(h2: *Self, ent: Entity, status: u16) void {
             if (!h2.reg.isInCollection(ent, h2.coll(.ws_upgrade_out))) return;
             const sess = h2.reg.get(ent, h2.coll(.ws_upgrade_out), Session) catch return;
-            defer h2.reg.destroy(ent) catch {};
+            defer h2.destroyEntity(ent) catch {};
             const conn_ptr = getConn(h2, sess.entity) orelse return;
             self_reject: {
                 const h1c = conn_ptr.h1 orelse break :self_reject;
@@ -6041,4 +6100,112 @@ test "stream accumulator — headers and body" {
     const f2 = fields.?[2];
     try testing.expectEqualStrings("host", f2.name[0..f2.name_len]);
     try testing.expectEqualStrings("localhost", f2.value[0..f2.value_len]);
+}
+
+
+// ── Fat-model stream-buffer release (the dead-letter + reaper) ──
+// testing.allocator is the leak gate: every byte these tests allocate
+// through h2's allocator must be freed by the reaper or the teardown
+// sweep, or the test fails on leak.
+
+const fat_test_opts = Options{ .registry_model = .fat };
+const FatTestWorld = rove.World(.{ .parts = parts(fat_test_opts) });
+const FatTestH2 = H2(.{ .registry_model = .fat, .world = FatTestWorld });
+
+fn fatTestServer(reg: *FatTestH2.Reg) !*FatTestH2 {
+    return FatTestH2.create(reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }, .{});
+}
+
+fn allocStreamBuffers(server: *FatTestH2, ent: Entity, cl: anytype) !void {
+    const hdr_buf = try testing.allocator.alloc(u8, 64);
+    try server.reg.set(ent, cl, ReqHeaders, .{ .fields = null, .count = 0, ._buf = hdr_buf.ptr, ._buf_len = 64 });
+    const body = try testing.allocator.alloc(u8, 128);
+    try server.reg.set(ent, cl, ReqBody, .{ .data = body.ptr, .len = 128 });
+    const resp = try testing.allocator.alloc(u8, 32);
+    try server.reg.set(ent, cl, RespBody, .{ .data = resp.ptr, .len = 32 });
+}
+
+test "fat: destroyEntity routes to the dead-letter; the reaper frees the buffers" {
+    var reg = try FatTestH2.Reg.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const server = fatTestServer(&reg) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.destroy();
+
+    const request_out = reg.coll(.request_out);
+    const ent = try reg.create(request_out);
+    try allocStreamBuffers(server, ent, request_out);
+
+    try server.destroyEntity(ent);
+    // Deferred: nothing freed, nothing destroyed before the flush.
+    try testing.expect(!reg.isStale(ent));
+
+    try reg.flush();
+    try testing.expect(reg.isInCollection(ent, reg.coll(._stream_dead)));
+
+    server.processStreamDead();
+    try reg.flush();
+    try testing.expect(reg.isStale(ent));
+    // The leak gate at test end proves the three buffers came back.
+}
+
+test "fat: an ending is never refused — a mid-move entity still reaches the dead-letter" {
+    var reg = try FatTestH2.Reg.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const server = fatTestServer(&reg) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.destroy();
+
+    const request_out = reg.coll(.request_out);
+    const response_in = reg.coll(.response_in);
+    const ent = try reg.create(request_out);
+    try allocStreamBuffers(server, ent, request_out);
+
+    // A move is already queued when the ending arrives — the exact shape
+    // that used to fail PendingMove into a silent `catch {}` leak.
+    try reg.move(ent, request_out, response_in);
+    try server.destroyEntity(ent);
+    try reg.flush();
+    try testing.expect(reg.isInCollection(ent, reg.coll(._stream_dead)));
+
+    server.processStreamDead();
+    try reg.flush();
+    try testing.expect(reg.isStale(ent));
+}
+
+test "fat: teardown frees the buffers of entities the consumer never ended" {
+    var reg = try FatTestH2.Reg.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+    const server = fatTestServer(&reg) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // Live entities in three shapes at shutdown: an unanswered request,
+    // one already in the dead-letter but not yet reaped, and a WS seam
+    // carrier. destroy() must release all of it.
+    const request_out = reg.coll(.request_out);
+    const ent_a = try reg.create(request_out);
+    try allocStreamBuffers(server, ent_a, request_out);
+
+    const ent_b = try reg.create(request_out);
+    try allocStreamBuffers(server, ent_b, request_out);
+    try server.destroyEntity(ent_b);
+    try reg.flush(); // in _stream_dead, unreaped
+
+    const ws_out = reg.coll(.ws_message_out);
+    const ent_c = try reg.create(ws_out);
+    const payload = try testing.allocator.alloc(u8, 16);
+    try reg.set(ent_c, ws_out, ReqBody, .{ .data = payload.ptr, .len = 16 });
+
+    server.destroy();
 }
