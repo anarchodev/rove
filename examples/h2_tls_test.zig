@@ -3,7 +3,9 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
-const MyH2 = h2.H2(.{});
+const h2_opts = h2.Options{ .registry_model = .fat };
+const MyWorld = rove.World(.{ .parts = h2.parts(h2_opts) });
+const MyH2 = h2.H2(.{ .registry_model = .fat, .world = MyWorld });
 
 fn processRequests(server: *MyH2, alloc: std.mem.Allocator) !void {
     for (
@@ -22,19 +24,19 @@ fn processRequests(server: *MyH2, alloc: std.mem.Allocator) !void {
             resp_len = rb.len;
         }
 
-        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 200 });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = resp_data, .len = resp_len });
-        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-        try server.reg.set(ent, &server.request_out, h2.Session, sess);
-        try server.reg.move(ent, &server.request_out, &server.response_in);
+        try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = 200 });
+        try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{ .data = resp_data, .len = resp_len });
+        try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+        try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+        try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
     }
 }
 
 fn cleanupResponses(server: *MyH2) !void {
     for (server.response_out.entitySlice()) |ent| {
-        try server.reg.destroy(ent);
+        try server.destroyEntity(ent);
     }
 }
 
@@ -51,7 +53,7 @@ pub fn main() !void {
     const tls_cfg = try h2.TlsConfig.create(alloc, cert_pem, key_pem);
     defer tls_cfg.destroy();
 
-    var reg = try rove.Registry.init(alloc, .{
+    var reg = try MyH2.Reg.init(alloc, .{
         .max_entities = 4096,
         .deferred_queue_capacity = 1024,
     });

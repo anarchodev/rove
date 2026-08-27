@@ -1057,28 +1057,6 @@ pub fn build(b: *std.Build) void {
     const echo_step = b.step("echo-server", "Run the echo server example");
     echo_step.dependOn(&run_echo.step);
 
-    // echo server on the fat-entity registry model (port 8081)
-    const echo_fat_mod = b.addModule("echo-server-fat", .{
-        .root_source_file = b.path("examples/echo_server_fat.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    echo_fat_mod.addImport("rove-io", io_mod);
-    echo_fat_mod.addImport("rove", rove_mod);
-
-    const echo_server_fat = b.addExecutable(.{
-        .name = "echo-server-fat",
-        .root_module = echo_fat_mod,
-    });
-    b.installArtifact(echo_server_fat);
-
-    const run_echo_fat = b.addRunArtifact(echo_server_fat);
-    const echo_fat_step = b.step("echo-server-fat", "Run the echo server example on the fat-entity registry");
-    echo_fat_step.dependOn(&run_echo_fat.step);
-    // The one artifact that instantiates Io under the fat registry model —
-    // gate its compile or that whole comptime path rots invisibly.
-    test_step.dependOn(&echo_server_fat.step);
-
     // h2 echo server
     const h2_echo_mod = b.addModule("h2-echo-server", .{
         .root_source_file = b.path("examples/h2_echo_server.zig"),
@@ -1103,31 +1081,6 @@ pub fn build(b: *std.Build) void {
     const h2_echo_step = b.step("h2-echo-server", "Run the HTTP/2 echo server example");
     h2_echo_step.dependOn(&run_h2_echo.step);
 
-    // h2 echo server on the fat-entity registry model (port 8445)
-    const h2_echo_fat_mod = b.addModule("h2-echo-server-fat", .{
-        .root_source_file = b.path("examples/h2_echo_server_fat.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    h2_echo_fat_mod.addImport("rove-h2", h2_mod);
-    h2_echo_fat_mod.addImport("rove", rove_mod);
-    h2_echo_fat_mod.link_libc = true;
-    h2_echo_fat_mod.linkSystemLibrary("nghttp2", .{});
-    h2_echo_fat_mod.linkSystemLibrary("ssl", .{});
-    h2_echo_fat_mod.linkSystemLibrary("crypto", .{});
-
-    const h2_echo_server_fat = b.addExecutable(.{
-        .name = "h2-echo-server-fat",
-        .root_module = h2_echo_fat_mod,
-    });
-    b.installArtifact(h2_echo_server_fat);
-    // The one artifact that instantiates H2 under the fat registry model —
-    // gate its compile or that whole comptime path rots invisibly.
-    test_step.dependOn(&h2_echo_server_fat.step);
-
-    const run_h2_echo_fat = b.addRunArtifact(h2_echo_server_fat);
-    const h2_echo_fat_step = b.step("h2-echo-server-fat", "Run the HTTP/2 echo server example on the fat-entity registry");
-    h2_echo_fat_step.dependOn(&run_h2_echo_fat.step);
 
     // h2 limit test
     const h2_limit_mod = b.addModule("h2-limit-test", .{

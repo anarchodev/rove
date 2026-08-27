@@ -21,8 +21,15 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
-const ServerH2 = h2.H2(.{});
-const ClientH2 = h2.H2(.{ .client = true });
+// Two worlds in one binary — the heterogeneous case explicit `.world`
+// exists for (a root `rove_world` could only name one).
+const server_opts = h2.Options{ .registry_model = .fat };
+const ServerWorld = rove.World(.{ .parts = h2.parts(server_opts) });
+const ServerH2 = h2.H2(.{ .registry_model = .fat, .world = ServerWorld });
+
+const client_opts = h2.Options{ .client = true, .registry_model = .fat };
+const ClientWorld = rove.World(.{ .parts = h2.parts(client_opts) });
+const ClientH2 = h2.H2(.{ .client = true, .registry_model = .fat, .world = ClientWorld });
 
 const PORT: u16 = 18441;
 
@@ -91,7 +98,7 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     // ── Server (worker-shaped: headers_first + extended_connect) ──────
-    var sreg = try rove.Registry.init(alloc, .{ .max_entities = 4096, .deferred_queue_capacity = 1024 });
+    var sreg = try ServerH2.Reg.init(alloc, .{ .max_entities = 4096, .deferred_queue_capacity = 1024 });
     const server = try ServerH2.create(&sreg, alloc, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, PORT), .{
         .max_connections = 64,
         .buf_count = 64,
@@ -104,7 +111,7 @@ pub fn main() !void {
     defer server.destroy();
 
     // ── Client (front-shaped: client_headers_first) ───────────────────
-    var creg = try rove.Registry.init(alloc, .{ .max_entities = 4096, .deferred_queue_capacity = 1024 });
+    var creg = try ClientH2.Reg.init(alloc, .{ .max_entities = 4096, .deferred_queue_capacity = 1024 });
     const client = try ClientH2.create(&creg, alloc, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0), .{
         .max_connections = 64,
         .buf_count = 64,
@@ -115,8 +122,8 @@ pub fn main() !void {
     defer creg.deinit();
     defer client.destroy();
 
-    const conn = try creg.create(&client.client_connect_in);
-    try creg.set(conn, &client.client_connect_in, h2.ConnectTarget, .{
+    const conn = try creg.create(client.coll(.client_connect_in));
+    try creg.set(conn, client.coll(.client_connect_in), h2.ConnectTarget, .{
         .addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, PORT),
     });
 
@@ -128,8 +135,8 @@ pub fn main() !void {
         try server.poll(0);
         const outs = client.client_connect_out.entitySlice();
         if (outs.len > 0) {
-            session = (try creg.get(outs[0], &client.client_connect_out, h2.Session)).*;
-            try creg.destroy(outs[0]);
+            session = (try creg.get(outs[0], client.coll(.client_connect_out), h2.Session)).*;
+            try client.destroyEntity(outs[0]);
             try creg.flush();
             connected = true;
             break;
@@ -156,9 +163,9 @@ pub fn main() !void {
         .{ .name = ":path", .name_len = 5, .value = "/chat", .value_len = 5 },
         .{ .name = ":authority", .name_len = 10, .value = "acme.localhost", .value_len = 14 },
     };
-    const req = try creg.create(&client.client_stream_request_in);
-    try creg.set(req, &client.client_stream_request_in, h2.Session, session);
-    try creg.set(req, &client.client_stream_request_in, h2.ReqHeaders, .{ .fields = @constCast(&hdrs), .count = hdrs.len });
+    const req = try creg.create(client.coll(.client_stream_request_in));
+    try creg.set(req, client.coll(.client_stream_request_in), h2.Session, session);
+    try creg.set(req, client.coll(.client_stream_request_in), h2.ReqHeaders, .{ .fields = @constCast(&hdrs), .count = hdrs.len });
 
     var collector: Collector = .{ .a = alloc };
     defer collector.bytes.deinit(alloc);
@@ -215,14 +222,14 @@ pub fn main() !void {
                     if (!std.mem.eql(u8, payload, "hello")) fail("server payload {s}", .{payload});
                     server_saw_hello = true;
                     // Echo it back through the seam surface.
-                    const se = try sreg.create(&server.ws_send_in);
-                    try sreg.set(se, &server.ws_send_in, h2.Session, .{ .entity = sess.entity });
-                    try sreg.set(se, &server.ws_send_in, h2.WsMeta, .{ .opcode = 1 });
+                    const se = try sreg.create(server.coll(.ws_send_in));
+                    try sreg.set(se, server.coll(.ws_send_in), h2.Session, .{ .entity = sess.entity });
+                    try sreg.set(se, server.coll(.ws_send_in), h2.WsMeta, .{ .opcode = 1 });
                     const dup = try alloc.dupe(u8, payload);
-                    try sreg.set(se, &server.ws_send_in, h2.ReqBody, .{ .data = dup.ptr, .len = @intCast(dup.len) });
+                    try sreg.set(se, server.coll(.ws_send_in), h2.ReqBody, .{ .data = dup.ptr, .len = @intCast(dup.len) });
                     echoed = true;
                 }
-                try sreg.destroy(ent);
+                try server.destroyEntity(ent);
             }
             try sreg.flush();
         }
@@ -240,7 +247,7 @@ pub fn main() !void {
                     .streaming, .eof => sink_live = true,
                     .gone => fail("response sink attach: gone", .{}),
                 }
-                try creg.destroy(ent);
+                try client.destroyEntity(ent);
             }
             try creg.flush();
         }
@@ -253,12 +260,12 @@ pub fn main() !void {
             for (ents) |ent| {
                 if (pending_send) |bytes| {
                     const copy = try alloc.dupe(u8, bytes);
-                    try creg.set(ent, &client.client_stream_data_out, h2.ReqBody, .{ .data = copy.ptr, .len = @intCast(copy.len) });
-                    try creg.move(ent, &client.client_stream_data_out, &client.client_stream_data_in);
+                    try creg.set(ent, client.coll(.client_stream_data_out), h2.ReqBody, .{ .data = copy.ptr, .len = @intCast(copy.len) });
+                    try creg.move(ent, client.coll(.client_stream_data_out), client.coll(.client_stream_data_in));
                     if (bytes.ptr == close_frame.items.ptr) sent_close = true;
                     pending_send = null;
                 } else if (sent_close) {
-                    try creg.move(ent, &client.client_stream_data_out, &client.client_stream_close_in);
+                    try creg.move(ent, client.coll(.client_stream_data_out), client.coll(.client_stream_close_in));
                 }
             }
             try creg.flush();
@@ -278,7 +285,7 @@ pub fn main() !void {
             const ents = client.client_response_out.entitySlice();
             for (ents) |ent| {
                 client_terminal = true;
-                try creg.destroy(ent);
+                try client.destroyEntity(ent);
             }
             try creg.flush();
         }

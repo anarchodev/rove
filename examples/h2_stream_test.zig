@@ -3,7 +3,9 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
-const MyH2 = h2.H2(.{});
+const h2_opts = h2.Options{ .registry_model = .fat };
+const MyWorld = rove.World(.{ .parts = h2.parts(h2_opts) });
+const MyH2 = h2.H2(.{ .registry_model = .fat, .world = MyWorld });
 
 var chunk_index: u32 = 0;
 
@@ -13,13 +15,13 @@ fn processRequests(server: *MyH2) !void {
         server.request_out.column(h2.StreamId),
         server.request_out.column(h2.Session),
     ) |ent, sid, sess| {
-        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 200 });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-        try server.reg.set(ent, &server.request_out, h2.Session, sess);
+        try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = 200 });
+        try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+        try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+        try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
         chunk_index = 0;
-        try server.reg.move(ent, &server.request_out, &server.stream_response_in);
+        try server.reg.move(ent, server.coll(.request_out), server.coll(.stream_response_in));
     }
 }
 
@@ -31,21 +33,21 @@ fn sendChunks(server: *MyH2, alloc: std.mem.Allocator) !void {
             const copy = alloc.alloc(u8, msg.len) catch continue;
             @memcpy(copy, msg);
 
-            try server.reg.set(ent, &server.stream_data_out, h2.RespBody, .{
+            try server.reg.set(ent, server.coll(.stream_data_out), h2.RespBody, .{
                 .data = copy.ptr,
                 .len = @intCast(msg.len),
             });
             chunk_index += 1;
-            try server.reg.move(ent, &server.stream_data_out, &server.stream_data_in);
+            try server.reg.move(ent, server.coll(.stream_data_out), server.coll(.stream_data_in));
         } else {
-            try server.reg.move(ent, &server.stream_data_out, &server.stream_close_in);
+            try server.reg.move(ent, server.coll(.stream_data_out), server.coll(.stream_close_in));
         }
     }
 }
 
 fn cleanupResponses(server: *MyH2) !void {
     for (server.response_out.entitySlice()) |ent| {
-        try server.reg.destroy(ent);
+        try server.destroyEntity(ent);
     }
 }
 
@@ -54,7 +56,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var reg = try rove.Registry.init(alloc, .{
+    var reg = try MyH2.Reg.init(alloc, .{
         .max_entities = 4096,
         .deferred_queue_capacity = 1024,
     });
