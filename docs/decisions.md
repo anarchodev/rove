@@ -799,7 +799,7 @@ behavior, and what handler-shape.md promised). Three reasons:
   mechanism as pseudo-headers). `request.ip` returns the **masked** IP (IPv4
   last octet zeroed; IPv6 /48) derived from `cf-connecting-ip` else the
   rightmost (edge-appended, spoof-resistant) XFF entry. The raw IP is
-  `request.unmaskedIp()` — a *method*: the call is the customer's explicit
+  `unmaskedIp()` (an activation capability) — a *function*: the call is the customer's explicit
   controller-responsibility moment, and it puts the raw IP on their tape.
   Stripping is what makes the friction real — with XFF visible, everyone
   would just read the header.
@@ -1007,7 +1007,7 @@ behavior, and what handler-shape.md promised). Three reasons:
 - **Decision**: ship `browser.getReplay` (the "why" tier — DOM=what,
   screenshot=how, replay=why) on a general **user-defined index-tag** facility
   rather than a bespoke session column. A handler attaches low-cardinality tags
-  to its request's log record via `request.tag(key, value)`; the log-server
+  to its request's log record via the `tag(key, value)` activation capability; the log-server
   indexes them in a `log_tags` companion table, so queries filter `?tag.k=v`
   (and `/v1/{tenant}/session/{id}` is sugar for `tag.session`). Session-replay
   is then just *a tag query*, not a one-off.
@@ -1019,7 +1019,7 @@ behavior, and what handler-shape.md promised). Three reasons:
   (the app's own id) is the cross-reconnect bonus.
 - **Bounds (low-cardinality posture, fail-loud)**: ≤4 tags/record, keys
   `[a-z0-9_]` (leading `_` reserved for engine tags), value ≤64 B. A violation
-  **throws** (`request.tag` is a handler bug surfaced on the record, not a silent
+  **throws** (an over-cap `tag` is a handler bug surfaced on the record, not a silent
   truncation). Capture rides the existing `console`-style path: tags move onto
   the `Response`/`Continuation` in `finishResponse` so they survive a `next()`
   (the dominant browser-agent path), and into the ndjson + sidecar so the indexer
@@ -1310,7 +1310,7 @@ under load is a footgun — the audit found exactly that).
 - What the replay store may CONTAIN per request is governed by the
   read-recording decision (§4.6): exactly the request inputs the handler read,
   with client IPs masked unless the handler explicitly called
-  `request.unmaskedIp()`.
+  the `unmaskedIp()` capability.
 - **Operator metrics ship on a dedicated loopback HTTP/1.1 `/metrics` listener
   per process, not an auth'd route on the data port** (decided + built
   2026-06-26; supersedes observability.md §2.1's scrape-JWT-on-`/_system/metrics`

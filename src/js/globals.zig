@@ -508,13 +508,13 @@ pub const DispatchState = struct {
     /// Accumulated `console.log` output. Owned by the dispatcher; reset
     /// between requests.
     console: *std.ArrayList(u8),
-    /// Accumulated user-defined index tags from `request.tag(k,v)`.
+    /// Accumulated user-defined index tags from `tag(k,v)`.
     /// Owned by the dispatcher (a per-dispatch buffer, like `console`);
     /// `finishResponse` moves them onto the Response/Continuation so
     /// they reach the log record even across a `next()`. Each key/value
     /// is an owned dupe; capped at `log_mod.MAX_TAGS`.
     tags: *std.ArrayList(log_mod.Tag),
-    /// The activation's shred identity from `request.shredKey(id)` — the
+    /// The activation's shred identity from `shredKey(id)` — the
     /// opaque name every value this activation writes seals under, so a
     /// later destroy of that name takes all of them together.
     ///
@@ -564,7 +564,7 @@ pub const DispatchState = struct {
     /// The activation's wire headers, borrowed for the lifetime of
     /// the JS run (the h2 entity row outlives dispatch, including
     /// park/resume and chunk re-fires). The lazy `request.headers`
-    /// getters and the `request.ip` / `request.unmaskedIp()` IP
+    /// getters and the `request.ip` / `unmaskedIp()` IP
     /// derivation read from here on access — recording each read
     /// into `readset.request_reads` (read-taping; see
     /// `tape.Channel.request_reads`).
@@ -639,7 +639,7 @@ pub const DispatchState = struct {
     /// boundary (`Trace.parent_saga`, a durable wake's provenance —
     /// handler-shape.md §3.2). Consumed by `finishResponse`, which
     /// stamps it as the reserved `_parent` record tag AFTER the handler
-    /// ran — so it never occupies the handler's `request.tag` quota and
+    /// ran — so it never occupies the handler's `tag` quota and
     /// never reaches the JS surface. Null everywhere but the durable-
     /// wake fire path.
     parent_saga: ?[]const u8 = null,

@@ -10,7 +10,7 @@ const cap = (fn) => {
   }
 };
 
-export default function ({ kv }) {
+export default function ({ kv, tag }) {
   const p = request.path;
   if (p === "/guards") {
     return {
@@ -59,27 +59,28 @@ export default function ({ kv }) {
       bigKey: cap(() => kv.set("K".repeat(257), "v")),
     };
   }
-  // `request.tag` validation. Kept beside the kv prefixes because it is the
+  // `tag` (activation capability, #849) validation. Kept beside the kv
+  // prefixes because it is the
   // same question — one rule, several engines — and the answer drifted the
   // same way: this had FOUR hand-copies and they disagreed about the
   // tag-count message (rove#505).
   if (p === "/tags") {
     const out = {
-      ok: cap(() => request.tag("order", "123")),
-      retag: cap(() => request.tag("order", "456")),
-      badKeyChars: cap(() => request.tag("Order-ID", "1")),
-      reservedKey: cap(() => request.tag("_internal", "1")),
-      longKey: cap(() => request.tag("k".repeat(33), "1")),
-      longVal: cap(() => request.tag("v", "x".repeat(65))),
-      ctrlVal: cap(() => request.tag("c", "a\u0001b")),
-      notString: cap(() => request.tag("n", 5)),
+      ok: cap(() => tag("order", "123")),
+      retag: cap(() => tag("order", "456")),
+      badKeyChars: cap(() => tag("Order-ID", "1")),
+      reservedKey: cap(() => tag("_internal", "1")),
+      longKey: cap(() => tag("k".repeat(33), "1")),
+      longVal: cap(() => tag("v", "x".repeat(65))),
+      ctrlVal: cap(() => tag("c", "a\u0001b")),
+      notString: cap(() => tag("n", 5)),
     };
     // Capacity: fill to the cap, then one more. The refusal message is the
     // one that differed between engines, so it has to be compared.
-    out.fill2 = cap(() => request.tag("aa", "1"));
-    out.fill3 = cap(() => request.tag("bb", "1"));
-    out.fill4 = cap(() => request.tag("cc", "1"));
-    out.overflow = cap(() => request.tag("dd", "1"));
+    out.fill2 = cap(() => tag("aa", "1"));
+    out.fill3 = cap(() => tag("bb", "1"));
+    out.fill4 = cap(() => tag("cc", "1"));
+    out.overflow = cap(() => tag("dd", "1"));
     return out;
   }
   // A customer prefix READ that every engine can run identically: the prod

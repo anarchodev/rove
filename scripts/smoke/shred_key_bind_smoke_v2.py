@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`request.shredKey(id)` binds an identity to a minted slot — the first
+"""`shredKey(id)` binds an identity to a minted slot — the first
 end-to-end exercise of the keyring pool.
 
 Everything under this has been landing without a caller: the keyring opens
@@ -44,41 +44,55 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
+from smoke_lib_v2 import V2Cluster  # noqa: E402
 
 # Names an identity, then writes under it. The write is what makes the
 # activation's raft entry carry the binding row.
 SRC = (
-    'export function bind() {\n'
-    '  request.shredKey((request.query.match(/id=([^&]+)/) || [])[1] || "u_default");\n'
-    '  kv.set("note", "v");\n'
-    '  return "bound\\n";\n'
-    '}\n'
-    'export function secret() {\n'
-    '  request.shredKey((request.query.match(/id=([^&]+)/) || [])[1] || "u_default");\n'
-    '  kv.set("card", "tuna-casserole-9f3a");\n'
-    '  return "readback:" + kv.get("card") + "\\n";\n'
-    '}\n'
-    'export function plain() {\n'
-    '  kv.set("plainrow", "pilchard-control-2b7e");\n'
-    '  return "plain\\n";\n'
-    '}\n'
-    'export function erase() {\n'
-    '  request.shredKey.destroy((request.query.match(/id=([^&]+)/) || [])[1] || "u_default");\n'
-    '  return "erased\\n";\n'
-    '}\n'
-    'export function peek() {\n'
-    '  const v = kv.get("card");\n'
-    '  return (v === null ? "absent" : "present:" + v) + "\\n";\n'
-    '}\n'
-    'export function burst() {\n'
-    '  const n = Number((request.query.match(/n=([0-9]+)/) || [])[1] || 0);\n'
-    '  try { request.shredKey("burst-" + n); return "ok\\n"; }\n'
-    '  catch (e) { return "refused\\n"; }\n'
-    '}\n'
-    'export function badId() {\n'
-    '  try { request.shredKey(""); return "accepted\\n"; }\n'
-    '  catch (e) { return "refused:" + e.constructor.name + "\\n"; }\n'
+    # Hand-composed default (the rpc_wrap recipe forwards no activation
+    # object to named functions, and `shredKey` is a capability on it —
+    # rove#849): destructure the caps once, route on ?fn= internally. Same
+    # wire as every rpc_wrap smoke.
+    'export default function ({ shredKey }) {\n'
+    '  const q = request.query || "";\n'
+    '  const fn = (q.match(/fn=([^&]+)/) || [])[1];\n'
+    '  const qid = () => (q.match(/id=([^&]+)/) || [])[1] || "u_default";\n'
+    '  const fns = {\n'
+    '    bind() {\n'
+    '      shredKey(qid());\n'
+    '      kv.set("note", "v");\n'
+    '      return "bound\\n";\n'
+    '    },\n'
+    '    secret() {\n'
+    '      shredKey(qid());\n'
+    '      kv.set("card", "tuna-casserole-9f3a");\n'
+    '      return "readback:" + kv.get("card") + "\\n";\n'
+    '    },\n'
+    '    plain() {\n'
+    '      kv.set("plainrow", "pilchard-control-2b7e");\n'
+    '      return "plain\\n";\n'
+    '    },\n'
+    '    erase() {\n'
+    '      shredKey.destroy(qid());\n'
+    '      return "erased\\n";\n'
+    '    },\n'
+    '    peek() {\n'
+    '      const v = kv.get("card");\n'
+    '      return (v === null ? "absent" : "present:" + v) + "\\n";\n'
+    '    },\n'
+    '    burst() {\n'
+    '      const n = Number((q.match(/n=([0-9]+)/) || [])[1] || 0);\n'
+    '      try { shredKey("burst-" + n); return "ok\\n"; }\n'
+    '      catch (e) { return "refused\\n"; }\n'
+    '    },\n'
+    '    badId() {\n'
+    '      try { shredKey(""); return "accepted\\n"; }\n'
+    '      catch (e) { return "refused:" + e.constructor.name + "\\n"; }\n'
+    '    },\n'
+    '  };\n'
+    '  const f = fns[fn];\n'
+    '  if (!f) { response.status = 404; return "no such fn: " + fn; }\n'
+    '  return f();\n'
     '}\n'
 )
 
@@ -113,7 +127,7 @@ def main() -> int:
         print("step 1: provision + deploy a handler that names an identity")
         r = c.provision("acme")
         check("provision → 200", r.status == 200, f"got {r.status}")
-        dep = c.deploy_handlers("acme", {"index.mjs": rpc_wrap(SRC)})
+        dep = c.deploy_handlers("acme", {"index.mjs": SRC})
         check("deploy → dep_id", bool(dep), f"dep_id={dep}")
 
         dirs = [keyring_dir(d, "acme") for d in c.data_dirs]

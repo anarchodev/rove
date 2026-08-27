@@ -6,7 +6,7 @@
 //!
 //! ## Why the tape holds ciphertext in the first place
 //!
-//! A value sealed under a per-identity key (`request.shredKey`) is
+//! A value sealed under a per-identity key (`shredKey`) is
 //! sealed at the WRITE boundary, so the ciphertext propagates by itself
 //! into the writeset, the raft entry, the LMDB page, the readset and the
 //! tape. That is the whole mechanism — no container below the write
@@ -81,7 +81,7 @@ pub const Error = error{
 /// Open every sealed kv value in a logs-door response body.
 ///
 /// Returns null when nothing changed — the overwhelmingly common case
-/// (no tenant using `request.shredKey`, or none of these records read a
+/// (no tenant using `shredKey`, or none of these records read a
 /// sealed value), and the case that must stay free.
 ///
 /// Returns `error.KeyMaterialUnverified` when any sealed value resolves
@@ -457,7 +457,7 @@ test "prefix rows are opened too — a page short by one row is not a page" {
 }
 
 test "a body with nothing sealed is not rewritten at all" {
-    // The path every tenant not using `request.shredKey` takes, which is
+    // The path every tenant not using `shredKey` takes, which is
     // to say almost every response. It must not pay for a re-encode.
     const a = testing.allocator;
     const b64 = try kvTapeB64(a, &.{

@@ -348,7 +348,7 @@ const EPILOGUE_BODY = EPILOGUE_BODY_HEAD ++ "\n" ++ CAPS_DECL ++ "\n" ++ EPILOGU
 const CAPS_DECL = blk: {
     var out: []const u8 = "  const __CAPS = [";
     for (reserved.CAPABILITY_NAMES) |n| out = out ++ "\"" ++ n ++ "\", ";
-    out = out ++ "];\n  const __REQ_FX = " ++ reserved.requestEffectArrayLiteral() ++ ";";
+    out = out ++ "];";
     break :blk out;
 };
 
@@ -536,7 +536,9 @@ const EPILOGUE_BODY_HEAD =
     \\  // a captured world misses (the original run never read the channel).
     \\  Object.defineProperty(request, "ip", { enumerable: true, configurable: true,
     \\    get() { if (!D.ipMasked) { if (D.captured) miss("request.ip"); return null; } return D.ipMasked.value || null; } });
-    \\  request.unmaskedIp = function () { if (!D.ipRaw) { if (D.captured) miss("request.unmaskedIp()"); return null; } return D.ipRaw.value || null; };
+    \\  // unmaskedIp — an activation capability, not a request member (#849);
+    \\  // assigned onto __act below, beside tag and shredKey.
+    \\  const __unmaskedIp = function () { if (!D.ipRaw) { if (D.captured) miss("unmaskedIp()"); return null; } return D.ipRaw.value || null; };
     \\  // `request.rewind` — the platform-metadata namespace, installed ONLY for
     \\  // a platform-bound activation, exactly as prod gates it on
     \\  // `state.platform != null`. A recorded root_verdict entry IS that proof;
@@ -695,16 +697,6 @@ const EPILOGUE_BODY_TAIL =
     \\  // Installed only when this run registered triggers, so the delegate
     \\  // skips the prev fetch + dispatch entirely otherwise.
     \\  if (globalThis.__rove_triggers && globalThis.__rove_triggers.length) globalThis.__rove_run_triggers = __runTriggers;
-    \\  // request.tag — the common native binding (rove-binding.Tag over the
-    \\  // offline delegate): arity gate, pair rules, capacity and refusal
-    \\  // shapes are ONE implementation with the worker. Each accepted call
-    \\  // lands in the effect log as {kind:"tag"} (the delegate pushes it) so
-    \\  // tests can assert what would index the record.
-    \\  request.tag = __rove_request_tag;
-    \\  // request.shredKey — the same common binding (rove-binding.ShredKey).
-    \\  // A FUNCTION on every engine, so a handler that scopes its
-    \\  // activation to an identity behaves the same offline as in prod.
-    \\  request.shredKey = __rove_request_shred_key;
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  // The activation object — the single argument every export receives
@@ -721,9 +713,16 @@ const EPILOGUE_BODY_TAIL =
     \\  for (const __k of __CAPS) if (__k in globalThis) __act[__k] = globalThis[__k];
     \\  __act.request = request;
     \\  __act.response = globalThis.response;
-    \\  // The three effects that hid on `request` (package-isolation.md §3.4).
-    \\  // Same function objects; they stay on `request` through the transition.
-    \\  for (const __k of __REQ_FX) if (request[__k] !== undefined) __act[__k] = request[__k];
+    \\  // The three effects that HID on `request` (package-isolation.md §3.4)
+    \\  // are capabilities on the activation object, and ONLY there (#849).
+    \\  // tag/shredKey are the common native binding (rove-binding.Tag /
+    \\  // .ShredKey over the offline delegate): arity gate, pair rules,
+    \\  // capacity and refusal shapes are ONE implementation with the
+    \\  // worker; each accepted call lands in the effect log so tests can
+    \\  // assert what would index the record.
+    \\  __act.tag = __rove_request_tag;
+    \\  __act.shredKey = __rove_request_shred_key;
+    \\  __act.unmaskedIp = __unmaskedIp;
     \\  let __result = null, __err = null, __short = false;
     \\  // Await like the worker's pumpJobs: drain microtasks, and if the promise
     \\  // is STILL pending treat it as a plain value (prod ships its JSON — "{}")
@@ -1069,9 +1068,15 @@ test "the driver passes the activation object, built from the shared list" {
         try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, n) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __CAPS = [") != null);
-    try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "const __REQ_FX = [") != null);
+    // The request-sourced effects are per-activation capabilities on the
+    // object (#849) — assigned directly, so each NAME from the shared list
+    // must appear as an `__act.` assignment, and none as a `request.` one.
     for (reserved.REQUEST_EFFECT_NAMES) |n| {
-        try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, n) != null);
+        var buf: [64]u8 = undefined;
+        const assign = std.fmt.bufPrint(&buf, "__act.{s} =", .{n}) catch unreachable;
+        try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, assign) != null);
+        const on_req = std.fmt.bufPrint(&buf, "request.{s} =", .{n}) catch unreachable;
+        try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, on_req) == null);
     }
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "__fn(__act)") != null);
     try std.testing.expect(std.mem.indexOf(u8, EPILOGUE_BODY, "ns[\"default\"](__act)") != null);

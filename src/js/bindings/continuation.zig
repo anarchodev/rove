@@ -70,7 +70,7 @@ pub const Continuation = struct {
     /// The author's `ctx`, JSON-serialized. The runtime forms the
     /// next hop's request body as ctx + the injected effect outcome.
     ctx_json: []u8,
-    /// User-defined index tags set via `request.tag(k,v)` during the
+    /// User-defined index tags set via `tag(k,v)` during the
     /// activation that returned this continuation. Owned slice + owned
     /// key/value. Harvested in `finishResponse` from the DispatchState
     /// (a continuation otherwise carries no console/tape — tags are the

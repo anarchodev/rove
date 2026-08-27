@@ -46,7 +46,7 @@ pub const RateLimitCaps = struct {
     /// can't bypass it. Deferred fires — scheduled sends, retries, anything
     /// a baked `__system/*` module issues — count too: being
     /// platform-issued is not evidence the send was admitted.
-    /// Burst cap on NEW identities named by `request.shredKey` — the
+    /// Burst cap on NEW identities named by `shredKey` — the
     /// footgun bound.
     ///
     /// A new identity mints a key, and slots are never reused, so this is
