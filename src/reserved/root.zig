@@ -15,7 +15,7 @@
 //!   allowed; the fire-time guard skips dispatch on platform keys.
 //!
 //! Also home to the handler-facing LIMITS every engine must agree on (the kv
-//! byte caps, the `request.tag` bounds). They sit in this leaf for the same
+//! byte caps, the `tag` bounds). They sit in this leaf for the same
 //! reason the prefixes do: the offline engines have to read them without
 //! importing the stack that gives them meaning, and a number transcribed into
 //! three preludes is three numbers waiting to disagree.
@@ -449,7 +449,7 @@ test "isCustomerWriteReserved: customer (non-_) keys allowed" {
 /// without breaking anyone, never lowered.
 pub const KV_KEY_MAX: usize = 256;
 
-/// Longest `request.shredKey(id)` identity, in bytes.
+/// Longest `shredKey(id)` identity, in bytes.
 ///
 /// A CONTRACT like the kv caps beside it: every engine must agree on what
 /// a handler may pass, or a handler is refused by one and accepted by
@@ -569,7 +569,7 @@ pub const KV_VAL_MAX: usize = 384 * 1024;
 pub const KV_WRITES_MAX: u32 = 1000;
 pub const KV_WRITE_BYTES_MAX: usize = 400 * 1024;
 
-/// `request.tag` limits — the low-cardinality index tags a handler may set.
+/// `tag` limits — the low-cardinality index tags a handler may set.
 ///
 /// Same reason the kv caps are here: a handler author reads "at most 4 tags"
 /// as a contract, and three engines have to agree on it. `src/log/root.zig`
@@ -619,6 +619,62 @@ pub fn capabilityLiteralBody() []const u8 {
     }
 }
 
+/// Capabilities in the CUSTOMER set only. A baked `__system/` activation's
+/// template (`SYSTEM_CAPABILITY_NAMES`) omits them:
+///
+///   - `kv` — a baked module holds ONE kv, the storage-rooted `rootKv`
+///     (#848), and spells the user root explicitly when it wants a row a
+///     handler named. Handing both spellings to one module is the
+///     writer/reader prefix-depth hazard: the same row nameable at two
+///     depths, and the mismatch surfaces as a scan that silently misses.
+///
+/// Every name here must also appear in `CAPABILITY_NAMES` — the comptime
+/// derivation below fails the build otherwise, so this list cannot drift
+/// into naming a capability that does not exist.
+pub const CUSTOMER_ONLY_CAPABILITY_NAMES = [_][]const u8{
+    "kv",
+};
+
+/// The capability set a baked `__system/` activation receives instead of the
+/// customer one — selected by code origin when the activation object is
+/// assembled (`package-isolation.md`: which set an activation holds is
+/// decided at assembly; not installing is the denial). Derived, not
+/// restated: `CAPABILITY_NAMES` minus `CUSTOMER_ONLY_CAPABILITY_NAMES`.
+pub const SYSTEM_CAPABILITY_NAMES = blk: {
+    var count: usize = 0;
+    for (CAPABILITY_NAMES) |n| {
+        if (!nameInList(n, &CUSTOMER_ONLY_CAPABILITY_NAMES)) count += 1;
+    }
+    // Every customer-only name must subtract a real member, or the list
+    // names a capability that does not exist.
+    if (count != CAPABILITY_NAMES.len - CUSTOMER_ONLY_CAPABILITY_NAMES.len)
+        @compileError("CUSTOMER_ONLY_CAPABILITY_NAMES has a name not in CAPABILITY_NAMES");
+    var out: [count][]const u8 = undefined;
+    var i: usize = 0;
+    for (CAPABILITY_NAMES) |n| {
+        if (!nameInList(n, &CUSTOMER_ONLY_CAPABILITY_NAMES)) {
+            out[i] = n;
+            i += 1;
+        }
+    }
+    break :blk out;
+};
+
+fn nameInList(name: []const u8, list: []const []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// `SYSTEM_CAPABILITY_NAMES` as a JS object-literal body, the system-set
+/// twin of `capabilityLiteralBody`.
+pub fn systemCapabilityLiteralBody() []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (SYSTEM_CAPABILITY_NAMES) |n| out = out ++ n ++ ", ";
+        return out;
+    }
+}
+
 /// Members of the activation object that are sourced from `request` rather
 /// than from a global — the three effects that hid on a documented data
 /// shape (`docs/architecture/package-isolation.md` §3.4):
@@ -633,10 +689,10 @@ pub fn capabilityLiteralBody() []const u8 {
 ///                  re-file the handler's writes under another erasure
 ///                  identity.
 ///
-/// They stay reachable as `request.*` through the transition and move for
-/// real at the cutover (tracker #753). Their natives ignore the receiver
-/// (`binding.Tag`/`ShredKey` resolve state from the context), so exposing
-/// the same function object on the activation binds nothing.
+/// They are reachable ONLY on the activation object (#849) — `request` is a
+/// data shape and carries no effects. Their natives ignore the receiver
+/// (`binding.Tag`/`ShredKey` resolve state from the context), so where the
+/// function object is exposed binds nothing.
 /// NUL-terminated: the worker hands these straight to `JS_SetPropertyStr`,
 /// which takes a C string.
 pub const REQUEST_EFFECT_NAMES = [_][:0]const u8{
@@ -644,16 +700,6 @@ pub const REQUEST_EFFECT_NAMES = [_][:0]const u8{
     "unmaskedIp",
     "shredKey",
 };
-
-/// `REQUEST_EFFECT_NAMES` as a JS array literal, for engines that build the
-/// activation object by evaluating source.
-pub fn requestEffectArrayLiteral() []const u8 {
-    comptime {
-        var out: []const u8 = "[";
-        for (REQUEST_EFFECT_NAMES) |n| out = out ++ "\"" ++ n ++ "\", ";
-        return out ++ "]";
-    }
-}
 
 test "isEngineOnly: engine namespaces are hidden, customer keys are not" {
     try std.testing.expect(isEngineOnly("_usage/blob/deadbeef"));

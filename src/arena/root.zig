@@ -23,7 +23,7 @@
 //!     plus the interrupt brake: arenajs's runtime polls
 //!     `rove_arena_interrupted()`, which trips on poison or the CPU budget
 //!     (the arena's missing budget, rove#452);
-//!   - `request.tag` (binding.Tag) and the `__rove_park_output` /
+//!   - `tag` (binding.Tag) and the `__rove_park_output` /
 //!     `__rove_poison` / `__rove_divergence` natives.
 //!
 //! Per-run state (tags, poison, deadline) resets in `rove_arena_run_begin`,

@@ -508,13 +508,13 @@ pub const DispatchState = struct {
     /// Accumulated `console.log` output. Owned by the dispatcher; reset
     /// between requests.
     console: *std.ArrayList(u8),
-    /// Accumulated user-defined index tags from `request.tag(k,v)`.
+    /// Accumulated user-defined index tags from `tag(k,v)`.
     /// Owned by the dispatcher (a per-dispatch buffer, like `console`);
     /// `finishResponse` moves them onto the Response/Continuation so
     /// they reach the log record even across a `next()`. Each key/value
     /// is an owned dupe; capped at `log_mod.MAX_TAGS`.
     tags: *std.ArrayList(log_mod.Tag),
-    /// The activation's shred identity from `request.shredKey(id)` — the
+    /// The activation's shred identity from `shredKey(id)` — the
     /// opaque name every value this activation writes seals under, so a
     /// later destroy of that name takes all of them together.
     ///
@@ -564,7 +564,7 @@ pub const DispatchState = struct {
     /// The activation's wire headers, borrowed for the lifetime of
     /// the JS run (the h2 entity row outlives dispatch, including
     /// park/resume and chunk re-fires). The lazy `request.headers`
-    /// getters and the `request.ip` / `request.unmaskedIp()` IP
+    /// getters and the `request.ip` / `unmaskedIp()` IP
     /// derivation read from here on access — recording each read
     /// into `readset.request_reads` (read-taping; see
     /// `tape.Channel.request_reads`).
@@ -639,7 +639,7 @@ pub const DispatchState = struct {
     /// boundary (`Trace.parent_saga`, a durable wake's provenance —
     /// handler-shape.md §3.2). Consumed by `finishResponse`, which
     /// stamps it as the reserved `_parent` record tag AFTER the handler
-    /// ran — so it never occupies the handler's `request.tag` quota and
+    /// ran — so it never occupies the handler's `tag` quota and
     /// never reaches the JS surface. Null everywhere but the durable-
     /// wake fire path.
     parent_saga: ?[]const u8 = null,
@@ -1048,6 +1048,16 @@ pub fn installStatic(ctx: *c.JSContext) void {
     //     oidc/sessions use `crypto`; retry/webhook/email use `http`)
     //     and customer handlers see the documented top-level names
     //     rather than the raw natives.
+    // The factory registry (tracker #753, the shims-as-factories shape): a
+    // factory-shaped shim registers `__rove_factories.<name> = function
+    // (caps) {...}` instead of assigning `globalThis.<name>` from an IIFE,
+    // and `_factories_invoke.js` below calls each one with the capabilities
+    // a platform shim receives, installing the result. The registry itself
+    // carries no authority — authority flows in through the caps argument —
+    // so it stays nameable; it is deleted with the rest of the ambient
+    // surface at the cutover.
+    evalSnippet(ctx, "_factories.js", "globalThis.__rove_factories = {};");
+
     evalSnippet(ctx, "kv.js", KV_JS);
     evalSnippet(ctx, "config.js", CONFIG_JS);
     evalSnippet(ctx, "console.js", CONSOLE_JS);
@@ -1081,6 +1091,35 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // blob depends on crypto.sha256 + http (both above) +
     // _system.blob.presign (`docs/architecture/routing-and-ingress.md`, customer blob storage).
     evalSnippet(ctx, "blob.js", BLOB_JS);
+
+    // Invoke the registered factories — after every shim has evaluated, so
+    // a factory's capabilities are complete regardless of shim eval order
+    // (an IIFE capture had to be sequenced below its producer; a factory
+    // does not), and before `_harden.js`, while `_system` is still
+    // reachable to assemble the caps from. Each factory runs ONCE per
+    // context; what it returns is installed at the ambient name
+    // (dual-support: the templates below pick it up by shorthand, and the
+    // ambient global goes away at the #753 cutover, not here).
+    //
+    // The caps a platform shim receives. Assembled by the engine, passed as
+    // ONE argument — a shim names what it was handed, nothing else. The
+    // per-shim narrowing (a namespace-rooted marker kv instead of the whole
+    // customer kv) arrives with the remaining conversions
+    // (`package-isolation.md` §4.3: narrowing is the normal case).
+    evalSnippet(ctx, "_factories_invoke.js",
+        \\(function () {
+        \\  const reg = globalThis.__rove_factories;
+        \\  const caps = {
+        \\    http: _system.http,
+        \\    sched: _system.sched,
+        \\    kv: globalThis.kv,
+        \\    formats: __rove.formats,
+        \\  };
+        \\  for (const name of Object.keys(reg)) {
+        \\    globalThis[name] = reg[name](caps);
+        \\  }
+        \\})();
+    );
 
     // Reachability hardening (docs/architecture/builtin-libs.md).
     // Every native shim above captured its slice as
@@ -1117,13 +1156,46 @@ pub fn installStatic(ctx: *c.JSContext) void {
         reserved.capabilityLiteralBody() ++ "};");
 
     // The SECOND capability template: what a baked `__system/` activation is
-    // handed instead of `caps`. Captured here because `_harden.js` below
-    // deletes `_system`, and a baked module — dispatched from the snapshot
-    // after that delete — can see neither `_system` nor a shim's closure.
+    // handed instead of `caps` — selected by code origin when the activation
+    // object is assembled (`installRequest`). Built once beside `caps` so a
+    // per-request activation is one prototype pick, never a set assembly.
     //
-    // A customer activation is never given this object, which is the whole of
-    // the access control: there is no flag to check because there is nothing
-    // to check it on.
+    // `kv` is deliberately absent (`reserved.CUSTOMER_ONLY_CAPABILITY_NAMES`):
+    // a baked module holds ONE kv — the storage-rooted grant
+    // (`__rove.rootKv*` today, the received `rootKv` at the cutover) — and
+    // spells the user root explicitly, so the same row is never nameable at
+    // two depths from one module.
+    //
+    // The selection is a GRANT, not the enforcement. Both templates live in
+    // the one shared realm, so customer code can still NAME this object; what
+    // keeps a grabbed system template inert in a customer activation is the
+    // per-activation gate on every privileged native it would reach
+    // (`rootKvGate` et al). The gates and this global holder both dissolve at
+    // the cutover, when nothing needs the name
+    // (`package-isolation.md`: not installing is the denial).
+    evalSnippet(ctx, "_caps_system.js", comptime "globalThis.__rove.capsSystem = { " ++
+        reserved.systemCapabilityLiteralBody() ++ "};");
+
+    // The system set's one member the shorthand cannot express: the
+    // storage-rooted kv, nested as `__system.rootKv` — what a baked
+    // activation holds INSTEAD of the customer `kv`. The nesting is
+    // organisation, not a boundary: not handing it to customer activations
+    // is what makes it safe, and the natives behind it stay
+    // `is_system_module`-gated (`rootKvGate`) while the templates remain
+    // nameable in the shared realm. Same function objects as the
+    // `__rove.rootKv*` privileged surface — one implementation, two doors,
+    // and the door on the activation object is the one that survives the
+    // cutover.
+    evalSnippet(ctx, "_caps_system_rootkv.js",
+        \\globalThis.__rove.capsSystem.__system = {
+        \\  rootKv: {
+        \\    get: __rove.rootKvGet,
+        \\    set: __rove.rootKvSet,
+        \\    delete: __rove.rootKvDelete,
+        \\    prefix: __rove.rootKvPrefix,
+        \\  },
+        \\};
+    );
 
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
@@ -1737,25 +1809,32 @@ test "lint(b): every globals/*.js export carries a JSDoc block (Phase A)" {
             }
         }
 
-        idx = 0;
-        while (std.mem.indexOfPos(u8, src, idx, "globalThis.")) |p| {
-            idx = p + 11;
-            var j = p + 11;
-            while (j < src.len and (std.ascii.isAlphanumeric(src[j]) or src[j] == '_')) : (j += 1) {}
-            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
-            if (j >= src.len or src[j] != '=') continue;
-            j += 1;
-            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
-            if (j >= src.len) continue;
-            const is_def = src[j] == '{' or std.mem.startsWith(u8, src[j..], "function");
-            if (!is_def) continue; // alias / re-export
-            if (!lintPrecededByJsdoc(src, p)) {
-                std.debug.print(
-                    "\nlint(b): globals/{s}.js — `globalThis.` export at " ++
-                        "offset {d} has no preceding /** JSDoc */\n",
-                    .{ g.name, p },
-                );
-                return error.UndocumentedExport;
+        // Both export spellings carry the same documentation duty: an IIFE
+        // shim assigns `globalThis.<name>`, a factory shim registers
+        // `__rove_factories.<name>` — either way it is the public surface's
+        // definition site, and the JSDoc there is what the doc pipeline
+        // reads.
+        for ([_][]const u8{ "globalThis.", "__rove_factories." }) |prefix| {
+            idx = 0;
+            while (std.mem.indexOfPos(u8, src, idx, prefix)) |p| {
+                idx = p + prefix.len;
+                var j = p + prefix.len;
+                while (j < src.len and (std.ascii.isAlphanumeric(src[j]) or src[j] == '_')) : (j += 1) {}
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
+                if (j >= src.len or src[j] != '=') continue;
+                j += 1;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
+                if (j >= src.len) continue;
+                const is_def = src[j] == '{' or std.mem.startsWith(u8, src[j..], "function");
+                if (!is_def) continue; // alias / re-export
+                if (!lintPrecededByJsdoc(src, p)) {
+                    std.debug.print(
+                        "\nlint(b): globals/{s}.js — `{s}` export at " ++
+                            "offset {d} has no preceding /** JSDoc */\n",
+                        .{ g.name, prefix, p },
+                    );
+                    return error.UndocumentedExport;
+                }
             }
         }
     }
@@ -1850,6 +1929,37 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  // the prototype chain, so a per-activation object costs one alloc.
         \\  const act = Object.create(caps);
         \\  if (act.kv !== globalThis.kv) throw new Error("prototype chain broke");
+        \\  // The SYSTEM set: what a baked `__system/` activation receives
+        \\  // instead. Shared members by the same identity rule; the
+        \\  // customer-only capabilities are absent, so the two sets are
+        \\  // demonstrably different — the system set's kv is NOT the
+        \\  // customer set's (a baked module holds one kv, the rooted
+        \\  // grant, and spells the user root explicitly).
+        \\  const sys = globalThis.__rove.capsSystem;
+        \\  if (typeof sys !== "object") throw new Error("__rove.capsSystem missing");
+        \\  if (sys === caps) throw new Error("system template aliases the customer template");
+        \\  const sgot = Object.keys(sys).sort().join(",");
+        \\  const swant = "__system,after,blob,config,http,next,platform,stream,webhook";
+        \\  if (sgot !== swant)
+        \\    throw new Error("system capability set drifted: got [" + sgot + "] want [" + swant + "]");
+        \\  for (const k of Object.keys(sys))
+        \\    if (k !== "__system" && sys[k] !== globalThis[k])
+        \\      throw new Error("capsSystem." + k + " is not the ambient " + k);
+        \\  if ("kv" in sys) throw new Error("kv must not be in the system template");
+        \\  if (Object.create(sys).kv !== undefined)
+        \\    throw new Error("a system activation would inherit a kv");
+        \\  // The rootKv grant (#848): the same gated natives as the
+        \\  // `__rove.rootKv*` privileged surface, by identity — one
+        \\  // implementation, two doors. Absent from the customer set.
+        \\  const rk = sys.__system && sys.__system.rootKv;
+        \\  if (typeof rk !== "object") throw new Error("__system.rootKv missing");
+        \\  if (rk.get !== globalThis.__rove.rootKvGet ||
+        \\      rk.set !== globalThis.__rove.rootKvSet ||
+        \\      rk.delete !== globalThis.__rove.rootKvDelete ||
+        \\      rk.prefix !== globalThis.__rove.rootKvPrefix)
+        \\    throw new Error("rootKv members are not the gated natives");
+        \\  if ("__system" in caps)
+        \\    throw new Error("__system must not be in the customer template");
         \\  return true;
         \\})();
     ;
@@ -1857,6 +1967,60 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         if (ctx.takeExceptionMessage(std.testing.allocator)) |m| {
             defer std.testing.allocator.free(m);
             std.debug.print("\ncaps regression: {s}\n", .{m});
+        } else |_| {}
+        return e;
+    };
+    defer result.deinit();
+}
+
+test "factories: a factory's return must not expose a capability it was handed" {
+    // The rule that replaces the IIFE lint for factory-shaped shims. An
+    // IIFE's failure mode was scoping (top-level consts landing in the
+    // global lexical environment); a factory's is provenance — returning a
+    // received capability on the public object would hand every caller the
+    // shim's own grant. A property of one expression (the return), checked
+    // by re-invoking every registered factory with marker capabilities and
+    // asserting no own property of the result IS one of them.
+    //
+    // Markers are empty but well-shaped: a factory may READ config off a
+    // cap at build time (`formats.sendOwed`), and an undefined member is
+    // fine where a throw would be a false failure.
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    installStatic(ctx.raw);
+
+    const assertion =
+        \\(function () {
+        \\  const reg = globalThis.__rove_factories;
+        \\  const names = Object.keys(reg);
+        \\  if (names.length === 0)
+        \\    throw new Error("no factories registered — webhook converted away?");
+        \\  const markers = { http: {}, sched: function () {}, kv: {}, formats: {} };
+        \\  for (const name of names) {
+        \\    const out = reg[name](markers);
+        \\    if (out === null || typeof out !== "object")
+        \\      throw new Error(name + " factory did not return an object");
+        \\    for (const k of Object.keys(out))
+        \\      for (const c of Object.keys(markers))
+        \\        if (out[k] === markers[c])
+        \\          throw new Error(name + "." + k + " exposes the '" + c + "' capability");
+        \\  }
+        \\  // The installed ambient came from the factory: same surface,
+        \\  // and the registry knows the name.
+        \\  if (typeof reg.webhook !== "function")
+        \\    throw new Error("webhook is not factory-registered");
+        \\  if (typeof globalThis.webhook.send !== "function")
+        \\    throw new Error("webhook.send missing from the installed object");
+        \\  return true;
+        \\})();
+    ;
+    var result = ctx.eval(assertion, "_factories_test.js", .{}) catch |e| {
+        if (ctx.takeExceptionMessage(std.testing.allocator)) |m| {
+            defer std.testing.allocator.free(m);
+            std.debug.print("\nfactory regression: {s}\n", .{m});
         } else |_| {}
         return e;
     };
@@ -1952,7 +2116,16 @@ test "every global shim is IIFE-wrapped, so its top level stays out of handler s
         }
 
         const rest = g.src[@min(i, g.src.len)..];
-        const wrapped = std.mem.startsWith(u8, rest, "(function () {") or
+        // A factory-shaped shim (`__rove_factories.<name> = function (caps)`)
+        // needs no wrap: it has no module-scope bindings for a handler to
+        // resolve — its internals live in the closure the engine invokes —
+        // so the property the IIFE exists to enforce holds by construction.
+        // Its own rule is the factory-return test (the return must not
+        // expose a capability it was handed). Matched anywhere rather than
+        // at the first code line: JSDoc precedes the assignment.
+        const is_factory = std.mem.indexOf(u8, g.src, "__rove_factories.") != null;
+        const wrapped = is_factory or
+            std.mem.startsWith(u8, rest, "(function () {") or
             std.mem.startsWith(u8, rest, "(() => {");
         if (!wrapped) {
             std.debug.print(

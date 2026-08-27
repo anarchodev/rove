@@ -243,7 +243,7 @@ pub const Dispatcher = struct {
         var console_buf: std.ArrayList(u8) = .empty;
         errdefer console_buf.deinit(self.allocator);
 
-        // Per-dispatch user-tag accumulator (`request.tag`). Owned here
+        // Per-dispatch user-tag accumulator (`tag`). Owned here
         // like `console_buf`; `finishResponse` MOVES the tags onto the
         // Response/Continuation (so they survive a `next()`), or frees
         // them on the drop paths. The errdefer covers error returns
@@ -750,7 +750,7 @@ fn finishResponse(
     // boundary rooted a NEW saga (handler-shape.md §3.2); the arming
     // saga rides its record as the reserved `_parent` tag — the
     // viewer's cross-saga jump. Stamped AFTER the handler ran so it
-    // never occupies the `request.tag` quota (the surface guard counts
+    // never occupies the `tag` quota (the surface guard counts
     // the live buffer, and an engine tag consuming a customer slot
     // would also be a prod-only, engine-divergent throw). Clamped to
     // the tag-value contract: `armed_by` transits customer-writable

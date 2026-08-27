@@ -109,6 +109,65 @@ test "dispatch: simple response write-back" {
     try testing.expectEqualStrings("", resp.exception);
 }
 
+test "dispatch: the cap set is selected by code origin (customer vs baked __system/)" {
+    // The grant decision (#753 phase A): a customer activation's object has
+    // the customer template as its prototype — `kv` reachable — while a
+    // baked `__system/` activation receives the system set, where `kv` is
+    // absent (not own, not inherited; the rooted grant is the one kv a
+    // baked module holds). Asserted through the real dispatch path, so the
+    // selection in `installRequest` is what is being tested, not the
+    // templates alone.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var customer = try runOne(
+        &d,
+        kv,
+        \\const a = arguments[0];
+        \\return JSON.stringify({
+        \\  kv: typeof a.kv,
+        \\  sys: typeof a.__system,
+        \\  proto: Object.getPrototypeOf(a) === globalThis.__rove.caps,
+        \\});
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer customer.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        "{\"kv\":\"object\",\"sys\":\"undefined\",\"proto\":true}",
+        customer.body,
+    );
+
+    // The baked activation holds the grant and it WORKS: a raw round-trip
+    // through `__system.rootKv`, whose spelling storage takes literally —
+    // no user-root reroot (the row is verified back through the raw door).
+    var system = try runOne(
+        &d,
+        kv,
+        \\const a = arguments[0];
+        \\a.__system.rootKv.set("_probe/raw", "1");
+        \\return JSON.stringify({
+        \\  kv: typeof a.kv,
+        \\  next: typeof a.next,
+        \\  proto: Object.getPrototypeOf(a) === globalThis.__rove.capsSystem,
+        \\  raw: a.__system.rootKv.get("_probe/raw"),
+        \\});
+    ,
+        .{ .method = "GET", .path = "/", .is_system_module = true },
+    );
+    defer system.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        "{\"kv\":\"undefined\",\"next\":\"function\",\"proto\":true,\"raw\":\"1\"}",
+        system.body,
+    );
+}
+
 test "dispatch: kv.get on missing key returns null" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
@@ -1636,7 +1695,7 @@ test "dispatch: console.log captured into response.console" {
     try testing.expectEqualStrings("hello world\nline2\n", resp.console);
 }
 
-test "dispatch: request.tag captured into response.tags (update-in-place)" {
+test "dispatch: tag captured into response.tags (update-in-place)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1649,9 +1708,9 @@ test "dispatch: request.tag captured into response.tags (update-in-place)" {
     var resp = try runOne(
         &d,
         kv,
-        \\request.tag("session", "S1");
-        \\request.tag("flow", "checkout");
-        \\request.tag("session", "S2"); // same key → updates in place
+        \\arguments[0].tag("session", "S1");
+        \\arguments[0].tag("flow", "checkout");
+        \\arguments[0].tag("session", "S2"); // same key → updates in place
         \\return "x";
     ,
         .{ .method = "GET", .path = "/" },
@@ -1691,10 +1750,10 @@ test "dispatch: Trace.parent_saga seeds the reserved _parent tag alongside user 
     var resp = try runOne(
         &d,
         kv,
-        \\request.tag("flow", "checkout");
-        \\request.tag("a", "1");
-        \\request.tag("b", "2");
-        \\request.tag("c", "3");
+        \\arguments[0].tag("flow", "checkout");
+        \\arguments[0].tag("a", "1");
+        \\arguments[0].tag("b", "2");
+        \\arguments[0].tag("c", "3");
         \\return "x";
     ,
         .{ .method = "GET", .path = "/", .trace = .{ .parent_saga = "corr-armed-me" } },
@@ -1746,7 +1805,7 @@ test "dispatch: a forged/oversized parent_saga is dropped, never stamped" {
     try testing.expectEqual(@as(usize, 0), resp2.tags.len);
 }
 
-test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
+test "dispatch: tag rejects reserved + over-cap (fail loud)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1761,7 +1820,7 @@ test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
     var resp = try runOne(
         &d,
         kv,
-        \\request.tag("_saga", "nope");
+        \\arguments[0].tag("_saga", "nope");
         \\return "x";
     ,
         .{ .method = "GET", .path = "/" },
@@ -3412,7 +3471,7 @@ test "dispatch: request.ip masked, unmaskedIp() raw, IP transport headers stripp
         \\export default function () {
         \\    return JSON.stringify({
         \\        ip: request.ip,
-        \\        raw: request.unmaskedIp(),
+        \\        raw: arguments[0].unmaskedIp(),
         \\        xff: request.headers["x-forwarded-for"] === undefined,
         \\        keys: Object.keys(request.headers).join(","),
         \\    });
@@ -3484,7 +3543,7 @@ test "dispatch: request.ip prefers cf-connecting-ip; IPv6 masks to /48; absent �
     {
         const bytecode = try ctx.compileToBytecode(
             \\export default function () {
-            \\    return request.ip + "|" + request.unmaskedIp();
+            \\    return request.ip + "|" + arguments[0].unmaskedIp();
             \\}
         ,
             "h.mjs",
@@ -3522,7 +3581,7 @@ test "dispatch: request.ip prefers cf-connecting-ip; IPv6 masks to /48; absent �
     {
         const bytecode = try ctx.compileToBytecode(
             \\export default function () {
-            \\    return JSON.stringify({ ip: request.ip, raw: request.unmaskedIp() });
+            \\    return JSON.stringify({ ip: request.ip, raw: arguments[0].unmaskedIp() });
             \\}
         ,
             "h.mjs",

@@ -550,7 +550,7 @@ pub const OfflineKv = struct {
     }
 };
 
-// ── request.tag — the common Tag binding's offline delegate ─────────────
+// ── tag — the common Tag binding's offline delegate ─────────────
 //
 // Per-run tag storage (the worker keeps state.tags on its DispatchState; the
 // offline engine keeps the equivalent here), generation-keyed like the
@@ -736,8 +736,8 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, cfg, "get", c.JS_NewCFunction2(ctx, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "config", cfg) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
-    // The common request.tag binding — the epilogue assigns it onto the
-    // per-request `request` object (`request.tag = __rove_request_tag`).
+    // The common tag binding — the epilogue assigns it onto the
+    // per-request `request` object (`tag = __rove_request_tag`).
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_tag", c.JS_NewCFunction2(ctx, T.jsRequestTag, "__rove_request_tag", 2, c.JS_CFUNC_generic, 0));
     const SK = binding.ShredKey(c, OfflineTag);
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_shred_key", c.JS_NewCFunction2(ctx, SK.jsRequestShredKey, "__rove_request_shred_key", 1, c.JS_CFUNC_generic, 0));

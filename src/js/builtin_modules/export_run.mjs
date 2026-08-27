@@ -125,7 +125,7 @@ function schedCancel(id) {
     return true;
 }
 
-export default function () {
+export default function ({ __system }) {
     const a = request.activation;
     if (a.kind !== "durable_wake" && a.kind !== "fetch_chunk") return { status: 200 };
     // A streaming intermediate is not an outcome — only the terminal event
@@ -242,12 +242,13 @@ export default function () {
                 // export; a marker without `bundle_requested` (pre-format-2,
                 // or an explicit {bundle:false}) finishes kv-only, exactly
                 // as before.
-                // `__rove.rootKvGet`, not `kv.get`: the release pointer is
+                // `__system.rootKv` — the storage-rooted kv this baked
+                // activation RECEIVES — not `kv.get`: the release pointer is
                 // ENGINE state, written below the binding, and a handler's kv
                 // is rooted at the user keyspace where it does not exist.
                 // Reading it through the handler door answers "absent" for
                 // every tenant, which reads here as "no deployment to bundle".
-                if (st.bundle_requested && __rove.rootKvGet("_deploy/current") !== null) {
+                if (st.bundle_requested && __system.rootKv.get("_deploy/current") !== null) {
                     st.phase = "bundle";
                     // Fall through to the shared issue tail below.
                 } else {

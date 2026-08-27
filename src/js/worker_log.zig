@@ -818,7 +818,7 @@ pub fn captureLog(
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
     saga_id: ?[]const u8,
-    /// User-defined index tags (`request.tag`). BORROWED — duped into
+    /// User-defined index tags (`tag`). BORROWED — duped into
     /// the record here, caller keeps ownership (freed when its
     /// Response/Continuation deinits). Pass `&.{}` on paths with no
     /// handler tags (early errors, faults).

@@ -420,7 +420,7 @@ overridden callback replays under its actual export. Validated in the matrix
 (`replay_matrix_smoke_v2.py` uses `{on:'onUpstream'}` with **no** `onFetchResult`
 — reproduction proves the recorded export is used). ~~(b) `TextDecoder`/`stream.*`/`next` absent in the bare
 replay arena~~ **FIXED** — the epilogue now shims `TextDecoder`/`TextEncoder`,
-`stream.*`/`on.*`/`next`/`webhook`/`schedule`/`cron`/`blob`/`request.tag`; outputs
+`stream.*`/`on.*`/`next`/`webhook`/`schedule`/`cron`/`blob`/`tag`; outputs
 are captured into the bundle (`stream`/`wakes`/`sends`) rather than fired.
 `stream`/`on`/`next`/`TextEncoder`/`TextDecoder` are fully faithful (the codec
 is real UTF-8 matching prod byte-for-byte — WTF-8 lone-surrogate encode + per-

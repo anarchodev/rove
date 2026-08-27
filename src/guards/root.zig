@@ -62,6 +62,7 @@ fn utf8Len(s: []const u8) usize {
 // ── kv ───────────────────────────────────────────────────────────────────
 
 pub const kv_reserved_code = "reserved_key";
+pub const kv_empty_key_code = "empty_key";
 pub const kv_key_too_large_code = "key_too_large";
 pub const kv_value_too_large_code = "value_too_large";
 /// The per-activation write budget (`reserved.KV_WRITES_MAX` /
@@ -74,6 +75,7 @@ pub const kv_writes_too_large_code = "writes_too_large";
 /// The size-cap messages, exported so a TAPED refusal (outcome-replay: the
 /// capture said no, replay throws the recorded code without re-deciding) can
 /// be re-materialized with the same text the live refusal carried.
+pub const kv_empty_key_message = "kv: key must not be empty";
 pub const kv_key_too_large_message = kvTooLargeMessage("key", reserved.KV_KEY_MAX);
 pub const kv_value_too_large_message = kvTooLargeMessage("value", reserved.KV_VAL_MAX);
 pub const kv_too_many_writes_message = std.fmt.comptimePrint(
@@ -131,10 +133,11 @@ fn kvTooLargeMessage(comptime which: []const u8, comptime limit: usize) []const 
 /// to refuse. What remains are the rules that are about the write ITSELF —
 /// how big it is, and how much this activation has already spent.
 ///
-/// ORDER IS CONTRACT: key size, then value size, then the activation's write
-/// budget. A key that breaks two rules must report the same one in every
-/// engine — and the budget comes last so a write that is individually illegal
-/// says so, rather than being blamed on the activation's total.
+/// ORDER IS CONTRACT: empty key, then key size, then value size, then the
+/// activation's write budget. A key that breaks two rules must report the
+/// same one in every engine — and the budget comes last so a write that is
+/// individually illegal says so, rather than being blamed on the activation's
+/// total.
 ///
 /// `spent` is what this activation has written BEFORE this call; the budget
 /// rules judge `spent + this write`.
@@ -143,6 +146,16 @@ pub fn checkKvWrite(
     value: ?[]const u8,
     spent: WriteBudget,
 ) Verdict {
+    // An empty key is refused, never resolved. A handler that computed an
+    // empty name — a missing id, an unparsed field — meant to name a row and
+    // got nothing; under the user root the write would otherwise land on the
+    // root prefix itself, a row whose visible name is "". Refusal is the
+    // write half; the read half needs no rule, because kv.get("") resolves
+    // inside the caller's root where nothing can now be written, and a read
+    // never throws. Same argument as checkShredKey's empty-id refusal.
+    if (key.len == 0) {
+        return .{ .throw = .err, .code = kv_empty_key_code, .message = kv_empty_key_message };
+    }
     if (utf8Len(key) > reserved.KV_KEY_MAX) {
         return .{
             .throw = .err,
@@ -219,19 +232,19 @@ pub fn kvReservedMessageFmt() []const u8 {
     return "kv: '{s}' is in a platform-reserved prefix";
 }
 
-// ── request.tag ──────────────────────────────────────────────────────────
+// ── tag ──────────────────────────────────────────────────────────
 
 fn tagLenMessage(comptime what: []const u8, comptime max: usize) []const u8 {
-    return std.fmt.comptimePrint("request.tag: {s} length must be 1..{d} bytes", .{ what, max });
+    return std.fmt.comptimePrint("tag: {s} length must be 1..{d} bytes", .{ what, max });
 }
 
-pub const tag_reserved_message = "request.tag: keys starting with '_' are reserved";
-pub const tag_charset_message = "request.tag: key must match [a-z0-9_]";
-pub const tag_control_message = "request.tag: value must not contain control characters";
-pub const tag_args_message = "request.tag(key, value) requires two string arguments";
+pub const tag_reserved_message = "tag: keys starting with '_' are reserved";
+pub const tag_charset_message = "tag: key must match [a-z0-9_]";
+pub const tag_control_message = "tag: value must not contain control characters";
+pub const tag_args_message = "tag(key, value) requires two string arguments";
 
 fn tagCapacityMessage() []const u8 {
-    return std.fmt.comptimePrint("request.tag: too many tags (max {d} per request)", .{reserved.TAG_MAX});
+    return std.fmt.comptimePrint("tag: too many tags (max {d} per request)", .{reserved.TAG_MAX});
 }
 
 /// One (key, value) pair. Capacity is separate because whether a call adds or
@@ -265,17 +278,17 @@ pub fn checkTagCapacity(count: usize) Verdict {
     return null;
 }
 
-pub const shred_key_args_message = "request.shredKey(id) requires a string argument";
-pub const shred_key_control_message = "request.shredKey: id must not contain control characters";
+pub const shred_key_args_message = "shredKey(id) requires a string argument";
+pub const shred_key_control_message = "shredKey: id must not contain control characters";
 
 fn shredKeyLenMessage() []const u8 {
     return std.fmt.comptimePrint(
-        "request.shredKey: id length must be 1..{d} bytes",
+        "shredKey: id length must be 1..{d} bytes",
         .{reserved.SHRED_KEY_MAX},
     );
 }
 
-/// One `request.shredKey(id)` identity.
+/// One `shredKey(id)` identity.
 ///
 /// Deliberately permissive about CONTENT: the engine never learns that an
 /// identity is a person, and the id is an opaque name the tenant chooses.
@@ -352,11 +365,11 @@ test "shredKey: the id's CONTENT is the tenant's business, not the engine's" {
     try std.testing.expect(checkShredKey("日本語") == null);
 }
 
-pub const shred_destroy_args_message = "request.shredKey.destroy(id) requires a string argument";
+pub const shred_destroy_args_message = "shredKey.destroy(id) requires a string argument";
 
 fn shredDestroyCapMessage() []const u8 {
     return std.fmt.comptimePrint(
-        "request.shredKey.destroy: too many identities destroyed in one activation (max {d})",
+        "shredKey.destroy: too many identities destroyed in one activation (max {d})",
         .{reserved.SHRED_DESTROY_MAX_PER_ACTIVATION},
     );
 }
@@ -385,6 +398,24 @@ test "kv: a leading-underscore key is an ordinary write" {
     // own keyspace and there is nothing to refuse.
     try testing.expect(checkKvWrite("_secret/mine", "v", .{}) == null);
     try testing.expect(checkKvWrite("_sched/by_id/x", "v", .{}) == null);
+}
+
+test "kv: an empty key is refused, never resolved" {
+    // A handler that computed an empty name meant to name a row and got
+    // nothing — the checkShredKey argument. Both write shapes refuse: a set
+    // and a delete of "" are the same bug.
+    try testing.expectEqualStrings(kv_empty_key_code, checkKvWrite("", "v", .{}).?.code);
+    try testing.expectEqualStrings(kv_empty_key_code, checkKvWrite("", null, .{}).?.code);
+    try testing.expect(checkKvWrite("", "v", .{}).?.throw == .err);
+}
+
+test "kv: order is contract — empty key before every other rule" {
+    // An empty key with an oversized value reports the KEY, and a full
+    // activation does not steal the blame either.
+    const big = "x" ** (reserved.KV_VAL_MAX + 1);
+    try testing.expectEqualStrings(kv_empty_key_code, checkKvWrite("", big, .{}).?.code);
+    const spent_full: WriteBudget = .{ .ops = reserved.KV_WRITES_MAX, .bytes = reserved.KV_WRITE_BYTES_MAX };
+    try testing.expectEqualStrings(kv_empty_key_code, checkKvWrite("", "v", spent_full).?.code);
 }
 
 test "kv: order is contract — key size before value size" {
@@ -473,13 +504,13 @@ test "kv: no namespace is refused — the allowlist has nothing left to allow" {
 test "tag: every rule, in the worker's order" {
     try testing.expect(checkTagPair("order", "123") == null);
     try testing.expectEqualStrings(
-        "request.tag: key length must be 1..32 bytes",
+        "tag: key length must be 1..32 bytes",
         checkTagPair("k" ** 33, "v").?.message,
     );
     try testing.expectEqualStrings(tag_reserved_message, checkTagPair("_x", "v").?.message);
     try testing.expectEqualStrings(tag_charset_message, checkTagPair("Order", "v").?.message);
     try testing.expectEqualStrings(
-        "request.tag: value length must be 1..64 bytes",
+        "tag: value length must be 1..64 bytes",
         checkTagPair("k", "v" ** 65).?.message,
     );
     try testing.expectEqualStrings(tag_control_message, checkTagPair("k", "a\x01b").?.message);
@@ -491,7 +522,7 @@ test "tag: every rule, in the worker's order" {
 test "tag: capacity refuses only at the cap" {
     try testing.expect(checkTagCapacity(reserved.TAG_MAX - 1) == null);
     try testing.expectEqualStrings(
-        "request.tag: too many tags (max 4 per request)",
+        "tag: too many tags (max 4 per request)",
         checkTagCapacity(reserved.TAG_MAX).?.message,
     );
 }
