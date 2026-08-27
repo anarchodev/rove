@@ -1117,13 +1117,25 @@ pub fn installStatic(ctx: *c.JSContext) void {
         reserved.capabilityLiteralBody() ++ "};");
 
     // The SECOND capability template: what a baked `__system/` activation is
-    // handed instead of `caps`. Captured here because `_harden.js` below
-    // deletes `_system`, and a baked module — dispatched from the snapshot
-    // after that delete — can see neither `_system` nor a shim's closure.
+    // handed instead of `caps` — selected by code origin when the activation
+    // object is assembled (`installRequest`). Built once beside `caps` so a
+    // per-request activation is one prototype pick, never a set assembly.
     //
-    // A customer activation is never given this object, which is the whole of
-    // the access control: there is no flag to check because there is nothing
-    // to check it on.
+    // `kv` is deliberately absent (`reserved.CUSTOMER_ONLY_CAPABILITY_NAMES`):
+    // a baked module holds ONE kv — the storage-rooted grant
+    // (`__rove.rootKv*` today, the received `rootKv` at the cutover) — and
+    // spells the user root explicitly, so the same row is never nameable at
+    // two depths from one module.
+    //
+    // The selection is a GRANT, not the enforcement. Both templates live in
+    // the one shared realm, so customer code can still NAME this object; what
+    // keeps a grabbed system template inert in a customer activation is the
+    // per-activation gate on every privileged native it would reach
+    // (`rootKvGate` et al). The gates and this global holder both dissolve at
+    // the cutover, when nothing needs the name
+    // (`package-isolation.md`: not installing is the denial).
+    evalSnippet(ctx, "_caps_system.js", comptime "globalThis.__rove.capsSystem = { " ++
+        reserved.systemCapabilityLiteralBody() ++ "};");
 
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
@@ -1850,6 +1862,25 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  // the prototype chain, so a per-activation object costs one alloc.
         \\  const act = Object.create(caps);
         \\  if (act.kv !== globalThis.kv) throw new Error("prototype chain broke");
+        \\  // The SYSTEM set: what a baked `__system/` activation receives
+        \\  // instead. Shared members by the same identity rule; the
+        \\  // customer-only capabilities are absent, so the two sets are
+        \\  // demonstrably different — the system set's kv is NOT the
+        \\  // customer set's (a baked module holds one kv, the rooted
+        \\  // grant, and spells the user root explicitly).
+        \\  const sys = globalThis.__rove.capsSystem;
+        \\  if (typeof sys !== "object") throw new Error("__rove.capsSystem missing");
+        \\  if (sys === caps) throw new Error("system template aliases the customer template");
+        \\  const sgot = Object.keys(sys).sort().join(",");
+        \\  const swant = "after,blob,config,http,next,platform,stream,webhook";
+        \\  if (sgot !== swant)
+        \\    throw new Error("system capability set drifted: got [" + sgot + "] want [" + swant + "]");
+        \\  for (const k of Object.keys(sys))
+        \\    if (sys[k] !== globalThis[k])
+        \\      throw new Error("capsSystem." + k + " is not the ambient " + k);
+        \\  if ("kv" in sys) throw new Error("kv must not be in the system template");
+        \\  if (Object.create(sys).kv !== undefined)
+        \\    throw new Error("a system activation would inherit a kv");
         \\  return true;
         \\})();
     ;

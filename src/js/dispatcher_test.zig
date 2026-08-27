@@ -109,6 +109,56 @@ test "dispatch: simple response write-back" {
     try testing.expectEqualStrings("", resp.exception);
 }
 
+test "dispatch: the cap set is selected by code origin (customer vs baked __system/)" {
+    // The grant decision (#753 phase A): a customer activation's object has
+    // the customer template as its prototype — `kv` reachable — while a
+    // baked `__system/` activation receives the system set, where `kv` is
+    // absent (not own, not inherited; the rooted grant is the one kv a
+    // baked module holds). Asserted through the real dispatch path, so the
+    // selection in `installRequest` is what is being tested, not the
+    // templates alone.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var customer = try runOne(
+        &d,
+        kv,
+        \\const a = arguments[0];
+        \\return JSON.stringify({
+        \\  kv: typeof a.kv,
+        \\  proto: Object.getPrototypeOf(a) === globalThis.__rove.caps,
+        \\});
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer customer.deinit(testing.allocator);
+    try testing.expectEqualStrings("{\"kv\":\"object\",\"proto\":true}", customer.body);
+
+    var system = try runOne(
+        &d,
+        kv,
+        \\const a = arguments[0];
+        \\return JSON.stringify({
+        \\  kv: typeof a.kv,
+        \\  next: typeof a.next,
+        \\  proto: Object.getPrototypeOf(a) === globalThis.__rove.capsSystem,
+        \\});
+    ,
+        .{ .method = "GET", .path = "/", .is_system_module = true },
+    );
+    defer system.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        "{\"kv\":\"undefined\",\"next\":\"function\",\"proto\":true}",
+        system.body,
+    );
+}
+
 test "dispatch: kv.get on missing key returns null" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

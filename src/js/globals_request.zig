@@ -734,9 +734,22 @@ pub fn installRequest(
     // handler destructuring `{ request, kv }` reads one of each.
     // `JS_GetPropertyStr` on the base `__rove` holder is a read, so it
     // allocates no per-request shadow.
+    //
+    // WHICH template is the grant decision, made once here, before any of
+    // the activation's code runs: a baked `__system/` module receives the
+    // system set, everything else the customer set. Per-activation is the
+    // right granularity for a grant exactly because it is the wrong one for
+    // a check — a package inside a customer handler is indistinguishable at
+    // call time, but the object is assembled before either exists
+    // (`docs/architecture/package-isolation.md`, the received-not-ambient
+    // model).
     const rove_holder = c.JS_GetPropertyStr(ctx, global, "__rove");
     defer c.JS_FreeValue(ctx, rove_holder);
-    const caps = c.JS_GetPropertyStr(ctx, rove_holder, "caps");
+    const caps = c.JS_GetPropertyStr(
+        ctx,
+        rove_holder,
+        if (state.is_system_module) "capsSystem" else "caps",
+    );
     defer c.JS_FreeValue(ctx, caps);
     const act = if (c.JS_IsObject(caps))
         c.JS_NewObjectProto(ctx, caps)
