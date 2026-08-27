@@ -28,6 +28,7 @@ checkout read REWIND_APPS_DIR and skip themselves when it is absent.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import queue
@@ -216,6 +217,9 @@ def main() -> int:
     ap.add_argument("--logs", default=None, help="directory for per-smoke logs")
     ap.add_argument("--json", default=None, help="write a machine-readable summary here")
     ap.add_argument("--baseline", default=None, help="compare against a prior --json summary")
+    ap.add_argument("--no-queue", action="store_true",
+                    help="fail immediately if another suite holds the box "
+                         "instead of queueing behind it")
     args = ap.parse_args()
 
     # Answered before any environment check: a BUILD step asks this, and it has
@@ -239,6 +243,40 @@ def main() -> int:
     if not os.environ.get("S3_ENDPOINT"):
         print("S3 env not set — `set -a; . ./.env; set +a` first", file=sys.stderr)
         return 2
+
+    # ── One suite per box ─────────────────────────────────────────────
+    # Ports are already disjoint (smoke_ports.py); the resource suites
+    # actually contend for is CPU — a saturated box trips raft election
+    # timeouts, which read as spurious failovers in BOTH runs. So suite
+    # runs queue on a box-global flock: the kernel blocks waiters and
+    # releases on process exit (crash included — no stale locks; the
+    # lock file itself is never unlinked, unlink+flock races). Several
+    # agents in several clones can all just start a suite; they run one
+    # at a time in roughly arrival order.
+    lock_path = "/tmp/rove-smoke-suite.lock"
+    lock_fd = open(lock_path, "a+", opener=lambda p, f: os.open(p, f, 0o666))
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            lock_fd.seek(0)
+            holder = lock_fd.read().strip() or "unknown holder"
+        except OSError:
+            holder = "unknown holder"
+        if args.no_queue:
+            print(f"another suite is running ({holder}); --no-queue set, exiting", file=sys.stderr)
+            return 3
+        print(f"another suite is running ({holder}); queued — this run starts when it finishes ...",
+              flush=True)
+        wait_t0 = time.monotonic()
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        print(f"suite lock acquired after {time.monotonic() - wait_t0:.0f}s", flush=True)
+    lock_fd.seek(0)
+    lock_fd.truncate(0)
+    lock_fd.write(f"pid={os.getpid()} cwd={os.getcwd()} started={time.strftime('%H:%M:%S')}\n")
+    lock_fd.flush()
+    # Held for the life of the process; the kernel releases it at exit.
+
 
     # Preflight the binaries. Several smokes drive the h2/ws example servers,
     # which the DEFAULT `zig build` install step produces — not the `rewind-*`
