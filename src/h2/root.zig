@@ -989,7 +989,7 @@ pub fn H2(comptime opts: Options) type {
         /// the conn and `retryPendingCloses` applies it next pass. The close
         /// still happens; no caller carries the retry. The bool exists only
         /// for callers that must know whether it took effect now.
-        fn closeConn(h2: *Self, entity: Entity) bool {
+        pub fn closeConn(h2: *Self, entity: Entity) bool {
             // Already closing — done, not an error.
             if (h2.reg.isInCollection(entity, h2.io.coll(.conn_closing))) return true;
 
