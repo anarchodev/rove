@@ -548,8 +548,17 @@ pub fn World(comptime cfg: WorldConfig) type {
             pub inline fn moveAnyOnly(self: *Reg, entity: Entity, sources: anytype, dst: anytype) !void {
                 return self.core.moveAnyOnly(entity, sources, dst);
             }
+            pub inline fn evict(self: *Reg, entity: Entity, dst: anytype) !void {
+                return self.core.evict(entity, dst);
+            }
             pub inline fn evictOnly(self: *Reg, entity: Entity, dst: anytype) !void {
                 return self.core.evictOnly(entity, dst);
+            }
+            pub inline fn evictOnlyImmediate(self: *Reg, entity: Entity, dst: anytype) !void {
+                return self.core.evictOnlyImmediate(entity, dst);
+            }
+            pub inline fn pendingOpCount(self: *const Reg) u32 {
+                return self.core.pendingOpCount();
             }
             pub inline fn collectionIdOf(self: *const Reg, entity: Entity) ?u8 {
                 return self.core.collectionIdOf(entity);
@@ -694,7 +703,7 @@ test "world: moveOnly/evictOnly — quiesce drops state memberships, spares iden
 
     // The erased-source flavor, back the other way.
     try reg.enter(e, reg.coll(.throttled));
-    try reg.evictOnly(e, active);
+    try reg.evictOnlyImmediate(e, active);
     try testing.expect(reg.isInCollection(e, active));
     try testing.expect(!reg.onAxis(e, throttle_axis));
     try testing.expect(reg.inSet(e, .tracked));

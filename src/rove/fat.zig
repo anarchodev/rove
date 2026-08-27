@@ -195,10 +195,14 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         // guard is all that stops two layers from picking the same slot.
         id_used: [MAX_COLLECTIONS]bool,
 
-        // Deferred queue
+        // Deferred queue (offset-keyed), plus the entity-keyed late
+        // queue: `evict`/`evictOnly` ops whose source resolves at
+        // execute time, drained after every offset-keyed batch.
         deferred_ops: []DeferredOp,
         deferred_count: u32,
         deferred_capacity: u32,
+        late_ops: []LateOp,
+        late_count: u32,
 
         // The base table: one universe struct per entity, addressed by
         // entity.index, never compacted. Point access only — the shadow
@@ -243,8 +247,14 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         };
 
         const EvictEntry = struct {
-            recipe: *const fn (*Self, *anyopaque, u32) void,
+            recipe: *const fn (*Self, *anyopaque, u32) Entity,
             ptr: *anyopaque,
+        };
+
+        const LateOp = struct {
+            entity: Entity,
+            dst_ptr: *anyopaque,
+            execute: *const fn (*Self, *anyopaque, Entity) void,
         };
 
         pub const DeferredOp = struct {
@@ -276,6 +286,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             }
 
             const deferred_ops = try allocator.alloc(DeferredOp, config.deferred_queue_capacity);
+            const late_ops = try allocator.alloc(LateOp, config.deferred_queue_capacity);
 
             const fat_table = try allocator.alloc(Fat, max);
             // Headers only: gen 0 + empty mask reads as "nothing written"
@@ -306,6 +317,8 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 .deferred_ops = deferred_ops,
                 .deferred_count = 0,
                 .deferred_capacity = config.deferred_queue_capacity,
+                .late_ops = late_ops,
+                .late_count = 0,
                 .fat_table = fat_table,
                 .column_fns = column_fns,
                 .coll_ptrs = [_]?*anyopaque{null} ** MAX_COLLECTIONS,
@@ -331,6 +344,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             self.allocator.free(self.flags);
             self.allocator.free(self.null_pool);
             self.allocator.free(self.deferred_ops);
+            self.allocator.free(self.late_ops);
             self.* = undefined;
         }
 
@@ -613,7 +627,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             const id = self.axisIds(ax)[idx];
             if (id == 0) return false;
             const entry = self.evict_recipes[id];
-            entry.recipe(self, entry.ptr, self.axisOffsets(ax)[idx]);
+            _ = entry.recipe(self, entry.ptr, self.axisOffsets(ax)[idx]);
             self.axisIds(ax)[idx] = 0;
             return true;
         }
@@ -674,6 +688,21 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         // =============================================================
 
         pub fn flush(self: *Self) !void {
+            while (self.deferred_count > 0 or self.late_count > 0) {
+                try self.flushBatch();
+                // Entity-keyed ops run after every offset-keyed batch:
+                // by now any queued op for their entity has executed,
+                // so resolving the source fresh is exact.
+                var li: u32 = 0;
+                while (li < self.late_count) : (li += 1) {
+                    const op = self.late_ops[li];
+                    op.execute(self, op.dst_ptr, op.entity);
+                }
+                self.late_count = 0;
+            }
+        }
+
+        fn flushBatch(self: *Self) !void {
             while (self.deferred_count > 0) {
                 const batch_count = self.deferred_count;
 
@@ -705,6 +734,13 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         // =============================================================
         // Queries
         // =============================================================
+
+        /// Ops queued for the next flush — offset-keyed and
+        /// entity-keyed both. The empty-queue preconditions (teardown
+        /// sweeps) check this, not `deferred_count` alone.
+        pub fn pendingOpCount(self: *const Self) u32 {
+            return self.deferred_count + self.late_count;
+        }
 
         pub fn isStale(self: *const Self, entity: Entity) bool {
             if (entity.index >= self.max_entities) return true;
@@ -902,7 +938,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             const new_offset = try dst.reserveSlots(1);
 
             const entry = self.evict_recipes[src_id];
-            entry.recipe(self, entry.ptr, self.axisOffsets(ax)[idx]);
+            _ = entry.recipe(self, entry.ptr, self.axisOffsets(ax)[idx]);
 
             dst.entitySlice()[new_offset] = entity;
             inline for (DstColl.RowType.types) |T| {
@@ -919,9 +955,50 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         /// the erased-source flavor of `moveOnly`, for a layer ending
         /// an entity it cannot name the holder of (the teardown
         /// sweep). Dropped memberships' rows PARK.
-        pub inline fn evictOnly(self: *Self, entity: Entity, dst: anytype) !void {
+        pub inline fn evictOnlyImmediate(self: *Self, entity: Entity, dst: anytype) !void {
             try self.evictImmediate(entity, dst);
             self.leaveOtherAxes(entity.index, dst.axis_index);
+        }
+
+        /// Deferred, ENTITY-KEYED evict: "wherever this entity is —
+        /// even after any op already queued for it — it ends up in
+        /// dst." Unlike the offset-keyed queue, the source resolves at
+        /// EXECUTE time, in a second pass after the offset-keyed batch,
+        /// so a pending move completes first and the eviction extracts
+        /// from wherever the entity landed. That makes this the one
+        /// mutation verb that never refuses a moving entity — an
+        /// ENDING verb must not be refusable, or callers grow silent
+        /// `catch {}` drops and retry machinery. Tolerant at execute:
+        /// an entity that died, or already sits in dst, is skipped.
+        /// dst must be on the total axis (the deferred queue's rule).
+        pub inline fn evict(self: *Self, entity: Entity, dst: anytype) !void {
+            return self.evictLate(entity, dst, false);
+        }
+
+        /// `evict` with `moveOnly`'s quiesce: on execute the entity
+        /// also leaves every non-identity partial axis.
+        pub inline fn evictOnly(self: *Self, entity: Entity, dst: anytype) !void {
+            return self.evictLate(entity, dst, true);
+        }
+
+        inline fn evictLate(self: *Self, entity: Entity, dst: anytype, comptime only: bool) !void {
+            const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+            const idx = entity.index;
+            if (idx >= self.max_entities) return error.InvalidEntity;
+            if (self.generations[idx] != entity.generation) return error.Stale;
+            if (comptime axes_spec.n_axes > 1) {
+                if (dst.axis_index != 0) return error.DeferredPartialAxis;
+            }
+            if (self.late_count >= self.deferred_capacity) return error.QueueFull;
+            // No PENDING check — tolerance for moving entities is the
+            // point. Freeze the entity if it is not already frozen.
+            self.flags[idx] |= PENDING_MOVE;
+            self.late_ops[self.late_count] = .{
+                .entity = entity,
+                .dst_ptr = @ptrCast(dst),
+                .execute = lateEvictRecipe(DstColl, only),
+            };
+            self.late_count += 1;
         }
 
         /// Cast the entity to a row type: one handle validation, then one
@@ -978,7 +1055,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 const id = self.axisIds(ax)[idx];
                 if (id == 0) continue;
                 const e = self.evict_recipes[id];
-                e.recipe(self, e.ptr, self.axisOffsets(ax)[idx]);
+                _ = e.recipe(self, e.ptr, self.axisOffsets(ax)[idx]);
                 self.axisIds(ax)[idx] = 0;
             }
         }
@@ -1138,9 +1215,9 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         /// half of eviction (insertion into a destination) lives in
         /// `evictImmediate`; this half is what gets type-erased so a
         /// foreign layer can extract without naming the collection.
-        fn evictRecipe(comptime SrcColl: type) *const fn (*Self, *anyopaque, u32) void {
+        fn evictRecipe(comptime SrcColl: type) *const fn (*Self, *anyopaque, u32) Entity {
             return &struct {
-                fn execute(reg: *Self, src_raw: *anyopaque, src_offset: u32) void {
+                fn execute(reg: *Self, src_raw: *anyopaque, src_offset: u32) Entity {
                     const src_coll: *SrcColl = @ptrCast(@alignCast(src_raw));
                     const entity = src_coll.entitySlice()[src_offset];
                     inline for (SrcColl.RowType.types) |T| {
@@ -1150,6 +1227,48 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                     }
                     const moved = src_coll.removeRun(src_offset, 1);
                     for (moved) |m| reg.axisOffsets(src_coll.axis_index)[m.index] = src_offset;
+                    return entity;
+                }
+            }.execute;
+        }
+
+        /// Execute half of the entity-keyed deferred evict: resolve the
+        /// entity's collection NOW (any offset-keyed op for it already
+        /// ran), extract through its type-erased evict recipe, insert
+        /// into the typed destination. Skips — clearing the freeze —
+        /// when the entity died or already sits in dst: an ending op
+        /// arriving after the end is not an error.
+        fn lateEvictRecipe(comptime DstColl: type, comptime only: bool) *const fn (*Self, *anyopaque, Entity) void {
+            return &struct {
+                fn execute(reg: *Self, dst_raw: *anyopaque, entity: Entity) void {
+                    const dst: *DstColl = @ptrCast(@alignCast(dst_raw));
+                    const idx = entity.index;
+                    if (reg.generations[idx] != entity.generation) return;
+                    const ax = dst.axis_index;
+                    const src_id = reg.axisIds(ax)[idx];
+                    if (src_id == 0 or src_id == dst.registry_id) {
+                        reg.flags[idx] &= ~PENDING_MOVE;
+                        return;
+                    }
+                    // Reserve first — the no-limbo discipline: a failed
+                    // grow may not leave the entity collection-less. It
+                    // is a tiny allocation on the ending path; failing
+                    // it means the process is done, and failing LOUD
+                    // beats an entity that silently never ends.
+                    const new_offset = dst.reserveSlots(1) catch
+                        std.debug.panic("fat registry: deferred evict could not reserve a slot in the destination", .{});
+                    const entry = reg.evict_recipes[src_id];
+                    _ = entry.recipe(reg, entry.ptr, reg.axisOffsets(ax)[idx]);
+                    dst.entitySlice()[new_offset] = entity;
+                    inline for (DstColl.RowType.types) |T| {
+                        if (comptime @sizeOf(T) > 0) {
+                            reg.unparkOne(T, entity, &dst.column(T)[new_offset]);
+                        }
+                    }
+                    reg.axisIds(ax)[idx] = dst.registry_id;
+                    reg.axisOffsets(ax)[idx] = new_offset;
+                    reg.flags[idx] &= ~PENDING_MOVE;
+                    if (comptime only) reg.leaveOtherAxes(idx, ax);
                 }
             }.execute;
         }
@@ -1175,7 +1294,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                                 const pid = reg.axisIds(ax)[idx];
                                 if (pid != 0) {
                                     const pe = reg.evict_recipes[pid];
-                                    pe.recipe(reg, pe.ptr, reg.axisOffsets(ax)[idx]);
+                                    _ = pe.recipe(reg, pe.ptr, reg.axisOffsets(ax)[idx]);
                                     reg.axisIds(ax)[idx] = 0;
                                 }
                             }
@@ -1901,7 +2020,7 @@ test "moveOnly — quiesce drops state axes at flush, keeps identity, parks valu
     try testing.expectEqual(@as(f32, 5), (try reg.getFat(e, Velocity)).x);
 }
 
-test "evictOnly — the erased-source quiesce" {
+test "evictOnlyImmediate — the erased-source quiesce" {
     var w: QuiesceWorld = undefined;
     try QuiesceWorld.setup(&w);
     defer w.deinit();
@@ -1909,7 +2028,7 @@ test "evictOnly — the erased-source quiesce" {
     const e = try w.liveEntity();
 
     // The caller names no source and no axes.
-    try reg.evictOnly(e, &w.b);
+    try reg.evictOnlyImmediate(e, &w.b);
     try testing.expect(reg.isInCollection(e, &w.b));
     try testing.expect(!reg.onAxis(e, 1));
     try testing.expect(!reg.onAxis(e, 2));
@@ -1946,4 +2065,70 @@ test "deferred moves refuse a partial-axis source; immediate stays open" {
     // The state axis mutates immediately instead.
     try reg.moveImmediate(e, &w.armed, &armed2);
     try testing.expect(reg.isInCollection(e, &armed2));
+}
+
+test "evict — deferred, entity-keyed: tolerates a moving entity" {
+    var w: QuiesceWorld = undefined;
+    try QuiesceWorld.setup(&w);
+    defer w.deinit();
+    const reg = &w.reg;
+    const e = try w.liveEntity();
+
+    // A move is already queued; the ending must not be refusable —
+    // the eviction resolves its source AFTER that move lands.
+    try reg.move(e, &w.a, &w.b);
+    try reg.evictOnly(e, &w.b);
+    try testing.expect(reg.isMoving(e));
+
+    try reg.flush();
+    // The queued move ran first (a → b); then the ending found the
+    // entity already in b and skipped — no double placement.
+    try testing.expect(reg.isInCollection(e, &w.b));
+    try testing.expect(!reg.isMoving(e));
+    // ... and the quiesce still ran its part via the late op? No — an
+    // already-in-dst ending skips whole. State memberships survive; a
+    // caller wanting both uses moveOnly for the move itself.
+    try testing.expect(reg.onAxis(e, 3));
+
+    // Now the real cross-collection case: queued move b→a, ending to b.
+    try reg.move(e, &w.b, &w.a);
+    try reg.evictOnly(e, &w.b);
+    try reg.flush();
+    try testing.expect(reg.isInCollection(e, &w.b));
+    try testing.expect(!reg.onAxis(e, 1));
+    try testing.expect(!reg.onAxis(e, 2));
+    try testing.expect(reg.onAxis(e, 3));
+    try testing.expectEqual(@as(f32, 5), (try reg.getFat(e, Velocity)).x);
+}
+
+test "evict — an ending queued for an entity that dies first is skipped" {
+    var w: QuiesceWorld = undefined;
+    try QuiesceWorld.setup(&w);
+    defer w.deinit();
+    const reg = &w.reg;
+    const e = try w.liveEntity();
+
+    try reg.destroy(e);
+    try reg.evict(e, &w.b);
+    try reg.flush();
+    try testing.expect(reg.isStale(e));
+    try testing.expectEqual(@as(u32, 0), w.b.count);
+    try testing.expectEqual(@as(u32, 0), reg.pendingOpCount());
+}
+
+test "evict — double-ending converges, values ride the park" {
+    var w: QuiesceWorld = undefined;
+    try QuiesceWorld.setup(&w);
+    defer w.deinit();
+    const reg = &w.reg;
+    const e = try w.liveEntity();
+    (try reg.getFat(e, Position)).* = .{ .x = 9, .y = 0 };
+
+    try reg.evict(e, &w.b);
+    try reg.evict(e, &w.b); // second ending: skipped at execute
+    try reg.flush();
+    try testing.expect(reg.isInCollection(e, &w.b));
+    try testing.expectEqual(@as(u32, 1), w.b.count);
+    try testing.expect(!reg.isMoving(e));
+    try testing.expectEqual(@as(f32, 9), (try reg.getFat(e, Position)).x);
 }

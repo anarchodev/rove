@@ -830,7 +830,9 @@ pub fn Io(comptime opts: Options) type {
         }
 
         inline fn deferredCount(self: *const Self) u32 {
-            return if (comptime uses_world) self.reg.core.deferred_count else self.reg.deferred_count;
+            // Entity-keyed (late) ops count too: the sweep's precondition
+            // is that NOTHING lands after it walks.
+            return if (comptime uses_world) self.reg.pendingOpCount() else self.reg.deferred_count;
         }
 
         /// A conn becomes live: one place for the whole birth —
@@ -1017,12 +1019,12 @@ pub fn Io(comptime opts: Options) type {
                     if (comptime hand_off) {
                         if (self.reg.isInCollection(ent, self.coll(.conn_dead))) continue;
                     }
-                    // evictOnly: entering the closing state quiesces —
+                    // evictOnlyImmediate: entering the closing state quiesces —
                     // whatever state axes an upper layer parked this conn
                     // on are left too, unnamed here. all_conns itself is
                     // identity, so this member list stays stable across
                     // the loop.
-                    self.reg.evictOnly(ent, self.coll(.conn_closing)) catch continue;
+                    self.reg.evictOnlyImmediate(ent, self.coll(.conn_closing)) catch continue;
                 }
             } else {
                 for (self.connections.entitySlice()) |ent| {
