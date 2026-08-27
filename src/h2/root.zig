@@ -612,6 +612,20 @@ pub fn H2(comptime opts: Options) type {
             break :blk names;
         };
 
+        /// The h2-side conn collections, derived from `COLLECTIONS` the same
+        /// way the stream chains are. Hand-writing this tuple is how a fourth
+        /// conn state gets added to the table and silently not searched — and
+        /// the symptom surfaces far away, as a write dropped in
+        /// `processWriteIn` or an `error.UnexpectedEntityCollection` escaping
+        /// the poll loop.
+        const SERVER_CONN_COLLS: []const []const u8 = blk: {
+            var names: []const []const u8 = &.{};
+            for (COLLECTIONS) |s| {
+                if (s.kind == .server_conn) names = names ++ &[_][]const u8{s.name};
+            }
+            break :blk names;
+        };
+
         const CLIENT_STREAM_CHAIN: []const []const u8 = blk: {
             var names: []const []const u8 = &.{};
             for (COLLECTIONS) |s| {
@@ -652,20 +666,40 @@ pub fn H2(comptime opts: Options) type {
             return out;
         }
 
-        /// All collections a connection entity can be in (io's + h2's).
+        /// io's live conn collection, then h2's — the tuple `closeConn` moves
+        /// an entity out of.
+        const LIVE_CONN_COLL_TYPES: []const type = blk: {
+            var types: []const type = &.{*@FieldType(IoType, "connections")};
+            for (SERVER_CONN_COLLS) |_| types = types ++ &[_]type{*ConnColl};
+            break :blk types;
+        };
+        const LiveConnColls = std.meta.Tuple(LIVE_CONN_COLL_TYPES);
+
+        /// `LiveConnColls` plus io's closing collection.
+        const ConnColls = std.meta.Tuple(
+            LIVE_CONN_COLL_TYPES ++ &[_]type{*@FieldType(IoType, "conn_closing")},
+        );
+
         /// The collections a LIVE conn can be in — the sources `closeConn`
         /// moves from. `conn_closing` is deliberately absent: it is the
         /// destination, never a source.
-        inline fn liveConnColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl } {
-            return .{ &h2.io.connections, &h2._conn_tls_handshake, &h2._conn_active };
+        inline fn liveConnColls(h2: *Self) LiveConnColls {
+            var out: LiveConnColls = undefined;
+            out[0] = &h2.io.connections;
+            inline for (SERVER_CONN_COLLS, 1..) |name, i| {
+                out[i] = &@field(h2, name);
+            }
+            return out;
         }
 
         /// Every collection a conn entity can be in, closing included — a
         /// completion that lands after the move still has to resolve its
         /// conn. Derived from `liveConnColls` so the two cannot drift.
-        inline fn connColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl, *@TypeOf(h2.io.conn_closing) } {
-            const live = h2.liveConnColls();
-            return live ++ .{&h2.io.conn_closing};
+        inline fn connColls(h2: *Self) ConnColls {
+            var out: ConnColls = undefined;
+            inline for (h2.liveConnColls(), 0..) |coll, i| out[i] = coll;
+            out[out.len - 1] = &h2.io.conn_closing;
+            return out;
         }
 
         /// End a connection. h2 decides a conn should stop; io ends it — so
@@ -1117,9 +1151,7 @@ pub fn H2(comptime opts: Options) type {
         /// trust boundary (front-door hardening plan B7).
         pub fn connPeerAddr(h2: *Self, conn_entity: Entity) ?std.net.Address {
             if (h2.reg.isStale(conn_entity)) return null;
-            const pa = h2.reg.getAny(conn_entity, h2.connColls(), rio.PeerAddr) catch return null;
-            if (!pa.valid) return null;
-            return pa.addr;
+            return h2.io.getPeerAddr(conn_entity);
         }
 
         /// True when the connection is driven by the HTTP/1.1 codec
@@ -1309,30 +1341,6 @@ pub fn H2(comptime opts: Options) type {
                 ws.writeFrame(&wr.send_buf, h2.allocator, op, payload) catch return;
             }
             _ = c.nghttp2_session_resume_data(live.ng, live.sid);
-        }
-
-        /// FD resolver callback for io — searches h2's connection collections in addition to io's.
-        fn resolveFdThunk(ctx: *anyopaque, entity: Entity) ?*rio.Fd {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2.reg.getAny(entity, h2.connColls(), rio.Fd) catch null;
-        }
-
-        /// PeerAddr mirror of `resolveFdThunk` — the accept-time
-        /// fixed-fd-install CQE may land after the conn was promoted
-        /// out of `io.connections`.
-        fn resolvePeerThunk(ctx: *anyopaque, entity: Entity) ?*rio.PeerAddr {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2.reg.getAny(entity, h2.connColls(), rio.PeerAddr) catch null;
-        }
-
-        /// Extra-conns callback for io's admission control. Returns the
-        /// count of conn entities h2 holds outside `io.connections` —
-        /// i.e. those that have already been promoted past the
-        /// post-accept window. Combined with `io.connections.len` in
-        /// `handleAccept` to estimate total in-flight conns.
-        fn extraConnsThunk(ctx: *anyopaque) usize {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2._conn_tls_handshake.entitySlice().len + h2._conn_active.entitySlice().len;
         }
 
         // =============================================================
@@ -2426,15 +2434,6 @@ pub fn H2(comptime opts: Options) type {
                 if (s.client_only and !has_client) continue;
                 reg.registerCollection(&@field(self, s.name));
             }
-
-            // Register FD resolver with io so that processWriteIn/processReadIn
-            // can find connection Fds when h2 has moved them to _conn_active etc.
-            self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
-            self.io.setPeerResolver(@ptrCast(self), &resolvePeerThunk);
-            // Admission control: io counts conns in `io.connections` +
-            // whatever this callback returns. h2 holds promoted conns
-            // in `_conn_tls_handshake` + `_conn_active`.
-            self.io.setExtraConnsFn(@ptrCast(self), &extraConnsThunk);
 
             return self;
         }
@@ -5595,7 +5594,6 @@ test "stream row contains all h2 base components" {
 test "connection row contains Conn" {
     const H2Type = H2(.{});
     try testing.expect(H2Type.ConnectionRow.contains(Conn));
-    try testing.expect(H2Type.ConnectionRow.contains(rio.Fd));
     try testing.expect(H2Type.ConnectionRow.contains(rio.ReadCycleEntity));
 }
 
