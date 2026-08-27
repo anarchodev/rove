@@ -137,6 +137,12 @@ fn ShadowStruct(comptime Universe: type) type {
 pub const AxesSpec = struct {
     n_axes: usize = 1,
     comp_axis: []const u8 = &.{},
+    /// Identity axes (per axis; empty = none): memberships that say
+    /// what the entity IS rather than what state it is in — they end
+    /// only at explicit leave or destroy, and `moveOnly`/`evictOnly`
+    /// leave them alone. Only a partial axis can be identity (the
+    /// total axis is liveness itself).
+    identity: []const bool = &.{},
 };
 
 /// `Universe` is a `Row` of every component type any registered collection
@@ -159,6 +165,12 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         }
         for (axes_spec.comp_axis) |ax| {
             if (ax >= axes_spec.n_axes) @compileError("FatRegistryAxes: comp_axis entry out of range");
+        }
+        if (axes_spec.identity.len != 0) {
+            if (axes_spec.identity.len != axes_spec.n_axes)
+                @compileError("FatRegistryAxes: identity must be empty or one entry per axis");
+            if (axes_spec.identity[0])
+                @compileError("FatRegistryAxes: the total axis cannot be an identity axis");
         }
     }
 
@@ -435,6 +447,20 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         // =============================================================
 
         pub inline fn move(self: *Self, entity: Entity, src: anytype, dst: anytype) !void {
+            return self.moveWith(entity, src, dst, false);
+        }
+
+        /// `move`, plus quiesce: when the op executes, the entity also
+        /// leaves every non-identity partial axis other than the
+        /// destination's — afterwards, dst (and any identity
+        /// memberships) is all the entity is. The call site names no
+        /// axes, so a state axis added later is dropped here without
+        /// this site changing. Dropped memberships' rows PARK.
+        pub inline fn moveOnly(self: *Self, entity: Entity, src: anytype, dst: anytype) !void {
+            return self.moveWith(entity, src, dst, true);
+        }
+
+        inline fn moveWith(self: *Self, entity: Entity, src: anytype, dst: anytype, comptime only: bool) !void {
             const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
             const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
             const idx = entity.index;
@@ -446,12 +472,19 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             // it keeps one flag byte.
             if (comptime axes_spec.n_axes > 1) {
                 if (src.axis_index != dst.axis_index) return error.WrongAxis;
+                // The deferred queue is a total-axis instrument: a
+                // partial-axis membership mutates immediately (enter /
+                // leave / moveImmediate). Keeping partial collections
+                // out of the queue is what lets destroy's and
+                // moveOnly's flush-time axis exits shift them without
+                // invalidating any queued op's recorded offset.
+                if (src.axis_index != 0) return error.DeferredPartialAxis;
             }
             if (self.axisIds(src.axis_index)[idx] != src.registry_id) return error.WrongCollection;
 
             self.flags[idx] |= PENDING_MOVE;
 
-            const recipe = moveRecipe(SrcColl, DstColl);
+            const recipe = moveRecipe(SrcColl, DstColl, only);
             try self.enqueueOp(.{
                 .src_collection_id = src.registry_id,
                 .src_offset = self.axisOffsets(src.axis_index)[idx],
@@ -774,6 +807,17 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         /// naming which sources the call site expects — an entity in
         /// none of them is an error, exactly as under the archetype.
         pub inline fn moveAny(self: *Self, entity: Entity, sources: anytype, dst: anytype) !void {
+            return self.moveAnyWith(entity, sources, dst, false);
+        }
+
+        /// `moveAny` with `moveOnly`'s quiesce — the candidate-tuple
+        /// flavor for a call site that cannot name the source but must
+        /// end with dst as the entity's only non-identity membership.
+        pub inline fn moveAnyOnly(self: *Self, entity: Entity, sources: anytype, dst: anytype) !void {
+            return self.moveAnyWith(entity, sources, dst, true);
+        }
+
+        inline fn moveAnyWith(self: *Self, entity: Entity, sources: anytype, dst: anytype, comptime only: bool) !void {
             const idx = entity.index;
             if (idx >= self.max_entities) return error.InvalidEntity;
             if (self.generations[idx] != entity.generation) return error.Stale;
@@ -787,9 +831,11 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 if (self.axisIds(src.axis_index)[idx] == src.registry_id) {
                     if (comptime axes_spec.n_axes > 1) {
                         if (src.axis_index != dst.axis_index) return error.WrongAxis;
+                        // Same total-axis-only rule as `move` — see there.
+                        if (src.axis_index != 0) return error.DeferredPartialAxis;
                     }
                     self.flags[idx] |= PENDING_MOVE;
-                    const recipe = moveRecipe(SrcColl, DstColl);
+                    const recipe = moveRecipe(SrcColl, DstColl, only);
                     try self.enqueueOp(.{
                         .src_collection_id = src.registry_id,
                         .src_offset = self.axisOffsets(src.axis_index)[idx],
@@ -868,6 +914,16 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             self.axisOffsets(ax)[idx] = new_offset;
         }
 
+        /// `evictImmediate`, plus quiesce: the entity also leaves every
+        /// non-identity partial axis other than the destination's —
+        /// the erased-source flavor of `moveOnly`, for a layer ending
+        /// an entity it cannot name the holder of (the teardown
+        /// sweep). Dropped memberships' rows PARK.
+        pub inline fn evictOnly(self: *Self, entity: Entity, dst: anytype) !void {
+            try self.evictImmediate(entity, dst);
+            self.leaveOtherAxes(entity.index, dst.axis_index);
+        }
+
         /// Cast the entity to a row type: one handle validation, then one
         /// `getFat` resolution per component of R. The RowType is the call
         /// site's DECLARED claim about which component set is meaningful
@@ -900,6 +956,31 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         inline fn axisOffsets(self: *Self, ax: u8) []u32 {
             if (comptime axes_spec.n_axes == 1) return self.offsets;
             return if (ax == 0) self.offsets else self.partial_offsets[ax - 1];
+        }
+
+        const identity_axes: [axes_spec.n_axes]bool = blk: {
+            var out: [axes_spec.n_axes]bool = @splat(false);
+            for (axes_spec.identity, 0..) |b, i| out[i] = b;
+            break :blk out;
+        };
+
+        /// Exit every non-identity partial axis other than `keep_ax` —
+        /// the quiesce half of `moveOnly`/`evictOnly`. Direct (no
+        /// stale/flag checks: callers own them), through the same
+        /// type-erased evict recipes destroy's axis walk uses, so each
+        /// dropped membership's row PARKS rather than being destroyed.
+        fn leaveOtherAxes(self: *Self, idx: u32, keep_ax: u8) void {
+            if (comptime axes_spec.n_axes == 1) return;
+            for (1..axes_spec.n_axes) |ax_usize| {
+                const ax: u8 = @intCast(ax_usize);
+                if (ax == keep_ax) continue;
+                if (identity_axes[ax]) continue;
+                const id = self.axisIds(ax)[idx];
+                if (id == 0) continue;
+                const e = self.evict_recipes[id];
+                e.recipe(self, e.ptr, self.axisOffsets(ax)[idx]);
+                self.axisIds(ax)[idx] = 0;
+            }
         }
 
         fn enqueueOp(self: *Self, op: DeferredOp) !void {
@@ -982,7 +1063,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         /// Comptime-generated move recipe for (SrcColl, DstColl) — copies
         /// shared components, parks dropped ones, unparks gained ones.
         /// Only instantiated if a move call site references this pair.
-        fn moveRecipe(comptime SrcColl: type, comptime DstColl: type) *const fn (*Self, *anyopaque, *anyopaque, u32, u32) anyerror!void {
+        fn moveRecipe(comptime SrcColl: type, comptime DstColl: type, comptime only: bool) *const fn (*Self, *anyopaque, *anyopaque, u32, u32) anyerror!void {
             const SrcRow = SrcColl.RowType;
             const DstRow = DstColl.RowType;
 
@@ -1039,6 +1120,9 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                         reg.axisIds(ax)[idx] = dst_coll.registry_id;
                         reg.axisOffsets(ax)[idx] = dest_base + @as(u32, @intCast(k));
                         reg.flags[idx] &= ~PENDING_MOVE;
+                        // moveOnly's quiesce, at execute time — after the
+                        // bookkeeping, so the leaves see a settled entity.
+                        if (comptime only) reg.leaveOtherAxes(idx, ax);
                     }
 
                     const moved = src_coll.removeRun(src_offset, count);
@@ -1731,4 +1815,135 @@ test "swap-remove bookkeeping — offsets stay correct after a middle move" {
     try testing.expectEqual(@as(i32, 10), (try reg.get(ents[0], &src, Fdish)).fd);
     try testing.expectEqual(@as(i32, 12), (try reg.get(ents[2], &src, Fdish)).fd);
     try testing.expectEqual(@as(i32, 11), (try reg.getFat(ents[1], Fdish)).fd);
+}
+
+
+const QuiesceReg = blk: {
+    // Velocity is the state axis 1's component; everything else stays
+    // on the total axis. Axis 2 is a state set, axis 3 an identity set.
+    var ca: [TestUniverse.len]u8 = @splat(0);
+    ca[TestUniverse.indexOf(Velocity)] = 1;
+    const ca_final = ca;
+    break :blk FatRegistryAxes(TestUniverse, .{
+        .n_axes = 4,
+        .comp_axis = &ca_final,
+        .identity = &.{ false, false, false, true },
+    });
+};
+
+const QuiesceWorld = struct {
+    reg: QuiesceReg,
+    a: Collection(Row(&.{Position}), .{}),
+    b: Collection(Row(&.{ Position, Fdish }), .{}),
+    armed: Collection(Row(&.{Velocity}), .{}),
+    pending: Collection(Row(&.{}), .{}),
+    ident: Collection(Row(&.{}), .{}),
+
+    /// In place, on caller-owned storage: registration takes interior
+    /// pointers, so the value must already sit at its final address —
+    /// the same reason the world's Reg keeps storage behind a heap
+    /// pointer.
+    fn setup(w: *QuiesceWorld) !void {
+        w.* = .{
+            .reg = try QuiesceReg.init(testing.allocator, .{ .max_entities = 16 }),
+            .a = try Collection(Row(&.{Position}), .{}).init(testing.allocator),
+            .b = try Collection(Row(&.{ Position, Fdish }), .{}).init(testing.allocator),
+            .armed = try Collection(Row(&.{Velocity}), .{}).init(testing.allocator),
+            .pending = try Collection(Row(&.{}), .{}).init(testing.allocator),
+            .ident = try Collection(Row(&.{}), .{}).init(testing.allocator),
+        };
+        w.reg.registerCollection(&w.a, 1);
+        w.reg.registerCollection(&w.b, 2);
+        w.reg.registerCollectionOnAxis(&w.armed, 3, 1);
+        w.reg.registerCollectionOnAxis(&w.pending, 4, 2);
+        w.reg.registerCollectionOnAxis(&w.ident, 5, 3);
+    }
+
+    fn deinit(w: *QuiesceWorld) void {
+        w.ident.deinit();
+        w.pending.deinit();
+        w.armed.deinit();
+        w.b.deinit();
+        w.a.deinit();
+        w.reg.deinit();
+    }
+
+    fn liveEntity(w: *QuiesceWorld) !Entity {
+        const e = try w.reg.create(&w.a);
+        try w.reg.enter(e, &w.armed);
+        (try w.reg.getFat(e, Velocity)).* = .{ .x = 5, .y = 6 };
+        try w.reg.enter(e, &w.pending);
+        try w.reg.enter(e, &w.ident);
+        return e;
+    }
+};
+
+test "moveOnly — quiesce drops state axes at flush, keeps identity, parks values" {
+    var w: QuiesceWorld = undefined;
+    try QuiesceWorld.setup(&w);
+    defer w.deinit();
+    const reg = &w.reg;
+    const e = try w.liveEntity();
+
+    try reg.moveOnly(e, &w.a, &w.b);
+    // Deferred: nothing changes before the flush the caller owns.
+    try testing.expect(reg.onAxis(e, 1));
+    try testing.expect(reg.onAxis(e, 2));
+
+    try reg.flush();
+    try testing.expect(reg.isInCollection(e, &w.b));
+    try testing.expect(!reg.onAxis(e, 1));
+    try testing.expect(!reg.onAxis(e, 2));
+    // Identity survives quiescing — it says what the entity IS.
+    try testing.expect(reg.onAxis(e, 3));
+    try testing.expectEqual(@as(u32, 1), w.ident.count);
+    // The dropped state's row parked, not destroyed.
+    try testing.expectEqual(@as(f32, 5), (try reg.getFat(e, Velocity)).x);
+}
+
+test "evictOnly — the erased-source quiesce" {
+    var w: QuiesceWorld = undefined;
+    try QuiesceWorld.setup(&w);
+    defer w.deinit();
+    const reg = &w.reg;
+    const e = try w.liveEntity();
+
+    // The caller names no source and no axes.
+    try reg.evictOnly(e, &w.b);
+    try testing.expect(reg.isInCollection(e, &w.b));
+    try testing.expect(!reg.onAxis(e, 1));
+    try testing.expect(!reg.onAxis(e, 2));
+    try testing.expect(reg.onAxis(e, 3));
+    try testing.expectEqual(@as(f32, 5), (try reg.getFat(e, Velocity)).x);
+}
+
+test "moveAnyOnly — candidate-tuple flavor of the quiesce" {
+    var w: QuiesceWorld = undefined;
+    try QuiesceWorld.setup(&w);
+    defer w.deinit();
+    const reg = &w.reg;
+    const e = try w.liveEntity();
+
+    try reg.moveAnyOnly(e, .{ &w.b, &w.a }, &w.b);
+    try reg.flush();
+    try testing.expect(reg.isInCollection(e, &w.b));
+    try testing.expect(!reg.onAxis(e, 1));
+    try testing.expect(reg.onAxis(e, 3));
+}
+
+test "deferred moves refuse a partial-axis source; immediate stays open" {
+    var w: QuiesceWorld = undefined;
+    try QuiesceWorld.setup(&w);
+    defer w.deinit();
+    const reg = &w.reg;
+
+    var armed2 = try Collection(Row(&.{Velocity}), .{}).init(testing.allocator);
+    defer armed2.deinit();
+    reg.registerCollectionOnAxis(&armed2, 6, 1);
+
+    const e = try w.liveEntity();
+    try testing.expectError(error.DeferredPartialAxis, reg.move(e, &w.armed, &armed2));
+    // The state axis mutates immediately instead.
+    try reg.moveImmediate(e, &w.armed, &armed2);
+    try testing.expect(reg.isInCollection(e, &armed2));
 }

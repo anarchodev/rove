@@ -91,6 +91,12 @@ pub const CollDecl = struct {
     kind: CollKind = .collection,
     options: CollectionOptions = .{},
     axis: type = lifecycle,
+    /// Set entries only: an IDENTITY membership says what the entity
+    /// IS ("every conn this instance created"), not what state it is
+    /// in — it ends only at explicit leave or destroy, and the quiesce
+    /// verbs (`moveOnly`/`evictOnly`) leave it alone. A multi-state
+    /// membership is state by nature and cannot be identity.
+    identity: bool = false,
 };
 
 /// One layer's contribution to the world: pure data, declared outside
@@ -176,6 +182,9 @@ pub fn World(comptime cfg: WorldConfig) type {
             );
             if (d.kind == .set and d.axis != lifecycle) @compileError(
                 "world: set entry '" ++ d.name ++ "' declares an axis — a set IS its own one-state axis and takes no `.axis`",
+            );
+            if (d.identity and d.kind != .set) @compileError(
+                "world: '" ++ d.name ++ "' declares .identity — identity is a property of set entries; a multi-state membership is state, and state drops on moveOnly",
             );
         }
         // The emergent partition: a component inherits the axis of the
@@ -365,7 +374,17 @@ pub fn World(comptime cfg: WorldConfig) type {
             pub const Core = fat_mod.FatRegistryAxes(universe, .{
                 .n_axes = axis_list.len + n_sets,
                 .comp_axis = &comp_axis,
+                .identity = &identity_axes,
             });
+
+            const identity_axes: [axis_list.len + n_sets]bool = blk: {
+                var out: [axis_list.len + n_sets]bool = @splat(false);
+                for (table) |d| {
+                    if (d.kind == .set and d.identity)
+                        out[axis_list.len + setBit(@field(CollId, d.name))] = true;
+                }
+                break :blk out;
+            };
             pub const Fat = Core.Fat;
 
             pub fn init(allocator: std.mem.Allocator, config: FatRegistryConfig) !Reg {
@@ -523,6 +542,15 @@ pub fn World(comptime cfg: WorldConfig) type {
             pub inline fn moveAny(self: *Reg, entity: Entity, sources: anytype, dst: anytype) !void {
                 return self.core.moveAny(entity, sources, dst);
             }
+            pub inline fn moveOnly(self: *Reg, entity: Entity, src: anytype, dst: anytype) !void {
+                return self.core.moveOnly(entity, src, dst);
+            }
+            pub inline fn moveAnyOnly(self: *Reg, entity: Entity, sources: anytype, dst: anytype) !void {
+                return self.core.moveAnyOnly(entity, sources, dst);
+            }
+            pub inline fn evictOnly(self: *Reg, entity: Entity, dst: anytype) !void {
+                return self.core.evictOnly(entity, dst);
+            }
             pub inline fn collectionIdOf(self: *const Reg, entity: Entity) ?u8 {
                 return self.core.collectionIdOf(entity);
             }
@@ -572,6 +600,7 @@ const throttle_part = Part{
     .name = "throttler",
     .collections = &.{
         .{ .name = "throttled", .row = Row(&.{TTokens}), .axis = throttle_axis },
+        .{ .name = "tracked", .kind = .set, .identity = true },
     },
 };
 const AxisWorld = World(.{ .parts = &.{ io_ish_part, app_part, throttle_part } });
@@ -635,6 +664,40 @@ test "world: a two-axis registry — lifecycle mechanics unchanged, axis edges g
     try reg.destroyImmediate(e);
     try testing.expect(reg.collectionIdOf(e) == null);
     try testing.expectEqual(@as(u32, 0), reg.coll(.throttled).count);
+}
+
+test "world: moveOnly/evictOnly — quiesce drops state memberships, spares identity" {
+    var reg = try AxisWorld.Reg.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    const active = reg.coll(.active);
+    const closing = reg.coll(.closing);
+    const e = try reg.create(active);
+    try reg.enter(e, reg.coll(.throttled));
+    (try reg.getFat(e, TTokens)).left = 3;
+    _ = try reg.join(e, .watched);
+    _ = try reg.join(e, .tracked);
+
+    // The call site names no axes: entering the closing state IS the
+    // quiesce, and a state axis added later is dropped here without
+    // this site changing.
+    try reg.moveOnly(e, active, closing);
+    try reg.flush();
+
+    try testing.expect(reg.isInCollection(e, closing));
+    try testing.expect(!reg.onAxis(e, throttle_axis));
+    try testing.expect(!reg.inSet(e, .watched));
+    // Identity says what the entity IS — it survives quiescing.
+    try testing.expect(reg.inSet(e, .tracked));
+    // The dropped state's row parked, not destroyed.
+    try testing.expectEqual(@as(u32, 3), (try reg.getFat(e, TTokens)).left);
+
+    // The erased-source flavor, back the other way.
+    try reg.enter(e, reg.coll(.throttled));
+    try reg.evictOnly(e, active);
+    try testing.expect(reg.isInCollection(e, active));
+    try testing.expect(!reg.onAxis(e, throttle_axis));
+    try testing.expect(reg.inSet(e, .tracked));
 }
 
 test "world: ids by table position, one namespace across parts" {
