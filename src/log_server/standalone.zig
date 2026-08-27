@@ -50,7 +50,14 @@ const zlib = @cImport({
     @cInclude("zlib.h");
 });
 
-const LogH2 = h2.H2(.{});
+const log_h2_opts = h2.Options{ .registry_model = .fat };
+
+/// The log server's world, declared by the module that instantiates it
+/// (explicit `.world`, not the root `rove_world` pattern): this module
+/// also compiles inside test builds, whose root declares nothing.
+pub const LogWorld = rove.World(.{ .parts = h2.parts(log_h2_opts) });
+
+const LogH2 = h2.H2(.{ .registry_model = .fat, .world = LogWorld });
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
@@ -176,7 +183,7 @@ fn threadMain(h: *Handle) void {
 fn runThread(h: *Handle) !void {
     const allocator = h.allocator;
 
-    var reg = rove.Registry.init(allocator, .{
+    var reg = LogH2.Reg.init(allocator, .{
         .max_entities = 1024,
         .deferred_queue_capacity = 256,
     }) catch |err| {
@@ -238,7 +245,7 @@ fn resolveBoundPort(server: *LogH2) !u16 {
 
 fn cleanupResponses(server: *LogH2) !void {
     const entities = server.response_out.entitySlice();
-    for (entities) |ent| try server.reg.destroy(ent);
+    for (entities) |ent| try server.destroyEntity(ent);
 }
 
 // ── Request routing ───────────────────────────────────────────────
@@ -1678,17 +1685,17 @@ fn setResponse(
     body_static: []const u8,
     cfg: *const Config,
 ) !void {
-    const headers = try buildResponseHeaders(server.reg.allocator, cfg, null);
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+    const headers = try buildResponseHeaders(server.allocator, cfg, null);
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = status });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, headers);
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{
         .data = null,
         .len = @intCast(body_static.len),
     });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
+    try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+    try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+    try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
 }
 
 fn setResponseOwned(
@@ -1700,17 +1707,17 @@ fn setResponseOwned(
     body_owned: []u8,
     cfg: *const Config,
 ) !void {
-    const headers = try buildResponseHeaders(server.reg.allocator, cfg, null);
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+    const headers = try buildResponseHeaders(server.allocator, cfg, null);
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = status });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, headers);
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{
         .data = body_owned.ptr,
         .len = @intCast(body_owned.len),
     });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
+    try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+    try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+    try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
 }
 
 /// CORS preflight response — 204 with the full allow-set so the
@@ -1722,14 +1729,14 @@ fn setPreflight(
     sess: h2.Session,
     cfg: *const Config,
 ) !void {
-    const headers = try buildResponseHeaders(server.reg.allocator, cfg, .preflight);
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
+    const headers = try buildResponseHeaders(server.allocator, cfg, .preflight);
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = 204 });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, headers);
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{ .data = null, .len = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+    try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+    try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
 }
 
 const ResponseKind = enum { normal, preflight };
