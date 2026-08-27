@@ -56,7 +56,7 @@ fn refusePlatformWrite(
     key: []const u8,
     value: ?[]const u8,
 ) ?c.JSValue {
-    const refusal = guards.checkKvWrite(key, value, true, .{
+    const refusal = guards.checkKvWrite(key, value, .{
         .ops = state.write_ops,
         // The side envelope this write lands on costs framing beyond the op
         // itself, and `notePlatformWrite` charges it. Judge against the same
@@ -465,7 +465,6 @@ pub fn jsPlatformRootPrefix(
 /// a platform-bound handler (`reserved_headers.zig`
 /// PLATFORM_CREDENTIAL_HEADERS). See `docs/architecture/control-plane.md` for
 /// the audit line and `docs/decisions.md` for the surface-minimization rule.
-
 /// `platform.instances.create(name)` — admin-only. Creates the
 /// instance directory, opens its app.db, writes the local
 /// `instance/{name}` marker, and mirrors the marker into the root
@@ -499,10 +498,8 @@ pub fn jsPlatformInstancesCreate(
         error.InvalidInstanceId => {
             const err_obj = c.JS_NewError(ctx);
             if (c.JS_IsException(err_obj)) return err_obj;
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
-                c.JS_NewStringLen(ctx, "invalid instance name", "invalid instance name".len));
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
-                c.JS_NewStringLen(ctx, "InvalidName", "InvalidName".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "message", c.JS_NewStringLen(ctx, "invalid instance name", "invalid instance name".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "code", c.JS_NewStringLen(ctx, "InvalidName", "InvalidName".len));
             return c.JS_Throw(ctx, err_obj);
         },
         else => {
@@ -617,10 +614,8 @@ pub fn jsPlatformInstancesDeployStarter(
         error.InstanceNotFound => {
             const err_obj = c.JS_NewError(ctx);
             if (c.JS_IsException(err_obj)) return err_obj;
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
-                c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
-                c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "message", c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "code", c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
             return c.JS_Throw(ctx, err_obj);
         },
         else => {
@@ -714,10 +709,8 @@ pub fn jsPlatformReleasesPublish(
         error.InstanceNotFound => {
             const err_obj = c.JS_NewError(ctx);
             if (c.JS_IsException(err_obj)) return err_obj;
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
-                c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
-                c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "message", c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "code", c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
             return c.JS_Throw(ctx, err_obj);
         },
         else => {
@@ -811,6 +804,55 @@ pub fn jsPlatformScope(
     return scope_obj;
 }
 
+// ── the cross-tenant door's keyspace — a BRIDGE, expiring at rove#716 ──
+//
+// `platform.scope(id).kv` is the same capability pointed at another tenant:
+// the question it answers is "what does a handler of `id` see at K". So it
+// resolves keys the way that handler's own kv does — under
+// `reserved.USER_KEY_ROOT` — or the admin reads a keyspace the tenant does not
+// write, which is how the account-deletion sweep came to scan, find nothing,
+// and report success.
+//
+// This does NOT go through `binding.Kv` the way a handler's kv does, and
+// deliberately: rove#716 deletes this surface outright, replacing admin's reach
+// into another store with a dispatched activation that runs in that store's own
+// scope. Building a delegate here would be a second implementation of the
+// resolution with a known expiry. The cost is that the rule is stated twice
+// until then, which is why it is stated in one place *here* rather than at four
+// call sites.
+//
+// Two carve-outs, and the boundary between them is WHO WROTE THE ROW, not what
+// it is named. Both of these are engine state, written by Zig below any binding
+// (`worker.zig`, `starter.zig`, `worker_system.zig`), so an admin reading them
+// is reading the engine rather than the tenant, and they never carried a root.
+//
+// `_export/` deliberately is NOT here even though it looks the same: those rows
+// are written by `@rewind/export` through the HANDLER's kv, so they sit under
+// the user root with everything else the tenant owns. Carving out by "looks
+// platform-ish" would break it — which is why this is a list of two, arrived at
+// by enumerating what the dashboard actually reads through this door.
+const SCOPE_RAW_PREFIXES = [_][]const u8{ "_deploy/", "_release/" };
+
+fn scopeIsRaw(key: []const u8) bool {
+    for (SCOPE_RAW_PREFIXES) |p| {
+        if (std.mem.startsWith(u8, key, p)) return true;
+    }
+    return false;
+}
+
+/// A key the admin NAMED, as the target tenant's store holds it.
+fn scopeStoreKey(buf: []u8, named: []const u8) ?[]const u8 {
+    if (scopeIsRaw(named)) return named;
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ reserved.USER_KEY_ROOT, named }) catch null;
+}
+
+/// The inverse, for row keys coming back off a scan — so a key the door hands
+/// out is a key the door accepts.
+fn scopeNamedKey(stored: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, stored, reserved.USER_KEY_ROOT)) return stored;
+    return stored[reserved.USER_KEY_ROOT.len..];
+}
+
 fn jsScopeKvGet(
     ctx: ?*c.JSContext,
     this: c.JSValue,
@@ -829,7 +871,10 @@ fn jsScopeKvGet(
     const tag = scopeTag(state.allocator, id) catch return js_exception;
     defer state.allocator.free(tag);
 
-    const value = inst.kv.get(key) catch |err| switch (err) {
+    var skey_buf: [reserved.STORAGE_KEY_MAX]u8 = undefined;
+    const skey = scopeStoreKey(&skey_buf, key) orelse return js_null;
+
+    const value = inst.kv.get(skey) catch |err| switch (err) {
         error.NotFound => {
             recordStoreGet(state, tag, key, "", .not_found, true);
             return js_null;
@@ -877,18 +922,53 @@ fn jsScopeKvPrefix(
     const tag = scopeTag(state.allocator, id) catch return js_exception;
     defer state.allocator.free(tag);
 
-    var scan = inst.kv.prefix(prefix_str, cursor_str, limit) catch |err| {
+    var spfx_buf: [reserved.STORAGE_KEY_MAX]u8 = undefined;
+    const spfx = scopeStoreKey(&spfx_buf, prefix_str) orelse return js_null;
+    // The cursor comes back in the spelling the caller was HANDED, so it
+    // resolves like any other key. An empty cursor means "from the start".
+    var scur_buf: [reserved.STORAGE_KEY_MAX]u8 = undefined;
+    const scur = if (cursor_str.len == 0)
+        cursor_str
+    else
+        scopeStoreKey(&scur_buf, cursor_str) orelse return js_null;
+
+    var scan = inst.kv.prefix(spfx, scur, limit) catch |err| {
         state.pending_kv_error = err;
         tapeStorePrefix(state, tag, prefix_str, cursor_str, limit, &.{}, .err);
         return js_null;
     };
     defer scan.deinit();
-    tapeStorePrefix(state, tag, prefix_str, cursor_str, limit, scan.entries, .ok);
+    // Taped in the spelling the CALLER used, like the handler binding does:
+    // the tape is a record of what the code asked for and got, and it should
+    // not move when a root does. Row keys come off storage resolved, so they
+    // are un-rooted for the tape; `scan.entries` itself stays resolved for the
+    // JS shaping below, which un-roots per row.
+    {
+        // `tapeStorePrefix` takes `anytype`, so the tape only needs a shape with
+        // `.key` and `.value` — no dependency on the store's own row type.
+        const NamedEntry = struct { key: []const u8, value: []const u8 };
+        var stack: [64]NamedEntry = undefined;
+        const heap: ?[]NamedEntry = if (scan.entries.len <= stack.len)
+            null
+        else
+            state.allocator.alloc(NamedEntry, scan.entries.len) catch null;
+        defer if (heap) |h| state.allocator.free(h);
+        if (heap != null or scan.entries.len <= stack.len) {
+            const named: []NamedEntry = if (heap) |h| h else stack[0..scan.entries.len];
+            for (scan.entries, 0..) |e, i| named[i] = .{ .key = scopeNamedKey(e.key), .value = e.value };
+            tapeStorePrefix(state, tag, prefix_str, cursor_str, limit, named, .ok);
+        } else {
+            tapeStorePrefix(state, tag, prefix_str, cursor_str, limit, scan.entries, .ok);
+        }
+    }
 
     const arr = c.JS_NewArray(ctx);
     for (scan.entries, 0..) |e, i| {
         const obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
+        // Handed back in the caller's spelling — the tape above holds the same,
+        // so a digest does not move when a root does.
+        const vkey = scopeNamedKey(e.key);
+        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, vkey.ptr, vkey.len));
         _ = c.JS_SetPropertyStr(ctx, obj, "value", c.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
         _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
     }
@@ -953,6 +1033,11 @@ fn scopeKvWrite(
         recordStoreWrite(state, tag, key, if (op == .put) val else null);
     }
 
+    // Resolved once, below the tape and above both branches — a self-scope
+    // write and a trampolined one must reach the same row.
+    var skey_buf: [reserved.STORAGE_KEY_MAX]u8 = undefined;
+    const skey = scopeStoreKey(&skey_buf, key) orelse return js_undefined;
+
     if (std.mem.eql(u8, id, state.instance_id)) {
         // Write to BOTH the dispatch's speculative overlay (`state.txn`) and
         // the writeset — exactly as `jsKvSet`/`jsKvDelete` do. `state.txn` is
@@ -967,30 +1052,30 @@ fn scopeKvWrite(
         // double-acquire wedge.
         switch (op) {
             .put => {
-                state.txn.put(key, val) catch |err| {
+                state.txn.put(skey, val) catch |err| {
                     state.pending_kv_error = err;
                     return js_undefined;
                 };
-                state.writeset.addPut(key, val) catch |err| {
+                state.writeset.addPut(skey, val) catch |err| {
                     state.pending_kv_error = err;
                 };
-                notePlatformWrite(state, key.len, val.len);
+                notePlatformWrite(state, skey.len, val.len);
             },
             .delete => {
-                state.txn.delete(key) catch |err| {
+                state.txn.delete(skey) catch |err| {
                     state.pending_kv_error = err;
                     return js_undefined;
                 };
-                state.writeset.addDelete(key) catch |err| {
+                state.writeset.addDelete(skey) catch |err| {
                     state.pending_kv_error = err;
                 };
-                notePlatformWrite(state, key.len, 0);
+                notePlatformWrite(state, skey.len, 0);
             },
         }
         return js_undefined;
     }
 
-    fn_ptr(fn_ctx, state.allocator, id, op, key, val) catch |err| switch (err) {
+    fn_ptr(fn_ctx, state.allocator, id, op, skey, val) catch |err| switch (err) {
         error.InstanceNotFound => return jsThrowInstanceNotFound(ctx),
         else => {
             state.pending_kv_error = err;
@@ -1000,7 +1085,7 @@ fn scopeKvWrite(
     // The trampoline's writeset is a SIDE envelope on the same entry, so it
     // costs this activation's budget — its op's wire bytes and the envelope's
     // framing — exactly as the self-scope branch above does.
-    notePlatformWrite(state, key.len, if (op == .put) val.len else 0);
+    notePlatformWrite(state, skey.len, if (op == .put) val.len else 0);
     return js_undefined;
 }
 

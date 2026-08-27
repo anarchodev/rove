@@ -141,7 +141,7 @@ def main() -> int:
         cs = wait_membership(lead, vnid, learner=True)
         check(f"node {vnid} is a learner", cs is not None and vnid in cs["learners"], f"cs={cs}")
         check(f"victim holds {PHANTOM} before it dies",
-              c.admin_kv_get("acme", PHANTOM, node=victim).status == 200)
+              c.node_kv_get("acme", PHANTOM, node=victim).status == 200)
         c.stop_node(victim)
 
         print("step 4: advance + compact past the victim's match; DELETE the phantom")
@@ -172,8 +172,8 @@ def main() -> int:
             # group awake on the node it lands on).
             for n in range(3):
                 if n != victim:
-                    c.admin_kv_get("acme", KEY, node=n)
-            rg = c.admin_kv_get("acme", KEY, node=victim)
+                    c.node_kv_get("acme", KEY, node=n)
+            rg = c.node_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and latest in rg.body:
                 healed = True
                 break
@@ -202,7 +202,7 @@ def main() -> int:
         cs = wait_membership(victim, vnid, learner=False, deadline_s=30.0)
         check(f"node {vnid} recovered as a voter after a rejoin-window crash",
               cs is not None and vnid in cs["voters"], f"cs={cs}")
-        rg = c.admin_kv_get("acme", KEY, node=victim)
+        rg = c.node_kv_get("acme", KEY, node=victim)
         check("recovered victim still holds the streamed data", rg.status == 200 and latest in rg.body,
               f"got {rg.status} {rg.body!r}")
 
@@ -213,7 +213,7 @@ def main() -> int:
                         data='{"value":"after-rejoin"}', want_status=204, deadline_s=15)
         caught = False
         for _ in range(60):  # ~30s
-            rg = c.admin_kv_get("acme", KEY, node=victim)
+            rg = c.node_kv_get("acme", KEY, node=victim)
             if rg.status == 200 and "after-rejoin" in rg.body:
                 caught = True
                 break
@@ -223,7 +223,7 @@ def main() -> int:
 
         # ⭐ The phantom key deleted on the cluster while the victim was gone must
         # NOT survive the replace-load — else the rejoined voter diverges.
-        pg = c.admin_kv_get("acme", PHANTOM, node=victim)
+        pg = c.node_kv_get("acme", PHANTOM, node=victim)
         gone = pg.status != 200 or not pg.body or "present" not in pg.body
         check("⭐ source-deleted phantom key is GONE on the rejoined node (no divergence)",
               gone, f"got {pg.status} {pg.body!r}")

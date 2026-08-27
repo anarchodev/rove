@@ -33,7 +33,6 @@ const epilogue = @import("epilogue.zig");
 const world = @import("world.zig");
 const export_fixture = @import("export_fixture.zig");
 
-
 /// Transcode a captured record (base64 tapes) into the declarative `world.json`
 /// — the ONE format `replay`/`sim` consume. Used by `pull` (online) and the
 /// `export-fixture` verb (offline).
@@ -127,6 +126,9 @@ const ip_mask = @import("ip_mask");
 // as an anonymous import in build.zig) — the SAME lists the worker's inbound
 // header installer enforces, so the sim's authored-header hygiene can't drift.
 const reserved_headers = @import("reserved_headers");
+// The store-side spelling of a handler-named key — shared with the kv
+// binding's delegate so seeding and calling resolve identically.
+const storeKey = @import("kv_binding.zig").storeKey;
 extern fn arena_set_trace_mode_r(r: *ArenaReactor, mode: c_int) void;
 extern fn arena_set_date_now_r(r: *ArenaReactor, ms: i64) void;
 extern fn arena_set_random_seed_r(r: *ArenaReactor, seed: u64) void;
@@ -264,7 +266,7 @@ pub const Engine = struct {
             const why: ?[]const u8 = if (lower.len > 0 and lower[0] == ':')
                 "an HTTP/2 pseudo-header (request.method/path/host carry these)"
             else if (reserved_headers.isStrippedIpHeader(lower))
-                "the client IP is reachable only via request.ip / request.unmaskedIp()"
+                "the client IP is reachable only via request.ip / unmaskedIp()"
             else if (reserved_headers.isReservedInternalHeader(lower))
                 "platform-reserved (x-rewind-* / x-rove-internal-*)"
             else
@@ -308,7 +310,7 @@ pub const Engine = struct {
             } else {
                 // Authored ip: derive BOTH channels prod-style — `request.ip`
                 // reads the masked form (ip_mask.zig, the worker's rule) and
-                // `request.unmaskedIp()` the raw. A malformed authored ip
+                // `unmaskedIp()` the raw. A malformed authored ip
                 // masks to null (empty entry → `request.ip === null`) but
                 // stays reachable raw — the prod disposition for a malformed
                 // transport header.
@@ -329,8 +331,15 @@ pub const Engine = struct {
         }
 
         // ── kv readset → map ──
+        // A world is AUTHORED in the spelling a handler uses (`"kv": { "user/jess": … }`),
+        // and the store holds keys as the binding resolves them — so seeding
+        // resolves too. Both directions of the same rule: the author never
+        // writes the root and the handler never sees it, but everything on the
+        // store side of the binding carries it. Skipping this is the
+        // writer/reader prefix-depth split, and it presents as a world that
+        // seeds cleanly and then reads back empty.
         var kv_map = std.StringHashMapUnmanaged([]const u8){};
-        for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
+        for (wv.kv) |p| try kv_map.put(a, try storeKey(a, p.key), p.value);
 
         // ── captured guard refusals → the outcome-replay map ("s"/"d" ++ key)
         var refusals = std.StringHashMapUnmanaged([]const u8){};
@@ -343,11 +352,13 @@ pub const Engine = struct {
         }
 
         // ── reads replay must refuse → the refusal map ("g"/"p" ++ key)
+        // Keyed by the STORE key: `elidedFor` is consulted inside the host,
+        // below the binding, where keys have already resolved.
         var elided = std.StringHashMapUnmanaged(hostmod.Refusal){};
         for (wv.kv_elided) |e| {
             const keyed = try std.mem.concat(a, u8, &.{
                 if (std.mem.eql(u8, e.op, "prefix")) "p" else "g",
-                e.key,
+                try storeKey(a, e.key),
             });
             try elided.put(a, keyed, .{ .bytes = e.bytes, .sealed = e.sealed });
         }
@@ -469,6 +480,7 @@ pub const Engine = struct {
             .elided = elided,
         };
         host.install();
+        hostmod.active_config_scope = wv.deployment_id;
 
         // GC mode, every run. Set on each run because the mode
         // binds at the entry reset. Forward sim and replay both run GC: the sim

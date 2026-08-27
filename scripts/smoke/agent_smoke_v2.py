@@ -327,8 +327,13 @@ def main() -> int:
         cfg = {"_config/llm_endpoint": f"http://127.0.0.1:{stub_port}/v1/messages",
                "_config/anthropic_api_key": "test", "_config/llm_model": "stub",
                "_config/screenshots": "1"}  # offer the opt-in screenshot tool
+        # `node_kv_put`, not `admin_kv_put`: `_config/*` is DEPLOYMENT-scoped
+        # (`reserved.configStorageKey`), and the handler door resolves that
+        # scope from the ADMIN's activation — so a config row written through
+        # it lands under the admin's dep_id where this tenant cannot read it.
+        # Seeding config mimics the deploy mirror, which is a store write.
         for k, v in cfg.items():
-            r = c.admin_kv_put(TENANT, k, v)
+            r = c.node_kv_put(TENANT, k, v, raw=True)
             check(f"set {k}", r.status == 204, f"got {r.status} {r.body!r}")
 
         print("step 3: WS upgrade through the front (Host → /agent)")

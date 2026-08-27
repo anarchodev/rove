@@ -162,7 +162,7 @@ def main() -> int:
 
         print(f"step 6: SIGSTOP followers {followers} — quorum now impossible")
         for i in followers:
-            c.node_procs[i].send_signal(signal.SIGSTOP)
+            c.freeze_node(i)
         print(f"  ok  froze followers {followers} (SIGSTOP)")
 
         # Wait through the fault window:
@@ -179,8 +179,7 @@ def main() -> int:
         if split < 0:
             print(f"  INCONCLUSIVE  no header block in response: {raw!r}")
             for i in followers:
-                if c.node_procs[i].poll() is None:
-                    c.node_procs[i].send_signal(signal.SIGCONT)
+                c.thaw_node(i)
             c.dump_node_log(node=L, grep=["stream", "wake", "commit", "fault",
                                           "error", "warn"])
             print(f"\nFAILURES ({len(failures)}): {failures}")
@@ -193,8 +192,7 @@ def main() -> int:
             print(f"  INCONCLUSIVE  initial `ready` frame missing — the stream "
                   f"never opened pre-freeze. body={body_str!r}")
             for i in followers:
-                if c.node_procs[i].poll() is None:
-                    c.node_procs[i].send_signal(signal.SIGCONT)
+                c.thaw_node(i)
             c.dump_node_log(node=L, grep=["stream", "ready", "deploy", "loader",
                                           "error", "warn"])
             print(f"\nFAILURES ({len(failures)}): {failures}")
@@ -219,8 +217,7 @@ def main() -> int:
         c.node_procs[L].send_signal(signal.SIGKILL)
         c.node_procs[L].wait()
         for i in followers:
-            if c.node_procs[i].poll() is None:
-                c.node_procs[i].send_signal(signal.SIGCONT)
+            c.thaw_node(i)
 
         # New leader among the (now-thawed) followers.
         nl = None
@@ -241,7 +238,7 @@ def main() -> int:
             advisory = "no new leader elected; rely on ASSERTION 1"
         else:
             print(f"  ok  killed node{L}; new leader=node{nl}")
-            r = c.admin_kv_get("streamfi", "counter", node=nl)
+            r = c.node_kv_get("streamfi", "counter", node=nl)
             # An absent key returns 404 (or 200 with an empty/sentinel body).
             absent = r.status == 404 or (r.status == 200 and r.body.strip() == "")
             check("ASSERTION 2 (advisory): `counter` absent on the new leader",

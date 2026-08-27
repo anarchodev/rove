@@ -1465,7 +1465,7 @@ fn classifyIgnored(
     );
 }
 
-/// Reserved tag key: the engine-populated per-saga id. `request.tag`
+/// Reserved tag key: the engine-populated per-saga id. `tag`
 /// rejects `_`-prefixed keys, so this can't collide with a user tag.
 /// Lets `?tag._saga=<id>` filter to one saga's activations even when
 /// the handler set no `session` tag of its own.

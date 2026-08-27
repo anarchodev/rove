@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -181,7 +180,7 @@ def main() -> int:
 
         print(f"step 2: FREEZE node {vnid} (SIGSTOP) — quorum 2/3 survives")
         frozen_idx = last_index(victim)
-        vproc.send_signal(signal.SIGSTOP)
+        c.freeze_node(victim)
         check(f"node {vnid} frozen", frozen_idx > 0, f"frozen at last_index={frozen_idx}")
 
         caught = False
@@ -216,7 +215,7 @@ def main() -> int:
 
         print(f"step 4: THAW node {vnid} (SIGCONT) — un-catchable from the log; "
               "only the snapshot trigger can recover it")
-        vproc.send_signal(signal.SIGCONT)
+        c.thaw_node(victim)
 
         print(f"step 5: ⭐ node {vnid} auto-recovers via the snapshot trigger "
               "(NO manual bootstrap, no ongoing load)")
@@ -241,7 +240,7 @@ def main() -> int:
         check("final write accepted (204)", w.status == 204, f"got {w.status}")
         repl, seen = False, ""
         for _ in range(40):
-            seen = c.admin_kv_get("acme", "final/marker", node=victim).body
+            seen = c.node_kv_get("acme", "final/marker", node=victim).body
             if "after-recovery" in seen:
                 repl = True; break
             time.sleep(0.5)

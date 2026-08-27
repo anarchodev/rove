@@ -138,7 +138,10 @@ def main() -> int:
             ],
             "login_path": "/login",
         }, separators=(",", ":"))
-        r = c.admin_kv_put("__auth__", "_oidc/config/default", cfg)
+        # Handler-read row ⇒ the HANDLER keyspace (the door's default): the
+        # app reads it through its rooted kv, exactly as production's
+        # rewind-ops seed does.
+        r = c.node_kv_put("__auth__", "_oidc/config/default", cfg)
         check("seed _oidc/config/default (v2-kv) → 204", r.status == 204,
               f"got {r.status} {r.body!r}")
 

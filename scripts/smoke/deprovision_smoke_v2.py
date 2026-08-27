@@ -89,16 +89,17 @@ def main() -> int:
         put_ok = False
         for _ in range(20):
             for n in range(len(c.node_ports)):
-                if c.admin_kv_put(TENANT, "secret", "alice-private-data", node=n).status == 204:
+                if c.node_kv_put(TENANT, "secret", "alice-private-data", node=n).status == 204:
                     put_ok = True
                     break
             if put_ok:
                 break
             time.sleep(0.3)
         check("the first tenant's secret was written", put_ok, "no node accepted the write")
-        rr = _curl(f"{cp_url.replace(str(c.cp_port), str(c.node_ports[0]))}"
-                   f"/_system/v2-kv?tenant={TENANT}&key=secret", method="GET",
-                   headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        # Through the helper, not a hand-rolled URL: the write above went via
+        # `node_kv_put`, and a read that spells the key itself is reading a
+        # different keyspace than the write wrote to.
+        rr = c.node_kv_get(TENANT, "secret")
         check("first tenant's secret is stored", "alice-private" in rr.body, f"got {rr.status} {rr.body!r}")
 
         print("step 2: delete")
@@ -148,9 +149,7 @@ def main() -> int:
               r.status == 200 and "reborn" in r.body, f"got {r.status} {r.body!r}")
 
         print("step 6: ⭐ the reborn tenant must NOT inherit the deleted one's data")
-        leaked = _curl(f"{cp_url.replace(str(c.cp_port), str(c.node_ports[0]))}"
-                       f"/_system/v2-kv?tenant={TENANT}&key=secret", method="GET",
-                       headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        leaked = c.node_kv_get(TENANT, "secret")
         check("previous tenant's KV is NOT readable by the new one",
               "alice-private" not in leaked.body,
               f"LEAK: got {leaked.status} {leaked.body!r}")
@@ -195,9 +194,9 @@ def main() -> int:
             deadline = time.time() + 15.0
             rr = None
             while time.time() < deadline:
-                rr = _curl(f"{c.node_url(i)}/_system/v2-kv?tenant={T2}"
-                           "&key=alive531",
-                           headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+                # The HANDLER wrote this key, so it resolves under the user
+                # root; the helper spells that once instead of every caller.
+                rr = c.node_kv_get(T2, "alive531", node=i)
                 if rr.status == 200 and "yes" in rr.body:
                     break
                 time.sleep(0.5)
@@ -255,9 +254,7 @@ def main() -> int:
             deadline = time.time() + 15.0
             rr = None
             while time.time() < deadline:
-                rr = _curl(f"{c.node_url(i)}/_system/v2-kv?tenant={TENANT}"
-                           "&key=reborn_key",
-                           headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+                rr = c.node_kv_get(TENANT, "reborn_key", node=i)
                 if rr.status == 200 and "reborn_val" in rr.body:
                     break
                 time.sleep(0.5)

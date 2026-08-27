@@ -172,6 +172,35 @@ pub fn componentDeinitNeedsCtx(comptime T: type) bool {
     return @hasDecl(T, "DeinitCtx") and componentHasDeinit(T);
 }
 
+/// True when every field of T declares a default, so `T{}` is well-formed.
+/// Non-structs (and structs with an undefaulted field) fall back to zeroing.
+fn hasAllFieldDefaults(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct") return false;
+    for (info.@"struct".fields) |f| {
+        if (f.default_value_ptr == null) return false;
+    }
+    return true;
+}
+
+/// Initialize freshly-reserved component slots to the component's own
+/// declared field defaults — NOT to zero. A component whose neutral value
+/// is not all-zeros (`Fd{ .fd = -1 }`, `ReadCycleEntity{ .entity = nil }`,
+/// where `Entity.nil.index` is `maxInt(u32)`) is otherwise born holding a
+/// value its author never declared valid: a live descriptor slot, a
+/// resolvable entity handle. Every path that materializes a component the
+/// source did not carry routes through here — entity creation and the
+/// `New` set of a collection move alike — so a component sees the same
+/// starting value however it comes into being.
+pub fn fillDefault(comptime T: type, items: []T) void {
+    if (comptime @sizeOf(T) == 0) return;
+    if (comptime hasAllFieldDefaults(T)) {
+        @memset(items, T{});
+    } else {
+        @memset(std.mem.sliceAsBytes(items), 0);
+    }
+}
+
 fn typeNameLessThan(comptime a: type, comptime b: type) bool {
     return std.mem.order(u8, @typeName(a), @typeName(b)) == .lt;
 }

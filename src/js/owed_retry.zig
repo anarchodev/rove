@@ -12,6 +12,7 @@
 //! scan keys on it.
 
 const std = @import("std");
+const reserved = @import("rove-reserved");
 const kv_mod = @import("raft-kv");
 
 const testing = std.testing;
@@ -21,7 +22,10 @@ const testing = std.testing;
 /// composition (`globals/webhook.js` + `__system/webhook_fire` +
 /// `__system/webhook_onresult`); Zig touches it only to *recognize*
 /// a lone owed-put in a writeset for §6.4 held-sync binding.
-pub const OWED_PREFIX: []const u8 = "_send/owed/";
+/// Rooted, for the same reason as `SCHED_BY_TIME_PREFIX`: `webhook.send` writes
+/// the owed marker through the handler's kv, and this matches keys off a
+/// WRITESET, which carries resolved keys.
+pub const OWED_PREFIX: []const u8 = reserved.USER_KEY_ROOT ++ "_send/owed/";
 
 /// §6.4 binding source: scan a writeset op-slice for exactly one
 /// `_send/owed/{id}` put and return the borrowed `{id}` suffix (a slice
@@ -48,22 +52,31 @@ pub fn scanLoneOwedSendId(ops: []const kv_mod.WriteSetOp) ?[]const u8 {
 }
 
 test "scanLoneOwedSendId: exactly one owed put → borrowed id" {
+    // Writeset ops carry RESOLVED keys — `webhook.send` writes the marker
+    // through the handler's kv, so it arrives here under the user root.
+    const R = reserved.USER_KEY_ROOT;
     const ops = [_]kv_mod.WriteSetOp{
-        .{ .put = .{ .key = "orders/1", .value = "x" } },
-        .{ .put = .{ .key = "_send/owed/wh-abc", .value = "{}" } },
-        .{ .delete = .{ .key = "_send/owed/wh-old" } },
+        .{ .put = .{ .key = R ++ "orders/1", .value = "x" } },
+        .{ .put = .{ .key = R ++ "_send/owed/wh-abc", .value = "{}" } },
+        .{ .delete = .{ .key = R ++ "_send/owed/wh-old" } },
     };
     try testing.expectEqualStrings("wh-abc", scanLoneOwedSendId(&ops).?);
 }
 
 test "scanLoneOwedSendId: zero or multiple owed puts → null" {
+    const R = reserved.USER_KEY_ROOT;
     const none = [_]kv_mod.WriteSetOp{
-        .{ .put = .{ .key = "orders/1", .value = "x" } },
+        .{ .put = .{ .key = R ++ "orders/1", .value = "x" } },
     };
     try testing.expectEqual(@as(?[]const u8, null), scanLoneOwedSendId(&none));
     const two = [_]kv_mod.WriteSetOp{
-        .{ .put = .{ .key = "_send/owed/a", .value = "{}" } },
-        .{ .put = .{ .key = "_send/owed/b", .value = "{}" } },
+        .{ .put = .{ .key = R ++ "_send/owed/a", .value = "{}" } },
+        .{ .put = .{ .key = R ++ "_send/owed/b", .value = "{}" } },
     };
     try testing.expectEqual(@as(?[]const u8, null), scanLoneOwedSendId(&two));
+    // Unrooted: an engine write below the binding, never a send marker.
+    const raw = [_]kv_mod.WriteSetOp{
+        .{ .put = .{ .key = "_send/owed/x", .value = "{}" } },
+    };
+    try testing.expectEqual(@as(?[]const u8, null), scanLoneOwedSendId(&raw));
 }

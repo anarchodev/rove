@@ -280,7 +280,36 @@ pub const Registry = struct {
     // Destroy — deferred
     // =============================================================
 
-    /// Destroy an entity (deferred). Source collection is looked up automatically.
+    /// Destroy an entity (deferred). Source collection is looked up
+    /// automatically.
+    ///
+    /// Who may call this is a question about how the entity got here, and
+    /// there are two answers, because rove entities are used for two different
+    /// things.
+    ///
+    /// **An owned resource is destroyed by the layer that created it.** A
+    /// connection, a read cycle: the creator holds the real resource behind
+    /// the entity — a descriptor, a registered buffer — so it is the only
+    /// layer that can know when releasing is safe. rove-io creates conns in
+    /// `handleAccept` and retires them in `processConnClosing`; nobody else
+    /// destroys them, which is what lets that teardown be an ordered sequence
+    /// rather than a destructor.
+    ///
+    /// **Submitted work is destroyed by the layer that services it.** A caller
+    /// creates an entity in the servicer's collection, stamps what the work
+    /// needs, and drops the handle in the same breath — rove-h2 submitting a
+    /// write into `io.write_in`, rove-js submitting a frame into
+    /// `h2.ws_send_in`. Retiring it IS servicing it, and the handoff is the
+    /// point: requiring the creator to destroy would force it to track
+    /// completion for no reason but to free. Dropping the handle is what makes
+    /// this safe, and it is not optional — a retained handle turns the
+    /// servicer's ordinary retirement into a dangling reference.
+    ///
+    /// Where the caller must *observe* completion before the work is released,
+    /// the release is a transition into a terminal collection rather than a
+    /// destroy at the point of noticing: `io.write_done` is reachable only
+    /// from `write_results`, so arriving there proves the CQE landed. See
+    /// `processWriteDone`.
     pub fn destroy(self: *Self, entity: Entity) !void {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;
@@ -307,6 +336,41 @@ pub const Registry = struct {
     // move — the core primitive
     // =============================================================
 
+    /// Move an entity to another collection, re-projecting it onto that
+    /// collection's row.
+    ///
+    /// **A move is a projection, not a transport.** The entity survives; its
+    /// state is whatever the destination row has room for. Three things happen
+    /// at once, and the recipe derives all three from the two rows without
+    /// being told:
+    ///
+    /// - components in both rows **carry** their values across
+    /// - components only in the destination are **constructed**, at their
+    ///   declared field defaults (`row.fillDefault`), then `init`ed
+    /// - components only in the source are **dropped**, and their `deinit`
+    ///   runs
+    ///
+    /// The consequence worth stating out loud, because no type-level mechanism
+    /// can warn about it: a round trip does not preserve values. In
+    /// `A(a,b,c) → B(a,c) → C(a,b,c)`, the `b` that comes back is a fresh one
+    /// carrying its declared default — not the one that left. Both moves are
+    /// individually well-formed; the danger is in the sequence, and `B → C` is
+    /// a plain widening with nothing to complain about.
+    ///
+    /// A narrowing move needs no ceremony at the call site, deliberately. A
+    /// list of the dropped types at the call site can only be checked against
+    /// the comptime-derived set and then discarded — the recipe never receives
+    /// it — so it adds a paste step and nothing to the operation. It would also
+    /// name only half of what a move does, teaching that moves carry and remove
+    /// while staying silent on construction. And it cannot be written at all
+    /// where a downstream embedder widens the row (rove-h2's
+    /// `opts.connection_row`): the dropped set depends on what the embedder
+    /// added, which would make a lower layer adding a `deinit` a breaking
+    /// change for every consumer.
+    ///
+    /// What keeps a narrowing move safe is therefore a property of components,
+    /// not of call sites: a `deinit` may release what its own component owns
+    /// and nothing else.
     pub inline fn move(self: *Self, entity: Entity, src: anytype, dst: anytype) !void {
         const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
         const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
@@ -315,14 +379,6 @@ pub const Registry = struct {
         if (self.generations[idx] != entity.generation) return error.Stale;
         if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
         if (self.collection_ids[idx] != src.registry_id) return error.WrongCollection;
-
-        // Comptime validation: src row must be subset of dst row
-        comptime {
-            @setEvalBranchQuota(4000);
-            if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
-                @compileError("move: source row is not a subset of destination row");
-            }
-        }
 
         self.flags[idx] |= PENDING_MOVE;
 
@@ -339,76 +395,20 @@ pub const Registry = struct {
     }
 
     // =============================================================
-    // moveStrip — deferred move with explicit component drop
-    // =============================================================
-
-    /// Move an entity from src to dst, explicitly dropping components.
-    /// The strip list must exactly match the components lost in the move.
-    pub inline fn moveStrip(self: *Self, entity: Entity, src: anytype, dst: anytype, comptime strip: []const type) !void {
-        const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
-        const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
-        const idx = entity.index;
-        if (idx >= self.max_entities) return error.InvalidEntity;
-        if (self.generations[idx] != entity.generation) return error.Stale;
-        if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
-        if (self.collection_ids[idx] != src.registry_id) return error.WrongCollection;
-
-        comptime {
-            const lost = SrcColl.RowType.subtract(&DstColl.RowType.types);
-            if (!Row(strip).equal(lost)) {
-                @compileError("moveStrip: strip list does not match lost components");
-            }
-        }
-
-        self.flags[idx] |= PENDING_MOVE;
-
-        const recipe = moveRecipe(SrcColl, DstColl);
-        try self.enqueueOp(.{
-            .src_collection_id = src.registry_id,
-            .src_offset = self.offsets[idx],
-            .count = 1,
-            .execute = recipe,
-            .src_ptr = @ptrCast(src),
-            .dst_ptr = @ptrCast(dst),
-        });
-    }
-
-    // =============================================================
     // Immediate operations — visible in the same tick
     // =============================================================
 
-    /// Immediately move an entity from src to dst. No deferred queue.
-    /// Src row must be a subset of dst row.
+    /// `move` without the deferred queue — the same projection, visible in
+    /// the same tick.
     pub inline fn moveImmediate(self: *Self, entity: Entity, src: anytype, dst: anytype) !void {
         const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
         const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
-
-        comptime {
-            if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
-                @compileError("moveImmediate: source row is not a subset of destination row");
-            }
-        }
-
         try self.executeMoveImmediate(SrcColl, src, DstColl, dst, entity);
     }
 
-    /// Immediately move an entity, explicitly stripping components.
-    pub inline fn moveStripImmediate(self: *Self, entity: Entity, src: anytype, dst: anytype, comptime strip: []const type) !void {
-        const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
-        const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
-
-        comptime {
-            const lost = SrcColl.RowType.subtract(&DstColl.RowType.types);
-            if (!Row(strip).equal(lost)) {
-                @compileError("moveStripImmediate: strip list does not match lost components");
-            }
-        }
-
-        try self.executeMoveImmediate(SrcColl, src, DstColl, dst, entity);
-    }
-
-    /// Immediately destroy an entity. Calls deinit, bumps generation.
-    /// Immediately destroy an entity. Source collection is looked up automatically.
+    /// `destroy` without the deferred queue: runs `deinit`, bumps the
+    /// generation, and looks the source collection up automatically. The
+    /// ownership rules on `destroy` apply unchanged.
     pub fn destroyImmediate(self: *Self, entity: Entity) !void {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;
@@ -449,10 +449,11 @@ pub const Registry = struct {
             dst.column(T)[new_offset] = src.column(T)[src_offset];
         }
 
-        // Zero-init + init new components
+        // Default-init + init new components (declared field defaults, not
+        // zero — see `row.fillDefault`).
         inline for (New.types) |T| {
             if (@sizeOf(T) > 0) {
-                dst.column(T)[new_offset] = std.mem.zeroes(T);
+                row_mod.fillDefault(T, dst.column(T)[new_offset .. new_offset + 1]);
             }
         }
         inline for (comptime New.initTypes()) |T| {
@@ -496,13 +497,6 @@ pub const Registry = struct {
         inline for (@typeInfo(@TypeOf(sources)).@"struct".fields) |field| {
             const src = @field(sources, field.name);
             const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
-
-            // Comptime validation per pair
-            comptime {
-                if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
-                    @compileError("moveAny: source row is not a subset of destination row");
-                }
-            }
 
             if (current_id == src.registry_id) {
                 self.flags[idx] |= PENDING_MOVE;
@@ -700,14 +694,11 @@ pub const Registry = struct {
                     );
                 }
 
-                // Zero-init + init only NEW components (not in source row)
+                // Default-init only NEW components (not in source row) —
+                // declared field defaults, not zero (see `row.fillDefault`).
                 inline for (New.types) |T| {
                     if (@sizeOf(T) > 0) {
-                        const col = dst_coll.column(T);
-                        const bytes: [*]u8 = @ptrCast(col.ptr);
-                        const byte_offset = dest_base * @sizeOf(T);
-                        const byte_len = count * @sizeOf(T);
-                        @memset(bytes[byte_offset .. byte_offset + byte_len], 0);
+                        row_mod.fillDefault(T, dst_coll.column(T)[dest_base .. dest_base + count]);
                     }
                 }
                 inline for (comptime New.initTypes()) |T| {
@@ -1216,7 +1207,7 @@ test "setDeinitCtx — retroactive propagation" {
     try testing.expectEqual(@as(u32, 1), counter);
 }
 
-test "moveStrip — explicit component drop" {
+test "move — a narrowing move drops the component and runs its deinit" {
     deinit_counter = 0;
 
     var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
@@ -1233,7 +1224,7 @@ test "moveStrip — explicit component drop" {
     const e = try reg.create(&wide);
     (try reg.get(e, &wide, Position)).x = 55;
 
-    try reg.moveStrip(e, &wide, &narrow, &.{Tracked});
+    try reg.move(e, &wide, &narrow);
     try reg.flush();
 
     try testing.expectEqual(@as(u32, 0), wide.count);
@@ -1264,7 +1255,7 @@ test "moveImmediate — visible before flush" {
     try testing.expectEqual(@as(f32, 99), (try reg.get(e, &b, Position)).x);
 }
 
-test "moveStripImmediate — immediate with component drop" {
+test "moveImmediate — a narrowing move drops the component in the same tick" {
     init_counter = 0;
     deinit_counter = 0;
 
@@ -1285,12 +1276,62 @@ test "moveStripImmediate — immediate with component drop" {
     init_counter = 0;
     deinit_counter = 0;
 
-    try reg.moveStripImmediate(e, &wide, &narrow, &.{Tracked});
+    try reg.moveImmediate(e, &wide, &narrow);
 
     try testing.expectEqual(@as(u32, 0), wide.count);
     try testing.expectEqual(@as(u32, 1), narrow.count);
     try testing.expectEqual(@as(f32, 77), (try reg.get(e, &narrow, Position)).x);
     try testing.expectEqual(@as(u32, 1), deinit_counter);
+}
+
+test "a move is a projection — a round trip does not bring the value back" {
+    // The trap `move`'s doc comment names, made executable. A(a,b) → B(a) →
+    // C(a,b) type-checks at every step and looks like it carries `b` there and
+    // back. It does not: the drop destroys it and the widening CONSTRUCTS a
+    // fresh one. Identity survives a move; state survives only where the
+    // destination row has room for it.
+    //
+    // No compile error is possible here — `B → C` is a plain widening with
+    // nothing to complain about. The danger is in the sequence, which is why
+    // it is written down rather than enforced.
+    init_counter = 0;
+    deinit_counter = 0;
+
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b);
+
+    var c = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
+    defer c.deinit();
+    reg.registerCollection(&c);
+
+    const e = try reg.create(&a);
+    (try reg.get(e, &a, Position)).x = 12;
+    (try reg.get(e, &a, Tracked)).value = 42;
+
+    // Count only what the two moves do — `create` already ran Tracked.init.
+    init_counter = 0;
+    deinit_counter = 0;
+
+    try reg.moveImmediate(e, &a, &b); // narrows: Tracked dropped + deinited
+    try reg.moveImmediate(e, &b, &c); // widens: Tracked constructed afresh
+
+    // The entity is the same one throughout.
+    try testing.expect(!reg.isStale(e));
+    try testing.expectEqual(@as(f32, 12), (try reg.get(e, &c, Position)).x);
+
+    // But `b` is not the one that left — it is a new component at its
+    // constructed value, not the 42 that was written before the narrowing.
+    try testing.expectEqual(@as(u32, 999), (try reg.get(e, &c, Tracked)).value);
+    try testing.expectEqual(@as(u32, 1), deinit_counter);
+    try testing.expectEqual(@as(u32, 1), init_counter);
 }
 
 test "destroyImmediate — no flush needed" {
@@ -1436,4 +1477,86 @@ test "createBatch — multiple entities" {
         try reg.set(e, &coll, Position, .{ .x = @floatFromInt(i), .y = 0, .z = 0 });
     }
     try testing.expectEqual(@as(f32, 5), coll.column(Position)[5].x);
+}
+
+// A component whose neutral value is NOT all-zeros — the shape that made
+// zero-init a hazard in rove-io (`Fd{ .fd = -1 }` reborn as fd 0, a live
+// descriptor slot; `ReadCycleEntity{ .entity = Entity.nil }` reborn as a
+// resolvable handle, since `Entity.nil.index` is `maxInt(u32)`).
+const Defaulted = struct {
+    fd: i32 = -1,
+    handle: Entity = Entity.nil,
+};
+
+test "fresh components get declared defaults, not zeroes — create" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Defaulted}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    const e = try reg.create(&a);
+    const d = try reg.get(e, &a, Defaulted);
+    try testing.expectEqual(@as(i32, -1), d.fd);
+    try testing.expect(d.handle.isNil());
+}
+
+test "fresh components get declared defaults, not zeroes — moveImmediate New set" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var src = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer src.deinit();
+    reg.registerCollection(&src);
+
+    var dst = try Collection(Row(&.{ Position, Defaulted }), .{}).init(testing.allocator);
+    defer dst.deinit();
+    reg.registerCollection(&dst);
+
+    const e = try reg.create(&src);
+    try reg.moveImmediate(e, &src, &dst);
+
+    // `Defaulted` is in the New set — the source never carried it.
+    const d = try reg.get(e, &dst, Defaulted);
+    try testing.expectEqual(@as(i32, -1), d.fd);
+    try testing.expect(d.handle.isNil());
+}
+
+test "fresh components get declared defaults, not zeroes — deferred move New set" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var src = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer src.deinit();
+    reg.registerCollection(&src);
+
+    var dst = try Collection(Row(&.{ Position, Defaulted }), .{}).init(testing.allocator);
+    defer dst.deinit();
+    reg.registerCollection(&dst);
+
+    const e = try reg.create(&src);
+    try reg.move(e, &src, &dst);
+    try reg.flush();
+
+    const d = try reg.get(e, &dst, Defaulted);
+    try testing.expectEqual(@as(i32, -1), d.fd);
+    try testing.expect(d.handle.isNil());
+}
+
+test "components without field defaults still zero-init" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    // `Position` declares no defaults — `fillDefault` must fall back to
+    // zeroing rather than failing to compile.
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    const e = try reg.create(&a);
+    const p = try reg.get(e, &a, Position);
+    try testing.expectEqual(@as(f32, 0), p.x);
+    try testing.expectEqual(@as(f32, 0), p.y);
+    try testing.expectEqual(@as(f32, 0), p.z);
 }

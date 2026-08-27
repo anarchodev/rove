@@ -126,6 +126,11 @@ LOG_SERVER = BIN_DIR / "rewind-logs"
 # REWIND_ROOT_TOKEN (src/rewind/main.zig). The harness exports this to
 # each worker (`REWIND_ROOT_TOKEN`) and uses it for admin-surface auth.
 ROOT_TOKEN = "smoke-nonprod-root-token-0123456789abcdef"
+# The root a handler's kv resolves under (`reserved.USER_KEY_ROOT`,
+# `src/reserved/root.zig`). Mirrored here because the raw `/_system/v2-kv` door
+# speaks storage's spelling and the harness mostly asks about handler rows.
+USER_KEY_ROOT = "_user/"
+
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 # Cluster KEK for per-tenant keyrings. Cluster-wide, never per-node —
 # see `_spawn_node`. A smoke value only; production reads it from the
@@ -406,6 +411,12 @@ class V2Cluster:
     log_data_dir: Path
     procs: list = field(default_factory=list)
     node_procs: dict = field(default_factory=dict)  # node index → Popen (for stop/start)
+    # Node indices currently SIGSTOPped by `freeze_node`. A frozen process is
+    # ALIVE — `poll()` returns None — so liveness cannot distinguish it from a
+    # healthy node, and every helper that polls a node over HTTP would block
+    # for its full timeout instead. Anything that talks to nodes must skip
+    # these; `alive_nodes()` is the one place that rule lives.
+    frozen_nodes: set = field(default_factory=set)
     log_paths: dict = field(default_factory=dict)
     # The log-server's operator-metrics port (the loopback :9113 listener in
     # production) — per-cluster allocation so concurrent smokes never scrape
@@ -630,7 +641,7 @@ class V2Cluster:
         """The leader's per-peer membership view for `tenant`'s group, or None if
         no node answers as leader. Tries each node's leader-gated
         `/_system/v2-member-status` (a follower 421s)."""
-        for i in range(len(self.node_ports)):
+        for i in self.alive_nodes():
             r = _curl(f"{self.node_url(i)}/_system/v2-member-status?tenant="
                       f"{urllib.parse.quote(tenant)}", timeout=5.0,
                       headers={"X-Rewind-Move-Secret": MOVE_SECRET})
@@ -745,6 +756,11 @@ class V2Cluster:
         await_ready(p, f"n{i + 1}", "listening on")
 
     def shutdown(self) -> None:
+        # Thaw first: a SIGSTOPped process does not act on SIGTERM until it
+        # resumes, so a frozen node would burn the 10s wait below and then be
+        # SIGKILLed — losing whatever it would have said on the way out.
+        for i in list(self.frozen_nodes):
+            self.thaw_node(i)
         for p in self.procs:
             if p.poll() is None:
                 p.send_signal(signal.SIGTERM)
@@ -1294,15 +1310,36 @@ class V2Cluster:
             raise RuntimeError(f"incarnation {tenant}: {r.status} {r.body}")
         return json.loads(r.body).get("incarnation", "")
 
-    def admin_kv_get(self, tenant: str, key: str, *, node: int = 0) -> HttpResponse:
-        """Read a tenant KV key via the worker's `/_system/v2-kv` (move-secret
-        gated) — handy for asserting a handler's durable writes landed."""
+    def admin_kv_get(self, tenant: str, key: str) -> HttpResponse:
+        """Read a tenant KV key as the OPERATOR would — through `__admin__`'s
+        `GET /v1/instances/:id/kv`, which reaches the target via
+        `platform.scope(id).kv`.
+
+        This asks "what does a handler of this tenant see at K", which is the
+        question a smoke's assertion is actually about: it wrote the row from a
+        handler and wants to read it back the same way.
+
+        It deliberately does NOT use `/_system/v2-kv`. That endpoint belongs to
+        the tenant-MOVE protocol (`src/js/v2_move.zig`), where a seed carries
+        the STORE's spelling — including namespaces no handler can name. The
+        two doors answer different questions and only agree while there is one
+        keyspace; `node_kv_get` is the one to reach for when the assertion is
+        about storage.
+
+        There is no `node` parameter, and that absence is the point: the front
+        Host-routes to `__admin__`, so this door cannot answer "did it reach
+        node 2". That is a question about the STORE and about replication, and
+        it has its own door — `node_kv_get`."""
+        import urllib.parse
+        self._ensure_admin_app()
+        q = urllib.parse.urlencode({"key": key})
         return _curl(
-            f"{self.node_url(node)}/_system/v2-kv?tenant={tenant}&key={key}",
-            headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+            f"{self.front_url()}/v1/instances/{urllib.parse.quote(tenant)}/kv?{q}",
+            host=self.host_for("__admin__"),
+            headers={"Authorization": f"Bearer {self.root_token}"})
 
     def admin_kv_seed(self, tenant: str, key: str, value: str, *,
-                      node: int = 0, retry_s: float = 20.0) -> HttpResponse:
+                      retry_s: float = 20.0) -> HttpResponse:
         """`admin_kv_put` for a row something LATER depends on: retries the
         retryable refusals and RAISES if the row never lands.
 
@@ -1323,7 +1360,7 @@ class V2Cluster:
         seeding a precondition, reach for this and there is nothing left to
         forget.
         """
-        r = self.admin_kv_put(tenant, key, value, node=node, retry_s=retry_s)
+        r = self.admin_kv_put(tenant, key, value, retry_s=retry_s)
         if r.status not in (200, 204):
             raise RuntimeError(
                 f"seed {tenant}/{key} refused after {retry_s}s: "
@@ -1333,13 +1370,12 @@ class V2Cluster:
         return r
 
     def admin_kv_put(self, tenant: str, key: str, value: str, *,
-                     node: int = 0, retry_s: float = 0.0) -> HttpResponse:
-        """Write a tenant KV key via the worker's `/_system/v2-kv` (move-secret
-        gated, same surface `three_node_smoke` seeds through). The PUT goes
-        through the addressed node's leader propose→commit path, so target the
-        leader node (a follower 503s). Symmetric to `admin_kv_get` — together
-        they assert replication/durability across moves + failovers without
-        needing the deployment-load path.
+                     retry_s: float = 0.0) -> HttpResponse:
+        """Write a tenant KV key as the OPERATOR would — through `__admin__`'s
+        `PUT /v1/instances/:id/kv`, which reaches the target via
+        `platform.scope(id).kv`. Symmetric to `admin_kv_get` on purpose: a seed
+        and its read-back must agree about which keyspace they mean, and the
+        only way to guarantee that is one door for both (rove#870).
 
         `retry_s > 0` retries the RETRYABLE refusals for that long, rotating
         nodes: `421` (not leader here) and `503` (single-writer contention, or a
@@ -1357,6 +1393,68 @@ class V2Cluster:
         fight them.
         """
         import json, time as _t
+        from urllib.parse import quote as _urlquote
+        self._ensure_admin_app()
+        deadline = _t.time() + retry_s
+        attempt = 0
+        while True:
+            r = _curl(
+                f"{self.front_url()}/v1/instances/{_urlquote(tenant)}/kv",
+                method="PUT",
+                host=self.host_for("__admin__"),
+                headers={"Authorization": f"Bearer {self.root_token}",
+                         "Content-Type": "application/json"},
+                data=json.dumps({"key": key, "value": value}))
+            if r.status not in (421, 503, 0) or _t.time() >= deadline:
+                return r
+            attempt += 1
+            _t.sleep(0.3)
+
+    # ── per-NODE access ───────────────────────────────────────────────────
+    #
+    # Two independent axes, and conflating them is a mistake worth not
+    # repeating:
+    #
+    #   WHICH NODE      `admin_kv_*` goes through the front, which Host-routes
+    #                   to `__admin__`; `node_kv_*` addresses one node directly
+    #                   through `/_system/v2-kv`.
+    #   WHICH KEYSPACE  a handler's keys resolve under `reserved.USER_KEY_ROOT`;
+    #                   engine and move-protocol keys do not.
+    #
+    # These are per-node and, by DEFAULT, in the handler's keyspace — because
+    # that is what the callers ask: "did the row the handler wrote reach the
+    # survivor / the follower / the new voter". Pass `raw=True` for the other
+    # question — the store's own spelling, which is what a move must carry and
+    # where `_config/` and the engine namespaces live.
+    #
+    # The default matters: a wrong one reads an empty keyspace silently, which
+    # is what "no such key" looks like from every caller.
+
+    def node_kv_get(self, tenant: str, key: str, *, node: int = 0,
+                    raw: bool = False) -> HttpResponse:
+        """Read from ONE node's store, move-secret gated. Served locally (no
+        leader needed), so it answers "does this node hold it" rather than "is
+        it committed".
+
+        `key` is in the HANDLER's keyspace unless `raw=True`.
+
+        The key is interpolated RAW: `v2_move.zig`'s `queryParam` returns the
+        substring after `=` without percent-decoding, so an encoded key is
+        looked up encoded and misses. Keys containing `&` or `=` are therefore
+        unreachable through this door — pre-existing, and not worth encoding
+        one side of."""
+        k = key if raw else USER_KEY_ROOT + key
+        return _curl(
+            f"{self.node_url(node)}/_system/v2-kv?tenant={tenant}&key={k}",
+            headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+
+    def node_kv_put(self, tenant: str, key: str, value: str, *,
+                    node: int = 0, retry_s: float = 0.0,
+                    raw: bool = False) -> HttpResponse:
+        """Write through ONE node's leader propose→commit path (a follower
+        421s / 503s). `retry_s > 0` rotates nodes through those refusals, which
+        is what the failover smokes need while a leader is being re-elected."""
+        import json, time as _t
         n = max(1, len(self.node_ports))
         deadline = _t.time() + retry_s
         attempt = 0
@@ -1366,11 +1464,28 @@ class V2Cluster:
                 f"{self.node_url(i)}/_system/v2-kv", method="PUT",
                 headers={"X-Rewind-Move-Secret": MOVE_SECRET,
                          "Content-Type": "application/json"},
-                data=json.dumps({"tenant": tenant, "key": key, "value": value}))
+                data=json.dumps({
+                    "tenant": tenant,
+                    "key": key if raw else USER_KEY_ROOT + key,
+                    "value": value}))
             if r.status not in (421, 503, 0) or _t.time() >= deadline:
                 return r
             attempt += 1
             _t.sleep(0.3)
+
+    def node_kv_seed(self, tenant: str, key: str, value: str, *,
+                     node: int = 0, retry_s: float = 20.0,
+                     raw: bool = False) -> HttpResponse:
+        """`node_kv_put` for a row something LATER depends on — retries the
+        retryable refusals and RAISES if it never lands. Same argument as
+        `admin_kv_seed`: a discarded 503 resurfaces far away as a wrong
+        ANSWER."""
+        r = self.node_kv_put(tenant, key, value, node=node, retry_s=retry_s, raw=raw)
+        if r.status not in (200, 204):
+            raise RuntimeError(
+                f"seed {tenant}/{key} on node {node} refused after {retry_s}s: "
+                f"{r.status} {r.body[:200]!r}")
+        return r
 
     def set_plan(self, tenant: str, plan_blob: str, *, node: int = 0) -> HttpResponse:
         """Install a tenant's resolved plan limits on its hot-path slot via the
@@ -1440,8 +1555,9 @@ class V2Cluster:
         """Single-shot (NO polling): index of a live node whose
         `/_system/v2-leader` returns 200 for `tenant`, else None. For tight
         failover-timing loops where the 0.4s `leader_node` poll is too coarse."""
-        for i in (nodes if nodes is not None else range(len(self.node_ports))):
-            if i not in self.node_procs or self.node_procs[i].poll() is not None:
+        alive = self.alive_nodes()
+        for i in (nodes if nodes is not None else alive):
+            if i not in alive:
                 continue
             r = _curl(f"{self.node_url(i)}/_system/v2-leader?tenant={tenant}",
                       headers={"X-Rewind-Move-Secret": MOVE_SECRET})
@@ -1460,6 +1576,35 @@ class V2Cluster:
                 return got
             time.sleep(0.4)
         return None
+
+    def alive_nodes(self) -> list:
+        """Node indices that can actually answer: spawned, not exited, and not
+        frozen. Every node-polling helper iterates THIS, never
+        `range(len(node_ports))` — a SIGSTOPped node accepts the connection and
+        never replies, so polling it costs the caller its whole timeout and
+        then raises out of the smoke."""
+        return [i for i in range(len(self.node_ports))
+                if i in self.node_procs
+                and self.node_procs[i].poll() is None
+                and i not in self.frozen_nodes]
+
+    def freeze_node(self, i: int) -> None:
+        """SIGSTOP node `i` — models a partitioned or arbitrarily-slow peer that
+        is still a cluster member (unlike `stop_node`/`kill_node`, which remove
+        it). Recorded in `frozen_nodes` so the polling helpers skip it; use
+        `thaw_node` to resume."""
+        p = self.node_procs.get(i)
+        if p is None or p.poll() is not None:
+            return
+        p.send_signal(signal.SIGSTOP)
+        self.frozen_nodes.add(i)
+
+    def thaw_node(self, i: int) -> None:
+        """SIGCONT node `i`, undoing `freeze_node`."""
+        p = self.node_procs.get(i)
+        if p is not None and p.poll() is None and i in self.frozen_nodes:
+            p.send_signal(signal.SIGCONT)
+        self.frozen_nodes.discard(i)
 
     def stop_node(self, i: int) -> None:
         """SIGTERM node `i` (simulate a node death / leader kill)."""

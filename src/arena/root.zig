@@ -23,7 +23,7 @@
 //!     plus the interrupt brake: arenajs's runtime polls
 //!     `rove_arena_interrupted()`, which trips on poison or the CPU budget
 //!     (the arena's missing budget, rove#452);
-//!   - `request.tag` (binding.Tag) and the `__rove_park_output` /
+//!   - `tag` (binding.Tag) and the `__rove_park_output` /
 //!     `__rove_poison` / `__rove_divergence` natives.
 //!
 //! Per-run state (tags, poison, deadline) resets in `rove_arena_run_begin`,
@@ -204,7 +204,7 @@ pub const ArenaKv = struct {
     /// not need one either: its reads come from the tape, which recorded the
     /// key the handler named.
     pub fn configScope(_: ArenaKv) u64 {
-        return 0;
+        return config_scope;
     }
 
     /// NOTE the binding treats the returned slice as borrowed for the
@@ -220,35 +220,36 @@ pub const ArenaKv = struct {
     /// The arena produces no tapes.
     pub fn recordRefusal(_: ArenaKv, _: binding.WriteOp, _: []const u8, _: anytype) void {}
 
-    pub fn get(self: ArenaKv, key: []const u8) binding.GetResult {
+    pub fn get(self: ArenaKv, k: binding.Key) binding.GetResult {
+        const key = k.stored;
         var outcome: c_int = 0;
         var val: [*c]u8 = null;
         var val_len: c_int = 0;
         const rc = _arena_host_kv_get(key.ptr, @intCast(key.len), &outcome, &val, &val_len);
-        const facade = exempt(key);
+        const facade = exempt(k.named);
         if (rc != 0) {
             if (val != null) std.c.free(val);
             // No entry for this key: authored-absent shape in both modes; a
             // CAPTURED world also records the divergence verdict host-side
             // (the poison model — nothing thrown, nothing catchable).
-            if (isCaptured(self.ctx)) poison(key);
-            if (!facade) FX.read(self.ctx, key, null);
+            if (isCaptured(self.ctx)) poison(k.named);
+            if (!facade) FX.read(self.ctx, k.named, null);
             return .absent;
         }
         switch (outcome) {
             0 => {
                 if (val == null or val_len == 0) {
                     if (val != null) std.c.free(val);
-                    if (!facade) FX.read(self.ctx, key, "");
+                    if (!facade) FX.read(self.ctx, k.named, "");
                     return .{ .value = "" };
                 }
                 const v: []const u8 = val[0..@intCast(val_len)];
-                if (!facade) FX.read(self.ctx, key, v);
+                if (!facade) FX.read(self.ctx, k.named, v);
                 return .{ .value = v };
             },
             1 => {
                 if (val != null) std.c.free(val);
-                if (!facade) FX.read(self.ctx, key, null);
+                if (!facade) FX.read(self.ctx, k.named, null);
                 return .absent;
             },
             // `elided` (`src/tape/root.zig` `KvOutcome`): the capture resolved
@@ -260,7 +261,7 @@ pub const ArenaKv = struct {
             4 => {
                 if (val != null) std.c.free(val);
                 poison(key);
-                if (!facade) FX.read(self.ctx, key, null);
+                if (!facade) FX.read(self.ctx, k.named, null);
                 return .absent;
             },
             else => {
@@ -276,7 +277,8 @@ pub const ArenaKv = struct {
         if (bytes.len > 0) std.c.free(@constCast(bytes.ptr));
     }
 
-    pub fn put(self: ArenaKv, _: ?*c.JSContext, key: []const u8, value: []const u8) bool {
+    pub fn put(self: ArenaKv, _: ?*c.JSContext, k: binding.Key, value: []const u8) bool {
+        const key = k.stored;
         var outcome: c_int = 0;
         const rc = _arena_host_kv_set(key.ptr, @intCast(key.len), value.ptr, @intCast(value.len), &outcome);
         if (rc != 0) {
@@ -287,11 +289,12 @@ pub const ArenaKv = struct {
             _ = c.JS_ThrowInternalError(self.ctx, "kv.set: recorded failure");
             return false;
         }
-        if (!exempt(key)) FX.write(self.ctx, key, value);
+        if (!exempt(k.named)) FX.write(self.ctx, k.named, value);
         return true;
     }
 
-    pub fn del(self: ArenaKv, _: ?*c.JSContext, key: []const u8) bool {
+    pub fn del(self: ArenaKv, _: ?*c.JSContext, k: binding.Key) bool {
+        const key = k.stored;
         var outcome: c_int = 0;
         const rc = _arena_host_kv_delete(key.ptr, @intCast(key.len), &outcome);
         if (rc != 0) {
@@ -302,7 +305,7 @@ pub const ArenaKv = struct {
             _ = c.JS_ThrowInternalError(self.ctx, "kv.delete: recorded failure");
             return false;
         }
-        if (!exempt(key)) FX.del(self.ctx, key);
+        if (!exempt(k.named)) FX.del(self.ctx, k.named);
         return true;
     }
 
@@ -323,7 +326,10 @@ pub const ArenaKv = struct {
     /// overlay — arenajs#1); rows the handler observes have harness keys
     /// stripped, and the scan records `count` + `rowsFold` like every
     /// engine.
-    pub fn prefix(self: ArenaKv, p: []const u8, cursor: []const u8, limit: u32) ?Page {
+    pub fn prefix(self: ArenaKv, req: binding.Scan) ?Page {
+        const p = req.prefix.stored;
+        const cursor = req.cursor.stored;
+        const limit = req.limit;
         var outcome: c_int = 0;
         var json: [*c]u8 = null;
         var json_len: c_int = 0;
@@ -337,13 +343,13 @@ pub const ArenaKv = struct {
         // that as a scan result would present an EMPTY page as a complete one
         // — the shape a partial page would have, and the reason the capture
         // elides pages all-or-nothing. Poison, then let the run unwind.
-        if (outcome == 4) poison(p);
+        if (outcome == 4) poison(req.prefix.named);
         const bytes: []const u8 = json[0..@intCast(json_len)];
         var parsed = std.json.parseFromSlice([]Row, std.heap.c_allocator, bytes, .{}) catch {
             std.c.free(json);
             return null;
         };
-        if (exempt(p)) {
+        if (exempt(req.prefix.named)) {
             return .{ .parsed = parsed, .json_ptr = json, .entries = parsed.value };
         }
         var n: usize = 0;
@@ -353,7 +359,15 @@ pub const ArenaKv = struct {
             n += 1;
         }
         const rows = parsed.value[0..n];
-        FX.prefixScan(self.ctx, std.heap.c_allocator, p, rows);
+        // Recorded in the spelling the handler used; `rows` stays STORED for
+        // the binding to un-map (see the offline delegate for why).
+        if (req.root.len == 0) {
+            FX.prefixScan(self.ctx, std.heap.c_allocator, req.prefix.named, rows);
+        } else if (std.heap.c_allocator.alloc(Row, rows.len)) |vis| {
+            defer std.heap.c_allocator.free(vis);
+            for (rows, 0..) |row, i| vis[i] = .{ .key = req.visible(row.key), .value = row.value };
+            FX.prefixScan(self.ctx, std.heap.c_allocator, req.prefix.named, vis);
+        } else |_| {}
         return .{ .parsed = parsed, .json_ptr = json, .entries = rows };
     }
 };
@@ -427,7 +441,7 @@ pub const ArenaTag = struct {
 
 // ── natives ──────────────────────────────────────────────────────────────
 
-const B = binding.Kv(c, ArenaKv);
+const B = binding.Kv(c, ArenaKv, .user);
 const T = binding.Tag(c, ArenaTag);
 
 fn undef() c.JSValue {
@@ -481,6 +495,24 @@ fn jsParkOutput(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSVal
 /// arenajs's base setup calls this (ROVE_ARENA): install the common binding
 /// over the wasm host + the arena natives. The same registration seam the
 /// native engines use.
+/// The config door's resolution scope for THIS run — the deployment the
+/// captured record ran under (0 = authored/visible spelling). Set by the
+/// shell through `__rove_set_config_scope` (a JS-callable native rather
+/// than a wasm C export: the emcc export list lives in arenajs's CMake,
+/// and a shell-control knob has no business needing a pin bump there).
+var config_scope: u64 = 0;
+
+fn jsSetConfigScope(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    if (argc < 1) return undef();
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (cstr == null) return undef();
+    defer c.JS_FreeCString(ctx, cstr);
+    const hex = @as([*]const u8, @ptrCast(cstr))[0..len];
+    config_scope = std.fmt.parseInt(u64, hex, 16) catch 0;
+    return undef();
+}
+
 export fn rove_arena_install(ctx: ?*c.JSContext) c_int {
     const g = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, g);
@@ -490,10 +522,16 @@ export fn rove_arena_install(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "delete", c.JS_NewCFunction2(ctx, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
+    // The config door (rove#830) — native like `kv`; the prelude excludes
+    // config.js for the same reason it excludes kv.js.
+    const cfg = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, cfg, "get", c.JS_NewCFunction2(ctx, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
+    if (c.JS_SetPropertyStr(ctx, g, "config", cfg) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_tag", c.JS_NewCFunction2(ctx, T.jsRequestTag, "__rove_request_tag", 2, c.JS_CFUNC_generic, 0));
     const SK = binding.ShredKey(c, ArenaTag);
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_shred_key", c.JS_NewCFunction2(ctx, SK.jsRequestShredKey, "__rove_request_shred_key", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, g, "__rove_set_config_scope", c.JS_NewCFunction2(ctx, jsSetConfigScope, "__rove_set_config_scope", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_divergence", c.JS_NewCFunction2(ctx, jsDivergence, "__rove_divergence", 0, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_park_output", c.JS_NewCFunction2(ctx, jsParkOutput, "__rove_park_output", 1, c.JS_CFUNC_generic, 0));
     return 0;

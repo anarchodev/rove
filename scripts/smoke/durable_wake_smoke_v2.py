@@ -84,7 +84,7 @@ HANDLERS = {
 
 
 def _kv_int(c, key: str, *, node: int = 0) -> int | None:
-    rr = c.admin_kv_get("acme", key, node=node)
+    rr = c.node_kv_get("acme", key, node=node)
     if rr.status == 200 and rr.body.strip().lstrip("-").isdigit():
         return int(rr.body.strip())
     return None

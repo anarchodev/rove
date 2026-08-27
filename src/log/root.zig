@@ -37,7 +37,7 @@ pub const Error = error{
 };
 
 /// A low-cardinality, user-defined index tag attached to a request's
-/// log record. Set by the handler via `request.tag(key, value)` and
+/// log record. Set by the handler via `tag(key, value)` and
 /// indexed in the log-server's `log_tags` table so log queries can
 /// filter `?tag.<key>=<value>` (and the `/v1/{tenant}/session/{id}`
 /// sugar route filters `tag.session`). The browser-agent tags its
@@ -47,7 +47,7 @@ pub const Error = error{
 /// Bounded by design (rove's low-cardinality posture): ≤`MAX_TAGS`
 /// per record, key/value lengths capped, keys restricted to
 /// `[a-z0-9_]`. A leading `_` is RESERVED for engine-populated tags
-/// (e.g. `_saga`, derived from `saga_id`) — `request.tag`
+/// (e.g. `_saga`, derived from `saga_id`) — `tag`
 /// rejects it. `key`/`value` are allocator-owned by the `LogRecord`.
 pub const Tag = struct {
     key: []const u8,
@@ -56,7 +56,7 @@ pub const Tag = struct {
 
 /// Max user tags per record. Tags are an observability index, not a
 /// payload — keep cardinality low. Over-cap is a handler bug
-/// (`request.tag` throws), not a silent truncation.
+/// (`tag` throws), not a silent truncation.
 pub const MAX_TAGS: usize = 4;
 /// Max ENGINE-populated tags per record, on top of `MAX_TAGS` — the
 /// defensive cap downstream copies apply is `MAX_RECORD_TAGS`, so an
@@ -64,13 +64,13 @@ pub const MAX_TAGS: usize = 4;
 pub const MAX_ENGINE_TAGS: usize = 1;
 /// The record-level total: every consumer sizing or capping a record's
 /// tag list uses THIS, never `MAX_TAGS` alone (which bounds only what
-/// `request.tag` accepts).
+/// `tag` accepts).
 pub const MAX_RECORD_TAGS: usize = MAX_TAGS + MAX_ENGINE_TAGS;
 /// Reserved engine tag: the saga that ARMED an activation whose arm
 /// crossed the durability boundary and therefore rooted a new saga
 /// (handler-shape.md §3.2 — a durable wake's provenance). Stamped by
 /// the dispatcher from `Trace.parent_saga`; `_`-keys are rejected on
-/// the `request.tag` surface, so it cannot collide.
+/// the `tag` surface, so it cannot collide.
 pub const PARENT_SAGA_TAG = "_parent";
 
 /// Whether a candidate `_parent` value may be stamped. `armed_by`
@@ -514,7 +514,7 @@ pub const LogRecord = struct {
     exception: []const u8,
     tapes: TapePayloads = .{},
     /// Low-cardinality index tags (≤`MAX_RECORD_TAGS`): the handler's
-    /// `request.tag(k, v)` set (≤`MAX_TAGS`) plus engine-stamped
+    /// `tag(k, v)` set (≤`MAX_TAGS`) plus engine-stamped
     /// `_`-tags (`_parent`). Owned slice with owned
     /// key/value bytes; `deinit` frees them. Empty (`&.{}`) when the
     /// handler set none. The log-server indexes these into `log_tags`

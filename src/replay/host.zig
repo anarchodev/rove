@@ -25,6 +25,18 @@ const decode = @import("tape_decode.zig");
 const path_confine = @import("path_confine.zig");
 const guards = @import("rove-binding").guards;
 
+/// A stored key in the spelling the HANDLER used.
+///
+/// The host sits below the binding, so every key it sees has already resolved
+/// under `reserved.USER_KEY_ROOT`. That is right for lookups and wrong for
+/// prose: a divergence message is read by the person who wrote
+/// `kv.get("big/blob")`, and telling them `kv.get("_user/big/blob")` names a
+/// key they have never typed and cannot search for. The root is invisible to a
+/// handler everywhere else; a diagnostic is not the place to leak it.
+fn named(k: []const u8) []const u8 {
+    return guards.reserved.userNamedKey(k);
+}
+
 /// The C ABI struct (`arena_replay_host`). Field order + signatures mirror the
 /// header exactly; a NULL responder reports "tape not installed" (code 1).
 pub const ReplayHost = extern struct {
@@ -50,10 +62,20 @@ pub var active_user: ?*anyopaque = null;
 /// subscription-marker dedup) resets when a new host takes over.
 pub var generation: u64 = 0;
 
+/// The active run's config-resolution scope (`world.deployment_id`) — the
+/// deployment whose `_config/{dep:016x}/…` rows `config.get` resolves to.
+/// 0 = authored world (visible spelling). Installed with the host so the kv
+/// delegate's `configScope` answers per run.
+pub var active_config_scope: u64 = 0;
+
 pub fn setHost(vt: *const ReplayHost, user: ?*anyopaque) void {
     active_vtable = vt;
     active_user = user;
     generation +%= 1;
+    // Authored scope by default on every install: a captured run's scope must
+    // not leak into the next run (the harness re-takes the host around nested
+    // sim runs). The captured-replay driver sets the real scope AFTER install.
+    active_config_scope = 0;
     arena_replay_set_host(vt, user);
 }
 
@@ -270,14 +292,14 @@ fn kvGet(
             // either: that identity's key is gone.
             h.setDiv(
                 "kv.get(\"{s}\") — sealed under a per-identity key " ++
-                    "(request.shredKey) that has been destroyed, so this value is " ++
+                    "(shredKey) that has been destroyed, so this value is " ++
                     "permanently unreadable and this run cannot be replayed against it",
-                .{k},
+                .{named(k)},
             );
         } else h.setDiv(
             "kv.get(\"{s}\") — the capture elided this value ({d} bytes over the " ++
                 "activation's kv budget), so this run cannot be replayed against it",
-            .{ k, lost.bytes },
+            .{ named(k), lost.bytes },
         );
         out_outcome.* = @intFromEnum(decode.KvOutcome.elided);
         out_val.* = null;
@@ -362,15 +384,15 @@ fn kvPrefix(
         if (lost.sealed) {
             h.setDiv(
                 "kv.prefix(\"{s}\") — a row on this page is sealed under a " ++
-                    "per-identity key (request.shredKey) that has been destroyed, so " ++
+                    "per-identity key (shredKey) that has been destroyed, so " ++
                     "the page is permanently incomplete and this run cannot be " ++
                     "replayed against it",
-                .{p},
+                .{named(p)},
             );
         } else h.setDiv(
             "kv.prefix(\"{s}\") — the capture elided this page ({d} row bytes over " ++
                 "the activation's kv budget), so this run cannot be replayed against it",
-            .{ p, lost.bytes },
+            .{ named(p), lost.bytes },
         );
     }
     // Reconstruct the scan from the closed-world map: keys under the prefix,

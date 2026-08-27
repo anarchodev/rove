@@ -1,0 +1,7 @@
+{
+  "name": "oidcsession",
+  "version": "1.0.0",
+  "dependencies": {
+    "@rewind/oidc": "^1.0.0"
+  }
+}

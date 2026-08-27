@@ -462,6 +462,9 @@ pub fn H2(comptime opts: Options) type {
         /// climbing rate under normal load means someone is holding
         /// slots open with stalled handshakes.
         handshake_reaped_total: u64 = 0,
+        /// Conns whose close could not be applied this pass; drives whether
+        /// `retryPendingCloses` walks at all.
+        close_requests_deferred: u32 = 0,
         recv_enobufs_logged: bool = false,
         recv_enobufs_last_logged_decade: u64 = 0,
         /// Server-side response counts by HTTP status CLASS, indexed
@@ -609,6 +612,20 @@ pub fn H2(comptime opts: Options) type {
             break :blk names;
         };
 
+        /// The h2-side conn collections, derived from `COLLECTIONS` the same
+        /// way the stream chains are. Hand-writing this tuple is how a fourth
+        /// conn state gets added to the table and silently not searched — and
+        /// the symptom surfaces far away, as a write dropped in
+        /// `processWriteIn` or an `error.UnexpectedEntityCollection` escaping
+        /// the poll loop.
+        const SERVER_CONN_COLLS: []const []const u8 = blk: {
+            var names: []const []const u8 = &.{};
+            for (COLLECTIONS) |s| {
+                if (s.kind == .server_conn) names = names ++ &[_][]const u8{s.name};
+            }
+            break :blk names;
+        };
+
         const CLIENT_STREAM_CHAIN: []const []const u8 = blk: {
             var names: []const []const u8 = &.{};
             for (COLLECTIONS) |s| {
@@ -649,9 +666,96 @@ pub fn H2(comptime opts: Options) type {
             return out;
         }
 
-        /// All collections a connection entity can be in (io's + h2's).
-        inline fn connColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl } {
-            return .{ &h2.io.connections, &h2._conn_tls_handshake, &h2._conn_active };
+        /// io's live conn collection, then h2's — the tuple `closeConn` moves
+        /// an entity out of.
+        const LIVE_CONN_COLL_TYPES: []const type = blk: {
+            var types: []const type = &.{*@FieldType(IoType, "connections")};
+            for (SERVER_CONN_COLLS) |_| types = types ++ &[_]type{*ConnColl};
+            break :blk types;
+        };
+        const LiveConnColls = std.meta.Tuple(LIVE_CONN_COLL_TYPES);
+
+        /// `LiveConnColls` plus io's closing collection.
+        const ConnColls = std.meta.Tuple(
+            LIVE_CONN_COLL_TYPES ++ &[_]type{*@FieldType(IoType, "conn_closing")},
+        );
+
+        /// The collections a LIVE conn can be in — the sources `closeConn`
+        /// moves from. `conn_closing` is deliberately absent: it is the
+        /// destination, never a source.
+        inline fn liveConnColls(h2: *Self) LiveConnColls {
+            var out: LiveConnColls = undefined;
+            out[0] = &h2.io.connections;
+            inline for (SERVER_CONN_COLLS, 1..) |name, i| {
+                out[i] = &@field(h2, name);
+            }
+            return out;
+        }
+
+        /// Every collection a conn entity can be in, closing included — a
+        /// completion that lands after the move still has to resolve its
+        /// conn. Derived from `liveConnColls` so the two cannot drift.
+        inline fn connColls(h2: *Self) ConnColls {
+            var out: ConnColls = undefined;
+            inline for (h2.liveConnColls(), 0..) |coll, i| out[i] = coll;
+            out[out.len - 1] = &h2.io.conn_closing;
+            return out;
+        }
+
+        /// End a connection. h2 decides a conn should stop; io ends it — so
+        /// this moves the entity into io's `conn_closing` seam and never
+        /// calls `reg.destroy`. io created the conn in `handleAccept`, so io
+        /// is what releases its descriptor slot.
+        ///
+        /// Returns whether the conn is closing *yet*. False means the move
+        /// could not be applied this pass — rove refuses a second collection
+        /// transition in one tick — in which case the request is recorded on
+        /// the conn and `retryPendingCloses` applies it next pass. The close
+        /// still happens; no caller carries the retry. The bool exists only
+        /// for callers that must know whether it took effect now.
+        fn closeConn(h2: *Self, entity: Entity) bool {
+            // Already closing — done, not an error.
+            if (h2.reg.isInCollection(entity, &h2.io.conn_closing)) return true;
+
+            h2.reg.moveAny(entity, h2.liveConnColls(), &h2.io.conn_closing) catch |err| switch (err) {
+                // Already gone: nothing holds a slot, so the conn is ended.
+                error.Stale, error.InvalidEntity => return true,
+                // Mid-transition — record the request and pick it up next
+                // pass. Silently dropping it here would strand the conn in a
+                // live collection after something decided it must end.
+                error.PendingMove => {
+                    if (getConn(h2, entity)) |cp| {
+                        if (!cp.close_requested) {
+                            cp.close_requested = true;
+                            h2.close_requests_deferred += 1;
+                        }
+                    }
+                    return false;
+                },
+                // In a conn collection `liveConnColls` does not name. Not
+                // reachable by construction, and silence here would be a
+                // leaked descriptor slot with no symptom until accepts fail.
+                else => {
+                    std.log.err("h2: closeConn could not place conn {d} — {s}", .{ entity.index, @errorName(err) });
+                    return false;
+                },
+            };
+            return true;
+        }
+
+        /// Apply close requests that `closeConn` could not place last pass.
+        /// Skipped entirely when none are outstanding, so the common path
+        /// pays one integer compare rather than a walk of every live conn.
+        fn retryPendingCloses(h2: *Self) void {
+            if (h2.close_requests_deferred == 0) return;
+            h2.close_requests_deferred = 0;
+            inline for (h2.liveConnColls()) |coll| {
+                for (coll.entitySlice()) |ent| {
+                    const cp = h2.reg.get(ent, coll, Conn) catch continue;
+                    if (!cp.close_requested) continue;
+                    _ = h2.closeConn(ent);
+                }
+            }
         }
 
         /// Find the current collection of a server stream entity, set H2IoResult, and move to response_out.
@@ -979,7 +1083,7 @@ pub fn H2(comptime opts: Options) type {
         pub fn serverStreamAbort(h2: *Self, conn_entity: Entity, stream_id: u32) void {
             const conn_ptr = getConn(h2, conn_entity) orelse return;
             if (conn_ptr.h1 != null) {
-                h2.reg.destroy(conn_entity) catch {};
+                _ = h2.closeConn(conn_entity);
                 return;
             }
             const ng = conn_ptr.ng_session orelse return;
@@ -1047,9 +1151,7 @@ pub fn H2(comptime opts: Options) type {
         /// trust boundary (front-door hardening plan B7).
         pub fn connPeerAddr(h2: *Self, conn_entity: Entity) ?std.net.Address {
             if (h2.reg.isStale(conn_entity)) return null;
-            const pa = h2.reg.getAny(conn_entity, h2.connColls(), rio.PeerAddr) catch return null;
-            if (!pa.valid) return null;
-            return pa.addr;
+            return h2.io.getPeerAddr(conn_entity);
         }
 
         /// True when the connection is driven by the HTTP/1.1 codec
@@ -1239,30 +1341,6 @@ pub fn H2(comptime opts: Options) type {
                 ws.writeFrame(&wr.send_buf, h2.allocator, op, payload) catch return;
             }
             _ = c.nghttp2_session_resume_data(live.ng, live.sid);
-        }
-
-        /// FD resolver callback for io — searches h2's connection collections in addition to io's.
-        fn resolveFdThunk(ctx: *anyopaque, entity: Entity) ?*rio.Fd {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2.reg.getAny(entity, h2.connColls(), rio.Fd) catch null;
-        }
-
-        /// PeerAddr mirror of `resolveFdThunk` — the accept-time
-        /// fixed-fd-install CQE may land after the conn was promoted
-        /// out of `io.connections`.
-        fn resolvePeerThunk(ctx: *anyopaque, entity: Entity) ?*rio.PeerAddr {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2.reg.getAny(entity, h2.connColls(), rio.PeerAddr) catch null;
-        }
-
-        /// Extra-conns callback for io's admission control. Returns the
-        /// count of conn entities h2 holds outside `io.connections` —
-        /// i.e. those that have already been promoted past the
-        /// post-accept window. Combined with `io.connections.len` in
-        /// `handleAccept` to estimate total in-flight conns.
-        fn extraConnsThunk(ctx: *anyopaque) usize {
-            const h2: *Self = @ptrCast(@alignCast(ctx));
-            return h2._conn_tls_handshake.entitySlice().len + h2._conn_active.entitySlice().len;
         }
 
         // =============================================================
@@ -2138,6 +2216,7 @@ pub fn H2(comptime opts: Options) type {
             recv_completions: u64,
             recv_returned_drain: u64,
             recv_returned_deinit: u64,
+            recv_returned_stale: u64,
             recv_outstanding: u64,
             buf_count: u64,
             recv_enobufs: u64,
@@ -2149,17 +2228,26 @@ pub fn H2(comptime opts: Options) type {
             conn_tls_handshake: usize,
             handshake_reaped: u64,
             io_connections: usize,
+            /// Peak live `WriteBuf` count — what a fixed egress pool must
+            /// cover. Read from collection membership, not counted.
+            write_bufs_peak: usize,
+            write_bufs_now: usize,
+            /// Write entities destroyed still holding a buffer — they bypassed
+            /// the release path and that buffer leaked. Must stay 0.
+            write_bufs_leaked: u64,
         };
 
         pub fn connStats(self: *Self) ConnStats {
             const drain = self.io.recv_buffers_returned;
             const deinit_r = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
+            const stale_r = self.io.recv_buffers_returned_via_stale;
             const comp = self.io.recv_completions_with_data;
             return .{
                 .recv_completions = comp,
                 .recv_returned_drain = drain,
                 .recv_returned_deinit = deinit_r,
-                .recv_outstanding = comp -| (drain + deinit_r),
+                .recv_returned_stale = stale_r,
+                .recv_outstanding = comp -| (drain + deinit_r + stale_r),
                 .buf_count = @as(u64, self.io.buf_count),
                 .recv_enobufs = self.recv_enobufs_total,
                 .admission_denied = self.io.admission_denied_total,
@@ -2170,6 +2258,9 @@ pub fn H2(comptime opts: Options) type {
                 .conn_tls_handshake = self._conn_tls_handshake.entitySlice().len,
                 .handshake_reaped = self.handshake_reaped_total,
                 .io_connections = self.io.connections.entitySlice().len,
+                .write_bufs_peak = self.io.write_bufs_peak,
+                .write_bufs_now = self.io.writeBufsLive(),
+                .write_bufs_leaked = self.io.cleanup_ctx.write_bufs_destroyed_live,
             };
         }
 
@@ -2185,6 +2276,7 @@ pub fn H2(comptime opts: Options) type {
                 \\# TYPE io_recv_buffers_returned_total counter
                 \\io_recv_buffers_returned_total{{src="drain"}} {d}
                 \\io_recv_buffers_returned_total{{src="deinit"}} {d}
+                \\io_recv_buffers_returned_total{{src="stale"}} {d}
                 \\# HELP io_recv_outstanding buffers currently held by the kernel (completions - returned). Must stay below buf_count.
                 \\# TYPE io_recv_outstanding gauge
                 \\io_recv_outstanding {d}
@@ -2215,6 +2307,15 @@ pub fn H2(comptime opts: Options) type {
                 \\# HELP h2_handshake_reaped_total connections destroyed for blowing the TLS handshake budget (slowloris canary).
                 \\# TYPE h2_handshake_reaped_total counter
                 \\h2_handshake_reaped_total {d}
+                \\# HELP io_write_bufs_live egress buffers io is holding right now, across write_in + _write_pending + write_results.
+                \\# TYPE io_write_bufs_live gauge
+                \\io_write_bufs_live {d}
+                \\# HELP io_write_bufs_peak high-water of the above — the size a fixed egress buffer pool would have to cover.
+                \\# TYPE io_write_bufs_peak gauge
+                \\io_write_bufs_peak {d}
+                \\# HELP io_write_bufs_leaked_total write entities destroyed while still holding a buffer — bypassed the release path. Must be 0.
+                \\# TYPE io_write_bufs_leaked_total counter
+                \\io_write_bufs_leaked_total {d}
                 \\# HELP h2_io_connections_size raw tcp connections owned by the io layer (pre-handshake or post-handshake unclaimed).
                 \\# TYPE h2_io_connections_size gauge
                 \\h2_io_connections_size {d}
@@ -2223,6 +2324,7 @@ pub fn H2(comptime opts: Options) type {
                 s.recv_completions,
                 s.recv_returned_drain,
                 s.recv_returned_deinit,
+                s.recv_returned_stale,
                 s.recv_outstanding,
                 s.buf_count,
                 s.recv_enobufs,
@@ -2233,6 +2335,9 @@ pub fn H2(comptime opts: Options) type {
                 s.conn_active,
                 s.conn_tls_handshake,
                 s.handshake_reaped,
+                s.write_bufs_now,
+                s.write_bufs_peak,
+                s.write_bufs_leaked,
                 s.io_connections,
             });
 
@@ -2281,6 +2386,7 @@ pub fn H2(comptime opts: Options) type {
             "io",           "h2_opts",                        "reg",                  "allocator",
             "recv_enobufs_total", "handshake_reaped_total",   "recv_enobufs_logged",  "recv_enobufs_last_logged_decade",
             "recv_enobufs_low_outstanding_streak", "http_status_class", "http_status_notable", "body_sinks",
+            "close_requests_deferred",
         };
         comptime {
             @setEvalBranchQuota(100_000);
@@ -2305,6 +2411,7 @@ pub fn H2(comptime opts: Options) type {
             self.allocator = allocator;
             self.recv_enobufs_total = 0;
             self.handshake_reaped_total = 0;
+            self.close_requests_deferred = 0;
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
@@ -2328,20 +2435,20 @@ pub fn H2(comptime opts: Options) type {
                 reg.registerCollection(&@field(self, s.name));
             }
 
-            // Register FD resolver with io so that processWriteIn/processReadIn
-            // can find connection Fds when h2 has moved them to _conn_active etc.
-            self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
-            self.io.setPeerResolver(@ptrCast(self), &resolvePeerThunk);
-            // Admission control: io counts conns in `io.connections` +
-            // whatever this callback returns. h2 holds promoted conns
-            // in `_conn_tls_handshake` + `_conn_active`.
-            self.io.setExtraConnsFn(@ptrCast(self), &extraConnsThunk);
-
             return self;
         }
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            // End every live conn the way every conn ends. Our collections
+            // deinit below, before `io.destroy` runs, so io cannot reach
+            // these — and a conn destroyed still holding its fd is the one
+            // thing `Fd.deinit` refuses to tolerate.
+            inline for (self.liveConnColls()) |coll| {
+                for (coll.entitySlice()) |ent| _ = self.closeConn(ent);
+            }
+            self.reg.flush() catch {};
+            self.io.shutdownAllConns();
             for (self.body_sinks.items) |ref| {
                 ref.sink.abort(ref.sink.ctx);
                 ref.sink.release(ref.sink.ctx);
@@ -2415,6 +2522,10 @@ pub fn H2(comptime opts: Options) type {
         }
 
         fn pollPostlude(self: *Self) !void {
+            // A close decided last pass but blocked by an in-flight move
+            // lands first, so nothing below treats the conn as live.
+            self.retryPendingCloses();
+            try self.reg.flush();
 
             // Phase 4: Triage reads that just arrived.
             try self.readsTriage();
@@ -2920,7 +3031,8 @@ pub fn H2(comptime opts: Options) type {
                 const consumed = self.io.recv_completions_with_data;
                 const returned_drain = self.io.recv_buffers_returned;
                 const returned_deinit = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
-                const returned = returned_drain + returned_deinit;
+                const returned_stale = self.io.recv_buffers_returned_via_stale;
+                const returned = returned_drain + returned_deinit + returned_stale;
                 const outstanding = consumed -| returned;
 
                 // INVARIANT (impossible by construction): outstanding
@@ -2933,10 +3045,10 @@ pub fn H2(comptime opts: Options) type {
                         &buf,
                         "\n================================================================\n" ++
                             "ROVE H2: recv buffer accounting broken — outstanding ({d}) > buf_count ({d}).\n" ++
-                            "  consumed={d} returned_drain={d} returned_deinit={d}\n" ++
+                            "  consumed={d} returned_drain={d} returned_deinit={d} returned_stale={d}\n" ++
                             "  This is impossible by construction; counters or ring management is buggy.\n" ++
                             "================================================================\n",
-                        .{ outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit },
+                        .{ outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit, returned_stale },
                     ) catch buf[0..0];
                     _ = std.posix.write(2, msg) catch {};
                     std.process.abort();
@@ -3002,7 +3114,7 @@ pub fn H2(comptime opts: Options) type {
 
             for (entities, conn_ents) |ent, conn_ent| {
                 if (!self.reg.isStale(conn_ent.entity)) {
-                    try self.reg.destroy(conn_ent.entity);
+                    _ = self.closeConn(conn_ent.entity);
                 }
                 try self.reg.move(ent, &self._read_errors, &self.io.read_in);
             }
@@ -3029,14 +3141,14 @@ pub fn H2(comptime opts: Options) type {
 
                 if (self.h2_opts.tls_config) |tls_cfg| {
                     conn_ptr.tls_conn = tls.TlsConn.create(tls_cfg, self.allocator) catch {
-                        try self.reg.destroy(conn_ent.entity);
+                        _ = self.closeConn(conn_ent.entity);
                         try self.reg.move(ent, &self._read_init, &self.io.read_in);
                         continue;
                     };
                     try self.reg.move(ent, &self._read_init, &self._read_handshake);
                 } else {
                     self.sessionCreate(conn_ptr, conn_ent.entity) catch {
-                        try self.reg.destroy(conn_ent.entity);
+                        _ = self.closeConn(conn_ent.entity);
                         try self.reg.move(ent, &self._read_init, &self.io.read_in);
                         continue;
                     };
@@ -3059,7 +3171,7 @@ pub fn H2(comptime opts: Options) type {
 
                 if (conn_ptr.tls_conn != null and conn_ptr.ng_session == null) {
                     if (max > 0 and active_count >= max) {
-                        try self.reg.destroy(ent);
+                        _ = self.closeConn(ent);
                         continue;
                     }
                     conn_ptr.last_active_ns = monotonicNs();
@@ -3081,7 +3193,7 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 if (max > 0 and active_count >= max) {
-                    try self.reg.destroy(ent);
+                    _ = self.closeConn(ent);
                     continue;
                 }
 
@@ -3145,12 +3257,12 @@ pub fn H2(comptime opts: Options) type {
                         // `decrypt_buf`.
                         if (!std.mem.eql(u8, tc.alpnProtocol(), "h2")) {
                             if (!self.h2_opts.accept_http1) {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                                 continue;
                             }
                             const h1c = Http1Conn.create(self.allocator) orelse {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                                 continue;
                             };
@@ -3162,7 +3274,7 @@ pub fn H2(comptime opts: Options) type {
                             continue;
                         }
                         self.sessionCreate(conn_ptr, conn_ent.entity) catch {
-                            try self.reg.destroy(conn_ent.entity);
+                            _ = self.closeConn(conn_ent.entity);
                             try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                             continue;
                         };
@@ -3176,7 +3288,7 @@ pub fn H2(comptime opts: Options) type {
                         try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     },
                     .data, .err => {
-                        try self.reg.destroy(conn_ent.entity);
+                        _ = self.closeConn(conn_ent.entity);
                         try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     },
                 }
@@ -3231,7 +3343,7 @@ pub fn H2(comptime opts: Options) type {
                 .ws_tunnel => |*tn| {
                     if (!tn.sink.push(tn.sink.ctx, bytes)) {
                         h1c.closing = true;
-                        self.reg.destroy(conn_entity) catch {};
+                        _ = self.closeConn(conn_entity);
                         return;
                     }
                     tn.unconsumed +|= @intCast(bytes.len);
@@ -3559,7 +3671,7 @@ pub fn H2(comptime opts: Options) type {
                 },
                 .sink_failed => {
                     h1c.closing = true;
-                    self.reg.destroy(conn_entity) catch {};
+                    _ = self.closeConn(conn_entity);
                     return false;
                 },
             }
@@ -4214,7 +4326,7 @@ pub fn H2(comptime opts: Options) type {
             const conn_ptr = getConn(h2, conn_entity) orelse return;
             const h1c = conn_ptr.h1 orelse return;
             const wr = h1c.wsWrite() orelse {
-                h2.reg.destroy(conn_entity) catch {};
+                _ = h2.closeConn(conn_entity);
                 return;
             };
             wr.closing = true;
@@ -4243,12 +4355,12 @@ pub fn H2(comptime opts: Options) type {
             // OOM duping either fails the connection, same as the response
             // appends below.
             const authority = self.allocator.dupe(u8, head.host orelse "") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             const path = self.allocator.dupe(u8, head.target) catch {
                 self.allocator.free(authority);
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
 
@@ -4266,28 +4378,28 @@ pub fn H2(comptime opts: Options) type {
             var resp: std.ArrayList(u8) = .empty;
             defer resp.deinit(self.allocator);
             resp.appendSlice(self.allocator, "HTTP/1.1 101 Switching Protocols\r\n") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, "Upgrade: websocket\r\nConnection: Upgrade\r\n") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, "Sec-WebSocket-Accept: ") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, accept) catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             resp.appendSlice(self.allocator, "\r\n\r\n") catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
 
             fr.wr.out.appendSlice(self.allocator, resp.items) catch {
-                self.reg.destroy(conn_entity) catch {};
+                _ = self.closeConn(conn_entity);
                 return;
             };
             self.wsFlush(conn_ptr, conn_entity);
@@ -4420,7 +4532,7 @@ pub fn H2(comptime opts: Options) type {
             const wr = h1c.wsWrite() orelse return;
             if (wr.write_inflight) return;
             if (wr.out.items.len == 0) {
-                if (wr.closing) self.reg.destroy(conn_entity) catch {};
+                if (wr.closing) _ = self.closeConn(conn_entity);
                 return;
             }
             const data = wr.out.toOwnedSlice(self.allocator) catch return;
@@ -4580,7 +4692,7 @@ pub fn H2(comptime opts: Options) type {
                                 var decrypt_buf: [65536]u8 = undefined;
                                 const fr = tc.feed(data_ptr[0..data_len], &decrypt_buf);
                                 if (fr.result == .err) {
-                                    try self.reg.destroy(conn_ent.entity);
+                                    _ = self.closeConn(conn_ent.entity);
                                     try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                     continue;
                                 }
@@ -4620,14 +4732,14 @@ pub fn H2(comptime opts: Options) type {
                         var decrypt_buf: [65536]u8 = undefined;
                         const feed_result = tc.feed(data_ptr[0..data_len], &decrypt_buf);
                         if (feed_result.result == .err) {
-                            try self.reg.destroy(conn_ent.entity);
+                            _ = self.closeConn(conn_ent.entity);
                             try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
                         }
                         if (feed_result.out_len > 0) {
                             const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, &decrypt_buf, feed_result.out_len);
                             if (rv < 0) {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             }
@@ -4647,13 +4759,13 @@ pub fn H2(comptime opts: Options) type {
                             // architecture/websockets.md): h1 terminates at the
                             // front; refuse rather than swap in.
                             if (!self.h2_opts.accept_http1) {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             }
                             conn_ptr.first_read_seen = true;
                             _ = self.http1SwapIn(conn_ptr) orelse {
-                                try self.reg.destroy(conn_ent.entity);
+                                _ = self.closeConn(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             };
@@ -4665,7 +4777,7 @@ pub fn H2(comptime opts: Options) type {
                         conn_ptr.first_read_seen = true;
                         const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, data_ptr, data_len);
                         if (rv < 0) {
-                            try self.reg.destroy(conn_ent.entity);
+                            _ = self.closeConn(conn_ent.entity);
                             try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
                         }
@@ -4743,9 +4855,11 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 if (failed) {
-                    try self.reg.destroy(conn_ent.entity);
+                    _ = self.closeConn(conn_ent.entity);
                 }
-                try self.reg.destroy(ent);
+                // io owns the buffer's release: it was kernel-visible until the
+                // completion landed, and reaching `write_done` is what proves it did.
+                try self.reg.move(ent, &self.io.write_results, &self.io.write_done);
             }
         }
 
@@ -4753,6 +4867,13 @@ pub fn H2(comptime opts: Options) type {
         // Phase 8: Drive all nghttp2 sends
         // =============================================================
 
+        /// Every failure below ends the connection, and a connection ends by
+        /// TRANSITION: `closeConn` moves it into io's closing state, which
+        /// shuts the socket down, posts the close, and gives up the descriptor
+        /// slot. `reg.destroy` on a conn skips all of that — io created it in
+        /// `handleAccept` and io is what releases it — so the socket is never
+        /// shut down, the slot leaks, and the teardown guard aborts the process
+        /// when that entity index is reissued.
         fn driveAllSends(self: *Self) !void {
             const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
@@ -4780,7 +4901,7 @@ pub fn H2(comptime opts: Options) type {
                 // want_write path below) and force-destroy once the peer
                 // drains or the grace deadline fires. `draining` is sticky.
                 if (conn_ptr.draining and now >= conn_ptr.drain_deadline_ns) {
-                    try self.reg.destroy(ent);
+                    _ = self.closeConn(ent);
                     continue;
                 }
 
@@ -4795,7 +4916,7 @@ pub fn H2(comptime opts: Options) type {
                     // the queue; the draining-deadline force-destroy above is
                     // the backstop for a peer that stops reading.
                     if (conn_ptr.send_inflight or conn_ptr.send_queue.items.len > 0) continue;
-                    try self.reg.destroy(ent);
+                    _ = self.closeConn(ent);
                     continue;
                 }
 
@@ -4815,7 +4936,7 @@ pub fn H2(comptime opts: Options) type {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             broke = true;
                             break;
                         }
@@ -4823,7 +4944,7 @@ pub fn H2(comptime opts: Options) type {
                         const flen: usize = @intCast(len);
                         if (accum_len + flen > accum_buf.len) {
                             const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
-                                try self.reg.destroy(ent);
+                                _ = self.closeConn(ent);
                                 broke = true;
                                 break;
                             };
@@ -4838,7 +4959,7 @@ pub fn H2(comptime opts: Options) type {
 
                     if (!broke and accum_len > 0) {
                         const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             continue;
                         };
                         self.enqueueConnSend(conn_ptr, ent, cipher);
@@ -4858,7 +4979,7 @@ pub fn H2(comptime opts: Options) type {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             broke = true;
                             break;
                         }
@@ -4872,7 +4993,7 @@ pub fn H2(comptime opts: Options) type {
                             // corrupted — loopback masks it (buffers rarely
                             // fill), a real network doesn't.
                             const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
-                                try self.reg.destroy(ent);
+                                _ = self.closeConn(ent);
                                 broke = true;
                                 break;
                             };
@@ -4885,7 +5006,7 @@ pub fn H2(comptime opts: Options) type {
 
                     if (!broke and accum_len > 0) {
                         const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             continue;
                         };
                         self.enqueueConnSend(conn_ptr, ent, copy);
@@ -4944,7 +5065,7 @@ pub fn H2(comptime opts: Options) type {
                         conn_ptr.last_active_ns != 0 and
                         now -| conn_ptr.last_active_ns > quiet_ns)
                     {
-                        try self.reg.destroy(ent);
+                        _ = self.closeConn(ent);
                     } else if (!h1c.closing) {
                         // Mid-request — INCLUDING a parked pending Upgrade
                         // (pending_upgrade ⇒ in_flight): the eventual
@@ -5015,7 +5136,7 @@ pub fn H2(comptime opts: Options) type {
                     if (conn_ptr.last_active_ns == 0) continue;
                     if (now -| conn_ptr.last_active_ns <= budget) continue;
                     self.handshake_reaped_total += 1;
-                    try self.reg.destroy(ent);
+                    _ = self.closeConn(ent);
                 }
                 const hs = self._conn_tls_handshake.entitySlice();
                 for (hs) |ent| {
@@ -5024,7 +5145,7 @@ pub fn H2(comptime opts: Options) type {
                     if (conn_ptr.last_active_ns == 0) continue;
                     if (now -| conn_ptr.last_active_ns <= budget) continue;
                     self.handshake_reaped_total += 1;
-                    try self.reg.destroy(ent);
+                    _ = self.closeConn(ent);
                 }
             }
 
@@ -5054,7 +5175,7 @@ pub fn H2(comptime opts: Options) type {
 
                 // h1: no session to drain — destroy directly.
                 if (conn_ptr.ng_session == null) {
-                    if (conn_ptr.h1 != null) try self.reg.destroy(ent);
+                    if (conn_ptr.h1 != null) _ = self.closeConn(ent);
                     continue;
                 }
 
@@ -5086,21 +5207,12 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 };
 
-                // Heap-allocate the target address so the pointer we
-                // hand io_uring is stable across swap-remove. Ownership
-                // transfers to the `ConnectAddr` component; its deinit
-                // frees the allocation when the entity is destroyed or
-                // the component is stripped during `moveStripImmediate`
-                // on connect success.
-                const addr_ptr = self.allocator.create(std.net.Address) catch {
-                    try self.reg.destroy(ce);
-                    try self.reg.set(ent, &self.client_connect_in, H2IoResult, .{ .err = -1 });
-                    try self.reg.move(ent, &self.client_connect_in, &self.client_connect_errors);
-                    continue;
-                };
-                addr_ptr.* = target.addr;
-
-                try self.reg.set(ce, &self.io.connect_in, rio.ConnectAddr, .{ .addr = addr_ptr });
+                // The target address goes into io's `connect_addrs` table,
+                // whose slots are stable for the entity's lifetime — a
+                // component column is not, and `prep_connect` outlives the
+                // move that would reshuffle it. No allocation, so no failure
+                // path and nothing to free.
+                try self.io.setConnectAddr(ce, &self.io.connect_in, target.addr);
                 try self.reg.set(ce, &self.io.connect_in, Conn, .{ .direction = .client, .pending_connect_entity = ent });
 
                 try self.reg.move(ent, &self.client_connect_in, &self._client_connect_pending);
@@ -5129,7 +5241,7 @@ pub fn H2(comptime opts: Options) type {
                 self.clientSessionCreate(conn_ptr, ent) catch {
                     self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = -1 }) catch {};
                     self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_errors) catch {};
-                    self.reg.destroy(ent) catch {};
+                    _ = self.closeConn(ent);
                     continue;
                 };
 
@@ -5489,7 +5601,6 @@ test "stream row contains all h2 base components" {
 test "connection row contains Conn" {
     const H2Type = H2(.{});
     try testing.expect(H2Type.ConnectionRow.contains(Conn));
-    try testing.expect(H2Type.ConnectionRow.contains(rio.Fd));
     try testing.expect(H2Type.ConnectionRow.contains(rio.ReadCycleEntity));
 }
 

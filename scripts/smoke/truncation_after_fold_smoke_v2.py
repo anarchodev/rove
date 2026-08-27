@@ -93,7 +93,7 @@ def last_index(c: V2Cluster, node: int) -> int:
 
 def key_absent_on(c: V2Cluster, node: int) -> tuple[bool, str]:
     """(absent, detail) for the orphan key on one node."""
-    r = c.admin_kv_get(TENANT, ORPHAN_KEY, node=node)
+    r = c.node_kv_get(TENANT, ORPHAN_KEY, node=node)
     if r.status == 404:
         return True, "404"
     if r.status == 200 and ORPHAN_VALUE in r.body:
@@ -132,7 +132,7 @@ def main() -> int:
 
         print("step 3: ⭐ a write that cannot reach quorum must be REFUSED, never acked")
         t0 = time.time()
-        r = c.admin_kv_put(TENANT, ORPHAN_KEY, ORPHAN_VALUE, node=leader)
+        r = c.node_kv_put(TENANT, ORPHAN_KEY, ORPHAN_VALUE, node=leader)
         took = time.time() - t0
         check("the un-committable write was refused",
               not (200 <= r.status < 300),
@@ -175,7 +175,7 @@ def main() -> int:
         deadline = time.time() + 45.0
         rejoined = False
         while time.time() < deadline:
-            if c.admin_kv_get(TENANT, "baseline", node=leader).status == 200:
+            if c.node_kv_get(TENANT, "baseline", node=leader).status == 200:
                 rejoined = True
                 break
             time.sleep(0.5)
@@ -192,11 +192,11 @@ def main() -> int:
             # Poll: a node that rejoined seconds ago catches up asynchronously,
             # so an immediate read races replication rather than testing it.
             deadline = time.time() + 30.0
-            g = c.admin_kv_get(TENANT, "after-rc1", node=i)
+            g = c.node_kv_get(TENANT, "after-rc1", node=i)
             while time.time() < deadline and not (
                     g.status == 200 and "committed-after" in g.body):
                 time.sleep(0.5)
-                g = c.admin_kv_get(TENANT, "after-rc1", node=i)
+                g = c.node_kv_get(TENANT, "after-rc1", node=i)
             check(f"node {i + 1} holds the post-recovery write",
                   g.status == 200 and "committed-after" in g.body,
                   f"{g.status} '{g.body.strip()[:30]}'")

@@ -147,13 +147,13 @@ def run_once(run_idx) -> str:
             return "fail-other"
         # C. seed write + replicate
         leader = c.leader_node(TENANT)
-        if leader is None or c.admin_kv_put(TENANT, KEY, V1, node=leader).status != 204:
+        if leader is None or c.node_kv_put(TENANT, KEY, V1, node=leader).status != 204:
             return "fail-other"
         for i in range(nodes):
             deadline = time.time() + 20
             ok = False
             while time.time() < deadline:
-                rr = c.admin_kv_get(TENANT, KEY, node=i)
+                rr = c.node_kv_get(TENANT, KEY, node=i)
                 if rr.status == 200 and rr.body == V1:
                     ok = True
                     break
@@ -181,9 +181,9 @@ def run_once(run_idx) -> str:
             # the pump's leaderless escalation can force-campaign — mirrors the
             # real genesis smoke's survivor-serves GET (leg E, line 142).
             for i in survivors:
-                c.admin_kv_get(TENANT, KEY, node=i)
+                c.node_kv_get(TENANT, KEY, node=i)
             ln = c.leader_now(TENANT, nodes=survivors)
-            if ln is not None and c.admin_kv_put(TENANT, KEY, V2, node=ln).status == 204:
+            if ln is not None and c.node_kv_put(TENANT, KEY, V2, node=ln).status == 204:
                 ok = True
                 break
             time.sleep(0.3)

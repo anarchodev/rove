@@ -15,6 +15,7 @@
 //! share it without copying.
 
 const std = @import("std");
+const reserved = @import("rove-reserved");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const tape_mod = @import("rove-tape");
@@ -242,7 +243,7 @@ pub const Dispatcher = struct {
         var console_buf: std.ArrayList(u8) = .empty;
         errdefer console_buf.deinit(self.allocator);
 
-        // Per-dispatch user-tag accumulator (`request.tag`). Owned here
+        // Per-dispatch user-tag accumulator (`tag`). Owned here
         // like `console_buf`; `finishResponse` MOVES the tags onto the
         // Response/Continuation (so they survive a `next()`), or frees
         // them on the drop paths. The errdefer covers error returns
@@ -401,8 +402,7 @@ pub const Dispatcher = struct {
             break :blk null;
         };
         if (mw_bytecode_opt) |mw_bc| {
-            const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending,
-                "_middlewares/index.mjs is not an ES module")) orelse
+            const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending, "_middlewares/index.mjs is not an ES module")) orelse
                 return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
             module_execution.runMiddleware(self, &rt, &ctx, mw_fun_val, activation, budget, &pending) catch |err| switch (err) {
                 error.Interrupted => return DispatchError.Interrupted,
@@ -415,8 +415,7 @@ pub const Dispatcher = struct {
             return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
         }
 
-        const fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, bytecode, &pending,
-            "handler bytecode is not an ES module (.mjs)")) orelse
+        const fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, bytecode, &pending, "handler bytecode is not an ES module (.mjs)")) orelse
             return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
 
         module_execution.runModule(self, &rt, &ctx, fun_val, request, activation, budget, &pending) catch |err| switch (err) {
@@ -751,7 +750,7 @@ fn finishResponse(
     // boundary rooted a NEW saga (handler-shape.md §3.2); the arming
     // saga rides its record as the reserved `_parent` tag — the
     // viewer's cross-saga jump. Stamped AFTER the handler ran so it
-    // never occupies the `request.tag` quota (the surface guard counts
+    // never occupies the `tag` quota (the surface guard counts
     // the live buffer, and an engine tag consuming a customer slot
     // would also be a prod-only, engine-divergent throw). Clamped to
     // the tag-value contract: `armed_by` transits customer-writable
@@ -814,6 +813,19 @@ fn finishResponse(
                 .put => |p| p.key,
                 .delete => |del| del.key,
             };
+            // Recorded as STORED, the writeset's own spelling — the kv tape
+            // beside this holds store-spelled keys too, and the seam scan
+            // intersects the two, so both sides carry the root and the
+            // intersection is exact. The seam's RENDER strips it
+            // (`reserved.userNamedKey`); recording stripped here and
+            // intersecting a mixed pair is the depth split that reads as
+            // no-interference.
+            //
+            // A write outside the user root is engine bookkeeping the handler
+            // did not make (the `_sub/dirty/` marker the write path injects),
+            // and it has no place in a blame view of what this activation
+            // touched.
+            if (!std.mem.startsWith(u8, key, reserved.USER_KEY_ROOT)) continue;
             rs.appendWriteKey(key) catch break;
         }
     }

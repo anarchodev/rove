@@ -293,7 +293,6 @@ pub const TenantKeys = struct {
         return out;
     }
 
-
     // ── writes ───────────────────────────────────────────────────────
 
     /// Seal every customer value this activation wrote, under `key_slot`.
@@ -321,11 +320,16 @@ pub const TenantKeys = struct {
                 .put => |put_op| put_op,
                 .delete => continue,
             };
-            // Reserved keys are platform state — the binding row this
-            // activation may have just written is among them — and
-            // sealing one would leave the platform unable to read its own
-            // bookkeeping.
-            if (reserved.isCustomerWriteReserved(p.key)) continue;
+            // Seal the TENANT's rows and nothing else. Engine state — the
+            // binding row this activation may have just written is among it —
+            // lives outside the user root, and sealing it would leave the
+            // platform unable to read its own bookkeeping.
+            //
+            // Asked positively, against the root. The negative form ("is this
+            // key reserved") answers YES for every rooted key, since the root
+            // itself leads with `_` — which silently disables sealing for the
+            // whole store rather than for the rows it means to protect.
+            if (!std.mem.startsWith(u8, p.key, reserved.USER_KEY_ROOT)) continue;
 
             const sealed = try seal_mod.seal(allocator, p.value, key, key_slot, seal_mod.KEY_VERSION);
             defer allocator.free(sealed);

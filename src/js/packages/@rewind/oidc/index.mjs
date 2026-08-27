@@ -52,11 +52,31 @@ function _rec(o) {
   return Object.assign({ v: REC_V }, o);
 }
 
+// The version an UNSTAMPED record is. Permanently 1, and a LITERAL: this
+// package must not read the engine's own format registry, because a package's record
+// shape is pinned with the package in the tenant's lockfile — one that read the
+// running binary's number would claim a version it did not write.
+const UNSTAMPED_V = 1;
+
 // Read a record, refusing a version this build does not implement.
-// `_oidc/`/`_rp/` are shim-writable, so an unknown `v` is as likely a
-// forged row as a newer engine — and both deserve the same answer,
-// which is to act as though no record is there rather than to trust
-// fields that may mean something else now.
+//
+// ABSENT is not "a version we do not implement". Every `_oidc/`/`_rp/` row
+// gained its `v` in one change that altered no other field, so a row without
+// the field is the shape v1 describes — this build reads it perfectly and the
+// only thing missing is a field that did not exist yet. Refusing it would log
+// out every session written by the previous version of this package the moment
+// a tenant upgrades, silently, which is the opposite of what the field is for.
+//
+// A `v` that is PRESENT and not a number is a different case and still
+// refused: `_oidc/`/`_rp/` are shim-writable (`reserved.zig` —
+// `!isCustomerWriteReserved("_rp/sess/sid")`), so that is a hand-written row
+// of unknown shape, and trusting fields that may mean something else now is
+// the misread the version exists to prevent.
+//
+// Accepting an unstamped row is not an escalation even though a handler could
+// forge one: forging a session in your OWN tenant grants nothing a handler
+// does not already have. That is the self-footgun `reserved.zig` describes,
+// not a boundary crossing.
 function _readRec(raw) {
   if (raw == null) return null;
   let o;
@@ -65,7 +85,9 @@ function _readRec(raw) {
   } catch (_e) {
     return null;
   }
-  return o.v === REC_V ? o : null;
+  if (o == null || typeof o !== "object") return null;
+  if (o.v !== undefined && typeof o.v !== "number") return null;
+  return (o.v ?? UNSTAMPED_V) === REC_V ? o : null;
 }
 
 function _b64urlRandom(n) {
@@ -1380,7 +1402,7 @@ const oidc = {
       // documented override/template relationship in code — it makes
       // the prod path work with zero bootstrap glue.
       let raw = kv.get("_oidc/config/" + name);
-      if (raw == null) raw = kv.get("_config/oidc/" + name);
+      if (raw == null) raw = config.get("oidc/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.provider: no client registry at _oidc/config/" + name +
@@ -1420,7 +1442,7 @@ const oidc = {
       // (above). Without this an operator must hand-seed _oidc/rp after every
       // wipe or the dashboard 500s.
       let raw = kv.get("_oidc/rp/" + name);
-      if (raw == null) raw = kv.get("_config/oidc/rp/" + name);
+      if (raw == null) raw = config.get("oidc/rp/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.rp: no RP config at _oidc/rp/" + name +

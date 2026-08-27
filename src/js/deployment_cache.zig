@@ -88,7 +88,6 @@ pub fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
 /// Re-export so callers reading worker.zig find the trigger guard
 /// without leaving the file. See `reserved.zig` for the prefix list
 /// and the customer-write guard counterpart.
-const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 
 /// Parse a `_subscriptions/<name>/<file>` deployment path into its
 /// name + file-kind. Mirror of `triggerPathToPrefix`:
@@ -1530,14 +1529,11 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_
                 // convention (`_triggers/<.../>index.{mjs,js}`), index
                 // it in the trigger registry. The bytecode lookup at
                 // fire time uses the same path key in `bytecodes`.
+                // No collision check: a trigger prefix names a key in the
+                // tenant's own rooted keyspace, and a platform namespace is not
+                // reachable from inside it. The whole leading-`_` range is the
+                // customer's to register.
                 if (triggerPathToPrefix(entry.path)) |derived_prefix| {
-                    if (isReservedTriggerPrefix(derived_prefix)) {
-                        std.log.warn(
-                            "rove-js: tenant {s} trigger {s} rejected — prefix '{s}' overlaps a platform namespace",
-                            .{ slot.instance_id, entry.path, derived_prefix },
-                        );
-                        return error.ReservedTriggerPrefix;
-                    }
                     const prefix_copy = try allocator.dupe(u8, derived_prefix);
                     errdefer allocator.free(prefix_copy);
                     const module_copy = try allocator.dupe(u8, entry.path);
@@ -1693,6 +1689,4 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_
         "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s), {d} trigger(s), {d} subscription(s))",
         .{ slot.instance_id, manifest.id, new_snap.bytecodes.count(), new_snap.statics.count(), new_snap.triggers.len, new_snap.subscriptions.len },
     );
-
 }
-

@@ -71,7 +71,7 @@ pub fn isReservedInternalHeader(name: []const u8) bool {
 
 /// The IP-transport headers hidden from `request.headers`. The client IP
 /// is personal data under GDPR; it is reachable ONLY via `request.ip`
-/// (masked) / `request.unmaskedIp()` (raw — the deliberate, taped
+/// (masked) / `unmaskedIp()` (raw — the deliberate, taped
 /// escalation). Hiding the raw headers is what makes that friction real:
 /// read-taping can't redact (a redacted input breaks replay determinism),
 /// so the surface is minimized instead. Enforced by the worker's inbound

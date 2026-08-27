@@ -132,7 +132,7 @@ def main() -> int:
         held = False
         deadline = time.time() + 60.0
         while time.time() < deadline:
-            if latest in c.admin_kv_get("acme", KEY, node=victim).body:
+            if latest in c.node_kv_get("acme", KEY, node=victim).body:
                 held = True
                 break
             time.sleep(1.0)
@@ -145,7 +145,7 @@ def main() -> int:
         healed = False
         deadline = time.time() + 90.0
         while time.time() < deadline:
-            rg = c.admin_kv_get("acme", KEY, node=victim)
+            rg = c.node_kv_get("acme", KEY, node=victim)
             cs = confstate(c, lead if c.leader_node('acme') is None else c.leader_node('acme'))
             voter = cs is not None and vnid in cs.get("voters", [])
             if rg.status == 200 and latest in rg.body and voter:
@@ -169,7 +169,7 @@ def main() -> int:
                             want_status=204, deadline_s=15)
             repl = False
             for _ in range(40):
-                if "after-reconcile" in c.admin_kv_get("acme", KEY, node=victim).body:
+                if "after-reconcile" in c.node_kv_get("acme", KEY, node=victim).body:
                     repl = True; break
                 time.sleep(0.5)
             check(f"⭐ fresh write replicated to node {vnid}", repl)

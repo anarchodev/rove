@@ -225,7 +225,7 @@ records are lost without a bump, and kept with one.
 ### The serve-side shred gate
 
 A kv value written by an activation that named an identity
-(`request.shredKey`) is sealed at the **write boundary**, so the ciphertext
+(`shredKey`, the activation capability) is sealed at the **write boundary**, so the ciphertext
 propagates by itself into the writeset, the raft entry, the LMDB page, the
 readset and the **tape**. That is the mechanism, not a side effect — opening
 before the tape append would put plaintext on the tape and defeat it.

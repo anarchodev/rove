@@ -198,13 +198,12 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
 
             const offset = self.count;
 
-            // Zero-init all component slots for the batch (byte-level zero)
+            // Default-init all component slots for the batch (declared field
+            // defaults, not zero — see `row.fillDefault`).
             inline for (R.types, 0..) |T, i| {
                 if (@sizeOf(T) > 0) {
-                    const raw: [*]u8 = self.columns[i].?;
-                    const byte_offset = offset * @sizeOf(T);
-                    const byte_len = count * @sizeOf(T);
-                    @memset(raw[byte_offset .. byte_offset + byte_len], 0);
+                    const typed = alignedPtr(T, self.columns[i].?);
+                    row_mod.fillDefault(T, typed[offset .. offset + count]);
                 }
             }
 
