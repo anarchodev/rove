@@ -99,10 +99,30 @@ io with components io has never heard of.
       (frees-then-destroys under fat; safe on any entity via
       null-defaults). Probe-verified: churn/multiplex/concurrency,
       byte-exact, archetype control identical.
-- [ ] Convert the four stream components (Req/Resp Headers/Body) to
-      release-by-transition or per-request arena — h2's analog of
-      rove#885. Retires destroyEntity's fat branch and the consumer
-      contract ("end terminal entities through destroyEntity").
+- [x] **Stream-buffer conversion — DONE 2026-08-27, as
+      release-by-transition** (per-request arena rejected: streams
+      interleave on a connection with no natural reset point, and an
+      arena would force consumers to allocate response bytes from h2's
+      arena — a cross-model contract change). Every fat ending routes
+      to the `_stream_dead` dead-letter via the new deferred
+      ENTITY-KEYED evict — an ending is never refused, a mid-move
+      entity included, which closes the silent-catch{} drop class the
+      strict destroy had — and the pollPostlude reaper frees the four
+      buffer components at a known phase OUTSIDE nghttp2's callbacks
+      (the archetype's flush-time release timing, which the old
+      call-site frees had quietly moved earlier). destroyEntity stays
+      as the seam NAME — the funnel verb, per the 4d resolution; what
+      retired is the per-call-site freeing (the fat branch), not the
+      funnel contract. Also fixed in the same pass, found by auditing
+      the ending sites: THREE fat leaks (WS identity entities carrying
+      owned ReqHeaders ended via bare reg.destroy — close callback,
+      CONNECT reject, h1 upgrade accept/reject) and ONE conn-teardown
+      bypass (wsUpgradeAccept's sink-failure path destroyed the conn
+      entity instead of closing it — now closeConn, both models); plus
+      the fat TEARDOWN leak: h2.destroy() now sweeps every collection
+      and frees still-live stream buffers (entities the consumer never
+      ended). testing.allocator leak-gates all three shapes: reap,
+      mid-move ending, teardown.
 - [ ] The h2-side call sites that want `getRow` (close/dispatch paths
       reading several components of a stream) — currently on compat
       getAny/moveAny, which FatRegistry now provides.
@@ -304,8 +324,12 @@ axis and per-axis offsets stay exact under swap-remove churn.
 ## 5 — Deferred + batch evict
 
 - [ ] Count-N evict recipe (the generalization `moveRecipe` already has).
-- [ ] Deferred evict: coherent because PENDING_MOVE freezes the entity;
-      needs the source id/recipe threaded through the op.
+- [x] Deferred evict — BUILT 2026-08-27, ENTITY-KEYED rather than
+      source-id-threaded: the op records the entity and resolves its
+      source at execute time, in a second pass after every offset-keyed
+      batch, which is also what makes it tolerant of an entity with a
+      move already queued (the strict offset-at-enqueue shape could
+      never be). See `evict`/`evictOnly` in fat.zig.
 - [ ] Batch evict: sort the worklist (counting pass on the id byte,
       offsets within), runs form at enqueue via RLE; all-members sets
       yield complete contiguous runs (K entities, M collections, M ops).
