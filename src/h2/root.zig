@@ -4867,6 +4867,13 @@ pub fn H2(comptime opts: Options) type {
         // Phase 8: Drive all nghttp2 sends
         // =============================================================
 
+        /// Every failure below ends the connection, and a connection ends by
+        /// TRANSITION: `closeConn` moves it into io's closing state, which
+        /// shuts the socket down, posts the close, and gives up the descriptor
+        /// slot. `reg.destroy` on a conn skips all of that — io created it in
+        /// `handleAccept` and io is what releases it — so the socket is never
+        /// shut down, the slot leaks, and the teardown guard aborts the process
+        /// when that entity index is reissued.
         fn driveAllSends(self: *Self) !void {
             const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
@@ -4929,7 +4936,7 @@ pub fn H2(comptime opts: Options) type {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             broke = true;
                             break;
                         }
@@ -4937,7 +4944,7 @@ pub fn H2(comptime opts: Options) type {
                         const flen: usize = @intCast(len);
                         if (accum_len + flen > accum_buf.len) {
                             const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
-                                try self.reg.destroy(ent);
+                                _ = self.closeConn(ent);
                                 broke = true;
                                 break;
                             };
@@ -4952,7 +4959,7 @@ pub fn H2(comptime opts: Options) type {
 
                     if (!broke and accum_len > 0) {
                         const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             continue;
                         };
                         self.enqueueConnSend(conn_ptr, ent, cipher);
@@ -4972,7 +4979,7 @@ pub fn H2(comptime opts: Options) type {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             broke = true;
                             break;
                         }
@@ -4986,7 +4993,7 @@ pub fn H2(comptime opts: Options) type {
                             // corrupted — loopback masks it (buffers rarely
                             // fill), a real network doesn't.
                             const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
-                                try self.reg.destroy(ent);
+                                _ = self.closeConn(ent);
                                 broke = true;
                                 break;
                             };
@@ -4999,7 +5006,7 @@ pub fn H2(comptime opts: Options) type {
 
                     if (!broke and accum_len > 0) {
                         const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
-                            try self.reg.destroy(ent);
+                            _ = self.closeConn(ent);
                             continue;
                         };
                         self.enqueueConnSend(conn_ptr, ent, copy);

@@ -280,7 +280,36 @@ pub const Registry = struct {
     // Destroy — deferred
     // =============================================================
 
-    /// Destroy an entity (deferred). Source collection is looked up automatically.
+    /// Destroy an entity (deferred). Source collection is looked up
+    /// automatically.
+    ///
+    /// Who may call this is a question about how the entity got here, and
+    /// there are two answers, because rove entities are used for two different
+    /// things.
+    ///
+    /// **An owned resource is destroyed by the layer that created it.** A
+    /// connection, a read cycle: the creator holds the real resource behind
+    /// the entity — a descriptor, a registered buffer — so it is the only
+    /// layer that can know when releasing is safe. rove-io creates conns in
+    /// `handleAccept` and retires them in `processConnClosing`; nobody else
+    /// destroys them, which is what lets that teardown be an ordered sequence
+    /// rather than a destructor.
+    ///
+    /// **Submitted work is destroyed by the layer that services it.** A caller
+    /// creates an entity in the servicer's collection, stamps what the work
+    /// needs, and drops the handle in the same breath — rove-h2 submitting a
+    /// write into `io.write_in`, rove-js submitting a frame into
+    /// `h2.ws_send_in`. Retiring it IS servicing it, and the handoff is the
+    /// point: requiring the creator to destroy would force it to track
+    /// completion for no reason but to free. Dropping the handle is what makes
+    /// this safe, and it is not optional — a retained handle turns the
+    /// servicer's ordinary retirement into a dangling reference.
+    ///
+    /// Where the caller must *observe* completion before the work is released,
+    /// the release is a transition into a terminal collection rather than a
+    /// destroy at the point of noticing: `io.write_done` is reachable only
+    /// from `write_results`, so arriving there proves the CQE landed. See
+    /// `processWriteDone`.
     pub fn destroy(self: *Self, entity: Entity) !void {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;
@@ -377,8 +406,9 @@ pub const Registry = struct {
         try self.executeMoveImmediate(SrcColl, src, DstColl, dst, entity);
     }
 
-    /// Immediately destroy an entity. Calls deinit, bumps generation.
-    /// Immediately destroy an entity. Source collection is looked up automatically.
+    /// `destroy` without the deferred queue: runs `deinit`, bumps the
+    /// generation, and looks the source collection up automatically. The
+    /// ownership rules on `destroy` apply unchanged.
     pub fn destroyImmediate(self: *Self, entity: Entity) !void {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;
