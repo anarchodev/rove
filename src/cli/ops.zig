@@ -36,6 +36,7 @@
 //! ROVE_PUBLISH_SSH?, ROVE_CP_URL_INTERNAL, REWIND_MOVE_SECRET.
 
 const std = @import("std");
+const reserved = @import("rove-reserved");
 const c = @import("common.zig");
 const storage_namespace = @import("storage_namespace.zig");
 const wire = @import("wire-headers");
@@ -353,11 +354,19 @@ fn cmdRelease(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, dep_i
     fatal("release flip failed on every worker after retries", .{});
 }
 
-/// PUT a system KV key via the worker's move-secret-gated `/_system/v2-kv`
+/// PUT a tenant KV key via the worker's move-secret-gated `/_system/v2-kv`
 /// (leader-gated → 6× round-robin retry). The bootstrap seam for operator
 /// allowlist + OIDC RP config: those keys grant access, so there's no
 /// operator-gated endpoint to write them through (chicken-and-egg) — the
 /// move-secret is the out-of-band authority, same surface a tenant move uses.
+///
+/// `key` is in the HANDLER's keyspace and resolves under
+/// `reserved.USER_KEY_ROOT` before it goes out. Every row this seeds is read by
+/// handler code — the registry middleware's operator token, the OIDC RP config
+/// — so the store's own spelling would put them where their readers cannot look.
+/// `/_system/v2-kv` speaks storage's spelling because it belongs to the move
+/// protocol; the resolution happens here, at the one caller that means
+/// something else by it.
 fn cmdKvPut(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, key: []const u8, value: []const u8) void {
     const ms = env.require("REWIND_MOVE_SECRET");
     const headers = [_]Header{
@@ -368,7 +377,8 @@ fn cmdKvPut(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, key: []
     body.appendSlice(a, "{\"tenant\":") catch oom();
     c.writeJsonString(&body, a, tenant);
     body.appendSlice(a, ",\"key\":") catch oom();
-    c.writeJsonString(&body, a, key);
+    const rooted = std.fmt.allocPrint(a, "{s}{s}", .{ reserved.USER_KEY_ROOT, key }) catch oom();
+    c.writeJsonString(&body, a, rooted);
     body.appendSlice(a, ",\"value\":") catch oom();
     c.writeJsonString(&body, a, value);
     body.appendSlice(a, "}") catch oom();

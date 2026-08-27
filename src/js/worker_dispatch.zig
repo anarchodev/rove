@@ -1788,15 +1788,44 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
-        // `/_system/*` — CORS gate, then auth + system route dispatch.
-        if (try system.tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {
-            processed += 1;
-            continue;
+        // `/_system/*` — CORS gate, then auth + system route dispatch. A
+        // route may resolve to an ACTIVATION instead of a door (rove#717),
+        // in which case it names the tenant and the baked module and falls
+        // through to the ordinary handler path below.
+        var forced_builtin: ?system.ForcedActivation = null;
+        switch (try system.tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {
+            .answered => {
+                processed += 1;
+                continue;
+            },
+            .activation => |fa| forced_builtin = fa,
+            .not_mine => {},
         }
 
         const host = worker_mod.hostOnly(authority);
 
-        const resolved = switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh, body)) {
+        const resolved = if (forced_builtin) |fa| blk: {
+            // The scope comes from the ROUTE, not the Host — the family
+            // authenticated the operator above, and the door already knows
+            // which tenant it means.
+            const inst = (worker.node.tenant.getInstance(fa.tenant) catch null) orelse {
+                try respb.setSimpleResponse(server, ent, sid, sess, 503, "platform tenant not initialized\n", allocator);
+                processed += 1;
+                continue;
+            };
+            // Make the group resolvable before the leader gate below reads
+            // it. The gate only LOOKS UP a gid, while the door this replaced
+            // went straight to `proposeWriteSet` → `registerTenant`, which
+            // creates one — so without this a bootstrap write against a
+            // provisioned-but-never-touched group 421s where it used to
+            // succeed. Idempotent; `mirrorDeployConfig` registers for the
+            // same reason before its own per-tenant leadership check.
+            _ = worker.raft.registerTenant(fa.tenant) catch {};
+            // `is_admin` here means "not customer traffic": it keeps the
+            // static-first block below from trying to serve an asset for a
+            // platform route. CORS was already stamped by the family gate.
+            break :blk ResolvedDispatch{ .handler_inst = inst, .scope_inst = inst, .is_admin = true };
+        } else switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh, body)) {
             .handled => {
                 processed += 1;
                 continue;
@@ -1865,7 +1894,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // request. `release` fires at end of iteration (continue or
         // fall-through). Snapshot pinning guarantees a request
         // sees one deployment version completely.
-        const snap = slot.pinCurrent() orelse {
+        // A forced BAKED module needs no deployment (rove#843): its code
+        // comes from `node.builtin_modules`, so the snapshot it runs against
+        // is empty and the tenant may never have been released — which is the
+        // bootstrap case `/_system/admin-kv` exists for. An ordinary
+        // route-resolved request still 503s, because "not deployed" must not
+        // quietly become "ran something else".
+        const snap = (if (forced_builtin != null)
+            slot.pinForBaked() catch |err| {
+                // Not "no deployment" — this tenant is allowed to have none.
+                // Name the real condition (rove#704): the empty snapshot
+                // could not be built.
+                const msg = try std.fmt.allocPrint(allocator, "system module scope unavailable: {s}\n", .{@errorName(err)});
+                defer allocator.free(msg);
+                try respb.setSimpleResponse(server, ent, sid, sess, 503, msg, allocator);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0, 0);
+                processed += 1;
+                continue;
+            }
+        else
+            slot.pinCurrent()) orelse {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{}, null, &.{}, .inbound, 0, 0);
             processed += 1;
@@ -2024,7 +2072,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // streamer, passing {hash, content_type} via the route's query (the
         // builtin parses request.query). No `/_assets` redirect (would rebase
         // relative ES-module imports) and no blocking read here.
-        var route = if (stream_static) |ss| blk: {
+        var route = if (forced_builtin) |fa| blk: {
+            // No query: a forced system module reads its input from the
+            // request BODY (the static streamer is the one that needs a
+            // synthesised query, below).
+            const mb = try allocator.dupe(u8, fa.module_base);
+            break :blk router_mod.Route{ .allocator = allocator, .module_base = mb, .query = null };
+        } else if (stream_static) |ss| blk: {
             const q = try std.fmt.allocPrint(allocator, "{{\"hash\":\"{s}\",\"ct\":\"{s}\"}}", .{ ss.hash_hex[0..], ss.content_type });
             errdefer allocator.free(q);
             const mb = try allocator.dupe(u8, "__system/static");
@@ -2043,7 +2097,24 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // The forced static-stream route resolves against the node-level
         // built-in registry (exact — NOT findBytecode's tenant walk-up, which
         // would fall through `__system/static` up to the tenant's index.mjs).
-        const bytecode = if (stream_static != null)
+        const bytecode = if (forced_builtin) |fa| bc_blk: {
+            // Exact node-level builtin lookup — NOT `findBytecode`'s tenant
+            // walk-up, which would fall through a missing builtin to the
+            // tenant's index.mjs and run the customer's code for a platform
+            // route.
+            var key_buf: [128]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{s}.mjs", .{fa.module_base}) catch {
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "system module name too long\n", allocator);
+                processed += 1;
+                continue;
+            };
+            break :bc_blk worker.node.builtin_modules.get(key) orelse {
+                // Baked in; absence is an invariant violation.
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "system module unavailable\n", allocator);
+                processed += 1;
+                continue;
+            };
+        } else if (stream_static != null)
             (worker.node.builtin_modules.get("__system/static.mjs") orelse {
                 // The builtin is baked in; absence is an invariant violation.
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "static streamer unavailable\n", allocator);
@@ -2553,6 +2624,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // arena and re-executed under GC) skip the doomed bump
             // attempt entirely.
             .arena_mode = if (worker_mod.isChurny(worker, scope_inst.id, dep_id, route.module_base)) .gc else .auto,
+            // From the DISPATCH DECISION, never the path: this arm of the
+            // inbound path runs a baked module only when the engine itself
+            // forced one (a `/_system/*` route resolving to an activation,
+            // or the static-stream fallback). Deriving it from
+            // `route.module_base` would let a URL spell its way into the
+            // grant — the confused-deputy shape rove#643 closed on the
+            // continuation path.
+            .is_system_module = forced_builtin != null or stream_static != null,
             .method = method,
             // `request.path` excludes the query string — the query lives
             // ONLY on `request.query` (handler-shape.md). Log records and
@@ -2621,7 +2700,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .pending_wakes = &pending_wakes,
                 .pending_stream_chunks = &stream_chunks,
             },
-            // `request.shredKey(id)` resolves through the worker, which
+            // `shredKey(id)` resolves through the worker, which
             // is what owns the tenant's slot pool and keyring.
             .shred = .{
                 .ctx = @ptrCast(worker),

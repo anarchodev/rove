@@ -4,7 +4,7 @@
 Proves the full `browser.getReplay` substrate without the WebSocket agent —
 just the engine machinery it rides on:
 
-  1. `request.tag("session","S1")` in a normal inbound handler is captured into
+  1. `tag("session","S1")` (the activation capability, rove#849) in a normal inbound handler is captured into
      the request's log record (the SuccessRec terminal path), flushed to S3,
      and indexed into `log_tags`.
   2. The SELF-TENANT logs door (decisions.md §4.10, Option A): a NON-admin
@@ -35,9 +35,9 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 # A handler that tags its own request, plus self-tenant + cross-tenant replay
 # probes. Routing is by module dir: /tag → tag/index.mjs, etc.
-TAG_SRC = r"""export default function () {
-    request.tag("session", "S1");
-    request.tag("flow", "smoke");
+TAG_SRC = r"""export default function ({ tag }) {
+    tag("session", "S1");
+    tag("flow", "smoke");
     return "tagged";
 }
 """

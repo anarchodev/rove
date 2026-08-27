@@ -44,7 +44,7 @@ const plan_mod = @import("rove-plan");
 pub const Action = enum(u8) {
     request,
     outbound,
-    /// NEW identities named by `request.shredKey` — never destroys, which
+    /// NEW identities named by `shredKey` — never destroys, which
     /// are free. Each one mints a key into a slot that is never reused, so
     /// admitting it is a permanent commitment; refusing it costs the
     /// handler an error it can see and fix.
@@ -582,7 +582,7 @@ test "limiter: outbound_sustained is a day-scale ceiling derived from the plan's
 test "limiter: a per-request UUID as a shred key hits the wall almost at once" {
     // The failure this cap exists for, and it is a MISTAKE rather than
     // abuse: a handler passing a request id or per-call UUID to
-    // `request.shredKey`. Always wrong — a key used once can never be
+    // `shredKey`. Always wrong — a key used once can never be
     // usefully shredded — and every call would mint a permanent key into
     // a slot that is never reused.
     const caps = RateLimitCaps{};

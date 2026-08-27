@@ -39,6 +39,7 @@
 //! `worker_dispatch.zig` / `worker_log.zig`.
 
 const std = @import("std");
+const reserved = @import("rove-reserved");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("raft-kv");
@@ -420,6 +421,13 @@ fn drainKvWakeInbox(worker: anytype) !void {
 /// matching arm fires — a key under two armed prefixes marks both.
 /// No allocation, no accumulation: N matches on one arm are one
 /// re-stamp (latest fire time wins), so nothing can overflow.
+/// A stored write key in the spelling a handler would use, or null when the
+/// write was not the handler's to see.
+fn namedKey(stored: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, stored, reserved.USER_KEY_ROOT)) return null;
+    return stored[reserved.USER_KEY_ROOT.len..];
+}
+
 fn matchEventsToWakes(
     events: *std.ArrayListUnmanaged(KvWakeEvent),
     wakes: *components_mod.StreamWakes,
@@ -434,8 +442,20 @@ fn matchEventsToWakes(
         // pre-`on.kv` stream path — fire on any prefix match. `maxInt`
         // event versions (producer couldn't read the clock) always pass.
         if (wakes.read_version != 0 and ev.write_version <= wakes.read_version) continue;
+        // The event carries the key as STORED — it is derived from the
+        // writeset, and `noteCommittedSchedWrites` parses it at that depth. An
+        // arm is what the HANDLER named (`after.kv("orders/")`), so the match
+        // happens on the named spelling, exactly as trigger and subscription
+        // matching do.
+        //
+        // A write that does not carry the user root is not a handler-visible
+        // one — the `_sub/dirty/` markers the write path injects below the
+        // binding are the live example — and must not fire a customer's arm.
+        // No platform-prefix list is consulted: the root already says which
+        // writes are the tenant's.
+        const named = namedKey(ev.key) orelse continue;
         for (wakes.kv_prefixes) |*arm| {
-            if (std.mem.startsWith(u8, ev.key, arm.prefix)) {
+            if (std.mem.startsWith(u8, named, arm.prefix)) {
                 arm.fired_at_ns = now_ns;
             }
         }
@@ -2012,7 +2032,6 @@ fn flushFireFetches(
 /// activation gets logged as 500 rather than skipped. Stream
 /// components on the entity deinit structurally when destroy fires
 /// (no manual cleanup site needed).
-
 /// Source payload for a subscription_fire activation.
 /// One variant per `SubscriptionEntry.Spec`. Borrowed slices —
 /// caller (the firing site) owns the bytes for
@@ -2021,7 +2040,6 @@ fn flushFireFetches(
 /// which carries it). Aliased here so this module's callers and the
 /// `worker.SubscriptionFireSource` re-export keep working.
 pub const SubscriptionFireSource = dispatcher_mod.SubscriptionFireSource;
-
 
 // ── Commit-gated post-propose ─────────────────────────────────────────
 

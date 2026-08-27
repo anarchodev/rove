@@ -21,7 +21,11 @@ const log_mod = @import("rove-log");
 pub const KEY_CAP: usize = 512;
 
 /// The three key sets one activation's kv tape yields. All keys are
-/// deduplicated and allocator-owned.
+/// deduplicated and allocator-owned, and all are STORE-spelled — the tape and
+/// the write-key list both record keys as the store holds them (carrying the
+/// user root), so the two sides of an intersection agree by construction.
+/// Rendering them for the customer is where the root strips
+/// (`reserved.userNamedKey`, at the seam route).
 pub const KeySets = struct {
     allocator: std.mem.Allocator,
     /// Exact keys read (`kv.get`).
@@ -282,19 +286,23 @@ fn buildKvTape(allocator: std.mem.Allocator, ops: []const struct { op: tape_mod.
 
 test "extractKeySets: reads from the tape, writes from the key list, dedup" {
     const a = testing.allocator;
+    // Keys as the producer records them: store-spelled — the kv tape and the
+    // write-key list both carry the user root (`globals_kv.zig` /
+    // `dispatcher.zig`). The seam intersects them as they are; the root
+    // strips only at the render (`standalone.zig`).
     const bytes = try buildKvTape(a, &.{
-        .{ .op = .get, .key = "cart/1" },
-        .{ .op = .get, .key = "cart/1" }, // dup read
-        .{ .op = .prefix, .key = "items/" },
+        .{ .op = .get, .key = "_user/cart/1" },
+        .{ .op = .get, .key = "_user/cart/1" }, // dup read
+        .{ .op = .prefix, .key = "_user/items/" },
     });
     defer a.free(bytes);
 
-    var ks = try extractKeySets(a, bytes, &.{ "cart/1", "tmp/x", "tmp/x" });
+    var ks = try extractKeySets(a, bytes, &.{ "_user/cart/1", "_user/tmp/x", "_user/tmp/x" });
     defer ks.deinit();
     try testing.expectEqual(@as(usize, 1), ks.reads.len);
-    try testing.expectEqualStrings("cart/1", ks.reads[0]);
+    try testing.expectEqualStrings("_user/cart/1", ks.reads[0]);
     try testing.expectEqual(@as(usize, 1), ks.read_prefixes.len);
-    try testing.expectEqualStrings("items/", ks.read_prefixes[0]);
+    try testing.expectEqualStrings("_user/items/", ks.read_prefixes[0]);
     try testing.expectEqual(@as(usize, 2), ks.writes.len);
     try testing.expect(!ks.truncated);
 
@@ -308,12 +316,12 @@ test "extractKeySets: reads from the tape, writes from the key list, dedup" {
 test "writesMatching: exact hit + under-prefix hit, misses stay out" {
     const a = testing.allocator;
     const target_bytes = try buildKvTape(a, &.{
-        .{ .op = .get, .key = "cart/1" },
-        .{ .op = .prefix, .key = "items/" },
+        .{ .op = .get, .key = "_user/cart/1" },
+        .{ .op = .prefix, .key = "_user/items/" },
     });
     defer a.free(target_bytes);
 
-    var cand = try extractKeySets(a, null, &.{ "cart/1", "items/42", "other/z" });
+    var cand = try extractKeySets(a, null, &.{ "_user/cart/1", "_user/items/42", "_user/other/z" });
     defer cand.deinit();
     var target = try extractKeySets(a, target_bytes, &.{});
     defer target.deinit();
@@ -321,30 +329,30 @@ test "writesMatching: exact hit + under-prefix hit, misses stay out" {
     var m = try writesMatching(a, &cand, &target, 32);
     defer m.deinit(a);
     try testing.expectEqual(@as(usize, 2), m.keys.len);
-    try testing.expectEqualStrings("cart/1", m.keys[0]);
-    try testing.expectEqualStrings("items/42", m.keys[1]);
+    try testing.expectEqualStrings("_user/cart/1", m.keys[0]);
+    try testing.expectEqualStrings("_user/items/42", m.keys[1]);
     try testing.expect(!m.truncated);
 }
 
 test "readsMatching: mirror direction, prefix reported as the prefix" {
     const a = testing.allocator;
     const cand_bytes = try buildKvTape(a, &.{
-        .{ .op = .get, .key = "cart/1" },
-        .{ .op = .prefix, .key = "cart/" },
-        .{ .op = .get, .key = "unrelated" },
+        .{ .op = .get, .key = "_user/cart/1" },
+        .{ .op = .prefix, .key = "_user/cart/" },
+        .{ .op = .get, .key = "_user/unrelated" },
     });
     defer a.free(cand_bytes);
 
     var cand = try extractKeySets(a, cand_bytes, &.{});
     defer cand.deinit();
-    var target = try extractKeySets(a, null, &.{"cart/1"});
+    var target = try extractKeySets(a, null, &.{"_user/cart/1"});
     defer target.deinit();
 
     var m = try readsMatching(a, &cand, &target, 32);
     defer m.deinit(a);
     try testing.expectEqual(@as(usize, 2), m.keys.len);
-    try testing.expectEqualStrings("cart/1", m.keys[0]);
-    try testing.expectEqualStrings("cart/", m.keys[1]);
+    try testing.expectEqualStrings("_user/cart/1", m.keys[0]);
+    try testing.expectEqualStrings("_user/cart/", m.keys[1]);
 }
 
 test "blobsFromRecordJson: present, null, and absent fields; write keys decode" {

@@ -33,50 +33,62 @@ export default function () {
     eq(request.cookies, { sid: "abc", theme: "dark" });
   });
 
+  // The activation object carries the three request-sourced effect
+  // capabilities (#849) — data stays on `request`, effects arrive here.
+  const A = arguments[0];
+
   // No edge proxy headers in the harness request → both IP surfaces null.
   check("request.ip", () => eq(request.ip, null));
-  check("request.unmaskedIp", () => eq(request.unmaskedIp(), null));
-
-  check("request.tag", () => {
-    eq(request.tag("k1", "v1"), undefined);
-    eq(request.tag("k1", "v2"), undefined);  // same key updates in place
-    throws(() => request.tag("k1"), /requires two string arguments/);
-    throws(() => request.tag("_x", "v"), /reserved/);
-    throws(() => request.tag("BadKey", "v"), /must match \[a-z0-9_\]/);
-    throws(() => request.tag("k2", ""), /value length/);
+  check("unmaskedIp()", () => {
+    eq(A.unmaskedIp(), null);
+    // Off `request` for good: a data shape carries no escalation.
+    eq(request.unmaskedIp, undefined);
   });
 
-  check("request.shredKey", () => {
+  check("tag()", () => {
+    eq(A.tag("k1", "v1"), undefined);
+    eq(A.tag("k1", "v2"), undefined);  // same key updates in place
+    throws(() => A.tag("k1"), /requires two string arguments/);
+    throws(() => A.tag("_x", "v"), /reserved/);
+    throws(() => A.tag("BadKey", "v"), /must match \[a-z0-9_\]/);
+    throws(() => A.tag("k2", ""), /value length/);
+    eq(request.tag, undefined);
+  });
+
+  check("shredKey()", () => {
+    // Off `request` for good (#849): a data shape carries no capability
+    // that replaces the activation's erasure identity.
+    eq(request.shredKey, undefined);
     // Scopes the activation to an opaque identity. Returns undefined and
     // re-scopes on a second call — an activation has exactly one identity.
-    eq(request.shredKey("u_7f3a9c"), undefined);
-    eq(request.shredKey("u_0e11bd"), undefined);
+    eq(A.shredKey("u_7f3a9c"), undefined);
+    eq(A.shredKey("u_0e11bd"), undefined);
     // The id's CONTENT is the tenant's business: the engine never learns
     // that an identity is a person, so anything printable is accepted.
-    eq(request.shredKey("customer@example.com"), undefined);
-    eq(request.shredKey("order:1234/line:7"), undefined);
-    throws(() => request.shredKey(), /requires a string argument/);
-    throws(() => request.shredKey(7), /requires a string argument/);
+    eq(A.shredKey("customer@example.com"), undefined);
+    eq(A.shredKey("order:1234/line:7"), undefined);
+    throws(() => A.shredKey(), /requires a string argument/);
+    throws(() => A.shredKey(7), /requires a string argument/);
     // Empty is refused rather than read as "no identity" — a handler that
     // computed one from a missing cookie meant to scope and got nothing,
     // and falling back to the tenant key would silently downgrade
     // erasure from per-identity to per-tenant.
-    throws(() => request.shredKey(""), /id length/);
-    throws(() => request.shredKey("u_1\n"), /control characters/);
-    throws(() => request.shredKey("x".repeat(129)), /id length/);
+    throws(() => A.shredKey(""), /id length/);
+    throws(() => A.shredKey("u_1\n"), /control characters/);
+    throws(() => A.shredKey("x".repeat(129)), /id length/);
   });
 
-  check("request.shredKey.destroy", () => {
+  check("shredKey.destroy", () => {
     // Erasure hangs off the scoping function: one concept, two verbs.
-    eq(typeof request.shredKey.destroy, "function");
+    eq(typeof A.shredKey.destroy, "function");
     // An identity this tenant never named has nothing to erase — not an
     // error, so a delete-account flow run twice does not fail the second
     // time.
-    eq(request.shredKey.destroy("never-named-identity"), undefined);
+    eq(A.shredKey.destroy("never-named-identity"), undefined);
     // Same identity rules as scoping.
-    throws(() => request.shredKey.destroy(), /requires a string argument/);
-    throws(() => request.shredKey.destroy(""), /id length/);
-    throws(() => request.shredKey.destroy("u\n"), /control characters/);
+    throws(() => A.shredKey.destroy(), /requires a string argument/);
+    throws(() => A.shredKey.destroy(""), /id length/);
+    throws(() => A.shredKey.destroy("u\n"), /control characters/);
     // The per-activation cap is a RULE, and lives with the other rules in
     // `rove-guards` (`checkShredDestroyCap`) where it is unit-tested. It
     // counts engine state this harness does not carry, so asserting it

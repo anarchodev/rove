@@ -7,9 +7,16 @@
 //! `tryHandleSystem` is the single entry point (called from `dispatchOnce`):
 //! CORS preflight, the Prometheus `metrics` render (`buildMetricsText`,
 //! re-exported from `root.zig`), raft snapshot bundling, the release POST
-//! (config-mirror), reset, and admin-kv. Every function takes
-//! `server`/`worker` as `anytype` — same structural-typing shape as the
-//! rest of the worker_*.zig family.
+//! (config-mirror), and reset. Every function takes `server`/`worker` as
+//! `anytype` — same structural-typing shape as the rest of the worker_*.zig
+//! family.
+//!
+//! Not every route here answers: a `Disposition.activation` says the route
+//! authenticated the caller and the WORK is an ordinary activation of baked
+//! code in a named tenant's scope (rove#717). `admin-kv` is the first —
+//! writing `__admin__`'s store through the dispatch path instead of a
+//! hand-rolled `TrackedTxn` is what gives the write a position in that
+//! tenant's activation order and a record in its log.
 
 const std = @import("std");
 const rove = @import("rove");
@@ -28,9 +35,36 @@ const worker_mod = @import("worker.zig");
 
 const RaftWait = worker_mod.RaftWait;
 
+/// What `tryHandleSystem` decided about a request.
+pub const Disposition = union(enum) {
+    /// Not a `/_system/*` path — the caller resolves it normally.
+    not_mine,
+    /// Answered here, including every refusal: the response is stamped and
+    /// the entity has moved to `response_in`.
+    answered,
+    /// Authorized, and the work is an ACTIVATION rather than a door
+    /// (rove#717). The caller dispatches `module` against `tenant` on the
+    /// ordinary handler path, so the write takes a position in that
+    /// tenant's own activation order and leaves a record — instead of the
+    /// door hand-rolling a `TrackedTxn` + propose + park of its own.
+    activation: ForcedActivation,
+};
+
+/// A `/_system/*` route that resolves to a baked module in a named tenant's
+/// scope. Both fields are static strings — a door names the module it means,
+/// so nothing here comes from the request.
+pub const ForcedActivation = struct {
+    /// The scope the activation runs in. Not derived from the Host: this
+    /// family authenticates the operator, and the door already knows which
+    /// tenant it is for.
+    tenant: []const u8,
+    /// Baked module path WITHOUT the `.mjs` suffix (the route's
+    /// `module_base` spelling); the bytecode key appends it.
+    module_base: []const u8,
+};
+
 /// `/_system/*` route handler — CORS preflight + `release` POST +
-/// admin-kv + raft-snapshot. Returns true iff the request matched and
-/// was finalized (response stamped + moved to `response_in`).
+/// admin-kv + raft-snapshot.
 pub fn tryHandleSystem(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -42,8 +76,8 @@ pub fn tryHandleSystem(
     path: []const u8,
     rh: h2.ReqHeaders,
     body: []const u8,
-) !bool {
-    if (!std.mem.startsWith(u8, path, "/_system/")) return false;
+) !Disposition {
+    if (!std.mem.startsWith(u8, path, "/_system/")) return .not_mine;
 
     // Every /_system/* response carries CORS headers when the worker
     // has an admin origin configured. Browsers enforce the origin
@@ -67,7 +101,7 @@ pub fn tryHandleSystem(
         } else {
             try respb.setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
         }
-        return true;
+        return .answered;
     }
 
     // Strip `?query=string` off the path before routing.
@@ -80,7 +114,7 @@ pub fn tryHandleSystem(
     // operator root bearer) and no CORS, so it short-circuits before the
     // admin-auth gate below. Disabled (404) when no move secret is set.
     if (try v2_move.tryHandleV2(server, allocator, worker, ent, sid, sess, method, sys_rest, path, rh, body)) {
-        return true;
+        return .answered;
     }
 
     // Liveness probe for load balancers / systemd-style supervisors.
@@ -91,7 +125,7 @@ pub fn tryHandleSystem(
     // arrives here if the listener is wedged.
     if (std.mem.eql(u8, sys_rest, "health")) {
         try respb.setSystemResponse(server, ent, sid, sess, 200, "ok\n", allocator, cors_origin, null);
-        return true;
+        return .answered;
     }
 
     // The engine publish door (`deploy`, `deploy/version`, `deploy/blob/…`).
@@ -102,7 +136,7 @@ pub fn tryHandleSystem(
     // cannot express "private"). That separation is also what keeps the
     // tenant-scoped deploy capability a verifier swap rather than a re-plumb.
     if (try deploy_door.tryHandleDeployDoor(server, allocator, worker, ent, sid, sess, method, sys_rest, rh, cors_origin)) {
-        return true;
+        return .answered;
     }
 
     // Per-endpoint auth. Most `/_system/*` endpoints require admin
@@ -122,7 +156,7 @@ pub fn tryHandleSystem(
         null;
 
     if (!try authorizeSystemRequest(server, allocator, worker, ent, sid, sess, rh, cors_origin, required_cap)) {
-        return true;
+        return .answered;
     }
 
     // Operator/bootstrap release endpoint. The `rewind` CLI's
@@ -135,7 +169,7 @@ pub fn tryHandleSystem(
     // `__admin__`'s deployed `publishRelease` RPC instead.
     if (std.mem.eql(u8, sys_rest, "release")) {
         try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
-        return true;
+        return .answered;
     }
 
     // Bootstrap + break-glass (`docs/architecture/cli-and-deploy.md` §4). Root-token
@@ -146,7 +180,7 @@ pub fn tryHandleSystem(
     // (content-addressed → same dep_id on re-run).
     if (std.mem.eql(u8, sys_rest, "reset")) {
         try handleReset(server, allocator, worker, ent, sid, sess, method, cors_origin);
-        return true;
+        return .answered;
     }
 
     // Leader-status probe used by smokes and the operator publish path
@@ -167,7 +201,7 @@ pub fn tryHandleSystem(
         } else {
             try respb.setSystemResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator, cors_origin, null);
         }
-        return true;
+        return .answered;
     }
 
     // Operator metrics in Prometheus text format. Surfaces the
@@ -180,7 +214,7 @@ pub fn tryHandleSystem(
     // = buf_count` once the right two numbers were paired in one line.
     if (std.mem.eql(u8, sys_rest, "metrics")) {
         try handleMetrics(server, allocator, worker, ent, sid, sess, cors_origin);
-        return true;
+        return .answered;
     }
 
     // Raft snapshot fetch — out-of-band catchup for far-behind
@@ -191,23 +225,38 @@ pub fn tryHandleSystem(
     //   /_system/raft-snapshot/{snap_id_hex}
     if (std.mem.startsWith(u8, sys_rest, "raft-snapshot/")) {
         try handleRaftSnapshot(server, allocator, worker, ent, sid, sess, method, sys_rest, cors_origin);
-        return true;
+        return .answered;
     }
 
     // Cluster-wide admin config push. The operator POSTs
     // `{"pairs":[{"key":"...","value":"..."},...]}` here (root bearer)
     // at platform bootstrap time so operator-supplied config lands in
     // `__admin__/app.db` via raft (envelope 0).
+    // Bootstrap kv seeding for `__admin__` (rove#717). NOT a door: the
+    // operator is authenticated above, and the write itself is an ordinary
+    // activation of baked code in `__admin__`'s own scope — so it takes a
+    // position in that tenant's activation order and leaves a record, which
+    // a hand-rolled `TrackedTxn` + propose never could.
+    //
+    // The tenant is `__admin__` because this route means `__admin__`, not
+    // because of the request's Host. Nothing about the target comes from the
+    // caller.
     if (std.mem.eql(u8, sys_rest, "admin-kv")) {
-        try handleAdminKv(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
-        return true;
+        if (!std.mem.eql(u8, method, "POST")) {
+            try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
+            return .answered;
+        }
+        return .{ .activation = .{
+            .tenant = tenant_mod.ADMIN_INSTANCE_ID,
+            .module_base = "__system/admin_kv_install",
+        } };
     }
 
     // No proxy subsystems live on the worker — the log, files, kv, and
     // tenant `/_system/*` routes are served by the standalone services
     // or the `__admin__` JS handler, not here.
     try respb.setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
-    return true;
+    return .answered;
 }
 
 /// Auth gate for `/_system/*` requests. Accepts either:
@@ -1171,145 +1220,6 @@ fn handleReset(
 }
 
 
-/// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes
-/// each pair into `__admin__/app.db` via a raft-replicated envelope
-/// 0 writeset, so every node sees the same admin config. The operator
-/// runs this at platform-bootstrap time to ship config (resend_key,
-/// platform_email_from, ...) without a per-node flag.
-///
-/// Idempotent: re-posting the same pairs re-stamps the kv rows, so
-/// re-running the seeding script with unchanged values is a no-op.
-fn handleAdminKv(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    method: []const u8,
-    body: []const u8,
-    cors_origin: ?[]const u8,
-) !void {
-    if (!std.mem.eql(u8, method, "POST")) {
-        try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
-        return;
-    }
-
-    const Pair = struct { key: []const u8, value: []const u8 };
-    var parsed = std.json.parseFromSlice(struct {
-        pairs: []const Pair,
-    }, allocator, body, .{ .ignore_unknown_fields = true }) catch {
-        try respb.setSystemResponse(server, ent, sid, sess, 400, "expected {\"pairs\":[{\"key\":\"...\",\"value\":\"...\"},...]}\n", allocator, cors_origin, null);
-        return;
-    };
-    defer parsed.deinit();
-
-    if (parsed.value.pairs.len == 0) {
-        try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
-        return;
-    }
-
-    const admin_inst_opt = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
-    const admin_inst = admin_inst_opt orelse {
-        try respb.setSystemResponse(server, ent, sid, sess, 503, "__admin__ tenant not initialized\n", allocator, cors_origin, null);
-        return;
-    };
-
-    var txn = admin_inst.kv.beginTrackedImmediate() catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "admin-kv txn open failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    for (parsed.value.pairs) |p| {
-        if (p.key.len == 0) {
-            txn.rollback() catch {};
-            try respb.setSystemResponse(server, ent, sid, sess, 400, "empty key\n", allocator, cors_origin, null);
-            return;
-        }
-        if (std.mem.indexOfScalar(u8, p.key, 0) != null or
-            std.mem.indexOfScalar(u8, p.value, 0) != null)
-        {
-            txn.rollback() catch {};
-            try respb.setSystemResponse(server, ent, sid, sess, 400, "key/value contains NUL\n", allocator, cors_origin, null);
-            return;
-        }
-        txn.put(p.key, p.value) catch |err| {
-            txn.rollback() catch {};
-            const msg = try std.fmt.allocPrint(allocator, "admin-kv put failed: {s}\n", .{@errorName(err)});
-            try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-            return;
-        };
-        ws.addPut(p.key, p.value) catch |err| {
-            txn.rollback() catch {};
-            const msg = try std.fmt.allocPrint(allocator, "admin-kv writeset failed: {s}\n", .{@errorName(err)});
-            try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-            return;
-        };
-    }
-    txn.commit() catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "admin-kv commit failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-
-    // Propose envelope-0 and PARK the request on raft commit — the
-    // 204 must not be released at accept (the caller proceeds
-    // assuming the bootstrap kv is durable; a pre-quorum fault would
-    // leave it acting on a write the cluster rolled back). Mirrors the Class-B-correct release handler above:
-    // drainRaftPending delivers the staged 204 at committedSeq>=seq
-    // / 503 on fault/timeout. The idiom-2 park-on-commit rule
-    // (`docs/architecture/consensus-robustness.md`; effect gating in
-    // `docs/architecture/effects-and-handlers.md`).
-    // System endpoint with no dispatched-handler readset; empty
-    // rs_bytes is the right value here.
-    const seq = (raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID, "") catch |err| {
-        // Synchronous propose failure (queue full / shutting down /
-        // not leader). The local write was a kvexp *speculative*
-        // commit (volatile — LMDB only at raft-apply); a propose
-        // that never reached raft leaves nothing durable to undo
-        // (kvexp has no kv_undo table). NotLeader → 421 (re-aim,
-        // decisions.md §10.5c); anything else → 503 without parking;
-        // the proposer invariant (kvexp volatility;
-        // `docs/architecture/consensus-robustness.md`).
-        const status: u16 = if (err == error.NotLeader) 421 else 503;
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            "admin-kv propose failed: {s}\n",
-            .{@errorName(err)},
-        );
-        try respb.setSystemResponseOwned(server, ent, sid, sess, status, msg, allocator, cors_origin, null);
-        return;
-    }).seq;
-
-    try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
-    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-    const group_id = worker.raft.gidForTenant(tenant_mod.ADMIN_INSTANCE_ID) orelse 0;
-    try server.reg.set(ent, server.coll(.request_out), RaftWait, .{
-        .group_id = group_id,
-        .seq = seq,
-        .deadline_ns = deadline_ns,
-    });
-    // Admin kv-write is always terminal — response sibling.
-    try server.reg.move(ent, server.coll(.request_out), worker.raft_pending_response);
-    // Emit Cmd.respond on a
-    // parked_unit so the commit-arm move routes through `interpretCmd
-    // .respond` (matching every other entity park path). Pass empty
-    // writeset — admin-kv's actual writes ride on the entity's own
-    // txn in pending_txns; the parked_unit here is move-routing-only.
-    var admin_cmds: effect_mod.cmd.BufferedCmds = .{};
-    admin_cmds.items.append(allocator, .{ .respond = .{
-        .entity = ent,
-        .source = .raft_pending_response,
-        .dest = .response_in,
-    } }) catch {};
-    const empty_ws = kv_mod.WriteSet.init(allocator);
-    var ws_local = empty_ws;
-    defer ws_local.deinit();
-    worker_mod.parkKvWakes(worker, seq, tenant_mod.ADMIN_INSTANCE_ID, &ws_local, admin_cmds) catch |perr|
-        std.log.warn("admin-kv: parkKvWakes failed: {s}", .{@errorName(perr)});
-}
 
 test "release-history key is pure digits (no sign) — regression for the i64 `+` bug" {
     // Mirrors the key construction in `handleRelease` (and the

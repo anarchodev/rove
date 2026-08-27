@@ -143,7 +143,16 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// entry width, new byte value, so the bump exists to make a stale reader
 /// reject loudly rather than misread an elided read as an ordinary one (the
 /// same posture as the v6 → v7 `refused` bump).
-pub const VERSION: u16 = 9;
+/// v9 → v10: the kv channel's storage-modeling keys (get entries; prefix
+/// requests, cursors, and rows) are STORE-spelled — they carry the user key
+/// root, exactly as the store and the writeset hold them — so a replay
+/// overlay is fed verbatim instead of every feed restating the root.
+/// Refusal entries (`refused`) stay NAMED: a refusal is a verdict on what
+/// the handler named, judged before the key resolves. No width or layout
+/// change; the bump exists because a v9 tape's named keys read against a
+/// v10 store-spelled overlay miss on every row — a silent all-miss dressed
+/// as a divergence, which is exactly what a version guard is for.
+pub const VERSION: u16 = 10;
 
 /// Wire width of a `BodyRef`: stamp(8) + digest(16) + offset(4) + len(4).
 /// Lockstep-asserted against the offline decoder above.
@@ -257,7 +266,7 @@ pub const Channel = enum(u16) {
     /// `request.body` was touched (its absence is what licenses
     /// eliding the trigger_payload body reference), and
     /// `ip_masked` / `ip_raw` for `request.ip` /
-    /// `request.unmaskedIp()`. Replay reading anything NOT recorded
+    /// `unmaskedIp()`. Replay reading anything NOT recorded
     /// here is a divergence error, never a silent undefined.
     request_reads = 4,
     /// What the activation itself was: the export it dispatched to, and
@@ -390,7 +399,7 @@ pub const RequestReadKind = enum(u8) {
     /// First `request.ip` access. `name = ""`; `value` = the masked
     /// client IP returned (empty value ⇒ null was returned).
     ip_masked = 3,
-    /// First `request.unmaskedIp()` call — the deliberate, taped
+    /// First `unmaskedIp()` call — the deliberate, taped
     /// raw-IP escalation. `name = ""`; `value` = the unmasked IP
     /// returned (empty value ⇒ null was returned).
     ip_raw = 4,

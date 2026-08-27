@@ -45,7 +45,7 @@ GROUPS = [
      "`receive` → `write` → `seal` upload session for large inbound "
      "bodies); `segments` is the append-log recipe on top of both — a "
      "hot kv tail whose history is sealed into blobs.",
-     ["kv", "blob", "segments"]),
+     ["kv", "config", "blob", "segments"]),
     ("Connection & wakes",
      "The held socket. `stream` pushes response bytes out over time; "
      "`after.*` arms one-shot wakes; `next()` keeps the connection "

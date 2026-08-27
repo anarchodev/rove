@@ -658,11 +658,11 @@ const activitypub = {
    */
   fromConfig(arg) {
     if (arg == null || typeof arg === "string") {
-      const path = arg ? "_config/activitypub/" + arg : "_config/activitypub";
-      const raw = kv.get(path);
+      const path = arg ? "activitypub/" + arg : "activitypub";
+      const raw = config.get(path);
       if (raw == null) {
         throw new Error(
-          "activitypub.fromConfig: config not found at " + path +
+          "activitypub.fromConfig: config not found at _config/" + path +
           ". Did you deploy the file?");
       }
       return new ActivityPubActor(JSON.parse(raw));

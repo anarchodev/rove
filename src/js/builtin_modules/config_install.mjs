@@ -22,7 +22,7 @@
 // That is what lets the deploy path split large configs across several of
 // these without any of them needing to be atomic.
 
-export default function () {
+export default function ({ __system }) {
     const msg = request.ctx || {};
     const pairs = msg.pairs;
     if (!Array.isArray(pairs) || pairs.length === 0) return { status: 200 };
@@ -34,8 +34,16 @@ export default function () {
         // so an identical write says nothing — and skipping keeps a re-run
         // from spending this activation's write budget, or a raft entry, on
         // work already done.
-        if (kv.get(p.key) === p.value) continue;
-        kv.set(p.key, p.value);
+        //
+        // `__system.rootKv` — the storage-rooted kv this baked activation
+        // RECEIVES (package-isolation.md, the received-not-ambient model) —
+        // not `kv.*`: the pairs arrive PRE-SCOPED (`_config/{dep_id}/…`)
+        // and must land in the engine namespace the config door reads
+        // (`config.get` resolves against it) — through the rooted handler
+        // binding they would reroot into this tenant's own keyspace and
+        // every reader would miss.
+        if (__system.rootKv.get(p.key) === p.value) continue;
+        __system.rootKv.set(p.key, p.value);
         wrote += 1;
     }
     return { status: 200, body: { wrote: wrote, of: pairs.length } };

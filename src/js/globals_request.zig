@@ -136,7 +136,7 @@ pub fn installRequest(
     // and so are the IP transport headers (`x-forwarded-for`,
     // `x-real-ip`, `cf-connecting-ip`, `forwarded`): the client IP
     // is reachable ONLY via `request.ip` (masked) /
-    // `request.unmaskedIp()` (raw, the deliberate taped
+    // `unmaskedIp()` (the activation capability — raw, the deliberate taped
     // escalation). Duplicate header names: last value wins,
     // first-occurrence enumeration position. Assigning to
     // `request.headers.x` throws in module (strict) code — the
@@ -189,7 +189,6 @@ pub fn installRequest(
     installHeaders(ctx, state, req_obj, request.headers);
     definePropertyGetter(ctx, req_obj, "cookies", c.JS_NewCFunction2(ctx, @ptrCast(&jsCookiesGetter), "cookies", 0, c.JS_CFUNC_getter_magic, 0));
     definePropertyGetter(ctx, req_obj, "ip", c.JS_NewCFunction2(ctx, @ptrCast(&jsIpGetter), "ip", 0, c.JS_CFUNC_getter_magic, 0));
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "unmaskedIp", c.JS_NewCFunction2(ctx, jsUnmaskedIp, "unmaskedIp", 0, c.JS_CFUNC_generic, 0));
     // `request.rewind` — the reserved namespace for platform-provided
     // per-activation metadata (`docs/handler-shape.md`, the reserved-names
     // section). Installed only on a platform-bound handler, and carrying only
@@ -200,19 +199,6 @@ pub fn installRequest(
         const rewind_obj = c.JS_NewObject(ctx);
         definePropertyGetter(ctx, rewind_obj, "isRoot", c.JS_NewCFunction2(ctx, @ptrCast(&jsIsRootGetter), "isRoot", 0, c.JS_CFUNC_getter_magic, 0));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "rewind", rewind_obj);
-    }
-    // request.tag(key, value): attach a low-cardinality index tag to
-    // this request's log record (see `jsRequestTag`).
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
-    // Scopes this activation's writes to one opaque identity, so
-    // destroying that identity's key erases them wherever they landed.
-    {
-        // `destroy` hangs off the scoping function rather than taking a
-        // name of its own: one concept, two verbs, and a call site that
-        // reads as what it does.
-        const shred_fn = c.JS_NewCFunction2(ctx, jsRequestShredKey, "shredKey", 1, c.JS_CFUNC_generic, 0);
-        _ = c.JS_SetPropertyStr(ctx, shred_fn, "destroy", c.JS_NewCFunction2(ctx, jsShredKeyDestroy, "destroy", 1, c.JS_CFUNC_generic, 0));
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "shredKey", shred_fn);
     }
     // request.sagaId: the engine's per-saga id, stable across every
     // activation of one saga (a held connection's frames, a callback
@@ -734,9 +720,22 @@ pub fn installRequest(
     // handler destructuring `{ request, kv }` reads one of each.
     // `JS_GetPropertyStr` on the base `__rove` holder is a read, so it
     // allocates no per-request shadow.
+    //
+    // WHICH template is the grant decision, made once here, before any of
+    // the activation's code runs: a baked `__system/` module receives the
+    // system set, everything else the customer set. Per-activation is the
+    // right granularity for a grant exactly because it is the wrong one for
+    // a check — a package inside a customer handler is indistinguishable at
+    // call time, but the object is assembled before either exists
+    // (`docs/architecture/package-isolation.md`, the received-not-ambient
+    // model).
     const rove_holder = c.JS_GetPropertyStr(ctx, global, "__rove");
     defer c.JS_FreeValue(ctx, rove_holder);
-    const caps = c.JS_GetPropertyStr(ctx, rove_holder, "caps");
+    const caps = c.JS_GetPropertyStr(
+        ctx,
+        rove_holder,
+        if (state.is_system_module) "capsSystem" else "caps",
+    );
     defer c.JS_FreeValue(ctx, caps);
     const act = if (c.JS_IsObject(caps))
         c.JS_NewObjectProto(ctx, caps)
@@ -747,13 +746,28 @@ pub fn installRequest(
         c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, act, "request", c.JS_DupValue(ctx, req_obj));
     _ = c.JS_SetPropertyStr(ctx, act, "response", c.JS_DupValue(ctx, resp_obj));
-    // The three effects that hid on `request` (package-isolation.md §3.4).
-    // Same function objects, exposed under the activation as well — their
-    // natives resolve state from the context and ignore the receiver, so
-    // there is nothing to rebind. They stay on `request` through the
-    // transition and move for real at the cutover.
-    inline for (reserved.REQUEST_EFFECT_NAMES) |n| {
-        _ = c.JS_SetPropertyStr(ctx, act, n, c.JS_GetPropertyStr(ctx, req_obj, n));
+    // The three effects that HID on `request` (package-isolation.md §3.4)
+    // are capabilities on the activation object, and ONLY there — `request`
+    // is a data shape (#849). Per-activation own properties, never template
+    // members: a template that carried them would share one activation's
+    // binding with every other. Their names are `reserved.
+    // REQUEST_EFFECT_NAMES`, the list the offline engines build from.
+    //
+    // tag(key, value): attach a low-cardinality index tag to this
+    // activation's log record (see `jsRequestTag`).
+    _ = c.JS_SetPropertyStr(ctx, act, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
+    // unmaskedIp(): the deliberate, taped escalation past `request.ip`'s
+    // masking.
+    _ = c.JS_SetPropertyStr(ctx, act, "unmaskedIp", c.JS_NewCFunction2(ctx, jsUnmaskedIp, "unmaskedIp", 0, c.JS_CFUNC_generic, 0));
+    // shredKey(id): scope this activation's writes to one opaque identity,
+    // so destroying that identity's key erases them wherever they landed.
+    {
+        // `destroy` hangs off the scoping function rather than taking a
+        // name of its own: one concept, two verbs, and a call site that
+        // reads as what it does.
+        const shred_fn = c.JS_NewCFunction2(ctx, jsRequestShredKey, "shredKey", 1, c.JS_CFUNC_generic, 0);
+        _ = c.JS_SetPropertyStr(ctx, shred_fn, "destroy", c.JS_NewCFunction2(ctx, jsShredKeyDestroy, "destroy", 1, c.JS_CFUNC_generic, 0));
+        _ = c.JS_SetPropertyStr(ctx, act, "shredKey", shred_fn);
     }
     return act;
 }
@@ -1007,7 +1021,7 @@ fn jsCookiesGetter(
 /// zeroed; IPv6: /48 kept, rest zeroed), or null when no edge proxy
 /// reported one (or it didn't parse). Masked is the default surface:
 /// coarse geo / abuse heuristics work, and the tape stays clear of
-/// precise personal data. The raw IP is `request.unmaskedIp()`.
+/// precise personal data. The raw IP is the `unmaskedIp()` activation capability.
 fn jsIpGetter(
     ctx: ?*c.JSContext,
     this_val: c.JSValue,
@@ -1025,7 +1039,7 @@ fn jsIpGetter(
     return selfReplaceWithValue(ctx, this_val, "ip", val);
 }
 
-/// `request.unmaskedIp()` — the deliberate raw-IP escalation. A
+/// `unmaskedIp()` — the activation capability for the deliberate raw-IP escalation. A
 /// method, not a property: the call shape is the "do you need this?"
 /// friction, and the call is the taped, controller-responsibility
 /// moment (the raw IP lands on the replay tape). Returns null when
@@ -1183,7 +1197,7 @@ fn parseCookies(
     }
 }
 
-// ── request.tag(key, value) ─────────────────────────────────────────
+// ── tag(key, value) — the activation capability ─────────────────────
 //
 // Attach a low-cardinality index tag to this request's log record.
 // Indexed by the log-server so a later query can filter
@@ -1262,7 +1276,7 @@ pub const WorkerTag = struct {
                     // at the moment they are least able to notice.
                     _ = c.JS_ThrowInternalError(
                         self.ctx,
-                        "request.shredKey: could not bind this identity (%s)",
+                        "shredKey: could not bind this identity (%s)",
                         @errorName(err).ptr,
                     );
                     return false;
@@ -1295,7 +1309,7 @@ pub const WorkerTag = struct {
         ) catch |err| {
             _ = c.JS_ThrowInternalError(
                 self.ctx,
-                "request.shredKey.destroy: could not erase this identity (%s)",
+                "shredKey.destroy: could not erase this identity (%s)",
                 @errorName(err).ptr,
             );
             return false;
@@ -1324,7 +1338,7 @@ const jsRequestTag = binding.Tag(c, WorkerTag).jsRequestTag;
 const jsRequestShredKey = binding.ShredKey(c, WorkerTag).jsRequestShredKey;
 const jsShredKeyDestroy = binding.ShredKey(c, WorkerTag).jsShredKeyDestroy;
 
-test "the request.tag limits match the log record's own bounds" {
+test "the tag limits match the log record's own bounds" {
     // The limits are a CONTRACT and live in `rove-reserved`, where the offline
     // engines read them without importing the log stack. Their meaning — how
     // many tags a log record can carry — lives in `rove-log`. This binds the

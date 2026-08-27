@@ -396,7 +396,11 @@ discovered:
 | written bytes per activation | 400 KiB (keys + values + 9 bytes framing per write) | `writes_too_large` |
 
 All four throw at the call site with a `code` you can branch on, so a handler
-never discovers a limit as a failed request. The byte budget counts what each
+never discovers a limit as a failed request. A write to the **empty key** is
+refused the same way (`empty_key`): a handler that computed an empty name — a
+missing id, an unparsed field — meant to name a row and got nothing.
+`kv.get("")` is `null`, not an error — reads never throw, and the refusal
+guarantees no row ever exists under the empty name. The byte budget counts what each
 write puts on the entry rather than the string lengths alone, so a thousand
 tiny writes spend 9 KB of it on framing — stated here because a budget
 measured in anything but the bytes it protects is one the entry can still
@@ -427,6 +431,22 @@ Each hop commits its own writes and hands the cursor on, so the work completes
 without any one entry growing. The hops are separate transactions — write the
 loop so a repeat of the last hop is harmless (a cursor in `ctx`, idempotent
 keys), because that is what makes it resumable across a leader change.
+
+**Deploy-time config — `config.get`.** A JSON file deployed at
+`_config/<name>.json` is readable as `config.get("<name>")` — the file's
+bytes as a string (parse JSON yourself), or `null` if this deployment
+carries no such file. That is the whole surface, and it is the only one:
+config is not part of the kv keyspace, it cannot be written at runtime, and
+its values are scoped to the deployment the activation runs under — code
+and config switch atomically on release, including a rollback and a deploy
+that removes a file. The reads are recorded like kv reads, so replay and
+sim cover them; a sim world seeds them as ordinary `_config/<name>` rows.
+
+```js
+const raw = config.get("oauth/google");   // _config/oauth/google.json
+if (raw === null) { response.status = 500; return "missing config: oauth/google"; }
+const cfg = JSON.parse(raw);
+```
 
 ### 2.6 The rule, and why there are no scope flags
 
@@ -901,12 +921,14 @@ to **this handler's own tenant** — a customer can read only its own logs, neve
 another's (`decisions.md` §4.8/§4.10). By default it filters by the engine
 per-saga key (`request.sagaId`, auto-stamped on every activation of a
 saga as the reserved `_saga` tag), so no per-frame tagging is needed; pass
-`{session}` to filter by a `request.tag("session", …)` value instead (survives
+`{session}` to filter by a `tag("session", …)` value instead (survives
 reconnects).
 
-**User-defined index tags (`request.tag`).** Not browser-specific — any handler
-can attach low-cardinality index tags to its request's log record:
-`request.tag("flow", "checkout")`. The log query surface then filters
+**User-defined index tags (`tag`).** An activation capability — destructure it
+from the activation object (`({ tag }) => …`); it is not a `request` member,
+because `request` is a data shape and `tag` writes the durable record. Any
+handler can attach low-cardinality index tags to its request's log record:
+`tag("flow", "checkout")`. The log query surface then filters
 `?tag.flow=checkout` (and `/v1/{tenant}/session/{id}` is sugar for
 `tag.session`). Bounded + fail-loud: ≤4 tags/record, keys `[a-z0-9_]` (a leading
 `_` is reserved for engine tags like `_saga`), value ≤64 bytes — a violation
@@ -1049,10 +1071,13 @@ data-minimization story, see `decisions.md` §4.6):
   spoof-resistant) `x-forwarded-for` entry; `null` when no edge proxy
   reported one. Masked covers coarse geo and abuse heuristics without
   putting a precise IP on the tape.
-- `request.unmaskedIp()` returns the raw client IP. It is a *method*
+- `unmaskedIp()` — an activation capability (`({ unmaskedIp }) => …`, not a
+  `request` member) — returns the raw client IP. It is a *function*
   deliberately: calling it is your explicit decision, as the data
   controller, to process precise IPs — and the call puts the raw IP
-  on your replay tape, where your retention window applies.
+  on your replay tape, where your retention window applies. Being a
+  capability rather than request data means a handler chooses whether
+  anything it delegates to can escalate past the mask at all.
 
 On replay, reading anything the original run didn't read raises a
 loud `REPLAY DIVERGENCE` error rather than silently returning

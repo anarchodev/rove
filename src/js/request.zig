@@ -491,7 +491,7 @@ pub const Request = struct {
     admin: Admin = .{},
     /// Worker-supplied re-entry trampolines.
     trampolines: Trampolines = .{},
-    /// How `request.shredKey(id)` turns an identity into the slot whose
+    /// How `shredKey(id)` turns an identity into the slot whose
     /// key this activation's writes seal under. Null off the worker —
     /// the offline engines have no key material, and the surface still
     /// validates and records the identity there.
@@ -535,7 +535,7 @@ pub const Response = struct {
     /// `content-type: application/json` when true. Suppressed when the
     /// handler set a content-type via `response.headers`.
     body_is_json: bool = false,
-    /// User-defined index tags set via `request.tag(k,v)` during this
+    /// User-defined index tags set via `tag(k,v)` during this
     /// activation (≤`MAX_TAGS`; the record may add ≤`MAX_ENGINE_TAGS`
     /// engine tags like `_parent` downstream). Owned slice + owned
     /// key/value; `deinit`

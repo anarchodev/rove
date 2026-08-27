@@ -4,7 +4,7 @@
 //! shared by the worker's request installer (`globals.zig`) and the sim's
 //! world build (`src/replay/root.zig`, which derives the masked channel
 //! from an authored ip so the two surfaces can't drift). `request.ip` is
-//! the masked form; `request.unmaskedIp()` is the deliberate raw
+//! the masked form; `unmaskedIp()` is the deliberate raw
 //! escalation (see `globals.zig` for the GDPR rationale).
 
 const std = @import("std");

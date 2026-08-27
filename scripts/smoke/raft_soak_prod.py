@@ -55,7 +55,7 @@ export function handler() {
         kv.set(b.key, b.value);
         response.status = 204; return "";
     }
-    const k = request.query?.key ?? "";
+    const k = new URLSearchParams(request.query || "").get("key") ?? "";
     return "value:" + (kv.get(k) ?? "none");
 }
 """
@@ -141,7 +141,19 @@ def main() -> int:
             check("deploy", False, str(e)); return 1
         c.wait_for_handler(TENANT, "/?fn=handler&key=warm", want_body="value:none")
         write_batch(c, 10)
-        cs = confstate(c, c.leader_node(TENANT))
+        # Provision under the reconciler births the group as the SOLE voter and
+        # GROWS it learner-first (genesis §2d), one membership change per
+        # reconcile pass — full formation takes several passes. Wait for it:
+        # asserting immediately is a race, and starting the kill/wipe rounds
+        # against a mid-grow group wedges it (a wiped voter of a 2-voter
+        # config leaves no quorum to commit the heal's conf-changes).
+        deadline = time.time() + 60
+        cs = None
+        while time.time() < deadline:
+            cs = confstate(c, c.leader_node(TENANT))
+            if cs is not None and len(cs.get("voters", [])) == 3:
+                break
+            time.sleep(1)
         check("3 voters at start", cs is not None and len(cs.get("voters", [])) == 3, f"cs={cs}")
 
         for r in range(ROUNDS):

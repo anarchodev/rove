@@ -40,7 +40,7 @@ export default function () {
       else {
         out.push(label + "." + k);
         // A FUNCTION carrying its own methods is public surface too
-        // (`request.shredKey.destroy`). Without this the sub-verb is
+        // (`shredKey.destroy`). Without this the sub-verb is
         // invisible to the inventory, so removing one would go unnoticed
         // — the exact drift this gate exists to catch.
         if (typeof v === "function") {
@@ -83,6 +83,7 @@ export default function () {
 
   const SHIM_ROOTS = {
     kv: () => addObj("kv", kv),
+    config: () => addObj("config", config),
     console: () => addObj("console", console),
     crypto: () => addObj("crypto", crypto),
     http: () => addObj("http", http),
@@ -121,6 +122,16 @@ export default function () {
   // The per-activation Zig-built surfaces.
   addObj("request", request);
   addObj("response", response);
+
+  // The request-sourced effect capabilities — per-activation own
+  // properties of the activation object (#849), not request members and
+  // not template members. Reflected from the object this activation
+  // received, so a capability that silently fell off the assembly fails
+  // the inventory rather than vanishing from it.
+  const __act = arguments[0] || {};
+  addCallable("tag", __act.tag);
+  addCallable("unmaskedIp", __act.unmaskedIp);
+  addCallable("shredKey", __act.shredKey);
 
   return JSON.stringify({ names: out, errors: errors });
 }

@@ -88,7 +88,6 @@ pub fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
 /// Re-export so callers reading worker.zig find the trigger guard
 /// without leaving the file. See `reserved.zig` for the prefix list
 /// and the customer-write guard counterpart.
-const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 
 /// Parse a `_subscriptions/<name>/<file>` deployment path into its
 /// name + file-kind. Mirror of `triggerPathToPrefix`:
@@ -575,6 +574,24 @@ pub const TenantSlot = struct {
     /// Atomic pointer to the current snapshot. Null until first load.
     current: std.atomic.Value(?*TenantFilesSnapshot),
 
+    /// The EMPTY snapshot a baked `__system/*` activation runs against when
+    /// this tenant has no deployment (rove#843). Lazily built on first need,
+    /// held for the slot's lifetime, released at teardown.
+    ///
+    /// Why it exists: a baked module's code comes from
+    /// `node.builtin_modules`, not from any deployment, so the six fields
+    /// `runResume` reads off a snapshot are all correctly EMPTY for it —
+    /// no bytecodes, no source hashes, no package resolver (the loader then
+    /// resolves as if no packages were declared), no triggers, no
+    /// subscriptions. Without this the dispatch path's `pinCurrent() orelse
+    /// 503` refuses the tenant before the module can run, which is why
+    /// `/_system/admin-kv` had to hand-roll its own write path to work at
+    /// bootstrap at all.
+    ///
+    /// `deployment_id` is 0 — read as "baked", not as "missing". Nothing
+    /// resolves 0 against a manifest: baked code resolves from the binary.
+    baked_snap: std.atomic.Value(?*TenantFilesSnapshot) = .init(null),
+
     /// This tenant's key state: the keyring, the slot pool, whether this
     /// node can vouch for what it holds, and the destroys it still owes.
     ///
@@ -686,6 +703,60 @@ pub const TenantSlot = struct {
         self.pin_lock.lock();
         defer self.pin_lock.unlock();
         const snap = self.current.load(.acquire) orelse return null;
+        snap.retain();
+        return snap;
+    }
+
+    /// Pin a snapshot for running a BAKED `__system/*` module (rove#843).
+    ///
+    /// Prefers the real deployment when there is one, so a released tenant's
+    /// platform activation still stamps its true `deployment_id` in the
+    /// record and still sees its own resolver. Falls back to the slot's
+    /// empty snapshot only when the tenant has never been released — the
+    /// bootstrap case, and the one Decided §3 of rove#691 says must work
+    /// ("a tenant with no deployment can still have activations").
+    ///
+    /// Caller MUST `release()` exactly as with `pinCurrent`.
+    ///
+    /// Deliberately NOT a fallback inside `pinCurrent`: an ordinary
+    /// route-resolved request on a deploymentless tenant must keep 503-ing.
+    /// Silently running something else would turn "not deployed" into "ran
+    /// the wrong thing", and only the caller knows the module is baked.
+    pub fn pinForBaked(self: *TenantSlot) error{OutOfMemory, NoBytecodeCache}!*TenantFilesSnapshot {
+        if (self.pinCurrent()) |snap| return snap;
+
+        self.pin_lock.lock();
+        defer self.pin_lock.unlock();
+        // Re-check under the lock: a deployment may have landed, and a
+        // concurrent caller may have built the empty one already.
+        if (self.current.load(.acquire)) |snap| {
+            snap.retain();
+            return snap;
+        }
+        if (self.baked_snap.load(.acquire)) |snap| {
+            snap.retain();
+            return snap;
+        }
+
+        const cache = self.bytecode_cache orelse return error.NoBytecodeCache;
+        const snap = try self.allocator.create(TenantFilesSnapshot);
+        snap.* = .{
+            .allocator = self.allocator,
+            .cache = cache,
+            .deployment_id = 0,
+            .bytecodes = .empty,
+            .source_hashes = .empty,
+            .resolver = null,
+            .statics = .empty,
+            .statics_by_hash = .empty,
+            .triggers = &.{},
+            .subscriptions = &.{},
+            .manifest_bytes = &.{},
+            // 1 = the slot's own reference (released in `freeTenantSlot`),
+            // exactly as a loaded snapshot starts.
+            .refcount = .init(1),
+        };
+        self.baked_snap.store(snap, .release);
         snap.retain();
         return snap;
     }
@@ -1178,6 +1249,11 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
         slot.current.store(null, .release);
         snap.release();
     }
+    // Same for the empty baked snapshot, when one was ever needed.
+    if (slot.baked_snap.load(.acquire)) |snap| {
+        slot.baked_snap.store(null, .release);
+        snap.release();
+    }
     // Free the current + all retired plan limits (no readers remain at
     // teardown). See `TenantSlot.plan_retired`.
     if (slot.plan.load(.acquire)) |p| allocator.destroy(p);
@@ -1453,14 +1529,11 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_
                 // convention (`_triggers/<.../>index.{mjs,js}`), index
                 // it in the trigger registry. The bytecode lookup at
                 // fire time uses the same path key in `bytecodes`.
+                // No collision check: a trigger prefix names a key in the
+                // tenant's own rooted keyspace, and a platform namespace is not
+                // reachable from inside it. The whole leading-`_` range is the
+                // customer's to register.
                 if (triggerPathToPrefix(entry.path)) |derived_prefix| {
-                    if (isReservedTriggerPrefix(derived_prefix)) {
-                        std.log.warn(
-                            "rove-js: tenant {s} trigger {s} rejected — prefix '{s}' overlaps a platform namespace",
-                            .{ slot.instance_id, entry.path, derived_prefix },
-                        );
-                        return error.ReservedTriggerPrefix;
-                    }
                     const prefix_copy = try allocator.dupe(u8, derived_prefix);
                     errdefer allocator.free(prefix_copy);
                     const module_copy = try allocator.dupe(u8, entry.path);
@@ -1616,6 +1689,4 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64, detail: ?*deployment_loader_
         "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s), {d} trigger(s), {d} subscription(s))",
         .{ slot.instance_id, manifest.id, new_snap.bytecodes.count(), new_snap.statics.count(), new_snap.triggers.len, new_snap.subscriptions.len },
     );
-
 }
-

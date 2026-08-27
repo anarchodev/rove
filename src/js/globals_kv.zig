@@ -86,15 +86,17 @@ fn foldDelete(state: *DispatchState, key: []const u8) void {
 /// rows, read-your-writes included — the digest is a behaviour log, and the
 /// scan the handler observed contains them. Best-effort like the other folds:
 /// an accumulator OOM skips the fold rather than failing the read.
-fn foldPrefix(state: *DispatchState, prefix: []const u8, entries: anytype) void {
+fn foldPrefix(state: *DispatchState, req: binding.Scan, entries: anytype) void {
     if (state.readset) |rs| {
         var acc: std.ArrayList(u8) = .empty;
         defer acc.deinit(state.allocator);
         for (entries) |e| {
-            acc.writer(state.allocator).print("{s}={x};", .{ e.key, digest_mod.foldValue(e.value) }) catch return;
+            // Row keys fold in the spelling the handler saw — the digest is a
+            // behaviour log, and the behaviour is over visible keys.
+            acc.writer(state.allocator).print("{s}={x};", .{ req.visible(e.key), digest_mod.foldValue(e.value) }) catch return;
         }
         var d = digestOf(rs);
-        d.kvPrefix(prefix, true, entries.len, digest_mod.foldValue(acc.items));
+        d.kvPrefix(req.prefix.named, true, entries.len, digest_mod.foldValue(acc.items));
         rs.interaction_digest = d.h;
     }
 }
@@ -201,6 +203,13 @@ pub const WorkerKv = struct {
     /// re-deciding — an old tape stays faithful to the rules that were live
     /// when it was cut. Refusals fold NOTHING into the digest (a refused
     /// write never happened), which is already true in every engine.
+    ///
+    /// Keyed by the NAMED spelling — the one exception to the tape's
+    /// store-spelled keys, and a principled one: a refusal is a verdict on
+    /// what the handler NAMED, judged and replayed BEFORE the key resolves
+    /// (a key the guards refuse as over-long has no resolved spelling at
+    /// all). It models no stored row and feeds no overlay; its only consumer
+    /// is `tapedRefusal`, which the binding consults with the named key.
     pub fn recordRefusal(self: WorkerKv, op: binding.WriteOp, key: []const u8, refusal: guards.Refusal) void {
         const state = self.state;
         if (state.readset) |rs| {
@@ -220,8 +229,16 @@ pub const WorkerKv = struct {
     /// information, so only those make it onto the tape. Saves tape size +
     /// S3 bytes per request without losing replay determinism. The digest
     /// folds them regardless (see the fold header above).
-    pub fn get(self: WorkerKv, key: []const u8) binding.GetResult {
+    pub fn get(self: WorkerKv, k: binding.Key) binding.GetResult {
         const state = self.state;
+        // Storage, the writeset, and the TAPE take the resolved key — the
+        // tape's read entries are the store's stand-in during replay, and an
+        // overlay fed from them must be keyed the way the store is (a
+        // named-keyed tape forces every feed to restate the root, which is
+        // the writer/reader prefix-depth split). Only the digest and the
+        // matching surfaces take the one the handler named; a RENDERED tape
+        // key is stripped at the presentation seam (`reserved.userNamedKey`).
+        const key = k.stored;
         // Since `ws_base`, not the whole writeset: the writeset is shared by
         // the batch, and a key an earlier activation in the batch wrote is a
         // foreign read for this one — it must be taped or this record's
@@ -230,15 +247,15 @@ pub const WorkerKv = struct {
 
         const value = state.kv.get(key) catch |err| switch (err) {
             error.NotFound => {
-                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key, "", .not_found) catch {};
-                foldRead(state, key, false, "");
+                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.stored, "", .not_found) catch {};
+                foldRead(state, k.named, false, "");
                 return .absent;
             },
             else => {
                 // A read never throws in prod: the storage error parks on the
                 // dispatch state and the handler sees absent.
                 state.pending_kv_error = err;
-                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key, "", .err) catch {};
+                if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.stored, "", .err) catch {};
                 return .absent;
             },
         };
@@ -247,7 +264,7 @@ pub const WorkerKv = struct {
         // whole scheme: if the value were opened before this, the tape
         // would hold plaintext and destroying the key would erase
         // everything except the copy replay keeps.
-        if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key, value, .ok) catch {};
+        if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, k.stored, value, .ok) catch {};
 
         // Then open it, and fold + return the PLAINTEXT. The digest must
         // be over the same bytes in every engine, and the offline engines
@@ -255,7 +272,7 @@ pub const WorkerKv = struct {
         // key distribution), so folding ciphertext here would diverge
         // from them on every sealed read.
         const opened = openStored(state, key, value) orelse return .absent;
-        foldRead(state, key, true, opened);
+        foldRead(state, k.named, true, opened);
         return .{ .value = opened };
     }
 
@@ -325,13 +342,18 @@ pub const WorkerKv = struct {
     /// (`docs/architecture/effects-and-handlers.md`): replay re-runs the
     /// handler and re-issues the write against its writeset overlay, so
     /// nothing about a write is taped — only folded.
-    pub fn put(self: WorkerKv, ctx: ?*c.JSContext, key: []const u8, value: []const u8) bool {
+    pub fn put(self: WorkerKv, ctx: ?*c.JSContext, k: binding.Key, value: []const u8) bool {
         const state = self.state;
+        // Storage and the writeset take the resolved key (the writeset rides
+        // the raft entry). Triggers, subscriptions and the digest take the
+        // named one: a trigger registered at `orders/` fires for
+        // `kv.set("orders/1")` whatever root the row lands under.
+        const key = k.stored;
 
         // Fast path: no triggers match → write directly, no savepoint, no
         // previousValue lookup, no chain machinery — no added cost over a
         // plain write.
-        if (!td.anyTriggerMatches(state, key)) {
+        if (!td.anyTriggerMatches(state, k.named)) {
             state.txn.put(key, value) catch |err| {
                 state.pending_kv_error = err;
                 return true;
@@ -339,8 +361,8 @@ pub const WorkerKv = struct {
             state.writeset.addPut(key, value) catch |err| {
                 state.pending_kv_error = err;
             };
-            foldWrite(state, key, value);
-            markSubscriptionsDirty(state, key);
+            foldWrite(state, k.named, value);
+            markSubscriptionsDirty(state, k.named);
             return true;
         }
 
@@ -373,7 +395,7 @@ pub const WorkerKv = struct {
         var cur_owned: ?[]u8 = null;
         defer if (cur_owned) |o| state.allocator.free(o);
         var cur_value: ?[]const u8 = value;
-        if (td.runBeforeChain(state, ctx, key, .put, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
+        if (td.runBeforeChain(state, ctx, k.named, .put, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
             td.rollbackInnerSavepoint(state);
             _ = td.rethrowAsTriggerRejected(state, ctx, trigger_path);
             return false;
@@ -389,10 +411,10 @@ pub const WorkerKv = struct {
         state.writeset.addPut(key, write_value) catch |err| {
             state.pending_kv_error = err;
         };
-        foldWrite(state, key, write_value);
-        markSubscriptionsDirty(state, key);
+        foldWrite(state, k.named, write_value);
+        markSubscriptionsDirty(state, k.named);
 
-        if (td.runAfterChain(state, ctx, key, .put, write_value, prev_owned)) |trigger_path| {
+        if (td.runAfterChain(state, ctx, k.named, .put, write_value, prev_owned)) |trigger_path| {
             td.rollbackInnerSavepoint(state);
             _ = td.rethrowAsTriggerRejected(state, ctx, trigger_path);
             return false;
@@ -404,14 +426,15 @@ pub const WorkerKv = struct {
         return true;
     }
 
-    pub fn del(self: WorkerKv, ctx: ?*c.JSContext, key: []const u8) bool {
+    pub fn del(self: WorkerKv, ctx: ?*c.JSContext, k: binding.Key) bool {
         const state = self.state;
+        const key = k.stored;
 
         // Fast path mirrors put — no triggers means no savepoint, no
         // previousValue lookup, no chain machinery. kv.delete (like kv.set)
         // is an OUTPUT and isn't taped — replay re-runs the handler against
         // its overlay.
-        if (!td.anyTriggerMatches(state, key)) {
+        if (!td.anyTriggerMatches(state, k.named)) {
             state.txn.delete(key) catch |err| {
                 state.pending_kv_error = err;
                 return true;
@@ -419,8 +442,8 @@ pub const WorkerKv = struct {
             state.writeset.addDelete(key) catch |err| {
                 state.pending_kv_error = err;
             };
-            foldDelete(state, key);
-            markSubscriptionsDirty(state, key);
+            foldDelete(state, k.named);
+            markSubscriptionsDirty(state, k.named);
             return true;
         }
 
@@ -447,7 +470,7 @@ pub const WorkerKv = struct {
         var cur_owned: ?[]u8 = null;
         defer if (cur_owned) |o| state.allocator.free(o);
         var cur_value: ?[]const u8 = null;
-        if (td.runBeforeChain(state, ctx, key, .delete, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
+        if (td.runBeforeChain(state, ctx, k.named, .delete, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
             td.rollbackInnerSavepoint(state);
             _ = td.rethrowAsTriggerRejected(state, ctx, trigger_path);
             return false;
@@ -461,10 +484,10 @@ pub const WorkerKv = struct {
         state.writeset.addDelete(key) catch |err| {
             state.pending_kv_error = err;
         };
-        foldDelete(state, key);
-        markSubscriptionsDirty(state, key);
+        foldDelete(state, k.named);
+        markSubscriptionsDirty(state, k.named);
 
-        if (td.runAfterChain(state, ctx, key, .delete, null, prev_owned)) |trigger_path| {
+        if (td.runAfterChain(state, ctx, k.named, .delete, null, prev_owned)) |trigger_path| {
             td.rollbackInnerSavepoint(state);
             _ = td.rethrowAsTriggerRejected(state, ctx, trigger_path);
             return false;
@@ -501,15 +524,16 @@ pub const WorkerKv = struct {
     /// inputs (prefix/cursor/limit) AND the full result list, so the
     /// replay engines can reconstruct the same rows without reaching live
     /// KV state.
-    pub fn prefix(self: WorkerKv, prefix_bytes: []const u8, cursor: []const u8, limit: u32) ?Page {
+    pub fn prefix(self: WorkerKv, req: binding.Scan) ?Page {
         const state = self.state;
+        const limit = req.limit;
 
-        var scan = state.kv.prefix(prefix_bytes, cursor, limit) catch |err| {
+        var scan = state.kv.prefix(req.prefix.stored, req.cursor.stored, limit) catch |err| {
             state.pending_kv_error = err;
             // Capture the failure path too — replay needs to surface the
             // same null return, otherwise a defensive `if (page === null)`
             // branch in the handler would diverge.
-            if (state.readset) |rs| rs.kv.appendKvPrefix(prefix_bytes, cursor, limit, &.{}, .err) catch {};
+            if (state.readset) |rs| rs.kv.appendKvPrefix(req.prefix.stored, req.cursor.stored, limit, &.{}, .err) catch {};
             return null;
         };
 
@@ -535,11 +559,16 @@ pub const WorkerKv = struct {
             // refactored read of such a key can't be served a stale write value.
             var np: usize = 0;
             for (scan.entries) |e| {
+                // Row keys ride the tape as STORED — the same spelling the
+                // writeset and the store use, so the three agree and a replay
+                // overlay serves the rows verbatim. The handler-visible
+                // spelling is the binding's to produce (`visibleKey`), and
+                // the digest's rows-fold uses it; the tape does not.
                 if (state.writeset.containsKeySince(state.ws_base, e.key)) continue;
                 pairs[np] = .{ .key = e.key, .value = e.value };
                 np += 1;
             }
-            rs.kv.appendKvPrefix(prefix_bytes, cursor, limit, pairs[0..np], .ok) catch {};
+            rs.kv.appendKvPrefix(req.prefix.stored, req.cursor.stored, limit, pairs[0..np], .ok) catch {};
         }
 
         // Opened AFTER the tape, for the reason `get` states: the tape
@@ -582,7 +611,7 @@ pub const WorkerKv = struct {
         // sits outside `skip_tape`: the digest hashes the scan the handler
         // observed. The error path above folds nothing, matching `get`'s —
         // the offline engines have no storage-error path to agree with.
-        foldPrefix(state, prefix_bytes, scan.entries[0..live]);
+        foldPrefix(state, req, scan.entries[0..live]);
 
         return .{ .scan = scan, .entries = scan.entries[0..live] };
     }
@@ -590,8 +619,53 @@ pub const WorkerKv = struct {
 
 /// The worker's instantiation of the common binding — what globals.zig
 /// registers as `_system.kv.{get,set,delete,prefix}`.
-const B = binding.Kv(c, WorkerKv);
+const B = binding.Kv(c, WorkerKv, .user);
+
+/// The same binding rooted at storage — what a baked `__system/` module holds
+/// when it needs a row the tenant cannot name: the release pointer, the config
+/// mirror's deployment-scoped rows.
+///
+/// Reached as `__rove.rootKv*`, gated on `is_system_module`.
+///
+/// The end state is a GRANT, not a check: a baked activation is handed a
+/// `.raw`-rooted kv when its activation object is assembled, and a customer
+/// activation is simply never given one (`package-isolation.md`, not installing
+/// is the denial). Reaching that shape requires baked modules to receive their
+/// caps as a parameter rather than name them as globals, which is the corpus
+/// migration, not this change.
+///
+/// Until then this sits on the existing privileged-ops surface, whose whole
+/// contract is `is_system_module`-gated entries — and the flag is used at the
+/// one granularity it answers correctly, since a baked module IS the
+/// activation's entry when it holds this.
+fn rootKvGate(ctx: ?*c.JSContext) bool {
+    if (getState(ctx).is_system_module) return true;
+    _ = c.JS_ThrowTypeError(ctx, "__rove.rootKv is not available to handler code");
+    return false;
+}
+const BRaw = binding.Kv(c, WorkerKv, .raw);
+
+pub fn jsRootKvGet(ctx: ?*c.JSContext, this: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    if (!rootKvGate(ctx)) return globals_mod.js_exception;
+    return BRaw.jsKvGet(ctx, this, argc, argv);
+}
+pub fn jsRootKvSet(ctx: ?*c.JSContext, this: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    if (!rootKvGate(ctx)) return globals_mod.js_exception;
+    return BRaw.jsKvSet(ctx, this, argc, argv);
+}
+pub fn jsRootKvDelete(ctx: ?*c.JSContext, this: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    if (!rootKvGate(ctx)) return globals_mod.js_exception;
+    return BRaw.jsKvDelete(ctx, this, argc, argv);
+}
+pub fn jsRootKvPrefix(ctx: ?*c.JSContext, this: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+    if (!rootKvGate(ctx)) return globals_mod.js_exception;
+    return BRaw.jsKvPrefix(ctx, this, argc, argv);
+}
 pub const jsKvGet = B.jsKvGet;
 pub const jsKvSet = B.jsKvSet;
 pub const jsKvDelete = B.jsKvDelete;
 pub const jsKvPrefix = B.jsKvPrefix;
+/// The config door (rove#830) — root-independent by construction (it
+/// computes its own storage resolution), so either instantiation serves it;
+/// registered once from the handler-facing surface.
+pub const jsConfigGet = B.jsConfigGet;

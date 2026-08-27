@@ -126,6 +126,11 @@ LOG_SERVER = BIN_DIR / "rewind-logs"
 # REWIND_ROOT_TOKEN (src/rewind/main.zig). The harness exports this to
 # each worker (`REWIND_ROOT_TOKEN`) and uses it for admin-surface auth.
 ROOT_TOKEN = "smoke-nonprod-root-token-0123456789abcdef"
+# The root a handler's kv resolves under (`reserved.USER_KEY_ROOT`,
+# `src/reserved/root.zig`). Mirrored here because the raw `/_system/v2-kv` door
+# speaks storage's spelling and the harness mostly asks about handler rows.
+USER_KEY_ROOT = "_user/"
+
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 # Cluster KEK for per-tenant keyrings. Cluster-wide, never per-node —
 # see `_spawn_node`. A smoke value only; production reads it from the
@@ -1315,12 +1320,11 @@ class V2Cluster:
         handler and wants to read it back the same way.
 
         It deliberately does NOT use `/_system/v2-kv`. That endpoint belongs to
-        the tenant-MOVE protocol (`src/js/v2_move.zig`), where a seed has to
-        carry the STORE's spelling — including namespaces no handler can name —
-        and the two questions stop having the same answer the moment handler
-        keys resolve under a root. The harness borrowed it because nothing else
-        could read a tenant's kv; that borrowing cost 66 smokes when the answers
-        diverged (rove#870).
+        the tenant-MOVE protocol (`src/js/v2_move.zig`), where a seed carries
+        the STORE's spelling — including namespaces no handler can name. The
+        two doors answer different questions and only agree while there is one
+        keyspace; `node_kv_get` is the one to reach for when the assertion is
+        about storage.
 
         There is no `node` parameter, and that absence is the point: the front
         Host-routes to `__admin__`, so this door cannot answer "did it reach
@@ -1406,28 +1410,47 @@ class V2Cluster:
             attempt += 1
             _t.sleep(0.3)
 
-    # ── the STORE's view, per node ────────────────────────────────────────
+    # ── per-NODE access ───────────────────────────────────────────────────
     #
-    # `/_system/v2-kv` is the tenant-MOVE surface (`src/js/v2_move.zig`), and
-    # its spelling is storage's own — which is what a move must carry, and what
-    # a replication assertion is about. These wrappers exist so that question
-    # has a door of its own, distinct from `admin_kv_*`, which asks what a
-    # HANDLER of the tenant sees (rove#870).
+    # Two independent axes, and conflating them is a mistake worth not
+    # repeating:
     #
-    # Reach for these when the assertion names a node: "did the write reach the
-    # survivor", "has the follower caught up", "did the new voter converge".
-    # Reach for `admin_kv_*` when it does not.
+    #   WHICH NODE      `admin_kv_*` goes through the front, which Host-routes
+    #                   to `__admin__`; `node_kv_*` addresses one node directly
+    #                   through `/_system/v2-kv`.
+    #   WHICH KEYSPACE  a handler's keys resolve under `reserved.USER_KEY_ROOT`;
+    #                   engine and move-protocol keys do not.
+    #
+    # These are per-node and, by DEFAULT, in the handler's keyspace — because
+    # that is what the callers ask: "did the row the handler wrote reach the
+    # survivor / the follower / the new voter". Pass `raw=True` for the other
+    # question — the store's own spelling, which is what a move must carry and
+    # where `_config/` and the engine namespaces live.
+    #
+    # The default matters: a wrong one reads an empty keyspace silently, which
+    # is what "no such key" looks like from every caller.
 
-    def node_kv_get(self, tenant: str, key: str, *, node: int = 0) -> HttpResponse:
-        """Read a tenant KV key from ONE node's store, move-secret gated.
-        Served locally (no leader needed), so it answers "does this node hold
-        it" rather than "is it committed"."""
+    def node_kv_get(self, tenant: str, key: str, *, node: int = 0,
+                    raw: bool = False) -> HttpResponse:
+        """Read from ONE node's store, move-secret gated. Served locally (no
+        leader needed), so it answers "does this node hold it" rather than "is
+        it committed".
+
+        `key` is in the HANDLER's keyspace unless `raw=True`.
+
+        The key is interpolated RAW: `v2_move.zig`'s `queryParam` returns the
+        substring after `=` without percent-decoding, so an encoded key is
+        looked up encoded and misses. Keys containing `&` or `=` are therefore
+        unreachable through this door — pre-existing, and not worth encoding
+        one side of."""
+        k = key if raw else USER_KEY_ROOT + key
         return _curl(
-            f"{self.node_url(node)}/_system/v2-kv?tenant={tenant}&key={key}",
+            f"{self.node_url(node)}/_system/v2-kv?tenant={tenant}&key={k}",
             headers={"X-Rewind-Move-Secret": MOVE_SECRET})
 
     def node_kv_put(self, tenant: str, key: str, value: str, *,
-                    node: int = 0, retry_s: float = 0.0) -> HttpResponse:
+                    node: int = 0, retry_s: float = 0.0,
+                    raw: bool = False) -> HttpResponse:
         """Write through ONE node's leader propose→commit path (a follower
         421s / 503s). `retry_s > 0` rotates nodes through those refusals, which
         is what the failover smokes need while a leader is being re-elected."""
@@ -1441,19 +1464,23 @@ class V2Cluster:
                 f"{self.node_url(i)}/_system/v2-kv", method="PUT",
                 headers={"X-Rewind-Move-Secret": MOVE_SECRET,
                          "Content-Type": "application/json"},
-                data=json.dumps({"tenant": tenant, "key": key, "value": value}))
+                data=json.dumps({
+                    "tenant": tenant,
+                    "key": key if raw else USER_KEY_ROOT + key,
+                    "value": value}))
             if r.status not in (421, 503, 0) or _t.time() >= deadline:
                 return r
             attempt += 1
             _t.sleep(0.3)
 
     def node_kv_seed(self, tenant: str, key: str, value: str, *,
-                     node: int = 0, retry_s: float = 20.0) -> HttpResponse:
+                     node: int = 0, retry_s: float = 20.0,
+                     raw: bool = False) -> HttpResponse:
         """`node_kv_put` for a row something LATER depends on — retries the
         retryable refusals and RAISES if it never lands. Same argument as
         `admin_kv_seed`: a discarded 503 resurfaces far away as a wrong
         ANSWER."""
-        r = self.node_kv_put(tenant, key, value, node=node, retry_s=retry_s)
+        r = self.node_kv_put(tenant, key, value, node=node, retry_s=retry_s, raw=raw)
         if r.status not in (200, 204):
             raise RuntimeError(
                 f"seed {tenant}/{key} on node {node} refused after {retry_s}s: "
