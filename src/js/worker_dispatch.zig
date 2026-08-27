@@ -2624,6 +2624,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // arena and re-executed under GC) skip the doomed bump
             // attempt entirely.
             .arena_mode = if (worker_mod.isChurny(worker, scope_inst.id, dep_id, route.module_base)) .gc else .auto,
+            // From the DISPATCH DECISION, never the path: this arm of the
+            // inbound path runs a baked module only when the engine itself
+            // forced one (a `/_system/*` route resolving to an activation,
+            // or the static-stream fallback). Deriving it from
+            // `route.module_base` would let a URL spell its way into the
+            // grant — the confused-deputy shape rove#643 closed on the
+            // continuation path.
+            .is_system_module = forced_builtin != null or stream_static != null,
             .method = method,
             // `request.path` excludes the query string — the query lives
             // ONLY on `request.query` (handler-shape.md). Log records and

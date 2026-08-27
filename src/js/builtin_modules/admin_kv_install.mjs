@@ -18,6 +18,13 @@
 // chicken-and-egg the door existed to dodge. Baked code needs no deployment
 // (rove#843), which is what lets the door stop being one.
 //
+// Writes go through `__system.rootKv` — the storage-rooted grant a baked
+// activation receives (#848) — because this is an OPERATOR door seeding
+// storage as it lies: the retired door wrote raw spellings, its callers
+// verify through `/_system/v2-kv` (raw), and seeded rows like the operator
+// allowlist are engine-read raw. The handler-rooted `kv` would silently
+// re-file every seed under the user root and every reader would miss.
+//
 // Idempotent: re-posting the same pairs re-stamps the same bytes at the same
 // keys. Callers rely on that — the ops seeding scripts re-run unconditionally.
 
@@ -30,7 +37,7 @@ function answer(status, body) {
     return body;
 }
 
-export default function () {
+export default function ({ __system }) {
     if (request.method !== "POST") return answer(405, "POST only\n");
 
     let payload;
@@ -60,6 +67,6 @@ export default function () {
         }
     }
 
-    for (const p of pairs) kv.set(p.key, p.value);
+    for (const p of pairs) __system.rootKv.set(p.key, p.value);
     return answer(204, "");
 }
