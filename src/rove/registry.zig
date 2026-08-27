@@ -504,6 +504,13 @@ pub const Registry = struct {
     /// `sources` is a tuple of collection pointers (e.g., `.{ &a, &b, &c }`).
     /// Only generates recipes for the (src, dst) pairs in the tuple — not N².
     /// Returns error.WrongCollection if the entity isn't in any of them.
+    /// Single-membership registry: an entity's one membership IS its
+    /// only one, so the fat model's quiescing flavors (`moveOnly`,
+    /// `moveAnyOnly`) are the plain verbs here — aliased so layers
+    /// generic over the registry model spell the seam one way.
+    pub const moveOnly = move;
+    pub const moveAnyOnly = moveAny;
+
     pub inline fn moveAny(self: *Self, entity: Entity, sources: anytype, dst: anytype) !void {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;

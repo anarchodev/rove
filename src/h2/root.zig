@@ -979,7 +979,10 @@ pub fn H2(comptime opts: Options) type {
             // Already closing — done, not an error.
             if (h2.reg.isInCollection(entity, h2.io.coll(.conn_closing))) return true;
 
-            h2.reg.moveAny(entity, h2.liveConnColls(), h2.io.coll(.conn_closing)) catch |err| switch (err) {
+            // moveAnyOnly: ending a conn quiesces it — every state-axis
+            // membership an upper layer gave it drops with the move,
+            // unnamed here; identity memberships (all_conns) survive.
+            h2.reg.moveAnyOnly(entity, h2.liveConnColls(), h2.io.coll(.conn_closing)) catch |err| switch (err) {
                 // Already gone: nothing holds a slot, so the conn is ended.
                 error.Stale, error.InvalidEntity => return true,
                 // Mid-transition — record the request and pick it up next

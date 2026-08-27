@@ -136,8 +136,9 @@ Ship each step alone: (a) is pure annotation, (b) must be bit-identical
 for the single-axis case, (c) delivers the first real second axis, (d)
 comes last so only the constraints that survive 4a–4c get syntax.
 
-**SPIKE DONE (2026-08-26, `src/rove/axes_spike.zig` — dies when 4a–4d
-land):** the throttle test-world validates the mechanics end to end.
+**SPIKE DONE 2026-08-26, file DELETED 2026-08-27 with 4d's landing
+(all conclusions graduated):** the throttle test-world validated the
+mechanics end to end.
 Per-axis `(id, offset)` records give dense co-residency with zero
 copies; `axisOf(T)` comptime-resolves so the cross-axis getFat is ONE
 membership lookup; leave parks / re-enter restores (path-independence's
@@ -259,20 +260,46 @@ axis and per-axis offsets stay exact under swap-remove churn.
       exist. What stays distinct is verb availability derived from
       axis shape: total = create/move/evict, no leave; multi-state
       partial = enter/move/leave; one-state partial = enter/leave.
-- [ ] **4d. Cross-axis constraints ("entanglement") — the real design
-      work.** Two attachment points: edge-attached clauses (precise,
-      but every call site must repeat them — forgettable) vs
-      STATE-ATTACHED declarations on the collection (`on_enter_leaves =
-      .{ .throttle }`, `excludes = ...`) enforced on every entry however
-      reached — cannot be bypassed, and being destination-properties
-      they are exactly what an erased-source evict can honor. Lean
-      state-attached as default, edge-attached as override. Standing
-      example: "no send work once lifecycle ∈ conn_closing", today a
-      runtime skip-check in processWriteIn. Asserts remain for genuine
-      can't-happens — framework-owned check-and-abort surviving
-      ReleaseFast — which is where the lost Fd bypass-abort class
-      returns, firing at the transition where the story is tellable
-      rather than at destruction where it is archaeology.
+- [x] **4d. Cross-axis constraints — RESOLVED 2026-08-27 as VERBS,
+      not declarations.** Quiescing is something a system SAYS at the
+      transition: `moveOnly` / `moveAnyOnly` (deferred, like their
+      plain forms) and `evictOnly` (immediate, erased source) move to
+      dst and leave every other non-identity partial axis — the call
+      site names no axes, so a state axis added later is dropped at
+      existing quiesce sites unchanged, and the destroy backstop
+      (exit every axis) bounds a forgotten quiesce to stale
+      co-membership until retirement. The seams adopted it: io's
+      teardown sweep evicts with `evictOnly`, h2's `closeConn` funnel
+      moves with `moveAnyOnly` (the archetype Registry aliases the
+      Only verbs to the plain ones — single membership is trivially
+      "only"). IDENTITY axes are the exemption that makes the verb
+      correct: a set entry may declare `.identity = true` (all_conns
+      does — admission and the sweep count closing conns, and the
+      sweep iterates the member list it must not mutate); identity
+      says what the entity IS and ends only at leave/destroy. io's
+      birth ritual consolidated into `birthConn` (create + fd + peer +
+      identity join in one place; the connect promotion upholds the
+      same invariant).
+      **REJECTED: state-attached constraint declarations** on the
+      CollDecl (`on_enter = .{ .leaves = ..., .excludes = ... }`,
+      or a world-level entanglement table). Reasons: behavior-in-data
+      where this codebase's proven pattern is the funnel verb
+      (closeConn / destroyEntity / shutdownAllConns); reading a move
+      should show everything it does; the backstop already makes the
+      guarded failure soft, so structural unbypassability bought
+      little; and the clause vocabulary was growing toward a DSL.
+      Do not re-propose without new information. What survives of
+      that design: §3's edge ASSERTS (checks, not behavior — the Fd
+      bypass-abort class firing at the transition where the story is
+      tellable) remain open and compatible with the verb shape; the
+      rule of thumb is "a membership whose exit requires releasing a
+      resource declares an assert, never relies on a silent leave."
+      Guard added with the verbs: deferred move/moveAny refuse
+      partial-axis SOURCES (`DeferredPartialAxis`) — the queue records
+      offsets at enqueue, and flush-time axis exits (destroy's,
+      moveOnly's) may shift partial collections; partial memberships
+      mutate immediately (enter/leave/moveImmediate), which every
+      real site already did.
 
 ## 5 — Deferred + batch evict
 

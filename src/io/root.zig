@@ -422,7 +422,11 @@ pub fn parts(comptime opts: Options) []const rove.Part {
         .{ .name = "_connect_pending", .row = rows.connect_in },
     };
     decls = decls ++ [_]rove.CollDecl{
-        .{ .name = "all_conns", .kind = .set },
+        // Identity, not state: membership means "a conn this instance
+        // created", wherever it lives and whatever it is doing —
+        // admission and the teardown sweep count closing conns too, so
+        // quiescing (moveOnly/evictOnly) must leave it alone.
+        .{ .name = "all_conns", .kind = .set, .identity = true },
     };
     return &.{.{ .name = "rove-io", .collections = decls }};
 }
@@ -829,6 +833,19 @@ pub fn Io(comptime opts: Options) type {
             return if (comptime uses_world) self.reg.core.deferred_count else self.reg.deferred_count;
         }
 
+        /// A conn becomes live: one place for the whole birth —
+        /// entity, descriptor, peer slot, and (fat model) the identity
+        /// membership admission and the teardown sweep count on. The
+        /// connect path's promotion in `handleConnect` upholds the
+        /// same invariant on its existing entity.
+        fn birthConn(self: *Self, file_slot: i32) !Entity {
+            const conn = try self.reg.create(self.coll(.connections));
+            try self.reg.set(conn, self.coll(.connections), Fd, .{ .fd = file_slot });
+            try self.reg.set(conn, self.coll(.connections), PeerAddr, .{});
+            if (comptime is_fat) _ = try self.reg.join(conn, .all_conns);
+            return conn;
+        }
+
         pub fn create(reg: *Reg, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
             var ring = if (io_opts.ring_params) |params|
                 try linux.IoUring.init_params(io_opts.ring_entries, params)
@@ -1000,7 +1017,12 @@ pub fn Io(comptime opts: Options) type {
                     if (comptime hand_off) {
                         if (self.reg.isInCollection(ent, self.coll(.conn_dead))) continue;
                     }
-                    self.reg.evictImmediate(ent, self.coll(.conn_closing)) catch continue;
+                    // evictOnly: entering the closing state quiesces —
+                    // whatever state axes an upper layer parked this conn
+                    // on are left too, unnamed here. all_conns itself is
+                    // identity, so this member list stays stable across
+                    // the loop.
+                    self.reg.evictOnly(ent, self.coll(.conn_closing)) catch continue;
                 }
             } else {
                 for (self.connections.entitySlice()) |ent| {
@@ -1544,10 +1566,7 @@ pub fn Io(comptime opts: Options) type {
             );
             nodelay_sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-            const conn = try self.reg.create(self.coll(.connections));
-            try self.reg.set(conn, self.coll(.connections), Fd, .{ .fd = @intCast(file_slot) });
-            try self.reg.set(conn, self.coll(.connections), PeerAddr, .{});
-            if (comptime is_fat) _ = try self.reg.join(conn, .all_conns);
+            const conn = try self.birthConn(@intCast(file_slot));
 
             // Resolve the peer address (see `PeerAddr`): install the
             // fixed file into the process fd table; the install CQE
@@ -1667,6 +1686,10 @@ pub fn Io(comptime opts: Options) type {
             try self.armRecv(read_ent, slot);
 
             try self.reg.moveStripImmediate(entity, self.coll(._connect_pending), self.coll(.connections), &.{ ConnectAddr, IoResult });
+            // The promoted conn joins the identity set exactly as
+            // `birthConn`'s fresh ones do — the invariant both uphold:
+            // every entity in `connections` is in all_conns, or
+            // admission undercounts and the teardown sweep misses it.
             if (comptime is_fat) _ = try self.reg.join(entity, .all_conns);
             // The `connect_addrs` slot needs no cleanup — the next entity to
             // take this index overwrites it.
@@ -2003,10 +2026,16 @@ test "fat: hand_off retirement parks the conn in conn_dead for the reaper" {
 test "fat: a declared world — registry-owned storage, tag-addressed set, sweep across parts" {
     const io_opts = Options{ .registry_model = .fat };
     // An upper layer's collection, declared as a sibling PART — io never
-    // names its type, the world numbers it, the registry owns it.
+    // names its type, the world numbers it, the registry owns it. Its
+    // state set stands in for any orthogonal membership an upper layer
+    // parks conns on (a pending-close mark, a throttle) — the sweep
+    // must drop it without naming it.
     const upper_part = rove.Part{
         .name = "upper",
-        .collections = &.{.{ .name = "upper_conns", .row = ConnectionBaseRow }},
+        .collections = &.{
+            .{ .name = "upper_conns", .row = ConnectionBaseRow },
+            .{ .name = "upper_marked", .kind = .set },
+        },
     };
     const W = rove.World(.{ .parts = parts(io_opts) ++ &[_]rove.Part{upper_part} });
     const WIo = Io(.{ .registry_model = .fat, .world = W });
@@ -2030,6 +2059,7 @@ test "fat: a declared world — registry-owned storage, tag-addressed set, sweep
     const conn = try reg.create(connections);
     try reg.set(conn, connections, Fd, .{ .fd = 2 });
     _ = try reg.join(conn, .all_conns);
+    _ = try reg.join(conn, .upper_marked);
     try reg.moveImmediate(conn, connections, upper);
     try testing.expect(reg.inSet(conn, .all_conns));
 
@@ -2053,6 +2083,10 @@ test "fat: a declared world — registry-owned storage, tag-addressed set, sweep
         try testing.expectEqual(@as(i32, -1), (try reg.get(ce, conn_closing, Fd)).fd);
     }
     try testing.expectEqual(@as(u32, 0), upper.count);
+    // The sweep QUIESCED: the upper layer's state membership dropped
+    // (io never named it), while the identity membership survives.
+    try testing.expect(!reg.inSet(conn, .upper_marked));
+    try testing.expect(reg.inSet(conn, .all_conns));
 }
 
 test "a connect target survives the swap-remove that reshuffles its neighbours" {
