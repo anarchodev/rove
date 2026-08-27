@@ -299,6 +299,16 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     try expectEval(ctx, a, "__t(() => kv.get('b'))", "ok:\"true\"");
 
     // ── guard refusals: shape, code, and order ──
+    // The empty key (rove#902): the write half refuses — a handler that
+    // computed an empty name meant to name a row and got nothing, and the
+    // write would otherwise land on the root prefix itself. The read half
+    // answers null (a read never throws; "" resolves inside the caller's
+    // root, where the refusal guarantees nothing is ever written).
+    try expectEval(ctx, a, "__t(() => kv.set('', 'v'))", "Error|empty_key|kv: key must not be empty");
+    try expectEval(ctx, a, "__t(() => kv.delete(''))", "Error|empty_key|kv: key must not be empty");
+    try expectEval(ctx, a, "__t(() => kv.get(''))", "ok:null");
+    // Order is contract: the empty key reports itself, not its value's size.
+    try expectEval(ctx, a, "__t(() => kv.set('', 'x'.repeat((384 * 1024) + 1)))", "Error|empty_key|kv: key must not be empty");
     // No reserved-prefix refusal: a leading-`_` name is an ordinary key inside
     // the caller's own root (the dedicated case below states why).
     try expectEval(ctx, a, "__t(() => kv.set('_secret/x', 'v'))", "ok:null");
@@ -389,6 +399,9 @@ test "kv binding: coercion, guards, shaping, paging — the common contract" {
     st.taped_refusal_key = "orders/fine";
     st.taped_refusal_code = "reserved_key";
     try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))", "Error|reserved_key|kv: 'orders/fine' is in a platform-reserved prefix");
+    // A taped empty_key refusal re-materializes with the current wording.
+    st.taped_refusal_code = "empty_key";
+    try expectEval(ctx, a, "__t(() => kv.set('orders/fine', 'v'))", "Error|empty_key|kv: key must not be empty");
     // A RETIRED code (rule gone from today's table) still throws, code
     // verbatim, with the generic capture message.
     st.taped_refusal_code = "some_retired_rule";

@@ -327,6 +327,9 @@ pub fn Kv(comptime q: type, comptime D: type, comptime root: Root) type {
             if (std.mem.eql(u8, code, guards.kv_reserved_code)) {
                 return throwRefusal(d, ctx, .{ .throw = .err, .code = guards.kv_reserved_code, .message = "" }, key);
             }
+            if (std.mem.eql(u8, code, guards.kv_empty_key_code)) {
+                return throwKvError(ctx, guards.kv_empty_key_message, code);
+            }
             if (std.mem.eql(u8, code, guards.kv_key_too_large_code)) {
                 return throwKvError(ctx, guards.kv_key_too_large_message, code);
             }
