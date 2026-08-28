@@ -294,6 +294,28 @@ that, io under the fat model has **zero hooks and zero residency
 contracts**: create it, and it comes back to you — for the component,
 the aggregate, and now the shutdown.
 
+**The deferred queue is per source collection (BUILT).** Each source
+collection owns its offset-keyed queue; a dirty list names the queues
+holding ops, so an empty flush — the common phase-boundary call — is one
+integer check and a drain visits only queues with work. Per-source
+queues make the swap-remove discipline structural: an op's recorded
+offsets can be invalidated only by removals from its own source (an
+execute touches its destination by append alone), so each queue drains
+independently in reverse — highest offsets first — and no
+cross-collection ordering exists. A per-queue ascending flag makes the
+iteration-order common case sort-free; only a funnel-order append (an
+entity-keyed caller hitting arbitrary offsets) sorts, and only that
+queue. RLE coalescing peeks its own source's tail, so a funnel verb
+alternating sources — closeConn touching conn and stream collections —
+still collapses each side into block ops. Capacity is the structural
+maximum: PENDING_MOVE admits one op per resident entity, so a queue
+reserves address space for max_entities ops in one anonymous NORESERVE
+mapping on its source's first deferred op — the OS backs pages on
+touch, physical cost is the high-water mark, the array never moves, and
+there is no QueueFull anywhere in the registry. The entity-keyed late
+queue (deferred evict) stays a single registry-wide list: it resolves
+its source at execute time, so it has no offsets to protect.
+
 **Deferred and batch eviction (designed, unbuilt).** A deferred evict is
 coherent because enqueueing sets PENDING_MOVE, which freezes the entity:
 "from wherever it is now" and "at flush" provably denote the same place.
