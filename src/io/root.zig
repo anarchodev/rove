@@ -645,8 +645,8 @@ pub fn Io(comptime opts: Options) type {
         /// End every connection still live, through the same closing path
         /// every other connection takes: move it in, post its shutdown and
         /// close, give up its slot. Afterwards no conn holds a live fd, so
-        /// destruction proceeds without `Fd.deinit` needing an exception for
-        /// teardown.
+        /// teardown retires conns through the same live-fd guard every other
+        /// retirement passes, with no exception carved out for shutdown.
         ///
         /// Under the archetype model, an upper layer holding conn
         /// collections of its own must close those first — rove-h2 does,
@@ -810,8 +810,10 @@ pub fn Io(comptime opts: Options) type {
                 if (self.reg.isMoving(ent)) continue;
                 if (wb.len > 0) {
                     self.allocator.free(@constCast(wb.data)[0..wb.len]);
-                    // Cleared so `WriteBuf.deinit`'s assertion sees a released
-                    // buffer rather than reporting this as a bypass.
+                    // Freed and cleared at the same site: this phase is the
+                    // only owner of a buffer whose send has completed, so a
+                    // pointer left behind is a second free with no owner to
+                    // catch it.
                     wb.* = .{};
                 }
                 try self.reg.destroy(ent);
@@ -884,9 +886,10 @@ pub fn Io(comptime opts: Options) type {
                         cl.user_data = INTERNAL_SENTINEL;
 
                         // The slot is spoken for. Clearing it here is what
-                        // makes `Fd.deinit` an assertion rather than a second
-                        // close of a descriptor the kernel may already have
-                        // reissued to a new accept.
+                        // lets the live-fd check at the `conn_dead` entry stay
+                        // an assertion instead of becoming a second close of a
+                        // descriptor the kernel may already have reissued to a
+                        // new accept.
                         fd.fd = -1;
                     }
                     continue;
@@ -930,12 +933,11 @@ pub fn Io(comptime opts: Options) type {
         /// Destroy a conn's read-cycle entity, returning any buffer it still
         /// holds to the registered ring first.
         ///
-        /// The ring return cannot be left to `ReadResult.deinit`: a buffer
-        /// returned twice over-advances the producer tail, shrinks the
-        /// distinct-buffer pool and surfaces as recv ENOBUFS at a tiny
-        /// connection count — so the return and the clear have to happen
-        /// together, which a destructor firing at an unknown time cannot
-        /// guarantee.
+        /// The return cannot be deferred to the destroy: a buffer returned
+        /// twice over-advances the producer tail, shrinks the distinct-buffer
+        /// pool and surfaces as recv ENOBUFS at a tiny connection count. The
+        /// return and the clear therefore happen together, at the one site
+        /// that knows both have happened.
         fn releaseReadCycle(self: *Self, cycle: ReadCycleEntity) void {
             const e = cycle.entity;
             if (e.isNil() or self.reg.isStale(e)) return;
@@ -952,8 +954,8 @@ pub fn Io(comptime opts: Options) type {
             self.reg.destroyImmediate(e) catch {};
         }
 
-        /// Release a write buffer and clear the component, so the entity can
-        /// be destroyed without `WriteBuf.deinit` reading it as a bypass.
+        /// Release a write buffer and clear the component, so the entity is
+        /// destroyed with nothing left owning the allocation.
         /// Safe for the pre-submission drops below — no SQE has been posted,
         /// so the kernel never saw this pointer. A buffer whose SQE IS in
         /// flight must go through `write_done` instead.
@@ -1011,11 +1013,11 @@ pub fn Io(comptime opts: Options) type {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
-                        // Clear so ReadResult.deinit (fired by the destroy below)
-                        // sees data==null and does NOT return this buffer a
-                        // SECOND time. A double buf_ring_add over-advances the
-                        // ring's producer tail, shrinks the distinct-buffer pool,
-                        // and manifests as recv ENOBUFS → the front crash-loop.
+                        // Return and clear together, which is what keeps any
+                        // later reader from returning this buffer a SECOND
+                        // time. A double buf_ring_add over-advances the ring's
+                        // producer tail, shrinks the distinct-buffer pool, and
+                        // manifests as recv ENOBUFS → the front crash-loop.
                         // Same return-then-clear the healthy path uses (below).
                         rr.* = .{};
                     }
@@ -1041,8 +1043,8 @@ pub fn Io(comptime opts: Options) type {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
-                        // Clear so destroy's ReadResult.deinit doesn't return
-                        // this buffer a second time (see the isStale branch).
+                        // Return and clear together, so nothing returns this
+                        // buffer a second time (see the isStale branch).
                         rr.* = .{};
                     }
                     try self.reg.destroy(ent);
@@ -1563,8 +1565,9 @@ test "closing posts the shutdown once and gives up the slot" {
     try testing.expect(st.shutdown_posted);
     try testing.expect(st.deadline_ns > 0);
 
-    // The slot is spoken for. Leaving a live fd here would let `Fd.deinit`
-    // close a descriptor the kernel may have already reissued.
+    // The slot is spoken for. Leaving a live fd here would trip the check at
+    // the `conn_dead` entry — the slot leaks, and its number may already have
+    // been reissued to a new accept.
     try testing.expectEqual(@as(i32, -1), (try reg.get(conn, io.coll(.conn_closing), Fd)).fd);
 
     // Posting is not retiring — the conn survives the pass that posts.
@@ -1630,9 +1633,9 @@ test "a peer that never finishes closing does not pin the slot" {
 }
 
 // NOTE: there is deliberately no test for a conn destroyed around
-// `conn_closing`. The guard in `Fd.deinit` aborts the process, so exercising
-// it would take the test runner down with it — the standing cost of a check
-// that stops rather than reports. What IS covered is the legal path: the
+// `conn_closing`. The guard at the one entry into `conn_dead` panics, so
+// exercising it would take the test runner down with it — the standing cost
+// of a check that stops rather than reports. What IS covered is the legal path: the
 // tests above assert `fd` is -1 by the time a conn is retired, which is the
 // condition that keeps the guard silent.
 
