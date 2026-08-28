@@ -20,6 +20,9 @@ zig build test         # THE gate: every unit test (inline Zig tests across all
 zig build rewind-worker # Build the V2 worker binary (src/rewind/main.zig)
 zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
 zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
+zig build smoke-bins   # Install EVERYTHING the smoke suite executes — run_all.py
+                       # and the smoke harness build this themselves; `test`
+                       # compiles binaries but installs NONE of them
 zig build v2-test      # Focused SUBSET of `test`: the raft substrate alone
 zig build conformance  # Behavior conformance — one corpus on every engine
                        # (cheap lane: no cluster). Folded into `test`.

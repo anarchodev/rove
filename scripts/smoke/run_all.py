@@ -28,6 +28,7 @@ checkout read REWIND_APPS_DIR and skip themselves when it is absent.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -204,9 +205,14 @@ def main() -> int:
     ap.add_argument("--filter", default=None, help="substring match on the script name")
     ap.add_argument("--list", action="store_true", help="list what would run, then exit")
     ap.add_argument("--build-steps", action="store_true",
-                    help="print the `zig build` STEPS that produce what the suite "
-                         "spawns (the examples come from the default install step, "
-                         "and their same-named steps RUN rather than build)")
+                    help="print the `zig build` STEP that produces what the suite "
+                         "spawns (`smoke-bins` — the one step that installs the "
+                         "whole closure, examples included)")
+    ap.add_argument("--no-build", action="store_true",
+                    help="skip the `zig build smoke-bins` preflight and trust "
+                         "zig-out/bin as it lies (for iterating when you KNOW "
+                         "it is current — a stale binary here reports phantom "
+                         "regressions with a straight face)")
     ap.add_argument("--required-binaries", action="store_true",
                     help="print the binaries that must exist before a smoke starts")
     ap.add_argument("--jobs", type=int, default=1,
@@ -221,7 +227,7 @@ def main() -> int:
     # Answered before any environment check: a BUILD step asks this, and it has
     # nothing built and no S3 env yet by definition.
     if args.build_steps:
-        print(" ".join(BUILD_STEPS))
+        print("smoke-bins")
         return 0
     if args.required_binaries:
         print(" ".join(REQUIRED_BINARIES))
@@ -240,20 +246,57 @@ def main() -> int:
         print("S3 env not set — `set -a; . ./.env; set +a` first", file=sys.stderr)
         return 2
 
-    # Preflight the binaries. Several smokes drive the h2/ws example servers,
-    # which the DEFAULT `zig build` install step produces — not the `rewind-*`
-    # steps — and five drive the `rewind` CUSTOMER CLI, which is its own step
-    # again (`zig build rewind`, no dash). Without this the suite reports a
-    # pile of unrelated-looking failures whose real cause is one missing
-    # build, which is exactly the kind of noise that teaches people to stop
-    # reading the report.
-    bin_dir = HERE.parent.parent / "zig-out" / "bin"
+    # Build what we are about to run. Existence in zig-out is no evidence of
+    # freshness: `zig build test` COMPILES every shipped binary but installs
+    # none of them, install-copy mtimes carry artifact times rather than
+    # install times, and a suite that trusted zig-out by existence once ran a
+    # stale pre-merge worker into 28 phantom "regressions". The only honest
+    # freshness check is invoking the builder — a current tree makes this a
+    # cache no-op measured in seconds. `--no-build` opts out for tight
+    # iteration loops that KNOW zig-out is current.
+    repo_root = HERE.parent.parent
+    if not args.no_build:
+        print("== zig build smoke-bins (the suite runs what it just built) ==",
+              flush=True)
+        rc = subprocess.run(["zig", "build", "smoke-bins"], cwd=repo_root).returncode
+        if rc != 0:
+            print("`zig build smoke-bins` failed — refusing to run smokes "
+                  "against whatever zig-out currently holds", file=sys.stderr)
+            return CANNOT_RUN_RC
+    # Members must never build mid-suite: a zig+cargo build saturates the box
+    # and trips raft election timeouts, which read as spurious failovers. The
+    # harness's own ensure honors this.
+    os.environ["REWIND_SMOKE_NO_BUILD"] = "1"
+
+    # Existence backstop for the --no-build path. Several smokes drive the
+    # h2/ws example servers and five drive the `rewind` CUSTOMER CLI; without
+    # this the suite reports a pile of unrelated-looking failures whose real
+    # cause is one missing build, which is exactly the kind of noise that
+    # teaches people to stop reading the report.
+    bin_dir = repo_root / "zig-out" / "bin"
     missing = [b for b in REQUIRED_BINARIES if not (bin_dir / b).exists()]
     if missing:
         print(f"missing binaries in {bin_dir}: {', '.join(missing)}", file=sys.stderr)
-        print("run `zig build` (default install) AND "
-              f"`zig build {' '.join(BUILD_STEPS)}` first", file=sys.stderr)
+        print("run `zig build smoke-bins` first", file=sys.stderr)
         return CANNOT_RUN_RC
+
+    # Record what this run measures: the tree and the exact binaries. A
+    # binary hash in the report is what lets "was that run stale?" be
+    # answered from the report itself, months later, instead of from a
+    # forensic mtime guess.
+    describe = subprocess.run(
+        ["git", "describe", "--always", "--dirty", "--abbrev=12"],
+        cwd=repo_root, capture_output=True, text=True).stdout.strip()
+    provenance = {
+        "git": describe or "unknown",
+        "built_by_runner": not args.no_build,
+        "binaries": {
+            b: hashlib.sha256((bin_dir / b).read_bytes()).hexdigest()[:16]
+            for b in REQUIRED_BINARIES
+        },
+    }
+    print(f"tree {provenance['git']}; "
+          f"{len(provenance['binaries'])} binaries hashed into the summary")
 
     # Clear what earlier runs left behind BEFORE allocating anything: an
     # orphaned node holds a port block and adds I/O the timing-sensitive
@@ -428,7 +471,11 @@ def main() -> int:
             print(f"    {n}")
 
     if args.json:
-        Path(args.json).write_text(json.dumps(results, indent=2, sort_keys=True))
+        # `_provenance` answers "what exactly did this run measure" — the
+        # question mtimes cannot. Underscore-keyed so the baseline compare
+        # (which looks up MEMBER names) never mistakes it for a smoke.
+        payload = {"_provenance": provenance, **results}
+        Path(args.json).write_text(json.dumps(payload, indent=2, sort_keys=True))
         print(f"summary → {args.json}")
 
     if args.baseline and os.path.exists(args.baseline):

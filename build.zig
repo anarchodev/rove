@@ -1863,6 +1863,25 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 
+    // ── smoke-bins: the smoke suite's binary closure, INSTALLED ──
+    // Everything `scripts/smoke/` executes, in one step. The compile gates
+    // above deliberately install nothing, so a green `zig build test` says
+    // nothing about zig-out/bin — and a suite trusting zig-out by existence
+    // alone once ran a stale pre-merge worker into 28 phantom regressions.
+    // `run_all.py` builds this step before spawning anything (its default);
+    // the smoke harness does the same for a standalone smoke. A binary a new
+    // smoke drives belongs in THIS list, or the suite will not rebuild it.
+    const smoke_bins_step = b.step(
+        "smoke-bins",
+        "Build + install every binary the smoke suite executes (run_all.py builds this before running)",
+    );
+    for ([_]*std.Build.Step.Compile{
+        rewind_exe, cp_exe,   front_exe,      ls_standalone, ops_exe,
+        cli_exe,    echo_server, h2_echo_server, ws_echo_exe,
+    }) |exe| {
+        smoke_bins_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     // CLI unit tests (`src/cli/*.zig` — e.g. the P-CLI package resolver in
     // packages.zig). Folded into the aggregate `test` step; also runnable in
     // isolation via `zig build cli-test`.
