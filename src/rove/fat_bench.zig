@@ -130,7 +130,7 @@ fn runMoveScenario(
 /// shape in both models; this is the parity check.
 fn benchPhaseMoves(alloc: std.mem.Allocator) !void {
     {
-        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
+        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
         defer reg.deinit();
         var pa = try Coll(PhaseRow).init(alloc);
         defer pa.deinit();
@@ -152,7 +152,7 @@ fn benchPhaseMoves(alloc: std.mem.Allocator) !void {
 /// every hop to keep the values alive.
 fn benchDetourSurvive(alloc: std.mem.Allocator) !void {
     {
-        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
+        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
@@ -191,7 +191,7 @@ fn benchResidentChurn(alloc: std.mem.Allocator, comptime K_RES: u32, comptime C:
     }.go;
 
     {
-        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
+        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
         defer reg.deinit();
         var idle = try CollN(NarrowRow, K_RES).init(alloc);
         defer idle.deinit();
@@ -238,7 +238,7 @@ fn benchIterate(alloc: std.mem.Allocator) !void {
     }.go;
 
     {
-        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
+        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
@@ -253,7 +253,7 @@ fn benchIterate(alloc: std.mem.Allocator) !void {
 /// column), `getFat` parked (shadow slot).
 fn benchLookup(alloc: std.mem.Allocator) !void {
     {
-        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 1024 });
+        var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
         defer reg.deinit();
         var wide = try Coll(WideRow).init(alloc);
         defer wide.deinit();
@@ -322,7 +322,7 @@ const CLOSE_CYCLES = 10;
 fn benchUnknownHome(alloc: std.mem.Allocator) !void {
     // ---- fat: id-indexed dispatch ----
     {
-        var reg = try FatStreamReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = 8192 });
+        var reg = try FatStreamReg.init(alloc, .{ .max_entities = MAXE });
         defer reg.deinit();
         var chain: [NCHAIN]StreamColl = undefined;
         for (&chain) |*c| c.* = try StreamColl.init(alloc);

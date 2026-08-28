@@ -56,11 +56,6 @@ const effectiveAlign = collection_mod.effectiveAlign;
 
 pub const FatRegistryConfig = struct {
     max_entities: u32,
-    /// Capacity of EACH source collection's deferred queue (allocated on
-    /// that collection's first deferred op), and of the entity-keyed late
-    /// queue. Per-source, so a teardown sweep concentrated in one
-    /// collection gets the full budget regardless of what else is queued.
-    deferred_queue_capacity: u32 = 256,
 };
 
 /// A typed pointer bundle over one entity's components for a declared
@@ -216,12 +211,23 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
         // names the queues holding ops, so an empty flush — the common
         // call — stays one integer check and a drain visits only
         // queues with work, never the id space.
+        //
+        // Queues never refuse and never move: a source can hold at
+        // most one op per resident entity (PENDING_MOVE admits one per
+        // entity), so on its first deferred op a source's queue
+        // RESERVES address space for max_entities ops in one anonymous
+        // NORESERVE mmap — full-proof by construction — and the OS
+        // backs pages on first touch, so physical memory is the
+        // queue's high-water mark at page granularity. No realloc
+        // means the array's address is stable for the registry's
+        // lifetime, which is what lets the drain hold a slice across
+        // op executes. There is no QueueFull; physical exhaustion is
+        // the OS's overcommit to enforce, like every page-backed heap.
         queues: [MAX_COLLECTIONS]CollQueue,
         dirty: [MAX_COLLECTIONS]u8,
         dirty_member: [MAX_COLLECTIONS]bool,
         dirty_count: u32,
         deferred_total: u32,
-        deferred_capacity: u32,
         // True while flushBatch executes: enqueues that happen during a
         // batch must land as NEW ops for the next batch — coalescing
         // could extend an op the batch already executed, silently
@@ -291,14 +297,15 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             dst_ptr: *anyopaque,
         };
 
-        /// One source collection's deferred queue. `ops` allocates on
-        /// the collection's first deferred op and lives until registry
-        /// deinit. `ascending` tracks whether appends arrived in
-        /// offset order — the common case, since a system deferring as
-        /// it iterates appends ascending — in which case the reverse
-        /// drain walk needs no sort at all; a funnel-order append
-        /// (entity-keyed callers hitting arbitrary offsets) clears it
-        /// and that one queue sorts before draining.
+        /// One source collection's deferred queue. `ops` is reserved
+        /// (mmap, max_entities capacity) on the collection's first
+        /// deferred op and lives until registry deinit. `ascending`
+        /// tracks whether appends arrived in offset order — the common
+        /// case, since a system deferring as it iterates appends
+        /// ascending — in which case the reverse drain walk needs no
+        /// sort at all; a funnel-order append (entity-keyed callers
+        /// hitting arbitrary offsets) clears it and that one queue
+        /// sorts before draining.
         const CollQueue = struct {
             ops: []DeferredOp = &.{},
             count: u32 = 0,
@@ -323,8 +330,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 null_pool[i] = .{ .index = @intCast(i), .generation = 0 };
                 offsets[i] = @intCast(i);
             }
-
-            const late_ops = try allocator.alloc(LateOp, config.deferred_queue_capacity);
 
             const fat_table = try allocator.alloc(Fat, max);
             // Headers only: gen 0 + empty mask reads as "nothing written"
@@ -357,9 +362,8 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 .dirty_member = [_]bool{false} ** MAX_COLLECTIONS,
                 .dirty_count = 0,
                 .deferred_total = 0,
-                .deferred_capacity = config.deferred_queue_capacity,
                 .in_flush = false,
-                .late_ops = late_ops,
+                .late_ops = &.{},
                 .late_count = 0,
                 .fat_table = fat_table,
                 .column_fns = column_fns,
@@ -386,9 +390,9 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             self.allocator.free(self.flags);
             self.allocator.free(self.null_pool);
             for (&self.queues) |*q| {
-                if (q.ops.len > 0) self.allocator.free(q.ops);
+                if (q.ops.len > 0) std.posix.munmap(queueBytes(q.ops));
             }
-            self.allocator.free(self.late_ops);
+            if (self.late_ops.len > 0) self.allocator.free(self.late_ops);
             self.* = undefined;
         }
 
@@ -540,8 +544,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             }
             if (self.axisIds(src.axis_index)[idx] != src.registry_id) return error.WrongCollection;
 
-            self.flags[idx] |= PENDING_MOVE;
-
             const recipe = moveRecipe(SrcColl, DstColl, only);
             try self.enqueueOp(src.registry_id, .{
                 .src_offset = self.axisOffsets(src.axis_index)[idx],
@@ -550,6 +552,10 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 .src_ptr = @ptrCast(src),
                 .dst_ptr = @ptrCast(dst),
             });
+            // Freeze AFTER the enqueue: a failed enqueue (allocator
+            // exhaustion) must not leave the entity frozen with no
+            // queued op to thaw it.
+            self.flags[idx] |= PENDING_MOVE;
         }
 
         /// Immediately move an entity. Same total semantics as `move`,
@@ -698,8 +704,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             const src_id = self.collection_ids[idx];
             if (src_id == 0) return error.InvalidEntity;
 
-            self.flags[idx] |= PENDING_MOVE;
-
             const entry = self.destroy_recipes[src_id];
             try self.enqueueOp(src_id, .{
                 .src_offset = self.offsets[idx],
@@ -708,6 +712,8 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 .src_ptr = entry.ptr,
                 .dst_ptr = @ptrFromInt(1),
             });
+            // Freeze AFTER the enqueue — see moveWith.
+            self.flags[idx] |= PENDING_MOVE;
         }
 
         /// Immediately destroy an entity. Source collection is looked up
@@ -766,6 +772,10 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                     const batch = q.count;
                     if (batch == 0) continue;
 
+                    // Holding this slice across executes is sound
+                    // because the reserved array never moves: an
+                    // enqueue during an execute appends past `batch`
+                    // in place.
                     const ops = q.ops[0..batch];
                     if (batch > 1 and !q.ascending) {
                         std.mem.sort(DeferredOp, ops, {}, opOrder);
@@ -931,7 +941,6 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                         // Same total-axis-only rule as `move` — see there.
                         if (src.axis_index != 0) return error.DeferredPartialAxis;
                     }
-                    self.flags[idx] |= PENDING_MOVE;
                     const recipe = moveRecipe(SrcColl, DstColl, only);
                     try self.enqueueOp(src.registry_id, .{
                         .src_offset = self.axisOffsets(src.axis_index)[idx],
@@ -940,6 +949,8 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                         .src_ptr = @ptrCast(src),
                         .dst_ptr = @ptrCast(dst),
                     });
+                    // Freeze AFTER the enqueue — see moveWith.
+                    self.flags[idx] |= PENDING_MOVE;
                     return;
                 }
             }
@@ -1049,16 +1060,17 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             if (comptime axes_spec.n_axes > 1) {
                 if (dst.axis_index != 0) return error.DeferredPartialAxis;
             }
-            if (self.late_count >= self.deferred_capacity) return error.QueueFull;
-            // No PENDING check — tolerance for moving entities is the
-            // point. Freeze the entity if it is not already frozen.
-            self.flags[idx] |= PENDING_MOVE;
+            if (self.late_count >= self.late_ops.len) try self.growLateQueue();
             self.late_ops[self.late_count] = .{
                 .entity = entity,
                 .dst_ptr = @ptrCast(dst),
                 .execute = lateEvictRecipe(DstColl, only),
             };
             self.late_count += 1;
+            // No PENDING check — tolerance for moving entities is the
+            // point. Freeze the entity if it is not already frozen,
+            // AFTER the append so a failed grow leaves it unfrozen.
+            self.flags[idx] |= PENDING_MOVE;
         }
 
         /// Cast the entity to a row type: one handle validation, then one
@@ -1138,13 +1150,12 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 }
                 if (op.src_offset < last.src_offset) q.ascending = false;
             }
-            if (q.count >= q.ops.len) {
-                // Also the never-allocated case (0 >= 0): a source's
-                // queue allocates on its first deferred op, so the
-                // common append pays no emptiness check of its own.
-                if (q.ops.len != 0 or self.deferred_capacity == 0) return error.QueueFull;
-                q.ops = try self.allocator.alloc(DeferredOp, self.deferred_capacity);
-            }
+            // The 0 >= 0 case is the reservation trigger: a source's
+            // queue reserves on its first deferred op, so the common
+            // append pays no emptiness check of its own. After the
+            // reservation this branch is dead — the queue's capacity is
+            // the structural maximum (one op per resident entity).
+            if (q.count >= q.ops.len) try self.reserveQueue(q);
 
             q.ops[q.count] = op;
             q.count += 1;
@@ -1154,6 +1165,39 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 self.dirty[self.dirty_count] = src_id;
                 self.dirty_count += 1;
             }
+        }
+
+        fn growLateQueue(self: *Self) error{OutOfMemory}!void {
+            @branchHint(.cold);
+            self.late_ops = if (self.late_ops.len == 0)
+                try self.allocator.alloc(LateOp, 16)
+            else
+                try self.allocator.realloc(self.late_ops, self.late_ops.len * 2);
+        }
+
+        /// The byte view of a queue's reserved region, as mmap'd —
+        /// what munmap needs back.
+        fn queueBytes(ops: []DeferredOp) []align(std.heap.page_size_min) u8 {
+            const p: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(ops.ptr));
+            return p[0 .. ops.len * @sizeOf(DeferredOp)];
+        }
+
+        /// Reserve a source's queue: address space for the structural
+        /// maximum (one op per resident entity ⇒ max_entities), in one
+        /// anonymous NORESERVE mapping. The OS backs pages on first
+        /// touch, so physical cost is the queue's high-water mark at
+        /// page granularity, and the array never moves.
+        fn reserveQueue(self: *Self, q: *CollQueue) error{OutOfMemory}!void {
+            @branchHint(.cold);
+            const bytes = std.posix.mmap(
+                null,
+                @as(usize, self.max_entities) * @sizeOf(DeferredOp),
+                std.posix.PROT.READ | std.posix.PROT.WRITE,
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
+                -1,
+                0,
+            ) catch return error.OutOfMemory;
+            q.ops = @as([*]DeferredOp, @ptrCast(@alignCast(bytes.ptr)))[0..self.max_entities];
         }
 
         fn opOrder(_: void, a: DeferredOp, b: DeferredOp) bool {
@@ -1703,39 +1747,40 @@ test "deferred batch — interleaved sources drain independently in one flush" {
     }
 }
 
-test "deferred queue capacity is per source collection" {
-    var reg = try TestReg.init(testing.allocator, .{ .max_entities = 16, .deferred_queue_capacity = 2 });
+test "deferred queue reserves the structural maximum on first use" {
+    var reg = try TestReg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
 
     var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer a.deinit();
     reg.registerCollection(&a, 1);
-    var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
-    defer b.deinit();
-    reg.registerCollection(&b, 2);
     var sink = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
     defer sink.deinit();
-    reg.registerCollection(&sink, 3);
+    reg.registerCollection(&sink, 2);
 
-    var as: [3]Entity = undefined;
-    for (&as) |*e| e.* = try reg.create(&a);
-    const be = try reg.create(&b);
+    // No queue memory before the first deferred op.
+    try testing.expectEqual(@as(usize, 0), reg.queues[1].ops.len);
 
-    // Non-contiguous offset order (1, 0, 2) so RLE coalescing cannot
-    // absorb the third op: a's queue fills at two.
-    try reg.move(as[1], &a, &sink);
-    try reg.move(as[0], &a, &sink);
-    try testing.expectError(error.QueueFull, reg.move(as[2], &a, &sink));
-
-    // A full queue on one source does not block another source.
-    try reg.move(be, &b, &sink);
+    // Enqueue in pair-swapped order (1,0, 3,2, …) so RLE coalescing
+    // absorbs nothing and every move is its own op — one op per
+    // resident entity, the bound the reservation is sized to.
+    var as: [24]Entity = undefined;
+    for (&as, 0..) |*e, i| {
+        e.* = try reg.create(&a);
+        try reg.set(e.*, &a, Position, .{ .x = @floatFromInt(i), .y = 0 });
+    }
+    var i: usize = 0;
+    while (i < as.len) : (i += 2) {
+        try reg.move(as[i + 1], &a, &sink);
+        try reg.move(as[i], &a, &sink);
+    }
+    // The first op reserved capacity for every entity at once.
+    try testing.expectEqual(@as(usize, 64), reg.queues[1].ops.len);
     try reg.flush();
-
-    try testing.expectEqual(@as(u32, 3), sink.count);
-    try testing.expect(reg.isInCollection(as[0], &sink));
-    try testing.expect(reg.isInCollection(as[1], &sink));
-    try testing.expect(reg.isInCollection(be, &sink));
-    try testing.expect(reg.isInCollection(as[2], &a));
+    try testing.expectEqual(@as(u32, 0), a.count);
+    for (as, 0..) |e, k| {
+        try testing.expectEqual(@as(f32, @floatFromInt(k)), (try reg.get(e, &sink, Position)).x);
+    }
 }
 
 test "moveImmediate — total, lossless, visible this tick" {

@@ -55,7 +55,6 @@ pub fn main() !void {
 
     var reg = try MyH2.Reg.init(alloc, .{
         .max_entities = 4096,
-        .deferred_queue_capacity = 1024,
     });
     defer reg.deinit();
 

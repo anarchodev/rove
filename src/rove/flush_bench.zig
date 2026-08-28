@@ -52,7 +52,6 @@ const FatReg = FatRegistry(Universe);
 const K = 4096; // sweep width (entities per cycle)
 const MAXE = 65536;
 const REPS = 5;
-const QCAP = 8192; // > K: worst case is a sweep whose ops never coalesce
 
 const EMPTY_FLUSHES = 1_000_000;
 const PING_ITERS = 100_000; // 2 flushes each
@@ -83,7 +82,7 @@ fn report(name: []const u8, totals: [REPS]u64, ops_per_rep: u64) void {
 // ---------------------------------------------------------------------------
 
 fn benchEmptyFlush(alloc: std.mem.Allocator) !void {
-    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
+    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
     defer reg.deinit();
     var ca = try CollN(K).init(alloc);
     defer ca.deinit();
@@ -105,7 +104,7 @@ fn benchEmptyFlush(alloc: std.mem.Allocator) !void {
 }
 
 fn benchOneOpFlush(alloc: std.mem.Allocator) !void {
-    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
+    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
     defer reg.deinit();
     var ca = try CollN(16).init(alloc);
     defer ca.deinit();
@@ -135,7 +134,7 @@ fn benchOneOpFlush(alloc: std.mem.Allocator) !void {
 /// touches two collections per entity (conn + stream). Churn leaves each
 /// side's offsets non-ascending, so this is the small-batch sort case.
 fn benchFunnelFlush(alloc: std.mem.Allocator) !void {
-    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
+    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
     defer reg.deinit();
     // Each side transiently holds both cohorts mid-flush (appends land
     // before the removals for lower-id sources execute).
@@ -182,7 +181,7 @@ fn benchFunnelFlush(alloc: std.mem.Allocator) !void {
 /// K ops from one source in iteration order: contiguous ascending, so
 /// enqueue coalesces the whole sweep into one block op.
 fn benchSweepAscending(alloc: std.mem.Allocator) !void {
-    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
+    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
     defer reg.deinit();
     var ca = try CollN(K).init(alloc);
     defer ca.deinit();
@@ -218,7 +217,7 @@ fn benchSweepAscending(alloc: std.mem.Allocator) !void {
 /// the queue machinery loses to the alternation — nothing about the
 /// entity work itself differs.
 fn benchSweepInterleaved(alloc: std.mem.Allocator) !void {
-    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
+    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
     defer reg.deinit();
     var ca = try CollN(K / 2).init(alloc);
     defer ca.deinit();
@@ -260,7 +259,7 @@ fn benchSweepInterleaved(alloc: std.mem.Allocator) !void {
 /// the sort no structure and RLE nothing contiguous — the full-work
 /// bound for any design that still sorts unordered appends.
 fn benchSweepShuffled(alloc: std.mem.Allocator) !void {
-    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
+    var reg = try FatReg.init(alloc, .{ .max_entities = MAXE });
     defer reg.deinit();
     var ca = try CollN(K).init(alloc);
     defer ca.deinit();
@@ -301,9 +300,9 @@ pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
     std.debug.print(
-        "flush-bench  deferred queue cap={d}, {d} reps (min/median), ReleaseFast\n" ++
+        "flush-bench  {d} reps (min/median), ReleaseFast\n" ++
             "row: {d}B | hot path: ns per flush CALL | sweeps: ns per entity-op, K={d}\n\n",
-        .{ QCAP, REPS, @sizeOf(A) + @sizeOf(M), K },
+        .{ REPS, @sizeOf(A) + @sizeOf(M), K },
     );
 
     try benchEmptyFlush(alloc);

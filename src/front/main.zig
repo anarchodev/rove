@@ -543,7 +543,6 @@ pub fn main() !void {
 
     var reg = try FrontH2.Reg.init(allocator, .{
         .max_entities = 8192,
-        .deferred_queue_capacity = 2048,
     });
     defer reg.deinit();
 
@@ -638,7 +637,7 @@ pub fn main() !void {
     var reg80_ptr: ?*FrontH2.Reg = null;
     if (http_port != 0) {
         const r80 = try allocator.create(FrontH2.Reg);
-        r80.* = try FrontH2.Reg.init(allocator, .{ .max_entities = 2048, .deferred_queue_capacity = 512 });
+        r80.* = try FrontH2.Reg.init(allocator, .{ .max_entities = 2048 });
         reg80_ptr = r80;
         const addr80 = try std.net.Address.parseIp("0.0.0.0", http_port);
         server80 = try FrontH2.create(r80, allocator, addr80, .{
