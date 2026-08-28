@@ -120,6 +120,28 @@ BIN_DIR = REPO_ROOT / "zig-out" / "bin"
 REWIND = BIN_DIR / "rewind-worker"
 LOG_SERVER = BIN_DIR / "rewind-logs"
 
+_smoke_bins_ensured = False
+
+
+def ensure_smoke_bins() -> None:
+    """Build the suite's binary closure (`zig build smoke-bins`) once per
+    process, so a standalone smoke runs what the tree says — not whatever a
+    past session left in zig-out. Existence is no evidence of freshness:
+    `zig build test` compiles every binary but installs none, and install
+    mtimes carry artifact times. A current tree makes this a cache no-op.
+
+    `REWIND_SMOKE_NO_BUILD=1` skips it — exported by run_all.py, which has
+    already built for the whole suite; a member building mid-suite would
+    saturate the box and trip raft election timeouts."""
+    global _smoke_bins_ensured
+    if _smoke_bins_ensured or os.environ.get("REWIND_SMOKE_NO_BUILD") == "1":
+        return
+    _smoke_bins_ensured = True
+    rc = subprocess.run(["zig", "build", "smoke-bins"], cwd=REPO_ROOT).returncode
+    if rc != 0:
+        raise SystemExit("`zig build smoke-bins` failed — refusing to smoke "
+                         "whatever zig-out currently holds")
+
 # Fixed shared secrets (smokes don't need rotation; these match the rewind
 # defaults so behavior is reproducible).
 # A non-default token: rewind refuses to boot on an unset/empty/default
@@ -463,10 +485,10 @@ class V2Cluster:
               worker_log_push: bool = True) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
+        ensure_smoke_bins()
         for b in (REWIND, CP_BIN, FRONT_BIN):
             if not Path(b).exists():
-                raise SystemExit(f"{b} missing — `zig build rewind-worker rewind-cp "
-                                 f"rewind-front`")
+                raise SystemExit(f"{b} missing — `zig build smoke-bins`")
         # One block from the process's port slot (smoke_ports) per spawn: the
         # cluster's whole footprint lives inside it, so concurrent smokes —
         # and a second cluster in the same smoke — can never collide.

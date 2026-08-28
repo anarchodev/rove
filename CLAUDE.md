@@ -20,6 +20,9 @@ zig build test         # THE gate: every unit test (inline Zig tests across all
 zig build rewind-worker # Build the V2 worker binary (src/rewind/main.zig)
 zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
 zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
+zig build smoke-bins   # Install EVERYTHING the smoke suite executes — run_all.py
+                       # and the smoke harness build this themselves; `test`
+                       # compiles binaries but installs NONE of them
 zig build v2-test      # Focused SUBSET of `test`: the raft substrate alone
 zig build conformance  # Behavior conformance — one corpus on every engine
                        # (cheap lane: no cluster). Folded into `test`.
@@ -214,6 +217,6 @@ Deliberately absent from that proof is any check of who is "using" a workspace, 
 Rules:
 - The main checkout (`/home/user/src/rove`) is load-bearing — it is what the script clones from; don't delete or move it.
 - Never run `git add -u` / `git commit` in a clone another session is using. Unexplained working-tree WIP is probably a sibling's — examine it, stage only your own files, and never commit another window's work without confirmation.
-- Smoke ports come from `scripts/smoke/smoke_ports.py` (each smoke process owns a disjoint slot), so concurrent smokes/suites don't collide on ports. The remaining reason not to run two full suites at once is CPU: a saturated box trips raft election timeouts, which reads as spurious failovers.
+- Smoke ports come from `scripts/smoke/smoke_ports.py` (each smoke process owns a disjoint slot), so concurrent smokes/suites don't collide on ports. Full suites additionally QUEUE on a box-global lock (`run_all.py` takes `/tmp/rove-smoke-suite.lock`; waiters block and print the holder; `--no-queue` to fail fast) because the resource suites contend for is CPU: a saturated box trips raft election timeouts, which reads as spurious failovers in BOTH runs. Just start your suite — it waits its turn.
 
 **Why clones and not `git worktree`.** Worktrees share the object store — about 39 MB here — while a workspace's real cost is its Zig build cache at 1-5 GB, which worktrees do *not* share. So the saving is under a percent, and it buys three problems: `git worktree` plus submodules is disclaimed by git itself (*"It is NOT recommended to make multiple checkouts of a superproject"* — git-worktree(1) BUGS), the stash stack is shared so one session can pop another's, and a branch can live in only one worktree. A local clone hardlinks the object files, so it costs the ~12 MB working tree and has none of that.

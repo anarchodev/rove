@@ -8,9 +8,6 @@ dispatcher together.
 ## Running them
 
 ```bash
-zig build                         # the h2 example servers a few smokes drive
-zig build rewind-worker rewind-cp rewind-front rewind-logs rewind-ops
-zig build rewind                  # the customer CLI — five smokes drive it
 set -a; . ./.env; set +a          # S3 credentials — V2 has no fs blob backend
 export REWIND_APPS_DIR=~/src/rewind-apps    # only for smokes that deploy first-party apps
 
@@ -20,6 +17,19 @@ scripts/smoke/run_all.py --filter deploy       # substring match on the name
 scripts/smoke/run_all.py --list                # what would run ([serial] = tail)
 python3 scripts/smoke/ctl_smoke_v2.py          # one smoke directly
 ```
+
+Binaries build themselves: `run_all.py` runs `zig build smoke-bins` — the one
+step that installs everything the suite executes (product binaries, the
+example servers, the `rewind` CLI) — before spawning anything, and the V2
+harness does the same for a standalone smoke. On a current tree that is a
+cache no-op measured in seconds. Existence in `zig-out/bin` is deliberately
+NOT trusted as freshness: `zig build test` compiles every binary but installs
+none, so a green gate says nothing about `zig-out`, and a suite that trusted
+it once ran a stale pre-merge worker into 28 phantom "regressions".
+`--no-build` (or `REWIND_SMOKE_NO_BUILD=1` for a single smoke) skips the
+build for tight iteration loops that KNOW `zig-out` is current. Each `--json`
+summary records the tree (`git describe`) and a hash of every binary it ran,
+so a run's provenance is answerable from the report itself.
 
 `--jobs N` runs a longest-first pool of N concurrent smokes, then a small
 SERIAL tail (election soaks and other members whose timing assertions
