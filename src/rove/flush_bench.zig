@@ -7,24 +7,25 @@
 //! `flush` is a phase-boundary primitive: rove-h2's poll prelude/postlude
 //! alone call it ~15 times per poll iteration, most with an empty or tiny
 //! queue. So the costs that matter are the empty-call fast path, the
-//! small-batch overhead (the `std.mem.sort` call whose only job is to
-//! restore highest-offset-first execution within each source collection —
-//! the swap-remove discipline), and how enqueue-time RLE coalescing fares
-//! when a funnel verb interleaves ops across collections (the coalescer
-//! only peeks the queue's global tail, so alternation breaks every run).
+//! small-batch overhead (any sorting done to restore highest-offset-first
+//! execution within a source collection — the swap-remove discipline),
+//! and how enqueue-time RLE coalescing fares when a funnel verb
+//! interleaves ops across collections. Each scenario pins one enqueue
+//! PATTERN; what the queue machinery makes of it is the measurement.
 //!
 //! Scenarios, hot path then sweeps:
 //!
 //! - **empty**       — flush with nothing pending, the dominant call.
 //! - **1 op**        — single-entity ping-pong, one op per flush.
 //! - **2×8 funnel**  — 16 ops per flush, enqueue alternating between two
-//!   source collections: RLE never fires, the sort actually reorders.
+//!   source collections in churned (non-ascending) offset order.
 //! - **sweep ascending**   — 4096 ops, one source, iteration order:
-//!   coalesces to one block op (today's best case; parity with
+//!   contiguous ascending offsets, RLE's best case (parity with
 //!   fat-bench's batch phase move).
-//! - **sweep interleaved** — 2×2048 ops alternating between two sources:
-//!   same total work as ascending, but 4096 uncoalesced ops. The delta
-//!   vs ascending is the per-op queue+sort+dispatch overhead.
+//! - **sweep interleaved** — 2×2048 ops alternating between two sources,
+//!   each side in iteration order: same total work as ascending; the
+//!   delta vs ascending is what per-op queue machinery the alternation
+//!   costs.
 //! - **sweep shuffled**    — 4096 ops, one source, random enqueue order:
 //!   the sort's full-work bound (no structure to exploit).
 //!
@@ -51,7 +52,7 @@ const FatReg = FatRegistry(Universe);
 const K = 4096; // sweep width (entities per cycle)
 const MAXE = 65536;
 const REPS = 5;
-const QCAP = 8192; // > K: the interleaved sweep queues 4096 uncoalesced ops
+const QCAP = 8192; // > K: worst case is a sweep whose ops never coalesce
 
 const EMPTY_FLUSHES = 1_000_000;
 const PING_ITERS = 100_000; // 2 flushes each
@@ -131,8 +132,8 @@ fn benchOneOpFlush(alloc: std.mem.Allocator) !void {
 
 /// One funnel-shaped phase: 8 entities of each side cross in the same
 /// batch, enqueued alternating a,b,a,b — the pattern of a sweep that
-/// touches two collections per entity (conn + stream). RLE coalescing
-/// never fires and the sort has real interleaving to undo.
+/// touches two collections per entity (conn + stream). Churn leaves each
+/// side's offsets non-ascending, so this is the small-batch sort case.
 fn benchFunnelFlush(alloc: std.mem.Allocator) !void {
     var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
     defer reg.deinit();
@@ -208,13 +209,14 @@ fn benchSweepAscending(alloc: std.mem.Allocator) !void {
         }
         if (rep > 0) totals[rep - 1] = t;
     }
-    report("sweep | 4096 ascending, coalesces to 1 block", totals, SWEEP_CYCLES * K);
+    report("sweep | 4096 one source, ascending", totals, SWEEP_CYCLES * K);
 }
 
 /// The same K entity-hops as the ascending sweep, but the enqueue
-/// alternates between two source collections: RLE never fires, so the
-/// queue holds K individual ops and the sort splits two interleaved
-/// runs. The delta vs the ascending sweep is pure queue machinery.
+/// alternates between two source collections, each side arriving in
+/// ascending offset order. The delta vs the ascending sweep is whatever
+/// the queue machinery loses to the alternation — nothing about the
+/// entity work itself differs.
 fn benchSweepInterleaved(alloc: std.mem.Allocator) !void {
     var reg = try FatReg.init(alloc, .{ .max_entities = MAXE, .deferred_queue_capacity = QCAP });
     defer reg.deinit();
@@ -251,7 +253,7 @@ fn benchSweepInterleaved(alloc: std.mem.Allocator) !void {
         }
         if (rep > 0) totals[rep - 1] = t;
     }
-    report("sweep | 2x2048 interleaved, 4096 ops uncoalesced", totals, SWEEP_CYCLES * K);
+    report("sweep | 2x2048 interleaved sources", totals, SWEEP_CYCLES * K);
 }
 
 /// K ops from one source in a fixed shuffled order: random offsets give
