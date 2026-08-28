@@ -691,7 +691,9 @@ against the **V1** code and is resolved — see git history for the findings and
 fixes. The living invariants it enforced are now stated as decisions and held
 across the V2 `architecture/` set: **state is collection membership, not a flag**
 and **one reconcile system, not parallel engines** (decisions.md §3.1);
-**resource-owning components declare `deinit`**; **fail loud on
+**release is a transition at a funnel, never a destructor** (decisions.md
+§17.2, which superseded the earlier "resource-owning components declare
+`deinit`" when the fat-entity model deleted lifecycle hooks); **fail loud on
 infallibility-violations**, don't swallow.
 
 ## 12. Pre-release surprises (customer-visible gotchas)

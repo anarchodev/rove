@@ -28,6 +28,7 @@ checkout read REWIND_APPS_DIR and skip themselves when it is absent.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -222,6 +223,9 @@ def main() -> int:
     ap.add_argument("--logs", default=None, help="directory for per-smoke logs")
     ap.add_argument("--json", default=None, help="write a machine-readable summary here")
     ap.add_argument("--baseline", default=None, help="compare against a prior --json summary")
+    ap.add_argument("--no-queue", action="store_true",
+                    help="fail immediately if another suite holds the box "
+                         "instead of queueing behind it")
     args = ap.parse_args()
 
     # Answered before any environment check: a BUILD step asks this, and it has
@@ -246,6 +250,44 @@ def main() -> int:
         print("S3 env not set — `set -a; . ./.env; set +a` first", file=sys.stderr)
         return 2
 
+    # ── One suite per box ─────────────────────────────────────────────
+    # Ports are already disjoint (smoke_ports.py); the resource suites
+    # actually contend for is CPU — a saturated box trips raft election
+    # timeouts, which read as spurious failovers in BOTH runs. So suite
+    # runs queue on a box-global flock: the kernel blocks waiters and
+    # releases on process exit (crash included — no stale locks; the
+    # lock file itself is never unlinked, unlink+flock races). Several
+    # agents in several clones can all just start a suite; they run one
+    # at a time in roughly arrival order.
+    lock_path = "/tmp/rove-smoke-suite.lock"
+    lock_fd = open(lock_path, "a+", opener=lambda p, f: os.open(p, f, 0o666))
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            lock_fd.seek(0)
+            holder = lock_fd.read().strip() or "unknown holder"
+        except OSError:
+            holder = "unknown holder"
+        if args.no_queue:
+            print(f"another suite is running ({holder}); --no-queue set, exiting", file=sys.stderr)
+            return 3
+        print(f"another suite is running ({holder}); queued — this run starts when it finishes ...",
+              flush=True)
+        wait_t0 = time.monotonic()
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        print(f"suite lock acquired after {time.monotonic() - wait_t0:.0f}s", flush=True)
+    lock_fd.seek(0)
+    lock_fd.truncate(0)
+    lock_fd.write(f"pid={os.getpid()} cwd={os.getcwd()} started={time.strftime('%H:%M:%S')}\n")
+    lock_fd.flush()
+    # Held for the life of the process; the kernel releases it at exit.
+
+    # The build happens INSIDE the lock, not before it: a zig+cargo build
+    # saturates the box, and a saturated box trips raft election timeouts in
+    # whatever suite is already running. Queuing first costs a waiter a few
+    # seconds and keeps one run from corrupting another's result.
+    #
     # Build what we are about to run. Existence in zig-out is no evidence of
     # freshness: `zig build test` COMPILES every shipped binary but installs
     # none of them, install-copy mtimes carry artifact times rather than

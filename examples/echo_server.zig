@@ -1,38 +1,64 @@
+// SPDX-FileCopyrightText: 2026 Loop46, Inc.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! The TCP echo server, in the declared-world
+//! shape: the root module declares the program's world ONCE (`rove_world`,
+//! the `std_options` idiom), built from io's part; `MyIo.Reg` resolves to
+//! the world's registry, which OWNS every declared collection — consumers
+//! address them through `reg.coll(.name)` in the world's one namespace.
+//! Moves are total and no lifecycle hooks run — release happens by
+//! transition through `conn_closing` and `write_done`.
 const std = @import("std");
 const rove = @import("rove");
 const rio = @import("rove-io");
 
-const MyIo = rio.Io(.{});
+const io_opts = rio.Options{};
 
-fn processReads(io: *MyIo, reg: *rove.Registry, alloc: std.mem.Allocator) !void {
+/// The world type, declared once at root scope. Values of its registry
+/// are constructed in `main` (one per worker thread in a threaded
+/// program) — never at root scope.
+pub const rove_world = rove.World(.{ .parts = rio.parts(io_opts) });
+
+const MyIo = rio.Io(io_opts);
+
+fn processReads(reg: *MyIo.Reg, alloc: std.mem.Allocator) !void {
+    const read_results = reg.coll(.read_results);
     for (
-        io.read_results.entitySlice(),
-        io.read_results.column(rio.ConnEntity),
-        io.read_results.column(rio.ReadResult),
+        read_results.entitySlice(),
+        read_results.column(rio.ConnEntity),
+        read_results.column(rio.ReadResult),
     ) |ent, conn_ent, result| {
         if (result.result > 0) {
             const data_len: u32 = @intCast(result.result);
             const copy = try alloc.alloc(u8, data_len);
             @memcpy(copy, result.data.?[0..data_len]);
 
-            const we = try reg.create(&io.write_in);
-            try reg.set(we, &io.write_in, rio.ConnEntity, conn_ent);
-            try reg.set(we, &io.write_in, rio.WriteBuf, .{
+            const write_in = reg.coll(.write_in);
+            const we = try reg.create(write_in);
+            try reg.set(we, write_in, rio.ConnEntity, conn_ent);
+            try reg.set(we, write_in, rio.WriteBuf, .{
                 .data = copy.ptr,
                 .len = data_len,
             });
 
-            try reg.move(ent, &io.read_results, &io.read_in);
+            try reg.move(ent, read_results, reg.coll(.read_in));
         } else {
-            try reg.destroy(conn_ent.entity);
+            // EOF or error: the conn still owns a live fd, so hand it to
+            // `conn_closing` — io's teardown system shuts the socket down
+            // and retires it. The read entity holds no buffer at EOF/error
+            // and can simply go.
             try reg.destroy(ent);
+            try reg.move(conn_ent.entity, reg.coll(.connections), reg.coll(.conn_closing));
         }
     }
 }
 
-fn processWrites(io: *MyIo, reg: *rove.Registry) !void {
-    for (io.write_results.entitySlice()) |ent| {
-        try reg.destroy(ent);
+fn processWrites(reg: *MyIo.Reg) !void {
+    // `write_done` is the terminal collection whose system frees the
+    // buffer — reaching it means the send's CQE landed and the kernel is
+    // done with the bytes.
+    const write_results = reg.coll(.write_results);
+    for (write_results.entitySlice()) |ent| {
+        try reg.move(ent, write_results, reg.coll(.write_done));
     }
 }
 
@@ -41,7 +67,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var reg = try rove.Registry.init(alloc, .{
+    var reg = try MyIo.Reg.init(alloc, .{
         .max_entities = 4096,
         .deferred_queue_capacity = 1024,
     });
@@ -59,9 +85,9 @@ pub fn main() !void {
 
     while (true) {
         _ = try io.poll(1);
-        try processReads(io, &reg, alloc);
+        try processReads(&reg, alloc);
         try reg.flush();
-        try processWrites(io, &reg);
+        try processWrites(&reg);
         try reg.flush();
     }
 }

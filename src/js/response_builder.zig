@@ -210,7 +210,7 @@ pub fn finalizeResponse(
         std.log.warn("rove-5xx: status={d} body_len={d} (canned response on send path)", .{ status_code, body_len });
     }
     try stageResponse(server, ent, sid, sess, status_code, hdrs, body_ptr, body_len);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
+    try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
 }
 
 /// Set the six response components on `ent` in `request_out` WITHOUT
@@ -230,12 +230,12 @@ pub fn stageResponse(
     body_ptr: ?[*]u8,
     body_len: u32,
 ) !void {
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = body_ptr, .len = body_len });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = status_code });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, hdrs);
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{ .data = body_ptr, .len = body_len });
+    try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+    try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
 }
 
 /// Overwrite an entity in `request_out` with a `421 Misdirected
@@ -291,8 +291,8 @@ pub fn overwriteWith413(
 ) !void {
     if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
     const body = try allocator.dupe(u8, entry_too_large_body);
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 413 });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = 413 });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{
         .data = body.ptr,
         .len = @intCast(body.len),
     });
@@ -307,8 +307,8 @@ pub fn overwriteWith421(
 ) !void {
     if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
     const body = try allocator.dupe(u8, "write not accepted here (rolled back); retry against the cluster leader\n");
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 421 });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = 421 });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{
         .data = body.ptr,
         .len = @intCast(body.len),
     });
@@ -340,8 +340,8 @@ pub fn overwriteWithKvQuotaExceeded(
             "delete data or upgrade the plan\"}}\n",
         .{ used, cap },
     );
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 507 });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = 507 });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{
         .data = body.ptr,
         .len = @intCast(body.len),
     });

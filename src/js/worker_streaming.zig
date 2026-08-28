@@ -88,7 +88,7 @@ const resolveDeployment = worker_mod.resolveDeployment;
 /// branches call this defensively after error logging — if the
 /// component fetch fails, the entity was never a stream anyway.
 fn markStreamDraining(server: anytype, ent: rove.Entity) void {
-    const drain_ptr = server.reg.get(ent, &server.stream_data_out, components_mod.StreamDraining) catch return;
+    const drain_ptr = server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamDraining) catch return;
     drain_ptr.is_draining = true;
 }
 
@@ -99,11 +99,11 @@ fn markStreamDraining(server: anytype, ent: rove.Entity) void {
 /// the steady-state case. Same defensive posture: if neither
 /// matches, the entity isn't a live stream — silent no-op.
 fn markStreamDrainingAnywhere(server: anytype, ent: rove.Entity) void {
-    if (server.reg.get(ent, &server.stream_response_in, components_mod.StreamDraining)) |dp| {
+    if (server.reg.get(ent, server.coll(.stream_response_in), components_mod.StreamDraining)) |dp| {
         dp.is_draining = true;
         return;
     } else |_| {}
-    if (server.reg.get(ent, &server.stream_data_out, components_mod.StreamDraining)) |dp| {
+    if (server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamDraining)) |dp| {
         dp.is_draining = true;
         return;
     } else |_| {}
@@ -275,11 +275,11 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // Draining state lives on the entity's StreamDraining
         // component. Reads of chunks/wakes/chain identity come from
         // the four stream components.
-        const draining_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamDraining) catch continue;
-        const chunks_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChunks) catch continue;
-        const wakes_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamWakes) catch continue;
-        const chain_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChain) catch continue;
-        const ctx_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.ChainContext) catch continue;
+        const draining_comp = server.reg.get(p.ent, server.coll(.stream_data_out), components_mod.StreamDraining) catch continue;
+        const chunks_comp = server.reg.get(p.ent, server.coll(.stream_data_out), components_mod.StreamChunks) catch continue;
+        const wakes_comp = server.reg.get(p.ent, server.coll(.stream_data_out), components_mod.StreamWakes) catch continue;
+        const chain_comp = server.reg.get(p.ent, server.coll(.stream_data_out), components_mod.StreamChain) catch continue;
+        const ctx_comp = server.reg.get(p.ent, server.coll(.stream_data_out), components_mod.ChainContext) catch continue;
 
         // Drain one chunk per tick — h2 cycles the entity back to
         // `stream_data_out` after each DATA frame ships. Same for
@@ -288,18 +288,18 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         if (chunks_comp.popOldest()) |chunk| {
             // RespBody takes ownership; h2's onDataSourceReadCb frees
             // the buffer after consuming it (h2/root.zig:818).
-            try server.reg.set(p.ent, &server.stream_data_out, h2.RespBody, .{
+            try server.reg.set(p.ent, server.coll(.stream_data_out), h2.RespBody, .{
                 .data = chunk.ptr,
                 .len = @intCast(chunk.len),
             });
-            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_data_in);
+            try server.reg.move(p.ent, server.coll(.stream_data_out), server.coll(.stream_data_in));
             continue;
         }
 
         // Chunks drained. If StreamDraining flagged the chain, close
         // now (END_STREAM); component deinit cleans up on destroy.
         if (draining_comp.is_draining) {
-            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+            try server.reg.move(p.ent, server.coll(.stream_data_out), server.coll(.stream_close_in));
             continue;
         }
 
@@ -322,7 +322,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                     "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
                     .{ ctx_comp.tenant_id, ctx_comp.saga_id orelse "(none)" },
                 );
-                try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+                try server.reg.move(p.ent, server.coll(.stream_data_out), server.coll(.stream_close_in));
                 continue;
             }
             resumeStream(worker, p.ent, p.sid, p.sess, .wake_batch) catch |err| {
@@ -330,7 +330,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                     "rove-js stream-resume (wake_batch): tenant={s} corr={s}: {s}; closing",
                     .{ ctx_comp.tenant_id, ctx_comp.saga_id orelse "(none)", @errorName(err) },
                 );
-                server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
+                server.reg.move(p.ent, server.coll(.stream_data_out), server.coll(.stream_close_in)) catch {};
             };
             continue;
         }
@@ -352,11 +352,11 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // final chunk's terminal arm sets `is_draining` (handled above),
         // which is what actually closes the stream.
         const pending_binds: u32 = blk: {
-            const cnt = server.reg.get(p.ent, &server.stream_data_out, components_mod.BoundFetchCount) catch break :blk 0;
+            const cnt = server.reg.get(p.ent, server.coll(.stream_data_out), components_mod.BoundFetchCount) catch break :blk 0;
             break :blk cnt.pending;
         };
         if (pending_binds == 0 and wakes_comp.interval_ms == 0 and wakes_comp.kv_prefixes.len == 0) {
-            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+            try server.reg.move(p.ent, server.coll(.stream_data_out), server.coll(.stream_close_in));
             continue;
         }
         // No wake due yet — idle, waiting for either a kv match or
@@ -398,12 +398,12 @@ fn drainKvWakeInbox(worker: anytype) !void {
     // identical. Listed last so a stream and a continuation never share
     // a column slice in one iteration.
     inline for (.{
-        &server.stream_response_in,
-        &server.stream_data_out,
-        &server.stream_data_in,
-        &server.stream_close_in,
-        &server._stream_data_sending,
-        &worker.parked_continuations,
+        server.coll(.stream_response_in),
+        server.coll(.stream_data_out),
+        server.coll(.stream_data_in),
+        server.coll(.stream_close_in),
+        server.coll(._stream_data_sending),
+        worker.parked_continuations,
     }) |coll| {
         const wakes_col = coll.column(components_mod.StreamWakes);
         const chains_col = coll.column(components_mod.ChainContext);
@@ -813,10 +813,10 @@ fn finishStreamResume(
                 // The entity is in stream_data_out (steady state) or
                 // stream_response_in (bound-fetch chunk during the
                 // one-tick post-commit window) — probe both.
-                if (server.reg.get(ctx.ent, &server.stream_data_out, components_mod.BoundFetchCount)) |cnt| {
+                if (server.reg.get(ctx.ent, server.coll(.stream_data_out), components_mod.BoundFetchCount)) |cnt| {
                     if (cnt.pending > 0) break :blk true;
                 } else |_| {}
-                if (server.reg.get(ctx.ent, &server.stream_response_in, components_mod.BoundFetchCount)) |cnt| {
+                if (server.reg.get(ctx.ent, server.coll(.stream_response_in), components_mod.BoundFetchCount)) |cnt| {
                     if (cnt.pending > 0) break :blk true;
                 } else |_| {}
                 break :blk false;
@@ -1057,10 +1057,10 @@ fn resumeStream(
     // for non-draining entities (the caller filters); the terminal /
     // cap-hit branches call `markStreamDraining(server, ent)`.
     const server = worker.h2;
-    const chain_ctx = server.reg.get(ent, &server.stream_data_out, components_mod.ChainContext) catch return error.ResumeNoChainCtx;
-    const chain_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChain) catch return error.ResumeNoChainState;
-    const chunks_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return error.ResumeNoChunks;
-    const wakes_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamWakes) catch return error.ResumeNoWakes;
+    const chain_ctx = server.reg.get(ent, server.coll(.stream_data_out), components_mod.ChainContext) catch return error.ResumeNoChainCtx;
+    const chain_st = server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamChain) catch return error.ResumeNoChainState;
+    const chunks_st = server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamChunks) catch return error.ResumeNoChunks;
+    const wakes_st = server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamWakes) catch return error.ResumeNoWakes;
 
     const path = chain_st.module_path;
     var dep = try resolveDeployment(worker, allocator, chain_ctx.tenant_id, path);
@@ -1254,23 +1254,23 @@ pub fn resumeBoundFetchStream(
     // markStreamDraining is hardcoded against stream_data_out — when
     // entity is in stream_response_in, we set is_draining directly
     // against the current collection.
-    const in_data_out = server.reg.isInCollection(ent, &server.stream_data_out);
+    const in_data_out = server.reg.isInCollection(ent, server.coll(.stream_data_out));
     const chain_ctx = if (in_data_out)
-        server.reg.get(ent, &server.stream_data_out, components_mod.ChainContext) catch return
+        server.reg.get(ent, server.coll(.stream_data_out), components_mod.ChainContext) catch return
     else
-        server.reg.get(ent, &server.stream_response_in, components_mod.ChainContext) catch return;
+        server.reg.get(ent, server.coll(.stream_response_in), components_mod.ChainContext) catch return;
     const chain_st = if (in_data_out)
-        server.reg.get(ent, &server.stream_data_out, components_mod.StreamChain) catch return
+        server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamChain) catch return
     else
-        server.reg.get(ent, &server.stream_response_in, components_mod.StreamChain) catch return;
+        server.reg.get(ent, server.coll(.stream_response_in), components_mod.StreamChain) catch return;
     const chunks_st = if (in_data_out)
-        server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return
+        server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamChunks) catch return
     else
-        server.reg.get(ent, &server.stream_response_in, components_mod.StreamChunks) catch return;
+        server.reg.get(ent, server.coll(.stream_response_in), components_mod.StreamChunks) catch return;
     const wakes_st = if (in_data_out)
-        server.reg.get(ent, &server.stream_data_out, components_mod.StreamWakes) catch return
+        server.reg.get(ent, server.coll(.stream_data_out), components_mod.StreamWakes) catch return
     else
-        server.reg.get(ent, &server.stream_response_in, components_mod.StreamWakes) catch return;
+        server.reg.get(ent, server.coll(.stream_response_in), components_mod.StreamWakes) catch return;
 
     const path = chain_st.module_path;
     var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
@@ -1320,9 +1320,9 @@ pub fn resumeBoundFetchStream(
     // Entity is in `stream_data_out` or `stream_response_in` at
     // this point; both carry BoundFetchCount via the merged Row.
     const fetches_pending: u32 = blk: {
-        const cnt_data = server.reg.get(ent, &server.stream_data_out, components_mod.BoundFetchCount) catch null;
+        const cnt_data = server.reg.get(ent, server.coll(.stream_data_out), components_mod.BoundFetchCount) catch null;
         if (cnt_data) |c| break :blk c.pending;
-        const cnt_in = server.reg.get(ent, &server.stream_response_in, components_mod.BoundFetchCount) catch null;
+        const cnt_in = server.reg.get(ent, server.coll(.stream_response_in), components_mod.BoundFetchCount) catch null;
         if (cnt_in) |c| break :blk c.pending;
         break :blk 0;
     };
@@ -2354,9 +2354,9 @@ pub fn proposeForgetfulWrites(
     // freeing it (no double-free).
     unit.tenant_id = try allocator.dupe(u8, tenant_id);
 
-    const ent = try worker.h2.reg.create(&worker.parked_units);
+    const ent = try worker.h2.reg.create(worker.parked_units);
     errdefer worker.h2.reg.destroy(ent) catch {};
-    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
+    try worker.h2.reg.set(ent, worker.parked_units, ParkedUnit, unit);
     unit = .{}; // ownership transferred to the column
     return seq;
 }
@@ -2716,9 +2716,9 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         // (`raft_pending_*`). Leave the head spooled; `drainSpools`
         // retries after the commit lands.
         if (server.reg.isMoving(held_ent)) return;
-        const ready_cont = server.reg.isInCollection(held_ent, &worker.parked_continuations);
-        const ready_stream = server.reg.isInCollection(held_ent, &server.stream_data_out) or
-            server.reg.isInCollection(held_ent, &server.stream_response_in);
+        const ready_cont = server.reg.isInCollection(held_ent, worker.parked_continuations);
+        const ready_stream = server.reg.isInCollection(held_ent, server.coll(.stream_data_out)) or
+            server.reg.isInCollection(held_ent, server.coll(.stream_response_in));
         if (!ready_cont and !ready_stream) {
             // The held entity isn't in a receivable collection right now.
             // It is only genuinely GONE if it's stale (destroyed/recycled) —
@@ -2761,8 +2761,8 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         // stream) are never gated — they open the stream.
         if (ready_stream and !ready_cont) {
             const sc: ?*components_mod.StreamChunks =
-                (server.reg.get(held_ent, &server.stream_data_out, components_mod.StreamChunks) catch null) orelse
-                (server.reg.get(held_ent, &server.stream_response_in, components_mod.StreamChunks) catch null);
+                (server.reg.get(held_ent, server.coll(.stream_data_out), components_mod.StreamChunks) catch null) orelse
+                (server.reg.get(held_ent, server.coll(.stream_response_in), components_mod.StreamChunks) catch null);
             if (sc) |chunks| {
                 if (chunks.atSoftCap()) return;
             }
@@ -3076,8 +3076,8 @@ fn progressRelayBacklog(worker: anytype, fetch_id: []const u8) void {
         const head = bl.headItem() orelse return;
         switch (head.payload) {
             .bytes => {
-                const in_out = server.reg.isInCollection(held_ent, &server.stream_data_out);
-                const in_resp = !in_out and server.reg.isInCollection(held_ent, &server.stream_response_in);
+                const in_out = server.reg.isInCollection(held_ent, server.coll(.stream_data_out));
+                const in_resp = !in_out and server.reg.isInCollection(held_ent, server.coll(.stream_response_in));
                 // Not in the stream pipeline yet: the decider (seq-0)
                 // activation hasn't run/committed. Stay backlogged;
                 // retry next tick. (A dead-end chain resolves via the
@@ -3085,9 +3085,9 @@ fn progressRelayBacklog(worker: anytype, fetch_id: []const u8) void {
                 if (!in_out and !in_resp) return;
                 const chunks: *components_mod.StreamChunks = blk: {
                     if (in_out) {
-                        if (server.reg.get(held_ent, &server.stream_data_out, components_mod.StreamChunks)) |p| break :blk p else |_| return;
+                        if (server.reg.get(held_ent, server.coll(.stream_data_out), components_mod.StreamChunks)) |p| break :blk p else |_| return;
                     }
-                    if (server.reg.get(held_ent, &server.stream_response_in, components_mod.StreamChunks)) |p| break :blk p else |_| return;
+                    if (server.reg.get(held_ent, server.coll(.stream_response_in), components_mod.StreamChunks)) |p| break :blk p else |_| return;
                 };
                 // Lossless backpressure: don't feed a queue at the
                 // high-water; the backlog holds, the engine window
@@ -3126,8 +3126,8 @@ fn progressRelayBacklog(worker: anytype, fetch_id: []const u8) void {
                 // went terminal instead tears the chain down
                 // (`scanAndCancelBoundFetches`), which drops this
                 // backlog rather than leaving it waiting.
-                if (!server.reg.isInCollection(held_ent, &server.stream_data_out) and
-                    !server.reg.isInCollection(held_ent, &server.stream_response_in))
+                if (!server.reg.isInCollection(held_ent, server.coll(.stream_data_out)) and
+                    !server.reg.isInCollection(held_ent, server.coll(.stream_response_in)))
                     return;
                 // Every relayed byte before it has been appended (FIFO)
                 // — hand the terminal to the normal bound-fetch dispatch
@@ -3386,7 +3386,7 @@ pub fn flushResumeFetches(
             // The trampoline's own count bump targets `request_out`
             // (the open-hop home); on the resume path the entity is
             // parked — bump where it actually lives.
-            if (worker.h2.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+            if (worker.h2.reg.get(ent, worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
                 cnt.pending +%= 1;
             } else |_| {}
         }

@@ -1166,12 +1166,12 @@ fn handleRelease(
     try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     const group_id = worker.raft.gidForTenant(parsed.value.tenant_id) orelse 0;
-    try server.reg.set(ent, &server.request_out, RaftWait, .{
+    try server.reg.set(ent, server.coll(.request_out), RaftWait, .{
         .group_id = group_id,
         .seq = seq,
         .deadline_ns = deadline_ns,
     });
-    try server.reg.move(ent, &server.request_out, &worker.raft_pending_response);
+    try server.reg.move(ent, server.coll(.request_out), worker.raft_pending_response);
     // Pass empty writeset — handleRelease's actual kv writes
     // (`_deploy/current`) ride on the entity's own txn in pending_txns;
     // the parked_unit here is move-routing-only.

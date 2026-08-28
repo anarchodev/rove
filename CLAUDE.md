@@ -134,13 +134,14 @@ rove-io abstraction.
 
 ### Core ECS pattern (rove module)
 
-The foundational abstraction used throughout:
+The foundational abstraction used throughout — the fat-entity model:
 - **Entity** — lightweight handle (index + generation) for safe identity tracking
-- **Row** — compile-time type composition defining an entity's component shape
-- **Collection** — SoA (Structure-of-Arrays) storage with alignment + component lifecycle
-- **Registry** — manages multiple collections; handles entity creation, destruction, and moves
+- **Row** — compile-time type composition naming the components a collection materializes
+- **Collection** — SoA (Structure-of-Arrays) storage with alignment; pure storage, no lifecycle hooks
+- **World** — the declared component/collection tables (`rove.World(.{ .parts = ... })`, one `Part` per layer, declared by the module that instantiates); its `Reg` owns every collection's storage, and its flattened table is the one id namespace (`CollId`)
+- **FatRegistry** — the storage model under the world: every entity conceptually carries the whole component universe (AoS shadow table + per-entity `{gen, written}` header); collections are the dense SoA views systems iterate; moves are total and lossless (components the destination lacks park in the shadow); membership axes — one total lifecycle axis, partial state axes with `enter`/`leave`, identity sets exempt from quiescing; `getFat`/`getRow` are the universal reads
 
-Systems are pure functions called between `poll()` and `reg.flush()`, not methods on the registry.
+Release is a TRANSITION owned by a system, never a destructor: buffers free in phases (`write_done`, `conn_dead`, the `_stream_dead` reaper) and endings go through funnel verbs (`closeConn`, `destroyEntity`, the `moveOnly`/`evictOnly` quiesce family — deferred `evict` is entity-keyed and never refuses a moving entity). Systems are pure functions called between `poll()` and `reg.flush()`, not methods on the registry.
 
 ### Request lifecycle (rove-js worker)
 
