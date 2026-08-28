@@ -24,16 +24,13 @@ const h2 = @import("rove-h2");
 const kv_mod = @import("raft-kv");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
-const effect_mod = @import("effect/root.zig");
 
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
-const raft_propose = @import("raft_propose.zig");
 const v2_move = @import("v2_move.zig");
 const deploy_door = @import("deploy_door.zig");
 const worker_mod = @import("worker.zig");
 
-const RaftWait = worker_mod.RaftWait;
 
 /// What `tryHandleSystem` decided about a request.
 pub const Disposition = union(enum) {
@@ -51,12 +48,16 @@ pub const Disposition = union(enum) {
 };
 
 /// A `/_system/*` route that resolves to a baked module in a named tenant's
-/// scope. Both fields are static strings — a door names the module it means,
-/// so nothing here comes from the request.
+/// scope. `module_base` is always a static string — the route names the
+/// module it means, never the request. `tenant` is static where the route
+/// has one fixed subject (admin-kv → `__admin__`) and request-derived where
+/// the AUTHENTICATED operator names the target (release) — in that case the
+/// route dups it with the per-request allocator, since the parse tree it
+/// borrows from is freed before the dispatch arm runs.
 pub const ForcedActivation = struct {
     /// The scope the activation runs in. Not derived from the Host: this
-    /// family authenticates the operator, and the door already knows which
-    /// tenant it is for.
+    /// family authenticates the operator first, and the tenant is the
+    /// route's own subject or the operator's validated target.
     tenant: []const u8,
     /// Baked module path WITHOUT the `.mjs` suffix (the route's
     /// `module_base` spelling); the bytecode key appends it.
@@ -168,8 +169,7 @@ pub fn tryHandleSystem(
     // at __admin__'s manifest. Customer release traffic goes through
     // `__admin__`'s deployed `publishRelease` RPC instead.
     if (std.mem.eql(u8, sys_rest, "release")) {
-        try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
-        return .answered;
+        return try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
     }
 
     // Bootstrap + break-glass (`docs/architecture/cli-and-deploy.md` §4). Root-token
@@ -938,12 +938,21 @@ fn handleRaftSnapshot(
 }
 
 
-/// Stamp `_deploy/current = {dep_id:0>16}` on the tenant's app.db,
-/// propose envelope 0, park the request on raft_pending, and
-/// return 204 once raft commits (or 503 on fault/timeout). Enqueues
-/// the deployment loader inline so the leader's worker starts
-/// fetching bytecodes immediately; the apply path on followers
-/// enqueues on its own when the writeset commits.
+/// `/_system/release` — validate the operator's `{tenant_id, dep_id}` and
+/// dispatch the flip as an ACTIVATION of baked `__system/release_flip` in
+/// the target tenant's own scope (rove#719). The write, the record, the
+/// tape, the park-on-commit and the 204's durability contract are all the
+/// ordinary handler path's; on commit the pump's origin-aware apply
+/// observer enqueues the deployment loader on every node, proposer
+/// included, replacing the door-era explicit nudge.
+///
+/// The route keeps three answers for itself: the 400s (malformed body), the
+/// 404 (unknown tenant — keeps stale dashboard sessions from populating the
+/// table with garbage), and the idempotent fast path — `_deploy/current`
+/// already naming `dep_id` answers 204 with no dispatch, plus a
+/// belt-and-braces loader nudge for a slot whose snapshot never landed.
+/// A READ on the request thread is fine; it is writes that need an
+/// activation behind them.
 ///
 /// Platform-bootstrap only — customer release traffic goes through
 /// __admin__'s deployed `publishRelease` RPC. Kept on the system
@@ -959,53 +968,39 @@ fn handleRelease(
     method: []const u8,
     body: []const u8,
     cors_origin: ?[]const u8,
-) !void {
+) !Disposition {
     if (!std.mem.eql(u8, method, "POST")) {
         try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
-        return;
+        return .answered;
     }
     var parsed = std.json.parseFromSlice(struct {
         tenant_id: []const u8,
         dep_id: u64,
     }, allocator, body, .{ .ignore_unknown_fields = true }) catch {
         try respb.setSystemResponse(server, ent, sid, sess, 400, "expected {\"tenant_id\":\"...\",\"dep_id\":N}\n", allocator, cors_origin, null);
-        return;
+        return .answered;
     };
     defer parsed.deinit();
 
     if (parsed.value.tenant_id.len == 0 or parsed.value.dep_id == 0) {
         try respb.setSystemResponse(server, ent, sid, sess, 400, "tenant_id required and dep_id must be > 0\n", allocator, cors_origin, null);
-        return;
+        return .answered;
     }
 
-    // Reject unknown tenants — keeps stale dashboard sessions from
-    // populating the table with garbage that never matches.
     const inst_opt = worker.node.tenant.getInstance(parsed.value.tenant_id) catch null;
     const inst = inst_opt orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown tenant\n", allocator, cors_origin, null);
-        return;
+        return .answered;
     };
 
-    // Persist the release pointer to the tenant's app.db. Stamps
-    // `_deploy/current = {dep_id:016x}` and proposes through raft
-    // envelope 0; followers' apply path picks it up and the worker's
-    // openTenantFiles reads it on first request after a restart.
-    var hex_buf: [16]u8 = undefined;
-    const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{parsed.value.dep_id}) catch unreachable;
-
-    // Idempotent fast path: matches `releasePublishTrampoline`. If
-    // the target's `_deploy/current` is already exactly `dep_id`,
-    // skip the raft propose. The platform-bootstrap flow (publishing
-    // __admin__ / __replay__) retries against each node in turn, so a
-    // retry can land here after the first commit; without this
-    // short-circuit every retry re-proposes a no-op envelope.
-    //
-    // With content-addressed dep_ids, "same id" genuinely means
-    // "same content", so the snapshot already in place IS the right
-    // one. Still enqueue the loader as belt-and-braces — if the
-    // tenant's slot was lazy-opened but its snapshot never landed
-    // (e.g. a deployment loader crash), this nudges another attempt.
-    // The loader is per-tenant dedup'd, so an extra enqueue is cheap.
+    // Idempotent fast path. With content-addressed dep_ids, "same id"
+    // genuinely means "same content", so the snapshot already in place IS
+    // the right one — answer without dispatching, so a bootstrap retry
+    // (each node hunted in turn) re-proposes nothing and grows no
+    // `_release/` history. Still nudge the loader as belt-and-braces: if
+    // the slot was lazy-opened but its snapshot never landed (a loader
+    // crash), this triggers another attempt; per-tenant dedup makes the
+    // extra enqueue cheap.
     if (inst.kv.get("_deploy/current")) |current_hex| {
         defer allocator.free(current_hex);
         const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
@@ -1017,169 +1012,16 @@ fn handleRelease(
                 );
             }
             try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
-            return;
+            return .answered;
         }
     } else |_| {}
 
-    var txn = inst.kv.beginTrackedImmediate() catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "release txn open failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-    txn.put("_deploy/current", hex) catch |err| {
-        txn.rollback() catch {};
-        const msg = try std.fmt.allocPrint(allocator, "release put failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-    // Release history: per-tenant `_release/{ts_ms:020}` → `{id:016x}`.
-    // Lex-ordered by timestamp (millis, zero-padded) so a reverse-
-    // scan returns newest-first — what the dashboard's Deploys tab
-    // needs. Same value gets written for re-releases of the same id;
-    // that's fine, the customer DID hit "deploy" again. Different
-    // releases get different timestamps even if content collides.
-    var ts_buf: [20]u8 = undefined;
-    // MUST be unsigned: `{d:0>20}` on a signed positive integer reserves a
-    // sign column and emits a leading `+` ("000000+<ms>"), which is not a
-    // digit — the dashboard reader's `parseInt(key.slice(9), 10)` then stops
-    // at the `+` and reads ts_ms as 0. u64 formats as pure digits.
-    const ts_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>20}", .{ts_ms}) catch unreachable;
-    var release_key_buf: [32]u8 = undefined;
-    const release_key = std.fmt.bufPrint(&release_key_buf, "_release/{s}", .{ts_str}) catch unreachable;
-    txn.put(release_key, hex) catch |err| {
-        txn.rollback() catch {};
-        const msg = try std.fmt.allocPrint(allocator, "release history put failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    ws.addPut("_deploy/current", hex) catch |err| {
-        txn.rollback() catch {};
-        const msg = try std.fmt.allocPrint(allocator, "release writeset failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-    ws.addPut(release_key, hex) catch |err| {
-        txn.rollback() catch {};
-        const msg = try std.fmt.allocPrint(allocator, "release-history writeset failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-
-    // No manifest fetch + no config-mirror on this hot path.
-    // The request thread never blocks on the network — release
-    // just records the new pointer + proposes. The deployment
-    // loader (running on a background thread) is responsible
-    // for fetching the manifest, mirroring `_config/*.json`
-    // entries into kv, and swapping the tenant's loaded
-    // bytecodes / statics. See `worker.zig::DeploymentLoader`.
-    //
-    // Trade-off: `_deploy/current` and the `_config/*` mirror
-    // are not atomic in raft. There is a small window
-    // after release commit where `kv.fromConfig(...)` returns
-    // the previous deployment's value. The window closes when
-    // the loader finishes — typically ~tens-of-ms for an empty
-    // manifest, ~hundreds-of-ms for one with bytecodes.
-    //
-    // Customer code that reads `_config/*` immediately after a
-    // release must either accept eventual consistency or wait
-    // on the loader's completion signal (SSE — future work).
-
-    txn.commit() catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "release commit failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-        return;
-    };
-
-    // Propose envelope-0 and capture the assigned seq so we can
-    // park this request on raft commit. The proposeBatcher coalesces
-    // any other proposals queued at the next raft tick — multiple
-    // parallel release POSTs become a single consensus round.
-    // handleRelease is an internal admin endpoint with no
-    // dispatched-handler readset to attach.
-    const seq = (raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id, "") catch |err| {
-        // Propose failed before raft accepted it (queue full,
-        // shutting down, not leader). The local write was a kvexp
-        // *speculative* commit (volatile — LMDB only at raft-apply);
-        // a propose that never reached raft leaves nothing durable,
-        // so there is no local undo to perform (kvexp has no
-        // kv_undo table). NotLeader → 421 (the retry-safe re-aim
-        // status, decisions.md §10.5c) so callers hunt the leader;
-        // anything else → 503 without parking; the proposer
-        // invariant (kvexp volatility; `docs/architecture/consensus-robustness.md`).
-        const status: u16 = if (err == error.NotLeader) 421 else 503;
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            "release propose failed: {s}\n",
-            .{@errorName(err)},
-        );
-        try respb.setSystemResponseOwned(server, ent, sid, sess, status, msg, allocator, cors_origin, null);
-        return;
-    }).seq;
-
-    // Enqueue the deployment loader directly — the leader's apply
-    // path is leader-skip for envelope-0, so the apply thread won't
-    // do this for us on this node. On follower nodes, apply.zig's
-    // _deploy/current detector enqueues automatically when the
-    // writeset commits.
-    if (worker.node.deploy.deployment_loader) |loader| {
-        loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
-            std.log.warn(
-                "release: deployment loader enqueue {s}/{d} failed: {s}",
-                .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
-            );
-        };
-    }
-
-    // Park the request on the response-sibling of raft-pending —
-    // release POST is always terminal (no cont / stream).
-    // drainRaftPending will:
-    //   - on commit: commit the parked txn + deliver 204
-    //   - on fault / timeout: roll back + deliver 503
-    // The worker thread is free to dispatch the next stream
-    // immediately; this is what lets proposeBatcher actually
-    // batch multiple in-flight release POSTs.
-    // A move-only Cmd.respond on
-    // a parked_unit routes the commit-arm move through `interpretCmd
-    // .respond` (matching every other entity park path). BUILD IT FIRST:
-    // if its (1-slot) alloc fails after the entity is committed to
-    // raft_pending_response, the commit-arm can't ship the 204 and the
-    // client waits out the full RaftWait deadline for a misleading 503,
-    // silently. Fail loud now while the entity is still in request_out.
-    var release_cmds: effect_mod.cmd.BufferedCmds = .{};
-    release_cmds.items.append(allocator, .{ .respond = .{
-        .entity = ent,
-        .source = .raft_pending_response,
-        .dest = .response_in,
-    } }) catch |err| {
-        std.log.warn(
-            "release: respond Cmd alloc failed (tenant={s} seq={d}): {s} — failing loud (500)",
-            .{ parsed.value.tenant_id, seq, @errorName(err) },
-        );
-        try respb.setSimpleResponse(server, ent, sid, sess, 500, "release response dispatch alloc failed\n", allocator);
-        return;
-    };
-
-    try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
-    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-    const group_id = worker.raft.gidForTenant(parsed.value.tenant_id) orelse 0;
-    try server.reg.set(ent, server.coll(.request_out), RaftWait, .{
-        .group_id = group_id,
-        .seq = seq,
-        .deadline_ns = deadline_ns,
-    });
-    try server.reg.move(ent, server.coll(.request_out), worker.raft_pending_response);
-    // Pass empty writeset — handleRelease's actual kv writes
-    // (`_deploy/current`) ride on the entity's own txn in pending_txns;
-    // the parked_unit here is move-routing-only.
-    const empty_ws = kv_mod.WriteSet.init(allocator);
-    var ws_local = empty_ws;
-    defer ws_local.deinit();
-    worker_mod.parkKvWakes(worker, seq, parsed.value.tenant_id, &ws_local, release_cmds) catch |perr|
-        std.log.warn("release: parkKvWakes (tenant={s}) failed: {s}", .{ parsed.value.tenant_id, @errorName(perr) });
+    // The tenant id borrows the JSON parse tree, which `parsed.deinit()`
+    // frees on return — the ForcedActivation outlives this frame, so dup
+    // it with the same per-request allocator the dispatch arm uses for the
+    // route it builds from this.
+    const tenant = try allocator.dupe(u8, parsed.value.tenant_id);
+    return .{ .activation = .{ .tenant = tenant, .module_base = "__system/release_flip" } };
 }
 
 /// `POST /_system/reset` — bootstrap + break-glass (`docs/architecture/cli-and-deploy.md`
@@ -1222,8 +1064,10 @@ fn handleReset(
 
 
 test "release-history key is pure digits (no sign) — regression for the i64 `+` bug" {
-    // Mirrors the key construction in `handleRelease` (and the
-    // `platform.releases.publish` trampoline in worker.zig). `ts_ms` MUST be
+    // Mirrors the key construction in `__system/release_flip.mjs` (JS pads
+    // with String.padStart, which cannot emit a sign) and the
+    // `platform.releases.publish` trampoline in worker.zig — the Zig side
+    // this test pins directly. `ts_ms` MUST be
     // unsigned: `{d:0>20}` on a signed positive integer reserves a sign column
     // and emits a leading `+` ("_release/000000+<ms>"). That `+` is not a
     // digit, so the dashboard reader's `parseInt(key.slice("_release/".len),

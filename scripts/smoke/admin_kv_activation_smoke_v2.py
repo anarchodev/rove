@@ -120,6 +120,29 @@ def main() -> int:
               r.status == 503 and "no deployment" in r.body,
               f"got {r.status} {r.body[:160]!r}")
 
+        print("step 5 (leg E): the release flip is an activation too (rove#719)")
+        # deploy_handlers releases through /_system/release; the flip now
+        # dispatches __system/release_flip against the tenant, so the
+        # tenant's log must carry a record for its own deployment — the one
+        # change a customer most expects to find in it. Deploy AFTER leg D's
+        # provision so "nodeploy" gains its first release here.
+        dep = c.deploy_handlers("nodeploy", {"index.mjs": "export default function () { return 'up'; }\n"})
+        check("deploy → released", bool(dep), f"dep_id={dep!r}")
+        r = c.wait_for_handler("nodeploy", "/", want_body="up")
+        check("released tenant serves", r.status == 200, f"got {r.status} {r.body[:120]!r}")
+        found = None
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            lr = c.log_get("nodeploy/list")
+            if lr.status == 200 and "/_system/release" in lr.body:
+                found = lr
+                break
+            time.sleep(0.5)
+        check("a record for the release flip is in the tenant's log",
+              found is not None,
+              "present" if found is not None
+              else "absent after 20s — the flip left no account of itself")
+
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1

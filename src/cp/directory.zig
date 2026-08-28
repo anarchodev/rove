@@ -665,7 +665,12 @@ pub const Directory = struct {
     /// the mutex — the seam by which a CP follower (no local proposer) stays
     /// in sync, and the leader's own writes land. Best-effort: a parse error
     /// is logged, not fatal (the durable store remains the source of truth).
-    fn onApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.ApplyOp, key: []const u8, value: []const u8) void {
+    fn onApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.ApplyOp, key: []const u8, value: []const u8, origin: bool) void {
+        // `origin` is unused: the CP applies on commit on every node (no
+        // worker overlay, so nothing skips), and its leader-side projection
+        // advances through the CommitHook — this observer only ever fires
+        // with origin == false here.
+        _ = origin;
         // `id_str` (the writeset's target tenant id) is unused: the
         // directory filters on its own group id — every entry in that
         // group is a directory write.

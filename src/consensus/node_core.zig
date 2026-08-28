@@ -285,7 +285,17 @@ pub const ApplyOp = enum { put, delete };
 pub const ApplyObserver = struct {
     ctx: *anyopaque,
     /// `value` is the written bytes for `.put`, and empty for `.delete`.
-    func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8, op: ApplyOp, key: []const u8, value: []const u8) void,
+    /// `origin` is true when the entry is THIS node's own live propose — the
+    /// skip-store path, where the worker's overlay already holds the write.
+    /// An observer decides per branch which half of its exactly-once story
+    /// it is: a projection that the proposing side already updated inline
+    /// returns early on `origin` (the worker's `_keys/dead/` eviction); a
+    /// side effect that only the observer performs acts on both (the
+    /// deployment-loader enqueue for a replicated `_deploy/current` flip —
+    /// the reason `origin` exists: an activation-written flip has no door
+    /// left to nudge the loader on the proposing node, rove#719). Nodes
+    /// that never skip (the CP) only ever see `origin == false`.
+    func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8, op: ApplyOp, key: []const u8, value: []const u8, origin: bool) void,
 };
 
 /// How committed entries apply to the tenant store (v2-build-order

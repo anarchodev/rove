@@ -227,7 +227,7 @@ const WorkerCtx = struct {
 /// lookup (which resolves the anchor, not the target tenant).
 /// Borrowed for the call; the loader dups it. Empty for root writesets
 /// (no `_deploy/current` or `_sched/` keys there — the checks filter them).
-fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.ApplyOp, key: []const u8, value: []const u8) void {
+fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.ApplyOp, key: []const u8, value: []const u8, origin: bool) void {
     _ = gid;
     // Only puts carry effects here. A DELETE of `_deploy/current` (a tenant
     // being torn down) has no dep to enqueue — dropping the release pointer
@@ -237,18 +237,28 @@ fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.A
     if (id_str.len == 0) return;
     const node: *rjs.NodeState = @ptrCast(@alignCast(ctx));
     if (std.mem.eql(u8, key, "_deploy/current")) {
+        // Fires on BOTH halves — replicated applies and this node's own
+        // propose (`origin`). The release flip is an activation now
+        // (rove#719): there is no door left to nudge the loader on the
+        // proposing node, so the origin-side observer IS that nudge. The
+        // enqueue is per-tenant dedup'd, so the door-era double (propose
+        // side + follower apply) stays as harmless as it was.
         const dep_id = std.fmt.parseInt(u64, value, 16) catch return;
         node.deploy.enqueueDeployment(id_str, dep_id);
         return;
     }
+    // Everything below is the REPLICATED-apply half of an exactly-once
+    // pair: the proposing side already did this work inline, so its own
+    // entries are done (`ApplyObserver.origin`).
+    if (origin) return;
     // `_keys/dead/{slot}` — an identity's key destroyed. Every node does
     // the same local work: evict now so a read stops resolving, and queue
     // the shard rewrite because this is the pump thread and it may not
     // fsync.
     //
-    // The proposing node did this inline at the destroy (the observer does
-    // not fire there — the leader-skip returns before `notifyApply`), so
-    // between the two halves every node acts exactly once.
+    // The proposing node did this inline at the destroy (its own entries
+    // return above on `origin`), so between the two halves every node acts
+    // exactly once.
     if (rjs.keyring.keyspace.parseDeadSlot(key)) |key_slot| {
         if (node.deploy.tenant_files_map.get(id_str)) |slot| {
             if (slot.keys) |keys| keys.evictAndQueue(key_slot);

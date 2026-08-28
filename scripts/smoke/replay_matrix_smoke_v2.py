@@ -134,6 +134,13 @@ def find_record(c, tenant, activation, tries=60):
                 r = json.loads(sr.body)["record"]
             except (json.JSONDecodeError, KeyError):
                 continue
+            # Platform activations land in the tenant's log too (rove#719 —
+            # the release flip is a record here now). They are baked-module
+            # activations this smoke's source-override replay cannot run
+            # (the module is not in the record — rove#254); the record this
+            # smoke wants is the CUSTOMER hop.
+            if (r.get("path") or "").startswith("/_system/"):
+                continue
             if r.get("activation") == activation:
                 return r
         time.sleep(0.5)
