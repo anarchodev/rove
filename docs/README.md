@@ -59,6 +59,8 @@ The maintained set. Subsystem-owned, kept current with the code.
 
 > Design-rationale reference (not a primary subsystem doc, but cited by ~10 source files): [raft-native-alignment.md](architecture/raft-native-alignment.md) — how membership + catch-up were re-aligned onto raft-rs's native model (all phases landed; Phase 3 in `decisions.md` §10.12).
 >
+> Design-rationale reference: [fat-entity-model.md](architecture/fat-entity-model.md) — the fat-entity ECS model rove's core runs on (AoS shadow + collections as SoA materialized views, membership axes): the argument, the adoption measurements (incl. the deleted archetype registry's comparison numbers), and the prior art. Locked decisions + rejected alternatives in `decisions.md` §17.
+>
 > Cross-cutting reference (cited by ~17 source files via its `§`-anchors): [format-versioning.md](architecture/format-versioning.md) — the as-built wire/on-disk/key-schema version scheme, the JS-engine-version tag, and the pre-launch freeze rules (shipped; the locked rules are also in `decisions.md` §14).
 >
 > Design-of-record references (graduated from `plans/`; cited by source + smoke scripts via their `§`/label anchors):

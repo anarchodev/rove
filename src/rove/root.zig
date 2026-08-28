@@ -5,13 +5,31 @@ const std = @import("std");
 pub const entity_mod = @import("entity.zig");
 pub const row_mod = @import("row.zig");
 pub const collection_mod = @import("collection.zig");
-pub const registry_mod = @import("registry.zig");
+pub const fat_mod = @import("fat.zig");
+pub const world_mod = @import("world.zig");
 
 pub const Entity = entity_mod.Entity;
 pub const Row = row_mod.Row;
 pub const Collection = collection_mod.Collection;
-pub const Registry = registry_mod.Registry;
+pub const FatRegistry = fat_mod.FatRegistry;
 pub const effectiveAlign = collection_mod.effectiveAlign;
+pub const World = world_mod.World;
+pub const Part = world_mod.Part;
+pub const CollDecl = world_mod.CollDecl;
+pub const CollKind = world_mod.CollKind;
+pub const lifecycle = world_mod.lifecycle;
+
+/// The world the program's root module declared, or null — the
+/// `std_options` idiom. A binary on the fat model declares its world
+/// ONCE at root scope (`pub const rove_world = rove.World(.{ .parts =
+/// ... })`); layers consult this instead of threading component lists
+/// through every boundary. Library test builds have no declaring root
+/// and see null — explicit `World(...)` construction remains the path
+/// for tests' mini-worlds.
+pub const declared_world: ?type = if (@hasDecl(@import("root"), "rove_world"))
+    @import("root").rove_world
+else
+    null;
 
 /// Make the process's stderr/stdout non-blocking so `std.log` writes on a
 /// single-threaded poll loop can NEVER wedge it on a backpressured log
@@ -38,5 +56,6 @@ test {
     _ = entity_mod;
     _ = row_mod;
     _ = collection_mod;
-    _ = registry_mod;
+    _ = fat_mod;
+    _ = world_mod;
 }

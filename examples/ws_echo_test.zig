@@ -17,7 +17,11 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
-const MyH2 = h2.H2(.{});
+const h2_opts = h2.Options{};
+
+pub const rove_world = rove.World(.{ .parts = h2.parts(h2_opts) });
+
+const MyH2 = h2.H2(h2_opts);
 
 /// Echo every completed inbound message back to its connection with the same
 /// opcode (text→text, binary→binary). A client-close signal (opcode 8) has
@@ -30,23 +34,23 @@ fn echoMessages(server: *MyH2, alloc: std.mem.Allocator) !void {
         server.ws_message_out.column(h2.ReqBody),
     ) |ent, sess, meta, body| {
         if (meta.opcode == @intFromEnum(h2.ws.Opcode.close)) {
-            try server.reg.destroy(ent);
+            try server.destroyEntity(ent);
             continue;
         }
 
         const payload = if (body.data) |d| d[0..body.len] else "";
         const copy = alloc.alloc(u8, payload.len) catch {
-            try server.reg.destroy(ent);
+            try server.destroyEntity(ent);
             continue;
         };
         @memcpy(copy, payload);
 
-        const out = try server.reg.create(&server.ws_send_in);
-        try server.reg.set(out, &server.ws_send_in, h2.Session, sess);
-        try server.reg.set(out, &server.ws_send_in, h2.WsMeta, meta);
-        try server.reg.set(out, &server.ws_send_in, h2.ReqBody, .{ .data = copy.ptr, .len = @intCast(payload.len) });
+        const out = try server.reg.create(server.coll(.ws_send_in));
+        try server.reg.set(out, server.coll(.ws_send_in), h2.Session, sess);
+        try server.reg.set(out, server.coll(.ws_send_in), h2.WsMeta, meta);
+        try server.reg.set(out, server.coll(.ws_send_in), h2.ReqBody, .{ .data = copy.ptr, .len = @intCast(payload.len) });
 
-        try server.reg.destroy(ent);
+        try server.destroyEntity(ent);
     }
 }
 
@@ -55,7 +59,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var reg = try rove.Registry.init(alloc, .{
+    var reg = try MyH2.Reg.init(alloc, .{
         .max_entities = 4096,
         .deferred_queue_capacity = 1024,
     });

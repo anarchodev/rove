@@ -28,6 +28,15 @@ pub fn Row(comptime input: []const type) type {
             return false;
         }
 
+        /// Position of T in this row's canonical (sorted) order.
+        /// Compile error if T is not in the row.
+        pub fn indexOf(comptime T: type) comptime_int {
+            inline for (types, 0..) |U, i| {
+                if (U == T) return i;
+            }
+            @compileError("Row.indexOf: " ++ @typeName(T) ++ " is not in this row");
+        }
+
         /// Returns true if every component in this row is also in Other.
         pub fn isSubsetOf(comptime Other: type) bool {
             inline for (types) |T| {
@@ -326,6 +335,14 @@ test "single element" {
 
 test "contains — positive" {
     try expect(Row(&.{ Position, Velocity }).contains(Position));
+}
+
+test "indexOf — canonical order, input order irrelevant" {
+    const R = Row(&.{ Velocity, Position });
+    // Canonical order is sorted by @typeName, not declaration order.
+    try expectEqual(R.types[R.indexOf(Position)], Position);
+    try expectEqual(R.types[R.indexOf(Velocity)], Velocity);
+    try expect(R.indexOf(Position) != R.indexOf(Velocity));
 }
 
 test "contains — negative" {
