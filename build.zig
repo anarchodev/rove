@@ -1280,6 +1280,14 @@ pub fn build(b: *std.Build) void {
     const run_h2_ws_connect = b.addRunArtifact(h2_ws_connect_test);
     b.step("h2-ws-connect-test", "Run the Extended-CONNECT WS tunnel test").dependOn(&run_h2_ws_connect.step);
 
+    // The gate COMPILES each example test binary (their steps run them):
+    // an example only its run step builds is a compile break `zig build
+    // test` cannot see, discovered whenever someone next runs it by hand.
+    for ([_]*std.Build.Step.Compile{
+        h2_stream_test,        h2_tls_test,   h2_client_test,
+        h2_client_stream_test, h2_limit_test, h2_ws_connect_test,
+    }) |exe| test_step.dependOn(&exe.step);
+
     // ── rust-ffi-smoke: V2 build-time cargo→link spike (docs/decisions.md,
     // deps are pinned-and-fetched at build time).
     // Step 1 — prove `cargo build → linkSystemLibrary` works end-to-end
@@ -1914,6 +1922,10 @@ pub fn build(b: *std.Build) void {
         cli_exe,    echo_server, h2_echo_server, ws_echo_exe,   s3_blob_smoke,
     }) |exe| {
         smoke_bins_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        // The gate COMPILES the whole closure (installing nothing): a
+        // smoke-driven binary that only smoke-bins builds is otherwise
+        // a compile break `zig build test` cannot see.
+        test_step.dependOn(&exe.step);
     }
 
     // CLI unit tests (`src/cli/*.zig` — e.g. the P-CLI package resolver in
