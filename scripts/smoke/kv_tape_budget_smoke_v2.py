@@ -98,12 +98,21 @@ def main() -> int:
         check("no node tore a peer down for an oversize frame", not oversize,
               "found 'oversize frame' in a node log" if oversize else "")
 
-        elided = metric_counter(c.metrics(0), "tape_kv_elided_total") or 0
+        # The counter is NODE-LOCAL (incremented where the activation ran),
+        # and the tenant's group lands on a node by startup-timing luck —
+        # scraping node 0 alone reads a forever-0 counter whenever
+        # placement lands elsewhere (which is what an in-suite run's
+        # slower interleaving produced while standalone runs passed).
+        # Sum across the cluster: placement is not the assertion.
+        def elided_total() -> int:
+            return sum(metric_counter(c.metrics(i), "tape_kv_elided_total") or 0
+                       for i in range(3))
+        elided = elided_total()
         for _ in range(20):
             if elided:
                 break
             time.sleep(0.5)
-            elided = metric_counter(c.metrics(0), "tape_kv_elided_total") or 0
+            elided = elided_total()
         check("tape_kv_elided_total counted the dropped reads", elided >= 1, f"got {elided}")
 
         # ── The record must say so, and replay must refuse it ──

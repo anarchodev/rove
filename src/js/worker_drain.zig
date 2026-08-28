@@ -173,7 +173,7 @@ fn drainEntityArm(
             const old_body_len: u32 = self.resp_bodies[i].len;
             try respb.overwrite503InPending(self.worker, self.source, ent, self.allocator);
             if (old_body_ptr) |p| self.allocator.free(p[0..old_body_len]);
-            try self.server.reg.move(ent, self.source, &self.server.response_in);
+            try self.server.reg.move(ent, self.source, self.server.coll(.response_in));
         }
     };
 
@@ -232,9 +232,9 @@ pub fn drainRaftPending(worker: anytype) !void {
     // queue moves. Forward-iter preserves per-tenant chain order
     // (entities enter the siblings in propose-seq order from
     // finalizeBatch).
-    try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_response, "raft_pending_response");
-    try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_cont, "raft_pending_cont");
-    try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_stream, "raft_pending_stream");
+    try drainEntityArm(worker, server, allocator, now_ns, worker.raft_pending_response, "raft_pending_response");
+    try drainEntityArm(worker, server, allocator, now_ns, worker.raft_pending_cont, "raft_pending_cont");
+    try drainEntityArm(worker, server, allocator, now_ns, worker.raft_pending_stream, "raft_pending_stream");
 
     // ── Non-entity parked units (idiom-1 SSE-emit gating —
     //    effect gating, docs/architecture/effects-and-handlers.md).
@@ -270,7 +270,7 @@ pub fn drainRaftPending(worker: anytype) !void {
             ids: []const rove.Entity,
 
             fn unitAt(self: *@This(), i: usize) ?*ParkedUnit {
-                return self.server.reg.get(self.ids[i], &self.worker.parked_units, ParkedUnit) catch null;
+                return self.server.reg.get(self.ids[i], self.worker.parked_units, ParkedUnit) catch null;
             }
             pub fn seqAt(self: *@This(), i: usize) u64 {
                 const u = self.unitAt(i) orelse return std.math.maxInt(u64);
@@ -358,6 +358,10 @@ pub fn drainRaftPending(worker: anytype) !void {
                     break :blk slot.app_kv.writeVersion() orelse std.math.maxInt(u64);
                 };
                 unit.buffered.releaseAll(self.worker, unit.tenant_id, wv);
+                // Release the unit's remaining ownership (tenant/wake ids,
+                // drained containers; txn is null by now — committed above)
+                // before the destroy: the fat model runs no deinit hooks.
+                ParkedUnit.deinit(self.allocator, @as([*]ParkedUnit, @ptrCast(unit))[0..1]);
                 self.server.reg.destroy(self.ids[i]) catch |err| std.log.warn(
                     "rove-js parked_units commit destroy: {s}",
                     .{@errorName(err)},
@@ -385,6 +389,9 @@ pub fn drainRaftPending(worker: anytype) !void {
                     self.allocator.destroy(t);
                     unit.txn = null;
                 }
+                // Same as the commit arm: release before destroy (txn is
+                // rolled back and nulled just above).
+                ParkedUnit.deinit(self.allocator, @as([*]ParkedUnit, @ptrCast(unit))[0..1]);
                 self.server.reg.destroy(self.ids[i]) catch |err| std.log.warn(
                     "rove-js parked_units fault destroy: {s}",
                     .{@errorName(err)},
@@ -516,11 +523,11 @@ fn applyForwardOutcome(worker: anytype, ent: rove.Entity, outcome: *ProxyOutcome
 /// `reg.move`), so only the response components are set here.
 fn finalizeForward(worker: anytype, ent: rove.Entity, status: u16, body: []u8) !void {
     const server = worker.h2;
-    try server.reg.set(ent, &worker.forward_pending, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &worker.forward_pending, h2.RespHeaders, .{ .fields = null, .count = 0 });
-    try server.reg.set(ent, &worker.forward_pending, h2.RespBody, .{ .data = body.ptr, .len = @intCast(body.len) });
-    try server.reg.set(ent, &worker.forward_pending, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.move(ent, &worker.forward_pending, &server.response_in);
+    try server.reg.set(ent, worker.forward_pending, h2.Status, .{ .code = status });
+    try server.reg.set(ent, worker.forward_pending, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try server.reg.set(ent, worker.forward_pending, h2.RespBody, .{ .data = body.ptr, .len = @intCast(body.len) });
+    try server.reg.set(ent, worker.forward_pending, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.move(ent, worker.forward_pending, server.coll(.response_in));
 }
 
 
@@ -623,23 +630,23 @@ fn resolveParkedWithHeaders(
     var hdrs = resp_hdrs;
     var hdrs_taken = false;
     errdefer if (!hdrs_taken) h2.RespHeaders.deinit(allocator, (&hdrs)[0..1]);
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) {
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) {
         h2.RespHeaders.deinit(allocator, (&hdrs)[0..1]);
         return; // already resolved
     }
     const owned = try allocator.dupe(u8, body);
     var owned_taken = false;
     errdefer if (!owned_taken) allocator.free(owned);
-    try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, hdrs);
+    try server.reg.set(ent, worker.parked_continuations, h2.Status, .{ .code = status });
+    try server.reg.set(ent, worker.parked_continuations, h2.RespHeaders, hdrs);
     hdrs_taken = true;
-    try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = owned.ptr, .len = @intCast(owned.len) });
+    try server.reg.set(ent, worker.parked_continuations, h2.RespBody, .{ .data = owned.ptr, .len = @intCast(owned.len) });
     owned_taken = true;
-    try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
-    try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
-    server.reg.move(ent, &worker.parked_continuations, &server.response_in) catch |err| {
-        server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
+    try server.reg.set(ent, worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, worker.parked_continuations, h2.StreamId, sid);
+    try server.reg.set(ent, worker.parked_continuations, h2.Session, sess);
+    server.reg.move(ent, worker.parked_continuations, server.coll(.response_in)) catch |err| {
+        server.reg.set(ent, worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
         allocator.free(owned);
         return err;
     };
@@ -928,18 +935,18 @@ fn proposeAndParkContResume(
             // sweep gates on isInCollection before reading it, so a
             // stale desc on an entity mid-commit-flow can't fire
             // spuriously.
-            try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = t.status });
-            try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, t.resp_hdrs);
-            try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = t.body.ptr, .len = @intCast(t.body.len) });
-            try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
-            try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
-            try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
-            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+            try server.reg.set(ent, worker.parked_continuations, h2.Status, .{ .code = t.status });
+            try server.reg.set(ent, worker.parked_continuations, h2.RespHeaders, t.resp_hdrs);
+            try server.reg.set(ent, worker.parked_continuations, h2.RespBody, .{ .data = t.body.ptr, .len = @intCast(t.body.len) });
+            try server.reg.set(ent, worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
+            try server.reg.set(ent, worker.parked_continuations, h2.StreamId, sid);
+            try server.reg.set(ent, worker.parked_continuations, h2.Session, sess);
+            try server.reg.set(ent, worker.parked_continuations, RaftWait, .{
                 .group_id = group_id,
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });
-            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
+            try server.reg.move(ent, worker.parked_continuations, worker.raft_pending_cont);
         },
         .repark => |r| {
             // Update the entity's ContDescriptor in place — replace
@@ -948,7 +955,7 @@ fn proposeAndParkContResume(
             // at commit and routes back to parked_continuations.
             // Ownership of r.new_cont and r.new_bound_sched_id
             // transfers directly into the component.
-            const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            const desc = try server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor);
             if (desc.cont) |*old_c| old_c.deinit(allocator);
             desc.cont = r.new_cont;
             if (desc.bound_schedule_id) |old_b| {
@@ -966,12 +973,12 @@ fn proposeAndParkContResume(
             // trampoline open hop's parking.
             const refreshed_deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
             desc.deadline_ns = refreshed_deadline_ns;
-            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+            try server.reg.set(ent, worker.parked_continuations, RaftWait, .{
                 .group_id = group_id,
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });
-            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
+            try server.reg.move(ent, worker.parked_continuations, worker.raft_pending_cont);
         },
         .stream => |s| {
             // The cont→stream transition (the streaming substrate,
@@ -987,7 +994,7 @@ fn proposeAndParkContResume(
             // stale — deinit its Continuation and clear the fields.
             // ChainContext stays — same tenant / saga id;
             // only the deployment_id and slices are reused unchanged.
-            const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            const desc = try server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor);
             if (desc.cont) |*old_c| old_c.deinit(allocator);
             if (desc.bound_schedule_id) |old_b| {
                 // NodeState cleanup — chain is no longer
@@ -1019,17 +1026,17 @@ fn proposeAndParkContResume(
             }
             if (s.resp_headers.len > 0) allocator.free(s.resp_headers);
 
-            try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = s.status });
-            try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, handler_resp_hdrs);
-            try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 });
-            try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
-            try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
-            try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
+            try server.reg.set(ent, worker.parked_continuations, h2.Status, .{ .code = s.status });
+            try server.reg.set(ent, worker.parked_continuations, h2.RespHeaders, handler_resp_hdrs);
+            try server.reg.set(ent, worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 });
+            try server.reg.set(ent, worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
+            try server.reg.set(ent, worker.parked_continuations, h2.StreamId, sid);
+            try server.reg.set(ent, worker.parked_continuations, h2.Session, sess);
 
             // Install StreamChain on the entity (already in
             // parked_continuations). Module path + ctx_json transfer
             // ownership into the component.
-            try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+            try server.reg.set(ent, worker.parked_continuations, components_mod.StreamChain, .{
                 .module_path = s.module_path,
                 .ctx_json = s.ctx_json,
                 .activation_count = 1,
@@ -1043,7 +1050,7 @@ fn proposeAndParkContResume(
                 errdefer components_mod.StreamChunks.deinit(allocator, (&staged)[0..1]);
                 try staged.queue.ensureUnusedCapacity(allocator, s.chunks.len);
                 for (s.chunks) |chunk| try staged.tryAppend(allocator, chunk);
-                try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged);
+                try server.reg.set(ent, worker.parked_continuations, components_mod.StreamChunks, staged);
             }
             // The spine of s.chunks held pointers transferred into
             // StreamChunks via tryAppend; free the outer spine.
@@ -1074,7 +1081,7 @@ fn proposeAndParkContResume(
             // this hop opened the stream), while carrying its pending
             // wake-batch queue across the swap.
             var carried_batches: std.ArrayListUnmanaged(components_mod.PendingWakeBatch) = .empty;
-            if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+            if (server.reg.get(ent, worker.parked_continuations, components_mod.StreamWakes)) |old| {
                 for (old.kv_prefixes) |arm| {
                     allocator.free(arm.prefix);
                     if (arm.on) |t| allocator.free(t);
@@ -1085,7 +1092,7 @@ fn proposeAndParkContResume(
                 old.pending_batches = .empty;
                 old.* = .{};
             } else |_| {}
-            try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+            try server.reg.set(ent, worker.parked_continuations, components_mod.StreamWakes, .{
                 .interval_ms = s.interval_ms,
                 .next_wake_ns = next_wake_ns,
                 .kv_prefixes = arms,
@@ -1093,12 +1100,12 @@ fn proposeAndParkContResume(
                 .pending_batches = carried_batches,
             });
 
-            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+            try server.reg.set(ent, worker.parked_continuations, RaftWait, .{
                 .group_id = group_id,
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });
-            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
+            try server.reg.move(ent, worker.parked_continuations, worker.raft_pending_cont);
         },
     }
     return seq;
@@ -1162,13 +1169,13 @@ fn installStreamComponentsInline(
 ) void {
     const server = worker.h2;
     const allocator = worker.allocator;
-    server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = status }) catch {};
-    server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, resp_headers) catch {};
-    server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
-    server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 }) catch {};
-    server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid) catch {};
-    server.reg.set(ent, &worker.parked_continuations, h2.Session, sess) catch {};
-    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+    server.reg.set(ent, worker.parked_continuations, h2.Status, .{ .code = status }) catch {};
+    server.reg.set(ent, worker.parked_continuations, h2.RespHeaders, resp_headers) catch {};
+    server.reg.set(ent, worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
+    server.reg.set(ent, worker.parked_continuations, h2.H2IoResult, .{ .err = 0 }) catch {};
+    server.reg.set(ent, worker.parked_continuations, h2.StreamId, sid) catch {};
+    server.reg.set(ent, worker.parked_continuations, h2.Session, sess) catch {};
+    server.reg.set(ent, worker.parked_continuations, components_mod.StreamChain, .{
         .module_path = module_path,
         .ctx_json = ctx_json,
         .activation_count = 1,
@@ -1177,7 +1184,7 @@ fn installStreamComponentsInline(
     var staged: components_mod.StreamChunks = .{};
     staged.queue.ensureUnusedCapacity(allocator, chunks.len) catch {};
     for (chunks) |chunk| staged.tryAppend(allocator, chunk) catch {};
-    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged) catch {};
+    server.reg.set(ent, worker.parked_continuations, components_mod.StreamChunks, staged) catch {};
     if (chunks.len > 0) allocator.free(chunks);
 
     const next_wake_ns: i64 = if (interval_ms > 0)
@@ -1191,7 +1198,7 @@ fn installStreamComponentsInline(
     // have armed on.kv/on.timer before the bound fetch opened the stream),
     // carrying its pending wake-batch queue across the swap.
     var carried_batches: std.ArrayListUnmanaged(components_mod.PendingWakeBatch) = .empty;
-    if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+    if (server.reg.get(ent, worker.parked_continuations, components_mod.StreamWakes)) |old| {
         for (old.kv_prefixes) |arm| {
             allocator.free(arm.prefix);
             if (arm.on) |t| allocator.free(t);
@@ -1202,7 +1209,7 @@ fn installStreamComponentsInline(
         old.pending_batches = .empty;
         old.* = .{};
     } else |_| {}
-    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+    server.reg.set(ent, worker.parked_continuations, components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = arms,
@@ -1210,7 +1217,7 @@ fn installStreamComponentsInline(
         .pending_batches = carried_batches,
     }) catch {};
 
-    server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
+    server.reg.moveImmediate(ent, worker.parked_continuations, server.coll(.stream_response_in)) catch |merr|
         std.log.warn("rove-js cont→stream move: {s}", .{@errorName(merr)});
 }
 
@@ -1397,7 +1404,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
 
     // Clear the stale ContDescriptor (the chain is no longer a cont).
     // ChainContext stays.
-    const stale_desc = server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
+    const stale_desc = server.reg.get(ctx.ent, worker.parked_continuations, components_mod.ContDescriptor) catch null;
     if (stale_desc) |d| {
         if (d.cont) |*old_c| old_c.deinit(allocator);
         if (d.bound_schedule_id) |b| {
@@ -1589,7 +1596,7 @@ fn installContWakes(
     // Carry the pending wake-batch queue across the re-arm — undispatched
     // export groups ride to the next sweep tick, not the freed arm slice.
     var carried: std.ArrayListUnmanaged(components_mod.PendingWakeBatch) = .empty;
-    if (server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+    if (server.reg.get(ent, worker.parked_continuations, components_mod.StreamWakes)) |old| {
         for (old.kv_prefixes) |arm| {
             allocator.free(arm.prefix);
             if (arm.on) |t| allocator.free(t);
@@ -1634,10 +1641,10 @@ fn installContWakes(
         }
         arms.deinit(allocator);
         if (timer_on) |t| allocator.free(t);
-        server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{ .pending_batches = carried }) catch {};
+        server.reg.set(ent, worker.parked_continuations, components_mod.StreamWakes, .{ .pending_batches = carried }) catch {};
         return; // OOM — leave the chain unarmed (but keep the queue)
     };
-    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+    server.reg.set(ent, worker.parked_continuations, components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = kv_prefixes,
@@ -1843,13 +1850,13 @@ fn finishContResume(
             const will_have_source = blk: {
                 if (ctx.wrote) {
                     if (worker_mod.scanLoneOwedSendId(ctx.ws.ops.items) != null) break :blk true;
-                } else if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.ContDescriptor)) |d| {
+                } else if (server.reg.get(ctx.ent, worker.parked_continuations, components_mod.ContDescriptor)) |d| {
                     if (d.bound_schedule_id != null) break :blk true;
                 } else |_| {}
-                if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.StreamWakes)) |sw| {
+                if (server.reg.get(ctx.ent, worker.parked_continuations, components_mod.StreamWakes)) |sw| {
                     if (sw.interval_ms > 0 or sw.kv_prefixes.len > 0) break :blk true;
                 } else |_| {}
-                if (server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+                if (server.reg.get(ctx.ent, worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
                     if (cnt.pending > 0) break :blk true;
                 } else |_| {}
                 if (!ctx.wrote) {
@@ -1947,7 +1954,7 @@ fn finishContResume(
             // send, and clearing would strand a chain still awaiting an
             // EARLIER hop's owed send — its callback must keep resuming
             // this park. Only the write-batch repark rewrites the binding.
-            const desc = server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+            const desc = server.reg.get(ctx.ent, worker.parked_continuations, components_mod.ContDescriptor) catch return;
             if (desc.cont) |*old_c| old_c.deinit(allocator);
             desc.cont = c2m;
             desc.deadline_ns = ctx.now_ns + CONT_HOLD_DEADLINE_NS;
@@ -2008,8 +2015,8 @@ fn finishContResume(
 /// than a 504.
 fn deadlineResumeExport(worker: anytype, ent: rove.Entity) ?[]const u8 {
     const server = worker.h2;
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return null;
-    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return null;
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) return null;
+    const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return null;
     const c = desc.cont orelse return null;
     const fname = c.fn_name orelse return null;
     return if (fname.len > 0) fname else null;
@@ -2050,9 +2057,9 @@ fn resumeContinuation(
     // (`proposeAndParkContResume` deinits the old cont before
     // installing a new one — but only AFTER capturing these locals,
     // and the function never reuses them after the mutation site).
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // resolve-once
-    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
-    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) return; // resolve-once
+    const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return;
+    const chain = server.reg.get(ent, worker.parked_continuations, components_mod.ChainContext) catch return;
     const c = desc.cont orelse return;
     const tenant_id = chain.tenant_id;
     const saga_id = chain.saga_id;
@@ -2104,7 +2111,7 @@ fn resumeContinuation(
     var wake_export: ?[]u8 = null;
     defer if (wake_export) |t| allocator.free(t);
     const resume_fn: ?[]const u8 = if (wake) blk: {
-        const sw = server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
+        const sw = server.reg.get(ent, worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
         // OOM → empty batch, arms stay fired and re-fire next tick
         // (safe under edge semantics).
         const wb_opt = sw.nextWakeBatch(allocator) catch null;
@@ -2283,7 +2290,7 @@ pub fn resumeBoundFetchChain(
 
     const allocator = worker.allocator;
     const server = worker.h2;
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) {
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) {
         // Bound chunks arriving for a chain that's
         // already transitioned to stream aren't wired yet. Log and
         // fall through to the unbound path by handing the event
@@ -2299,8 +2306,8 @@ pub fn resumeBoundFetchChain(
         worker_mod.fireFetchEventActivation(worker, ev, null);
         return;
     }
-    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
-    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return;
+    const chain = server.reg.get(ent, worker.parked_continuations, components_mod.ChainContext) catch return;
     const c = desc.cont orelse return;
     const tenant_id = chain.tenant_id;
     const saga_id = chain.saga_id;
@@ -2365,7 +2372,7 @@ pub fn resumeBoundFetchChain(
     // component read fails (corrupt entity / wrong collection —
     // both shouldn't happen but we don't want to panic on it).
     const fetches_pending: u32 = blk: {
-        const cnt = server.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        const cnt = server.reg.get(ent, worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
         break :blk cnt.pending;
     };
 
@@ -2456,8 +2463,8 @@ pub fn resumeBoundFetchChain(
     // so the error path can resolve the held socket cleanly.
     // resumeContinuation reads them from caller-supplied locals;
     // here we pull from the parked_continuations collection.
-    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return;
-    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return;
+    const sid_ptr = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch return;
+    const sess_ptr = server.reg.get(ent, worker.parked_continuations, h2.Session) catch return;
     const sid = sid_ptr.*;
     const sess = sess_ptr.*;
 
@@ -2533,14 +2540,14 @@ pub fn resumeBoundContinuation(
     // wrong / lost).
     const server = worker.h2;
     if (worker.lookupBoundSendEntity(sched_id)) |ent| {
-        if (server.reg.isInCollection(ent, &worker.parked_continuations)) {
-            const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch null;
-            const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
+        if (server.reg.isInCollection(ent, worker.parked_continuations)) {
+            const chain = server.reg.get(ent, worker.parked_continuations, components_mod.ChainContext) catch null;
+            const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch null;
             if (chain != null and desc != null and std.mem.eql(u8, chain.?.tenant_id, tenant_id)) {
                 const bsid = desc.?.bound_schedule_id;
                 if (bsid != null and std.mem.eql(u8, bsid.?, sched_id)) {
-                    const sid = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return false;
-                    const sess = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return false;
+                    const sid = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch return false;
+                    const sess = server.reg.get(ent, worker.parked_continuations, h2.Session) catch return false;
                     resumeContinuation(worker, ent, sid.*, sess.*, outcome_json, true, false) catch |err| {
                         std.log.warn(
                             "rove-js cont-resume: {s}/{s}: {s}; 502",
@@ -2816,7 +2823,7 @@ pub fn drainBodyPending(worker: anytype) !void {
                 wait.status = .resolved;
             },
         }
-        try server.reg.move(ent, &worker.body_pending, &server.request_out);
+        try server.reg.move(ent, worker.body_pending, server.coll(.request_out));
     }
 }
 
@@ -2929,9 +2936,9 @@ pub fn parkKvWakes(
     cmds = .{};
     errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
     unit.tenant_id = try allocator.dupe(u8, tenant_id);
-    const ent = try worker.h2.reg.create(&worker.parked_units);
+    const ent = try worker.h2.reg.create(worker.parked_units);
     errdefer worker.h2.reg.destroy(ent) catch {};
-    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
+    try worker.h2.reg.set(ent, worker.parked_units, ParkedUnit, unit);
     unit = .{};
 }
 
@@ -2970,6 +2977,12 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
             const n = @min(slice.len - idx, buf.len);
             std.mem.copyForwards(rove.Entity, buf[0..n], slice[idx .. idx + n]);
             for (buf[0..n]) |ent| {
+                // Release each unit's ownership before the destroy — the
+                // fat model runs no deinit hooks, and these units never
+                // reached a release arm.
+                if (server.reg.getFat(ent, ParkedUnit) catch null) |pu| {
+                    ParkedUnit.deinit(worker.allocator, @as([*]ParkedUnit, @ptrCast(pu))[0..1]);
+                }
                 server.reg.destroy(ent) catch |err| std.log.warn(
                     "drainOnLeadershipLoss: parked_units destroy: {s}",
                     .{@errorName(err)},
@@ -2981,9 +2994,9 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
 
     // Downgrade every entry across the three raft-pending
     // siblings to 503 + move to response_in.
-    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_response);
-    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_cont);
-    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_stream);
+    try drainLeadershipLossColl(worker, server, allocator, worker.raft_pending_response);
+    try drainLeadershipLossColl(worker, server, allocator, worker.raft_pending_cont);
+    try drainLeadershipLossColl(worker, server, allocator, worker.raft_pending_stream);
 }
 
 /// Walk one raft-pending sibling, 503 every entry, move to
@@ -3008,7 +3021,7 @@ fn drainLeadershipLossColl(
         const old_body_len: u32 = resp_body.len;
         try respb.overwrite503InPending(worker, coll, ent, allocator);
         if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-        try server.reg.move(ent, coll, &server.response_in);
+        try server.reg.move(ent, coll, server.coll(.response_in));
     }
 }
 
@@ -3044,7 +3057,7 @@ pub fn cleanupResponses(worker: anytype) !void {
         // registry entry. Walk + collect first so we don't mutate
         // the map mid-iteration.
         scanAndCancelBoundFetches(worker, ent);
-        try server.reg.destroy(ent);
+        try server.destroyEntity(ent);
     }
 }
 
@@ -3120,8 +3133,8 @@ fn failInboundChunkChain(worker: anytype, ent: rove.Entity, job: anytype, msg: [
     const server = worker.h2;
     releaseInboundChunkParks(worker, job);
     job.kill();
-    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return;
-    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return;
+    const sid_ptr = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch return;
+    const sess_ptr = server.reg.get(ent, worker.parked_continuations, h2.Session) catch return;
     resolveParked(worker, ent, sid_ptr.*, sess_ptr.*, 503, msg) catch {};
 }
 
@@ -3195,7 +3208,7 @@ pub fn pumpInboundChunks(worker: anytype) void {
         // fire), so the gate's S3 round-trip is off the serial path.
         _ = job.prepareFires();
         if (!advanceInboundChunkGate(worker, job)) {
-            if (server.reg.isInCollection(ent, &worker.parked_continuations)) {
+            if (server.reg.isInCollection(ent, worker.parked_continuations)) {
                 failInboundChunkChain(worker, ent, job, "chunk durability gate failed\n");
             } else {
                 // First fire not parked yet — let the dispatch walk
@@ -3206,7 +3219,7 @@ pub fn pumpInboundChunks(worker: anytype) void {
             continue;
         }
         if (!job.first_fired) continue; // dispatchOnce owns the probe fire
-        if (!server.reg.isInCollection(ent, &worker.parked_continuations)) continue; // fire in flight
+        if (!server.reg.isInCollection(ent, worker.parked_continuations)) continue; // fire in flight
         // The prior fire fully resolved (commit included) — repay its
         // window so the client can send the next stretch.
         job.repayResolved();
@@ -3245,9 +3258,9 @@ pub fn pumpInboundChunks(worker: anytype) void {
 fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const allocator = worker.allocator;
     const server = worker.h2;
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return false; // resolve-once
-    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return false;
-    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return false;
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) return false; // resolve-once
+    const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return false;
+    const chain = server.reg.get(ent, worker.parked_continuations, components_mod.ChainContext) catch return false;
     const c = desc.cont orelse return false;
     const tenant_id = chain.tenant_id;
     const saga_id = chain.saga_id;
@@ -3301,7 +3314,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
 
     const fetches_pending: u32 = blk: {
-        const cnt = server.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        const cnt = server.reg.get(ent, worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
         break :blk cnt.pending;
     };
 
@@ -3356,7 +3369,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     // `request.headers` the first one did (handler-shape §5.3 reads
     // them per chunk).
     const req_headers: ?h2.ReqHeaders = blk: {
-        const p = server.reg.get(ent, &worker.parked_continuations, h2.ReqHeaders) catch break :blk null;
+        const p = server.reg.get(ent, worker.parked_continuations, h2.ReqHeaders) catch break :blk null;
         break :blk p.*;
     };
 
@@ -3386,8 +3399,8 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         },
     };
 
-    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return false;
-    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return false;
+    const sid_ptr = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch return false;
+    const sess_ptr = server.reg.get(ent, worker.parked_continuations, h2.Session) catch return false;
     const sid = sid_ptr.*;
     const sess = sess_ptr.*;
 

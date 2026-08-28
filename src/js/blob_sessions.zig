@@ -174,7 +174,9 @@ pub fn seal(
             hash_hex[i * 2 + 1] = hex_chars[b & 0x0f];
         }
         const body = s.buf.toOwnedSlice(allocator) catch return Error.OutOfMemory;
-        // Component deinit frees tenant/corr and the (now-empty) buf.
+        // Release the session's remaining ownership (tenant/corr, the
+        // now-empty buf) before the destroy — no deinit hooks run.
+        Session.deinit(allocator, @as([*]Session, @ptrCast(s))[0..1]);
         reg.destroyImmediate(ent) catch {};
         return .{ .hash_hex = hash_hex, .body = body };
     }
@@ -202,7 +204,14 @@ pub fn sweepBlobSessions(worker: anytype) void {
             stale.append(allocator, ent) catch return;
         }
     }
-    for (stale.items) |ent| worker.h2.reg.destroyImmediate(ent) catch {};
+    for (stale.items) |ent| {
+        // Release before destroy — a swept session still owns its ids
+        // and its accumulated bytes.
+        if (worker.h2.reg.getFat(ent, Session) catch null) |sp| {
+            Session.deinit(worker.allocator, @as([*]Session, @ptrCast(sp))[0..1]);
+        }
+        worker.h2.reg.destroyImmediate(ent) catch {};
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -217,21 +226,24 @@ fn findSession(coll: anytype, tenant_id: []const u8, corr: []const u8) ?*Session
     return null;
 }
 
-const TestRow = rove.Row(&.{Session});
-const TestColl = rove.Collection(TestRow, .{});
+// The tests run the model the worker runs: a fat mini-world. (Under
+// the archetype, destroy fired Session's deinit hook; under fat the
+// seal/sweep paths release explicitly, which is what these exercise.)
+const TestWorld = rove.World(.{ .parts = &.{.{
+    .name = "blob-test",
+    .collections = &.{.{ .name = "sessions", .row = rove.Row(&.{Session}) }},
+}} });
 
 test "blob session write/seal round-trip matches one-shot sha256" {
-    var reg = try rove.Registry.init(testing.allocator, .{ .max_entities = 16 });
+    var reg = try TestWorld.Reg.init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
-    var coll = try TestColl.init(testing.allocator);
-    defer coll.deinit();
-    reg.registerCollection(&coll);
+    const coll = reg.coll(.sessions);
 
-    _ = try write(testing.allocator, &reg, &coll, "t1", "c1", "hello ", 1);
-    const total = try write(testing.allocator, &reg, &coll, "t1", "c1", "world", 2);
+    _ = try write(testing.allocator, &reg, coll, "t1", "c1", "hello ", 1);
+    const total = try write(testing.allocator, &reg, coll, "t1", "c1", "world", 2);
     try testing.expectEqual(@as(u64, 11), total);
 
-    const sealed = try seal(testing.allocator, &reg, &coll, "t1", "c1");
+    const sealed = try seal(testing.allocator, &reg, coll, "t1", "c1");
     defer testing.allocator.free(sealed.body);
     try testing.expectEqualStrings("hello world", sealed.body);
 
@@ -246,54 +258,50 @@ test "blob session write/seal round-trip matches one-shot sha256" {
     try testing.expectEqualSlices(u8, &expect_hex, &sealed.hash_hex);
 
     // Session is gone: a second seal errors, a write starts fresh.
-    try testing.expectError(Error.NoSession, seal(testing.allocator, &reg, &coll, "t1", "c1"));
+    try testing.expectError(Error.NoSession, seal(testing.allocator, &reg, coll, "t1", "c1"));
     try testing.expectEqual(@as(usize, 0), coll.entitySlice().len);
 }
 
 test "blob session per-tenant cap + isolation" {
-    var reg = try rove.Registry.init(testing.allocator, .{ .max_entities = 16 });
+    var reg = try TestWorld.Reg.init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
-    var coll = try TestColl.init(testing.allocator);
-    defer coll.deinit();
-    reg.registerCollection(&coll);
+    const coll = reg.coll(.sessions);
 
-    _ = try write(testing.allocator, &reg, &coll, "t1", "c1", "a", 1);
-    _ = try write(testing.allocator, &reg, &coll, "t1", "c2", "b", 1);
+    _ = try write(testing.allocator, &reg, coll, "t1", "c1", "a", 1);
+    _ = try write(testing.allocator, &reg, coll, "t1", "c2", "b", 1);
     try testing.expectError(
         Error.TooManySessions,
-        write(testing.allocator, &reg, &coll, "t1", "c3", "c", 1),
+        write(testing.allocator, &reg, coll, "t1", "c3", "c", 1),
     );
     // A different tenant is unaffected; existing sessions still accept.
-    _ = try write(testing.allocator, &reg, &coll, "t2", "c1", "d", 1);
-    _ = try write(testing.allocator, &reg, &coll, "t1", "c1", "aa", 2);
+    _ = try write(testing.allocator, &reg, coll, "t2", "c1", "d", 1);
+    _ = try write(testing.allocator, &reg, coll, "t1", "c1", "aa", 2);
 
     // Sessions are tenant-isolated even on equal saga ids.
-    const s1 = try seal(testing.allocator, &reg, &coll, "t1", "c1");
+    const s1 = try seal(testing.allocator, &reg, coll, "t1", "c1");
     defer testing.allocator.free(s1.body);
     try testing.expectEqualStrings("aaa", s1.body);
-    const s2 = try seal(testing.allocator, &reg, &coll, "t2", "c1");
+    const s2 = try seal(testing.allocator, &reg, coll, "t2", "c1");
     defer testing.allocator.free(s2.body);
     try testing.expectEqualStrings("d", s2.body);
 
-    const rest = try seal(testing.allocator, &reg, &coll, "t1", "c2");
+    const rest = try seal(testing.allocator, &reg, coll, "t1", "c2");
     defer testing.allocator.free(rest.body);
 }
 
 test "blob session size cap" {
-    var reg = try rove.Registry.init(testing.allocator, .{ .max_entities = 16 });
+    var reg = try TestWorld.Reg.init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
-    var coll = try TestColl.init(testing.allocator);
-    defer coll.deinit();
-    reg.registerCollection(&coll);
+    const coll = reg.coll(.sessions);
 
     const chunk = try testing.allocator.alloc(u8, MAX_SESSION_BYTES);
     defer testing.allocator.free(chunk);
     @memset(chunk, 'x');
-    _ = try write(testing.allocator, &reg, &coll, "t1", "c1", chunk, 1);
+    _ = try write(testing.allocator, &reg, coll, "t1", "c1", chunk, 1);
     try testing.expectError(
         Error.SessionTooLarge,
-        write(testing.allocator, &reg, &coll, "t1", "c1", "y", 2),
+        write(testing.allocator, &reg, coll, "t1", "c1", "y", 2),
     );
-    const sealed = try seal(testing.allocator, &reg, &coll, "t1", "c1");
+    const sealed = try seal(testing.allocator, &reg, coll, "t1", "c1");
     testing.allocator.free(sealed.body);
 }

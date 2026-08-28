@@ -353,7 +353,7 @@ pub fn interpretCmd(
             const server = worker.h2;
             const chunks_ptr = server.reg.get(
                 sc.stream_entity,
-                &server.stream_data_out,
+                server.coll(.stream_data_out),
                 components_mod.StreamChunks,
             ) catch {
                 std.log.info(
@@ -375,7 +375,7 @@ pub fn interpretCmd(
             const server = worker.h2;
             const drain_ptr = server.reg.get(
                 sce.stream_entity,
-                &server.stream_data_out,
+                server.coll(.stream_data_out),
                 components_mod.StreamDraining,
             ) catch return; // entity gone — nothing to flip
             drain_ptr.is_draining = true;
@@ -415,17 +415,17 @@ pub fn interpretCmd(
                 .raft_pending_response => stampAndMoveRespond(
                     worker,
                     ro,
-                    &worker.raft_pending_response,
+                    worker.raft_pending_response,
                 ),
                 .raft_pending_cont => stampAndMoveRespond(
                     worker,
                     ro,
-                    &worker.raft_pending_cont,
+                    worker.raft_pending_cont,
                 ),
                 .raft_pending_stream => stampAndMoveRespond(
                     worker,
                     ro,
-                    &worker.raft_pending_stream,
+                    worker.raft_pending_stream,
                 ),
             }
         },
@@ -458,12 +458,12 @@ pub fn interpretCmd(
 /// in `fireWsMessage`.
 pub fn emitWsSend(worker: anytype, wo: WsSendOut) !void {
     const server = worker.h2;
-    const ent = try server.reg.create(&server.ws_send_in);
+    const ent = try server.reg.create(server.coll(.ws_send_in));
     errdefer server.reg.destroy(ent) catch {};
-    try server.reg.set(ent, &server.ws_send_in, h2.Session, .{ .entity = wo.conn_entity });
-    try server.reg.set(ent, &server.ws_send_in, h2.WsMeta, .{ .opcode = wo.opcode });
+    try server.reg.set(ent, server.coll(.ws_send_in), h2.Session, .{ .entity = wo.conn_entity });
+    try server.reg.set(ent, server.coll(.ws_send_in), h2.WsMeta, .{ .opcode = wo.opcode });
     const data: ?[*]u8 = if (wo.bytes.len > 0) wo.bytes.ptr else null;
-    try server.reg.set(ent, &server.ws_send_in, h2.ReqBody, .{ .data = data, .len = @intCast(wo.bytes.len) });
+    try server.reg.set(ent, server.coll(.ws_send_in), h2.ReqBody, .{ .data = data, .len = @intCast(wo.bytes.len) });
 }
 
 /// `respond` interpreter shared body. Stamps the four payload
@@ -480,11 +480,11 @@ fn stampAndMoveRespond(worker: anytype, ro: RespondOut, source_coll: anytype) vo
     // destination. The `parked_continuations` collection lives on
     // `worker`, not `worker.h2`; the others live on h2.
     switch (ro.dest) {
-        .response_in => server.reg.move(ro.entity, source_coll, &server.response_in) catch |err|
+        .response_in => server.reg.move(ro.entity, source_coll, server.coll(.response_in)) catch |err|
             std.log.warn("interpretCmd respond: move→response_in: {s}", .{@errorName(err)}),
-        .parked_continuations => server.reg.move(ro.entity, source_coll, &worker.parked_continuations) catch |err|
+        .parked_continuations => server.reg.move(ro.entity, source_coll, worker.parked_continuations) catch |err|
             std.log.warn("interpretCmd respond: move→parked_continuations: {s}", .{@errorName(err)}),
-        .stream_response_in => server.reg.move(ro.entity, source_coll, &server.stream_response_in) catch |err|
+        .stream_response_in => server.reg.move(ro.entity, source_coll, server.coll(.stream_response_in)) catch |err|
             std.log.warn("interpretCmd respond: move→stream_response_in: {s}", .{@errorName(err)}),
     }
 }

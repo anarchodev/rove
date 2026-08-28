@@ -58,9 +58,21 @@ test {
     _ = cert_expiry_mod;
 }
 
+const front_h2_opts = h2.Options{
+    .client = true,
+    .request_row = rove.Row(&.{proxy_mod.FlowRef}),
+};
+
+/// The front door's world — module-declared (explicit `.world`), the
+/// same shape as the other binaries. Two registries run on this ONE
+/// world type: the main proxy and the :80 redirect listener — N values
+/// of one type, never one shared value.
+pub const FrontWorld = rove.World(.{ .parts = h2.parts(front_h2_opts) });
+
 const FrontH2 = h2.H2(.{
     .client = true,
     .request_row = rove.Row(&.{proxy_mod.FlowRef}),
+    .world = FrontWorld,
 });
 
 const Proxy = proxy_mod.Proxy(FrontH2);
@@ -205,7 +217,7 @@ fn unpackCert(frame: []const u8) ?UnpackedCert {
 
 fn cleanupResponses(server: *FrontH2) !void {
     const entities = server.response_out.entitySlice();
-    for (entities) |ent| try server.reg.destroy(ent);
+    for (entities) |ent| try server.destroyEntity(ent);
 }
 
 fn getEnvCfg(name: []const u8) []const u8 {
@@ -231,13 +243,13 @@ const ACME_PREFIX = "/.well-known/acme-challenge/";
 
 /// Reply helper for the `:80` listener: immediate status, no body.
 fn replyStatus80(server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16) !void {
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = code });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{ .data = null, .len = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+    try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+    try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
 }
 
 /// Pack a single response header into the `h2.RespHeaders` layout — one buffer
@@ -259,16 +271,16 @@ fn packRespHeader(a: std.mem.Allocator, name: []const u8, value: []const u8) !h2
 /// Reply with status + headers + (optional, owned) body. Mirrors
 /// `replyStatus80` but carries a header set and body.
 fn replyFull(server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16, rh: h2.RespHeaders, body: ?[]u8) !void {
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, rh);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+    try server.reg.set(ent, server.coll(.request_out), h2.Status, .{ .code = code });
+    try server.reg.set(ent, server.coll(.request_out), h2.RespHeaders, rh);
+    try server.reg.set(ent, server.coll(.request_out), h2.RespBody, .{
         .data = if (body) |b| b.ptr else null,
         .len = if (body) |b| @intCast(b.len) else 0,
     });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
+    try server.reg.set(ent, server.coll(.request_out), h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, server.coll(.request_out), h2.StreamId, sid);
+    try server.reg.set(ent, server.coll(.request_out), h2.Session, sess);
+    try server.reg.move(ent, server.coll(.request_out), server.coll(.response_in));
 }
 
 /// Fetch the ACME HTTP-01 key-authorization for `token` from the CP issuer.
@@ -529,7 +541,7 @@ pub fn main() !void {
     try resolver.start(@intCast(@max(1, envMs("REWIND_FRONT_RESOLVER_THREADS", route_resolver_mod.RouteResolver.DEFAULT_THREADS))));
     defer resolver.shutdown();
 
-    var reg = try rove.Registry.init(allocator, .{
+    var reg = try FrontH2.Reg.init(allocator, .{
         .max_entities = 8192,
         .deferred_queue_capacity = 2048,
     });
@@ -623,10 +635,10 @@ pub fn main() !void {
         break :blk if (tls_config != null) 80 else 0;
     };
     var server80: ?*FrontH2 = null;
-    var reg80_ptr: ?*rove.Registry = null;
+    var reg80_ptr: ?*FrontH2.Reg = null;
     if (http_port != 0) {
-        const r80 = try allocator.create(rove.Registry);
-        r80.* = try rove.Registry.init(allocator, .{ .max_entities = 2048, .deferred_queue_capacity = 512 });
+        const r80 = try allocator.create(FrontH2.Reg);
+        r80.* = try FrontH2.Reg.init(allocator, .{ .max_entities = 2048, .deferred_queue_capacity = 512 });
         reg80_ptr = r80;
         const addr80 = try std.net.Address.parseIp("0.0.0.0", http_port);
         server80 = try FrontH2.create(r80, allocator, addr80, .{
@@ -768,7 +780,7 @@ pub fn main() !void {
 /// The :80 listener loop — its own thread (see the spawn site). Owns
 /// `s80` + `reg80` exclusively. Blocking work here (the ACME challenge
 /// CP lookup) cannot stall the :443 poll loop.
-fn port80Loop(s80: *FrontH2, reg80: *rove.Registry, allocator: std.mem.Allocator, cp_urls: []const []const u8) void {
+fn port80Loop(s80: *FrontH2, reg80: *FrontH2.Reg, allocator: std.mem.Allocator, cp_urls: []const []const u8) void {
     while (!stop_flag.load(.acquire)) {
         // `pollWithTimeout` — nanoseconds. `poll` takes a COUNT of completions
         // to wait for, so `poll(10 * ns_per_ms)` asks for ten million of them

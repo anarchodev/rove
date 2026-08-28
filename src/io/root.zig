@@ -4,7 +4,6 @@ const std = @import("std");
 const rove = @import("rove");
 const Row = rove.Row;
 const Collection = rove.Collection;
-const Registry = rove.Registry;
 const Entity = rove.Entity;
 const linux = std.os.linux;
 const posix = std.posix;
@@ -27,45 +26,6 @@ fn getSqeOrSubmit(ring: *linux.IoUring) !*linux.io_uring_sqe {
 // Component types
 // =============================================================================
 
-/// Cleanup context shared by WriteBuf, ReadCycleEntity, and ReadResult
-/// destructors. Stored on the Io struct, registered with registry via
-/// setDeinitCtx. `buf_ring` / `buf_base` / `buf_size` / `buf_count`
-/// let ReadResult.deinit return a kernel-held buffer to the ring when
-/// its owning read entity is destroyed (e.g. via the cascade in
-/// ReadCycleEntity.deinit). Without that path, every aborted-mid-recv
-/// connection leaks its buffer permanently — drains the ring to zero
-/// after a few thousand short-lived connections and the kernel
-/// returns ENOBUFS for every subsequent recv.
-pub const IoCleanupCtx = struct {
-    ring: *linux.IoUring,
-    max_connections: u32,
-    reg: *Registry,
-    buf_ring: *align(std.heap.page_size_min) linux.io_uring_buf_ring = undefined,
-    buf_base: []u8 = undefined,
-    buf_size: u32 = 0,
-    buf_count: u16 = 0,
-    /// Read entities destroyed while still holding a registered buffer — they
-    /// bypassed the return-then-clear every live path does, so that buffer is
-    /// gone from the ring for the life of the process.
-    ///
-    /// Expected steady state is NOT zero: it reads **one per process
-    /// shutdown**. `Io.destroy` deinits the read collections directly, so a
-    /// connection still mid-read when the drain began lands here. That is
-    /// harmless — `free_buf_ring` runs a few lines later — and it is the only
-    /// path measured to reach it. A count rising during operation is the real
-    /// signal, and it means the ring is draining.
-    recv_bufs_destroyed_live: u64 = 0,
-    /// Conns destroyed while still holding a live descriptor slot — i.e.
-    /// something destroyed a conn entity without routing it through
-    /// `conn_closing`. Should never move.
-    fd_destroyed_live: u64 = 0,
-    /// Write entities destroyed while still holding a buffer — they bypassed
-    /// `write_done` / `releaseWriteBuf`, so that buffer leaked.
-    write_bufs_destroyed_live: u64 = 0,
-    /// Conns destroyed while their read-cycle link was still live — they
-    /// bypassed `releaseReadCycle`, so that read entity leaked.
-    read_cycles_destroyed_live: u64 = 0,
-};
 
 /// Peer (remote) address of an accepted connection, resolved once at
 /// accept time. Direct descriptors have no process fd to getpeername
@@ -73,131 +33,53 @@ pub const IoCleanupCtx = struct {
 /// completions (batched accepts would mis-attribute clients) — so
 /// the accept handler submits an IORING_OP_FIXED_FD_INSTALL and the
 /// install CQE getpeername()s the materialized fd, fills this, and
-/// closes it again. `.none` until that CQE lands (a request racing
-/// the window just has no peer identity) and forever on
-/// client-direction connections.
-///
-/// Held as in/in6 rather than as a `std.net.Address`, because a
-/// `std.net.Address` is 112 bytes and 108 of them are the Unix-domain
-/// path — a variant an accepted TCP socket cannot be. `Io.conn_slots`
-/// holds one of these per entity index, so that unreachable variant
-/// would otherwise be the single largest thing rove-io allocates.
-const PeerAddr = union(enum) {
-    none,
-    in: std.net.Ip4Address,
-    in6: std.net.Ip6Address,
-
-    fn from(addr: std.net.Address) PeerAddr {
-        return switch (addr.any.family) {
-            posix.AF.INET => .{ .in = addr.in },
-            posix.AF.INET6 => .{ .in6 = addr.in6 },
-            else => .none,
-        };
-    }
-
-    fn toAddress(self: PeerAddr) ?std.net.Address {
-        return switch (self) {
-            .none => null,
-            .in => |a| .{ .in = a },
-            .in6 => |a| .{ .in6 = a },
-        };
-    }
+/// closes it again. `valid` stays false until that CQE lands (a
+/// request racing the window just has no peer identity) and forever
+/// on client-direction connections.
+pub const PeerAddr = struct {
+    addr: std.net.Address = undefined,
+    valid: bool = false,
 };
 
-/// A connection's descriptor slot and peer identity, held in `Io.conn_slots`
-/// and keyed by `entity.index`.
-///
-/// This is not a component, and cannot be one. A component lookup is keyed by
-/// (entity, collection), but a conn does not stay in one collection: rove-h2
-/// promotes it out of `io.connections` into collections of its own while io is
-/// still driving the socket. io's own lookup then fails for a conn it owns the
-/// descriptor for. `entity.index` is stable across every move, so a table keyed
-/// by it answers for a conn wherever it currently lives — and the layer that
-/// happens to hold the entity stops being io's business.
-///
-/// `fd` and `peer` share one slot rather than living in two parallel tables:
-/// they are claimed and released together on exactly the same events, and two
-/// tables would be one lifetime expressed twice, with a way to drift.
-///
-/// Same argument as `ConnectAddr`/`Io.connect_addrs`, reached from the other
-/// direction: there the fixed slot is what makes an address safe to hand the
-/// kernel, here it is what makes a conn findable after a move.
-const ConnSlot = struct {
-    /// Generation of the entity holding this slot. Checked on every lookup, so
-    /// a slot whose index has been reissued does not answer for its predecessor.
-    generation: u32 = 0,
-    /// Whether `generation` names a live claim. Tracked apart from the
-    /// generation because generation 0 is a legal entity generation.
-    claimed: bool = false,
-    /// Registered-file slot index, or -1 once `conn_closing` has posted the
-    /// close. A claimed slot with a live `fd` outside that window is the
-    /// bypassed-teardown break `assertSlotFree` aborts on.
+/// The connection's direct-descriptor slot. -1 = released. A conn
+/// reaches destruction through `conn_closing`, which posts the
+/// shutdown and close and clears this — the invariant "no conn is
+/// destroyed holding a live slot" is CODE at the one entry into
+/// `conn_dead` (processConnClosing's move-site panic): a live fd
+/// there means a teardown path skipped the close, the slot leaks,
+/// and the slot number may already be reissued — nothing after that
+/// can be trusted. Closing it "defensively" would land on somebody
+/// else's connection.
+pub const Fd = struct {
     fd: i32 = -1,
-    peer: PeerAddr = .none,
 };
 
 pub const ConnEntity = struct { entity: Entity = Entity.nil };
 
+/// One recv completion: result code + the kernel-held ring buffer (if
+/// any). Buffers return to the ring by TRANSITION — `processReadIn`'s
+/// drain, `releaseReadCycle` at conn retirement, and `handleCqe`'s
+/// stale-completion reclaim — never by destructor. A buffer returned
+/// twice over-advances the producer tail and shrinks the pool until
+/// recv reports ENOBUFS at a tiny connection count, so the return and
+/// the clear always happen together at one owning site.
 pub const ReadResult = struct {
     result: i32 = 0,
     data: ?[*]u8 = null,
     buf_id: u16 = 0,
-
-    pub const DeinitCtx = IoCleanupCtx;
-
-    /// A registered buffer is returned by TRANSITION, not by destruction.
-    /// Every path that drops a read entity returns the buffer to the ring and
-    /// clears this component first — `processReadIn`'s three drops,
-    /// `releaseReadCycle` at conn teardown, and `reclaimStaleBuffer` for a
-    /// completion that outlived its entity. So on every live path this sees
-    /// `data == null` and only counts.
-    ///
-    /// Returning the buffer here instead would put a ring operation in a
-    /// destructor, which is the one place that cannot know whether the return
-    /// already happened. A buffer added twice over-advances the ring's
-    /// producer tail, shrinks the distinct-buffer pool, and surfaces as recv
-    /// `ENOBUFS` at a connection count nowhere near the limit — a symptom
-    /// arbitrarily far from its cause.
-    ///
-    /// Counted rather than aborted, and counted rather than fixed: the buffer
-    /// is one of a fixed pool, so the loss is bounded and diagnosable, and a
-    /// destructor that quietly repairs the leak is a destructor that hides it.
-    pub fn deinit(_: std.mem.Allocator, items: []ReadResult, ctx: *DeinitCtx) void {
-        for (items) |item| {
-            if (item.data != null) ctx.recv_bufs_destroyed_live += 1;
-        }
-    }
 };
 
+/// An egress buffer. Released by TRANSITION, not destruction:
+/// `processWriteDone` frees it and clears the component once the
+/// send's completion lands, and the pre-submission drops in
+/// `processWriteIn` go through `releaseWriteBuf`. The free cannot be
+/// destructor-shaped because the buffer is kernel-visible — a
+/// `prep_send` keeps reading it until the CQE arrives, across
+/// short-write resubmits at new offsets.
 pub const WriteBuf = struct {
     data: [*]const u8 = undefined,
     len: u32 = 0,
     offset: u32 = 0,
-
-    /// A write buffer is released by TRANSITION, not by destruction —
-    /// `processWriteDone` frees it and clears this component, and the
-    /// pre-submission drops in `processWriteIn` call `releaseWriteBuf`. So on
-    /// every legal path this sees `len == 0` and does nothing.
-    ///
-    /// The free cannot live here because the buffer is kernel-visible:
-    /// `prep_send` hands the kernel a pointer into it and keeps reading until
-    /// the completion lands, across a short-write resubmit that re-posts the
-    /// same allocation at a new offset. A destructor cannot know whether that
-    /// completion has arrived. A `len > 0` here means a write entity was
-    /// destroyed around the release path, so the buffer leaks — and had the
-    /// old destructor still been freeing, it could have freed memory the
-    /// kernel was mid-read on.
-    ///
-    /// Counted rather than aborted, unlike a live descriptor: a leaked buffer is
-    /// bounded and diagnosable where a leaked descriptor slot is a fixed
-    /// resource that runs out.
-    pub const DeinitCtx = IoCleanupCtx;
-
-    pub fn deinit(_: std.mem.Allocator, items: []WriteBuf, ctx: *DeinitCtx) void {
-        for (items) |item| {
-            if (item.len > 0) ctx.write_bufs_destroyed_live += 1;
-        }
-    }
 };
 
 pub const IoResult = struct { err: i32 = 0 };
@@ -229,29 +111,12 @@ pub const ConnectAddr = struct {
 
 /// Links a connection to its read-cycle entity. When the connection
 /// is destroyed, the read-cycle entity is also destroyed.
+/// Links a connection to its read-cycle entity. A reference, not
+/// ownership: the read cycle is released by `releaseReadCycle`, at the
+/// point `conn_closing` has established the recv is quiet — the one
+/// place that condition is knowable.
 pub const ReadCycleEntity = struct {
     entity: Entity = Entity.nil,
-
-    pub const DeinitCtx = IoCleanupCtx;
-
-    /// Links a connection to its read-cycle entity.
-    ///
-    /// The link is a reference, not ownership: the read cycle is released by
-    /// `releaseReadCycle`, at the point `conn_closing` has established the
-    /// recv is quiet. That condition is the whole reason the release cannot
-    /// live here — a destructor fires whenever the entity happens to be
-    /// destroyed, which may be while a recv is still armed against the buffer
-    /// it would return.
-    ///
-    /// A live link here means a conn was destroyed around the closing state,
-    /// so its read entity leaks. Counted, not aborted: the entity is bounded
-    /// by the registry and the leak is diagnosable.
-    pub fn deinit(_: std.mem.Allocator, items: []ReadCycleEntity, ctx: *DeinitCtx) void {
-        for (items) |item| {
-            if (!item.entity.isNil() and !ctx.reg.isStale(item.entity))
-                ctx.read_cycles_destroyed_live += 1;
-        }
-    }
 };
 
 // =============================================================================
@@ -278,10 +143,34 @@ pub const ClosingState = struct {
     deadline_ns: u64 = 0,
 };
 
-/// A live conn carries only its read-cycle link. The descriptor and the peer
-/// address live in `Io.conn_slots`, keyed by `entity.index` — see `ConnSlot`
-/// for why they cannot be components.
-pub const ConnectionBaseRow = Row(&.{ReadCycleEntity});
+/// io's collections, as data. An upper layer merges this with its own set
+/// to build ONE collection enum over the shared registry, so an entity's
+/// collection can be read from `collection_ids` rather than tested against
+/// each candidate in turn.
+pub const CollRef = struct {
+    name: [:0]const u8,
+    /// Registered only when the instance has the connect (client) half.
+    connect_only: bool = false,
+};
+
+pub const COLLECTIONS = [_]CollRef{
+    .{ .name = "connections" },
+    .{ .name = "conn_closing" },
+    .{ .name = "conn_dead" },
+    .{ .name = "read_results" },
+    .{ .name = "write_results" },
+    .{ .name = "write_done" },
+    .{ .name = "read_in" },
+    .{ .name = "write_in" },
+    .{ .name = "_read_pending" },
+    .{ .name = "_write_pending" },
+    .{ .name = "connect_in", .connect_only = true },
+    .{ .name = "connect_errors", .connect_only = true },
+    .{ .name = "_connect_socket_pending", .connect_only = true },
+    .{ .name = "_connect_pending", .connect_only = true },
+};
+
+pub const ConnectionBaseRow = Row(&.{ Fd, ReadCycleEntity, PeerAddr });
 /// The closing row is the connection row plus `ClosingState`, so a move in
 /// from any live conn collection is an ordinary widening — no components are
 /// dropped, and nothing is destroyed by the transition itself.
@@ -289,10 +178,11 @@ pub const ClosingBaseRow = ConnectionBaseRow.merge(Row(&.{ClosingState}));
 pub const ReadBaseRow = Row(&.{ ConnEntity, ReadResult });
 pub const WriteInBaseRow = Row(&.{ ConnEntity, WriteBuf });
 pub const WriteResultBaseRow = Row(&.{ ConnEntity, WriteBuf, IoResult });
-// The connection row stays a subset of the connect row, so the
-// `_connect_pending → connections` strip drops components and adds none.
-const ConnectInBaseRow = Row(&.{ ConnectAddr, IoResult, ReadCycleEntity });
-const ConnectErrorBaseRow = Row(&.{ ConnectAddr, IoResult });
+// PeerAddr rides along so the connection row stays a subset of the
+// connect rows (the `_connect_pending → connections` strip requires
+// it); client-direction conns just keep it invalid.
+const ConnectInBaseRow = Row(&.{ ConnectAddr, Fd, IoResult, ReadCycleEntity, PeerAddr });
+const ConnectErrorBaseRow = Row(&.{ ConnectAddr, Fd, IoResult, PeerAddr });
 
 // =============================================================================
 // CQE user_data encoding
@@ -317,12 +207,92 @@ fn decodeEntity(user_data: u64) Entity {
 // Io type
 // =============================================================================
 
+/// What retirement out of `conn_closing` does with the entity.
+/// `.destroy` ends it (the default). `.hand_off` moves it into the
+/// terminal `conn_dead` collection instead, for a composing layer that
+/// must release foreign state riding the entity (rove-h2's nghttp2
+/// session / TLS conn) at a point provably after every reader — the
+/// layer that opts in OWNS draining `conn_dead` (free, then destroy),
+/// including once at teardown BEFORE io's destroy.
+pub const RetireMode = enum { destroy, hand_off };
+
 pub const Options = struct {
     connection_row: type = Row(&.{}),
     read_row: type = Row(&.{}),
     write_row: type = Row(&.{}),
     connect: bool = false,
+    on_retire: RetireMode = .destroy,
+    /// The declared world this instantiation runs in (fat model). When
+    /// null, the root module's `rove_world` declaration is consulted
+    /// (`rove.declared_world`); pass explicitly for tests' mini-worlds
+    /// or when a composing layer resolved the world already. The world
+    /// must contain io's part — build it from `parts(the same Options)`.
+    world: ?type = null,
 };
+
+/// The rows io's collections materialize, given the caller's fragments —
+/// the single computation both `Io(...)` and `parts(...)` read, so the
+/// world a root declares and the types the layer instantiates cannot
+/// drift apart.
+fn RowsFor(comptime opts: Options) type {
+    return struct {
+        pub const conn = ConnectionBaseRow.merge(opts.connection_row);
+        pub const closing = ClosingBaseRow.merge(opts.connection_row);
+        pub const read = ReadBaseRow.merge(opts.read_row);
+        pub const write_in = WriteInBaseRow.merge(opts.write_row);
+        pub const write_result = WriteResultBaseRow.merge(opts.write_row);
+        pub const connect_in = ConnectInBaseRow.merge(opts.connection_row);
+        pub const connect_error = ConnectErrorBaseRow.merge(opts.connection_row);
+    };
+}
+
+/// io's contribution to a declared world: one part, collections in
+/// `COLLECTIONS` order plus the `all_conns` membership set. A binary on
+/// the fat model composes its root `rove_world` from this —
+/// `rove.World(.{ .parts = rio.parts(io_opts) })` — passing the SAME
+/// options value it instantiates `Io` with; a composing layer folds it
+/// into its own `parts` instead.
+pub fn parts(comptime opts: Options) []const rove.Part {
+    const rows = RowsFor(opts);
+    comptime var decls: []const rove.CollDecl = &.{
+        .{ .name = "connections", .row = rows.conn },
+        .{ .name = "conn_closing", .row = rows.closing },
+        .{ .name = "conn_dead" },
+        .{ .name = "read_results", .row = rows.read },
+        .{ .name = "write_results", .row = rows.write_result },
+        .{ .name = "write_done", .row = rows.write_result },
+        .{ .name = "read_in", .row = rows.read },
+        .{ .name = "write_in", .row = rows.write_in },
+        .{ .name = "_read_pending", .row = rows.read },
+        .{ .name = "_write_pending", .row = rows.write_in },
+    };
+    if (opts.connect) decls = decls ++ [_]rove.CollDecl{
+        .{ .name = "connect_in", .row = rows.connect_in },
+        .{ .name = "connect_errors", .row = rows.connect_error },
+        .{ .name = "_connect_socket_pending", .row = rows.connect_in },
+        .{ .name = "_connect_pending", .row = rows.connect_in },
+    };
+    decls = decls ++ [_]rove.CollDecl{
+        // Identity, not state: membership means "a conn this instance
+        // created", wherever it lives and whatever it is doing —
+        // admission and the teardown sweep count closing conns too, so
+        // quiescing (moveOnly/evictOnly) must leave it alone.
+        .{ .name = "all_conns", .kind = .set, .identity = true },
+    };
+    return &.{.{ .name = "rove-io", .collections = decls }};
+}
+
+/// Comptime guard: the declared world's storage type for `name` must be
+/// the very type this instantiation computed. Identity (not structural)
+/// equality is the point — the registry-owned collection pointers are
+/// only usable if both sides evaluated the same rows from the same
+/// options value.
+fn checkWorldColl(comptime WorldT: type, comptime name: [:0]const u8, comptime Local: type) void {
+    if (WorldT.CollOf(@field(WorldT.CollId, name)) != Local) @compileError(
+        "rove-io: world row for '" ++ name ++
+            "' does not match this instantiation — the root rove_world was built from different Io options; declare the options once and use the same value at both sites",
+    );
+}
 
 pub const IoOptions = struct {
     ring_entries: u16 = 4096,
@@ -341,44 +311,111 @@ pub const IoOptions = struct {
 };
 
 pub fn Io(comptime opts: Options) type {
-    const conn_row = ConnectionBaseRow.merge(opts.connection_row);
-    const read_row = ReadBaseRow.merge(opts.read_row);
-    const write_in_row = WriteInBaseRow.merge(opts.write_row);
-    const write_result_row = WriteResultBaseRow.merge(opts.write_row);
-    const read_pending_row = read_row;
-    const write_pending_row = write_in_row;
+    const rows = RowsFor(opts);
+    const conn_row = rows.conn;
+    const read_row = rows.read;
+    const write_in_row = rows.write_in;
+    const write_result_row = rows.write_result;
 
-    const connect_in_row = ConnectInBaseRow.merge(opts.connection_row);
-    const connect_error_row = ConnectErrorBaseRow.merge(opts.connection_row);
-    const connect_socket_pending_row = connect_in_row;
-    const connect_pending_row = connect_in_row;
+    const connect_in_row = rows.connect_in;
+    const connect_error_row = rows.connect_error;
 
     const has_connect = opts.connect;
 
     // Collection types
     const ConnColl = Collection(conn_row, .{});
-    const ClosingColl = Collection(ClosingBaseRow.merge(opts.connection_row), .{});
+    const ClosingColl = Collection(rows.closing, .{});
+    const DeadColl = Collection(Row(&.{}), .{});
     const ReadResultColl = Collection(read_row, .{});
     const WriteResultColl = Collection(write_result_row, .{});
     const ReadInColl = Collection(read_row, .{});
     const WriteInColl = Collection(write_in_row, .{});
-    const ReadPendingColl = Collection(read_pending_row, .{});
-    const WritePendingColl = Collection(write_pending_row, .{});
+    const ReadPendingColl = Collection(read_row, .{});
+    const WritePendingColl = Collection(write_in_row, .{});
 
     const ConnectInColl = if (has_connect) Collection(connect_in_row, .{}) else void;
     const ConnectErrorColl = if (has_connect) Collection(connect_error_row, .{}) else void;
-    const ConnectSocketPendingColl = if (has_connect) Collection(connect_socket_pending_row, .{}) else void;
-    const ConnectPendingColl = if (has_connect) Collection(connect_pending_row, .{}) else void;
+    const ConnectSocketPendingColl = if (has_connect) Collection(connect_in_row, .{}) else void;
+    const ConnectPendingColl = if (has_connect) Collection(connect_in_row, .{}) else void;
+
+    // The declared world: the explicit option wins, the root module's
+    // `rove_world` is the fallback. One is REQUIRED — the world is
+    // where the closed universe and the id namespace come from.
+    const maybe_world: ?type = if (opts.world) |W| W else rove.declared_world;
+    comptime {
+        if (maybe_world == null) @compileError(
+            "rove-io: no declared world — declare `pub const rove_world = rove.World(.{ .parts = rio.parts(opts) })` in the binary's root module, or pass `.world` explicitly (tests' mini-worlds)",
+        );
+    }
+    const WorldT = maybe_world.?;
+
+    comptime {
+        // The world must contain io's part, with rows computed from
+        // the SAME options this instantiation received — different
+        // options at the two sites would give collections whose
+        // types disagree with the registry-owned storage.
+        for (COLLECTIONS) |cc| {
+            if (cc.connect_only and !has_connect) continue;
+            if (!@hasField(WorldT.CollId, cc.name)) @compileError(
+                "rove-io: the declared world lacks io's '" ++ cc.name ++
+                    "' — build the root rove_world from rio.parts(the same Io options)",
+            );
+        }
+        if (!@hasField(WorldT.CollId, "all_conns")) @compileError(
+            "rove-io: the declared world lacks io's 'all_conns' membership set — build the root rove_world from rio.parts(the same Io options)",
+        );
+    }
+    comptime {
+        // Storage-type identity per collection: proves the world was
+        // built from these options (declare the Io options once, pass
+        // the same value to rio.parts at the root and to Io here).
+        checkWorldColl(WorldT, "connections", ConnColl);
+        checkWorldColl(WorldT, "conn_closing", ClosingColl);
+        checkWorldColl(WorldT, "conn_dead", DeadColl);
+        checkWorldColl(WorldT, "read_results", ReadResultColl);
+        checkWorldColl(WorldT, "write_results", WriteResultColl);
+        checkWorldColl(WorldT, "write_done", WriteResultColl);
+        checkWorldColl(WorldT, "read_in", ReadInColl);
+        checkWorldColl(WorldT, "write_in", WriteInColl);
+        checkWorldColl(WorldT, "_read_pending", ReadPendingColl);
+        checkWorldColl(WorldT, "_write_pending", WritePendingColl);
+        if (has_connect) {
+            checkWorldColl(WorldT, "connect_in", ConnectInColl);
+            checkWorldColl(WorldT, "connect_errors", ConnectErrorColl);
+            checkWorldColl(WorldT, "_connect_socket_pending", ConnectSocketPendingColl);
+            checkWorldColl(WorldT, "_connect_pending", ConnectPendingColl);
+        }
+    }
+
+    const hand_off = opts.on_retire == .hand_off;
 
     return struct {
         const Self = @This();
+
+        /// The registry type this instantiation runs on: the world's,
+        /// which OWNS every declared collection. Callers create one and
+        /// pass it to `create`.
+        pub const Reg = WorldT.Reg;
+
+        /// Collection fields are stable pointers into registry-owned
+        /// storage, fetched once at `create`.
+        fn CollField(comptime C: type) type {
+            if (C == void) return void;
+            return *C;
+        }
+
+        /// Pointer to one of io's collections — the storage is the
+        /// registry's; these fields carry its stable pointers.
+        pub inline fn coll(self: *Self, comptime name: @TypeOf(.enum_literal)) @FieldType(Self, @tagName(name)) {
+            return @field(self, @tagName(name));
+        }
 
         // Public collection types (for external access to row types)
         pub const ConnectionRow = conn_row;
         pub const ReadRow = read_row;
 
         // Collections
-        connections: ConnColl,
+        connections: CollField(ConnColl),
         /// Connections on their way out. A conn ends by moving here —
         /// never by `reg.destroy` from an upper layer — so the layer that
         /// created it is the layer that releases its descriptor slot, and
@@ -387,7 +424,11 @@ pub fn Io(comptime opts: Options) type {
         ///
         /// Unprefixed on purpose: this is a seam other code moves entities
         /// into, like `read_in` / `write_in`, not internal bookkeeping.
-        conn_closing: ClosingColl,
+        conn_closing: CollField(ClosingColl),
+        /// Terminal hand-off collection (empty row): retirement under
+        /// `.hand_off` moves conns here instead of destroying, and the
+        /// composing layer drains it — free foreign state, then destroy.
+        conn_dead: CollField(DeadColl),
 
         /// Connect targets, indexed by `entity.index`. Sized at startup from
         /// the registry's entity capacity and never resized, so a slot's
@@ -396,8 +437,8 @@ pub fn Io(comptime opts: Options) type {
         /// (see `ConnectAddr`). Nothing to free: a slot is reused by the next
         /// entity to claim that index.
         connect_addrs: []std.net.Address,
-        read_results: ReadResultColl,
-        write_results: WriteResultColl,
+        read_results: CollField(ReadResultColl),
+        write_results: CollField(WriteResultColl),
         /// Write entities the upper layer is finished with. Its buffer is
         /// still live here — releasing it is this layer's job, in
         /// `processWriteDone`, because the buffer was kernel-visible and only
@@ -405,16 +446,16 @@ pub fn Io(comptime opts: Options) type {
         ///
         /// Unprefixed: a seam the upper layer moves entities into, like
         /// `write_in`, not internal bookkeeping.
-        write_done: WriteResultColl,
-        read_in: ReadInColl,
-        write_in: WriteInColl,
-        _read_pending: ReadPendingColl,
-        _write_pending: WritePendingColl,
+        write_done: CollField(WriteResultColl),
+        read_in: CollField(ReadInColl),
+        write_in: CollField(WriteInColl),
+        _read_pending: CollField(ReadPendingColl),
+        _write_pending: CollField(WritePendingColl),
 
-        connect_in: ConnectInColl,
-        connect_errors: ConnectErrorColl,
-        _connect_socket_pending: ConnectSocketPendingColl,
-        _connect_pending: ConnectPendingColl,
+        connect_in: CollField(ConnectInColl),
+        connect_errors: CollField(ConnectErrorColl),
+        _connect_socket_pending: CollField(ConnectSocketPendingColl),
+        _connect_pending: CollField(ConnectPendingColl),
 
         // io_uring state
         ring: linux.IoUring,
@@ -424,20 +465,6 @@ pub fn Io(comptime opts: Options) type {
         buf_count: u16,
         listen_fd: posix.socket_t,
         max_connections: u32,
-
-        cleanup_ctx: IoCleanupCtx,
-
-        /// Descriptor slot and peer address per conn, indexed by `entity.index`.
-        /// Sized to the registry's entity capacity at startup, so a lookup is an
-        /// array read that never fails for capacity reasons. See `ConnSlot`.
-        conn_slots: []ConnSlot,
-
-        /// Conns holding a descriptor slot: claimed at accept/connect, released
-        /// when `conn_closing` retires them. This spans every collection a conn
-        /// can be in — io's, and whatever the upper layer promoted it into —
-        /// which is exactly the number `handleAccept`'s admission check needs,
-        /// and the reason it needs no help from that layer to get it.
-        live_conns: usize = 0,
 
         /// Admission-control telemetry. Friendly back-pressure when
         /// the conn count approaches `buf_count` — we refuse the
@@ -461,7 +488,7 @@ pub fn Io(comptime opts: Options) type {
         /// Buffers reclaimed from a completion whose entity had already
         /// been destroyed. Counted apart from `recv_buffers_returned` so
         /// the source of a return stays attributable, the same way
-        /// `IoCleanupCtx.recv_bufs_destroyed_live` attributes a loss.
+        /// `IoCleanupCtx.recv_buffers_returned_via_deinit` is.
         recv_buffers_returned_via_stale: u64 = 0,
 
         /// Connections retired out of `conn_closing`, and how many of those
@@ -479,12 +506,7 @@ pub fn Io(comptime opts: Options) type {
         conn_closing_retired: u64 = 0,
         conn_closing_deadline_expired: u64 = 0,
 
-        /// Slots taken over from a previous holder that was destroyed without
-        /// being retired — see `claimConnSlot`. Should never move; a rising
-        /// count means conns are dying around `conn_closing`.
-        conn_slots_reclaimed: u64 = 0,
-
-        reg: *Registry,
+        reg: *Reg,
         allocator: std.mem.Allocator,
 
         const BUF_GROUP_ID: u16 = 0;
@@ -495,127 +517,47 @@ pub fn Io(comptime opts: Options) type {
         /// completion that arrives afterwards still returns its buffer.
         const CLOSE_RECV_GRACE_NS: u64 = 2 * std.time.ns_per_s;
 
-        /// The conn's slot, or null if `entity` holds none — it was never a
-        /// conn, or its slot has already been released and the index reissued.
-        /// The generation check is what makes the second case a null rather
-        /// than a stranger's descriptor.
-        fn slotOf(self: *Self, entity: Entity) ?*ConnSlot {
-            if (entity.index >= self.conn_slots.len) return null;
-            const slot = &self.conn_slots[entity.index];
-            if (!slot.claimed or slot.generation != entity.generation) return null;
-            return slot;
-        }
-
-        /// Take the slot for a freshly accepted or connected conn.
-        ///
-        /// A slot still claimed here means the previous holder of this index
-        /// was destroyed without being released — reuse of the index is one of
-        /// the two places that break becomes observable.
-        fn claimConnSlot(self: *Self, entity: Entity, fd: i32) void {
-            const slot = &self.conn_slots[entity.index];
-            // Its descriptor still being live is the serious form; see
-            // `assertSlotFree` for why that stops the process.
-            self.assertSlotFree(slot, entity.index);
-            if (slot.claimed) {
-                // Claimed, but the descriptor was already given back: the
-                // previous holder got as far as the shutdown and was then
-                // destroyed without being retired. The socket is down, so
-                // there is nothing to abort over — but the count has to come
-                // back. `live_conns` gates admission, so a claim that leaks
-                // one refuses a real connection later, somewhere with no
-                // visible connection to the cause.
-                self.conn_slots_reclaimed += 1;
-                self.live_conns -= 1;
-            }
-            slot.* = .{ .generation = entity.generation, .claimed = true, .fd = fd };
-            self.live_conns += 1;
-        }
-
-        /// Give the slot back. Called where the conn is retired — from
-        /// `processConnClosing`, which has established the socket is down, and
-        /// from the connect-failure path, where it never came up.
-        fn releaseConnSlot(self: *Self, entity: Entity) void {
-            const slot = self.slotOf(entity) orelse return;
-            slot.* = .{};
-            self.live_conns -= 1;
-        }
-
-        /// Abort if `slot` still holds a live descriptor.
-        ///
-        /// A connection reaches destruction through `conn_closing`, which posts
-        /// the shutdown and close and clears `fd` — so on every legal path this
-        /// sees -1 or an unclaimed slot and does nothing.
-        ///
-        /// A live fd here means a conn was destroyed around the closing state.
-        /// That is a programmer error, not an operating error, and the honest
-        /// response is to stop: the descriptor leaks, the peer never observes a
-        /// close, and — the part that actually decides it — a path that was
-        /// supposed to be unreachable just ran, so nothing else it did can be
-        /// trusted either. "It is only an fd" is an assumption about code we
-        /// have just established we do not understand.
-        ///
-        /// Closing the socket instead would be worse than useless: it would
-        /// hide the break, and the slot number may already have been reissued
-        /// to a new accept, so the close would land on somebody else's
-        /// connection.
-        ///
-        /// The two places this can fire are the two places a leaked slot
-        /// becomes observable: reuse of the entity index, and the end of the
-        /// process. A destructor on the conn row would fire at the moment of
-        /// the destroy instead — but a destructor is exactly what this module
-        /// is retiring, because it runs at a time nobody chose. Teardown is not
-        /// an exception: `shutdownAllConns` takes every remaining conn through
-        /// the closing path before `destroy` sweeps, so the fds are already -1.
-        ///
-        /// An explicit check and `abort`, not `std.debug.assert`, because the
-        /// shipped binaries are ReleaseFast (`scripts/ops/build.sh`) where an
-        /// assert compiles to nothing — the same reason the recv-buffer
-        /// invariant in rove-h2 is written this way.
-        fn assertSlotFree(self: *Self, slot: *ConnSlot, index: u32) void {
-            if (!slot.claimed or slot.fd < 0) return;
-            self.cleanup_ctx.fd_destroyed_live += 1;
-            var buf: [512]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &buf,
-                "\n================================================================\n" ++
-                    "ROVE IO: conn (entity index {d}) destroyed while its fd ({d})\n" ++
-                    "  was still live. It bypassed `conn_closing`, so the socket was\n" ++
-                    "  never shut down and the descriptor slot is leaked. A path that\n" ++
-                    "  cannot be reached has been reached; the rest of its work is\n" ++
-                    "  suspect.\n" ++
-                    "================================================================\n",
-                .{ index, slot.fd },
-            ) catch buf[0..0];
-            _ = posix.write(2, msg) catch {};
-            std.process.abort();
-        }
-
-        /// The registered-file slot for a connection entity, wherever the conn
-        /// currently lives.
-        pub fn getFd(self: *Self, entity: Entity) ?i32 {
-            const slot = self.slotOf(entity) orelse return null;
-            return slot.fd;
+        /// Look up the Fd for a connection entity — `getFat` resolves it
+        /// wherever the entity lives, whichever layer's collection holds
+        /// it. Callers pass conn entities only.
+        pub fn getFd(self: *Self, entity: Entity) ?*Fd {
+            return self.reg.getFat(entity, Fd) catch null;
         }
 
         /// Park a connect target for `entity` and mark the component. The
         /// address lives in `connect_addrs`, not in the component, because
         /// only the table's slot is stable enough to hand to `prep_connect`.
-        pub fn setConnectAddr(self: *Self, entity: Entity, coll: anytype, addr: std.net.Address) !void {
+        pub fn setConnectAddr(self: *Self, entity: Entity, c: anytype, addr: std.net.Address) !void {
             if (!has_connect) @compileError("setConnectAddr requires .connect = true");
             self.connect_addrs[entity.index] = addr;
-            try self.reg.set(entity, coll, ConnectAddr, .{ .owner = entity });
+            try self.reg.set(entity, c, ConnectAddr, .{ .owner = entity });
         }
 
-        /// `getFd`'s mirror: the peer identity of a conn, wherever it lives.
-        /// Null until the fixed-fd-install CQE lands — which may be well after
-        /// the conn was promoted out of `io.connections`, and is precisely the
-        /// case a component column could not serve.
-        pub fn getPeerAddr(self: *Self, entity: Entity) ?std.net.Address {
-            const slot = self.slotOf(entity) orelse return null;
-            return slot.peer.toAddress();
+        /// PeerAddr mirror of `getFd`: the conn entity may have moved
+        /// into an upper-layer collection by the time the
+        /// fixed-fd-install CQE lands; `getFat` answers wherever it is.
+        pub fn getPeerAddr(self: *Self, entity: Entity) ?*PeerAddr {
+            return self.reg.getFat(entity, PeerAddr) catch null;
         }
 
-        pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
+        fn collInit(reg: *Reg, comptime name: [:0]const u8, comptime C: type) CollField(C) {
+            return reg.coll(@field(WorldT.CollId, name));
+        }
+
+        /// A conn becomes live: one place for the whole birth —
+        /// entity, descriptor, peer slot, and (fat model) the identity
+        /// membership admission and the teardown sweep count on. The
+        /// connect path's promotion in `handleConnect` upholds the
+        /// same invariant on its existing entity.
+        fn birthConn(self: *Self, file_slot: i32) !Entity {
+            const conn = try self.reg.create(self.coll(.connections));
+            try self.reg.set(conn, self.coll(.connections), Fd, .{ .fd = file_slot });
+            try self.reg.set(conn, self.coll(.connections), PeerAddr, .{});
+            _ = try self.reg.join(conn, .all_conns);
+            return conn;
+        }
+
+        pub fn create(reg: *Reg, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
             var ring = if (io_opts.ring_params) |params|
                 try linux.IoUring.init_params(io_opts.ring_entries, params)
             else
@@ -668,24 +610,24 @@ pub fn Io(comptime opts: Options) type {
 
             const self = try allocator.create(Self);
             self.* = .{
-                .connections = try ConnColl.init(allocator),
-                .conn_closing = try ClosingColl.init(allocator),
-                .conn_slots = try allocator.alloc(ConnSlot, reg.max_entities),
+                .connections = collInit(reg, "connections", ConnColl),
+                .conn_closing = collInit(reg, "conn_closing", ClosingColl),
+                .conn_dead = collInit(reg, "conn_dead", DeadColl),
                 .connect_addrs = if (has_connect)
-                    try allocator.alloc(std.net.Address, reg.max_entities)
+                    try allocator.alloc(std.net.Address, reg.maxEntities())
                 else
                     &.{},
-                .read_results = try ReadResultColl.init(allocator),
-                .write_results = try WriteResultColl.init(allocator),
-                .write_done = try WriteResultColl.init(allocator),
-                .read_in = try ReadInColl.init(allocator),
-                .write_in = try WriteInColl.init(allocator),
-                ._read_pending = try ReadPendingColl.init(allocator),
-                ._write_pending = try WritePendingColl.init(allocator),
-                .connect_in = if (has_connect) try ConnectInColl.init(allocator) else {},
-                .connect_errors = if (has_connect) try ConnectErrorColl.init(allocator) else {},
-                ._connect_socket_pending = if (has_connect) try ConnectSocketPendingColl.init(allocator) else {},
-                ._connect_pending = if (has_connect) try ConnectPendingColl.init(allocator) else {},
+                .read_results = collInit(reg, "read_results", ReadResultColl),
+                .write_results = collInit(reg, "write_results", WriteResultColl),
+                .write_done = collInit(reg, "write_done", WriteResultColl),
+                .read_in = collInit(reg, "read_in", ReadInColl),
+                .write_in = collInit(reg, "write_in", WriteInColl),
+                ._read_pending = collInit(reg, "_read_pending", ReadPendingColl),
+                ._write_pending = collInit(reg, "_write_pending", WritePendingColl),
+                .connect_in = if (has_connect) collInit(reg, "connect_in", ConnectInColl) else {},
+                .connect_errors = if (has_connect) collInit(reg, "connect_errors", ConnectErrorColl) else {},
+                ._connect_socket_pending = if (has_connect) collInit(reg, "_connect_socket_pending", ConnectSocketPendingColl) else {},
+                ._connect_pending = if (has_connect) collInit(reg, "_connect_pending", ConnectPendingColl) else {},
                 .ring = ring,
                 .buf_ring = br,
                 .buf_base = buf_base,
@@ -693,46 +635,9 @@ pub fn Io(comptime opts: Options) type {
                 .buf_count = io_opts.buf_count,
                 .listen_fd = listen_fd,
                 .max_connections = io_opts.max_connections,
-                .cleanup_ctx = .{
-                    .ring = undefined, // set below
-                    .max_connections = io_opts.max_connections,
-                    .reg = reg,
-                    .buf_ring = br,
-                    .buf_base = buf_base,
-                    .buf_size = io_opts.buf_size,
-                    .buf_count = io_opts.buf_count,
-                },
                 .reg = reg,
                 .allocator = allocator,
             };
-
-            // Set ring pointer now that self is at its final heap location
-            self.cleanup_ctx.ring = &self.ring;
-
-            // Register collections with registry
-            reg.registerCollection(&self.connections);
-            reg.registerCollection(&self.conn_closing);
-            reg.registerCollection(&self.read_results);
-            reg.registerCollection(&self.write_results);
-            reg.registerCollection(&self.write_done);
-            reg.registerCollection(&self.read_in);
-            reg.registerCollection(&self.write_in);
-            reg.registerCollection(&self._read_pending);
-            reg.registerCollection(&self._write_pending);
-            if (has_connect) {
-                reg.registerCollection(&self.connect_in);
-                reg.registerCollection(&self.connect_errors);
-                reg.registerCollection(&self._connect_socket_pending);
-                reg.registerCollection(&self._connect_pending);
-            }
-
-            // Register deinit contexts. `ReadResult.deinit` returns
-            // the buffer (if any) to the registered ring when its
-            // owning read entity is destroyed — the fix for the
-            // leak that drained the ring at xargs+curl workloads.
-            reg.setDeinitCtx(WriteBuf, &self.cleanup_ctx);
-            reg.setDeinitCtx(ReadCycleEntity, &self.cleanup_ctx);
-            reg.setDeinitCtx(ReadResult, &self.cleanup_ctx);
 
             return self;
         }
@@ -740,11 +645,14 @@ pub fn Io(comptime opts: Options) type {
         /// End every connection still live, through the same closing path
         /// every other connection takes: move it in, post its shutdown and
         /// close, give up its slot. Afterwards no conn holds a live fd, so
-        /// `destroy`'s slot sweep passes without teardown needing an
-        /// exception carved out of the invariant.
+        /// teardown retires conns through the same live-fd guard every other
+        /// retirement passes, with no exception carved out for shutdown.
         ///
-        /// An upper layer holding conn collections of its own must close
-        /// those first — rove-h2 does, at the top of its `destroy`.
+        /// Under the archetype model, an upper layer holding conn
+        /// collections of its own must close those first — rove-h2 does,
+        /// at the top of its `destroy`. Under the fat model that contract
+        /// is gone: the sweep walks `all_conns` and evicts each member
+        /// into `conn_closing` from whichever collection holds it.
         ///
         /// The submit is the point. Without it the shutdown and close SQEs
         /// sit in the submission queue until `ring.deinit` discards them,
@@ -753,10 +661,36 @@ pub fn Io(comptime opts: Options) type {
         /// the kernel has the ops, and blocking teardown to watch them land
         /// buys the peer nothing it does not already have.
         pub fn shutdownAllConns(self: *Self) void {
-            for (self.connections.entitySlice()) |ent| {
+            // PRECONDITION: the deferred queue is empty — the caller
+            // flushes at a boundary it owns before teardown. Checked
+            // loudly rather than flushed away here: flushes live outside
+            // systems, and a flush in here would execute other systems'
+            // queued ops at a point their enqueuer did not choose. Left
+            // unchecked, a dirty queue makes the sweep silently partial:
+            // a conn mid-move is skipped as pending, lands in its
+            // destination at the tail flush after the loop has passed
+            // it, and never closes.
+            if (self.reg.pendingOpCount() != 0) std.debug.panic(
+                "shutdownAllConns: {d} deferred op(s) queued — flush at a caller-owned boundary before teardown",
+                .{self.reg.pendingOpCount()},
+            );
+            // End every conn this instance ever created, wherever it
+            // lives — including collections an upper layer owns, which
+            // io cannot name; the type-erased evict recipe is what
+            // makes that expressible. evictOnlyImmediate: entering the
+            // closing state quiesces — whatever state axes an upper
+            // layer parked this conn on are left too, unnamed here.
+            // all_conns itself is identity, so this member list stays
+            // stable across the loop (entities leave it only at
+            // destroy).
+            for (self.reg.setMembers(.all_conns)) |ent| {
                 if (self.reg.isStale(ent)) continue;
                 if (self.reg.isMoving(ent)) continue;
-                self.reg.move(ent, &self.connections, &self.conn_closing) catch continue;
+                if (self.reg.isInCollection(ent, self.coll(.conn_closing))) continue;
+                if (comptime hand_off) {
+                    if (self.reg.isInCollection(ent, self.coll(.conn_dead))) continue;
+                }
+                self.reg.evictOnlyImmediate(ent, self.coll(.conn_closing)) catch continue;
             }
             self.reg.flush() catch {};
             self.processConnClosing() catch {};
@@ -767,28 +701,7 @@ pub fn Io(comptime opts: Options) type {
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
             self.shutdownAllConns();
-            // Every conn has been through the closing path by now, so every
-            // slot is either free or holds -1. One that still holds a live
-            // descriptor was destroyed around that path; `assertSlotFree`
-            // explains why the process stops for it rather than tidying up.
-            for (self.conn_slots, 0..) |*slot, i| self.assertSlotFree(slot, @intCast(i));
-            self.connections.deinit();
-            self.conn_closing.deinit();
-            allocator.free(self.conn_slots);
             if (has_connect) allocator.free(self.connect_addrs);
-            self.read_results.deinit();
-            self.write_results.deinit();
-            self.write_done.deinit();
-            self.read_in.deinit();
-            self.write_in.deinit();
-            self._read_pending.deinit();
-            self._write_pending.deinit();
-            if (has_connect) {
-                self.connect_in.deinit();
-                self.connect_errors.deinit();
-                self._connect_socket_pending.deinit();
-                self._connect_pending.deinit();
-            }
             linux.IoUring.free_buf_ring(self.ring.fd, self.buf_ring, self.buf_count, BUF_GROUP_ID);
             allocator.free(self.buf_base);
             posix.close(self.listen_fd);
@@ -897,12 +810,26 @@ pub fn Io(comptime opts: Options) type {
                 if (self.reg.isMoving(ent)) continue;
                 if (wb.len > 0) {
                     self.allocator.free(@constCast(wb.data)[0..wb.len]);
-                    // Cleared so `WriteBuf.deinit`'s assertion sees a released
-                    // buffer rather than reporting this as a bypass.
+                    // Freed and cleared at the same site: this phase is the
+                    // only owner of a buffer whose send has completed, so a
+                    // pointer left behind is a second free with no owner to
+                    // catch it.
                     wb.* = .{};
                 }
                 try self.reg.destroy(ent);
             }
+        }
+
+        /// Live `WriteBuf` count: the collections whose row carries one,
+        /// summed. Derived at comptime from the rows, so a write collection
+        /// added later is included without anyone remembering to.
+        pub fn writeBufsLive(self: *Self) usize {
+            var n: usize = 0;
+            inline for (.{ self.coll(.write_in), self.coll(._write_pending), self.coll(.write_results), self.coll(.write_done) }) |wc| {
+                const C = @typeInfo(@TypeOf(wc)).pointer.child;
+                if (comptime C.RowType.contains(WriteBuf)) n += wc.entitySlice().len;
+            }
+            return n;
         }
 
         /// Own the teardown of every connection an upper layer handed over.
@@ -918,18 +845,6 @@ pub fn Io(comptime opts: Options) type {
         /// knows nothing of sessions — so the upper layer sends it and drains
         /// it BEFORE handing the conn over. Arriving here means "the protocol
         /// is finished with this connection; take the socket down."
-        /// Live `WriteBuf` count: the collections whose row carries one,
-        /// summed. Derived at comptime from the rows, so a write collection
-        /// added later is included without anyone remembering to.
-        pub fn writeBufsLive(self: *Self) usize {
-            var n: usize = 0;
-            inline for (.{ &self.write_in, &self._write_pending, &self.write_results, &self.write_done }) |coll| {
-                const Coll = @typeInfo(@TypeOf(coll)).pointer.child;
-                if (comptime Coll.RowType.contains(WriteBuf)) n += coll.entitySlice().len;
-            }
-            return n;
-        }
-
         fn processConnClosing(self: *Self) !void {
             const live_bufs = self.writeBufsLive();
             if (live_bufs > self.write_bufs_peak) self.write_bufs_peak = live_bufs;
@@ -937,22 +852,17 @@ pub fn Io(comptime opts: Options) type {
             const now = monotonicNs();
             const entities = self.conn_closing.entitySlice();
             const states = self.conn_closing.column(ClosingState);
+            const fds = self.conn_closing.column(Fd);
             const cycles = self.conn_closing.column(ReadCycleEntity);
 
-            for (entities, states, cycles) |ent, *st, cycle| {
+            for (entities, states, fds, cycles) |ent, *st, *fd, cycle| {
                 if (self.reg.isStale(ent)) continue;
                 if (self.reg.isMoving(ent)) continue;
-                // A conn with no slot has no descriptor to take down — it
-                // never got one, or already gave it back. It still has to be
-                // retired, so this is a missing fd rather than a reason to
-                // skip the entity: `continue` here would strand it in
-                // `conn_closing` for the life of the process.
-                const slot = self.slotOf(ent);
 
                 if (!st.shutdown_posted) {
                     st.shutdown_posted = true;
                     st.deadline_ns = now + CLOSE_RECV_GRACE_NS;
-                    if (slot) |sl| if (sl.fd >= 0 and @as(u32, @intCast(sl.fd)) < self.max_connections) {
+                    if (fd.fd >= 0 and @as(u32, @intCast(fd.fd)) < self.max_connections) {
                         // Shut down before freeing the slot. `close_direct`
                         // alone is not enough: a conn torn down with a recv
                         // still armed keeps the socket alive, because the
@@ -967,20 +877,21 @@ pub fn Io(comptime opts: Options) type {
                         // reports the socket already gone (ENOTCONN after the
                         // peer's own FIN).
                         const sh = try getSqeOrSubmit(&self.ring);
-                        sh.prep_shutdown(@intCast(sl.fd), linux.SHUT.RDWR);
+                        sh.prep_shutdown(@intCast(fd.fd), linux.SHUT.RDWR);
                         sh.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK;
                         sh.user_data = INTERNAL_SENTINEL;
 
                         const cl = try getSqeOrSubmit(&self.ring);
-                        cl.prep_close_direct(@intCast(sl.fd));
+                        cl.prep_close_direct(@intCast(fd.fd));
                         cl.user_data = INTERNAL_SENTINEL;
 
-                        // The descriptor is spoken for. Clearing it here is
-                        // what makes `assertSlotFree` an assertion rather than
-                        // a second close of a descriptor the kernel may
-                        // already have reissued to a new accept.
-                        sl.fd = -1;
-                    };
+                        // The slot is spoken for. Clearing it here is what
+                        // lets the live-fd check at the `conn_dead` entry stay
+                        // an assertion instead of becoming a second close of a
+                        // descriptor the kernel may already have reissued to a
+                        // new accept.
+                        fd.fd = -1;
+                    }
                     continue;
                 }
 
@@ -989,7 +900,7 @@ pub fn Io(comptime opts: Options) type {
                 // entity outlives the completion that names it.
                 const recv_armed = !cycle.entity.isNil() and
                     !self.reg.isStale(cycle.entity) and
-                    self.reg.isInCollection(cycle.entity, &self._read_pending);
+                    self.reg.isInCollection(cycle.entity, self.coll(._read_pending));
                 if (recv_armed and now < st.deadline_ns) continue;
 
                 self.conn_closing_retired += 1;
@@ -999,24 +910,39 @@ pub fn Io(comptime opts: Options) type {
                 // grace window expired), which is the condition that makes
                 // destroying it safe — and only this loop knows that.
                 self.releaseReadCycle(cycle);
-                self.releaseConnSlot(ent);
-                try self.reg.destroy(ent);
+                if (comptime hand_off) {
+                    // The one entry into `conn_dead`, so the one place the
+                    // invariant is checkable at its transition: retirement
+                    // means the descriptor slot was given up. A live fd here
+                    // is a teardown path that skipped the close — about to
+                    // leak the slot with no symptom until accepts fail.
+                    // Explicit panic: the shipped build is ReleaseFast,
+                    // where an assert is not compiled.
+                    const fd_ptr = try self.reg.get(ent, self.coll(.conn_closing), Fd);
+                    if (fd_ptr.fd != -1) std.debug.panic(
+                        "rove-io: conn {d} retired into conn_dead holding live fd {d}",
+                        .{ ent.index, fd_ptr.fd },
+                    );
+                    try self.reg.move(ent, self.coll(.conn_closing), self.coll(.conn_dead));
+                } else {
+                    try self.reg.destroy(ent);
+                }
             }
         }
 
         /// Destroy a conn's read-cycle entity, returning any buffer it still
         /// holds to the registered ring first.
         ///
-        /// The ring return cannot be left to `ReadResult.deinit`: a buffer
-        /// returned twice over-advances the producer tail, shrinks the
-        /// distinct-buffer pool and surfaces as recv ENOBUFS at a tiny
-        /// connection count — so the return and the clear have to happen
-        /// together, which a destructor firing at an unknown time cannot
-        /// guarantee.
+        /// The return cannot be deferred to the destroy: a buffer returned
+        /// twice over-advances the producer tail, shrinks the distinct-buffer
+        /// pool and surfaces as recv ENOBUFS at a tiny connection count. The
+        /// return and the clear therefore happen together, at the one site
+        /// that knows both have happened.
         fn releaseReadCycle(self: *Self, cycle: ReadCycleEntity) void {
             const e = cycle.entity;
             if (e.isNil() or self.reg.isStale(e)) return;
-            if (self.reg.getAny(e, .{ &self._read_pending, &self.read_in, &self.read_results }, ReadResult) catch null) |rr| {
+            const found: ?*ReadResult = self.reg.getFat(e, ReadResult) catch null;
+            if (found) |rr| {
                 if (rr.data != null) {
                     const mask = linux.IoUring.buf_ring_mask(self.buf_count);
                     self.returnBufferToRing(rr.buf_id, mask, 0);
@@ -1028,8 +954,8 @@ pub fn Io(comptime opts: Options) type {
             self.reg.destroyImmediate(e) catch {};
         }
 
-        /// Release a write buffer and clear the component, so the entity can
-        /// be destroyed without `WriteBuf.deinit` reading it as a bypass.
+        /// Release a write buffer and clear the component, so the entity is
+        /// destroyed with nothing left owning the allocation.
         /// Safe for the pre-submission drops below — no SQE has been posted,
         /// so the kernel never saw this pointer. A buffer whose SQE IS in
         /// flight must go through `write_done` instead.
@@ -1054,7 +980,7 @@ pub fn Io(comptime opts: Options) type {
                 // an in-flight completion can find it — but it takes no new
                 // work. Arming a send here would race the teardown for the
                 // same descriptor slot.
-                if (self.reg.isInCollection(conn_ent.entity, &self.conn_closing)) {
+                if (self.reg.isInCollection(conn_ent.entity, self.coll(.conn_closing))) {
                     self.releaseWriteBuf(wb);
                     try self.reg.destroy(ent);
                     continue;
@@ -1067,11 +993,11 @@ pub fn Io(comptime opts: Options) type {
                 };
 
                 const sqe = try getSqeOrSubmit(&self.ring);
-                sqe.prep_send(conn_fd, @constCast(wb.data)[wb.offset..wb.len], 0);
+                sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
                 sqe.flags |= linux.IOSQE_FIXED_FILE;
                 sqe.user_data = encodeEntity(ent);
 
-                try self.reg.move(ent, &self.write_in, &self._write_pending);
+                try self.reg.move(ent, self.coll(.write_in), self.coll(._write_pending));
             }
         }
 
@@ -1087,11 +1013,11 @@ pub fn Io(comptime opts: Options) type {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
-                        // Clear so ReadResult.deinit (fired by the destroy below)
-                        // sees data==null and does NOT return this buffer a
-                        // SECOND time. A double buf_ring_add over-advances the
-                        // ring's producer tail, shrinks the distinct-buffer pool,
-                        // and manifests as recv ENOBUFS → the front crash-loop.
+                        // Return and clear together, which is what keeps any
+                        // later reader from returning this buffer a SECOND
+                        // time. A double buf_ring_add over-advances the ring's
+                        // producer tail, shrinks the distinct-buffer pool, and
+                        // manifests as recv ENOBUFS → the front crash-loop.
                         // Same return-then-clear the healthy path uses (below).
                         rr.* = .{};
                     }
@@ -1103,7 +1029,7 @@ pub fn Io(comptime opts: Options) type {
                 // cycle is still holding, then drop the read entity — the
                 // same return-then-clear the isStale branch above does, and
                 // for the same double-return reason.
-                if (self.reg.isInCollection(conn_ent.entity, &self.conn_closing)) {
+                if (self.reg.isInCollection(conn_ent.entity, self.coll(.conn_closing))) {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
@@ -1117,8 +1043,8 @@ pub fn Io(comptime opts: Options) type {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
-                        // Clear so destroy's ReadResult.deinit doesn't return
-                        // this buffer a second time (see the isStale branch).
+                        // Return and clear together, so nothing returns this
+                        // buffer a second time (see the isStale branch).
                         rr.* = .{};
                     }
                     try self.reg.destroy(ent);
@@ -1132,8 +1058,8 @@ pub fn Io(comptime opts: Options) type {
 
                 rr.* = .{};
 
-                try self.armRecv(ent, conn_fd);
-                try self.reg.move(ent, &self.read_in, &self._read_pending);
+                try self.armRecv(ent, conn_fd.fd);
+                try self.reg.move(ent, self.coll(.read_in), self.coll(._read_pending));
             }
 
             if (armed > 0) {
@@ -1152,7 +1078,7 @@ pub fn Io(comptime opts: Options) type {
                 sqe.prep_socket_direct_alloc(posix.AF.INET, posix.SOCK.STREAM, 0, 0);
                 sqe.user_data = encodeEntity(ent);
 
-                try self.reg.move(ent, &self.connect_in, &self._connect_socket_pending);
+                try self.reg.move(ent, self.coll(.connect_in), self.coll(._connect_socket_pending));
             }
         }
 
@@ -1181,29 +1107,30 @@ pub fn Io(comptime opts: Options) type {
                 return;
             }
 
-            if (self.reg.isInCollection(entity, &self._read_pending)) {
+            if (self.reg.isInCollection(entity, self.coll(._read_pending))) {
                 try self.handleRecv(entity, cqe);
                 return;
             }
-            if (self.reg.isInCollection(entity, &self._write_pending)) {
+            if (self.reg.isInCollection(entity, self.coll(._write_pending))) {
                 try self.handleSend(entity, cqe);
                 return;
             }
             if (has_connect) {
-                if (self.reg.isInCollection(entity, &self._connect_socket_pending)) {
+                if (self.reg.isInCollection(entity, self.coll(._connect_socket_pending))) {
                     try self.handleConnectSocket(entity, cqe);
                     return;
                 }
-                if (self.reg.isInCollection(entity, &self._connect_pending)) {
+                if (self.reg.isInCollection(entity, self.coll(._connect_pending))) {
                     try self.handleConnect(entity, cqe);
                     return;
                 }
             }
-            // A conn-entity CQE is the accept-time fixed-fd install (the only
-            // op posted with a conn entity as user_data). Holding a slot is
-            // what makes it a conn, wherever the entity currently lives.
-            if (self.slotOf(entity)) |slot| {
-                handlePeerInstall(slot, cqe);
+            // A conn-entity CQE is the accept-time fixed-fd install
+            // (the only op posted with a conn entity as user_data).
+            // The conn may already live in an upper-layer collection —
+            // resolve through the peer hook, not self.connections.
+            if (self.getPeerAddr(entity)) |pa| {
+                handlePeerInstall(pa, cqe);
                 return;
             }
             return error.UnexpectedEntityCollection;
@@ -1212,14 +1139,14 @@ pub fn Io(comptime opts: Options) type {
         /// Fixed-fd-install CQE: `res` is a real process fd for the
         /// accepted socket. getpeername it, record, close. Failure at
         /// any step just leaves the conn without a peer identity.
-        fn handlePeerInstall(slot: *ConnSlot, cqe: linux.io_uring_cqe) void {
+        fn handlePeerInstall(pa: *PeerAddr, cqe: linux.io_uring_cqe) void {
             if (cqe.res < 0) return;
             const real_fd: posix.fd_t = @intCast(cqe.res);
             defer posix.close(real_fd);
             var storage: posix.sockaddr.storage align(4) = undefined;
             var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
             posix.getpeername(real_fd, @ptrCast(&storage), &len) catch return;
-            slot.peer = PeerAddr.from(std.net.Address.initPosix(@ptrCast(&storage)));
+            pa.* = .{ .addr = std.net.Address.initPosix(@ptrCast(&storage)), .valid = true };
         }
 
         fn handleAccept(self: *Self, cqe: linux.io_uring_cqe) !void {
@@ -1249,10 +1176,10 @@ pub fn Io(comptime opts: Options) type {
             // A conn that is closing still owns its descriptor slot until
             // the teardown completes, so it counts against the budget just
             // like a live one. Admitting into a slot that is not free yet is
-            // how the pool goes negative under churn. `live_conns` counts
-            // claims rather than collection membership, so a conn the upper
-            // layer has promoted into its own collections is still counted.
-            const total_conns = self.live_conns;
+            // how the pool goes negative under churn.
+            // The membership set counts every conn this instance
+            // created, wherever it lives — no estimate, no hook.
+            const total_conns: usize = self.reg.setCount(.all_conns);
             const budget: usize = @as(usize, self.buf_count) - (@as(usize, self.buf_count) / 8);
             if (total_conns >= budget) {
                 const close_sqe = try getSqeOrSubmit(&self.ring);
@@ -1281,8 +1208,7 @@ pub fn Io(comptime opts: Options) type {
             );
             nodelay_sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-            const conn = try self.reg.create(&self.connections);
-            self.claimConnSlot(conn, @intCast(file_slot));
+            const conn = try self.birthConn(@intCast(file_slot));
 
             // Resolve the peer address (see `PeerAddr`): install the
             // fixed file into the process fd table; the install CQE
@@ -1295,9 +1221,9 @@ pub fn Io(comptime opts: Options) type {
             install_sqe.user_data = encodeEntity(conn);
 
             // Create read-cycle entity and link to connection
-            const read_ent = try self.reg.create(&self._read_pending);
-            try self.reg.set(read_ent, &self._read_pending, ConnEntity, .{ .entity = conn });
-            try self.reg.set(conn, &self.connections, ReadCycleEntity, .{ .entity = read_ent });
+            const read_ent = try self.reg.create(self.coll(._read_pending));
+            try self.reg.set(read_ent, self.coll(._read_pending), ConnEntity, .{ .entity = conn });
+            try self.reg.set(conn, self.coll(.connections), ReadCycleEntity, .{ .entity = read_ent });
 
             try self.armRecv(read_ent, @intCast(file_slot));
         }
@@ -1308,37 +1234,37 @@ pub fn Io(comptime opts: Options) type {
                 const pos = @as(usize, self.buf_size) * buf_id;
                 const buf_ptr: [*]u8 = @ptrCast(self.buf_base[pos..].ptr);
 
-                try self.reg.set(entity, &self._read_pending, ReadResult, .{
+                try self.reg.set(entity, self.coll(._read_pending), ReadResult, .{
                     .result = cqe.res,
                     .data = buf_ptr,
                     .buf_id = buf_id,
                 });
                 self.recv_completions_with_data += 1;
             } else {
-                try self.reg.set(entity, &self._read_pending, ReadResult, .{ .result = cqe.res });
+                try self.reg.set(entity, self.coll(._read_pending), ReadResult, .{ .result = cqe.res });
             }
 
-            try self.reg.moveImmediate(entity, &self._read_pending, &self.read_results);
+            try self.reg.moveImmediate(entity, self.coll(._read_pending), self.coll(.read_results));
         }
 
         fn handleSend(self: *Self, entity: Entity, cqe: linux.io_uring_cqe) !void {
             if (cqe.res < 0) {
-                try self.reg.moveImmediate(entity, &self._write_pending, &self.write_results);
-                try self.reg.set(entity, &self.write_results, IoResult, .{ .err = cqe.res });
+                try self.reg.moveImmediate(entity, self.coll(._write_pending), self.coll(.write_results));
+                try self.reg.set(entity, self.coll(.write_results), IoResult, .{ .err = cqe.res });
                 return;
             }
 
-            const wb = try self.reg.get(entity, &self._write_pending, WriteBuf);
+            const wb = try self.reg.get(entity, self.coll(._write_pending), WriteBuf);
             wb.offset += @intCast(cqe.res);
 
             if (wb.offset >= wb.len) {
-                try self.reg.moveImmediate(entity, &self._write_pending, &self.write_results);
-                try self.reg.set(entity, &self.write_results, IoResult, .{ .err = 0 });
+                try self.reg.moveImmediate(entity, self.coll(._write_pending), self.coll(.write_results));
+                try self.reg.set(entity, self.coll(.write_results), IoResult, .{ .err = 0 });
             } else {
-                const conn_ent = try self.reg.get(entity, &self._write_pending, ConnEntity);
+                const conn_ent = try self.reg.get(entity, self.coll(._write_pending), ConnEntity);
                 const conn_fd = self.getFd(conn_ent.entity) orelse return error.InvalidEntity;
                 const sqe = try getSqeOrSubmit(&self.ring);
-                sqe.prep_send(conn_fd, @constCast(wb.data)[wb.offset..wb.len], 0);
+                sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
                 sqe.flags |= linux.IOSQE_FIXED_FILE;
                 sqe.user_data = encodeEntity(entity);
             }
@@ -1348,13 +1274,13 @@ pub fn Io(comptime opts: Options) type {
             if (!has_connect) unreachable;
 
             if (cqe.res < 0) {
-                try self.reg.set(entity, &self._connect_socket_pending, IoResult, .{ .err = cqe.res });
-                try self.reg.moveImmediate(entity, &self._connect_socket_pending, &self.connect_errors);
+                try self.reg.set(entity, self.coll(._connect_socket_pending), IoResult, .{ .err = cqe.res });
+                try self.reg.moveStripImmediate(entity, self.coll(._connect_socket_pending), self.coll(.connect_errors), &.{ReadCycleEntity});
                 return;
             }
 
             const slot: i32 = cqe.res;
-            self.claimConnSlot(entity, slot);
+            try self.reg.set(entity, self.coll(._connect_socket_pending), Fd, .{ .fd = slot });
 
             const nodelay_sqe = try self.ring.setsockopt(
                 INTERNAL_SENTINEL,
@@ -1376,36 +1302,37 @@ pub fn Io(comptime opts: Options) type {
             sqe.flags |= linux.IOSQE_FIXED_FILE;
             sqe.user_data = encodeEntity(entity);
 
-            try self.reg.moveImmediate(entity, &self._connect_socket_pending, &self._connect_pending);
+            try self.reg.moveImmediate(entity, self.coll(._connect_socket_pending), self.coll(._connect_pending));
         }
 
         fn handleConnect(self: *Self, entity: Entity, cqe: linux.io_uring_cqe) !void {
             if (!has_connect) unreachable;
 
-            const conn_slot = self.slotOf(entity) orelse return error.InvalidEntity;
-            const slot = conn_slot.fd;
+            const fd_ptr = try self.reg.get(entity, self.coll(._connect_pending), Fd);
+            const slot = fd_ptr.fd;
 
             if (cqe.res < 0) {
                 const close_sqe = try getSqeOrSubmit(&self.ring);
                 close_sqe.prep_close_direct(@intCast(slot));
                 close_sqe.user_data = INTERNAL_SENTINEL;
-                // The socket never came up, so this conn never reaches
-                // `conn_closing` — the descriptor is given back here, and the
-                // entity moves on to `connect_errors` holding nothing.
-                conn_slot.fd = -1;
-                self.releaseConnSlot(entity);
-                try self.reg.set(entity, &self._connect_pending, IoResult, .{ .err = cqe.res });
-                try self.reg.moveImmediate(entity, &self._connect_pending, &self.connect_errors);
+                fd_ptr.fd = -1;
+                try self.reg.set(entity, self.coll(._connect_pending), IoResult, .{ .err = cqe.res });
+                try self.reg.moveStripImmediate(entity, self.coll(._connect_pending), self.coll(.connect_errors), &.{ReadCycleEntity});
                 return;
             }
 
-            const read_ent = try self.reg.create(&self._read_pending);
-            try self.reg.set(read_ent, &self._read_pending, ConnEntity, .{ .entity = entity });
-            try self.reg.set(entity, &self._connect_pending, ReadCycleEntity, .{ .entity = read_ent });
+            const read_ent = try self.reg.create(self.coll(._read_pending));
+            try self.reg.set(read_ent, self.coll(._read_pending), ConnEntity, .{ .entity = entity });
+            try self.reg.set(entity, self.coll(._connect_pending), ReadCycleEntity, .{ .entity = read_ent });
 
             try self.armRecv(read_ent, slot);
 
-            try self.reg.moveImmediate(entity, &self._connect_pending, &self.connections);
+            try self.reg.moveStripImmediate(entity, self.coll(._connect_pending), self.coll(.connections), &.{ ConnectAddr, IoResult });
+            // The promoted conn joins the identity set exactly as
+            // `birthConn`'s fresh ones do — the invariant both uphold:
+            // every entity in `connections` is in all_conns, or
+            // admission undercounts and the teardown sweep misses it.
+            _ = try self.reg.join(entity, .all_conns);
             // The `connect_addrs` slot needs no cleanup — the next entity to
             // take this index overwrites it.
         }
@@ -1450,13 +1377,20 @@ pub fn Io(comptime opts: Options) type {
 
 const testing = std.testing;
 
+// The default test fixtures: one world for the plain shape, one for the
+// connect shape — tests' mini-worlds via explicit `.world`.
+const TestWorld = rove.World(.{ .parts = parts(.{}) });
+const TestIo = Io(.{ .world = TestWorld });
+const TestWorldConnect = rove.World(.{ .parts = parts(.{ .connect = true }) });
+const TestIoConnect = Io(.{ .connect = true, .world = TestWorldConnect });
+
 test "component types are valid rove components" {
-    const R = Row(&.{ ConnEntity, ReadResult, WriteBuf, IoResult, ReadCycleEntity, ConnectAddr });
-    try testing.expectEqual(@as(usize, 6), R.len);
+    const R = Row(&.{ Fd, ConnEntity, ReadResult, WriteBuf, IoResult, ReadCycleEntity, ConnectAddr });
+    try testing.expectEqual(@as(usize, 7), R.len);
 }
 
 test "Io type has expected collections" {
-    const IoType = Io(.{});
+    const IoType = TestIo;
     try testing.expect(@hasField(IoType, "connections"));
     try testing.expect(@hasField(IoType, "read_results"));
     try testing.expect(@hasField(IoType, "write_results"));
@@ -1467,7 +1401,7 @@ test "Io type has expected collections" {
 }
 
 test "Io with connect has connect collections" {
-    const IoType = Io(.{ .connect = true });
+    const IoType = TestIoConnect;
     try testing.expect(@hasField(IoType, "connect_in"));
     try testing.expect(@hasField(IoType, "connect_errors"));
     try testing.expect(@hasField(IoType, "_connect_socket_pending"));
@@ -1475,16 +1409,19 @@ test "Io with connect has connect collections" {
 }
 
 test "connection row contains base components" {
-    const IoType = Io(.{});
+    const IoType = TestIo;
     try testing.expect(IoType.ConnectionRow.contains(ReadCycleEntity));
-    // The descriptor and the peer address are NOT here — they live in
-    // `conn_slots`, so io can find them after rove-h2 has moved the conn.
-    try testing.expect(!IoType.ConnectionRow.contains(ReadResult));
+    try testing.expect(IoType.ConnectionRow.contains(Fd));
 }
 
+const WidenSession = struct { id: u64 };
+const widen_opts = Options{ .connection_row = Row(&.{WidenSession}) };
+const WidenWorld = rove.World(.{ .parts = parts(widen_opts) });
+
 test "user components widen connection row" {
-    const MySession = struct { id: u64 };
-    const IoType = Io(.{ .connection_row = Row(&.{MySession}) });
+    const MySession = WidenSession;
+    const IoType = Io(.{ .connection_row = Row(&.{WidenSession}), .world = WidenWorld });
+    try testing.expect(IoType.ConnectionRow.contains(Fd));
     try testing.expect(IoType.ConnectionRow.contains(ReadCycleEntity));
     try testing.expect(IoType.ConnectionRow.contains(MySession));
 }
@@ -1500,22 +1437,22 @@ test "connect entity row is superset of connection row" {
     try testing.expect(conn_row.isSubsetOf(connect_pending_row));
 }
 
-test "works with user collections on same registry" {
+test "works with user collections on the same registry — a sibling part" {
     const MySession = struct { id: u64 };
     const PlayerRow = Row(&.{MySession});
+    const W = rove.World(.{ .parts = parts(.{}) ++ &[_]rove.Part{.{
+        .name = "game",
+        .collections = &.{.{ .name = "players", .row = PlayerRow }},
+    }} });
 
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    var reg = try W.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
+    const players = reg.coll(.players);
 
-    // User collection on the same registry
-    var players = try Collection(PlayerRow, .{}).init(testing.allocator);
-    defer players.deinit();
-    reg.registerCollection(&players);
-
-    const player = try reg.create(&players);
+    const player = try reg.create(players);
     try testing.expect(!reg.isStale(player));
-    try reg.set(player, &players, MySession, .{ .id = 99 });
-    const sess = try reg.get(player, &players, MySession);
+    try reg.set(player, players, MySession, .{ .id = 99 });
+    const sess = try reg.get(player, players, MySession);
     try testing.expectEqual(@as(u64, 99), sess.id);
 }
 
@@ -1525,68 +1462,11 @@ test "entity encoding round-trip" {
     try testing.expect(e.eql(decoded));
 }
 
-test "a read entity destroyed still holding a buffer is counted, not repaired" {
-    // The teardown case, which no smoke can cover: a guard that fires only at
-    // shutdown runs after a smoke has stopped asserting. Measured against the
-    // real suite, this is the ONLY path that reaches `ReadResult.deinit` with
-    // a live buffer — one per process shutdown, on a conn still mid-read when
-    // the drain began.
-    //
-    // The destructor counts rather than returns. Returning here would put a
-    // ring operation in the one place that cannot know whether the return
-    // already happened, and a double `buf_ring_add` over-advances the producer
-    // tail into recv ENOBUFS at a tiny connection count.
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
-    defer reg.deinit();
-    const io = try testIo(&reg);
-    defer io.destroy();
-
-    const ent = try reg.create(&io._read_pending);
-    // Stand in for a completed recv whose buffer has not yet flowed through
-    // `processReadIn`: `data` non-null is what makes it a held buffer.
-    try reg.set(ent, &io._read_pending, ReadResult, .{
-        .result = 8,
-        .data = io.buf_base.ptr,
-        .buf_id = 0,
-    });
-
-    try testing.expectEqual(@as(u64, 0), io.cleanup_ctx.recv_bufs_destroyed_live);
-
-    try reg.destroyImmediate(ent);
-
-    // Counted once, and the ring's producer tail is untouched — the buffer is
-    // out of circulation, which is the honest report.
-    try testing.expectEqual(@as(u64, 1), io.cleanup_ctx.recv_bufs_destroyed_live);
-}
-
-test "a read entity that returned its buffer first is not counted as a loss" {
-    // The live paths (`processReadIn`, `releaseReadCycle`, `reclaimStaleBuffer`)
-    // all return-then-clear, which is what keeps the counter at its shutdown
-    // baseline during operation. Clearing is the whole protocol.
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
-    defer reg.deinit();
-    const io = try testIo(&reg);
-    defer io.destroy();
-
-    const ent = try reg.create(&io._read_pending);
-    try reg.set(ent, &io._read_pending, ReadResult, .{
-        .result = 8,
-        .data = io.buf_base.ptr,
-        .buf_id = 0,
-    });
-    // What every live path does before dropping the entity.
-    (try reg.get(ent, &io._read_pending, ReadResult)).* = .{};
-
-    try reg.destroyImmediate(ent);
-
-    try testing.expectEqual(@as(u64, 0), io.cleanup_ctx.recv_bufs_destroyed_live);
-}
-
 test "stale completion carrying a buffer returns it to the ring" {
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    var reg = try TestIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
 
-    const IoType = Io(.{});
+    const IoType = TestIo;
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
     const io = IoType.create(&reg, testing.allocator, addr, .{
         .ring_entries = 8,
@@ -1603,7 +1483,7 @@ test "stale completion carrying a buffer returns it to the ring" {
 
     // An entity that has been destroyed: its generation is bumped, so any
     // completion still referencing it decodes as stale.
-    const doomed = try reg.create(&io._read_pending);
+    const doomed = try reg.create(io.coll(._read_pending));
     try reg.destroyImmediate(doomed);
     try testing.expect(reg.isStale(doomed));
 
@@ -1622,10 +1502,10 @@ test "stale completion carrying a buffer returns it to the ring" {
 }
 
 test "stale completion without a buffer is dropped silently" {
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    var reg = try TestIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
 
-    const IoType = Io(.{});
+    const IoType = TestIo;
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
     const io = IoType.create(&reg, testing.allocator, addr, .{
         .ring_entries = 8,
@@ -1638,7 +1518,7 @@ test "stale completion without a buffer is dropped silently" {
     };
     defer io.destroy();
 
-    const doomed = try reg.create(&io._write_pending);
+    const doomed = try reg.create(io.coll(._write_pending));
     try reg.destroyImmediate(doomed);
 
     const before = io.recv_buffers_returned_via_stale;
@@ -1655,9 +1535,9 @@ test "stale completion without a buffer is dropped silently" {
     try testing.expectEqual(before, io.recv_buffers_returned_via_stale);
 }
 
-fn testIo(reg: *Registry) !*Io(.{}) {
+fn testIo(reg: *TestIo.Reg) !*TestIo {
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    return Io(.{}).create(reg, testing.allocator, addr, .{
+    return TestIo.create(reg, testing.allocator, addr, .{
         .ring_entries = 8,
         .buf_count = 8,
         .buf_size = 256,
@@ -1669,42 +1549,43 @@ fn testIo(reg: *Registry) !*Io(.{}) {
 }
 
 test "closing posts the shutdown once and gives up the slot" {
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    var reg = try TestIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
     const io = try testIo(&reg);
     defer io.destroy();
 
-    const conn = try reg.create(&io.connections);
-    io.claimConnSlot(conn, 2);
-    try reg.move(conn, &io.connections, &io.conn_closing);
+    const conn = try reg.create(io.coll(.connections));
+    try reg.set(conn, io.coll(.connections), Fd, .{ .fd = 2 });
+    try reg.move(conn, io.coll(.connections), io.coll(.conn_closing));
     try reg.flush();
 
     try io.processConnClosing();
 
-    const st = try reg.get(conn, &io.conn_closing, ClosingState);
+    const st = try reg.get(conn, io.coll(.conn_closing), ClosingState);
     try testing.expect(st.shutdown_posted);
     try testing.expect(st.deadline_ns > 0);
 
-    // The slot is spoken for. Leaving a live fd here would let the teardown
-    // sweep close a descriptor the kernel may have already reissued.
-    try testing.expectEqual(@as(i32, -1), io.getFd(conn).?);
+    // The slot is spoken for. Leaving a live fd here would trip the check at
+    // the `conn_dead` entry — the slot leaks, and its number may already have
+    // been reissued to a new accept.
+    try testing.expectEqual(@as(i32, -1), (try reg.get(conn, io.coll(.conn_closing), Fd)).fd);
 
     // Posting is not retiring — the conn survives the pass that posts.
     try testing.expect(!reg.isStale(conn));
 }
 
 test "a closing conn outlives its armed recv, then retires" {
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    var reg = try TestIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
     const io = try testIo(&reg);
     defer io.destroy();
 
-    const conn = try reg.create(&io.connections);
-    io.claimConnSlot(conn, 2);
-    const read_ent = try reg.create(&io._read_pending);
-    try reg.set(read_ent, &io._read_pending, ConnEntity, .{ .entity = conn });
-    try reg.set(conn, &io.connections, ReadCycleEntity, .{ .entity = read_ent });
-    try reg.move(conn, &io.connections, &io.conn_closing);
+    const conn = try reg.create(io.coll(.connections));
+    try reg.set(conn, io.coll(.connections), Fd, .{ .fd = 2 });
+    const read_ent = try reg.create(io.coll(._read_pending));
+    try reg.set(read_ent, io.coll(._read_pending), ConnEntity, .{ .entity = conn });
+    try reg.set(conn, io.coll(.connections), ReadCycleEntity, .{ .entity = read_ent });
+    try reg.move(conn, io.coll(.connections), io.coll(.conn_closing));
     try reg.flush();
 
     try io.processConnClosing(); // posts the shutdown
@@ -1715,7 +1596,7 @@ test "a closing conn outlives its armed recv, then retires" {
     try testing.expectEqual(@as(u64, 0), io.conn_closing_retired);
 
     // The shutdown completes the recv: the read entity leaves _read_pending.
-    try reg.moveImmediate(read_ent, &io._read_pending, &io.read_results);
+    try reg.moveImmediate(read_ent, io.coll(._read_pending), io.coll(.read_results));
 
     try io.processConnClosing();
     try reg.flush();
@@ -1726,24 +1607,24 @@ test "a closing conn outlives its armed recv, then retires" {
 }
 
 test "a peer that never finishes closing does not pin the slot" {
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    var reg = try TestIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
     const io = try testIo(&reg);
     defer io.destroy();
 
-    const conn = try reg.create(&io.connections);
-    io.claimConnSlot(conn, 2);
-    const read_ent = try reg.create(&io._read_pending);
-    try reg.set(read_ent, &io._read_pending, ConnEntity, .{ .entity = conn });
-    try reg.set(conn, &io.connections, ReadCycleEntity, .{ .entity = read_ent });
-    try reg.move(conn, &io.connections, &io.conn_closing);
+    const conn = try reg.create(io.coll(.connections));
+    try reg.set(conn, io.coll(.connections), Fd, .{ .fd = 2 });
+    const read_ent = try reg.create(io.coll(._read_pending));
+    try reg.set(read_ent, io.coll(._read_pending), ConnEntity, .{ .entity = conn });
+    try reg.set(conn, io.coll(.connections), ReadCycleEntity, .{ .entity = read_ent });
+    try reg.move(conn, io.coll(.connections), io.coll(.conn_closing));
     try reg.flush();
 
     try io.processConnClosing();
     try reg.flush();
 
     // Expire the grace window with the recv still armed.
-    (try reg.get(conn, &io.conn_closing, ClosingState)).deadline_ns = 1;
+    (try reg.get(conn, io.coll(.conn_closing), ClosingState)).deadline_ns = 1;
 
     try io.processConnClosing();
     try reg.flush();
@@ -1752,133 +1633,114 @@ test "a peer that never finishes closing does not pin the slot" {
 }
 
 // NOTE: there is deliberately no test for a conn destroyed around
-// `conn_closing`. `assertSlotFree` aborts the process, so exercising it would
-// take the test runner down with it — the standing cost of a check that stops
-// rather than reports. What IS covered is the legal path: the tests above
-// assert `fd` is -1 by the time a conn is retired, which is the condition
-// that keeps the guard silent.
+// `conn_closing`. The guard at the one entry into `conn_dead` panics, so
+// exercising it would take the test runner down with it — the standing cost
+// of a check that stops rather than reports. What IS covered is the legal path: the
+// tests above assert `fd` is -1 by the time a conn is retired, which is the
+// condition that keeps the guard silent.
 
-test "a conn holding no slot still retires out of conn_closing" {
-    // There is no descriptor to take down, but the entity still has to leave.
-    // Treating a missing slot as a reason to skip would strand it in
-    // `conn_closing` for the life of the process — a leak with no symptom
-    // until the collection is the thing that runs out.
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+test "fat: hand_off retirement parks the conn in conn_dead for the reaper" {
+    const io_opts = Options{ .on_retire = .hand_off };
+    const W = rove.World(.{ .parts = parts(io_opts) });
+    const FatIo = Io(.{ .on_retire = .hand_off, .world = W });
+    var reg = try FatIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
-    const io = try testIo(&reg);
+    const io = FatIo.create(&reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
     defer io.destroy();
 
-    const conn = try reg.create(&io.connections);
-    try reg.move(conn, &io.connections, &io.conn_closing);
-    try reg.flush();
-    try testing.expect(io.getFd(conn) == null);
-
-    try io.processConnClosing(); // nothing to post, but the state advances
-    try reg.flush();
-    try io.processConnClosing(); // retires
+    const connections = reg.coll(.connections);
+    const conn = try reg.create(connections);
+    try reg.set(conn, connections, Fd, .{ .fd = 2 });
+    _ = try reg.join(conn, .all_conns);
+    try reg.move(conn, connections, reg.coll(.conn_closing));
     try reg.flush();
 
-    try testing.expect(reg.isStale(conn));
-    try testing.expectEqual(@as(u64, 1), io.conn_closing_retired);
-    try testing.expectEqual(@as(usize, 0), io.live_conns);
+    try io.processConnClosing(); // posts the shutdown, gives up the slot
+    try io.processConnClosing(); // recv quiet — retires, but hands off
+    try reg.flush();
+
+    // Retired WITHOUT being destroyed: the composing layer owns the end.
+    try testing.expect(!reg.isStale(conn));
+    try testing.expect(reg.isInCollection(conn, reg.coll(.conn_dead)));
+    try testing.expect(reg.inSet(conn, .all_conns));
+
+    // The sweep must not resurrect a handed-off conn into conn_closing.
+    io.shutdownAllConns();
+    try testing.expect(reg.isInCollection(conn, reg.coll(.conn_dead)));
 }
 
-test "a conn is found after another layer moves it out of io's collection" {
-    // THE case the retired resolver hooks existed for. rove-h2 promotes an
-    // accepted conn into collections of its own while io is still driving the
-    // socket, so a lookup keyed by (entity, collection) fails for a conn io
-    // owns the descriptor for. `conn_slots` is keyed by `entity.index`, which
-    // no move touches.
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+test "fat: a declared world — registry-owned storage, tag-addressed set, sweep across parts" {
+    const io_opts = Options{};
+    // An upper layer's collection, declared as a sibling PART — io never
+    // names its type, the world numbers it, the registry owns it. Its
+    // state set stands in for any orthogonal membership an upper layer
+    // parks conns on (a pending-close mark, a throttle) — the sweep
+    // must drop it without naming it.
+    const upper_part = rove.Part{
+        .name = "upper",
+        .collections = &.{
+            .{ .name = "upper_conns", .row = ConnectionBaseRow },
+            .{ .name = "upper_marked", .kind = .set },
+        },
+    };
+    const W = rove.World(.{ .parts = parts(io_opts) ++ &[_]rove.Part{upper_part} });
+    const WIo = Io(.{ .world = W });
+
+    var reg = try WIo.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
-    const io = try testIo(&reg);
+    const io = WIo.create(&reg, testing.allocator, try std.net.Address.parseIp("127.0.0.1", 0), .{
+        .ring_entries = 8,
+        .buf_count = 8,
+        .buf_size = 256,
+        .max_connections = 8,
+    }) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
     defer io.destroy();
 
-    // Stand in for h2's `_conn_active` — same row, a collection io knows
-    // nothing about.
-    var upper = try Collection(ConnectionBaseRow, .{}).init(testing.allocator);
-    defer upper.deinit();
-    reg.registerCollection(&upper);
+    const connections = reg.coll(.connections);
+    const upper = reg.coll(.upper_conns);
 
-    const conn = try reg.create(&io.connections);
-    io.claimConnSlot(conn, 2);
-    io.conn_slots[conn.index].peer = PeerAddr.from(try std.net.Address.parseIp("10.0.0.1", 80));
+    const conn = try reg.create(connections);
+    try reg.set(conn, connections, Fd, .{ .fd = 2 });
+    _ = try reg.join(conn, .all_conns);
+    _ = try reg.join(conn, .upper_marked);
+    try reg.moveImmediate(conn, connections, upper);
+    try testing.expect(reg.inSet(conn, .all_conns));
 
-    try reg.moveImmediate(conn, &io.connections, &upper);
-    try testing.expect(!reg.isInCollection(conn, &io.connections));
+    // A second conn whose deferred move to the sibling part's collection
+    // lands at the caller-owned flush that is shutdownAllConns's
+    // precondition. The sweep must still find and close it over there.
+    const conn2 = try reg.create(connections);
+    try reg.set(conn2, connections, Fd, .{ .fd = 3 });
+    _ = try reg.join(conn2, .all_conns);
+    try reg.move(conn2, connections, upper);
+    try reg.flush(); // the boundary the precondition demands
 
-    try testing.expectEqual(@as(i32, 2), io.getFd(conn).?);
-    try testing.expect(io.getPeerAddr(conn).?.eql(try std.net.Address.parseIp("10.0.0.1", 80)));
+    io.shutdownAllConns();
 
-    // And it survives the move back into io's closing state.
-    try reg.moveImmediate(conn, &upper, &io.conn_closing);
-    try testing.expectEqual(@as(i32, 2), io.getFd(conn).?);
-
-    try io.processConnClosing();
-    try reg.flush();
-}
-
-test "a slot stops answering for the entity whose index was reissued" {
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
-    defer reg.deinit();
-    const io = try testIo(&reg);
-    defer io.destroy();
-
-    const first = try reg.create(&io.connections);
-    io.claimConnSlot(first, 2);
-    try testing.expectEqual(@as(usize, 1), io.live_conns);
-
-    try reg.move(first, &io.connections, &io.conn_closing);
-    try reg.flush();
-    try io.processConnClosing(); // posts the shutdown, clears the fd
-    try reg.flush();
-    try io.processConnClosing(); // retires: destroy + release
-    try reg.flush();
-    try testing.expect(reg.isStale(first));
-    try testing.expectEqual(@as(usize, 0), io.live_conns);
-
-    // The registry reissues the index with a new generation. The stale handle
-    // must not resolve to the new conn's descriptor — the generation check is
-    // the whole reason a bare `fd_by_entity[index]` would not do.
-    const second = try reg.create(&io.connections);
-    try testing.expectEqual(first.index, second.index);
-    io.claimConnSlot(second, 5);
-
-    try testing.expectEqual(@as(i32, 5), io.getFd(second).?);
-    try testing.expect(io.getFd(first) == null);
-    try testing.expect(io.getPeerAddr(first) == null);
-
-    io.releaseConnSlot(second);
-}
-
-test "live_conns counts a conn wherever it sits, so admission needs no help" {
-    // Admission control used to ask the upper layer how many conns it was
-    // holding. It counts claims instead: one per descriptor, from accept to
-    // retire, regardless of whose collection the entity is in.
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
-    defer reg.deinit();
-    const io = try testIo(&reg);
-    defer io.destroy();
-
-    var upper = try Collection(ConnectionBaseRow, .{}).init(testing.allocator);
-    defer upper.deinit();
-    reg.registerCollection(&upper);
-
-    const a = try reg.create(&io.connections);
-    io.claimConnSlot(a, 2);
-    const b = try reg.create(&io.connections);
-    io.claimConnSlot(b, 3);
-    try testing.expectEqual(@as(usize, 2), io.live_conns);
-
-    // Promoted out of io entirely — still two descriptors in flight.
-    try reg.moveImmediate(a, &io.connections, &upper);
-    try reg.moveImmediate(b, &io.connections, &upper);
-    try testing.expectEqual(@as(usize, 0), io.connections.entitySlice().len);
-    try testing.expectEqual(@as(usize, 2), io.live_conns);
-
-    io.releaseConnSlot(a);
-    io.releaseConnSlot(b);
-    try testing.expectEqual(@as(usize, 0), io.live_conns);
+    // Both swept out of the sibling part's collection into conn_closing —
+    // the ordinary teardown, with storage the registry owns end to end.
+    const conn_closing = reg.coll(.conn_closing);
+    for ([_]Entity{ conn, conn2 }) |ce| {
+        try testing.expect(reg.isInCollection(ce, conn_closing));
+        try testing.expect((try reg.get(ce, conn_closing, ClosingState)).shutdown_posted);
+        try testing.expectEqual(@as(i32, -1), (try reg.get(ce, conn_closing, Fd)).fd);
+    }
+    try testing.expectEqual(@as(u32, 0), upper.count);
+    // The sweep QUIESCED: the upper layer's state membership dropped
+    // (io never named it), while the identity membership survives.
+    try testing.expect(!reg.inSet(conn, .upper_marked));
+    try testing.expect(reg.inSet(conn, .all_conns));
 }
 
 test "a connect target survives the swap-remove that reshuffles its neighbours" {
@@ -1888,10 +1750,10 @@ test "a connect target survives the swap-remove that reshuffles its neighbours" 
     // One session's requests landed on the other session's socket. A table
     // indexed by `entity.index` cannot do that: the slot is the entity's for
     // as long as the entity exists, whatever its collection does.
-    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    var reg = try TestIoConnect.Reg.init(testing.allocator, .{ .max_entities = 64 });
     defer reg.deinit();
 
-    const IoType = Io(.{ .connect = true });
+    const IoType = TestIoConnect;
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
     const io = IoType.create(&reg, testing.allocator, addr, .{
         .ring_entries = 8,
@@ -1907,28 +1769,20 @@ test "a connect target survives the swap-remove that reshuffles its neighbours" 
     const a_addr = try std.net.Address.parseIp("10.0.0.1", 1111);
     const b_addr = try std.net.Address.parseIp("10.0.0.2", 2222);
 
-    const a = try reg.create(&io.connect_in);
-    const b = try reg.create(&io.connect_in);
-    try io.setConnectAddr(a, &io.connect_in, a_addr);
-    try io.setConnectAddr(b, &io.connect_in, b_addr);
+    const a = try reg.create(io.coll(.connect_in));
+    const b = try reg.create(io.coll(.connect_in));
+    try io.setConnectAddr(a, io.coll(.connect_in), a_addr);
+    try io.setConnectAddr(b, io.coll(.connect_in), b_addr);
 
     // Take `a` out from under `b`: `removeRun` swap-removes, copying the tail
     // row over the vacated slot. Under the old layout this is the exact moment
     // `&b`'s column pointer started referring to someone else's bytes.
-    try reg.moveImmediate(a, &io.connect_in, &io._connect_socket_pending);
+    try reg.moveImmediate(a, io.coll(.connect_in), io.coll(._connect_socket_pending));
 
     try testing.expect(io.connect_addrs[a.index].eql(a_addr));
     try testing.expect(io.connect_addrs[b.index].eql(b_addr));
 
     // And the component still names its own entity after the move.
-    const ca = try reg.get(a, &io._connect_socket_pending, ConnectAddr);
+    const ca = try reg.get(a, io.coll(._connect_socket_pending), ConnectAddr);
     try testing.expect(ca.owner.eql(a));
-}
-
-test "a conn slot stays small enough to hold one per entity" {
-    // `conn_slots` is sized to the registry's entity capacity, so the slot's
-    // width is multiplied by `max_entities` in every worker. A `std.net.Address`
-    // in here would be 112 bytes of which 108 are a Unix-domain path an
-    // accepted socket cannot have — 8 MiB per worker for an unreachable case.
-    try testing.expect(@sizeOf(ConnSlot) <= 48);
 }
