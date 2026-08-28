@@ -77,12 +77,12 @@ pub fn Fns(comptime FrontH2: type) type {
                 self.tunnelAttemptFailed(t);
                 return;
             };
-            const pump = self.reg.create(&self.server.client_stream_request_in) catch {
+            const pump = self.reg.create(self.server.coll(.client_stream_request_in)) catch {
                 if (packed_hdrs._buf) |b| self.allocator.free(b[0..packed_hdrs._buf_len]);
                 self.tunnelAttemptFailed(t);
                 return;
             };
-            const coll = &self.server.client_stream_request_in;
+            const coll = self.server.coll(.client_stream_request_in);
             t.attempt += 1;
             self.reg.set(pump, coll, h2.Session, .{ .entity = leg.sess }) catch {};
             self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
@@ -100,7 +100,7 @@ pub fn Fns(comptime FrontH2: type) type {
         /// (plan B7), one owned buffer via `packFields`.
         pub fn packTunnelHeaders(self: *Self, t: *WsTunnel) !h2.ReqHeaders {
             // :path comes from the Upgrade head (still on the entity).
-            const rh_src = self.reg.get(t.upgrade_ent, &self.server.ws_upgrade_out, h2.ReqHeaders) catch null;
+            const rh_src = self.reg.get(t.upgrade_ent, self.server.coll(.ws_upgrade_out), h2.ReqHeaders) catch null;
             const path: []const u8 = if (rh_src) |rh| (headerValue(rh.*, ":path") orelse "/") else "/";
 
             var pairs: [8]NameValue = undefined;
@@ -244,7 +244,11 @@ pub fn Fns(comptime FrontH2: type) type {
         fn upTunnelAbort(ctx: *anyopaque) void {
             const t = tunnelOf(ctx);
             if (!t.down_gone and !t.proxy.reg.isStale(t.down_conn)) {
-                t.proxy.reg.destroy(t.down_conn) catch {};
+                // End the CONN the way every conn ends — through h2's
+                // funnel, so the session/TLS state is reaped and io
+                // releases the descriptor slot. A bare destroy bypassed
+                // both.
+                _ = t.proxy.server.closeConn(t.down_conn);
             }
         }
         fn upTunnelDrained(ctx: *anyopaque) u32 {

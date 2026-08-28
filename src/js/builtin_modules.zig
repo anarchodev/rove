@@ -126,6 +126,14 @@ const MODULES = [_]struct {
         .wake_targetable = true,
     },
     .{
+        // rove#717: bootstrap kv seeding for `__admin__`, in `__admin__`'s
+        // own scope. Reached only by resolving the authenticated
+        // `/_system/admin-kv` route to an activation — no shim names it, so
+        // it needs no targetable grant.
+        .path = "__system/admin_kv_install.mjs",
+        .src = @embedFile("builtin_admin_kv_install_mjs"),
+    },
+    .{
         // rove#719: a deployment's config rows, written by the tenant in its
         // own scope. Dispatched by the deploy path once the manifest lands,
         // so the rows are durable before anything can release that

@@ -1,0 +1,369 @@
+# The fat-entity model
+
+**Status: ADOPTED — rove IS this model (2026-08-27).** The locked decisions
+and rejected alternatives are `decisions.md` §17; this doc is the design
+record — the argument, the measurements, and the prior art. The
+implementation is `FatRegistry` (`src/rove/fat.zig`) under the declared
+world tables (`src/rove/world.zig`); the measurements are `zig build
+fat-bench` and `zig build access-bench`. The archetype `Registry` this doc
+measures against was deleted at adoption — the comparison tables below are
+the record of why, and the only place the archetype numbers survive.
+
+## Thesis
+
+**The simplicity of the fat-structs model with the performance of the
+archetype model.** Every entity conceptually carries every component — the
+fat struct every systems programmer already knows how to reason about — and
+collections become materialized views over those records: the dense,
+type-gated iteration sets that are the reason an ECS exists.
+
+## The model
+
+One sentence per piece:
+
+- **Base table.** The shadow store: one AoS array of a comptime-built
+  universe struct, `max_entities` long, addressed by `entity.index`,
+  never compacted — a parked component's address is stable for the
+  entity's lifetime. This is the fat-struct array *literally*, not just
+  conceptually — AoS because the shadow is never iterated (collections
+  are for that); every access is per-entity and usually multi-component,
+  so clustering one entity's components wins for exactly the operations
+  the shadow serves. Collections are its SoA projections.
+- **Materialized views.** A collection is a membership predicate (the
+  state) plus a column projection (the row), physically maintained: moving
+  an entity copies shared columns view-to-view, *parks* dropped columns in
+  the base table, *unparks* gained ones. Move copies are incremental view
+  maintenance, nothing more.
+- **Total moves.** Any collection to any collection, no row-subset
+  requirement, lossless by construction. A component's value is
+  path-independent: always the last value a system wrote, never a function
+  of the route the entity took through the collection graph.
+- **One defaulting point.** Birth writes declared field defaults
+  (`row.fillDefault`); a per-entity `{ gen, written-mask }` header at the
+  front of each shadow struct makes a virgin or reborn slot read as the
+  default lazily — a mismatched gen zeroes the whole mask in one write —
+  so birth and death are O(row), not O(universe), a reborn index can
+  never resurrect its predecessor's values, and the validity check
+  shares a cache line with the data it guards.
+- **No lifecycle hooks.** Moves and destroys run no component init/deinit.
+  Release is a transition owned by a system (rove-style §16); the releasing
+  system writes the component back to its default as part of the release it
+  already owns.
+- **Universal reads.** `getFat(entity, T)` resolves a component wherever it
+  lives — the owning view's column when resident, the base table when
+  parked — with no candidate set at the call site.
+
+"Safe to read" — the row — stops being a storage fact and becomes the
+view's contract: the type system still stops a system from naming a
+component its view lacks, but existence is no longer state-dependent.
+
+## Why the simplicity is real
+
+The fat struct is the model everyone already has: create the record, fields
+persist, tear down with the whole record in hand. Archetype ECS deviates
+from that intuition — fields appear and vanish with state — and the
+deviation is where rewind's resource-ordering bugs lived. The fat model
+restores the intuition and keeps what the ECS machinery is actually good
+for: state as membership that cannot disagree with itself, and read-safety
+as a typed property of a system's signature instead of a comment.
+
+The sharpest consequence is the resource story. A layer creates an `Fd` on
+an entity; the component rides the base table through every state any layer
+invents — there is no operation that strips it — and the owner's
+close-collection system, a real system with phase ordering and a full view,
+is *guaranteed* to see it again. "The creating layer destroys" (§17)
+upgrades from a discipline every path had to respect into a property the
+framework enforces, and the failure mode flips from silent (a component
+stripped en route is a leak with no trace) to visible (an entity stuck
+short of teardown is countable membership). Two residuals stay honest:
+something must still route the entity into the teardown chain — the
+decide/execute split remains a protocol — and value-invalidation (writing
+`fd = -1` after close) is the releasing system's contract, checked by
+nothing.
+
+Composition inverts from thread-down to gather-up. Libraries stop being
+generic over user rows: your components survive passage through another
+layer's states without that layer's cooperation, any layer can attach
+components to any entity unilaterally, and views can span layers. The
+row-fragment threading of principle #9, the superset rule's row pollution,
+and the resolver hooks of rove#877 all dissolve rather than get patched.
+
+## Why the performance holds (measured)
+
+`fat-bench`, ReleaseFast, one quiet box, min-of-5 — parity or better
+everywhere except one knowable premium:
+
+| scenario | archetype | fat |
+|---|---|---|
+| phase move (identical 40B rows), batch / immediate | 5.9 / 8.8 ns | 5.8 / 9.1 ns |
+| detour with survival, batch / immediate | 9.7 / 12.7 ns (carry-all) | 10.3 / 12.6 ns (park/unpark) |
+| detour, lossy `moveStrip` (values destroyed) | 11.4 ns | — |
+| resident churn, K=4096 / K=16384 | 12.1 / 12.0 ns | 13.8 / 11.7 ns |
+| iterate a column | 0.3 ns | 0.3 ns |
+| resolve unknown home (11 same-row colls) | 1.6 ns id-index, 2.1–3.5 ns getAny scan | 2.9 ns getFat |
+| close from unknown home | ~62 ns any dispatch | ~62 ns |
+
+Findings that matter more than any single number:
+
+- **Survival is nearly free.** The archetype's cheapest detour — destroying
+  the values — saves about a nanosecond over the fat model's lossless one.
+- **SoA insulates both models from row width.** Untouched columns never
+  enter cache, so the "carry-all footprint tax" mostly does not exist
+  mechanically; carry-all's real cost is semantic (every intermediate row
+  must name every surviving component).
+- **Dispatch does not matter for moves** (~62 ns is the deferred-move
+  machinery itself) **and barely matters for reads** (everything ≤ 3.5 ns).
+  The coll-enum declared-id index is the fastest resolver; `getFat` pays
+  ~1.4 ns for its fn-pointer generality.
+- Microbench caveats: hot cache, one machine, and the ECS layer is
+  nanoseconds under a request path dominated by nghttp2/TLS/syscalls.
+  These numbers bound relative overhead; they predict no throughput.
+
+**End to end** — the rove-io echo server runs on both models
+(`echo-server` / `echo-server-fat`, same wiring, one option line apart)
+and a side-by-side bench (ReleaseFast, 8 client threads, 512B verified
+echoes, reps alternating variants) lands where the microbench said it
+would: connection churn at parity (~15.8k conns/s both — connect/accept/
+shutdown/close syscalls dominate, the ECS layer is invisible), and
+persistent round-trips at parity (medians within ~1% across a 10-rep
+alternating run, 5 wins each; an earlier 4% fat edge did not reproduce).
+Zero payload errors either side across ~10^6 round-trips and ~5x10^5
+churned connections. Absolute rates are box-load-dependent; only the
+within-run comparison is meaningful.
+
+**The conclusion the measurements support:** at rove's scale — thousands
+of entities, components kept small because kernel-visible and large data
+live behind pointers anyway — *move cost was never the binding
+constraint*. An operation's ECS traffic is ~100ns inside even the
+thinnest 7µs echo request; iteration density is the term that actually
+scales, and both models share it. The row-subset discipline priced
+itself as speed (keep rows tight so moves stay cheap) but was actually
+buying safety (don't silently lose data). With safety provided
+structurally instead, transitions are free to spend on clarity: as many
+phases, seams, and per-resource close collections as the state machine
+wants — each hop costs ~10ns, and each buys a place where a system with
+a full view owns one step. The regime where this reverses is the one
+rove is not in: per-tick moves over game-engine-scale populations, or
+large inline components.
+
+## Relationship to coll-enum
+
+The declared-collection-id work (merged into this branch) composes with the
+fat model rather than competing: it supplies the readable namespace —
+membership as an enum value, typed recovery through an exhaustive switch —
+and the fat model is a storage rule on top of it. `FatRegistry` registers
+under declared ids with the same guards as `Registry`; `collectionIdOf` is
+the readable-membership primitive, and typed recovery lives in the layer
+that declares the enum, where it is checked. Notably, coll-enum alone
+already wins the unknown-home resolve case on archetype storage; what it
+cannot do — span row-divergent candidates, resolve without any candidate
+knowledge — is exactly what the fat model adds, because under fat, rows
+never diverge.
+
+## Costs and open questions
+
+- **Memory:** union-of-universe × `max_entities`, mostly cold; plus 4 bytes
+  per (component, entity) of stamps. Charged even for components three
+  entities ever hold.
+- **Closed world:** the component universe must be known at one comptime
+  point. Composition becomes gather-up (each layer exports components +
+  collections; the app unions them) — the same direction coll-enum's
+  namespace already took, and the registry declaration doubles as a
+  manifest of all entity state.
+- **The subset check's successor.** The comptime row-subset rule also
+  forced you to notice when a destination expected a component nobody had
+  written. Total moves delete the check; whether "the sender wrote what the
+  receiving view trusts" stays convention or gains a checkable handoff is
+  the one unreplaced safety.
+- **Materialize vs read-through is a per-(view, column) knob.** A column
+  iterated every tick wants materialization; one read once per entity could
+  read through to the base table (the §2 fixed-pool exemption, reappearing
+  as "don't materialize this column"). Kernel-visible components should be
+  base-table-only: intermittent address stability is worse than none.
+  The knob already has an API surface: `Io`'s `connection_row` stops
+  meaning "required, or your data doesn't exist" and comes to mean
+  "materialize my component in io's views, I iterate it" — per-entity
+  access needs only universe membership. (That gap closed in adoption: the declared world's
+  tables carry row-less components — "in the world, materialized
+  nowhere.")
+- **Residency assumptions, censused against io.** Of the three resolver
+  hooks the archetype model forced on io, universal reads dissolve two
+  (`fd_resolver`, `peer_resolver` — completions name entities by id and
+  `getFat` answers wherever the conn lives, so an upper layer may hold
+  conn entities in its own collections). What survives as contract: io's
+  admission count and shutdown sweep see only io's own collections — a
+  membership *aggregate*, which per-entity reads cannot dissolve and a
+  shared reference-set view would. The teardown seam itself gets more
+  permissive: ending a conn is one total move into `conn_closing` from
+  any collection at all.
+- **Views are still a partition — in the prototype.** The designed
+  generalization is membership axes with edge clauses (next section):
+  multiple simultaneous memberships made safe by construction.
+- **What the archetype still holds:** "left the collection" is structural
+  destruction there. Under fat it is a contract kept by releasing systems.
+  Whether any component *wants* enforced destruction on exit is a
+  per-component question this model answers with convention.
+
+## Membership axes and edge clauses (axes BUILT; edge clauses REJECTED)
+
+*As-built note:* the axes shipped as designed below — the emergent
+partition (axis = a type, identity = its declaration site), one total
+lifecycle axis, partial axes with enter/leave, and the set/collection
+storage merge (a set = an empty-row collection on a one-state axis). The
+edge-clause vocabulary did NOT ship: cross-axis quiescing became the
+imperative `moveOnly`/`evictOnly` verb family with identity-axis
+exemptions, and declared clauses — behavior or checks — were rejected
+(`decisions.md` §17.3). The clause design below is kept as the record of
+the road not taken.
+
+**The safety condition for multiple membership** falls out of the model's
+one invariant: each component has exactly one live home. Two memberships
+may coexist iff their *materialized* rows are disjoint — then no component
+is contested, and reads/writes stay coherent with zero copies. Overlap is
+fine when only one membership materializes the shared component (the
+others read through), and a deliberately stale materialized copy is
+legitimate only as *declared snapshot semantics* with a named refresh
+point (double buffering). "Only one is writable" is not a safety
+condition by itself: an unrefreshed read-only copy is a silent fork.
+
+**The axis partition makes disjointness structural.** Assign every
+component to an axis; a collection materializes only its own axis's
+components. Then an entity holds one membership *per axis* — a product
+state: a definite position in each of several independent state machines
+— and cross-axis co-residency is safe by construction, no pairwise row
+checking. Exclusivity within an axis is maintained by the operation
+itself: changing axis-k membership IS the move on axis k. Mechanics:
+`collection_ids` grows from one byte to one per axis; per-membership
+offsets live in per-collection sparse indexes (the sparse-set layout);
+destroy leaves every axis. The phase/seam/home trichotomy collapses into
+axis shapes — a phase is a many-state axis, a seam a two-state axis (in
+the mailbox or not), a home a one-state axis — and the empty-row set
+(pure membership, zero components) is unconditionally safe to overlap
+with anything. This also completes rove-library principle #1: flags like
+`close_requested` exist today because the single membership slot is
+occupied by lifecycle; with axes, "never a flag, always a collection"
+becomes fully honorable.
+
+**Edge clauses replace whole-graph analysis.** There is no global
+comptime pass over the transition graph, and none is needed: safety is
+inductive if every edge either statically preserves the invariants or
+carries a declared, runtime-checked clause. Two clause flavors, in
+preference order:
+
+- `leaves = .{...}` — the edge *performs* the repair (moving lifecycle
+  into `conn_closing` atomically leaves `ws_send_in`). No failure path.
+  Prefer this: edges do work, the same philosophy as release-by-transition.
+- `asserts = .{...}` — the edge *detects* a can't-happen (the entity
+  being in the conflicting state would mean an upstream bug). The check
+  is a framework primitive compiling to explicit check-and-abort in every
+  build mode — a violated co-residency precondition is an infallibility
+  violation (two live copies = corruption), and the shipped build strips
+  `std.debug.assert`, so the loudness cannot be left to the caller.
+
+Cross-axis constraints — which product states are legal — are the real
+design surface the partition opens ("entanglement": axes that may not
+move independently). They are expressed as clauses on the edges that
+could violate them, so residual risk is *enumerable*: every edge is
+statically discharged, self-repairing, or carries a named assert, and
+the assert list is greppable the way `unsafe` blocks are — except these
+stay checked at runtime.
+
+**Worked example — `all_conns` retires `extra_conns_fn` (BUILT).**
+`EntitySet` is implemented: dense list + sparse index, declared bit ids,
+membership orthogonal to the entity's collection, and destroy draining a
+per-entity mask so a set can never hold a dead entity — the "leaves on
+the terminal edge" clause exists today as destroy-leaves-all, pending
+real edge clauses. io (fat model) declares `all_conns`, joins it on the
+accept and connect-promotion edges, and admission control reads
+`all_conns.count` — O(1), exact, regardless of which layer or collection
+holds any conn — so `extra_conns_fn` is void under fat and its setter a
+compile error. Verified by the churn probe: 500 sequential connections
+against a ~224-conn admission budget stalls within the first 256 if a
+member ever leaks.
+
+The evict recipe is BUILT too: `evictImmediate(entity, dst)` extracts
+from whatever collection holds the entity through a type-erased
+per-collection recipe (park the whole row, remove) and inserts into a
+typed destination — the destination slot reserved first so failure
+never leaves the entity collection-less, and there is deliberately no
+observable in-no-collection state. io's shutdown sweep (fat model)
+walks `all_conns` and evicts every member into `conn_closing` from
+wherever it lives, verified by a test that adopts a conn into a
+collection io cannot name and watches the sweep end it anyway. With
+that, io under the fat model has **zero hooks and zero residency
+contracts**: create it, and it comes back to you — for the component,
+the aggregate, and now the shutdown.
+
+**Deferred and batch eviction (designed, unbuilt).** A deferred evict is
+coherent because enqueueing sets PENDING_MOVE, which freezes the entity:
+"from wherever it is now" and "at flush" provably denote the same place.
+Its batching story: keep sets insertion-ordered (a set maintained in
+(collection, offset) order would have to observe every member move AND
+every bystander swap-fill — hot-path cost to speed a cold path), and
+instead SORT THE WORKLIST at the point of batch eviction — a one-byte
+counting pass on collection id, offsets within. For an all-members set
+like `all_conns` each bucket's offsets are the complete contiguous
+range, so K entities across M collections coalesce into M queue entries.
+Runs form at ENQUEUE (RLE over the sorted worklist); a count-N evict
+recipe then executes each run batched, as deferred moves already do.
+One honest asymmetry: the shadow is entity-indexed, so park/unpark is
+scatter/gather per entity even batched — the count-N recipe coalesces
+removeRun, reserve, and handles, and makes column access sequential,
+but not the component transfers. Full memcpy-grade needs the shadow
+BYPASS: the destination is comptime-known, so components the source
+also materializes (a null-check in the erased accessor table) copy
+column-to-column, one memcpy per component per run; only the row
+difference parks or defaults. For the sweep (conn row vs closing row
+differ by ClosingState alone) that is nearly everything. The same
+division of labor as a bitmap index scan: the index stays cheap to
+maintain, the consumer imposes physical order per operation.
+
+## Prior art
+
+The pieces all exist; the package as a *semantic contract* is the
+less-traveled part.
+
+- **Handmade Hero sim regions** (Muratori): entities live chunk-resident in
+  packed low-frequency form and are unpacked into the sim region's dense
+  working collections (static / moving geometry) when near the camera, then
+  packed back out. Park/unpark with a *spatial* predicate where ours is
+  *state*. His pack step must swizzle entity pointers to stored IDs and
+  back; rove's `Entity` handles are already the stable reference, so park
+  is bitwise.
+- **EnTT sparse sets + owning groups**: per-component sparse sets are the
+  base table; an owning group incrementally reorders its pools so members
+  sit contiguous — a materialized view maintained by swaps, down to the
+  same partition-ish constraint (a pool owned by at most one group). No
+  declared state graph, no park (nothing ever leaves the base table).
+- **Archetype engines patching toward the same end** — evidence the pain is
+  recognized: Unity DOTS enableable components (a state flip masks a
+  component instead of causing a structural move; storage stays allocated)
+  and flecs union relationships (state changes that do not move the entity
+  between tables). Both keep membership as a filtered scan rather than a
+  dense set, and neither makes lossless moves a guarantee.
+- **Databases**: materialized views + incremental view maintenance is the
+  literature this doc's framing borrows. Vertica/C-store is the sharpest
+  match — base store plus differently-organized materialized projections,
+  with a *tuple mover* migrating records between write- and read-optimized
+  homes. SAP HANA's delta/main split is the same shape; a Postgres partial
+  index is a membership predicate, materialized.
+- **DOD canon**: Fabian's existence-based processing (membership in a table
+  IS the boolean) is the ancestry of rove-library principle #1 itself;
+  hot/cold structure splitting is what this model does *dynamically per
+  state* — the view is the hot split, the shadow the cold one, and the
+  split point moves with the entity's phase. Kelley's "Practical
+  Data-Oriented Design" is the Zig-world statement of
+  state-as-array-membership.
+- **Structural analogies** that are more than cute: register allocation
+  (columns are registers, the shadow the stack slot, park/unpark are
+  spill/fill, "safe to read" is live-range analysis) and virtual memory
+  (resident vs paged-out over one canonical backing store) — both live
+  under the same one-live-copy discipline.
+
+## What came next
+
+The question this section once deferred — should rove *become* this — was
+answered 2026-08-27: h2, io, and all four binaries ported, the archetype
+registry deleted, the adoption locked (`decisions.md` §17.1). The follow-ons
+still open (batch/count-N evict with the shadow bypass, the cold-working-set
+benchmark) live in GitHub issues per the docs lifecycle.

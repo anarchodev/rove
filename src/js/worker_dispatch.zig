@@ -350,7 +350,7 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
     {
         const bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
         errdefer if (bsid) |x| allocator.free(x);
-        try server.reg.set(s.ent, &server.request_out, components_mod.ContDescriptor, .{
+        try server.reg.set(s.ent, server.coll(.request_out), components_mod.ContDescriptor, .{
             .cont = cont,
             .deadline_ns = s.cont_deadline_ns,
             .bound_schedule_id = bsid,
@@ -363,7 +363,7 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
         errdefer allocator.free(tid);
         const corr: ?[]u8 = if (s.saga_id) |c| try allocator.dupe(u8, c) else null;
         errdefer if (corr) |x| allocator.free(x);
-        try server.reg.set(s.ent, &server.request_out, components_mod.ChainContext, .{
+        try server.reg.set(s.ent, server.coll(.request_out), components_mod.ChainContext, .{
             .tenant_id = tid,
             .saga_id = corr,
             .deployment_id = s.deployment_id,
@@ -371,7 +371,7 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
     }
 
     try armContWakesIfAny(server, allocator, s);
-    try server.reg.move(s.ent, &server.request_out, &worker.parked_continuations);
+    try server.reg.move(s.ent, server.coll(.request_out), worker.parked_continuations);
     return true;
 }
 
@@ -391,7 +391,7 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
     {
         const bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
         errdefer if (bsid) |x| allocator.free(x);
-        try server.reg.set(s.ent, &server.request_out, components_mod.ContDescriptor, .{
+        try server.reg.set(s.ent, server.coll(.request_out), components_mod.ContDescriptor, .{
             .cont = cont,
             .deadline_ns = s.cont_deadline_ns,
             .bound_schedule_id = bsid,
@@ -404,7 +404,7 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
         errdefer allocator.free(tid);
         const corr: ?[]u8 = if (s.saga_id) |c| try allocator.dupe(u8, c) else null;
         errdefer if (corr) |x| allocator.free(x);
-        try server.reg.set(s.ent, &server.request_out, components_mod.ChainContext, .{
+        try server.reg.set(s.ent, server.coll(.request_out), components_mod.ChainContext, .{
             .tenant_id = tid,
             .saga_id = corr,
             .deployment_id = s.deployment_id,
@@ -468,7 +468,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         }
         if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
     }
-    try server.reg.set(s.ent, &server.request_out, components_mod.StreamWakes, .{
+    try server.reg.set(s.ent, server.coll(.request_out), components_mod.StreamWakes, .{
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake_ns,
         .kv_prefixes = kv_prefixes,
@@ -525,7 +525,7 @@ fn streamParkIfAny(
     errdefer meta.deinit(worker.allocator);
     try worker_mod.setStreamComponents(
         server,
-        &server.request_out,
+        server.coll(.request_out),
         s.ent,
         worker.allocator,
         tenant_id,
@@ -543,7 +543,7 @@ fn streamParkIfAny(
     // submits the response headers we already stamped (Status +
     // RespHeaders) on the entity, then transitions it to
     // `stream_data_out` where `serviceParkedStreams` takes over.
-    try server.reg.move(s.ent, &server.request_out, &server.stream_response_in);
+    try server.reg.move(s.ent, server.coll(.request_out), server.coll(.stream_response_in));
     return true;
 }
 
@@ -576,7 +576,7 @@ fn streamRecordIfAnyAt(
     errdefer meta_opt.deinit(allocator);
     try worker_mod.setStreamComponents(
         server,
-        &server.request_out,
+        server.coll(.request_out),
         s.ent,
         allocator,
         anchor_id,
@@ -669,10 +669,10 @@ const ParkRoute = enum {
 
     /// Move the parked entity out of `request_out` into its sibling.
     fn moveToSibling(self: ParkRoute, worker: anytype, server: anytype, ent: rove.Entity) !void {
-        try server.reg.move(ent, &server.request_out, switch (self) {
-            .stream => &worker.raft_pending_stream,
-            .cont => &worker.raft_pending_cont,
-            .response => &worker.raft_pending_response,
+        try server.reg.move(ent, server.coll(.request_out), switch (self) {
+            .stream => worker.raft_pending_stream,
+            .cont => worker.raft_pending_cont,
+            .response => worker.raft_pending_response,
         });
     }
 
@@ -728,7 +728,7 @@ fn parkSuccessesOnSiblings(
         const delivered = blk: {
             contRecordIfAny(worker, server, allocator, anchor_id, s) catch break :blk false; // sets the entity's ContDescriptor component
             streamRecordIfAnyAt(worker, server, allocator, anchor_id, s) catch break :blk false; // sets the entity's stream components
-            server.reg.set(s.ent, &server.request_out, RaftWait, .{ .group_id = group_id, .seq = seq, .deadline_ns = deadline_ns }) catch break :blk false;
+            server.reg.set(s.ent, server.coll(.request_out), RaftWait, .{ .group_id = group_id, .seq = seq, .deadline_ns = deadline_ns }) catch break :blk false;
             route.moveToSibling(worker, server, s.ent) catch break :blk false;
             break :blk true;
         };
@@ -739,8 +739,8 @@ fn parkSuccessesOnSiblings(
             );
             // Whatever state the entity is in, it must not be re-dispatched
             // from request_out next tick (that would double-execute the
-            // handler). Destroy is a no-op on an already-dead entity.
-            server.reg.destroy(s.ent) catch {};
+            // handler). The funnel is a no-op on an already-dead entity.
+            server.destroyEntity(s.ent) catch {};
         }
         captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq);
     }
@@ -908,7 +908,7 @@ fn finalizeBatch(
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
                     );
-                    server.reg.move(s.ent, &server.request_out, &server.response_in) catch |e2| panic_mod.invariantViolated(
+                    server.reg.move(s.ent, server.coll(.request_out), server.coll(.response_in)) catch |e2| panic_mod.invariantViolated(
                         "finalizeBatch.move(idiom0_barrier_fail)",
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
@@ -1053,7 +1053,7 @@ fn finalizeBatch(
                 processed += 1;
                 continue;
             }
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
+            server.reg.move(s.ent, server.coll(.request_out), server.coll(.response_in)) catch |err| panic_mod.invariantViolated(
                 "finalizeBatch.move(read_only)",
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err) },
@@ -1093,7 +1093,7 @@ fn finalizeBatch(
                     "tenant={s} err={s}",
                     .{ anchor_id, @errorName(e2) },
                 );
-                server.reg.move(s.ent, &server.request_out, &server.response_in) catch |e2| panic_mod.invariantViolated(
+                server.reg.move(s.ent, server.coll(.request_out), server.coll(.response_in)) catch |e2| panic_mod.invariantViolated(
                     "finalizeBatch.move(kv_cap)",
                     "tenant={s} err={s}",
                     .{ anchor_id, @errorName(e2) },
@@ -1151,7 +1151,7 @@ fn finalizeBatch(
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err2) },
             );
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err2| panic_mod.invariantViolated(
+            server.reg.move(s.ent, server.coll(.request_out), server.coll(.response_in)) catch |err2| panic_mod.invariantViolated(
                 "finalizeBatch.move(propose_fail)",
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err2) },
@@ -1323,8 +1323,8 @@ fn parkForward(
         return true;
     };
     const deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + FORWARD_PARK_DEADLINE_NS;
-    try server.reg.set(ent, &server.request_out, ForwardWait, .{ .forward_id = fid, .deadline_ns = deadline_ns });
-    try server.reg.move(ent, &server.request_out, &worker.forward_pending);
+    try server.reg.set(ent, server.coll(.request_out), ForwardWait, .{ .forward_id = fid, .deadline_ns = deadline_ns });
+    try server.reg.move(ent, server.coll(.request_out), worker.forward_pending);
     return true;
 }
 
@@ -1594,8 +1594,8 @@ pub fn drainRequestReceiving(worker: anytype) !void {
     const entities = server.request_receiving.entitySlice();
     if (entities.len == 0) return;
     for (entities) |ent| {
-        server.reg.set(ent, &server.request_receiving, worker_mod.BodyInbound, .{ .receiving = true }) catch continue;
-        server.reg.move(ent, &server.request_receiving, &server.request_out) catch continue;
+        server.reg.set(ent, server.coll(.request_receiving), worker_mod.BodyInbound, .{ .receiving = true }) catch continue;
+        server.reg.move(ent, server.coll(.request_receiving), server.coll(.request_out)) catch continue;
     }
     try server.reg.flush();
 }
@@ -1776,7 +1776,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // `v2-kv` bundle POST must arrive whole). Flip to classic
         // buffering and come back body-complete.
         if (body_inbound.receiving and std.mem.startsWith(u8, path, "/_system")) {
-            try server.reg.set(ent, &server.request_out, worker_mod.BodyInbound, .{ .receiving = false });
+            try server.reg.set(ent, server.coll(.request_out), worker_mod.BodyInbound, .{ .receiving = false });
             switch (server.requestBodyBuffer(ent)) {
                 // .buffering: comes back via request_buffering at
                 // END_STREAM. .body_complete: attached in place —
@@ -1788,15 +1788,44 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
-        // `/_system/*` — CORS gate, then auth + system route dispatch.
-        if (try system.tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {
-            processed += 1;
-            continue;
+        // `/_system/*` — CORS gate, then auth + system route dispatch. A
+        // route may resolve to an ACTIVATION instead of a door (rove#717),
+        // in which case it names the tenant and the baked module and falls
+        // through to the ordinary handler path below.
+        var forced_builtin: ?system.ForcedActivation = null;
+        switch (try system.tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {
+            .answered => {
+                processed += 1;
+                continue;
+            },
+            .activation => |fa| forced_builtin = fa,
+            .not_mine => {},
         }
 
         const host = worker_mod.hostOnly(authority);
 
-        const resolved = switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh, body)) {
+        const resolved = if (forced_builtin) |fa| blk: {
+            // The scope comes from the ROUTE, not the Host — the family
+            // authenticated the operator above, and the door already knows
+            // which tenant it means.
+            const inst = (worker.node.tenant.getInstance(fa.tenant) catch null) orelse {
+                try respb.setSimpleResponse(server, ent, sid, sess, 503, "platform tenant not initialized\n", allocator);
+                processed += 1;
+                continue;
+            };
+            // Make the group resolvable before the leader gate below reads
+            // it. The gate only LOOKS UP a gid, while the door this replaced
+            // went straight to `proposeWriteSet` → `registerTenant`, which
+            // creates one — so without this a bootstrap write against a
+            // provisioned-but-never-touched group 421s where it used to
+            // succeed. Idempotent; `mirrorDeployConfig` registers for the
+            // same reason before its own per-tenant leadership check.
+            _ = worker.raft.registerTenant(fa.tenant) catch {};
+            // `is_admin` here means "not customer traffic": it keeps the
+            // static-first block below from trying to serve an asset for a
+            // platform route. CORS was already stamped by the family gate.
+            break :blk ResolvedDispatch{ .handler_inst = inst, .scope_inst = inst, .is_admin = true };
+        } else switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh, body)) {
             .handled => {
                 processed += 1;
                 continue;
@@ -1865,7 +1894,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // request. `release` fires at end of iteration (continue or
         // fall-through). Snapshot pinning guarantees a request
         // sees one deployment version completely.
-        const snap = slot.pinCurrent() orelse {
+        // A forced BAKED module needs no deployment (rove#843): its code
+        // comes from `node.builtin_modules`, so the snapshot it runs against
+        // is empty and the tenant may never have been released — which is the
+        // bootstrap case `/_system/admin-kv` exists for. An ordinary
+        // route-resolved request still 503s, because "not deployed" must not
+        // quietly become "ran something else".
+        const snap = (if (forced_builtin != null)
+            slot.pinForBaked() catch |err| {
+                // Not "no deployment" — this tenant is allowed to have none.
+                // Name the real condition (rove#704): the empty snapshot
+                // could not be built.
+                const msg = try std.fmt.allocPrint(allocator, "system module scope unavailable: {s}\n", .{@errorName(err)});
+                defer allocator.free(msg);
+                try respb.setSimpleResponse(server, ent, sid, sess, 503, msg, allocator);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0, 0);
+                processed += 1;
+                continue;
+            }
+        else
+            slot.pinCurrent()) orelse {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{}, null, &.{}, .inbound, 0, 0);
             processed += 1;
@@ -1934,7 +1982,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // Marked on admission only: a refused request is answered with the
         // 429 below and never walked again, so it has nothing to remember.
         if (allowed and !rate_charged.charged) {
-            try server.reg.set(ent, &server.request_out, worker_mod.RateCharged, .{ .charged = true });
+            try server.reg.set(ent, server.coll(.request_out), worker_mod.RateCharged, .{ .charged = true });
         }
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
@@ -2024,7 +2072,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // streamer, passing {hash, content_type} via the route's query (the
         // builtin parses request.query). No `/_assets` redirect (would rebase
         // relative ES-module imports) and no blocking read here.
-        var route = if (stream_static) |ss| blk: {
+        var route = if (forced_builtin) |fa| blk: {
+            // No query: a forced system module reads its input from the
+            // request BODY (the static streamer is the one that needs a
+            // synthesised query, below).
+            const mb = try allocator.dupe(u8, fa.module_base);
+            break :blk router_mod.Route{ .allocator = allocator, .module_base = mb, .query = null };
+        } else if (stream_static) |ss| blk: {
             const q = try std.fmt.allocPrint(allocator, "{{\"hash\":\"{s}\",\"ct\":\"{s}\"}}", .{ ss.hash_hex[0..], ss.content_type });
             errdefer allocator.free(q);
             const mb = try allocator.dupe(u8, "__system/static");
@@ -2043,7 +2097,24 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // The forced static-stream route resolves against the node-level
         // built-in registry (exact — NOT findBytecode's tenant walk-up, which
         // would fall through `__system/static` up to the tenant's index.mjs).
-        const bytecode = if (stream_static != null)
+        const bytecode = if (forced_builtin) |fa| bc_blk: {
+            // Exact node-level builtin lookup — NOT `findBytecode`'s tenant
+            // walk-up, which would fall through a missing builtin to the
+            // tenant's index.mjs and run the customer's code for a platform
+            // route.
+            var key_buf: [128]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{s}.mjs", .{fa.module_base}) catch {
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "system module name too long\n", allocator);
+                processed += 1;
+                continue;
+            };
+            break :bc_blk worker.node.builtin_modules.get(key) orelse {
+                // Baked in; absence is an invariant violation.
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "system module unavailable\n", allocator);
+                processed += 1;
+                continue;
+            };
+        } else if (stream_static != null)
             (worker.node.builtin_modules.get("__system/static.mjs") orelse {
                 // The builtin is baked in; absence is an invariant violation.
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "static streamer unavailable\n", allocator);
@@ -2183,10 +2254,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     processed += 1;
                     continue;
                 }
-                try server.reg.set(ent, &server.request_out, worker_mod.BodyInbound, .{ .receiving = false });
+                try server.reg.set(ent, server.coll(.request_out), worker_mod.BodyInbound, .{ .receiving = false });
                 switch (server.requestBodyBuffer(ent)) {
                     .body_complete => {
-                        if (server.reg.get(ent, &server.request_out, h2.ReqBody)) |rb| {
+                        if (server.reg.get(ent, server.coll(.request_out), h2.ReqBody)) |rb| {
                             body = if (rb.data) |p| p[0..rb.len] else "";
                         } else |_| {}
                     },
@@ -2412,13 +2483,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     if (worker.node.blob_coord.coordinator) |coord| {
                         const wid = worker.coord_queue_id;
                         if (coord.submit(wid, kv_mod.hashStoreId(scope_inst.id), body)) |seq| {
-                            try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
+                            try server.reg.set(ent, server.coll(.request_out), worker_mod.BodyDurabilityWait, .{
                                 .worker_seq = seq,
                                 .queue_id = wid,
                                 .status = .fresh,
                                 .tenant_id = scope_inst.id,
                             });
-                            try server.reg.move(ent, &server.request_out, &worker.body_pending);
+                            try server.reg.move(ent, server.coll(.request_out), worker.body_pending);
                             processed += 1;
                             continue;
                         } else |err| {
@@ -2553,6 +2624,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // arena and re-executed under GC) skip the doomed bump
             // attempt entirely.
             .arena_mode = if (worker_mod.isChurny(worker, scope_inst.id, dep_id, route.module_base)) .gc else .auto,
+            // From the DISPATCH DECISION, never the path: this arm of the
+            // inbound path runs a baked module only when the engine itself
+            // forced one (a `/_system/*` route resolving to an activation,
+            // or the static-stream fallback). Deriving it from
+            // `route.module_base` would let a URL spell its way into the
+            // grant — the confused-deputy shape rove#643 closed on the
+            // continuation path.
+            .is_system_module = forced_builtin != null or stream_static != null,
             .method = method,
             // `request.path` excludes the query string — the query lives
             // ONLY on `request.query` (handler-shape.md). Log records and

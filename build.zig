@@ -465,6 +465,38 @@ pub fn build(b: *std.Build) void {
     // rove tests
     const rove_tests = b.addTest(.{ .root_module = rove_mod });
     test_step.dependOn(&b.addRunArtifact(rove_tests).step);
+    // Isolated core-ECS test step — entity/row/collection/registry/fat
+    // without the rest of the suite.
+    const rove_test_step = b.step("rove-test", "Run the core rove (ECS) unit tests in isolation");
+    rove_test_step.dependOn(&b.addRunArtifact(rove_tests).step);
+
+    // fat-bench: core-ECS move-cost microbenchmark — Registry (archetype)
+    // vs FatRegistry (fat-entity shadow model) on the same Collection
+    // machinery. Its own module rooted in src/rove so the registry code
+    // under measurement compiles at ReleaseFast (rove_mod compiles at the
+    // session's optimize mode). The gate compiles it; only the step runs it.
+    const fat_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/rove/fat_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const fat_bench = b.addExecutable(.{ .name = "fat-bench", .root_module = fat_bench_mod });
+    test_step.dependOn(&fat_bench.step);
+    const fat_bench_step = b.step("fat-bench", "Run the core-ECS move-cost microbenchmark (ReleaseFast)");
+    fat_bench_step.dependOn(&b.addRunArtifact(fat_bench).step);
+
+    // access-bench: dense-walk vs gather vs flag-scan — the memory-hierarchy
+    // number behind collections-as-dense-arrays. Same ReleaseFast isolation
+    // as fat-bench; the gate compiles it, only the step runs it.
+    const access_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/rove/access_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const access_bench = b.addExecutable(.{ .name = "access-bench", .root_module = access_bench_mod });
+    test_step.dependOn(&access_bench.step);
+    const access_bench_step = b.step("access-bench", "Run the access-pattern microbenchmark (ReleaseFast)");
+    access_bench_step.dependOn(&b.addRunArtifact(access_bench).step);
 
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
@@ -863,6 +895,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "builtin_webhook_fire_mjs", .path = "src/js/builtin_modules/webhook_fire.mjs" },
         .{ .name = "builtin_dispatch_fire_mjs", .path = "src/js/builtin_modules/dispatch_fire.mjs" },
         .{ .name = "builtin_dispatch_result_mjs", .path = "src/js/builtin_modules/dispatch_result.mjs" },
+        .{ .name = "builtin_admin_kv_install_mjs", .path = "src/js/builtin_modules/admin_kv_install.mjs" },
         .{ .name = "builtin_config_install_mjs", .path = "src/js/builtin_modules/config_install.mjs" },
         // §2.6 durable scheduled wake — the `scheduler_tick` baked
         // module (durable-wake P1; docs/architecture/effects-and-handlers.md). Add an entry here AND
@@ -1053,6 +1086,7 @@ pub fn build(b: *std.Build) void {
     const run_h2_echo = b.addRunArtifact(h2_echo_server);
     const h2_echo_step = b.step("h2-echo-server", "Run the HTTP/2 echo server example");
     h2_echo_step.dependOn(&run_h2_echo.step);
+
 
     // h2 limit test
     const h2_limit_mod = b.addModule("h2-limit-test", .{

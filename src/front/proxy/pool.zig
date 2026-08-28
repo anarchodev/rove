@@ -248,11 +248,11 @@ pub fn Fns(comptime FrontH2: type) type {
                 break :blk a;
             };
 
-            const ce = self.reg.create(&self.server.client_connect_in) catch return false;
-            self.reg.set(ce, &self.server.client_connect_in, h2.ConnectTarget, .{ .addr = addr }) catch {};
-            self.reg.set(ce, &self.server.client_connect_in, h2.Session, .{}) catch {};
-            self.reg.set(ce, &self.server.client_connect_in, h2.H2IoResult, .{ .err = 0 }) catch {};
-            self.reg.set(ce, &self.server.client_connect_in, FlowRef, .{ .ptr = @ptrCast(leg) }) catch {};
+            const ce = self.reg.create(self.server.coll(.client_connect_in)) catch return false;
+            self.reg.set(ce, self.server.coll(.client_connect_in), h2.ConnectTarget, .{ .addr = addr }) catch {};
+            self.reg.set(ce, self.server.coll(.client_connect_in), h2.Session, .{}) catch {};
+            self.reg.set(ce, self.server.coll(.client_connect_in), h2.H2IoResult, .{ .err = 0 }) catch {};
+            self.reg.set(ce, self.server.coll(.client_connect_in), FlowRef, .{ .ptr = @ptrCast(leg) }) catch {};
 
             leg.state = .connecting;
             leg.connect_deadline_ns = now + self.connect_timeout_ns;
@@ -269,7 +269,7 @@ pub fn Fns(comptime FrontH2: type) type {
 
         pub fn consumeConnects(self: *Self, now_ns: i128) !void {
             {
-                const coll = &self.server.client_connect_out;
+                const coll = self.server.coll(.client_connect_out);
                 const entities = coll.entitySlice();
                 const sessions = coll.column(h2.Session);
                 const flow_refs = coll.column(FlowRef);
@@ -284,11 +284,11 @@ pub fn Fns(comptime FrontH2: type) type {
                         leg.connect_deadline_ns = 0;
                         self.drainWaiters(leg.up, true);
                     }
-                    try self.reg.destroy(ent);
+                    try self.server.destroyEntity(ent);
                 }
             }
             {
-                const coll = &self.server.client_connect_errors;
+                const coll = self.server.coll(.client_connect_errors);
                 const entities = coll.entitySlice();
                 const flow_refs = coll.column(FlowRef);
                 for (entities, flow_refs) |ent, fr| {
@@ -305,7 +305,7 @@ pub fn Fns(comptime FrontH2: type) type {
                         // whole node's dials are exhausted.
                         if (!leg.up.anyConnecting()) self.drainWaiters(leg.up, false);
                     }
-                    try self.reg.destroy(ent);
+                    try self.server.destroyEntity(ent);
                 }
             }
         }

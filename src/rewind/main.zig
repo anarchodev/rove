@@ -348,7 +348,9 @@ fn workerMain(args: *WorkerCtx) !void {
     var compiler = try QjsCompiler.init();
     defer compiler.deinit();
 
-    var reg = try rove.Registry.init(allocator, .{
+    // One registry VALUE per worker thread, of the worker's ONE world
+    // type — prod's N shared-nothing workers are N values of it.
+    var reg = try Worker.H2.Reg.init(allocator, .{
         .max_entities = 65536,
         .deferred_queue_capacity = 4096,
     });

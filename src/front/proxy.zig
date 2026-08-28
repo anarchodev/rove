@@ -313,7 +313,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        reg: *rove.Registry,
+        reg: *FrontH2.Reg,
         server: *FrontH2,
         /// CP origins for `/_cp/route` (any CP node answers; tried in
         /// order). `REWIND_CP_URL`.
@@ -626,7 +626,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         pub fn init(
             allocator: std.mem.Allocator,
-            reg: *rove.Registry,
+            reg: *FrontH2.Reg,
             server: *FrontH2,
             cp_urls: []const []const u8,
             cache: *RouteCache,
@@ -744,7 +744,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// headers-first propagates END TO END: the worker sees them
         /// while the body is still arriving at the edge.
         fn intakeStreaming(self: *Self, now_ns: i128) !void {
-            const coll = &self.server.request_receiving;
+            const coll = self.server.coll(.request_receiving);
             const entities = coll.entitySlice();
             const sids = coll.column(h2.StreamId);
             const sessions = coll.column(h2.Session);
@@ -787,7 +787,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// The body is stolen from the entity into the flow (replay
         /// buffer) — always replayable, whatever its size.
         fn intakeClassic(self: *Self, now_ns: i128) !void {
-            const coll = &self.server.request_out;
+            const coll = self.server.coll(.request_out);
             const entities = coll.entitySlice();
             const sids = coll.column(h2.StreamId);
             const sessions = coll.column(h2.Session);
@@ -826,7 +826,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// for the upstream 200 (`consumeResponseHeaders`), so a refused
         /// tunnel is a plain HTTP error downstream.
         fn intakeWsUpgrades(self: *Self, now_ns: i128) !void {
-            const coll = &self.server.ws_upgrade_out;
+            const coll = self.server.coll(.ws_upgrade_out);
             const entities = coll.entitySlice();
             const sids = coll.column(h2.StreamId);
             const sessions = coll.column(h2.Session);
@@ -838,7 +838,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 if (fr.ptr != null) continue; // already tunnel-bound
                 if (self.reg.isStale(sess.entity)) {
                     // Downstream died before disposition.
-                    try self.reg.destroy(ent);
+                    try self.server.destroyEntity(ent);
                     continue;
                 }
                 const authority_raw = headerValue(rh, ":authority") orelse {
@@ -1149,12 +1149,12 @@ pub fn Proxy(comptime FrontH2: type) type {
                 return;
             };
 
-            const pump = self.reg.create(&self.server.client_stream_request_in) catch {
+            const pump = self.reg.create(self.server.coll(.client_stream_request_in)) catch {
                 if (packed_hdrs._buf) |b| self.allocator.free(b[0..packed_hdrs._buf_len]);
                 self.attemptFailed(flow, false, false);
                 return;
             };
-            const coll = &self.server.client_stream_request_in;
+            const coll = self.server.coll(.client_stream_request_in);
             flow.attempt += 1;
             self.reg.set(pump, coll, h2.Session, .{ .entity = leg.sess }) catch {};
             self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
@@ -1375,7 +1375,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         /// Streaming response heads (client_headers_first early emit).
         fn consumeResponseHeaders(self: *Self) !void {
-            const coll = &self.server.client_response_receiving;
+            const coll = self.server.coll(.client_response_receiving);
             const entities = coll.entitySlice();
             const sids = coll.column(h2.StreamId);
             const sessions = coll.column(h2.Session);
@@ -1383,7 +1383,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             const resp_hdrs = coll.column(h2.RespHeaders);
 
             for (entities, sids, sessions, statuses, resp_hdrs) |ent, sid, sess, status, rh| {
-                defer self.reg.destroy(ent) catch {};
+                defer self.server.destroyEntity(ent) catch {};
                 // WS tunnel CONNECT responses first — an unmapped stream
                 // is reset below, which must never hit a live tunnel.
                 if (self.tunnels_by_up.get(keyOf(sess.entity, sid.id))) |t| {
@@ -1442,7 +1442,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.set(flow.down_ent, src, h2.Status, .{ .code = code }) catch {};
             self.reg.set(flow.down_ent, src, h2.RespHeaders, packed_hdrs) catch {};
             self.reg.set(flow.down_ent, src, h2.H2IoResult, .{ .err = 0 }) catch {};
-            self.reg.move(flow.down_ent, src, &self.server.stream_response_in) catch {};
+            self.reg.move(flow.down_ent, src, self.server.coll(.stream_response_in)) catch {};
             flow.down_home = .responding;
             flow.resp_started = true;
             flow.final_status = code;
@@ -1451,7 +1451,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Upstream pump: feed request-body chunks / close, account
         /// drained chunks, register fresh attempts' stream ids.
         fn pumpUpstream(self: *Self) !void {
-            const coll = &self.server.client_stream_data_out;
+            const coll = self.server.coll(.client_stream_data_out);
             const entities = coll.entitySlice();
             const sids = coll.column(h2.StreamId);
             const sessions = coll.column(h2.Session);
@@ -1488,7 +1488,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                         if (leftover > 0) std.mem.copyForwards(u8, t.up_buf.items[0..leftover], t.up_buf.items[n..]);
                         t.up_buf.shrinkRetainingCapacity(leftover);
                         self.reg.set(ent, coll, h2.ReqBody, .{ .data = chunk.ptr, .len = n }) catch {};
-                        self.reg.move(ent, coll, &self.server.client_stream_data_in) catch {};
+                        self.reg.move(ent, coll, self.server.coll(.client_stream_data_in)) catch {};
                         t.chunk_inflight = n;
                     }
                     continue;
@@ -1521,12 +1521,12 @@ pub fn Proxy(comptime FrontH2: type) type {
                     const chunk = self.allocator.alloc(u8, n) catch continue;
                     @memcpy(chunk, flow.body.items[off .. off + n]);
                     self.reg.set(ent, coll, h2.ReqBody, .{ .data = chunk.ptr, .len = n }) catch {};
-                    self.reg.move(ent, coll, &self.server.client_stream_data_in) catch {};
+                    self.reg.move(ent, coll, self.server.coll(.client_stream_data_in)) catch {};
                     flow.sent += n;
                     flow.up_chunk_inflight = n;
                     if (!flow.replayable) self.compactBody(flow);
                 } else if (flow.body_complete and !flow.up_closed) {
-                    self.reg.move(ent, coll, &self.server.client_stream_close_in) catch {};
+                    self.reg.move(ent, coll, self.server.coll(.client_stream_close_in)) catch {};
                     flow.up_closed = true;
                 }
                 // else: nothing to send yet — the entity waits here.
@@ -1535,7 +1535,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         /// Downstream pump: feed response chunks / close / abort.
         fn pumpDownstream(self: *Self) !void {
-            const coll = &self.server.stream_data_out;
+            const coll = self.server.coll(.stream_data_out);
             const entities = coll.entitySlice();
             const flow_refs = coll.column(FlowRef);
 
@@ -1557,7 +1557,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     std.mem.copyForwards(u8, flow.resp_queue.items[0..rem], flow.resp_queue.items[n..]);
                     flow.resp_queue.shrinkRetainingCapacity(rem);
                     self.reg.set(ent, coll, h2.RespBody, .{ .data = chunk.ptr, .len = n }) catch {};
-                    self.reg.move(ent, coll, &self.server.stream_data_in) catch {};
+                    self.reg.move(ent, coll, self.server.coll(.stream_data_in)) catch {};
                     flow.down_chunk_inflight = n;
                 } else if (flow.resp_failed) {
                     // Upstream died mid-response: hard-abort downstream
@@ -1566,7 +1566,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     self.server.serverStreamAbort(flow.down_sess, flow.down_sid);
                     flow.down_closed = true;
                 } else if (flow.resp_eof) {
-                    self.reg.move(ent, coll, &self.server.stream_close_in) catch {};
+                    self.reg.move(ent, coll, self.server.coll(.stream_close_in)) catch {};
                     flow.down_closed = true;
                 }
             }
@@ -1574,7 +1574,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         /// Terminal events for upstream request entities.
         fn consumeUpstreamTerminal(self: *Self) !void {
-            const coll = &self.server.client_response_out;
+            const coll = self.server.coll(.client_response_out);
             const entities = coll.entitySlice();
             const sids = coll.column(h2.StreamId);
             const statuses = coll.column(h2.Status);
@@ -1584,7 +1584,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             const flow_refs = coll.column(FlowRef);
 
             for (entities, sids, statuses, resp_hdrs, resp_bodies, io_results, flow_refs) |ent, sid, status, rh, *rb, io_res, fr| {
-                defer self.reg.destroy(ent) catch {};
+                defer self.server.destroyEntity(ent) catch {};
                 _ = sid;
                 // Repay the submitting leg's in-flight slot (plan A3) —
                 // exactly one terminal per submit, current attempt or
@@ -1742,7 +1742,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Terminal events for downstream entities (response written or
         /// stream dead). Detach + destroy.
         fn consumeServerTerminal(self: *Self) !void {
-            const coll = &self.server.response_out;
+            const coll = self.server.coll(.response_out);
             const entities = coll.entitySlice();
             const flow_refs = coll.column(FlowRef);
 
@@ -1756,7 +1756,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.maybeDestroyFlow(flow);
                     }
                 }
-                try self.reg.destroy(ent);
+                try self.server.destroyEntity(ent);
             }
         }
 
@@ -1769,7 +1769,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             try self.reg.set(ent, coll, h2.H2IoResult, .{ .err = 0 });
             try self.reg.set(ent, coll, h2.StreamId, sid);
             try self.reg.set(ent, coll, h2.Session, sess);
-            try self.reg.move(ent, coll, &self.server.response_in);
+            try self.reg.move(ent, coll, self.server.coll(.response_in));
         }
 
         /// Answer the flow's downstream request with a buffered
@@ -1782,7 +1782,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.set(flow.down_ent, src, h2.RespHeaders, packed_hdrs) catch {};
             self.reg.set(flow.down_ent, src, h2.RespBody, body) catch {};
             self.reg.set(flow.down_ent, src, h2.H2IoResult, .{ .err = 0 }) catch {};
-            self.reg.move(flow.down_ent, src, &self.server.response_in) catch {};
+            self.reg.move(flow.down_ent, src, self.server.coll(.response_in)) catch {};
             flow.down_home = .responding;
             flow.resp_started = true;
             flow.final_status = code;
@@ -1805,10 +1805,10 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.maybeDestroyFlow(flow);
         }
 
-        fn downColl(self: *Self, flow: *Flow) *@TypeOf(self.server.request_out) {
+        fn downColl(self: *Self, flow: *Flow) @TypeOf(self.server.coll(.request_out)) {
             return switch (flow.down_home) {
-                .receiving => &self.server.request_receiving,
-                .classic, .responding => &self.server.request_out, // .responding never used as a source
+                .receiving => self.server.coll(.request_receiving),
+                .classic, .responding => self.server.coll(.request_out), // .responding never used as a source
             };
         }
 
