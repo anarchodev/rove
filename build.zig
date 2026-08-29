@@ -512,6 +512,18 @@ pub fn build(b: *std.Build) void {
     const flush_bench_step = b.step("flush-bench", "Run the deferred-queue flush microbenchmark (ReleaseFast)");
     flush_bench_step.dependOn(&b.addRunArtifact(flush_bench).step);
 
+    // boot-probe: what a worker-shaped registry COMMITS at init (VmRSS
+    // delta), before any entity exists. Same isolation as fat-bench.
+    const boot_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/rove/boot_probe.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const boot_probe = b.addExecutable(.{ .name = "boot-probe", .root_module = boot_probe_mod });
+    test_step.dependOn(&boot_probe.step);
+    const boot_probe_step = b.step("boot-probe", "Print a worker-shaped registry's boot-time memory commit");
+    boot_probe_step.dependOn(&b.addRunArtifact(boot_probe).step);
+
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);

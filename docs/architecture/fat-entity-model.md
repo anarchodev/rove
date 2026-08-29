@@ -44,7 +44,15 @@ One sentence per piece:
   default lazily — a mismatched gen zeroes the whole mask in one write —
   so birth and death are O(row), not O(universe), a reborn index can
   never resurrect its predecessor's values, and the validity check
-  shares a cache line with the data it guards.
+  shares a cache line with the data it guards. The same header is why
+  the base table is never initialized: a zero header is gen 0 + empty
+  mask, so a fresh zero page IS a fresh slot. The table is one anonymous
+  NORESERVE mapping (hugepage-advised — it is walked by entity index, and
+  2 MiB pages cut the TLB cost of that), the OS backs pages on first
+  touch, and boot commits none of it: physical memory follows the
+  entities that actually park, where committing the whole table at init
+  would cost a worker-sized universe tens of MiB per thread before a
+  single connection arrives.
 - **No lifecycle hooks.** Moves and destroys run no component init/deinit.
   Release is a transition owned by a system (rove-style §16); the releasing
   system writes the component back to its default as part of the release it
